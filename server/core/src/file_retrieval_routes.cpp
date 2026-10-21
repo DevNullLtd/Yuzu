@@ -3,6 +3,7 @@
 #include "body_cap_policy.hpp" // kBodyCapTable binding assert below
 #include "evp_raii.hpp"
 #include "http_route_sink.hpp"
+#include "query_int_parse.hpp" // read_json_int_strict (#4644)
 #include "rest_a4_envelope_http.hpp" // detail::a4_error — operator-route A4 envelope
 #include "rest_audit.hpp" // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "upload_grant_parsers.hpp"
@@ -21,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <unordered_map>
@@ -372,8 +374,18 @@ void register_mint(HttpRouteSink& sink, Deps deps) {
         params.minted_by = session->username;
         if (auto it = body.find("declared_max_size"); it != body.end() && it->is_number_integer())
             params.declared_max_size = it->get<std::int64_t>();
-        if (auto it = body.find("ttl_secs"); it != body.end() && it->is_number_integer())
-            params.requested_ttl_secs = it->get<std::int64_t>();
+        // ABSENT keeps the server default; a PRESENT ttl_secs must be one JSON integer >= 1 (#4644).
+        // A wrong type, 0 or a negative value used to be ignored and fall to the default, which is
+        // also the MAXIMUM (900 s): a caller asking for a short grant got the longest one. A value
+        // above the maximum still clamps to it, as documented.
+        if (body.contains("ttl_secs")) {
+            const auto ttl = read_json_int_strict(body, "ttl_secs", 0);
+            if (!ttl || *ttl < 1) {
+                send_generic(res, 400, "ttl_secs must be a JSON integer of at least 1");
+                return;
+            }
+            params.requested_ttl_secs = *ttl;
+        }
 
         // The MCP twin enforces `^[0-9a-f]{64}$` on this field through its
         // input schema; REST accepted anything and persisted it verbatim.
@@ -410,6 +422,9 @@ void register_mint(HttpRouteSink& sink, Deps deps) {
                               {"expires_at", minted->expires_at},
                               {"destination_key", minted->destination_key}};
         res.status = 201;
+        // The body carries the raw one-time grant secret: never cached or stored by a proxy.
+        res.set_header("Cache-Control", "no-store, no-cache, must-revalidate");
+        res.set_header("Pragma", "no-cache");
         res.set_content(out.dump(), "application/json");
     });
 }
@@ -419,6 +434,22 @@ void register_list(HttpRouteSink& sink, Deps deps) {
         auto session = deps.auth_fn ? deps.auth_fn(req, res) : std::nullopt;
         if (!session)
             return;
+        // A service-scoped token is refused outright, as the MCP twin's `perm_fn` gate does
+        // (its ITServiceOwner ceiling plus the empty `kServiceScopeGlobalSafe` allow-list).
+        // The list-admit resolver below evaluates the MINTER's username, so without this a
+        // service token would inherit its minter's UploadGrant:Read view (the whole fleet for
+        // a minter with a global grant). Non-service sessions skip this block entirely.
+        // `register_file_retrieval_routes` refuses to register with an unwired closure, so it
+        // is bound here. A closure that did not write the denial (returned false) still
+        // refuses: the generic 403 below is the fail-closed fallback for that.
+        if (!session->token_scope_service.empty()) {
+            if (!deps.deny_service_scoped_fn(req, res, "upload_grant.list.access_denied",
+                                             "service-scoped tokens may not list upload grants",
+                                             "UploadGrant", ""))
+                send_generic(res, 403, "permission denied");
+            return;
+        }
+
         if (!require_store(deps, res))
             return;
 
@@ -1047,6 +1078,12 @@ void register_cancel(HttpRouteSink& sink, Deps deps) {
 } // namespace
 
 void register_file_retrieval_routes(HttpRouteSink& sink, Deps deps) {
+    // The list route refuses a service-scoped token through this closure. Refuse at
+    // registration, before any route is added, rather than substituting a different answer
+    // at request time (the same convention as register_health_routes).
+    if (!deps.deny_service_scoped_fn)
+        throw std::invalid_argument(
+            "register_file_retrieval_routes: deps.deny_service_scoped_fn must be bound");
     register_mint(sink, deps);
     register_list(sink, deps);
     register_revoke(sink, deps);

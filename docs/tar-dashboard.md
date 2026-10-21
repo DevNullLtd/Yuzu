@@ -17,7 +17,7 @@ The page is also the home for several affordances that did not have anywhere to 
 2. **Process tree viewer** — reconstructed per-host from that host's local TAR warehouse (`$Process_Live` + `$TCP_Live`) only, with no seed (as-built; see §5). Forensic timeline of every process born under a parent over a chosen window, with an honest "no-seed" completeness caveat (Windows is names-only). **The pane also embeds device-level DNS-cache + ARP-table panels (ADR-0015)** — dispatched read-only `tar.sql` over `$DNS_Live`/`$ARP_Live` to the selected host, rendered beside the tree. These are **device views, not per-process** (the DNS cache carries no pid); they audit `tar.dns.read` / `tar.arp.read` (DNS is usage-class PII, separately countable).
 3. **Capture sources frame (ADR-0015)** — a per-device toggle table for every TAR capture source, with a category filter and a **staged-then-push guardrail**: toggling a source only *stages* the change; nothing is dispatched until the operator clicks **Push** (guards against accidentally enabling a usage-class source). Reads `tar status` + `tar compatibility`; Push dispatches `tar configure <source>_enabled` per change (audited `tar.sources.read` / `tar.sources.configure`). The same configure path is reachable via MCP/REST `crossplatform.tar.configure`.
 
-The page is also the surface where **scope walking** (per `docs/scope-walking-design.md`) becomes most visibly useful — the TAR SQL frame is the canonical iterative-narrowing tool, and result-set chips on this page are the operator's reasoning chain made visible.
+The page is also the surface where **scope walking** (per `docs/scope-walking-design.md`) becomes most visibly useful — the TAR SQL query is the canonical iterative-narrowing tool (it now starts from the Result sets page, **From TAR query**, rather than from a frame on `/tar`), and result-set chips are the operator's reasoning chain made visible.
 
 ## 2. Information architecture
 
@@ -74,7 +74,7 @@ URL structure:
 |---|---|---|
 | `/tar` | The page | `Infrastructure:Read` |
 | `/fragments/tar/retention-paused` | HTMX fragment for the paused-sources table | `Infrastructure:Read` |
-| `/fragments/tar/sql` | (existing, relocated) HTMX fragment for the SQL frame | `Infrastructure:Read` + dispatch |
+| `/fragments/tar/sql` | (retired) the SQL frame fragment; Ad-hoc TAR SQL now starts from Result sets > From TAR query (`POST /api/v1/result-sets/from-tar-query`) | `Execution:Execute` |
 | `/fragments/tar/process-tree` | HTMX fragment for the tree viewer | `Infrastructure:Read` |
 | `/api/v1/tar/retention-status` | JSON: per-device per-source enabled/disabled | `Infrastructure:Read` |
 | `/api/v1/tar/process-tree/{device_id}` | JSON: reconstructed tree for one device — **DEFERRED, not implemented (§5.6)**; the shipped viewer is HTMX-fragment-only | `Infrastructure:Read` |
@@ -98,6 +98,8 @@ This avoids a new persistent server-side mirror, which would have to be reconcil
 - Scope-restricted queries (the operator usually narrows first via a result set)
 - Manual **Refresh** button for ad-hoc re-fan-out (automatic background refresh is planned for Phase 15.G operational hardening)
 - Manual "Refresh" button for ad-hoc re-fan-out
+
+> **Bounded scan read (#4644).** The scan's response read goes through the byte-aware store fetch (10,000 rows / 50 MiB of response payload). A cut is reported, never silent: the page shows a "Partial result" banner, qualifies its header counts and, with no rows in the part that was read, replaces the "still in progress" / "all clear" empty states with one saying the page cannot tell; `GET /api/v1/tar/retention-paused` and `list_tar_retention_paused` carry `result_truncated_by_cap: true` and also set `store_degraded: true`. This page is a dispatch-and-poll view, not a capture source, so the CORE capture-source pattern (§8 of the implementer doc) does not apply.
 
 ### 3.2 Extending `tar.status`
 
@@ -147,6 +149,8 @@ Server dispatches a new agent action `tar.purge_source` with `{source: <name>}`.
 - Integration: stand up the UAT stack, disable a source on a synthetic agent, confirm the row appears in the page within one refresh tick, click re-enable, confirm the row drops.
 
 ## 4. PR-D — TAR SQL frame, scope-walking-aware
+
+> **As built:** the frame was not kept on `/tar`. The TAR page carries a short note linking to Result sets, and the same query (parent scope, SQL, name, include-empty) is run from **Result sets > From TAR query**, behind a confirm that shows the SQL. The text below is the original design.
 
 The frame body is largely the existing `/fragments/tar-sql` route (`server/core/src/dashboard_routes.cpp:500`). PR-D moves it onto the new page and wires it into the result-set primitive (`docs/scope-walking-design.md`):
 
@@ -343,7 +347,7 @@ Per `docs/observability-conventions.md`:
 | Metric | Type | Labels | Status |
 |---|---|---|---|
 | `yuzu_tar_dashboard_view_total` | counter | `frame` (retention/sql/tree), `result` | shipped (PR-A.A) |
-| `yuzu_tar_retention_paused_devices` | gauge | `source` | shipped (PR-A.A) |
+| `yuzu_tar_retention_paused_devices` | gauge | `source` | shipped (PR-A.A). Set from the rows of the page's own scan read. A cut scan (`result_truncated_by_cap`, see the bounded-read note in §3.1) does not update it, because its rows would under-count; the gauge keeps the last value from an uncut scan, so it can be stale. It is a per-render view, not a fleet total. |
 | `yuzu_tar_source_purge_total` | counter | `result` | **shipped** (Phase 15.A — dashboard fragment + `POST /api/v1/tar/retention-paused/purge`) |
 | `yuzu_tar_source_reenable_total` | counter | `result` | shipped (PR-A.A — dashboard fragment only, no REST twin) |
 | `yuzu_tar_scan_dispatched_total` | counter | `result` | shipped (PR-A.A) |

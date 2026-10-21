@@ -3,17 +3,23 @@
     "method": "POST",
     "path": "/api/settings/api-tokens",
     "capability_id": "post.api-settings-api-tokens",
-    "rest_v1_twin": "POST /api/v1/tokens",
+    "rest_v1_twin": {
+      "method": "POST",
+      "path": "/api/v1/tokens"
+    },
     "mcp_twin": "create_api_token",
-    "status": "exception:same ApiTokenStore write + same RBAC gate as its v1/MCP twins (#2146 B4), but this dashboard-form route does NOT call step_up_fn while POST /api/v1/tokens does -- a real gate mismatch (composed-of requires gate-match, not just data-match), recorded rather than smoothed into twinned"
+    "status": "twinned"
   },
   {
     "method": "DELETE",
     "path": "/api/settings/api-tokens/{param}",
     "capability_id": "delete.api-settings-api-tokens-param",
-    "rest_v1_twin": "DELETE /api/v1/tokens/{id}",
+    "rest_v1_twin": {
+      "method": "DELETE",
+      "path": "/api/v1/tokens/{id}"
+    },
     "mcp_twin": "revoke_api_token",
-    "status": "exception:same ApiTokenStore delete + same RBAC gate as its v1/MCP twins (#2146 B4), but this dashboard-form route does NOT call step_up_fn while DELETE /api/v1/tokens/{id} does -- same gate-mismatch caveat as the sibling POST row above"
+    "status": "twinned"
   },
   {
     "method": "POST",
@@ -40,6 +46,22 @@
     "status": "planned:#2146"
   },
   {
+    "method": "POST",
+    "path": "/api/v1/users/me/password",
+    "capability_id": "post.api-v1-users-me-password",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "exception:#5342 self-service local password change has NO MCP twin, permanently -- an MCP caller is a token, not the human, and a token that can change its owner's password converts token compromise into account takeover (the route itself refuses every token/MCP session); credentials never transit the agentic channel"
+  },
+  {
+    "method": "POST",
+    "path": "/api/v1/users/{param}/password",
+    "capability_id": "post.api-v1-users-param-password",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "exception:#5357 revisit:2027-01-04 admin password reset has no MCP twin: approval tickets persist canonical args in plaintext, so a password argument would be stored and shown; the planned twin is a reset_user_password tool that takes no password argument (#5357)"
+  },
+  {
     "method": "GET",
     "path": "/fragments/settings/api-tokens",
     "capability_id": "get.fragments-settings-api-tokens",
@@ -62,5 +84,73 @@
     "rest_v1_twin": null,
     "mcp_twin": null,
     "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/access/users/list",
+    "capability_id": "get.fragments-access-users-list",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "exception:#5955 revisit:2026-11-30 UI-only fragment; no machine twin yet (ADR-1005, owner-accepted temporary 2026-10-15)"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/access/users/detail",
+    "capability_id": "get.fragments-access-users-detail",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "exception:#5955 revisit:2026-11-30 UI-only fragment composed over get.fragments-access-users-list; no machine twin yet (ADR-1005, owner-accepted temporary 2026-10-15)"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/access/tokens/list",
+    "capability_id": "get.fragments-access-tokens-list",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "exception:#5955 revisit:2026-11-30 UI-only fragment; no machine twin yet (ADR-1005, owner-accepted temporary 2026-10-15)"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/access/roles/list",
+    "capability_id": "get.fragments-access-roles-list",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/rbac/roles"
+    },
+    "mcp_twin": "discover_permissions",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/access/roles/permissions",
+    "capability_id": "get.fragments-access-roles-permissions",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/rbac/roles/{param}/permissions"
+    },
+    "mcp_twin": "discover_permissions",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/access/roles/assignments",
+    "capability_id": "get.fragments-access-roles-assignments",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/rbac/roles/assignments"
+    },
+    "mcp_twin": "list_rbac_role_assignments",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/access/enforcement",
+    "capability_id": "get.fragments-access-enforcement",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/me"
+    },
+    "mcp_twin": null,
+    "status": "twinned-rest-only"
   }
 ]

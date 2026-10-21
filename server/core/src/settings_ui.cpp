@@ -1,8 +1,12 @@
 // Settings page HTML — compiled in its own translation unit.
-// Uses HTMX for all server interactions; no client-side JavaScript except clipboard.
+// HTMX-first. Plain JS only where htmx has no CSP-safe equivalent: clipboard
+// copy, and fetch() for the JSON REST v1 routes (engine principals, #5342
+// password change/reset). Never `hx-on` — the CSP blocks it (CLAUDE.md).
+
+#include "app_shell.hpp"
 
 // NOLINTBEGIN(cert-err58-cpp)
-extern const char* const kSettingsHtml =
+const char* const kSettingsPageTemplate =
     R"HTM(<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -13,199 +17,236 @@ extern const char* const kSettingsHtml =
   <script src="/static/htmx.js"></script>
   <script src="/static/sse.js"></script>
   <style>
-    body { min-height: 100vh; }
+    body { min-height: calc(100vh - var(--shell-top-h)); }
 
-    /* ── Content ───────────────────────────────────────────── */
+    /* ── Page frame ────────────────────────────────────────── */
     .content {
-      max-width: 800px; margin: 1.5rem auto; padding: 0 1.5rem;
+      max-width: 1200px; padding: 22px 28px 36px;
+      display: flex; flex-direction: column; gap: 22px;
     }
+    code { font-family: var(--mds-font-family-mono); font-size: 12.5px; }
+    .muted { color: var(--mut); }
+    .hint { color: var(--mut); font-size: 12.5px; }
+    .section-body a:not(.btn) { color: var(--primary); }
 
-    /* ── Section cards ─────────────────────────────────────── */
+    /* ── Section panels (bordered regions, header + body) ──── */
     .section {
-      background: var(--surface); border: 1px solid var(--border);
-      border-radius: 0.5rem; margin-bottom: 1.5rem; overflow: hidden;
+      background: var(--surface); border: 1px solid var(--line);
+      border-radius: var(--rad-panel); min-width: 0; overflow: hidden;
     }
     .section-header {
-      padding: 0.75rem 1rem; font-size: 0.85rem; font-weight: 600;
-      border-bottom: 1px solid var(--border);
-      display: flex; align-items: center; gap: 0.5rem;
+      padding: 12px 16px; font-size: 14px; font-weight: 600;
+      border-bottom: 1px solid var(--line);
+      display: flex; align-items: center; gap: 8px;
     }
-    .section-body { padding: 1rem; }
+    .section-body { padding: 16px; overflow-x: auto; }
+    .section-intro {
+      margin: 0 0 12px; max-width: 80ch; font-size: 13px; color: var(--mut);
+    }
+    .sub-head {
+      margin: 16px 0 8px; font-size: 13px; font-weight: 600; color: var(--ink);
+    }
+    .section-note {
+      margin: 12px 0 0; font-size: 12.5px; color: var(--mut);
+    }
+    .section-note.warn { color: var(--warn); }
 
     /* ── Form elements ─────────────────────────────────────── */
     .form-row {
-      display: flex; align-items: center; gap: 1rem;
-      margin-bottom: 0.75rem;
+      display: flex; align-items: center; gap: 16px;
+      margin-bottom: 12px;
     }
     .form-row:last-child { margin-bottom: 0; }
-    .form-row label {
-      flex: 0 0 140px; font-size: 0.8rem; color: var(--mds-color-theme-text-tertiary);
-      font-weight: 600;
+    .form-row > label:first-child {
+      flex: 0 0 180px; font-size: 13px; color: var(--ink2); font-weight: 500;
     }
-    .form-row input[type="text"],
-    .form-row input[type="password"],
-    .form-row select {
-      flex: 1; padding: 0.4rem 0.6rem;
-      background: var(--bg); color: var(--fg);
-      border: 1px solid var(--border); border-radius: 0.3rem;
-      font-size: 0.8rem; font-family: var(--mono);
-      outline: none;
+    .section-body :is(input:not([type="checkbox"], [type="radio"], [type="range"],
+                                [type="file"], [type="hidden"]), select) {
+      height: var(--ctl); padding: 0 10px;
+      background: var(--bg); color: var(--ink);
+      border: 1px solid var(--line2); border-radius: var(--rad-ctl);
+      font: inherit; font-size: 13.5px; min-width: 0;
     }
-    .form-row input:focus, .form-row select:focus {
-      border-color: var(--accent);
+    .section-body textarea {
+      padding: 8px 10px; background: var(--bg); color: var(--ink);
+      border: 1px solid var(--line2); border-radius: var(--rad-ctl);
+      font-family: var(--mds-font-family-mono); font-size: 12.5px;
+    }
+    .form-row input[type="text"], .form-row input[type="password"], .form-row select { flex: 1; }
+    .form-row input.num-narrow { width: 7rem; flex: 0 0 auto; }
+    .form-row input[type="text"], .form-row input[type="password"] {
+      font-family: var(--mds-font-family-mono); font-size: 12.5px;
+    }
+    .section-body ::placeholder { color: var(--faint); }
+    .section-body input[type="checkbox"]:not(.toggle input) {
+      accent-color: var(--primary); width: 16px; height: 16px;
+    }
+    .section-body input[type="range"] { accent-color: var(--primary); }
+    .section-body input[type="file"]::file-selector-button {
+      height: 28px; margin-right: 10px; padding: 0 10px; cursor: pointer;
+      color: var(--ink); background: var(--raise); font: inherit; font-size: 13px; font-weight: 500;
+      border: 1px solid var(--line2); border-radius: var(--rad-ctl);
+    }
+    .section-body :is(input, select, textarea):focus { border-color: var(--primary); }
+    .section-body :is(input, select, textarea, summary):focus-visible,
+    .toggle input:focus-visible + .slider {
+      outline: 2px solid var(--focus); outline-offset: 2px;
     }
 
-    /* ── Toggle switch ─────────────────────────────────────── */
+    /* ── Switch ────────────────────────────────────────────── */
     .toggle {
-      position: relative; display: inline-block;
-      width: 42px; height: 22px;
+      position: relative; display: inline-block; flex: 0 0 36px;
+      width: 36px; height: 20px;
     }
     .toggle input { opacity: 0; width: 0; height: 0; }
     .toggle .slider {
-      position: absolute; cursor: pointer;
-      top: 0; left: 0; right: 0; bottom: 0;
-      background: var(--mds-color-theme-outline-secondary); border-radius: 22px;
-      transition: 0.2s;
+      position: absolute; cursor: pointer; inset: 0;
+      background: var(--line2); border-radius: 3px;
+      transition: background .12s;
     }
     .toggle .slider::before {
-      content: ''; position: absolute;
-      height: 16px; width: 16px; left: 3px; bottom: 3px;
-      background: white; border-radius: 50%;
-      transition: 0.2s;
+      content: ''; position: absolute; top: 2px; left: 2px;
+      height: 16px; width: 16px; background: var(--raise); border-radius: 2px;
+      transition: left .12s;
     }
-    .toggle input:checked + .slider { background: var(--green); }
-    .toggle input:checked + .slider::before { transform: translateX(20px); }
-
-    /* ── Settings button overrides (smaller than design-system default) ── */
-    .btn { height: auto; padding: 0.4rem 1rem; font-size: 0.8rem; border: none; }
+    .toggle input:checked + .slider { background: var(--primary); }
+    .toggle input:checked + .slider::before { left: 18px; background: var(--on-primary); }
 
     /* ── File upload ───────────────────────────────────────── */
     .file-upload {
-      display: flex; align-items: center; gap: 0.75rem;
+      display: flex; align-items: center; flex-wrap: wrap; gap: 12px;
     }
     .file-name {
-      font-size: 0.75rem; color: var(--mds-color-theme-text-tertiary); font-family: var(--mono);
+      font-size: 12.5px; color: var(--mut); font-family: var(--mds-font-family-mono);
     }
 
-    /* ── User table ────────────────────────────────────────── */
+    /* ── Tables ────────────────────────────────────────────── */
     .user-table {
-      width: 100%; border-collapse: collapse; font-size: 0.8rem;
+      width: 100%; border-collapse: separate; border-spacing: 0;
+      border: 1px solid var(--line); border-radius: var(--rad-panel);
+      font-size: 13.5px; overflow: hidden;
     }
     .user-table th {
-      text-align: left; padding: 0.4rem 0.6rem;
-      border-bottom: 2px solid var(--border); color: var(--mds-color-theme-text-tertiary);
-      font-size: 0.7rem; text-transform: uppercase;
-      letter-spacing: 0.05em; font-weight: 600;
+      text-align: left; padding: 8px 12px; white-space: nowrap;
+      background: var(--surface2); border-bottom: 1px solid var(--line);
+      color: var(--mut); font-size: 12.5px; font-weight: 500;
     }
     .user-table td {
-      padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border);
+      padding: var(--cell-y) 12px; border-bottom: 1px solid var(--line);
+      color: var(--ink2); vertical-align: middle;
     }
-    .user-table tr:hover { background: var(--mds-color-state-hover); }
+    /* A state class on a <td> must out-rank .user-table td above. */
+    .user-table td.muted { color: var(--mut); }
+    .user-table td.feedback-error { color: var(--bad); }
+    .user-table tbody tr:last-child td { border-bottom: 0; }
+    .user-table tbody tr:hover td { background: var(--surface2); }
+    .user-table td .btn:not(.add-user-form .btn) {
+      height: 28px; padding: 0 8px; background: none; border-color: transparent;
+      color: var(--primary); font-size: 13px;
+    }
+    .user-table td .btn-danger:not(.add-user-form .btn) { color: var(--bad); }
+    .user-table td .btn:not(.add-user-form .btn):hover:not(:disabled) {
+      background: none; border-color: transparent; opacity: 1; text-decoration: underline;
+    }
+    .user-table td input:not([type="range"], [type="checkbox"], [type="hidden"],
+                             .add-user-form input) { height: 28px; font-size: 13px; }
     .role-badge {
-      font-size: 0.7rem; padding: 0.1rem 0.5rem;
-      border-radius: 1rem; font-weight: 600;
+      display: inline-flex; align-items: center; padding: 1px 8px; border-radius: 3px;
+      font-size: 12.5px; font-weight: 500; white-space: nowrap;
+      background: var(--surface2); color: var(--mut);
     }
-    .role-admin { background: var(--accent); color: var(--mds-color-text-on-accent); }
-    .role-user  { background: var(--mds-color-theme-outline-secondary); color: var(--mds-color-text-on-accent); }
-
-    /* ── Disabled/coming-soon overlay ──────────────────────── */
-    .coming-soon {
-      position: relative; opacity: 0.45; pointer-events: none;
-    }
-    .coming-soon-badge {
-      position: absolute; top: 0.75rem; right: 1rem;
-      font-size: 0.65rem; padding: 0.15rem 0.5rem;
-      background: var(--yellow); color: #000;
-      border-radius: 1rem; font-weight: 700;
-      pointer-events: auto;
-    }
+    .role-admin { background: var(--mds-color-bg-info-tinted); color: var(--info); }
+    .role-ok    { background: var(--mds-color-bg-success-tinted); color: var(--ok); }
+    .role-warn  { background: var(--mds-color-bg-warning-tinted); color: var(--warn); }
+    .role-bad   { background: var(--mds-color-bg-error-tinted); color: var(--bad); }
 
     /* ── Feedback ──────────────────────────────────────────── */
     .feedback {
-      font-size: 0.8rem; margin-top: 0.75rem; min-height: 1.2em;
+      font-size: 13px; margin-top: 12px; min-height: 1.2em;
     }
-    .feedback-ok    { color: var(--green); }
-    .feedback-error { color: var(--red); }
+    .feedback:empty { display: none; }
+    .feedback-ok    { color: var(--ok); }
+    .feedback-error { color: var(--bad); }
+    .feedback-warning {
+      padding: 12px 14px; border: 1px solid var(--line2);
+      border-radius: var(--rad-panel); background: var(--surface2); color: var(--ink2);
+      font-size: 13.5px;
+    }
+    .feedback-warning { border-color: color-mix(in srgb, var(--warn) 50%, var(--line2)); }
 
-    /* ── Add user form ─────────────────────────────────────── */
+    /* ── Add-row forms ─────────────────────────────────────── */
     .add-user-form {
-      display: flex; gap: 0.5rem; align-items: flex-end;
-      margin-top: 1rem; padding-top: 0.75rem;
-      border-top: 1px solid var(--border);
+      display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end;
+      margin-top: 16px; padding-top: 16px;
+      border-top: 1px solid var(--line);
     }
-    .add-user-form .mini-field {
-      display: flex; flex-direction: column; gap: 0.2rem;
+    /* #5572 — the base class had no flex-wrap, so a row with enough fields
+       (the OTA upload form: platform/arch selects + two file inputs +
+       rollout + mandatory + submit, the widest consumer of this class)
+       overflows its container with nowrap and pushes the submit button out
+       of view with no scroll affordance inside a form row. Wrapping is a
+       no-op for every narrower .add-user-form instance that already fits
+       on one line. */
+    .mini-field {
+      display: flex; flex-direction: column; gap: 5px;
+      min-width: 0;
     }
-    .add-user-form .mini-field label {
-      font-size: 0.65rem; color: var(--mds-color-theme-text-tertiary); font-weight: 600;
+    .add-user-form input[type="file"] {
+      max-width: 260px;
     }
-    .add-user-form input, .add-user-form select {
-      padding: 0.35rem 0.5rem;
-      background: var(--bg); color: var(--fg);
-      border: 1px solid var(--border); border-radius: 0.3rem;
-      font-size: 0.8rem; outline: none;
+    .mini-field label {
+      font-size: 13px; color: var(--ink2); font-weight: 500;
     }
+    /* #5572 — flex-wrap now comes from the .add-user-form base rule; this
+       override only needs the layout tweaks still specific to the nested
+       password-change variant. */
+    .pw-form { margin-top: 4px; padding-top: 0; border-top: none; }
 
     /* ── Token reveal ──────────────────────────────────────── */
     .token-reveal {
-      margin-top: 1rem; padding: 0.75rem;
-      background: var(--mds-color-theme-background-canvas); border: 1px solid var(--green);
-      border-radius: 0.3rem;
+      margin: 16px 0 12px; padding: 12px 14px;
+      background: var(--surface2);
+      border: 1px solid color-mix(in srgb, var(--warn) 50%, var(--line2));
+      border-radius: var(--rad-panel);
     }
     .token-reveal-header {
-      font-size: 0.7rem; color: var(--green);
-      margin-bottom: 0.3rem; font-weight: 600;
+      font-size: 13px; color: var(--ink);
+      margin-bottom: 6px; font-weight: 600;
     }
     .token-reveal code {
-      font-size: 0.85rem; word-break: break-all;
-      color: var(--fg); user-select: all;
+      font-size: 13px; word-break: break-all;
+      color: var(--ink); user-select: all;
     }
 
     /* ── HTMX loading indicator ────────────────────────────── */
     .htmx-indicator {
-      display: none; color: var(--mds-color-theme-text-tertiary); font-size: 0.75rem;
+      display: none; color: var(--mut); font-size: 12.5px;
     }
     .htmx-request .htmx-indicator,
     .htmx-request.htmx-indicator { display: inline; }
   </style>
 </head>
-<body>
+)HTM"
+    // #5572 CI fix — MSVC's raw-string literal has a hard ~16,380-byte cap
+    // (C2026 "string too big"); the CSS growth here pushed the first chunk
+    // over it. Split here, at the </head>/<body> boundary — already the
+    // idiom this file uses (see every other )HTM"\n R"HTM( pair below).
+    // GCC/Clang have no such limit, so this only shows up on the Windows
+    // CI leg; docs/build-guide.md and
+    // build-and-observability-gotchas-from-pki.md document the pattern.
+    R"HTM(<body>
 
-  <nav class="nav-bar">
-    <a href="/" class="nav-brand">
-      <svg class="icon"><use href="/static/icons.svg#home"></use></svg> Yuzu
-    </a>
-    <a href="/" class="nav-link">Dashboard</a>
-    <a href="/instructions" class="nav-link">Instructions</a>
-    <a href="/compliance" class="nav-link">Compliance</a>
-    <a href="/guardian" class="nav-link">Guardian</a>
-    <a href="/dex" class="nav-link">DEX</a>
-    <a href="/tar" class="nav-link">TAR</a>
-    <a href="/hardware" class="nav-link">Hardware</a>
-    <a href="/software" class="nav-link">Software</a>
-    <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
-    <a href="/result-sets" class="nav-link">Result Sets</a>
-    <a href="/settings" class="nav-link active" id="nav-settings-link">Settings</a>
-    <span class="nav-spacer"></span>
-    <span class="nav-user" id="nav-user"></span>
-    <button class="nav-logout" hx-post="/logout">Logout</button>
-  </nav>
-  <div class="context-bar" id="context-bar">
-    <span class="context-role-badge" id="role-badge"></span>
-    <span class="context-user" id="context-user"></span>
-    <span class="context-spacer"></span>
-    <button class="context-bell" title="Notifications">
-      <svg class="icon"><use href="/static/icons.svg#bell"></use></svg>
-    </button>
-  </div>
+  <!--yuzu:shell--><!--/yuzu:shell-->
 
   <div class="content">
+
+    <div class="page-header"><h1>Settings</h1></div>
 
     <!-- ── Server Configuration ───────────────────────────── -->
     <div class="section">
       <div class="section-header">Server Configuration</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+        <p class="section-intro">
           Network listeners, session limits, and rate limiting.
           These values are set at server startup via CLI flags or environment variables.
         </p>
@@ -213,7 +254,7 @@ extern const char* const kSettingsHtml =
              hx-get="/fragments/settings/server-config"
              hx-trigger="load"
              hx-swap="innerHTML">
-          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+          <span class="muted">Loading...</span>
         </div>
       </div>
     </div>
@@ -227,23 +268,23 @@ extern const char* const kSettingsHtml =
              hx-get="/fragments/settings/tls"
              hx-trigger="load"
              hx-swap="innerHTML">
-          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+          <span class="muted">Loading...</span>
         </div>
       </div>
     </div>
 
-    <!-- ── HTTPS Dashboard ────────────────────────────────── -->
+    <!-- ── HTTPS Console ────────────────────────────────── -->
     <div class="section">
-      <div class="section-header">HTTPS Dashboard</div>
+      <div class="section-header">HTTPS Console</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
-          TLS termination for the web dashboard and REST API.
+        <p class="section-intro">
+          TLS termination for the web Console and REST API.
         </p>
         <div id="https-section"
              hx-get="/fragments/settings/https"
              hx-trigger="load"
              hx-swap="innerHTML">
-          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+          <span class="muted">Loading...</span>
         </div>
       </div>
     </div>
@@ -252,16 +293,16 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">Internal Certificate Authority</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+        <p class="section-intro">
           The built-in CA that issues the default server certificates and per-agent
-          mTLS client certificates. Download the root to trust the dashboard, review
+          mTLS client certificates. Download the root to trust the Console, review
           issued certificates, and revoke a compromised agent.
         </p>
         <div id="ca-section"
              hx-get="/fragments/settings/ca"
              hx-trigger="load"
              hx-swap="innerHTML">
-          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+          <span class="muted">Loading...</span>
         </div>
       </div>
     </div>
@@ -274,7 +315,7 @@ extern const char* const kSettingsHtml =
              hx-get="/fragments/settings/users"
              hx-trigger="load, refreshUsers from:body"
              hx-swap="innerHTML">
-          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+          <span class="muted">Loading...</span>
         </div>
       </div>
     </div>
@@ -283,7 +324,7 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">Multi-Factor Authentication</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+        <p class="section-intro">
           Add a TOTP-based second factor to your account (Google Authenticator, 1Password,
           Authy, Microsoft Authenticator). Recovery codes let you sign in if you lose your
           authenticator device.
@@ -292,7 +333,7 @@ extern const char* const kSettingsHtml =
              hx-get="/fragments/settings/mfa"
              hx-trigger="load, refreshMfa from:body"
              hx-swap="innerHTML">
-          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+          <span class="muted">Loading...</span>
         </div>
       </div>
     </div>
@@ -301,7 +342,7 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">Enrollment Tokens</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+        <p class="section-intro">
           Generate pre-shared tokens to auto-enroll agents.
           The raw token is shown <strong>once</strong> — copy it before closing.
         </p>
@@ -309,7 +350,7 @@ extern const char* const kSettingsHtml =
              hx-get="/fragments/settings/tokens"
              hx-trigger="load, refreshTokens from:body"
              hx-swap="innerHTML">
-          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+          <span class="muted">Loading...</span>
         </div>
       </div>
     </div>
@@ -318,7 +359,7 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">API Tokens</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+        <p class="section-intro">
           Generate tokens for programmatic REST API access.
           Pass via <code>Authorization: Bearer &lt;token&gt;</code> or
           <code>X-Yuzu-Token</code> header.
@@ -328,7 +369,7 @@ extern const char* const kSettingsHtml =
              hx-get="/fragments/settings/api-tokens"
              hx-trigger="load, refreshApiTokens from:body"
              hx-swap="innerHTML">
-          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+          <span class="muted">Loading...</span>
         </div>
       </div>
     </div>
@@ -337,7 +378,7 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">Engine Principals</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+        <p class="section-intro">
           Durable identities for autonomous use-case engine modules — owner, justification,
           and classification outlive any one credential. Revoke is terminal; recovery mints
           a successor principal (never un-revoked). A user cannot be deleted while owning an
@@ -355,7 +396,7 @@ extern const char* const kSettingsHtml =
              hx-get="/fragments/settings/engine-principals"
              hx-trigger="load, refreshEnginePrincipals from:body"
              hx-swap="innerHTML">
-          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+          <span class="muted">Loading...</span>
         </div>
       </div>
     </div>
@@ -366,7 +407,7 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">Access Reviews</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+        <p class="section-intro">
           Periodic review evidence for every user/group/engine-principal's direct role grants.
           This panel is a convenience view — the REST API (<code>/api/v1/access-reviews*</code>)
           and MCP twins are the primary surface.
@@ -375,7 +416,7 @@ extern const char* const kSettingsHtml =
              hx-get="/fragments/settings/access-reviews"
              hx-trigger="load, refreshAccessReview from:body"
              hx-swap="innerHTML">
-          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+          <span class="muted">Loading...</span>
         </div>
       </div>
     </div>
@@ -386,7 +427,7 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">Auto-Approve Policies</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+        <p class="section-intro">
           Define rules to automatically approve agents on registration.
           Matching agents skip the pending queue entirely.
         </p>
@@ -394,7 +435,7 @@ extern const char* const kSettingsHtml =
              hx-get="/fragments/settings/auto-approve"
              hx-trigger="load, refreshAutoApprove from:body"
              hx-swap="innerHTML">
-          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+          <span class="muted">Loading...</span>
         </div>
       </div>
     </div>
@@ -405,7 +446,7 @@ extern const char* const kSettingsHtml =
          sse-connect="/events">
       <div class="section-header">Pending Agent Approvals</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+        <p class="section-intro">
           Agents that registered without an enrollment token are shown here.
           Approve or deny them to control fleet membership.
         </p>
@@ -413,7 +454,7 @@ extern const char* const kSettingsHtml =
              hx-get="/fragments/settings/pending"
              hx-trigger="load, sse:pending-agent, refreshPending from:body"
              hx-swap="innerHTML">
-          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+          <span class="muted">Loading...</span>
         </div>
       </div>
     </div>
@@ -422,7 +463,7 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">Plugin Code Signing</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+        <p class="section-intro">
           Operator-managed trust bundle for agent plugin code signing.
           Upload a PEM bundle of CA certificates that should anchor plugin signatures;
           enable "Require signed plugins" to reject unsigned plugins on every agent.
@@ -431,7 +472,7 @@ extern const char* const kSettingsHtml =
              hx-get="/fragments/settings/plugin-signing"
              hx-trigger="load, refreshPluginSigning from:body"
              hx-swap="innerHTML">
-          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+          <span class="muted">Loading...</span>
         </div>
       </div>
     </div>
@@ -440,14 +481,14 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">Agent Updates (OTA)</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+        <p class="section-intro">
           Upload agent binaries and manage fleet-wide update rollout.
         </p>
         <div id="updates-section"
              hx-get="/fragments/settings/updates"
              hx-trigger="load"
              hx-swap="innerHTML">
-          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+          <span class="muted">Loading...</span>
         </div>
       </div>
     </div>
@@ -458,7 +499,7 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">Gateway</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+        <p class="section-intro">
           The Erlang/OTP gateway node sits between agents and this server,
           providing connection multiplexing, heartbeat batching, and circuit breaker protection.
         </p>
@@ -466,7 +507,7 @@ extern const char* const kSettingsHtml =
              hx-get="/fragments/settings/gateway"
              hx-trigger="load"
              hx-swap="innerHTML">
-          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+          <span class="muted">Loading...</span>
         </div>
       </div>
     </div>
@@ -475,14 +516,14 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">Analytics &amp; Telemetry</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+        <p class="section-intro">
           Event collection, ClickHouse integration, and JSONL export.
         </p>
         <div id="analytics-section"
              hx-get="/fragments/settings/analytics"
              hx-trigger="load"
              hx-swap="innerHTML">
-          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+          <span class="muted">Loading...</span>
         </div>
       </div>
     </div>
@@ -491,32 +532,14 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">Data Retention</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+        <p class="section-intro">
           Retention policies for response data and audit logs.
         </p>
         <div id="data-retention-section"
              hx-get="/fragments/settings/data-retention"
              hx-trigger="load"
              hx-swap="innerHTML">
-          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
-        </div>
-      </div>
-    </div>
-
-    <!-- ── DEX Alerts (F1) ────────────────────────────────── -->
-    <div class="section">
-      <div class="section-header">DEX Alerts</div>
-      <div class="section-body">
-        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
-          Route DEX reliability signals to operator notifications and the
-          <code>dex.signal</code> webhook event, and tune the fleet blast-radius
-          incident thresholds. Changes apply immediately.
-        </p>
-        <div id="dex-alerts-section"
-             hx-get="/fragments/settings/dex-alerts"
-             hx-trigger="load"
-             hx-swap="innerHTML">
-          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+          <span class="muted">Loading...</span>
         </div>
       </div>
     </div>
@@ -525,14 +548,14 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">MCP (AI Integration)</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+        <p class="section-intro">
           Model Context Protocol endpoint for AI-driven fleet management. MCP allows AI models to query agents, check compliance, and manage your fleet through a secure JSON-RPC interface.
         </p>
         <div id="mcp-section"
              hx-get="/fragments/settings/mcp"
              hx-trigger="load"
              hx-swap="innerHTML">
-          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+          <span class="muted">Loading...</span>
         </div>
       </div>
     </div>
@@ -541,14 +564,14 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">Vulnerability Management</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+        <p class="section-intro">
           NVD CVE feed synchronization for vulnerability scanning.
         </p>
         <div id="nvd-section"
              hx-get="/fragments/settings/nvd"
              hx-trigger="load"
              hx-swap="innerHTML">
-          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+          <span class="muted">Loading...</span>
         </div>
       </div>
     </div>
@@ -557,31 +580,14 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">Management Groups</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+        <p class="section-intro">
           Organize devices into a hierarchy for access scoping and targeted operations.
         </p>
         <div id="mgmt-groups-section"
              hx-get="/fragments/settings/management-groups"
              hx-trigger="load, refreshMgmtGroups from:body"
              hx-swap="innerHTML">
-          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
-        </div>
-      </div>
-    </div>
-
-    <!-- ── Tag Compliance ──────────────────────────────────── -->
-    <div class="section">
-      <div class="section-header">Tag Compliance</div>
-      <div class="section-body">
-        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
-          Devices should have all 4 structured tag categories assigned.
-          Devices missing tags are flagged but continue to function normally.
-        </p>
-        <div id="tag-compliance-section"
-             hx-get="/fragments/settings/tag-compliance"
-             hx-trigger="load"
-             hx-swap="innerHTML">
-          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+          <span class="muted">Loading...</span>
         </div>
       </div>
     </div>
@@ -594,7 +600,7 @@ extern const char* const kSettingsHtml =
              hx-get="/fragments/settings/directory"
              hx-trigger="load"
              hx-swap="innerHTML">
-          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+          <span class="muted">Loading...</span>
         </div>
       </div>
     </div>
@@ -628,46 +634,40 @@ extern const char* const kSettingsHtml =
       showToast(d.message || 'Done', d.level || 'success');
     });
 
-    /* ── Two-click confirm for bulk destructive operations ── */
-    function twoClickConfirm(btn, action) {
-      if (btn.dataset.confirming === 'true') {
-        action();
-        btn.dataset.confirming = 'false';
-        btn.textContent = btn.dataset.originalText;
-        btn.classList.remove('btn-confirming');
-        return;
-      }
-      btn.dataset.originalText = btn.textContent;
-      btn.dataset.confirming = 'true';
-      btn.textContent = 'Confirm: ' + btn.dataset.originalText + '?';
-      btn.classList.add('btn-confirming');
-      setTimeout(function() {
-        if (btn.dataset.confirming === 'true') {
-          btn.dataset.confirming = 'false';
-          btn.textContent = btn.dataset.originalText;
-          btn.classList.remove('btn-confirming');
-        }
-      }, 3000);
-    }
+    /* ── Enrollment token form: the "unlimited" hint hides once either limit is
+       finite. The Groups page does the same in yuzu-groups.js (this page does
+       not load it). ── */
+    document.addEventListener('input', function(e) {
+      var f = e.target.closest('[data-token-form]');
+      if (!f) return;
+      var zero = function(n) {
+        var i = f.querySelector('[name="' + n + '"]');
+        var v = i ? i.value.trim() : '';
+        return v === '' || /^0+$/.test(v);
+      };
+      var w = f.querySelector('[data-token-unlimited]');
+      if (w) w.hidden = !(zero('max_uses') && zero('ttl_hours'));
+    });
 
-    /* ── Populate nav bar + context bar ─────────────────────── */
+    /* A stale enrolment action answers 409 with the refreshed list as its body (and a
+       toast). htmx drops every 4xx body by default; show this one. The Groups page does
+       the same in yuzu-groups.js. */
+    document.body.addEventListener('htmx:beforeSwap', function(e) {
+      var d = e.detail;
+      if (d.xhr.status === 409 && d.target &&
+          d.target.matches('#token-section, #pending-section, #auto-approve-section') &&
+          (d.xhr.getResponseHeader('Content-Type') || '').indexOf('text/html') !== -1) {
+        d.shouldSwap = true;
+        d.isError = false;
+      }
+    });
+
 )HTM"
     // Split here purely to keep each raw-string literal under MSVC's 16 KB
     // C2026 cap (adjacent literals concatenate byte-for-byte; the engine-
     // principals console section pushed this template over the limit). Local
     // GCC/Clang have no such cap, so this only surfaces on the Windows leg.
-    R"HTM(    fetch('/api/me').then(function(r){return r.json()}).then(function(d){
-      document.getElementById('nav-user').textContent = (d.display_name || d.username);
-      var role = d.rbac_role || d.role;
-      document.getElementById('role-badge').textContent = role;
-      document.getElementById('context-user').textContent = (d.display_name || d.username);
-      document.body.setAttribute('data-role', role);
-      if(d.role !== 'admin' && role !== 'Administrator' && role !== 'PlatformEngineer') {
-        var sl = document.getElementById('nav-settings-link');
-        if(sl) sl.style.display = 'none';
-      }
-    });
-
+    R"HTM(
     /* Minimal vanilla JS — only for clipboard copy (no HTMX equivalent) */
     document.body.addEventListener('click', function(e) {
       if (e.target.closest('[data-copy-token]')) {
@@ -779,8 +779,8 @@ extern const char* const kSettingsHtml =
               '<div class="token-reveal">' +
               '  <div class="token-reveal-header">COPY THIS SECRET NOW — it will not be shown again</div>' +
               '  <code></code><br>' +
-              '  <button class="btn btn-secondary" style="margin-top:0.5rem;font-size:0.7rem" data-copy-token>Copy to Clipboard</button>' +
-              '  <button class="btn btn-secondary" style="margin-top:0.5rem;margin-left:0.5rem;font-size:0.7rem" data-dismiss-reveal>Dismiss</button>' +
+              '  <button class="btn btn-secondary btn-sm" style="margin-top:0.5rem" data-copy-token>Copy to Clipboard</button>' +
+              '  <button class="btn btn-secondary btn-sm" style="margin-top:0.5rem;margin-left:0.5rem" data-dismiss-reveal>Dismiss</button>' +
               '</div>';
             reveal.querySelector('code').textContent = secret;
             /* G5 (secret hygiene): auto-clear the revealed secret from the
@@ -803,15 +803,195 @@ extern const char* const kSettingsHtml =
         if (feedback) feedback.textContent = 'Error: ' + err.message;
       });
     });
-    /* Ctrl+K / Cmd+K — navigate to dashboard command palette */
-    document.addEventListener('keydown', function(e) {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
-        e.preventDefault();
-        window.location.href = '/?palette=1';
+)HTM"
+    // Split here to keep each raw-string literal under MSVC's 16 KB C2026 cap
+    // (the #5342 password-change block below). Adjacent literals concatenate
+    // byte-for-byte, so the runtime HTML is unchanged by the split.
+    R"HTM(    /* "Sign out everywhere" (users fragment, own row) — redirect to the
+       login page once DELETE /api/v1/sessions/me has run. A body-level
+       htmx:afterRequest listener keyed on data-signout-everywhere, NOT an
+       hx-on attribute: htmx compiles hx-on:* with new Function(), which this
+       page's CSP (no 'unsafe-eval') blocks at runtime. A 401 also redirects
+       (the session is already gone); anything else toasts and stays. */
+    document.body.addEventListener('htmx:afterRequest', function(e) {
+      var el = e.detail && e.detail.elt;
+      if (!el || !el.hasAttribute || !el.hasAttribute('data-signout-everywhere')) return;
+      var status = e.detail.xhr ? e.detail.xhr.status : 0;
+      if (e.detail.successful || status === 401) {
+        window.location = '/login';
+        return;
       }
+      showToast('Sign out everywhere failed (HTTP ' + status + ')', 'error');
+    });
+
+    /* ── #5342 Local password change (own row) / admin reset (other local
+       rows). JSON REST routes, so a plain fetch() — no hx-post (htmx would
+       send form-encoding) and no hx-on (CSP). Toggle buttons and the
+       delegated submit listener are keyed on data-pw-toggle / data-pw-action
+       (settings_routes.cpp render_users_fragment). The username is read from
+       an html_escape'd data attribute and only ever reaches the URL through
+       encodeURIComponent and the page through textContent (showToast). The
+       client-side checks mirror password_policy.hpp (12..1024 BYTES, UTF-8);
+       the server re-checks and stays authoritative. */
+    function yuzuPwBytes(s) {
+      try { return new TextEncoder().encode(s).length; } catch (_) { return s.length; }
+    }
+    function yuzuPwErr(resp, fallback) {
+      var d = resp && resp.data;
+      if (d && d.error && d.error.message) return d.error.message;
+      return fallback + (resp && resp.status ? ' (HTTP ' + resp.status + ')' : '');
+    }
+    /* POST JSON; on a 401 MFA step-up envelope, prompt for a code, POST it
+       to meta.challenge_url (same-origin path only) and retry ONCE — the
+       dashboard's htmx step-up intercept, re-done for fetch(). */
+    function yuzuPwPost(url, payload, done, retried) {
+      fetch(url, {
+        method: 'POST',
+        credentials: 'same-origin',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+      .then(function(r) {
+        return r.text().then(function(t) {
+          var d = null;
+          try { d = JSON.parse(t); } catch (_) {}
+          return { status: r.status, data: d };
+        });
+      })
+      .then(function(resp) {
+        var meta = resp.data && resp.data.meta;
+        if (resp.status === 401 && !retried && meta && meta.mfa_step_up_required) {
+          var challenge = meta.challenge_url;
+          if (typeof challenge !== 'string' || challenge.charAt(0) !== '/' ||
+              challenge.charAt(1) === '/' || challenge.charAt(1) === '\\')
+            challenge = '/login/mfa/stepup';
+          if (challenge.split('?')[0] !== '/login/mfa/stepup') {
+            /* An SSO session's challenge is a re-login at the IdP
+               (/auth/oidc/start), not a code POST — never send it a code. */
+            showToast('MFA step-up required: sign in again through your identity provider, then retry.', 'warning');
+            done(false, { cancelled: true });
+            return;
+          }
+          var code = window.prompt('MFA step-up required for this action.\n\nEnter your 6-digit TOTP code (or a recovery code):');
+          if (!code) { done(false, { cancelled: true }); return; }
+          var form = new URLSearchParams();
+          form.set('code', code.trim());
+          fetch(challenge, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: form.toString()
+          }).then(function(sr) {
+            if (!sr.ok) {
+              showToast('MFA step-up failed — verify your code and try again.', 'error');
+              done(false, { cancelled: true });
+              return;
+            }
+            yuzuPwPost(url, payload, done, true);
+          }).catch(function() {
+            showToast('MFA step-up request failed — please try again.', 'error');
+            done(false, { cancelled: true });
+          });
+          return;
+        }
+        if (resp.status === 401) {
+          /* Not a step-up: the session itself is gone (expired or revoked). */
+          window.location.href = '/login';
+          return;
+        }
+        done(resp.status >= 200 && resp.status < 300, resp);
+      })
+      .catch(function(err) {
+        showToast('Password request failed: ' + err.message, 'error');
+        done(false, { cancelled: true });
+      });
+    }
+    document.body.addEventListener('click', function(e) {
+      var t = e.target.closest('[data-pw-toggle]');
+      if (!t) return;
+      var row = document.getElementById(t.getAttribute('data-pw-toggle'));
+      if (!row) return;
+      row.hidden = !row.hidden;
+      var form = row.querySelector('form');
+      if (row.hidden) {
+        if (form) form.reset();
+      } else {
+        var first = row.querySelector('input[type=password]');
+        if (first) first.focus();
+      }
+    });
+    document.body.addEventListener('submit', function(e) {
+      var form = e.target.closest('form[data-pw-action]');
+      if (!form) return;
+      e.preventDefault();
+      var action = form.getAttribute('data-pw-action');
+      var user = form.getAttribute('data-username') || '';
+      var row = document.getElementById(form.getAttribute('data-pw-row') || '');
+      var cur = form.querySelector('input[name=current_password]');
+      var next = form.querySelector('input[name=new_password]').value;
+      var confirmPw = form.querySelector('input[name=confirm_password]').value;
+      if (next !== confirmPw) {
+        showToast('The new password and its confirmation do not match.', 'error');
+        return;
+      }
+      var n = yuzuPwBytes(next);
+      if (n < 12) { showToast('The new password must be at least 12 bytes.', 'error'); return; }
+      if (n > 1024) { showToast('The new password must be at most 1024 bytes.', 'error'); return; }
+      var url, payload;
+      if (action === 'self') {
+        url = '/api/v1/users/me/password';
+        payload = { current_password: cur ? cur.value : '', new_password: next };
+      } else if (action === 'reset') {
+        url = '/api/v1/users/' + encodeURIComponent(user) + '/password';
+        payload = { new_password: next };
+      } else {
+        return;
+      }
+      var btn = form.querySelector('button[type=submit]');
+      if (btn) btn.disabled = true;
+      yuzuPwPost(url, payload, function(ok, resp) {
+        if (btn) btn.disabled = false;
+        if (!ok) {
+          if (resp && resp.cancelled) return;
+          showToast(yuzuPwErr(resp, action === 'self' ? 'Password change failed' : 'Password reset failed'), 'error');
+          return;
+        }
+        form.reset();
+        if (row) row.hidden = true;
+        var d = (resp.data && resp.data.data) || {};
+        if (action === 'self') {
+          /* #5342 Gate 7: a self-change revokes EVERY session of the account,
+             this one included, and never re-issues one (session_reissued is
+             always false) — sign in again with the new password. */
+          showToast('Password changed. All your sessions were signed out — sign in again with the new password.', 'warning');
+          setTimeout(function() { window.location = '/login'; }, 2500);
+        } else {
+          var msg = 'Password reset for "' + user + '". Their dashboard sessions were signed out.';
+          var tokens = d.api_tokens_active;
+          /* Warn unless the server CONFIRMED zero active API tokens: null
+             (api_tokens_unknown) means it could not check, never "none". */
+          var confirmedNone = (typeof tokens === 'number' && tokens === 0);
+          if (typeof tokens === 'number' && tokens > 0) {
+            msg += ' ' + tokens + ' API token' + (tokens === 1 ? '' : 's') +
+                   ' remain active and were NOT revoked — revoke them if the account may be compromised.';
+          } else if (!confirmedNone) {
+            msg += ' Could not confirm whether the account has active API tokens; any it has were NOT revoked — review them if the account may be compromised.';
+          }
+          /* #5342 Gate 8: lockout_cleared is true only when a lockout existed
+             and was cleared in the same transaction as the reset. */
+          if (d.lockout_cleared === true)
+            msg += ' Its account lockout was cleared.';
+          showToast(msg, confirmedNone ? 'success' : 'warning');
+        }
+      });
     });
   </script>
 </body>
 </html>
 )HTM";
+
+// The shell (sidebar + header) is rendered into the template once, at static init (app_shell.hpp).
+extern const char* const kSettingsHtml =
+    yuzu::server::shell::bake(kSettingsPageTemplate, {.active_key = "settings"});
 // NOLINTEND(cert-err58-cpp)

@@ -27,6 +27,7 @@
  * deterministically under TSan with no TSan report (#438).
  */
 
+#include "rbac_store.hpp"
 #include "settings_routes.hpp"
 
 #include "api_token_store.hpp"
@@ -35,11 +36,15 @@
 #include "oidc_principal.hpp"
 #include "oidc_provider.hpp"
 #include "runtime_config_store.hpp"
+#include "session_store.hpp"
 #include "tag_store.hpp"
 #include "test_auth_db_pg_helper.hpp"
+#include "test_auth_db_rbac_pg_template.hpp" // clone already carries the rbac_store schema
+#include "test_principal_lock_gate.hpp"
 #include "test_route_sink.hpp"
 #include "update_registry.hpp"
 #include "../test_helpers.hpp"
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/auto_approve.hpp>
@@ -49,11 +54,14 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 
 #include <filesystem>
 #include <memory>
 #include <shared_mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -120,10 +128,18 @@ struct SettingsRoutesHarness {
     // tests can act as different principals against the same harness.
     std::string session_user;
     auth::Role session_role{auth::Role::admin};
+    bool elevated{false};
 
     // Audit capture — each audit_fn_ call from the routes layer appends an
     // entry. Tests assert on this to verify CC7.2 evidence emission.
     std::vector<AuditCall> audit_calls;
+    // The audit-first `attempted` rows (the bool-returning hook) and a switch that makes that
+    // write fail. A token caller is exempt from the same-site gate; the cross-site cases set a
+    // cookie source ("local") and Origin/Host headers explicitly.
+    std::vector<AuditCall> attempts;
+    bool attempt_audit_ok{true};
+    bool outcome_audit_ok{true}; // the post-change success row (bool hook)
+    std::string session_source{"api_token"};
 
     SettingsRoutesHarness() : tmp(unique_temp_path("settings-routes-users")) {
         cfg.auth_config_path = tmp.path / "auth.cfg";
@@ -139,11 +155,14 @@ struct SettingsRoutesHarness {
             auth::Session s;
             s.username = session_user;
             s.role = session_role;
+            s.auth_source = session_source;
             return s;
         };
 
         auto admin_fn = [this](const httplib::Request&, httplib::Response& res) {
-            if (session_user.empty() || session_role != auth::Role::admin) {
+            // `elevated` models a JIT-elevated `user` session: require_admin admits it through
+            // effective_role while the session's own durable role stays `user`.
+            if (session_user.empty() || (session_role != auth::Role::admin && !elevated)) {
                 res.status = 403;
                 return false;
             }
@@ -162,6 +181,17 @@ struct SettingsRoutesHarness {
             return true;
         };
 
+        auto audit_read_fn = [this](const httplib::Request&, const std::string& action,
+                                    const std::string& result, const std::string& target_type,
+                                    const std::string& target_id,
+                                    const std::string& detail) -> bool {
+            const bool attempted = result == "attempted";
+            if (attempted ? !attempt_audit_ok : !outcome_audit_ok)
+                return false;
+            (attempted ? attempts : audit_calls)
+                .push_back({action, result, target_type, target_id, detail});
+            return true;
+        };
         auto gateway_count_fn = []() -> std::size_t { return 0; };
         auto agents_json_fn = []() -> std::string { return "[]"; };
 
@@ -175,7 +205,8 @@ struct SettingsRoutesHarness {
                                /*audit_store=*/nullptr,
                                /*gateway_enabled=*/false,
                                gateway_count_fn, agents_json_fn,
-                               oidc_mu, oidc_provider);
+                               oidc_mu, oidc_provider, /*metrics_registry=*/nullptr,
+                               /*step_up_fn=*/{}, audit_read_fn);
     }
     // No destructor — TmpDirGuard cleans the temp dir on its own; nothing
     // else owns OS resources. The previous fixture had to stop() the
@@ -235,7 +266,7 @@ constexpr std::string_view kSelfDemoteToast =
 constexpr std::string_view kDuplicateUsernameToast =
     R"({"showToast":{"message":"Username already exists","level":"error"}})";
 constexpr std::string_view kShortPasswordToast =
-    R"({"showToast":{"message":"Password must be at least 12 characters","level":"error"}})";
+    R"({"showToast":{"message":"Password must be at least 12 bytes","level":"error"}})";
 
 } // namespace
 
@@ -259,7 +290,10 @@ namespace {
 /// (SettingsRoutesHarness above passes `api_token_store=nullptr`, which
 /// deliberately fails closed on delete). Local to these ADR-2001 cases only.
 struct SettingsAdr2001Harness {
-    yuzu::test::AuthDbPg auth_db;
+    yuzu::test::AuthDbPg auth_db{0, false, &yuzu::test::auth_db_rbac_pg_template};
+    // #4966: the last-Administrator guard AuthManager::remove_user/update_role now require (fail
+    // closed without it), built on the same pool: the production composition.
+    std::unique_ptr<yuzu::server::RbacStore> rbac_guard;
     Config cfg{};
     auth::AuthManager auth_mgr{};
     auth::AutoApproveEngine auto_approve{};
@@ -269,13 +303,51 @@ struct SettingsAdr2001Harness {
     std::unique_ptr<ApiTokenStore> token_store;
     SettingsRoutes routes;
     yuzu::server::test::TestRouteSink sink;
+    // #4966: wired so the last-Administrator refusal counter is observable.
+    yuzu::MetricsRegistry metrics;
+
+    // #4966: a durable SessionStore, wired only on request, so a case can make the post-commit
+    // durable session wipe genuinely fail (`wipe_fault.arm()`). RAII-restored; detached from
+    // `auth_mgr` in the destructor.
+    std::unique_ptr<yuzu::server::SessionStore> session_store;
+    yuzu::test::SessionWipeFault wipe_fault{auth_db.pool()};
 
     std::string session_user{"admin"};
     auth::Role session_role{auth::Role::admin};
+    bool elevated{false};
     std::vector<AuditCall> audit_calls;
+    // The audit-first `attempted` rows (the bool-returning hook) and a switch that makes that
+    // write fail. A token caller is exempt from the same-site gate; the cross-site cases set a
+    // cookie source ("local") and Origin/Host headers explicitly.
+    std::vector<AuditCall> attempts;
+    bool attempt_audit_ok{true};
+    bool outcome_audit_ok{true}; // the post-change success row (bool hook)
+    std::string session_source{"api_token"};
+    // The MFA step-up gate: records every action label it is asked about and, while
+    // `step_up_refuse` is set, refuses like a session without fresh MFA proof.
+    bool step_up_refuse{false};
+    bool step_up_plain_body{false}; // refuse with a non-envelope body
+    std::vector<std::string> step_up_labels;
+
+    ~SettingsAdr2001Harness() {
+        wipe_fault.repair();
+        auth_mgr.set_session_store(nullptr);
+        session_store.reset();
+    }
+    SettingsAdr2001Harness(const SettingsAdr2001Harness&) = delete;
+    SettingsAdr2001Harness& operator=(const SettingsAdr2001Harness&) = delete;
+
+    void use_session_store() {
+        session_store = std::make_unique<yuzu::server::SessionStore>(auth_db.pool());
+        REQUIRE(session_store->is_open());
+        auth_mgr.set_session_store(session_store.get());
+    }
 
     SettingsAdr2001Harness() {
         auth_mgr.set_auth_db(auth_db.get());
+        rbac_guard = std::make_unique<yuzu::server::RbacStore>(auth_db.pool());
+        REQUIRE(rbac_guard->is_open());
+        auth_mgr.set_rbac_store(rbac_guard.get());
         REQUIRE(auth_mgr.upsert_user("admin", "adminpassword1", auth::Role::admin));
         REQUIRE(auth_mgr.upsert_user("bob", "bobpassword12", auth::Role::user));
 
@@ -292,10 +364,13 @@ struct SettingsAdr2001Harness {
             auth::Session s;
             s.username = session_user;
             s.role = session_role;
+            s.auth_source = session_source;
             return s;
         };
         auto admin_fn = [this](const httplib::Request&, httplib::Response& res) {
-            if (session_user.empty() || session_role != auth::Role::admin) {
+            // `elevated` models a JIT-elevated `user` session: require_admin admits it through
+            // effective_role while the session's own durable role stays `user`.
+            if (session_user.empty() || (session_role != auth::Role::admin && !elevated)) {
                 res.status = 403;
                 return false;
             }
@@ -309,8 +384,35 @@ struct SettingsAdr2001Harness {
             audit_calls.push_back({action, result, target_type, target_id, detail});
             return true;
         };
+        auto audit_read_fn = [this](const httplib::Request&, const std::string& action,
+                                    const std::string& result, const std::string& target_type,
+                                    const std::string& target_id,
+                                    const std::string& detail) -> bool {
+            const bool attempted = result == "attempted";
+            if (attempted ? !attempt_audit_ok : !outcome_audit_ok)
+                return false;
+            (attempted ? attempts : audit_calls)
+                .push_back({action, result, target_type, target_id, detail});
+            return true;
+        };
         auto gateway_count_fn = []() -> std::size_t { return 0; };
         auto agents_json_fn = []() -> std::string { return "[]"; };
+
+        auto step_up_fn = [this](const httplib::Request&, httplib::Response& res,
+                                 const auth::Session&, const std::string& label) -> bool {
+            step_up_labels.push_back(label);
+            if (step_up_refuse) {
+                res.status = 403;
+                res.set_content(
+                    step_up_plain_body
+                        ? std::string("not json")
+                        : std::string(
+                              R"({"error":{"code":403,"message":"MFA step-up refused for test"}})"),
+                    "application/json");
+                return false;
+            }
+            return true;
+        };
 
         routes.register_routes(sink, auth_fn, admin_fn, perm_fn, audit_fn, cfg, auth_mgr,
                                auto_approve, token_store.get(),
@@ -320,11 +422,30 @@ struct SettingsAdr2001Harness {
                                /*runtime_config_store=*/nullptr,
                                /*audit_store=*/nullptr,
                                /*gateway_enabled=*/false, gateway_count_fn, agents_json_fn,
-                               oidc_mu, oidc_provider);
+                               oidc_mu, oidc_provider, &metrics, step_up_fn, audit_read_fn);
     }
 
     auto delete_user(const std::string& username) {
         return sink.Delete("/api/settings/users/" + username);
+    }
+    auto set_role(const std::string& username, const std::string& role) {
+        return sink.Post("/api/settings/users/" + username + "/role",
+                         R"({"role":")" + role + R"("})", "application/json");
+    }
+    double refused_dashboard() {
+        return metrics
+            .counter("yuzu_server_rbac_last_admin_guard_refused_total",
+                     {{"transport", "dashboard"}})
+            .value();
+    }
+
+    /// The detail of the (single) audit call matching action+result for `target`, or "<none>".
+    std::string audit_detail(std::string_view action, std::string_view result,
+                             std::string_view target) const {
+        for (const auto& a : audit_calls)
+            if (a.action == action && a.result == result && a.target_id == target)
+                return a.detail;
+        return "<none>";
     }
 
     /// True if any captured audit call matches all four fields — mirrors
@@ -362,6 +483,43 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: admin cannot delete self",
     CHECK(h.has_audit("user.delete", "denied", "User", "admin"));
 }
 
+TEST_CASE("SettingsRoutes POST role: a JIT-elevated user cannot change an account role",
+          "[settings][users][elevation]") {
+    SettingsRoutesHarness h;
+    h.session_user = "mallory";
+    h.session_role = auth::Role::user; // durable role
+    h.elevated = true;                 // admitted by admin_fn through the elevation
+    auto res = h.Post("/api/settings/users/bob/role", R"({"role":"admin"})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.has_audit("user.role_change", "denied", "User", "bob"));
+    CHECK(h.audit_calls.back().detail == "elevated_session_role_change_blocked");
+    CHECK(h.auth_mgr.get_user_role("bob") == auth::Role::user); // unchanged
+}
+
+TEST_CASE("SettingsRoutes POST role: a JIT-elevated user cannot mint a standing admin; "
+          "an administrator still can",
+          "[pg][settings][users][elevation]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "mallory";
+    h.session_role = auth::Role::user;
+    h.elevated = true;
+    auto res = h.set_role("bob", "admin");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.audit_detail("user.role_change", "denied", "bob") ==
+          "elevated_session_role_change_blocked");
+    CHECK(h.auth_mgr.get_user_role("bob") == auth::Role::user); // unchanged
+    // The same call from a session whose own role is admin still works.
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+    h.elevated = false;
+    res = h.set_role("bob", "admin");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.auth_mgr.get_user_role("bob") == auth::Role::admin);
+}
+
 TEST_CASE("SettingsRoutes DELETE /api/settings/users: admin can delete other users",
           "[pg][settings][users]") {
     // Governance Gate 7 BLOCKING fix (UP-7): a null ApiTokenStore now fails
@@ -376,6 +534,35 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: admin can delete other use
     CHECK_FALSE(h.auth_mgr.get_user_role("bob").has_value());
     // Successful destructive op also requires an audit entry (CO-1).
     CHECK(h.has_audit("user.delete", "success", "User", "bob"));
+}
+
+TEST_CASE("SettingsRoutes POST /api/settings/users: re-creating a removed username is refused "
+          "honestly, not as a weak password",
+          "[pg][settings][users]") {
+    SettingsAdr2001Harness h;
+    REQUIRE(h.delete_user("bob")->status == 200);
+    h.audit_calls.clear();
+
+    // A policy-valid password: the store (not the policy) refuses, because the removed account's
+    // row still holds the name.
+    auto res = h.sink.Post("/api/settings/users", "username=bob&password=anotherpassword1",
+                           "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(res->body.find("removed account") != std::string::npos);
+    CHECK(res->body.find("at least") == std::string::npos);
+    CHECK(res->body.find("anotherpassword1") == std::string::npos); // never echoed
+    CHECK(res->get_header_value("HX-Trigger").find("anotherpassword1") == std::string::npos);
+    CHECK(h.audit_detail("user.create", "denied", "bob") == "create_refused");
+    CHECK_FALSE(h.auth_mgr.get_user_role("bob").has_value());
+
+    // A genuinely short password is still the weak-password answer.
+    res = h.sink.Post("/api/settings/users", "username=carol&password=short",
+                      "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(res->body.find("at least") != std::string::npos);
+    CHECK(h.audit_detail("user.create", "denied", "carol") == "weak_password");
 }
 
 TEST_CASE("SettingsRoutes DELETE /api/settings/users: a null ApiTokenStore fails CLOSED "
@@ -458,16 +645,19 @@ TEST_CASE("SettingsRoutes POST /api/settings/users: role parameter ignored on cr
     CHECK(h.has_audit("user.create", "success", "User", "newadmin"));
 }
 
-TEST_CASE("SettingsRoutes POST /api/settings/users: admin self-password-change allowed",
+TEST_CASE("SettingsRoutes POST /api/settings/users: re-posting your own username is a 409 "
+          "and never a password change",
           "[settings][users]") {
     SettingsRoutesHarness h;
     h.session_user = "admin";
     h.session_role = auth::Role::admin;
 
-    // Self-password-change via the POST create endpoint is now a duplicate
-    // username rejection (C1 fix: creation always uses 'user' role, duplicates blocked).
-    // Self-password-change should use a dedicated endpoint in future.
-    // For now, creating with an existing username returns 409.
+    // The create endpoint can NEVER change a password — an existing username
+    // (here the caller's own) is a duplicate-username 409 (C1 fix: creation
+    // always uses 'user' role, duplicates blocked; AuthDB::upsert_user is
+    // INSERT-only). Changing your own password is POST
+    // /api/v1/users/me/password (#5342, test_rest_password_routes.cpp), which
+    // demands the current password.
     auto res = h.Post("/api/settings/users",
                         "username=admin&password=anotherpass12&role=admin",
                         "application/x-www-form-urlencoded");
@@ -659,6 +849,32 @@ TEST_CASE("is_valid_principal: rejects an over-255-byte principal", "[settings][
 // (3) audit the attempt as denied with detail="weak_password", (4) leave
 // the user NOT persisted.
 
+TEST_CASE("SettingsRoutes POST /api/settings/users: a dot-only username is refused",
+          "[settings][users]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+    for (const char* name : {".", "..", "..."}) {
+        INFO(name);
+        auto res = h.Post("/api/settings/users",
+                          std::string("username=") + name + "&password=a-long-enough-password",
+                          "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK_FALSE(h.has_user(name));
+        CHECK(h.has_audit("user.create", "denied", "User", name));
+    }
+    // A name that merely contains a dot is fine, at either end.
+    for (const char* name : {"a.b", ".hidden", "x.", "-x"}) {
+        INFO(name);
+        auto ok = h.Post("/api/settings/users",
+                         std::string("username=") + name + "&password=a-long-enough-password",
+                         "application/x-www-form-urlencoded");
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+    }
+}
+
 TEST_CASE("SettingsRoutes POST /api/settings/users: short password rejected with toast",
           "[settings][users][weak-password]") {
     SettingsRoutesHarness h;
@@ -712,7 +928,7 @@ TEST_CASE("SettingsRoutes /fragments/settings/users: add-user form carries minle
     REQUIRE(res);
     REQUIRE(res->status == 200);
     CHECK(res->body.find("minlength=\"12\"") != std::string::npos);
-    CHECK(res->body.find("min 12 chars") != std::string::npos);
+    CHECK(res->body.find("(12-1024 bytes)") != std::string::npos);
 }
 
 // ── Self-deletion guard — UI side (#403) ─────────────────────────────────────
@@ -970,4 +1186,915 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: revokes a SCIM-linked OIDC
             found_success = true;
     }
     CHECK(found_success);
+}
+
+// ── #5342 password buttons + CSP (no hx-on) ─────────────────────────────────
+//
+// Own LOCAL row → "Change password" (data-pw-action="self"); every other LOCAL
+// row → "Reset password" (data-pw-action="reset"); SSO and SCIM rows → no
+// password control at all. The fragment must never carry an `hx-on`
+// attribute: htmx compiles hx-on:* with new Function(), which the dashboard
+// CSP (no 'unsafe-eval') blocks at runtime, so the handler silently does
+// nothing (CLAUDE.md "No htmx hx-on").
+
+namespace {
+std::size_t count_of(const std::string& hay, std::string_view needle) {
+    std::size_t n = 0;
+    for (auto pos = hay.find(needle); pos != std::string::npos;
+         pos = hay.find(needle, pos + needle.size()))
+        ++n;
+    return n;
+}
+} // namespace
+
+TEST_CASE("SettingsRoutes GET /fragments/settings/users: password buttons on local rows only, "
+          "no hx-on",
+          "[settings][users][ui][password]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+    REQUIRE(h.auth_mgr.upsert_user("carol", "carolpassword1", auth::Role::user));
+
+    auto res = h.Get("/fragments/settings/users");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto& body = res->body;
+
+    // Exactly one self form, on the caller's own row; one reset form per
+    // other local account.
+    CHECK(count_of(body, "data-pw-action=\"self\"") == 1);
+    CHECK(body.find("data-pw-action=\"self\" data-username=\"admin\"") != std::string::npos);
+    CHECK(count_of(body, "data-pw-action=\"reset\"") == 2);
+    CHECK(body.find("data-pw-action=\"reset\" data-username=\"bob\"") != std::string::npos);
+    CHECK(body.find("data-pw-action=\"reset\" data-username=\"carol\"") != std::string::npos);
+    CHECK(body.find("data-pw-action=\"reset\" data-username=\"admin\"") == std::string::npos);
+    CHECK(count_of(body, ">Change password</button>") == 2); // toggle + submit
+    CHECK(count_of(body, ">Reset password</button>") == 4);  // 2 x (toggle + submit)
+    // Only the self form asks for the current password.
+    CHECK(count_of(body, "name=\"current_password\"") == 1);
+    CHECK(count_of(body, "name=\"confirm_password\"") == 3);
+    // The forms are hidden until toggled and carry the policy bounds.
+    CHECK(count_of(body, "class=\"pw-form-row\"") == 3);
+    // self: current+new+confirm; 2 x reset: new+confirm; + the add-user form's password.
+    CHECK(count_of(body, "maxlength=\"1024\"") == 8);
+    // No CSP-blocked inline htmx handlers anywhere in the fragment —
+    // including the "Sign out everywhere" button, which used one before.
+    CHECK(body.find("hx-on") == std::string::npos);
+    CHECK(body.find("data-signout-everywhere") != std::string::npos);
+    CHECK(body.find("hx-delete=\"/api/v1/sessions/me\" hx-swap=\"none\"") != std::string::npos);
+}
+
+TEST_CASE("SettingsRoutes GET /fragments/settings/users: no password controls on SSO or SCIM rows",
+          "[pg][settings][users][ui][password]") {
+    SettingsAdr2001Harness h;
+    const std::string principal = "oidc:https://idp.example#sub-77";
+    REQUIRE(h.auth_db->upsert_sso_identity(principal, "https://idp.example", "sub-77", "Ola", "oidc")
+                .has_value());
+    REQUIRE(h.auth_mgr.upsert_user("scimmy", "scimpassword12", auth::Role::user));
+    REQUIRE(h.auth_db->set_identity_source("scimmy", "scim").has_value());
+    REQUIRE(h.auth_db->set_provisioning_source("scimmy", "scim").has_value());
+
+    SECTION("local admin viewing") {
+        auto res = h.sink.Get("/fragments/settings/users");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto& body = res->body;
+        CHECK(body.find("data-pw-action=\"self\" data-username=\"admin\"") != std::string::npos);
+        CHECK(body.find("data-pw-action=\"reset\" data-username=\"bob\"") != std::string::npos);
+        CHECK(body.find("data-username=\"scimmy\"") == std::string::npos);
+        CHECK(body.find("data-username=\"oidc:") == std::string::npos);
+        CHECK(count_of(body, "data-pw-action=") == 2);
+        CHECK(body.find("hx-on") == std::string::npos);
+    }
+    SECTION("an SSO admin viewing has no self form (409 not_local on the route)") {
+        h.session_user = principal;
+        auto res = h.sink.Get("/fragments/settings/users");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto& body = res->body;
+        CHECK(body.find("data-pw-action=\"self\"") == std::string::npos);
+        // Both local accounts are "other" rows for this caller.
+        CHECK(body.find("data-pw-action=\"reset\" data-username=\"admin\"") != std::string::npos);
+        CHECK(body.find("data-pw-action=\"reset\" data-username=\"bob\"") != std::string::npos);
+        CHECK(count_of(body, "data-pw-action=") == 2);
+        CHECK(body.find("hx-on") == std::string::npos);
+    }
+}
+
+// ── #4644: the API-token form's ttl_hours is strict, and refusal mints nothing ──
+// `ttl_hours` of `0x5` used to read as 0 (never expires) and a negative TTL still computes 0.
+// This form answers 200 with a feedback span (its existing convention), so the proof that
+// matters is that NO token exists afterwards. `0`, an empty field and `-0` keep their documented
+// meaning (no expiry).
+TEST_CASE("SettingsRoutes POST api-tokens: a malformed or negative ttl_hours mints nothing",
+          "[pg][settings][api_tokens][numeric_params]") {
+    constexpr const char* kFormCt = "application/x-www-form-urlencoded";
+    for (const char* body : {"name=t1&ttl_hours=0x5", "name=t1&ttl_hours=5h", "name=t1&ttl_hours=%205",
+                             "name=t1&ttl_hours=1e1", "name=t1&ttl_hours=-1",
+                             "name=t1&ttl_hours=99999999999999999999"}) {
+        SettingsAdr2001Harness h;
+        INFO(body);
+        auto res = h.sink.Post("/api/settings/api-tokens", body, kFormCt);
+        REQUIRE(res);
+        CHECK(res->body.find("Invalid TTL value") != std::string::npos);
+        const auto listed = h.token_store->list_tokens();
+        REQUIRE(listed.has_value());
+        CHECK(listed->empty());
+    }
+}
+
+TEST_CASE("SettingsRoutes POST api-tokens: an empty or literal-zero ttl_hours still mints a token",
+          "[pg][settings][api_tokens][numeric_params]") {
+    constexpr const char* kFormCt = "application/x-www-form-urlencoded";
+    for (const char* body : {"name=t1", "name=t1&ttl_hours=", "name=t1&ttl_hours=0",
+                             "name=t1&ttl_hours=-0", "name=t1&ttl_hours=24"}) {
+        SettingsAdr2001Harness h;
+        INFO(body);
+        auto res = h.sink.Post("/api/settings/api-tokens", body, kFormCt);
+        REQUIRE(res);
+        CHECK(res->body.find("Invalid TTL value") == std::string::npos);
+        const auto listed = h.token_store->list_tokens();
+        REQUIRE(listed.has_value());
+        CHECK(listed->size() == 1);
+    }
+}
+
+// The auto-approve rule index is a `(\d+)` path segment: a 21-digit value made `stoul` THROW (a
+// 500). It cannot name a rule, so the engine reports "not found": the page re-renders (200), a
+// denied `rule_not_found` row is audited, and the rule list is untouched.
+TEST_CASE("SettingsRoutes auto-approve: a rule index that overflows is not a 500 and changes nothing",
+          "[pg][settings][numeric_params]") {
+    SettingsAdr2001Harness h;
+    h.auto_approve.add_rule({});
+    const auto before = h.auto_approve.list_rules().size();
+    auto toggle = h.sink.Post("/api/settings/auto-approve/99999999999999999999/toggle", "",
+                              "application/x-www-form-urlencoded");
+    REQUIRE(toggle);
+    CHECK(toggle->status == 200);
+    auto del = h.sink.Delete("/api/settings/auto-approve/99999999999999999999");
+    REQUIRE(del);
+    CHECK(del->status == 200);
+    CHECK(h.auto_approve.list_rules().size() == before);
+    std::size_t not_found_rows = 0;
+    for (const auto& c : h.audit_calls)
+        if (c.result == "denied" && c.detail.find("rule_not_found") != std::string::npos)
+            ++not_found_rows;
+    CHECK(not_found_rows == 2);
+}
+
+// ── #4966: the last-Administrator guard on the dashboard delete and role routes ──────────────
+//
+// The harness seeds exactly one active admin ("admin") and one user ("bob"). The caller is the
+// mock session "ops" (admin_fn only looks at the mock role, never at the user table), so the
+// self-target guards never fire and the only thing standing in the way is the account-lifecycle
+// guard. RBAC is OFF in these cases, so the column floor (the active `role='admin'` population)
+// is the one that applies.
+
+namespace {
+
+constexpr std::string_view kEarlyDeleteMsg =
+    "Cannot delete: this account is the fleet's last administrator";
+constexpr std::string_view kLateDeleteMsg =
+    "Cannot delete: this account is the fleet's last administrator. Its credentials were "
+    "revoked before the refusal; the account remains active";
+constexpr std::string_view kDemoteMsg =
+    "Cannot demote: this account is the fleet's last administrator";
+
+std::string toast_for(std::string_view message) {
+    return R"({"showToast":{"message":")" + std::string(message) + R"(","level":"error"}})";
+}
+
+} // namespace
+
+TEST_CASE("SettingsRoutes DELETE: the last administrator is refused EARLY with 409, nothing "
+          "revoked, counted and audited (#4966)",
+          "[pg][settings][users][lifecycle_guard][lastadmin]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+    auto token = h.token_store->create_token("t-admin", "admin");
+    REQUIRE(token.has_value());
+
+    auto res = h.delete_user("admin");
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(res->get_header_value("HX-Trigger") == toast_for(kEarlyDeleteMsg));
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == 409);
+    CHECK(body["error"]["message"] == std::string(kEarlyDeleteMsg));
+    CHECK_FALSE(body["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(body["error"]["retry_after_ms"].is_null()); // a business refusal is not retryable
+
+    CHECK(h.has_audit("user.delete", "denied", "User", "admin"));
+    CHECK(h.audit_detail("user.delete", "denied", "admin") == "last_administrator_blocked");
+    CHECK(h.refused_dashboard() == 1.0);
+    // The early refusal's whole point: NOTHING was revoked and the account is untouched.
+    CHECK(h.auth_mgr.get_user_role("admin").has_value());
+    CHECK(h.token_store->validate_token(*token).has_value());
+}
+
+TEST_CASE("SettingsRoutes DELETE: a LATE refusal (state changed after the early check) says "
+          "the credentials were revoked and the account remains active (#4966)",
+          "[pg][settings][users][lifecycle_guard][lastadmin][late]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+    // Two admins: the early check passes. The revoke is parked on the principal advisory lock,
+    // the OTHER admin is demoted (allowed: "admin" survives), then the revoke resumes and the
+    // guard finds "admin" is now the last one.
+    REQUIRE(h.auth_mgr.upsert_user("carol", "carolpassword1", auth::Role::admin));
+    auto token = h.token_store->create_token("t-admin", "admin");
+    REQUIRE(token.has_value());
+
+    std::unique_ptr<httplib::Response> res;
+    {
+        yuzu::test::PrincipalLockGate gate(h.auth_db.pool(), "admin");
+        // Declared AFTER the gate: destroyed first, releases the gate, then joins (RAII).
+        yuzu::test::Workers workers([&] { gate.release(); });
+        workers.add([&] { res = h.delete_user("admin"); });
+        REQUIRE(gate.wait_until_contended());
+        REQUIRE(h.auth_mgr.update_role_checked("carol", auth::Role::user) ==
+                auth::UpdateRoleOutcome::Updated);
+        gate.release();
+        workers.join_all();
+    }
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(res->get_header_value("HX-Trigger") == toast_for(kLateDeleteMsg));
+    CHECK(nlohmann::json::parse(res->body)["error"]["message"] == std::string(kLateDeleteMsg));
+
+    // `partial`, not `denied`: credentials were revoked before the refusal.
+    CHECK(h.audit_detail("user.delete", "denied", "admin") == "<none>");
+    const auto detail = h.audit_detail("user.delete", "partial", "admin");
+    CHECK(detail.starts_with("last_administrator_blocked "));
+    CHECK(detail.find("credentials_revoked_before_refusal=true") != std::string::npos);
+    CHECK(detail.find("account_remains_active=true") != std::string::npos);
+    CHECK(detail.find("api_tokens_revoked=1") != std::string::npos);
+    CHECK(h.refused_dashboard() == 1.0);
+    // The recorded state matches the sentence: credentials gone, account still active.
+    CHECK_FALSE(h.token_store->validate_token(*token).has_value());
+    CHECK(h.auth_mgr.get_user_role("admin").has_value());
+}
+
+TEST_CASE("SettingsRoutes DELETE: with a spare administrator the delete still succeeds and "
+          "nothing is counted (#4966)",
+          "[pg][settings][users][lifecycle_guard][lastadmin]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+    REQUIRE(h.auth_mgr.upsert_user("carol", "carolpassword1", auth::Role::admin));
+
+    auto res = h.delete_user("admin");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_FALSE(h.auth_mgr.get_user_role("admin").has_value());
+    CHECK(h.has_audit("user.delete", "success", "User", "admin"));
+    CHECK(h.refused_dashboard() == 0.0);
+}
+
+TEST_CASE("SettingsRoutes DELETE: an unwired guard answers the retryable 503 shape, never a "
+          "bare delete (#4966)",
+          "[pg][settings][users][lifecycle_guard][storefailure]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+    h.auth_mgr.set_rbac_store(nullptr); // fail-closed arm: AuthDB set, guard not wired
+
+    auto res = h.delete_user("bob");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK_FALSE(res->get_header_value("HX-Trigger").empty());
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == 503);
+    CHECK(body["error"]["retry_after_ms"] == 2000);
+    CHECK(h.has_audit("user.delete", "failure", "User", "bob"));
+    CHECK(h.audit_detail("user.delete", "failure", "bob").starts_with("store_failure"));
+    // Nothing was removed: the unguarded AuthDB path is never reached.
+    h.auth_mgr.set_rbac_store(h.rbac_guard.get());
+    CHECK(h.auth_mgr.get_user_role("bob").has_value());
+    CHECK(h.refused_dashboard() == 0.0);
+}
+
+TEST_CASE("SettingsRoutes POST role: demoting the last administrator is refused with 409, "
+          "toast, audit and counter (#4966)",
+          "[pg][settings][users][lifecycle_guard][lastadmin][role]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+
+    auto res = h.set_role("admin", "user");
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(res->get_header_value("HX-Trigger") == toast_for(kDemoteMsg));
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == 409);
+    CHECK(body["error"]["message"] == std::string(kDemoteMsg));
+    CHECK(h.has_audit("user.role_change", "denied", "User", "admin"));
+    CHECK(h.audit_detail("user.role_change", "denied", "admin") == "last_administrator_blocked");
+    CHECK(h.refused_dashboard() == 1.0);
+    CHECK(h.auth_mgr.get_user_role("admin").value() == auth::Role::admin);
+}
+
+TEST_CASE("SettingsRoutes POST role: with a spare administrator the demotion succeeds "
+          "unchanged (#4966)",
+          "[pg][settings][users][lifecycle_guard][role]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+    REQUIRE(h.auth_mgr.upsert_user("carol", "carolpassword1", auth::Role::admin));
+
+    auto res = h.set_role("admin", "user");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.auth_mgr.get_user_role("admin").value() == auth::Role::user);
+    CHECK(h.audit_detail("user.role_change", "success", "admin") ==
+          "old_role=admin,new_role=user");
+    CHECK(h.refused_dashboard() == 0.0);
+}
+
+TEST_CASE("SettingsRoutes POST role: a store failure answers a 503 with NO retry hint and says to "
+          "check the role and revoke the sessions (#4966)",
+          "[pg][settings][users][lifecycle_guard][storefailure][role]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+    REQUIRE(h.auth_mgr.upsert_user("carol", "carolpassword1", auth::Role::admin));
+    h.auth_mgr.set_rbac_store(nullptr); // the fail-closed arm: a StoreFailure with nothing attempted
+
+    auto res = h.set_role("carol", "user");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    // The route cannot tell "nothing committed" from "committed, acknowledgement lost, and the
+    // failure path's durable session wipe failed too", and a repeat in the second case is a 200
+    // no-op that never redoes the wipe: so there is no Retry-After and no retry_after_ms.
+    CHECK(res->get_header_value("Retry-After").empty());
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["retry_after_ms"].is_null());
+    const auto msg = body["error"]["message"].get<std::string>();
+    CHECK(msg.find("may or may not have been applied") != std::string::npos);
+    CHECK(msg.find("Check the user's role") != std::string::npos);
+    CHECK(msg.find("revoke the user's sessions") != std::string::npos);
+    CHECK(msg.find("Try again") == std::string::npos);
+    CHECK(h.has_audit("user.role_change", "failure", "User", "carol"));
+    h.auth_mgr.set_rbac_store(h.rbac_guard.get());
+    CHECK(h.auth_mgr.get_user_role("carol").value() == auth::Role::admin);
+}
+
+TEST_CASE("SettingsRoutes POST role: a lock-timeout store failure whose durable session wipe also "
+          "fails leaves the durable session, and a repeat after a commit is a no-op (#4966)",
+          "[pg][settings][users][lifecycle_guard][storefailure][role][wipefailed]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+    h.use_session_store();
+    // A short lock bound so the guarded write fails after 300 ms instead of 2 s.
+    yuzu::server::RbacStore fast{h.auth_db.pool(), std::chrono::milliseconds(300)};
+    REQUIRE(fast.is_open());
+    struct Restore {
+        SettingsAdr2001Harness& h;
+        ~Restore() { h.auth_mgr.set_rbac_store(h.rbac_guard.get()); }
+    } restore{h};
+    h.auth_mgr.set_rbac_store(&fast);
+    const auto token = h.auth_mgr.create_local_session_for_test("bob", auth::Role::user, false);
+    REQUIRE_FALSE(token.empty());
+
+    const auto durable_sessions_of_bob = [&] {
+        auto lease = h.auth_db.pool().acquire();
+        REQUIRE(lease);
+        yuzu::server::pg::PgResult r = yuzu::server::pg::exec_params(
+            lease.get(), "SELECT 1 FROM session_store.sessions WHERE username = 'bob'",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        return PQntuples(r.get());
+    };
+    REQUIRE(durable_sessions_of_bob() == 1);
+
+    std::unique_ptr<httplib::Response> res;
+    {
+        yuzu::test::HeldLocks hold(h.auth_db.pool());
+        hold.lock_rbac_enabled(); // every guarded lifecycle write queues behind this row
+        h.wipe_fault.arm();       // ... and the failure path's durable wipe cannot succeed either
+        yuzu::test::Workers workers([&] { hold.rollback(); });
+        workers.add([&] { res = h.set_role("bob", "admin"); });
+        workers.join_all();
+    }
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After").empty());
+    CHECK(nlohmann::json::parse(res->body)["error"]["retry_after_ms"].is_null());
+    CHECK(nlohmann::json::parse(res->body)["error"]["message"].get<std::string>().find(
+              "revoke the user's sessions") != std::string::npos);
+    // What actually holds: nothing committed (a lock timeout), and the DURABLE session SURVIVED
+    // because its wipe failed. The response told the operator to revoke the user's sessions; it
+    // does not claim a retry converges.
+    h.wipe_fault.repair();
+    CHECK(durable_sessions_of_bob() == 1);
+    CHECK(h.auth_mgr.get_user_role("bob").value() == auth::Role::user);
+
+    // The case the no-retry shape exists for: had the change COMMITTED (simulated here by writing
+    // the role directly), the repeat is the 200 "Role unchanged" no-op and does NOT redo the wipe.
+    {
+        auto lease = h.auth_db.pool().acquire();
+        REQUIRE(lease);
+        yuzu::server::pg::PgResult r = yuzu::server::pg::exec_params(
+            lease.get(), "UPDATE auth.users SET role = 'admin' WHERE username = 'bob'",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    h.auth_mgr.set_rbac_store(h.rbac_guard.get());
+    auto again = h.set_role("bob", "admin");
+    REQUIRE(again);
+    CHECK(again->status == 200);
+    CHECK(h.has_audit("user.role_change", "no_op", "User", "bob"));
+    CHECK(durable_sessions_of_bob() == 1); // still there: the repeat is not a convergence path
+}
+
+TEST_CASE("SettingsRoutes DELETE: a failed durable session wipe after the deactivation is a "
+          "503 partial that says the account IS deactivated (#4966)",
+          "[pg][settings][users][lifecycle_guard][wipefailed]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+    h.use_session_store();
+    const auto token = h.auth_mgr.create_local_session_for_test("bob", auth::Role::user, false);
+    REQUIRE_FALSE(token.empty());
+    const auto durable_sessions_of_bob = [&] {
+        auto lease = h.auth_db.pool().acquire();
+        REQUIRE(lease);
+        yuzu::server::pg::PgResult r = yuzu::server::pg::exec_params(
+            lease.get(), "SELECT 1 FROM session_store.sessions WHERE username = 'bob'",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        return PQntuples(r.get());
+    };
+    REQUIRE(durable_sessions_of_bob() == 1);
+    h.wipe_fault.arm();
+
+    auto res = h.delete_user("bob");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    // The DELETE route DOES converge on a repeat (the second call re-runs the wipe), so it keeps
+    // the retry shape.
+    CHECK(res->get_header_value("Retry-After") == "2");
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["message"].get<std::string>().starts_with("User deactivated, but session"));
+    CHECK_FALSE(h.auth_mgr.get_user_role("bob").has_value()); // deactivated
+    CHECK(h.has_audit("user.delete", "partial", "User", "bob"));
+    CHECK(h.audit_detail("user.delete", "partial", "bob")
+              .starts_with("account_deactivated session_wipe_failed=true"));
+    // A repeat once the store is healthy finishes the job and answers 404 (already inactive).
+    h.wipe_fault.repair();
+    CHECK(durable_sessions_of_bob() == 1); // the wipe failed: the durable session survived
+    auto again = h.delete_user("bob");
+    REQUIRE(again);
+    CHECK(again->status == 404);
+    // ... and it genuinely finished the job: the durable session is gone now.
+    CHECK(durable_sessions_of_bob() == 0);
+    CHECK_FALSE(h.auth_mgr.validate_session(token).has_value());
+}
+
+TEST_CASE("SettingsRoutes POST role: a failed durable session wipe after the role change is a "
+          "503 partial with NO retry hint (a repeat is a 200 no-op that never redoes the wipe) "
+          "(#4966)",
+          "[pg][settings][users][lifecycle_guard][wipefailed][role]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+    h.use_session_store();
+    h.wipe_fault.arm();
+
+    auto res = h.set_role("bob", "admin");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After").empty());
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == 503);
+    CHECK(body["error"]["retry_after_ms"].is_null());
+    CHECK(body["error"]["message"].get<std::string>().find("Revoke the user's sessions") !=
+          std::string::npos);
+    CHECK(h.auth_mgr.get_user_role("bob").value() == auth::Role::admin); // the role IS changed
+    CHECK(h.has_audit("user.role_change", "partial", "User", "bob"));
+    CHECK(h.audit_detail("user.role_change", "partial", "bob") ==
+          "role_changed session_wipe_failed=true old_role=user new_role=admin");
+
+    // The reason there is no hint: repeating the request is a no-op that does not redo the wipe.
+    h.wipe_fault.repair();
+    auto again = h.set_role("bob", "admin");
+    REQUIRE(again);
+    CHECK(again->status == 200);
+    CHECK(h.has_audit("user.role_change", "no_op", "User", "bob"));
+}
+
+TEST_CASE("SettingsRoutes DELETE: the store-failure text says the delete MAY not have "
+          "completed (a lost commit acknowledgement is possible) (#4966)",
+          "[pg][settings][users][lifecycle_guard][storefailure]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+    h.auth_mgr.set_rbac_store(nullptr);
+    auto res = h.delete_user("bob");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    const auto msg = nlohmann::json::parse(res->body)["error"]["message"].get<std::string>();
+    CHECK(msg.find("may not have completed") != std::string::npos);
+    h.auth_mgr.set_rbac_store(h.rbac_guard.get());
+}
+
+TEST_CASE("SettingsRoutes POST role: an INACTIVE account is a 404 user_not_found at the route "
+          "(the inactive-account store rules are reached through AuthManager and SCIM, not "
+          "this route) (#4966)",
+          "[pg][settings][users][lifecycle_guard][role][inactive]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+    REQUIRE(h.auth_mgr.remove_user("bob")); // deactivated
+
+    for (const char* role : {"admin", "user"}) {
+        CAPTURE(role);
+        auto res = h.set_role("bob", role);
+        REQUIRE(res);
+        CHECK(res->status == 404);
+        CHECK(nlohmann::json::parse(res->body)["error"]["message"] == "User not found");
+        CHECK(h.has_audit("user.role_change", "denied", "User", "bob"));
+        CHECK(h.audit_detail("user.role_change", "denied", "bob") == "user_not_found");
+    }
+    // Never promoted, and no 409 inactive_promotion_refused leaked out of the route.
+    auto lease = h.auth_db.pool().acquire();
+    REQUIRE(lease);
+    yuzu::server::pg::PgResult r = yuzu::server::pg::exec_params(
+        lease.get(), "SELECT role FROM auth.users WHERE username = 'bob'",
+        std::vector<std::string>{});
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(r.get()) == 1);
+    CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == "user");
+}
+
+// The dashboard API-token mutations sit behind the same MFA step-up gate as POST /api/v1/tokens
+// and DELETE /api/v1/tokens/{id}. A refused step-up must stop the request before it mints or
+// revokes anything, and a passing one must leave the existing behaviour unchanged.
+TEST_CASE("SettingsRoutes POST api-tokens: a refused MFA step-up mints nothing",
+          "[pg][settings][api_tokens][step_up]") {
+    constexpr const char* kFormCt = "application/x-www-form-urlencoded";
+    SettingsAdr2001Harness h;
+    h.step_up_refuse = true;
+
+    auto res = h.sink.Post("/api/settings/api-tokens", "name=t1&ttl_hours=24", kFormCt);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->get_header_value("HX-Trigger").find("MFA step-up refused for test") !=
+          std::string::npos);
+    REQUIRE(h.step_up_labels.size() == 1);
+    CHECK(h.step_up_labels[0] == "POST /api/settings/api-tokens");
+    const auto listed = h.token_store->list_tokens();
+    REQUIRE(listed.has_value());
+    CHECK(listed->empty());
+
+    h.step_up_refuse = false;
+    auto ok = h.sink.Post("/api/settings/api-tokens", "name=t1&ttl_hours=24", kFormCt);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    const auto after = h.token_store->list_tokens();
+    REQUIRE(after.has_value());
+    CHECK(after->size() == 1);
+}
+
+TEST_CASE("SettingsRoutes DELETE api-tokens: a refused MFA step-up revokes nothing",
+          "[pg][settings][api_tokens][step_up]") {
+    SettingsAdr2001Harness h;
+    REQUIRE(h.token_store->create_token("keep-me", "admin").has_value());
+    const auto before = h.token_store->list_tokens("admin");
+    REQUIRE(before.has_value());
+    REQUIRE(before->size() == 1);
+    const std::string id = (*before)[0].token_id;
+
+    h.step_up_refuse = true;
+    auto res = h.sink.Delete("/api/settings/api-tokens/" + id);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->get_header_value("HX-Trigger").find("MFA step-up refused for test") !=
+          std::string::npos);
+    REQUIRE(h.step_up_labels.size() == 1);
+    CHECK(h.step_up_labels[0] == "DELETE /api/settings/api-tokens/{id}");
+    const auto still = h.token_store->list_tokens("admin");
+    REQUIRE(still.has_value());
+    REQUIRE(still->size() == 1);
+    CHECK_FALSE((*still)[0].revoked);
+
+    h.step_up_refuse = false;
+    auto ok = h.sink.Delete("/api/settings/api-tokens/" + id);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    const auto gone = h.token_store->list_tokens("admin");
+    REQUIRE(gone.has_value());
+    CHECK((gone->empty() || (*gone)[0].revoked));
+}
+
+// The gate runs before anything else in the handler. The dashboard answers a validation failure
+// with HTTP 200 and a feedback span, so a refused request that still comes back 403 with the
+// label recorded proves the step-up check ran before the form was read; for DELETE the same
+// holds for an id that does not exist.
+TEST_CASE("SettingsRoutes api-tokens: the step-up gate runs before form validation and lookup",
+          "[pg][settings][api_tokens][step_up]") {
+    constexpr const char* kFormCt = "application/x-www-form-urlencoded";
+    SettingsAdr2001Harness h;
+    h.step_up_refuse = true;
+
+    for (const char* body : {"name=", "name=t1&ttl_hours=0x5", "name=t1&mcp_tier=bogus",
+                             "name=t1&mcp_tier=operator"}) {
+        INFO(body);
+        h.step_up_labels.clear();
+        auto res = h.sink.Post("/api/settings/api-tokens", body, kFormCt);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.step_up_labels == std::vector<std::string>{"POST /api/settings/api-tokens"});
+    }
+    {
+        h.step_up_labels.clear();
+        auto res = h.sink.Post("/api/settings/api-tokens",
+                               "name=" + std::string(300, 'x'), kFormCt);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.step_up_labels.size() == 1);
+    }
+    {
+        h.step_up_labels.clear();
+        auto res = h.sink.Delete("/api/settings/api-tokens/does-not-exist");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.step_up_labels ==
+              std::vector<std::string>{"DELETE /api/settings/api-tokens/{id}"});
+    }
+    const auto listed = h.token_store->list_tokens();
+    REQUIRE(listed.has_value());
+    CHECK(listed->empty());
+}
+
+// An MCP-tier token needs an expiry of at most 90 days. The form must refuse the request itself,
+// as POST /api/v1/tokens does, instead of letting the store reject it and reporting the result as
+// a CSPRNG failure (503, the entropy-failure counter and a csprng_unavailable audit row).
+TEST_CASE("SettingsRoutes POST api-tokens: an MCP tier without a usable TTL is an input error, "
+          "not a CSPRNG failure",
+          "[pg][settings][api_tokens][numeric_params]") {
+    constexpr const char* kFormCt = "application/x-www-form-urlencoded";
+    auto csprng_failures = [](SettingsAdr2001Harness& h) {
+        return h.metrics
+            .counter("yuzu_secure_random_failure_total",
+                     {{"reason", "prng_failure"}, {"site", "api_token_htmx"}})
+            .value();
+    };
+    for (const char* body : {"name=t1&mcp_tier=operator", "name=t1&mcp_tier=operator&ttl_hours=0",
+                             "name=t1&mcp_tier=operator&ttl_hours=2161"}) {
+        SettingsAdr2001Harness h;
+        INFO(body);
+        auto res = h.sink.Post("/api/settings/api-tokens", body, kFormCt);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("feedback-error") != std::string::npos);
+        CHECK(res->body.find("CSPRNG") == std::string::npos);
+        CHECK(csprng_failures(h) == 0.0);
+        const auto listed = h.token_store->list_tokens();
+        REQUIRE(listed.has_value());
+        CHECK(listed->empty());
+    }
+    SettingsAdr2001Harness h;
+    auto ok = h.sink.Post("/api/settings/api-tokens", "name=t1&mcp_tier=operator&ttl_hours=2160",
+                          kFormCt);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    const auto listed = h.token_store->list_tokens();
+    REQUIRE(listed.has_value());
+    CHECK(listed->size() == 1);
+}
+
+// With no token store behind the routes, both token mutations answer 503 with an A4 envelope and an
+// error toast, before reaching any store call. SettingsRoutesHarness registers the routes with a
+// null ApiTokenStore, so this needs no Postgres.
+TEST_CASE("SettingsRoutes api-tokens: both mutations answer 503 when the token store is unavailable",
+          "[settings][api_tokens]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+
+    auto created = h.Post("/api/settings/api-tokens", "name=t1&ttl_hours=24",
+                          "application/x-www-form-urlencoded");
+    REQUIRE(created);
+    CHECK(created->status == 503);
+    CHECK(created->get_header_value("HX-Trigger").find("Token store unavailable") !=
+          std::string::npos);
+    CHECK(nlohmann::json::parse(created->body).contains("error"));
+
+    auto revoked = h.Delete("/api/settings/api-tokens/some-token");
+    REQUIRE(revoked);
+    CHECK(revoked->status == 503);
+    CHECK(revoked->get_header_value("HX-Trigger").find("Token store unavailable") !=
+          std::string::npos);
+    CHECK(nlohmann::json::parse(revoked->body).contains("error"));
+}
+
+// When the refusal body is not an A4 envelope the toast falls back to a fixed message instead of
+// showing nothing.
+TEST_CASE("SettingsRoutes api-tokens: a refused step-up without an envelope body still toasts",
+          "[pg][settings][api_tokens][step_up]") {
+    SettingsAdr2001Harness h;
+    h.step_up_refuse = true;
+    h.step_up_plain_body = true;
+
+    auto created = h.sink.Post("/api/settings/api-tokens", "name=t1",
+                               "application/x-www-form-urlencoded");
+    REQUIRE(created);
+    CHECK(created->status == 403);
+    CHECK(created->get_header_value("HX-Trigger").find("MFA step-up required") !=
+          std::string::npos);
+
+    auto revoked = h.sink.Delete("/api/settings/api-tokens/some-token");
+    REQUIRE(revoked);
+    CHECK(revoked->status == 403);
+    CHECK(revoked->get_header_value("HX-Trigger").find("MFA step-up required") !=
+          std::string::npos);
+}
+
+// ── Same-site gate and audit-first on the Users and roles write path ────────────
+//
+// A cookie session needs an Origin/Referer naming this site (browser_write_is_cross_site); a
+// token caller does not. An `attempted` row is written first and a failed write refuses the
+// change with 503 + Sec-Audit-Failed (audited_write.hpp, ADR-0033 section 9).
+
+namespace {
+
+const std::unordered_map<std::string, std::string> kSiblingOrigin{
+    {"Host", "yuzu.example"}, {"Origin", "https://evil.yuzu.example"}};
+const std::unordered_map<std::string, std::string> kSameSite{
+    {"Host", "yuzu.example"}, {"Origin", "https://yuzu.example"}};
+const std::unordered_map<std::string, std::string> kNoOrigin{{"Host", "yuzu.example"}};
+
+} // namespace
+
+TEST_CASE("SettingsRoutes POST /api/settings/users: a cookie write from another origin or with no "
+          "Origin is refused 403 and creates nothing",
+          "[settings][users][security][csrf]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_source = "local"; // a cookie session
+    const std::string form = "username=mallory&password=mallorypass12";
+    const char* ct = "application/x-www-form-urlencoded";
+
+    for (const auto* headers : {&kSiblingOrigin, &kNoOrigin}) {
+        auto res = h.sink.dispatch("POST", "/api/settings/users", form, ct, *headers);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(res->body.find("cross-site request refused") != std::string::npos);
+        CHECK_FALSE(h.has_user("mallory"));
+    }
+    CHECK(h.has_audit("csrf.denied", "denied", "Endpoint", "/api/settings/users"));
+    CHECK(h.attempts.empty()); // refused before the audit-first row
+
+    auto ok = h.sink.dispatch("POST", "/api/settings/users", form, ct, kSameSite);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(h.has_user("mallory"));
+}
+
+TEST_CASE("SettingsRoutes POST role: a cross-site or text/plain write is refused and changes "
+          "nothing; a non-JSON same-site body is 415",
+          "[settings][users][role][security][csrf]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_source = "local";
+    const std::string body = R"({"role":"admin"})";
+
+    auto cross = h.sink.dispatch("POST", "/api/settings/users/bob/role", body, "text/plain",
+                                 kSiblingOrigin);
+    REQUIRE(cross);
+    CHECK(cross->status == 403);
+    CHECK(h.role_of("bob") == auth::Role::user);
+    CHECK(h.has_audit("csrf.denied", "denied", "Endpoint",
+                      "/api/settings/users/{username}/role"));
+
+    auto plain = h.sink.dispatch("POST", "/api/settings/users/bob/role", body, "text/plain",
+                                 kSameSite);
+    REQUIRE(plain);
+    CHECK(plain->status == 415);
+    CHECK(h.role_of("bob") == auth::Role::user);
+    CHECK(h.has_audit("user.role_change", "denied", "User", "bob"));
+    CHECK(h.attempts.empty());
+
+    auto form = h.sink.dispatch("POST", "/api/settings/users/bob/role", body,
+                                "application/x-www-form-urlencoded", kSameSite);
+    REQUIRE(form);
+    CHECK(form->status == 415);
+
+    auto ok = h.sink.dispatch("POST", "/api/settings/users/bob/role", body,
+                              "application/json; charset=utf-8", kSameSite);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(h.role_of("bob") == auth::Role::admin);
+}
+
+TEST_CASE("SettingsRoutes DELETE /api/settings/users: a cookie write from another origin is "
+          "refused 403 and removes nothing",
+          "[pg][settings][users][security][csrf]") {
+    SettingsAdr2001Harness h;
+    h.session_source = "local";
+    // A credential that the credentials-first revoke would kill: it must survive the refusal.
+    auto token = h.token_store->create_token("bob-refusal", "bob");
+    REQUIRE(token);
+    REQUIRE(h.token_store->validate_token(*token).has_value());
+    for (const auto* headers : {&kSiblingOrigin, &kNoOrigin}) {
+        auto res = h.sink.dispatch("DELETE", "/api/settings/users/bob", "", "application/json",
+                                   *headers);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.auth_mgr.get_user_role("bob").has_value());
+        CHECK(h.token_store->validate_token(*token).has_value());
+    }
+    CHECK(h.has_audit("csrf.denied", "denied", "Endpoint", "/api/settings/users/{username}"));
+    CHECK(h.attempts.empty());
+
+    auto ok = h.sink.dispatch("DELETE", "/api/settings/users/bob", "", "application/json",
+                              kSameSite);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK_FALSE(h.auth_mgr.get_user_role("bob").has_value());
+}
+
+TEST_CASE("SettingsRoutes add user and change role: the attempted row is written first and its "
+          "failure refuses the change with 503 + Sec-Audit-Failed",
+          "[settings][users][role][audit]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+
+    h.attempt_audit_ok = false;
+    auto create = h.Post("/api/settings/users", "username=carol&password=carolpassword1",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(create);
+    CHECK(create->status == 503);
+    CHECK(create->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK_FALSE(h.has_user("carol"));
+
+    auto role = h.Post("/api/settings/users/bob/role", R"({"role":"admin"})");
+    REQUIRE(role);
+    CHECK(role->status == 503);
+    CHECK(role->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.role_of("bob") == auth::Role::user);
+    CHECK_FALSE(h.has_audit("user.role_change", "success", "User", "bob"));
+
+    h.attempt_audit_ok = true;
+    REQUIRE(h.Post("/api/settings/users", "username=carol&password=carolpassword1",
+                   "application/x-www-form-urlencoded")->status == 200);
+    REQUIRE(h.Post("/api/settings/users/bob/role", R"({"role":"admin"})")->status == 200);
+    REQUIRE(h.attempts.size() == 2);
+    CHECK(h.attempts[0].action == "user.create");
+    CHECK(h.attempts[0].result == "attempted");
+    CHECK(h.attempts[0].target_id == "carol");
+    CHECK(h.attempts[1].action == "user.role_change");
+    CHECK(h.attempts[1].result == "attempted");
+    CHECK(h.attempts[1].detail == "old_role=user,new_role=admin");
+}
+
+TEST_CASE("SettingsRoutes DELETE /api/settings/users: a failed attempted row refuses the delete "
+          "before any credential is revoked",
+          "[pg][settings][users][audit]") {
+    SettingsAdr2001Harness h;
+    auto token = h.token_store->create_token("bob-refusal", "bob");
+    REQUIRE(token);
+    REQUIRE(h.token_store->validate_token(*token).has_value());
+    h.attempt_audit_ok = false;
+    auto res = h.delete_user("bob");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.auth_mgr.get_user_role("bob").has_value());
+    CHECK(h.token_store->validate_token(*token).has_value()); // nothing was revoked
+    CHECK_FALSE(h.has_audit("user.delete", "success", "User", "bob"));
+
+    h.attempt_audit_ok = true;
+    auto ok = h.delete_user("bob");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    REQUIRE(h.attempts.size() == 1);
+    CHECK(h.attempts[0].action == "user.delete");
+    CHECK(h.attempts[0].result == "attempted");
+}
+
+TEST_CASE("SettingsRoutes add user and change role: a lost outcome row keeps the 2xx and marks "
+          "Sec-Audit-Failed",
+          "[settings][users][role][audit]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.outcome_audit_ok = false;
+
+    auto create = h.Post("/api/settings/users", "username=carol&password=carolpassword1",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(create);
+    CHECK(create->status == 200);
+    CHECK(create->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.has_user("carol"));
+
+    auto role = h.Post("/api/settings/users/bob/role", R"({"role":"admin"})");
+    REQUIRE(role);
+    CHECK(role->status == 200);
+    CHECK(role->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.role_of("bob") == auth::Role::admin);
+    REQUIRE(h.attempts.size() == 2); // the attempted rows were written before the changes
+}
+
+TEST_CASE("SettingsRoutes DELETE /api/settings/users: a lost outcome row keeps the 200 and marks "
+          "Sec-Audit-Failed",
+          "[pg][settings][users][audit]") {
+    SettingsAdr2001Harness h;
+    h.outcome_audit_ok = false;
+    auto res = h.delete_user("bob");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK_FALSE(h.auth_mgr.get_user_role("bob").has_value());
+    REQUIRE(h.attempts.size() == 1);
 }

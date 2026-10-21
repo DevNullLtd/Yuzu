@@ -8,11 +8,26 @@
 # delegates. Argument shape mirrors scripts/test/synthetic-uat-tests.sh
 # so /test orchestration treats it like any other Phase 5 gate.
 #
-# Defaults run only the 184 safe+mutating definitions (no destructive,
-# no interactive, no network-disrupt). The 25 destructive instructions
-# are the candidate pool for PR C's hand-written semantic-correctness
-# overrides; the 3 network-disrupt instructions belong to the quarantine
-# ceremony (PR B).
+# Defaults run only the safe+mutating definitions the runner can dispatch (it
+# prints the exact counts). Opt-in classes, via --risks: destructive and forensic
+# (the server refuses a broadcast for these, so a run needs --target-agent-id,
+# --confirm-target (that agent's hostname), --run-id and a --params-override file,
+# and a non-loopback --dashboard also needs --allow-remote; the runner's --help
+# has the full rules and the side effects),
+# server-internal (catalog-only definitions the dispatch chokepoint denies, so they
+# cannot pass),
+# interactive, and network-disrupt (the quarantine ceremony, PR B).
+# scripts/test/instructions-risk-classification.json is the authority.
+#
+# A destructive/forensic run is by hand, on a dedicated disposable stack. NOTE: --risks
+# here is a comma list (--risks destructive,forensic); the Python runner it calls takes
+# the classes space-separated. --confirm-target is a wrong-target typo guard against
+# what the connected server reports; it cannot detect an ssh -L tunnel or a port forward
+# to a different stack, and it is not an authorisation control. The password on the
+# command line is visible in ps; http:// with --allow-remote sends it in cleartext.
+# Permissions: Execution:Execute to dispatch, Response:Read to poll the results and
+# Infrastructure:Read for the agent lookup. The manifest is an attempt log, not outcome
+# evidence; see the runner's --help for the recovery recipe after a stop.
 #
 # Usage:
 #   bash scripts/test/instructions-tests.sh \
@@ -21,9 +36,16 @@
 #       --run-id "$RUN_ID" --gate-name instructions
 #
 # Returns:
-#   0  every runnable instruction passed (or returned expected pending_approval)
-#   1  one or more failed / errored
-#   2  argument or infrastructure error (login, content-dir empty)
+#   0    every runnable instruction passed (or returned expected pending_approval)
+#   1    one or more failed / errored, the run stopped early, or a destructive/forensic
+#        run executed nothing (every such row skipped or pending approval)
+#   2    argument, infrastructure or pre-flight error with nothing dispatched
+#        (login, content-dir empty, destructive/forensic targeting, --params-override,
+#        --run-id, --poll-timeout below 1 for a targeted run, --output equal to
+#        --manifest, an --output that is a symlink (POSIX) or not a regular file, a
+#        --dashboard with userinfo or a backslash, or (targeted run) an --output or
+#        manifest that already exists)
+#   130  interrupted (Ctrl-C, Ctrl-Break or SIGTERM)
 
 set -uo pipefail
 
@@ -36,10 +58,14 @@ PASSWORD=""
 RUN_ID=""
 GATE_NAME="instructions"
 RISKS=("safe" "mutating")
+TARGET_AGENT_ID=""
+CONFIRM_TARGET=""
+MANIFEST=""
+ALLOW_REMOTE=0
 MATCH=""
 ONLY_ID=""
 PARALLELISM="4"
-POLL_TIMEOUT="30"
+POLL_TIMEOUT=""
 PARAMS_OVERRIDE=""
 OUTPUT=""
 VERBOSE=0
@@ -54,18 +80,43 @@ Required:
 
 Optional:
   --user NAME              admin user (default: admin)
-  --run-id ID              record per-instruction timings to test-runs DB
+  --run-id ID              record per-instruction timings to test-runs DB; also
+                           names the User-Agent and the manifest (required for
+                           destructive/forensic; [A-Za-z0-9][A-Za-z0-9._-]{0,63})
   --gate-name NAME         gate name to scope timings under (default: instructions)
-  --risks LIST             comma-separated risk classes to run
+  --risks LIST             COMMA-separated risk classes to run (the Python
+                           runner takes them space-separated)
                            (default: safe,mutating; choices: safe, mutating,
-                           destructive, network-disrupt, interactive)
+                           destructive, forensic, server-internal,
+                           network-disrupt, interactive; destructive and
+                           forensic need --target-agent-id, --confirm-target,
+                           --run-id and --params-override, and
+                           server-internal cannot pass)
+  --target-agent-id ID     the id of the one connected agent sent as the target
+                           of destructive and forensic dispatches
+  --confirm-target HOST    that agent's hostname (must match the server's agent
+                           list; required whenever destructive or forensic is
+                           selected, with --target-agent-id and --run-id)
+  --manifest PATH          destructive/forensic dispatch record, written before
+                           each dispatch (default: in the current directory);
+                           created exclusively: the path must not already exist
+  --allow-remote           permit destructive/forensic against a non-loopback
+                           --dashboard (refused by default)
   --match REGEX            run only definition ids matching this regex
   --only-id ID             run exactly one definition (debugging)
-  --parallelism N          concurrent dispatches (default: 4)
-  --poll-timeout SECONDS   per-instruction response poll cap (default: 30)
-  --params-override FILE   JSON mapping {definition_id: {param: value}} —
-                           hand-written overrides for the schema-synthesised
-                           defaults (used by PR C semantic-correctness suite)
+  --parallelism N          concurrent dispatches (default: 4; forced to 1 when
+                           destructive or forensic is selected)
+  --poll-timeout SECONDS   per-instruction response poll cap (when not given the
+                           runner uses 30 s, and 120 s for destructive/forensic
+                           rows; the deadline can overrun by up to two polls,
+                           about 20 s. A
+                           targeted row that ends without a verdict - no rows,
+                           still running, polls failing - fails and stops the
+                           run; raise it for a slow or quiet action)
+  --params-override FILE   JSON mapping {definition_id: {param: value}} (strings
+                           or integers) — overrides for the schema-synthesised
+                           defaults; for destructive/forensic it is required and
+                           is the whole params object. See the runner's --help.
   --output FILE            write per-instruction outcomes JSON
   --verbose                print every outcome (default: fail/error only)
 EOF
@@ -79,6 +130,10 @@ while [[ $# -gt 0 ]]; do
         --run-id)           RUN_ID="$2"; shift 2 ;;
         --gate-name)        GATE_NAME="$2"; shift 2 ;;
         --risks)            IFS=',' read -ra RISKS <<< "$2"; shift 2 ;;
+        --target-agent-id)  TARGET_AGENT_ID="$2"; shift 2 ;;
+        --confirm-target)   CONFIRM_TARGET="$2"; shift 2 ;;
+        --manifest)         MANIFEST="$2"; shift 2 ;;
+        --allow-remote)     ALLOW_REMOTE=1; shift ;;
         --match)            MATCH="$2"; shift 2 ;;
         --only-id)          ONLY_ID="$2"; shift 2 ;;
         --parallelism)      PARALLELISM="$2"; shift 2 ;;
@@ -117,10 +172,14 @@ ARGS=(
     --password "$PASSWORD"
     --risks "${RISKS[@]}"
     --parallelism "$PARALLELISM"
-    --poll-timeout "$POLL_TIMEOUT"
     --gate-name "$GATE_NAME"
 )
 [[ -n "$RUN_ID" ]]          && ARGS+=(--run-id "$RUN_ID")
+[[ -n "$POLL_TIMEOUT" ]]    && ARGS+=(--poll-timeout "$POLL_TIMEOUT")
+[[ -n "$TARGET_AGENT_ID" ]] && ARGS+=(--target-agent-id "$TARGET_AGENT_ID")
+[[ -n "$CONFIRM_TARGET" ]]  && ARGS+=(--confirm-target "$CONFIRM_TARGET")
+[[ -n "$MANIFEST" ]]        && ARGS+=(--manifest "$MANIFEST")
+[[ "$ALLOW_REMOTE" -eq 1 ]] && ARGS+=(--allow-remote)
 [[ -n "$MATCH" ]]           && ARGS+=(--match "$MATCH")
 [[ -n "$ONLY_ID" ]]         && ARGS+=(--only-id "$ONLY_ID")
 [[ -n "$PARAMS_OVERRIDE" ]] && ARGS+=(--params-override "$PARAMS_OVERRIDE")

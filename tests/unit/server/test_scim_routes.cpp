@@ -23,6 +23,7 @@
  * broken (test_helpers.hpp skip-vs-fail contract, via yuzu::test::AuthDbPg).
  */
 
+#include "rbac_store.hpp"
 #include "scim_routes.hpp"
 
 #include "analytics_event.hpp"
@@ -33,11 +34,17 @@
 #include "oidc_principal.hpp"
 #include "on_behalf_guard.hpp"
 #include "rate_limiter.hpp"
+#include "refusal_log_throttle.hpp"
 #include "saml_principal.hpp"
+#include "session_store.hpp"
+#include "test_auth_db_rbac_pg_template.hpp" // clone already carries the rbac_store schema
 #include "test_loopback_http.hpp"
+#include "../test_log_capture.hpp"
+#include "test_principal_lock_gate.hpp"
 #include "test_route_sink.hpp"
 #include "web_utils.hpp"
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
@@ -51,14 +58,19 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
+#include <spdlog/sinks/base_sink.h>
 
 #include <libpq-fe.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <set>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -77,7 +89,10 @@ namespace {
 /// TestRouteSink. PG-gated: SKIPs when YUZU_TEST_POSTGRES_DSN is unset,
 /// FAILs when set but broken (via yuzu::test::AuthDbPg).
 struct Fixture {
-    yuzu::test::AuthDbPg auth_db;
+    yuzu::test::AuthDbPg auth_db{0, false, &yuzu::test::auth_db_rbac_pg_template};
+    // #4966: the last-Administrator guard AuthManager::remove_user/update_role now require (fail
+    // closed without it), built on the same pool: the production composition.
+    std::unique_ptr<yuzu::server::RbacStore> rbac_guard;
     auth::AuthManager auth_mgr;
     std::unique_ptr<ScimStore> scim_store;
     // ADR-2001 §§1,3: shares auth_db's PgPool, same "one PgPool, independent
@@ -104,6 +119,12 @@ struct Fixture {
     // directly, mirroring ScimIntegrationServer's `metrics` member below.
     yuzu::MetricsRegistry metrics;
     const std::string token{"unit-test-scim-bearer-token-0123456789"};
+    // #4966: a durable SessionStore, wired only on request (`use_session_store()`), so a case can
+    // make the post-commit durable session wipe genuinely fail (`wipe_fault.arm()`). RAII: the
+    // renamed table is restored even when a REQUIRE unwinds. Declared after `auth_db` (they
+    // borrow its pool) and detached from `auth_mgr` in the destructor.
+    std::unique_ptr<yuzu::server::SessionStore> session_store;
+    yuzu::test::SessionWipeFault wipe_fault{auth_db.pool()};
 
     /// `broken_audit=true` points AuditStore at an unroutable pool so every
     /// `AuditStore::log()` call returns false thereafter — used to exercise
@@ -112,8 +133,21 @@ struct Fixture {
     /// `scim_admin_group` mirrors `Config::scim_admin_group` (#2021
     /// Groups->role) — empty (the default) means no SCIM group ever
     /// promotes to admin.
-    explicit Fixture(bool broken_audit = false, std::string scim_admin_group = {}) {
+    ///
+    /// `lifecycle_lock_timeout` is the account-lifecycle guard's lock bound: the production 2000 ms
+    /// by default, a short value for a case that needs a lock wait to EXPIRE (a StoreFailure from
+    /// the guarded write) without paying two seconds.
+    explicit Fixture(bool broken_audit = false, std::string scim_admin_group = {},
+                     std::chrono::milliseconds lifecycle_lock_timeout =
+                         yuzu::server::kDefaultLifecycleLockTimeout) {
         auth_mgr.set_auth_db(auth_db.get());
+        rbac_guard = std::make_unique<yuzu::server::RbacStore>(auth_db.pool(),
+                                                               lifecycle_lock_timeout);
+        REQUIRE(rbac_guard->is_open());
+        auth_mgr.set_rbac_store(rbac_guard.get());
+        // A second active admin: cases that demote/remove an admin test the write path, not the
+        // last-Administrator refusal (that has its own cases).
+        REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", auth::Role::admin).has_value());
         auth_mgr.set_metrics_registry(&metrics);
 
         scim_store = std::make_unique<ScimStore>(auth_db.pool());
@@ -143,11 +177,21 @@ struct Fixture {
     }
 
     ~Fixture() {
+        wipe_fault.repair();
+        auth_mgr.set_session_store(nullptr);
+        session_store.reset();
         routes.reset();
         audit_store.reset();
         analytics_store.reset();
         token_store.reset();
         scim_store.reset();
+    }
+
+    /// Wire a real durable SessionStore so the post-commit session wipe is a real DELETE.
+    void use_session_store() {
+        session_store = std::make_unique<yuzu::server::SessionStore>(auth_db.pool());
+        REQUIRE(session_store->is_open());
+        auth_mgr.set_session_store(session_store.get());
     }
 
     std::unordered_map<std::string, std::string> auth_header() const {
@@ -1113,6 +1157,7 @@ TEST_CASE("ScimRoutes: deprovision refused for a DB-elevated admin even with a C
     // too, with no further change needed here.)
     auth::AuthManager cold_auth_mgr;
     cold_auth_mgr.set_auth_db(f.auth_db.get());
+    cold_auth_mgr.set_rbac_store(f.rbac_guard.get());
 
     // Prime the cache for "dana" only, via `reactivate_user` — a legitimate,
     // idempotent AuthDB write (harmless on an already-active row; clears
@@ -1453,7 +1498,7 @@ TEST_CASE("revoke_deprovision_credentials: revokes tokens and sessions for EVERY
     auto oidc_token = f.token_store->create_token("t2", oidc_principal);
     REQUIRE(oidc_token.has_value());
 
-    auto slug_session = f.auth_mgr.create_local_session("yolanda", auth::Role::user, true);
+    auto slug_session = f.auth_mgr.create_local_session_for_test("yolanda", auth::Role::user, true);
     auto oidc_session = f.auth_mgr.create_oidc_session("Yolanda", "y@example.com", "sub-yolanda",
                                                         "https://idp.example.com/");
     REQUIRE_FALSE(slug_session.empty());
@@ -1490,7 +1535,7 @@ TEST_CASE("ScimRoutes: PATCH active=false revokes API tokens AND sessions for BO
     auto oidc_token = f.token_store->create_token("oidc-token", oidc_principal);
     REQUIRE(oidc_token.has_value());
 
-    auto slug_session = f.auth_mgr.create_local_session("trent", auth::Role::user, true);
+    auto slug_session = f.auth_mgr.create_local_session_for_test("trent", auth::Role::user, true);
     auto oidc_session =
         f.auth_mgr.create_oidc_session("Trent", "trent@example.com", sub, iss);
     REQUIRE(f.auth_mgr.validate_session(slug_session).has_value());
@@ -2049,17 +2094,16 @@ TEST_CASE("ScimRoutes: SAML D2 — a broken saml_login_observations table "
 }
 
 TEST_CASE("ScimRoutes: revive-on-reprovision refuses an operator-elevated account — 404, and "
-         "the remove_user() undo leaves the account INACTIVE, not reactivated-at-elevated-role "
-         "(UP-N5/FIX-5, Gate-8 round-2)",
+         "the tombstone stays INACTIVE (UP-N5/FIX-5; since #4966 refused BEFORE reactivation)",
          "[pg][scim][routes][revive][role_refusal]") {
-    // Gate-8 round-2 MEDIUM (privilege fail-open): the revive path
-    // (POST re-provisioning a tombstoned SCIM account) reactivates the
-    // underlying auth row FIRST, then refuses if the role isn't 'user',
-    // undoing the reactivation via remove_user(). Previously that undo's
-    // bool return was discarded — a failure there would leave the account
-    // ACTIVE at its elevated role behind a 404 the IdP never retries. This
-    // exercises the happy-path undo (remove_user() succeeds) end-to-end:
-    // the account must land INACTIVE, never reactivated.
+    // The revive path (POST re-provisioning a tombstoned SCIM account) used to reactivate the
+    // underlying auth row FIRST, then refuse if the role was not 'user' and undo the
+    // reactivation. #4966 reads the tombstone's role (inactive rows included) BEFORE the
+    // reactivation, so an elevated tombstone is refused without ever coming back active; the
+    // post-reactivation check and its GUARDED undo remain only as the residual for a role that
+    // changes in the window between the two (compensate_created_account, covered by the
+    // compensation cases further down). Dedicated pre-check assertions: the "revive refuses an
+    // elevated TOMBSTONE" case.
     Fixture f;
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "frank"}})->body);
     auto old_id = created["id"].get<std::string>();
@@ -2078,9 +2122,7 @@ TEST_CASE("ScimRoutes: revive-on-reprovision refuses an operator-elevated accoun
     CHECK(*mapping_deleted);
     REQUIRE(f.auth_db->get_provisioning_source("frank").value() == "scim");
 
-    // Re-POST: hits the REVIVE branch, reactivate_user() succeeds (role
-    // column untouched by it), the role check sees 'admin' != 'user' and
-    // refuses — remove_user()'s undo is exercised here.
+    // Re-POST: hits the REVIVE branch; the pre-check sees 'admin' != 'user' and refuses.
     auto revive_res = f.post("/scim/v2/Users", {{"userName", "frank"}});
     REQUIRE(revive_res);
     CHECK(revive_res->status == 404);
@@ -2090,18 +2132,6 @@ TEST_CASE("ScimRoutes: revive-on-reprovision refuses an operator-elevated accoun
     // in-memory cache entry the same way the other deactivation assertions
     // in this file do (see e.g. the revive/deprovision tests above).
     CHECK_FALSE(f.auth_mgr.get_user_role("frank").has_value());
-
-    // NOTE (injection gap): this test exercises the SUCCESS path of the
-    // remove_user() undo (matches the deactivate() sibling's checked-return
-    // pattern). Forcing remove_user()'s own DB write to fail at exactly
-    // that point — without also failing the earlier reactivate_user() call
-    // on the same connection (which would hit a different, already-tested
-    // 500 branch) — needs either a multi-second SQLITE_BUSY wait on
-    // AuthDB's fixed 5s busy_timeout or corrupting the shared auth.db file
-    // mid-request, neither of which is a clean/fast unit-test injection.
-    // The code path itself (`if (!auth_mgr->remove_user(...)) { ... 500
-    // ... }`) is exercised by inspection and mirrors deactivate()'s
-    // identical, already-tested contract.
 }
 
 // ── M-OPTDEREF ───────────────────────────────────────────────────────────
@@ -2585,7 +2615,10 @@ struct ScimIntegrationServer {
     // immediately followed by `ts.start();`, so folding AuthDB construction
     // into this struct's own member-init (rather than deferring it inside
     // start(), as the old SQLite AuthDB did) changes nothing observable.
-    yuzu::test::AuthDbPg auth_db;
+    yuzu::test::AuthDbPg auth_db{0, false, &yuzu::test::auth_db_rbac_pg_template};
+    // #4966: the last-Administrator guard AuthManager::remove_user/update_role now require (fail
+    // closed without it), built on the same pool: the production composition.
+    std::unique_ptr<yuzu::server::RbacStore> rbac_guard;
     auth::AuthManager auth_mgr;
     std::unique_ptr<ScimStore> scim_store;
     // ADR-2001 §§1,3: shares auth_db's PgPool, same "one PgPool" pattern as
@@ -2612,6 +2645,12 @@ struct ScimIntegrationServer {
 
     void start() {
         auth_mgr.set_auth_db(auth_db.get());
+        rbac_guard = std::make_unique<yuzu::server::RbacStore>(auth_db.pool());
+        REQUIRE(rbac_guard->is_open());
+        auth_mgr.set_rbac_store(rbac_guard.get());
+        // A second active admin: cases that demote/remove an admin test the write path, not the
+        // last-Administrator refusal (that has its own cases).
+        REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", auth::Role::admin).has_value());
 
         scim_store = std::make_unique<ScimStore>(auth_db.pool());
         REQUIRE(scim_store->is_open());
@@ -3615,7 +3654,7 @@ TEST_CASE("Groups integration: PATCH rename OFF the admin group demotes every cu
     // effect (AuthManager::update_role) is directly checkable, not just
     // inferred from the role/audit outcome.
     auto session_token =
-        ts.auth_mgr.create_local_session("mia", auth::Role::admin, /*mfa_verified=*/true);
+        ts.auth_mgr.create_local_session_for_test("mia", auth::Role::admin, /*mfa_verified=*/true);
     REQUIRE_FALSE(session_token.empty());
     REQUIRE(ts.auth_mgr.validate_session(session_token).has_value());
 
@@ -3898,7 +3937,7 @@ TEST_CASE("Groups integration: PATCH rejected by the member cap must not commit 
     auto group_id = json::parse(group_post->body)["id"].get<std::string>();
     REQUIRE(ts.auth_mgr.get_user_role("admin_member").value() == auth::Role::admin);
 
-    auto session_token = ts.auth_mgr.create_local_session("admin_member", auth::Role::admin,
+    auto session_token = ts.auth_mgr.create_local_session_for_test("admin_member", auth::Role::admin,
                                                           /*mfa_verified=*/true);
     REQUIRE_FALSE(session_token.empty());
 
@@ -4210,7 +4249,7 @@ TEST_CASE("Groups integration: PATCH persist failure leaves displayName, members
     auto group_id = json::parse(group_post->body)["id"].get<std::string>();
     REQUIRE(ts.auth_mgr.get_user_role("faultowen").value() == auth::Role::admin);
 
-    auto session_token = ts.auth_mgr.create_local_session("faultowen", auth::Role::admin,
+    auto session_token = ts.auth_mgr.create_local_session_for_test("faultowen", auth::Role::admin,
                                                            /*mfa_verified=*/true);
     REQUIRE_FALSE(session_token.empty());
 
@@ -4289,7 +4328,7 @@ TEST_CASE("Groups integration: PUT persist failure leaves displayName, membershi
     auto group_id = json::parse(group_post->body)["id"].get<std::string>();
     REQUIRE(ts.auth_mgr.get_user_role("faultpia").value() == auth::Role::admin);
 
-    auto session_token = ts.auth_mgr.create_local_session("faultpia", auth::Role::admin,
+    auto session_token = ts.auth_mgr.create_local_session_for_test("faultpia", auth::Role::admin,
                                                            /*mfa_verified=*/true);
     REQUIRE_FALSE(session_token.empty());
 
@@ -4483,3 +4522,1795 @@ TEST_CASE("ScimRoutes: GET Groups fails closed rather than rendering an empty me
 }
 
 #endif // YUZU_SCIM_TSAN_BUILD
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// #4966: the last-Administrator guard on every SCIM site that deactivates or demotes an account
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+//
+// SCIM only ever owns role='user' accounts, and `deprovision_role_ok` 404s any column admin BEFORE
+// the guard runs. The refusal therefore fires on the GRANT floor: a role='user' SCIM account that
+// is the fleet's only authenticatable Administrator grant holder, under RBAC ON. (The column floor
+// is reachable from SCIM only through the group-derived demotion in `recompute_scim_user_role`.)
+
+namespace {
+
+constexpr const char* kRefusedAction = "scim.user.last_administrator_refused";
+
+json deactivate_ops() {
+    return json{{"Operations", json::array({{{"op", "replace"}, {"value", {{"active", false}}}}})}};
+}
+
+/// The captured spdlog text ends each line with the sink's platform EOL ("\r\n" on Windows). The
+/// CWE-117 checks look for an INJECTED carriage return, so drop that terminator first. It erases
+/// the '\r' of EVERY "\r\n" pair, an injected pair included: an injected CRLF pair is covered by
+/// the LF checks, and the '\r' checks only see a lone injected '\r'.
+std::string without_sink_crlf(std::string text) {
+    for (std::size_t pos = 0; (pos = text.find("\r\n", pos)) != std::string::npos;) {
+        text.erase(pos, 1);
+    }
+    return text;
+}
+
+/// RBAC ON with `name` as the SOLE authenticatable Administrator grant holder.
+void make_sole_grant_holder(Fixture& f, const std::string& name) {
+    REQUIRE(f.rbac_guard->assign_role({"user", name, "Administrator"}).has_value());
+    REQUIRE(f.rbac_guard->set_rbac_enabled(true).has_value());
+}
+
+double scim_refused(Fixture& f) {
+    return f.metrics
+        .counter("yuzu_server_rbac_last_admin_guard_refused_total", {{"transport", "scim"}})
+        .value();
+}
+
+std::vector<AuditEvent> audit_rows(Fixture& f, const std::string& action,
+                                   const std::string& target) {
+    AuditQuery q;
+    q.action = action;
+    q.target_id = target;
+    auto rows = f.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    return *rows;
+}
+
+/// The analytics events of one type (the severity channel the critical escalations use).
+std::vector<AnalyticsEvent> events_of(Fixture& f, const std::string& type) {
+    auto all = f.analytics_store->query_recent(100);
+    REQUIRE(all.has_value());
+    std::vector<AnalyticsEvent> out;
+    for (const auto& e : *all)
+        if (e.event_type == type)
+            out.push_back(e);
+    return out;
+}
+
+/// `yuzu_server_rbac_lifecycle_store_failure_total{op}` and
+/// `yuzu_scim_compensation_failed_total{outcome}` as the SCIM tests observe them.
+double lifecycle_failures(Fixture& f, const char* op) {
+    return f.metrics.counter("yuzu_server_rbac_lifecycle_store_failure_total", {{"op", op}})
+        .value();
+}
+double compensation_failed(Fixture& f, const char* outcome) {
+    return f.metrics.counter("yuzu_scim_compensation_failed_total", {{"outcome", outcome}})
+        .value();
+}
+
+json activate_ops() {
+    return json{{"Operations", json::array({{{"op", "replace"}, {"value", {{"active", true}}}}})}};
+}
+
+} // namespace
+
+TEST_CASE("ScimRoutes: deprovisioning the fleet's last Administrator grant holder is refused "
+          "EARLY with 409/mutability on PATCH, PUT and DELETE, nothing revoked (#4966)",
+          "[pg][scim][routes][lastadmin]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "ada"}})->body);
+    const auto id = created["id"].get<std::string>();
+    auto token = f.token_store->create_token("t-ada", "ada");
+    REQUIRE(token.has_value());
+    make_sole_grant_holder(f, "ada");
+
+    std::unique_ptr<httplib::Response> res;
+    SECTION("PATCH active:false") {
+        res = f.patch("/scim/v2/Users/" + id, deactivate_ops());
+    }
+    SECTION("PUT active:false") {
+        res = f.put("/scim/v2/Users/" + id, {{"userName", "ada"}, {"active", false}});
+    }
+    SECTION("DELETE") {
+        res = f.del("/scim/v2/Users/" + id);
+    }
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    const auto body = json::parse(res->body);
+    CHECK(body["scimType"] == "mutability");
+    CHECK(body["status"] == "409");
+    CHECK(body["detail"].get<std::string>().find("last administrator") != std::string::npos);
+    // The early refusal states no credential sentence, because none was revoked.
+    CHECK(body["detail"].get<std::string>().find("revoked") == std::string::npos);
+
+    // Nothing changed: the account, the mapping and the credentials are all intact.
+    CHECK(f.auth_mgr.get_user_role("ada").has_value());
+    auto resource = f.scim_store->get_by_scim_id(id);
+    REQUIRE(resource.has_value());
+    CHECK(resource->active);
+    CHECK(f.token_store->validate_token(*token).has_value());
+
+    const auto rows = audit_rows(f, kRefusedAction, id);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].result == "denied"); // vocabulary: a policy refusal, like provenance_denied
+    CHECK(rows[0].detail.find("early_refusal=true") != std::string::npos);
+    CHECK(rows[0].detail.find("credentials_revoked_before_refusal=false") != std::string::npos);
+    // What the refusal LEFT in place: the person's token is still live and no session was touched.
+    CHECK(rows[0].detail.find("live_api_tokens_slug=1") != std::string::npos);
+    // The count is the username's own tokens only: a 0 must never read as "nothing live".
+    CHECK(rows[0].detail.find("linked_principals_not_walked=true") != std::string::npos);
+    CHECK(rows[0].detail.find("sessions_not_revoked=true") != std::string::npos);
+    CHECK(audit_rows(f, "scim.user.deactivated", id).empty());
+    CHECK(audit_rows(f, "scim.user.deleted", id).empty());
+    CHECK(scim_refused(f) == 1.0);
+    // A terminated person whose account and credentials stay live is escalated, not only a 409.
+    const auto crit = events_of(f, kRefusedAction);
+    REQUIRE(crit.size() == 1);
+    CHECK(crit[0].severity == Severity::kCritical);
+}
+
+TEST_CASE("ScimRoutes: a repeated refusal is audited and counted EVERY time (#4966)",
+          "[pg][scim][routes][lastadmin][retry]") {
+    // An IdP retries a 409, and a 409 does not prove it ever stops. Only the LOG line is
+    // throttled (refusal_log_throttle.hpp, unit-tested below); the evidence never is.
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "bea"}})->body);
+    const auto id = created["id"].get<std::string>();
+    make_sole_grant_holder(f, "bea");
+
+    for (int i = 0; i < 3; ++i) {
+        auto res = f.patch("/scim/v2/Users/" + id, deactivate_ops());
+        REQUIRE(res);
+        CHECK(res->status == 409);
+    }
+    CHECK(audit_rows(f, kRefusedAction, id).size() == 3);
+    CHECK(scim_refused(f) == 3.0);
+    CHECK(events_of(f, kRefusedAction).size() == 3); // the critical event is never throttled
+    CHECK(f.auth_mgr.get_user_role("bea").has_value());
+}
+
+TEST_CASE("ScimRoutes: the grant floor applies under RBAC ON only; under RBAC OFF the same "
+          "deprovision proceeds (#4966)",
+          "[pg][scim][routes][lastadmin][regime]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "cleo"}})->body);
+    const auto id = created["id"].get<std::string>();
+    REQUIRE(f.rbac_guard->assign_role({"user", "cleo", "Administrator"}).has_value());
+    REQUIRE(f.rbac_guard->set_rbac_enabled(false).has_value());
+
+    auto res = f.patch("/scim/v2/Users/" + id, deactivate_ops());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_FALSE(f.auth_mgr.get_user_role("cleo").has_value());
+    CHECK(scim_refused(f) == 0.0);
+}
+
+TEST_CASE("ScimRoutes: a LATE refusal (state changed after the early check) says the linked "
+          "credentials were revoked and the account remains active (#4966)",
+          "[pg][scim][routes][lastadmin][late]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "dara"}})->body);
+    const auto id = created["id"].get<std::string>();
+    // A second authenticatable grant holder makes the early check pass.
+    REQUIRE(f.auth_mgr.upsert_user("carol", "carolpassword1", auth::Role::user));
+    REQUIRE(f.rbac_guard->assign_role({"user", "dara", "Administrator"}).has_value());
+    REQUIRE(f.rbac_guard->assign_role({"user", "carol", "Administrator"}).has_value());
+    REQUIRE(f.rbac_guard->set_rbac_enabled(true).has_value());
+    auto token = f.token_store->create_token("t-dara", "dara");
+    REQUIRE(token.has_value());
+
+    std::unique_ptr<httplib::Response> res;
+    std::string audit_action;
+    {
+        yuzu::test::PrincipalLockGate gate(f.auth_db.pool(), "dara");
+        // Declared AFTER the gate: destroyed first, releases the gate, then joins (RAII).
+        yuzu::test::Workers workers([&] { gate.release(); });
+        SECTION("PATCH active:false") {
+            audit_action = "scim.user.deactivated";
+            workers.add([&] { res = f.patch("/scim/v2/Users/" + id, deactivate_ops()); });
+        }
+        SECTION("DELETE") {
+            audit_action = "scim.user.deleted";
+            workers.add([&] { res = f.del("/scim/v2/Users/" + id); });
+        }
+        REQUIRE(gate.wait_until_contended());
+        // The other holder loses the grant (allowed: dara remains), so dara is now the last.
+        REQUIRE(f.rbac_guard->unassign_role("user", "carol", "Administrator").has_value());
+        gate.release();
+        workers.join_all();
+    }
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    const auto body = json::parse(res->body);
+    CHECK(body["scimType"] == "mutability");
+    const auto detail = body["detail"].get<std::string>();
+    CHECK(detail.find("revoked before the refusal") != std::string::npos);
+    CHECK(detail.find("remains active") != std::string::npos);
+
+    // The sentence matches the recorded state: credentials gone, account and mapping intact.
+    CHECK_FALSE(f.token_store->validate_token(*token).has_value());
+    CHECK(f.auth_mgr.get_user_role("dara").has_value());
+    auto resource = f.scim_store->get_by_scim_id(id);
+    REQUIRE(resource.has_value());
+    CHECK(resource->active);
+
+    const auto rows = audit_rows(f, kRefusedAction, id);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].detail.find("early_refusal=false") != std::string::npos);
+    CHECK(rows[0].detail.find("credentials_revoked_before_refusal=true") != std::string::npos);
+    CHECK(rows[0].detail.find("api_tokens_revoked=1") != std::string::npos);
+    CHECK(rows[0].detail.find("attempted_action=" + audit_action) != std::string::npos);
+    // `partial`, not `denied`: the credentials WERE revoked before the guard refused (the early
+    // refusal above stays `denied`, nothing was revoked).
+    CHECK(rows[0].result == "partial");
+    CHECK(rows[0].detail.find("live_api_tokens_slug=0") != std::string::npos); // revoked
+    CHECK(rows[0].detail.find("identity_links_unchanged=true") != std::string::npos);
+    CHECK(audit_rows(f, audit_action, id).empty()); // no success row for a refused termination
+    CHECK(scim_refused(f) == 1.0);
+    const auto crit = events_of(f, kRefusedAction); // the LATE refusal is escalated too
+    REQUIRE(crit.size() == 1);
+    CHECK(crit[0].severity == Severity::kCritical);
+}
+
+TEST_CASE("ScimRoutes: POST active:false is a REQUESTED deactivation, guarded and typed 409 "
+          "(#4966)",
+          "[pg][scim][routes][lastadmin][post_inactive]") {
+    Fixture f;
+    REQUIRE(f.auth_mgr.upsert_user("carol", "carolpassword1", auth::Role::user));
+    REQUIRE(f.rbac_guard->assign_role({"user", "carol", "Administrator"}).has_value());
+    REQUIRE(f.rbac_guard->set_rbac_enabled(true).has_value());
+
+    std::unique_ptr<httplib::Response> res;
+    {
+        // Park the new account's credential revoke; while it waits the account is granted the
+        // fleet's only Administrator (carol loses hers), so the guard refuses what the early
+        // check let through.
+        yuzu::test::PrincipalLockGate gate(f.auth_db.pool(), "pia");
+        yuzu::test::Workers workers([&] { gate.release(); });
+        workers.add([&] {
+            res = f.post("/scim/v2/Users", {{"userName", "pia"}, {"active", false}});
+        });
+        REQUIRE(gate.wait_until_contended());
+        REQUIRE(f.rbac_guard->assign_role({"user", "pia", "Administrator"}).has_value());
+        REQUIRE(f.rbac_guard->unassign_role("user", "carol", "Administrator").has_value());
+        gate.release();
+        workers.join_all();
+    }
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(json::parse(res->body)["scimType"] == "mutability");
+    // The account stays ACTIVE and mapped (it is the last counted administrator, so no undo can
+    // remove it): documented non-convergence, an operator resolves it.
+    CHECK(f.auth_mgr.get_user_role("pia").has_value());
+    CHECK(f.scim_store->get_by_username("pia").has_value());
+    CHECK(scim_refused(f) == 1.0);
+}
+
+TEST_CASE("ScimRoutes: a group-derived DEMOTION of the last active administrator account is "
+          "refused, recorded as its own audit action, and the role is unchanged (#4966)",
+          "[pg][scim][routes][lastadmin][groups]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    auto user = json::parse(f.post("/scim/v2/Users", {{"userName", "gil"}})->body);
+    const auto user_id = user["id"].get<std::string>();
+    auto group = json::parse(f.post("/scim/v2/Groups", {{"displayName", "Yuzu-Admins"}})->body);
+    const auto group_id = group["id"].get<std::string>();
+
+    json add_body{{"Operations",
+                   json::array({{{"op", "add"},
+                                 {"path", "members"},
+                                 {"value", json::array({{{"value", user_id}}})}}})}};
+    REQUIRE(f.patch("/scim/v2/Groups/" + group_id, add_body)->status == 200);
+    REQUIRE(f.auth_mgr.get_user_role("gil").value() == auth::Role::admin);
+    // gil is now the ONLY active admin account.
+    REQUIRE(f.auth_mgr.update_role_checked("spare_admin", auth::Role::user) ==
+            auth::UpdateRoleOutcome::Updated);
+
+    json remove_body{
+        {"Operations",
+         json::array({{{"op", "remove"}, {"path", "members[value eq \"" + user_id + "\"]"}}})}};
+    auto res = f.patch("/scim/v2/Groups/" + group_id, remove_body);
+    REQUIRE(res);
+    CHECK(res->status == 200); // the Group op itself succeeded; the demotion side effect did not
+
+    CHECK(f.auth_mgr.get_user_role("gil").value() == auth::Role::admin);
+    const auto rows = audit_rows(f, kRefusedAction, user_id);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].detail.find("attempted_action=scim.user.role_changed") != std::string::npos);
+    CHECK(rows[0].detail.find("role_unchanged=true") != std::string::npos);
+    CHECK(scim_refused(f) == 1.0);
+    // Distinguishable from a store fault: no generic role-change failure row, no failure counter.
+    for (const auto& r : audit_rows(f, "scim.user.role_changed", user_id))
+        CHECK(r.result != "failure");
+    CHECK(f.metrics.counter("yuzu_scim_role_change_failures_total").value() == 0.0);
+}
+
+TEST_CASE("ScimRoutes: revive refuses an elevated TOMBSTONE before reactivating it (#4966)",
+          "[pg][scim][routes][lastadmin][precheck]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "hal"}})->body);
+    const auto old_id = created["id"].get<std::string>();
+    REQUIRE(f.auth_mgr.update_role("hal", auth::Role::admin));
+    REQUIRE(f.auth_mgr.remove_user("hal")); // tombstoned at role 'admin' (spare_admin remains)
+    REQUIRE(f.scim_store->delete_by_scim_id(old_id).has_value());
+    // The tombstone's role is readable although the row is inactive.
+    REQUIRE(f.auth_db->get_role_including_inactive("hal").value() == auth::Role::admin);
+
+    auto res = f.post("/scim/v2/Users", {{"userName", "hal"}});
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    CHECK_FALSE(f.auth_mgr.get_user_role("hal").has_value()); // never reactivated
+    CHECK_FALSE(f.scim_store->get_by_username("hal").has_value());
+    const auto rows = audit_rows(f, "scim.user.provenance_denied", "hal");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].detail.find("tombstone role is not 'user'") != std::string::npos);
+}
+
+TEST_CASE("ScimRoutes: provisioning refuses a username that already holds an Administrator "
+          "grant, for both fresh create and revive (#4966)",
+          "[pg][scim][routes][lastadmin][precheck]") {
+    Fixture f;
+    SECTION("fresh create") {
+        REQUIRE(f.rbac_guard->assign_role({"user", "ivo", "Administrator"}).has_value());
+        auto res = f.post("/scim/v2/Users", {{"userName", "ivo"}});
+        REQUIRE(res);
+        CHECK(res->status == 404);
+        // Nothing was created: no auth row, no provenance, no mapping.
+        CHECK_FALSE(f.auth_db->get_provisioning_source("ivo").has_value());
+        CHECK_FALSE(f.scim_store->get_by_username("ivo").has_value());
+    }
+    SECTION("revive") {
+        auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "ivo"}})->body);
+        REQUIRE(f.del("/scim/v2/Users/" + created["id"].get<std::string>())->status == 204);
+        REQUIRE(f.rbac_guard->assign_role({"user", "ivo", "Administrator"}).has_value());
+        auto res = f.post("/scim/v2/Users", {{"userName", "ivo"}});
+        REQUIRE(res);
+        CHECK(res->status == 404);
+        CHECK_FALSE(f.auth_mgr.get_user_role("ivo").has_value()); // still a tombstone
+        CHECK_FALSE(f.scim_store->get_by_username("ivo").has_value());
+    }
+    const auto rows = audit_rows(f, "scim.user.provenance_denied", "ivo");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].detail == "username holds an Administrator grant");
+}
+
+TEST_CASE("ScimRoutes: a compensation the guard refuses is a 500 that leaves the account "
+          "active, with a failure audit row, a critical event and the refusal counter (#4966)",
+          "[pg][scim][routes][lastadmin][compensation]") {
+    Fixture f;
+    REQUIRE(f.auth_mgr.upsert_user("carol", "carolpassword1", auth::Role::user));
+    REQUIRE(f.rbac_guard->assign_role({"user", "carol", "Administrator"}).has_value());
+    REQUIRE(f.rbac_guard->set_rbac_enabled(true).has_value());
+
+    std::unique_ptr<httplib::Response> res;
+    {
+        // Park the mapping write on the externalId unique index. While it waits the freshly
+        // created account is granted the fleet's only Administrator, so when the collision then
+        // fails the write the undo of the account creation is refused by the guard.
+        yuzu::test::UncommittedScimRowGate gate(f.auth_db.pool(), "ext-collide");
+        // Unwinding rolls the gate back (the request's insert then succeeds) before joining.
+        yuzu::test::Workers workers([&] { gate.rollback(); });
+        workers.add([&] {
+            res = f.post("/scim/v2/Users", {{"userName", "jo"}, {"externalId", "ext-collide"}});
+        });
+        REQUIRE(gate.wait_until_contended());
+        REQUIRE(f.rbac_guard->assign_role({"user", "jo", "Administrator"}).has_value());
+        REQUIRE(f.rbac_guard->unassign_role("user", "carol", "Administrator").has_value());
+        gate.commit();
+        workers.join_all();
+    }
+    REQUIRE(res);
+    // Not the 409 uniqueness the IdP could act on: the undo did not happen, so a retryable 500.
+    CHECK(res->status == 500);
+    CHECK(f.auth_mgr.get_user_role("jo").has_value()); // left ACTIVE
+    // A refused undo is NOT an IdP removal attempt: it has its own counter and does not feed the
+    // refusal counter.
+    CHECK(scim_refused(f) == 0.0);
+    CHECK(compensation_failed(f, "guard_refused_last_administrator") == 1.0);
+    CHECK(compensation_failed(f, "store_failure") == 0.0);
+
+    const auto rows = audit_rows(f, "scim.user.compensation_failed", "jo");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].result == "failure");
+    CHECK(rows[0].detail.find("guard_refused_last_administrator") != std::string::npos);
+
+    auto events = f.analytics_store->query_recent(20);
+    REQUIRE(events.has_value());
+    bool found = false;
+    for (const auto& e : *events) {
+        if (e.event_type == "scim.user.compensation_failed") {
+            CHECK(e.severity == Severity::kCritical);
+            found = true;
+        }
+    }
+    CHECK(found);
+}
+
+TEST_CASE("ScimRoutes: a compensation that SUCCEEDS still answers the original 409 and "
+          "deactivates the just-created account (#4966)",
+          "[pg][scim][routes][lastadmin][compensation]") {
+    Fixture f;
+    json first = json::parse(
+        f.post("/scim/v2/Users", {{"userName", "kay"}, {"externalId", "ext-dup"}})->body);
+    auto res = f.post("/scim/v2/Users", {{"userName", "lou"}, {"externalId", "ext-dup"}});
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(json::parse(res->body)["scimType"] == "uniqueness");
+    CHECK_FALSE(f.auth_mgr.get_user_role("lou").has_value()); // undone through the guard
+    CHECK(audit_rows(f, "scim.user.compensation_failed", "lou").empty());
+}
+
+TEST_CASE("ScimRoutes: a hostile group displayName is neutralised in the demotion-refusal "
+          "audit detail AND its log line (CWE-117, #4966)",
+          "[pg][scim][routes][lastadmin][groups][logforge]") {
+    // The admin-group name is configuration, so the hostile name can be BOTH the configured admin
+    // group and the group the IdP sends: scim_json.cpp validates a displayName for NUL and a
+    // 256-byte cap only, so CR/LF and a forged "[error]" prefix reach the route.
+    const std::string hostile = "Yuzu-Admins\r\n[error] FORGED user=root";
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/hostile};
+    auto user = json::parse(f.post("/scim/v2/Users", {{"userName", "gus_log"}})->body);
+    const auto user_id = user["id"].get<std::string>();
+    auto group = json::parse(f.post("/scim/v2/Groups", {{"displayName", hostile}})->body);
+    const auto group_id = group["id"].get<std::string>();
+    json add_body{{"Operations",
+                   json::array({{{"op", "add"},
+                                 {"path", "members"},
+                                 {"value", json::array({{{"value", user_id}}})}}})}};
+    REQUIRE(f.patch("/scim/v2/Groups/" + group_id, add_body)->status == 200);
+    REQUIRE(f.auth_mgr.get_user_role("gus_log").value() == auth::Role::admin);
+    REQUIRE(f.auth_mgr.update_role_checked("spare_admin", auth::Role::user) ==
+            auth::UpdateRoleOutcome::Updated); // gus_log is now the ONLY active admin account
+
+    json remove_body{
+        {"Operations",
+         json::array({{{"op", "remove"}, {"path", "members[value eq \"" + user_id + "\"]"}}})}};
+    // The refusal's WARN text is written through the process-wide `refusal_log_throttle()` (one
+    // warn per username per 60 s, shared by every Fixture in this process): this case sees the
+    // warn only because no other case refuses 'gus_log' first. Keep the username unique to this
+    // case, or assert on the throttle-independent audit detail instead.
+    yuzu::test::LogCapture capture;
+    auto res = f.patch("/scim/v2/Groups/" + group_id, remove_body);
+    capture.stop(); // quiesce before reading the captured text
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(f.auth_mgr.get_user_role("gus_log").value() == auth::Role::admin);
+
+    const std::string neutral = "via_group=\"Yuzu-Admins__[error] FORGED user=root op=group_patch\"";
+    const auto refused = audit_rows(f, kRefusedAction, user_id);
+    REQUIRE(refused.size() == 1);
+    CHECK(refused[0].detail.find('\r') == std::string::npos);
+    CHECK(refused[0].detail.find('\n') == std::string::npos);
+    CHECK(refused[0].detail.find(neutral) != std::string::npos);
+    // The pre-existing role-change rows on the same path embed the same group name: neutralised too.
+    const auto changed = audit_rows(f, "scim.user.role_changed", user_id);
+    REQUIRE_FALSE(changed.empty());
+    for (const auto& r : changed) {
+        CHECK(r.detail.find('\r') == std::string::npos);
+        CHECK(r.detail.find('\n') == std::string::npos);
+    }
+
+    const std::string logs = without_sink_crlf(capture.text());
+    CHECK(logs.find('\r') == std::string::npos);
+    // The forged prefix never starts a physical log line of its own ...
+    CHECK(logs.find("\n[error] FORGED") == std::string::npos);
+    // ... and the neutralised text does appear (on the refusal's own line).
+    CHECK(logs.find(neutral) != std::string::npos);
+    CHECK(logs.find("refused to remove the last protected administrator 'gus_log'") !=
+          std::string::npos);
+}
+
+TEST_CASE("ScimRoutes: Unicode line separators (NEL, U+2028, U+2029) and quote characters in a "
+          "group displayName are neutralised in the audit detail AND the log line (CWE-117, #4966)",
+          "[pg][scim][routes][lastadmin][groups][logforge]") {
+    // The admin-group name is configuration; the hostile name is both the configured admin group
+    // and the group the IdP sends, then the group is RENAMED to a second hostile name so the
+    // refusal's trigger carries BOTH names (`via_group="<new>" ... renamed_from='<old>'`).
+    const std::string old_name = "Yuzu-Admins\xE2\x80\xA8[error] FORGED 'q' \xC2\x85 x\xE2\x80\xA9y";
+    const std::string new_name = "Renamed\xE2\x80\xA8\r\n[error] 'evil' \"dq\"";
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/old_name};
+    auto user = json::parse(f.post("/scim/v2/Users", {{"userName", "uni_log"}})->body);
+    const auto user_id = user["id"].get<std::string>();
+    auto group = json::parse(f.post("/scim/v2/Groups", {{"displayName", old_name}})->body);
+    const auto group_id = group["id"].get<std::string>();
+    json add_body{{"Operations",
+                   json::array({{{"op", "add"},
+                                 {"path", "members"},
+                                 {"value", json::array({{{"value", user_id}}})}}})}};
+    REQUIRE(f.patch("/scim/v2/Groups/" + group_id, add_body)->status == 200);
+    REQUIRE(f.auth_mgr.get_user_role("uni_log").value() == auth::Role::admin);
+    REQUIRE(f.auth_mgr.update_role_checked("spare_admin", auth::Role::user) ==
+            auth::UpdateRoleOutcome::Updated); // uni_log is now the ONLY active admin account
+
+    json rename_body{
+        {"Operations",
+         json::array({{{"op", "replace"}, {"path", "displayName"}, {"value", new_name}}})}};
+    yuzu::test::LogCapture capture;
+    auto res = f.patch("/scim/v2/Groups/" + group_id, rename_body);
+    capture.stop();
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    // Each separator is ONE '_' (log_key_token folds NEL / U+2028 / U+2029 as units), both quote
+    // characters are '_', spaces and '=' survive.
+    const std::string expected =
+        "via_group=\"Renamed___[error] _evil_ _dq_ op=group_patch "
+        "renamed_from='Yuzu-Admins_[error] FORGED _q_ _ x_y'\"";
+    const auto refused = audit_rows(f, kRefusedAction, user_id);
+    REQUIRE(refused.size() == 1);
+    CHECK(refused[0].detail.find(expected) != std::string::npos);
+    for (const auto& r : refused) {
+        CHECK(r.detail.find("\xE2\x80\xA8") == std::string::npos);
+        CHECK(r.detail.find("\xE2\x80\xA9") == std::string::npos);
+        CHECK(r.detail.find("\xC2\x85") == std::string::npos);
+    }
+    // The renamed_from value cannot be closed early: exactly the two delimiter apostrophes.
+    const auto from = refused[0].detail.find("renamed_from='");
+    REQUIRE(from != std::string::npos);
+    const auto close = refused[0].detail.find('\'', from + 14);
+    REQUIRE(close != std::string::npos);
+    CHECK(refused[0].detail.find('\'', close + 1) == std::string::npos);
+
+    const std::string logs = without_sink_crlf(capture.text());
+    CHECK(logs.find("\xE2\x80\xA8") == std::string::npos);
+    CHECK(logs.find("\xE2\x80\xA9") == std::string::npos);
+    CHECK(logs.find("\xC2\x85") == std::string::npos);
+    CHECK(logs.find('\r') == std::string::npos);
+    CHECK(logs.find("\n[error] FORGED") == std::string::npos);
+    CHECK(logs.find("\n[error] 'evil'") == std::string::npos);
+    CHECK(logs.find(expected) != std::string::npos);
+}
+
+TEST_CASE("enumerate_principals_for_audit maps every byte >= 0x80 and caps the length of an "
+          "IdP-chosen principal (CWE-117, #4966)",
+          "[scim][lastadmin][logforge]") {
+    // A line separator (U+2028 = E2 80 A8) and NEL (C2 85) inside an OIDC sub / SAML NameID.
+    const std::vector<std::string> principals = {"oidc:iss#a\xE2\x80\xA8" "b", "saml:n\xC2\x85" "m"};
+    const auto out = enumerate_principals_for_audit(principals);
+    CHECK(out == " revoked_principals=oidc:iss#a___b,saml:n__m");
+    CHECK(out.find("\xE2") == std::string::npos);
+    CHECK(out.find("\xC2") == std::string::npos);
+    // A very long principal is shortened, not embedded whole.
+    const std::vector<std::string> long_one = {"oidc:" + std::string(5000, 'x')};
+    const auto capped = enumerate_principals_for_audit(long_one);
+    CHECK(capped.size() < 400);
+    CHECK(capped.find('~') != std::string::npos);
+}
+
+TEST_CASE("enumerate_principals_for_audit neutralises an IdP-chosen principal string (CWE-117, "
+          "#4966)",
+          "[scim][lastadmin][logforge]") {
+    const std::vector<std::string> principals = {"slug", "oidc:https://iss#su\nb=1,x y"};
+    const auto out = enumerate_principals_for_audit(principals);
+    CHECK(out == " revoked_principals=slug,oidc:https://iss#su_b_1_x_y");
+    CHECK(out.find('\n') == std::string::npos);
+    // The field's own delimiters survive, so the parser still sees exactly two entries.
+    CHECK(std::count(out.begin(), out.end(), ',') == 1);
+}
+
+TEST_CASE("ScimRoutes: a StoreFailure from the guarded deactivation is a retryable 503 with the "
+          "account state stated, credentials revoked, counted (#4966)",
+          "[pg][scim][routes][lastadmin][storefailure]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/{}, std::chrono::milliseconds(300)};
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "sfa"}})->body);
+    const auto id = created["id"].get<std::string>();
+    auto token = f.token_store->create_token("t-sfa", "sfa");
+    REQUIRE(token.has_value());
+
+    std::unique_ptr<httplib::Response> res;
+    std::string audit_action;
+    yuzu::test::HeldLocks hold(f.auth_db.pool());
+    hold.lock_rbac_enabled(); // every guarded lifecycle write queues behind this row
+    yuzu::test::Workers workers([&] { hold.rollback(); });
+    SECTION("PATCH active:false") {
+        audit_action = "scim.user.deactivated";
+        workers.add([&] { res = f.patch("/scim/v2/Users/" + id, deactivate_ops()); });
+    }
+    SECTION("PUT active:false") {
+        audit_action = "scim.user.deactivated";
+        workers.add([&] { res = f.put("/scim/v2/Users/" + id, {{"userName", "sfa"}, {"active", false}}); });
+    }
+    SECTION("DELETE") {
+        audit_action = "scim.user.deleted";
+        workers.add([&] { res = f.del("/scim/v2/Users/" + id); });
+    }
+    SECTION("POST active:false") {
+        audit_action = "scim.user.provisioned";
+        workers.add([&] {
+            res = f.post("/scim/v2/Users", {{"userName", "sfb"}, {"active", false}});
+        });
+    }
+    workers.join_all(); // the guarded write waits out the shortened lock_timeout and fails
+
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2");
+    const auto body = json::parse(res->body);
+    // The standard header is the retry contract on the SCIM surface; the body is the plain
+    // RFC 7644 error (no `retry_after_ms` extension member).
+    CHECK_FALSE(body.contains("retry_after_ms"));
+    CHECK(body["status"] == "503");
+    CHECK(body["detail"].get<std::string>().find("indeterminate") != std::string::npos);
+    CHECK(body["detail"].get<std::string>().find("retry") != std::string::npos);
+
+    const bool post_case = audit_action == "scim.user.provisioned";
+    std::string target = id;
+    if (post_case) {
+        auto mapped = f.scim_store->get_by_username("sfb"); // the half-made account's mapping
+        REQUIRE(mapped.has_value());
+        target = mapped->scim_id;
+    }
+    const auto rows = audit_rows(f, audit_action, target);
+    REQUIRE_FALSE(rows.empty());
+    const auto& row = rows.back();
+    CHECK(row.result == "failure");
+    CHECK(row.detail.find("account_state=unknown credentials_revoked=true") != std::string::npos);
+    CHECK(lifecycle_failures(f, "deactivate") == 1.0);
+    CHECK(scim_refused(f) == 0.0); // a store fault is not a refusal
+    if (!post_case) {
+        // Credentials-first: the token IS gone, the account is untouched (nothing committed).
+        CHECK_FALSE(f.token_store->validate_token(*token).has_value());
+        CHECK(f.auth_mgr.get_user_role("sfa").has_value());
+    }
+}
+
+TEST_CASE("ScimRoutes: a failed durable session wipe after the deactivation is a 500 that says "
+          "the account IS deactivated (#4966)",
+          "[pg][scim][routes][lastadmin][wipefailed]") {
+    Fixture f;
+    f.use_session_store();
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "wfa"}})->body);
+    const auto id = created["id"].get<std::string>();
+    f.wipe_fault.arm();
+
+    std::unique_ptr<httplib::Response> res;
+    std::string audit_action;
+    SECTION("PATCH active:false") {
+        audit_action = "scim.user.deactivated";
+        res = f.patch("/scim/v2/Users/" + id, deactivate_ops());
+    }
+    SECTION("PUT active:false") {
+        audit_action = "scim.user.deactivated";
+        res = f.put("/scim/v2/Users/" + id, {{"userName", "wfa"}, {"active", false}});
+    }
+    SECTION("DELETE") {
+        audit_action = "scim.user.deleted";
+        res = f.del("/scim/v2/Users/" + id);
+    }
+    REQUIRE(res);
+    CHECK(res->status == 500);
+    CHECK(res->get_header_value("Retry-After").empty()); // no retry promise: see #5214
+    CHECK_FALSE(f.auth_mgr.get_user_role("wfa").has_value()); // the account IS deactivated
+    const auto rows = audit_rows(f, audit_action, id);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].result == "failure");
+    CHECK(rows[0].detail.find("account deactivated; durable session wipe failed") !=
+          std::string::npos);
+    CHECK(lifecycle_failures(f, "deactivate") == 0.0); // a wipe failure is not a guard failure
+}
+
+TEST_CASE("ScimRoutes: a failed durable session wipe on POST active:false is the same 500 "
+          "(#4966)",
+          "[pg][scim][routes][lastadmin][wipefailed]") {
+    Fixture f;
+    f.use_session_store();
+    f.wipe_fault.arm();
+    auto res = f.post("/scim/v2/Users", {{"userName", "wfp"}, {"active", false}});
+    REQUIRE(res);
+    CHECK(res->status == 500);
+    CHECK_FALSE(f.auth_mgr.get_user_role("wfp").has_value());
+}
+
+namespace {
+
+/// Poll `pred` every few milliseconds up to a deadline (event-driven, never a fixed sleep).
+template <typename Pred>
+bool wait_until(Pred pred, std::chrono::milliseconds deadline = std::chrono::milliseconds(10000)) {
+    const auto end = std::chrono::steady_clock::now() + deadline;
+    while (std::chrono::steady_clock::now() < end) {
+        if (pred())
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return pred();
+}
+
+double recompute_skipped(Fixture& f, const char* cause) {
+    return f.metrics.counter("yuzu_scim_group_recompute_skipped_total", {{"cause", cause}})
+        .value();
+}
+
+/// The value of ` <key>=<value>` in an audit detail (up to the next space), or empty.
+std::string detail_field(const std::string& detail, const std::string& key) {
+    const auto pos = detail.find(" " + key + "=");
+    if (pos == std::string::npos)
+        return {};
+    const auto start = pos + key.size() + 2;
+    return detail.substr(start, detail.find(' ', start) - start);
+}
+
+/// The detail of the single audit row of `action` on `target` (the Group success rows carry the
+/// recompute verdict; the summary row carries the per-class counts and names).
+std::string only_detail(Fixture& f, const char* action, const std::string& target) {
+    const auto rows = audit_rows(f, action, target);
+    REQUIRE(rows.size() == 1);
+    return rows[0].detail;
+}
+
+// The read faults of the recompute's steps 1-3 (step 4 is `yuzu::test::RoleColumnFault`). Each is a
+// REAL failed SQL read, restored by RAII. They are test-file-local on purpose: nothing but this
+// file's recompute cases needs them.
+
+/// Step 1: `scim_store.scim_resources` moved aside, so `get_by_scim_id` and `resource_exists`
+/// both fail. The Group tables, the bearer token and the audit store keep working, so a Group
+/// DELETE (which resolves no member) still reaches the recompute.
+class ScimResourcesFault : public yuzu::test::SqlFault {
+public:
+    explicit ScimResourcesFault(yuzu::server::pg::PgPool& pool)
+        : SqlFault(pool, "ALTER TABLE scim_store.scim_resources RENAME TO scim_resources_gone",
+                   "ALTER TABLE scim_store.scim_resources_gone RENAME TO scim_resources") {}
+};
+
+/// Step 2: the `auth.users.provisioning_source` column moved aside, so
+/// `AuthDB::get_provisioning_source` fails while `get_user` (role) still answers.
+class ProvisioningSourceFault : public yuzu::test::SqlFault {
+public:
+    explicit ProvisioningSourceFault(yuzu::server::pg::PgPool& pool)
+        : SqlFault(pool,
+                   "ALTER TABLE auth.users RENAME COLUMN provisioning_source TO prov_src_gone",
+                   "ALTER TABLE auth.users RENAME COLUMN prov_src_gone TO provisioning_source") {}
+};
+
+/// Step 3: `scim_store.scim_group_members` moved aside AT THE COMMIT of a Group DELETE, i.e. after
+/// the delete is durable but before the recompute reads the members' groups
+/// (`list_group_display_names_for_user`). No plain rename can do this, because the Group handlers
+/// read and write the same table first: `arm()` installs a DEFERRED constraint trigger on
+/// `scim_groups` that renames the members table when the deleting transaction commits, `repair()`
+/// drops it and restores the table. Inert for every other statement.
+class MembersReadFaultAfterGroupDelete : public yuzu::test::SqlFault {
+public:
+    explicit MembersReadFaultAfterGroupDelete(yuzu::server::pg::PgPool& pool)
+        : SqlFault(
+              pool,
+              "DO $do$ BEGIN "
+              "EXECUTE $f$CREATE OR REPLACE FUNCTION public.yuzu_test_after_group_delete() "
+              "RETURNS trigger LANGUAGE plpgsql AS $b$ BEGIN "
+              "EXECUTE 'ALTER TABLE scim_store.scim_group_members RENAME TO "
+              "scim_group_members_gone'; RETURN NULL; END $b$$f$; "
+              "EXECUTE $f$CREATE CONSTRAINT TRIGGER yuzu_test_after_group_delete AFTER DELETE ON "
+              "scim_store.scim_groups DEFERRABLE INITIALLY DEFERRED FOR EACH ROW "
+              "EXECUTE FUNCTION public.yuzu_test_after_group_delete()$f$; "
+              "END $do$",
+              "DO $do$ BEGIN "
+              "DROP TRIGGER IF EXISTS yuzu_test_after_group_delete ON scim_store.scim_groups; "
+              "DROP FUNCTION IF EXISTS public.yuzu_test_after_group_delete(); "
+              "IF to_regclass('scim_store.scim_group_members_gone') IS NOT NULL THEN "
+              "ALTER TABLE scim_store.scim_group_members_gone RENAME TO scim_group_members; "
+              "END IF; END $do$") {}
+};
+
+} // namespace
+
+TEST_CASE("ScimRoutes: a group role recompute skips the remaining PROMOTIONS after the first "
+          "store failure and records ONE recompute_incomplete row (#4966)",
+          "[pg][scim][routes][lastadmin][groups][storefailure]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins",
+              std::chrono::milliseconds(300)};
+    json members = json::array();
+    std::vector<std::string> ids;
+    for (const char* name : {"gm1", "gm2", "gm3"}) {
+        auto u = json::parse(f.post("/scim/v2/Users", {{"userName", name}})->body);
+        ids.push_back(u["id"].get<std::string>());
+        members.push_back({{"value", ids.back()}});
+    }
+
+    std::unique_ptr<httplib::Response> res;
+    json group_body;
+    {
+        yuzu::test::HeldLocks hold(f.auth_db.pool());
+        hold.lock_rbac_enabled();
+        yuzu::test::Workers workers([&] { hold.rollback(); });
+        workers.add([&] {
+            // All three members would be promoted; every promotion queues behind the held row.
+            res = f.post("/scim/v2/Groups", {{"displayName", "Yuzu-Admins"}, {"members", members}});
+        });
+        workers.join_all();
+    }
+    REQUIRE(res);
+    // The status is NOT changed by the skipped promotions: the membership write committed.
+    CHECK(res->status == 201);
+    group_body = json::parse(res->body);
+
+    // ONE member paid the wait and failed; the other two were skipped, not retried.
+    CHECK(lifecycle_failures(f, "set_role") == 1.0);
+    CHECK(f.metrics.counter("yuzu_scim_role_change_failures_total").value() == 1.0);
+    std::size_t failure_rows = 0;
+    for (const auto& id : ids)
+        for (const auto& r : audit_rows(f, "scim.user.role_changed", id))
+            if (r.result == "failure")
+                ++failure_rows;
+    CHECK(failure_rows == 1);
+    // Nothing was promoted.
+    for (const char* name : {"gm1", "gm2", "gm3"})
+        CHECK(f.auth_mgr.get_user_role(name).value() == auth::Role::user);
+
+    // The skipped promotions are recorded ONCE, with the count and the (neutralised) usernames,
+    // as a `partial` Group row, and counted by cause.
+    const auto incomplete = audit_rows(f, "scim.group.recompute_incomplete",
+                                       group_body["id"].get<std::string>());
+    REQUIRE(incomplete.size() == 1);
+    CHECK(incomplete[0].result == "partial");
+    CHECK(incomplete[0].target_type == "Group");
+    CHECK(detail_field(incomplete[0].detail, "skipped_promotions") == "2");
+    CHECK(detail_field(incomplete[0].detail, "failed") == "1"); // the member that paid the wait
+    std::size_t skipped_named = 0;
+    for (const char* name : {"gm1", "gm2", "gm3"})
+        if (detail_field(incomplete[0].detail, "skipped_promotions_users").find(name) !=
+            std::string::npos)
+            ++skipped_named;
+    CHECK(skipped_named == 2); // the failed member is NOT in the skipped list
+    CHECK(recompute_skipped(f, "promotion") == 2.0);
+    CHECK(recompute_skipped(f, "undetermined") == 0.0);
+    // The success row never claims a completeness the recompute did not reach.
+    CHECK(only_detail(f, "scim.group.created", group_body["id"].get<std::string>()) ==
+          "recompute=incomplete");
+}
+
+TEST_CASE("ScimRoutes: after a store failure the remaining DEMOTIONS are still attempted, and each "
+          "failed demotion of an IdP-removed administrator is escalated (#4966)",
+          "[pg][scim][routes][lastadmin][groups][storefailure][demotion]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins",
+              std::chrono::milliseconds(300)};
+    json members = json::array();
+    std::vector<std::string> ids;
+    const std::vector<std::string> names{"dm1", "dm2", "dm3"};
+    for (const auto& name : names) {
+        auto u = json::parse(f.post("/scim/v2/Users", {{"userName", name}})->body);
+        ids.push_back(u["id"].get<std::string>());
+        members.push_back({{"value", ids.back()}});
+    }
+    auto group = json::parse(
+        f.post("/scim/v2/Groups", {{"displayName", "Yuzu-Admins"}, {"members", members}})->body);
+    for (const auto& name : names) // all three are admins through the group (spare_admin remains)
+        REQUIRE(f.auth_mgr.get_user_role(name).value() == auth::Role::admin);
+
+    std::unique_ptr<httplib::Response> res;
+    yuzu::test::LogCapture capture;
+    {
+        yuzu::test::HeldLocks hold(f.auth_db.pool());
+        hold.lock_rbac_enabled();
+        yuzu::test::Workers workers([&] { hold.rollback(); });
+        workers.add([&] { res = f.del("/scim/v2/Groups/" + group["id"].get<std::string>()); });
+        // The FIRST demotion waits out the 300 ms lock bound and fails; release the row as soon as
+        // that failure is counted, so the SECOND and THIRD demotions find it free. They are
+        // attempted only because demotions are never skipped.
+        REQUIRE(wait_until([&] {
+            return f.metrics.counter("yuzu_scim_role_change_failures_total").value() >= 1.0;
+        }));
+        hold.rollback();
+        workers.join_all();
+    }
+    capture.stop();
+    REQUIRE(res);
+    CHECK(res->status == 204); // the Group DELETE itself committed
+
+    std::size_t still_admin = 0, demoted = 0;
+    std::string retained;
+    for (const auto& name : names) {
+        if (f.auth_mgr.get_user_role(name).value() == auth::Role::admin) {
+            ++still_admin;
+            retained = name;
+        } else {
+            ++demoted;
+        }
+    }
+    CHECK(still_admin == 1); // only the member whose attempt hit the lock timeout
+    CHECK(demoted == 2);     // members 2 and 3 WERE attempted after the failure and demoted
+    CHECK(f.metrics.counter("yuzu_scim_role_change_failures_total").value() == 1.0);
+    // No promotion was involved, so nothing is reported as skipped; but the ONE failed demotion
+    // is on record in the summary row, and the success row says the recompute was incomplete.
+    const auto gid = group["id"].get<std::string>();
+    const auto summary = only_detail(f, "scim.group.recompute_incomplete", gid);
+    CHECK(detail_field(summary, "failed") == "1");
+    CHECK(detail_field(summary, "failed_users") == retained);
+    CHECK(detail_field(summary, "skipped_promotions").empty());
+    CHECK(recompute_skipped(f, "promotion") == 0.0);
+    CHECK(only_detail(f, "scim.group.deleted", gid) == "recompute=incomplete");
+
+    // The failed demotion is escalated: a critical analytics event naming the user, and a
+    // critical log line saying an IdP-removed admin retains the role.
+    const auto crit = events_of(f, "scim.user.role_demotion_incomplete");
+    REQUIRE(crit.size() == 1);
+    CHECK(crit[0].severity == Severity::kCritical);
+    CHECK(crit[0].attributes.value("username", "") == retained);
+    CHECK(capture.text().find("IdP-removed admin '" + retained + "'") != std::string::npos);
+    CHECK(capture.text().find("retains or may retain role") != std::string::npos);
+    // A StoreFailure is INDETERMINATE (the write may have committed): the event says "unknown",
+    // never the false "role_applied":false, and the log does not claim the change did not apply.
+    REQUIRE(crit[0].attributes.contains("role_applied"));
+    CHECK(crit[0].attributes["role_applied"] == "unknown");
+    CHECK(crit[0].attributes["session_wipe_failed"] == "unknown"); // the wipe state is unknown too
+    // The failure AUDIT row carries the same marker, so it never reads like a definite no-apply.
+    REQUIRE(!retained.empty()); // the lookup below indexes by it
+    const auto retained_id =
+        ids[static_cast<std::size_t>(std::find(names.begin(), names.end(), retained) -
+                                     names.begin())];
+    std::vector<AuditEvent> fail_rows;
+    for (const auto& r : audit_rows(f, "scim.user.role_changed", retained_id))
+        if (r.result == "failure") // the earlier promotion's success row is not the subject
+            fail_rows.push_back(r);
+    REQUIRE(fail_rows.size() == 1);
+    CHECK(fail_rows[0].detail.find(" role_applied=unknown") != std::string::npos);
+    CHECK(fail_rows[0].detail.find("role_changed=true") == std::string::npos);
+    CHECK(capture.text().find("may not have completed") != std::string::npos);
+    CHECK(capture.text().find("the role change may not have applied") != std::string::npos);
+    CHECK(capture.text().find("did NOT complete") == std::string::npos);
+    CHECK(capture.text().find("role change did NOT apply") == std::string::npos);
+}
+
+TEST_CASE("ScimRoutes: a refused group-derived demotion raises the critical analytics event "
+          "(#4966)",
+          "[pg][scim][routes][lastadmin][groups]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    auto user = json::parse(f.post("/scim/v2/Users", {{"userName", "crt"}})->body);
+    const auto user_id = user["id"].get<std::string>();
+    auto group = json::parse(f.post("/scim/v2/Groups", {{"displayName", "Yuzu-Admins"}})->body);
+    const auto group_id = group["id"].get<std::string>();
+    json add_body{{"Operations",
+                   json::array({{{"op", "add"},
+                                 {"path", "members"},
+                                 {"value", json::array({{{"value", user_id}}})}}})}};
+    REQUIRE(f.patch("/scim/v2/Groups/" + group_id, add_body)->status == 200);
+    REQUIRE(f.auth_mgr.update_role_checked("spare_admin", auth::Role::user) ==
+            auth::UpdateRoleOutcome::Updated); // crt is now the ONLY active admin account
+
+    json remove_body{
+        {"Operations",
+         json::array({{{"op", "remove"}, {"path", "members[value eq \"" + user_id + "\"]"}}})}};
+    REQUIRE(f.patch("/scim/v2/Groups/" + group_id, remove_body)->status == 200);
+    // The IdP repeats the sync cycle: the member is re-added (no role change, still admin) and
+    // removed again, so the demotion is attempted and refused a second time.
+    REQUIRE(f.patch("/scim/v2/Groups/" + group_id, add_body)->status == 200);
+    REQUIRE(f.patch("/scim/v2/Groups/" + group_id, remove_body)->status == 200);
+
+    // Every refusal escalates (an IdP-demoted person keeps admin; the operator must act).
+    CHECK(audit_rows(f, kRefusedAction, user_id).size() == 2);
+    CHECK(scim_refused(f) == 2.0);
+    // Each refused request says so: a summary row, and a group success row that is NOT complete.
+    const auto summaries = audit_rows(f, "scim.group.recompute_incomplete", group_id);
+    REQUIRE(summaries.size() == 2);
+    for (const auto& r : summaries) {
+        CHECK(r.result == "partial");
+        CHECK(detail_field(r.detail, "refused") == "1");
+        CHECK(detail_field(r.detail, "refused_users") == "crt");
+    }
+    std::size_t incomplete_updates = 0;
+    for (const auto& r : audit_rows(f, "scim.group.updated", group_id))
+        if (r.detail == "recompute=incomplete")
+            ++incomplete_updates;
+    CHECK(incomplete_updates == 2); // the two removals; the two re-adds are complete
+    const auto crit = events_of(f, kRefusedAction);
+    REQUIRE(crit.size() == 2);
+    for (const auto& e : crit) {
+        CHECK(e.severity == Severity::kCritical);
+        CHECK(e.attributes.value("username", "") == "crt");
+        CHECK(e.attributes.value("group_derived_demotion", false));
+    }
+    CHECK(f.auth_mgr.get_user_role("crt").value() == auth::Role::admin);
+}
+
+TEST_CASE("ScimRoutes: a Group change whose recompute reaches every member says "
+          "recompute=complete on all four handlers (#4966)",
+          "[pg][scim][routes][lastadmin][groups][recompute]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    const auto h1 = json::parse(f.post("/scim/v2/Users", {{"userName", "h1"}})->body)["id"]
+                        .get<std::string>();
+    const auto h2 = json::parse(f.post("/scim/v2/Users", {{"userName", "h2"}})->body)["id"]
+                        .get<std::string>();
+    const auto member_list = [](const std::string& id) {
+        return json::array({{{"value", id}}});
+    };
+
+    auto created = f.post("/scim/v2/Groups", {{"displayName", "Yuzu-Admins"},
+                                              {"members", member_list(h1)}});
+    REQUIRE(created->status == 201);
+    const auto gid = json::parse(created->body)["id"].get<std::string>();
+    CHECK(f.auth_mgr.get_user_role("h1").value() == auth::Role::admin);
+    CHECK(only_detail(f, "scim.group.created", gid) == "recompute=complete");
+
+    // PUT swaps h1 for h2: a demotion and a promotion, both landed.
+    REQUIRE(f.put("/scim/v2/Groups/" + gid,
+                  {{"displayName", "Yuzu-Admins"}, {"members", member_list(h2)}})->status == 200);
+    CHECK(f.auth_mgr.get_user_role("h1").value() == auth::Role::user);
+    CHECK(f.auth_mgr.get_user_role("h2").value() == auth::Role::admin);
+
+    json add_h1{{"Operations", json::array({{{"op", "add"}, {"path", "members"},
+                                             {"value", member_list(h1)}}})}};
+    REQUIRE(f.patch("/scim/v2/Groups/" + gid, add_h1)->status == 200);
+    CHECK(f.auth_mgr.get_user_role("h1").value() == auth::Role::admin);
+
+    REQUIRE(f.del("/scim/v2/Groups/" + gid)->status == 204);
+    CHECK(f.auth_mgr.get_user_role("h1").value() == auth::Role::user);
+    CHECK(f.auth_mgr.get_user_role("h2").value() == auth::Role::user);
+
+    for (const auto& r : audit_rows(f, "scim.group.updated", gid))
+        CHECK(r.detail == "recompute=complete");
+    CHECK(audit_rows(f, "scim.group.updated", gid).size() == 2);
+    CHECK(only_detail(f, "scim.group.deleted", gid) == "recompute=complete");
+    CHECK(audit_rows(f, "scim.group.recompute_incomplete", gid).empty());
+    CHECK(recompute_skipped(f, "promotion") == 0.0);
+    CHECK(recompute_skipped(f, "undetermined") == 0.0);
+}
+
+TEST_CASE("ScimRoutes: a Group request recomputes its REMOVED members before the kept ones, so a "
+          "failing store is spent on the demotion first (#4966)",
+          "[pg][scim][routes][lastadmin][groups][recompute][order]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins",
+              std::chrono::milliseconds(300)};
+    // The store lists a group's members by ascending scim_id. Give the KEPT member the smaller id,
+    // so a naive old-then-new order would recompute it before the removed one.
+    std::vector<std::pair<std::string, std::string>> users; // (scim_id, username)
+    for (const char* name : {"ordx", "ordy"})
+        users.emplace_back(json::parse(f.post("/scim/v2/Users", {{"userName", name}})->body)["id"]
+                               .get<std::string>(),
+                           name);
+    std::sort(users.begin(), users.end());
+    const auto& [kept_id, kept_name] = users[0];
+    const auto& [removed_id, removed_name] = users[1];
+
+    auto created = f.post(
+        "/scim/v2/Groups",
+        {{"displayName", "Yuzu-Admins"},
+         {"members", json::array({{{"value", kept_id}}, {{"value", removed_id}}})}});
+    REQUIRE(created->status == 201);
+    const auto gid = json::parse(created->body)["id"].get<std::string>();
+    // The kept member needs a PROMOTION again (its role was lowered out of band); the removed one
+    // is an admin the IdP is taking away: a DEMOTION.
+    REQUIRE(f.auth_mgr.update_role_checked(kept_name, auth::Role::user) ==
+            auth::UpdateRoleOutcome::Updated);
+    REQUIRE(f.auth_mgr.get_user_role(removed_name).value() == auth::Role::admin);
+
+    std::unique_ptr<httplib::Response> res;
+    {
+        yuzu::test::HeldLocks hold(f.auth_db.pool());
+        hold.lock_rbac_enabled();
+        yuzu::test::Workers workers([&] { hold.rollback(); });
+        workers.add([&] {
+            res = f.put("/scim/v2/Groups/" + gid,
+                        {{"displayName", "Yuzu-Admins"},
+                         {"members", json::array({{{"value", kept_id}}})}});
+        });
+        workers.join_all();
+    }
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const auto summary = only_detail(f, "scim.group.recompute_incomplete", gid);
+    // The removed member went FIRST: its demotion paid the wait and failed, which then skipped the
+    // kept member's promotion. The other order fails BOTH members and skips nothing.
+    CHECK(detail_field(summary, "failed") == "1");
+    CHECK(detail_field(summary, "failed_users") == removed_name);
+    CHECK(detail_field(summary, "skipped_promotions") == "1");
+    CHECK(detail_field(summary, "skipped_promotions_users") == kept_name);
+    CHECK(only_detail(f, "scim.group.updated", gid) == "recompute=incomplete");
+}
+
+TEST_CASE("ScimRoutes: a failed READ in the Group recompute is UNDETERMINED, never silently "
+          "'no change': it is counted, named in the summary row and the success row is "
+          "incomplete (#4966)",
+          "[pg][scim][routes][lastadmin][groups][recompute][undetermined]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    const auto user_id = json::parse(f.post("/scim/v2/Users", {{"userName", "und"}})->body)["id"]
+                             .get<std::string>();
+    auto created = f.post("/scim/v2/Groups", {{"displayName", "Yuzu-Admins"},
+                                              {"members", json::array({{{"value", user_id}}})}});
+    REQUIRE(created->status == 201);
+    const auto gid = json::parse(created->body)["id"].get<std::string>();
+    REQUIRE(f.auth_mgr.get_user_role("und").value() == auth::Role::admin);
+
+    // The IdP deletes the admin group. The recompute must demote `und`, but one of its reads
+    // fails: it has to be reported, not skipped as if nothing needed doing.
+    std::string expected_name = "und";
+    std::unique_ptr<httplib::Response> res;
+    SECTION("step 1: the SCIM resource read fails") {
+        ScimResourcesFault fault(f.auth_db.pool());
+        fault.arm();
+        res = f.del("/scim/v2/Groups/" + gid);
+        fault.repair();
+        expected_name = "scim_id:" + user_id;
+    }
+    SECTION("step 2: the provisioning-source read fails") {
+        ProvisioningSourceFault fault(f.auth_db.pool());
+        fault.arm();
+        res = f.del("/scim/v2/Groups/" + gid);
+        fault.repair();
+    }
+    SECTION("step 3: the group-membership read fails") {
+        MembersReadFaultAfterGroupDelete fault(f.auth_db.pool());
+        fault.arm();
+        res = f.del("/scim/v2/Groups/" + gid);
+        fault.repair();
+    }
+    SECTION("step 4: the current-role read fails") {
+        yuzu::test::RoleColumnFault fault(f.auth_db.pool());
+        fault.arm();
+        res = f.del("/scim/v2/Groups/" + gid);
+        fault.repair();
+    }
+    REQUIRE(res);
+    CHECK(res->status == 204); // the delete itself committed; the status never changes
+    // Nothing was changed: the account is still an admin, and the delete is the only evidence.
+    CHECK(f.auth_mgr.get_user_role("und").value() == auth::Role::admin);
+    CHECK(audit_rows(f, "scim.user.role_changed", user_id).size() == 1); // the promotion only
+
+    const auto summary = only_detail(f, "scim.group.recompute_incomplete", gid);
+    CHECK(detail_field(summary, "undetermined") == "1");
+    CHECK(detail_field(summary, "undetermined_users") == expected_name);
+    CHECK(detail_field(summary, "failed").empty());
+    CHECK(detail_field(summary, "skipped_promotions").empty());
+    CHECK(recompute_skipped(f, "undetermined") == 1.0);
+    CHECK(recompute_skipped(f, "promotion") == 0.0);
+    CHECK(only_detail(f, "scim.group.deleted", gid) == "recompute=incomplete");
+}
+
+TEST_CASE("ScimRoutes: provisioning answers a retryable 503 when the Administrator-grant read "
+          "is unavailable, and 500 when a tombstone's role cannot be read (#4966)",
+          "[pg][scim][routes][lastadmin][precheck][storefailure]") {
+    Fixture f;
+    SECTION("grant read unavailable: 503 + Retry-After, nothing created") {
+        yuzu::test::GrantReadFault fault(f.auth_db.pool());
+        fault.arm();
+        auto res = f.post("/scim/v2/Users", {{"userName", "gr1"}});
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Retry-After") == "2");
+        CHECK_FALSE(json::parse(res->body).contains("retry_after_ms"));
+        fault.repair();
+        CHECK_FALSE(f.auth_db->get_provisioning_source("gr1").has_value());
+        CHECK_FALSE(f.scim_store->get_by_username("gr1").has_value());
+        const auto rows = audit_rows(f, "scim.user.provisioned", "gr1");
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].detail == "administrator grant check unavailable");
+        CHECK(lifecycle_failures(f, "grant_read") == 1.0);
+    }
+    SECTION("tombstone role unreadable: 500, never revived") {
+        auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "tr1"}})->body);
+        REQUIRE(f.del("/scim/v2/Users/" + created["id"].get<std::string>())->status == 204);
+        yuzu::test::RoleColumnFault fault(f.auth_db.pool());
+        fault.arm();
+        auto res = f.post("/scim/v2/Users", {{"userName", "tr1"}});
+        REQUIRE(res);
+        CHECK(res->status == 500);
+        fault.repair();
+        CHECK_FALSE(f.auth_mgr.get_user_role("tr1").has_value()); // still a tombstone
+        const auto rows = audit_rows(f, "scim.user.provisioned", "tr1");
+        REQUIRE_FALSE(rows.empty());
+        CHECK(rows.back().detail == "tombstone role unreadable before revive");
+    }
+}
+
+TEST_CASE("ScimRoutes: PATCH/PUT active:true applies the same pre-checks as a POST revive "
+          "(#4966)",
+          "[pg][scim][routes][lastadmin][precheck][reactivate]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "rea"}})->body);
+    const auto id = created["id"].get<std::string>();
+    REQUIRE(f.patch("/scim/v2/Users/" + id, deactivate_ops())->status == 200);
+    REQUIRE_FALSE(f.auth_mgr.get_user_role("rea").has_value()); // deactivated
+
+    std::unique_ptr<httplib::Response> res;
+    std::string expect_detail;
+    int expect_status = 404;
+    SECTION("a username that now holds an Administrator grant is not reactivated") {
+        REQUIRE(f.rbac_guard->assign_role({"user", "rea", "Administrator"}).has_value());
+        res = f.patch("/scim/v2/Users/" + id, activate_ops());
+        expect_detail = "username holds an Administrator grant";
+    }
+    SECTION("a tombstone elevated outside SCIM is not reactivated (PUT)") {
+        auto lease = f.auth_db.pool().acquire();
+        REQUIRE(lease);
+        yuzu::server::pg::PgResult r = yuzu::server::pg::exec_params(
+            lease.get(), "UPDATE auth.users SET role = 'admin' WHERE username = 'rea'",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+        lease.reset();
+        res = f.put("/scim/v2/Users/" + id, {{"userName", "rea"}, {"active", true}});
+        expect_detail = "tombstone role is not 'user' for username=rea";
+    }
+    SECTION("an unreadable grant answer fails closed with a retryable 503") {
+        yuzu::test::GrantReadFault fault(f.auth_db.pool());
+        fault.arm();
+        res = f.patch("/scim/v2/Users/" + id, activate_ops());
+        expect_status = 503;
+        expect_detail = "administrator grant check unavailable";
+        CHECK(res->get_header_value("Retry-After") == "2");
+    }
+    REQUIRE(res);
+    CHECK(res->status == expect_status);
+    CHECK_FALSE(f.auth_mgr.get_user_role("rea").has_value()); // never reactivated
+    auto resource = f.scim_store->get_by_scim_id(id);
+    REQUIRE(resource.has_value());
+    CHECK_FALSE(resource->active);
+    const std::string action = expect_status == 404 ? "scim.user.provenance_denied"
+                                                    : "scim.user.reactivated";
+    const auto rows = audit_rows(f, action, id);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].detail == expect_detail);
+}
+
+TEST_CASE("ScimRoutes: a Group request that removes members writes ONE crash-breadcrumb log "
+          "line naming their SCIM ids; one that removes nobody writes none (#4966)",
+          "[pg][scim][routes][lastadmin][groups][recompute][breadcrumb]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    const auto id_of = [&](const std::string& name) {
+        return json::parse(f.post("/scim/v2/Users", {{"userName", name}})->body)["id"]
+            .get<std::string>();
+    };
+    const auto b1 = id_of("bc_one");
+    const auto b2 = id_of("bc_two");
+    const auto b3 = id_of("bc_three");
+    const auto members = [](std::initializer_list<std::string> ids) {
+        json a = json::array();
+        for (const auto& i : ids)
+            a.push_back({{"value", i}});
+        return a;
+    };
+    const auto gid = json::parse(f.post("/scim/v2/Groups", {{"displayName", "Crumbs"},
+                                                            {"members", members({b1, b2, b3})}})
+                                     ->body)["id"].get<std::string>();
+    const std::string marker = "role recompute starting for";
+
+    SECTION("PUT that removes one member") {
+        // Captured at WARN: the line must reach a logger configured with --log-level warn.
+        yuzu::test::LogCapture capture(spdlog::level::warn);
+        REQUIRE(f.put("/scim/v2/Groups/" + gid,
+                      {{"displayName", "Crumbs"}, {"members", members({b1, b2})}})->status == 200);
+        capture.stop();
+        const std::string logs = without_sink_crlf(capture.text());
+        const auto at = logs.find(marker);
+        REQUIRE(at != std::string::npos);
+        CHECK(logs.find("[warning] SCIM: Group scim_id=" + gid) != std::string::npos);
+        CHECK(logs.find(marker, at + 1) == std::string::npos); // exactly one line
+        // The member is named by SCIM id, never by username: the line needs no store read.
+        CHECK(logs.find("1 removed member(s): " + b3) != std::string::npos);
+        CHECK(logs.find("bc_three", at) == std::string::npos);
+        CHECK(logs.find("Group scim_id=" + gid + " membership change committed; " + marker) !=
+              std::string::npos);
+        CHECK(logs.find(b1, at) == std::string::npos); // kept members are not named
+    }
+    SECTION("PUT that removes nobody") {
+        yuzu::test::LogCapture capture;
+        REQUIRE(f.put("/scim/v2/Groups/" + gid,
+                      {{"displayName", "Crumbs"}, {"members", members({b1, b2, b3})}})
+                    ->status == 200);
+        capture.stop();
+        CHECK(capture.text().find(marker) == std::string::npos);
+    }
+    SECTION("PATCH remove") {
+        json ops{{"Operations",
+                  json::array({{{"op", "remove"},
+                                {"path", "members[value eq \"" + b2 + "\"]"}}})}};
+        yuzu::test::LogCapture capture;
+        REQUIRE(f.patch("/scim/v2/Groups/" + gid, ops)->status == 200);
+        capture.stop();
+        CHECK(capture.text().find("1 removed member(s): " + b2) != std::string::npos);
+    }
+    SECTION("PATCH add removes nobody") {
+        json ops{{"Operations", json::array({{{"op", "add"},
+                                              {"path", "members"},
+                                              {"value", members({b1})}}})}};
+        yuzu::test::LogCapture capture;
+        REQUIRE(f.patch("/scim/v2/Groups/" + gid, ops)->status == 200);
+        capture.stop();
+        CHECK(capture.text().find(marker) == std::string::npos);
+    }
+    SECTION("DELETE names every former member") {
+        yuzu::test::LogCapture capture;
+        REQUIRE(f.del("/scim/v2/Groups/" + gid)->status == 204);
+        capture.stop();
+        const std::string logs = capture.text();
+        CHECK(logs.find("3 removed member(s): ") != std::string::npos);
+        CHECK(logs.find(b1) != std::string::npos);
+        CHECK(logs.find(b2) != std::string::npos);
+        CHECK(logs.find(b3) != std::string::npos);
+    }
+}
+
+TEST_CASE("ScimRoutes: a Group rename that flips the admin-group match writes the crash "
+          "breadcrumb even when nobody is removed; one that does not writes none (#4966)",
+          "[pg][scim][routes][lastadmin][groups][recompute][breadcrumb]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    const auto id_of = [&](const std::string& name) {
+        return json::parse(f.post("/scim/v2/Users", {{"userName", name}})->body)["id"]
+            .get<std::string>();
+    };
+    const auto r1 = id_of("rn_one");
+    const auto r2 = id_of("rn_two");
+    const json members = json::array({{{"value", r1}}, {{"value", r2}}});
+    const std::string marker = "membership change committed; role recompute starting";
+    const std::string flip_text =
+        "the group rename changes the admin-group match and 2 current member(s) will be "
+        "recomputed";
+    const auto rename_ops = [](const std::string& to) {
+        return json{{"Operations", json::array({{{"op", "replace"},
+                                                  {"path", "displayName"},
+                                                  {"value", to}}})}};
+    };
+
+    SECTION("PATCH rename onto the admin group name") {
+        const auto gid = json::parse(f.post("/scim/v2/Groups", {{"displayName", "Crumbs"},
+                                                                {"members", members}})
+                                         ->body)["id"].get<std::string>();
+        yuzu::test::LogCapture capture(spdlog::level::warn);
+        REQUIRE(f.patch("/scim/v2/Groups/" + gid, rename_ops("Yuzu-Admins"))->status == 200);
+        capture.stop();
+        const std::string logs = without_sink_crlf(capture.text());
+        CHECK(logs.find("[warning] SCIM: Group scim_id=" + gid + " " + marker) !=
+              std::string::npos);
+        CHECK(logs.find(flip_text) != std::string::npos);
+        CHECK(logs.find("removed member(s)") == std::string::npos); // nobody was removed
+    }
+    SECTION("PUT rename away from the admin group name") {
+        const auto gid = json::parse(f.post("/scim/v2/Groups", {{"displayName", "Yuzu-Admins"},
+                                                                {"members", members}})
+                                         ->body)["id"].get<std::string>();
+        yuzu::test::LogCapture capture(spdlog::level::warn);
+        REQUIRE(f.put("/scim/v2/Groups/" + gid,
+                      {{"displayName", "Crumbs"}, {"members", members}})->status == 200);
+        capture.stop();
+        const std::string logs = without_sink_crlf(capture.text());
+        CHECK(logs.find("Group scim_id=" + gid + " " + marker) != std::string::npos);
+        CHECK(logs.find(flip_text) != std::string::npos);
+    }
+    SECTION("PUT rename that also removes a member writes ONE line with both facts") {
+        const auto gid = json::parse(f.post("/scim/v2/Groups", {{"displayName", "Crumbs"},
+                                                                {"members", members}})
+                                         ->body)["id"].get<std::string>();
+        yuzu::test::LogCapture capture(spdlog::level::warn);
+        REQUIRE(f.put("/scim/v2/Groups/" + gid,
+                      {{"displayName", "Yuzu-Admins"},
+                       {"members", json::array({{{"value", r1}}})}})->status == 200);
+        capture.stop();
+        const std::string logs = without_sink_crlf(capture.text());
+        const auto at = logs.find(marker);
+        REQUIRE(at != std::string::npos);
+        CHECK(logs.find(marker, at + 1) == std::string::npos);
+        CHECK(logs.find("for 1 removed member(s): " + r2) != std::string::npos);
+        CHECK(logs.find("the group rename changes the admin-group match and 1 current member(s) "
+                        "will be recomputed") != std::string::npos);
+    }
+    SECTION("a flipping rename of an EMPTY group writes nothing (no '0 current member(s)' line)") {
+        const auto gid = json::parse(f.post("/scim/v2/Groups", {{"displayName", "Crumbs"}})
+                                         ->body)["id"].get<std::string>();
+        yuzu::test::LogCapture capture(spdlog::level::warn);
+        REQUIRE(f.patch("/scim/v2/Groups/" + gid, rename_ops("Yuzu-Admins"))->status == 200);
+        REQUIRE(f.put("/scim/v2/Groups/" + gid,
+                      {{"displayName", "Crumbs"}, {"members", json::array()}})->status == 200);
+        capture.stop();
+        CHECK(capture.text().find(marker) == std::string::npos);
+        CHECK(capture.text().find("0 current member(s)") == std::string::npos);
+    }
+    SECTION("a rename that does not change the admin-group match writes nothing") {
+        const auto gid = json::parse(f.post("/scim/v2/Groups", {{"displayName", "Crumbs"},
+                                                                {"members", members}})
+                                         ->body)["id"].get<std::string>();
+        yuzu::test::LogCapture capture(spdlog::level::warn);
+        REQUIRE(f.patch("/scim/v2/Groups/" + gid, rename_ops("Crumbs-Renamed"))->status == 200);
+        REQUIRE(f.put("/scim/v2/Groups/" + gid,
+                      {{"displayName", "Crumbs-Again"}, {"members", members}})->status == 200);
+        capture.stop();
+        CHECK(capture.text().find(marker) == std::string::npos);
+    }
+}
+
+TEST_CASE("ScimRoutes: the crash-breadcrumb names at most 20 member ids and counts the rest "
+          "exactly (#4966)",
+          "[pg][scim][routes][lastadmin][groups][recompute][breadcrumb]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    json members = json::array();
+    std::vector<std::string> ids;
+    for (int i = 0; i < 22; ++i) {
+        const auto name = "bulk" + std::to_string(i);
+        ids.push_back(json::parse(f.post("/scim/v2/Users", {{"userName", name}})->body)["id"]
+                          .get<std::string>());
+        members.push_back({{"value", ids.back()}});
+    }
+    const auto gid = json::parse(
+        f.post("/scim/v2/Groups", {{"displayName", "Crumbs"}, {"members", members}})->body)["id"]
+                         .get<std::string>();
+
+    yuzu::test::LogCapture capture;
+    REQUIRE(f.put("/scim/v2/Groups/" + gid, {{"displayName", "Crumbs"}, {"members", json::array()}})
+                ->status == 200);
+    capture.stop();
+    const std::string logs = capture.text();
+    const auto at = logs.find("22 removed member(s): ");
+    REQUIRE(at != std::string::npos);
+    const auto eol = logs.find('\n', at);
+    const std::string line = logs.substr(at, eol == std::string::npos ? eol : eol - at);
+    CHECK(line.find(",+2 more") != std::string::npos);
+    std::size_t named = 0;
+    for (const auto& id : ids)
+        if (line.find(id) != std::string::npos)
+            ++named;
+    CHECK(named == 20);
+}
+
+namespace {
+
+/// A spdlog sink that records what reaches it, counts flushes, and optionally throws on the
+/// crash-breadcrumb line (its logger's error handler rethrows, so the exception reaches the
+/// caller of `logger->warn`, as a failing format or a broken sink would).
+class BreadcrumbProbeSink final : public spdlog::sinks::base_sink<std::mutex> {
+public:
+    bool throw_on_breadcrumb = false;
+    int flushes = 0;
+    int breadcrumb_attempts = 0;
+    std::vector<std::string> lines;
+    int flushes_after_breadcrumb = 0;
+    /// Invoked at most ONCE, on the first flush after the breadcrumb line made by
+    /// `callback_thread`, from inside flush_(). A flush from any other thread (a background
+    /// store thread holding a copy of this logger) is counted but never runs it.
+    ///
+    /// The real constraint: flush_() runs with this sink's (non-recursive) mutex held, so
+    /// anything the callback does that logs through the logger owning this sink on the SAME
+    /// thread re-enters sink_it_ and self-deadlocks. The callback must therefore silence that
+    /// logger for its duration (the test does) and must not take a lock the logging path holds.
+    /// It captures test locals by reference: call `disarm()` before they go out of scope.
+    std::function<void()> on_first_flush_after_breadcrumb;
+    std::thread::id callback_thread{}; ///< the only thread allowed to run the callback
+
+    /// Drops the callback under the sink mutex, so no later flush can run a closure whose
+    /// captures have been destroyed.
+    void disarm() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        on_first_flush_after_breadcrumb = nullptr;
+    }
+
+protected:
+    void sink_it_(const spdlog::details::log_msg& msg) override {
+        const std::string text(msg.payload.data(), msg.payload.size());
+        if (text.find("role recompute starting") != std::string::npos) {
+            ++breadcrumb_attempts;
+            seen_breadcrumb_ = true;
+            if (throw_on_breadcrumb)
+                throw std::runtime_error("injected sink failure");
+        }
+        lines.push_back(text);
+    }
+    void flush_() override {
+        ++flushes;
+        if (seen_breadcrumb_) {
+            ++flushes_after_breadcrumb;
+            if (!callback_fired_ && on_first_flush_after_breadcrumb &&
+                std::this_thread::get_id() == callback_thread) {
+                callback_fired_ = true; // strictly one-shot, set before the call
+                on_first_flush_after_breadcrumb();
+            }
+        }
+    }
+
+private:
+    bool seen_breadcrumb_ = false;
+    bool callback_fired_ = false;
+};
+
+/// Installs a probe-sink logger as the default logger for its lifetime.
+struct BreadcrumbProbe {
+    std::shared_ptr<BreadcrumbProbeSink> sink = std::make_shared<BreadcrumbProbeSink>();
+    std::shared_ptr<spdlog::logger> logger;
+    std::shared_ptr<spdlog::logger> prev = spdlog::default_logger();
+    spdlog::level::level_enum prev_level = spdlog::get_level();
+    BreadcrumbProbe() {
+        logger = std::make_shared<spdlog::logger>("breadcrumb_probe", sink);
+        logger->set_level(spdlog::level::trace);
+        logger->set_error_handler([](const std::string& msg) { throw std::runtime_error(msg); });
+        spdlog::set_default_logger(logger);
+        spdlog::set_level(spdlog::level::trace);
+    }
+    /// Idempotent: the destructor does not re-install `prev` after an explicit stop(), which
+    /// would clobber a default logger some later scope installed in between. It also disarms
+    /// the sink callback first, so a throwing step or a failed REQUIRE in a test (which unwinds
+    /// to the destructor) cannot leave a closure over dead test locals armed.
+    void stop() {
+        if (stopped_)
+            return;
+        stopped_ = true;
+        sink->disarm();
+        spdlog::set_default_logger(prev);
+        spdlog::set_level(prev_level);
+    }
+    ~BreadcrumbProbe() { stop(); }
+
+private:
+    bool stopped_ = false;
+};
+
+} // namespace
+
+TEST_CASE("ScimRoutes: the crash-breadcrumb flushes the logger right after its line, before "
+          "the first member is recomputed (#4966)",
+          "[pg][scim][routes][lastadmin][groups][recompute][breadcrumb]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    const auto uid = json::parse(f.post("/scim/v2/Users", {{"userName", "fl_admin"}})->body)["id"]
+                         .get<std::string>();
+    const auto gid =
+        json::parse(f.post("/scim/v2/Groups", {{"displayName", "Yuzu-Admins"},
+                                               {"members", json::array({{{"value", uid}}})}})
+                        ->body)["id"].get<std::string>();
+    REQUIRE(f.auth_mgr.get_user_role("fl_admin").value() == auth::Role::admin);
+    BreadcrumbProbe probe;
+    // The removed member is demoted by the recompute loop. At the first flush after the
+    // breadcrumb line the demotion must NOT have happened yet: the flush precedes the loop, so a
+    // SIGKILL inside the loop cannot lose a line still sitting in a buffer.
+    //
+    // The callback runs under the sink mutex, so it reads the role with AuthDB::get_user (a
+    // plain store read) rather than AuthManager::get_user_role, whose error paths log, and it
+    // silences the probe logger for its duration: a Postgres blip inside the read would
+    // otherwise log through this very sink and self-deadlock the test instead of failing it.
+    std::optional<auth::Role> role_at_first_flush;
+    probe.sink->callback_thread = std::this_thread::get_id();
+    probe.sink->on_first_flush_after_breadcrumb = [&] {
+        // RAII: a throwing get_user must not leave the probe logger silenced.
+        struct LevelGuard {
+            spdlog::logger& l;
+            explicit LevelGuard(spdlog::logger& lg) : l(lg) { l.set_level(spdlog::level::off); }
+            ~LevelGuard() { l.set_level(spdlog::level::trace); }
+        } silence{*probe.logger};
+        if (auto u = f.auth_db->get_user("fl_admin"))
+            role_at_first_flush = u->role;
+    };
+    // probe.stop() (or the destructor, if the REQUIRE throws) disarms the callback before the
+    // closure's captures die.
+    REQUIRE(f.put("/scim/v2/Groups/" + gid,
+                  {{"displayName", "Yuzu-Admins"}, {"members", json::array()}})
+                ->status == 200);
+    probe.stop();
+    CHECK(probe.sink->breadcrumb_attempts == 1);
+    CHECK(probe.sink->flushes_after_breadcrumb >= 1);
+    REQUIRE(role_at_first_flush.has_value());
+    CHECK(*role_at_first_flush == auth::Role::admin);
+    CHECK(f.auth_mgr.get_user_role("fl_admin").value() == auth::Role::user); // demoted after
+}
+
+TEST_CASE("ScimRoutes: a logger that throws on the crash-breadcrumb does not skip the recompute "
+          "(#4966)",
+          "[pg][scim][routes][lastadmin][groups][recompute][breadcrumb]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    const auto uid = json::parse(f.post("/scim/v2/Users", {{"userName", "th_admin"}})->body)["id"]
+                         .get<std::string>();
+    const auto gid =
+        json::parse(f.post("/scim/v2/Groups", {{"displayName", "Yuzu-Admins"},
+                                               {"members", json::array({{{"value", uid}}})}})
+                        ->body)["id"].get<std::string>();
+    REQUIRE(f.auth_mgr.get_user_role("th_admin").value() == auth::Role::admin);
+
+    BreadcrumbProbe probe;
+    probe.sink->throw_on_breadcrumb = true;
+    const auto res = f.put("/scim/v2/Groups/" + gid,
+                           {{"displayName", "Yuzu-Admins"}, {"members", json::array()}});
+    probe.stop();
+    REQUIRE(res);
+    CHECK(res->status == 200); // the helper swallowed the logger failure
+    CHECK(probe.sink->breadcrumb_attempts == 1);
+    // The recompute loop still ran: the removed member was demoted and the request says complete.
+    CHECK(f.auth_mgr.get_user_role("th_admin").value() == auth::Role::user);
+    CHECK(only_detail(f, "scim.group.updated", gid) == "recompute=complete");
+}
+
+TEST_CASE("ScimRoutes: replacing the ONLY administrator in ONE Group change keeps the old one "
+          "(the guard refuses, the recompute is incomplete) while the new one is promoted; the "
+          "same replacement as TWO changes demotes the old one completely (#4966)",
+          "[pg][scim][routes][lastadmin][groups][recompute][replace]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    const auto old_id = json::parse(f.post("/scim/v2/Users", {{"userName", "hpa"}})->body)["id"]
+                            .get<std::string>();
+    const auto new_id = json::parse(f.post("/scim/v2/Users", {{"userName", "hpb"}})->body)["id"]
+                            .get<std::string>();
+    auto created = f.post("/scim/v2/Groups",
+                          {{"displayName", "Yuzu-Admins"},
+                           {"members", json::array({{{"value", old_id}}})}});
+    REQUIRE(created->status == 201);
+    const auto gid = json::parse(created->body)["id"].get<std::string>();
+    REQUIRE(f.auth_mgr.get_user_role("hpa").value() == auth::Role::admin);
+    // hpa is now the ONLY active local admin account: no other administrator exists to take over.
+    REQUIRE(f.auth_mgr.update_role_checked("spare_admin", auth::Role::user) ==
+            auth::UpdateRoleOutcome::Updated);
+    const auto replace_ops = json{{"Operations",
+                                   json::array({{{"op", "remove"},
+                                                 {"path", "members[value eq \"" + old_id + "\"]"}},
+                                                {{"op", "add"},
+                                                 {"path", "members"},
+                                                 {"value", json::array({{{"value", new_id}}})}}})}};
+
+    SECTION("ONE change removes hpa and adds hpb (PUT)") {
+        REQUIRE(f.put("/scim/v2/Groups/" + gid,
+                      {{"displayName", "Yuzu-Admins"},
+                       {"members", json::array({{{"value", new_id}}})}})->status == 200);
+    }
+    SECTION("ONE change removes hpa and adds hpb (PATCH)") {
+        REQUIRE(f.patch("/scim/v2/Groups/" + gid, replace_ops)->status == 200);
+    }
+    // Removed members are recomputed first: hpa's demotion ran while hpb was still a plain user,
+    // so the guard refused it; hpb was promoted afterwards. Both end up administrators, loudly.
+    CHECK(f.auth_mgr.get_user_role("hpa").value() == auth::Role::admin);
+    CHECK(f.auth_mgr.get_user_role("hpb").value() == auth::Role::admin);
+    const auto refused = audit_rows(f, kRefusedAction, old_id);
+    REQUIRE(refused.size() == 1);
+    CHECK(scim_refused(f) == 1.0);
+    CHECK(only_detail(f, "scim.group.updated", gid) == "recompute=incomplete");
+    const auto summary = only_detail(f, "scim.group.recompute_incomplete", gid);
+    CHECK(detail_field(summary, "refused") == "1");
+    CHECK(detail_field(summary, "refused_users") == "hpa");
+    CHECK(detail_field(summary, "failed").empty());
+    CHECK(events_of(f, kRefusedAction).size() == 1);
+}
+
+TEST_CASE("ScimRoutes: replacing the ONLY administrator as TWO Group changes (add the new one, "
+          "then remove the old one) demotes the old one and says recompute=complete both times "
+          "(#4966)",
+          "[pg][scim][routes][lastadmin][groups][recompute][replace]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    const auto old_id = json::parse(f.post("/scim/v2/Users", {{"userName", "hpc"}})->body)["id"]
+                            .get<std::string>();
+    const auto new_id = json::parse(f.post("/scim/v2/Users", {{"userName", "hpd"}})->body)["id"]
+                            .get<std::string>();
+    auto created = f.post("/scim/v2/Groups",
+                          {{"displayName", "Yuzu-Admins"},
+                           {"members", json::array({{{"value", old_id}}})}});
+    REQUIRE(created->status == 201);
+    const auto gid = json::parse(created->body)["id"].get<std::string>();
+    REQUIRE(f.auth_mgr.update_role_checked("spare_admin", auth::Role::user) ==
+            auth::UpdateRoleOutcome::Updated); // hpc is the ONLY active administrator
+
+    const json add_new{{"Operations",
+                        json::array({{{"op", "add"},
+                                      {"path", "members"},
+                                      {"value", json::array({{{"value", new_id}}})}}})}};
+    REQUIRE(f.patch("/scim/v2/Groups/" + gid, add_new)->status == 200);
+    CHECK(f.auth_mgr.get_user_role("hpd").value() == auth::Role::admin);
+    CHECK(f.auth_mgr.get_user_role("hpc").value() == auth::Role::admin);
+
+    const json remove_old{
+        {"Operations",
+         json::array({{{"op", "remove"}, {"path", "members[value eq \"" + old_id + "\"]"}}})}};
+    REQUIRE(f.patch("/scim/v2/Groups/" + gid, remove_old)->status == 200);
+    CHECK(f.auth_mgr.get_user_role("hpc").value() == auth::Role::user);
+    CHECK(f.auth_mgr.get_user_role("hpd").value() == auth::Role::admin);
+
+    const auto updated = audit_rows(f, "scim.group.updated", gid);
+    REQUIRE(updated.size() == 2);
+    for (const auto& r : updated)
+        CHECK(r.detail == "recompute=complete");
+    CHECK(audit_rows(f, "scim.group.recompute_incomplete", gid).empty());
+    CHECK(audit_rows(f, kRefusedAction, old_id).empty());
+    CHECK(scim_refused(f) == 0.0);
+}
+
+TEST_CASE("ScimRoutes: a Group DELETE whose demotion lands but whose durable session wipe fails "
+          "is reported incomplete, with the role applied and the escalation saying so (#4966)",
+          "[pg][scim][routes][lastadmin][groups][recompute][wipefailed]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    f.use_session_store();
+    const auto uid = json::parse(f.post("/scim/v2/Users", {{"userName", "wgd"}})->body)["id"]
+                         .get<std::string>();
+    auto created = f.post("/scim/v2/Groups", {{"displayName", "Yuzu-Admins"},
+                                              {"members", json::array({{{"value", uid}}})}});
+    REQUIRE(created->status == 201);
+    const auto gid = json::parse(created->body)["id"].get<std::string>();
+    REQUIRE(f.auth_mgr.get_user_role("wgd").value() == auth::Role::admin);
+    // The member holds a live (durable) session: the demotion must wipe it.
+    REQUIRE_FALSE(f.auth_mgr.create_local_session_for_test("wgd", auth::Role::admin, false).empty());
+
+    yuzu::test::LogCapture capture;
+    f.wipe_fault.arm();
+    const auto res = f.del("/scim/v2/Groups/" + gid);
+    f.wipe_fault.repair();
+    capture.stop();
+    REQUIRE(res);
+    CHECK(res->status == 204); // the Group DELETE itself committed
+
+    // The role change DID commit; only the durable session wipe failed.
+    CHECK(f.auth_mgr.get_user_role("wgd").value() == auth::Role::user);
+    const auto summary = only_detail(f, "scim.group.recompute_incomplete", gid);
+    CHECK(detail_field(summary, "failed") == "1");
+    CHECK(detail_field(summary, "failed_users") == "wgd");
+    CHECK(only_detail(f, "scim.group.deleted", gid) == "recompute=incomplete");
+    CHECK(f.metrics.counter("yuzu_scim_role_change_failures_total").value() == 1.0);
+
+    std::vector<AuditEvent> fail_rows;
+    for (const auto& r : audit_rows(f, "scim.user.role_changed", uid))
+        if (r.result == "failure")
+            fail_rows.push_back(r);
+    REQUIRE(fail_rows.size() == 1);
+    CHECK(fail_rows[0].detail.find(" role_changed=true session_wipe_failed=true") !=
+          std::string::npos);
+
+    const auto crit = events_of(f, "scim.user.role_demotion_incomplete");
+    REQUIRE(crit.size() == 1);
+    CHECK(crit[0].severity == Severity::kCritical);
+    REQUIRE(crit[0].attributes.contains("role_applied"));
+    CHECK(crit[0].attributes["role_applied"] == true);
+    CHECK(crit[0].attributes["session_wipe_failed"] == true);
+    CHECK(capture.text().find("was applied but the durable session wipe failed") !=
+          std::string::npos);
+    CHECK(capture.text().find("the role IS changed but its durable session wipe failed") !=
+          std::string::npos);
+    CHECK(capture.text().find("did NOT complete") == std::string::npos);
+}
+
+TEST_CASE("ScimRoutes: the Group summary row names at most 20 members per class and counts the "
+          "rest exactly (#4966)",
+          "[pg][scim][routes][lastadmin][groups][recompute][undetermined]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    constexpr std::size_t kMembers = 22; // two more than the 20 that are named
+    json members = json::array();
+    std::set<std::string> ids;
+    for (std::size_t i = 0; i < kMembers; ++i) {
+        auto u = json::parse(
+            f.post("/scim/v2/Users", {{"userName", "cap" + std::to_string(i)}})->body);
+        ids.insert(u["id"].get<std::string>());
+        members.push_back({{"value", u["id"]}});
+    }
+    auto created = f.post("/scim/v2/Groups", {{"displayName", "Yuzu-Admins"}, {"members", members}});
+    REQUIRE(created->status == 201);
+    const auto gid = json::parse(created->body)["id"].get<std::string>();
+
+    // Every member's SCIM resource read fails, so each is UNDETERMINED and named `scim_id:<id>`.
+    std::unique_ptr<httplib::Response> res;
+    {
+        ScimResourcesFault fault(f.auth_db.pool());
+        fault.arm();
+        res = f.del("/scim/v2/Groups/" + gid);
+        fault.repair();
+    }
+    REQUIRE(res);
+    CHECK(res->status == 204);
+
+    const auto summary = only_detail(f, "scim.group.recompute_incomplete", gid);
+    const std::string head = "members=22 undetermined=22 undetermined_users=";
+    const std::string tail = ",+2 more";
+    REQUIRE(summary.rfind(head, 0) == 0);
+    const auto tail_pos = summary.find(tail);
+    REQUIRE(tail_pos != std::string::npos);
+    // Exactly 20 distinct names, every one a real member, then the exact remainder.
+    const std::string listed = summary.substr(head.size(), tail_pos - head.size());
+    std::set<std::string> named;
+    for (std::size_t start = 0; start <= listed.size();) {
+        const auto comma = listed.find(',', start);
+        const auto end = comma == std::string::npos ? listed.size() : comma;
+        named.insert(listed.substr(start, end - start));
+        start = end + 1;
+    }
+    CHECK(named.size() == 20);
+    for (const auto& n : named) {
+        INFO(n);
+        CHECK(n.rfind("scim_id:", 0) == 0);
+        CHECK(ids.count(n.substr(std::string("scim_id:").size())) == 1);
+    }
+    CHECK(recompute_skipped(f, "undetermined") == 22.0);
+    CHECK(only_detail(f, "scim.group.deleted", gid) == "recompute=incomplete");
+}
+
+TEST_CASE("RefusalLogThrottle: one warn per key per interval, bounded memory, clock-injected "
+          "(#4966)",
+          "[scim][lastadmin][throttle]") {
+    using namespace std::chrono;
+    RefusalLogThrottle t(seconds(60), /*max_keys=*/2);
+    const auto t0 = RefusalLogThrottle::Clock::now();
+
+    CHECK(t.should_warn("a", t0));                    // first sighting warns
+    CHECK_FALSE(t.should_warn("a", t0 + seconds(1))); // within the window: demoted
+    CHECK_FALSE(t.should_warn("a", t0 + seconds(59)));
+    CHECK(t.should_warn("a", t0 + seconds(60)));       // window elapsed: warns again
+    CHECK(t.should_warn("b", t0 + seconds(60)));       // keys are independent
+    // The table is full of live keys: a third key is demoted, never tracked, never unbounded.
+    CHECK_FALSE(t.should_warn("c", t0 + seconds(61)));
+    CHECK_FALSE(t.should_warn("c", t0 + seconds(62)));
+    // Once the old keys age out, the table accepts a new one again.
+    CHECK(t.should_warn("c", t0 + seconds(130)));
+}

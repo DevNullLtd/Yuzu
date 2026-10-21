@@ -28,6 +28,29 @@
 /// planned — EXTEND it, never fork it, exactly like
 /// `authz_topology_floor.hpp`'s own rule.
 ///
+/// SCOPE EXTENSION (#5342 Gate 7): `POST /api/v1/users/{name}/password` (the
+/// admin password reset, `rest_api_v1.cpp`'s `password_route_admin_gate`) is
+/// the fourth REST caller — a REST-only route with NO MCP twin (ADR-1005
+/// parity-ledger exception). Re-keying another account's password is a
+/// standing-authority act of the same class: it lets the caller sign in AS
+/// that account, so a JIT elevation, an IdP-group-derived session role, or a
+/// custom role holding `UserManagement:Write` must not suffice. The route
+/// calls this predicate with `RbacAdminSurface::kRest`, then
+/// `RbacStore::check_caller_authorized_under_current_regime`, for EVERY target
+/// — there is deliberately no "is the target an admin" classification
+/// anywhere on that path — and uses `is_self_target` (below) for its
+/// self-target refusal. It adds no exception to any rule in this header.
+///
+/// SCOPE EXTENSION (Guardian policy-generation raise): `POST
+/// /api/v1/guaranteed-state/policy-generation/raise` (`rest_api_v1.cpp`) and its MCP twin
+/// `raise_guardian_policy_generation` (`mcp_server.cpp`) gate on this predicate with
+/// `RbacAdminSurface::kRest` / `kMcp` respectively. Raising the fleet-wide Guardian policy
+/// generation converges every agent behind it to the rule set the server holds at that moment,
+/// replacing the rules those agents hold, so it is a standing fleet-wide authority act and
+/// `GuaranteedState:Push` (which any pusher holds) must not suffice. Neither call site adds an
+/// exception to any rule in this header; the REST route calls `deny_mcp_token_session` before
+/// the predicate, as A1 does.
+///
 /// THE RULE: a caller passes iff they hold a DURABLE `Administrator`
 /// authority right now, re-read fresh from the store rather than trusted
 /// from the session's cached view:
@@ -129,12 +152,14 @@ namespace yuzu::server {
 /// change that adds a default argument, reopens the #520 gap the
 /// `kRest`-only tier check (below) exists to close.
 enum class RbacAdminSurface {
-    kRest, ///< The REST v1 route pair (A2) plus the enforcement-toggle route
-           ///< (A1). An MCP-tier bearer token of ANY tier is structurally
-           ///< denied here — REST has no maker-checker approval flow to fall
-           ///< back on.
+    kRest, ///< The REST v1 route pair (A2), the enforcement-toggle route (A1),
+           ///< the admin password reset (#5342), and the Guardian policy-generation
+           ///< raise route. An MCP-tier bearer token
+           ///< of ANY tier is structurally denied here — REST has no
+           ///< maker-checker approval flow to fall back on.
     kMcp,  ///< The `assign_rbac_role`/`unassign_rbac_role` MCP tools (A2)
-           ///< plus `set_rbac_enforcement` (A1). NO tier rule is applied
+           ///< plus `set_rbac_enforcement` (A1) and
+           ///< `raise_guardian_policy_generation`. NO tier rule is applied
            ///< here — the MCP transport's own ladder (`tier_allows`,
            ///< `requires_approval`'s ticket flow, the handler's own #4309
            ///< empty-tier deny) already fully governs tier for this surface.
@@ -227,7 +252,9 @@ enum class RbacAdminGate {
 /// (`user.delete`/#397) and self-role-change (`user.role_change`/#403)
 /// guards, lifted here per those guards' own doc comment: a third call site
 /// (A2's unassign-own-Administrator-grant guard) is exactly the trigger
-/// named there. EXTEND this, never fork a second copy of the comparison.
+/// named there; the fourth is the #5342 admin password reset's self-target
+/// refusal (`POST /api/v1/users/{name}/password` → use `/users/me/password`).
+/// EXTEND this, never fork a second copy of the comparison.
 ///
 /// An EMPTY `session.username` fails closed to `true` (self) — the same
 /// defense-in-depth both existing call sites already comment on

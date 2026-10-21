@@ -24,6 +24,7 @@
 #include "schedule_runner.hpp"
 
 #include "../test_helpers.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 
@@ -220,6 +221,18 @@ struct Harness {
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
         auto sql =
             "UPDATE schedule_engine.schedules SET next_execution_at = 1 WHERE id = '" + id + "'";
+        yuzu::server::pg::PgResult res{PQexec(conn.get(), sql.c_str())};
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    // Age an approval's review stamp by `seconds` (negative = into the future), directly in
+    // the table: the sweep and liveness check run on database time, so a fixture row is the
+    // only way to put a ticket at a chosen age.
+    void age_review(const std::string& approval_id, int64_t seconds) {
+        yuzu::server::pg::PgConn conn{PQconnectdb(instr_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        auto sql = "UPDATE approval_manager.approvals SET reviewed_at = reviewed_at - (" +
+                   std::to_string(seconds) + ") WHERE id = '" + approval_id + "'";
         yuzu::server::pg::PgResult res{PQexec(conn.get(), sql.c_str())};
         REQUIRE(res.status() == PGRES_COMMAND_OK);
     }
@@ -473,6 +486,78 @@ TEST_CASE("ScheduleRunner: approving the ticket fires the held occurrence exactl
 
     CHECK(h.enqueues.size() == 1); // no second fire
     CHECK(h.approvals.query({.status = "pending"}).size() == 1);
+}
+
+// #6061 (governance SG-2): the runner retires an approved ticket by advancing the
+// schedule, never by consume_ticket(), so it did not see the 7-day lifetime consume
+// enforces: an approved ticket older than the TTL fired unattended as the schedule's
+// creator. The fire path now asks ApprovalManager::ticket_is_live (the consume CAS
+// predicate, database time). No submit() sweep runs between the aging and the tick
+// that fires, so only the liveness check can refuse it.
+TEST_CASE("ScheduleRunner: an approved ticket past its lifetime does not fire; a fresh ask is "
+          "raised instead (#6061)",
+          "[schedule][runner][approval][pg][6061]") {
+    Harness h;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+
+    h.runner.tick(); // submits
+    auto pending = h.approvals.query({.status = "pending"});
+    REQUIRE(pending.size() == 1);
+    const std::string stale_id = pending[0].id;
+    REQUIRE(h.approvals.approve(stale_id, "boss", "ok").has_value());
+    h.age_review(stale_id, kApprovalTicketTtlSeconds + 60);
+
+    auto before = h.approvals.get(stale_id);
+    REQUIRE(before);
+    REQUIRE(before->status == "approved"); // not swept: the runner's own check must refuse it
+
+    h.runner.tick();
+
+    CHECK(h.enqueues.empty()); // nothing fired under the expired approval
+    CHECK(h.get(id).execution_count == 0);
+    CHECK(h.get(id).next_execution_at == 1); // occurrence held, not advanced
+    auto fresh = h.approvals.query({.status = "pending"});
+    REQUIRE(fresh.size() == 1); // a new ask replaced it
+    CHECK(fresh[0].id != stale_id);
+    auto stale_after = h.approvals.get(stale_id);
+    REQUIRE(stale_after);
+    CHECK(stale_after->consumed_at == 0);
+}
+
+TEST_CASE("ScheduleRunner: an approved ticket just inside its lifetime still fires (#6061)",
+          "[schedule][runner][approval][pg][6061]") {
+    Harness h;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+
+    h.runner.tick(); // submits
+    auto pending = h.approvals.query({.status = "pending"});
+    REQUIRE(pending.size() == 1);
+    REQUIRE(h.approvals.approve(pending[0].id, "boss", "ok").has_value());
+    // 60s inside the window: off the inter-clock knife edge, still unambiguously live.
+    h.age_review(pending[0].id, kApprovalTicketTtlSeconds - 60);
+
+    h.runner.tick();
+
+    REQUIRE(h.enqueues.size() == 1);
+    CHECK(h.enqueues[0].approval_id == pending[0].id);
+    CHECK(h.get(id).execution_count == 1);
+}
+
+TEST_CASE("ScheduleRunner: an approved ticket reviewed in the far future does not fire (#6061)",
+          "[schedule][runner][approval][pg][6061]") {
+    Harness h;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+
+    h.runner.tick();
+    auto pending = h.approvals.query({.status = "pending"});
+    REQUIRE(pending.size() == 1);
+    REQUIRE(h.approvals.approve(pending[0].id, "boss", "ok").has_value());
+    h.age_review(pending[0].id, -10 * 365 * 24 * 3600); // reviewed ten years from now
+
+    h.runner.tick();
+
+    CHECK(h.enqueues.empty());
+    CHECK(h.get(id).execution_count == 0);
 }
 
 // #1398 hardening (governance Gate 4 unhappy-path CRITICAL finding): a
@@ -929,4 +1014,75 @@ TEST_CASE("ScheduleRunner: an unset should_stop fires every due schedule, "
     const auto sb = h.get(id_b);
     CHECK(sa.next_execution_at != 1);
     CHECK(sb.next_execution_at != 1);
+}
+
+// #4982 fix round 2 (Fix 5): the identical swallowed-mark_cancelled-failure
+// pattern this issue's own metric was built to observe (REST/MCP, Part A)
+// also existed, uninstrumented, at this file's four mark_cancelled call
+// sites. This test forces the FencedOut path's mark_cancelled to genuinely
+// FAIL (the established LOCK TABLE + short lock_timeout_ms technique against
+// execution_tracker.executions, matching test_rest_result_sets_async.cpp's
+// own #4982 tests) and asserts the new
+// yuzu_exec_tracker_bookkeeping_failed_total{op=mark_cancelled,surface=schedule}
+// series increments. A SEPARATE ExecutionTracker/PgPool pointed at the SAME
+// already-migrated database is used (rather than Harness's own h.tracker/
+// instr_pool) purely to attach a short lock_timeout_ms without touching the
+// other 19 Harness-based tests' shared pool options.
+TEST_CASE("ScheduleRunner: mark_cancelled failing on a FencedOut fire is now "
+          "observable via yuzu_exec_tracker_bookkeeping_failed_total{op=mark_cancelled,"
+          "surface=schedule} (#4982 fix round 2, Fix 5)",
+          "[schedule][runner][pg][4982]") {
+    Harness h;
+    auto id = h.make_due("test.def", "interval");
+
+    yuzu::server::pg::PgPool short_lock_pool{
+        {.conninfo = h.instr_db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    ExecutionTracker short_lock_tracker(short_lock_pool);
+    REQUIRE(short_lock_tracker.is_open());
+
+    yuzu::server::pg::PgConn locker{PQconnectdb(h.instr_db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+
+    yuzu::MetricsRegistry metrics;
+    ScheduleRunner raw_runner(ScheduleRunner::Deps{
+        .schedule_engine = &h.engine,
+        .instruction_store = &h.is,
+        .execution_tracker = &short_lock_tracker,
+        .approval_manager = &h.approvals,
+        .metrics = &metrics,
+        // Fires AFTER create_execution has already committed the exec row,
+        // BEFORE fire_with_approval's post-outcome mark_cancelled — same
+        // timing as test_rest_result_sets_async.cpp's on_dispatch hook.
+        .enqueue_fn =
+            [&](const yuzu::server::OutboxEnqueueRequest&) -> yuzu::server::OutboxEnqueueOutcome {
+            REQUIRE(yuzu::server::pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{})
+                        .status() == PGRES_COMMAND_OK);
+            REQUIRE(yuzu::server::pg::exec_params(
+                        locker.get(),
+                        "LOCK TABLE execution_tracker.executions IN ACCESS EXCLUSIVE MODE",
+                        std::vector<std::string>{})
+                        .status() == PGRES_COMMAND_OK);
+            return yuzu::server::OutboxEnqueueOutcome::FencedOut;
+        },
+        .arming_check = [](const std::string&, const std::string&, const std::string&) {
+            return true;
+        },
+    });
+
+    raw_runner.tick();
+
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    CHECK(metrics
+              .counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                       {{"op", "mark_cancelled"}, {"surface", "schedule"}})
+              .value() == 1.0);
+
+    // The schedule stayed due (FencedOut never advances it) and the exec row
+    // it speculatively created is still stuck at 'running' — mark_cancelled
+    // genuinely failed, not merely was skipped.
+    const auto s = h.get(id);
+    CHECK(s.next_execution_at == 1);
 }

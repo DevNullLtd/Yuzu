@@ -8,6 +8,7 @@
 #include <yuzu/server/auth.hpp>
 
 #include "api_token_store.hpp"
+#include "agent_registry.hpp" // #6065 PR-Q: DispatchDenial -- AuthorizeDispatchFn's error type (as mcp_server.hpp)
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "auth_routes.hpp" // ListReadGate — ADR-0017 list-read gate result type
@@ -137,6 +138,21 @@ public:
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation,
                            const std::string& agent_id)>;
+    /// #6065 PR-Q: the shared dispatch chokepoint's PRE-DISPATCH dry run
+    /// (`classify_and_authorize_dispatch`): given the caller and a
+    /// (plugin, action) pair it answers the capability row or a typed
+    /// `DispatchDenial`. The identical type to `McpServer::AuthorizeDispatchFn`
+    /// (server.cpp static_asserts it), and server.cpp hands BOTH a copy of the
+    /// SAME closure -- a route-local binder here would be a drift between the
+    /// two surfaces. FAIL-CLOSED
+    /// contract: a route that requires it answers 500 when it is unwired,
+    /// never "no gate". The empty/default `{}` exists ONLY for source-stability
+    /// of the other (unrelated) call sites. Consumers: POST and DELETE
+    /// /api/v1/quarantine.
+    using AuthorizeDispatchFn = std::function<std::expected<yuzu::server::CommandCapability,
+                                                             yuzu::server::detail::DispatchDenial>(
+        const yuzu::server::DispatchCaller& caller, std::string_view plugin,
+        std::string_view action)>;
     /// ADR-0017 admit-then-filter list-read gate for a list/fan-out route
     /// over per-agent data (`AuthRoutes::require_list_read`). Unlike PermFn/
     /// ScopedPermFn (bool: caller re-derives the session separately if
@@ -179,6 +195,28 @@ public:
     /// class branches (see the route's own comment in rest_api_v1.cpp).
     /// Empty/default `{}` = the two routes answer 503 (misconfiguration).
     using AgentsJsonFn = std::function<nlohmann::json()>;
+    /// #4983 — presence-merged agent-id existence check for `POST
+    /// /api/v1/result-sets`'s caller-supplied `device_ids[]`. Deliberately
+    /// NOT `AgentsJsonFn` above: `AgentsJsonFn` is backed by
+    /// `AgentRegistry::to_json_obj()`, which is LOCAL-REPLICA-ONLY, whereas
+    /// this is backed by `AgentRegistry::all_ids()`, which additionally
+    /// merges in any cross-replica agent known only via presence
+    /// (`configure_presence`/`live_presence()`, HA WS-5, ADR-2002 §7a) — the
+    /// SAME domain `evaluate_scope`'s `ScopePopulation::Fleet` path and every
+    /// real dispatch already use. #4981 (PR-3) fixed exactly this local-vs-
+    /// presence domain mismatch on the sibling `scope/preview` route; using
+    /// `AgentsJsonFn`'s local-only snapshot here would reintroduce the same
+    /// bug class one route over — a real device known only via presence
+    /// would be wrongly rejected as nonexistent. Called ONCE per request
+    /// (never per supplied id) and the result cached in an
+    /// `unordered_set` for O(1) per-id membership checks — the
+    /// `device_ids[]` array can be up to `ResultSetStore::kMaxMembersPerSet`
+    /// entries, so a per-id backing call would be its own DoS. Empty/default
+    /// `{}` = the route answers 503 when `device_ids` is non-empty
+    /// (misconfiguration), same fail-closed contract as `FleetReadFn`/
+    /// `ScopeEvaluateFn`. Set via `set_all_agent_ids_fn` (below), BEFORE
+    /// `register_routes()`.
+    using AllAgentIdsFn = std::function<std::vector<std::string>()>;
     /// #4981 PR-2 — `POST /api/v1/scope/preview`'s SOLE scope-evaluation
     /// callback: a thin closure over `AgentRegistry::evaluate_scope` with the
     /// caller's tag/custom-properties/result-set stores already bound (see
@@ -546,7 +584,18 @@ public:
         // `!guaranteed_state_store` guard's practical behaviour.
         // `guaranteed_state_store` above stays wired too, for the
         // rule/baseline MUTATORS this seam does not cover.
-        std::shared_ptr<const GuardianApi> guardian_api = nullptr);
+        std::shared_ptr<const GuardianApi> guardian_api = nullptr,
+        // #5047: closes the cross-transport MCP-tier bypass on the 4
+        // result-set write routes (create/pin/unpin/delete), which have no
+        // `perm_fn`/RBAC gate at all (ownership-only by design — see
+        // TierPolicyFn's doc comment in auth_routes.hpp). Trailing optional
+        // dep; `{}` fails closed (503) for a TIERED caller and passes
+        // through for an untiered one — see TierPolicyFn's own contract.
+        TierPolicyFn tier_policy_fn = {},
+        // #6065 PR-Q: see AuthorizeDispatchFn's doc comment above. Trailing optional
+        // dep; `{}` makes POST and DELETE /api/v1/quarantine FAIL CLOSED (500) -- an unwired
+        // chokepoint is misconfiguration, not "no gate".
+        AuthorizeDispatchFn authorize_dispatch_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -637,7 +686,15 @@ public:
         std::shared_ptr<const DexPerfApi> dex_perf_api = nullptr,
         // ADR-0031 WS-A4 (ninth family): see the production overload's doc
         // comment above; identical trailing-optional-dep, required-or-503.
-        std::shared_ptr<const GuardianApi> guardian_api = nullptr);
+        std::shared_ptr<const GuardianApi> guardian_api = nullptr,
+        // #5047: see the production overload's doc comment above; identical
+        // trailing-optional-dep, fail-closed-for-a-tiered-caller-when-unwired
+        // contract (TierPolicyFn's own doc comment, auth_routes.hpp).
+        TierPolicyFn tier_policy_fn = {},
+        // #6065 PR-Q: see AuthorizeDispatchFn's doc comment above. Trailing optional
+        // dep; `{}` makes POST and DELETE /api/v1/quarantine FAIL CLOSED (500) -- an unwired
+        // chokepoint is misconfiguration, not "no gate".
+        AuthorizeDispatchFn authorize_dispatch_fn = {});
 
     /// PR 4.3 — engine-principal lifecycle store backing
     /// `/api/v1/engine-principals`, threaded post-construction. (During the
@@ -659,10 +716,113 @@ public:
     /// `POST /api/v1/scope/preview` answer 503 (misconfiguration).
     void set_scope_evaluate_fn(ScopeEvaluateFn fn) { scope_evaluate_fn_ = std::move(fn); }
 
+    /// #4983 — see `AllAgentIdsFn`'s doc comment above. MUST be called
+    /// BEFORE `register_routes()`, same timing contract as
+    /// `set_engine_principal_store`. Unset (`{}`, the default) makes
+    /// `POST /api/v1/result-sets` answer 503 whenever a non-empty
+    /// `device_ids` is supplied (misconfiguration) — a request with no
+    /// `device_ids` is unaffected either way.
+    void set_all_agent_ids_fn(AllAgentIdsFn fn) { all_agent_ids_fn_ = std::move(fn); }
+
+    /// #5342 Gate 7 (C5) — an audit writer that stamps the principal
+    /// EXPLICITLY instead of re-resolving it from the request's session.
+    /// Wired from `AuthRoutes::audit_log_for_principal`. The password routes
+    /// capture the principal once, up front, and pass it to every REFUSAL row
+    /// they write (the success rows are written inside the credential-change
+    /// transaction from `AuditEventFn`'s event). Returns true iff the row
+    /// persisted (true in audit-off mode).
+    using AuditPrincipalFn = std::function<bool(
+        const httplib::Request& req, const std::string& action, const std::string& result,
+        const std::string& principal, const std::string& principal_role,
+        const std::string& target_type, const std::string& target_id, const std::string& detail)>;
+
+    /// #5342 Gate 8 — builds (does NOT write) the identity/request half of an
+    /// audit row for an explicit principal: `AuthRoutes::
+    /// make_audit_event_for_principal`. The password routes hand it to
+    /// `CredentialChangeOwner` as the template of the success row(s), which are
+    /// persisted INSIDE the credential-change transaction (`AuditStore::
+    /// log_in_txn`) so the change and its evidence commit or abort together.
+    using AuditEventFn = std::function<AuditEvent(
+        const httplib::Request& req, const std::string& principal,
+        const std::string& principal_role, const std::string& target_type,
+        const std::string& target_id)>;
+
+    /// #5342 — the local-account password routes' dependencies:
+    /// `POST /api/v1/users/me/password` (self-service, proves the current
+    /// password) and `POST /api/v1/users/{name}/password` (admin reset).
+    ///   * `auth_mgr` — `commit_password_change`, the ONE credential write
+    ///     (it delegates to `CredentialChangeOwner`: credential + sessions +
+    ///     provisional MFA + lockout + audit in one transaction).
+    ///   * `verify_current_fn` — `AuthRoutes::password_change_verify_fn()`: the
+    ///     ONE lockout-accounted password check `/login` also uses (incl. the
+    ///     sso-only gate), so this file never carries a second copy of the
+    ///     striped-lock section.
+    ///   * `audit_principal_fn` — `AuthRoutes::audit_log_for_principal` (see
+    ///     `AuditPrincipalFn`): every REFUSAL row these routes write goes
+    ///     through it.
+    ///   * `audit_event_fn` — `AuthRoutes::make_audit_event_for_principal` (see
+    ///     `AuditEventFn`): the template of the in-transaction success row(s).
+    ///   * `break_glass_user` — `Config::break_glass_user`; the admin reset
+    ///     refuses it as a target (403 `break_glass_target`) — the sealed
+    ///     escape hatch is re-keyed only out of band, never by a session an
+    ///     IdP compromise could have produced.
+    /// The admin route additionally uses `register_routes`' own `rbac_store`
+    /// and `auth_db` (the `is_rbac_administrator` gate); the lockout clear is
+    /// part of the credential-change transaction itself (not
+    /// `lockout_clear_fn`). Any required member unset ⇒ the route answers 503
+    /// (misconfiguration), never a partial write. MUST be called BEFORE
+    /// `register_routes()`, same timing contract as
+    /// `set_engine_principal_store`.
+    struct PasswordChangeDeps {
+        auth::AuthManager* auth_mgr{nullptr};
+        PasswordVerifyFn verify_current_fn;
+        AuditPrincipalFn audit_principal_fn;
+        std::string break_glass_user;
+        AuditEventFn audit_event_fn;
+    };
+    void set_password_change_deps(PasswordChangeDeps deps) { password_deps_ = std::move(deps); }
+
+    /// #5342 — the operator-declared trusted-origin allowlist (#2537,
+    /// `Config::csrf_trusted_origins`, normalised at boot) for the CSRF
+    /// same-site gate the password routes apply to their cookie sessions —
+    /// the same setter idiom as `CaRoutes`/`DashboardRoutes`. Unset = same-host
+    /// only (fail-closed behind a Host-rewriting proxy, never open). MUST be
+    /// called BEFORE `register_routes()` (captured by value).
+    void set_csrf_trusted_origins(std::vector<std::string> origins) {
+        csrf_trusted_origins_ = std::move(origins);
+    }
+
+    /// #6065 PR-Q: an audit writer that stamps a row from a SESSION the caller already
+    /// holds instead of re-resolving one from the request. `audit_fn` re-resolves
+    /// (`AuthRoutes::make_audit_event` tries the cookie, then the bearer token), so a
+    /// credential that lapsed or was revoked between the route's own resolution and the
+    /// audit write, or a second credential on the same request, made a row name a
+    /// different actor than the record it describes (`rest-audit-principal-reresolution`).
+    /// Wired from `AuthRoutes::audit_as_session_fn()` (which stamps the principal, the
+    /// `principal_role` passed in, the engine class and the session correlator).
+    /// `principal_role` is the session's effective role, captured once per binding: the
+    /// route binds at its first look-up and again at its second, so a row written between
+    /// the two (a 503, a 400) carries the first look-up's role and every row after carries
+    /// the second's, the session the dispatch check authorizes. Returns true iff the row
+    /// persisted (true in audit-off mode). Used by `POST` and `DELETE /api/v1/quarantine`:
+    /// an unwired writer makes both answer 500, and neither uses the re-resolving `audit_fn`
+    /// for the request; the single `failure` row that records the unwired writer is the only
+    /// row written through it. MUST be called BEFORE `register_routes()` (captured by
+    /// value).
+    using AuditAsSessionFn = std::function<bool(
+        const httplib::Request& req, const auth::Session& session,
+        const std::string& principal_role, const std::string& action, const std::string& result,
+        const std::string& target_type, const std::string& target_id, const std::string& detail)>;
+    void set_audit_as_session_fn(AuditAsSessionFn fn) { audit_as_session_fn_ = std::move(fn); }
+
 private:
+    AuditAsSessionFn audit_as_session_fn_;
     EnginePrincipalStore* engine_principal_store_{nullptr};
     UserExistsFn user_exists_fn_;
+    PasswordChangeDeps password_deps_;
+    std::vector<std::string> csrf_trusted_origins_;
     ScopeEvaluateFn scope_evaluate_fn_;
+    AllAgentIdsFn all_agent_ids_fn_;
 };
 
 } // namespace yuzu::server

@@ -36,16 +36,58 @@ Group=yuzu
 # external DSNs are first-class, just edit the file. Mode 0600 yuzu:yuzu
 # (the DSN embeds a credential).
 EnvironmentFile=-/etc/yuzu/yuzu-server.env
-# --data-dir holds the server's runtime state files (enrollment-tokens.cfg,
-# pending-agents.cfg, auto-approve.cfg), agent-updates/ (when --update-dir
-# is unset), upload-blobs/, and the NVD cache nvd_cves.db — the one
-# remaining server SQLite store, a recorded deferral on ADR-0006's ladder
+# --data-dir holds the server's runtime state files (auto-approve.cfg — still
+# per-replica; a pre-6.2 install's enrollment-tokens.cfg/pending-agents.cfg are
+# read here exactly ONCE by the HA WS-6 6.2 importer, then renamed aside and
+# never read again — enrollment/pending state itself is Postgres-authoritative,
+# see docs/adr/2002-high-availability-architecture.md §8), agent-updates/ (when
+# --update-dir is unset), upload-blobs/, and the NVD cache nvd_cves.db — the
+# one remaining server SQLite store, a recorded deferral on ADR-0006's ladder
 # (docs/postgres-migration-ladder.md). Every other server store, including
 # auth, sessions and account lockout, lives in the Postgres substrate
 # (YUZU_POSTGRES_DSN / EnvironmentFile above); legacy *.db files left here
 # by older releases are only probed at startup to warn, never read.
 # /var/lib/yuzu matches StateDirectory, WorkingDirectory, and the
 # ReadWritePaths grant below.
+#
+# --gateway-upstream enables the gateway-upstream service. This unit runs with
+# gRPC TLS on (no --no-tls), so :50055 is a strict mutual-TLS listener, and the
+# server requires an AUTHORIZED gateway peer (an SPKI public-key pin) before it
+# starts that service:
+#   - Generated default certificates (no --cert/--key, as shipped): the server
+#     pins its own generated default-gateway.pem automatically. Nothing to set.
+#   - Operator certificates (--cert/--key added, together with --ca-cert; a
+#     --ca-cert given alone, or any of --management-cert, --management-key and
+#     --management-ca-cert, which exist only as command-line flags, counts too):
+#     there is no automatic pin, and the server REFUSES TO START until one is given:
+#     --gateway-peer-pin <64-hex SPKI SHA-256> or --gateway-peer-pin-file <path>
+#     (repeatable), or YUZU_GATEWAY_PEER_PINS / YUZU_GATEWAY_PEER_PIN_FILE in
+#     /etc/yuzu/yuzu-server.env. If you run no gateway, remove the
+#     --gateway-upstream line instead. A package upgrade overwrites this unit
+#     file, so make that change in a drop-in (`systemctl edit yuzu-server`) that
+#     first clears the inherited command with an empty `ExecStart=` line and then
+#     gives the full command line without --gateway-upstream.
+#   - Pin files must be readable by the `yuzu` user. ProtectHome=true and
+#     PrivateTmp=true hide /home and /tmp from the service, so keep them under
+#     /etc/yuzu.
+# Before upgrading a package install that uses your own certificates, check what
+# this unit (and any drop-in: `systemctl cat` prints both) and
+# /etc/yuzu/yuzu-server.env pass, ignoring comment lines such as this block:
+#   systemctl cat yuzu-server | grep -v '^[[:space:]]*#' | grep -E -- \
+#     '--(management-)?(cert|key|ca-cert)|--no-tls|--gateway-upstream|YUZU_(CERT|KEY|CA_CERT|GATEWAY|INSECURE_GATEWAY)'
+#   grep -v '^[[:space:]]*#' /etc/yuzu/yuzu-server.env | grep -E 'YUZU_(CERT|KEY|CA_CERT|GATEWAY|INSECURE_GATEWAY)'
+# YUZU_CERT, YUZU_KEY and YUZU_CA_CERT are the environment names of --cert, --key
+# and --ca-cert, so an Environment="YUZU_CERT=..." line plus --gateway-upstream
+# refuses to start like the flag does. The RPM restarts the service on upgrade,
+# so a missing pin fails there; the deb only enables it, so the failure shows at the
+# next restart or reboot. systemd stops retrying after the start-limit above.
+# --insecure-gateway-peer is deliberately NOT set here: it disables peer
+# authorization, and this unit is not a plaintext deployment.
+# The yuzu-gateway package's release config (built from gateway/config/sys.config)
+# dials :50055 in PLAINTEXT, which this TLS listener does not accept, so as
+# installed the gateway does not connect to this unit. It needs the TLS upstream
+# channel from gateway/config/sys.config.prod, with certificate files that the
+# yuzu-gw user can read.
 ExecStart=/usr/local/bin/yuzu-server \
     --listen 0.0.0.0:50051 \
     --gateway-upstream 0.0.0.0:50055 \
@@ -64,7 +106,10 @@ RestartSec=5
 # drain is ~156s (120s response cap + pump ticks + the 30s socket write timeout, see
 # docs/user-manual/server-admin.md "Sizing"). The two constraints share this one value by
 # coincidence, not by design — raising it for the rollup budget alone still covers MCP;
-# don't LOWER it without checking both.
+# don't LOWER it without checking both. A THIRD, independent reason this value must not drop
+# below a few seconds (#4666 PR-4): the T_server dedicated async logger's exit-time worker
+# join has no self-armed watchdog, so a stalled log sink leaves it bounded ONLY by a second
+# SIGTERM or this deadline — see guardian_ingest.hpp's own header banner.
 TimeoutStopSec=210
 
 # File-descriptor headroom. The default 1024 soft limit is comfortably

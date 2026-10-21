@@ -331,7 +331,10 @@ public:
     /// A policy allowance, pinned here and in the implementing PR's description (per
     /// §7.7b item 5): at most one quota holder plus one predecessor still in its
     /// callback per slot is the STRUCTURAL population under the consumer's
-    /// one-nested-refill-per-callback shape, but successive submissions can reuse
+    /// one-nested-refill-per-callback shape (since #5168 a completion callback can
+    /// dispatch up to TWO off-lock: the same-key refill and one parked arm (of any
+    /// class) - still bounded by the class quota, which binds first), but
+    /// successive submissions can reuse
     /// released quota while earlier callbacks are still alive, so the factor is a
     /// backstop rather than a proof. Derived from the CLAMPED total_quota, never a
     /// Config knob (an injected ceiling <= sum(quotas) would recreate the R3

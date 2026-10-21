@@ -7,28 +7,35 @@
 /// the Actions lens (generic action runner) is added on top of this `Deps` struct
 /// by feat/hardware-ci-actions without touching the routes registered here.
 ///
-/// Shares `InventoryDeviceRow`/`InventoryDevicesResult` with `InventoryRoutes` (the
-/// roster shape is identical; the roster's PRODUCTION source is the same
-/// `inv_devices_fn` roster body in server.cpp, extracted so both the Software tab's
-/// existing DevicesFn and this module's unfiltered RosterFn share one build). Query/
-/// sort/paginate/JSON logic lives in `hardware_list_model.hpp` (PURE, no httplib) —
-/// this class only wires HTTP semantics (auth, gates, audit) around it.
+/// `InventoryDeviceRow`/`InventoryDevicesResult` are declared in `inventory_routes.hpp`
+/// and shared with `hardware_list_model`/`inventory_ci_join` (the roster's PRODUCTION
+/// source is the `build_hw_roster` body in server.cpp, handed to this module as its
+/// unfiltered RosterFn). Query/sort/paginate/JSON logic lives in
+/// `hardware_list_model.hpp` (PURE, no httplib) — this class only wires HTTP semantics
+/// (auth, gates, audit) around it.
 ///
 /// AUTH: the list and REST twin gate SOLELY on `FleetReadFn` (admit-then-filter,
 /// ADR-0017 — never stacked with a second permission check for the same
 /// securable:operation, the BLOCKING defect `FleetReadFn`'s own contract exists to
 /// avoid). The CI record and its lenses gate on `scoped_perm_fn(Inventory,Read,id)`
-/// — the tier + management-group chokepoint, same as the Software tab's per-device
-/// drill.
+/// — the tier + management-group chokepoint.
 
 #include "authz_gates.hpp"           // authz::FleetReadGate
 #include "command_capability.hpp"    // CommandCapability, ClassificationError
+#include "device_containment_render.hpp" // kContainmentUi
 #include "dex_routes.hpp"            // DexAgentResponse (ResponsesFn return type)
 #include "hardware_action_form.hpp"  // ActionFormSpec
 #include "hardware_list_model.hpp"
 #include "inventory_routes.hpp"      // InventoryDeviceRow / InventoryDevicesResult reuse
+#include "quarantine_visible.hpp"    // QuarantineListFn (list pill)
+#include "audited_write.hpp"         // WriteGate (same-site gate for the sync POSTs)
+#include "software_sync_decision.hpp" // software_sync::{Selector, Resolved, DispatchResult}
+#include "software_sync_runner.hpp"   // software_sync::Runner (the shared fleet-run sequence)
 
+#include <atomic>
+#include <cstdint>
 #include <expected>
+#include <mutex>
 #include <unordered_map>
 
 #include <httplib.h>
@@ -37,6 +44,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server {
@@ -64,13 +72,19 @@ struct HwSyncAffordance {
 };
 struct HwCiAffordances {
     HwSyncAffordance sync;
-    bool can_write_tags{false}; // Tag:Write probe passed → Add/remove tag controls render
+    bool can_write_tags{false}; // Tag:Write probe passed → Add tag control renders
+    // Tag:Delete is a different permission from Tag:Write; probed only when the Tags
+    // lens is the active one (so a record view on another lens pays no extra probe).
+    bool can_delete_tags{false};
     // Round-3 merge: the DEX/Guardian/Live lenses reuse device_routes.cpp's existing
     // fragments verbatim, which gate on scoped GuaranteedState:Read — a STRICTER
     // check than the Inventory:Read the CI record itself already passed. htmx does
     // not swap a 403, so the lens body checks this first and renders an honest note
     // instead of an hx-get a caller without the permission could never see resolve.
     bool can_read_guaranteed_state{false};
+    /// Render the record banner placeholder, the Containment tab and the Containment lens body.
+    /// Copied from HardwareRoutes::Deps; the default is the compile-time kContainmentUi.
+    bool containment_ui{kContainmentUi};
 };
 
 /// The lens tab bar alone, id="hw-lens-bar" — factored out so a lens-only response
@@ -79,7 +93,8 @@ struct HwCiAffordances {
 /// changes which tab looks active). `oob=true` emits `hx-swap-oob="true"` on the
 /// wrapping div; the full record render uses `oob=false` since the bar is already
 /// in the right place in the DOM.
-std::string render_hardware_lens_bar(const std::string& agent_id, const std::string& active, bool oob);
+std::string render_hardware_lens_bar(const std::string& agent_id, const std::string& active, bool oob,
+                                     bool containment_ui = kContainmentUi);
 
 /// The CI record: back link + header (hostname/OS/online/last-seen/agent id/Sync now)
 /// + lens tabs + the active lens's body. `lens` in {"overview","software","tags","actions"}.
@@ -105,13 +120,29 @@ std::string render_hardware_sync_terminal(const std::string& agent_id, const std
 
 std::string render_hardware_software_lens(const std::string& agent_id,
                                           const std::optional<std::vector<SoftwareEntry>>& software,
-                                          bool truncated, bool online, const HwSyncAffordance& sync);
+                                          bool truncated, bool online, const HwSyncAffordance& sync,
+                                          std::optional<std::int64_t> software_last_seen = std::nullopt);
+
+/// Tag dialog wording, shared by the tags lens, the bulk bar and their tests.
+/// The environment value set is closed and exact-case (TagStore::set_tag_checked).
+inline constexpr std::string_view kHwTagKeyHint =
+    "Common keys: role, environment (Dev, UAT or Production, exact case), location, service.";
+inline constexpr std::string_view kHwServiceTagSetNote =
+    "Setting it also creates the service's management group if it does not exist. The service "
+    "tag decides which service-scoped API tokens can reach this device.";
+inline constexpr std::string_view kHwServiceTagRemoveNote =
+    "The service tag decides which service-scoped API tokens can reach this device. Removing it "
+    "takes the device out of that service's scope.";
 
 std::string render_hardware_tags_lens(const std::string& agent_id,
                                       const std::optional<std::vector<DeviceTag>>& tags,
-                                      bool can_write);
+                                      bool can_write, bool can_delete = false);
 
 std::string render_hardware_not_found(const std::string& agent_id);
+
+/// #5531: the roster read FAILED and nothing else about the device is readable —
+/// distinct from `render_hardware_not_found`.
+std::string render_hardware_roster_unreadable(const std::string& agent_id);
 
 /// One plugin's advertised actions, as reported by a connected agent — a light
 /// mirror of `AgentRegistry::PluginMeta` that keeps gRPC/registry headers out of
@@ -171,7 +202,11 @@ std::string render_hardware_action_result(const std::string& plugin, const std::
 class HardwareRoutes {
 public:
     using AuthFn = InventoryRoutes::AuthFn;
-    using ScopedPermFn = InventoryRoutes::ScopedPermFn;
+    /// Per-device tier + management-group scope gate (wraps require_scoped_permission).
+    using ScopedPermFn =
+        std::function<bool(const httplib::Request&, httplib::Response&,
+                           const std::string& securable_type, const std::string& operation,
+                           const std::string& agent_id)>;
     using AuditFn = InventoryRoutes::AuditFn;
 
     /// The route's SOLE authorization gate for the fleet-wide list + its REST twin.
@@ -188,6 +223,9 @@ public:
     /// up on `FleetReadFn`'s own scope (silently reconciling two different scope
     /// predicates is exactly the class of bug `FleetReadFn`'s doc comment warns
     /// about). Empty closure = route renders "unavailable" and 503s on the REST twin.
+    /// A FAILED roster read (#5531) returns `roster_degraded = true` with empty
+    /// rows: the fragment renders the roster-unavailable banner (still 200, htmx
+    /// does not swap a 5xx) and the REST twin 503s — never an empty page.
     using RosterFn = std::function<InventoryDevicesResult()>;
 
     /// The full per-device CI record composition (identity + CI blob + software +
@@ -236,7 +274,9 @@ public:
     /// registry refused (no live session / stream write failed).
     using SyncDispatchFn = std::function<HwSyncDispatchResult(const std::string& agent_id,
                                                               const std::string& source)>;
-    /// The live session's self-reported agent_version; nullopt == no live session.
+    /// The live session's self-reported agent_version; nullopt == no session on THIS server
+    /// process (sessions are per process, so a device attached to another replica reads the same
+    /// as a disconnected one).
     using AgentVersionFn = std::function<std::optional<std::string>(const std::string& agent_id)>;
     /// One plugin's pre-serialised plugin-docs manifest JSON (`plugin_docs_manifest`),
     /// nullopt when no manifest documents that plugin.
@@ -248,6 +288,11 @@ public:
     /// `device_routes.cpp`'s list already follows.
     using DexScoreFn = std::function<int(const std::string& agent_id)>;
 
+    /// Type-level (not per-device) permission gate: same contract as `ScopedPermFn` minus
+    /// the agent id — false means the response is already written.
+    using SyncPermFn = std::function<bool(const httplib::Request&, httplib::Response&,
+                                          const std::string& securable_type,
+                                          const std::string& operation)>;
     struct Deps {
         AuthFn auth_fn;
         ScopedPermFn scoped_perm_fn;
@@ -265,6 +310,26 @@ public:
         SyncDispatchFn sync_dispatch_fn;  // Sync now (R2.3)
         AgentVersionFn agent_version_fn;  // Sync now version floor (R2.3)
         DexScoreFn dex_score_fn;          // Devices-page merge (round 3)
+        /// The authoritative active-quarantine read, for the list's Quarantined pill. Empty
+        /// = no pill and no banner (the panel and lens have their own routes).
+        QuarantineListFn quarantine_list_fn;
+        /// Show every quarantine/containment control on the Hardware pages. False: no pill,
+        /// row link, banner, panel, tab or lens, no list-time quarantine read, and the quarantine
+        /// plugin's rows are left out of the Actions lens. The default is kContainmentUi.
+        bool containment_ui{kContainmentUi};
+        /// POST /api/v1/hardware/sync — the Software page's fleet/group/scope "Sync now".
+        /// `sync_perm_fn` is the type-level Execution:Execute gate (it writes the 401/403).
+        /// `sync_runner` is the fleet run (resolve, cap, cooldown, in-flight lease, audit, send).
+        /// `sync_perm_fn`, `auth_fn` or `sync_runner` empty == the route answers an AUDITED 500
+        /// (result=failure, nothing sent): a missing derivation is a misconfiguration, not an
+        /// outage.
+        SyncPermFn sync_perm_fn;
+        /// Shared with the MCP tool `sync_hardware_software` so the per-operator cooldown and
+        /// the single in-flight slot bind BOTH surfaces: production wires one instance into both.
+        std::shared_ptr<software_sync::Runner> sync_runner;
+        /// Same-site gate for the cookie-authorised sync POSTs (both the fleet and the
+        /// per-device route). Unwired fails closed: a header-less request is refused.
+        WriteGate write_gate;
     };
 
     void register_routes(httplib::Server& svr, Deps deps);
@@ -277,6 +342,7 @@ private:
                                     const HardwareCiDetail& detail) const;
 
     Deps deps_;
+
 };
 
 } // namespace yuzu::server

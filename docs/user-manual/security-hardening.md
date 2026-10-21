@@ -75,11 +75,11 @@ yuzu-agent --cert-store MY --cert-subject "agent-001"
 
 | Port | Protocol | Direction | Purpose | Restrict To |
 |------|----------|-----------|---------|-------------|
-| 8080 | TCP | Inbound | Web dashboard + REST API | Admin network |
+| 8080 | TCP | Inbound | HTTP→HTTPS redirect + unauthenticated health probes in cleartext (the dashboard with `--no-https`) | Orchestrator/admin network |
 | 8443 | TCP | Inbound | HTTPS dashboard | Admin network |
 | 50051 | TCP | Inbound | Agent gRPC | Agent network |
 | 50052 | TCP | Inbound | Management gRPC | Admin network |
-| 50055 | TCP | Inbound | Gateway upstream | Gateway hosts only |
+| 50055 | TCP | Inbound | Gateway upstream (mutual TLS plus an SPKI public-key pin of the gateway's key, or an acknowledged-disabled plaintext rig) | Gateway hosts only |
 | 9568 | TCP | Inbound | Gateway Prometheus | Monitoring network |
 
 **Recommendations:**
@@ -107,26 +107,55 @@ Run each component under its own system user:
 
 ## Gateway TLS (if you deploy the Erlang gateway)
 
-> **⚠ The gateway agent listener (`:50051`) is plaintext in the *shipped* composes.**
+> **⚠ The gateway agent listener (`:50051`) is plaintext in every shipped compose except the reference gateway compose.**
 > The gateway is the command fan-out plane — a plaintext, untrusted-network-reachable
 > agent listener lets an on-path attacker inject commands (fleet RCE).
 > **One-way (server-authenticated) TLS now exists for it (PKI PR5c)** — enable it on
 > the agent listener (`transport_opts` with `verify => verify_none`,
 > `fail_if_no_peer_cert => false`; see `gateway/config/sys.config.prod`) and ship the
-> CA to your agents. It is not on by default in the deployed composes until PR5b.
+> CA to your agents. `docker-compose.reference-gateway.yml` ships it (#1314); the
+> cluster compose boots the image default `sys.config` and the demo and UAT composes use their own UAT/demo `sys.config`; all of those listen in plaintext.
 
 If you deploy the gateway, you **must** protect the agent edge — either enable the
 PR5c one-way TLS above (and distribute the CA), **or** at the network layer:
-- **Terminate TLS in front** of the gateway (reverse proxy / L7 LB doing TLS on
-  `:50051`, forwarding only over loopback or a trusted segment), **or**
-- keep `:50051` on a **trusted network** (VPN / private subnet / service mesh) — never
+- **Front the gateway at L4 or with TLS passthrough only** (a plain TCP load balancer,
+  an L4 virtual IP or a TLS-passthrough proxy that keeps one TCP connection per agent
+  end to end), with the gateway agent listener itself running the one-way TLS above.
+  A reverse proxy or L7 load balancer that terminates TLS or HTTP/2 in front of
+  `:50051` is no longer a supported way to protect this edge: the gateway binds each
+  agent's heartbeats to the connection that opened its session, and such a proxy can
+  spread one agent's calls over several connections (see
+  [Heartbeat admission](gateway.md#heartbeat-admission)), **or**
+- keep `:50051` on a **trusted network** (VPN / private subnet / a mesh policy that does not
+  terminate HTTP/2; see [Heartbeat admission](gateway.md#heartbeat-admission)), never
   directly internet-exposed.
 
 The gateway→server **upstream** hop supports mutual TLS (`gateway/config/sys.config.prod`
 `{https,...}`), and the gateway **fails closed** if that channel is configured `https`
-without `verify_peer`. Direct agent→server connections (no gateway) are already full
-mTLS over any network. Full detail + the deployment runbook: `docs/user-manual/gateway.md`
+without `verify_peer`. The server's gateway-upstream service additionally requires an
+authorized gateway peer: the gateway's client certificate must carry `serverAuth`, be inside
+its validity window and have a public key that matches a configured SPKI pin (automatic on
+the generated default certificates, explicit with `--gateway-peer-pin` /
+`--gateway-peer-pin-file` otherwise), and the server refuses to start without one unless
+`--insecure-gateway-peer` acknowledges a plaintext rig. The check wraps the service, which the
+server registers on the one gRPC server that also listens for agents and management, so it
+applies on every one of those ports; without it, a caller with no certificate could reach the
+service on the agent port of a default-certificate install, and any holder of a CA-issued
+client certificate (an agent leaf included) could reach it on the strict ports. Keep the
+gateway key readable only by the server and gateway processes: the pin authorizes exactly that
+key, so anyone who can read it can act as the gateway. See
+[Gateway upstream peer authorization](server-admin.md#gateway-upstream-peer-authorization).
+Direct agent→server connections (no gateway) use TLS. Full detail + the deployment runbook: `docs/user-manual/gateway.md`
 "TLS posture" and `docs/pki-architecture.md` "Gateway TLS".
+
+The agent listener authenticates the gateway to agents, not agents to the gateway.
+The gateway admits an agent `Heartbeat` only on the connection that opened the
+session's `Subscribe` stream, and only for a session that gateway node holds
+(a rejected heartbeat is answered `NOT_FOUND`, counted, and not forwarded).
+`Subscribe` admission is unchanged, and the binding relies on one connection per
+agent between the agent and the gateway (see the supported topologies above). The
+same change removes the session id from two gateway log lines, which reduces the
+disclosure of session ids in logs; some log lines still include session ids.
 
 The gateway **management plane** (`:50063`) — the port the server's command
 forwarding dials — is the highest-value gateway surface: whoever it admits can
@@ -536,6 +565,61 @@ You can also use `whitelist` to add exceptions (IP or CIDR range) to the quarant
 releasing — the usual repair when a device has been contained without a reachable management
 address. `whitelist` is the repair path for a device whose exceptions are wrong.
 
+### Containment from the Hardware page
+
+> **Hidden in this release.** The Hardware page controls described below (pill, panel, banner and Containment tab) are not shown until an approval workflow for containment actions is added to the dashboard. Creating a quarantine record through `POST /api/v1/quarantine` (which the **Quarantine device** button calls) now runs the same dispatch approval check as the quarantine plugin's `quarantine` action, so with RBAC on only an administrator (account role `admin`) who also holds `Security:Execute` globally in their own right can create one through REST or the dashboard today (a JIT elevation supplies the administrator role but not the grant; with RBAC off the legacy gate already requires the `admin` role); there is no approval-request path on those surfaces yet, which is planned follow-up work. Releasing a record (`DELETE /api/v1/quarantine/{agent_id}`, the **Release from quarantine** button) is likewise administrator-only under the same conditions. The MCP tools and the quarantine plugin's actions on the Instructions page (role-gated approval) are unchanged.
+
+The dashboard shows and drives quarantine records without a separate page:
+
+- **Quarantined devices** panel on `/hardware` lists the active records you may read
+  (newest first, at most 200), with who quarantined the device, when, why, the whitelist and
+  how far containment has been shown to reach it: *Recorded* (the server holds the record),
+  *Applied, not confirmed* (a re-dispatch was accepted) or *Confirmed on device at the last status read* (a status
+  read reported the quarantine active; it is a point-in-time reading, not a live one). A read that cannot be completed is a banner, never
+  "no device is quarantined".
+- A **Quarantined** pill marks rows on the Hardware list, and the record header carries a
+  banner while the device has an active record. Instructions to a quarantined device are
+  withheld until it is released; Sync now still works.
+- The record's **Containment** tab shows the same state and offers **Quarantine device**
+  (a reason is required in the dialog) and **Release from quarantine**. Both call
+  `POST /api/v1/quarantine` and `DELETE /api/v1/quarantine/{agent_id}` and need
+  `Security:Execute` on the device. **Quarantine device** then also runs the dispatch
+  approval check for the `quarantine.quarantine` pair, before any record is written: the
+  caller must be an administrator or carry an approved request. REST has no ticket path today,
+  so with RBAC on a non-administrator who holds `Security:Execute` on the device is refused with
+  `403` (`approval_required`), and a caller who holds it only through a management group is
+  refused with `403` (`forbidden`), exactly as at the MCP `quarantine_device` pre-check; an
+  MCP supervised token remains the approved path for a non-administrator. A refused request
+  writes no record. **Release from quarantine** runs the same check for the `quarantine.unquarantine`
+  pair, so a caller who cannot create a record cannot end one: the same `403` answers apply, the
+  record stays active, and the refusal is audited as `quarantine.disable` with `result=denied`.
+  There is no REST or MCP path for a non-administrator to end a record; an administrator
+  releases it (a JIT elevation counts only if the account also holds `Security:Execute`
+  globally, otherwise the release is refused `forbidden`).
+- **Release ends the server record only.** It does not remove the device's firewall rules;
+  run the plugin's `unquarantine` action from the Actions tab for that. The reverse also
+  holds: the plugin's `unquarantine` alone does not end the record, and only an administrator
+  can (release through REST needs one), so while the record stays active the device is still
+  withheld from other instructions and the reconciler re-applies the stored isolation when it
+  next reconnects. Once the record is
+  released the lens reads "No active quarantine record" and cannot say whether the rules
+  were removed, so check the plugin's `status` action.
+- An offline device can be quarantined: the record is stored now and applied when the device
+  next connects.
+
+**Diagnosing an unexpected `403` on quarantine creation or release.** Search the audit log for action
+`quarantine.enable` (create) or `quarantine.disable` (release), result `denied`, target type `Security`, target id the device's agent id;
+`detail` holds `reason=<label> securable=<name>`. A `denied` row whose `detail` is `authenticated principal changed during the request now=<account>` is the `401` for a request whose two session look-ups named different principals, not an approval refusal. A refusal by the scoped permission gate itself
+(the caller has no `Security:Execute` on the device) is audited by that gate, not under
+`quarantine.enable`. `yuzu_server_dispatch_denied_total{reason}` shows the fleet-wide trend only.
+
+| Reason label | What it means | What to do |
+|---|---|---|
+| `approval_required` | RBAC is on and the account role is not `admin` (the RBAC `Administrator` role alone does not count) | Use an administrator account, or MCP `quarantine_device` on the supervised tier. A JIT elevation that lapsed between the route's two checks reads the same way |
+| `forbidden` | The caller's own `Security:Execute` grant is not global (group-only, or administrator only through a JIT elevation), or the RBAC store could not be read | Grant it globally; if the grant exists, check `yuzu_server_rbac_read_degrade_total` first, because a transient RBAC failure reads as a denial and retrying later can succeed |
+| `unclassified`, `ambiguous` | The quarantine action could not be matched to one catalogue entry | Report it: this is a defect, not a permission problem |
+| (a `500`, no label) | The dispatch check is not wired on this server | Report it; the route fails closed and writes no record |
+
 ### Quarantine now blocks instruction dispatch (#881)
 
 A quarantined device is refused at the **server's dispatch chokepoint**, not only at its own
@@ -549,7 +633,13 @@ Two consequences worth planning for:
 - **The quarantine plugin's own actions are exempt** — `quarantine`, `unquarantine`, `status` and
   `whitelist` still reach a contained device, so release stays possible. The exemption is keyed on
   the action, not the plugin, so a future fifth action would be gated until it is deliberately
-  added.
+  added. These four actions, and the Guardian rule push `__guard__.push_rules`, are also exempt
+  from the per-plugin/action kill switch, the per-OS kill switch (and its agent-presence read),
+  the plugin-presence filter and a degraded plugin-config store, so none of them can strand a
+  contained device. A kill-switch row for one of these pairs is still accepted and displayed, but
+  it is informational only and has no dispatch effect. To stop Guardian rule delivery during an
+  incident, disable or remove the rules instead; see
+  [Guaranteed State](guaranteed-state.md#baselines--how-guards-reach-agents).
 - **Four server-internal pushes are also exempt, and you should know they exist.** The TAR
   fleet-topology snapshot request (`tar.fleet_snapshot`), the Guardian rule push
   (`__guard__.push_rules`), the asset-tag sync (`asset_tags.sync`) and the on-demand inventory
@@ -730,12 +820,14 @@ Platform implementations:
 
 ## OIDC Hardening
 
-When using OIDC/Entra ID:
+When using OIDC (for example with Keycloak or Microsoft Entra ID):
 - Set `--oidc-admin-group` to restrict admin access to a specific group
 - Use `--session-timeout` to limit session duration
 - Configure the OIDC provider to require MFA
 - Restrict the app registration to your tenant (single-tenant)
 - Rotate the client secret regularly
+- **Use an `https` issuer only, and never `--oidc-skip-tls-verify` outside a lab.** The server fetches the issuer's JWKS and trusts it as the signature key for every ID token, and sends the client secret to the token endpoint, both over the issuer's own scheme. With an `http://` issuer, or with TLS verification off, anyone who can sit on the network path (or poison the issuer's DNS name) can substitute the keys and mint a sign-in for any user, up to the administrator group, and can read the client secret. The server logs a warning for an `http://` issuer on a non-loopback host. Plain `http://` to a PUBLIC address is refused outright (no switch; the error is `plain http is not permitted to a public address`), which closes the internet man-in-the-middle case; `http://` to a loopback or private address is allowed only with `--oidc-allow-private-networks` and stays exposed to anyone on that network path (keys, token response and client secret in the clear), so it is a lab setup.
+- **Egress control.** The server's OIDC requests (discovery, JWKS, Test Connection, token POST) go to hosts the IdP's discovery document names, and Test Connection goes to whatever issuer an administrator types. Each request is resolved by the server, every resolved address is classified, and the connection is pinned to a permitted address (Windows token POST: pre-checked only, strictly: one refused address in its answer refuses the request; see below). Link-local addresses (the cloud metadata address `169.254.169.254` included), the other listed cloud metadata addresses, multicast and unspecified addresses are always refused (Oracle Cloud's `192.0.0.192` is not listed: it lies in the `192.0.0.0/24` special-purpose block that `--oidc-allow-private-networks` admits). Loopback, RFC 1918, carrier-grade NAT and IPv6 unique-local addresses are refused unless the server operator starts the process with `--oidc-allow-private-networks`, which no dashboard or REST caller can set. Leave it off unless your IdP is on an internal network. Residual: on Windows the token POST resolves its name again inside WinHTTP, so DNS rebinding between the check and the connect is not covered for that one request (that request does not follow redirects and accepts only HTTP status 200, so a 3xx cannot move it to an unchecked host or be taken for a token response; host names must be ASCII, with an internationalized name given as punycode); there is no per-host allow-list and no HTTP proxy on the discovery and JWKS path (the Windows token POST uses the system default proxy). NAT64: an IPv6 address inside a NAT64 prefix is classified by the IPv4 address embedded in it (every RFC 6052 section 2.2 layout), so `Pref64 + 169.254.169.254` is refused as link-local. The server learns prefixes from RFC 7050 (it resolves `ipv4only.arpa`, only when a request is about to be pinned to an otherwise permitted IPv6 address, and repeats the lookup after 10 minutes, or 1 minute when it learned none; a learned prefix is only ever added to the set and kept until restart, never forgotten by a later answer, and an answer that would take the set past 64 prefixes refuses the fetch instead of being installed partially) and from `--oidc-nat64-prefix`; a failed lookup means "none discovered" and does not fail the request. A configured prefix is trusted to describe a translator and may therefore permit a destination its own address class would otherwise gate; only the always-refused tier is never relaxed. Teredo, IPv6 benchmarking and the other non-global parts of `2001::/23` are refused unless the private-network switch is set, except the sub-ranges the IANA registry marks globally reachable. Residual: translators the server cannot see, that is a translator whose prefix is neither discoverable nor configured, a proxy, a VPN, or CLAT/464XLAT outside the host, can still map an address that classifies as public to a private destination; because TLS verification still uses the host name, such a path is limited to a blind TCP connect for `https`, and plain `http` to a public-looking (translated) address is refused by the cleartext rule above. See [Authentication -> Network and trust](authentication.md#network-and-trust). **Operator warning:** a configured prefix asserts that a NAT64 translator lives there and can permit HTTPS connections to ULA addresses even when `--oidc-allow-private-networks` is off; declare only actual translation prefixes (native IPv6 services inside a declared prefix get the same embedded-IPv4 classification; always-refused addresses remain blocked).
 
 > **Upgrading: if `oidc_client_secret` was ever set on this install, rotate it.**
 > Releases up to and including v0.13.0 emitted the value in the clear to three places - the

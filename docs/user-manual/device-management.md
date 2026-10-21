@@ -22,11 +22,13 @@ yuzu-agent --server server.example.com:50051
 
 The agent will attempt registration, receive a "pending" status, and retry periodically until approved.
 
-**Server side (dashboard):** Navigate to **Settings > Pending Agents** to see the queue. Each entry shows the agent's hostname, OS, architecture, and the time it first connected. Click **Approve** or **Deny**.
+**Server side (dashboard):** Navigate to **Estate > Groups and enrolment** (panel **Agents waiting for approval**) or **Settings > Pending Agent Approvals**; both show the same queue. The page is named "Groups and enrolment" (UK spelling); the Settings panels keep their existing US-spelling names. Each entry shows the agent's hostname, OS, architecture, version and the time it first asked to join (UTC). Click **Approve**, **Deny**, or **Forget** (`DELETE /api/settings/pending-agents/{id}`, audited as `enrollment.remove`; it removes a waiting request, and the agent is queued again the next time it asks to join). A denied agent stays listed as **Denied** ("denial recorded") with no button. The page offers no way to reverse a denial and the product has no reinstate action today (see below); the **Deny** and **Deny all** confirmations say "This page offers no way to reverse a denial." **Approve all** and **Deny all** act on every waiting agent, including any that arrive after the page loaded, and their confirmation gives the total and the first ten hostnames. At most 200 rows are listed (waiting agents first, then denied). When more than 200 agents are waiting, the panel says "Showing 200 of N" and the two bulk buttons are disabled, because they would also act on the agents not shown; when every waiting agent is listed but denied ones are cut off, it says how many denied agents are not listed.
+
+The page opens for any signed-in user, but the three panels need the Administrator account role; other users see "Not available to your account" in each panel, and those page views write no denied-access audit rows.
 
 **Server side (API):**
 
-There is no dedicated JSON API endpoint to list pending agents. Use the HTMX fragment to retrieve the rendered HTML list:
+To list the queue as JSON, use `GET /api/v1/enrollment/pending-agents` (pending and denied requests; permission `Enrollment:Read`; `503` when the enrollment store is degraded; REST only, there is no MCP tool for it). See [REST API](rest-api.md#get-apiv1enrollmentpending-agents). Approve, deny and remove have no JSON endpoint; they are the dashboard routes below. The dashboard's own list is an HTMX fragment:
 
 ```bash
 # List pending agents (returns HTML fragment)
@@ -36,20 +38,39 @@ curl -s http://localhost:8080/fragments/settings/pending -b "$COOKIE"
 ```bash
 # Approve a pending agent
 curl -s -X POST http://localhost:8080/api/settings/pending-agents/agent-001/approve \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
 
 ```bash
 # Deny a pending agent
 curl -s -X POST http://localhost:8080/api/settings/pending-agents/agent-001/deny \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
+
+Approve and deny, like remove below, only act on a row that is still `pending`. On an agent that was already approved or denied they return `409` (with the refreshed list and an error toast) and change nothing, so a stale click or a repeated request can never reverse a denial or turn an enrolled agent into a denied one. An unknown agent id changes nothing and gets a warning toast; both cases are recorded as `denied` audit rows.
+
+**A denial is permanent for that agent id.** There is no reinstate action, no supported way to delete a denied row, and nothing overrides it: an enrollment token or an auto-approve rule presented by a denied agent is refused (`enrollment_status` `denied`), and a token's use is rolled back rather than consumed. If a machine was denied by mistake, it can only come back as a new agent: reinstall it or wipe its agent data directory (it holds the agent id in `agent.db` and, by default, the client certificate in `certs/`), so that it generates a new id and certificate. A different `--agent-id` / `YUZU_AGENT_ID` alone is not enough on a server that requires client certificates, because the agent still presents the old certificate (CN = old id) and the server refuses the mismatch; use it only together with a wiped data directory. The new id is an ordinary first registration: a valid enrollment token enrolls it at once, an enabled auto-approve rule it matches approves it, and otherwise it waits in the pending queue. The denial is keyed on the old id only, so if you meant to keep that machine out, remove or tighten the token or rule that would admit it. The old id stays listed as **Denied**.
 
 ```bash
 # Remove a pending agent from the queue entirely
 curl -s -X DELETE http://localhost:8080/api/settings/pending-agents/agent-001 \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
+
+`DELETE` only succeeds against a row that is still `pending` — it returns `409` if the agent has
+already been approved or denied, refusing to silently reverse that admin decision (WS-6 6.2). A
+Tier 1 agent removed while genuinely pending simply re-enters the pending queue on its next
+reconnect attempt, same as if it had never been seen. Before this guard, removing an already-
+*approved* row (typically a Tier 2, token-enrolled agent) deleted the row backing its enrollment
+with no admin decision behind it and no audit trail — that specific gap is now closed, since an
+approved row can no longer be removed via this endpoint at all. There is no remaining asymmetry for
+the remove-then-reconnect case: a still-`pending` agent (Tier 1 or Tier 2, before it has presented a
+valid token) behaves identically either way, and a Tier 2 agent's token-based enrollment
+(`consume_and_enroll`) creates a fresh `approved` row on the next successful token presentation
+regardless of whether a prior pending row existed.
 
 ### Tier 2: Pre-Shared Enrollment Tokens
 
@@ -61,11 +82,14 @@ This endpoint is designed for the HTMX dashboard and accepts form-encoded parame
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/enrollment-tokens \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -d "label=datacenter-rollout-q1&max_uses=100&ttl_hours=72"
 ```
 
-The response is an HTML fragment (the updated tokens table). The raw token value is displayed once in the fragment and cannot be retrieved again.
+The response is an HTML fragment (the updated tokens table) sent with `Cache-Control: no-store, private`. The raw token value is displayed once in the fragment and cannot be retrieved again.
+
+On the dashboard (**Estate > Groups and enrolment**, panel **Enrolment tokens**, or **Settings > Enrollment Tokens**) the token is shown once above the list, with **Copy to Clipboard** and **Done**. It lives inside the token panel: navigating away, **Done**, revoking a token, generating another or anything else that reloads the panel removes it for good, and the only recovery is to revoke that token and generate a new one. **Copy to Clipboard** needs HTTPS or `localhost`. Where it cannot copy, the Groups and enrolment button says "Copy failed. Select the text." and you copy the token by hand. The Settings panel keeps its older button, which has no failure message: without HTTPS or `localhost` it does nothing, and if the browser refuses the copy it still says "Copied!". Check the clipboard, or select the token by hand, before you leave the panel. The list shows each token's expiry in UTC and its status (**Active**, **Expired**, **Exhausted** or **Revoked**, active first) and lists at most 200 tokens; the form shows "Unlimited uses and no expiry" while both limit fields are empty or zero.
 
 **Generate tokens in batch (JSON API for scripting):**
 
@@ -73,6 +97,7 @@ This endpoint accepts JSON and returns a JSON response, making it suitable for a
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/enrollment-tokens/batch \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -91,6 +116,8 @@ Response:
   "tokens": ["yuzu_enroll_xxx...", "yuzu_enroll_yyy...", "..."]
 }
 ```
+
+`count`, `max_uses` and `ttl_hours` may each be a JSON integer or a numeric string (`"count": "10"`); an empty string or an omitted key keeps the default (`count` 10, `max_uses` 1, `ttl_hours` 0 = no expiry). A float, boolean, `null`, a number outside the 32-bit range, a negative `ttl_hours` or `max_uses`, a `count` outside 1 to 10000, or a body that is not one JSON object is `400` and mints nothing. Before this check a JSON number was silently ignored, so the example above minted single-use tokens that never expired.
 
 **Agent side:**
 
@@ -113,10 +140,11 @@ curl -s http://localhost:8080/fragments/settings/tokens -b "$COOKIE"
 
 ```bash
 curl -s -X DELETE http://localhost:8080/api/settings/enrollment-tokens/tok_a1b2c3d4 \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
 
-Tokens are persisted in `enrollment-tokens.cfg` alongside the server configuration file. They survive server restarts.
+Tokens are persisted in the PostgreSQL `auth.enrollment_tokens` table (WS-6 6.2) — shared by every server replica, not a per-replica file. They survive server restarts and image swaps. A pre-6.2 install's `enrollment-tokens.cfg` is imported once, automatically, at the first 6.2 boot (see `docs/adr/2002-high-availability-architecture.md` §8).
 
 ### Tier 3: Platform Trust (Planned)
 
@@ -128,26 +156,34 @@ Reserved for future implementation. Proto fields exist for `machine_certificate`
 
 Administrators can configure rules that automatically approve agents matching specific criteria, reducing manual toil for large deployments.
 
-**View current auto-approval policies (dashboard):** Navigate to **Settings > Auto-Approve**.
+**View current auto-approval policies (dashboard):** Navigate to **Estate > Groups and enrolment** (panel **Auto-approve rules**) or **Settings > Auto-Approve Policies**. Each rule is described by what it matches: "Agent-reported hostname matches ..." and "Agent-reported provider ..." are marked "(not verified)" because the agent states the hostname and the attestation provider itself; "Address the server sees matches ..." is the connection's peer address (IPv4 only), so it never matches an agent that enrolls through a gateway, which carries no peer address; and "Agent CA fingerprint ..." is marked "(never matches at this release)" because Register does not yet populate the fingerprint. The match mode is two buttons (**Any rule matches (first match)** and **All enabled rules must match**) and each asks for confirmation. In "all" mode an enabled CA fingerprint rule means no agent is ever auto-approved, because that rule never matches at this release; disable or remove it, or use "any" mode. A rule that matches every agent is flagged **Matches every agent**.
 
 **Add an auto-approval rule:**
 
-The auto-approve endpoints use form-encoded parameters (designed for the HTMX dashboard) and return HTML fragments.
+The auto-approve endpoints use form-encoded parameters (designed for the HTMX dashboard) and return HTML fragments. The four writes below are dashboard writes: a request whose `Origin` (or `Referer`) names a different site is refused with `403`; a request with neither header (curl, automation) is accepted, as for the other Settings writes.
+
+Every write is recorded before it is applied: an `attempt` audit row is written first and, if it cannot be stored, the write is refused with `503` (`Sec-Audit-Failed: true`) and nothing changes. A rule that cannot be saved to disk is refused with `500` and nothing changes. Error responses are the standard JSON error body; the dashboard shows a toast.
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/auto-approve \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -d "type=hostname_glob&value=web-*.example.com&label=Production+web+servers"
 ```
 
 This rule automatically approves any agent whose hostname matches the glob pattern `web-*.example.com`.
 
-Supported rule types: `hostname_glob`, `trusted_ca`, `ip_subnet`, `cloud_provider`.
+Supported rule types: `hostname_glob`, `trusted_ca`, `ip_subnet`, `cloud_provider`. A value is at most 253 characters and a label at most 128. The server refuses two shapes outright: a hostname glob made only of `*` characters, and an `ip_subnet` with a `/0` prefix (for example `0.0.0.0/0`). It accepts other rules that are just as broad, for example a hostname glob of only `*` and `?` characters such as `?*`. The dashboard flags every existing rule that matches every agent (**Matches every agent**). On **Groups and enrolment** the **Add rule** confirmation also says "This matches every agent." when the value you typed has that shape (for a `*`-only glob or a `/0` range the server then refuses the rule); the Settings panel asks the same fixed confirmation for every value.
+
+**These rules are not a strong admission control.** `hostname_glob` and `cloud_provider` match strings the registering agent states about itself (its hostname and attestation provider); any client that can reach the Register endpoint can claim a matching value, which makes such a rule no stronger than `*`. `ip_subnet` matches the connection's peer address: an agent that registers through a gateway (`ProxyRegister`) carries no peer address, so an `ip_subnet` rule never matches it. In `all` mode that means no gateway-connected agent is auto-approved while an enabled `ip_subnet` rule exists. `trusted_ca` can never match today because Register does not yet populate the CA fingerprint; in `all` mode an enabled `trusted_ca` rule therefore stops every auto-approval (all enabled rules must match). Verified proof for the first two is reserved for a later tier. Treat `any`-mode `hostname_glob`/`cloud_provider` rules as a convenience for a trusted network, not as a security boundary.
+
+If the saved policy file (`auto-approve.cfg`) is damaged (a line with an unknown type, a short line, or a `mode:` other than exactly `any` or `all`), the server activates no auto-approve rules at start (every agent waits for manual approval), logs an error, and keeps the original as `auto-approve.cfg.rejected`; re-create the rules in Settings.
 
 **Set the auto-approve match mode:**
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/auto-approve/mode \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -d "mode=any"
 ```
@@ -159,12 +195,14 @@ Supported modes:
 | `any` | First matching enabled rule auto-approves the agent (default) |
 | `all` | All enabled rules must match for auto-approval |
 
+
 Note: Auto-approval only applies when rules exist and are enabled. When no rules are configured, all agents enter the pending queue regardless of mode. To disable auto-approval entirely, remove or disable all rules.
 
 **Toggle a rule on/off:**
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/auto-approve/0/toggle \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
 
@@ -172,8 +210,11 @@ curl -s -X POST http://localhost:8080/api/settings/auto-approve/0/toggle \
 
 ```bash
 curl -s -X DELETE http://localhost:8080/api/settings/auto-approve/0 \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
+
+Rules are addressed by their position in the list, and the position shifts when another administrator adds or removes a rule. The dashboard therefore also sends the rule it is showing (`type` and `value`, and for a toggle the `enabled` state it saw, as form fields on the toggle and as query parameters on the delete). If the rule now at that position is a different one, or that position no longer exists, nothing changes: the answer is `409` with the refreshed list and a warning, and the audit row is `denied` (`stale_rule_view`, or `rule_not_found` when the position is gone). A script that states none of these keeps acting on the position, and an unknown position is a `200` no-op. To make a script safe against a concurrent edit, add them, for example `-d "type=hostname_glob&value=web-*.example.com&enabled=1"` on the toggle.
 
 **View the auto-approve settings fragment (HTMX):**
 
@@ -327,13 +368,17 @@ The full set of agent command-line flags:
 | `--cert-store` | Windows certificate store name (e.g. `MY`) | (none) |
 | `--cert-subject` | Subject CN match for cert store lookup | (none) |
 | `--cert-thumbprint` | SHA-1 thumbprint for cert store lookup (hex) | (none) |
+| `--no-cert-discovery` | Disable client-certificate auto-discovery. By default, when no `--client-cert` and no `--cert-store` is given, the agent looks for a client certificate and key pair in `YUZU_CLIENT_CERT`/`YUZU_CLIENT_KEY`, then (Linux and macOS only) at `/etc/yuzu/agent.pem` + `/etc/yuzu/agent-key.pem`, `/etc/pki/tls/certs/yuzu-agent.pem` + `/etc/pki/tls/private/yuzu-agent.pem`, and `/etc/ssl/certs/yuzu-agent.pem` + `/etc/ssl/private/yuzu-agent.pem`, using the first pair whose files both exist. Windows checks only the environment variables. This flag turns that search off; it does not affect discovery of the install CA used to verify the server. It does **not** stop `YUZU_CLIENT_CERT`/`YUZU_CLIENT_KEY` from being used: those are also the environment bindings of `--client-cert`/`--client-key`, so when set they still configure the client certificate | (enabled) |
 | `--cert-dir` | Directory for the auto-provisioned per-agent mTLS credential (env `YUZU_CERT_DIR`) | `<data-dir>/certs` |
 | `--no-auto-provision-cert` | Disable PKI auto-provisioning (do not request a per-agent client certificate at enrollment) | (enabled) |
+| `--tls-system-roots` | Allow the agent to verify the server against the operating system's trust store when no CA is pinned (no `--ca-cert`, and no install CA found at the standard path, for example `/etc/yuzu/certs/default-ca.pem` or `C:/ProgramData/Yuzu/certs/default-ca.pem`). Without it the agent refuses to connect in that situation, because the system store does not trust a Yuzu self-signed install CA and accepting any publicly trusted certificate would allow an impostor server. Use it only when the server certificate chains to a public or corporate CA already in the system store; the agent logs a warning when it is in effect. Env: `YUZU_TLS_SYSTEM_ROOTS`, read by value: `1`/`true`/`yes`/`on` enable it, `0`/`false`/`no`/`off` or unset leave it off. The flag can only turn it on | off |
 | `--plugin-dir` | Directory containing plugin shared libraries (env `YUZU_PLUGIN_DIR`). The default is `<exe_dir>/../plugins`, where `<exe_dir>` is the directory part of the path the agent was started by (`argv[0]`), not resolved through `PATH` or symlinks. Started by absolute path, as the published agent image (`yuzu-agent-chisel`, `ENTRYPOINT ["/usr/local/bin/yuzu-agent"]`) does, it is `/usr/local/plugins`. Nothing is installed there: the image's default `CMD` passes `--plugin-dir /usr/lib/yuzu/plugins`. Started by bare name through `PATH`, `argv[0]` has no directory part, so the default resolves against the working directory (`<cwd>/../plugins`). A compose `command:` (or `docker run` argument) override replaces the image's `CMD`, so it must restate `--plugin-dir` | `<exe_dir>/../plugins` |
 | `--log-level` | Logging verbosity (`trace`, `debug`, `info`, `warn`, `error`; lowercase and case sensitive, and an unrecognised value, including `WARN`, is treated as `off`; `--verbose` forces `trace` whatever this says). The `agent_actions` plugin's `set_log_level` action (needs `Infrastructure:Write` and, through the REST command dispatch, `Execution:Execute`) changes it at runtime but does not persist it, so it reverts when the agent restarts (env `YUZU_LOG_LEVEL`) | `info` |
 | `--log-file` | Path for an on-disk log file, written in addition to the console. A Windows service agent has no console, so it defaults to `yuzu-agent.log` under its data directory (env `YUZU_LOG_FILE`) | (none) |
 | `--log-max-size` | Size in bytes at which the agent's log file rotates. Applies whenever the agent writes a log file (`--log-file`, or the Windows-service default above), otherwise ignored (env `YUZU_LOG_MAX_SIZE`) | `52428800` (50 MB) |
 | `--log-max-files` | Number of rotated log files kept. Applies whenever the agent writes a log file, otherwise ignored (env `YUZU_LOG_MAX_FILES`) | `5` |
+| `--debug` | Sets the agent's `debug_mode` configuration value to `true`. In this release it enables no extra behaviour: the only effect is that the `status` plugin's `connection` output reports `debug_mode` as `true`. It does not change the log level; use `--log-level debug` or `--verbose` for more logging. No environment variable | off |
+| `--update-check-interval` | Seconds between OTA update checks. Values are clamped to between 1 second and 8,760 hours (one year); the startup log line `OTA update checker started (interval=…s)` shows the effective value. Ignored with `--no-auto-update` (env `YUZU_UPDATE_CHECK_INTERVAL`) | `21600` (6 hours) |
 
 Agent logging is asynchronous (#4666 PR-2): a producer thread enqueues a formatted line onto a fixed-size 8192-slot queue and returns; one dedicated worker thread does the actual sink I/O, so a stalled log destination no longer blocks the agent. Under sustained overload the queue silently drops the oldest still-queued lines (`overrun_oldest`) rather than growing or blocking. There is no `--log-sync` flag to opt back into synchronous logging. A shutdown that cannot tear this logger down within an internal 2-second grace, or that fails outright while doing so, self-exits with a new code, 5 (distinct from the existing 1/3/4); see "Stopping a wedged agent" in [Server Administration](server-admin.md) for the full exit-code reference and the async-logging behavior details, and "If log volume matters" in the same page for the level-gating consequence for the SIGINT/SIGTERM shutdown log line (it goes silent at `--log-level warn` or above).
 
@@ -369,6 +414,15 @@ generates a fresh keypair + CSR and the server issues a **new** leaf with a
 (`GET /api/v1/ca/issued`) as an orphaned row that no live agent holds — this is
 harmless, but if you reconcile the inventory you should expect one orphan per
 key-loss event and may revoke it for tidiness. No manual re-enrollment is needed.
+The same happens when the key is unreadable or unparseable at startup, or when
+`agent-client.pem` no longer matches `agent-client.key` (an interrupted renewal
+replaced the key but not the leaf): the agent logs `agent_csr: ... treating the
+credential as missing`, enrols without a client certificate (accepted under
+gradual enforcement) and receives a new leaf. A transient read failure of the key
+file triggers this too. After upgrading to this version, any agent already
+holding a mismatched pair re-enrols once on its first restart; the signer applies
+a per-agent 30 s floor and no global limit, so expect one issued row per such
+agent.
 
 > **Revocation is not bypassable by key deletion.** Auto-re-provisioning applies
 > only when the agent's prior cert was *not* revoked. If you **revoke** an
@@ -386,7 +440,7 @@ key-loss event and may revoke it for tidiness. No manual re-enrollment is needed
 > off the data plane — the server never sees the agent's leaf on the
 > gateway→server hop. To decommission a gateway-proxied agent promptly, also
 > disconnect it at the gateway/management layer. Through-gateway cryptographic
-> revocation is planned with the QUIC transport migration. See
+> revocation is tracked in #5578 (no committed release). See
 > `docs/auth-architecture.md` "Gateway-proxied agents: revocation scope".
 
 ### Windows Certificate Store Integration
@@ -419,7 +473,7 @@ Administrators can upload new agent binaries to the server and promote them to p
 
 ### Upload a New Binary
 
-**Dashboard:** Navigate to **Settings > Agent Updates** and use the upload form.
+**Dashboard:** Navigate to **Settings > Plugins and updates** (or the **Agent Updates** panel on the Settings page) and use the upload form. The upload names the version (the file name without its extension). On **Settings > Plugins and updates** the upload and each rollout change ask you to confirm; the older Settings page does not. Uploading a package with the same platform, architecture and version replaces it and resets its rollout and mandatory flag. The rollout percentage is the share of devices that may be offered the package, not how many have updated.
 
 **API:**
 
@@ -427,6 +481,7 @@ The upload endpoint accepts multipart form data. The version is derived automati
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/updates/upload \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -F "file=@yuzu-agent-0.9.4-linux-x64.tar.gz" \
   -F "platform=linux" \
@@ -440,7 +495,7 @@ curl -s -X POST http://localhost:8080/api/settings/updates/upload \
 | `file` | Yes | The agent binary to upload |
 | `platform` | Yes | Target platform (`linux`, `windows`, `darwin`) |
 | `arch` | Yes | Target architecture (`x86_64`, `aarch64`) |
-| `rollout_pct` | No | Rollout percentage, 0--100 (default: `100`) |
+| `rollout_pct` | No | Rollout percentage, 0--100 (default: `100`). An empty value is the default; a malformed value (`0x5`, `5abc`, `1e1`) is `400` and nothing is stored, it never becomes `100`; an out-of-range integer is clamped to 0--100 |
 | `mandatory` | No | Whether agents must apply this update (`true`/`false`, default: `false`) |
 
 ### View Available Updates
@@ -455,6 +510,7 @@ The rollout endpoint controls what percentage of eligible agents receive a given
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/updates/linux/x86_64/0.9.4/rollout \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -d "rollout_pct=100"
 ```
@@ -464,6 +520,7 @@ To do a staged rollout, set a lower percentage first and increase it over time:
 ```bash
 # Start with 10% of agents
 curl -s -X POST http://localhost:8080/api/settings/updates/linux/x86_64/0.9.4/rollout \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -d "rollout_pct=10"
 ```
@@ -472,6 +529,7 @@ curl -s -X POST http://localhost:8080/api/settings/updates/linux/x86_64/0.9.4/ro
 
 ```bash
 curl -s -X DELETE http://localhost:8080/api/settings/updates/linux/x86_64/0.9.4 \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
 
@@ -485,9 +543,9 @@ Most enrollment and device management operations are performed through the HTMX 
 
 | Route | Description |
 |---|---|
-| `GET /fragments/settings/pending` | Pending agents queue |
-| `GET /fragments/settings/tokens` | Enrollment tokens list |
-| `GET /fragments/settings/auto-approve` | Auto-approval policies |
+| `GET /fragments/settings/pending` | Pending agents queue (also hosted by `/groups`) |
+| `GET /fragments/settings/tokens` | Enrollment tokens list (also hosted by `/groups`) |
+| `GET /fragments/settings/auto-approve` | Auto-approval policies (also hosted by `/groups`) |
 | `GET /fragments/settings/updates` | OTA agent updates |
 
 ### Action Endpoints
@@ -503,12 +561,12 @@ Unless noted, these endpoints accept form-encoded parameters and return HTML fra
 | `POST` | `/api/settings/enrollment-tokens` | Generate an enrollment token (form-encoded) | HTMX |
 | `POST` | `/api/settings/enrollment-tokens/batch` | Generate tokens in batch (JSON in, JSON out) | JSON |
 | `DELETE` | `/api/settings/enrollment-tokens/{token_id}` | Revoke a token | HTMX |
-| `POST` | `/api/settings/auto-approve` | Add a rule (form: `type`, `value`, `label`) | HTMX |
-| `POST` | `/api/settings/auto-approve/mode` | Set match mode (form: `mode=any\|all`) | HTMX |
+| `POST` | `/api/settings/auto-approve` | Add a rule (form: `type`, `value`, `label`); `400` and nothing saved for an unknown type, empty value, `:` or control character in value or label, malformed `ip_subnet` (IPv4 with optional `/0-32`) or `trusted_ca` that is not 64 hex characters | HTMX |
+| `POST` | `/api/settings/auto-approve/mode` | Set match mode (form: `mode=any\|all`); other values return `400` | HTMX |
 | `POST` | `/api/settings/auto-approve/{index}/toggle` | Enable/disable a rule | HTMX |
 | `DELETE` | `/api/settings/auto-approve/{index}` | Delete a rule | HTMX |
 | `POST` | `/api/settings/updates/upload` | Upload an agent binary (multipart) | HTMX |
-| `POST` | `/api/settings/updates/{platform}/{arch}/{version}/rollout` | Set rollout percentage (form: `rollout_pct`) | HTMX |
+| `POST` | `/api/settings/updates/{platform}/{arch}/{version}/rollout` | Set rollout percentage (form: `rollout_pct`; a malformed value is `400` with an error toast and nothing changes) | HTMX |
 | `DELETE` | `/api/settings/updates/{platform}/{arch}/{version}` | Remove an uploaded binary | HTMX |
 
 ---

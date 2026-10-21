@@ -13,19 +13,21 @@
 #include "custom_properties_store.hpp"
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
 #include "execution_tracker.hpp"
+#include "instruction_param_schema.hpp" // ParamValidatorCache (Deps::param_validators)
 #include "instruction_store.hpp"
 #include "policy_store.hpp"
 #include "product_pack_store.hpp"
 #include "response_store.hpp"
 #include "schedule_api.hpp" // ADR-0031 WS-A4 (seventh family): ScheduleApi — replaces a direct ScheduleEngine reach
 #include "tag_store.hpp"
-#include "workflow_api.hpp" // ADR-0031 WS-A4 (eighth family): WorkflowApi — replaces a direct WorkflowEngine reach for the read triad
+#include "workflow_api.hpp" // ADR-0031 WS-A4 (eighth family): WorkflowApi — replaces a direct WorkflowEngine reach for the v1 workflow reads
 #include "workflow_engine.hpp"
 
 #include <httplib.h>
 
 #include <cstddef>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -34,6 +36,12 @@
 namespace yuzu::server {
 
 class CommandCapabilityRegistry;
+
+/// Describe `yuzu_server_instruction_param_rejected_total{route,reason}` and pre-seed every
+/// (route, reason) series to 0 so the family exists before the first refusal. Called once at
+/// server start; idempotent. `route` is `instruction_execute` for
+/// `POST /api/instructions/{id}/execute`; `reason` is `shape`, `violation` or `schema_invalid`.
+void seed_instruction_param_rejected_metrics(yuzu::MetricsRegistry& metrics);
 
 /// Workflow, product-pack, execution fragment, and scope-estimate routes.
 /// Extracted from ServerImpl::start_web_server() for god-object decomposition.
@@ -44,6 +52,8 @@ public:
     using PermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation)>;
+    using ProbePermFn = std::function<bool(const httplib::Request&, const std::string& securable_type,
+                                           const std::string& operation)>;
     using AuditFn = std::function<void(const httplib::Request&, const std::string& action,
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
@@ -106,7 +116,8 @@ public:
 
     /// #1712 / #3290 Phase 2 — the injected-callback twin of
     /// `AuthRoutes::require_fleet_read`, backing the executions-drawer
-    /// detail route's real per-agent/service confinement (same shape as
+    /// detail route's and the executions LIST fragment's real
+    /// per-agent/service confinement (same shape as
     /// `McpServer::FleetReadFn`/`RestApiV1::FleetReadFn`/
     /// `DashboardRoutes::FleetReadFn` — server.cpp wires the SAME
     /// conversion lambda into all of them so they cannot drift). MUST be
@@ -138,12 +149,23 @@ public:
         yuzu::server::detail::StreamBudget* stream_budget{nullptr};
         AuthFn auth_fn;
         PermFn perm_fn;
+        /// Side-effect-free permission probe for RENDERING decisions only (never a gate):
+        /// `perm_fn` against a throwaway Response (the gate still writes one
+        /// `auth.permission_required` audit row per probe for a caller without the grant).
+        /// Routes keep gating with perm_fn / fleet_read_fn; the probe only decides whether to
+        /// render a control. Unwired = cannot decide: the control is not rendered.
+        ProbePermFn probe_perm_fn;
         /// #1712 / #3290 Phase 2 — see FleetReadFn's doc comment above.
-        /// Used ONLY by the executions-drawer detail route
-        /// (/fragments/executions/{id}/detail); every other route in this
-        /// file keeps using `perm_fn` above unchanged.
+        /// Consumed by the executions-drawer detail route
+        /// (/fragments/executions/{id}/detail), the executions LIST
+        /// fragment (/fragments/executions, #3526), /sse/executions/{id} and
+        /// GET /api/workflow-executions/{id}; the remaining routes in this
+        /// file keep using `perm_fn` above unchanged.
         FleetReadFn fleet_read_fn;
         AuditFn audit_fn;
+        /// `--csrf-trusted-origin` allowlist (#2537) for the same-site gate on the dashboard's
+        /// `POST /api/instructions/{id}/execute`. Empty = same-host only.
+        std::vector<std::string> csrf_trusted_origins;
         EmitEventFn emit_fn;
         ScopeEstimateFn scope_fn;
         /// Kept for the legacy unversioned GET/mutator routes above (`GET
@@ -153,20 +175,22 @@ public:
         /// install/uninstall fan-out (`make_item_delete_fn`) — none of these
         /// has a public REST v1/MCP twin of its own, so they are deliberately
         /// OUTSIDE the `WorkflowApi` seam below (mirrors the `schedule`
-        /// family's own legacy-mutator carve-out). The three READ routes that
+        /// family's own legacy-mutator carve-out). The READ routes that
         /// DO have a public twin (`GET /api/v1/workflows[/{id}]`,
-        /// `GET /api/v1/workflow-executions/{id}`) route through
+        /// `GET /api/v1/workflow-executions[/{id}]`) route through
         /// `workflow_api` instead, below.
         WorkflowEngine* workflow_engine{nullptr};
         ExecutionTracker* execution_tracker{nullptr};
         /// ADR-0031 WS-A4 (eighth family): the workflow-read seam — replaces
         /// a direct `WorkflowEngine*` reach for `GET /api/v1/workflows`,
-        /// `GET /api/v1/workflows/{id}` and `GET /api/v1/workflow-executions/
-        /// {id}` (the seamed read triad; the legacy unversioned GET routes
-        /// and every mutator above keep their own `WorkflowEngine*` wiring,
-        /// unaffected by this seam). Unwired (default-constructed null
-        /// `shared_ptr`) ⇒ each of the three v1 routes answers its own
-        /// pre-seam "workflow engine not available" 503 exactly, since
+        /// `GET /api/v1/workflows/{id}`, `GET /api/v1/workflow-executions` and
+        /// `GET /api/v1/workflow-executions/{id}` (the seamed reads; the legacy
+        /// unversioned GET routes and every mutator above keep their own
+        /// `WorkflowEngine*` wiring, unaffected by this seam). Unwired
+        /// (default-constructed null `shared_ptr`) ⇒ every seamed v1
+        /// route except the execution list answers its own pre-seam
+        /// "workflow engine not available" 503 exactly (the list route is new and answers a plain 503 "service
+        /// unavailable"), since
         /// `workflow_api` is constructed if-and-only-if `workflow_engine_`
         /// is (server.cpp) — see `workflow_api.hpp`'s own doc comment for
         /// the full carve-out list.
@@ -228,6 +252,12 @@ public:
         /// that leaves this nullptr is asserting an unwired-classifier
         /// configuration never reached in production.
         const yuzu::server::CommandCapabilityRegistry* capability_registry{nullptr};
+        /// The prepared `parameter_schema` validators for `POST /api/instructions/:id/execute`.
+        /// One cache owned by ServerImpl for all call sites that take it from Deps (today the
+        /// execute route), so its byte budget is global rather than per route-registration.
+        /// nullptr = register_routes creates a private cache (test harnesses that build Deps by
+        /// hand).
+        std::shared_ptr<instr::ParamValidatorCache> param_validators;
     };
 
     /// Production overload — wraps `httplib::Server&` in an HttplibRouteSink

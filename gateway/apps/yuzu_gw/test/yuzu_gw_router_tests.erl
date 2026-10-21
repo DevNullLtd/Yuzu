@@ -9,6 +9,9 @@
 -module(yuzu_gw_router_tests).
 -include_lib("eunit/include/eunit.hrl").
 
+-export([log/2]).  %% logger handler callback, see invalid_default_warns_once/0
+-define(LOG_HANDLER, yuzu_router_test_log).
+
 %%%===================================================================
 %%% Test fixture
 %%%===================================================================
@@ -24,7 +27,15 @@ router_test_() ->
       {"skipped agents send error immediately", fun fanout_skipped/0},
       {"all agents missing completes immediately", fun fanout_all_missing/0},
       {"timeout fires when agents don't respond", fun fanout_timeout/0},
-      {"completion fires when all respond", fun fanout_all_respond/0}
+      {"completion fires when all respond", fun fanout_all_respond/0},
+      {"a negative or zero timeout does not crash the router and uses the default",
+       fun non_positive_timeout_uses_default/0},
+      {"a huge timeout is clamped to 3600 seconds",
+       fun huge_timeout_is_clamped/0},
+      {"command_timeout_s: valid kept, out of range or not an integer replaced",
+       fun command_timeout_rules/0},
+      {"an invalid default_command_timeout_s warns once, naming the key, however many commands use it",
+       fun invalid_default_warns_once/0}
      ]}.
 
 setup() ->
@@ -128,6 +139,108 @@ fanout_timeout() ->
         ?assert(false, "Expected fanout_complete with timed_out")
     end,
     kill_fake(AgentPid).
+
+%% The timer a fanout holds, ms remaining, read from the router's state (the
+%% fanout record: tag, from, stream_ref, targets, received, skipped, timeout_ref).
+fanout_timer_ms(RouterPid, FanoutRef) ->
+    {state, Fanouts} = sys:get_state(RouterPid),
+    TRef = element(7, maps:get(FanoutRef, Fanouts)),
+    erlang:read_timer(TRef).
+
+with_default_timeout(Seconds, Fun) ->
+    Old = application:get_env(yuzu_gw, default_command_timeout_s),
+    application:set_env(yuzu_gw, default_command_timeout_s, Seconds),
+    try Fun()
+    after
+        case Old of
+            {ok, V}   -> application:set_env(yuzu_gw, default_command_timeout_s, V);
+            undefined -> application:unset_env(yuzu_gw, default_command_timeout_s)
+        end
+    end.
+
+%% erlang:send_after(-5000, ...) raised badarg inside the router. The router
+%% survives, answers, and arms its timer with the configured default.
+non_positive_timeout_uses_default() ->
+    RouterPid = whereis(yuzu_gw_router),
+    {AgentPid, AgentId} = register_fake_agent(<<"npt-1">>),
+    with_default_timeout(9, fun() ->
+        [begin
+             Cmd = #{command_id => <<"cmd-npt">>, plugin => <<"svc">>,
+                     parameters => #{<<"pw">> => <<"secret">>}},
+             {ok, Ref} = yuzu_gw_router:send_command([AgentId], Cmd,
+                                                     #{timeout_seconds => T}),
+             ?assertEqual(RouterPid, whereis(yuzu_gw_router)),
+             Ms = fanout_timer_ms(RouterPid, Ref),
+             ?assert(Ms > 8000 andalso Ms =< 9000)
+         end || T <- [-5, 0, -2147483648]]
+    end),
+    ?assert(is_process_alive(RouterPid)),
+    kill_fake(AgentPid).
+
+huge_timeout_is_clamped() ->
+    RouterPid = whereis(yuzu_gw_router),
+    {AgentPid, AgentId} = register_fake_agent(<<"hug-1">>),
+    {ok, Ref} = yuzu_gw_router:send_command([AgentId], #{command_id => <<"c">>},
+                                            #{timeout_seconds => 2147483647}),
+    Ms = fanout_timer_ms(RouterPid, Ref),
+    ?assert(Ms > 3599000 andalso Ms =< 3600000),
+    kill_fake(AgentPid).
+
+command_timeout_rules() ->
+    with_default_timeout(7, fun() ->
+        T = fun(O) -> yuzu_gw_router:command_timeout_s(O) end,
+        ?assertEqual(1, T(#{timeout_seconds => 1})),
+        ?assertEqual(300, T(#{timeout_seconds => 300})),
+        ?assertEqual(3600, T(#{timeout_seconds => 3600})),
+        ?assertEqual(3600, T(#{timeout_seconds => 3601})),
+        ?assertEqual(7, T(#{})),
+        ?assertEqual(7, T(#{timeout_seconds => 0})),
+        ?assertEqual(7, T(#{timeout_seconds => -1})),
+        ?assertEqual(7, T(#{timeout_seconds => <<"5">>})),
+        ?assertEqual(7, T(#{timeout_seconds => 1.5})),
+        ?assertEqual(7, T(not_a_map))
+    end),
+    %% An invalid or absent configured default is 300.
+    with_default_timeout(0, fun() -> ?assertEqual(300, yuzu_gw_router:command_timeout_s(#{})) end),
+    with_default_timeout(99999, fun() -> ?assertEqual(300, yuzu_gw_router:command_timeout_s(#{})) end),
+    application:unset_env(yuzu_gw, default_command_timeout_s),
+    ?assertEqual(300, yuzu_gw_router:command_timeout_s(#{})),
+    application:set_env(yuzu_gw, default_command_timeout_s, 5).
+
+%% The default is read on every command that sends no timeout: an invalid one
+%% must not log once per command. One WARN names the key and the commands still
+%% run with the default.
+invalid_default_warns_once() ->
+    RouterPid = whereis(yuzu_gw_router),
+    {AgentPid, AgentId} = register_fake_agent(<<"idw-1">>),
+    Table = ets:new(router_test_log, [public, ordered_set]),
+    catch logger:remove_handler(?LOG_HANDLER),
+    ok = logger:add_handler(?LOG_HANDLER, ?MODULE, #{config => #{table => Table}, level => all}),
+    try
+        with_default_timeout(0, fun() ->
+            [begin
+                 {ok, Ref} = yuzu_gw_router:send_command([AgentId], #{command_id => <<"c">>}, #{}),
+                 Ms = fanout_timer_ms(RouterPid, Ref),
+                 ?assert(Ms > 299000 andalso Ms =< 300000)
+             end || _ <- lists:seq(1, 5)]
+        end),
+        Lines = [T || {_, T} <- ets:tab2list(Table),
+                      binary:match(T, <<"default_command_timeout_s">>) =/= nomatch],
+        ?assertEqual(1, length(Lines))
+    after
+        logger:remove_handler(?LOG_HANDLER),
+        ets:delete(Table),
+        kill_fake(AgentPid)
+    end.
+
+%% logger handler callback: WARN and above, as text.
+log(#{level := Level} = Event, #{config := #{table := Table}}) when Level =:= warning;
+                                                                    Level =:= error ->
+    Text = unicode:characters_to_binary(logger_formatter:format(Event, #{})),
+    catch ets:insert(Table, {erlang:unique_integer([monotonic]), Text}),
+    ok;
+log(_Event, _Config) ->
+    ok.
 
 fanout_all_respond() ->
     Agents = [register_fake_agent(iolist_to_binary(io_lib:format("far-~b", [I])))

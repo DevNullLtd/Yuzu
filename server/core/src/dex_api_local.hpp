@@ -17,11 +17,13 @@
 #include <memory>
 
 #include "dex_api.hpp"
+#include "dex_score_policy_provider.hpp" // DexScorePolicyProvider::ReadFn - pure, no store type
 #include "dex_types.hpp" // DexFleet — a pure POD (the FleetFn return), not a store type
 
 namespace yuzu::server {
 
 class GuaranteedStateStore;
+class RuntimeConfigStore;
 
 /// Supplies the cross-store `DexFleet` denominator (agent registry + health
 /// snapshot), assembled in server.cpp — the SAME `dex_fleet_fn` closure
@@ -42,15 +44,30 @@ using FleetFn = std::function<DexFleet()>;
 ///
 /// `fleet_fn` may be empty — the impl then uses `DexFleet{}` (the honest
 /// "no data" denominator), exactly as the handlers' `fleet_fn_ ? fleet_fn_()
-/// : DexFleet{}` guard does today.
+/// : DexFleet{}` guard does today; `apps()` treats an empty `fleet_fn` as an
+/// unknown population (nullopt).
 ///
 /// LIFETIME CONTRACT (load-bearing, mirrors verify_api_local.hpp): `store` is
 /// borrowed, NOT owned — it MUST outlive every call to the returned API.
 /// `ServerImpl` guarantees this by joining the web thread (`web_server_->
 /// stop()`) before destroying `guaranteed_state_store_`, so no handler can
-/// reach the API after it dies. `fleet_fn`'s captures are subject to the same
-/// ordering.
+/// reach the API after it dies. `fleet_fn`'s and `policy_fn`'s captures are
+/// subject to the same ordering.
+///
+/// `policy_fn` may be empty - the impl then scores under the shipped defaults
+/// (`dex_default_score_policy()`, source "default"). A `policy_fn` that returns
+/// an error makes `apps()` degrade with `degraded_reason`
+/// "score_policy_unavailable"; see `DexScorePolicyFn` for the contract.
 [[nodiscard]] std::shared_ptr<DexApi> make_local_dex_api(GuaranteedStateStore* store,
-                                                         FleetFn fleet_fn);
+                                                         FleetFn fleet_fn,
+                                                         DexScorePolicyFn policy_fn = {});
+
+/// The production `DexScorePolicyProvider::ReadFn`: reads the stored score policy
+/// document (`kDexScorePolicyKey`) from the runtime config store. A stored value is
+/// the document text, nothing stored is `nullopt`, and a failed read is an error.
+/// Named here, not inline in server.cpp, so a test can run the production mapping.
+/// `store` is borrowed by reference and MUST outlive the returned function.
+[[nodiscard]] DexScorePolicyProvider::ReadFn
+dex_score_policy_store_reader(RuntimeConfigStore& store);
 
 } // namespace yuzu::server

@@ -44,7 +44,7 @@ A definition can exist standalone (without a set or pack). Sets group definition
 
 - **Substrate, not scripts.** Definitions target stable plugin primitives. OS-specific syscalls stay inside the plugin layer. Content authors never write shell commands.
 - **Everything is an InstructionDefinition.** Ad-hoc commands, scheduled tasks, policy checks, and remediation actions all use the same definition-to-execution-to-response pipeline.
-- **Typed end-to-end.** Parameter schemas validate input before dispatch. Result schemas type output for downstream consumption (ClickHouse, Splunk, CSV export).
+- **Typed end-to-end.** Parameter schemas validate input before dispatch on `POST /api/instructions/{id}/execute` (no other dispatch surface validates yet). Result schemas type output for downstream consumption (ClickHouse, Splunk, CSV export).
 - **Governed execution.** Every state-changing action can require approval. Every execution is audited. Every response is persisted.
 
 ### Two Definition Types
@@ -79,15 +79,19 @@ spec:
 
 ### Saving YAML via API
 
+Cookie-session writes to the instruction routes must carry an Origin (or Referer) naming the server; token-authenticated requests do not.
+
 ```bash
 # Save a definition from a YAML file (form-encoded; the yaml_source field
 # carries the document verbatim)
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions/yaml \
   --data-urlencode "yaml_source@definitions/process-list.yaml"
 
 # Validate YAML without saving
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions/validate-yaml \
   --data-urlencode "yaml_source@definitions/process-list.yaml"
 ```
@@ -100,6 +104,54 @@ The Instruction Management page provides two authoring modes:
 - **Code mode** -- a CodeMirror editor with YAML syntax highlighting, live validation, and auto-complete for known plugin/action pairs.
 
 Both modes are served as HTMX fragments.
+
+**Saving keeps what the YAML does not carry.** The editor's Save writes only the
+fields the YAML expresses (name, plugin, action, description, and the optional
+`type`, `version`, `concurrency` and `approval`). Everything else stored on the
+definition -- its instruction set, enabled flag, TTLs, result schema,
+visualization, response templates, platforms, minimum agent version, required
+plugins and readable payload -- is kept. When the YAML omits `type`, `version`,
+`concurrency` or `approval`, the stored value is kept as well; a value that
+differs from the stored one is an intentional edit and is written, and a change
+of `approval` is recorded in the audit detail as `approval_mode: <old> -> <new>`.
+
+**Library list.** The Definitions tab lists up to 100 definitions by default.
+`GET /fragments/instructions` takes `name`, `plugin`, `type` and `limit` (maximum
+500); a cut list says "Showing the first N. Narrow the filter." The "Needs
+approval" column and the instruction sets panel appear for callers who hold
+`InstructionDefinition:Read` and `InstructionSet:Read` respectively.
+
+**Page controls follow permissions.** New, Edit, Import, Delete and the set
+controls appear for callers who hold `InstructionDefinition:Write`,
+`InstructionDefinition:Delete`, `InstructionSet:Write` and `InstructionSet:Delete`
+respectively, not for a role. Each capability is probed once per page render, and
+a denied probe is audited as a denial, so loading the page as a caller who lacks
+a capability writes one denial row for it.
+
+**Sets.** The sets panel lists each set with the number of definitions in it.
+New set asks for a name and description. Delete set states that its definitions
+stay and become unassigned. Each library row has a set select that assigns the
+definition to a set or clears it.
+
+**Response templates.** Templates on a library row opens a panel directly under the
+library filters, scrolled into view, with that definition's templates: the built-in
+default (never editable) first, then the authored ones. Close empties the panel.
+New, Edit and Delete open dialogs that call
+`/api/v1/definitions/{id}/response-templates`. Filters are written one per line as
+`column | op | value`.
+
+**Import and export.** Import definition takes the JSON document that Export
+produces (Ed25519-signed or not); unsigned documents can be refused by policy and
+a duplicate id is refused. When the audit record could not be written the page
+says so. Export saves the definition as `<id>.json`.
+
+**Dispatch.** Selecting a definition on the Executions tab reads its parameters
+from `GET /api/v1/instructions/{id}`; `grant_secret` and `grant_id` are write-only
+password inputs. The Target select offers a scope expression with Validate
+(syntax only) and Preview (needs `Infrastructure:Read`). Dispatch always
+confirms, naming the instruction, `plugin:action`, type and target; a definition
+whose approval mode is not `auto` says it will be submitted for approval and not
+run, and an expression that was not previewed needs `DISPATCH` typed to send.
 
 ---
 
@@ -304,6 +356,7 @@ metadata:
 ```bash
 # Create an instruction set
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instruction-sets \
   -H "Content-Type: application/json" \
   -d '{
@@ -313,6 +366,7 @@ curl -s -b cookies.txt \
 
 # Delete a set (cascades to contained definitions)
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X DELETE http://localhost:8080/api/instruction-sets/abc123
 ```
 
@@ -333,14 +387,14 @@ Parameters use a JSON Schema subset. The root object describes the input shape; 
 | `datetime` | ISO 8601 timestamp | String | `"2026-03-17T18:20:00Z"` |
 | `guid` | UUID / GUID | String | `"550e8400-e29b-41d4-a716-446655440000"` |
 
-Parameters are transmitted as `map<string, string>` in the `CommandRequest` protobuf message. The server validates values against declared types and constraints before dispatch.
+Parameters are transmitted as `map<string, string>` in the `CommandRequest` protobuf message. `POST /api/instructions/{id}/execute` validates the request's `params` against the declared types and constraints before dispatch (see [Parameter validation](#parameter-validation)); no other dispatch surface does yet.
 
 ### Validation Constraints
 
 | Constraint | Applicable Types | Description |
 |---|---|---|
-| `maxLength` | `string` | Maximum character count. |
-| `minLength` | `string` | Minimum character count. |
+| `maxLength` | `string` | Maximum length in bytes (UTF-8). |
+| `minLength` | `string` | Minimum length in bytes (UTF-8). |
 | `pattern` | `string` | Regex the value must match. |
 | `enum` | `string` | List of allowed values. |
 | `minimum` | `int32`, `int64` | Minimum value (inclusive). |
@@ -379,6 +433,90 @@ parameters:
       type: boolean
       default: false
 ```
+
+### Parameter validation
+
+`POST /api/instructions/{id}/execute` validates the request's `params` against the definition's stored
+`parameter_schema` before the approval gate, strictly (details and error bodies: [REST API](rest-api.md)).
+A refused call creates no approval ticket, execution row or dispatch. Enforced as declared:
+
+- a name the schema does not declare is refused (path `/*`); a required name without a `default` must
+  be sent; a `default` satisfies `required` but is **not** injected, so the plugin still receives only
+  what you sent;
+- `type`, `enum` (case-sensitive), `pattern` (anchor it: it is a search, not a full match), `minimum`/`maximum`
+  (`int32` also gets the 32-bit range) and `minLength`/`maxLength`;
+- an integer is a JSON integer or a string of digits with an optional leading `-` (`"+5"`, `" 5"`,
+  `"5.0"` and JSON `5.0` are refused); a boolean is `true`/`false` or the strings `"true"`/`"false"`;
+- `null` is never read as an omission: a parameter refuses it (omit the key instead);
+- a string containing a NUL character is refused.
+
+A definition that stores no schema (empty, whitespace or `{}`, which is what the YAML editor stores for a
+definition created there) is not validated. The YAML editor, `PUT /api/instructions/{id}` and
+response-template changes **keep** the stored schema: editing `spec.parameters` in the YAML editor does not
+change what execute enforces.
+
+Limits on a stored schema (a schema over a limit is refused when it is written, and a stored one that is
+over a limit makes execute answer `500`):
+
+| Limit | Value |
+|---|---|
+| schema text | 262144 bytes |
+| properties per schema | 128 |
+| members per `enum` | 256 |
+| `pattern` length | 1024 bytes |
+| compiled pattern size | 32768 RE2 instructions each, 65536 per schema, and RE2's 512 KiB memory budget per pattern |
+| integer `minimum`/`maximum` | magnitude below 2^53 |
+| string matched against a `pattern` | 64 KiB |
+| matching work per request (or per schema, for `default`s) | (bytes + 1) x pattern size, plus one unit per `enum` member compared, up to 16777216 |
+
+`enabled: false` hides a definition from the discovery catalog and stops its schedules (the schedule
+poller records `definition_disabled`), but it does **not** stop `POST /api/instructions/{id}/execute`:
+that route does not read `enabled`.
+
+### Replacing a stored parameter schema
+
+No route replaces a stored schema in place: `PUT /api/instructions/{id}`, the YAML editor and
+response-template changes keep it, and `POST /api/instructions/import` answers `409` for an id that
+already exists. To replace one (a wrong or legacy schema, a `500` from execute, or a corrected bundled
+definition on an existing install), export the definition, delete it and import it again with a
+corrected `parameter_schema`:
+
+1. `GET /api/instructions/{id}/export` (`InstructionDefinition:Read`) and keep the document. It carries
+   the fields import reads, including `yaml_source`, `instruction_set_id` and
+   `response_templates_spec`, which the delete removes (the delete and re-import also reset `created_at`,
+   which import never reads). It carries **no** `signature` or `publicKey`.
+2. Edit its `parameter_schema` (a string holding the schema JSON). Unless the server runs with
+   `--allow-unsigned-definitions`, the edited document must also be signed before import, or the import
+   answers `400` as unsigned: add a hex `signature` and `publicKey` (an Ed25519 signature over the exact
+   bytes of `yaml_source`, 128 and 64 hex characters). The signature covers `yaml_source` only, so `plugin`, `action`, `type`, `approval_mode` and `concurrency_mode` are read from it and must agree with the envelope. A definition whose `yaml_source` is empty cannot be
+   signed (import answers an error about a signature without `yaml_source`), so only the unsigned flag
+   works for it.
+3. Rehearse the import, because step 5 cannot be rehearsed (an existing id answers `409`) and a refused
+   import leaves the definition deleted: `POST /api/instructions/import` the corrected, signed document
+   once with a different `id` (import reads `id` from the document and accepts any id that is free), confirm
+   it is accepted, then `DELETE` that temporary id. The signature covers only the `yaml_source` bytes, so it
+   stays valid. The temporary definition is live until it is deleted.
+4. `DELETE /api/instructions/{id}` (`InstructionDefinition:Delete`, audit action `instruction.delete`).
+5. `POST /api/instructions/import` with the edited document (`InstructionDefinition:Write`, audit action
+   `instruction.import`). The schema is checked as it is written, so a bad one is refused with a `400`.
+
+The signature covers only the `yaml_source` bytes (not the schema, plugin, action, `approval_mode` or
+`created_by`), and the verifier takes `publicKey` from the request, so it is an integrity check and not
+publisher authentication. See [REST API](rest-api.md).
+
+- A bundled definition is tombstoned by the delete, so the bundled reseed does not bring the old one back.
+  Any public import skips the tombstone, whether signed or unsigned under `--allow-unsigned-definitions`
+  (both run as a non-seed insert), so the replacement lands and later boots leave it alone. The tombstone is
+  permanent: a replaced bundled definition never receives later bundled corrections from the reseed.
+- The delete removes only the definition row. A schedule that references the id has its occurrences skipped
+  and audited as `definition_unknown` until the id exists again. A policy does not name the instruction; its
+  fragment does (`check_instruction`, `fix_instruction` and `post_check_instruction`, which falls back to
+  `check_instruction`). Check, fix and verify dispatches that name a missing id log `unknown check/fix instruction`
+  and send nothing, a remediation then reports `fix dispatch failed (unknown instruction or no agents)`, `POST /api/workflows/{id}/execute` for
+  a workflow with a step that names it answers `400` (`references unknown instruction`), and a pending
+  approval keeps its `definition_id` (no foreign key was found). Check policy fragments, stored workflows and
+  pending approvals for the id before deleting. Other references were not checked.
+- Between steps 4 and 5 the definition does not exist, and a refused import leaves it deleted. Have the corrected (and, unless the unsigned flag is set, signed) document ready and rehearsed before step 4, and do both in one maintenance window.
 
 ---
 
@@ -460,11 +598,97 @@ When a user (or MCP tool) executes an instruction that requires approval:
 
 1. **HTTP 202 response.** The server returns `{"status": "pending_approval", "approval_id": "...", "definition_id": "..."}` instead of dispatching immediately. The execution is queued, not dropped.
 2. **Dashboard toast notification.** A toast appears in the web dashboard confirming the request was submitted for approval. The toast includes the approval ID for reference.
-3. **Approvals tab.** The pending request is visible in the **Approvals** tab of the dashboard. The executor can check its status there at any time. Once an approver approves or rejects the request, the status updates in the tab and the execution either proceeds or is discarded.
+3. **Approvals tab or page.** The pending request is visible in the **Approvals** tab of the dashboard and on the Approvals page (`/approvals`). The executor can check its status there at any time. Once an approver approves or rejects the request, the status updates in the tab and the execution either proceeds or is discarded. On the Approvals page, **Approve** and **Reject** open a dialog with an optional reviewer comment (capped at 4000 bytes); the sidebar pending-approvals badge refreshes after each decision.
 
 The submitter cannot approve their own request. A different user with the appropriate role must review it.
 
+### Who can approve
+
+Approving or rejecting a request is an act of human review, so the server asks for more than the
+`Approval:Approve` permission. The same rules apply to the dashboard Approvals page, which posts to
+the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approvals/{id}/reject`:
+
+- **An interactive browser session.** The reviewer must be signed in through the sign-in page with a
+  local account or OIDC single sign-on, and the request must carry that session cookie. An API token or an MCP
+  token is refused with `403` and an A4 error envelope, however much it is permitted to do
+  elsewhere.
+- **A fresh MFA step-up.** Approve and reject are step-up endpoints, like token creation and role
+  changes. If the session's MFA proof is older than `--mfa-step-up-window-secs` (default 300), the
+  request returns `401` with `meta.mfa_step_up_required: true`; the dashboard prompts for the code
+  inline, and a script posts the code to `/login/mfa/stepup` and retries (see
+  [Step-up on high-risk surfaces](authentication.md#step-up-on-high-risk-surfaces-pr-2)). **Read
+  "fresh MFA step-up" with its limit.** As on every step-up endpoint, the gate cannot demand a factor
+  an account does not have, so it passes without a second factor for: a local account with no
+  enrolled MFA factor (the gate itself passes it in every `--mfa-enforcement` mode; `required`, and
+  `admin-only` for admins, make login force enrolment first, so in practice this is any account under
+  `optional` and a non-admin under `admin-only`); an SSO account whose identity provider did not
+  assert MFA (`amr`), **unless `--mfa-enforcement=required`** (under `admin-only` it still passes for
+  a non-admin role); and any session when `--mfa-step-up-window-secs=0`. To make a fresh factor
+  mandatory for every approver, run with `--mfa-enforcement=required`, and know its prerequisite and
+  cost first: your identity provider must assert an MFA-method `amr` for approvers, and an SSO session
+  without one gets `401` and loops through re-sign-in at EVERY step-up endpoint (token creation, user and
+  role management, Guardian writes, software deploy, JIT elevation), not only approval, so check `amr`
+  before you enable it; the way back is restarting the server in `optional` temporarily (it weakens MFA fleet-wide, so restore your intended enforcement afterwards), not just any non-`required` mode, because an
+  `amr`-less OIDC admin is still gated under `admin-only` (see
+  [MFA on SSO sessions](authentication.md#mfa-on-sso-sessions-pr-3) and the
+  [recovery runbook](../ops-runbooks/auth-db-recovery.md#locked-out-by-mfa-enforcement-misconfiguration)). Every local user must also enrol at
+  login. SAML users are refused at step-up gates in every mode, so `required` does not change that. A requirement that the approver
+  specifically holds an enrolled factor, whatever the enforcement mode, is tracked in #6079.
+- **A human principal.** An engine principal is never admitted.
+- **Not the submitter.** Unchanged: the reviewer cannot be the person who submitted the request
+  (HTTP 400, audited as denied).
+- **Not a SAML session.** MFA step-up is not available for SAML sessions (#4935), so a user who
+  signed in through SAML is refused with `403` while step-up is on. Approvers who use SAML cannot
+  approve until they sign in with a local account or OIDC, or step-up is disabled (next point).
+  **A deployment where every approver signs in through SAML has no working approver path** until
+  they are given an OIDC provider or a local account, or you accept losing step-up fleet-wide with
+  `--mfa-step-up-window-secs=0`. Under `--auth-mode=sso-only` the only local sign-in left is the
+  break-glass account, which is not a substitute. This is a known limitation, tracked in #6098 (the
+  SAML step-up decision is #4935).
+- **If you disable step-up, assurance drops.** `--mfa-step-up-window-secs=0` turns the step-up gate
+  off for approve and reject along with every other step-up endpoint. Approval then requires only an
+  interactive session with the permission. Do not run that way if approvals are a control you rely
+  on; if you must, have a person review every `approval.approve` audit row with `result=success`
+  and check every `attempted` row that has no outcome row, comparing counts per `target_id` (each
+  decision writes a `result=attempted` row first, and a decision whose outcome row failed to write
+  leaves only that `attempted` row; see [Audit Log](audit-log.md)).
+
+**MCP clients cannot approve.** MCP callers authenticate with a bearer token and the MCP transport runs no MFA step-up, so the MCP tools
+`approve_request` and `reject_request` always return a typed refusal, whatever credential the caller used
+(a browser cookie session that reaches `/mcp/v1/` is refused too). This is an exception
+recorded in ADR-1005's exception ledger (entry 2026-10-18): human review is a human-session act. The tools stay registered, and listing
+pending approvals through MCP (`list_pending_approvals`, `get_pending_approval_count`) is
+unchanged. A supervised-tier agentic worker still gets its ticket from the first call and still
+recalls the tool with the `approval_id`; a person approves the ticket in the dashboard or over REST
+with a signed-in session.
+
+**Failure behaviour.**
+
+- If the server cannot resolve the caller's session while recording the decision, the request fails
+  closed with `503` and the request stays pending. It is no longer recorded with the reviewer
+  `unknown`.
+- The approval attempt is written to the audit log before the decision is applied. If that audit row
+  cannot be written, the request returns `503` and nothing changes (#5823).
+- An approved request that has not been used within 7 days of its review is refused when it is
+  consumed, even if no new request has been submitted since to sweep expired tickets. The check
+  uses database time. The submitter must request approval again. The status shown in the Approvals
+  tab and page, and returned by the list routes, is only rewritten to `expired` by the next approval
+  submission, so an aged approved request keeps showing `approved` until then although it can no
+  longer be used (tracked in #6098).
+
+**If the dialog says you do not have permission.** The Approvals dialog shows that one message for
+every `403`. The causes, in the order the server checks them: you lack `Approval:Approve`; the
+request carried no same-site `Origin` or `Referer` (for example a reverse proxy rewrites `Host` and the
+public address is not listed in `--csrf-trusted-origin`); or you signed in through SAML while step-up
+is on. The Approve and Reject buttons are a render hint only: a SAML session is shown them and the
+route still refuses it. The Approvals tab on Instructions has no dialog: it shows the server's message
+in a toast on a `403`, "Your session expired; sign in again." on a plain `401`, and the same code prompt
+as the Approvals page on a step-up `401`, then repeats the decision once after a correct code.
+
 ### Approval API
+
+Approve and reject need a signed-in session cookie (see [Who can approve](#who-can-approve)); a bearer
+token is refused. The examples assume a session that has completed MFA step-up. A cookie-session `POST` must carry an `Origin` (or `Referer`) naming the server, as a browser sends; a request with neither, or naming another site, is refused with `403` (`--csrf-trusted-origin` entries are accepted). The error table is in the [REST API reference](rest-api.md).
 
 ```bash
 # Check pending approval count
@@ -473,13 +697,17 @@ curl -s -b cookies.txt \
 
 # Approve an execution request
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/approvals/REQ-001/approve \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"comment": "Reviewed — safe to proceed."}'
 
 # Reject an execution request
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/approvals/REQ-001/reject \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"comment": "Not approved for production during change freeze."}'
 ```
@@ -571,7 +799,7 @@ The ScheduleEngine supports recurring instruction executions with four frequency
 | `daily` | `time_of_day` | Runs once per day at the specified time. |
 | `weekly` | `time_of_day`, `day_of_week` | Runs once per week. `day_of_week`: 0=Sunday through 6=Saturday. |
 | `monthly` | `time_of_day`, `day_of_month` | Runs once per month. `day_of_month`: 1-28 (no 29/30/31 to avoid month-length issues). |
-| `interval` | `interval_minutes` | Runs every N minutes. Minimum: 1 minute. |
+| `interval` | `interval_minutes` | Runs every N minutes. Minimum: 1 minute; maximum: 35791394. |
 
 ### Execution semantics
 
@@ -610,7 +838,7 @@ and `yuzu_schedule_tick_errors_total` counters.
 | `name` | string | Human-readable schedule name. |
 | `definition_id` | string | The instruction definition to execute. |
 | `frequency_type` | string | `daily`, `weekly`, `monthly`, or `interval`. |
-| `interval_minutes` | int | Minutes between executions (for `interval` type). |
+| `interval_minutes` | int | Minutes between executions (for `interval` type), 1-35791394. |
 | `time_of_day` | string | HH:MM format (for `daily`, `weekly`, `monthly`). |
 | `day_of_week` | int | 0-6 (for `weekly`). |
 | `day_of_month` | int | 1-28 (for `monthly`). |
@@ -623,6 +851,7 @@ and `yuzu_schedule_tick_errors_total` counters.
 ```bash
 # Create a schedule — daily service check at 06:00
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/schedules \
   -H "Content-Type: application/json" \
   -d '{
@@ -637,6 +866,7 @@ curl -s -b cookies.txt \
 
 # Create a schedule — every 30 minutes
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/schedules \
   -H "Content-Type: application/json" \
   -d '{
@@ -650,12 +880,14 @@ curl -s -b cookies.txt \
 
 # Enable or disable a schedule
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/schedules/SCHED-001/enable \
   -H "Content-Type: application/json" \
   -d '{"enabled": false}'
 
 # Delete a schedule
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X DELETE http://localhost:8080/api/schedules/SCHED-001
 ```
 
@@ -713,12 +945,14 @@ Rerun creates a new execution linked to the original via `rerun_of`. Two modes:
 ```bash
 # Rerun all agents
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/executions/EXEC-001/rerun \
   -H "Content-Type: application/json" \
   -d '{"scope": "all"}'
 
 # Rerun only failed agents
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/executions/EXEC-001/rerun \
   -H "Content-Type: application/json" \
   -d '{"scope": "failed_only"}'
@@ -732,6 +966,7 @@ Cancellation records the requesting user for audit:
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/executions/EXEC-001/cancel
 ```
 
@@ -890,6 +1125,7 @@ POST /api/instructions
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions \
   -H "Content-Type: application/json" \
   -d '{
@@ -916,6 +1152,7 @@ PUT /api/instructions/{id}
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X PUT http://localhost:8080/api/instructions/crossplatform.service.inspect \
   -H "Content-Type: application/json" \
   -d '{
@@ -933,6 +1170,7 @@ DELETE /api/instructions/{id}
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X DELETE http://localhost:8080/api/instructions/crossplatform.service.inspect
 ```
 
@@ -946,6 +1184,7 @@ Accepts `Content-Type: application/x-yaml`. Parses the YAML, extracts metadata a
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions/yaml \
   -H "Content-Type: application/x-yaml" \
   --data-binary @my-definition.yaml
@@ -961,6 +1200,7 @@ Returns validation errors without saving.
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions/validate-yaml \
   -H "Content-Type: application/x-yaml" \
   --data-binary @my-definition.yaml
@@ -974,6 +1214,7 @@ POST /api/instructions/import
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions/import \
   -H "Content-Type: application/json" \
   -d @exported-definition.json
@@ -1011,6 +1252,7 @@ Dispatches the instruction definition to agents. Requires `Execution:Execute` pe
 - `agent_ids` — optional array of specific agent IDs to target.
 - `scope` — optional scope expression (e.g., `group:servers`, `os:windows AND tag:prod`), or `__all__` for every enrolled agent. **Omit both `scope` and `agent_ids`** to broadcast. A *supplied* empty string, a non-string `scope`, an empty `agent_ids`, a non-array `agent_ids`, or a non-string entry is refused with `400` rather than widened to the whole fleet (#2500) — a target the caller named that resolves to nothing is an error, not a request for everything.
 - `params` — key-value parameters to pass to the plugin action. Keys should match the definition's `parameter_schema`.
+  This route checks them against it (see [Parameter validation](#parameter-validation)).
 
 **Response (200):**
 
@@ -1030,6 +1272,7 @@ Dispatches the instruction definition to agents. Requires `Execution:Execute` pe
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions/filesystem.exists/execute \
   -H "Content-Type: application/json" \
   -d '{"params":{"path":"C:\\Windows"}}'
@@ -1069,6 +1312,7 @@ POST /api/instruction-sets
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instruction-sets \
   -H "Content-Type: application/json" \
   -d '{
@@ -1087,6 +1331,7 @@ Cascade-deletes all definitions in the set.
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X DELETE http://localhost:8080/api/instruction-sets/SET-001
 ```
 
@@ -1131,7 +1376,7 @@ DELETE /api/schedules/{id}
 ```
 
 ```bash
-curl -s -b cookies.txt -X DELETE http://localhost:8080/api/schedules/SCHED-001
+curl -s -b cookies.txt -X DELETE http://localhost:8080/api/schedules/SCHED-001 -H "Origin: http://localhost:8080"
 ```
 
 #### Enable/disable a schedule
@@ -1142,6 +1387,7 @@ POST /api/schedules/{id}/enable
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/schedules/SCHED-001/enable \
   -H "Content-Type: application/json" \
   -d '{"enabled": true}'
@@ -1181,13 +1427,21 @@ curl -s -b cookies.txt http://localhost:8080/api/approvals/pending/count
 POST /api/approvals/{id}/approve
 ```
 
+Approve and reject need a signed-in session cookie, a fresh MFA step-up (which an account with no
+enrolled factor passes, #6079) and a same-site `Origin`/`Referer`; an API or MCP token is refused
+with `403`. See
+[Who can approve](#who-can-approve) and the error table in the [REST API reference](rest-api.md).
+
 The reviewer must be a different operator than the submitter — self-approval
 is rejected with HTTP 400 (`"reviewer cannot be the same as the submitter"`),
-and the denied attempt is recorded in the audit log.
+and the denied attempt is recorded in the audit log. The `comment` is capped at
+4,000 bytes (HTTP 400 beyond that).
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/approvals/REQ-001/approve \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"comment": "Approved."}'
 ```
@@ -1200,7 +1454,9 @@ POST /api/approvals/{id}/reject
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/approvals/REQ-001/reject \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"comment": "Denied — change freeze in effect."}'
 ```
@@ -1280,6 +1536,7 @@ POST /api/executions/{id}/rerun
 ```bash
 # Rerun failed agents only
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/executions/EXEC-001/rerun \
   -H "Content-Type: application/json" \
   -d '{"scope": "failed_only"}'
@@ -1293,8 +1550,11 @@ POST /api/executions/{id}/cancel
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/executions/EXEC-001/cancel
 ```
+
+Cancelling an execution that already finished (`succeeded`, `completed` or `cancelled`) answers `409` and changes nothing; the Executions page offers Cancel only for executions that are still running. Per-device results and the live view are on the page's detail pane.
 
 ---
 
@@ -1307,9 +1567,21 @@ The Instruction Management page is accessible from the main dashboard. It uses H
 | Tab | Description |
 |---|---|
 | **Definitions** | Browse, search, create, edit, and delete instruction definitions. Supports both form mode and CodeMirror YAML editor. |
-| **Executions** | Execute instructions and view results. The top section provides an execution form: select a definition from the dropdown (grouped by plugin), fill in parameters (auto-populated from the definition's schema), choose a scope (all agents, a group, or an individual agent), and click Execute. Below the form, the execution history table shows each run with a 4-segment status sparkbar (succeeded / failed / running / pending — length encodes count, hue encodes status), the resolved definition name, the wall-clock dispatch time in the operator's local timezone (`HH:MM:SS.mmm <TZ>`, e.g. `12:22:33.251 BST`; full ISO-8601 UTC on hover), and — on failed rows — an 80-character preview of the most recent agent error. The "Fan-out" cell shows succeeded / failed / targeted counts that update in real time as agents respond. Click any row to expand an inline drawer that **live-updates via SSE as responses arrive** — no page reload required. The drawer shows a KPI strip (Total / Succeeded / Failed / p50 / p95 duration), a small-multiples agent grid colored by status (decile-bucketed when the execution targets more than 1024 agents), a per-agent table sorted failed-first with inline duration bars, and a responses table with a **Time** column showing the server-side response arrival time at millisecond precision (same wall-clock format as above). The drawer is keyboard-reachable via Tab and Enter/Space. Pass `?definition_id=<id>` in the page URL to pre-filter the list to one definition. |
+| **Executions** | Execute instructions and view results. The top section provides an execution form: select a definition from the dropdown (grouped by plugin), fill in parameters (auto-populated from the definition's schema), choose a scope (all agents, a group, or an individual agent), and click Execute. Below the form, the execution history table shows each run with a 4-segment status sparkbar (succeeded / failed / running / pending — length encodes count, hue encodes status), the resolved definition name, the wall-clock dispatch time in the operator's local timezone (`HH:MM:SS.mmm <TZ>`, e.g. `12:22:33.251 BST`; full ISO-8601 UTC on hover), and — on failed rows — an 80-character preview of the most recent agent error. The "Fan-out" cell shows succeeded / failed / targeted counts that update in real time as agents respond. Click any row to expand an inline drawer that **live-updates via SSE as responses arrive** — no page reload required. The drawer shows a KPI strip (Total / Succeeded / Failed / p50 / p95 duration), a small-multiples agent grid colored by status (decile-bucketed when the execution targets more than 1024 agents), a per-agent table sorted failed-first with inline duration bars, and a responses table with a **Time** column showing the server-side response arrival time at millisecond precision (same wall-clock format as above). The drawer is keyboard-reachable via Tab and Enter/Space. The Executions page (`/executions`) takes `?definition_id=<id>` and `?status=<s>` to pre-filter the list and `?id=<execution>` to open one. |
 | **Schedules** | Create, enable/disable, and delete recurring schedules. Shows next and last execution times. |
-| **Approvals** | Review pending approval requests. Approve or reject with comments. Badge shows pending count. A submitter cannot review their own request — a pending row you submitted shows "You submitted this — another reviewer must approve" instead of buttons, and any backend denial (self-review, already-reviewed) surfaces as an error toast. |
+| **Approvals** | Review pending approval requests. Approve or reject with comments. The sidebar's Approvals entry shows the pending count. A submitter cannot review their own request — a pending row you submitted shows "You submitted this — another reviewer must approve" instead of buttons, and any backend denial (self-review, already-reviewed) surfaces as an error toast. |
+
+**Executions and Approvals pages.** `/executions` and `/approvals` are read-only pages in the sidebar under Instructions: Executions lists the dispatch history with the same status counters as the tab, and Approvals lists the approval queue, pending first. Both honour your access scope and show a note, not an empty list, when a store cannot be read. Executing stays on the Instructions tab. On `/approvals`, pending rows carry Approve and Reject buttons (dialog with an optional comment). On `/executions`, selecting a row shows per-device results; a running execution updates live over SSE (a chip shows the stream state); and **Cancel execution** (dialog, shown when you may cancel and the execution is not finished) cancels it. Fleet-wide figures (today, all time, device success rate, average duration) appear for unconfined operators only and are hidden when the store cannot be read.
+
+**Workflows page.** `/workflows` is a page in the sidebar under Instructions (its workflow actions are described below): the workflow definitions (name, description, step count; selecting one lists its steps with each step's failure policy) and the recurring schedules. Schedules run a single instruction on the cadence the scheduler really applies (once, every N minutes, daily, weekly or monthly; time of day, weekday and day of month are stored but not used) and are not linked to workflows. A schedule you did not create shows only whether it targets all devices or a subset.
+
+The definitions table also shows each workflow's Last run and Result (the newest run you may see: "Not run" when there is none, "None visible" when runs exist only on devices outside your scope, "Unknown" when the list of newest runs was cut off before it reached that workflow). Selecting a workflow loads its latest run in the **Latest run** panel (status, start, duration, device count and one row per step) and the **Recent runs** disclosure lists its ten newest runs; selecting one loads it. A step shown as *Dispatched* means the command was sent: it says nothing about the result on a device, and for a caller confined to a device scope it reads *Dispatched (run-wide)* because the send covered the run's whole target list. A skipped step says why only for the three reasons the engine writes (condition not met, previous step failed, workflow aborted); a failed step shows its error text when the engine stored one, otherwise "No detail.". A run is visible to you only if at least one of its target devices is in your scope; a run you may not see and a run that does not exist look the same.
+
+**Workflow actions.** **New workflow** (shown when you hold `Workflow:Write`) opens a dialog for the workflow's YAML; the server's message is shown if the YAML is refused, and nothing runs until you run it. Each row's **Run now** (needs `Workflow:Execute`) opens a device checklist built from the connected devices you may see (filter box, the first 200 matches shown, at most 500 selected); without permission to list devices it falls back to a box of device ids, one per line. Each step is sent to every selected device in order; a step whose instruction needs approval is refused, and device results are not collected on this page. The server runs the whole workflow before it answers, so the page waits 8 seconds, then says the run may keep running on the server, disables that workflow's Run now and checks its newest run every 5 seconds for up to 10 minutes. Check Recent runs before running it again. **Delete** in the Steps panel (needs `Workflow:Delete`) retires the workflow after a confirmation; run history is kept and there is no undelete in the console. A control you may not use is shown disabled with the permission it needs. Instruction names appear on step rows only if you also hold `InstructionDefinition:Read`; otherwise the step's label or instruction id is shown. **Schedule actions.** Each schedule row has **Enable**/**Disable** and **Delete**, enabled only on schedules you created (a schedule with no recorded creator is nobody's, so both stay disabled). **Enable** needs `Schedule:Write` and `Execution:Execute` and asks for confirmation because the schedule then runs without anyone present; **Disable** needs `Schedule:Write` and is one click; **Delete** needs `Schedule:Delete` and confirms first. After a change the list is re-read and the stored state shown. **New schedule** (needs `Schedule:Write` and `Execution:Execute`; the instruction list needs `InstructionDefinition:Read`) takes a name, an enabled instruction, a cadence (once runs at the next scheduler tick, about now; the scheduler ignores time of day), targets, whether each run needs approval and parameters as JSON. Leaving targets empty needs an explicit acknowledgement that it reaches every device. A final summary shows the instruction's approval mode before the schedule is created enabled; a run can still be refused when it fires. Not verified by running a workflow against a live fleet: that the server keeps running a workflow after the page stops waiting.
+
+Who sees what: Administrator, Operator, PlatformEngineer, Viewer and ITServiceOwner hold `Workflow:Read` and see all definitions; runs follow the fleet-read scope of the account. A caller scoped only to management groups is refused the definitions and schedules panels (the existing global-grant rule) but sees runs that include a device in scope. ITServiceOwner can create, enable and delete its own schedules elsewhere but has no Run, New workflow or Delete workflow control, and a service-scoped token is refused the schedules panel outright.
+
+Operational notes: listing definitions reads each workflow's steps with one query per row (up to 101 per page load, newest first), so the page asks for 101 and never renders the YAML. Opening the page or refreshing a denied panel writes a denial audit row for each refused panel, so a denied panel is not polled; reading a run's detail writes `workflow_execution.detail.fetch`. Not verified by running it: that a run keeps going on the server when the browser disconnects, and the content of the `perm_fn` denial audit rows for the refused panels.
 
 ### YAML Editor
 
@@ -1351,7 +1623,7 @@ When the dispatched (plugin, action) reverse-resolves to an enabled `Instruction
 
 - **First-match arbitrariness.** When multiple enabled definitions share `(plugin, action)` and more than one declares a visualization, the alphabetically-first definition wins. Authors should ensure at most one chart-bearing definition per `(plugin, action)` — or dispatch via the Instructions tab (which carries `definition_id` explicitly).
 - **F5 mid-dispatch.** Reloading the dashboard within the 2-second window cancels the deferred chart load. Re-dispatch to recover.
-- **Row cap.** Each chart's underlying response read is capped at 10 000 rows. When the cap is hit, the payload includes `rows_capped: true`; the dashboard renders the chart from the truncated set and the `command.dispatch` audit detail records the truncation.
+- **Row cap.** Each chart's underlying response read is capped at 10 000 rows. The read is also capped at 50 MiB of row payload. `rows_capped: true` means the 10 000-row cap cut the read; when either the row cap or the 50 MiB cap cut it, the payload also carries `result_truncated_by_cap: true` and `truncation_cause` (`row_cap` or `byte_cap`). The dashboard renders the chart from the truncated set and shows a "Partial result" notice in the chart's card above the chart, naming which cap cut it. The chart is fetched independently of the results table, so the notice appears on every page that shows the chart deck, including the filtered results view.
 - **No definition? No chart.** Free-form `(plugin, action)` dispatches that don't correspond to any enabled definition with `spec.visualization` produce only the standard tabular results — the dashboard does not render an empty chart card.
 - **Dashboard YAML editor strips `spec.visualization`.** The dashboard's CodeMirror editor (`POST /api/instructions/yaml`) saves the YAML source verbatim into `yaml_source` but its schema-aware field extractor (`instruction_yaml`, which indexes the id/name/plugin/action/type/description/concurrency/approval columns from both the canonical nested and flat schemas) does not extract `spec.visualization` into the indexed `visualization_spec` column. Result: editing a chart-bearing definition in the dashboard editor and saving silently disables its chart until the definition is re-imported via `POST /api/v1/definitions/import` (JSON envelope, full visualization extraction) or via a server restart that triggers the bundled-content auto-import. Author chart-bearing definitions through `POST /api/v1/definitions/import` rather than the editor save. Tracked as a known gap pending yaml-cpp Windows MSVC resolution (#625).
 

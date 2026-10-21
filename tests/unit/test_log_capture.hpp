@@ -30,6 +30,7 @@
  * spdlog's ostream sink, which most test_helpers.hpp consumers don't need.
  */
 
+#include <cstddef>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -61,6 +62,12 @@ struct LogCapture {
     void stop() {
         if (stopped_)
             return;
+        // set_default_logger registered the capture logger under its name; its sink holds a
+        // reference to `oss_`, so leaving it in the registry would let a later flush_all or
+        // shutdown touch a destroyed stream. Drop it BEFORE restoring: spdlog's drop() also
+        // nulls the default logger when the dropped name is the default's, and dropping after
+        // the restore would do that to a restored OUTER capture (same name) when captures nest.
+        spdlog::drop("test_log_capture");
         spdlog::set_default_logger(prev_);
         spdlog::set_level(prev_level_);
         stopped_ = true;
@@ -82,5 +89,25 @@ private:
     spdlog::level::level_enum prev_level_;
     bool stopped_{false};
 };
+
+/// Count the control bytes in captured log text that a single well-formed line could not
+/// contain: every byte below 0x20 and DEL (0x7F), except a '\n'. On Windows spdlog ends a line
+/// with "\r\n", so there (only) a '\r' immediately followed by '\n' is also accepted; elsewhere a
+/// '\r' is always a stray byte. A lone '\r' injected mid-line counts on every platform.
+[[nodiscard]] inline std::size_t stray_control_bytes(const std::string& s) {
+    std::size_t n = 0;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        const auto c = static_cast<unsigned char>(s[i]);
+        if (c == '\n')
+            continue;
+#ifdef _WIN32
+        if (c == '\r' && i + 1 < s.size() && s[i + 1] == '\n')
+            continue;
+#endif
+        if (c < 0x20 || c == 0x7F)
+            ++n;
+    }
+    return n;
+}
 
 } // namespace yuzu::test

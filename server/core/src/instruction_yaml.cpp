@@ -20,7 +20,10 @@ namespace {
 // `spec.parameters.type: object` before `spec.type` reaches the scanner, and
 // whichever the find() hits first wins. Here the child level is the minimum
 // indentation across the block's lines, and only keys at that level match.
-std::string child_value(const std::string& block, std::string_view key) {
+// `present`, when given, is set true iff the key exists as a plain or quoted scalar - so an
+// explicit empty one (`description: ""`) can be told apart from an absent key, a nested
+// mapping or a block scalar, all of which come back as the empty string.
+std::string child_value(const std::string& block, std::string_view key, bool* present = nullptr) {
     // Pass 1: find the block's own (minimum) indentation.
     std::size_t child_indent = std::string::npos;
     for (std::size_t line_start = 0; line_start < block.size();) {
@@ -95,6 +98,8 @@ std::string child_value(const std::string& block, std::string_view key) {
                             return {};
                     }
                 }
+                if (present)
+                    *present = true;
                 return std::string{val};
             }
         }
@@ -133,8 +138,11 @@ DefinitionFields parse_definition_yaml(const std::string& yaml_source) {
     f.action = first_non_empty(child_value(execution, "action"), child_value(spec, "action"));
     for (auto& c : f.action)
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    f.description =
-        first_non_empty(child_value(metadata, "description"), child_value(spec, "description"));
+    bool has_meta_desc = false, has_spec_desc = false;
+    const auto meta_desc = child_value(metadata, "description", &has_meta_desc);
+    const auto spec_desc = child_value(spec, "description", &has_spec_desc);
+    f.description = first_non_empty(meta_desc, spec_desc);
+    f.has_description = has_meta_desc || has_spec_desc;
     f.concurrency =
         first_non_empty(child_value(execution, "concurrency"), child_value(spec, "concurrency"));
     // Flat form: `approval: auto` scalar. Canonical form: an `approval:`

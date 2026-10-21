@@ -17,6 +17,13 @@ option('enable_enterprise', type: 'boolean', value: false,
        description: 'Build commercial enterprise modules from enterprise/. '
                   + 'Requires a commercial license — see enterprise/LICENSE-ENTERPRISE.md. '
                   + 'OSS AGPL builds MUST leave this off.')
+option('require_gateway', type: 'boolean', value: false,
+       description: 'Fail configure when rebar3 (the Erlang gateway toolchain) is not '
+                  + 'found, instead of silently skipping the gateway build and its '
+                  + 'eunit/ct tests. For local fresh setups: CI instead asserts the gateway '
+                  + 'tests were registered (scripts/ci/assert-gateway-tests.py), because a '
+                  + 'non-default option stored in a persistent CI build dir breaks '
+                  + 'reconfigures from older branches (#4841).')
 # Sanitizers, LTO: use Meson built-ins instead of custom options:
 #   -Db_lto=true                       Link-time optimisation
 #   -Db_sanitize=address,undefined     AddressSanitizer + UBSan

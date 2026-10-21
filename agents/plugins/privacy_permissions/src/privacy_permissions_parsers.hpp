@@ -39,6 +39,7 @@
  */
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -49,6 +50,7 @@
 #include <vector>
 
 #include <constraint_accumulator.hpp>
+#include <row_byte_budget.hpp>
 
 #include <yuzu/plugin.h> // YuzuResultStatus / Completeness (C ABI: no OS types)
 #include <yuzu/string_utils.hpp>
@@ -214,6 +216,31 @@ inline void fill_uncovered_categories(std::string_view os, std::vector<Permissio
         if (!covered) rows.push_back({os, "-", cat, PermissionState::absent, "-", "-", "-", false});
     }
 }
+
+// ── run-wide output budget (shared by the macOS and Windows legs) ────────────────────────
+
+inline constexpr std::size_t kMaxRunOutputBytes = 16u * 1024u * 1024u;
+inline constexpr std::string_view kBudgetExceededToken = "collection:budget_exceeded";
+
+/// Run-wide bound on the bytes a leg puts on the wire: each row is charged at its formatted
+/// length (every field, escaping and separator). macOS checks it between sources, so the one
+/// source that crosses it (itself bounded) is kept; Windows asks would_exceed() before a
+/// profile's rows are emitted, and charges the machine-wide rows first so they always fit.
+struct OutputBudget {
+    yuzu::shared::RowByteBudget budget{.max_bytes = kMaxRunOutputBytes};
+
+    [[nodiscard]] bool exhausted() const noexcept { return budget.full(); }
+    [[nodiscard]] static std::size_t cost(std::span<const PermissionRow> rows) {
+        std::size_t n = 0;
+        for (const auto& r : rows) n += format_row(r).size() + 1; // +1: the row separator
+        return n;
+    }
+    [[nodiscard]] bool would_exceed(std::span<const PermissionRow> rows) const {
+        return !budget.fits(cost(rows), rows.size());
+    }
+    // Allocates: the unconditional reserve.
+    void charge(std::span<const PermissionRow> rows) { budget.add(cost(rows), rows.size()); }
+};
 
 // ── status selection (pure; the one decision every leg shares) ──────────
 

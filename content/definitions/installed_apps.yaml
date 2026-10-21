@@ -44,7 +44,9 @@ metadata:
     version, publisher or install date, so such a row can split into any
     count: accept a row only when it has exactly 5 or exactly 7 tokens under
     the escape-aware split, reject any other count, and read the sixth and
-    seventh columns only for agents known to run plugin 1.2.0 or later.
+    seventh columns only for agents known to run plugin 1.2.0 or later. A
+    macOS list may lead with a warning|bundle_id_* row; ignore lines whose
+    first token is not app.
   tags: [software, inventory, compliance]
 
 spec:
@@ -84,12 +86,12 @@ spec:
         platforms: [windows, darwin]
       - name: install_location
         type: string
-        description: "Where the application lives on disk, as the OS reports it. Windows: the Uninstall key's InstallLocation value, returned raw — a REG_EXPAND_SZ value such as %ProgramFiles%\\Vendor is NOT expanded — or \"-\" when the value is absent (many MSI-registered products, SDK/runtime component packages and NSIS/portable installers write none — 182 of 241 rows on one developer workstation), longer than 511 characters, not a string type, or a per-user install (this action is machine scope). Where the same product is registered in more than one hive the smallest populated value wins. Unlike windows.software.msi.list, separators are \"/\": backslashes are emitted as \"/\" (a UNC path reads //srv/share; not reversible), so C:\\Program Files\\7-Zip\\ reads C:/Program Files/7-Zip/. macOS: the location system_profiler reports, normally the .app bundle path and occasionally a non-bundle directory; this can lie under a user's home (/Users/<account>/...). Always \"-\" on Linux by design: a package installs files to many prefixes, so there is no single install location. Values: path or \"-\". The value is as reported by the OS: untrusted and non-canonical."
+        description: "Where the application lives on disk, as the OS reports it. Windows: the Uninstall key's InstallLocation value, returned raw — a REG_EXPAND_SZ value such as %ProgramFiles%\\Vendor is NOT expanded — or \"-\" when the value is absent (many MSI-registered products, SDK/runtime component packages and NSIS/portable installers write none — 182 of 241 rows on one developer workstation), longer than 64 KiB (the registry reader's bound; a value between 4 KiB and 64 KiB is cut to 4 KiB at a character boundary), or not a string type. Applications installed only into a logged-in user's own hive are not listed by this machine-scope action at all (use list_per_user); entries in the agent service account's own HKCU Uninstall key keep their InstallLocation. Where the same product is registered in more than one hive the smallest populated value wins. Unlike windows.software.msi.list, separators are \"/\": backslashes are emitted as \"/\" (a UNC path reads //srv/share; not reversible), so C:\\Program Files\\7-Zip\\ reads C:/Program Files/7-Zip/. macOS: the location system_profiler reports, normally the .app bundle path and occasionally a non-bundle directory; this can lie under a user's home (/Users/<account>/...). Always \"-\" on Linux by design: a package installs files to many prefixes, so there is no single install location. Values: path or \"-\". The value is as reported by the OS: untrusted and non-canonical."
         example: "C:/Program Files/7-Zip/"
         platforms: [windows, darwin]
       - name: bundle_id
         type: string
-        description: "The macOS CFBundleIdentifier read in-process from the bundle at install_location (reverse-DNS form). Always \"-\" on Windows and Linux, which have no bundle identifier concept; \"-\" on macOS when the location is not a bundle or carries no identifier, and for rows beyond the per-run enrichment cap (5000 applications / 120 s), which is not reported as degraded. The value is as reported by the OS: untrusted, as reported by the local bundle — a local user can plant a bundle whose identifier is any string. Values: bundle identifier or \"-\"."
+        description: "The macOS CFBundleIdentifier read in-process from the bundle at install_location (reverse-DNS form). Always \"-\" on Windows and Linux, which have no bundle identifier concept; \"-\" on macOS when the location is not a bundle or carries no identifier, and for rows the bounded bundle-id pass did not reach (30 s deadline, at most 5000 applications submitted, one pass in flight per agent process (one per device)) -- a cut-short or capped pass is reported by a leading warning|bundle_id_* row and a CONSTRAINED / PARTIAL status, never silently. An identifier is cut at 4 KiB at read. The value is as reported by the OS: untrusted, as reported by the local bundle — a local user can plant a bundle whose identifier is any string. Values: bundle identifier or \"-\"."
         example: "com.apple.ActivityMonitor"
         platforms: [darwin]
     aggregation:

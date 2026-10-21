@@ -66,7 +66,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service account (LocalSystem today, #1442) | None documented in this plugin's code: the WMI query and WUA COM search are daemon-mediated broker calls, and the three registry reads are presence-only `RegOpenKeyExA(..., KEY_READ)` calls against HKLM. | 2026-09-07, bare-metal, `SYSTEM` | `installed`/`missing`: `WMI query failed: ...` / `Failed to ... (0x...)` rows plus `UNAVAILABLE`/`CONSTRAINED`; `pending_reboot`: the affected check's row reads `false` (key not found reads the same as key inaccessible — no distinct refusal shape) |
-| macOS | agent daemon, unprivileged | None measured: `system_profiler`, `softwareupdate -l`, and the DNS/TCP probes all returned real data unprivileged. | 2026-09-07, euid 501 (`alex`) | tool spawn/timeout is forwarded via `forward_runner_failure`; a fully-filtered `softwareupdate -l` output returns zero `missing` rows with no explicit refusal marker (see Caveats) |
+| macOS | agent daemon, unprivileged | None measured: `system_profiler`, `softwareupdate -l`, and the DNS/TCP probes all returned real data unprivileged. | 2026-09-07, euid 501 (`jsmith`) | tool spawn/timeout is forwarded via `forward_runner_failure`; a fully-filtered `softwareupdate -l` output returns zero `missing` rows with no explicit refusal marker (see Caveats) |
 | Linux | agent daemon (`_yuzu`/`yuzu` per `docs/agent-privilege-model.md`'s general convention — no dedicated row exists for this plugin) | None measured: `rpm`/`apt`/`yum` and the filesystem/kernel checks all ran successfully. Sample was captured as `euid 0` in a container, so this is not evidence the agent's usual non-root identity is sufficient — only that the code makes no explicit privilege check. | 2026-09-06, container, `euid 0` | a spawn/timeout failure is forwarded via `forward_runner_failure`; a clean "nothing to report" exit (e.g. `apt` finding no upgrades) is not distinguishable from a refusal in the row data alone |
 
 No row exists in `docs/agent-privilege-model.md` for `windows_updates`.
@@ -86,9 +86,9 @@ vendor update service.
 | Definition | Parameter | Type | Required | Default | Constraints | Description |
 |---|---|---|---|---|---|---|
 | `device.windows_updates.patch_connectivity` | `targets` | string | no | - | - | Comma-separated list of URLs to test connectivity against. If empty, uses platform-default patch servers (e.g. Windows Update endpoints, apt/yum/dnf repos, macOS Software Update). Example: "https://update.microsoft.com,https://download.windowsupdate.com" |
-| `device.windows_updates.patch_connectivity` | `timeout_seconds` | int32 | no | 10 | minimum 1 · maximum 60 | TCP connection timeout per target. Default: 10, min: 1, max: 60. |
+| `device.windows_updates.patch_connectivity` | `timeout_seconds` | int32 | no | 10 | minimum 1 · maximum 60 | TCP connection timeout per target. Default: 10, min: 1, max: 60. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute. |
 | `workflow.patch_connectivity_audit` | `targets` | string | no | - | - | Comma-separated list of patch server URLs to test. Leave empty to use platform defaults. |
-| `workflow.patch_connectivity_audit` | `timeout_seconds` | int32 | no | 10 | minimum 1 · maximum 60 | TCP connection timeout per target. |
+| `workflow.patch_connectivity_audit` | `timeout_seconds` | int32 | no | 10 | minimum 1 · maximum 60 | TCP connection timeout per target, 1-60 seconds. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute. |
 | `workflow.patch_connectivity_audit` | `upload_log_path` | string | no | - | maxLength 4096 | Optional. Path to a local diagnostic log file to upload to the server after the connectivity test. If provided, the log will be uploaded via agent.content_dist.upload_file in a chained step. |
 <!-- END GENERATED -->
 

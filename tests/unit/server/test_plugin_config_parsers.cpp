@@ -10,6 +10,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
+#include <unordered_set>
+#include <vector>
 
 using namespace yuzu::server::plugin_config;
 
@@ -270,4 +272,122 @@ TEST_CASE("#3265: every system_reserved dispatch capability's (plugin, action) i
         INFO("plugin=" << cap.plugin << " action=" << cap.action);
         CHECK(parse_kill_switch_scope(cap.plugin, cap.action).has_value());
     }
+}
+
+// ── #5294: per-OS kill-switch scope + resolver ───────────────────────────
+
+TEST_CASE("is_valid_agent_os / parse_kill_switch_scope: os is the closed set windows|linux|darwin",
+          "[plugin_config][parsers][killswitch]") {
+    for (const char* ok : {"windows", "linux", "darwin"}) {
+        CHECK(is_valid_agent_os(ok));
+        auto s = parse_kill_switch_scope("email", "send", ok);
+        REQUIRE(s.has_value());
+        CHECK(s->os == ok);
+    }
+    for (const std::string bad :
+         {std::string("Windows"), std::string("macos"), std::string("windwos"),
+          std::string("win-dows"), std::string("@"), std::string(65, 'a')}) {
+        CHECK_FALSE(is_valid_agent_os(bad));
+        CHECK_FALSE(parse_kill_switch_scope("email", "", bad).has_value());
+    }
+    CHECK(parse_kill_switch_scope("email", "", "").has_value()); // empty = all OSes
+    // The os grammar is independent of the plugin grammar.
+    CHECK(parse_kill_switch_scope("__guard__", "", "windows").has_value());
+}
+
+TEST_CASE("kill_switch_scope_key appends @<os> and never collides with an identifier key",
+          "[plugin_config][parsers][killswitch]") {
+    CHECK(kill_switch_scope_key({"p", "", ""}) == "p");
+    CHECK(kill_switch_scope_key({"p", "a", ""}) == "p.a");
+    CHECK(kill_switch_scope_key({"p", "", "windows"}) == "p@windows");
+    CHECK(kill_switch_scope_key({"p", "a", "windows"}) == "p.a@windows");
+    CHECK_FALSE(is_valid_identifier("p@windows"));
+}
+
+TEST_CASE("resolve_kill_switch: base layer ANDed with the per-OS layer",
+          "[plugin_config][parsers][killswitch]") {
+    using Rows = std::vector<KillSwitchRowView>;
+    using Set = std::unordered_set<std::string>;
+    const auto resolve = [](std::string_view action, const Rows& rows) {
+        return resolve_kill_switch(action, rows);
+    };
+
+    CHECK(resolve("a", {}) == Set{});
+    // plugin row OFF -> killed for everyone.
+    CHECK_FALSE(resolve("a", {{"", "", false}}).has_value());
+    // action row ON over plugin row OFF -> existing override preserved.
+    CHECK(resolve("a", {{"", "", false}, {"a", "", true}}) == Set{});
+    // plugin ON + plugin@windows OFF -> windows withheld.
+    CHECK(resolve("a", {{"", "", true}, {"", "windows", false}}) == Set{"windows"});
+    // action@windows ON beats plugin@windows OFF inside the OS layer.
+    CHECK(resolve("a", {{"", "windows", false}, {"a", "windows", true}}) == Set{});
+    // per-OS ON never widens an OFF plugin row.
+    CHECK_FALSE(resolve("a", {{"", "", false}, {"", "windows", true}}).has_value());
+    // rows for a different action are ignored.
+    CHECK(resolve("a", {{"b", "", false}, {"b", "linux", false}}) == Set{});
+}
+
+// ── kill_switch_set_detail: the reason reaches the audit evidence ────────────
+
+TEST_CASE("kill_switch_set_detail without a reason is the unchanged evidence format",
+          "[server][config][killswitch]") {
+    const KillSwitchScope plain{"tar", "sql", ""};
+    CHECK(kill_switch_set_detail(plain, false) == "enabled=false");
+    CHECK(kill_switch_set_detail(plain, true, "") == "enabled=true");
+    CHECK(kill_switch_set_detail(KillSwitchScope{"quarantine", "", ""}, false) ==
+          "enabled=false, protective_exempt=true");
+}
+
+TEST_CASE("kill_switch_set_detail appends a quoted, bounded, control-stripped reason",
+          "[server][config][killswitch]") {
+    const KillSwitchScope plain{"tar", "sql", ""};
+    CHECK(kill_switch_set_detail(plain, false, "incident INC-42") ==
+          "enabled=false, reason=\"incident INC-42\"");
+    // Protective marker first, then the reason.
+    CHECK(kill_switch_set_detail(KillSwitchScope{"quarantine", "", ""}, false, "drill") ==
+          "enabled=false, protective_exempt=true, reason=\"drill\"");
+    // Quote and backslash cannot close the field; tab and other controls flatten to a space.
+    CHECK(kill_switch_set_detail(plain, false, "a\"b\\c\td\x01" "e") ==
+          "enabled=false, reason=\"a\\\"b\\\\c d e\"");
+    // A reason longer than the cap is cut at 512 bytes: the evidence line stays bounded even
+    // for a caller that skipped is_valid_reason.
+    const auto long_detail = kill_switch_set_detail(plain, false, std::string(2000, 'x'));
+    CHECK(long_detail ==
+          "enabled=false, reason=\"" + std::string(512, 'x') + "\", reason_truncated=true");
+    // Exactly at the cap is whole, not truncated.
+    CHECK(kill_switch_set_detail(plain, false, std::string(kMaxReasonBytes, 'x')) ==
+          "enabled=false, reason=\"" + std::string(kMaxReasonBytes, 'x') + "\"");
+}
+
+TEST_CASE("kill_switch_set_detail never tears a UTF-8 sequence at the cut",
+          "[server][config][killswitch]") {
+    const KillSwitchScope plain{"tar", "sql", ""};
+    // 511 ASCII bytes then a two-byte e-acute (C3 A9) straddling the 512-byte cut: the whole
+    // character is dropped, not half of it.
+    const std::string two = std::string(511, 'x') + "\xC3\xA9" + "tail";
+    CHECK(kill_switch_set_detail(plain, false, two) ==
+          "enabled=false, reason=\"" + std::string(511, 'x') + "\", reason_truncated=true");
+    // A four-byte sequence (U+1F600) starting at byte 510 would end at 514: dropped whole.
+    const std::string four = std::string(510, 'x') + "\xF0\x9F\x98\x80" + "tail";
+    CHECK(kill_switch_set_detail(plain, false, four) ==
+          "enabled=false, reason=\"" + std::string(510, 'x') + "\", reason_truncated=true");
+    // A sequence that ENDS exactly on the cut is kept.
+    const std::string fits = std::string(510, 'x') + "\xC3\xA9" + "tail";
+    CHECK(kill_switch_set_detail(plain, false, fits) ==
+          "enabled=false, reason=\"" + std::string(510, 'x') + "\xC3\xA9\", reason_truncated=true");
+    // A three-byte sequence (U+20AC) whose lead is at byte 510 or 511 straddles the cut either way.
+    const std::string three510 = std::string(510, 'x') + "\xE2\x82\xAC" + "tail";
+    CHECK(kill_switch_set_detail(plain, false, three510) ==
+          "enabled=false, reason=\"" + std::string(510, 'x') + "\", reason_truncated=true");
+    const std::string three511 = std::string(511, 'x') + "\xE2\x82\xAC" + "tail";
+    CHECK(kill_switch_set_detail(plain, false, three511) ==
+          "enabled=false, reason=\"" + std::string(511, 'x') + "\", reason_truncated=true");
+    // Exactly 512 bytes ending in a whole three-byte character: kept, and not marked truncated.
+    const std::string whole = std::string(509, 'x') + "\xE2\x82\xAC";
+    CHECK(kill_switch_set_detail(plain, false, whole) ==
+          "enabled=false, reason=\"" + whole + "\"");
+    // Invalid UTF-8 (a bare run of continuation bytes) never reads past the string: the cut backs
+    // up to the start and the result is an empty, marked reason.
+    CHECK(kill_switch_set_detail(plain, false, std::string(600, '\x80')) ==
+          "enabled=false, reason=\"\", reason_truncated=true");
 }

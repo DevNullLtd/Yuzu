@@ -7,7 +7,7 @@
 ## GetSystemFirmwareTable('RSMB'); Linux sysfs DMI (/sys/class/dmi/id/bios_*)
 ## plus fwupd (org.freedesktop.fwupd GetDevices/GetUpgrades over the sd-bus
 ## system bus); macOS IOKit IODeviceTree (/rom, /chosen, root) plus
-## sysctlbyname hw.model.
+## sysctlbyname hw.model and hw.optional.arm64 (Apple Silicon gate).
 ##
 ## Wire rows lead with a fixed tag: `firmware|<field>|<value>|<source>` (the
 ## data rows) or, only when the action's one exception handler fires,
@@ -64,13 +64,13 @@ spec:
         platforms: [windows, linux, darwin]
       - name: field
         type: string
-        description: 'The firmware fact. Every OS: vendor, version, release_date. Windows raw SMBIOS: rom_size_bytes, bios_release, ec_release (each only when the table specifies it). Linux: bios_release (DMI, only when present and well formed), update_pending (the aggregate fwupd verdict), fwupd_device (one row per fwupd device). macOS: version_source (which device-tree node and key carried the version), model. For a `constrained` row: the reason (internal_error).'
+        description: 'The firmware fact. Every OS: vendor, version, release_date. Windows raw SMBIOS: rom_size_bytes, bios_release, ec_release (a row only when the table specifies the value; a half-specified release pair, or a failed SMBIOS read, reads `unreadable`). Linux: bios_release (DMI, when present; a malformed one reads `unreadable`), update_pending (the aggregate fwupd verdict), fwupd_device (one row per fwupd device). macOS: version_source (which device-tree node and key carried the version), model. For a `constrained` row: the reason (internal_error).'
         values: [vendor, version, release_date, rom_size_bytes, bios_release, ec_release, update_pending, fwupd_device, version_source, model, internal_error]
         example: version
         platforms: [windows, linux, darwin]
       - name: value
         type: string
-        description: 'The value. vendor, version, release_date: the text read, else `absent` (the OS reports nothing) or `unreadable` (the read failed). release_date is `YYYY-MM-DD` when the source used a recognised date shape, otherwise the source text unchanged. update_pending: `yes`, `no` or `unknown` (aggregate over updatable fwupd devices), `unavailable` (the system bus answered and fwupd is not on it: a state, not a failure) or `unreadable` (the fwupd read failed, or this build has no libsystemd and reports the fwupd:not_built reason). fwupd_device: `id=<id>;name=<name>;version=<version>;updatable=<yes|no>;needs_reboot=<yes|no>;update_pending=<yes|no|unknown>;unmodelled=<yes|no>`, where unmodelled=yes means a device flag bit above those the plugin names was set. Other fields: a decimal number, an `<major>.<minor>` release, a device-tree `<node>#<key>` reference or the hardware model. Empty on a `constrained` row.'
+        description: 'The value. vendor, version, release_date: the text read, else `absent` (the OS reports nothing) or `unreadable` (the read failed). rom_size_bytes, bios_release, ec_release and version_source can also read `unreadable` (a failed SMBIOS read, a half-specified or malformed release, an unreadable device-tree version). release_date is `YYYY-MM-DD` when the source used a recognised date shape, otherwise the source text unchanged. update_pending: `yes`, `no` or `unknown` (aggregate over updatable fwupd devices), `unavailable` (the system bus answered and fwupd is not on it: a state, not a failure) or `unreadable` (the fwupd read failed, or this build has no libsystemd and reports the fwupd:not_built reason). fwupd_device: `id=<id>;name=<name>;version=<version>;updatable=<yes|no>;needs_reboot=<yes|no>;update_pending=<yes|no|unknown>;unmodelled=<yes|no>`, where unmodelled=yes means a device flag bit above those the plugin names was set. Other fields: a decimal number, an `<major>.<minor>` release, a device-tree `<node>#<key>` reference or the hardware model. Empty on a `constrained` row.'
         example: A1.2.3
         platforms: [windows, linux, darwin]
       - name: source

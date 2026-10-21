@@ -13,14 +13,17 @@
  * What is pinned per host (host-independent shape first, then per-OS):
  *  - every action returns rc 0 and emits a `status|<action>|<level>|<tokens>`
  *    row FIRST (4 fields), then only rows of the action's own kinds;
- *  - manager rows have 7 fields and package rows 5 (escape-aware split);
+ *  - manager rows have 7 fields; package rows have 5 (Homebrew) or 9 (snap and
+ *    flatpak) fields (escape-aware split);
  *  - Linux `packages`: exactly `status|packages|unsupported|linux:owned_by_installed_apps`,
  *    ZERO `package|` rows, UNAVAILABLE/PARTIAL typed status (Linux never
  *    enumerates a package; installed_apps owns the roster). MUTATION: if the
  *    Linux leg ever emitted a package row, or the token changed, this fails;
- *  - Linux `managers`: exactly `status|managers|unsupported|linux:planned` and
- *    nothing else, UNAVAILABLE/PARTIAL typed status (the leg is a planned
- *    placeholder; the real leg follows as its own PR and replaces this case);
+ *  - Linux `managers` / `store_packages`: status first (supported or constrained,
+ *    read from the real host), then only `manager|` / `package|snap|` /
+ *    `package|flatpak|` rows with their fixed field counts;
+ *  - macOS `store_packages`: exactly `status|store_packages|unsupported|
+ *    macos:owned_by_installed_apps`, zero rows (installed_apps owns the list);
  *  - Windows: both actions exactly `status|<action>|unsupported|windows:planned`
  *    and nothing else (the legs are declared planned);
  *  - macOS: two tiers read from the real host: when /opt/homebrew/Cellar is a
@@ -29,9 +32,10 @@
  *    `package|homebrew|` row (so removing the macOS wiring fails it). No
  *    host-specific count or name is asserted (CI's macOS runner has unknown
  *    contents);
- *  - the six declared legs (2 actions x 3 OSes) are never UNDECLARED, match the
- *    values the code implements, and the host's own leg agrees with what the
- *    action actually emits;
+ *  - the nine declared legs (3 actions x 3 OSes) are never UNDECLARED, match the
+ *    values the code implements (an unsupported-by-design leg is rung 0 with no
+ *    mechanism, #4881), and the host's own leg agrees with what the action
+ *    actually emits;
  *  - the exception firewall (run_guarded, through a synthetic descriptor: the
  *    real plugin cannot be made to throw) turns any throw into exactly one
  *    `constrained` status row carrying the fixed token, UNAVAILABLE/PARTIAL and
@@ -44,6 +48,7 @@
 #include <yuzu/plugin.hpp>
 
 #include "local_dispatcher.hpp"
+#include "pkg_inventory_test_support.hpp"
 
 #include "pkg_inventory_legs.hpp"
 #include "pkg_inventory_parsers.hpp"
@@ -56,43 +61,15 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace fs = std::filesystem;
 
+using yuzu::test::pkg_inventory_support::captured_rows;
+using yuzu::test::pkg_inventory_support::split_fields_escape_aware;
+
 namespace {
-
-/// Escape-aware field split. yuzu::util::safe_output_field escapes a literal
-/// '|' as '\|', so a naive split('|') overcounts fields on any row whose text
-/// happens to contain a pipe.
-std::vector<std::string> split_fields_escape_aware(const std::string& row) {
-    std::vector<std::string> out;
-    std::string cur;
-    for (std::size_t i = 0; i < row.size(); ++i) {
-        if (row[i] == '\\' && i + 1 < row.size() && row[i + 1] == '|') {
-            cur += '|';
-            ++i;
-        } else if (row[i] == '|') {
-            out.push_back(cur);
-            cur.clear();
-        } else {
-            cur += row[i];
-        }
-    }
-    out.push_back(cur);
-    return out;
-}
-
-std::vector<std::string> captured_rows(const std::string& captured) {
-    std::vector<std::string> out;
-    std::istringstream ss(captured);
-    std::string line;
-    while (std::getline(ss, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (!line.empty()) out.push_back(line);
-    }
-    return out;
-}
 
 /// Under `meson test` (MESON_BUILD_ROOT is always set) a missing plugin means
 /// the build is genuinely broken and must NOT report "All tests passed".
@@ -163,7 +140,7 @@ std::optional<LoadedPlugin> load_pkg_inventory_plugin() {
     return LoadedPlugin{std::move(*loaded), d};
 }
 
-constexpr const char* kActions[] = {"managers", "packages"};
+constexpr const char* kActions[] = {"managers", "packages", "store_packages"};
 
 bool starts_with(const std::string& s, std::string_view prefix) {
     return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
@@ -240,9 +217,15 @@ TEST_CASE("pkg_inventory plugin: status row first, then only well-formed rows of
                 CHECK(std::string_view{action} == "managers");
                 CHECK(f.size() == 7);
             } else if (f[0] == "package") {
-                CHECK(std::string_view{action} == "packages");
-                REQUIRE(f.size() == 5);
-                CHECK(f[1] == "homebrew");
+                REQUIRE(f.size() >= 2);
+                if (std::string_view{action} == "packages") {
+                    REQUIRE(f.size() == 5);
+                    CHECK(f[1] == "homebrew");
+                } else {
+                    CHECK(std::string_view{action} == "store_packages");
+                    REQUIRE(f.size() == 9);
+                    CHECK((f[1] == "snap" || f[1] == "flatpak"));
+                }
             } else {
                 FAIL("unexpected row kind after the status row: " << f[0]);
             }
@@ -320,19 +303,22 @@ TEST_CASE("pkg_inventory plugin: per-OS leg contract on this host", "[pkg_invent
         CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
         CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     }
-    // Linux `managers` is declared planned: the status row and nothing else.
-    {
-        const auto result = dispatcher.run(plugin->descriptor, "managers");
+    // `managers` and `store_packages` are real reads of this host: the content is
+    // host-specific (no counts or names asserted), the shape is not.
+    for (const auto [action, prefix, fields] :
+         {std::tuple{"managers", "manager|", std::size_t{7}},
+          std::tuple{"store_packages", "package|", std::size_t{9}}}) {
+        INFO("action: " << action);
+        const auto result = dispatcher.run(plugin->descriptor, action);
         CHECK(result.rc == 0);
         const auto rows = captured_rows(result.captured);
-        REQUIRE(rows.size() == 1);
-        CHECK(rows[0] == "status|managers|unsupported|linux:planned");
-        CHECK(rows[0] == std::string{"status|managers|unsupported|"} +
-                             std::string{kTokenLinuxPlanned});
-        CHECK(count_rows_with_prefix(rows, "manager|") == 0);
-        CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
-        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
-        CHECK(result.result_provenance == "linux:planned");
+        REQUIRE_FALSE(rows.empty());
+        CHECK((starts_with(rows[0], std::string{"status|"} + action + "|supported|") ||
+               starts_with(rows[0], std::string{"status|"} + action + "|constrained|")));
+        for (std::size_t i = 1; i < rows.size(); ++i) {
+            CHECK(starts_with(rows[i], prefix));
+            CHECK(split_fields_escape_aware(rows[i]).size() == fields);
+        }
     }
 #elif defined(__APPLE__)
     // Values read from the real host, in two tiers so an existing-but-empty or
@@ -341,6 +327,19 @@ TEST_CASE("pkg_inventory plugin: per-OS leg contract on this host", "[pkg_invent
     //  - /opt/homebrew/Cellar is a directory   -> `managers` has >=1 manager|homebrew| row
     //    (present or unavailable: a marker that exists always yields a row);
     //  - it holds a well-named formula version -> `packages` has >=1 package row.
+    {
+        // installed_apps owns the macOS application list: store_packages reads nothing.
+        const auto result = dispatcher.run(plugin->descriptor, "store_packages");
+        CHECK(result.rc == 0);
+        const auto rows = captured_rows(result.captured);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == "status|store_packages|unsupported|macos:owned_by_installed_apps");
+        CHECK(rows[0] == std::string{"status|store_packages|unsupported|"} +
+                             std::string{kTokenMacosStoreOwned});
+        CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+        CHECK(result.result_provenance == "macos:owned_by_installed_apps");
+    }
     std::error_code cellar_ec;
     if (!fs::is_directory("/opt/homebrew/Cellar", cellar_ec)) {
         WARN("no /opt/homebrew/Cellar on this host -- only the shape cases apply");
@@ -396,7 +395,7 @@ TEST_CASE("pkg_inventory plugin: an unknown action is refused, not silently igno
     CHECK(split_fields_escape_aware(hrows[0]).size() == 1);
 }
 
-TEST_CASE("pkg_inventory plugin: ABI4 descriptors declare all six legs and the host leg agrees with "
+TEST_CASE("pkg_inventory plugin: ABI4 descriptors declare all nine legs and the host leg agrees with "
           "what the action emits",
           "[pkg_inventory][descriptors]") {
     auto plugin = load_pkg_inventory_plugin();
@@ -404,12 +403,12 @@ TEST_CASE("pkg_inventory plugin: ABI4 descriptors declare all six legs and the h
         require_plugin_or_skip();
         return;
     }
-    REQUIRE(plugin->descriptor->action_descriptor_count == 2);
+    REQUIRE(plugin->descriptor->action_descriptor_count == 3);
     REQUIRE(plugin->descriptor->action_descriptors != nullptr);
 
-    // The declared support per leg is what the code implements TODAY (macOS Homebrew
-    // wired; Linux managers and both Windows legs planned; Linux packages unsupported
-    // by design). Landing a leg without flipping its descriptor, or the reverse, fails
+    // The declared support per leg is what the code implements TODAY (macOS Homebrew and
+    // the Linux managers + store_packages legs wired; the Windows legs planned; Linux
+    // packages and macOS store_packages unsupported by design). Landing a leg without flipping its descriptor, or the reverse, fails
     // here; the capability-matrix gate compares the doc to the descriptor, not the
     // descriptor to behaviour.
     struct Expected {
@@ -417,8 +416,9 @@ TEST_CASE("pkg_inventory plugin: ABI4 descriptors declare all six legs and the h
         YuzuSupportLevel linux_leg, macos_leg, windows_leg;
     };
     const Expected expected[] = {
-        {"managers", YUZU_SUPPORT_PLANNED, YUZU_SUPPORT_SUPPORTED, YUZU_SUPPORT_PLANNED},
+        {"managers", YUZU_SUPPORT_SUPPORTED, YUZU_SUPPORT_SUPPORTED, YUZU_SUPPORT_PLANNED},
         {"packages", YUZU_SUPPORT_UNSUPPORTED, YUZU_SUPPORT_SUPPORTED, YUZU_SUPPORT_PLANNED},
+        {"store_packages", YUZU_SUPPORT_SUPPORTED, YUZU_SUPPORT_UNSUPPORTED, YUZU_SUPPORT_PLANNED},
     };
     yuzu::agent::LocalDispatcher dispatcher;
     for (std::size_t i = 0; i < plugin->descriptor->action_descriptor_count; ++i) {
@@ -432,6 +432,16 @@ TEST_CASE("pkg_inventory plugin: ABI4 descriptors declare all six legs and the h
         CHECK(d.linux_leg.support == expected[i].linux_leg);
         CHECK(d.macos_leg.support == expected[i].macos_leg);
         CHECK(d.windows_leg.support == expected[i].windows_leg);
+        // #4881 idiom (antivirus_plugin.cpp, app_control_plugin.cpp): an
+        // unsupported-by-design leg is rung 0 with no mechanism and a note naming
+        // the owner. MUTATION: restoring "none by design" / rung 1 fails here.
+        for (const auto* leg : {&d.linux_leg, &d.macos_leg, &d.windows_leg}) {
+            if (leg->support == YUZU_SUPPORT_UNSUPPORTED) {
+                CHECK(leg->rung == 0);
+                CHECK(leg->mechanism == nullptr);
+                CHECK(leg->fallback != nullptr);
+            }
+        }
 
 #if defined(_WIN32)
         const auto host_support = d.windows_leg.support;

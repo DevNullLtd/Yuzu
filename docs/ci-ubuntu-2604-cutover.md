@@ -5,10 +5,12 @@ off the old single-host runners: all Linux → Big Tam (`yuzu-bigtam-linux`), al
 Windows → Wee Tam (`yuzu-weetam-windows`). Sequence: `ci.yml` linux (#1609,
 merged) → `sanitizer-tests` + `nightly` + `codeql` Linux → **`release.yml` Linux
 legs + the remaining Windows stragglers + build-speed** (PR #1615). **`yuzu-wsl2-linux`
-(Shulgi) and `yuzu-local-windows` are retired** — remove them from
-`.github/runner-inventory.json` (item 6) to silence the inventory sentinel.
-`proto-compat` / `cache-prune-linux` keep the bare `[self-hosted, Linux, X64]`
-label (no compiler) and land on Big Tam.
+(Shulgi) and `yuzu-local-windows` are retired**, and are removed from
+`.github/runner-inventory.json` (item 6). `proto-compat` / `cache-prune-linux`
+are pinned to `yuzu-bigtam-linux`; they previously used the bare
+`[self-hosted, Linux, X64]` label, which the Shulgi WSL2 runner also carried.
+The runners were deregistered on GitHub (Settings → Actions → Runners) on
+2026-10-03, per the repo admin.
 
 The sections below are the historical runbook + per-file record; the future-tense
 "deferred" / "pre-flip" framing is preserved as the record of how the flip was
@@ -166,10 +168,11 @@ Incremental order: do ci.yml first, prove it green on Big Tam, then the rest.
    the runner NAME, not a label — would have queued forever; Shulgi's label is
    `yuzu-shulgi`. release.yml only runs at tag time, so the first Big Tam release
    is its real validation; note Big Tam ships RPM 6.0 vs Shulgi's 4.x.)
-6. **`.github/runner-inventory.json`** — **PENDING.** Remove `yuzu-wsl2-linux` and
-   `yuzu-local-windows` entirely (both retired); confirm the Big Tam + Wee Tam
-   roles are marked live. Until this lands the inventory sentinel flags the retired
-   runners as missing. No workflow gate depends on it — the pool gates are
+6. **`.github/runner-inventory.json`** — **DONE.** The runners were deregistered
+   on GitHub on 2026-10-03 (per the repo admin), and `yuzu-wsl2-linux` and
+   `yuzu-local-windows` were removed from the inventory (both retired); `proto-compat` and
+   `cache-prune-linux` are pinned to `yuzu-bigtam-linux`, so a bare-label job can no
+   longer land on a Shulgi runner if one is ever re-registered. The pool gates are
    label-driven, so retired runners just drop out (nothing gates on `all_healthy`).
 7. **`docs/ci-architecture.md`** — **DONE (2026-06-21, #1615).** Runner-topology
    table consolidated (Big Tam = all Linux, Wee Tam = all Windows, both retired
@@ -185,6 +188,9 @@ Incremental order: do ci.yml first, prove it green on Big Tam, then the rest.
 
 ## Rollback
 
-Revert the `runs-on` pins and compiler tokens to gcc-13/clang-19/`ImageOS: ubuntu24`
-and the jobs run on Shulgi again unchanged. The staged 26.04 Docker images and
-native files are inert when nothing references them, so they need no rollback.
+Shulgi is retired, so reverting the `runs-on` pins and compiler tokens to
+gcc-13/clang-19/`ImageOS: ubuntu24` no longer puts jobs back on it by itself.
+Recovery from an extended Big Tam outage would need the Shulgi runners
+re-registered, their entries restored in `.github/runner-inventory.json`, and the
+pins reverted together. The staged 26.04 Docker images and native files are inert
+when nothing references them, so they need no rollback.

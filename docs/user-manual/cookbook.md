@@ -39,13 +39,20 @@ def wait_for(exec_id, timeout=120):
     raise TimeoutError(f"Execution {exec_id} did not complete in {timeout}s")
 
 def get_responses(definition_id, exec_id=None, limit=1000):
-    """Fetch result rows for a definition (optionally filtered by execution)."""
-    params = {"limit": limit}
+    """Fetch result rows for a definition (optionally filtered by execution).
+
+    The route serves at most 1000 rows per request, so a full page means rows
+    may be missing: fail loudly rather than analyse a partial result.
+    """
+    params = {"limit": min(limit, 1000)}
     if exec_id:
         params["execution_id"] = exec_id
     r = requests.get(f"{YUZU}/api/responses/{definition_id}", headers=HEADERS, params=params)
     r.raise_for_status()
-    return r.json()
+    body = r.json()
+    if body.get("result_truncated_by_cap") or body["count"] >= params["limit"]:
+        raise RuntimeError("response page is full: narrow the scope or filter, or fetch it in pages")
+    return body
 ```
 
 ### Scope Expression Cheat Sheet
@@ -601,6 +608,8 @@ Policy: no critical vulnerabilities allowed:
 result.severity != 'critical' && result.severity != 'high'
 ```
 
+An `UNREADABLE` row means the check could not run (unreadable `/proc/sys` or `sshd_config`); treat it as not assessed — add `&& result.severity != 'UNREADABLE'` or gate on the `summary|UNREADABLE|<n>` count — rather than letting a "no critical/high" policy pass a host it never measured.
+
 Policy: CVSS score must be below threshold:
 
 ```cel
@@ -692,14 +701,19 @@ def wait_for(exec_id, timeout=300):
         time.sleep(3)
     raise TimeoutError(f"Execution {exec_id} timed out")
 
-def get_responses(definition_id, exec_id=None, limit=10000):
-    params = {"limit": limit}
+def get_responses(definition_id, exec_id=None, limit=1000):
+    # The route serves at most 1000 rows per request; a full page means rows may
+    # be missing, so raise instead of analysing a partial result.
+    params = {"limit": min(limit, 1000)}
     if exec_id:
         params["execution_id"] = exec_id
     r = requests.get(f"{YUZU}/api/responses/{definition_id}",
                      headers=HEADERS, params=params)
     r.raise_for_status()
-    return r.json()
+    body = r.json()
+    if body.get("result_truncated_by_cap") or body["count"] >= params["limit"]:
+        raise RuntimeError("response page is full: narrow the scope or filter, or fetch it in pages")
+    return body
 
 # ── Step 1: Query TAR on Windows machines for network events ─────────────
 # Scope to Windows first (cheapest filter — just an attribute check).
@@ -859,6 +873,7 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 | `device.network_config.dns_servers` | dns_servers | Q | WLM | *(none)* | adapter:string, server:string, type:string |
 | `device.network_config.proxy` | proxy | Q | WLM | *(none)* | proxy_type:string, proxy_address:string, bypass:string |
 | `device.network_config.dns_cache` | dns_cache | Q | WLM | *(none)* | name:string, record_type:string, ttl:int32 |
+| `device.network_config.routes` | routes | Q | WLM | *(none)* | family:string, destination:string, prefix_len:int32, gateway:string, interface:string, metric:string, table:string, route_type:string, origin:string |
 | `device.network.netstat_list` | netstat | Q | WLM | *(none)* | proto:string, local_addr:string, local_port:int32, remote_addr:string, remote_port:int32, state:string, pid:int32 |
 | `device.network_diag.listening` | listening | Q | WLM | *(none)* | proto:string, local_addr:string, local_port:int32, pid:int32 |
 | `device.network_diag.connections` | connections | Q | WLM | *(none)* | proto:string, local_addr:string, remote_addr:string, remote_port:int32, pid:int32 |

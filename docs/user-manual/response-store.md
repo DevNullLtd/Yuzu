@@ -69,9 +69,9 @@ filtering and pagination.
 |---|---|---|
 | `agent_id` | string | Filter by agent |
 | `status` | integer | Filter by status (integer enum value) |
-| `since` | integer | Only responses after this Unix timestamp |
-| `until` | integer | Only responses before this Unix timestamp |
-| `limit` | integer | Number of responses to return (default 100) |
+| `since` | integer | Only responses at or after this Unix timestamp (inclusive); omit for no lower bound, `0` is accepted and matches the same rows |
+| `until` | integer | Only responses at or before this Unix timestamp (inclusive); omit for no upper bound, must be `1` or more (`0` is `400`) |
+| `limit` | integer | Number of responses to return (default 100, at most 1000; zero or below means the default). Asking for more than 1000 and getting a full page sets `result_truncated_by_cap` in the envelope |
 | `offset` | integer | Offset for pagination (default 0) |
 
 **Response envelope:**
@@ -82,6 +82,10 @@ filtering and pagination.
   "count": 42
 }
 ```
+
+When the caller asked for more than 1000 rows and the page came back full (exactly 1000 rows), the
+envelope also carries `"result_truncated_by_cap": true`: more rows may exist past the ceiling. The
+field is absent otherwise.
 
 **Example --- fetch all responses for an instruction:**
 
@@ -132,8 +136,8 @@ fleet-wide statistics without downloading every row.
 | `op_column` | string | Column for sum/avg/min/max operations |
 | `agent_id` | string | Filter by agent |
 | `status` | integer | Filter by status |
-| `since` | integer | Only responses after this Unix timestamp |
-| `until` | integer | Only responses before this Unix timestamp |
+| `since` | integer | Only responses at or after this Unix timestamp (inclusive); omit for no lower bound, `0` is accepted and matches the same rows |
+| `until` | integer | Only responses at or before this Unix timestamp (inclusive); omit for no upper bound, must be `1` or more (`0` is `400`) |
 
 **Response:**
 
@@ -171,7 +175,10 @@ filter parameters to the response query endpoint.
 
 The dedicated export endpoint supports both CSV and JSON formats with the same
 filter parameters as the query endpoint. It defaults to a higher limit
-(10,000 rows) for bulk exports.
+(10,000 rows) for bulk exports. Numeric parameters must be one whole base-10 integer
+(`since=1e9`, `limit=100abc`, `status=0x1` and `since=1.5` are `400`, not a different
+filter); omitting `since` or `until` means no bound on that side, `since=0` is accepted and matches the same rows as omitting it, and `until=0` or a negative
+value is `400`.
 
 **Query parameters:**
 
@@ -180,9 +187,9 @@ filter parameters as the query endpoint. It defaults to a higher limit
 | `format` | string | Export format: `csv` or `json` (default: `json`) |
 | `agent_id` | string | Filter by agent |
 | `status` | integer | Filter by status |
-| `since` | integer | Only responses after this Unix timestamp |
-| `until` | integer | Only responses before this Unix timestamp |
-| `limit` | integer | Number of responses to export (default 10,000) |
+| `since` | integer | Only responses at or after this Unix timestamp (inclusive); omit for no lower bound, `0` is accepted and matches the same rows |
+| `until` | integer | Only responses at or before this Unix timestamp (inclusive); omit for no upper bound, must be `1` or more (`0` is `400`) |
+| `limit` | integer | Number of responses to export (default and maximum 10,000; zero or below serves one row) |
 
 **Example --- export instruction responses as CSV:**
 
@@ -203,6 +210,28 @@ curl -s -b cookies.txt \
 The CSV format includes the columns:
 `id`, `instruction_id`, `agent_id`, `timestamp`, `status`, `output`, `error_detail`.
 
+**A bounded export can be cut.** Besides the row limit, an export stops once the rows served
+carry 50 MiB of `output` plus `error_detail` (always on whole rows, and at least one row is
+served; the last row kept can run past the cap by up to its own size: about 4 MiB for text output,
+up to about 12 MiB for output dense in invalid bytes or NULs, because each field is cut to 2 MiB at
+ingest before invalid bytes and NULs are replaced by the 3-byte U+FFFD; this includes the `error_detail` written when a terminal frame closes a running row). The cap is not
+configurable. A cut export, whether by the row limit with more matching rows left, or by the byte
+cap, is marked, so check for it before trusting a bulk pull: the JSON envelope has a top-level
+`"result_truncated_by_cap": true`, and a CSV file ends with one extra trailer record,
+`# result_truncated_by_cap cause=row_cap` (or `byte_cap`) padded with empty fields to the header's
+width. The trailer is the signal that reaches every consumer. Agent output is arbitrary, so a
+quoted cell can contain text that looks like the trailer: parse the file as CSV and read the final
+record, do not regex-match lines. Two out-of-body signals accompany
+it: a CSV response carries an `X-Result-Truncated-By-Cap: true` header, and the download is named
+`responses-<instruction_id>-truncated.<json|csv>` instead of `responses-<instruction_id>.<json|csv>`.
+A plain `curl -o responses.csv ...` keeps neither (curl picks the file name and drops the headers);
+`curl -OJ` keeps the name, and `curl -sS -D - -o responses.csv ...` prints the headers. An uncut
+export carries none of these. To read past a cap there is no cursor: pull once per `agent_id`, or
+set `until` to the oldest `timestamp` received (inclusive, so rows tied at that second return
+again: de-duplicate on `id`). In the JSON envelope, `count` is the number of rows served. The
+REST v1 twin (`GET /api/v1/responses/{id}/export`) marks a cut the same way, with the JSON flag
+under `pagination` and a 10-field CSV trailer.
+
 ### Generic JSON-to-CSV export
 
 **POST /api/export/json-to-csv**
@@ -215,6 +244,7 @@ curl -s -b cookies.txt \
   'http://localhost:8080/api/v1/audit?limit=1000' \
   | jq -c '.data' \
   | curl -s -b cookies.txt \
+      -H "Origin: http://localhost:8080" \
       -X POST \
       -H 'Content-Type: application/json' \
       -d @- \
@@ -254,6 +284,7 @@ ORDER BY (agent_id, collected);
 curl -s -b cookies.txt \
   'http://localhost:8080/api/responses/disk-usage-001' \
   | curl -s -b cookies.txt \
+      -H "Origin: http://localhost:8080" \
       -X POST -H 'Content-Type: application/json' -d @- \
       'http://localhost:8080/api/export/json-to-csv' \
   | clickhouse-client --query "INSERT INTO yuzu_disk_usage FORMAT CSV"
@@ -278,7 +309,7 @@ curl -s -b cookies.txt \
 ## Storage substrate (PostgreSQL, ADR-0039)
 
 Since the Postgres migration (ADR-0006/0039), responses live in the server's
-PostgreSQL database (schema `response_store`), not a local `responses.db`. Two
+PostgreSQL database (schema `response_store`), not a local `responses.db`. Three
 operator-visible notes:
 
 - **History reset on cutover.** The legacy SQLite `responses.db` is **not**
@@ -293,6 +324,44 @@ operator-visible notes:
   are replaced with the Unicode replacement character (U+FFFD) at ingest. The
   response row is still stored and still renders (defanged) — it is not
   dropped or turned into a 500.
+- **Facets are bounded.** Each response keeps the distinct (column, value) pairs of its output as
+  facets, which drive the facet filter, group-from-results and the agent-count preview.
+  - **Long values.** A value over 2048 bytes (measured on the value as stored, after invalid UTF-8
+    and NUL bytes are rewritten) is left out of the response's facets. It is excluded, never
+    truncated, because a prefix would be a different value than the one the agent reported. The
+    response row, its output and every other facet still persist. Before this limit, one such value
+    made the whole facet insert fail and the response lost ALL of its facets. The limit exists
+    because the value is part of two database indexes, which refuse an entry over about 2.7 KB.
+  - **Older rows.** Older servers indexed values that fit the database index limit (about 2.7 KB
+    for an incompressible value, minus the instruction id length; a compressible value could be
+    larger). Rows already stored by an older server stay readable until retention removes them.
+    Values over 2048 bytes in newly ingested responses are not indexed, so the facet filter, the
+    dropdowns and the group-from-results count show nothing or "0 agents" for such a value; this
+    includes values between 2049 bytes and about 2.6 KB that older servers indexed. The results
+    page shows a hint when a filter value is over 2048 bytes, the REST and MCP agent-count previews
+    name such a filter in `unindexed_filter_keys`, and the create-group form and the group-from-results
+    `422` say the count may be wrong.
+  - **Cap.** At most 5,000 facets are kept per response, chosen by most lines first, then column
+    index ascending, then value ascending, so the same output always keeps the same facets. A rare
+    value (one line, such as a single package on one host) sorts late and is the first to be cut.
+    The symptom is an agent missing from a facet filter or preview while its response still shows in
+    the results. Before, which 5,000 survived was whichever the server held first, so a rare value
+    could be cut and the choice was not repeatable.
+  - **Lost facets are not recoverable.** A response whose facets were lost (`batch_failed`, or cut
+    by `cap`) has no facets re-derived afterwards, and nothing marks such a response as affected
+    (#5630). For `batch_failed` (a refused facet insert) run the command again and recreate any static
+    group built from the affected response from the NEW run, because running the command again does
+    not repair a group that already exists. For `cap` a re-run of the same output cuts the same
+    facets, so use a command or filter that returns fewer distinct values. For `value_too_long`
+    there is nothing to re-run. A `cap` or `batch_failed` response logs a warning naming its
+    `response_id` ("facet count (N) exceeds the per-response cap" and "facet batch insert failed");
+    a `value_too_long` exclusion logs only at debug level, so at the default level only the counter
+    shows it.
+  - **Counting.** Every facet that did not persist is counted in
+    `yuzu_server_response_facets_dropped_total{reason}` (`value_too_long`, `cap`, `batch_failed`);
+    see [metrics.md](metrics.md).
+  - **Retention.** Facet rows are removed with their response by the existing reaper
+    (`--response-retention-days`, default 90); there is no separate facet retention.
 
 ## Retention and cleanup
 

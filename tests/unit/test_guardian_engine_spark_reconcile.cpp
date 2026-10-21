@@ -7,12 +7,17 @@
 
 #include <yuzu/agent/guardian_engine.hpp>
 #include <yuzu/agent/kv_store.hpp>
+#include <yuzu/agent/plugin_loader.hpp> // sha256_file (#4045: the expected baseline hashes)
 
 #include "guaranteed_state.pb.h"
+#include "guardian_arm_ack.hpp" // kWedgeSuppressMaxDecisions (#5459: the held-generation valve test)
+#include "guardian_baseline_heartbeat.hpp" // emit_guardian_baseline_persist_heartbeat_tags (#4045)
+#include "guardian_baseline_persister.hpp" // GuardianBaselinePersister (#4045)
 #include "guardian_arm_heartbeat.hpp" // GuardianArmStats complete type (rung 9c PR-3)
 #include "guardian_backend.hpp" // guardian_backend_from_state/label (#2298 F13)
 #include "guardian_convergence_scheduler.hpp" // ConvergenceScheduler (started_for_test, #2238)
 #include "guardian_journal_format.hpp" // kJournalNamespace, parse_journal_batch (item 7 PR-Ag)
+#include "guardian_health_heartbeat.hpp" // #5403: the pending-Disarm age / deadline-count emitters
 #include "guardian_joined_thread_role.hpp" // GuardianJoinedThreadRole (death test below)
 #include "guardian_io_executor.hpp" // GuardianIoExecutor::submit() (rung 9c R5.1 death test)
 #include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (aggregate inertness)
@@ -28,13 +33,17 @@
 #include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp> // #4045: the persisted baseline record
 
 #include <algorithm>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -67,6 +76,7 @@ namespace gpb = ::yuzu::guardian::v1;
 using yuzu::agent::emit_spark_heartbeat_tags; // #4685 AC8
 using yuzu::agent::FileMechanismTestControls; // #4685 AC2 (Windows-only real-mechanism test)
 using yuzu::agent::FileSparkParams;           // #4685 AC2/AC7 raw-consumer spec
+using yuzu::agent::GuardianBaselinePersister;
 using yuzu::agent::GuardianEngine;
 using yuzu::agent::ISparkMechanism;
 using yuzu::agent::KvStore;
@@ -125,6 +135,10 @@ struct ScopedTestSqlite3 {
 void drop_kv_store_table_for_test(const std::filesystem::path& db_path) {
     ScopedTestSqlite3 db;
     REQUIRE(sqlite3_open(db_path.string().c_str(), &db.raw) == SQLITE_OK);
+    // The engine's own KvStore connection holds this file open in WAL mode with a 5 s busy
+    // timeout; this second connection must wait for it too, or the DDL races a checkpoint
+    // or a commit under load and fails SQLITE_BUSY (observed as rc 5 at 24-40 parallel runs).
+    sqlite3_busy_timeout(db.raw, 5000);
     char* err = nullptr;
     const int rc = sqlite3_exec(db.raw, "DROP TABLE kv_store", nullptr, nullptr, &err);
     if (err)
@@ -134,6 +148,10 @@ void drop_kv_store_table_for_test(const std::filesystem::path& db_path) {
 void recreate_kv_store_table_for_test(const std::filesystem::path& db_path) {
     ScopedTestSqlite3 db;
     REQUIRE(sqlite3_open(db_path.string().c_str(), &db.raw) == SQLITE_OK);
+    // The engine's own KvStore connection holds this file open in WAL mode with a 5 s busy
+    // timeout; this second connection must wait for it too, or the DDL races a checkpoint
+    // or a commit under load and fails SQLITE_BUSY (observed as rc 5 at 24-40 parallel runs).
+    sqlite3_busy_timeout(db.raw, 5000);
     char* err = nullptr;
     const int rc = sqlite3_exec(db.raw,
                                 "CREATE TABLE IF NOT EXISTS kv_store ("
@@ -177,17 +195,27 @@ public:
         // unlike watching_count() (reflects watched_, populated only past the hang
         // gate/failure checks below), this proves a SUPPRESSED retry never reaches the
         // mechanism at all, not merely that it hasn't (yet) committed.
-        watch_calls_.fetch_add(1, std::memory_order_relaxed);
+        // #5459 FU-10: the 1-based ORDER in which watch() calls entered (SparkEngine serialises a
+        // type's mechanism calls, so for one type this is the lock order).
+        const int ordinal = watch_calls_.fetch_add(1, std::memory_order_relaxed) + 1;
         bool hang = false;
         bool do_throw = false;
         {
             std::lock_guard<std::mutex> lk{mu_};
+            if (first_watch_key_.empty())
+                first_watch_key_ = key; // #5459: the key the (hung) first arm was for
             if (fail_next_watch_) {
                 fail_next_watch_ = false;
                 return std::unexpected("forced watch failure");
             }
             hang = hang_next_watch_;
             hang_next_watch_ = false;
+            if (hang_on_ordinal_ != 0 && ordinal == hang_on_ordinal_) {
+                hang = true; // #5459 FU-10: the Nth watch() to enter hangs, whichever rule it is for
+                hang_on_ordinal_ = 0;
+            }
+            if (hang)
+                hung_watch_key_ = key;
             do_throw = throw_next_watch_;
             throw_next_watch_ = false;
         }
@@ -204,6 +232,20 @@ public:
             gate_cv_.notify_all();
             gate_cv_.wait(gate_lk, [this] { return released_; });
         }
+        // #5168: park-ALL gate, unlike the one-shot hang above. Every watch() blocks
+        // here until release_park_all(), so a test can hold the Service class's whole
+        // I/O quota AND its compensating-disarm reservation exhausted at once and
+        // assert what the runtime does with the arms that cannot be admitted -
+        // deterministically, with no dependence on how fast a fake watch() returns.
+        {
+            std::unique_lock<std::mutex> gate_lk{gate_mu_};
+            if (park_all_) {
+                ++parked_watches_;
+                gate_cv_.notify_all();
+                gate_cv_.wait(gate_lk, [this] { return !park_all_; });
+                --parked_watches_;
+            }
+        }
         // #2818 pin: THROW rather than return std::unexpected, and do it AFTER the hang
         // gate. Both halves matter. `fail_next_watch_` is checked before the gate and
         // returns immediately, so it cannot produce the state that pin needs — a watch
@@ -213,6 +255,22 @@ public:
         // under memory pressure.
         if (do_throw)
             throw std::runtime_error("forced watch throw");
+        // #5459: a ONE-SHOT outcome decided AFTER the gate, i.e. while the arm is parked
+        // and only when it is finally released. fail_next_watch_ cannot do this (it
+        // returns before the gate, so the arm never hangs) and do_throw above is captured
+        // at ENTRY, so a test that decides the outcome after the arm is already parked
+        // needs this one. Consumed here, so a later watch() (a recovery attempt) is never
+        // affected: injection cannot be left on.
+        LateWatchOutcome late = LateWatchOutcome::None;
+        {
+            std::lock_guard<std::mutex> lk{mu_};
+            late = late_watch_outcome_;
+            late_watch_outcome_ = LateWatchOutcome::None;
+        }
+        if (late == LateWatchOutcome::Refuse)
+            return std::unexpected("forced late watch refusal");
+        if (late == LateWatchOutcome::Throw)
+            throw std::runtime_error("forced late watch throw");
         std::lock_guard<std::mutex> lk{mu_};
         watched_.insert(key);
         return {};
@@ -230,8 +288,25 @@ public:
             gate_cv_.notify_all();
             gate_cv_.wait(gate_lk, [this] { return released_; });
         }
-        std::lock_guard<std::mutex> lk{mu_};
-        watched_.erase(key);
+        // #4472: an unwatch() hang with its OWN gate, so a test can hold a disarm after the
+        // shared gate above has already been released for a hung arm (that gate latches open).
+        bool isolated_hang = false;
+        {
+            std::lock_guard<std::mutex> lk{mu_};
+            isolated_hang = isolated_hang_next_unwatch_;
+            isolated_hang_next_unwatch_ = false;
+        }
+        if (isolated_hang) {
+            std::unique_lock<std::mutex> gate_lk{isolated_gate_mu_};
+            isolated_entered_ = true;
+            isolated_gate_cv_.notify_all();
+            isolated_gate_cv_.wait(gate_lk, [this] { return isolated_released_; });
+        }
+        {
+            std::lock_guard<std::mutex> lk{mu_};
+            watched_.erase(key);
+        }
+        unwatch_completed_.fetch_add(1, std::memory_order_relaxed);
     }
     void stop() override {}
     /// #4685: drives Guardian's capability-set inputs directly - both default false,
@@ -268,6 +343,54 @@ public:
         std::lock_guard<std::mutex> lk{mu_};
         hang_next_unwatch_ = true;
     }
+    /// #5459: what the next watch() does once it is released from the hang gate (see the
+    /// consume site in watch()). None = succeed. One-shot. Refuse returns an error; Throw
+    /// throws, which SparkEngine's watch_guarded() turns into the SAME refusal-shaped
+    /// failure (a mechanism throw can never surface as the runtime's IoFailure::WorkerThrew).
+    enum class LateWatchOutcome { None, Refuse, Throw };
+    void set_late_watch_outcome(LateWatchOutcome o) {
+        std::lock_guard<std::mutex> lk{mu_};
+        late_watch_outcome_ = o;
+    }
+    /// #5459: the key of the FIRST watch() this mechanism ever received; empty before one.
+    std::string first_watch_key() {
+        std::lock_guard<std::mutex> lk{mu_};
+        return first_watch_key_;
+    }
+    /// #5459 FU-10: the Nth watch() to ENTER this mechanism (1-based, counted from construction)
+    /// hangs on the shared gate, whichever rule it is for. Lets a test that arms two same-type
+    /// rules in ONE push hang exactly the second to enter without depending on which rule the
+    /// engine's two arm workers reach the type lock with first: the first one commits, the second
+    /// hangs. One-shot; 0 = off (the default, so every other test is unaffected).
+    void hang_watch_ordinal(int n) {
+        std::lock_guard<std::mutex> lk{mu_};
+        hang_on_ordinal_ = n;
+    }
+    /// #5459 FU-10: the key of the watch() that took the hang gate (either hang_next_watch() or
+    /// hang_watch_ordinal()); empty before one.
+    std::string hung_watch_key() {
+        std::lock_guard<std::mutex> lk{mu_};
+        return hung_watch_key_;
+    }
+    /// #5459: unwatch() calls that RAN TO COMPLETION (after any hang gate), so a test can
+    /// tell a stale subscription's disarm having finished from it merely being parked.
+    int unwatch_completed_count() const { return unwatch_completed_.load(std::memory_order_relaxed); }
+    /// #4472: the next unwatch() parks on a gate independent of hang_next_watch()'s.
+    void hang_next_unwatch_isolated() {
+        std::lock_guard<std::mutex> lk{mu_};
+        isolated_hang_next_unwatch_ = true;
+    }
+    bool wait_entered_isolated_unwatch(std::chrono::seconds timeout) {
+        std::unique_lock<std::mutex> gate_lk{isolated_gate_mu_};
+        return isolated_gate_cv_.wait_for(gate_lk, timeout, [this] { return isolated_entered_; });
+    }
+    void release_isolated_unwatch_hang() {
+        {
+            std::lock_guard<std::mutex> gate_lk{isolated_gate_mu_};
+            isolated_released_ = true;
+        }
+        isolated_gate_cv_.notify_all();
+    }
     /// Blocks until a hung watch()/unwatch() has actually entered its wait (avoids a
     /// racy sleep-based poll for "is it parked yet").
     bool wait_entered_hang(std::chrono::seconds timeout) {
@@ -294,9 +417,37 @@ public:
         return watched_;
     }
     int watch_call_count() const { return watch_calls_.load(std::memory_order_relaxed); }
+    /// #5168: every subsequent watch() parks until release_park_all().
+    void set_park_all_watches() {
+        std::lock_guard<std::mutex> gate_lk{gate_mu_};
+        park_all_ = true;
+    }
+    void release_park_all() {
+        {
+            std::lock_guard<std::mutex> gate_lk{gate_mu_};
+            park_all_ = false;
+        }
+        gate_cv_.notify_all();
+    }
+    int parked_watch_count() {
+        std::lock_guard<std::mutex> gate_lk{gate_mu_};
+        return parked_watches_;
+    }
+    /// Opens every gate above (each one latches or is idempotent), so no watch()/unwatch()
+    /// - parked now or entering later - can block. Fixture teardown only.
+    void release_all_gates() {
+        release_hang();
+        release_park_all();
+        release_isolated_unwatch_hang();
+    }
 
 private:
     std::atomic<int> watch_calls_{0};
+    std::atomic<int> unwatch_completed_{0}; ///< #5459
+    LateWatchOutcome late_watch_outcome_{LateWatchOutcome::None}; ///< #5459, guarded by mu_
+    std::string first_watch_key_;                                  ///< #5459, guarded by mu_
+    int hang_on_ordinal_{0};                                       ///< #5459 FU-10, guarded by mu_
+    std::string hung_watch_key_;                                   ///< #5459 FU-10, guarded by mu_
     std::atomic<bool> inert_for_test_{false};
     std::atomic<bool> boot_inert_for_test_{false};
     std::mutex mu_;
@@ -305,6 +456,11 @@ private:
     bool throw_next_watch_{false};
     bool hang_next_watch_{false};
     bool hang_next_unwatch_{false};
+    bool isolated_hang_next_unwatch_{false}; ///< #4472, guarded by mu_
+    std::mutex isolated_gate_mu_;
+    std::condition_variable isolated_gate_cv_;
+    bool isolated_entered_{false};  ///< guarded by isolated_gate_mu_
+    bool isolated_released_{false}; ///< guarded by isolated_gate_mu_
     // Gate is a SEPARATE lock from mu_ (see watch()'s comment) - release_hang() must
     // never need mu_, or a caller blocked trying to take mu_ mid-hang (e.g. a concurrent
     // is_watching() from the test's own polling) could never be released.
@@ -312,6 +468,8 @@ private:
     std::condition_variable gate_cv_;
     bool entered_hang_{false};
     bool released_{false};
+    bool park_all_{false};      ///< #5168, guarded by gate_mu_
+    int parked_watches_{0};     ///< #5168, guarded by gate_mu_
 };
 
 // Service: the ONE type with a mechanism registered in this fixture -> Arm.
@@ -333,6 +491,14 @@ gpb::GuaranteedStateRule make_service_rule(const std::string& id, bool enabled =
     return r;
 }
 
+// #4415: an identical re-push of a healthy, committed rule is a skip (no teardown, no re-arm). A
+// test that needs the rule REBUILT by a later push (a refused re-arm, a re-seeded baseline) pushes
+// it with changed content; the name is content but not part of the spark key.
+gpb::GuaranteedStateRule renamed_rule(gpb::GuaranteedStateRule r, const std::string& name) {
+    r.set_name(name);
+    return r;
+}
+
 // File: NO mechanism registered in this fixture -> a routine Unsupported gap.
 // `path` defaults to a fixed placeholder (this fixture never registers a File
 // mechanism, so nothing ever opens it); #4685's real-mechanism tests pass a real
@@ -349,6 +515,25 @@ make_file_rule(const std::string& id, bool enabled = true,
     auto* a = r.mutable_assertion();
     a->set_type("file-exists");
     (*a->mutable_params())["path"] = path;
+    return r;
+}
+
+// #4045: file-hash-equals, no authored expected_hash by default (baseline-on-arm). Spark type
+// file-change, so under prefer_spark_=true with a File mechanism registered it arms via Spark.
+gpb::GuaranteedStateRule
+make_file_hash_rule(const std::string& id, const std::string& path,
+                    const std::string& expected_hash = "") {
+    gpb::GuaranteedStateRule r;
+    r.set_rule_id(id);
+    r.set_name(id);
+    r.set_enabled(true);
+    r.set_enforcement_mode("audit");
+    r.mutable_spark()->set_type("file-change");
+    auto* a = r.mutable_assertion();
+    a->set_type("file-hash-equals");
+    (*a->mutable_params())["path"] = path;
+    if (!expected_hash.empty())
+        (*a->mutable_params())["expected_hash"] = expected_hash;
     return r;
 }
 
@@ -394,6 +579,11 @@ struct SparkReconcileFixture {
     std::unique_ptr<KvStore> kv;
     SparkEngine spark_engine;
     FakeServiceMechanism* mechanism{nullptr}; // borrowed; owned by spark_engine
+    /// #5459: a SECOND, independent mechanism registered under SparkType::Registry when the
+    /// fixture is built with `with_registry_sibling`, so a test can hold the Service type's
+    /// watch() parked (mechanism ops are serialised PER TYPE) while a healthy Registry rule arms,
+    /// commits and is observably torn down / re-armed (or, being suppressed, left alone).
+    FakeServiceMechanism* sibling_mechanism{nullptr}; // borrowed; owned by spark_engine
     std::unique_ptr<GuardianEngine> engine;
     std::mutex sent_mu;
     std::vector<OutboxEntry> sent;
@@ -410,9 +600,14 @@ struct SparkReconcileFixture {
     /// make_service_rule(); FakeServiceMechanism is entirely type-agnostic (its
     /// watch()/unwatch() do not look at which SparkType it is registered under), so
     /// this changes only what the fixture registers it AS, nothing else.
+    /// `wire_first` (#5513) selects the PRODUCTION boot order, wire_spark_engine() BEFORE
+    /// start_local() (agent.cpp), so spark is Available while the boot re-arm walk runs.
+    /// Default false keeps the historical order (start_local() first, so the walk never
+    /// reaches spark) that every pre-existing fixture user was written against.
     explicit SparkReconcileFixture(std::uint64_t periodic_bound_ms = 0,
                                    std::optional<std::chrono::milliseconds> backend_op_deadline = std::nullopt,
-                                   SparkType mechanism_type = SparkType::Service) {
+                                   SparkType mechanism_type = SparkType::Service,
+                                   bool with_registry_sibling = false, bool wire_first = false) {
         auto opened = KvStore::open(db_.path);
         REQUIRE(opened.has_value());
         kv = std::make_unique<KvStore>(std::move(*opened));
@@ -420,20 +615,34 @@ struct SparkReconcileFixture {
         auto mech = std::make_unique<FakeServiceMechanism>();
         mechanism = mech.get();
         REQUIRE(spark_engine.register_mechanism(mechanism_type, std::move(mech)).has_value());
+        if (with_registry_sibling) {
+            REQUIRE(mechanism_type != SparkType::Registry);
+            auto sib = std::make_unique<FakeServiceMechanism>();
+            sibling_mechanism = sib.get();
+            REQUIRE(spark_engine.register_mechanism(SparkType::Registry, std::move(sib)).has_value());
+        }
         spark_engine.start();
 
         engine = std::make_unique<GuardianEngine>(kv.get(), "agent-test", /*prefer_spark=*/true);
+        // The two timing seams must precede wire_spark_engine() (it constructs the worker and
+        // the runtime), and are harmless before start_local(), so one lambda serves both orders.
+        const auto configure_and_wire = [&] {
+            if (periodic_bound_ms > 0)
+                engine->set_drain_worker_timing_for_test(periodic_bound_ms);
+            if (backend_op_deadline)
+                engine->set_spark_backend_op_deadline_for_test(*backend_op_deadline);
+            engine->wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
+                                      [this](const OutboxEntry& e) {
+                                          std::lock_guard<std::mutex> lk{sent_mu};
+                                          sent.push_back(e);
+                                          return SendResult::Sent;
+                                      });
+        };
+        if (wire_first)
+            configure_and_wire();
         REQUIRE(engine->start_local().has_value());
-        if (periodic_bound_ms > 0)
-            engine->set_drain_worker_timing_for_test(periodic_bound_ms);
-        if (backend_op_deadline)
-            engine->set_spark_backend_op_deadline_for_test(*backend_op_deadline);
-        engine->wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
-                                  [this](const OutboxEntry& e) {
-                                      std::lock_guard<std::mutex> lk{sent_mu};
-                                      sent.push_back(e);
-                                      return SendResult::Sent;
-                                  });
+        if (!wire_first)
+            configure_and_wire();
         REQUIRE(engine->spark_availability() == GuardianEngine::SparkAvailability::Available);
     }
 
@@ -443,6 +652,27 @@ struct SparkReconcileFixture {
     // teardown must complete before the SparkEngine it borrowed from is torn
     // down, since GuardianSparkEngineBackend holds a borrowed SparkEngine*.
     ~SparkReconcileFixture() {
+        // Quiesce the detached arm/disarm workers BEFORE anything they touch is destroyed.
+        // Releasing a parked mechanism does not wait for its worker: it resumes into
+        // SparkEngine::arm() on `spark_engine`, a member of this fixture, so without an
+        // edge from "worker finished" to "fixture destroyed" it can run after the frame
+        // is gone (nightly ASan stack-use-after-return in SparkEngine::arm, 2026-10-11, in
+        // the #2233 item 3 test). active_io_workers() counts a worker until its payload is
+        // destroyed (#4147), so 0 means none can still reach the mechanism or the engine.
+        // Bounded, like BootRig5513::shutdown(): a worker that never finishes is reported
+        // on stderr (no CHECK/REQUIRE -- this can run during unwind) and teardown proceeds
+        // as before. Not covered: a test that resets `engine` itself skips this wait.
+        if (mechanism)
+            mechanism->release_all_gates();
+        if (sibling_mechanism)
+            sibling_mechanism->release_all_gates();
+        if (engine &&
+            !yuzu::test::spin_until([this] { return engine->active_io_workers() == 0; },
+                                    std::chrono::seconds{10})) {
+            std::fprintf(stderr,
+                         "~SparkReconcileFixture: workers still alive after the bounded wait; "
+                         "proceeding with teardown anyway\n");
+        }
         engine.reset();
         spark_engine.stop();
     }
@@ -803,7 +1033,7 @@ TEST_CASE("start_local degrades per-rule when a re-arm throws: the other cached 
           "[spark][guardian][reconcile][boot]") {
     // #2238 item 1 (fixes BLOCKING-2a): guardian_engine.cpp's start_local() catches a
     // std::system_error thrown while re-arming a single cached rule (modelling a legacy
-    // guard's std::thread ctor throwing under thread/handle exhaustion) and continues to
+    // guard's std::thread ctor throwing under thread-creation failure) and continues to
     // the next rule instead of letting the throw escape and terminate the agent. Nothing
     // in production can force that throw deterministically (see the handover's survey of
     // guard_systemd.cpp / guard_file.cpp / guard_registry.cpp), so this drives it via
@@ -900,6 +1130,1092 @@ TEST_CASE("start_local degrades per-rule when a re-arm throws: the other cached 
     engine.set_rearm_fault_hook_for_test(nullptr);
     engine.stop();
     spark_engine.stop();
+}
+
+// ---------------------------------------------------------------------------
+// #5513 boot re-arm catch-up
+//
+// A boot re-arm that failed at an already-acknowledged generation used to leave the agent
+// reporting that generation, so the server's heartbeat reconcile (which only pushes while the
+// reported value is BEHIND its current) never re-sent the rule. The engine now reports 0 while a
+// boot re-arm is unresolved (GuardianEngine::boot_rearm_unresolved()) and clears that on the first
+// clean application, so the server's catch-up push re-arms the rule.
+//
+// LIVE vs DORMANT. Production runs prefer_spark=false, where journal_maintenance_tick() returns at
+// its `!prefer_spark_` guard: only the synchronous set (the start_local() walk) and the
+// apply_rules() tail clear are reachable there. Every case below whose name says "dormant" needs
+// prefer_spark=true (the tick-side set from a drained boot receipt, the tick-side clear, and the
+// ledger latch) and is dormant code today; it is here so the flip PR knows what it turns on.
+//
+// Every Spark BOOT case runs in PRODUCTION ORDER (wire_spark_engine() before start_local()) over a
+// RESTARTED engine on the same on-disk KV (the one post-boot case uses the fixture's wire_first
+// flag instead), and forces its interleaving with the fake mechanism's
+// gates rather than assuming what attach_rule() returns. hang_next_watch()/release_hang() is the
+// FIRST park only: release_hang() latches open for the life of the mechanism, so any SECOND park
+// in a case uses set_park_all_watches()/release_park_all(). set_late_watch_outcome() is consumed
+// after both gates. A "flag HOLDS" assertion is only made after draining to quiescence (pending 0
+// and no live backend worker), never while an arm may still be in flight.
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr std::uint64_t kGen5513 = 7; // the persisted, already-acknowledged generation
+
+std::string push_bytes_5513(const std::vector<gpb::GuaranteedStateRule>& rules,
+                            std::uint64_t generation, bool full_sync = true) {
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(full_sync);
+    p.set_policy_generation(generation);
+    for (const auto& r : rules)
+        *p.add_rules() = r;
+    return p.SerializeAsString();
+}
+
+/// The same injected thread-creation-failure throw the "start_local degrades per-rule" test uses,
+/// aimed at exactly one rule by id.
+std::function<void(const std::string&)> rearm_throw_hook_5513(std::string target) {
+    return [target = std::move(target)](const std::string& rule_id) {
+        if (rule_id == target)
+            throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again),
+                                    "injected thread exhaustion");
+    };
+}
+
+/// A restartable engine over ONE on-disk KV. SparkReconcileFixture cannot be used for the boot
+/// cases because they need a SECOND engine incarnation reading what the first one persisted
+/// (the fixture's KV, SparkEngine and mechanism live exactly as long as its one engine). Every
+/// incarnation gets a fresh KvStore, SparkEngine and mechanism(s), the shape the "start_local
+/// degrades per-rule" test already uses for its two phases. The backend-op deadline is widened
+/// so no real clock can expire a parked claim: a case that needs a wedge expires the claim
+/// itself with the runtime's synthetic clock.
+struct BootRig5513 {
+    yuzu::test::TempDbFile db_{unique_kv_path()}; // declared first: destroyed last
+    std::unique_ptr<KvStore> kv;
+    std::unique_ptr<SparkEngine> spark_engine; // null when built without spark
+    FakeServiceMechanism* mechanism{nullptr};  // borrowed; owned by spark_engine
+    FakeServiceMechanism* sibling_mechanism{nullptr}; // Registry type, only with_registry_sibling
+    std::unique_ptr<GuardianEngine> engine;
+
+    BootRig5513() = default;
+    BootRig5513(const BootRig5513&) = delete;
+    BootRig5513& operator=(const BootRig5513&) = delete;
+    ~BootRig5513() { shutdown(); }
+
+    void construct(bool prefer_spark, bool with_spark, bool with_registry_sibling = false) {
+        auto opened = KvStore::open(db_.path);
+        REQUIRE(opened.has_value());
+        kv = std::make_unique<KvStore>(std::move(*opened));
+        if (with_spark) {
+            spark_engine = std::make_unique<SparkEngine>();
+            auto mech = std::make_unique<FakeServiceMechanism>();
+            mechanism = mech.get();
+            REQUIRE(spark_engine->register_mechanism(SparkType::Service, std::move(mech))
+                        .has_value());
+            if (with_registry_sibling) {
+                auto sib = std::make_unique<FakeServiceMechanism>();
+                sibling_mechanism = sib.get();
+                REQUIRE(spark_engine->register_mechanism(SparkType::Registry, std::move(sib))
+                            .has_value());
+            }
+            spark_engine->start();
+        }
+        engine = std::make_unique<GuardianEngine>(kv.get(), "agent-test", prefer_spark);
+        if (with_spark)
+            engine->set_spark_backend_op_deadline_for_test(std::chrono::milliseconds{60'000});
+    }
+
+    /// Spark wiring; a caller wanting production order calls this BEFORE start_local().
+    void wire() {
+        REQUIRE(spark_engine != nullptr);
+        engine->wire_spark_engine(spark_engine.get(), /*spark_disabled_by_config=*/false,
+                                  [](const OutboxEntry&) { return SendResult::Sent; });
+        REQUIRE(engine->spark_availability() == GuardianEngine::SparkAvailability::Available);
+    }
+
+    void release_gates() {
+        for (FakeServiceMechanism* m : {mechanism, sibling_mechanism}) {
+            if (m)
+                m->release_all_gates();
+        }
+    }
+
+    /// Releases every gate FIRST (a parked worker would otherwise outlive the engine that owns
+    /// its claim), waits (bounded) for the released worker to finish, then tears down in the
+    /// fixture's order: engine, then SparkEngine, then KV. The wait is an event-driven poll with
+    /// no REQUIRE/CHECK (REQUIRE throws, and shutdown() also runs from the destructor, possibly
+    /// during unwind); a timeout is reported on stderr, then teardown proceeds.
+    void shutdown() {
+        release_gates();
+        if (engine &&
+            !yuzu::test::spin_until([&] { return engine->active_io_workers() == 0; },
+                                    std::chrono::seconds{10})) {
+            std::fprintf(stderr,
+                         "BootRig5513::shutdown: workers still alive after the bounded wait; "
+                         "proceeding with teardown anyway\n");
+        }
+        engine.reset();
+        if (spark_engine)
+            spark_engine->stop();
+        spark_engine.reset();
+        mechanism = nullptr;
+        sibling_mechanism = nullptr;
+        kv.reset();
+    }
+
+    yuzu::agent::GuardianDispatchResult push(const std::vector<gpb::GuaranteedStateRule>& rules,
+                                             std::uint64_t generation, bool full_sync = true) {
+        return yuzu::agent::guardian_dispatch_push_bytes_for_test(
+            *engine, push_bytes_5513(rules, generation, full_sync));
+    }
+    void push_ok(const std::vector<gpb::GuaranteedStateRule>& rules, std::uint64_t generation,
+                 bool full_sync = true) {
+        REQUIRE(push(rules, generation, full_sync).exit_code == 0);
+    }
+
+    /// Drives the heartbeat tick until `pred` holds or the (sanitizer-scaled) bound elapses.
+    template <typename Pred>
+    [[nodiscard]] bool tick_until(Pred pred,
+                                  std::chrono::milliseconds timeout = std::chrono::seconds{10}) {
+        return yuzu::test::spin_until(
+            [&] {
+                engine->journal_maintenance_tick();
+                return pred();
+            },
+            timeout);
+    }
+    void tick_n(int n) {
+        for (int i = 0; i < n; ++i)
+            engine->journal_maintenance_tick();
+    }
+
+    /// QUIESCENT: nothing pending in the ack ledger and no backend arm/disarm still running (the
+    /// shape this file's set_fail_next_watch loop uses), then a bounded COUNT of extra ticks so a
+    /// tick that observed the quiescent state has certainly run. Never call while a gate is held.
+    void quiesce() {
+        REQUIRE(tick_until([&] {
+            return engine->ack_pending_count_for_test() == 0 && engine->active_io_workers() == 0;
+        }));
+        tick_n(3);
+    }
+
+    /// Phase 1: a throwaway incarnation that persists `rules` at `generation`, settles, and shuts
+    /// down. Leaves the KV holding the rules and the acknowledged generation.
+    void seed(bool prefer_spark, bool with_spark,
+              const std::vector<gpb::GuaranteedStateRule>& rules, std::uint64_t generation,
+              bool with_registry_sibling = false) {
+        construct(prefer_spark, with_spark, with_registry_sibling);
+        if (with_spark)
+            wire();
+        REQUIRE(engine->start_local().has_value());
+        push_ok(rules, generation);
+        if (prefer_spark && with_spark) {
+            REQUIRE(tick_until([&] { return engine->spark_armed_rule_count() == rules.size(); }));
+        }
+        quiesce();
+        REQUIRE(engine->policy_generation() == generation);
+        REQUIRE_FALSE(engine->boot_rearm_unresolved());
+        shutdown();
+    }
+};
+
+} // namespace
+
+TEST_CASE("#5513 live (prefer_spark=false, spark wired, production order): a boot re-arm throw "
+          "reports generation 0, and the same-generation catch-up push clears it",
+          "[spark][guardian][reconcile][boot][5513]") {
+    // The production configuration: prefer_spark is const false, spark_runtime_ is wired before
+    // start_local() (so decide_retry() runs on the catch-up with a non-null runtime), and the
+    // heartbeat tick returns at its prefer_spark guard, so the apply_rules() tail is the ONLY
+    // clearer. Mutation: deleting the tail clear leaves the agent reporting 0 forever; deleting
+    // the synchronous set leaves it reporting kGen5513 after the failed boot.
+    BootRig5513 r;
+    r.seed(/*prefer_spark=*/false, /*with_spark=*/true, {make_file_rule("r1")}, kGen5513);
+
+    r.construct(false, true);
+    r.wire();
+    r.engine->set_rearm_fault_hook_for_test(rearm_throw_hook_5513("r1"));
+    const auto failures_before = r.engine->arm_failure_count();
+    REQUIRE(r.engine->start_local().has_value()); // degrade contract: the throw does not escape
+
+    CHECK(r.engine->policy_generation() == 0); // reported, not the persisted kGen5513
+    CHECK(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->arm_failure_count() == failures_before + 1);
+    CHECK(r.engine->ack_pending_count_for_test() == 0);
+    const auto report = r.engine->generation_report();
+    CHECK(report.reported == 0);
+    CHECK(report.boot_rearm_unresolved);
+
+    // The tick is not a clearer at prefer_spark=false: it returns before the ack drain.
+    r.tick_n(3);
+    CHECK(r.engine->policy_generation() == 0);
+    CHECK(r.engine->boot_rearm_unresolved());
+
+    // The server's reconcile push at its current generation (the agent's reported 0 is behind).
+    r.push_ok({make_file_rule("r1")}, kGen5513);
+    CHECK(r.engine->policy_generation() == kGen5513);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->ack_pending_count_for_test() == 0);
+    const auto cleared = r.engine->generation_report();
+    CHECK(cleared.reported == kGen5513);
+    CHECK_FALSE(cleared.boot_rearm_unresolved);
+}
+
+TEST_CASE("#5513 live (prefer_spark=false): a healthy boot re-arm never holds the reported "
+          "generation",
+          "[spark][guardian][reconcile][boot][5513]") {
+    // Control for the legacy path: no throw, so the reported generation is the persisted one and
+    // the flag never rises. Mutation: a set keyed on anything but a failed re-arm reports 0 here.
+    BootRig5513 r;
+    r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
+
+    r.construct(false, false);
+    const auto failures_before = r.engine->arm_failure_count();
+    REQUIRE(r.engine->start_local().has_value());
+    CHECK(r.engine->policy_generation() == kGen5513);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->arm_failure_count() == failures_before);
+    r.tick_n(3);
+    CHECK(r.engine->policy_generation() == kGen5513);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+}
+
+TEST_CASE("#5513 live (prefer_spark=false): a catch-up push the KV refuses leaves the flag set and "
+          "the reported generation 0, until a push applies",
+          "[spark][guardian][reconcile][boot][5513]") {
+    // The persistent-failure shape on the production (legacy) path. A legacy re-arm failure at
+    // APPLY time has no deterministic seam (reconcile_rule_locked's legacy branch never returns
+    // Failed; the fault hook fires only in start_local()), so the catch-up is made to fail by a
+    // real KV write failure instead: the rule persist is refused, apply_rules() returns the
+    // error, and the flag must stay set on every refused attempt. Mutation: clearing the flag
+    // before the persist reports kGen5513 here.
+    BootRig5513 r;
+    r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
+
+    r.construct(false, false);
+    r.engine->set_rearm_fault_hook_for_test(rearm_throw_hook_5513("r1"));
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == 0);
+
+    drop_kv_store_table_for_test(r.db_.path);
+    for (int i = 0; i < 2; ++i) {
+        const auto refused = r.push({make_file_rule("r1")}, kGen5513);
+        CHECK(refused.exit_code != 0);
+        CHECK(r.engine->boot_rearm_unresolved());
+        CHECK(r.engine->policy_generation() == 0);
+    }
+
+    recreate_kv_store_table_for_test(r.db_.path);
+    r.push_ok({make_file_rule("r1")}, kGen5513);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == kGen5513);
+}
+
+TEST_CASE("#5513 live (prefer_spark=false): a catch-up whose generation persist fails clears the "
+          "flag but reports the HELD generation, never a newer one",
+          "[spark][guardian][reconcile][boot][5513]") {
+    // The flag clears on a clean APPLICATION; advancing the internal generation is a separate step
+    // that needs the generation write to succeed. An empty delta push writes no rule, so the only
+    // KV write is that generation persist: dropping the table makes exactly it fail. The agent
+    // then reports the generation it really holds (kGen5513), which is BEHIND the pushed
+    // kGen5513 + 1, so the server's reconcile keeps pushing; reporting the pushed value here
+    // would be a false acknowledgment. Once the store is back, the same push persists and
+    // advances, and a restart reads it from disk.
+    BootRig5513 r;
+    r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
+
+    r.construct(false, false);
+    r.engine->set_rearm_fault_hook_for_test(rearm_throw_hook_5513("r1"));
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.engine->boot_rearm_unresolved());
+
+    drop_kv_store_table_for_test(r.db_.path);
+    r.push_ok({}, kGen5513 + 1, /*full_sync=*/false);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == kGen5513); // held, below the server's current
+
+    recreate_kv_store_table_for_test(r.db_.path);
+    r.push_ok({}, kGen5513 + 1, /*full_sync=*/false);
+    CHECK(r.engine->policy_generation() == kGen5513 + 1);
+
+    r.shutdown();
+    r.construct(false, false);
+    REQUIRE(r.engine->start_local().has_value());
+    CHECK(r.engine->policy_generation() == kGen5513 + 1); // durable
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+}
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a boot arm that drains as a failure reports 0, and "
+          "only the tick clears it once the catch-up arm commits",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // Boot arm parked in watch() (Accepted, pending), then released with a late refusal: the drain
+    // folds it as a failure on the BOOT application, which sets the flag (the tick-side set). The
+    // catch-up push re-arms through apply_rules() but its arm is parked too, so the tail cannot
+    // clear (pending), and the tick must not clear while the receipt is Pending; the clear comes
+    // from the tick once the arm commits. Mutations: deleting the tick-side set never reaches 0;
+    // deleting the tick-side clear (or leaving only the tail clear) never returns to kGen5513.
+    using namespace std::chrono_literals;
+    BootRig5513 r;
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+
+    r.construct(true, true);
+    r.wire(); // production order
+    r.mechanism->hang_next_watch();
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.mechanism->wait_entered_hang(30s)); // the boot arm is IN watch()
+
+    // Accepted alone never holds: the receipt is pending, not failed.
+    CHECK(r.engine->policy_generation() == kGen5513);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->ack_pending_count_for_test() == 1);
+
+    r.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+    r.mechanism->release_hang();
+    REQUIRE(r.tick_until([&] { return r.engine->boot_rearm_unresolved(); }));
+    CHECK(r.engine->policy_generation() == 0);
+
+    // The catch-up arm is held in watch() by the park-all gate (the hang gate is latched open).
+    r.mechanism->set_park_all_watches();
+    const auto pending_reply = r.push({make_service_rule("r1")}, kGen5513);
+    REQUIRE(pending_reply.exit_code == 0);
+    // The push_rules reply text reads the REPORTED generation, so while the flag is set it says 0
+    // (not the persisted kGen5513) even though the push itself was accepted.
+    CHECK(pending_reply.output.find(" generation=0 ") != std::string::npos);
+    REQUIRE(yuzu::test::spin_until([&] { return r.mechanism->parked_watch_count() == 1; }));
+    CHECK(r.engine->policy_generation() == 0); // the tail cannot clear: the receipt is pending
+    CHECK(r.engine->boot_rearm_unresolved());
+    for (int i = 0; i < 3; ++i) {
+        r.engine->journal_maintenance_tick(); // a pending receipt must not clear it either
+        CHECK(r.engine->policy_generation() == 0);
+        CHECK(r.engine->boot_rearm_unresolved());
+    }
+
+    r.mechanism->release_park_all();
+    REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen5513; }));
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+}
+
+namespace {
+
+/// T4 body. `singleton` seeds only the throwing rule (an empty ledger after boot: nothing for any
+/// sibling receipt to drain); otherwise two siblings arm and commit beside it.
+void run_boot_throw_drained_before_push_5513(bool singleton) {
+    constexpr std::uint64_t kGen = 9;
+    BootRig5513 r;
+    const std::vector<gpb::GuaranteedStateRule> all =
+        singleton ? std::vector<gpb::GuaranteedStateRule>{make_service_rule("r2", true, "SvcB")}
+                  : std::vector<gpb::GuaranteedStateRule>{make_service_rule("r1", true, "SvcA"),
+                                                         make_service_rule("r2", true, "SvcB"),
+                                                         make_service_rule("r3", true, "SvcC")};
+    r.seed(true, true, all, kGen);
+
+    r.construct(true, true);
+    r.wire(); // production order
+    r.engine->set_rearm_fault_hook_for_test(rearm_throw_hook_5513("r2"));
+    const auto failures_before = r.engine->arm_failure_count();
+    REQUIRE(r.engine->start_local().has_value());
+
+    // Set synchronously by the walk's catch, before any tick has run.
+    CHECK(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == 0);
+    const auto report = r.engine->generation_report();
+    CHECK(report.reported == 0);
+    CHECK(report.boot_rearm_unresolved);
+
+    if (!singleton)
+        REQUIRE(r.tick_until([&] { return r.engine->spark_armed_rule_count() == 2; }));
+    // Drain to QUIESCENT before asserting the flag HOLDS: the sibling receipts have committed and
+    // the boot application has nothing pending and no counted failure, so the tick's can_advance()
+    // is true. Only the failure latch keeps it false.
+    r.quiesce();
+    CHECK(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == 0);
+    CHECK(r.engine->arm_failure_count() == failures_before + 1);
+    CHECK(r.engine->spark_armed_rule_count() == (singleton ? 0u : 2u));
+
+    // The catch-up push at the server's generation arms the rule and the tick clears the flag.
+    r.push_ok(all, kGen);
+    REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen; }));
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->spark_armed_rule_count() == all.size());
+}
+
+} // namespace
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a boot throw beside committed siblings stays "
+          "unresolved after the tick drains to quiescence (the ledger latch)",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // The tripwire for the tick-side clear. The two sibling arms commit and drain clean, so the
+    // boot application has pending 0, no counted failure and (without the latch) can_advance() is
+    // TRUE: the first maintenance tick would erase the flag before the first heartbeat ever read
+    // it. Mutation: delete the latch_failure() in the synchronous set helper and the
+    // post-quiescence CHECKs fail (flag false, reported kGen).
+    run_boot_throw_drained_before_push_5513(/*singleton=*/false);
+}
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a boot throw as the ONLY cached rule stays "
+          "unresolved across ticks (empty ledger, the ledger latch)",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // Singleton variant of the case above: no sibling receipt at all, so can_advance() is true on
+    // the very first tick unless the latch holds it. Same mutation, red on the first tick.
+    run_boot_throw_drained_before_push_5513(/*singleton=*/true);
+}
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a boot arm the runtime refuses SYNCHRONOUSLY "
+          "(ReconcileOutcome::Failed) reports 0, holds across ticks and refused pushes, and a "
+          "clean catch-up clears it",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // The only test that reaches start_local()'s `case ReconcileOutcome::Failed:` arm (every
+    // sibling goes through the throw catches or the async drain). The refusal is REAL and needs
+    // no timing: GuardianSparkRuntime::begin_stop() before start_local() makes attach_core()
+    // return Failed("stopping") at its first locked check, which attach_rule() returns as
+    // unexpected and reconcile_rule_locked() maps to Failed with no receipt registered.
+    // (apply_rules() can never observe this under mtx_, because stop() holds it across
+    // begin_stop(); calling it directly on the runtime ahead of the boot walk is the test-only
+    // reach.) Because the runtime stays stopped, a push of the same rule is refused too, so the
+    // clearing push is the operator removing the rule: an application with nothing to arm is
+    // clean. Mutation: deleting note_boot_rearm_failure_locked() from the Failed arm reports
+    // kGen5513 and no unresolved flag right after start_local().
+    BootRig5513 r;
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+
+    r.construct(true, true);
+    r.wire(); // production order
+    auto* rt = r.engine->spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    rt->begin_stop();
+    const auto failures_before = r.engine->arm_failure_count();
+    REQUIRE(r.engine->start_local().has_value());
+
+    // Set synchronously by the walk, before any tick has run.
+    CHECK(r.engine->policy_generation() == 0); // reported, not the persisted kGen5513
+    CHECK(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->arm_failure_count() == failures_before + 1);
+    CHECK(r.engine->ack_pending_count_for_test() == 0); // a refusal registers no receipt
+    CHECK(r.engine->spark_armed_rule_count() == 0);
+    const auto report = r.engine->generation_report();
+    CHECK(report.reported == 0);
+    CHECK(report.boot_rearm_unresolved);
+
+    // Nothing is pending, so only the failure latch keeps the tick from clearing it.
+    r.tick_n(3);
+    CHECK(r.engine->policy_generation() == 0);
+    CHECK(r.engine->boot_rearm_unresolved());
+
+    // The catch-up push at the server's generation re-attempts the arm and is refused again.
+    r.push_ok({make_service_rule("r1")}, kGen5513);
+    r.tick_n(3);
+    CHECK(r.engine->policy_generation() == 0);
+    CHECK(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->arm_failure_count() == failures_before + 2);
+
+    // A clean catch-up: the server's rule set no longer carries the refused rule.
+    r.push_ok({}, kGen5513);
+    REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen5513; }));
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->arm_failure_count() == failures_before + 2);
+}
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a healthy but SLOW boot arm never holds the "
+          "reported generation at any step",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // The boot arm is parked in watch() (Accepted, pending) while ticks run, then released and
+    // committed. Mutations: a set on Accepted alone, or one keyed on !can_advance(), reports 0 at
+    // the first or the mid-hang check.
+    using namespace std::chrono_literals;
+    BootRig5513 r;
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+
+    r.construct(true, true);
+    r.wire();
+    r.mechanism->hang_next_watch();
+    const auto failures_before = r.engine->arm_failure_count();
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.mechanism->wait_entered_hang(30s));
+
+    CHECK(r.engine->policy_generation() == kGen5513);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->ack_pending_count_for_test() == 1);
+    for (int i = 0; i < 3; ++i) {
+        r.engine->journal_maintenance_tick(); // drains: the receipt is still Pending
+        CHECK(r.engine->policy_generation() == kGen5513);
+        CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    }
+
+    r.mechanism->release_hang(); // the late outcome is the default: the arm succeeds
+    REQUIRE(r.tick_until([&] { return r.engine->spark_armed_rule_count() == 1; }));
+    r.quiesce();
+    CHECK(r.engine->policy_generation() == kGen5513);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->arm_failure_count() == failures_before);
+}
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a persistently failing rule holds the reported "
+          "generation at 0 across every catch-up, and the first clean push clears it",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // Boot failure as in the drained-failure case above, then three catch-up pushes each preceded
+    // by a single-shot set_fail_next_watch(). A refusal may resolve synchronously (Failed) or
+    // asynchronously (drained), and BOTH hold, so the case never depends on which. Each iteration
+    // drains to quiescence BEFORE re-arming the single-shot (an arm still in flight would consume
+    // it, the flake the boot_inert refusal loop in this file documents). Mutation: a clear fired
+    // by begin_application or by a Reapply flips the reported value to kGen5513 mid-loop.
+    using namespace std::chrono_literals;
+    BootRig5513 r;
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+
+    r.construct(true, true);
+    r.wire();
+    r.mechanism->hang_next_watch();
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.mechanism->wait_entered_hang(30s));
+    r.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+    r.mechanism->release_hang();
+    REQUIRE(r.tick_until([&] { return r.engine->boot_rearm_unresolved(); }));
+    r.quiesce();
+    REQUIRE(r.engine->policy_generation() == 0);
+
+    auto last_failures = r.engine->arm_failure_count();
+    for (int i = 0; i < 3; ++i) {
+        r.mechanism->set_fail_next_watch();
+        r.push_ok({make_service_rule("r1")}, kGen5513);
+        CHECK(r.engine->policy_generation() == 0); // right after the push, before any drain
+        CHECK(r.engine->boot_rearm_unresolved());
+        r.quiesce();
+        CHECK(r.engine->policy_generation() == 0);
+        CHECK(r.engine->boot_rearm_unresolved());
+        CHECK(r.engine->spark_armed_rule_count() == 0);
+        const auto failures = r.engine->arm_failure_count();
+        CHECK(failures > last_failures); // each refused attempt is counted
+        last_failures = failures;
+    }
+
+    r.push_ok({make_service_rule("r1")}, kGen5513); // no injected fault: the arm commits
+    REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen5513; }));
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->spark_armed_rule_count() == 1);
+}
+
+namespace {
+
+/// #5513 back-off rig: the boot arm is refused SYNCHRONOUSLY (the runtime is stopped before the
+/// boot walk, exactly as the "refuses SYNCHRONOUSLY" case above), and it stays stopped, so every
+/// later push of the rule is refused too and reaches apply_rules()' tail with the flag still set.
+/// That is the only deterministic way to produce several FAILED catch-ups in a row, hence
+/// [dormant] (prefer_spark=true).
+void stage_refused_boot_5513(BootRig5513& r) {
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+    r.construct(true, true);
+    r.wire(); // production order
+    auto* rt = r.engine->spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    rt->begin_stop();
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.engine->boot_rearm_unresolved());
+}
+
+/// Consumes exactly `real` heartbeat reports and asserts each is the REAL persisted generation
+/// with the companion still set, then ONE more asserting the holdoff is spent (reported 0,
+/// companion set). Calls generation_report() exactly real + 1 times.
+void expect_backoff_reports_5513(GuardianEngine& e, std::uint32_t real) {
+    for (std::uint32_t i = 0; i < real; ++i) {
+        const auto rep = e.generation_report();
+        CHECK(rep.reported == kGen5513);
+        CHECK(rep.boot_rearm_unresolved);
+    }
+    const auto spent = e.generation_report();
+    CHECK(spent.reported == 0);
+    CHECK(spent.boot_rearm_unresolved);
+    CHECK(e.boot_report_holdoff_for_test() == 0);
+}
+
+} // namespace
+
+TEST_CASE("#5513 back-off dormant (prefer_spark=true): each failed catch-up earns the next "
+          "heartbeats' real report, escalating 1, 2, 4, 8, 10, 10, and a re-push replaces it",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // Reported-value sequence asserted (R = the real persisted kGen5513 with the companion set,
+    // Z = 0 with the companion set): after the boot failure alone Z (no failed catch-up yet);
+    // after catch-up #1: R Z; #2: R R Z; #3 (only ONE of its 4 consumed, so a re-push replaces
+    // the remainder): R; #4: exactly 8 R then Z; #5 and #6: 10 R then Z each. policy_generation()
+    // (the const accessor __guard__ replies use) is 0 throughout, and the internal generation is
+    // never touched. Mutations: dropping the holdoff set leaves Z at #1; dropping the cap
+    // reports 16 R at #5/#6; `holdoff +=` instead of `=` reports 11 R at #4; consuming nothing
+    // in generation_report() never reaches Z.
+    BootRig5513 r;
+    stage_refused_boot_5513(r);
+
+    // The boot failure alone is not a failed catch-up: no holdoff, so the report is 0 and it
+    // does not decay across repeated reads.
+    CHECK(r.engine->boot_catchup_failures_for_test() == 0);
+    CHECK(r.engine->boot_report_holdoff_for_test() == 0);
+    for (int i = 0; i < 3; ++i) {
+        const auto rep = r.engine->generation_report();
+        CHECK(rep.reported == 0);
+        CHECK(rep.boot_rearm_unresolved);
+    }
+
+    const std::uint32_t expected[] = {1, 2, 4, 8, 10, 10};
+    for (std::uint32_t i = 0; i < 6; ++i) {
+        r.push_ok({make_service_rule("r1")}, kGen5513); // refused again: the tail sees !clean
+        CHECK(r.engine->boot_rearm_unresolved());
+        CHECK(r.engine->policy_generation() == 0);
+        CHECK(r.engine->boot_catchup_failures_for_test() == i + 1);
+        CHECK(r.engine->boot_report_holdoff_for_test() == expected[i]);
+        if (i == 2) {
+            // Consume ONE of the 4: the next push must REPLACE the remaining 3, not add to it.
+            const auto rep = r.engine->generation_report();
+            CHECK(rep.reported == kGen5513);
+            CHECK(rep.boot_rearm_unresolved);
+            CHECK(r.engine->boot_report_holdoff_for_test() == 3);
+            continue;
+        }
+        expect_backoff_reports_5513(*r.engine, expected[i]);
+        CHECK(r.engine->policy_generation() == 0); // reads never leak the holdoff
+    }
+    // The internal value is untouched by any of it: a clean push at the same generation clears
+    // the flag and the reported value returns to it.
+    r.push_ok({}, kGen5513);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == kGen5513);
+}
+
+TEST_CASE("#5513 back-off dormant (prefer_spark=true): the failure counter saturates, the holdoff "
+          "holds at the cap, and a clean push clears the back-off",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // 40 failed catch-ups: past the counter's 16 cap and past 32, where an uncapped counter
+    // would shift by >= 32 (undefined; on x86 it wraps and the holdoff collapses to 1). The
+    // holdoff must still be exactly the 10-heartbeat ceiling. Then a clean push with holdoff
+    // still unspent: the flag clears, the back-off state is reset, and the report is the real
+    // value with no companion. Mutations: no counter cap (holdoff 1 or UBSan at failure 33);
+    // no reset of the two members on the tail clear (accessors stay 16 / 10 after the clear).
+    BootRig5513 r;
+    stage_refused_boot_5513(r);
+
+    for (std::uint32_t i = 1; i <= 40; ++i) {
+        r.push_ok({make_service_rule("r1")}, kGen5513);
+        REQUIRE(r.engine->boot_catchup_failures_for_test() == std::min<std::uint32_t>(i, 16));
+        if (i >= 5)
+            REQUIRE(r.engine->boot_report_holdoff_for_test() ==
+                    GuardianEngine::kBootReportBackoffMaxHeartbeats);
+    }
+    CHECK(r.engine->boot_report_holdoff_for_test() == 10);
+    CHECK(r.engine->policy_generation() == 0);
+
+    r.push_ok({}, kGen5513); // clean: the operator removed the refused rule
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->boot_catchup_failures_for_test() == 0);
+    CHECK(r.engine->boot_report_holdoff_for_test() == 0);
+    for (int i = 0; i < 3; ++i) {
+        const auto rep = r.engine->generation_report();
+        CHECK(rep.reported == kGen5513);
+        CHECK_FALSE(rep.boot_rearm_unresolved);
+    }
+    CHECK(r.engine->policy_generation() == kGen5513);
+}
+
+TEST_CASE("#5513 back-off dormant (prefer_spark=true): a failed push with NO unresolved boot "
+          "re-arm neither counts nor holds off, and a healthy boot always reports the real "
+          "generation",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // Healthy boot (flag never set), then a later push of the rule is refused once: that is an
+    // ordinary held push, not a boot catch-up. Mutations: dropping the
+    // `boot_unresolved_` term of the tail's else-if counts it (accessors 1 / 1); applying or
+    // consuming holdoff without the flag would show here only through those accessors, since
+    // the report would read {G, false} either way.
+    BootRig5513 r;
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+    r.construct(true, true);
+    r.wire();
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.tick_until([&] { return r.engine->spark_armed_rule_count() == 1; }));
+    r.quiesce();
+    for (int i = 0; i < 3; ++i) {
+        const auto rep = r.engine->generation_report();
+        CHECK(rep.reported == kGen5513);
+        CHECK_FALSE(rep.boot_rearm_unresolved);
+    }
+
+    // A single-shot refusal (resolved synchronously or drained, the case does not depend on
+    // which): the push reaches the tail !clean, but the flag was never set. The rule is pushed
+    // with changed content so it is rebuilt: an identical push of the healthy rule is a skip
+    // (#4415) and would never reach the mechanism.
+    const auto failures_before = r.engine->arm_failure_count();
+    r.mechanism->set_fail_next_watch();
+    r.push_ok({renamed_rule(make_service_rule("r1"), "r1-v2")}, kGen5513);
+    r.quiesce();
+    CHECK(r.engine->arm_failure_count() > failures_before); // the push did fail to arm
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->boot_catchup_failures_for_test() == 0);
+    CHECK(r.engine->boot_report_holdoff_for_test() == 0);
+    const auto rep = r.engine->generation_report();
+    CHECK(rep.reported == kGen5513);
+    CHECK_FALSE(rep.boot_rearm_unresolved);
+}
+
+TEST_CASE("#5513 back-off live (prefer_spark=false): pushes that return before the tail (invalid "
+          "rule id, KV refusal) are not failed catch-ups and earn no holdoff",
+          "[spark][guardian][reconcile][boot][5513]") {
+    // The #4665 reject and the put_rule early return both leave the boot application's flag
+    // owned by it and must not count. Mutation: moving the count to the top of apply_rules (or
+    // counting any non-ok return) reports the real generation after the first refused push.
+    BootRig5513 r;
+    r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
+
+    r.construct(false, false);
+    r.engine->set_rearm_fault_hook_for_test(rearm_throw_hook_5513("r1"));
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.engine->boot_rearm_unresolved());
+
+    CHECK(r.push({make_file_rule("")}, kGen5513).exit_code != 0); // invalid rule_id: rejected
+    CHECK(r.engine->boot_catchup_failures_for_test() == 0);
+    CHECK(r.engine->boot_report_holdoff_for_test() == 0);
+
+    drop_kv_store_table_for_test(r.db_.path);
+    for (int i = 0; i < 2; ++i) {
+        CHECK(r.push({make_file_rule("r1")}, kGen5513).exit_code != 0); // put_rule refused
+        CHECK(r.engine->boot_catchup_failures_for_test() == 0);
+        CHECK(r.engine->boot_report_holdoff_for_test() == 0);
+        const auto rep = r.engine->generation_report();
+        CHECK(rep.reported == 0);
+        CHECK(rep.boot_rearm_unresolved);
+    }
+
+    recreate_kv_store_table_for_test(r.db_.path);
+    r.push_ok({make_file_rule("r1")}, kGen5513);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    const auto cleared = r.engine->generation_report();
+    CHECK(cleared.reported == kGen5513);
+    CHECK_FALSE(cleared.boot_rearm_unresolved);
+}
+
+TEST_CASE("#5513 back-off dormant (prefer_spark=true): the tick's can_advance() clear resets the "
+          "back-off",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // Boot arm drained as a failure (flag set by the tick), then a catch-up whose arm is parked
+    // (Accepted, pending): the tail sees !clean and starts the back-off (failure 1, holdoff 1);
+    // ticks while it is pending neither clear nor consume it. Releasing the arm lets the TICK
+    // clear the flag, and that clear (not the tail's) must reset both members. Mutation:
+    // deleting the two resets from the tick's clear leaves 1 / 1 after the flag is gone.
+    using namespace std::chrono_literals;
+    BootRig5513 r;
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+
+    r.construct(true, true);
+    r.wire();
+    r.mechanism->hang_next_watch();
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.mechanism->wait_entered_hang(30s));
+    r.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+    r.mechanism->release_hang();
+    REQUIRE(r.tick_until([&] { return r.engine->boot_rearm_unresolved(); }));
+    CHECK(r.engine->boot_catchup_failures_for_test() == 0); // the boot failure is not a catch-up
+    CHECK(r.engine->boot_report_holdoff_for_test() == 0);
+
+    r.mechanism->set_park_all_watches();
+    REQUIRE(r.push({make_service_rule("r1")}, kGen5513).exit_code == 0);
+    REQUIRE(yuzu::test::spin_until([&] { return r.mechanism->parked_watch_count() == 1; }));
+    CHECK(r.engine->boot_catchup_failures_for_test() == 1);
+    CHECK(r.engine->boot_report_holdoff_for_test() == 1);
+    for (int i = 0; i < 3; ++i) {
+        r.engine->journal_maintenance_tick();
+        CHECK(r.engine->boot_catchup_failures_for_test() == 1);
+        CHECK(r.engine->boot_report_holdoff_for_test() == 1);
+    }
+
+    r.mechanism->release_park_all();
+    REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen5513; }));
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->boot_catchup_failures_for_test() == 0);
+    CHECK(r.engine->boot_report_holdoff_for_test() == 0);
+    const auto rep = r.engine->generation_report();
+    CHECK(rep.reported == kGen5513);
+    CHECK_FALSE(rep.boot_rearm_unresolved);
+}
+
+TEST_CASE("#5513 dormant (prefer_spark=true): one rule fixed and one still failing keeps the "
+          "reported generation at 0 until a fully clean application",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // r1 (Registry, its own mechanism) arms cleanly every time; r2 (Service) fails at boot (late
+    // refusal) and on the first catch-up (single-shot refusal on the Service mechanism only). After
+    // the first catch-up a rule IS armed, yet the application is not clean. Mutation: a clear keyed
+    // on "any rule armed" instead of "every rule clean" reports kGen5513 after the first catch-up.
+    using namespace std::chrono_literals;
+    const std::vector<gpb::GuaranteedStateRule> rules = {make_registry_rule("r1"),
+                                                         make_service_rule("r2", true, "SvcB")};
+    BootRig5513 r;
+    r.seed(true, true, rules, kGen5513, /*with_registry_sibling=*/true);
+
+    r.construct(true, true, /*with_registry_sibling=*/true);
+    r.wire();
+    r.mechanism->hang_next_watch(); // only r2 uses the Service mechanism
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.mechanism->wait_entered_hang(30s));
+    r.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+    r.mechanism->release_hang();
+    REQUIRE(r.tick_until([&] { return r.engine->boot_rearm_unresolved(); }));
+    r.quiesce();
+    REQUIRE(r.engine->policy_generation() == 0);
+    REQUIRE(r.engine->spark_armed_rule_count() == 1); // r1 armed at boot, r2 did not
+
+    r.mechanism->set_fail_next_watch(); // Service mechanism only
+    r.push_ok(rules, kGen5513);
+    r.quiesce();
+    CHECK(r.engine->policy_generation() == 0);
+    CHECK(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->spark_armed_rule_count() == 1); // r1 re-armed, r2 still not
+
+    r.push_ok(rules, kGen5513); // clean
+    REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen5513; }));
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->spark_armed_rule_count() == 2);
+}
+
+namespace {
+
+enum class LateOutcome5513 { RefuseAfterPushes, SuccessAfterPushes, SuccessNoPush };
+
+/// T11 body: a boot arm wedged by a (synthetic) expired claim, so the drain retains it.
+void run_wedged_boot_arm_5513(LateOutcome5513 outcome) {
+    using namespace std::chrono_literals;
+    BootRig5513 r;
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+
+    r.construct(true, true);
+    r.wire();
+    r.mechanism->hang_next_watch();
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.mechanism->wait_entered_hang(30s));
+    const std::string key = r.mechanism->first_watch_key();
+    REQUIRE_FALSE(key.empty());
+    auto* rt = r.engine->spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    REQUIRE(yuzu::test::spin_until([&] { return rt->active_backend_op_workers() == 1; }, 10s));
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 1);
+
+    const auto await_late_result_landed = [&] {
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                return rt->active_backend_op_workers() == 0 &&
+                       rt->claim_queue_depth_for_test(key) == 0;
+            },
+            10s));
+    };
+
+    // Expire the claim with the runtime's synthetic clock (never a sleep): the drain reads the
+    // receipt as an outstanding Wedged one, which sets the flag AND is retained in the ledger.
+    REQUIRE(rt->expire_overdue_claims_at_for_test(std::chrono::steady_clock::now() + 600s) == 1);
+    REQUIRE(r.tick_until([&] { return r.engine->boot_rearm_unresolved(); }));
+    CHECK(r.engine->policy_generation() == 0);
+    // Retained BEFORE any late outcome is released. Releasing first turns the retained wedge into
+    // an ordinary failure and the identical retry below into an avoidable Reapply.
+    CHECK(r.engine->ack_failed_receipt_count_for_test() == 1);
+
+    if (outcome == LateOutcome5513::SuccessNoPush) {
+        // No push at all: the late success is adopted while the BOOT application is current. The
+        // recovery scan retires the counted failure, can_advance() turns true, and the tick clears
+        // the flag. A tick clear guarded on "the boot application is not open" would never fire.
+        r.mechanism->release_hang(); // late outcome None: success
+        await_late_result_landed();
+        REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen5513; }));
+        CHECK_FALSE(r.engine->boot_rearm_unresolved());
+        CHECK(r.engine->spark_armed_rule_count() == 1);
+        CHECK(r.mechanism->watch_call_count() == 1); // recovered, never re-armed
+        return;
+    }
+
+    // First same-generation push: a Reapply (the boot application's content id is a sentinel).
+    // The attach re-observes the retained claim and constructs no new one, so no new watch().
+    r.push_ok({make_service_rule("r1")}, kGen5513);
+    CHECK(r.mechanism->watch_call_count() == 1);
+    CHECK(r.engine->policy_generation() == 0); // the tail cannot clear: the receipt is pending
+    CHECK(r.engine->boot_rearm_unresolved());
+    REQUIRE(r.tick_until([&] {
+        return r.engine->ack_failed_receipt_count_for_test() == 1 &&
+               r.engine->ack_pending_count_for_test() == 0;
+    }));
+    CHECK(r.engine->policy_generation() == 0);
+    CHECK(r.engine->boot_rearm_unresolved());
+
+    // Second identical push: SUPPRESSED while the retained wedge is outstanding (the open
+    // application survives: pending 0, failed 1; nothing reaches the mechanism).
+    r.push_ok({make_service_rule("r1")}, kGen5513);
+    {
+        const auto s = r.engine->arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->pending == 0);
+        CHECK(s->failed == 1);
+    }
+    CHECK(r.mechanism->watch_call_count() == 1);
+    CHECK(r.engine->policy_generation() == 0);
+    CHECK(r.engine->boot_rearm_unresolved());
+
+    if (outcome == LateOutcome5513::RefuseAfterPushes) {
+        // The late refusal pops the claim; the retained entry reads Blocking, so the next push is
+        // a real Reapply with ONE fresh watch(), and the clean application clears the flag.
+        r.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+        r.mechanism->release_hang();
+        await_late_result_landed();
+        r.push_ok({make_service_rule("r1")}, kGen5513);
+        REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen5513; }));
+        CHECK_FALSE(r.engine->boot_rearm_unresolved());
+        CHECK(r.mechanism->watch_call_count() == 2);
+        CHECK(r.engine->spark_armed_rule_count() == 1);
+    } else {
+        // The late success is ADOPTED: the recovery scan on the post-push application retires the
+        // counted failure with NO further push, and the tick clears the flag.
+        r.mechanism->release_hang(); // late outcome None: success
+        await_late_result_landed();
+        REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen5513; }));
+        CHECK_FALSE(r.engine->boot_rearm_unresolved());
+        CHECK(r.engine->spark_armed_rule_count() == 1);
+        CHECK(r.mechanism->watch_call_count() == 1);
+    }
+}
+
+} // namespace
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a wedged boot arm is retained, held through "
+          "suppressed retries, and a late REFUSAL is repaired by one Reapply",
+          "[spark][guardian][reconcile][boot][5513][dormant][liveness]") {
+    // Mutations: no set on a drained Wedged receipt (never reaches 0); releasing the late outcome
+    // before the retain step; a clear that fires on the Reapply or the Suppress.
+    run_wedged_boot_arm_5513(LateOutcome5513::RefuseAfterPushes);
+}
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a wedged boot arm whose late SUCCESS is adopted "
+          "after the retries clears with no further push",
+          "[spark][guardian][reconcile][boot][5513][dormant][liveness]") {
+    // Mutation: a missing tick-side clear never reaches kGen5513 once the recovery scan has
+    // retired the counted failure.
+    run_wedged_boot_arm_5513(LateOutcome5513::SuccessAfterPushes);
+}
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a wedged boot arm whose late SUCCESS lands while "
+          "the BOOT application is still current clears with no push at all",
+          "[spark][guardian][reconcile][boot][5513][dormant][liveness]") {
+    // Mutation: a tick clear guarded by "the boot application is not open" never fires here, and
+    // a missing tick clear is red as above.
+    run_wedged_boot_arm_5513(LateOutcome5513::SuccessNoPush);
+}
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a rejected push leaves a set flag and the boot "
+          "application untouched, and the next clean push clears it",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // Flag already set by the synchronous boot throw. The #4665 reject returns before
+    // begin_application(), so nothing about the boot state may change. Mutation: clearing the
+    // flag (or the boot application's ledger state) on a rejected push.
+    BootRig5513 r;
+    const std::vector<gpb::GuaranteedStateRule> rules = {make_service_rule("r2", true, "SvcB")};
+    r.seed(true, true, rules, kGen5513);
+
+    r.construct(true, true);
+    r.wire();
+    r.engine->set_rearm_fault_hook_for_test(rearm_throw_hook_5513("r2"));
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == 0);
+    const auto pending_before = r.engine->ack_pending_count_for_test();
+
+    // An empty rule_id is rejected for the WHOLE push before any state is touched.
+    const auto rejected = r.push({make_service_rule("r2", true, "SvcB"), make_service_rule("")},
+                                 kGen5513 + 1);
+    CHECK(rejected.exit_code != 0);
+    CHECK(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == 0);
+    CHECK(r.engine->ack_pending_count_for_test() == pending_before);
+
+    r.push_ok(rules, kGen5513);
+    REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen5513; }));
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->spark_armed_rule_count() == 1);
+}
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a rejected push does not close the boot "
+          "application, so a later drained boot failure still sets the flag",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // Flag NOT yet set: the boot arm is parked (Accepted). The rejected push must leave the boot
+    // application current, which is observable only afterwards: the late refusal is drained against
+    // the boot application and must still set the flag. Mutation: clearing the "boot application
+    // open" marker at the top of apply_rules() (before the reject) leaves the flag false forever.
+    using namespace std::chrono_literals;
+    BootRig5513 r;
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+
+    r.construct(true, true);
+    r.wire();
+    r.mechanism->hang_next_watch();
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.mechanism->wait_entered_hang(30s));
+    const auto pending_before = r.engine->ack_pending_count_for_test();
+    REQUIRE(pending_before == 1);
+
+    const auto rejected = r.push({make_service_rule("")}, kGen5513 + 1);
+    CHECK(rejected.exit_code != 0);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == kGen5513);
+    CHECK(r.engine->ack_pending_count_for_test() == pending_before);
+
+    r.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+    r.mechanism->release_hang();
+    REQUIRE(r.tick_until([&] { return r.engine->boot_rearm_unresolved(); }));
+    CHECK(r.engine->policy_generation() == 0);
+}
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a post-boot held push never reports generation 0 "
+          "or raises the boot flag",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // Healthy boot (flag false), one clean push to kGen5513, then a push at the next generation
+    // whose arm is parked and then refused: the drained failure belongs to an ordinary
+    // application, not the boot one, so the reported value is HELD at kGen5513 (never 0) and the
+    // flag stays false. Mutation: a tick-side set not guarded by "the boot application is open"
+    // reports 0 on an ordinary held push.
+    using namespace std::chrono_literals;
+    SparkReconcileFixture f{/*periodic_bound_ms=*/0,
+                            /*backend_op_deadline=*/std::chrono::milliseconds{60'000},
+                            SparkType::Service, /*with_registry_sibling=*/false,
+                            /*wire_first=*/true};
+    // Release the park gate on EVERY exit path, before the fixture tears down the engine.
+    struct ReleaseOnExit {
+        SparkReconcileFixture& fx;
+        ~ReleaseOnExit() {
+            fx.mechanism->release_park_all();
+            fx.mechanism->release_hang();
+        }
+    } release_parked{f};
+    const std::vector<gpb::GuaranteedStateRule> rules = {make_service_rule("r1")};
+    // The held push carries the rule with changed content so it is rebuilt (and its arm parked):
+    // an identical push of the healthy rule is a skip (#4415) and arms nothing.
+    const std::vector<gpb::GuaranteedStateRule> rules_v2 = {
+        renamed_rule(make_service_rule("r1"), "r1-v2")};
+    const auto dispatch = [&](std::uint64_t generation) {
+        return yuzu::agent::guardian_dispatch_push_bytes_for_test(
+            *f.engine, push_bytes_5513(generation == kGen5513 ? rules : rules_v2, generation));
+    };
+
+    CHECK_FALSE(f.engine->boot_rearm_unresolved());
+    REQUIRE(dispatch(kGen5513).exit_code == 0);
+    REQUIRE(yuzu::test::spin_until([&] {
+        f.engine->journal_maintenance_tick();
+        return f.engine->policy_generation() == kGen5513;
+    }));
+    CHECK_FALSE(f.engine->boot_rearm_unresolved());
+
+    f.mechanism->set_park_all_watches();
+    REQUIRE(dispatch(kGen5513 + 1).exit_code == 0);
+    REQUIRE(yuzu::test::spin_until([&] { return f.mechanism->parked_watch_count() == 1; }));
+    // held: the next generation is not acknowledged
+    CHECK(f.engine->policy_generation() == kGen5513);
+    f.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+    f.mechanism->release_park_all();
+    REQUIRE(yuzu::test::spin_until([&] {
+        f.engine->journal_maintenance_tick();
+        return f.engine->ack_pending_count_for_test() == 0 && f.engine->active_io_workers() == 0;
+    }));
+    for (int i = 0; i < 3; ++i)
+        f.engine->journal_maintenance_tick();
+
+    CHECK(f.engine->arm_failure_count() >= 1); // the refusal was drained and counted
+    CHECK(f.engine->policy_generation() == kGen5513); // held, not 0
+    CHECK_FALSE(f.engine->boot_rearm_unresolved());
 }
 
 TEST_CASE("prefer_spark=false never populates unsupported_rules_, even for a type "
@@ -1760,6 +3076,83 @@ TEST_CASE("journal_stats() surfaces evicted_unclassified from the engine's real 
     spark_engine.stop();
 }
 
+TEST_CASE("journal_stats() forwards the drain worker's cross-lane hold release count (#3972)",
+          "[spark][guardian][reconcile][journal][order]") {
+    using namespace std::chrono_literals;
+    // The plumbing seam the fleet-tags sizeof static_assert cannot cover: the
+    // GuardianEngine::journal_stats() assignment of send_order_hold_releases. Deleting the
+    // forward leaves every worker-level test green while the heartbeat tag is permanently
+    // ABSENT, reading as "no reordering window ever opened". prefer_spark=false constructs the
+    // drain worker without starting it, so hand-fed entries drive wrapped_send_for_test() on this
+    // thread, at the production default H = 1 s (the knob is not reachable through the engine).
+    struct Gate {
+        std::mutex mu;
+        std::condition_variable cv;
+        bool open{false};
+    };
+    auto gate = std::make_shared<Gate>(); // shared: the parked detached send keeps it alive
+
+    auto opened = KvStore::open(unique_kv_path());
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service,
+                                            std::make_unique<FakeServiceMechanism>())
+                .has_value());
+    spark_engine.start();
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/false};
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
+                             [gate](const OutboxEntry& e) {
+                                 if (e.domain == yuzu::agent::OutboxDomain::Compliance) {
+                                     std::unique_lock<std::mutex> lk{gate->mu};
+                                     gate->cv.wait(lk, [&] { return gate->open; });
+                                 }
+                                 return SendResult::Sent;
+                             });
+    auto* worker = engine.drain_worker_for_test();
+    REQUIRE(worker != nullptr);
+    const auto release_gate = [&] {
+        {
+            std::lock_guard<std::mutex> lk{gate->mu};
+            gate->open = true;
+        }
+        gate->cv.notify_all();
+        CHECK(yuzu::test::spin_until([&] { return worker->active_send_workers() == 0; }));
+    };
+    bool released = false;
+    yuzu::test::ScopeExit unwind{[&] {
+        if (!released)
+            release_gate();
+    }};
+
+    CHECK(engine.journal_stats().send_order_hold_releases == 0);
+
+    // An OLDER compliance send parks in its executor (past the 200 ms offer wait) ...
+    OutboxEntry older;
+    older.domain = yuzu::agent::OutboxDomain::Compliance;
+    older.seq = 5;
+    older.event_id = older.rule_id = "c-5";
+    CHECK(worker->wrapped_send_for_test(older) == SendResult::Retain);
+
+    // ... so a YOUNGER lifecycle entry is denied until the 1 s hold expires, then released.
+    OutboxEntry younger;
+    younger.domain = yuzu::agent::OutboxDomain::Lifecycle;
+    younger.seq = 7;
+    younger.event_id = younger.rule_id = "l-7";
+    younger.lifecycle_kind = "armed";
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return worker->wrapped_send_for_test(younger) == SendResult::Sent; }, 10s));
+    REQUIRE(worker->cross_lane_order_release_count() == 1);
+
+    CHECK(engine.journal_stats().send_order_hold_releases == 1); // the forward under test
+
+    released = true;
+    release_gate();
+    engine.stop();
+    spark_engine.stop();
+}
+
 // ---------------------------------------------------------------------------
 // Death test: the drain worker taking GuardianEngine::mtx_ must ABORT, not hang.
 // ---------------------------------------------------------------------------
@@ -1946,13 +3339,8 @@ TEST_CASE("a GuardianIoExecutor::submit() completion callback taking mtx_ aborts
 
 #endif // !_WIN32
 
-// 0.14.x ONLY: [!mayfail] because of #5168 (boot re-arm refuses the 4th/5th Service
-// rule when the compensating-disarm reservation is exhausted). The test runs the engine
-// at prefer_spark=true; production builds GuardianEngine with prefer_spark=false
-// (agent.cpp), so the refusal cannot reach a 0.14.x endpoint. The fix (PR #5184) is on
-// dev for 0.15.0; drop this tag when 0.15.0 reaches main. A failure is still reported.
 TEST_CASE("PRODUCTION boot order: wire_spark_engine before start_local",
-          "[spark][guardian][reconcile][journal][boot][!mayfail]") {
+          "[spark][guardian][reconcile][journal][boot]") {
     // Every other test here (and SparkReconcileFixture itself) calls start_local() BEFORE
     // wire_spark_engine(). Production does the reverse - agent.cpp:969-1001 wires first and
     // documents it as a header contract - so the order that actually ships was untested
@@ -2091,6 +3479,140 @@ TEST_CASE("PRODUCTION boot order: wire_spark_engine before start_local",
     CHECK(std::string_view{yuzu::agent::guardian_backend_label(yuzu::agent::guardian_backend_from_state(
               /*prefer_spark=*/true, engine.spark_availability()))} == "spark");
 
+    engine.stop();
+    spark_engine.stop();
+}
+
+TEST_CASE("#5168: boot re-arm of more Service rules than the compensating-disarm reservation "
+          "holds arms every rule - the surplus is parked and redriven and never left unenforced",
+          "[spark][guardian][reconcile][boot]") {
+    // Service reservation capacity == GuardianIoExecutor::Config{}.service_quota == 3.
+    // Before #5168 the 4th+ rule of a cached policy was REFUSED synchronously at boot
+    // ("compensating-disarm reservation exhausted") and stayed unenforced until the
+    // next policy push. The park-all gate holds the first three arms in watch(), so
+    // the pool is deterministically exhausted while the remaining three are attached.
+    constexpr int kRules = 6;
+    const auto kv_path = unique_kv_path();
+    yuzu::test::TempDbFile db{kv_path};
+    {
+        auto opened = KvStore::open(kv_path);
+        REQUIRE(opened.has_value());
+        KvStore kv{std::move(*opened)};
+        SparkEngine spark_engine;
+        REQUIRE(spark_engine.register_mechanism(SparkType::Service,
+                                                std::make_unique<FakeServiceMechanism>())
+                    .has_value());
+        spark_engine.start();
+        GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+        REQUIRE(engine.start_local().has_value());
+        engine.wire_spark_engine(&spark_engine, false,
+                                 [](const OutboxEntry&) { return SendResult::Retain; });
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        for (int i = 0; i < kRules; ++i)
+            *p.add_rules() = make_service_rule("r" + std::to_string(i), true,
+                                               "Svc" + std::to_string(i));
+        REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString())
+                    .exit_code == 0);
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                engine.journal_maintenance_tick();
+                return engine.spark_armed_rule_count() == kRules;
+            },
+            std::chrono::seconds(30)));
+        engine.stop();
+        spark_engine.stop();
+    }
+
+    auto opened = KvStore::open(kv_path);
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    auto mech = std::make_unique<FakeServiceMechanism>();
+    auto* mechanism = mech.get(); // borrowed; owned by spark_engine
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
+    spark_engine.start();
+    mechanism->set_park_all_watches();
+
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+    // Declared AFTER engine so it runs BEFORE engine's destructor: a failed REQUIRE below
+    // must not leave watch() parked while engine.stop() waits on the workers.
+    struct Release {
+        FakeServiceMechanism* m;
+        ~Release() { m->release_park_all(); }
+    } release_guard{mechanism};
+    engine.wire_spark_engine(&spark_engine, false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    REQUIRE(engine.start_local().has_value());
+    REQUIRE(engine.rule_count() == kRules);
+
+    auto* rt = engine.spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    // Three arms hold the whole Service quota and reservation; the other three are
+    // parked (not failed): nothing armed yet, nothing left unenforced-for-good.
+    // watch() is per-type-serialised (spark_mechanism.hpp), so only ONE of the three
+    // admitted arms is inside the fake at a time; the other two wait on that lock
+    // while still holding their quota slot and reservation permit.
+    REQUIRE(yuzu::test::spin_until([&] { return mechanism->parked_watch_count() == 1; }));
+    REQUIRE(yuzu::test::spin_until([&] { return rt->arms_parked() == 3; }));
+    CHECK(mechanism->watch_call_count() == 1);
+    CHECK(rt->compensation_reservation_refused() == 3);
+    CHECK(rt->arms_parked_total() == 3);
+    CHECK(engine.spark_armed_rule_count() == 0);
+
+    mechanism->release_park_all();
+    REQUIRE(yuzu::test::spin_until([&] { return engine.spark_armed_rule_count() == kRules; }));
+    CHECK(mechanism->watch_call_count() == kRules);
+    CHECK(mechanism->watching_count() == kRules);
+    CHECK(rt->arms_parked() == 0);
+    CHECK(engine.armed_guard_count() == 0);
+    // The rules stay armed: a maintenance tick (which also runs the claim-deadline
+    // expiry pass) must not re-expire or tear down anything.
+    engine.journal_maintenance_tick();
+    CHECK(engine.spark_armed_rule_count() == kRules);
+    CHECK(mechanism->watching_count() == kRules);
+
+    engine.stop();
+    spark_engine.stop();
+}
+
+TEST_CASE("#5168: with the production default (prefer_spark false) no rule reaches the spark "
+          "runtime, so nothing is ever parked",
+          "[spark][guardian][reconcile][boot]") {
+    // The parked-arm path lives in the spark arm path, which production leaves off (the
+    // two-argument GuardianEngine constructor, agent.cpp). This pins that the change is
+    // dormant there: the changelog and design docs scope the fix to the spark backend.
+    const auto kv_path = unique_kv_path();
+    yuzu::test::TempDbFile db{kv_path};
+    auto opened = KvStore::open(kv_path);
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    auto mech = std::make_unique<FakeServiceMechanism>();
+    auto* mechanism = mech.get(); // borrowed; owned by spark_engine
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
+    spark_engine.start();
+    GuardianEngine engine{&kv, "agent-test"};
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(&spark_engine, false,
+                             [](const OutboxEntry&) { return SendResult::Retain; });
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    for (int i = 0; i < 6; ++i)
+        *p.add_rules() = make_service_rule("d" + std::to_string(i), true, "Svc" + std::to_string(i));
+    REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString())
+                .exit_code == 0);
+    auto* rt = engine.spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    // Spark arms are asynchronous, so an immediate read proves nothing: give a spark arm
+    // (which would reach the mechanism within milliseconds) time to show itself. A
+    // negative assertion, so a bounded sleep is the honest tool here.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    engine.journal_maintenance_tick();
+    CHECK(mechanism->watch_call_count() == 0); // nothing reached the spark mechanism
+    CHECK(rt->arms_parked_total() == 0);
+    CHECK(rt->arms_parked() == 0);
+    CHECK(engine.spark_armed_rule_count() == 0);
     engine.stop();
     spark_engine.stop();
 }
@@ -2913,6 +4435,158 @@ TEST_CASE("rung 9c PR-2 Unit 3: a hung unwatch() no longer wedges apply_rules() 
                                    std::chrono::seconds(10)));
 }
 
+// #5403 export half, through the REAL GuardianEngine + SparkEngine + runtime: a Disarm whose
+// mechanism unwatch() is parked is reported by the engine's heartbeat accessors, aged with a
+// synthetic `now` (never a sleep), latched once past the observation threshold, and gone from
+// the age export when the call completes. The runtime-level semantics have their own tests in
+// test_guardian_spark_runtime.cpp; this one proves the engine forwards them and that the
+// agent's real emitters turn them into the pinned tags.
+TEST_CASE("#5403: the engine exports a hung Disarm's age and deadline count as heartbeat tags, "
+          "and the age disappears on completion",
+          "[spark][guardian][reconcile][liveness][disarm]") {
+    SparkReconcileFixture f;
+    // Release the parked mechanism on EVERY exit path, declared after `f` so it runs BEFORE
+    // the fixture tears down SparkEngine/GuardianEngine (same rationale as the #2233 test).
+    struct ReleaseHangOnExit {
+        SparkReconcileFixture& fx;
+        ~ReleaseHangOnExit() { fx.mechanism->release_hang(); }
+    };
+    ReleaseHangOnExit release_parked{f};
+
+    f.apply(make_service_rule("r1"));
+    REQUIRE(f.mechanism->watching_count() == 1);
+
+    // Quiet agent: no Disarm pending, so BOTH exports are silent (the age is absent, not 0).
+    CHECK_FALSE(f.engine->oldest_pending_disarm_age_seconds().has_value());
+    CHECK(f.engine->disarm_deadline_elapsed() == 0);
+    {
+        // Through the SAME helper agent.cpp's heartbeat calls (not a hand-assembled copy).
+        std::map<std::string, std::string> tags;
+        yuzu::agent::collect_guardian_spark_health_tags(*f.engine, tags,
+                                                         std::chrono::steady_clock::now());
+        CHECK(tags.empty());
+    }
+
+    f.mechanism->hang_next_unwatch();
+    // full_sync with the rule disabled: detach_all() -> off-lock Disarm -> parked unwatch().
+    auto dr = f.dispatch_raw(make_service_rule("r1", /*enabled=*/false));
+    REQUIRE(dr.exit_code == 0);
+    REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(30)));
+
+    // Pending: the age is present (young, so it floors to a small whole number of seconds).
+    REQUIRE(f.engine->oldest_pending_disarm_age_seconds().has_value());
+    // Synthetic clock, no sleep: 95 s after now the same claim reads at least 95 whole seconds.
+    const auto later = std::chrono::steady_clock::now() + std::chrono::seconds(95);
+    const auto aged = f.engine->oldest_pending_disarm_age_seconds(later);
+    REQUIRE(aged.has_value());
+    CHECK(*aged >= 95);
+    // A `now` that predates the claim clamps to zero rather than wrapping.
+    const auto before = f.engine->oldest_pending_disarm_age_seconds(
+        std::chrono::steady_clock::time_point{});
+    REQUIRE(before.has_value());
+    CHECK(*before == 0);
+
+    // Latch: a pass 31 s on observes the Disarm pending past the threshold, once.
+    REQUIRE(f.engine->spark_runtime_for_test() != nullptr);
+    const auto thirty_one = std::chrono::steady_clock::now() + std::chrono::seconds(31);
+    f.engine->spark_runtime_for_test()->expire_overdue_claims_at_for_test(thirty_one);
+    f.engine->spark_runtime_for_test()->expire_overdue_claims_at_for_test(thirty_one + std::chrono::seconds(5));
+    CHECK(f.engine->disarm_deadline_elapsed() == 1);
+
+    {
+        std::map<std::string, std::string> tags;
+        yuzu::agent::collect_guardian_spark_health_tags(*f.engine, tags, later);
+        REQUIRE(tags.count("yuzu.guardian_disarm_pending_age_seconds") == 1);
+        CHECK(std::stoull(tags.at("yuzu.guardian_disarm_pending_age_seconds")) >= 95);
+        CHECK(tags.at("yuzu.guardian_disarm_deadline_elapsed") == "1");
+    }
+
+    // Completion: the call returns, the claim pops, the age export disappears. The
+    // cumulative count is not undone.
+    f.mechanism->release_hang();
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return !f.engine->oldest_pending_disarm_age_seconds(later).has_value(); },
+        std::chrono::seconds(10)));
+    CHECK(f.engine->disarm_deadline_elapsed() == 1);
+    // The age is gone; the cumulative count is not, so exactly that one tag remains.
+    std::map<std::string, std::string> after;
+    yuzu::agent::collect_guardian_spark_health_tags(*f.engine, after,
+                                                     std::chrono::steady_clock::now());
+    CHECK(after.count("yuzu.guardian_disarm_pending_age_seconds") == 0);
+    CHECK(after.size() == 1);
+    CHECK(after.at("yuzu.guardian_disarm_deadline_elapsed") == "1");
+}
+
+// #5404 export half, through the REAL GuardianEngine + runtime: the engine's claim-lifecycle
+// snapshot is all-zero on a healthy engine (so the sparse emitter ships NO tag), and a counter
+// the runtime bumps through its own production path reaches the snapshot and the pinned tag.
+// The accessor -> field mapping itself is pinned in test_guardian_health_heartbeat.cpp; this
+// proves the engine reads the wired runtime and forwards it.
+TEST_CASE("#5404: the engine's claim-lifecycle snapshot is silent when healthy and carries a "
+          "runtime counter bumped through the ack-drain tick",
+          "[spark][guardian][reconcile][claim]") {
+    SparkReconcileFixture f;
+    f.apply(make_service_rule("r1")); // a live armed rule: the healthy steady state
+    REQUIRE(f.mechanism->watching_count() == 1);
+
+    {
+        const auto quiet = f.engine->spark_claim_health_stats();
+        CHECK(quiet.orphan_disarms_started == 0);
+        CHECK(quiet.dead_watchers_erased_on_lost == 0);
+        CHECK(quiet.tombstones_released_by_reaper == 0);
+        CHECK(quiet.claim_index_release_failures == 0);
+        CHECK(quiet.claim_drain_failures == 0);
+        CHECK(quiet.retained_tombstones == 0);
+        CHECK(quiet.detach_sweep_left_residue == 0);
+        CHECK(quiet.detach_claim_failures == 0);
+        CHECK(quiet.detach_post_commit_failures == 0);
+        CHECK(quiet.claims_dropped_at_stop == 0);
+        CHECK(quiet.ack_maint_exceptions == 0);
+        CHECK(f.engine->ack_maint_exceptions() == 0);
+        std::map<std::string, std::string> tags;
+        yuzu::agent::emit_guardian_health_heartbeat_tags(tags, quiet);
+        CHECK(tags.empty()); // sparse: a healthy engine reports nothing
+    }
+
+    // The runtime's orphan pass (inside the ack-drain tick's expiry call) throws once at its
+    // top; the runtime contains it and counts it in claim_drain_failures. Nothing else moves.
+    REQUIRE(f.engine->spark_runtime_for_test() != nullptr);
+    f.engine->spark_runtime_for_test()->set_drain_fault_point_for_test(15);
+    f.engine->journal_maintenance_tick();
+    CHECK(f.engine->spark_runtime_for_test()->claim_drain_failures() == 1);
+
+    const auto stats = f.engine->spark_claim_health_stats();
+    CHECK(stats.claim_drain_failures == 1);
+    CHECK(stats.orphan_disarms_started == 0);
+    CHECK(stats.claim_index_release_failures == 0);
+    CHECK(stats.detach_claim_failures == 0);
+    CHECK(stats.ack_maint_exceptions == 0); // the runtime contained it; the ack firewall did not
+    std::map<std::string, std::string> tags;
+    yuzu::agent::emit_guardian_health_heartbeat_tags(tags, stats);
+    REQUIRE(tags.size() == 1);
+    CHECK(tags.at("yuzu.guardian_claim_drain_failures") == "1");
+}
+
+TEST_CASE("#5404: an engine with no Spark runtime wired reports an all-zero claim-lifecycle "
+          "snapshot",
+          "[spark][guardian][reconcile][claim]") {
+    yuzu::test::TempDbFile db{unique_kv_path()};
+    auto opened = KvStore::open(db.path);
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/false};
+    REQUIRE(engine.start_local().has_value()); // never wire_spark_engine()'d: no runtime
+    CHECK(engine.spark_runtime_for_test() == nullptr);
+    const auto s = engine.spark_claim_health_stats();
+    CHECK(s.claim_drain_failures == 0);
+    CHECK(s.retained_tombstones == 0);
+    CHECK(s.ack_maint_exceptions == 0);
+    std::map<std::string, std::string> tags;
+    yuzu::agent::emit_guardian_health_heartbeat_tags(tags, s);
+    CHECK(tags.empty());
+    engine.stop();
+}
+
 // ---------------------------------------------------------------------------
 // #2233 item 3: the OTHER half of the liveness fix - a genuinely failed (timed
 // out) arm must be COUNTED, so apply_rules' policy_generation hold-on-failure
@@ -2958,6 +4632,268 @@ TEST_CASE("#2233 item 3: a timed-out arm holds policy_generation for retry, not 
     CHECK(f.engine->rule_count() == 1);        // persisted (put_rule_locked ran)
     CHECK(f.engine->spark_armed_rule_count() == 0);
     // (the parked mechanism is released by `release_parked` above on every exit path)
+}
+
+// ---------------------------------------------------------------------------
+// #4472 compensation hold, engine level (re-based on #5459 option D). An operator withdraws a
+// rule whose arm is hung and re-adds the identical rule while the arm's late success is
+// compensated: the late success lands after the withdrawal (so it is disarmed, not adopted) and
+// its compensating disarm is parked inside unwatch(). The re-add re-observes the same retained
+// Wedged claim and the generation is held. The server's identical re-pushes then arrive while the
+// compensating teardown is outstanding: each is SUPPRESSED (the ledger retains the claim as
+// compensation-pending), so none pays a teardown or a new watch(), and none acknowledges. The
+// disarm then finishes and pops the claim with no replacement arm; the next push is a Reapply.
+// Pass condition: the generation is NOT acknowledged while the disarm is outstanding, the held
+// pushes cost the mechanism nothing, AND the rule ends armed on the mechanism. The runtime-level
+// twin (test_guardian_spark_runtime.cpp, "#4472: ...") drives the same ledger decision with the
+// late success landing inside a single full_sync's detach_all / re-attach window, which an
+// engine test cannot park.
+// ---------------------------------------------------------------------------
+namespace {
+// These two mirror guardian_engine.cpp's file-local kKvNamespace / kKeyGen (the on-disk
+// layout of the persisted generation); a rename there must be mirrored here.
+constexpr std::string_view kGuardianKvNamespace5459 = "__guardian__";
+constexpr std::string_view kGuardianGenerationKey5459 = "meta:policy_generation";
+
+/// `finish_disarm_before_drain` false: the compensating disarm is still parked when the fourth
+/// identical application's heartbeat drain runs (the repro). True: it is released after that
+/// application's re-attach but before the drain (the control).
+void run_post_k_4472_scenario(bool finish_disarm_before_drain) {
+    using namespace std::chrono_literals;
+    SparkReconcileFixture f;
+    struct ReleaseOnExit {
+        SparkReconcileFixture& fx;
+        ~ReleaseOnExit() {
+            fx.mechanism->release_isolated_unwatch_hang();
+            fx.mechanism->release_hang();
+        }
+    };
+    ReleaseOnExit release_parked{f};
+
+    const auto push = [&](std::uint64_t generation, bool with_rule) {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(generation);
+        if (with_rule)
+            *p.add_rules() = make_service_rule("r1");
+        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+        REQUIRE(dr.exit_code == 0);
+    };
+    const auto drain_pending = [&] {
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                f.engine->journal_maintenance_tick();
+                return f.engine->ack_pending_count_for_test() == 0;
+            },
+            10s));
+    };
+
+    // The arm hangs inside the mechanism; the synthetic clock expires its claim to a retained
+    // Wedged head without any wait. Generation 5 is held.
+    f.mechanism->hang_next_watch();
+    push(5, true);
+    REQUIRE(f.mechanism->wait_entered_hang(30s));
+    REQUIRE(f.engine->spark_runtime_for_test() != nullptr);
+    REQUIRE(f.engine->spark_runtime_for_test()->expire_overdue_claims_at_for_test(
+                std::chrono::steady_clock::now() + 600s) == 1);
+    drain_pending();
+    REQUIRE(f.engine->policy_generation() == 0);
+
+    // Withdrawal (full_sync omitting r1): the wedge is deactivated. Then the hung arm returns its
+    // subscription; with the rule no longer wanted it is compensated, and that disarm parks.
+    push(6, false);
+    drain_pending();
+    f.mechanism->hang_next_unwatch_isolated();
+    f.mechanism->release_hang();
+    REQUIRE(f.mechanism->wait_entered_isolated_unwatch(30s));
+
+    // The identical re-add (the one real application: it re-observes the retained claim), then
+    // three more identical pushes, each followed by the heartbeat drain. While the compensating
+    // teardown is outstanding each of those three is SUPPRESSED by decide_retry(): the open
+    // application survives (pending 0 / failed 1), and the mechanism sees no new watch() and no
+    // unwatch() completing. In the control the teardown is released AFTER the fourth push is
+    // decided, so that push is suppressed too.
+    int watches_after_readd = 0;
+    int unwatches_after_readd = 0;
+    for (int i = 0; i < 4; ++i) {
+        push(7, true);
+        if (i > 0) {
+            const auto s = f.engine->arm_stats();
+            REQUIRE(s.has_value());
+            CHECK(s->pending == 0); // no new application was opened: the push was suppressed
+            CHECK(s->failed == 1);  // the compensating wedge is still the open failure
+            CHECK(f.mechanism->watch_call_count() == watches_after_readd);
+            CHECK(f.mechanism->unwatch_completed_count() == unwatches_after_readd);
+        }
+        if (i == 3 && finish_disarm_before_drain) {
+            f.mechanism->release_isolated_unwatch_hang();
+            REQUIRE(yuzu::test::spin_until([&] { return f.engine->active_io_workers() == 0; }, 10s));
+        }
+        drain_pending();
+        if (i == 0) {
+            watches_after_readd = f.mechanism->watch_call_count();
+            unwatches_after_readd = f.mechanism->unwatch_completed_count();
+        }
+        if (i < 3)
+            REQUIRE(f.engine->policy_generation() < 7);
+    }
+
+    // (a) With the disarm outstanding the generation must not have been acknowledged, or the
+    // server stops re-sending (agent_gen >= current). In the control it is held too: the claim
+    // is popped, the wedge is no longer outstanding, and the counted failure still holds the
+    // generation (nothing acknowledges it; only a later successful application can).
+    const bool acknowledged = f.engine->policy_generation() >= 7;
+    CHECK_FALSE(acknowledged);
+    if (finish_disarm_before_drain)
+        REQUIRE_FALSE(acknowledged); // the retry below is only owed (and modelled) in this case
+
+    // The disarm completes; the compensated claim is popped.
+    f.mechanism->release_isolated_unwatch_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return f.engine->active_io_workers() == 0; }, 10s));
+
+    // (b) With an acknowledged generation nothing re-sends the rule; with a held one the server's
+    // identical retry arrives. Either way the rule must end armed on the mechanism.
+    if (!acknowledged) {
+        push(7, true);
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                f.engine->journal_maintenance_tick();
+                return f.engine->ack_pending_count_for_test() == 0 &&
+                       f.engine->active_io_workers() == 0;
+            },
+            10s));
+    }
+    CHECK(f.engine->rule_count() == 1);
+    CHECK(f.engine->spark_armed_rule_count() == 1);
+    CHECK(f.mechanism->watching_count() == 1);
+    // The heal is exactly ONE fresh arm after the pop (the original hung arm's watch() plus the
+    // replacement), never a leaked second dispatch while the compensation was outstanding.
+    CHECK(f.mechanism->watch_call_count() == 2);
+    // The scenario's end state: the rule is armed, so the held generation is finally
+    // acknowledged by the heartbeat tick AND durably stored (the same final check the [5459]
+    // rig tests make).
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            f.engine->journal_maintenance_tick();
+            return f.engine->policy_generation() == 7;
+        },
+        10s));
+    const auto stored = f.kv->get(kGuardianKvNamespace5459, kGuardianGenerationKey5459);
+    REQUIRE(stored.has_value());
+    CHECK(std::stoull(*stored) == 7);
+}
+} // namespace
+
+TEST_CASE("#4472: a compensating disarm still outstanding at the heartbeat drain is never "
+          "acknowledged, the held pushes are suppressed, and the rule must end armed",
+          "[spark][guardian][reconcile][liveness][4472]") {
+    run_post_k_4472_scenario(/*finish_disarm_before_drain=*/false);
+}
+
+TEST_CASE("#4472 control: a compensating disarm that finished before the heartbeat drain holds "
+          "the generation, and the retry arms the rule",
+          "[spark][guardian][reconcile][liveness][4472]") {
+    run_post_k_4472_scenario(/*finish_disarm_before_drain=*/true);
+}
+
+// #4472 export half, through the REAL GuardianEngine + SparkEngine + runtime: a compensating
+// teardown whose mechanism unwatch() is parked is reported by the engine's heartbeat accessors
+// (an age from the instant the compensation became owed, never a plain-Disarm age), aged with a
+// synthetic `now` (never a sleep), latched once past its deadline, and gone from the age export
+// when the teardown completes. The agent's real emitters turn them into the pinned tags.
+TEST_CASE("#4472: the engine exports an outstanding compensating teardown's age and deadline "
+          "count as heartbeat tags, and the age disappears on completion",
+          "[spark][guardian][reconcile][liveness][4472]") {
+    using namespace std::chrono_literals;
+    SparkReconcileFixture f;
+    struct ReleaseOnExit {
+        SparkReconcileFixture& fx;
+        ~ReleaseOnExit() {
+            fx.mechanism->release_isolated_unwatch_hang();
+            fx.mechanism->release_hang();
+        }
+    };
+    ReleaseOnExit release_parked{f};
+
+    const auto push = [&](std::uint64_t generation, bool with_rule) {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(generation);
+        if (with_rule)
+            *p.add_rules() = make_service_rule("r1");
+        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+        REQUIRE(dr.exit_code == 0);
+    };
+    const auto drain_pending = [&] {
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                f.engine->journal_maintenance_tick();
+                return f.engine->ack_pending_count_for_test() == 0;
+            },
+            10s));
+    };
+    const auto emit_tags = [&](std::chrono::steady_clock::time_point now) {
+        // The SAME helper agent.cpp's heartbeat calls, not a hand-assembled copy.
+        std::map<std::string, std::string> tags;
+        yuzu::agent::collect_guardian_spark_health_tags(*f.engine, tags, now);
+        return tags;
+    };
+
+    // Quiet agent: both exports are silent (the age is absent, not 0).
+    CHECK_FALSE(f.engine->oldest_outstanding_compensation_age_seconds().has_value());
+    CHECK(emit_tags(std::chrono::steady_clock::now()).empty());
+
+    // A hung arm that wedges, a withdrawal, then the arm's late success: compensated, and that
+    // disarm parks inside unwatch().
+    f.mechanism->hang_next_watch();
+    push(5, true);
+    REQUIRE(f.mechanism->wait_entered_hang(30s));
+    REQUIRE(f.engine->spark_runtime_for_test() != nullptr);
+    REQUIRE(f.engine->spark_runtime_for_test()->expire_overdue_claims_at_for_test(
+                std::chrono::steady_clock::now() + 600s) == 1);
+    drain_pending();
+    // A hung arm is not a compensation: still nothing to export.
+    CHECK_FALSE(f.engine->oldest_outstanding_compensation_age_seconds().has_value());
+    push(6, false);
+    drain_pending();
+    f.mechanism->hang_next_unwatch_isolated();
+    f.mechanism->release_hang();
+    REQUIRE(f.mechanism->wait_entered_isolated_unwatch(30s));
+
+    // Pending: present, young; a plain-Disarm age is absent (this is an Arm claim's teardown).
+    REQUIRE(f.engine->oldest_outstanding_compensation_age_seconds().has_value());
+    CHECK_FALSE(f.engine->oldest_pending_disarm_age_seconds().has_value());
+    const auto later = std::chrono::steady_clock::now() + 95s;
+    const auto aged = f.engine->oldest_outstanding_compensation_age_seconds(later);
+    REQUIRE(aged.has_value());
+    CHECK(*aged >= 95);
+    const auto before =
+        f.engine->oldest_outstanding_compensation_age_seconds(std::chrono::steady_clock::time_point{});
+    REQUIRE(before.has_value());
+    CHECK(*before == 0);
+
+    // Latch: two passes well past the deadline observe it once.
+    const auto far_future = std::chrono::steady_clock::now() + 3600s;
+    f.engine->spark_runtime_for_test()->expire_overdue_claims_at_for_test(far_future);
+    f.engine->spark_runtime_for_test()->expire_overdue_claims_at_for_test(far_future + 5s);
+    {
+        const auto tags = emit_tags(later);
+        REQUIRE(tags.count("yuzu.guardian_compensation_pending_age_seconds") == 1);
+        CHECK(std::stoull(tags.at("yuzu.guardian_compensation_pending_age_seconds")) >= 95);
+        REQUIRE(tags.count("yuzu.guardian_compensation_deadline_elapsed") == 1);
+        CHECK(tags.at("yuzu.guardian_compensation_deadline_elapsed") == "1");
+        CHECK(tags.count("yuzu.guardian_disarm_pending_age_seconds") == 0);
+    }
+
+    // Completion: the teardown returns, the claim pops, the age export disappears; the
+    // cumulative count is not undone.
+    f.mechanism->release_isolated_unwatch_hang();
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return !f.engine->oldest_outstanding_compensation_age_seconds(later).has_value(); },
+        10s));
+    const auto after = emit_tags(later);
+    CHECK(after.count("yuzu.guardian_compensation_pending_age_seconds") == 0);
+    CHECK(after.at("yuzu.guardian_compensation_deadline_elapsed") == "1");
 }
 
 #ifndef _WIN32
@@ -3288,7 +5224,21 @@ TEST_CASE("rung 9c PR-2 Unit 6 gate: journal_maintenance_tick() does not advance
     // therefore false on every later tick, permanently (the server's heartbeat
     // reconcile only re-pushes while the agent reports a generation BEHIND its own -
     // this would silently and permanently stop that retry).
+    //
+    // The arm is PARKED in the mechanism across the push, not left to race it (nightly
+    // TSan, #4019). attach_rule(NonWaiting) reports Armed - not Accepted - whenever the
+    // detached arm worker commits before the push re-checks the claim
+    // (guardian_spark_runtime.cpp, "completion can precede this function's own
+    // resumption"); an Armed rule leaves nothing pending, so apply_rules() itself
+    // persists and advances the generation and the tick under test never gets to. Both
+    // orders are correct production behaviour. This test needs the Accepted one, so it
+    // makes the commit happen-after the push returns: watch() cannot return until
+    // release_hang(), which runs only once the push has. Without that edge the order was
+    // scheduler luck - TSan's slowdown lost it most nights (`1 == 0` below).
     SparkReconcileFixture f;
+    f.mechanism->hang_next_watch();
+    // Every exit path, declared after `f` so it runs first (governance cs-202).
+    yuzu::test::ScopeExit release_parked{[&] { f.mechanism->release_hang(); }};
 
     gpb::GuaranteedStatePush p;
     p.set_full_sync(true);
@@ -3296,14 +5246,23 @@ TEST_CASE("rung 9c PR-2 Unit 6 gate: journal_maintenance_tick() does not advance
     *p.add_rules() = make_service_rule("r1");
     REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString())
                 .exit_code == 0);
-    REQUIRE(yuzu::test::spin_until([&] { return f.engine->spark_armed_rule_count() == 1; }));
+    REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds{30}));
+    REQUIRE(f.engine->ack_pending_count_for_test() == 1); // Accepted, not Armed
     REQUIRE(f.engine->policy_generation() == 0); // not yet acknowledged - no tick has run
+
+    // Let the arm commit, and wait for the worker's completion (which records the
+    // outcome) to finish - so the next tick's drain finds the receipt terminal.
+    f.mechanism->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return f.engine->active_io_workers() == 0; }));
+    REQUIRE(f.engine->spark_armed_rule_count() == 1);
 
     // A real KV-write failure (not a fault-injection stand-in): drop the table through
     // a second connection to the SAME on-disk file, so persist_generation_locked()'s
     // kv_->set() call genuinely fails ("no such table") on THIS tick.
     drop_kv_store_table_for_test(f.db_.path);
     f.engine->journal_maintenance_tick();
+    // Non-vacuity: this tick drained the receipt, so it really attempted the persist.
+    REQUIRE(f.engine->ack_pending_count_for_test() == 0);
     // TARGET: the failed persist must NOT have published policy_generation_. Before the
     // fix, this was already 1 here - the exact bug the coordinator's gate caught.
     CHECK(f.engine->policy_generation() == 0);
@@ -3371,9 +5330,10 @@ TEST_CASE("rung 9c PR-2 governance hardening: an IDENTICAL repeat push recovers 
     // reaching the tail-gate persist this test targets - this whole-table-drop
     // fault can't isolate "rules durably stored, only the generation marker's own
     // write fails" from "everything in the table fails together". decide_retry()'s
-    // pending.empty() fix does not itself depend on rule count or content (proven
-    // independently, rule-content-free, by the ledger-level "EMPTY pending map"
-    // unit test in test_guardian_arm_ack.cpp) - but a selective-KV-fault test
+    // nothing-outstanding fix does not itself depend on rule count or content (proven
+    // independently, rule-content-free, by the ledger-level "decide_retry(): no pending
+    // receipts and no retained outstanding work is Reapply" unit test in
+    // test_guardian_arm_ack.cpp) - but a selective-KV-fault test
     // exercising this exact tail-gate failure with real, already-armed rules
     // present is tracked as a follow-up, not fixed here.
     gpb::GuaranteedStatePush p;
@@ -3514,80 +5474,865 @@ TEST_CASE("governance UP-1 residual, round 2 (#4221): retargeting a rule onto an
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// rung 9c PR-5e (#4221, K-bound closeout, decision 1): end-to-end proof the
-// FULL production wiring - apply_rules() -> decide_retry()/begin_application()
-// -> journal_maintenance_tick()'s drain -> can_advance() -> persist+advance -
-// K-waives a persistently Wedged-only rule after exactly
-// kReapplyWaiverThreshold identical server retries, through the real
-// GuardianEngine entry point rather than the raw GuardianSparkRuntime/
-// GuardianArmAckLedger APIs the sibling ledger-level tests exercise directly.
+// #5459 (option D) - a still-hung arm HOLDS its generation; it is never acknowledged.
+//
+// History: rung 9c PR-5e (#4221, K-bound closeout) acknowledged a persistently Wedged-only
+// rule after three identical server retries. The server then stopped re-pushing
+// (agent_gen >= current), so if the parked call later FAILED, its completion callback popped
+// the claim with no replacement arm and the rule was desired, acknowledged and unarmed
+// (#5459). The waiver is DELETED: the generation stays honestly HELD, the server's re-push
+// keeps arriving, and GuardianArmAckLedger::decide_retry() Suppresses each identical held push
+// (no teardown, no re-arm, no new watch()) for as long as the wedge (or its compensating
+// teardown) is outstanding, up to kWedgeSuppressMaxDecisions, then forces ONE Reapply.
+// When the wedged claim pops, the next push is a Reapply and the rule re-arms.
+//
+// These cases live in the engine fixture because the ownership question is the ENGINE's:
+// nothing at the runtime or ledger level can say whether the rule ends armed once the held
+// generation is finally acknowledged, only the real GuardianEngine + SparkEngine + mechanism
+// can. Every end-state assertion is about the rule's LIVE subscription (right key, once, on a
+// fresh incarnation), never about a counter.
+//
+// What "live subscription for the correct rule and incarnation" means in this fixture: the
+// runtime holds r1 (spark_armed_rule_count), the mechanism is watching exactly the key the
+// first arm was for (not a sibling's, not a second key), the runtime's own status accessor
+// knows r1, and the replacement arm is exactly one MORE watch() call than the failed one.
+// FakeServiceMechanism ignores the incarnation argument, so that last count is the closest
+// this fixture gets to "the correct incarnation".
 // ═══════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("rung 9c PR-5e (#4221): K-bound waives a persistently Wedged-only rule "
-          "after 3 identical server retries, advancing policy_generation, through "
-          "GuardianEngine::apply_rules()/journal_maintenance_tick() end to end",
-          "[spark][guardian][reconcile][liveness]") {
-    SparkReconcileFixture f{/*periodic_bound_ms=*/0,
-                            /*backend_op_deadline=*/std::chrono::milliseconds(50)};
-    REQUIRE(f.engine->policy_generation() == 0);
+namespace {
 
-    // hang_next_watch() is consumed by the FIRST watch() call only - up-2's
-    // Reobserved path means every SUBSEQUENT identical retry re-observes the
-    // SAME already-wedged claim without ever calling watch() again, so this
-    // single arm covers the whole test; no re-arming needed between retries.
-    f.mechanism->hang_next_watch();
-    struct ReleaseHangOnExit {
+/// How long the maintenance-driven recovery wait may take. The recovery is tick-driven, so a
+/// working fix needs a few ticks, not wall time and a passing run exits the poll at once; this
+/// bound only caps a failing run, and is the file's usual 10 s so a loaded runner (or the
+/// sanitizer scale applied by spin_until) cannot turn a slow worker re-arm into a false red.
+constexpr std::chrono::seconds kRecoveryWindow5459{10};
+
+/// The generation every rig push carries (the held one).
+constexpr std::uint64_t kHeldGeneration5459 = 5;
+
+struct LateFailureRig5459 {
+    SparkReconcileFixture f;
+    // Declared AFTER `f` so it destructs FIRST (before the engine is torn down) on every
+    // exit path, including a failed REQUIRE: both gates are released, so no parked worker
+    // outlives the fixture and engine.reset() cannot wait on a gate nobody will open.
+    struct ReleaseGatesOnExit {
         SparkReconcileFixture& fx;
-        ~ReleaseHangOnExit() { fx.mechanism->release_hang(); }
-    } release_parked{f};
+        ~ReleaseGatesOnExit() {
+            fx.mechanism->release_isolated_unwatch_hang();
+            fx.mechanism->release_hang();
+            // A worker still alive after both gates are open is a leak that must not read
+            // green. FAIL_CHECK records a failure without throwing (safe in a destructor,
+            // including during a failing REQUIRE's unwind) unless the binary runs with
+            // Catch2's --abort/-x, which makes it throw (then a real leak terminates the
+            // process instead of reporting a red assertion; nothing here uses -x).
+            if (auto* rt = fx.engine->spark_runtime_for_test()) {
+                const bool drained = yuzu::test::spin_until(
+                    [&] { return rt->active_backend_op_workers() == 0; }, std::chrono::seconds(10));
+                if (!drained)
+                    FAIL_CHECK("LateFailureRig5459: a backend worker was still alive after both "
+                               "gates were released (leaked parked worker)");
+            }
+        }
+    } release_gates{f};
 
-    gpb::GuaranteedStatePush p;
-    p.set_full_sync(true);
-    p.set_policy_generation(5);
-    *p.add_rules() = make_service_rule("r1");
-    const auto push_bytes = p.SerializeAsString(); // identical bytes every retry
+    std::string push_bytes;
+    std::string key; // the key the hung first arm was for
+    /// 1 when the push also carries a healthy sibling "r2", a REGISTRY rule on its own mechanism
+    /// (`f.sibling_mechanism`). Mechanism calls are serialised per type, so a Service-type sibling
+    /// could not arm while r1's watch() is parked; a Registry one can. r2 arms and commits normally
+    /// and is the observable victim of an unwanted teardown + re-arm of the whole push.
+    int siblings{0};
+    /// #5459 FU-10: 1 when the push also carries a healthy SAME-TYPE sibling "r3" (a second Service
+    /// rule, distinct service name so a distinct key, on the SAME mechanism and so under the same
+    /// per-type lock as r1). Which of r1/r3 hangs is not fixed: park_and_wedge() hangs the SECOND
+    /// watch() to enter the mechanism, so the first commits and is the sibling, whichever rule the
+    /// engine's two arm workers reach the type lock with first. `key` is the hung rule's key and
+    /// `sibling_key` the committed one.
+    bool same_type{false};
+    std::string sibling_key;
 
-    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, push_bytes);
-    REQUIRE(dr.exit_code == 0);
-    REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(30)));
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    f.engine->journal_maintenance_tick(); // drains: r1 resolves Wedged, retained+eligible
+    explicit LateFailureRig5459(std::uint64_t generation = kHeldGeneration5459,
+                                bool with_sibling = false, bool same_type_sibling = false)
+        : f(/*periodic_bound_ms=*/0, /*backend_op_deadline=*/std::nullopt, SparkType::Service,
+            with_sibling),
+          siblings(with_sibling ? 1 : 0), same_type(same_type_sibling) {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(generation);
+        *p.add_rules() = make_service_rule("r1");
+        if (with_sibling)
+            *p.add_rules() = make_registry_rule("r2");
+        if (same_type_sibling)
+            *p.add_rules() = make_service_rule("r3", true, "Notepad");
+        push_bytes = p.SerializeAsString(); // identical bytes on every re-application
+    }
 
-    CHECK(f.engine->policy_generation() == 0); // held - reapply_count 0 < K
-    {
+    yuzu::agent::GuardianSparkRuntime& runtime() {
+        auto* rt = f.engine->spark_runtime_for_test();
+        REQUIRE(rt != nullptr);
+        return *rt;
+    }
+    void push() {
+        const auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, push_bytes);
+        REQUIRE(dr.exit_code == 0);
+    }
+    /// The generation as DURABLY stored (what a restart would read), not the in-memory value.
+    std::optional<std::uint64_t> persisted_generation() {
+        const auto v = f.kv->get(kGuardianKvNamespace5459, kGuardianGenerationKey5459);
+        if (!v)
+            return std::nullopt;
+        return static_cast<std::uint64_t>(std::stoull(*v));
+    }
+    /// The generation is HELD: neither the in-memory nor the durable value has moved.
+    void require_generation_held() {
+        REQUIRE(f.engine->policy_generation() == 0);
+        REQUIRE(persisted_generation().value_or(0) == 0);
+    }
+
+    /// Step 1. The first arm ENTERS its real backend call and parks there; its claim is
+    /// then expired with a synthetic clock (never a sleep), so the heartbeat drain sees a
+    /// retained outstanding Wedged receipt, and generation 5 is held.
+    void park_and_wedge() {
+        using namespace std::chrono_literals;
+        if (same_type)
+            f.mechanism->hang_watch_ordinal(2); // the first watch() commits, the second hangs
+        else
+            f.mechanism->hang_next_watch();
+        push();
+        REQUIRE(f.mechanism->wait_entered_hang(30s)); // event-driven: the arm is IN watch()
+        if (same_type) {
+            key = f.mechanism->hung_watch_key();
+            sibling_key = f.mechanism->first_watch_key();
+            REQUIRE_FALSE(key.empty());
+            REQUIRE_FALSE(sibling_key.empty());
+            REQUIRE(key != sibling_key);
+        } else {
+            key = f.mechanism->first_watch_key();
+            REQUIRE_FALSE(key.empty());
+        }
+        if (siblings > 0) {
+            // r1's Service arm is the parked one; the Registry sibling's arm commits on its own
+            // mechanism and key, independently.
+            REQUIRE(yuzu::test::spin_until(
+                [&] {
+                    return f.sibling_mechanism->watching_count() == 1 &&
+                           f.engine->spark_armed_rule_count() == 1;
+                },
+                10s));
+        }
+        if (same_type) {
+            // The first watch() returned before the second entered, so the sibling's subscription
+            // is physically registered; its commit into the runtime is the worker's next step.
+            REQUIRE(yuzu::test::spin_until(
+                [&] { return f.engine->spark_armed_rule_count() == 1; }, 10s));
+            REQUIRE(f.mechanism->watched_snapshot() == std::set<std::string>{sibling_key});
+        }
+        // Outstanding, and this key really is the claim's key (a wrong key would read 0).
+        REQUIRE(f.mechanism->watch_call_count() == (same_type ? 2 : 1));
+        REQUIRE(f.mechanism->watching_count() == (same_type ? 1u : 0u));
+        // Only r1's hung worker is left alive (a sibling's worker may still be unwinding).
+        // Resolved ONCE, outside every poll: runtime() contains a REQUIRE, and a REQUIRE
+        // inside a spin_until predicate runs once per poll and inflates the assertion count
+        // by a timing-dependent amount.
+        auto& rt = runtime();
+        REQUIRE(yuzu::test::spin_until([&] { return rt.active_backend_op_workers() == 1; }, 10s));
+        REQUIRE(rt.claim_queue_depth_for_test(key) == 1);
+        REQUIRE(f.engine->spark_armed_rule_count() ==
+                static_cast<std::size_t>(siblings + (same_type ? 1 : 0)));
+        REQUIRE(rt.expire_overdue_claims_at_for_test(std::chrono::steady_clock::now() + 600s) == 1);
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                f.engine->journal_maintenance_tick();
+                return f.engine->ack_pending_count_for_test() == 0;
+            },
+            10s));
+        require_generation_held();
+        // The wedge is the one retained failure the ledger's retry suppression keys on.
         const auto s = f.engine->arm_stats();
+        REQUIRE(s.has_value());
+        REQUIRE(s->failed == 1);
+        REQUIRE(s->pending == 0);
+    }
+
+    /// One identical server re-push while the generation is still behind, expected to be
+    /// SUPPRESSED: the open Application survives (a Reapply would begin a fresh one, whose
+    /// arm_stats read pending 1 / failed 0 until its drain), nothing reaches the mechanism
+    /// (no new watch(), no unwatch() beyond `unwatch_baseline`), and nothing is acknowledged.
+    void suppressed_repush(int unwatch_baseline = 0) {
+        REQUIRE(f.engine->policy_generation() < kHeldGeneration5459); // server-like: only while behind
+        const int watches_before = f.mechanism->watch_call_count();
+        push();
+        const auto s = f.engine->arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->pending == 0); // no new application: nothing was re-armed
+        CHECK(s->failed == 1);  // the wedge's failure is still on the open application
+        CHECK(f.mechanism->watch_call_count() == watches_before);
+        CHECK(f.mechanism->unwatch_completed_count() == unwatch_baseline);
+        CHECK(runtime().claim_queue_depth_for_test(key) == 1); // the same claim, still outstanding
+        f.engine->journal_maintenance_tick();
+        require_generation_held();
+    }
+    void suppressed_repushes(int n) {
+        for (int i = 0; i < n; ++i)
+            suppressed_repush();
+    }
+
+    /// Wait until the released call's completion callback has FINISHED: the worker has
+    /// returned and the claim is gone from its key's FIFO. Event-driven; no tick involved.
+    void await_late_result_landed() {
+        using namespace std::chrono_literals;
+        auto& rt = runtime(); // once, outside the poll (runtime() holds a REQUIRE)
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                return rt.active_backend_op_workers() == 0 && rt.claim_queue_depth_for_test(key) == 0;
+            },
+            10s));
+    }
+
+    /// After the late FAILURE has popped the claim: a bounded number of maintenance ticks (a
+    /// count, not a wait) neither arm the rule nor acknowledge the generation. The recovery
+    /// owner is the server's next re-push, and it is owed precisely because the generation
+    /// is still held.
+    void require_unarmed_and_still_held_after_failure() {
+        for (int i = 0; i < 20; ++i)
+            f.engine->journal_maintenance_tick();
+        REQUIRE(f.engine->spark_armed_rule_count() == 0);
+        REQUIRE(f.mechanism->watching_count() == 0);
+        require_generation_held();
+    }
+
+    [[nodiscard]] bool has_live_subscription() {
+        return f.engine->spark_armed_rule_count() == 1 && f.mechanism->watching_count() == 1;
+    }
+    /// #4415: the skip is for HEALTHY rules, and a rule in an Unknown-eval episode is deliberately
+    /// rebuilt. These Service rules are read through the real reader, so on a host with no system
+    /// bus (a bare container) they read Unknown, and whether the next push skips them would then
+    /// race the first evaluation. Waits for `rule_id`'s first verdict and SKIPs the case on such a
+    /// host; the skip-versus-Unknown boundary itself is pinned deterministically (File rules) in
+    /// test_guardian_spark_reapply_skip_engine.cpp, case 5a.
+    void require_rule_has_known_verdict(const std::string& rule_id) {
+        using namespace std::chrono_literals;
+        auto& rt = runtime(); // once, outside the poll
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                const auto st = rt.status_for_rule(rule_id);
+                return st.has_value() && (st->last_compliant.has_value() || st->in_unknown);
+            },
+            30s));
+        if (rt.status_for_rule(rule_id)->in_unknown)
+            SKIP("this host reads the Service rule Unknown (no system bus), so it is never skipped");
+    }
+    /// Drive ONLY the heartbeat maintenance tick until the rule has a live subscription or
+    /// the window closes. Returns whether it got there; the caller asserts the individual
+    /// signals so a failure names the one that is missing.
+    bool recovers_by_maintenance_only() {
+        return yuzu::test::spin_until(
+            [&] {
+                f.engine->journal_maintenance_tick();
+                return has_live_subscription();
+            },
+            kRecoveryWindow5459);
+    }
+    /// The end state: r1 is armed for the right key, once, and on a fresh incarnation
+    /// (`expected_watch_calls` counts every watch() including the failed first one).
+    void check_live_correct_subscription(int expected_watch_calls) {
+        REQUIRE(f.engine->spark_armed_rule_count() == 1); // the runtime holds r1 (not just rule_count())
+        CHECK(f.mechanism->watching_count() == 1);
+        CHECK(f.mechanism->watched_snapshot() == std::set<std::string>{key}); // THIS rule's key
+        CHECK(runtime().status_for_rule("r1").has_value());
+        CHECK(runtime().armed_key_count() == 1);
+        CHECK(f.mechanism->watch_call_count() == expected_watch_calls);
+        // A stale or doubled subscription would leave the failed arm's key still registered
+        // elsewhere or more watchers than keys; one key, one watcher is the whole picture.
+    }
+    /// The held generation is acknowledged AND durably stored - and only after the rule is
+    /// live (the callers assert the subscription first).
+    void require_acknowledged_after_arm(std::uint64_t generation = kHeldGeneration5459) {
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                f.engine->journal_maintenance_tick();
+                return f.engine->policy_generation() == generation;
+            },
+            std::chrono::seconds(10)));
+        REQUIRE(persisted_generation().has_value());
+        CHECK(*persisted_generation() == generation);
+    }
+    /// The server's next re-push after a late failure, sent because the agent still reports a
+    /// generation behind its own: the rule re-arms through the normal path, and only THEN is
+    /// the generation acknowledged and persisted.
+    void repush_rearms_then_acknowledges(int expected_watch_calls) {
+        REQUIRE(f.engine->policy_generation() < kHeldGeneration5459);
+        push();
+        REQUIRE(recovers_by_maintenance_only());
+        check_live_correct_subscription(expected_watch_calls);
+        require_acknowledged_after_arm();
+    }
+};
+
+} // namespace
+
+TEST_CASE("#5459 held generation: identical pushes while a hung arm is outstanding are "
+          "SUPPRESSED (no teardown, no new watch(), a healthy sibling untouched), never "
+          "acknowledged; the safety valve forces one Reapply that re-observes the SAME claim, "
+          "then suppression resumes",
+          "[spark][guardian][reconcile][liveness][5459][5459held]") {
+    using namespace std::chrono_literals;
+    // r1 (Service) hangs; r2 is a healthy sibling (Registry, its own mechanism and key). A
+    // teardown + re-arm of the whole push is the cost suppression avoids, and r2 is where that cost
+    // is observable: a suppressed push leaves its watch/unwatch counts and its live subscription
+    // exactly as they were, while a real Reapply moves both.
+    LateFailureRig5459 r{kHeldGeneration5459, /*with_sibling=*/true};
+    r.park_and_wedge();
+    auto& sib = *r.f.sibling_mechanism;
+    const auto sibling_watched = sib.watched_snapshot();
+    REQUIRE(sibling_watched.size() == 1);
+    REQUIRE(sib.watch_call_count() == 1);
+    REQUIRE(sib.unwatch_completed_count() == 0);
+    // #4415: the forced Reapply below moves the sibling ONLY if the sibling is rebuilt, and the
+    // skip leaves a healthy, unchanged rule alone. r2 is a REGISTRY rule: on a host with no
+    // registry (Linux, macOS) it reads Unknown and is always rebuilt; on Windows it reads a verdict
+    // and is skipped. Wait for its first verdict, then expect the matching outcome on this host.
+    auto& rt5459 = r.runtime();
+    decltype(rt5459.status_for_rule("r2")) first_verdict; // the snapshot that satisfied the poll
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            first_verdict = rt5459.status_for_rule("r2");
+            return first_verdict.has_value() &&
+                   (first_verdict->last_compliant.has_value() || first_verdict->in_unknown);
+        },
+        30s));
+    const int sibling_rebuilds = first_verdict->in_unknown ? 1 : 0;
+
+    // Held: every identical push up to the budget is Suppressed. The Application survives
+    // each one (pending 0 / failed 1), the mechanisms see nothing, nothing is acknowledged.
+    r.suppressed_repushes(static_cast<int>(yuzu::agent::kWedgeSuppressMaxDecisions));
+    CHECK(r.f.mechanism->watch_call_count() == 1);
+    CHECK(r.f.mechanism->unwatch_completed_count() == 0);
+    CHECK(sib.watch_call_count() == 1);
+    CHECK(sib.unwatch_completed_count() == 0);
+    CHECK(sib.watched_snapshot() == sibling_watched); // the sibling's subscription untouched
+    CHECK(r.f.engine->spark_armed_rule_count() == 1);
+
+    // Budget exhausted: the NEXT identical push is a forced Reapply - a fresh Application whose
+    // re-attach re-observes the SAME retained claim (no new watch(): a forced Reapply does not
+    // unstick the worker, it only bounds the dependence on the suppress classification).
+    r.push();
+    {
+        const auto s = r.f.engine->arm_stats();
+        REQUIRE(s.has_value());
+        // A new Application: r1's re-observed (hung) claim is registered in this application's
+        // pending set (its Wedged receipt is already terminal when registered, and it only moves
+        // to failed_receipts at the next drain tick, which has not run yet), so r1 contributes
+        // pending 1 deterministically. r2's re-arm is a separate worker that may or may not have
+        // resolved by now (it did under load: pending 1), so only r1's contribution is asserted
+        // here; r2's re-arm is awaited event-driven just below.
+        CHECK(s->pending >= 1);
+        CHECK(s->failed == 0);
+    }
+    CHECK(r.f.mechanism->watch_call_count() == 1);
+    CHECK(r.f.mechanism->unwatch_completed_count() == 0);
+    CHECK(r.runtime().claim_queue_depth_for_test(r.key) == 1); // the very same claim
+    // The real Reapply moves the sibling only when it is rebuilt (an Unknown sibling, see above):
+    // its teardown unwatches r2 and the re-arm watches it again (+1 each). A healthy sibling is
+    // skipped and stays exactly as it was.
+    // With sibling_rebuilds == 0 (Windows) this wait is already true on entry and proves nothing
+    // about the Reapply; the untouched-sibling property is pinned by the same counts re-checked
+    // after the valve drains and after the late-recovery tail below.
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            return sib.unwatch_completed_count() == sibling_rebuilds &&
+                   sib.watch_call_count() == 1 + sibling_rebuilds && sib.watching_count() == 1;
+        },
+        10s));
+    CHECK(sib.watched_snapshot() == sibling_watched); // r2 re-armed on its own key
+    // Wedge ownership survived the valve: the next drain retains it again, and the generation
+    // is STILL held (the valve acknowledges nothing).
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            r.f.engine->journal_maintenance_tick();
+            return r.f.engine->ack_pending_count_for_test() == 0;
+        },
+        std::chrono::seconds(10)));
+    {
+        const auto s = r.f.engine->arm_stats();
         REQUIRE(s.has_value());
         CHECK(s->failed == 1);
+        CHECK(s->pending == 0);
     }
+    r.require_generation_held();
 
-    // 3 more identical server retries (4 established applications in total - see
-    // the sibling ledger-level K-bound test's own comment on this exact
-    // arithmetic: begin_application()'s reapply_count starts at 0 on the FIRST
-    // application, so K==3 needs 3 MORE identical begin_application() calls).
-    for (int i = 0; i < 3; ++i) {
-        dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, push_bytes);
-        REQUIRE(dr.exit_code == 0);
-        f.engine->journal_maintenance_tick();
-        // governance Gate 4/happy-path finding: assert the intermediate ticks too,
-        // not just before/after the loop - proves the waiver genuinely fires at
-        // exactly the 3rd retry, not one (or more) retries early.
-        if (i < 2)
-            CHECK(f.engine->policy_generation() == 0);
-    }
+    // The budget is back to zero: the following push is Suppressed again, not another Reapply
+    // (suppressed_repush asserts no new Service watch() and no Service unwatch; the sibling is
+    // checked here).
+    r.suppressed_repush();
+    CHECK(sib.watch_call_count() == 1 + sibling_rebuilds);
+    CHECK(sib.unwatch_completed_count() == sibling_rebuilds);
+    CHECK(sib.watched_snapshot() == sibling_watched);
 
-    // The 3rd retry installed reapply_count == 3 == K, and the single remaining
-    // failure is still genuinely, settledly Wedged (the mechanism's watch() call
-    // is still parked in the hook this whole time) - K-waived. The generation
-    // advances and is durably persisted.
-    CHECK(f.engine->policy_generation() == 5);
-    {
-        const auto s = f.engine->arm_stats();
-        REQUIRE(s.has_value());
-        CHECK(s->failed == 1); // telemetry still reports it - K-waiver never erases it
-    }
-
-    // (the parked mechanism is released by `release_parked` above on every exit path)
+    // The claim was re-owned by the new Application (the rule is active again), so the hung
+    // arm's late SUCCESS is still adopted, and only then is the generation acknowledged.
+    r.f.mechanism->release_hang();
+    r.await_late_result_landed();
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            r.f.engine->journal_maintenance_tick();
+            return r.f.engine->spark_armed_rule_count() == 2 && r.f.mechanism->watching_count() == 1;
+        },
+        kRecoveryWindow5459));
+    CHECK(r.f.mechanism->watch_call_count() == 1); // r1 adopted its ORIGINAL arm, no replacement
+    CHECK(r.f.mechanism->unwatch_completed_count() == 0);
+    CHECK(r.f.mechanism->is_watching(r.key));
+    CHECK(sib.watch_call_count() == 1 + sibling_rebuilds);
+    CHECK(sib.unwatch_completed_count() == sibling_rebuilds);
+    r.require_acknowledged_after_arm();
 }
+
+TEST_CASE("#5459 (a): a hung arm that later REFUSES holds its generation, ends armed on the "
+          "server's next re-push, and only then is acknowledged",
+          "[spark][guardian][reconcile][5459][5459a]") {
+    LateFailureRig5459 r;
+    r.park_and_wedge();
+    r.suppressed_repushes(3); // the held re-pushes while the arm is still hung cost nothing
+
+    // Only now does the parked call return, as a refusal.
+    r.f.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+    r.f.mechanism->release_hang();
+    r.await_late_result_landed();
+
+    // The failure has landed; NOTHING was acknowledged (that is the whole fix) and nothing
+    // re-arms by maintenance alone - the owed recovery event is the held generation's re-push.
+    r.require_unarmed_and_still_held_after_failure();
+    r.repush_rearms_then_acknowledges(/*expected_watch_calls=*/2);
+}
+
+TEST_CASE("#5459 (a): a hung arm that later THROWS holds its generation, ends armed on the "
+          "server's next re-push, and only then is acknowledged",
+          "[spark][guardian][reconcile][5459][5459a]") {
+    // A mechanism throw is contained by SparkEngine's watch_guarded() and arrives at the
+    // runtime as the same refusal-shaped failure as the case above, NOT as the executor's
+    // IoFailure::WorkerThrew (no seam produces that AFTER a parked mechanism call). This case
+    // still earns its place: it is the other way a real mechanism fails.
+    LateFailureRig5459 r;
+    r.park_and_wedge();
+    r.suppressed_repushes(3);
+
+    r.f.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Throw);
+    r.f.mechanism->release_hang();
+    r.await_late_result_landed();
+
+    r.require_unarmed_and_still_held_after_failure();
+    r.repush_rearms_then_acknowledges(/*expected_watch_calls=*/2);
+}
+
+TEST_CASE("#5459 (b): a hung arm whose late SUCCESS fails to be adopted holds its generation "
+          "through the compensating disarm (pushes suppressed), ends armed on the next re-push, "
+          "and only then is acknowledged",
+          "[spark][guardian][reconcile][5459][5459b]") {
+    using namespace std::chrono_literals;
+    LateFailureRig5459 r;
+    r.park_and_wedge();
+    r.suppressed_repushes(2); // pre-compensation: the plain hung-wedge flavour
+    REQUIRE_FALSE(r.f.engine->oldest_outstanding_compensation_age_seconds().has_value());
+
+    // The late arm will SUCCEED, but its adoption fails (fault point 12: after index_->add
+    // moved the mapping), so on_arm_complete falls to the compensating-disarm path; that
+    // disarm is parked on its own isolated gate so the window can be held open.
+    r.runtime().set_drain_fault_point_for_test(12); // one-shot, self-clearing
+    r.f.mechanism->hang_next_unwatch_isolated();
+    r.f.mechanism->release_hang();
+    REQUIRE(r.f.mechanism->wait_entered_isolated_unwatch(30s)); // compensation is outstanding
+
+    // The claim is a compensating head now (CompensationPending, not a hung arm). The
+    // generation is still held, and the compensating-teardown flavour of the wedge is still
+    // tracked by the ledger, so held pushes stay Suppressed across it as well.
+    REQUIRE(r.f.engine->oldest_outstanding_compensation_age_seconds().has_value());
+    r.require_generation_held();
+
+    // No premature replacement arm while the compensation is outstanding: a bounded number of
+    // ticks (a count, not a wait) must not start a second watch(), and the claim is still the
+    // key's marker. The held re-pushes meanwhile are suppressed (no teardown, no re-arm).
+    for (int i = 0; i < 20; ++i)
+        r.f.engine->journal_maintenance_tick();
+    CHECK(r.f.mechanism->watch_call_count() == 1);
+    CHECK(r.runtime().claim_queue_depth_for_test(r.key) == 1);
+    CHECK(r.f.mechanism->unwatch_completed_count() == 0);
+    r.suppressed_repushes(3);
+    r.require_generation_held();
+
+    // The compensation finishes; the stale subscription is torn down and the claim popped.
+    r.f.mechanism->release_isolated_unwatch_hang();
+    r.await_late_result_landed();
+    CHECK(r.f.mechanism->unwatch_completed_count() == 1);
+
+    r.require_unarmed_and_still_held_after_failure();
+    r.repush_rearms_then_acknowledges(/*expected_watch_calls=*/2);
+}
+
+TEST_CASE("#5459 control: a hung arm whose late SUCCESS is adopted ends armed with no re-push "
+          "and only then acknowledges the held generation (the harness CAN observe a live "
+          "subscription)",
+          "[spark][guardian][reconcile][5459][5459control]") {
+    LateFailureRig5459 r;
+    r.park_and_wedge();
+    r.suppressed_repushes(2);
+
+    // The same scenario, released into SUCCESS instead of failure. #4508's late-adoption
+    // path commits the original subscription, so the recovery drain decrements the failure and
+    // the held generation is acknowledged by the maintenance tick alone. No replacement arm:
+    // the original watch() is the only one.
+    r.require_generation_held(); // still held right up to the release
+    r.f.mechanism->release_hang();
+    r.await_late_result_landed();
+    REQUIRE(r.recovers_by_maintenance_only());
+    r.check_live_correct_subscription(/*expected_watch_calls=*/1);
+    r.require_acknowledged_after_arm();
+    CHECK(r.f.mechanism->unwatch_completed_count() == 0);
+}
+
+TEST_CASE("#5459 valve spent, then the late success is adopted: the next identical push is a "
+          "Reapply that tears the just-armed rule down NOWHERE (#4415 skip) and acknowledges the "
+          "held generation inline",
+          "[spark][guardian][reconcile][5459][5459valve]") {
+    // Rewritten for #4415. Before the skip, this forced Reapply tore the just-armed rule down
+    // and re-armed it (one teardown, one replacement watch) and could never acknowledge on the
+    // push itself. The rule is healthy, committed and unchanged, so the fresh application now
+    // skips it: no receipt, nothing failed, and apply_rules acknowledges inline.
+    LateFailureRig5459 r;
+    r.park_and_wedge();
+    r.suppressed_repushes(static_cast<int>(yuzu::agent::kWedgeSuppressMaxDecisions)); // budget spent
+
+    // The hung arm succeeds and nobody withdrew the rule: adopted. NO tick runs between the
+    // adoption and the next push, so the ledger still holds the entry as Recovered-but-uncleared.
+    r.f.mechanism->release_hang();
+    r.await_late_result_landed();
+    REQUIRE(r.f.engine->spark_armed_rule_count() == 1);
+    REQUIRE(r.f.mechanism->watch_call_count() == 1);
+    REQUIRE(r.f.mechanism->unwatch_completed_count() == 0);
+    r.require_generation_held();
+
+    // The valve is spent, so this identical push is a forced Reapply: a fresh application.
+    r.require_rule_has_known_verdict("r1"); // a healthy rule is the one that is skipped
+    const auto epoch_before = r.runtime().application_fence_for_test();
+    r.push();
+    CHECK(r.runtime().application_fence_for_test().first == epoch_before.first + 1); // a real Reapply
+    CHECK(r.runtime().application_fence_for_test().second == epoch_before.second);   // no new incarnation
+    {
+        const auto s = r.f.engine->arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->failed == 0); // a NEW application (a Suppress would have kept failed == 1)
+        CHECK(s->pending == 0);
+    }
+    // Acknowledged on the push itself: the skip registers no receipt, so nothing is pending.
+    CHECK(r.f.engine->policy_generation() == kHeldGeneration5459);
+    r.check_live_correct_subscription(/*expected_watch_calls=*/1); // the ORIGINAL arm, never replaced
+    CHECK(r.f.mechanism->unwatch_completed_count() == 0);          // the just-armed rule was not torn down
+    REQUIRE(r.persisted_generation().has_value());
+    CHECK(*r.persisted_generation() == kHeldGeneration5459);
+}
+
+// FU-10 (AC-16, a flip precondition). The per-type mechanism lock is why a Service-type sibling
+// cannot arm while one Service watch() is parked, and it is why the forced Reapply the safety
+// valve buys used to cost a healthy same-type sibling: its teardown and its re-arm queued behind
+// the hung call, the re-arm expired CongestionExpired, and every later push was a Reapply for the
+// length of the hang. Rewritten for #4415: the Reapply skips the healthy sibling, so none of that
+// happens. The Registry sibling in [5459held] is on its OWN mechanism; this test keeps the sibling
+// on the SAME one, which is where the old cost was visible.
+TEST_CASE("#5459 FU-10 (AC-16): the forced Reapply during a hung same-type watch() leaves a "
+          "healthy same-type sibling alone (#4415 skip): nothing queues behind the hung call, "
+          "nothing expires, the generation stays held, and the late success alone acknowledges it",
+          "[spark][guardian][reconcile][liveness][5459][5459fu10]") {
+    using namespace std::chrono_literals;
+    LateFailureRig5459 r{kHeldGeneration5459, /*with_sibling=*/false, /*same_type_sibling=*/true};
+    // Declared after `r` so it destructs first: the re-armable park gate is open on every exit path.
+    struct ReleaseParkOnExit {
+        FakeServiceMechanism& m;
+        ~ReleaseParkOnExit() { m.release_park_all(); }
+    } release_park{*r.f.mechanism};
+
+    r.park_and_wedge(); // `key` = the hung rule's key, `sibling_key` = the committed same-type one
+    auto& m = *r.f.mechanism;
+    auto& rt = r.runtime(); // once, outside every poll (runtime() holds a REQUIRE)
+    const std::string hung_key = r.key;
+    const std::string sib_key = r.sibling_key;
+    REQUIRE(r.f.engine->spark_armed_rule_count() == 1); // the sibling is live: the premise
+    REQUIRE(m.watch_call_count() == 2);
+
+    // The valve's budget is spent by identical retained-wedge pushes, none of which touches the
+    // healthy sibling.
+    r.suppressed_repushes(static_cast<int>(yuzu::agent::kWedgeSuppressMaxDecisions));
+    CHECK(m.watch_call_count() == 2);
+    CHECK(m.unwatch_completed_count() == 0);
+    CHECK(r.f.engine->spark_armed_rule_count() == 1);
+
+    // The forced Reapply: a fresh application (the detach epoch moves) whose full_sync detach
+    // is scoped to rules the push omits, so the healthy sibling is neither withdrawn nor rebuilt.
+    // The sibling is whichever of r1/r3 is committed (the other is the hung one).
+    r.require_rule_has_known_verdict(rt.status_for_rule("r1").has_value() ? "r1" : "r3");
+    const auto epoch_before = rt.application_fence_for_test().first;
+    r.push();
+    CHECK(rt.application_fence_for_test().first == epoch_before + 1);
+    CHECK(r.f.engine->spark_armed_rule_count() == 1); // the sibling's detection never goes off
+    CHECK(rt.claim_queue_depth_for_test(sib_key) == 0); // no pending disarm, no queued re-arm
+    CHECK(rt.claim_queue_depth_for_test(hung_key) == 1); // the very same hung claim, re-observed
+    CHECK(rt.active_backend_op_workers() == 1);          // only the hung call: no disarm worker blocked behind it
+    // A bounded number of maintenance ticks (a count, not a wait) changes nothing: no teardown
+    // reaches the mechanism and no replacement watch() starts.
+    for (int i = 0; i < 20; ++i)
+        r.f.engine->journal_maintenance_tick();
+    CHECK(m.unwatch_completed_count() == 0);
+    CHECK(m.watch_call_count() == 2);
+    CHECK(m.watched_snapshot() == std::set<std::string>{sib_key});
+    CHECK(r.f.engine->spark_armed_rule_count() == 1);
+    // Nothing is queued to age out, so no claim can expire CongestionExpired (a synthetic clock,
+    // never a sleep).
+    CHECK(rt.expire_overdue_claims_at_for_test(std::chrono::steady_clock::now() + 600s) == 0);
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            r.f.engine->journal_maintenance_tick();
+            return r.f.engine->ack_pending_count_for_test() == 0;
+        },
+        10s));
+    {
+        const auto s = r.f.engine->arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->pending == 0);
+        CHECK(s->failed == 1); // the wedge alone (it was 2 with the sibling's expired re-arm)
+    }
+    r.require_generation_held(); // in memory and on disk
+
+    // The next push is a Suppress again (the valve's budget is back to zero), not the Reapply
+    // every later push used to be while the sibling's expired re-arm kept the application
+    // counting two failures against one retained wedge.
+    r.suppressed_repush();
+    CHECK(m.watch_call_count() == 2);
+    CHECK(m.unwatch_completed_count() == 0);
+
+    // Release the hang. The hung arm's late success is adopted, the sibling was never withdrawn,
+    // so the held generation is acknowledged by maintenance alone: no re-push is owed.
+    m.release_hang();
+    r.await_late_result_landed();
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            r.f.engine->journal_maintenance_tick();
+            return r.f.engine->spark_armed_rule_count() == 2 && m.watching_count() == 2;
+        },
+        kRecoveryWindow5459));
+    CHECK(m.watch_call_count() == 2); // the hung rule adopted its ORIGINAL arm; no replacement
+    CHECK(m.unwatch_completed_count() == 0);
+    CHECK(m.watched_snapshot() == std::set<std::string>{hung_key, sib_key});
+    r.require_acknowledged_after_arm();
+}
+
+// FU-11 (a flip precondition). A subscription armed LATE (a wedged arm whose late success is
+// adopted) must stay live across the next identical push and the following acknowledgment.
+// [5459control] and the last phase of [5459held] pin adoption followed by the acknowledgment with
+// no push in between, and [5459valve] pins the push when the valve budget is already spent. What
+// they leave open, and this test pins: (1) the identical push that lands in the window between the
+// adoption and the next heartbeat tick, with the valve budget UNSPENT; (2) the identical push
+// that arrives AFTER the acknowledgment (the server may still send one).
+TEST_CASE("#5459 FU-11: a subscription armed late stays live across the next identical push and "
+          "the following acknowledgment; a re-push after the acknowledgment leaves it alone "
+          "(#4415 skip): still exactly one live subscription, generation still acknowledged",
+          "[spark][guardian][reconcile][liveness][5459][5459fu11]") {
+    using namespace std::chrono_literals;
+    LateFailureRig5459 r;
+    r.park_and_wedge();
+    r.suppressed_repushes(2); // budget NOT spent: a handful of the kWedgeSuppressMaxDecisions
+    auto& m = *r.f.mechanism;
+    auto& rt = r.runtime(); // once, outside every poll
+
+    // The hung arm's late success is adopted. NO maintenance tick runs after it, so the ledger
+    // still holds the entry as adopted-but-uncleared (the generation is not yet acknowledged).
+    m.release_hang();
+    r.await_late_result_landed();
+    REQUIRE(r.f.engine->spark_armed_rule_count() == 1);
+    REQUIRE(m.watch_call_count() == 1);
+    REQUIRE(m.unwatch_completed_count() == 0);
+    r.require_generation_held();
+
+    // The next identical push: adopted-but-uncleared is outstanding work, so with budget left it
+    // is SUPPRESSED, not a teardown. The same application survives (failed 1, nothing pending),
+    // the subscription is never withdrawn and no second watch() is made.
+    r.push();
+    {
+        const auto s = r.f.engine->arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->pending == 0);
+        CHECK(s->failed == 1); // a Reapply would have begun a new application (failed 0)
+    }
+    CHECK(m.watch_call_count() == 1);
+    CHECK(m.unwatch_completed_count() == 0);
+    CHECK(r.f.engine->spark_armed_rule_count() == 1);
+    CHECK(m.watched_snapshot() == std::set<std::string>{r.key});
+    r.require_generation_held();
+
+    // The following ticks clear the adopted entry and acknowledge, on the ORIGINAL subscription.
+    REQUIRE(r.recovers_by_maintenance_only());
+    r.check_live_correct_subscription(/*expected_watch_calls=*/1);
+    r.require_acknowledged_after_arm();
+    CHECK(m.unwatch_completed_count() == 0);
+
+    // After the acknowledgment an identical push can still arrive. Nothing is outstanding, so it
+    // is a real Reapply (decide_retry's empty-pending case), but the rule is healthy, committed
+    // and unchanged, so #4415's skip leaves it alone: it used to be torn down and re-armed once.
+    // The end state is the invariant: one live subscription for the right key (not two), the
+    // ORIGINAL watch() still the only one, and the generation still acknowledged and durably stored.
+    r.require_rule_has_known_verdict("r1");
+    const auto epoch_before = rt.application_fence_for_test().first;
+    r.push();
+    CHECK(rt.application_fence_for_test().first == epoch_before + 1); // a real Reapply, not a Suppress
+    CHECK(r.f.engine->policy_generation() == kHeldGeneration5459); // the push itself never regresses it
+    for (int i = 0; i < 20; ++i)
+        r.f.engine->journal_maintenance_tick(); // a count, not a wait: nothing is left to settle
+    r.check_live_correct_subscription(/*expected_watch_calls=*/1);
+    CHECK(m.unwatch_completed_count() == 0);
+    CHECK(rt.active_backend_op_workers() == 0);
+    CHECK(r.f.engine->spark_armed_rule_count() == 1);
+    CHECK(m.watching_count() == 1);
+    CHECK(r.f.engine->policy_generation() == kHeldGeneration5459);
+    REQUIRE(r.persisted_generation().has_value());
+    CHECK(*r.persisted_generation() == kHeldGeneration5459);
+}
+
+TEST_CASE("#5459 valve spent, then the KV store fails mid-push: every push is a real Reapply "
+          "that is refused while the fault lasts (the sibling stays armed and untouched, the "
+          "generation stays held in memory, and on disk up to the fault), and once the store is "
+          "back the next push applies and only then acknowledges",
+          "[spark][guardian][reconcile][5459][5459kv]") {
+    using namespace std::chrono_literals;
+    // Rewritten for #4415. Before it, the forced Reapply's full_sync tore every spark rule down
+    // BEFORE its first rule persist failed, so a refused push left the whole set unarmed until
+    // the store came back. The detach is now scoped to rules the push omits, and the persist
+    // refusal returns before any per-rule reconcile, so the armed set simply stays as it was.
+    //
+    // r1 hangs (Service); r2 is a sibling on its own mechanism, so a teardown is observable as an
+    // armed count that drops.
+    LateFailureRig5459 r{kHeldGeneration5459, /*with_sibling=*/true};
+    r.park_and_wedge();
+    auto& sib = *r.f.sibling_mechanism;
+    REQUIRE(r.f.engine->spark_armed_rule_count() == 1); // r2 only; r1 is the hung arm
+    r.suppressed_repushes(static_cast<int>(yuzu::agent::kWedgeSuppressMaxDecisions)); // budget spent
+
+    // Before the fault the generation is held both in memory and on disk (a real, readable
+    // store: this is the only point at which the on-disk half is meaningful).
+    r.require_generation_held();
+
+    // The store fails. The next identical push is the valve's forced Reapply: its rule persist
+    // fails and the push is refused.
+    drop_kv_store_table_for_test(r.f.db_.path);
+    const auto fault_push = [&] {
+        return yuzu::agent::guardian_dispatch_push_bytes_for_test(*r.f.engine, r.push_bytes);
+    };
+    for (int i = 0; i < 3; ++i) {
+        // i == 0 is the forced Reapply; i > 0 is a Reapply because the failed application
+        // latched a failure. Either way the push is NOT suppressed, and either way it is refused
+        // before it reconciles anything: the sibling is neither withdrawn nor rebuilt.
+        const auto dr = fault_push();
+        CHECK(dr.exit_code != 0);
+        CHECK(r.f.engine->spark_armed_rule_count() == 1);
+        CHECK(sib.watching_count() == 1);
+        CHECK(sib.unwatch_completed_count() == 0);
+        CHECK(sib.watch_call_count() == 1);
+        r.f.engine->journal_maintenance_tick();
+        CHECK(r.f.engine->policy_generation() == 0); // held in memory (never published)
+    }
+    // The recreated table is empty, so nothing about the durable value can be read back here;
+    // the on-disk half was asserted before the fault, and the acknowledged-and-persisted
+    // generation is asserted after recovery below.
+    recreate_kv_store_table_for_test(r.f.db_.path);
+
+    // The store is healthy: the next push is applied in full. r1 re-observes its still-hung
+    // claim. r2 is deliberately not asserted on from here: off Windows its Registry read is
+    // Unknown, which the skip never treats as healthy, so whether it is rebuilt is a property of
+    // the host, not of this case. Nothing is acknowledged until every rule is live.
+    r.push();
+    // Drain BEFORE the hung arm returns, so the ledger retains the re-observed wedge (a wedge
+    // first drained after its late success was adopted is the documented one-avoidable-Reapply
+    // limit, not what this case is about).
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            r.f.engine->journal_maintenance_tick();
+            return r.f.engine->ack_pending_count_for_test() == 0 && sib.watching_count() == 1;
+        },
+        10s));
+    r.require_generation_held();
+    r.f.mechanism->release_hang();
+    r.await_late_result_landed();
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            r.f.engine->journal_maintenance_tick();
+            return r.f.engine->spark_armed_rule_count() == 2 && r.f.mechanism->watching_count() == 1;
+        },
+        kRecoveryWindow5459));
+    CHECK(r.f.mechanism->is_watching(r.key));
+    CHECK(sib.watching_count() == 1);
+    r.require_acknowledged_after_arm();
+}
+
+// Sub-class 3 of #5459 (the drain-to-persist gap), restated for option D. Under the waiver, a
+// drain observed the wedge "eligible", acknowledged the generation, and a completion that landed
+// between that observation and the persist stranded the rule. There is no waiver now: once a
+// drain has retained a wedge, can_advance() is false whether or not the claim has since popped,
+// so a pop between the retaining drain and the next tick changes nothing about acknowledgement.
+// Closed by construction, not by timing.
+TEST_CASE("#5459 sub-class 3: a pop between the drain that retained a wedge and the next tick "
+          "changes nothing, because can_advance() is false either way",
+          "[spark][guardian][reconcile][5459][5459subclass3]") {
+    LateFailureRig5459 r;
+    r.park_and_wedge(); // the drain retained the wedge; the generation is held
+    // Land the late failure with NO tick in between (the exact window the waiver lost).
+    r.f.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+    r.f.mechanism->release_hang();
+    r.await_late_result_landed();
+    r.require_generation_held();      // checked before ANY further tick has observed the pop
+    r.require_unarmed_and_still_held_after_failure(); // and after a bounded run of them
+    r.repush_rearms_then_acknowledges(/*expected_watch_calls=*/2);
+}
+
+// OPTION D PROBE, NOT PART OF THE REGRESSION SET (hence no [5459] tag). Q1: after the late
+// failure has popped the claim, does a FRESH re-attach - a server re-push, which is the one
+// event a held generation keeps producing - take the normal arm path and arm the rule? Under D
+// it is the recovery owner, so this stays as the minimal statement of that fact, for both a
+// same-generation re-push and a distinct next generation.
+TEST_CASE("#5459 option D probe (NOT part of the regression set): after the late failure, a "
+          "server re-push re-arms the rule",
+          "[spark][guardian][reconcile][5459probe]") {
+    SECTION("the same generation (what a still-held generation re-pushes)") {
+        LateFailureRig5459 r;
+        r.park_and_wedge();
+        r.f.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+        r.f.mechanism->release_hang();
+        r.await_late_result_landed();
+        r.require_unarmed_and_still_held_after_failure(); // nothing re-arms by itself
+
+        r.push();
+        REQUIRE(r.recovers_by_maintenance_only());
+        r.check_live_correct_subscription(/*expected_watch_calls=*/2);
+        r.require_acknowledged_after_arm();
+    }
+    SECTION("the next generation (a distinct generation arriving)") {
+        LateFailureRig5459 r;
+        r.park_and_wedge();
+        r.f.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+        r.f.mechanism->release_hang();
+        r.await_late_result_landed();
+        r.require_unarmed_and_still_held_after_failure();
+
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(6);
+        *p.add_rules() = make_service_rule("r1");
+        const auto dr =
+            yuzu::agent::guardian_dispatch_push_bytes_for_test(*r.f.engine, p.SerializeAsString());
+        REQUIRE(dr.exit_code == 0);
+        REQUIRE(r.recovers_by_maintenance_only());
+        r.check_live_correct_subscription(/*expected_watch_calls=*/2);
+        // The new generation is acknowledged by the NEXT drain after its arm commits.
+        r.require_acknowledged_after_arm(6);
+    }
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // #4685 — Guardian's capability filter must key off `boot_inert` alone
@@ -3781,9 +6526,9 @@ void check_production_order_degraded_still_arms(SparkType type) {
 /// arm ATTEMPT that failed, never a misclassification into Unsupported (which would
 /// require boot_inert) and never a silent legacy fallback. Distinct from the
 /// hanging-watch Wedged case pinned elsewhere in this file: a synchronous refusal
-/// resolves Failed immediately, never eligible for the Wedged-only K-bound generation
-/// waiver, so the generation stays held across every identical retry - not just the
-/// first three.
+/// resolves Failed immediately, never an outstanding wedge (so never suppressed by
+/// decide_retry() and never acknowledged), so the generation stays held across every
+/// identical retry, each of which is a real Reapply.
 void check_boot_inert_false_but_watch_refused_stays_failed(SparkType type) {
     SparkReconcileFixture f{/*periodic_bound_ms=*/0, std::nullopt, type};
 
@@ -3808,7 +6553,7 @@ void check_boot_inert_false_but_watch_refused_stays_failed(SparkType type) {
             f.engine->journal_maintenance_tick();
             return f.engine->ack_pending_count_for_test() == 0 && f.engine->active_io_workers() == 0;
         }));
-        CHECK(f.engine->policy_generation() == 0); // held, every retry - no K-waiver for Failed
+        CHECK(f.engine->policy_generation() == 0); // held, every retry - a Failed arm is never acknowledged
         CHECK(f.engine->armed_guard_count() == 0); // no legacy fallback
         CHECK(f.engine->spark_armed_rule_count() == 0);
         CHECK(f.engine->unsupported_counts_by_type().count(type) == 0); // Failed, not Unsupported
@@ -4315,3 +7060,3625 @@ TEST_CASE("#4685 AC3 (Registry, real mechanism): an already-armed rule undergoin
 }
 
 #endif // _WIN32
+
+// ── #4045 ─────────────────────────────────────────────────────────────────────────────────
+// Spark's baseline-on-arm capture must reach the #4021 KV record. The runtime STAGES the
+// capture edge (test_guardian_spark_runtime.cpp, "#4045 R1-R7"); an engine-owned persister
+// drains it from apply_rules (before any re-arm seeds), stop(), and the drain worker. These
+// drive the real engine + a REAL temp file through the fixture's File-typed fake mechanism
+// (the real File mechanism is Windows-only; GuardianStateReader::read_file is not).
+//
+// ARM-TIME EVAL: an accepted arm evaluates the key once itself (the "T_detect ... via=callback-arm"
+// pass inside apply()), so a target that EXISTS when apply() runs is captured before the test
+// can do anything. The failure-path cases (E2/E3/E5/E8) therefore apply against an ABSENT
+// target, break the KV, and only then create the file and evaluate: the capture lands with the
+// store already failing. The explicit evaluate_key calls elsewhere are redundant but harmless.
+//
+// Waiting discipline: a FORCED persist pass (persist_now_4045) and evaluate_key make the flow
+// synchronous. The background drain worker may ALSO persist after an enqueue wake (its backstop
+// is pinned to one hour, so only the wake can run it), and after a FAILED worker pass it backs
+// off for 5 s, so tests that need a deterministic pass park the worker first
+// (drain_worker_for_test()->stop()) and every assertion is on END STATE; failure counts are
+// ">=" wherever the worker can still run.
+namespace {
+
+struct Spark4045Target {
+    yuzu::test::TempDir dir{"yuzu_test_4045_"};
+    Spark4045Target() { fs::create_directories(dir.path); }
+    [[nodiscard]] fs::path file(const std::string& name = "target.txt") const {
+        return dir.path / name;
+    }
+    static void write(const fs::path& p, const std::string& content) {
+        std::ofstream o(p, std::ios::binary | std::ios::trunc);
+        o << content;
+        REQUIRE(o.good());
+    }
+};
+
+std::string spark_file_key_4045(const fs::path& p) {
+    return yuzu::agent::spark_key(SparkSpec{SparkType::File, FileSparkParams{p.string()}});
+}
+std::string baseline_fingerprint_4045(const fs::path& p) {
+    return "file-hash-equals|" + p.string(); // guardian_baseline_fingerprint's layout
+}
+void eval_initial_4045(GuardianEngine& e, const fs::path& p) {
+    auto* rt = e.spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    rt->evaluate_key(spark_file_key_4045(p), yuzu::agent::EvalReason::Initial);
+}
+/// One FORCED persist pass (the apply_rules/stop() trigger: it ignores the worker's retry
+/// backoff, which a failed worker pass has set for 5 s).
+GuardianBaselinePersister::Outcome persist_now_4045(GuardianEngine& e) {
+    auto* persister = e.baseline_persister_for_test();
+    auto* rt = e.spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    return persister->persist_staged(*rt, GuardianBaselinePersister::Trigger::Forced);
+}
+/// Run `sql` on a SECOND connection to the engine's KV file (real SQLite fault injection).
+void exec_sql_4045(const fs::path& db_path, const std::string& sql) {
+    ScopedTestSqlite3 db;
+    REQUIRE(sqlite3_open(db_path.string().c_str(), &db.raw) == SQLITE_OK);
+    sqlite3_busy_timeout(db.raw, 5000);
+    char* err = nullptr;
+    const int rc = sqlite3_exec(db.raw, sql.c_str(), nullptr, nullptr, &err);
+    if (err)
+        sqlite3_free(err);
+    REQUIRE(rc == SQLITE_OK);
+}
+/// Make every baseline write whose key matches `key_like` (a SQL LIKE pattern) fail for real,
+/// while rule and journal writes keep succeeding. BEFORE INSERT fires for the upsert too.
+void fail_baseline_writes_4045(const fs::path& db_path, const std::string& key_like = "baseline:%") {
+    exec_sql_4045(db_path, "CREATE TRIGGER yuzu_test_4045_fail BEFORE INSERT ON kv_store WHEN "
+                           "NEW.key LIKE '" + key_like +
+                               "' BEGIN SELECT RAISE(ABORT,'injected baseline write failure'); END;");
+}
+void heal_baseline_writes_4045(const fs::path& db_path) {
+    exec_sql_4045(db_path, "DROP TRIGGER yuzu_test_4045_fail;");
+}
+/// Joins on scope exit, so a REQUIRE that throws cannot unwind past a joinable std::thread.
+struct Join4045 {
+    explicit Join4045(std::thread& thread) : t(thread) {}
+    Join4045(const Join4045&) = delete;
+    Join4045& operator=(const Join4045&) = delete;
+    std::thread& t;
+    ~Join4045() {
+        if (t.joinable())
+            t.join();
+    }
+};
+/// Clears every engine and persister test hook on ANY exit, including a failing REQUIRE. The
+/// hooks capture test locals by reference, so one left installed would let the fixture's own
+/// stop() pass (or the drain worker) invoke a dangling hook while the failure unwinds. Declare
+/// it AFTER the locals the hooks capture so it destructs BEFORE them.
+struct HookGuard4045 {
+    explicit HookGuard4045(GuardianEngine& engine) : e(engine) {}
+    HookGuard4045(const HookGuard4045&) = delete;
+    HookGuard4045& operator=(const HookGuard4045&) = delete;
+    GuardianEngine& e;
+    ~HookGuard4045() {
+        e.set_apply_post_drain_hook_for_test(nullptr);
+        e.set_seed_read_hook_for_test(nullptr);
+        e.set_post_attach_hook_for_test(nullptr);
+        e.set_stop_stage_hook_for_test(nullptr);
+        if (auto* p = e.baseline_persister_for_test()) {
+            p->set_post_snapshot_hook_for_test(nullptr);
+            p->set_post_write_hook_for_test(nullptr);
+        }
+    }
+};
+std::vector<OutboxEntry> compliance_4045(SparkReconcileFixture& f, const std::string& rule_id) {
+    std::lock_guard<std::mutex> lk{f.sent_mu};
+    std::vector<OutboxEntry> out;
+    for (const auto& e : f.sent)
+        if (e.domain == yuzu::agent::OutboxDomain::Compliance && e.rule_id == rule_id)
+            out.push_back(e);
+    return out;
+}
+bool has_compliant_4045(SparkReconcileFixture& f, const std::string& rule_id) {
+    for (const auto& e : compliance_4045(f, rule_id))
+        if (e.drift.compliant)
+            return true;
+    return false;
+}
+/// The first NON-compliant (drift) entry for `rule_id`, if one has been sent.
+std::optional<OutboxEntry> first_drift_4045(SparkReconcileFixture& f, const std::string& rule_id) {
+    for (const auto& e : compliance_4045(f, rule_id))
+        if (!e.drift.compliant)
+            return e;
+    return std::nullopt;
+}
+std::optional<nlohmann::json> baseline_record_4045(KvStore& kv, const std::string& rule_id) {
+    auto v = kv.get(GuardianEngine::kv_namespace(), "baseline:" + rule_id);
+    if (!v)
+        return std::nullopt;
+    return nlohmann::json::parse(*v);
+}
+std::string hash_of_4045(const fs::path& p) { return yuzu::agent::sha256_file(p); }
+/// A production budget with ONLY its wall replaced, so a test of the tuple or failure limits
+/// keeps the production values for those and a host stall cannot end a pass early.
+yuzu::agent::GuardianBaselinePassBudget with_wall_4045(yuzu::agent::GuardianBaselinePassBudget b,
+                                                       std::chrono::milliseconds wall) {
+    b.max_wall = wall;
+    return b;
+}
+
+} // namespace
+
+TEST_CASE("#4045 E1: Spark's first capture is persisted and a full_sync re-arm keeps it "
+          "(headline: no laundered compliant)",
+          "[spark][guardian][baseline][reconcile]") {
+    Spark4045Target t; // declared first: outlives the fixture's engine
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path target = t.file();
+    Spark4045Target::write(target, "content A");
+    const std::string h_a = hash_of_4045(target);
+
+    f.apply(make_file_hash_rule("r1", target.string()));
+    eval_initial_4045(*f.engine, target);
+    REQUIRE(yuzu::test::spin_until([&] { return has_compliant_4045(f, "r1"); }));
+    CHECK(compliance_4045(f, "r1").front().drift.expected_value == h_a);
+
+    persist_now_4045(*f.engine);
+    const auto rec = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(rec.has_value()); // the capture was persisted
+    CHECK(rec->value("schema", -1) == 1);
+    CHECK(rec->value("fingerprint", std::string{}) == baseline_fingerprint_4045(target));
+    CHECK(rec->value("hash", std::string{}) == h_a);
+
+    // The file drifts, then a fleet push that CHANGES the rule re-arms it (full_sync detach +
+    // attach). Changed content is needed since #4415: an identical push of a healthy rule whose
+    // persisted baseline equals the live one is a skip and keeps the live baseline instead (that
+    // path is pinned in test_guardian_spark_reapply_skip_engine.cpp, case 4a).
+    Spark4045Target::write(target, "content B, longer");
+    const std::string h_b = hash_of_4045(target);
+    REQUIRE(h_b != h_a);
+    f.apply(renamed_rule(make_file_hash_rule("r1", target.string()), "r1-v2"), /*full_sync=*/true);
+    eval_initial_4045(*f.engine, target);
+
+    // The re-armed generation is seeded with A, so B is DRIFT, not a re-baselined compliant.
+    REQUIRE(yuzu::test::spin_until([&] { return first_drift_4045(f, "r1").has_value(); }));
+    const auto drift = first_drift_4045(f, "r1");
+    CHECK(drift->drift.expected_value == h_a);
+    CHECK(drift->drift.detected_value == h_b);
+    const auto after = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(after.has_value());
+    CHECK(after->value("hash", std::string{}) == h_a); // the guard never lets drift replace it
+}
+
+TEST_CASE("#4045 E2: the apply_rules drain persists a failed-then-recovered capture BEFORE the "
+          "re-arm seeds",
+          "[spark][guardian][baseline][reconcile]") {
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path target = t.file(); // ABSENT at apply(): see the ARM-TIME EVAL note above
+    const auto rule = make_file_hash_rule("r1", target.string());
+
+    f.apply(rule); // apply()'s own rule write needs the table, so break it AFTER
+    drop_kv_store_table_for_test(f.db_.path);
+    Spark4045Target::write(target, "content A"); // the first good read: the capture's persist
+    const std::string h_a = hash_of_4045(target); // attempt must fail and stay staged
+    eval_initial_4045(*f.engine, target);
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    // The enqueue-triggered worker attempt has provably run and failed...
+    REQUIRE(yuzu::test::spin_until([&] { return persister->persist_failures() >= 1; }));
+    // ...and the worker is now parked for good. Without this the worker, woken by the re-arm's
+    // own teardown enqueues, could persist the still-staged capture before apply_rules reaches its
+    // seed read and the test would pass without apply_rules' drain. From here ONLY that drain
+    // can persist A, and entries are read straight off the runtime (no worker to send them).
+    f.engine->drain_worker_for_test()->stop();
+
+    Spark4045Target::write(target, "content B, longer");
+    const std::string h_b = hash_of_4045(target);
+    recreate_kv_store_table_for_test(f.db_.path);
+    // Changed content, so the push re-arms the rule and reads the seed: an identical push whose
+    // seed equals the live baseline is a skip (#4415) and would never reach the seed read.
+    f.apply(renamed_rule(rule, "r1-v2"), /*full_sync=*/true); // no seam call
+    eval_initial_4045(*f.engine, target);
+
+    std::vector<OutboxEntry> drained;
+    REQUIRE(yuzu::test::spin_until([&] {
+        rt->drain([&](const OutboxEntry& e) {
+            drained.push_back(e);
+            return SendResult::Sent;
+        });
+        for (const auto& e : drained)
+            if (e.domain == yuzu::agent::OutboxDomain::Compliance && !e.drift.compliant &&
+                e.drift.expected_value == h_a && e.drift.detected_value == h_b)
+                return true;
+        return false;
+    }));
+    const auto rec = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(rec.has_value());
+    CHECK(rec->value("hash", std::string{}) == h_a);
+}
+
+TEST_CASE("#4045 E3: a failed persist is counted, stays staged and is retried; success clears it",
+          "[spark][guardian][baseline][reconcile]") {
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path target = t.file(); // ABSENT at apply(): see the ARM-TIME EVAL note above
+
+    f.apply(make_file_hash_rule("r1", target.string()));
+    drop_kv_store_table_for_test(f.db_.path);
+    Spark4045Target::write(target, "content A");
+    const std::string h_a = hash_of_4045(target);
+    eval_initial_4045(*f.engine, target);
+    const auto failed_pass = persist_now_4045(*f.engine);
+    CHECK(failed_pass.failed == 1);
+
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    REQUIRE(yuzu::test::spin_until([&] { return persister->persist_failures() >= 1; }));
+    // Never dropped: a failed tuple was never out of staging (snapshot-and-erase-by-identity).
+    CHECK(rt->staged_baseline_count_for_test() == 1);
+
+    recreate_kv_store_table_for_test(f.db_.path);
+    persist_now_4045(*f.engine);
+    const auto rec = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(rec.has_value());
+    CHECK(rec->value("hash", std::string{}) == h_a);
+    CHECK(yuzu::test::spin_until([&] { return rt->staged_baseline_count_for_test() == 0; }));
+}
+
+TEST_CASE("#4045 E4: a retarget persists the new target's capture over the old record",
+          "[spark][guardian][baseline][reconcile]") {
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path p1 = t.file("one.txt");
+    const fs::path p2 = t.file("two.txt");
+    Spark4045Target::write(p1, "content A");
+    Spark4045Target::write(p2, "content C, a different target");
+    const std::string h_c = hash_of_4045(p2);
+
+    f.apply(make_file_hash_rule("r1", p1.string()));
+    eval_initial_4045(*f.engine, p1);
+    REQUIRE(yuzu::test::spin_until([&] { return has_compliant_4045(f, "r1"); }));
+    persist_now_4045(*f.engine);
+    const auto first = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(first.has_value()); // the capture was persisted
+    CHECK(first->value("fingerprint", std::string{}) == baseline_fingerprint_4045(p1));
+
+    // Same rule_id re-authored against a different path (non-full_sync replace): the seed's
+    // fingerprint mismatch means "capture fresh", and that capture replaces the record.
+    f.apply(make_file_hash_rule("r1", p2.string()), /*full_sync=*/false);
+    eval_initial_4045(*f.engine, p2);
+    persist_now_4045(*f.engine);
+
+    REQUIRE(yuzu::test::spin_until([&] {
+        const auto rec = baseline_record_4045(*f.kv, "r1");
+        return rec && rec->value("fingerprint", std::string{}) == baseline_fingerprint_4045(p2);
+    }));
+    const auto rec = baseline_record_4045(*f.kv, "r1");
+    CHECK(rec->value("hash", std::string{}) == h_c);
+    // A fresh capture on the new target is compliant: never a drift against the OLD target.
+    CHECK_FALSE(first_drift_4045(f, "r1").has_value());
+}
+
+TEST_CASE("#4045 E5: the overwrite guard holds on the Spark path (a refusal is counted apart, "
+          "not a failure)",
+          "[spark][guardian][baseline][reconcile]") {
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path target = t.file(); // ABSENT at apply(): see the ARM-TIME EVAL note above
+
+    f.apply(make_file_hash_rule("r1", target.string())); // Absent record: the capture path
+    drop_kv_store_table_for_test(f.db_.path);
+    Spark4045Target::write(target, "content A");
+    eval_initial_4045(*f.engine, target); // capture staged; the worker's attempt fails, stays staged
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    REQUIRE(yuzu::test::spin_until([&] { return persister->persist_failures() >= 1; }));
+    // Parked for good: a late worker cycle must not run the guard between the table coming
+    // back and the direct write below (it could otherwise see the transient stale-schema read
+    // error and degrade to write-anyway, overwriting the record this test sets up).
+    f.engine->drain_worker_for_test()->stop();
+
+    // The table returns holding a DIFFERENT well-formed baseline for the same target (as if
+    // the arm-time seed read had failed while a good record existed). Written directly, not
+    // via the guard, so a late worker cycle cannot make this setup itself refuse.
+    recreate_kv_store_table_for_test(f.db_.path);
+    const std::string h_x(64, 'a');
+    nlohmann::json existing;
+    existing["schema"] = 1;
+    existing["fingerprint"] = baseline_fingerprint_4045(target);
+    existing["hash"] = h_x;
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", existing.dump()));
+
+    const auto failures_before = f.engine->baseline_persist_failures();
+    const auto outcome = persister->persist_staged(*rt, GuardianBaselinePersister::Trigger::Forced);
+    CHECK(outcome.written == 0); // the guard refused: first capture on record wins
+    CHECK(outcome.refused == 1);
+    CHECK(outcome.failed == 0);  // ...and a refusal is not a failure (erased, never retried)
+    const auto rec = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(rec.has_value());
+    CHECK(rec->value("hash", std::string{}) == h_x);
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+    // Counted on its own accessor, NOT in the failure aggregate (the guard worked).
+    CHECK(f.engine->baseline_persist_refusals() == 1);
+    CHECK(f.engine->baseline_persist_failures() == failures_before);
+}
+
+TEST_CASE("#4045 E6: a production-order restart re-seeds Spark's persisted capture",
+          "[spark][guardian][baseline][reconcile][boot]") {
+    // Two-phase production-order pattern (wire_spark_engine BEFORE start_local) of "a
+    // production-order restart reconstructs unsupported_rules_ from cached KV", inlined on
+    // purpose: no shared production-order fixture is added here.
+    Spark4045Target t;
+    const auto kv_path = unique_kv_path();
+    yuzu::test::TempDbFile db{kv_path};
+    const fs::path target = t.file();
+    Spark4045Target::write(target, "content A");
+    const std::string h_a = hash_of_4045(target);
+    const auto rule = make_file_hash_rule("r1", target.string());
+
+    // Phase 1: arm, capture, persist, shut down.
+    {
+        auto opened = KvStore::open(kv_path);
+        REQUIRE(opened.has_value());
+        KvStore kv{std::move(*opened)};
+        SparkEngine spark_engine;
+        REQUIRE(spark_engine.register_mechanism(SparkType::File,
+                                                std::make_unique<FakeServiceMechanism>())
+                    .has_value());
+        spark_engine.start();
+        GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+        REQUIRE(engine.start_local().has_value());
+        engine.wire_spark_engine(&spark_engine, false,
+                                 [](const OutboxEntry&) { return SendResult::Sent; });
+        REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        *p.add_rules() = rule;
+        REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString())
+                    .exit_code == 0);
+        REQUIRE(yuzu::test::spin_until([&] {
+            engine.journal_maintenance_tick();
+            return engine.spark_armed_rule_count() == 1 && engine.ack_pending_count_for_test() == 0 &&
+                   engine.active_io_workers() == 0;
+        }));
+        eval_initial_4045(engine, target);
+        persist_now_4045(engine);
+        engine.stop();
+        spark_engine.stop();
+    }
+
+    // The target drifts while the agent is down.
+    Spark4045Target::write(target, "content B, longer");
+    const std::string h_b = hash_of_4045(target);
+    REQUIRE(h_b != h_a);
+
+    // Phase 2: a fresh boot over the same store, in PRODUCTION order, with no push.
+    std::mutex sent_mu;
+    std::vector<OutboxEntry> sent;
+    auto opened = KvStore::open(kv_path);
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    REQUIRE(spark_engine.register_mechanism(SparkType::File, std::make_unique<FakeServiceMechanism>())
+                .has_value());
+    spark_engine.start();
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+    engine.wire_spark_engine(&spark_engine, false, [&](const OutboxEntry& e) {
+        std::lock_guard<std::mutex> lk{sent_mu};
+        sent.push_back(e);
+        return SendResult::Sent;
+    });
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+    REQUIRE(engine.start_local().has_value());
+    // The boot arm settles OFF-lock; evaluate_key returns early while the key is not yet armed.
+    REQUIRE(yuzu::test::spin_until([&] {
+        engine.journal_maintenance_tick();
+        return engine.spark_armed_rule_count() == 1 && engine.ack_pending_count_for_test() == 0 &&
+               engine.active_io_workers() == 0;
+    }));
+    eval_initial_4045(engine, target);
+
+    REQUIRE(yuzu::test::spin_until([&] {
+        std::lock_guard<std::mutex> lk{sent_mu};
+        for (const auto& e : sent)
+            if (e.domain == yuzu::agent::OutboxDomain::Compliance && e.rule_id == "r1" &&
+                !e.drift.compliant)
+                return e.drift.expected_value == h_a && e.drift.detected_value == h_b;
+        return false;
+    }));
+    engine.stop();
+    spark_engine.stop();
+}
+
+TEST_CASE("#4045 E7: prefer_spark=false is inert (nothing staged, no record)",
+          "[spark][guardian][baseline][reconcile]") {
+    Spark4045Target t;
+    yuzu::test::TempDbFile db{unique_kv_path()};
+    auto opened = KvStore::open(db.path);
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    REQUIRE(spark_engine.register_mechanism(SparkType::File, std::make_unique<FakeServiceMechanism>())
+                .has_value());
+    spark_engine.start();
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/false}; // the production default
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(&spark_engine, false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+
+    const fs::path target = t.file();
+    Spark4045Target::write(target, "content A");
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = make_file_hash_rule("r1", target.string());
+    REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString())
+                .exit_code == 0);
+
+    auto* rt = engine.spark_runtime_for_test();
+    REQUIRE(rt != nullptr); // the runtime exists even under prefer_spark=false...
+    eval_initial_4045(engine, target); // ...but no key is armed on it, so this is a no-op
+    CHECK(engine.spark_armed_rule_count() == 0);
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+    CHECK_FALSE(kv.get(GuardianEngine::kv_namespace(), "baseline:r1").has_value());
+
+    engine.stop();
+    spark_engine.stop();
+}
+
+TEST_CASE("#4045 E8: stop() flushes a still-staged capture",
+          "[spark][guardian][baseline][reconcile]") {
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path target = t.file(); // ABSENT at apply(): see the ARM-TIME EVAL note above
+
+    f.apply(make_file_hash_rule("r1", target.string()));
+    drop_kv_store_table_for_test(f.db_.path);
+    Spark4045Target::write(target, "content A");
+    const std::string h_a = hash_of_4045(target);
+    eval_initial_4045(*f.engine, target); // staged; the worker's attempt fails, stays staged
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    REQUIRE(yuzu::test::spin_until([&] { return persister->persist_failures() >= 1; }));
+
+    recreate_kv_store_table_for_test(f.db_.path);
+    f.engine->stop(); // the final drain runs after the worker is joined and begin_stop()
+
+    const auto rec = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(rec.has_value());
+    CHECK(rec->value("hash", std::string{}) == h_a);
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+}
+
+TEST_CASE("#4045 E9: the drain worker alone persists a capture (no seam, no apply_rules, no stop)",
+          "[spark][guardian][baseline][reconcile]") {
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path target = t.file();
+    Spark4045Target::write(target, "content A"); // PRESENT at apply(): the capture lands inside it
+    const std::string h_a = hash_of_4045(target);
+
+    f.apply(make_file_hash_rule("r1", target.string()));
+
+    // The periodic backstop is pinned at one hour, so only the capture's compliant-edge enqueue
+    // can wake the worker: nothing here calls the persist seam, re-enters apply_rules, or stops
+    // the engine, so this fails if the worker loop does not run the persist step.
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return baseline_record_4045(*f.kv, "r1").has_value(); }));
+    const auto rec = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(rec.has_value());
+    CHECK(rec->value("hash", std::string{}) == h_a);
+    // The worker erases the entry from staging just AFTER its write returns, so the record can
+    // be visible a moment before staging is empty: wait for the end state.
+    CHECK(yuzu::test::spin_until(
+        [&] { return f.engine->spark_runtime_for_test()->staged_baseline_count_for_test() == 0; }));
+
+    // A healthy persist is a zero count, and a zero count ships no heartbeat tag.
+    CHECK(f.engine->baseline_persist_failures() == 0);
+    std::map<std::string, std::string> tags;
+    yuzu::agent::emit_guardian_baseline_persist_heartbeat_tags(tags, f.engine->baseline_persist_failures());
+    CHECK(tags.empty());
+}
+
+TEST_CASE("#4045 E10: a failing baseline persist surfaces on the heartbeat tag",
+          "[spark][guardian][baseline][reconcile]") {
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path target = t.file(); // ABSENT at apply(): see the ARM-TIME EVAL note above
+
+    f.apply(make_file_hash_rule("r1", target.string()));
+    drop_kv_store_table_for_test(f.db_.path);
+    Spark4045Target::write(target, "content A");
+    eval_initial_4045(*f.engine, target); // staged; the persist attempt fails and stays staged
+    auto* persister = f.engine->baseline_persister_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(yuzu::test::spin_until([&] { return persister->persist_failures() >= 1; }));
+
+    // The heartbeat reads the engine accessor; it must carry the persister's failure count.
+    CHECK(f.engine->baseline_persist_failures() >= 1);
+    std::map<std::string, std::string> tags;
+    yuzu::agent::emit_guardian_baseline_persist_heartbeat_tags(tags, f.engine->baseline_persist_failures());
+    REQUIRE(tags.count("yuzu.guardian_baseline_persist_failures") == 1);
+    CHECK(std::stoull(tags.at("yuzu.guardian_baseline_persist_failures")) >= 1);
+    recreate_kv_store_table_for_test(f.db_.path); // let the stop() flush succeed quietly
+}
+
+// ── #4045 adversarial-review fixes ───────────────────────────────────────────────────────
+// C4045-1: persist-before-seed must hold even when an in-flight evaluation of the OLD
+// generation stages its first-ever capture AFTER apply_rules' drain. The two engine seams fire
+// at the exact windows (post-drain; post-seed-read) so the interleaving is deterministic: the
+// hook body runs the old generation's evaluation inline (it is still live), and the file then
+// changes A -> B. Without the fence the replacement finds no record, captures B as compliant
+// and never reports drift; with it the replacement is seeded from the staged A.
+//
+// The drain worker is stopped first so it cannot persist A on its own wake (that would make the
+// KV seed find A and the test pass without the fence).
+namespace {
+
+enum class HookPoint4045 { PostDrain, PostSeedRead };
+
+void run_old_gen_stages_late_4045(bool full_sync, HookPoint4045 where) {
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path target = t.file(); // ABSENT at the first apply: no capture yet
+    const auto rule = make_file_hash_rule("r1", target.string());
+    f.apply(rule);
+    // The arm-time evaluation (it reads the ABSENT target and reports it) runs asynchronously
+    // after apply() settles. Wait until it is observed, BEFORE the target is written, so it can
+    // never read A early, stage it ahead of the hook and make this exercise the drain instead
+    // of the fence. Only then park the worker.
+    REQUIRE(yuzu::test::spin_until([&] { return !compliance_4045(f, "r1").empty(); }));
+    f.engine->drain_worker_for_test()->stop();
+
+    auto* rt = f.engine->spark_runtime_for_test();
+    auto* persister = f.engine->baseline_persister_for_test();
+    REQUIRE(rt != nullptr);
+    REQUIRE(persister != nullptr);
+    Spark4045Target::write(target, "content A");
+    const std::string h_a = hash_of_4045(target);
+    std::string h_b;
+
+    auto old_generation_stages_then_file_drifts = [&] {
+        eval_initial_4045(*f.engine, target); // the still-live OLD generation reads A and stages it
+        CHECK(rt->staged_baseline_count_for_test() == 1);
+        Spark4045Target::write(target, "content B, longer");
+        h_b = hash_of_4045(target);
+    };
+    HookGuard4045 hooks{*f.engine};
+    if (where == HookPoint4045::PostDrain)
+        f.engine->set_apply_post_drain_hook_for_test(old_generation_stages_then_file_drifts);
+    else
+        f.engine->set_seed_read_hook_for_test(
+            [&](const std::string&) { old_generation_stages_then_file_drifts(); });
+
+    f.apply(rule, full_sync);
+    f.engine->set_apply_post_drain_hook_for_test(nullptr);
+    f.engine->set_seed_read_hook_for_test(nullptr);
+    REQUIRE_FALSE(h_b.empty()); // the hook ran
+    REQUIRE(h_b != h_a);
+    eval_initial_4045(*f.engine, target);
+
+    // The replacement generation must be seeded with A, so B is DRIFT against A.
+    std::vector<OutboxEntry> drained;
+    const bool drifted = yuzu::test::spin_until([&] {
+        rt->drain([&](const OutboxEntry& e) {
+            drained.push_back(e);
+            return SendResult::Sent;
+        });
+        for (const auto& e : drained)
+            if (e.domain == yuzu::agent::OutboxDomain::Compliance && !e.drift.compliant &&
+                e.drift.expected_value == h_a && e.drift.detected_value == h_b)
+                return true;
+        return false;
+    });
+    CHECK(drifted); // RED without the fence: the replacement captured B as compliant
+    for (const auto& e : drained) // and never a compliant edge on B
+        CHECK_FALSE((e.domain == yuzu::agent::OutboxDomain::Compliance && e.drift.compliant &&
+                     e.drift.expected_value == h_b));
+
+    // The durable record is the first capture, A.
+    (void)persister->persist_staged(*rt, GuardianBaselinePersister::Trigger::Forced);
+    const auto rec = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(rec.has_value());
+    CHECK(rec->value("hash", std::string{}) == h_a);
+}
+
+} // namespace
+
+TEST_CASE("#4045 E11: a capture the old generation stages after the apply drain still seeds a "
+          "full_sync re-arm",
+          "[spark][guardian][baseline][reconcile]") {
+    run_old_gen_stages_late_4045(/*full_sync=*/true, HookPoint4045::PostDrain);
+}
+
+TEST_CASE("#4045 E12: a capture the old generation stages after the apply drain still seeds a "
+          "same-id replace",
+          "[spark][guardian][baseline][reconcile]") {
+    run_old_gen_stages_late_4045(/*full_sync=*/false, HookPoint4045::PostDrain);
+}
+
+TEST_CASE("#4045 E13: a capture staged between the seed read and the attach still seeds the "
+          "replacement (the old generation is live until attach_core detaches it)",
+          "[spark][guardian][baseline][reconcile]") {
+    run_old_gen_stages_late_4045(/*full_sync=*/false, HookPoint4045::PostSeedRead);
+}
+
+TEST_CASE("#4045 E14a: the persister's seed fence is held from a baseline-on-arm seed read "
+          "THROUGH attach_rule (past attach_core's staged read) and released when the reconcile "
+          "returns",
+          "[spark][guardian][baseline][reconcile]") {
+    // The fence is REQUIRED (not an optimisation) now that an entry leaves staging after its
+    // write: without it a worker pass could write and erase a capture between the engine's KV
+    // seed read and attach_core's staged read, and neither read would see it (E17 drives that
+    // schedule end to end). persist_mu_ is the pass lock; the engine holds it from the seed
+    // read through attach_rule. Probed from another thread (try_lock on the owning thread
+    // would be undefined) at the post-seed-read hook AND at the post-attach hook (which fires
+    // after attach_rule has returned, so after attach_core's staged read): releasing the fence
+    // anywhere earlier turns the second probe red. The worker is parked first so it
+    // cannot hold persist_mu_ itself at any probe (every wake takes it for one pass), which
+    // would satisfy a "held" probe without the fence and fail the "released" one.
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    const fs::path target = t.file();
+    auto* persister = f.engine->baseline_persister_for_test();
+    REQUIRE(persister != nullptr);
+    std::atomic<int> fires{0};
+    std::atomic<int> attach_fires{0};
+    std::atomic<bool> held_in_hook{false};
+    std::atomic<bool> held_post_attach{false};
+    HookGuard4045 hooks{*f.engine};
+    f.engine->set_seed_read_hook_for_test([&](const std::string&) {
+        fires.fetch_add(1);
+        std::thread probe([&] { held_in_hook.store(persister->seed_fence_held_for_test()); });
+        probe.join();
+    });
+    f.engine->set_post_attach_hook_for_test([&](const std::string&) {
+        attach_fires.fetch_add(1);
+        std::thread probe([&] { held_post_attach.store(persister->seed_fence_held_for_test()); });
+        probe.join();
+    });
+    f.apply(make_file_hash_rule("r1", target.string()));
+    f.engine->set_seed_read_hook_for_test(nullptr);
+    f.engine->set_post_attach_hook_for_test(nullptr);
+    REQUIRE(fires.load() >= 1);
+    REQUIRE(attach_fires.load() >= 1);
+    CHECK(held_in_hook.load());     // RED without the fence: persist_mu_ is free at the seed read
+    CHECK(held_post_attach.load()); // RED if released before the attach returns
+    bool held_after = true;
+    std::thread probe([&] { held_after = persister->seed_fence_held_for_test(); });
+    probe.join();
+    CHECK_FALSE(held_after); // released when reconcile returns
+}
+
+TEST_CASE("#4045 E14b: a drain waiting on an in-flight worker pass makes that pass yield, and its "
+          "own pass is bounded by its BUDGET: a failing KV costs at most max_failures failed "
+          "writes, never one per staged capture",
+          "[spark][guardian][baseline][reconcile]") {
+    // A worker pass is parked mid-flight (post-snapshot hook, persist_mu_ held) while
+    // apply_rules' own drain arrives and waits behind it. The worker pass yields to the waiter
+    // before its first write, and the apply's pass attempts at most max_failures (3) writes
+    // (an unbudgeted loop would make 6 for the 6 staged captures, one that stops at the first
+    // failure would make 1), and the staged captures stay visible to attach_core (still in staging) the whole time.
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path target = t.file();
+    const auto rule = make_file_hash_rule("r1", target.string());
+    f.apply(rule);
+    REQUIRE(yuzu::test::spin_until([&] { return !compliance_4045(f, "r1").empty(); }));
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+
+    fail_baseline_writes_4045(f.db_.path); // rule/journal writes keep working; baseline ones fail
+    constexpr int kN = 6;
+    for (int i = 0; i < kN; ++i)
+        rt->stage_baseline_for_test("s" + std::to_string(i), "/yuzu_test_4045_b/" + std::to_string(i),
+                                    std::string(64, 'a'));
+    const auto failures_before = persister->persist_failures();
+
+    std::atomic<bool> in_pass{false};
+    std::atomic<bool> release{false};
+    std::atomic<std::size_t> staged_in_pass{0};
+    std::atomic<bool> hook_armed{true};
+    HookGuard4045 hooks{*f.engine};
+    persister->set_post_snapshot_hook_for_test([&] {
+        if (!hook_armed.exchange(false))
+            return; // only the first pass parks
+        staged_in_pass.store(rt->staged_baseline_count_for_test());
+        in_pass.store(true);
+        (void)yuzu::test::spin_until([&] { return release.load(); });
+    });
+    GuardianBaselinePersister::Outcome worker_pass;
+    std::thread p1([&] {
+        worker_pass = persister->persist_staged(*rt, GuardianBaselinePersister::Trigger::Worker);
+    });
+    Join4045 join_p1{p1};
+    REQUIRE(yuzu::test::spin_until([&] { return in_pass.load(); }));
+
+    int apply_exit = -1;
+    std::atomic<bool> apply_done{false};
+    std::thread a([&] {
+        apply_exit = f.dispatch_raw(rule, /*full_sync=*/false).exit_code;
+        apply_done.store(true);
+    });
+    Join4045 join_a{a};
+    // apply_rules' forced drain is now blocked behind the parked pass: observed, not slept.
+    REQUIRE(yuzu::test::spin_until([&] { return persister->lock_waiters_for_test() == 1; }));
+    CHECK_FALSE(apply_done.load());
+    CHECK(staged_in_pass.load() == static_cast<std::size_t>(kN)); // visible while the pass runs
+
+    release.store(true);
+    p1.join();
+    a.join();
+    persister->set_post_snapshot_hook_for_test(nullptr);
+    CHECK(worker_pass.yielded); // the waiting apply drain goes first
+    CHECK(worker_pass.failed == 0);
+    CHECK(worker_pass.written == 0);
+    CHECK_FALSE(worker_pass.budget_exhausted);
+    CHECK(apply_exit == 0);
+    // One failed PASS: the apply drain's, 3 writes (max_failures), not one per staged capture.
+    CHECK(persister->persist_failures() == failures_before + 1);
+    CHECK(rt->staged_baseline_count_for_test() == static_cast<std::size_t>(kN)); // none lost
+    heal_baseline_writes_4045(f.db_.path);
+}
+
+TEST_CASE("#4045 E17: a pass launched between the seed read and the attach cannot hide "
+          "the capture: the replacement still drifts against it (the fence keeps the race closed)",
+          "[spark][guardian][baseline][reconcile]") {
+    // The schedule that makes the fence REQUIRED: T_s (engine KV seed read: empty, the capture
+    // is only staged) < W (a pass writes the capture) < E (the pass erases it from staging) <
+    // T_a (attach_core's staged read). Without the fence neither read sees the capture, the
+    // replacement captures the drifted content as compliant, and no drift is ever reported.
+    // Here the seed-read hook launches a racing pass and waits until it has either FINISHED
+    // (no fence: it ran in the gap) or is observed BLOCKED on persist_mu_ (fence: lock_waiters
+    // is only incremented when the try_lock found the mutex held). Both outcomes are observed,
+    // never slept for, so the unmutated run and the mutated run are both deterministic.
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    const fs::path target = t.file(); // ABSENT at the first apply: no capture yet
+    const auto rule = make_file_hash_rule("r1", target.string());
+    f.apply(rule);
+    REQUIRE(yuzu::test::spin_until([&] { return !compliance_4045(f, "r1").empty(); }));
+    f.engine->drain_worker_for_test()->stop();
+    auto* rt = f.engine->spark_runtime_for_test();
+    auto* persister = f.engine->baseline_persister_for_test();
+    REQUIRE(rt != nullptr);
+    REQUIRE(persister != nullptr);
+
+    Spark4045Target::write(target, "content A");
+    const std::string h_a = hash_of_4045(target);
+    std::string h_b;
+    // After apply_rules' drain: the still-live OLD generation reads A and stages it.
+    f.engine->set_apply_post_drain_hook_for_test([&] { eval_initial_4045(*f.engine, target); });
+
+    std::atomic<bool> w_done{false};
+    GuardianBaselinePersister::Outcome w_out;
+    std::atomic<bool> held_past_attach{false};
+    HookGuard4045 hooks{*f.engine};
+    // Declared AFTER the guard: on a failing REQUIRE the thread is joined before the hooks it
+    // may still be reading are cleared.
+    std::thread w;
+    Join4045 join_w{w};
+    // The fence must span the ATTACH too: the racing pass launched at the seed read is
+    // still blocked, not finished, when attach_rule has returned.
+    f.engine->set_post_attach_hook_for_test([&](const std::string&) {
+        held_past_attach.store(!w_done.load() && persister->lock_waiters_for_test() >= 1);
+    });
+    f.engine->set_seed_read_hook_for_test([&](const std::string&) {
+        // The seed read just found the KV empty. Launch the pass, then drift the file.
+        // A Forced pass, not a Worker one: a Worker pass DEFERS for the whole apply_rules (E37,
+        // E38), so it would never reach the lock here. The fence must still hold against any
+        // pass that does, and the boot re-arm (start_local), which has no ApplyScope, can be
+        // raced by a real worker pass.
+        w = std::thread([&] {
+            w_out = persister->persist_staged(*rt, GuardianBaselinePersister::Trigger::Forced);
+            w_done.store(true);
+        });
+        CHECK(yuzu::test::spin_until(
+            [&] { return w_done.load() || persister->lock_waiters_for_test() >= 1; }));
+        Spark4045Target::write(target, "content B, longer");
+        h_b = hash_of_4045(target);
+    });
+    f.apply(rule, /*full_sync=*/false);
+    f.engine->set_apply_post_drain_hook_for_test(nullptr);
+    f.engine->set_seed_read_hook_for_test(nullptr);
+    if (w.joinable())
+        w.join();
+    REQUIRE_FALSE(h_b.empty()); // the hook ran
+    REQUIRE(h_b != h_a);
+    CHECK(held_past_attach.load()); // RED if the fence is released before attach_rule returns
+    CHECK(w_out.written == 1); // the pass did run, after the reconcile released the fence
+
+    eval_initial_4045(*f.engine, target);
+    std::vector<OutboxEntry> drained;
+    const bool drifted = yuzu::test::spin_until([&] {
+        rt->drain([&](const OutboxEntry& e) {
+            drained.push_back(e);
+            return SendResult::Sent;
+        });
+        for (const auto& e : drained)
+            if (e.domain == yuzu::agent::OutboxDomain::Compliance && !e.drift.compliant &&
+                e.drift.expected_value == h_a && e.drift.detected_value == h_b)
+                return true;
+        return false;
+    });
+    CHECK(drifted); // RED without the fence: the replacement captured B as compliant
+    const auto rec = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(rec.has_value());
+    CHECK(rec->value("hash", std::string{}) == h_a);
+}
+
+// C4045-2: every staging-loss channel must reach the heartbeat aggregate.
+TEST_CASE("#4045 E15: failed staging attempts and displaced captures surface on the heartbeat tag",
+          "[spark][guardian][baseline][reconcile]") {
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    // Parked first: a worker pass between the inserts would persist and erase them.
+    f.engine->drain_worker_for_test()->stop();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    CHECK(f.engine->baseline_persist_failures() == 0);
+
+    // A retarget over a still-unpersisted capture loses the first capture (A -> B)...
+    rt->stage_baseline_for_test("cap-rule", "/yuzu_test_4045_cap/a", std::string(64, 'a'));
+    rt->stage_baseline_for_test("cap-rule", "/yuzu_test_4045_cap/b", std::string(64, 'b'));
+    CHECK(rt->staged_baseline_drops() == 1);
+    CHECK(f.engine->baseline_persist_failures() == 1);
+    // ...and an allocation failure while staging drops the new capture.
+    rt->fail_next_stage_baseline_for_test();
+    rt->stage_baseline_for_test("alloc-rule", "/yuzu_test_4045_cap/c", std::string(64, 'c'));
+    CHECK(rt->staged_baseline_drops() == 2);
+
+    // No KV write failed and nothing threw: the ONLY signal is the drops, and it is exported.
+    CHECK(f.engine->baseline_persist_failures() == 2);
+    std::map<std::string, std::string> tags;
+    yuzu::agent::emit_guardian_baseline_persist_heartbeat_tags(tags, f.engine->baseline_persist_failures());
+    REQUIRE(tags.count("yuzu.guardian_baseline_persist_failures") == 1);
+    CHECK(tags.at("yuzu.guardian_baseline_persist_failures") == "2");
+    CHECK(std::string{yuzu::agent::kGuardianBaselinePersistFailuresTag} ==
+          "yuzu.guardian_baseline_persist_failures");
+}
+
+TEST_CASE("#4045 E16: a capture staged with no KV store is counted, logged once and kept",
+          "[spark][guardian][baseline][reconcile]") {
+    // A standalone persister over a null store and the fixture's runtime (the engine itself
+    // refuses apply_rules without a store, so the engine-level path cannot stage this).
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    rt->stage_baseline_for_test("r1", "/yuzu_test_4045_nostore", std::string(64, 'b'));
+    REQUIRE(rt->staged_baseline_count_for_test() == 1);
+
+    yuzu::agent::GuardianBaselinePersister no_store{nullptr};
+    CHECK(no_store.no_store_pending() == 0);
+    (void)no_store.persist_staged(*rt, GuardianBaselinePersister::Trigger::Forced);
+    (void)no_store.persist_staged(*rt, GuardianBaselinePersister::Trigger::Forced);
+    (void)no_store.persist_staged(*rt, GuardianBaselinePersister::Trigger::Forced);
+    CHECK(no_store.no_store_pending() == 3);       // counted per pass that finds a capture
+    CHECK(no_store.no_store_logs_for_test() == 1); // ...but logged ONCE
+    CHECK(no_store.persist_failures() == 0);
+    CHECK(rt->staged_baseline_count_for_test() == 1); // never discarded
+
+    // Nothing staged -> nothing counted (a quiescent no-store engine is not an incident).
+    rt->erase_staged_baselines_if_unchanged(rt->snapshot_staged_baselines());
+    (void)no_store.persist_staged(*rt, GuardianBaselinePersister::Trigger::Forced);
+    CHECK(no_store.no_store_pending() == 3);
+}
+
+// ── #4045: budgeted passes, rotation, backoff, stop flush ─────────────────────────────────
+TEST_CASE("#4045 E18: a failing tuple does NOT block the ones behind it (no head-of-line "
+          "starvation), and a pass gives up after max_failures failed writes",
+          "[spark][guardian][baseline][reconcile]") {
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    // Only the tuple and failure budgets are under test: a 1 h wall keeps a host stall from
+    // ending a pass early (the wall budget has its own injected-clock cases, E25 and E26).
+    // The tuple and failure limits are the production ones (kBaselinePassBudget): only the wall
+    // is replaced, so this case still goes RED if a production limit changes.
+    persister->set_budgets_for_test(
+        with_wall_4045(yuzu::agent::kBaselinePassBudget, std::chrono::hours{1}),
+        with_wall_4045(yuzu::agent::kBaselineStopBudget, std::chrono::hours{1}));
+    for (int i = 0; i < 5; ++i)
+        rt->stage_baseline_for_test("r" + std::to_string(i), "/yuzu_test_4045_e18/" + std::to_string(i),
+                                    std::string(64, 'a'));
+    // r0, the FIRST tuple in rule_id order, fails for real on every pass (a per-key fault). A
+    // pass that stopped at the first failure would persist none of the five behind it.
+    fail_baseline_writes_4045(f.db_.path, "baseline:r0");
+
+    const auto out = persist_now_4045(*f.engine);
+    CHECK(out.written == 4);
+    CHECK(out.failed == 1);
+    CHECK_FALSE(out.budget_exhausted);
+    CHECK(persister->persist_failures() == 1); // one failed PASS
+    CHECK(rt->staged_baseline_count_for_test() == 1); // only r0 stays staged
+    CHECK_FALSE(baseline_record_4045(*f.kv, "r0").has_value());
+    CHECK(baseline_record_4045(*f.kv, "r1").has_value());
+    CHECK(baseline_record_4045(*f.kv, "r4").has_value());
+
+    // A GLOBAL fault: every write fails. The pass attempts max_failures (3) of the 5 and stops;
+    // it is still ONE failed pass, and nothing is lost.
+    heal_baseline_writes_4045(f.db_.path);
+    rt->erase_staged_baselines_if_unchanged(rt->snapshot_staged_baselines());
+    for (int i = 0; i < 5; ++i)
+        rt->stage_baseline_for_test("g" + std::to_string(i), "/yuzu_test_4045_e18g/" + std::to_string(i),
+                                    std::string(64, 'b'));
+    fail_baseline_writes_4045(f.db_.path);
+    const auto before = persister->persist_failures();
+    const auto global = persist_now_4045(*f.engine);
+    CHECK(global.written == 0);
+    CHECK(global.failed == 3); // max_failures
+    CHECK(persister->persist_failures() == before + 1);
+    CHECK(rt->staged_baseline_count_for_test() == 5); // none lost, two never attempted
+    CHECK_FALSE(baseline_record_4045(*f.kv, "g4").has_value());
+
+    heal_baseline_writes_4045(f.db_.path);
+    const auto healed = persist_now_4045(*f.engine);
+    CHECK(healed.written == 5);
+    CHECK(healed.failed == 0);
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+    CHECK(baseline_record_4045(*f.kv, "g4").has_value());
+}
+
+TEST_CASE("#4045 E19: staging has no cap and a pass has a tuple budget: 300 captures all persist "
+          "over back-to-back budget-exhausted passes, none dropped",
+          "[spark][guardian][baseline][reconcile]") {
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* rt = f.engine->spark_runtime_for_test();
+    auto* persister = f.engine->baseline_persister_for_test();
+    REQUIRE(rt != nullptr);
+    REQUIRE(persister != nullptr);
+    constexpr int kN = 300; // more than a fixed staging cap of 256 would hold
+    // Only the tuple budget is under test; a 1 h wall keeps a host stall from ending a pass early.
+    // The limits are the production ones, so a changed kBaselinePassBudget goes RED here.
+    persister->set_budgets_for_test(
+        with_wall_4045(yuzu::agent::kBaselinePassBudget, std::chrono::hours{1}),
+        with_wall_4045(yuzu::agent::kBaselineStopBudget, std::chrono::hours{1}));
+    for (int i = 0; i < kN; ++i)
+        rt->stage_baseline_for_test("r" + std::to_string(i), "/yuzu_test_4045_e19/" + std::to_string(i),
+                                    std::string(64, 'a'));
+    CHECK(rt->staged_baseline_count_for_test() == static_cast<std::size_t>(kN));
+    CHECK(f.engine->baseline_persist_failures() == 0); // nothing dropped
+
+    // 64 tuples per pass (kBaselinePassBudget): 4 full passes report budget_exhausted, the
+    // 5th drains the last 44. A budget-exhausted pass is NOT a failure and sets no backoff.
+    std::size_t written = 0;
+    int passes = 0;
+    int exhausted = 0;
+    while (rt->staged_baseline_count_for_test() != 0 && passes < 20) {
+        const auto out = persist_now_4045(*f.engine);
+        ++passes;
+        written += out.written;
+        CHECK(out.failed == 0);
+        if (out.budget_exhausted)
+            ++exhausted;
+    }
+    CHECK(written == static_cast<std::size_t>(kN));
+    CHECK(passes == 5);
+    CHECK(exhausted == 4);
+    CHECK(persister->persist_failures() == 0);
+    CHECK(persister->backoff_for_test() == std::chrono::seconds{0});
+    CHECK(baseline_record_4045(*f.kv, "r0").has_value());
+    CHECK(baseline_record_4045(*f.kv, "r299").has_value());
+}
+
+TEST_CASE("#4045 E20: the worker retry backoff doubles 5 s -> 60 s, forced drains ignore it, "
+          "success resets it (injected clock, no sleeps)",
+          "[spark][guardian][baseline][reconcile]") {
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    using Trig = GuardianBaselinePersister::Trigger;
+    using namespace std::chrono_literals;
+
+    auto now_s = std::make_shared<std::atomic<std::int64_t>>(1000);
+    const auto base = std::chrono::steady_clock::time_point{};
+    persister->set_clock_for_test(
+        [now_s, base] { return base + std::chrono::seconds{now_s->load()}; });
+    rt->stage_baseline_for_test("r1", "/yuzu_test_4045_e20", std::string(64, 'a'));
+    fail_baseline_writes_4045(f.db_.path);
+
+    auto w1 = persister->persist_staged(*rt, Trig::Worker);
+    CHECK(w1.failed == 1);
+    CHECK(persister->backoff_for_test() == 5s);
+    now_s->store(1004); // 4 s later: the retry is not due
+    auto w2 = persister->persist_staged(*rt, Trig::Worker);
+    CHECK(w2.backoff_deferred);
+    CHECK(w2.failed == 0);
+    CHECK(persister->persist_failures() == 1); // nothing was attempted
+    now_s->store(1005); // due
+    auto w3 = persister->persist_staged(*rt, Trig::Worker);
+    CHECK(w3.failed == 1);
+    CHECK(persister->backoff_for_test() == 10s);
+    // A forced drain (apply_rules / stop) attempts regardless of the backoff...
+    auto f1 = persister->persist_staged(*rt, Trig::Forced);
+    CHECK_FALSE(f1.backoff_deferred);
+    CHECK(f1.failed == 1);
+    CHECK(persister->backoff_for_test() == 20s); // ...and a failed pass widens it
+    // The width doubles up to the 60 s cap.
+    for (int i = 0; i < 3; ++i) {
+        now_s->fetch_add(1000);
+        (void)persister->persist_staged(*rt, Trig::Worker);
+    }
+    CHECK(persister->backoff_for_test() == 60s);
+    CHECK(persister->persist_failures() == 6);
+
+    // Healing: once the backoff has elapsed the worker pass writes, and the width resets.
+    heal_baseline_writes_4045(f.db_.path);
+    now_s->fetch_add(1000);
+    auto w4 = persister->persist_staged(*rt, Trig::Worker);
+    CHECK(w4.written == 1);
+    CHECK(persister->backoff_for_test() == 0s);
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+    persister->set_clock_for_test({});
+}
+
+TEST_CASE("#4045 E21: the heartbeat getter never waits on mtx_ or on a persist pass",
+          "[spark][guardian][baseline][reconcile]") {
+    // baseline_persist_failures() is lock-free: it must return while apply_rules holds mtx_
+    // (the post-drain hook runs with mtx_ held) AND while a persist pass is parked holding
+    // persist_mu_. Probed from another thread, bounded by spin_until, so a regression to a
+    // mtx_-taking getter fails the CHECK instead of hanging the binary.
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+
+    std::atomic<bool> got{false};
+    std::atomic<std::uint64_t> seen{99};
+    std::thread probe;
+    Join4045 join_probe{probe};
+    std::atomic<bool> hook_ok{false};
+    HookGuard4045 hooks{*f.engine};
+    f.engine->set_apply_post_drain_hook_for_test([&] {
+        probe = std::thread([&] {
+            seen.store(f.engine->baseline_persist_failures());
+            got.store(true);
+        });
+        hook_ok.store(yuzu::test::spin_until([&] { return got.load(); }));
+    });
+    f.apply(make_file_hash_rule("r1", t.file().string()));
+    f.engine->set_apply_post_drain_hook_for_test(nullptr);
+    CHECK(hook_ok.load()); // RED if the getter takes mtx_ (it would wait for apply_rules)
+    CHECK(seen.load() == 0);
+    if (probe.joinable())
+        probe.join();
+
+    // And while a pass is parked mid-flight holding persist_mu_.
+    rt->stage_baseline_for_test("r9", "/yuzu_test_4045_e21", std::string(64, 'a'));
+    std::atomic<bool> in_pass{false};
+    std::atomic<bool> release{false};
+    // Declared AFTER the locals the hook below captures, so it clears the hook before they die.
+    HookGuard4045 pass_hooks{*f.engine};
+    persister->set_post_snapshot_hook_for_test([&] {
+        in_pass.store(true);
+        (void)yuzu::test::spin_until([&] { return release.load(); });
+    });
+    std::thread pass([&] { (void)persister->persist_staged(*rt, GuardianBaselinePersister::Trigger::Forced); });
+    Join4045 join_pass{pass};
+    REQUIRE(yuzu::test::spin_until([&] { return in_pass.load(); }));
+    std::atomic<bool> got2{false};
+    std::thread probe2([&] {
+        (void)f.engine->baseline_persist_failures();
+        got2.store(true);
+    });
+    Join4045 join_probe2{probe2};
+    CHECK(yuzu::test::spin_until([&] { return got2.load(); }, std::chrono::milliseconds{500}));
+    release.store(true);
+    pass.join();
+    probe2.join();
+    persister->set_post_snapshot_hook_for_test(nullptr);
+}
+
+TEST_CASE("#4045 E22: a throw out of the snapshot is firewalled and counted on the engine "
+          "aggregate, and loses no capture (engine and worker firewalls)",
+          "[spark][guardian][baseline][reconcile]") {
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    CHECK(f.engine->baseline_persist_failures() == 0);
+
+    // Worker firewall: park-free, the worker is live; wake it with the seam armed.
+    persister->set_backoff_for_test(std::chrono::milliseconds{1}, std::chrono::milliseconds{1});
+    rt->stage_baseline_for_test("r1", "/yuzu_test_4045_e22", std::string(64, 'a'));
+    rt->fail_next_snapshot_for_test();
+    f.engine->drain_worker_for_test()->notify();
+    REQUIRE(yuzu::test::spin_until([&] { return persister->firewalled_exceptions() >= 1; }));
+    // ...nothing was lost to the throw: the worker's next pass persists it once the backoff the
+    // throw set (shortened here to 1 ms so the test does not wait out 5 s) has elapsed. The
+    // throw consumed the wake that triggered it and the backstop is pinned to an hour, so each
+    // poll wakes it again.
+    REQUIRE(yuzu::test::spin_until([&] {
+        f.engine->drain_worker_for_test()->notify();
+        return baseline_record_4045(*f.kv, "r1").has_value();
+    }));
+
+    // Engine firewall (apply_rules' drain): park the worker so only apply_rules runs a pass.
+    f.engine->drain_worker_for_test()->stop();
+    const auto before = persister->firewalled_exceptions();
+    rt->stage_baseline_for_test("r2", "/yuzu_test_4045_e22b", std::string(64, 'b'));
+    rt->fail_next_snapshot_for_test();
+    f.apply(make_file_hash_rule("r1", t.file().string()));
+    CHECK(persister->firewalled_exceptions() == before + 1);
+    // Only a STOP-time throw is a loss with a log line: a Forced pass leaves staging untouched.
+    CHECK(f.engine->baseline_stop_flush_threw_logs_for_test() == 0);
+    CHECK(rt->staged_baseline_count_for_test() >= 1); // r2 is still staged, never lost
+    CHECK(f.engine->baseline_persist_failures() >= before + 1);
+    // The aggregate is the sum of the persister's terms (E23 pins each term).
+    CHECK(f.engine->baseline_persist_failures() == persister->failure_signals());
+}
+
+TEST_CASE("#4045 E23: every term of the heartbeat aggregate is pinned",
+          "[spark][guardian][baseline][reconcile]") {
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+
+    auto drops = std::make_shared<std::atomic<std::uint64_t>>(0);
+    yuzu::agent::GuardianBaselinePersister no_store{nullptr, drops};
+    CHECK(no_store.failure_signals() == 0);
+    drops->store(3); // runtime drops
+    CHECK(no_store.failure_signals() == 3);
+    rt->stage_baseline_for_test("r1", "/yuzu_test_4045_e23", std::string(64, 'a'));
+    (void)no_store.persist_staged(*rt, GuardianBaselinePersister::Trigger::Forced); // one pass that found a capture and no store
+    CHECK(no_store.failure_signals() == 4);
+    no_store.note_firewalled_exception(); // a firewalled throw
+    CHECK(no_store.failure_signals() == 5);
+
+    // The failed-pass term, on a persister over the real store with every write failing.
+    yuzu::agent::GuardianBaselinePersister real{f.kv.get(), drops};
+    fail_baseline_writes_4045(f.db_.path);
+    (void)real.persist_staged(*rt, GuardianBaselinePersister::Trigger::Forced);
+    CHECK(real.persist_failures() == 1);
+    CHECK(real.failure_signals() == 4); // 3 drops + 1 failed pass
+    heal_baseline_writes_4045(f.db_.path);
+    // A refusal is NOT a term: the guard working must not read as a failure.
+    nlohmann::json existing;
+    existing["schema"] = 1;
+    existing["fingerprint"] = "file-hash-equals|/yuzu_test_4045_e23";
+    existing["hash"] = std::string(64, 'c');
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", existing.dump()));
+    (void)real.persist_staged(*rt, GuardianBaselinePersister::Trigger::Forced);
+    CHECK(real.persist_refusals() == 1);
+    CHECK(real.failure_signals() == 4);
+}
+
+// ── #4045: staging failure, wall/tuple budgets, stop skip ─────────────────────────────────
+TEST_CASE("#4045 E24: a capture that could not be staged keeps its baseline: a later change is "
+          "DRIFT against the original, the next evaluation stages the ORIGINAL hash and it persists",
+          "[spark][guardian][baseline][reconcile]") {
+    // An allocation failure while staging is counted, but the capture must neither be forgotten
+    // (the baseline would be neither staged nor durable, so a full_sync or restart would
+    // re-baseline drifted content) nor be dropped from the live state (the next evaluation, often
+    // the change event itself, would then capture the drifted content as the baseline and
+    // report it compliant). The baseline stays committed and staging is retried.
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    const fs::path target = t.file();
+    Spark4045Target::write(target, "content A");
+    const std::string h_a = hash_of_4045(target);
+
+    rt->fail_next_stage_baseline_for_test(); // consumed by the arm-time evaluation inside apply()
+    f.apply(make_file_hash_rule("r1", target.string()));
+    REQUIRE(yuzu::test::spin_until([&] { return rt->staged_baseline_drops() == 1; }));
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+    CHECK(f.engine->baseline_persist_failures() == 1); // counted on the heartbeat aggregate
+    std::vector<OutboxEntry> drained; // the worker is parked, so drain the outbox by hand
+    const auto drain_now = [&] {
+        rt->drain([&](const OutboxEntry& e) {
+            drained.push_back(e);
+            return SendResult::Sent;
+        });
+    };
+    const auto drift_vs = [&](const std::string& expected, const std::string& detected) {
+        for (const auto& e : drained)
+            if (e.domain == yuzu::agent::OutboxDomain::Compliance && !e.drift.compliant &&
+                e.drift.expected_value == expected && e.drift.detected_value == detected)
+                return true;
+        return false;
+    };
+    drain_now();
+    int compliant_edges = 0;
+    for (const auto& e : drained)
+        if (e.domain == yuzu::agent::OutboxDomain::Compliance && e.drift.compliant)
+            ++compliant_edges;
+    CHECK(compliant_edges == 1); // the verdict committed even though the capture was not staged
+
+    // The file changes before anything is staged. The live baseline is still A, so this is drift
+    // against A (RED if the failed stage cleared the baseline: B would be captured and reported
+    // compliant, with no drift event at all).
+    Spark4045Target::write(target, "content B, longer");
+    const std::string h_b = hash_of_4045(target);
+    REQUIRE(h_b != h_a);
+    eval_initial_4045(*f.engine, target);
+    drain_now();
+    CHECK(drift_vs(h_a, h_b));
+
+    // The same evaluation retried staging with the ORIGINAL hash, and it persists as such.
+    CHECK(rt->staged_baseline_count_for_test() == 1);
+    CHECK(rt->staged_baseline_drops() == 1); // the retry staged cleanly: no second drop
+    const auto out = persist_now_4045(*f.engine);
+    CHECK(out.written == 1);
+    const auto rec = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(rec.has_value());
+    CHECK(rec->value("hash", std::string{}) == h_a);
+
+    // A full_sync re-arm seeds from the record: still drift against A, record untouched. The
+    // rule is renamed so it is re-armed at all: an identical push of a healthy rule whose
+    // persisted baseline equals the live one is a skip (#4415).
+    drained.clear();
+    f.apply(renamed_rule(make_file_hash_rule("r1", target.string()), "r1-v2"), /*full_sync=*/true);
+    eval_initial_4045(*f.engine, target);
+    const bool drifted_again = yuzu::test::spin_until([&] {
+        drain_now();
+        return drift_vs(h_a, h_b);
+    });
+    CHECK(drifted_again);
+    CHECK(baseline_record_4045(*f.kv, "r1")->value("hash", std::string{}) == h_a);
+}
+
+namespace {
+/// An injected steady clock the test advances by hand; the persister reads it for the backoff
+/// and the pass wall budget. Restores the real clock on any exit.
+struct FakeClock4045 {
+    std::shared_ptr<std::atomic<std::int64_t>> ms = std::make_shared<std::atomic<std::int64_t>>(1'000'000);
+    GuardianBaselinePersister& p;
+    explicit FakeClock4045(GuardianBaselinePersister& persister) : p(persister) {
+        auto m = ms;
+        p.set_clock_for_test([m] {
+            return std::chrono::steady_clock::time_point{} + std::chrono::milliseconds{m->load()};
+        });
+    }
+    ~FakeClock4045() { p.set_clock_for_test({}); }
+    void advance(std::int64_t d) { ms->fetch_add(d); }
+};
+void stage_n_4045(yuzu::agent::GuardianSparkRuntime& rt, int n, const char* tag, char fill = 'a') {
+    for (int i = 0; i < n; ++i)
+        rt.stage_baseline_for_test("r" + std::to_string(i), std::string{"/yuzu_test_4045_"} + tag + "/" + std::to_string(i),
+                                   std::string(64, fill));
+}
+} // namespace
+
+TEST_CASE("#4045 E25: the pass wall budget stops a run of SLOW but successful writes, and a "
+          "budget-exhausted pass is not a failure (no backoff)",
+          "[spark][guardian][baseline][reconcile]") {
+    using namespace std::chrono_literals;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    FakeClock4045 clock{*persister};
+    HookGuard4045 hooks{*f.engine};
+    // Every write "takes" 600 ms on the injected clock: the 2 s wall budget is reached after the
+    // 4th write (elapsed 2400 ms at the next between-tuples check), whatever the 10 captures.
+    persister->set_post_write_hook_for_test([&] { clock.advance(600); });
+    stage_n_4045(*rt, 10, "e25");
+
+    using Trig = GuardianBaselinePersister::Trigger;
+    const auto first = persister->persist_staged(*rt, Trig::Worker);
+    CHECK(first.written == 4);
+    CHECK(first.failed == 0);
+    CHECK(first.budget_exhausted);
+    CHECK(rt->staged_baseline_count_for_test() == 6);
+    CHECK(persister->persist_failures() == 0);
+    CHECK(persister->backoff_for_test() == 0ms); // exhausted is NOT a failure: no backoff
+    // ...so the very next worker pass is not deferred and carries on from where it stopped.
+    const auto second = persister->persist_staged(*rt, Trig::Worker);
+    CHECK_FALSE(second.backoff_deferred);
+    CHECK(second.written == 4);
+    const auto third = persister->persist_staged(*rt, Trig::Worker);
+    CHECK(third.written == 2);
+    CHECK_FALSE(third.budget_exhausted);
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+    CHECK(persister->backoff_deferrals_for_test() == 0);
+
+    // A budget-exhausted pass that follows a FAILED one clears the backoff the failure set: it
+    // made progress with no failure, exactly like a pass that drained everything.
+    persister->set_post_write_hook_for_test(nullptr);
+    stage_n_4045(*rt, 6, "e25b", 'b');
+    fail_baseline_writes_4045(f.db_.path);
+    CHECK(persister->persist_staged(*rt, Trig::Forced).failed == 3);
+    CHECK(persister->backoff_for_test() == 5000ms);
+    heal_baseline_writes_4045(f.db_.path);
+    persister->set_budgets_for_test({2, 3, 1h}, {2, 1, 1h});
+    clock.advance(5000); // the backoff has elapsed: a Worker pass is due
+    const auto recovered = persister->persist_staged(*rt, Trig::Worker);
+    CHECK(recovered.written == 2);
+    CHECK(recovered.budget_exhausted);
+    CHECK(persister->backoff_for_test() == 0ms); // RED if an exhausted pass left the backoff set
+}
+
+TEST_CASE("#4045 E26: the tuple budget caps a pass, and the wall budget is wall-time not "
+          "wall-count (a stalled FAILING write ends the pass at once)",
+          "[spark][guardian][baseline][reconcile]") {
+    using namespace std::chrono_literals;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    FakeClock4045 clock{*persister};
+    HookGuard4045 hooks{*f.engine};
+    using Trig = GuardianBaselinePersister::Trigger;
+    stage_n_4045(*rt, 7, "e26");
+
+    persister->set_budgets_for_test({3, 3, 1h}, {3, 1, 1h}); // 3 tuples per pass, effectively no wall
+    CHECK(persister->persist_staged(*rt, Trig::Forced).written == 3);
+    CHECK(persister->persist_staged(*rt, Trig::Forced).written == 3);
+    const auto last = persister->persist_staged(*rt, Trig::Forced);
+    CHECK(last.written == 1);
+    CHECK_FALSE(last.budget_exhausted);
+
+    // A BUSY store: every write fails after a 5 s busy timeout. After the FIRST failure the wall
+    // budget (2 s) is spent, so the pass stops with 1 failed write although max_failures is 3.
+    persister->set_budgets_for_test(yuzu::agent::kBaselinePassBudget, yuzu::agent::kBaselineStopBudget);
+    stage_n_4045(*rt, 5, "e26b", 'b');
+    fail_baseline_writes_4045(f.db_.path);
+    persister->set_post_write_hook_for_test([&] { clock.advance(5000); });
+    const auto busy = persister->persist_staged(*rt, Trig::Forced);
+    CHECK(busy.failed == 1);
+    CHECK(busy.written == 0);
+    CHECK_FALSE(busy.budget_exhausted); // it failed: the failure backoff governs, not a re-run
+    CHECK(rt->staged_baseline_count_for_test() == 5);
+    heal_baseline_writes_4045(f.db_.path);
+}
+
+TEST_CASE("#4045 E27: the rotating cursor stops a tuple that fails every time from starving the "
+          "ones sorted behind it, across passes",
+          "[spark][guardian][baseline][reconcile]") {
+    using namespace std::chrono_literals;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    using Trig = GuardianBaselinePersister::Trigger;
+    // ONE failure ends a pass (the stop-style budget on every pass), so without rotation the
+    // deterministic failer r0 would end every pass before any later tuple was tried.
+    persister->set_budgets_for_test({64, 1, 1h}, {64, 1, 1h});
+    stage_n_4045(*rt, 5, "e27");
+    fail_baseline_writes_4045(f.db_.path, "baseline:r0");
+
+    const auto p1 = persister->persist_staged(*rt, Trig::Forced);
+    CHECK(p1.failed == 1);
+    CHECK(p1.written == 0); // r0 first, then the pass gave up
+    CHECK(rt->staged_baseline_count_for_test() == 5);
+    const auto p2 = persister->persist_staged(*rt, Trig::Forced);
+    // Starts AFTER r0: r1..r4 persist, then the lap wraps to r0 and fails.
+    CHECK(p2.written == 4);
+    CHECK(p2.failed == 1);
+    CHECK(rt->staged_baseline_count_for_test() == 1); // only the poisoned r0
+    CHECK(baseline_record_4045(*f.kv, "r1").has_value());
+    CHECK(baseline_record_4045(*f.kv, "r4").has_value());
+    CHECK_FALSE(baseline_record_4045(*f.kv, "r0").has_value());
+    heal_baseline_writes_4045(f.db_.path);
+    CHECK(persister->persist_staged(*rt, Trig::Forced).written == 1);
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+}
+
+TEST_CASE("#4045 E28: stop() runs under the tighter stop budget and SKIPS its pass only when it "
+          "starts late after a pass DURING this stop failed slowly",
+          "[spark][guardian][baseline][reconcile]") {
+    using namespace std::chrono_literals;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    FakeClock4045 clock{*persister};
+    HookGuard4045 hooks{*f.engine};
+    using Trig = GuardianBaselinePersister::Trigger;
+    stage_n_4045(*rt, 5, "e28");
+    fail_baseline_writes_4045(f.db_.path);
+
+    // Stop budget: ONE failure ends the pass, even though the (fast) failure spent no wall.
+    const auto stop1 = persister->persist_staged(*rt, Trig::Stop);
+    CHECK(stop1.failed == 1);
+    CHECK_FALSE(stop1.skipped_after_stall);
+    // A FAST failure is not a stall: stop still tries (nothing slow to repeat).
+    const auto stop2 = persister->persist_staged(*rt, Trig::Stop);
+    CHECK_FALSE(stop2.skipped_after_stall);
+    CHECK(stop2.failed == 1);
+
+    // stop() has begun and a pass in flight fails SLOWLY (a BUSY store: each write burns a busy
+    // timeout of stop()'s shared shutdown deadline). A stall alone does not skip an EARLY Stop
+    // pass (#5604: the store may have healed, and one more attempt fits the grace)...
+    persister->begin_stop();
+    persister->set_post_write_hook_for_test([&] { clock.advance(5000); });
+    const auto slow = persister->persist_staged(*rt, Trig::Forced);
+    CHECK(slow.failed == 1);
+    const auto early = persister->persist_staged(*rt, Trig::Stop);
+    CHECK_FALSE(early.skipped_after_stall);
+    CHECK(early.failed == 1); // it tried, and failed slowly again
+    // ... but one that would start LATE after the stall is skipped without touching the store.
+    clock.advance(yuzu::agent::kBaselineStopLatestStart.count());
+    const auto failures = persister->persist_failures();
+    const auto stop3 = persister->persist_staged(*rt, Trig::Stop);
+    CHECK(stop3.skipped_after_stall);
+    CHECK(stop3.failed == 0);
+    CHECK(stop3.written == 0);
+    CHECK(persister->persist_failures() == failures); // nothing was attempted
+    CHECK(rt->staged_baseline_count_for_test() == 5);  // and nothing was lost
+
+    // A pass that gets through without a slow failure clears the stall, so a later stop tries.
+    heal_baseline_writes_4045(f.db_.path);
+    persister->set_post_write_hook_for_test(nullptr);
+    CHECK(persister->persist_staged(*rt, Trig::Forced).written == 5);
+    stage_n_4045(*rt, 2, "e28b", 'c');
+    const auto stop4 = persister->persist_staged(*rt, Trig::Stop);
+    CHECK_FALSE(stop4.skipped_after_stall);
+    CHECK(stop4.written == 2);
+}
+
+TEST_CASE("#4045 E28b: the stop skip is bounded to a stall observed during THIS stop: an older "
+          "one is stale, a slow failure after an earlier success still counts, and the mark is "
+          "first-call-wins",
+          "[spark][guardian][baseline][reconcile]") {
+    using namespace std::chrono_literals;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    int writes = 0; // captured by a hook below: declared before the guard that clears it
+    FakeClock4045 clock{*persister};
+    HookGuard4045 hooks{*f.engine};
+    using Trig = GuardianBaselinePersister::Trigger;
+    stage_n_4045(*rt, 3, "e28s");
+    fail_baseline_writes_4045(f.db_.path);
+    persister->set_post_write_hook_for_test([&] { clock.advance(5000); });
+
+    SECTION("a stall that ended before stop began is stale: the store healed, so stop writes") {
+        // RED before the mark existed: the flag outlived the stall, so a heal followed by
+        // stop() skipped the flush and lost the staged captures on a healthy store.
+        CHECK(persister->persist_staged(*rt, Trig::Forced).failed == 1); // slow, at T
+        heal_baseline_writes_4045(f.db_.path);
+        persister->set_post_write_hook_for_test(nullptr); // healthy writes take no time
+        clock.advance(30'000);
+        persister->begin_stop();
+        // late: only staleness saves it
+        clock.advance(yuzu::agent::kBaselineStopLatestStart.count());
+        const auto stop = persister->persist_staged(*rt, Trig::Stop);
+        CHECK_FALSE(stop.skipped_after_stall);
+        CHECK(stop.written == 3);
+        CHECK(rt->staged_baseline_count_for_test() == 0);
+    }
+    SECTION("a stale stall with the store STILL failing: stop makes its one attempt") {
+        CHECK(persister->persist_staged(*rt, Trig::Forced).failed == 1);
+        clock.advance(30'000);
+        persister->begin_stop();
+        // late: only staleness saves it
+        clock.advance(yuzu::agent::kBaselineStopLatestStart.count());
+        const auto stop = persister->persist_staged(*rt, Trig::Stop);
+        CHECK_FALSE(stop.skipped_after_stall);
+        CHECK(stop.failed == 1); // the stop budget's single failure
+        CHECK(rt->staged_baseline_count_for_test() == 3);
+    }
+    SECTION("a slow failure AFTER an earlier success in the same pass is a stall") {
+        // RED while a pass had to persist nothing to count: one tuple written, then the BUSY
+        // timeout, and stop() added its own timeout on top of the worker's.
+        heal_baseline_writes_4045(f.db_.path);
+        exec_sql_4045(f.db_.path, "CREATE TRIGGER yuzu_test_4045_fail BEFORE INSERT ON kv_store "
+                                  "WHEN NEW.key IN ('baseline:r1','baseline:r2') BEGIN "
+                                  "SELECT RAISE(ABORT,'x'); END;");
+        persister->set_post_write_hook_for_test([&] {
+            if (++writes > 1)
+                clock.advance(5000); // r0 is fast; the failing r1 is slow
+        });
+        persister->begin_stop();
+        const auto pass = persister->persist_staged(*rt, Trig::Worker);
+        CHECK(pass.written == 1);
+        CHECK(pass.failed == 1);
+        clock.advance(yuzu::agent::kBaselineStopLatestStart.count()); // a late start
+        const auto stop = persister->persist_staged(*rt, Trig::Stop);
+        CHECK(stop.skipped_after_stall);
+    }
+    SECTION("a second begin_stop() (the destructor's stop()) does not move the mark") {
+        persister->begin_stop();
+        CHECK(persister->persist_staged(*rt, Trig::Forced).failed == 1); // slow, after the mark
+        clock.advance(yuzu::agent::kBaselineStopLatestStart.count()); // a late start
+        persister->begin_stop(); // would make the stall stale if it moved the mark
+        const auto stop = persister->persist_staged(*rt, Trig::Stop);
+        CHECK(stop.skipped_after_stall);
+    }
+    SECTION("without begin_stop() a Stop pass never skips") {
+        CHECK(persister->persist_staged(*rt, Trig::Forced).failed == 1);
+        const auto stop = persister->persist_staged(*rt, Trig::Stop);
+        CHECK_FALSE(stop.skipped_after_stall);
+        CHECK(stop.failed == 1);
+    }
+}
+
+TEST_CASE("#4045 E29: the REAL worker honours the retry backoff: wakes while a failed pass's "
+          "backoff is pending are deferred, not retried (a Forced worker pass would retry at once)",
+          "[spark][guardian][baseline][reconcile]") {
+    using namespace std::chrono_literals;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    auto* worker = f.engine->drain_worker_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    REQUIRE(worker != nullptr);
+    // A one-hour backoff makes the REAL clock irrelevant: once a pass has failed, no wall time
+    // this test can take makes the next worker pass due. (The setter is locked, so it is safe
+    // against the live worker; the hour-long periodic backstop means only notify() wakes it.)
+    persister->set_backoff_for_test(1h, 1h);
+    // The failing trigger goes in BEFORE the capture is staged: the worker's boot cycle or an
+    // unrelated wake could otherwise persist the capture between the two and the failed pass
+    // this test waits for would never happen.
+    fail_baseline_writes_4045(f.db_.path);
+    stage_n_4045(*rt, 1, "e29");
+    worker->notify();
+    REQUIRE(yuzu::test::spin_until([&] { return persister->persist_failures() == 1; }));
+    for (std::uint64_t i = 1; i <= 5; ++i) {
+        worker->notify();
+        REQUIRE(yuzu::test::spin_until([&] { return persister->backoff_deferrals_for_test() >= i; }));
+    }
+    CHECK(persister->persist_failures() == 1); // RED if the worker passed Forced: one per wake
+    CHECK(persister->backoff_for_test() == 1h);
+    heal_baseline_writes_4045(f.db_.path);
+}
+
+TEST_CASE("#4045 E30: a Worker pass that was waiting on the lock re-checks the backoff after it "
+          "gets the lock (another drainer failed while it waited)",
+          "[spark][guardian][baseline][reconcile]") {
+    using namespace std::chrono_literals;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    FakeClock4045 clock{*persister};
+    HookGuard4045 hooks{*f.engine};
+    using Trig = GuardianBaselinePersister::Trigger;
+    stage_n_4045(*rt, 1, "e30");
+    fail_baseline_writes_4045(f.db_.path);
+
+    std::atomic<bool> in_pass{false};
+    std::atomic<bool> release{false};
+    std::atomic<bool> hook_armed{true};
+    persister->set_post_snapshot_hook_for_test([&] {
+        if (!hook_armed.exchange(false))
+            return;
+        in_pass.store(true);
+        (void)yuzu::test::spin_until([&] { return release.load(); });
+    });
+    GuardianBaselinePersister::Outcome forced;
+    std::thread a([&] { forced = persister->persist_staged(*rt, Trig::Forced); });
+    Join4045 join_a{a};
+    REQUIRE(yuzu::test::spin_until([&] { return in_pass.load(); }));
+    // The Worker pass sees no backoff yet (nothing has failed), so it queues on the lock...
+    GuardianBaselinePersister::Outcome worker;
+    std::thread b([&] { worker = persister->persist_staged(*rt, Trig::Worker); });
+    Join4045 join_b{b};
+    REQUIRE(yuzu::test::spin_until([&] { return persister->lock_waiters_for_test() == 1; }));
+    release.store(true);
+    a.join();
+    b.join();
+    // ...the Forced pass fails and sets the backoff, and the waiter must NOT write again.
+    CHECK(forced.failed == 1);
+    CHECK(worker.backoff_deferred); // RED without the post-lock due() re-check
+    CHECK(worker.failed == 0);
+    CHECK(persister->persist_failures() == 1);
+    CHECK(persister->lock_waiters_for_test() == 0);
+    heal_baseline_writes_4045(f.db_.path);
+}
+
+TEST_CASE("#4045 E31: the INFO line for a persisted capture carries the rule id through "
+          "log_id_token only, and is emitted once per Written capture",
+          "[spark][guardian][baseline][reconcile]") {
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    // The line is a pure function of the rule id (no path and no hash can be passed in), and a
+    // hostile id cannot forge a log line.
+    const std::string line = GuardianBaselinePersister::persisted_log_line("evil\nrule id=x");
+    CHECK(line.find('\n') == std::string::npos);
+    CHECK(line.find(' ' + std::string{"id=x"}) == std::string::npos);
+    CHECK(line == "Guardian: persisted Spark baseline capture for rule 'evil_rule_id_x' (#4045)");
+
+    stage_n_4045(*rt, 3, "e31");
+    CHECK(persister->info_logs_for_test() == 0);
+    CHECK(persist_now_4045(*f.engine).written == 3);
+    CHECK(persister->info_logs_for_test() == 3);
+    // A refusal is not a persisted capture: no line.
+    rt->stage_baseline_for_test("r0", "/yuzu_test_4045_e31/0", std::string(64, 'z'));
+    (void)persist_now_4045(*f.engine);
+    CHECK(persister->persist_refusals() == 1);
+    CHECK(persister->info_logs_for_test() == 3);
+}
+
+TEST_CASE("#4045 E32: the LIVE worker re-runs at once while a budget-exhausted pass leaves "
+          "captures staged (no failure, no wait for the next wake or the backstop)",
+          "[spark][guardian][baseline][reconcile]") {
+    using namespace std::chrono_literals;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    // The periodic backstop is pinned to one hour, so only a wake or the immediate re-run can
+    // start another pass. 2 tuples per pass, 9 captures: one wake must drain all of them.
+    persister->set_budgets_for_test({2, 3, 1h}, {2, 1, 1h}); // locked: safe against the live worker
+    stage_n_4045(*rt, 9, "e32");
+    f.engine->drain_worker_for_test()->notify(); // ONE wake
+    REQUIRE(yuzu::test::spin_until([&] { return rt->staged_baseline_count_for_test() == 0; }));
+    CHECK(baseline_record_4045(*f.kv, "r0").has_value());
+    CHECK(baseline_record_4045(*f.kv, "r8").has_value());
+    CHECK(persister->persist_failures() == 0);
+    CHECK(persister->backoff_deferrals_for_test() == 0);
+}
+
+TEST_CASE("#4045 E33: a throw out of the snapshot widens the worker backoff, so a persistent "
+          "allocation failure cannot re-run on every wake",
+          "[spark][guardian][baseline][reconcile]") {
+    using namespace std::chrono_literals;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    FakeClock4045 clock{*persister};
+    using Trig = GuardianBaselinePersister::Trigger;
+    stage_n_4045(*rt, 1, "e33");
+    rt->fail_next_snapshot_for_test();
+    CHECK_THROWS_AS(persister->persist_staged(*rt, Trig::Worker), std::bad_alloc);
+    CHECK(persister->backoff_for_test() == 5s);
+    const auto deferred = persister->persist_staged(*rt, Trig::Worker);
+    CHECK(deferred.backoff_deferred);
+    CHECK(rt->staged_baseline_count_for_test() == 1); // nothing lost
+    clock.advance(5000);
+    CHECK(persister->persist_staged(*rt, Trig::Worker).written == 1); // due again: it persists
+}
+
+TEST_CASE("#4045 E34: a pass polls its stop predicate before every tuple: a stop request ends it "
+          "with nothing written, nothing lost and no re-run request",
+          "[spark][guardian][baseline][reconcile]") {
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    using Trig = GuardianBaselinePersister::Trigger;
+    stage_n_4045(*rt, 3, "e34");
+
+    int polls = 0;
+    const auto out = persister->persist_staged(*rt, Trig::Worker, [&polls] {
+        ++polls;
+        return true; // stop() is already joining this worker
+    });
+    CHECK(polls == 1);
+    CHECK(out.written == 0);
+    CHECK(out.failed == 0);
+    CHECK_FALSE(out.budget_exhausted); // a stop is neither a failure nor a request to re-run
+    CHECK(rt->staged_baseline_count_for_test() == 3);
+    CHECK(persister->backoff_for_test() == std::chrono::seconds{0});
+
+    // Stop requested only AFTER the first tuple: that one is persisted, the rest stay staged.
+    int calls = 0;
+    const auto partial = persister->persist_staged(*rt, Trig::Worker, [&calls] { return ++calls > 1; });
+    CHECK(partial.written == 1);
+    CHECK(rt->staged_baseline_count_for_test() == 2);
+}
+
+// ── #4045: stop flush, yielding, zero-attempt passes ──────────────────────────────────────
+TEST_CASE("#4045 E35: stop() persists EVERY staged capture on a healthy store (the stop budget "
+          "has no tuple cap), at the persister and through the engine",
+          "[spark][guardian][baseline][reconcile]") {
+    // A tuple cap on the stop budget would abandon the rest on a healthy store: at a cap of 64,
+    // 200 staged would persist 64 and lose 136 in a few milliseconds (a 1 s wall and ONE failure
+    // already bound the pass).
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    FakeClock4045 clock{*persister}; // frozen: the 1 s stop wall can never end the pass early
+    using Trig = GuardianBaselinePersister::Trigger;
+
+    constexpr int kN = 200;
+    stage_n_4045(*rt, kN, "e35");
+    const auto out = persister->persist_staged(*rt, Trig::Stop);
+    CHECK(out.written == static_cast<std::size_t>(kN));
+    CHECK_FALSE(out.budget_exhausted);
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+
+    // The same through GuardianEngine::stop().
+    stage_n_4045(*rt, kN, "e35b", 'b');
+    f.engine->stop();
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+    CHECK(baseline_record_4045(*f.kv, "r0").has_value());
+    CHECK(baseline_record_4045(*f.kv, "r199").has_value());
+}
+
+TEST_CASE("#4045 E36: a pass that attempted nothing (stop predicate true at the first tuple) "
+          "changes no bookkeeping: not the rotation cursor, not the backoff, not the stall",
+          "[spark][guardian][baseline][reconcile]") {
+    using namespace std::chrono_literals;
+    using Trig = GuardianBaselinePersister::Trigger;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    FakeClock4045 clock{*persister};
+    HookGuard4045 hooks{*f.engine};
+
+    SECTION("the rotation cursor does not move onto a tuple that was never tried") {
+        // RED before the guard: the cursor landed on r0, so the next pass started after it and,
+        // with one failure ending it, never reached r0 before stop() exited.
+        persister->set_budgets_for_test({64, 1, 1h}, {64, 1, 1h});
+        stage_n_4045(*rt, 3, "e36");
+        exec_sql_4045(f.db_.path, "CREATE TRIGGER yuzu_test_4045_fail BEFORE INSERT ON kv_store "
+                                  "WHEN NEW.key = 'baseline:r1' BEGIN SELECT RAISE(ABORT,'x'); END;");
+        const auto interrupted = persister->persist_staged(*rt, Trig::Worker, [] { return true; });
+        CHECK(interrupted.written == 0);
+        const auto next = persister->persist_staged(*rt, Trig::Stop);
+        CHECK(next.written >= 1);
+        CHECK(baseline_record_4045(*f.kv, "r0").has_value());
+    }
+    SECTION("the backoff and the stall survive an interrupted pass") {
+        // RED before the guard: the interrupted pass took the "no failure" branch, so it cleared
+        // the backoff a real failure had set and the stall flag a Stop pass reads.
+        stage_n_4045(*rt, 3, "e36b");
+        fail_baseline_writes_4045(f.db_.path);
+        persister->begin_stop();
+        persister->set_post_write_hook_for_test([&] { clock.advance(5000); });
+        const auto slow = persister->persist_staged(*rt, Trig::Worker);
+        CHECK(slow.failed == 1);
+        CHECK(persister->backoff_for_test() == 5000ms);
+        clock.advance(10'000); // the backoff has elapsed: the next Worker pass is due
+        const auto interrupted = persister->persist_staged(*rt, Trig::Worker, [] { return true; });
+        CHECK(interrupted.written == 0);
+        CHECK(interrupted.failed == 0);
+        CHECK(persister->backoff_for_test() == 5000ms); // untouched
+        clock.advance(yuzu::agent::kBaselineStopLatestStart.count()); // a late start
+        const auto stop = persister->persist_staged(*rt, Trig::Stop);
+        CHECK(stop.skipped_after_stall); // still stalled
+    }
+}
+
+TEST_CASE("#4045 E37: a Worker pass yields to a seed-fence or Forced waiter after its current "
+          "tuple, and defers outright while an apply_rules is in flight",
+          "[spark][guardian][baseline][reconcile]") {
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    using Trig = GuardianBaselinePersister::Trigger;
+
+    SECTION("yields to the seed fence between tuples") {
+        stage_n_4045(*rt, 5, "e37a");
+        std::atomic<bool> in_pass{false};
+        std::atomic<bool> release{false};
+        std::atomic<bool> armed{true};
+        std::atomic<bool> got_fence{false};
+        HookGuard4045 hooks{*f.engine};
+        persister->set_post_write_hook_for_test([&] { // after tuple 1, persist_mu_ held
+            if (!armed.exchange(false))
+                return;
+            in_pass.store(true);
+            (void)yuzu::test::spin_until([&] { return release.load(); });
+        });
+        GuardianBaselinePersister::Outcome worker;
+        std::thread a([&] { worker = persister->persist_staged(*rt, Trig::Worker); });
+        Join4045 join_a{a};
+        REQUIRE(yuzu::test::spin_until([&] { return in_pass.load(); }));
+        std::thread b([&] {
+            auto fence = persister->hold_seed_fence();
+            got_fence.store(true);
+        });
+        Join4045 join_b{b};
+        REQUIRE(yuzu::test::spin_until([&] { return persister->lock_waiters_for_test() == 1; }));
+        release.store(true);
+        a.join();
+        b.join();
+        // RED while a pass ignored waiters: all five were written before the fence got in.
+        CHECK(worker.written == 1);
+        CHECK(worker.yielded);
+        CHECK_FALSE(worker.budget_exhausted);
+        CHECK(worker.failed == 0);
+        CHECK(rt->staged_baseline_count_for_test() == 4); // the leftovers stay staged
+        CHECK(got_fence.load());
+        CHECK(persister->yields_for_test() == 1);
+        CHECK(persister->lock_waiters_for_test() == 0);
+    }
+    SECTION("yields to a Forced (apply_rules) pass waiting on the lock") {
+        stage_n_4045(*rt, 5, "e37b");
+        std::atomic<bool> in_pass{false};
+        std::atomic<bool> release{false};
+        std::atomic<bool> armed{true};
+        HookGuard4045 hooks{*f.engine};
+        persister->set_post_write_hook_for_test([&] {
+            if (!armed.exchange(false))
+                return;
+            in_pass.store(true);
+            (void)yuzu::test::spin_until([&] { return release.load(); });
+        });
+        GuardianBaselinePersister::Outcome worker;
+        GuardianBaselinePersister::Outcome forced;
+        std::thread a([&] { worker = persister->persist_staged(*rt, Trig::Worker); });
+        Join4045 join_a{a};
+        REQUIRE(yuzu::test::spin_until([&] { return in_pass.load(); }));
+        std::thread b([&] { forced = persister->persist_staged(*rt, Trig::Forced); });
+        Join4045 join_b{b};
+        REQUIRE(yuzu::test::spin_until([&] { return persister->lock_waiters_for_test() == 1; }));
+        release.store(true);
+        a.join();
+        b.join();
+        CHECK(worker.written == 1);
+        CHECK(worker.yielded);
+        CHECK(forced.written == 4); // the Forced pass then drains the rest
+        CHECK(rt->staged_baseline_count_for_test() == 0);
+    }
+    SECTION("a deferring Worker pass does not wait behind the seed fence (its thread stays free)") {
+        stage_n_4045(*rt, 2, "e37f");
+        GuardianBaselinePersister::ApplyScope scope{persister};
+        auto fence = persister->hold_seed_fence(); // what reconcile_rule_locked holds per rule
+        std::atomic<bool> done{false};
+        GuardianBaselinePersister::Outcome worker;
+        std::thread a([&] {
+            worker = persister->persist_staged(*rt, Trig::Worker);
+            done.store(true);
+        });
+        Join4045 join_a{a};
+        const bool returned = yuzu::test::spin_until([&] { return done.load(); });
+        if (!returned)
+            fence.unlock(); // unblock a regressed pass so the join below cannot hang
+        a.join();
+        CHECK(returned); // RED if the Worker pass queued on the lock the apply holds
+        CHECK(worker.yielded);
+        CHECK(worker.written == 0);
+    }
+    SECTION("a Worker pass defers while an ApplyScope is alive; Forced and Stop passes do not") {
+        stage_n_4045(*rt, 3, "e37c");
+        {
+            GuardianBaselinePersister::ApplyScope scope{persister};
+            CHECK(persister->apply_active_for_test() == 1);
+            const auto worker = persister->persist_staged(*rt, Trig::Worker);
+            CHECK(worker.yielded);
+            CHECK(worker.written == 0);
+            CHECK_FALSE(worker.budget_exhausted);
+            CHECK(rt->staged_baseline_count_for_test() == 3);
+            CHECK(persister->persist_failures() == 0);
+            CHECK(persister->backoff_for_test() == std::chrono::seconds{0});
+            const auto forced = persister->persist_staged(*rt, Trig::Forced);
+            CHECK(forced.written == 3);
+            CHECK_FALSE(forced.yielded);
+        }
+        CHECK(persister->apply_active_for_test() == 0);
+        stage_n_4045(*rt, 2, "e37d", 'b');
+        const auto after = persister->persist_staged(*rt, Trig::Worker);
+        CHECK_FALSE(after.yielded);
+        CHECK(after.written == 2);
+    }
+}
+
+TEST_CASE("#4045 E38: apply_rules holds the ApplyScope for its whole run, and a LIVE worker that "
+          "deferred re-checks soon without any further wake",
+          "[spark][guardian][baseline][reconcile]") {
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File}; // worker live, 1 h backstop
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    auto* worker = f.engine->drain_worker_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    REQUIRE(worker != nullptr);
+    HookGuard4045 hooks{*f.engine};
+
+    std::uint32_t during = 99;
+    bool worker_yielded_inline = false;
+    bool deferred_seen = false;
+    bool still_staged_during = false;
+    f.engine->set_apply_post_drain_hook_for_test([&] { // runs inside apply_rules, mtx_ held
+        during = persister->apply_active_for_test();
+        // A capture staged mid-apply: an inline Worker pass, and then the live worker once
+        // woken, must defer rather than persist.
+        rt->stage_baseline_for_test("r9", "/yuzu_test_4045_e38", std::string(64, 'a'));
+        worker_yielded_inline =
+            persister->persist_staged(*rt, GuardianBaselinePersister::Trigger::Worker).yielded;
+        const auto before = persister->yields_for_test();
+        worker->notify();
+        deferred_seen =
+            yuzu::test::spin_until([&] { return persister->yields_for_test() > before; });
+        still_staged_during = rt->staged_baseline_count_for_test() == 1;
+    });
+    // A DISABLED rule: arming one would enqueue (lifecycle / compliance entries) and so wake the
+    // worker after the apply, which would hide whether the deferral arms a re-check of its own.
+    REQUIRE(f.dispatch_raw(make_service_rule("r1", /*enabled=*/false), /*full_sync=*/false)
+                .exit_code == 0);
+    f.engine->set_apply_post_drain_hook_for_test(nullptr);
+    CHECK(during == 1);
+    CHECK(worker_yielded_inline);
+    CHECK(deferred_seen);       // RED while the worker did not defer during an apply
+    CHECK(still_staged_during);
+    CHECK(persister->apply_active_for_test() == 0); // released on return
+    // Nothing woke the worker after the apply (its backstop is an hour): only the short
+    // re-check the deferral arms can bring it back.
+    CHECK(yuzu::test::spin_until([&] { return rt->staged_baseline_count_for_test() == 0; }));
+    CHECK(baseline_record_4045(*f.kv, "r9").has_value());
+}
+
+TEST_CASE("#4045 E39: engine stop() runs the Stop pass once, apply_rules runs a Forced pass, and "
+          "a second stop() makes no further attempt",
+          "[spark][guardian][baseline][reconcile]") {
+    // Write attempts tell the triggers apart on a failing (fast) store: Forced stops after 3
+    // failures, Stop after 1 and a worker pass would be deferred by its backoff.
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    std::atomic<int> writes{0};
+    HookGuard4045 hooks{*f.engine};
+    persister->set_post_write_hook_for_test([&] { ++writes; });
+    stage_n_4045(*rt, 5, "e39");
+    fail_baseline_writes_4045(f.db_.path);
+
+    f.apply(make_file_hash_rule("r1", t.file().string()));
+    CHECK(writes.load() == 3); // apply_rules: Forced (RED if it used the Stop trigger: 1)
+    writes.store(0);
+    f.engine->stop();
+    CHECK(writes.load() == 1); // stop(): Stop (RED if it used Forced: 3)
+    writes.store(0);
+    f.engine->stop(); // what ~GuardianEngine does after an explicit stop()
+    CHECK(writes.load() == 0);
+    CHECK(rt->staged_baseline_count_for_test() == 5);
+}
+
+TEST_CASE("#4045 E40: the rotating cursor is the LAST attempted tuple, so four deterministic "
+          "failers at the head cannot starve a healthy tail",
+          "[spark][guardian][baseline][reconcile]") {
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    using Trig = GuardianBaselinePersister::Trigger;
+    persister->set_budgets_for_test(
+        with_wall_4045(yuzu::agent::kBaselinePassBudget, std::chrono::hours{1}),
+        with_wall_4045(yuzu::agent::kBaselineStopBudget, std::chrono::hours{1}));
+    stage_n_4045(*rt, 5, "e40");
+    // r0..r3 fail every time (4 failers >= max_failures 3); r4 is healthy.
+    exec_sql_4045(f.db_.path, "CREATE TRIGGER yuzu_test_4045_fail BEFORE INSERT ON kv_store WHEN "
+                              "NEW.key IN ('baseline:r0','baseline:r1','baseline:r2','baseline:r3') "
+                              "BEGIN SELECT RAISE(ABORT,'x'); END;");
+    (void)persister->persist_staged(*rt, Trig::Forced); // r0, r1, r2 fail (3 failures)
+    (void)persister->persist_staged(*rt, Trig::Forced); // must START AFTER r2: r3 fails, r4 persists
+    // RED with the cursor on the FIRST attempted tuple: every pass restarts at r0 and r4 starves.
+    CHECK(baseline_record_4045(*f.kv, "r4").has_value());
+}
+
+TEST_CASE("#4045 E41: the worker passes ITS stop flag to the pass: a pass in flight when stop() "
+          "joins the worker ends before writing anything",
+          "[spark][guardian][baseline][reconcile]") {
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File}; // worker live
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    auto* worker = f.engine->drain_worker_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    REQUIRE(worker != nullptr);
+    std::atomic<bool> in_pass{false};
+    std::atomic<bool> armed{true};
+    HookGuard4045 hooks{*f.engine};
+    persister->set_post_snapshot_hook_for_test([&] { // runs on the worker thread
+        if (!armed.exchange(false))
+            return;
+        in_pass.store(true);
+        (void)yuzu::test::spin_until([&] { return worker->stop_requested_for_test(); });
+    });
+    stage_n_4045(*rt, 3, "e41");
+    worker->notify();
+    REQUIRE(yuzu::test::spin_until([&] { return in_pass.load(); }));
+    worker->stop(); // sets the flag the parked hook is waiting for, then joins
+    // RED if the worker passed no stop predicate: the pass would then write all three.
+    CHECK(rt->staged_baseline_count_for_test() == 3);
+    CHECK(persister->persist_failures() == 0);
+}
+
+TEST_CASE("#4045 E42: engine stop() marks its start before joining the worker, so a worker pass "
+          "that fails slowly DURING the stop and leaves the stop late makes the stop flush skip",
+          "[spark][guardian][baseline][reconcile]") {
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File}; // worker live
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    auto* worker = f.engine->drain_worker_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    REQUIRE(worker != nullptr);
+    std::atomic<int> attempts{0};
+    std::atomic<bool> in_hook{false};
+    // An injected clock makes the failed write count as slow (it must take at least
+    // kBaselineStopTroubleThreshold) and the stop late (kBaselineStopLatestStart past its mark)
+    // without burning that long on the real clock. Only the worker's hook below advances it, so
+    // the live worker cannot race it.
+    FakeClock4045 clock{*persister};
+    HookGuard4045 hooks{*f.engine};
+    fail_baseline_writes_4045(f.db_.path);
+    // The worker's first write parks until stop() has been requested, which is after
+    // GuardianEngine::stop() marked its start, then "takes" the latest start on the injected
+    // clock (which is also far above the trouble threshold). Installed BEFORE anything is
+    // staged, so whichever wake runs the first pass sees it.
+    persister->set_post_write_hook_for_test([&] {
+        if (++attempts != 1)
+            return;
+        in_hook.store(true);
+        (void)yuzu::test::spin_until([&] { return worker->stop_requested_for_test(); });
+        clock.advance(yuzu::agent::kBaselineStopLatestStart.count());
+    });
+    stage_n_4045(*rt, 3, "e42");
+    worker->notify();
+    REQUIRE(yuzu::test::spin_until([&] { return in_hook.load(); }));
+    // The write began at the clock's current reading and has not ended: moving the clock now
+    // puts stop()'s mark strictly BETWEEN the write's start and its end, so a stall stamped
+    // with the write's START (before the mark) would not count as this stop's.
+    clock.advance(1);
+    f.engine->stop();
+    // RED if stop() did not mark its start: the flush would then not skip and make a second
+    // attempt, spending another busy timeout of the shared shutdown deadline.
+    CHECK(attempts.load() == 1);
+    CHECK(rt->staged_baseline_count_for_test() == 3);
+    // The operator-visible ERROR line was emitted from the real stop(), once.
+    CHECK(persister->stop_skip_logs_for_test(GuardianBaselinePersister::StopSkip::Stalled) == 1);
+    f.engine->stop(); // what ~GuardianEngine does: no second line
+    CHECK(persister->stop_skip_logs_for_test(GuardianBaselinePersister::StopSkip::Stalled) == 1);
+}
+
+TEST_CASE("#4045 E43: a full_sync push inside the staging-failure window still reports drift "
+          "against the ORIGINAL capture (the withdrawal stages it before the re-arm)",
+          "[spark][guardian][baseline][reconcile]") {
+    // apply_rules(full_sync) withdraws every generation before it re-arms, so attach_core finds
+    // no prior generation to retry from; the withdrawal itself must stage the committed hash.
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    const fs::path target = t.file();
+    Spark4045Target::write(target, "content A");
+    const std::string h_a = hash_of_4045(target);
+
+    rt->fail_next_stage_baseline_for_test(); // the arm-time capture is not staged
+    f.apply(make_file_hash_rule("r1", target.string()));
+    REQUIRE(yuzu::test::spin_until([&] { return rt->staged_baseline_drops() == 1; }));
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+
+    Spark4045Target::write(target, "content B, longer");
+    const std::string h_b = hash_of_4045(target);
+    REQUIRE(h_b != h_a);
+    std::vector<OutboxEntry> drained;
+    rt->drain([&](const OutboxEntry& e) { // discard what the arm produced
+        return SendResult::Sent;
+    });
+    f.apply(make_file_hash_rule("r1", target.string()), /*full_sync=*/true);
+    eval_initial_4045(*f.engine, target);
+    const bool drifted = yuzu::test::spin_until([&] {
+        rt->drain([&](const OutboxEntry& e) {
+            drained.push_back(e);
+            return SendResult::Sent;
+        });
+        for (const auto& e : drained)
+            if (e.domain == yuzu::agent::OutboxDomain::Compliance && !e.drift.compliant &&
+                e.drift.expected_value == h_a && e.drift.detected_value == h_b)
+                return true;
+        return false;
+    });
+    CHECK(drifted); // RED: the re-armed rule captured B as its baseline and reported compliant
+    const auto out = persist_now_4045(*f.engine);
+    (void)out;
+    const auto rec = baseline_record_4045(*f.kv, "r1");
+    REQUIRE(rec.has_value());
+    CHECK(rec->value("hash", std::string{}) == h_a);
+}
+
+TEST_CASE("#4045 E44: a clean stop() stages a capture whose staging failed, so the ORIGINAL "
+          "hash is the one persisted",
+          "[spark][guardian][baseline][reconcile]") {
+    // stop() withdraws no rule, so the withdrawal staging of E43 never runs at a stop: without
+    // a stop-time stage the committed capture dies with the process and the next boot
+    // re-captures whatever the file holds then.
+    Spark4045Target t;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    const fs::path target = t.file();
+    Spark4045Target::write(target, "content A");
+    const std::string h_a = hash_of_4045(target);
+
+    SECTION("one staging failure: stop stages the committed hash and flushes it") {
+        rt->fail_next_stage_baseline_for_test(); // the arm-time capture is not staged
+        f.apply(make_file_hash_rule("r1", target.string()));
+        REQUIRE(yuzu::test::spin_until([&] { return rt->staged_baseline_drops() == 1; }));
+        CHECK(rt->staged_baseline_count_for_test() == 0);
+        Spark4045Target::write(target, "content B, longer"); // the file changes before the stop
+        f.engine->stop();
+        // RED if the sweep ran before the runtime began stopping: a commit could then still
+        // stage between the sweep and the Stop pass and be lost.
+        CHECK(rt->unstaged_sweep_stopping_for_test() == 1);
+        CHECK(f.engine->baseline_stop_unstaged_logs_for_test() == 0);
+        const auto rec = baseline_record_4045(*f.kv, "r1");
+        REQUIRE(rec.has_value()); // RED: absent, the capture was never staged at stop
+        CHECK(rec->value("hash", std::string{}) == h_a);
+        CHECK(rt->staged_baseline_count_for_test() == 0);
+        CHECK(rt->staged_baseline_drops() == 1); // the stop-time stage succeeded: no new drop
+    }
+    SECTION("a second staging failure at stop is counted, not thrown, and loses only that capture") {
+        rt->fail_next_stage_baseline_for_test(2); // the arm-time stage and the stop-time one
+        f.apply(make_file_hash_rule("r1", target.string()));
+        REQUIRE(yuzu::test::spin_until([&] { return rt->staged_baseline_drops() == 1; }));
+        f.engine->stop();
+        CHECK(rt->staged_baseline_drops() == 2);
+        CHECK_FALSE(baseline_record_4045(*f.kv, "r1").has_value());
+        // The loss has a log line (the drop counter dies with the process): one ERROR line from
+        // the real stop(), and none from the destructor's second stop().
+        CHECK(f.engine->baseline_stop_unstaged_logs_for_test() == 1);
+        f.engine->stop();
+        CHECK(f.engine->baseline_stop_unstaged_logs_for_test() == 1);
+    }
+    SECTION("a capture that did stage normally is not staged again (no extra drop, one record)") {
+        f.apply(make_file_hash_rule("r1", target.string()));
+        REQUIRE(yuzu::test::spin_until([&] { return rt->staged_baseline_count_for_test() == 1; }));
+        f.engine->stop();
+        CHECK(rt->staged_baseline_drops() == 0);
+        const auto rec = baseline_record_4045(*f.kv, "r1");
+        REQUIRE(rec.has_value());
+        CHECK(rec->value("hash", std::string{}) == h_a);
+    }
+}
+
+// ── #4045: shared stop deadline ───────────────────────────────────────────────────────────
+TEST_CASE("#4045 E45: stop() marks its start BEFORE it waits for the engine mutex, so a stall "
+          "that ends while it is queued behind an apply_rules is this stop's",
+          "[spark][guardian][baseline][reconcile]") {
+    using Trig = GuardianBaselinePersister::Trigger;
+    using Skip = GuardianBaselinePersister::StopSkip;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    std::atomic<int> writes{0};
+    std::atomic<bool> in_apply{false};
+    std::atomic<bool> release{false};
+    int apply_rc = -1;
+    FakeClock4045 clock{*persister};
+    HookGuard4045 hooks{*f.engine};
+
+    f.engine->set_apply_post_drain_hook_for_test([&] { // runs inside apply_rules, mtx_ held
+        in_apply.store(true);
+        // Bounded far above the main thread's 5 s wait below, so that wait is the one that times
+        // out first when stop() never marks, and the hook cannot release stop() by timing out.
+        (void)yuzu::test::spin_until([&] { return release.load(); }, std::chrono::seconds{30});
+    });
+    std::thread apply_thread([&] {
+        apply_rc = f.dispatch_raw(make_service_rule("r1", /*enabled=*/false), false).exit_code;
+    });
+    Join4045 join_apply{apply_thread};
+    yuzu::test::ScopeExit unpark_apply{[&] { release.store(true); }}; // before join_apply joins
+    REQUIRE(yuzu::test::spin_until([&] { return in_apply.load(); }));
+
+    // apply_rules holds mtx_. Captures staged now, and a store that fails SLOWLY.
+    stage_n_4045(*rt, 3, "e45");
+    fail_baseline_writes_4045(f.db_.path);
+    std::atomic<bool> in_write{false};
+    persister->set_post_write_hook_for_test([&] {
+        ++writes;
+        in_write.store(true);
+        // The failed write has run but has not ended: hold it here until stop() has taken its
+        // mark, then make it slow AND leave the stop late.
+        (void)yuzu::test::spin_until([&] { return persister->stop_begun_for_test(); },
+                                     std::chrono::seconds{30});
+        clock.advance(yuzu::agent::kBaselineStopLatestStart.count());
+    });
+    GuardianBaselinePersister::Outcome forced;
+    std::thread pass_thread([&] { forced = persister->persist_staged(*rt, Trig::Forced); });
+    Join4045 join_pass{pass_thread};
+    REQUIRE(yuzu::test::spin_until([&] { return in_write.load(); }));
+    // stop() begins while the write is in flight: its mark lies strictly between the write's
+    // start and its end, so a stall stamped with the write's START would predate it.
+    clock.advance(1);
+    std::thread stop_thread([&] { f.engine->stop(); });
+    Join4045 join_stop{stop_thread};
+    yuzu::test::ScopeExit unpark_stop{[&] { release.store(true); }}; // before join_stop joins
+    // stop() cannot have the mutex, yet its mark is already taken. RED if the mark is taken
+    // after the lock: it would only appear once the apply_rules below returns.
+    REQUIRE(yuzu::test::spin_until([&] { return persister->stop_begun_for_test(); }));
+
+    // The slow failure ends after the mark, while stop() is still queued for the mutex.
+    pass_thread.join();
+    CHECK(forced.failed == 1);
+    const int before = writes.load();
+    release.store(true);
+    apply_thread.join();
+    stop_thread.join();
+    CHECK(apply_rc == 0);
+    // RED if the mark were taken after stop() got the mutex: the stall would then predate it,
+    // and the late Stop pass would spend another busy timeout of the shutdown deadline.
+    CHECK(writes.load() == before);
+    CHECK(persister->stop_skip_logs_for_test(Skip::Stalled) == 1);
+    CHECK(rt->staged_baseline_count_for_test() == 3);
+}
+
+TEST_CASE("#4045 E46: a Stop pass that cannot start inside kBaselineStopLatestStart of the stop "
+          "mark, after this stop ran a slow stage, is skipped and logged, one that can is not",
+          "[spark][guardian][baseline][reconcile]") {
+    using namespace std::chrono_literals;
+    using Trig = GuardianBaselinePersister::Trigger;
+    using Skip = GuardianBaselinePersister::StopSkip;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    FakeClock4045 clock{*persister};
+    HookGuard4045 hooks{*f.engine};
+
+    // The constants behind the rule: the grace stop() shares and the one write that must still
+    // fit inside it. A drift in either (agent.cpp's kShutdownDeadlineGrace, KvStore's stop busy
+    // timeout) must be a conscious edit here.
+    CHECK(yuzu::agent::kBaselineShutdownGrace == 20'000ms);
+    CHECK(yuzu::agent::kKvStoreBusyTimeout == 5'000ms);
+    CHECK(yuzu::agent::kKvStoreStopBusyTimeout == 1'000ms); // the unit the 18 s is derived in
+    CHECK(yuzu::agent::kBaselineStopLatestStart == 18'000ms);
+
+    stage_n_4045(*rt, 3, "e46");
+    persister->begin_stop();
+    persister->note_stop_store_trouble(); // the evidence rule is E53's; this case pins the bound
+
+    SECTION("one millisecond before the latest start: the pass runs") {
+        clock.advance(17'999);
+        const auto out = persister->persist_staged(*rt, Trig::Stop);
+        CHECK_FALSE(out.skipped_late_start);
+        CHECK(out.written == 3);
+        CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 0);
+    }
+    SECTION("at the latest start: skipped, nothing attempted, nothing lost, logged once") {
+        clock.advance(18'000);
+        std::atomic<int> writes{0};
+        persister->set_post_write_hook_for_test([&] { ++writes; });
+        const auto out = persister->persist_staged(*rt, Trig::Stop);
+        CHECK(out.skipped_late_start);
+        CHECK_FALSE(out.skipped_after_stall); // a different reason from the stall skip
+        CHECK(out.written == 0);
+        CHECK(out.failed == 0);
+        CHECK(writes.load() == 0);
+        CHECK(rt->staged_baseline_count_for_test() == 3);
+        CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 1);
+        CHECK(persister->stop_skip_logs_for_test(Skip::Stalled) == 0);
+        CHECK(persister->persist_staged(*rt, Trig::Forced).written == 3);
+    }
+    SECTION("a skipped pass with nothing staged is silent") {
+        clock.advance(20'000);
+        CHECK(persister->persist_staged(*rt, Trig::Forced).written == 3);
+        const auto out = persister->persist_staged(*rt, Trig::Stop);
+        CHECK(out.skipped_late_start);
+        CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 0);
+    }
+    SECTION("only a Stop pass is bounded by the mark") {
+        clock.advance(60'000);
+        CHECK(persister->persist_staged(*rt, Trig::Worker).written == 3);
+    }
+}
+
+TEST_CASE("#4045 E47: the stop mark does not depend on the clock reading a non-zero value",
+          "[spark][guardian][baseline][reconcile]") {
+    // A clock whose epoch reads 0 must still produce a valid mark: the mark's validity is its
+    // own state, not a sentinel value of the timestamp.
+    using Trig = GuardianBaselinePersister::Trigger;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    auto ms = std::make_shared<std::atomic<std::int64_t>>(0);
+    persister->set_clock_for_test([ms] {
+        return std::chrono::steady_clock::time_point{} + std::chrono::milliseconds{ms->load()};
+    });
+    yuzu::test::ScopeExit restore{[&] { persister->set_clock_for_test({}); }};
+    HookGuard4045 hooks{*f.engine};
+    stage_n_4045(*rt, 3, "e47");
+    fail_baseline_writes_4045(f.db_.path);
+    persister->begin_stop(); // the mark reads rep 0
+    CHECK(persister->stop_begun_for_test());
+    persister->set_post_write_hook_for_test([&] { ms->fetch_add(18'000); });
+    CHECK(persister->persist_staged(*rt, Trig::Forced).failed == 1); // slow, ends at 18 s
+    ms->fetch_add(1);
+    persister->begin_stop(); // a second call must not move the mark either
+    const auto stop = persister->persist_staged(*rt, Trig::Stop);
+    CHECK(stop.skipped_after_stall); // RED if a rep-0 mark were read as "no stop begun"
+}
+
+TEST_CASE("#4045 E48: the operator-visible stop-time lines are emitted at their call sites and "
+          "carry the wording metrics.md tells operators to search for",
+          "[spark][guardian][baseline][reconcile]") {
+    // What is pinned, honestly: the line text (pure functions, scraped against metrics.md) and
+    // that each CALL SITE is reached exactly when it should be (a counter beside the log call).
+    // spdlog output itself cannot be captured across the agent-core / test-binary image
+    // boundary (the same reason as info_logs_for_test), so deleting only the spdlog::error call
+    // inside a site, keeping its counter, is not detected.
+    using Skip = GuardianBaselinePersister::StopSkip;
+    using Trig = GuardianBaselinePersister::Trigger;
+    const auto skip_stalled = GuardianBaselinePersister::stop_skip_log_line(Skip::Stalled);
+    const auto skip_late = GuardianBaselinePersister::stop_skip_log_line(Skip::LateStart);
+    const auto incomplete = GuardianBaselinePersister::stop_incomplete_log_line(2, true);
+    CHECK(skip_stalled != skip_late);
+    CHECK(incomplete ==
+          "Guardian: the final Spark baseline flush at stop was incomplete (failed=2, "
+          "budget_exhausted=true); staged captures are lost to this process (#4045)");
+    for (const auto& line : {skip_stalled, skip_late, incomplete})
+        CHECK(line.find('\n') == std::string::npos);
+
+    CHECK(skip_stalled.find("skipped the final Spark baseline flush at stop") != std::string::npos);
+    CHECK(skip_late.find("skipped the final Spark baseline flush at stop") != std::string::npos);
+    CHECK(incomplete.find("the final Spark baseline flush at stop was incomplete") !=
+          std::string::npos);
+    CHECK(GuardianBaselinePersister::stop_unstaged_log_line(2) ==
+          "Guardian: 2 committed Spark baseline capture(s) could not be staged for the final "
+          "flush at stop; they are lost to this process (#4045)");
+    CHECK(GuardianBaselinePersister::stop_unstaged_log_line(1).find('\n') == std::string::npos);
+    const auto flush_threw = GuardianBaselinePersister::stop_flush_threw_log_line();
+    const auto sweep_threw = GuardianBaselinePersister::stop_sweep_threw_log_line();
+    CHECK(flush_threw ==
+          "Guardian: the final Spark baseline flush at stop was cut short by an allocation or "
+          "lock failure; captures it had not written are lost to this process (#4045)");
+    CHECK(sweep_threw ==
+          "Guardian: staging the committed Spark baseline captures for the final flush at stop "
+          "failed (an allocation or lock failure); captures that were never staged are lost to "
+          "this process (#4045)");
+    for (const auto& line : {flush_threw, sweep_threw})
+        CHECK(line.find('\n') == std::string::npos);
+
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+
+    SECTION("a healthy stop logs none of the ERROR lines and one INFO line per capture") {
+        stage_n_4045(*rt, 2, "e48h");
+        f.engine->stop();
+        CHECK(f.engine->baseline_stop_incomplete_logs_for_test() == 0);
+        CHECK(f.engine->baseline_stop_flush_threw_logs_for_test() == 0);
+        CHECK(f.engine->baseline_stop_sweep_threw_logs_for_test() == 0);
+        CHECK(f.engine->baseline_stop_unstaged_logs_for_test() == 0);
+        CHECK(persister->stop_skip_logs_for_test(Skip::Stalled) == 0);
+        CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 0);
+        CHECK(persister->info_logs_for_test() == 2);
+    }
+    SECTION("a stop whose pass fails logs the incomplete line once, and not again on the "
+            "destructor's second stop()") {
+        stage_n_4045(*rt, 2, "e48i");
+        fail_baseline_writes_4045(f.db_.path);
+        f.engine->stop();
+        CHECK(f.engine->baseline_stop_incomplete_logs_for_test() == 1);
+        CHECK(persister->stop_skip_logs_for_test(Skip::Stalled) == 0);
+        f.engine->stop();
+        CHECK(f.engine->baseline_stop_incomplete_logs_for_test() == 1);
+    }
+    SECTION("a Stop pass cut short by a throw logs the flush-threw line once") {
+        stage_n_4045(*rt, 2, "e48t");
+        const auto before = persister->firewalled_exceptions();
+        rt->fail_next_snapshot_for_test();
+        f.engine->stop();
+        CHECK(f.engine->baseline_stop_flush_threw_logs_for_test() == 1);
+        CHECK(f.engine->baseline_stop_sweep_threw_logs_for_test() == 0);
+        CHECK(persister->firewalled_exceptions() == before + 1);
+        CHECK(f.engine->baseline_stop_incomplete_logs_for_test() == 0);
+        f.engine->stop();
+        CHECK(f.engine->baseline_stop_flush_threw_logs_for_test() == 1);
+    }
+    SECTION("a staging sweep that throws from its lock logs the sweep-threw line once and the "
+            "Stop pass still runs") {
+        stage_n_4045(*rt, 2, "e48w");
+        const auto before = persister->firewalled_exceptions();
+        rt->fail_next_unstaged_sweep_for_test();
+        f.engine->stop();
+        CHECK(f.engine->baseline_stop_sweep_threw_logs_for_test() == 1);
+        CHECK(f.engine->baseline_stop_flush_threw_logs_for_test() == 0);
+        CHECK(persister->firewalled_exceptions() == before + 1);
+        CHECK(rt->staged_baseline_count_for_test() == 0); // the pass after the sweep persisted
+        CHECK(baseline_record_4045(*f.kv, "r0").has_value());
+    }
+    SECTION("a late Stop pass skipped by a stall logs the stall line, not the incomplete one") {
+        FakeClock4045 clock{*persister};
+        stage_n_4045(*rt, 2, "e48s");
+        fail_baseline_writes_4045(f.db_.path);
+        HookGuard4045 hooks{*f.engine};
+        persister->begin_stop();
+        persister->set_post_write_hook_for_test(
+            [&] { clock.advance(yuzu::agent::kBaselineStopLatestStart.count()); });
+        CHECK(persister->persist_staged(*rt, Trig::Forced).failed == 1);
+        CHECK(persister->persist_staged(*rt, Trig::Stop).skipped_after_stall);
+        CHECK(persister->stop_skip_logs_for_test(Skip::Stalled) == 1);
+        CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 0);
+        CHECK(f.engine->baseline_stop_incomplete_logs_for_test() == 0);
+    }
+}
+
+// ── #4045: stall timing, waiter accounting, production budgets, setter locks ──────────────
+TEST_CASE("#4045 E49: the stall mark is the END of the SLOW write, timed per write, and any slow "
+          "failure in a pass counts",
+          "[spark][guardian][baseline][reconcile]") {
+    using Trig = GuardianBaselinePersister::Trigger;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    FakeClock4045 clock{*persister};
+    HookGuard4045 hooks{*f.engine};
+    // The trouble threshold (750 ms, kBaselineStopTroubleThreshold) decides what is slow; the
+    // pass wall is a 1 h one so these passes always run to their failure budget.
+    persister->set_budgets_for_test(
+        with_wall_4045(yuzu::agent::kBaselinePassBudget, std::chrono::hours{1}),
+        {64, 1, std::chrono::milliseconds{1000}});
+    stage_n_4045(*rt, 3, "e49");
+
+    SECTION("the mark is when the slow write ENDED, not when the pass ended") {
+        // RED if stalled_at_ were the pass's end time: the stall would then look newer than
+        // the stop that began between the slow write and the end of the pass.
+        fail_baseline_writes_4045(f.db_.path);
+        int n = 0;
+        persister->set_post_write_hook_for_test([&] {
+            ++n;
+            if (n == 1) {
+                clock.advance(5000); // the slow failure, over BEFORE the mark
+                return;
+            }
+            clock.advance(1);
+            if (n == 2)
+                persister->begin_stop(); // stop begins mid-pass, after the slow write
+        });
+        CHECK(persister->persist_staged(*rt, Trig::Forced).failed == 3);
+        persister->set_post_write_hook_for_test(nullptr);
+        // late: only staleness saves it
+        clock.advance(yuzu::agent::kBaselineStopLatestStart.count());
+        CHECK_FALSE(persister->persist_staged(*rt, Trig::Stop).skipped_after_stall);
+    }
+    SECTION("slowness is timed per failing write, not from the start of the pass") {
+        // r0 and r1 succeed slowly (2 s each), r2 fails FAST. RED if slowness were measured from
+        // the pass start: the fast failure would then look slow and skip a flush that costs
+        // nothing, losing the captures on a store that merely has one bad key.
+        exec_sql_4045(f.db_.path, "CREATE TRIGGER yuzu_test_4045_fail BEFORE INSERT ON kv_store "
+                                  "WHEN NEW.key = 'baseline:r2' BEGIN SELECT RAISE(ABORT,'x'); END;");
+        int n = 0;
+        persister->set_post_write_hook_for_test([&] {
+            if (++n <= 2)
+                clock.advance(2000);
+        });
+        persister->begin_stop();
+        const auto pass = persister->persist_staged(*rt, Trig::Worker);
+        CHECK(pass.written == 2);
+        CHECK(pass.failed == 1);
+        persister->set_post_write_hook_for_test(nullptr);
+        // late: only the evidence matters
+        clock.advance(yuzu::agent::kBaselineStopLatestStart.count());
+        const auto stop = persister->persist_staged(*rt, Trig::Stop);
+        CHECK_FALSE(stop.skipped_after_stall);
+        CHECK(stop.failed == 1); // it tried the one remaining capture
+    }
+    SECTION("a slow failure followed by a fast one in the same pass is still a stall") {
+        // RED if only the LAST failure's speed counted.
+        fail_baseline_writes_4045(f.db_.path);
+        int n = 0;
+        // The stop's mark is taken right after the slow write ends, so it lies between that
+        // write's start and its end (a stall stamped with the write's START would predate it).
+        persister->set_post_write_hook_for_test([&] {
+            if (++n == 1) {
+                clock.advance(5000);
+                persister->begin_stop();
+            } else {
+                clock.advance(1);
+            }
+        });
+        CHECK(persister->persist_staged(*rt, Trig::Forced).failed == 3);
+        persister->set_post_write_hook_for_test(nullptr);
+        clock.advance(yuzu::agent::kBaselineStopLatestStart.count()); // a late start
+        CHECK(persister->persist_staged(*rt, Trig::Stop).skipped_after_stall);
+    }
+}
+
+TEST_CASE("#4045 E50: a waiter that has come and gone leaves no yield behind: the next Worker "
+          "pass runs normally",
+          "[spark][guardian][baseline][reconcile]") {
+    // The Worker pass yields to a counted waiter; if the count leaked, every later Worker pass
+    // would yield before its first tuple forever and only apply_rules and stop() would persist.
+    using Trig = GuardianBaselinePersister::Trigger;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    stage_n_4045(*rt, 5, "e50");
+    std::atomic<bool> in_pass{false};
+    std::atomic<bool> release{false};
+    std::atomic<bool> armed{true};
+    HookGuard4045 hooks{*f.engine};
+    persister->set_post_write_hook_for_test([&] {
+        if (!armed.exchange(false))
+            return;
+        in_pass.store(true);
+        (void)yuzu::test::spin_until([&] { return release.load(); });
+    });
+    GuardianBaselinePersister::Outcome worker;
+    std::thread a([&] { worker = persister->persist_staged(*rt, Trig::Worker); });
+    Join4045 join_a{a};
+    // Declared after the join guards, so a failing REQUIRE releases the parked pass BEFORE any
+    // of them tries to join it.
+    yuzu::test::ScopeExit unpark{[&] { release.store(true); }};
+    REQUIRE(yuzu::test::spin_until([&] { return in_pass.load(); }));
+
+    SECTION("a seed-fence waiter") {
+        std::thread b([&] { auto fence = persister->hold_seed_fence(); });
+        Join4045 join_b{b};
+        yuzu::test::ScopeExit unpark_b{[&] { release.store(true); }};
+        REQUIRE(yuzu::test::spin_until([&] { return persister->lock_waiters_for_test() == 1; }));
+        release.store(true);
+        a.join();
+        b.join();
+        CHECK(worker.yielded);
+        persister->set_post_write_hook_for_test(nullptr);
+        const auto next = persister->persist_staged(*rt, Trig::Worker);
+        CHECK_FALSE(next.yielded); // RED if the waiter count leaked
+        CHECK(next.written == 4);
+    }
+    SECTION("a Forced pass") {
+        GuardianBaselinePersister::Outcome forced;
+        std::thread b([&] { forced = persister->persist_staged(*rt, Trig::Forced); });
+        Join4045 join_b{b};
+        yuzu::test::ScopeExit unpark_b{[&] { release.store(true); }};
+        REQUIRE(yuzu::test::spin_until([&] { return persister->lock_waiters_for_test() == 1; }));
+        release.store(true);
+        a.join();
+        b.join();
+        CHECK(worker.yielded);
+        CHECK(forced.written == 4); // it persisted what the yielding worker left
+        persister->set_post_write_hook_for_test(nullptr);
+        stage_n_4045(*rt, 2, "e50b", 'b');
+        const auto next = persister->persist_staged(*rt, Trig::Worker);
+        CHECK_FALSE(next.yielded); // RED if the waiter count leaked
+        CHECK(next.written == 2);
+    }
+}
+
+TEST_CASE("#4045 E51: the production pass budgets are pinned, and the stop wall bounds a stop "
+          "pass on the persister's own defaults",
+          "[spark][guardian][baseline][reconcile]") {
+    using namespace std::chrono_literals;
+    using Trig = GuardianBaselinePersister::Trigger;
+    // The user manual and design s24 quote these numbers: a change is a conscious edit here.
+    CHECK(yuzu::agent::kBaselinePassBudget.max_tuples == 64);
+    CHECK(yuzu::agent::kBaselinePassBudget.max_failures == 3);
+    CHECK(yuzu::agent::kBaselinePassBudget.max_wall == 2000ms);
+    CHECK(yuzu::agent::kBaselineStopBudget.max_tuples == (std::numeric_limits<std::size_t>::max)());
+    CHECK(yuzu::agent::kBaselineStopBudget.max_failures == 1);
+    CHECK(yuzu::agent::kBaselineStopBudget.max_wall == 1000ms);
+
+    // And the persister really runs on them (no set_budgets_for_test here): each write takes
+    // 600 ms of injected time, so a 1000 ms stop wall ends the pass after the SECOND write.
+    // RED for a stop wall of 1 ms (one write) and for 2 s or more (all three).
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    FakeClock4045 clock{*persister};
+    HookGuard4045 hooks{*f.engine};
+    stage_n_4045(*rt, 3, "e51");
+    persister->set_post_write_hook_for_test([&] { clock.advance(600); });
+    const auto out = persister->persist_staged(*rt, Trig::Stop);
+    CHECK(out.written == 2);
+    CHECK(out.budget_exhausted);
+    CHECK(rt->staged_baseline_count_for_test() == 1);
+}
+
+TEST_CASE("#4045 E52: the test-hook and budget setters wait for a pass in flight (they take "
+          "persist_mu_), so they are safe against the live worker",
+          "[spark][guardian][baseline][reconcile]") {
+    // Negative pin: while a pass is parked holding persist_mu_, a setter must NOT return. The
+    // probe waits a short bounded time and expects no return; with the lock present it can never
+    // return early (no flake), and with the lock removed it returns at once and fails the case.
+    // (set_backoff_for_test's lock is pinned by E29 under TSan.)
+    using Trig = GuardianBaselinePersister::Trigger;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    std::atomic<bool> in_pass{false};
+    std::atomic<bool> release{false};
+    std::atomic<int> returned{0};
+    HookGuard4045 hooks{*f.engine};
+    const auto parked = [&] {
+        in_pass.store(true);
+        (void)yuzu::test::spin_until([&] { return release.load(); });
+    };
+    const auto quiet_for_a_moment = [&] {
+        return !yuzu::test::spin_until([&] { return returned.load() > 0; },
+                                       std::chrono::milliseconds{50});
+    };
+
+    SECTION("a pass parked after its snapshot: the write-hook and budget setters wait") {
+        stage_n_4045(*rt, 1, "e52a");
+        persister->set_post_snapshot_hook_for_test(parked);
+        std::thread pass([&] { (void)persister->persist_staged(*rt, Trig::Forced); });
+        Join4045 join_pass{pass};
+        yuzu::test::ScopeExit unpark_pass{[&] { release.store(true); }};
+        REQUIRE(yuzu::test::spin_until([&] { return in_pass.load(); }));
+        std::thread s1([&] {
+            persister->set_post_write_hook_for_test(nullptr);
+            ++returned;
+        });
+        Join4045 join_s1{s1};
+        std::thread s2([&] {
+            persister->set_budgets_for_test(yuzu::agent::kBaselinePassBudget,
+                                            yuzu::agent::kBaselineStopBudget);
+            ++returned;
+        });
+        Join4045 join_s2{s2};
+        CHECK(quiet_for_a_moment()); // RED if either setter skipped the lock
+        release.store(true);
+        s1.join();
+        s2.join();
+        pass.join();
+        CHECK(returned.load() == 2);
+    }
+    SECTION("a pass parked after a write: the snapshot-hook setter waits") {
+        stage_n_4045(*rt, 1, "e52b");
+        persister->set_post_write_hook_for_test(parked);
+        std::thread pass([&] { (void)persister->persist_staged(*rt, Trig::Forced); });
+        Join4045 join_pass{pass};
+        yuzu::test::ScopeExit unpark_pass{[&] { release.store(true); }};
+        REQUIRE(yuzu::test::spin_until([&] { return in_pass.load(); }));
+        std::thread s([&] {
+            persister->set_post_snapshot_hook_for_test(nullptr);
+            ++returned;
+        });
+        Join4045 join_s{s};
+        CHECK(quiet_for_a_moment()); // RED if the setter skipped the lock
+        release.store(true);
+        s.join();
+        pass.join();
+        CHECK(returned.load() == 1);
+    }
+}
+
+// ── #4045: the late-start skip is health-gated ─────────────────────────────────────────────
+TEST_CASE("#4045 E48b: metrics.md names the stop-time lines an operator is told to search for",
+          "[spark][guardian][baseline][reconcile]") {
+    namespace fs = std::filesystem;
+    // Locate the doc without a build-injected root: $MESON_SOURCE_ROOT, then walking up from the
+    // working directory, then from this source file. A binary run from outside the tree finds
+    // none of them and SKIPS (a loud message, not a failure of the code under test).
+    const fs::path rel{"docs/user-manual/metrics.md"};
+    std::vector<fs::path> starts;
+    if (const char* root = std::getenv("MESON_SOURCE_ROOT"))
+        starts.emplace_back(root);
+    std::error_code ec;
+    starts.emplace_back(fs::current_path(ec));
+    starts.emplace_back(fs::absolute(fs::path(__FILE__), ec).parent_path());
+    fs::path doc;
+    for (auto base : starts) {
+        for (int up = 0; up < 8 && doc.empty(); ++up) {
+            if (fs::exists(base / rel, ec))
+                doc = base / rel;
+            if (!base.has_parent_path() || base.parent_path() == base)
+                break;
+            base = base.parent_path();
+        }
+        if (!doc.empty())
+            break;
+    }
+    if (doc.empty())
+        SKIP("docs/user-manual/metrics.md not found from $MESON_SOURCE_ROOT, the working "
+             "directory or this source file: run the binary from inside the source tree");
+    std::ifstream in(doc);
+    const std::string text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    REQUIRE_FALSE(text.empty());
+    for (const char* phrase : {"the final Spark baseline flush at stop was incomplete",
+                               "skipped the final Spark baseline flush at stop",
+                               "could not be staged for the final flush at stop",
+                               "flush at stop was cut short by an allocation or lock failure",
+                               "captures for the final flush at stop failed"}) {
+        INFO("metrics.md must name: " << phrase);
+        CHECK(text.find(phrase) != std::string::npos);
+    }
+}
+
+TEST_CASE("#4045 E53: store trouble is a stage that took 750 ms or more, and only with it "
+          "does a late start skip the Stop pass",
+          "[spark][guardian][baseline][reconcile]") {
+    using Trig = GuardianBaselinePersister::Trigger;
+    using Skip = GuardianBaselinePersister::StopSkip;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    FakeClock4045 clock{*persister};
+    HookGuard4045 hooks{*f.engine};
+
+    SECTION("the threshold is the stop busy budget less a 250 ms measurement slack") {
+        using namespace std::chrono_literals;
+        static_assert(yuzu::agent::kBaselineStopTroubleSlack == 250ms);
+        CHECK(yuzu::agent::kBaselineStopTroubleThreshold == 750ms);
+        CHECK(yuzu::agent::kBaselineStopTroubleThreshold ==
+              yuzu::agent::kKvStoreStopBusyTimeout - yuzu::agent::kBaselineStopTroubleSlack);
+    }
+    SECTION("stop_stage_end: a stage under the threshold is not trouble, one at it is") {
+        auto began = persister->stop_stage_begin();
+        clock.advance(749);
+        persister->stop_stage_end(began);
+        CHECK_FALSE(persister->stop_store_trouble_for_test());
+        began = persister->stop_stage_begin();
+        clock.advance(750);
+        persister->stop_stage_end(began);
+        CHECK(persister->stop_store_trouble_for_test());
+    }
+    SECTION("a stage of a whole stop busy budget (what a BUSY store costs) is trouble") {
+        const auto began = persister->stop_stage_begin();
+        clock.advance(1'000);
+        persister->stop_stage_end(began);
+        CHECK(persister->stop_store_trouble_for_test());
+    }
+    SECTION("a BUSY stage that measures a little under the budget is still trouble") {
+        const auto began = persister->stop_stage_begin();
+        // The stage is timed by a different clock reading than the handler's own deadline check,
+        // so a BUSY stage can measure a little under the 1 s budget: 985 ms is still over the
+        // 750 ms threshold, which is why the threshold sits below the budget.
+        clock.advance(985);
+        persister->stop_stage_end(began);
+        CHECK(persister->stop_store_trouble_for_test());
+    }
+    SECTION("a stage that ends at once (a fast failure looks like this) is not trouble") {
+        persister->stop_stage_end(persister->stop_stage_begin());
+        CHECK_FALSE(persister->stop_store_trouble_for_test());
+    }
+    SECTION("a late start with NO trouble runs: a healthy pass is not cut for being late") {
+        stage_n_4045(*rt, 3, "e53a");
+        persister->begin_stop();
+        clock.advance(19'000);
+        const auto out = persister->persist_staged(*rt, Trig::Stop);
+        CHECK_FALSE(out.skipped_late_start);
+        CHECK(out.written == 3);
+        CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 0);
+    }
+    SECTION("a late start WITH trouble skips") {
+        stage_n_4045(*rt, 3, "e53b");
+        persister->begin_stop();
+        persister->note_stop_store_trouble();
+        clock.advance(18'000);
+        const auto out = persister->persist_staged(*rt, Trig::Stop);
+        CHECK(out.skipped_late_start);
+        CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 1);
+    }
+    SECTION("trouble with an early start does not skip") {
+        stage_n_4045(*rt, 3, "e53c");
+        persister->begin_stop();
+        persister->note_stop_store_trouble();
+        clock.advance(17'999);
+        CHECK(persister->persist_staged(*rt, Trig::Stop).written == 3);
+    }
+    SECTION("a stall that ended after the mark and a late start: the stall reason wins") {
+        stage_n_4045(*rt, 2, "e53d");
+        fail_baseline_writes_4045(f.db_.path);
+        persister->begin_stop();
+        persister->set_post_write_hook_for_test([&] { clock.advance(19'000); });
+        CHECK(persister->persist_staged(*rt, Trig::Forced).failed == 1);
+        persister->set_post_write_hook_for_test(nullptr);
+        const auto out = persister->persist_staged(*rt, Trig::Stop);
+        CHECK(out.skipped_after_stall);
+        CHECK(persister->stop_skip_logs_for_test(Skip::Stalled) == 1);
+        CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 0);
+    }
+    SECTION("the late-start clock is read when the Stop pass HAS the lock, not at its entry") {
+        // A Stop pass queued behind a parked pass for 19 s of injected time is late once it
+        // gets the lock.
+        stage_n_4045(*rt, 2, "e53e");
+        persister->begin_stop();
+        persister->note_stop_store_trouble();
+        std::atomic<bool> in_pass{false}, release{false};
+        persister->set_post_snapshot_hook_for_test([&] {
+            in_pass.store(true);
+            (void)yuzu::test::spin_until([&] { return release.load(); });
+        });
+        std::thread a([&] { (void)persister->persist_staged(*rt, Trig::Forced); });
+        Join4045 ja{a};
+        REQUIRE(yuzu::test::spin_until([&] { return in_pass.load(); }));
+        GuardianBaselinePersister::Outcome stop;
+        std::thread t([&] { stop = persister->persist_staged(*rt, Trig::Stop); });
+        Join4045 jt{t};
+        // Declared after BOTH joins so, on a failing REQUIRE, the release runs before they
+        // join (destruction is in reverse order) and the parked pass can finish.
+        yuzu::test::ScopeExit up{[&] { release.store(true); }};
+        REQUIRE(yuzu::test::spin_until([&] { return persister->lock_waiters_for_test() == 1; }));
+        clock.advance(19'000);
+        release.store(true);
+        a.join();
+        t.join();
+        CHECK(stop.skipped_late_start);
+    }
+}
+
+TEST_CASE("#4045 E54: engine stop() on a HEALTHY store persists the captures although its mutex "
+          "wait ate 19 s, and skips only when one of its own store stages ran slow",
+          "[spark][guardian][baseline][reconcile]") {
+    using Skip = GuardianBaselinePersister::StopSkip;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    FakeClock4045 clock{*persister};
+    HookGuard4045 hooks{*f.engine};
+
+    // Per case: how long stop() waited for the engine mutex (injected clock), whether the
+    // loss-ledger write really fails (fast, baseline writes stay healthy), and which stage the
+    // hook makes slow by how much. The hook fires at the START of the stage, so the injected
+    // time lands inside the stage's own measured span.
+    std::int64_t hold_ms = 19'000;
+    bool fail_ledger = false;
+    std::string slow_stage;
+    std::int64_t slow_ms = 0;
+    bool expect_skip = false;
+
+    SECTION("healthy store, apply_rules held the mutex for 19 s: the pass runs") {
+        expect_skip = false;
+    }
+    SECTION("the loss-ledger write fails FAST (a non-BUSY error): not evidence, the pass runs") {
+        fail_ledger = true;
+        expect_skip = false; // RED if a failed stage counted as trouble whatever its duration
+    }
+    SECTION("the loss-ledger write SUCCEEDS but takes a stop busy budget (1 s): skipped") {
+        hold_ms = 17'000;
+        slow_stage = "ledger";
+        slow_ms = 1'000;
+        expect_skip = true;
+    }
+    SECTION("the loss-ledger write fails AND takes a stop busy budget (a BUSY store): skipped") {
+        fail_ledger = true;
+        hold_ms = 17'000;
+        slow_stage = "ledger";
+        slow_ms = 1'000;
+        expect_skip = true;
+    }
+    SECTION("the second journal flush takes a stop busy budget (1 s): skipped") {
+        hold_ms = 17'000;
+        slow_stage = "journal_flush_2";
+        slow_ms = 1'000;
+        expect_skip = true;
+    }
+    SECTION("the second journal flush takes exactly the 750 ms threshold: skipped") {
+        hold_ms = 17'250;
+        slow_stage = "journal_flush_2";
+        slow_ms = 750;
+        expect_skip = true;
+    }
+    SECTION("the second journal flush takes just under the threshold: not trouble, runs") {
+        // 17'251 + 749 = 18 s: the pass is late, so only the missing evidence lets it run.
+        hold_ms = 17'251;
+        slow_stage = "journal_flush_2";
+        slow_ms = 749;
+        expect_skip = false;
+    }
+    SECTION("the first journal flush takes a stop busy budget (1 s): skipped") {
+        hold_ms = 17'000;
+        slow_stage = "journal_flush_1";
+        slow_ms = 1'000;
+        expect_skip = true;
+    }
+    SECTION("the worker join takes a stop busy budget (1 s): a thread join is not a store stage, "
+            "so it is not trouble and the pass runs") {
+        // The join is not timed as store-trouble evidence; the worker's own slow baseline
+        // write is the evidence, and it reaches the persister through its stall instead.
+        hold_ms = 17'000;
+        slow_stage = "worker_join";
+        slow_ms = 1'000;
+        expect_skip = false;
+    }
+
+    f.engine->set_stop_stage_hook_for_test([&](const char* stage) {
+        if (slow_stage == stage)
+            clock.advance(slow_ms);
+    });
+
+    // stop() queued behind a parked apply_rules, as in E45.
+    std::atomic<bool> in_apply{false};
+    std::atomic<bool> release{false};
+    int apply_rc = -1;
+    f.engine->set_apply_post_drain_hook_for_test([&] {
+        in_apply.store(true);
+        (void)yuzu::test::spin_until([&] { return release.load(); });
+    });
+    std::thread apply_thread([&] {
+        apply_rc = f.dispatch_raw(make_service_rule("r1", /*enabled=*/false), false).exit_code;
+    });
+    Join4045 join_apply{apply_thread};
+    yuzu::test::ScopeExit unpark_apply{[&] { release.store(true); }};
+    REQUIRE(yuzu::test::spin_until([&] { return in_apply.load(); }));
+    // apply_rules ran its one Forced pass at its start; what is staged now stays staged.
+    stage_n_4045(*rt, 3, "e54");
+    if (fail_ledger)
+        fail_baseline_writes_4045(f.db_.path, "legacy_sink_loss_ledger");
+    std::thread stop_thread([&] { f.engine->stop(); });
+    Join4045 join_stop{stop_thread};
+    yuzu::test::ScopeExit unpark_stop{[&] { release.store(true); }};
+    REQUIRE(yuzu::test::spin_until([&] { return persister->stop_begun_for_test(); }));
+    clock.advance(hold_ms);
+    release.store(true);
+    apply_thread.join();
+    stop_thread.join();
+    CHECK(apply_rc == 0);
+
+    if (expect_skip) {
+        CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 1);
+        CHECK(rt->staged_baseline_count_for_test() == 3);
+        CHECK_FALSE(baseline_record_4045(*f.kv, "r0").has_value());
+    } else {
+        // RED if the late start were judged on elapsed time alone (a healthy store forfeiting its
+        // captures after a long mutex wait).
+        CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 0);
+        CHECK(persister->stop_skip_logs_for_test(Skip::Stalled) == 0);
+        CHECK(rt->staged_baseline_count_for_test() == 0);
+        for (const char* id : {"r0", "r1", "r2"})
+            CHECK(baseline_record_4045(*f.kv, id).has_value());
+    }
+}
+
+TEST_CASE("#4045 E55: a stop() that read the persister pointer before wire published it still "
+          "gets its mark once it holds the engine mutex",
+          "[spark][guardian][baseline][reconcile]") {
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    REQUIRE(persister != nullptr);
+    // The top-of-stop() read finds null, exactly as if wire_spark_engine had not yet published.
+    f.engine->unpublish_baseline_persister_for_test();
+    REQUIRE_FALSE(persister->stop_begun_for_test());
+    f.engine->stop();
+    CHECK(persister->stop_begun_for_test()); // RED without the post-lock begin_stop()
+}
+
+TEST_CASE("#4045 E56: a lifecycle-journal flush that FAILS FAST at stop() is no store trouble, "
+          "whether it wrote nothing or only part of its records",
+          "[spark][guardian][baseline][reconcile]") {
+    SparkReconcileFixture f;
+    auto* persister = f.engine->baseline_persister_for_test();
+    REQUIRE(persister != nullptr);
+    // Leave journal records pending: the arm resolves on a worker after apply_rules' own exit
+    // flush, so nothing but stop() flushes them (the same ordering gate as the tick-retry case).
+    // The two-batch section needs more records than one 256 KiB batch carries: the journal
+    // estimates each at its worst-case JSON-escaped size, and a 4096-byte field of control
+    // characters (the field cap, escaped to six bytes each) costs about 24.6 KB, so twelve of
+    // them overflow the first batch (ten fit) with the rest in a second.
+    constexpr int kRules = 12;
+    const std::string big_name(yuzu::agent::kMaxJournalFieldBytes, '\x01');
+    gpb::GuaranteedStatePush push;
+    push.set_full_sync(true);
+    f.mechanism->hang_next_watch();
+    for (int i = 0; i < kRules; ++i) {
+        auto r = make_service_rule("r" + std::to_string(i), true, "Svc" + std::to_string(i));
+        r.set_name(big_name);
+        *push.add_rules() = std::move(r);
+    }
+    REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, push.SerializeAsString())
+                .exit_code == 0);
+    REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(5)));
+    f.mechanism->release_hang();
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return f.engine->spark_armed_rule_count() == static_cast<std::size_t>(kRules); }));
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    REQUIRE(yuzu::test::spin_until([&] {
+        return rt->snapshot_pending().records.size() == static_cast<std::size_t>(kRules);
+    }));
+    REQUIRE_FALSE(persister->stop_store_trouble_for_test());
+
+    SECTION("both flushes write nothing (injected write failures): not trouble") {
+        f.engine->lifecycle_journal_for_test()->inject_write_failures_for_test(2);
+        f.engine->stop();
+        CHECK(f.engine->lifecycle_journal_for_test()->batches_written() == 0);
+        CHECK(f.engine->lifecycle_journal_for_test()->write_failures() == 2);
+        CHECK(rt->snapshot_pending().records.size() == static_cast<std::size_t>(kRules));
+        CHECK_FALSE(persister->stop_store_trouble_for_test());
+        // #5604: records left pending after the last flush are logged once. (The second
+        // stop() here would persist them, so the once-only latch is pinned by the next section.)
+        CHECK(f.engine->journal_stop_pending_logs_for_test() == 1);
+    }
+    SECTION("records still pending at a second stop() are not logged again") {
+        // A persistent write ceiling keeps every record pending across both stop() calls, so the
+        // second stop() reaches the once-only latch with records still unpersisted.
+        f.engine->lifecycle_journal_for_test()->set_write_ceiling_for_test(0, 0);
+        f.engine->stop();
+        CHECK(rt->pending_journal_depth() > 0);
+        CHECK(f.engine->journal_stop_pending_logs_for_test() == 1);
+        f.engine->stop(); // the destructor's second stop(): same records still pending
+        CHECK(rt->pending_journal_depth() > 0);
+        CHECK(f.engine->journal_stop_pending_logs_for_test() == 1); // RED without the latch: 2
+    }
+    SECTION("flush 1 fails but the final flush persists everything: nothing is logged") {
+        // Only the FINAL flush may log: a record that flush 1 could not write and flush 2 did is
+        // not lost.
+        f.engine->lifecycle_journal_for_test()->inject_write_failures_for_test(1);
+        f.engine->stop();
+        CHECK(f.engine->lifecycle_journal_for_test()->write_failures() == 1);
+        CHECK(rt->snapshot_pending().records.empty());
+        CHECK(f.engine->journal_stop_pending_logs_for_test() == 0); // RED if flush 1 logged
+    }
+    SECTION("two batches, the second fails in both flushes: a PARTIAL persist, fast, is not "
+            "trouble") {
+        // Flush 1 makes batch 1 durable and fails batch 2; flush 2 fails batch 2 again. Each
+        // returns the committed prefix (nothing, for flush 2) with records still pending.
+        f.engine->lifecycle_journal_for_test()->inject_write_failures_for_test(2, 1);
+        f.engine->stop();
+        CHECK(f.engine->lifecycle_journal_for_test()->batches_written() == 1);
+        CHECK(f.engine->lifecycle_journal_for_test()->write_failures() == 2);
+        const auto left = rt->snapshot_pending().records.size();
+        CHECK(left > 0); // the second batch stays staged for the next retry
+        CHECK(left < static_cast<std::size_t>(kRules)); // and the first batch is durable and erased
+        CHECK_FALSE(persister->stop_store_trouble_for_test());
+    }
+    SECTION("nothing fails: no trouble recorded") {
+        f.engine->stop();
+        CHECK(f.engine->lifecycle_journal_for_test()->batches_written() == 2);
+        CHECK(rt->snapshot_pending().records.empty());
+        CHECK_FALSE(persister->stop_store_trouble_for_test());
+        CHECK(f.engine->journal_stop_pending_logs_for_test() == 0); // nothing left, nothing logged
+    }
+}
+
+TEST_CASE("#4045 E57: a journal flush that fails FAST (the write ceiling) is no evidence of a "
+          "slow baseline write: a stop queued 19 s still persists the captures",
+          "[spark][guardian][baseline][reconcile]") {
+    using Skip = GuardianBaselinePersister::StopSkip;
+    SparkReconcileFixture f;
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    // One journal record stays pending (the arm resolves on a worker after apply_rules' own
+    // exit flush, so only stop() flushes it, as in E56).
+    f.mechanism->hang_next_watch();
+    REQUIRE(f.dispatch_raw(make_service_rule("r1")).exit_code == 0);
+    REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(5)));
+    f.mechanism->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return f.engine->spark_armed_rule_count() == 1; }));
+    f.engine->drain_worker_for_test()->stop();
+    FakeClock4045 clock{*persister};
+    HookGuard4045 hooks{*f.engine};
+    // The journal's hard write ceiling rejects every batch without touching the store: the
+    // flush fails in microseconds while the baseline table stays writable (the production
+    // route is GuardianLifecycleJournal::seed_size_gauges_ failing closed at boot).
+    f.engine->lifecycle_journal_for_test()->set_write_ceiling_for_test(0, 0);
+
+    // stop() queued behind a parked apply_rules, as in E54.
+    std::atomic<bool> in_apply{false};
+    std::atomic<bool> release{false};
+    int apply_rc = -1;
+    f.engine->set_apply_post_drain_hook_for_test([&] {
+        in_apply.store(true);
+        (void)yuzu::test::spin_until([&] { return release.load(); });
+    });
+    std::thread apply_thread([&] {
+        apply_rc = f.dispatch_raw(make_service_rule("r1", /*enabled=*/false), false).exit_code;
+    });
+    Join4045 join_apply{apply_thread};
+    yuzu::test::ScopeExit unpark_apply{[&] { release.store(true); }};
+    REQUIRE(yuzu::test::spin_until([&] { return in_apply.load(); }));
+    stage_n_4045(*rt, 3, "e57");
+    std::thread stop_thread([&] { f.engine->stop(); });
+    Join4045 join_stop{stop_thread};
+    yuzu::test::ScopeExit unpark_stop{[&] { release.store(true); }};
+    REQUIRE(yuzu::test::spin_until([&] { return persister->stop_begun_for_test(); }));
+    clock.advance(19'000);
+    release.store(true);
+    apply_thread.join();
+    stop_thread.join();
+    CHECK(apply_rc == 0);
+    CHECK_FALSE(persister->stop_store_trouble_for_test());
+    CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 0);
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+    for (const char* id : {"r0", "r1", "r2"})
+        CHECK(baseline_record_4045(*f.kv, id).has_value());
+}
+
+// ---------------------------------------------------------------------------------------------
+// #5604: stop() runs its KV stages at a terminal, shorter busy budget
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE("#5604 stop(): under real SQLITE_BUSY every KV stage is cut at the stop budget, and the "
+          "budget stays lowered afterwards",
+          "[spark][guardian][baseline][reconcile][busy]") {
+    using namespace std::chrono_literals;
+    using Clock = std::chrono::steady_clock;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    HookGuard4045 hooks{*f.engine};
+
+    // Production values are 5 s and 1 s; scaled to 2 s and 100 ms so the case stays under a
+    // second while keeping the ratio: a stage that ran at the NORMAL budget would take 2 s,
+    // which the per-stage upper bounds below (1 s) reject by a wide margin.
+    f.kv->set_busy_timeout(2000ms);
+    f.engine->set_stop_busy_timeout_for_test(100ms);
+    stage_n_4045(*rt, 1, "5604");
+
+    std::vector<std::pair<std::string, Clock::time_point>> marks;
+    f.engine->set_stop_stage_hook_for_test(
+        [&](const char* stage) { marks.emplace_back(stage, Clock::now()); });
+
+    // A second connection holds the write lock for the whole stop(): every KV write inside
+    // stop() (the loss-ledger write and the Stop pass's baseline write) really waits on a
+    // locked database and fails with SQLITE_BUSY.
+    sqlite3* holder = nullptr;
+    REQUIRE(sqlite3_open(f.db_.path.string().c_str(), &holder) == SQLITE_OK);
+    yuzu::test::ScopeExit close_holder{[&] { sqlite3_close(holder); }};
+    REQUIRE(sqlite3_exec(holder, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    const auto t0 = Clock::now();
+    f.engine->stop();
+    const auto t1 = Clock::now();
+    sqlite3_exec(holder, "ROLLBACK", nullptr, nullptr, nullptr);
+
+    const auto ms = [](Clock::time_point a, Clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    REQUIRE(marks.size() == 4);
+    CHECK(marks[0].first == "journal_flush_1");
+    CHECK(marks[1].first == "worker_join");
+    CHECK(marks[2].first == "ledger");
+    CHECK(marks[3].first == "journal_flush_2");
+    // Stages that write nothing are instant; the ledger stage is one BUSY write at the stop
+    // budget (100 ms), not the 2000 ms the store started with. The lower bound is the assertion
+    // that the budget really cuts the wait; the upper bound only has to stay clear of the 2000 ms
+    // starting budget, with room for scheduler delay on a loaded shared runner (Windows rounds
+    // the handler's sleeps up to its ~15.6 ms tick).
+    CHECK(ms(marks[0].second, marks[1].second) < 1500.0);
+    CHECK(ms(marks[1].second, marks[2].second) < 1500.0);
+    const double ledger = ms(marks[2].second, marks[3].second);
+    CHECK(ledger >= 100.0);
+    CHECK(ledger < 1000.0);
+    // The Stop pass: one baseline write, also BUSY at the stop budget.
+    const double stop_pass = ms(marks[3].second, t1);
+    CHECK(stop_pass >= 100.0);
+    CHECK(stop_pass < 1000.0);
+    CHECK(ms(t0, t1) < 3000.0);
+
+    // The pass ran and failed (the wait was shorter than the trouble threshold, so it is not a
+    // stall), and the capture stays staged: a lost-to-this-process capture, recaptured next boot.
+    CHECK(persister->persist_failures() == 1);
+    CHECK(persister->stop_skip_logs_for_test(GuardianBaselinePersister::StopSkip::Stalled) == 0);
+    CHECK(persister->stop_skip_logs_for_test(GuardianBaselinePersister::StopSkip::LateStart) == 0);
+    CHECK(rt->staged_baseline_count_for_test() == 1);
+    // Terminal: stop() never raises the budget again.
+    CHECK(f.kv->busy_timeout_for_test() == 100ms);
+}
+
+TEST_CASE("#5604 stop(): the budget is lowered BEFORE stop() waits for the engine mutex (ordering "
+          "only: no write is in flight here; the cut of an in-flight wait is the KvStore case's)",
+          "[spark][guardian][baseline][reconcile][busy]") {
+    using namespace std::chrono_literals;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    REQUIRE(persister != nullptr);
+    HookGuard4045 hooks{*f.engine};
+    CHECK(f.kv->busy_timeout_for_test() == yuzu::agent::kKvStoreBusyTimeout);
+
+    std::atomic<bool> in_apply{false};
+    std::atomic<bool> release{false};
+    int apply_rc = -1;
+    f.engine->set_apply_post_drain_hook_for_test([&] {
+        in_apply.store(true);
+        (void)yuzu::test::spin_until([&] { return release.load(); });
+    });
+    std::thread apply_thread([&] {
+        apply_rc = f.dispatch_raw(make_service_rule("r1", /*enabled=*/false), false).exit_code;
+    });
+    Join4045 join_apply{apply_thread};
+    yuzu::test::ScopeExit unpark_apply{[&] { release.store(true); }};
+    REQUIRE(yuzu::test::spin_until([&] { return in_apply.load(); }));
+    // apply_rules holds mtx_ and is parked. stop() queues behind it: it has begun and lowered
+    // the budget while apply_rules still holds the mutex.
+    std::thread stop_thread([&] { f.engine->stop(); });
+    Join4045 join_stop{stop_thread};
+    yuzu::test::ScopeExit unpark_stop{[&] { release.store(true); }};
+    REQUIRE(yuzu::test::spin_until([&] {
+        return f.kv->busy_timeout_for_test() == yuzu::agent::kKvStoreStopBusyTimeout;
+    }));
+    CHECK(in_apply.load()); // apply_rules is still parked inside the engine mutex
+    release.store(true);
+    apply_thread.join();
+    stop_thread.join();
+    CHECK(apply_rc == 0);
+}
+
+TEST_CASE("#5604 the Stop pass's stall rule compares a failed write against the trouble "
+          "threshold, not against the pass's own 1 s wall",
+          "[spark][guardian][baseline][reconcile][busy]") {
+    using Trig = GuardianBaselinePersister::Trigger;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    FakeClock4045 clock{*persister};
+    HookGuard4045 hooks{*f.engine};
+    stage_n_4045(*rt, 2, "5604s");
+    fail_baseline_writes_4045(f.db_.path);
+    persister->begin_stop();
+    const auto threshold = yuzu::agent::kBaselineStopTroubleThreshold.count();
+
+    SECTION("a failed write one millisecond under the threshold is not a stall (checked with a "
+            "LATE Stop pass, where a stall would skip it)") {
+        persister->set_post_write_hook_for_test([&] { clock.advance(threshold - 1); });
+        CHECK(persister->persist_staged(*rt, Trig::Forced).failed == 2);
+        persister->set_post_write_hook_for_test(nullptr);
+        // late: only the evidence matters
+        clock.advance(yuzu::agent::kBaselineStopLatestStart.count());
+        CHECK_FALSE(persister->persist_staged(*rt, Trig::Stop).skipped_after_stall);
+    }
+    SECTION("a failed write that took the threshold is a stall, although it is under the 1 s "
+            "wall (a BUSY write at the stop busy budget measures a little short of it): a late "
+            "Stop pass skips") {
+        persister->set_post_write_hook_for_test([&] { clock.advance(threshold); });
+        CHECK(persister->persist_staged(*rt, Trig::Forced).failed == 2);
+        persister->set_post_write_hook_for_test(nullptr);
+        clock.advance(yuzu::agent::kBaselineStopLatestStart.count()); // a late start
+        CHECK(persister->persist_staged(*rt, Trig::Stop).skipped_after_stall);
+        CHECK(threshold < yuzu::agent::kBaselineStopBudget.max_wall.count());
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// #5604: the Stop pass is skipped only when it starts LATE with slow
+// evidence (a slow failed worker write alone no longer discards an early pass), the worker join
+// is not store-trouble evidence, and journal records lost at stop are logged.
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE("#5604 A1: a worker baseline write cut by stop()'s lowered budget does not by itself "
+          "discard the Stop pass; only a LATE start after that stall does",
+          "[spark][guardian][baseline][reconcile][busy]") {
+    using namespace std::chrono_literals;
+    using Clock = std::chrono::steady_clock;
+    using Trig = GuardianBaselinePersister::Trigger;
+    using Skip = GuardianBaselinePersister::StopSkip;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop(); // the "worker" pass below is driven by this test
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    FakeClock4045 clock{*persister};
+    HookGuard4045 hooks{*f.engine};
+    // Production values are 5 s and 1 s; scaled to 2 s and 100 ms (the stall itself is declared
+    // on the injected persister clock below, because the 750 ms trouble threshold is a
+    // constant). Everything else is real: a second connection holds the write lock, so the
+    // worker's baseline write really waits in the busy handler and really fails SQLITE_BUSY.
+    f.kv->set_busy_timeout(2000ms);
+    f.engine->set_stop_busy_timeout_for_test(100ms);
+    stage_n_4045(*rt, 1, "5604a1");
+
+    enum class Heal { AfterWorkerWriteFails, BeforeWorkerWrites, Never };
+    Heal heal = Heal::AfterWorkerWriteFails;
+    std::int64_t stall_ms = 1000; // what the failed worker write "took" on the persister's clock
+    bool expect_stall_skip = false;
+    SECTION("the holder releases right after the cut worker write fails: the Stop pass writes "
+            "(red before the lateness gate)") {}
+    SECTION("control: the store is healthy, the worker's write succeeds") {
+        heal = Heal::BeforeWorkerWrites;
+    }
+    SECTION("the store never heals: the early Stop pass makes its one attempt, fails, and the "
+            "capture stays staged with the incomplete ERROR line") {
+        heal = Heal::Never;
+    }
+    SECTION("the same stall followed by a LATE start is skipped "
+            "(the late-start rule, implementer decision)") {
+        stall_ms = yuzu::agent::kBaselineStopLatestStart.count();
+        expect_stall_skip = true;
+    }
+
+    sqlite3* holder = nullptr;
+    REQUIRE(sqlite3_open(f.db_.path.string().c_str(), &holder) == SQLITE_OK);
+    yuzu::test::ScopeExit close_holder{[&] { sqlite3_close(holder); }};
+    REQUIRE(sqlite3_exec(holder, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) == SQLITE_OK);
+    const auto release_holder = [&] {
+        sqlite3_exec(holder, "ROLLBACK", nullptr, nullptr, nullptr);
+    };
+
+    std::atomic<bool> in_pass{false};
+    std::atomic<bool> first_write_done{false};
+    persister->set_post_snapshot_hook_for_test([&] {
+        if (heal == Heal::BeforeWorkerWrites)
+            release_holder();
+        in_pass.store(true);
+    });
+    persister->set_post_write_hook_for_test([&] {
+        if (first_write_done.exchange(true))
+            return; // only the worker's write is declared slow
+        clock.advance(stall_ms);
+        if (heal == Heal::AfterWorkerWriteFails)
+            release_holder();
+    });
+    GuardianBaselinePersister::Outcome worker_out{};
+    std::thread worker([&] { worker_out = persister->persist_staged(*rt, Trig::Worker); });
+    Join4045 join_worker{worker};
+    yuzu::test::ScopeExit release_at_exit{[&] { release_holder(); }};
+    REQUIRE(yuzu::test::spin_until([&] { return in_pass.load(); }));
+
+    const auto t0 = Clock::now();
+    f.engine->stop();
+    worker.join();
+    const double total_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+
+    // The worker's write was cut by the LOWERED budget (100 ms), not the 2000 ms it started under.
+    CHECK(total_ms < 1500.0);
+    CHECK(f.kv->busy_timeout_for_test() == 100ms);
+    const bool record = baseline_record_4045(*f.kv, "r0").has_value();
+    const auto stalled_skips = persister->stop_skip_logs_for_test(Skip::Stalled);
+    CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 0);
+    if (heal == Heal::BeforeWorkerWrites) {
+        CHECK(worker_out.written == 1);
+        CHECK(stalled_skips == 0);
+        CHECK(record);
+        CHECK(rt->staged_baseline_count_for_test() == 0);
+    } else if (expect_stall_skip) {
+        CHECK(worker_out.failed == 1);
+        CHECK(stalled_skips == 1);
+        CHECK_FALSE(record);
+        CHECK(rt->staged_baseline_count_for_test() == 1);
+        CHECK(f.engine->baseline_stop_incomplete_logs_for_test() == 0); // skipped, not attempted
+    } else if (heal == Heal::AfterWorkerWriteFails) {
+        CHECK(worker_out.failed == 1);
+        CHECK(stalled_skips == 0); // RED on cd1e2ad87: the stall alone skipped the pass
+        CHECK(record);
+        CHECK(rt->staged_baseline_count_for_test() == 0);
+        CHECK(f.engine->baseline_stop_incomplete_logs_for_test() == 0);
+    } else { // Never
+        CHECK(worker_out.failed == 1);
+        CHECK(stalled_skips == 0);
+        CHECK_FALSE(record);
+        CHECK(rt->staged_baseline_count_for_test() == 1);
+        CHECK(f.engine->baseline_stop_incomplete_logs_for_test() == 1);
+        CHECK(persister->persist_failures() == 2); // the worker's pass and the Stop pass
+    }
+}
+
+TEST_CASE("#5604 the worker join is a thread join, not a store stage: a slow join alone is not "
+          "store-trouble evidence, a slow loss-ledger write is",
+          "[spark][guardian][baseline][reconcile]") {
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    REQUIRE(persister != nullptr);
+    FakeClock4045 clock{*persister};
+    HookGuard4045 hooks{*f.engine};
+    std::string slow_stage;
+    SECTION("a join that takes 2 s of the persister's clock") { slow_stage = "worker_join"; }
+    SECTION("contrast: a loss-ledger write that takes 2 s") { slow_stage = "ledger"; }
+    f.engine->set_stop_stage_hook_for_test([&](const char* stage) {
+        if (slow_stage == stage)
+            clock.advance(2000);
+    });
+    f.engine->stop();
+    CHECK(persister->stop_store_trouble_for_test() == (slow_stage == "ledger"));
+}
+
+TEST_CASE("#5604 stop(): a lifecycle-journal record that real SQLITE_BUSY keeps unpersisted costs "
+          "one stop budget per flush, is logged once, and the Stop pass still runs (both journal "
+          "flushes, the loss ledger and the Stop pass in series, worker stopped)",
+          "[spark][guardian][baseline][reconcile][busy]") {
+    using namespace std::chrono_literals;
+    using Clock = std::chrono::steady_clock;
+    SparkReconcileFixture f;
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    // One journal record stays pending (the arm resolves on a worker after apply_rules' own
+    // exit flush, so only stop() flushes it, as in E56).
+    f.mechanism->hang_next_watch();
+    REQUIRE(f.dispatch_raw(make_service_rule("r1")).exit_code == 0);
+    REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(5)));
+    f.mechanism->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return f.engine->spark_armed_rule_count() == 1; }));
+    REQUIRE(yuzu::test::spin_until([&] { return !rt->snapshot_pending().records.empty(); }));
+    f.engine->drain_worker_for_test()->stop();
+    HookGuard4045 hooks{*f.engine};
+    f.kv->set_busy_timeout(2000ms);
+    f.engine->set_stop_busy_timeout_for_test(100ms);
+    stage_n_4045(*rt, 1, "5604j");
+
+    std::vector<std::pair<std::string, Clock::time_point>> marks;
+    f.engine->set_stop_stage_hook_for_test(
+        [&](const char* stage) { marks.emplace_back(stage, Clock::now()); });
+    Clock::time_point pass_start{};
+    persister->set_post_snapshot_hook_for_test([&] { pass_start = Clock::now(); });
+
+    sqlite3* holder = nullptr;
+    REQUIRE(sqlite3_open(f.db_.path.string().c_str(), &holder) == SQLITE_OK);
+    yuzu::test::ScopeExit close_holder{[&] { sqlite3_close(holder); }};
+    REQUIRE(sqlite3_exec(holder, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    const auto t0 = Clock::now();
+    f.engine->stop();
+    const auto t1 = Clock::now();
+    const auto ms = [](Clock::time_point a, Clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    REQUIRE(marks.size() == 4);
+    CHECK(marks[0].first == "journal_flush_1");
+    CHECK(marks[3].first == "journal_flush_2");
+    // Four serial BUSY waits at the stop budget: journal flush 1, the loss ledger, journal flush
+    // 2 and the Stop pass's baseline write. The lower bounds are the assertion that each wait is
+    // really spent and really cut at 100 ms; the upper bounds only have to clear the 2000 ms
+    // starting budget.
+    const double flush1 = ms(marks[0].second, marks[1].second);
+    const double ledger = ms(marks[2].second, marks[3].second);
+    REQUIRE(pass_start != Clock::time_point{});
+    const double flush2 = ms(marks[3].second, pass_start);
+    const double pass = ms(pass_start, t1);
+    for (const double stage : {flush1, ledger, flush2, pass}) {
+        CHECK(stage >= 100.0);
+        CHECK(stage < 1000.0);
+    }
+    CHECK(ms(t0, t1) < 3000.0);
+
+    // The loss is visible: one ERROR line for the pending record(s), the incomplete-flush line
+    // for the lost capture; the destructor's second stop() adds no second journal line.
+    CHECK(f.engine->journal_stop_pending_logs_for_test() == 1);
+    CHECK(rt->pending_journal_depth() >= 1);
+    CHECK(f.engine->baseline_stop_incomplete_logs_for_test() == 1);
+    CHECK(rt->staged_baseline_count_for_test() == 1);
+    // Released first, so the destructor-style second stop() does not spend four more waits.
+    sqlite3_exec(holder, "ROLLBACK", nullptr, nullptr, nullptr);
+    f.engine->stop();
+    CHECK(f.engine->journal_stop_pending_logs_for_test() == 1);
+}
+
+TEST_CASE("#5604 the stop-time journal-loss ERROR line names the count and the stage, nothing else",
+          "[spark][guardian][baseline][reconcile]") {
+    const auto line = GuardianEngine::stop_journal_pending_log_line(3, "journal_flush_2");
+    CHECK(line.find("3 lifecycle-journal record(s)") != std::string::npos);
+    CHECK(line.find("journal_flush_2") != std::string::npos);
+    CHECK(line.find("lost when this process exits") != std::string::npos);
+}
+
+TEST_CASE("#5604 stop(): a second stop() after the store healed currently does NOT persist the "
+          "capture the first stop() skipped or failed (the Stop pass runs once per engine, so the "
+          "lateness rule is never consulted again)",
+          "[spark][guardian][baseline][reconcile][busy]") {
+    // run()'s exit ScopeExit calls guardian_->stop() again after AgentImpl::stop() did, and so
+    // does the destructor. begin_stop() is first-call-wins, so a second call would be judged
+    // from the FIRST call's mark if it reached the lateness rule at all; it does not, because
+    // persist_staged_baselines_locked(at_stop) returns at once once baseline_stop_flush_done_
+    // is set. This case pins that outcome, not a design goal: a capture whose first Stop pass
+    // was skipped (or failed) stays unpersisted although the store healed before the second call.
+    using namespace std::chrono_literals;
+    using Skip = GuardianBaselinePersister::StopSkip;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    FakeClock4045 clock{*persister};
+    HookGuard4045 hooks{*f.engine};
+    f.engine->set_stop_busy_timeout_for_test(100ms); // scaled from 1 s: the lock is real
+    stage_n_4045(*rt, 1, "5604b");
+
+    // The first stop(): the loss-ledger stage is a real BUSY write that the injected clock
+    // counts as one stop busy budget (store trouble), and for the late section the second
+    // journal flush moves the clock to the 18 s latest start.
+    bool late_first_stop = false;
+    std::atomic<bool> first_stop_running{true};
+    f.engine->set_stop_stage_hook_for_test([&](const char* stage) {
+        if (!first_stop_running.load())
+            return;
+        if (std::string_view{stage} == "ledger")
+            clock.advance(1'000);
+        if (late_first_stop && std::string_view{stage} == "journal_flush_2")
+            clock.advance(yuzu::agent::kBaselineStopLatestStart.count() - 1'000);
+    });
+    SECTION("the first Stop pass was skipped as late with trouble evidence") {
+        late_first_stop = true;
+    }
+    SECTION("control: the first Stop pass started early, ran and failed on the locked store") {
+        late_first_stop = false;
+    }
+
+    sqlite3* holder = nullptr;
+    REQUIRE(sqlite3_open(f.db_.path.string().c_str(), &holder) == SQLITE_OK);
+    yuzu::test::ScopeExit close_holder{[&] { sqlite3_close(holder); }};
+    REQUIRE(sqlite3_exec(holder, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    f.engine->stop();
+    first_stop_running.store(false);
+    CHECK(persister->stop_store_trouble_for_test());
+    if (late_first_stop) {
+        CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 1);
+        CHECK(persister->persist_failures() == 0); // skipped, never attempted
+    } else {
+        CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 0);
+        CHECK(persister->persist_failures() == 1); // ran and failed on the locked store
+        CHECK(f.engine->baseline_stop_incomplete_logs_for_test() == 1);
+    }
+    CHECK(rt->staged_baseline_count_for_test() == 1);
+    CHECK_FALSE(baseline_record_4045(*f.kv, "r0").has_value());
+
+    // The store heals, and the second stop() (ScopeExit / destructor) runs.
+    REQUIRE(sqlite3_exec(holder, "ROLLBACK", nullptr, nullptr, nullptr) == SQLITE_OK);
+    const auto skips_late = persister->stop_skip_logs_for_test(Skip::LateStart);
+    const auto failures = persister->persist_failures();
+    f.engine->stop();
+
+    // Currently: the second stop() makes no Stop pass at all. No skip is counted, no write is
+    // attempted, the capture stays staged and unpersisted although the store is healthy.
+    CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == skips_late);
+    CHECK(persister->stop_skip_logs_for_test(Skip::Stalled) == 0);
+    CHECK(persister->persist_failures() == failures);
+    CHECK(rt->staged_baseline_count_for_test() == 1);
+    CHECK_FALSE(baseline_record_4045(*f.kv, "r0").has_value());
+}

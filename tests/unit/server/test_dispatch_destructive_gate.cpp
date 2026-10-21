@@ -50,14 +50,19 @@
 #include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_policy.hpp"
+#include "capability_decls/plugin_action_catalogue_update_source_trust.hpp"
 #include "capability_decls/plugin_action_catalogue_app_control.hpp"
 #include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
 #include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
+#include "capability_decls/plugin_action_catalogue_local_security_policy.hpp"
 #include "capability_decls/plugin_action_catalogue_privacy_permissions.hpp"
 #include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
+#include "capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
+#include "capability_decls/plugin_action_catalogue_shares.hpp"
+#include "capability_decls/plugin_action_catalogue_remote_access_audit.hpp"
 #include "command_capability.hpp"
 #include "dispatch_caller.hpp"
 
@@ -417,6 +422,33 @@ TEST_CASE("execution_artifacts: the REAL catalogue fragment (not the independent
     }
 }
 
+TEST_CASE("remote_access_audit: the REAL catalogue fragment is Forensics-securable and gates "
+          "as single-target — one agent id is Targeted; zero or two are refused — so a drift in "
+          "the shipped securable string (the Forensics literal the gate keys on) fails here",
+          "[server][dispatch][security]") {
+    CommandCapabilityRegistry registry{
+        yuzu::server::capdecls::plugin_action_catalogue_remote_access_audit()};
+    auto classified = registry.classify("remote_access_audit", "list");
+    REQUIRE(classified.has_value());
+    CHECK(classified->securable == kForensicsSecurable);
+    CHECK(requires_explicit_targets(*classified));
+
+    const auto targeted = evaluate_destructive_targeting(classified,
+                                                          /*valid_nonempty_agent_ids=*/true,
+                                                          /*scope_key_present=*/false,
+                                                          /*agent_id_count=*/1);
+    CHECK(targeted.verdict == DestructiveTargetingVerdict::Targeted);
+    for (const std::size_t n : {std::size_t{0}, std::size_t{2}}) {
+        const auto refused = evaluate_destructive_targeting(classified,
+                                                             /*valid_nonempty_agent_ids=*/n != 0,
+                                                             /*scope_key_present=*/false,
+                                                             /*agent_id_count=*/n);
+        CHECK(refused.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
+        CHECK(refused.refusal_reason == kReasonForensicUntargeted);
+        CHECK(refused.refusal_message == kForensicUntargetedMessage);
+    }
+}
+
 TEST_CASE("Inventory ReadOnly row stays NotDestructive — the single-target rule does not leak "
           "onto every ReadOnly securable",
           "[server][dispatch][security]") {
@@ -617,7 +649,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 19,
           "[server][dispatch][security]") {
     namespace capdecls = yuzu::server::capdecls;
 
-    const std::array<std::span<const CommandCapability>, 24> sources{{
+    const std::array<std::span<const CommandCapability>, 29> sources{{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
         capdecls::plugin_action_catalogue_b(),
@@ -633,14 +665,19 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 19,
         capdecls::plugin_action_catalogue_peripherals(),
         capdecls::plugin_action_catalogue_printing(),
         capdecls::plugin_action_catalogue_browser_policy(),
+        capdecls::plugin_action_catalogue_update_source_trust(),
         capdecls::plugin_action_catalogue_app_control(),
         capdecls::plugin_action_catalogue_firmware_posture(),
         capdecls::plugin_action_catalogue_runtimes(),
         capdecls::plugin_action_catalogue_platform_security(),
         capdecls::plugin_action_catalogue_browser_inventory(),
+        capdecls::plugin_action_catalogue_local_security_policy(),
         capdecls::plugin_action_catalogue_privacy_permissions(),
         capdecls::plugin_action_catalogue_system_hardening(),
         capdecls::plugin_action_catalogue_pkg_inventory(),
+        capdecls::plugin_action_catalogue_mgmt_posture(),
+        capdecls::plugin_action_catalogue_shares(),
+        capdecls::plugin_action_catalogue_remote_access_audit(),
         capdecls::core_dispatch_capabilities(),
     }};
 
@@ -677,7 +714,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 19,
     CHECK(destructive_execution_securable_count == 4);
 
     // Composability spot check — mirrors test_capability_catalogue.cpp's own
-    // `build_registry`: the same twenty-four spans compose into a real registry
+    // `build_registry`: the same twenty-nine spans compose into a real registry
     // exactly as the production composition site does, and a known
     // Destructive row still resolves through it.
     CommandCapabilityRegistry registry{
@@ -696,14 +733,19 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 19,
         capdecls::plugin_action_catalogue_peripherals(),
         capdecls::plugin_action_catalogue_printing(),
         capdecls::plugin_action_catalogue_browser_policy(),
+        capdecls::plugin_action_catalogue_update_source_trust(),
         capdecls::plugin_action_catalogue_app_control(),
         capdecls::plugin_action_catalogue_firmware_posture(),
         capdecls::plugin_action_catalogue_runtimes(),
         capdecls::plugin_action_catalogue_platform_security(),
         capdecls::plugin_action_catalogue_browser_inventory(),
+        capdecls::plugin_action_catalogue_local_security_policy(),
         capdecls::plugin_action_catalogue_privacy_permissions(),
         capdecls::plugin_action_catalogue_system_hardening(),
         capdecls::plugin_action_catalogue_pkg_inventory(),
+        capdecls::plugin_action_catalogue_mgmt_posture(),
+        capdecls::plugin_action_catalogue_shares(),
+        capdecls::plugin_action_catalogue_remote_access_audit(),
         capdecls::core_dispatch_capabilities(),
     };
     auto classified = registry.classify("tar", "purge_source");

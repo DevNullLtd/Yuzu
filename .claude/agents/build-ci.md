@@ -87,7 +87,7 @@ When reviewing another agent's Change Summary:
 
 This is the state `main` ships. `meson.build` Windows branch constructs `protobuf_dep` and `grpcpp_dep` from scratch using `find_library()` + `declare_dependency()` — Linux/macOS continue to use `dependency('protobuf', method: 'cmake', ...)` unchanged.
 
-If you are about to (a) remove the static-linkage override in the triplet, or (b) simplify `meson.build`'s Windows branch to use `method: 'cmake'`, **stop and read this section**. We've tried those and they don't work. The long-term escape from this trap is **moving off gRPC entirely — tracked as P1 in #376 (Strategic: Migrate transport off gRPC to QUIC)**.
+If you are about to (a) remove the static-linkage override in the triplet, or (b) simplify `meson.build`'s Windows branch to use `method: 'cmake'`, **stop and read this section**. We've tried those and they don't work. There is no escape hatch: gRPC is the permanent transport (ADR-0066 withdrew the #376 QUIC migration), so this configuration is permanent and load-bearing.
 
 ### Why this rule exists
 
@@ -180,7 +180,7 @@ The approach:
 
 ### Strategic escape: migrate off gRPC
 
-The long-term plan is to **eliminate the gRPC dependency entirely** — see **P1 #376 "Strategic: Migrate transport off gRPC to QUIC"**. QUIC (via MsQuic or similar) gives us the same reliable multiplexed bidirectional streams without the C++ ABI / CMake ecosystem tax, which would make the entire "Windows MSVC static-link history and #375" section obsolete history. It's deferred until current customer commitments ship because the transport rewrite touches agent, server, gateway, and the SDK — multi-week work that can't happen under a rollout pause.
+**Withdrawn (2026-10-08, ADR-0066):** the plan to eliminate the gRPC dependency by moving to QUIC (#376) was abandoned; gRPC is the permanent transport. Treat this section as live guidance, not obsolete-in-waiting history.
 
 ## Windows DLL-boundary absl hash seed mismatch (#501)
 
@@ -253,9 +253,9 @@ If this returns `0`, no successful CI run has completed recently and the build i
 
 When Windows CI fails with vcpkg-related errors and the logs are ambiguous, direct filesystem inspection of the runner's workspace is often the only way to diagnose. The Windows runner's workspace is at `C:\actions-runner\_work\Yuzu\Yuzu`, accessible from WSL2 on the same physical box as `/mnt/c/actions-runner/_work/Yuzu/Yuzu`.
 
-A one-off diagnostic script lives at `/mnt/c/Users/natha/inspect-vcpkg.sh` (outside the repo — keep it there so `git clean` doesn't delete it). It auto-detects WSL2 vs MSYS2 path conventions and dumps the `vcpkg_installed/` layout, force-fresh sentinel files, per-triplet `share/*/` cmake configs, `libprotobuf*.lib` locations, vcpkg version, and the triplet overlay listing. Safe to run while the runner is busy — read-only on the target tree. Usage:
+A one-off diagnostic script lives at `/mnt/c/Users/<user>/inspect-vcpkg.sh` (outside the repo — keep it there so `git clean` doesn't delete it). It auto-detects WSL2 vs MSYS2 path conventions and dumps the `vcpkg_installed/` layout, force-fresh sentinel files, per-triplet `share/*/` cmake configs, `libprotobuf*.lib` locations, vcpkg version, and the triplet overlay listing. Safe to run while the runner is busy — read-only on the target tree. Usage:
 
-    bash /mnt/c/Users/natha/inspect-vcpkg.sh > /tmp/vcpkg-state.txt 2>&1
+    bash /mnt/c/Users/<user>/inspect-vcpkg.sh > /tmp/vcpkg-state.txt 2>&1
 
 ### hex.pm flake on the gateway CT test (Windows and Linux alike)
 
@@ -265,7 +265,7 @@ What actually happens: `gateway ct` activates rebar3's `test` profile which pull
 
 **Prior art for pre-fetching** lives in `deploy/docker/Dockerfile.ci-gateway` — the CI image runs `rebar3 compile --deps_only` at image build time in a clone of the gateway, then copies `_build/` into `/opt/rebar3_deps/_build`. Subsequent rebar3 runs inside the image find meck/proper/etc. locally and never hit hex.pm. This mitigation applies to any containerized Linux CI path that uses the ci-gateway image.
 
-**The self-hosted runners are bare-metal** (`yuzu-wsl2-linux`, `yuzu-local-windows`), not containerized, so they don't benefit from the ci-gateway image's pre-fetch. The equivalent runner-side mitigations are:
+**The self-hosted runners are bare-metal** (the Big Tam and Wee Tam pools), not containerized, so they don't benefit from the ci-gateway image's pre-fetch. The equivalent runner-side mitigations are:
 
 1. **Runner-level rebar3 cache seeding** — run `rebar3 as test compile --deps_only` once inside a clone of `gateway/` on the runner. Rebar3 caches the fetched hex packages at `~/.cache/rebar3/hex/hexpm/packages/` (Linux/WSL2) or `%LOCALAPPDATA%\rebar3\hex\hexpm\packages\` (native Windows). This cache is persistent across CI runs and `git clean -ffdx` in `$GITHUB_WORKSPACE` doesn't touch it. One-time bootstrap per runner.
 2. **Retry wrapper in `scripts/test_gateway.py`** — wrap the `rebar3 as test ct` invocation in a bounded retry loop that re-runs on rebar3's fetch-failure exit code. This handles flake transparently without any runner-side state.

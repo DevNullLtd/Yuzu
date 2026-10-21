@@ -6,13 +6,14 @@ Reference for the Windows build toolchain paths and prerequisites. CLAUDE.md kee
 
 ```bash
 source ./setup_msvc_env.sh           # MSVC paths
-source scripts/ensure-erlang.sh      # Erlang/OTP on PATH (gateway target)
 meson compile -C build-windows       # canonical Windows dir; coexists with build-linux from WSL2
 ```
 
 **Do NOT use `vcvars64.bat`.** It returns exit code 1 due to optional extension failures (Clang, bundled CMake, ConnectionManager) even though cl.exe is set up correctly. This causes `.bat` wrapper scripts to abort or misbehave. `setup_msvc_env.sh` sets all MSVC paths directly in MSYS2 bash and is the only supported build method.
 
-`scripts/ensure-erlang.sh` is the sibling helper for the Erlang/OTP toolchain (see "Toolchain activation (Erlang on PATH)" in `docs/erlang-gateway-build.md`). Source both before invoking meson if your build touches the gateway custom_target.
+The gateway's Erlang/OTP needs no activation step: Meson resolves the pinned release at configure time and hands it to the gateway build and tests (see "Toolchain activation (Erlang on PATH)" in `docs/erlang-gateway-build.md`). `scripts/ensure-erlang.sh` applies the same pin to an interactive shell, for running rebar3 or `erl` by hand.
+
+**Python for build scripts:** every Meson target that runs a repo script uses the interpreter running Meson itself (`yuzu_python` in the root `meson.build`), i.e. the native `C:\Python314` of the runner contract. A bare `python3` under MSYS2 bash is MSYS2's `/usr/bin/python3`, which cannot open the `C:/` paths Meson passes and made every script test fail in ~0.04s.
 
 ## Toolchain paths
 
@@ -105,7 +106,7 @@ files correctly.
 Every shipped `.ps1` begins with a `PSVersionTable.PSVersion.Major -lt 7`
 guard that exits 1 with an actionable message. CI workflow steps use
 `shell: pwsh` rather than `shell: powershell`. The
-`yuzu-local-windows` runner has `pwsh` 7.6.1 pre-installed. See
+retired `yuzu-local-windows` runner had `pwsh` 7.6.1 pre-installed; the Wee Tam runners are provisioned per `deploy/windows/README.md`. See
 issue #517 for the migration history.
 
 **Exception: installer helpers run on end-user hosts.** Scripts the

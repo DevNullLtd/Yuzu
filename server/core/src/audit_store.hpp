@@ -1,5 +1,7 @@
 #pragma once
 
+#include "utf8_sanitize.hpp"
+
 /// @file audit_store.hpp
 /// SOC 2 evidence chain — operator actions, agent enrolment, fleet-topology
 /// events, background schedule execution, and every behavioural-PII access.
@@ -43,6 +45,11 @@
 ///    rows (`legacy_sqlite_probe::warn_if_legacy_rows`).
 
 #include <yuzu/audit_retention_rules.hpp>
+
+// PGconn (`log_in_txn`'s caller-held connection): included directly rather
+// than forward-declaring libpq's private `pg_conn` tag — api_token_store.hpp's
+// rationale (#5342).
+#include <libpq-fe.h>
 
 #include <atomic>
 #include <cstddef>
@@ -98,8 +105,13 @@ struct AuditQuery {
     std::string action;
     std::string target_type;
     std::string target_id;
-    int64_t since{0};
-    int64_t until{0};
+    /// Epoch-second bounds, PRESENCE-tracked (#4644): unset = no bound on that side, a set value
+    /// is a literal inclusive bound. A literal 0 is NOT "unbounded" -- the old `int64_t{0}`
+    /// default made an omitted bound and a computed window that collapsed to 0 the same thing,
+    /// so the latter returned the whole log. Every surface rejects `until <= 0` before it gets
+    /// here; `since == 0` is a harmless literal bound (every stored timestamp is positive).
+    std::optional<int64_t> since;
+    std::optional<int64_t> until;
     int limit{100};
     int offset{0};
     // Match any action that starts with one of these prefixes (OR-combined),
@@ -128,6 +140,23 @@ struct AuditQuery {
 // (see random_sample). Public so the REST layer can report `recency_capped` to an
 // auditor (#4 / SOC 2 CC7.2 evidence honesty).
 inline constexpr std::size_t kAuditSampleScanCap = 10000;
+
+/// Largest `offset` any audit read surface accepts (REST v1, legacy REST, MCP).
+/// An offset above it is a 400, never a silent clamp: a client must not receive a
+/// different page than it asked for. Auditors narrow with `since`/`until`.
+inline constexpr int kAuditMaxOffset = 10000;
+
+/// True when every string filter of `q` is safe to bind: no NUL (it would truncate the bound
+/// value at the C-string boundary and widen the filter) and valid UTF-8 (Postgres rejects the
+/// bind, which would surface as a false 503 plus a false read-degrade count). One copy for the
+/// legacy and v1 REST routes; MCP gets valid UTF-8 from its JSON parser.
+inline bool audit_string_filters_wellformed(const AuditQuery& q) {
+    for (const std::string* v : {&q.principal, &q.action, &q.target_type, &q.target_id}) {
+        if (v->find('\0') != std::string::npos || sanitize_utf8_strict(*v) != *v)
+            return false;
+    }
+    return true;
+}
 
 // ── Retention clock guard (#2360) ──────────────────────────────────────────
 //
@@ -254,6 +283,11 @@ public:
     AuditStore& operator=(AuditStore&&) = delete;
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
+    /// The retention window this store was constructed with and actually
+    /// enforces (days; <= 0 means "never expire"). Read-only: the value is
+    /// copied at construction and never re-read, so this is the ENFORCED
+    /// figure, which can differ from Config / a stored runtime override.
+    [[nodiscard]] int retention_days() const noexcept { return retention_days_; }
 
     /// Wire a metrics registry for `yuzu_server_audit_read_degrade_total{reason}`
     /// (degrade-distinguishable reads). Set ONCE during single-threaded startup,
@@ -275,6 +309,28 @@ public:
     /// (store not open, pool-acquire timeout, or query error) `emit_failed_`
     /// increments and the row is lost. `[[nodiscard]]` makes any discard visible.
     [[nodiscard]] bool log(const AuditEvent& event);
+
+    /// The ADR-0012 §3 query-owner seam for this store (#5342): the SAME
+    /// sanitize + INSERT as `log()`, issued on a connection the CALLER already
+    /// holds inside ITS OWN open transaction (`pool.with_txn_for`'s `PGconn*`),
+    /// so an audit row commits or aborts together with the mutation it records.
+    /// `log()` is exactly "lease + `log_in_txn` + `count_committed`".
+    ///
+    /// Returns true iff the INSERT succeeded (the row is written but NOT yet
+    /// committed — the caller's COMMIT decides). On failure `emit_failed_`
+    /// increments (same accounting as `log()`) and the caller's transaction is
+    /// in the aborted state: it MUST roll back (return false from its
+    /// `with_txn_for` callback) — never "proceed without the row". Does NOT
+    /// touch the success buckets (`events_written`): the caller calls
+    /// `count_committed(result)` once per row AFTER its own commit is confirmed,
+    /// so a rolled-back row is never counted as written. Takes no lease and
+    /// never re-enters the pool (no nested acquire).
+    [[nodiscard]] bool log_in_txn(PGconn* conn, const AuditEvent& event);
+
+    /// Bump the `events_written(result)` bucket for ONE row whose transaction
+    /// has COMMITTED. Called by `log()` itself and by a `log_in_txn` caller
+    /// after its commit. Lock-free.
+    void count_committed(std::string_view result) noexcept;
 
     /// Degrade-distinguishable read: `std::nullopt` on a store/pool/query failure
     /// (evidence integrity — a blip must not read as "no audit activity"); an

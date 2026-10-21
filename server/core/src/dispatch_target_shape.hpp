@@ -82,6 +82,11 @@ namespace yuzu::server {
 /// across five files is how that lands in production unnoticed.
 inline constexpr std::string_view kBroadcastScope{"__all__"};
 
+/// The prefix that selects a management group in a scope string (`group:<id>`). Named for the
+/// same reason as `kBroadcastScope`: `classify_dispatch_arm` and every resolver that strips
+/// the prefix must agree on it.
+inline constexpr std::string_view kGroupScopePrefix{"group:"};
+
 /// One violated bound. Neither field is ever caller-derived.
 struct BoundViolation {
     /// Closed-set metric label - stays a literal.
@@ -201,6 +206,12 @@ inline constexpr std::string_view kReasonQuarantined{"quarantined"};
 /// misspelled or unregistered plugin name should be observable the same way
 /// a quarantine denial is.
 inline constexpr std::string_view kReasonUnknownPlugin{"unknown_plugin"};
+
+/// #5294: a dispatch target withheld because the per-OS kill switch for its
+/// agent OS is OFF. Same standing as `kReasonUnknownPlugin` -- a policy
+/// withholding, not a targeting-shape violation, so deliberately NOT a member
+/// of either array above, and emitted from the same three routes.
+inline constexpr std::string_view kReasonKillSwitchedOs{"kill_switched_os"};
 
 /// #4496: the from-inventory-query result-set producer (REST and its MCP
 /// twin) refused because the underlying inventory read hit its row/byte cap.
@@ -349,7 +360,7 @@ enum class DispatchArm {
 [[nodiscard]] inline DispatchArm classify_dispatch_arm(bool has_agent_ids,
                                                        std::string_view scope_expr) {
     const bool real_scope = !scope_expr.empty() && scope_expr != kBroadcastScope;
-    if (real_scope && scope_expr.starts_with("group:"))
+    if (real_scope && scope_expr.starts_with(kGroupScopePrefix))
         return DispatchArm::Group;
     if (real_scope)
         return DispatchArm::Scope;

@@ -25,6 +25,31 @@
 %%% Test fixture
 %%%===================================================================
 
+%% format_status/1 shows the queued and postponed events by type only (the
+%% head of the queue is the "Last event" of a terminate report); the other keys
+%% pass through untouched.
+format_status_reduces_events_to_their_type_test() ->
+    Secret = <<"MARKER-enrollment-token">>,
+    From = {self(), make_ref()},
+    Status = #{state => streaming, data => not_a_data_record,
+               reason => {error, badarg},
+               queue => [{cast, #{enrollment_token => Secret}},
+                         {{call, From}, {dispatch, Secret}},
+                         {info, {tag, Secret}}, junk],
+               postponed => [{cast, Secret}],
+               log => []},
+    Out = yuzu_gw_agent:format_status(Status),
+    ?assertEqual([{cast, '$redacted'}, {{call, From}, '$redacted'},
+                  {info, '$redacted'}, '$redacted'], maps:get(queue, Out)),
+    ?assertEqual([{cast, '$redacted'}], maps:get(postponed, Out)),
+    ?assertEqual({error, badarg}, maps:get(reason, Out)),
+    ?assertEqual(streaming, maps:get(state, Out)),
+    ?assertEqual('$redacted', maps:get(data, Out)),
+    ?assertEqual(nomatch, binary:match(iolist_to_binary(io_lib:format("~0p", [Out])), Secret)),
+    %% A queue that is not a list is not shown; an absent queue stays absent.
+    ?assertEqual('$redacted', maps:get(queue, yuzu_gw_agent:format_status(#{queue => x}))),
+    ?assertNot(maps:is_key(queue, yuzu_gw_agent:format_status(#{state => s}))).
+
 agent_test_() ->
     {setup,
      fun setup/0,
@@ -213,9 +238,9 @@ stream_home_id_identical_on_connect_and_disconnect() ->
     {Pid, AgentId} = start_agent(<<"shi-1">>, self()),
     Pid ! stream_closed,
     ok = wait_for_death(Pid, 2000),
-    Calls = meck:history(yuzu_gw_upstream),
-    NotifyCalls = [Args || {_, {yuzu_gw_upstream, notify_stream_status, Args}, _} <- Calls,
-                            lists:nth(1, Args) =:= AgentId],
+    %% The process is dead, so no further call can arrive: waiting for 2
+    %% still proves "exactly 2".
+    NotifyCalls = await_notify_calls(AgentId, 2),
     ?assertEqual(2, length(NotifyCalls)), % exactly one CONNECTED, one DISCONNECTED
     [ConnectedArgs, DisconnectedArgs] = NotifyCalls,
     ?assertEqual(connected, lists:nth(3, ConnectedArgs)),
@@ -236,10 +261,11 @@ reannounce_same_session_resends_connected() ->
     SessionId = <<"sess-", AgentId/binary>>,
     meck:reset(yuzu_gw_upstream), % discard the init/1 CONNECTED call
     ok = yuzu_gw_agent:reannounce(Pid, SessionId),
-    timer:sleep(20),
-    Calls = meck:history(yuzu_gw_upstream),
-    NotifyCalls = [Args || {_, {yuzu_gw_upstream, notify_stream_status, Args}, _} <- Calls,
-                            lists:nth(1, Args) =:= AgentId],
+    %% reannounce/2 is a cast; get_info/1 is a call from this same process,
+    %% so its reply proves the cast was handled and every notify it makes has
+    %% been issued. Waiting for 1 then still proves "exactly 1".
+    {ok, _} = yuzu_gw_agent:get_info(Pid),
+    NotifyCalls = await_notify_calls(AgentId, 1),
     ?assertEqual(1, length(NotifyCalls)),
     [Args] = NotifyCalls,
     ?assertEqual(SessionId, lists:nth(2, Args)),
@@ -254,6 +280,11 @@ reannounce_different_session_ignored() ->
     {Pid, AgentId} = start_agent(<<"rdi-1">>, self()),
     meck:reset(yuzu_gw_upstream), % discard the init/1 CONNECTED call
     ok = yuzu_gw_agent:reannounce(Pid, <<"sess-someone-else">>),
+    %% Barrier: the get_info/1 reply proves the reannounce cast was handled.
+    %% The fixed sleep after it is a NEGATIVE check ("no notify arrived"): it
+    %% gives a wrongly-issued call's async meck history cast time to land, so
+    %% it is kept rather than polled.
+    {ok, _} = yuzu_gw_agent:get_info(Pid),
     timer:sleep(20),
     Calls = meck:history(yuzu_gw_upstream),
     NotifyCalls = [Args || {_, {yuzu_gw_upstream, notify_stream_status, Args}, _} <- Calls,
@@ -358,6 +389,28 @@ start_agent(AgentId, StreamPid) ->
     {ok, Pid} = yuzu_gw_agent:start_link(Args),
     unlink(Pid),
     {Pid, AgentId}.
+
+%% Poll meck history until at least N notify_stream_status calls for AgentId
+%% are recorded (or a 2s deadline passes), and return them in call order.
+%% meck records each call with an async cast to its own process, so reading
+%% history right after the agent acted (or after a fixed sleep) is an
+%% UPPER-bound race on a loaded runner (#4851 runs this suite on macOS CI for
+%% the first time; BigMags shares its CPU between two agents). Callers first
+%% make sure no further call can be made (a get_info/1 barrier, or the process
+%% is dead), and the calls already made were cast to meck before that, so
+%% waiting for N and then asserting the exact count is no weaker than the old
+%% fixed sleep.
+await_notify_calls(AgentId, N) ->
+    await_notify_calls(AgentId, N, erlang:monotonic_time(millisecond) + 2000).
+
+await_notify_calls(AgentId, N, Deadline) ->
+    Calls = [Args || {_, {yuzu_gw_upstream, notify_stream_status, Args}, _}
+                         <- meck:history(yuzu_gw_upstream),
+                     lists:nth(1, Args) =:= AgentId],
+    case length(Calls) < N andalso erlang:monotonic_time(millisecond) < Deadline of
+        true -> timer:sleep(10), await_notify_calls(AgentId, N, Deadline);
+        false -> Calls
+    end.
 
 stop_agent(Pid) ->
     case is_process_alive(Pid) of

@@ -154,8 +154,10 @@ constexpr ExpectedResolution kExpected[] = {
     {"POST",   "/api/instructions/validate-yaml",          3149824u,           false, "instruction_yaml"},
     {"POST",   "/fragments/instructions/yaml-preview",    3149824u,           false, "instruction_yaml"},
     // body_cap_policy.hpp hardware row — the Hardware CI list/record/sync REST
-    // v1 twin (hardware_routes.cpp). Only POST .../sync carries a body (one
-    // short "source" enum token); requires_measurable=true closes the same
+    // v1 twin (hardware_routes.cpp). Only POST .../sync and the fleet fan-out
+    // POST /api/v1/hardware/sync carry a body (a short "source" enum token, and
+    // for the fan-out a scope token or a <=1024-character expression, which
+    // inherits this row by segment-boundary prefix); requires_measurable=true closes the same
     // pre-auth-buffering gap the upload_session row above does (governance
     // Gate 2). ANY method — the bodyless GET list/record routes on the same
     // prefix are unaffected but share the class rather than falling to the
@@ -163,6 +165,7 @@ constexpr ExpectedResolution kExpected[] = {
     {"GET",    "/api/v1/hardware",                        4u * 1024,          true,  "hardware"},
     {"GET",    "/api/v1/hardware/agent-1",                4u * 1024,          true,  "hardware"},
     {"POST",   "/api/v1/hardware/agent-1/sync",           4u * 1024,          true,  "hardware"},
+    {"POST",   "/api/v1/hardware/sync",                   4u * 1024,          true,  "hardware"},
     // body_cap_policy.hpp rbac_role_assignment row — A2 global human role
     // assignment (rest_api_v1.cpp). POST body is {principal_type,
     // principal_id}; DELETE carries none. ANY method — the DELETE sibling
@@ -175,6 +178,20 @@ constexpr ExpectedResolution kExpected[] = {
     // inherit this row and falls to the catch-all instead.
     {"PUT",    "/api/v1/rbac/enforcement",                             1u * 1024, false, "rbac_enforcement"},
     {"PUT",    "/api/v1/rbac/enforcement-evil",                        4u * 1024 * 1024, false, "default"},
+    // body_cap_policy.hpp guardian_policy_generation row: the Guardian policy-generation
+    // raise (rest_api_v1.cpp). ANY method. Body is {"target_generation": N,
+    // "acknowledge_rule_set_replaced": true}. Segment-boundary probes prove neither a
+    // lookalike sibling nor the guardian_rule_authoring prefix swallows it.
+    {"POST",   "/api/v1/guaranteed-state/policy-generation/raise",     1u * 1024, false, "guardian_policy_generation"},
+    {"POST",   "/api/v1/guaranteed-state/policy-generation-evil/raise", 4u * 1024 * 1024, false, "default"},
+    // body_cap_policy.hpp users row — the /api/v1/users REST v1 subtree
+    // (#5342 password routes + unlock + elevation-eligibility). ANY method;
+    // a segment-boundary probe proves "/api/v1/usersevil" does NOT inherit it.
+    {"POST",   "/api/v1/users/me/password",                            16u * 1024, false, "users"},
+    {"POST",   "/api/v1/users/alice/password",                         16u * 1024, false, "users"},
+    {"POST",   "/api/v1/users/alice/unlock",                           16u * 1024, false, "users"},
+    {"POST",   "/api/v1/users/elevation-eligibility",                  16u * 1024, false, "users"},
+    {"POST",   "/api/v1/usersevil",                                    4u * 1024 * 1024, false, "default"},
     // Catch-all default — ordinary JSON/form traffic.
     {"POST",   "/api/v1/some-ordinary-mutation-route",    4u * 1024 * 1024,   false, "default"},
     {"GET",    "/api/v1/devices",                         4u * 1024 * 1024,   false, "default"},
@@ -210,6 +227,8 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "hardware",
     "rbac_role_assignment",
     "rbac_enforcement",
+    "guardian_policy_generation",
+    "users",
     "default",
 };
 
@@ -352,8 +371,10 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // twin, governance Gate 2) + rbac_role_assignment(1: A2 global human
     // role assignment, .claude/plans/rbac-industry-leading-DELIVERY-PLAN.md
     // §2) + rbac_enforcement(1: A1 enforcement enable/disable toggle) +
+    // guardian_policy_generation(1: the Guardian policy-generation raise) +
+    // users(1: the /api/v1/users subtree, #5342 password routes) +
     // default(1).
-    CHECK(std::size(kBodyCapTable) == 31);
+    CHECK(std::size(kBodyCapTable) == 33);
 }
 
 // ── 7. requires_measurable: ON for /mcp/ and upload_session, OFF elsewhere ──
@@ -371,6 +392,7 @@ TEST_CASE("resolve_body_cap: requires_measurable is ON for /mcp/, upload_session
     CHECK(resolve_body_cap("PUT", "/api/v1/uploads/abc123/chunk").requires_measurable);
     CHECK(resolve_body_cap("POST", "/api/v1/uploads").requires_measurable);
     CHECK(resolve_body_cap("POST", "/api/v1/hardware/agent-1/sync").requires_measurable);
+    CHECK(resolve_body_cap("POST", "/api/v1/hardware/sync").requires_measurable);
     CHECK(resolve_body_cap("GET", "/api/v1/hardware").requires_measurable);
 
     // Public REST (bundles), SCIM, certificate import (REST + dashboard),

@@ -15,6 +15,9 @@
 
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
+#include "audit_store.hpp"
+#include "dashboard_api_routes.hpp"
+#include "test_route_sink.hpp"
 #include "test_analytics_pg_helper.hpp" // AnalyticsEventStorePg — ADR-0049 PG port
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "test_tag_store_pg_helper.hpp" // TagStorePg — ADR-0050 PG port
@@ -25,6 +28,7 @@
 #include "service_scope_policy.hpp"
 #include "tag_store.hpp"
 #include "../test_helpers.hpp" // YUZU_REQUIRE_PG_DB_TPL / PgTestTemplate / TempDbFile
+#include "../test_log_capture.hpp" // yuzu::test::LogCapture / stray_control_bytes
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/server.hpp>
@@ -34,11 +38,13 @@
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <memory>
 #include <shared_mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -253,6 +259,15 @@ TEST_CASE("AuthRoutes::make_audit_event — populates principal from Bearer toke
     CHECK(event.principal == "test_user");
     CHECK(event.principal_role == "admin");
     CHECK(event.principal_class == "agent"); // bearer token (ADR-1005 Phase 3a)
+    CHECK(event.session_id.empty());         // no cookie -> never the digest of ""
+
+    // An unrelated or empty cookie beside the token is still no session cookie.
+    auto unrelated = request_with_header("Authorization", "Bearer " + raw);
+    unrelated.set_header("Cookie", "theme=dark");
+    CHECK(fix.ar->make_audit_event(unrelated, "mcp.list_agents", "success").session_id.empty());
+    auto blank = request_with_header("Authorization", "Bearer " + raw);
+    blank.set_header("Cookie", "yuzu_session=");
+    CHECK(fix.ar->make_audit_event(blank, "mcp.list_agents", "success").session_id.empty());
 }
 
 TEST_CASE("AuthRoutes::make_audit_event — populates principal from X-Yuzu-Token",
@@ -265,6 +280,7 @@ TEST_CASE("AuthRoutes::make_audit_event — populates principal from X-Yuzu-Toke
     CHECK(event.principal == "test_user");
     CHECK(event.principal_role == "admin");
     CHECK(event.principal_class == "agent"); // X-Yuzu-Token (ADR-1005 Phase 3a)
+    CHECK(event.session_id.empty());
 }
 
 TEST_CASE("AuthRoutes::make_audit_event — populates principal from session cookie",
@@ -277,8 +293,61 @@ TEST_CASE("AuthRoutes::make_audit_event — populates principal from session coo
     auto event = fix.ar->make_audit_event(req, "dashboard.action", "success");
     CHECK(event.principal == "test_user");
     CHECK(event.principal_role == "admin");
-    CHECK(event.session_id == *cookie);
+    CHECK(event.session_id == auth::AuthManager::sha256_hex(*cookie));
+    CHECK(event.session_id != *cookie);
     CHECK(event.principal_class == "human"); // session cookie (ADR-1005 Phase 3a)
+
+    // The cookie among unrelated ones: the extractor stops at the next ';'.
+    auto crowded = request_with_header("Cookie", "a=b; yuzu_session=" + *cookie + "; c=d");
+    CHECK(fix.ar->make_audit_event(crowded, "dashboard.action", "success").session_id ==
+          auth::AuthManager::sha256_hex(*cookie));
+}
+
+TEST_CASE("AuthRoutes::make_audit_event — stale cookie beside a valid Bearer token "
+          "records the cookie digest",
+          "[pg][auth_routes][audit]") {
+    AuthRoutesFixture fix;
+    auto req = request_with_header("Authorization", "Bearer " + fix.mint_token());
+    req.set_header("Cookie", "yuzu_session=not-a-live-session");
+
+    auto event = fix.ar->make_audit_event(req, "dashboard.action", "success");
+    CHECK(event.principal == "test_user");
+    CHECK(event.principal_class == "agent"); // the token authenticated (cookie fell through)
+    CHECK(event.session_id == auth::AuthManager::sha256_hex("not-a-live-session"));
+    CHECK(event.session_id != "not-a-live-session");
+}
+
+TEST_CASE("AuthRoutes::make_audit_event — a cookie that resolves no session records "
+          "no session_id",
+          "[pg][auth_routes][audit]") {
+    AuthRoutesFixture fix;
+    auto req = request_with_header("Cookie", "yuzu_session=not-a-live-session");
+
+    auto event = fix.ar->make_audit_event(req, "dashboard.action", "denied");
+    CHECK(event.principal.empty());
+    CHECK(event.session_id.empty());
+}
+
+TEST_CASE("AuthRoutes::make_audit_event_for_principal — session_id is the cookie "
+          "digest and empty without a cookie",
+          "[pg][auth_routes][audit]") {
+    AuthRoutesFixture fix;
+    auto cookie = fix.auth_mgr.authenticate("test_user", "test_password");
+    REQUIRE(cookie.has_value());
+
+    auto with_cookie = request_with_header("Cookie", "yuzu_session=" + *cookie);
+    auto ev = fix.ar->make_audit_event_for_principal(with_cookie, "login.success", "success",
+                                                     "test_user", "admin");
+    CHECK(ev.session_id == auth::AuthManager::sha256_hex(*cookie));
+    CHECK(ev.session_id != *cookie);
+
+    auto bearer = request_with_header("Authorization", "Bearer " + fix.mint_token());
+    CHECK(fix.ar->make_audit_event_for_principal(bearer, "login.success", "success",
+                                                 "test_user", "admin").session_id.empty());
+
+    httplib::Request bare;
+    CHECK(fix.ar->make_audit_event_for_principal(bare, "login.failure", "failure",
+                                                 "test_user", "").session_id.empty());
 }
 
 TEST_CASE("AuthRoutes::make_audit_event — empty principal when no auth present",
@@ -309,6 +378,30 @@ TEST_CASE("AuthRoutes::emit_event — analytics event records principal from "
         if (e.event_type == "test.event") {
             CHECK(e.principal == "test_user");
             CHECK(e.principal_role == "admin");
+            CHECK(e.session_id.empty());
+            found = true;
+            break;
+        }
+    }
+    CHECK(found);
+}
+
+TEST_CASE("AuthRoutes::emit_event — analytics session_id is the cookie digest",
+          "[pg][auth_routes][analytics]") {
+    AuthRoutesFixture fix;
+    auto cookie = fix.auth_mgr.authenticate("test_user", "test_password");
+    REQUIRE(cookie.has_value());
+    auto req = request_with_header("Cookie", "yuzu_session=" + *cookie);
+
+    fix.ar->emit_event("test.cookie.event", req);
+
+    auto events = fix.analytics->query_recent(10);
+    REQUIRE(events.has_value());
+    bool found = false;
+    for (const auto& e : *events) {
+        if (e.event_type == "test.cookie.event") {
+            CHECK(e.session_id == auth::AuthManager::sha256_hex(*cookie));
+            CHECK(e.session_id != *cookie);
             found = true;
             break;
         }
@@ -464,6 +557,168 @@ TEST_CASE("AuthRoutes::require_admin — unscoped admin token is accepted (regre
     bool ok = fix.ar->require_admin(req, res);
     CHECK(ok);
     CHECK(res.status != 403);
+}
+
+// ---------------------------------------------------------------------------
+// require_admin decision table (#5779): every Session state pinned to its
+// (return, status, A4 message, audit row). The expected values are the
+// pre-refactor behaviour (require_admin before it was rebuilt on
+// authz::admin_gate_verdict), so this table must hold unchanged on both sides.
+// ---------------------------------------------------------------------------
+
+namespace {
+yuzu::test::PgTestTemplate admin_gate_table_audit_tpl{"admingateaudit", [](const std::string& dsn) {
+    pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    AuditStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("admingateaudit template: store failed to migrate");
+}};
+} // namespace
+
+TEST_CASE("AuthRoutes::require_admin — decision table over every session state",
+          "[pg][auth_routes][admin_gate][scope][mcp]") {
+    AuthRoutesFixture fix; // test_user = admin; api_tokens + analytics are PG clones
+    yuzu::test::PostgresTestDb audit_db{admin_gate_table_audit_tpl};
+    REQUIRE(audit_db.available());
+    pg::PgPool audit_pool{{.conninfo = audit_db.dsn(), .size = 2}};
+    AuditStore audit_store{audit_pool};
+    REQUIRE(audit_store.is_open());
+    AuthRoutes ar{fix.cfg, fix.auth_mgr, /*rbac_store=*/nullptr, fix.api_tokens.get(),
+                  &audit_store, /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                  fix.analytics.get(), fix.oidc_mu, fix.oidc_provider};
+    REQUIRE(fix.auth_mgr.upsert_user("plain_user", "password1234", auth::Role::user));
+
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    auto token = [&](const char* who, const char* scope, const char* tier) {
+        auto raw = fix.api_tokens->create_token("t", who, now + 3600, scope, tier);
+        REQUIRE(raw.has_value());
+        return "Bearer " + *raw;
+    };
+    auto cookie = [&](const std::string& tok) { return "yuzu_session=" + tok; };
+
+    // outcome: 0 admit, 401 unauthenticated, 403 denied.
+    struct Row {
+        const char* name;
+        std::string header; // "" = send no credential
+        std::string value;
+        int status;
+        const char* message;      // A4 error.message ("" when admitted)
+        const char* audit_target; // target_type of the auth.admin_required row ("" = none/blank)
+        const char* audit_detail; // detail of that row ("" for the admin-role denial)
+        bool audit_row;
+    };
+    const std::string admin_cookie = fix.auth_mgr.create_local_session_for_test(
+        "test_user", auth::Role::admin, true);
+    const std::string user_cookie = fix.auth_mgr.create_local_session_for_test(
+        "plain_user", auth::Role::user, true);
+    const std::string elevated_cookie = fix.auth_mgr.create_local_session_for_test(
+        "plain_user", auth::Role::user, true);
+    REQUIRE(fix.auth_mgr.elevate_session(elevated_cookie, std::chrono::seconds(300)).has_value());
+
+    const char* kSvc = "service-scoped tokens cannot perform admin operations";
+    const char* kMcp = "MCP tokens cannot perform admin operations";
+    const char* kRole = "admin role required";
+    const Row rows[] = {
+        {"no credential", "", "", 401, "unauthorized", "", "", false},
+        {"cookie admin", "Cookie", cookie(admin_cookie), 0, "", "", "", false},
+        {"cookie user", "Cookie", cookie(user_cookie), 403, kRole, "endpoint", "", true},
+        {"cookie user, JIT-elevated", "Cookie", cookie(elevated_cookie), 0, "", "", "", false},
+        {"token admin", "Authorization", token("test_user", "", ""), 0, "", "", "", false},
+        {"token user", "Authorization", token("plain_user", "", ""), 403, kRole, "endpoint", "",
+         true},
+        {"token admin + mcp", "Authorization", token("test_user", "", "readonly"), 403, kMcp, "",
+         "MCP token blocked from admin route", true},
+        {"token user + mcp", "Authorization", token("plain_user", "", "supervised"), 403, kMcp, "",
+         "MCP token blocked from admin route", true},
+        {"token admin + service scope", "Authorization", token("test_user", "finance-svc", ""), 403,
+         kSvc, "", "service-scoped token blocked from admin route", true},
+        {"token user + service scope", "Authorization", token("plain_user", "finance-svc", ""), 403,
+         kSvc, "", "service-scoped token blocked from admin route", true},
+        {"token admin + scope AND mcp (scope wins)", "Authorization",
+         token("test_user", "finance-svc", "readonly"), 403, kSvc, "",
+         "service-scoped token blocked from admin route", true},
+    };
+
+    // The /api/me side of the parity pin: the SAME credential through the real
+    // require_auth must report can_access_settings == what require_admin admits.
+    yuzu::server::test::TestRouteSink sink;
+    yuzu::server::dashboard_api::register_dashboard_api_routes(
+        sink, yuzu::server::dashboard_api::Deps{
+                  .auth_fn = [&ar](const httplib::Request& r, httplib::Response& s) {
+                      return ar.require_auth(r, s);
+                  },
+                  .perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                const std::string&) { return true; },
+                  .visible_agents_json_fn = [](const std::string&) { return nlohmann::json::array(); },
+              });
+
+    for (const auto& row : rows) {
+        INFO(row.name);
+        {
+            std::unordered_map<std::string, std::string> hdrs;
+            if (!row.header.empty())
+                hdrs.emplace(row.header, row.value);
+            const auto audits_before = audit_store.query(AuditQuery{.action = "auth.admin_required"});
+            REQUIRE(audits_before.has_value());
+            auto me = sink.dispatch("GET", "/api/me", "", "application/json", hdrs);
+            REQUIRE(me);
+            if (row.status == 401) {
+                CHECK(me->status == 401);
+                CHECK_FALSE(nlohmann::json::parse(me->body).contains("can_access_settings"));
+            } else {
+                CHECK(me->status == 200);
+                CHECK(nlohmann::json::parse(me->body)["can_access_settings"].get<bool>() ==
+                      (row.status == 0));
+                CHECK(me->get_header_value("Cache-Control") == "no-store, private");
+            }
+            // Reporting never consults the gate: no audit row from /api/me.
+            const auto audits_after = audit_store.query(AuditQuery{.action = "auth.admin_required"});
+            REQUIRE(audits_after.has_value());
+            CHECK(audits_after->size() == audits_before->size());
+        }
+        httplib::Request req;
+        req.path = "/settings";
+        if (!row.header.empty())
+            req.headers.emplace(row.header, row.value);
+        httplib::Response res;
+        auto before = audit_store.query(AuditQuery{.action = "auth.admin_required"});
+        REQUIRE(before.has_value());
+
+        const bool ok = ar.require_admin(req, res);
+        CHECK(ok == (row.status == 0));
+        if (row.status == 0) {
+            CHECK(res.status != 403);
+            CHECK(res.status != 401);
+        } else {
+            CHECK(res.status == row.status);
+            auto j = nlohmann::json::parse(res.body);
+            CHECK(j["error"]["code"].get<int>() == row.status);
+            CHECK(j["error"]["message"].get<std::string>() == row.message);
+            CHECK_FALSE(j["error"].contains("permission"));
+        }
+        auto after = audit_store.query(AuditQuery{.action = "auth.admin_required"});
+        REQUIRE(after.has_value());
+        const auto added = after->size() - before->size();
+        CHECK(added == (row.audit_row ? 1u : 0u));
+        if (row.audit_row && added == 1u) {
+            // The row this call wrote: the one id past everything seen before.
+            int64_t max_before = 0;
+            for (const auto& b : *before)
+                max_before = std::max(max_before, b.id);
+            const AuditEvent* found = nullptr;
+            for (const auto& a : *after)
+                if (a.id > max_before)
+                    found = &a;
+            REQUIRE(found != nullptr);
+            const auto& e = *found;
+            CHECK(e.result == "denied");
+            CHECK(e.target_type == row.audit_target);
+            CHECK(e.target_id == (std::string(row.audit_target) == "endpoint" ? "/settings" : ""));
+            CHECK(e.detail == row.audit_detail);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -798,6 +1053,40 @@ TEST_CASE("AuthRoutes::require_permission — no MCP tier (incl. readonly, admin
         CHECK_FALSE(ok);
         CHECK(res.status == 403);
         CHECK(res.body.find("MCP token tier does not allow") != std::string::npos);
+    }
+}
+
+// #5771: AuditLog:Read is in the topology floor. The audit surfaces are reached by
+// ordinary API tokens as well as cookie sessions; a token session carries its creator's
+// live legacy role, so with RBAC off a non-admin creator's token is refused and an
+// admin creator's is admitted. Real bearer -> require_permission path (no mocks).
+TEST_CASE("AuthRoutes::require_permission — AuditLog:Read floor: RBAC-off ordinary API token "
+          "of a non-admin is refused, an admin-owned token is admitted (#5771)",
+          "[pg][auth_routes][security][floor]") {
+    AuthRoutesFixture fix;
+    REQUIRE(fix.auth_mgr.upsert_user("plain_user", "plain_password1", auth::Role::user));
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+
+    auto user_raw = fix.api_tokens->create_token("audit-user", "plain_user", now + 3600);
+    REQUIRE(user_raw.has_value());
+    auto admin_raw = fix.api_tokens->create_token("audit-admin", "test_user", now + 3600);
+    REQUIRE(admin_raw.has_value());
+
+    {
+        auto req = request_with_header("Authorization", "Bearer " + *user_raw);
+        httplib::Response res;
+        CHECK_FALSE(fix.ar->require_permission(req, res, "AuditLog", "Read"));
+        CHECK(res.status == 403);
+        CHECK(fix.counter("yuzu_auth_topology_floor_denied_total",
+                          {{"permission", "AuditLog:Read"}}) == 1.0);
+    }
+    {
+        auto req = request_with_header("Authorization", "Bearer " + *admin_raw);
+        httplib::Response res;
+        CHECK(fix.ar->require_permission(req, res, "AuditLog", "Read"));
+        CHECK(fix.counter("yuzu_auth_topology_floor_denied_total",
+                          {{"permission", "AuditLog:Read"}}) == 1.0);
     }
 }
 
@@ -1291,6 +1580,29 @@ TEST_CASE("AuthRoutes::require_list_read — a dual-attribute token "
     CHECK(res.body.find("cannot read the fleet-wide status rollup") != std::string::npos);
 }
 
+// Clause 5 of the service-scoped confinement row: a blanket deny must not name a `.permission`
+// that would not admit the caller. This gate refuses the whole credential class, so granting
+// Response:Read to anyone would not admit a service-scoped token.
+TEST_CASE("AuthRoutes::require_list_read: the service-scoped-token 403 names no `permission` "
+          "field and keeps its message",
+          "[pg][auth_routes][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, service_scope_flip_rbac_tpl);
+    ServiceScopeFlipRig r{rbac_db_.dsn()};
+    auto token = r.mint("printers");
+    auto req = request_with_header("Authorization", "Bearer " + token);
+    httplib::Response res;
+
+    auto gate = r.ar->require_list_read(req, res, "Response", "Read");
+    CHECK_FALSE(gate.admitted);
+    CHECK(res.status == 403);
+    const auto j = nlohmann::json::parse(res.body, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(j.is_discarded());
+    CHECK(j["error"]["message"] ==
+          "service-scoped tokens cannot read the fleet-wide status rollup");
+    CHECK_FALSE(j["error"].contains("permission"));
+    CHECK(res.body.find("\"permission\"") == std::string::npos);
+}
+
 // ---------------------------------------------------------------------------
 // authz::is_service_tag_key / authz::service_scope_may_mutate_tag_key (#3289)
 // — pure predicates in service_scope_policy.hpp. No fixture, no store.
@@ -1689,4 +2001,431 @@ TEST_CASE("revalidate_stream: an unreachable token store is INDETERMINATE, not r
     }
 
     CHECK(f.ar->revalidate_stream(req, "test_user") == auth::CredentialCheck::kIndeterminate);
+}
+
+// ---------------------------------------------------------------------------
+// #5047: AuthRoutes::require_tier_policy — the MCP tier/approval belt
+// extracted VERBATIM out of require_permission's mcp_tier branch so a route
+// with no RBAC gate at all (the result-set write routes, ownership-only by
+// design) can still apply it. Unlike require_permission, this takes an
+// already-resolved `auth::Session` directly rather than re-authenticating a
+// request — so these tests construct a `Session` by hand (no minted token
+// needed) and call it straight, the same shape the result-set REST/fragment
+// routes use in production (server.cpp wires this exact method as
+// `tier_policy_fn`). The pre-existing require_permission TEST_CASEs above
+// this block are the regression net proving the extraction changed no
+// observable behaviour of require_permission itself.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::require_tier_policy — an empty mcp_tier is a no-op "
+          "(pass-through, nothing this belt enforces — #4309 is the separate "
+          "open question of whether it should)",
+          "[pg][auth_routes][mcp][tier_policy]") {
+    AuthRoutesFixture fix;
+    auth::Session session;
+    session.username = "test_user";
+    httplib::Request req;
+    req.path = "/api/v1/result-sets";
+    httplib::Response res;
+
+    CHECK(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write",
+                                            /*actionable_permission=*/true));
+    CHECK(res.status == -1); // httplib::Response's unset default — nothing written
+}
+
+TEST_CASE("AuthRoutes::require_tier_policy — readonly tier is denied "
+          "Infrastructure:Write",
+          "[pg][auth_routes][mcp][tier_policy]") {
+    AuthRoutesFixture fix;
+    auth::Session session;
+    session.username = "test_user";
+    session.mcp_tier = "readonly";
+    httplib::Request req;
+    req.path = "/api/v1/result-sets";
+    httplib::Response res;
+
+    CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write",
+                                            /*actionable_permission=*/true));
+    CHECK(res.status == 403);
+}
+
+TEST_CASE("AuthRoutes::require_tier_policy — operator tier is denied "
+          "Infrastructure:Write and Infrastructure:Delete (not on "
+          "tier_allows' operator allow-list)",
+          "[pg][auth_routes][mcp][tier_policy]") {
+    AuthRoutesFixture fix;
+    auth::Session session;
+    session.username = "test_user";
+    session.mcp_tier = "operator";
+    httplib::Request req;
+    req.path = "/api/v1/result-sets";
+
+    {
+        httplib::Response res;
+        CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write",
+                                            /*actionable_permission=*/true));
+        CHECK(res.status == 403);
+    }
+    {
+        httplib::Response res;
+        req.path = "/api/v1/result-sets/rs_deadbeef0123";
+        CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Delete",
+                                            /*actionable_permission=*/true));
+        CHECK(res.status == 403);
+    }
+}
+
+TEST_CASE("AuthRoutes::require_tier_policy — supervised tier IS allowed "
+          "Infrastructure:Write (create/pin/unpin are never approval-gated "
+          "at any tier — Infrastructure:Write is absent from "
+          "requires_approval()'s list)",
+          "[pg][auth_routes][mcp][tier_policy]") {
+    AuthRoutesFixture fix;
+    auth::Session session;
+    session.username = "test_user";
+    session.mcp_tier = "supervised";
+    httplib::Request req;
+    req.path = "/api/v1/result-sets";
+    httplib::Response res;
+
+    CHECK(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write",
+                                            /*actionable_permission=*/true));
+}
+
+TEST_CASE("AuthRoutes::require_tier_policy — supervised tier's "
+          "Infrastructure:Delete is approval-gated on a REST transport (403 "
+          "with a remediation pointing at the MCP ticket-then-recall flow), "
+          "mirroring the existing require_permission ApiToken:Write shape",
+          "[pg][auth_routes][mcp][tier_policy]") {
+    AuthRoutesFixture fix;
+    auth::Session session;
+    session.username = "test_user";
+    session.mcp_tier = "supervised";
+    httplib::Request req;
+    req.path = "/api/v1/result-sets/rs_deadbeef0123"; // a REST (non-MCP) transport
+    httplib::Response res;
+
+    CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Delete",
+                                            /*actionable_permission=*/true));
+    CHECK(res.status == 403);
+    CHECK(res.body.find("approval") != std::string::npos);
+    CHECK(res.body.find("ticket-then-recall") != std::string::npos);
+}
+
+TEST_CASE("AuthRoutes::require_tier_policy — the supervised-tier "
+          "Infrastructure:Delete approval gate is skipped on the MCP "
+          "transport itself (mcp_server.cpp's own C8 ticket-then-recall gate "
+          "is authoritative there, #289)",
+          "[pg][auth_routes][mcp][tier_policy]") {
+    AuthRoutesFixture fix;
+    auth::Session session;
+    session.username = "test_user";
+    session.mcp_tier = "supervised";
+    httplib::Request req;
+    req.path = "/mcp/v1/";
+    httplib::Response res;
+
+    CHECK(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Delete",
+                                            /*actionable_permission=*/true));
+}
+
+TEST_CASE("AuthRoutes::require_tier_policy — an engine-principal session "
+          "(hard-locked to mcp_tier=readonly, #5047 DoD) is denied "
+          "Infrastructure:Write — a REAL behavior change on the result-set "
+          "REST write routes, which have no perm_fn/engine-branch gate at "
+          "all and previously admitted an engine session on ownership alone",
+          "[pg][auth_routes][mcp][tier_policy][engine]") {
+    AuthRoutesFixture fix;
+    auth::Session session;
+    session.username = "engine:svc-1";
+    session.principal_kind = "engine";
+    session.mcp_tier = "readonly"; // the ONLY tier api_token_store.cpp's
+                                    // validate_engine_mint ever admits (§8)
+    httplib::Request req;
+    req.path = "/api/v1/result-sets";
+    httplib::Response res;
+
+    CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write",
+                                            /*actionable_permission=*/true));
+    CHECK(res.status == 403);
+}
+
+// ---------------------------------------------------------------------------
+// #5047 governance fix round (adversarial review, both Kimi and Codex,
+// independently): the two denial arms above unconditionally named
+// `Infrastructure:Write`/`:Delete` as the A4 `.permission` field, which
+// falsely implies holding that grant would admit the caller — true on
+// require_permission's own RBAC-gated context (unchanged: default
+// `actionable_permission = true`), but NOT on a gate-less route like the
+// result-set write family, which has no RBAC check at all (clause 5,
+// docs/auth-architecture.md "Service-scoped token fleet-wide confinement",
+// CATASTROPHIC MUST — a denial must not name a `.permission` that would not,
+// by itself, admit the caller). These tests pin BOTH the preserved default
+// behaviour (true) and the new opt-out (false) on both denial arms.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::require_tier_policy — actionable_permission=true "
+          "matches require_permission's own envelope (the tier_allows "
+          "denial names .permission) — actionable_permission has no "
+          "default (#5047 fix round); this pins the explicit-true side",
+          "[pg][auth_routes][mcp][tier_policy][clause5]") {
+    AuthRoutesFixture fix;
+    auth::Session session;
+    session.username = "test_user";
+    session.mcp_tier = "readonly";
+    httplib::Request req;
+    req.path = "/api/v1/result-sets";
+    httplib::Response res;
+
+    CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write",
+                                            /*actionable_permission=*/true));
+    CHECK(res.status == 403);
+    CHECK(res.body.find("\"permission\":\"Infrastructure:Write\"") != std::string::npos);
+}
+
+TEST_CASE("AuthRoutes::require_tier_policy — actionable_permission=false "
+          "omits .permission on a gate-less caller's tier_allows denial "
+          "(#5047 fix round)",
+          "[pg][auth_routes][mcp][tier_policy][clause5]") {
+    AuthRoutesFixture fix;
+    auth::Session session;
+    session.username = "test_user";
+    session.mcp_tier = "readonly";
+    httplib::Request req;
+    req.path = "/api/v1/result-sets";
+    httplib::Response res;
+
+    CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write",
+                                            /*actionable_permission=*/false));
+    CHECK(res.status == 403);
+    CHECK(res.body.find("\"permission\"") == std::string::npos);
+    // The message still steers correctly — only the structured self-
+    // remediation field is withheld.
+    CHECK(res.body.find("does not allow") != std::string::npos);
+    // A remediation string fills the gap instead (enterprise-readiness Gate
+    // 6 finding, #5047 governance fix round) — a caller hitting this cold
+    // gets a next step, not just a bare "not X" with an unexplained label.
+    CHECK(res.body.find("higher MCP token tier") != std::string::npos);
+}
+
+TEST_CASE("AuthRoutes::require_tier_policy — actionable_permission=false "
+          "omits .permission on a gate-less caller's requires_approval "
+          "denial too, keeping .remediation (#5047 fix round)",
+          "[pg][auth_routes][mcp][tier_policy][clause5]") {
+    AuthRoutesFixture fix;
+    auth::Session session;
+    session.username = "test_user";
+    session.mcp_tier = "supervised";
+    httplib::Request req;
+    req.path = "/api/v1/result-sets/rs_deadbeef0123"; // non-MCP transport
+    httplib::Response res;
+
+    CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Delete",
+                                            /*actionable_permission=*/false));
+    CHECK(res.status == 403);
+    CHECK(res.body.find("\"permission\"") == std::string::npos);
+    CHECK(res.body.find("ticket-then-recall") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// #5047 governance fix round (Gate 3 quality-engineer + Gate 4 unhappy-path,
+// converged independently): every test above calls `require_tier_policy`
+// directly with an explicit literal `actionable_permission` — none of them
+// exercise what `server.cpp` actually WIRES into production. A regression
+// reverting either `server.cpp` call site back to naming `.permission` would
+// have passed every test above. `AuthRoutes::gateless_tier_policy_fn()` is
+// the SOLE production factory both `server.cpp` sites call TODAY (no more
+// locally-duplicated lambdas) — this test obtains the REAL callable via that
+// factory, the exact same object `server.cpp` wires into `RestApiV1`/
+// `result_set::Deps`, and drives it directly. This proves the factory itself
+// is correct and gives both current call sites one shared, single-source
+// implementation to inherit from (a regression IN the factory, e.g. someone
+// changes its `false` to `true`, fails this test at both call sites at
+// once). It does NOT prove `server.cpp` keeps calling this factory — this
+// test only drives the factory's output and cannot observe whether a call
+// site actually invokes it; a future reversion of a `server.cpp` site to its
+// own hand-rolled lambda, or a new third gate-less call site written
+// in-line, would not be caught here (Gate 8 architect/quality-engineer
+// finding, independently converged).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::gateless_tier_policy_fn — the REAL production "
+          "TierPolicyFn both server.cpp sites wire omits .permission on "
+          "both denial arms (#5047 fix round, closes the wiring-coverage "
+          "gap Gate 3/4 found)",
+          "[pg][auth_routes][mcp][tier_policy][clause5]") {
+    AuthRoutesFixture fix;
+    yuzu::server::TierPolicyFn real_production_fn = fix.ar->gateless_tier_policy_fn();
+    REQUIRE(real_production_fn);
+
+    SECTION("tier_allows denial") {
+        auth::Session session;
+        session.username = "test_user";
+        session.mcp_tier = "readonly";
+        httplib::Request req;
+        req.path = "/api/v1/result-sets";
+        httplib::Response res;
+
+        CHECK_FALSE(real_production_fn(req, res, session, "Infrastructure", "Write"));
+        CHECK(res.status == 403);
+        CHECK(res.body.find("\"permission\"") == std::string::npos);
+        CHECK(res.body.find("higher MCP token tier") != std::string::npos);
+    }
+
+    SECTION("requires_approval denial") {
+        auth::Session session;
+        session.username = "test_user";
+        session.mcp_tier = "supervised";
+        httplib::Request req;
+        req.path = "/api/v1/result-sets/rs_deadbeef0123";
+        httplib::Response res;
+
+        CHECK_FALSE(real_production_fn(req, res, session, "Infrastructure", "Delete"));
+        CHECK(res.status == 403);
+        CHECK(res.body.find("\"permission\"") == std::string::npos);
+        CHECK(res.body.find("ticket-then-recall") != std::string::npos);
+    }
+
+    SECTION("untiered pass-through, still the real fn") {
+        auth::Session session;
+        session.username = "test_user";
+        httplib::Request req;
+        req.path = "/api/v1/result-sets";
+        httplib::Response res;
+
+        CHECK(real_production_fn(req, res, session, "Infrastructure", "Write"));
+        CHECK(res.status == -1); // nothing written — a genuine pass-through
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #6065 PR-Q (rest-audit-principal-reresolution): AuthRoutes::audit_log_for_session is the ONE
+// writer POST and DELETE /api/v1/quarantine stamp their rows through (server.cpp binds it as
+// RestApiV1::AuditAsSessionFn). Every route test substitutes its own writer, so this is the
+// only place the real fields are pinned: the principal, the role the caller captured, the
+// engine class, and the neutralised failure log (CWE-117).
+// ---------------------------------------------------------------------------
+TEST_CASE("AuthRoutes::audit_as_session_fn stamps the session it is handed, the captured role "
+          "and the engine class; a failed write logs neutralised fields",
+          "[pg][auth_routes][audit]") {
+    AuthRoutesFixture fix;
+    yuzu::test::PostgresTestDb audit_db{admin_gate_table_audit_tpl};
+    REQUIRE(audit_db.available());
+    pg::PgPool audit_pool{{.conninfo = audit_db.dsn(), .size = 2}};
+    AuditStore audit_store{audit_pool};
+    REQUIRE(audit_store.is_open());
+    AuthRoutes ar{fix.cfg, fix.auth_mgr, /*rbac_store=*/nullptr, fix.api_tokens.get(),
+                  &audit_store, /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                  fix.analytics.get(), fix.oidc_mu, fix.oidc_provider};
+    // THE production writer: server.cpp hands exactly this closure to RestApiV1, so a
+    // transposed argument anywhere on the path shows up in the row asserted below.
+    const auto write = ar.audit_as_session_fn();
+    httplib::Request req;
+    req.remote_addr = "10.1.2.3";
+    req.set_header("User-Agent", "audit-session-test/1");
+
+    auto one_row = [&](const std::string& action) {
+        AuditQuery q;
+        q.action = action;
+        auto rows = audit_store.query(q);
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        return rows->front();
+    };
+
+    SECTION("a human session: the principal, the role passed in rather than the base role, and "
+            "each target field in its own column") {
+        auth::Session s;
+        s.username = "alice";
+        s.role = auth::Role::user; // the base role; the caller passes the effective one
+        REQUIRE(write(req, s, "admin", "quarantine.enable", "attempt", "Security", "agent-1",
+                      "why"));
+        const auto e = one_row("quarantine.enable");
+        CHECK(e.principal == "alice");
+        CHECK(e.principal_role == "admin");
+        CHECK(e.result == "attempt");
+        CHECK(e.target_type == "Security");
+        CHECK(e.target_id == "agent-1");
+        CHECK(e.detail == "why");
+        CHECK(e.source_ip == "10.1.2.3");
+        CHECK(e.user_agent == "audit-session-test/1");
+        CHECK(e.principal_class != "engine");
+    }
+
+    SECTION("an engine session audits as the engine class, not the class its bearer implies") {
+        auth::Session s;
+        s.username = "engine:ci";
+        s.role = auth::Role::user;
+        s.principal_kind = "engine";
+        REQUIRE(write(req, s, "user", "quarantine.disable", "success", "Security", "agent-1", ""));
+        const auto e = one_row("quarantine.disable");
+        CHECK(e.principal == "engine:ci");
+        CHECK(e.principal_class == "engine");
+    }
+
+    SECTION("a failed write logs the principal and target id neutralised, one record, no "
+            "forged line (the persisted row keeps the raw value; here the store is broken)") {
+        {
+            pg::PgConn conn{PQconnectdb(audit_db.dsn().c_str())};
+            REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+            pg::PgResult r{PQexec(conn.get(),
+                                  "ALTER TABLE audit_store.audit_events RENAME TO audit_events_gone")};
+            REQUIRE(r.ok());
+        }
+        yuzu::test::LogCapture capture{spdlog::level::warn};
+
+        auth::Session s;
+        s.username = "ali\nFORGED-PRINCIPAL";
+        const bool ok = write(req, s, "user", "quarantine.enable", "failure", "Security",
+                              "agent\nFORGED-TARGET", "");
+        capture.stop(); // restore and quiesce before reading the text
+
+        CHECK_FALSE(ok);
+        const std::string text = capture.text();
+        REQUIRE(text.find("AuditStore::log failed") != std::string::npos);
+        // The record for this write stays ONE line: both hostile fields appear on it
+        // (neutralised in place), and no line of the captured output starts with a hostile
+        // marker, which a raw newline in either field would have produced. (The store logs
+        // its own multi-line error text first, so the whole output is not one line.)
+        std::istringstream lines(text);
+        std::string line;
+        std::string record;
+        while (std::getline(lines, line)) {
+            CHECK(line.rfind("FORGED", 0) == std::string::npos);
+            if (line.find("audit_log_for_principal: AuditStore::log failed") != std::string::npos)
+                record = line;
+        }
+        REQUIRE_FALSE(record.empty());
+        CHECK(record.find("FORGED-PRINCIPAL") != std::string::npos);
+        CHECK(record.find("FORGED-TARGET") != std::string::npos);
+        CHECK(yuzu::test::stray_control_bytes(text) == 0);
+    }
+}
+
+// The shared capture helper nests: stopping an inner capture restores the OUTER one as the default
+// logger (not null), and neither leaves its registry entry behind (a registered capture logger's
+// sink references a stream that dies with the capture).
+TEST_CASE("LogCapture nested captures restore the outer logger and leave no registry entry",
+          "[log_capture]") {
+    auto before = spdlog::default_logger();
+    {
+        yuzu::test::LogCapture outer{spdlog::level::warn};
+        spdlog::warn("outer-before");
+        {
+            yuzu::test::LogCapture inner{spdlog::level::warn};
+            spdlog::warn("inner-line");
+            inner.stop();
+            REQUIRE(spdlog::default_logger() != nullptr);
+            CHECK(inner.text().find("inner-line") != std::string::npos);
+            CHECK(inner.text().find("outer-before") == std::string::npos);
+        }
+        REQUIRE(spdlog::default_logger() != nullptr);
+        spdlog::warn("outer-after");
+        outer.stop();
+        CHECK(outer.text().find("outer-before") != std::string::npos);
+        CHECK(outer.text().find("outer-after") != std::string::npos);
+        CHECK(outer.text().find("inner-line") == std::string::npos);
+    }
+    CHECK(spdlog::default_logger() == before);
+    CHECK(spdlog::get("test_log_capture") == nullptr);
 }

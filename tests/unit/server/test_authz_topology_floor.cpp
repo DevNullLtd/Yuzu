@@ -21,10 +21,13 @@
 
 #include "api_token_store.hpp"
 #include "audit_store.hpp"
+#include "dashboard_api_routes.hpp"
 #include "engine_principal_store.hpp"
 #include "oidc_provider.hpp"
 #include "rbac_store.hpp"
+#include "rest_api_v1.hpp"
 #include "test_rbac_store_pg_helper.hpp" // PG-backed RbacStore (ADR-0041)
+#include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -47,6 +50,7 @@
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace yuzu::server;
@@ -110,7 +114,7 @@ struct FloorFixture {
     /// is keyed by username).
     httplib::Request session_request(const std::string& username, auth::Role role) {
         REQUIRE(auth_mgr.upsert_user(username, "password1234", role));
-        auto token = auth_mgr.create_local_session(username, role, /*mfa_verified=*/true);
+        auto token = auth_mgr.create_local_session_for_test(username, role, /*mfa_verified=*/true);
         httplib::Request req;
         req.headers.emplace("Cookie", "yuzu_session=" + token);
         return req;
@@ -122,7 +126,7 @@ struct FloorFixture {
     /// `elevate_session`'s own contract puts eligibility on the caller).
     httplib::Request elevated_session_request(const std::string& username) {
         REQUIRE(auth_mgr.upsert_user(username, "password1234", auth::Role::user));
-        auto token = auth_mgr.create_local_session(username, auth::Role::user, /*mfa_verified=*/true);
+        auto token = auth_mgr.create_local_session_for_test(username, auth::Role::user, /*mfa_verified=*/true);
         REQUIRE(auth_mgr.elevate_session(token, std::chrono::seconds(300)).has_value());
         httplib::Request req;
         req.headers.emplace("Cookie", "yuzu_session=" + token);
@@ -130,7 +134,7 @@ struct FloorFixture {
     }
 };
 
-/// Literal, INDEPENDENT copy of the five documented floored pairs — used by
+/// Literal, INDEPENDENT copy of the documented floored pairs — used by
 /// every test below that needs to enumerate "the floored set" for anything
 /// other than `topology_floor_applies` itself. Deliberately NOT derived from
 /// `kTopologyFloor`: a test that iterates the production array to build its
@@ -160,20 +164,23 @@ constexpr FloorPair kExpectedFloorPairs[] = {
     // Wave 7 PR7.2 (app_usage) — see authz_topology_floor.hpp's kTopologyFloor
     // comment for the rationale.
     {"Forensics", "Read"},
+    // #5771 — the audit trail (evidence-grade data).
+    {"AuditLog", "Read"},
 };
 
 } // namespace
 
 // ── 1. Lock the set ──────────────────────────────────────────────────────
 
-TEST_CASE("topology_floor_applies: exactly the ten documented pairs are floored",
+TEST_CASE("topology_floor_applies: exactly the eleven documented pairs are floored",
           "[authz][floor]") {
-    // Positive: the ten floored pairs (a change to kTopologyFloor's
+    // Positive: the eleven floored pairs (a change to kTopologyFloor's
     // MEMBERSHIP must break these). #4028 (api-parity programme #2146)
     // added the four Settings read-twin securables to the original three;
-    // #4031 added Enrollment/OidcConfig; Wave 7 PR7.2 added Forensics — see
-    // authz_topology_floor.hpp's file-header note on why these PRs extended
-    // this floor beyond its original "authorization topology" framing.
+    // #4031 added Enrollment/OidcConfig; Wave 7 PR7.2 added Forensics; #5771
+    // added AuditLog:Read — see authz_topology_floor.hpp's file-header note
+    // on why these PRs extended this floor beyond its original
+    // "authorization topology" framing.
     CHECK(topology_floor_applies("AccessReview", "Read"));
     CHECK(topology_floor_applies("UserManagement", "Read"));
     CHECK(topology_floor_applies("EnginePrincipal", "Read"));
@@ -184,6 +191,7 @@ TEST_CASE("topology_floor_applies: exactly the ten documented pairs are floored"
     CHECK(topology_floor_applies("Enrollment", "Read"));
     CHECK(topology_floor_applies("OidcConfig", "Read"));
     CHECK(topology_floor_applies("Forensics", "Read"));
+    CHECK(topology_floor_applies("AuditLog", "Read"));
 
     // Negative: a representative spread of pairs that must NOT be floored —
     // proves the set is narrow, not "every Read" or "every op on these
@@ -197,11 +205,12 @@ TEST_CASE("topology_floor_applies: exactly the ten documented pairs are floored"
     CHECK_FALSE(topology_floor_applies("Directory", "Read")); // #4031: NOT floored, see PR notes
     CHECK_FALSE(topology_floor_applies("Enrollment", "Write"));
     CHECK_FALSE(topology_floor_applies("Forensics", "Write"));
+    CHECK_FALSE(topology_floor_applies("AuditLog", "Write")); // #5771: the READ pair only
 
-    // Cardinality lock: an eleventh pair silently added to kTopologyFloor
+    // Cardinality lock: a twelfth pair silently added to kTopologyFloor
     // without updating this file's positive/negative lists must still break
     // this test even though every entry it DOES check still round-trips.
-    CHECK(std::size(kTopologyFloor) == 10);
+    CHECK(std::size(kTopologyFloor) == 11);
 }
 
 // ── 1b. Every floored securable must actually EXIST in the catalogue ─────
@@ -386,6 +395,201 @@ TEST_CASE("require_permission: a floored denial's audit reason and counter are d
                                             {{"permission", "Infrastructure:Write"}});
         CHECK(counter.value() == 0.0);
     }
+}
+
+// ── 9b. has_permission: the render-time probe (PR #5846 review; #5792) ─────
+
+TEST_CASE("has_permission: gives require_permission's verdict and writes no denial row, while "
+          "the gate still does (mutation: drop the probe guard in audit_log and the first "
+          "assertion fails)",
+          "[pg][authz][probe]") {
+    FloorFixture fix;
+    const AuditQuery denied_rows{.action = "auth.permission_required", .limit = 10};
+
+    SECTION("a denied probe leaves no auth.permission_required row; the gate leaves one") {
+        auto req = fix.session_request("kim", auth::Role::user);
+        CHECK_FALSE(fix.ar->has_permission(req, "Infrastructure", "Write"));
+        auto after_probe = fix.audit_store->query(denied_rows);
+        REQUIRE(after_probe.has_value());
+        CHECK(after_probe->empty());
+
+        httplib::Response res;
+        CHECK_FALSE(fix.ar->require_permission(req, res, "Infrastructure", "Write"));
+        auto after_gate = fix.audit_store->query(denied_rows);
+        REQUIRE(after_gate.has_value());
+        CHECK(after_gate->size() == 1);
+
+        // The suppression does not outlive the probe: a second probe adds nothing and a later
+        // gate denial is recorded again.
+        CHECK_FALSE(fix.ar->has_permission(req, "Infrastructure", "Write"));
+        httplib::Response res2;
+        CHECK_FALSE(fix.ar->require_permission(req, res2, "Infrastructure", "Write"));
+        auto after_both = fix.audit_store->query(denied_rows);
+        REQUIRE(after_both.has_value());
+        CHECK(after_both->size() == 2);
+    }
+
+    SECTION("the probe answers exactly as the gate does: admit, role denial, floored denial, "
+            "elevation") {
+        struct Case {
+            const char* user;
+            auth::Role role;
+            const char* securable;
+            const char* operation;
+            bool elevated;
+        };
+        const Case cases[] = {
+            {"lee", auth::Role::user, "Infrastructure", "Read", false},    // legacy Read allowed
+            {"mo", auth::Role::user, "Execution", "Execute", false},       // legacy needs admin
+            {"ned", auth::Role::user, "AccessReview", "Read", false},      // topology floor
+            {"ola", auth::Role::admin, "Execution", "Execute", false},     // admin
+            {"pat", auth::Role::user, "Execution", "Execute", true},       // JIT elevation
+        };
+        for (const auto& c : cases) {
+            INFO(c.user << " " << c.securable << ":" << c.operation);
+            auto req = c.elevated ? fix.elevated_session_request(c.user)
+                                  : fix.session_request(c.user, c.role);
+            httplib::Response res;
+            const bool gate = fix.ar->require_permission(req, res, c.securable, c.operation);
+            const bool probe = fix.ar->has_permission(req, c.securable, c.operation);
+            CHECK(probe == gate);
+        }
+    }
+
+    SECTION("an unauthenticated request is simply not permitted, and nothing is written") {
+        httplib::Request anon;
+        CHECK_FALSE(fix.ar->has_permission(anon, "Infrastructure", "Read"));
+        auto rows = fix.audit_store->query(denied_rows);
+        REQUIRE(rows.has_value());
+        CHECK(rows->empty());
+    }
+}
+
+TEST_CASE("probe_fleet_read / probe_permission: the gate's verdict with no denial row (PR #5859 "
+          "review; mutation: drop the AuditProbeScope in either and the row counts fail)",
+          "[pg][authz][probe]") {
+    FloorFixture fix;
+    const AuditQuery fleet_rows{.action = "auth.fleet_read_required", .limit = 10};
+    const AuditQuery perm_rows{.action = "auth.permission_required", .limit = 10};
+
+    SECTION("a denied fleet-read probe writes no row; the gate writes one") {
+        auto req = fix.session_request("quin", auth::Role::user);
+        httplib::Response probe_res;
+        // A non-Read operation is the gate's deterministic, audited refusal.
+        auto probed = fix.ar->probe_fleet_read(req, probe_res, "Infrastructure", "Write");
+        CHECK_FALSE(probed.has_value());
+        CHECK(probe_res.status == 403); // the response is still written, for the caller to read
+        auto after_probe = fix.audit_store->query(fleet_rows);
+        REQUIRE(after_probe.has_value());
+        CHECK(after_probe->empty());
+
+        httplib::Response gate_res;
+        auto gated = fix.ar->require_fleet_read(req, gate_res, "Infrastructure", "Write");
+        CHECK_FALSE(gated.has_value());
+        auto after_gate = fix.audit_store->query(fleet_rows);
+        REQUIRE(after_gate.has_value());
+        CHECK(after_gate->size() == 1);
+    }
+
+    SECTION("the probe answers with the gate's own verdict and status (this fixture has no "
+            "management-group store, so the fleet gate fails closed for both; the admit path "
+            "of the shared decision is covered by the has_permission cases above)") {
+        for (auto role : {auth::Role::user, auth::Role::admin}) {
+            auto req = fix.session_request(role == auth::Role::admin ? "rae" : "ray", role);
+            httplib::Response a, b;
+            auto probed = fix.ar->probe_fleet_read(req, a, "Infrastructure", "Read");
+            auto gated = fix.ar->require_fleet_read(req, b, "Infrastructure", "Read");
+            CHECK(probed.has_value() == gated.has_value());
+            CHECK(a.status == b.status);
+            if (probed && gated)
+                CHECK(probed->visible_for_query() == gated->visible_for_query());
+        }
+    }
+
+    SECTION("probe_permission keeps the gate's status and writes no row") {
+        auto req = fix.session_request("sam", auth::Role::user);
+        httplib::Response res;
+        CHECK_FALSE(fix.ar->probe_permission(req, res, "Execution", "Execute"));
+        CHECK(res.status == 403);
+        auto rows = fix.audit_store->query(perm_rows);
+        REQUIRE(rows.has_value());
+        CHECK(rows->empty());
+    }
+}
+
+TEST_CASE("probe_permission / probe_fleet_read: a token caller keeps its denial row while a cookie "
+          "sign-in does not (mutation: drop the denial_row_may_be_withheld check in audit_log)",
+          "[pg][authz][probe]") {
+    FloorFixture fix;
+    yuzu::server::ApiTokenStore tokens{*fix.audit_pool};
+    REQUIRE(tokens.is_open());
+    REQUIRE(fix.auth_mgr.upsert_user("tess", "password1234", auth::Role::user));
+    const auto expiry = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count() +
+                        3600;
+    auto raw = tokens.create_token("probe-token", "tess", expiry);
+    REQUIRE(raw.has_value());
+    AuthRoutes ar(fix.cfg, fix.auth_mgr, &fix.rbac_store, &tokens, fix.audit_store.get(),
+                  /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr, /*analytics_store=*/nullptr,
+                  fix.oidc_mu, fix.oidc_provider);
+    const AuditQuery perm_rows{.action = "auth.permission_required", .limit = 20};
+    const AuditQuery fleet_rows{.action = "auth.fleet_read_required", .limit = 20};
+    auto count = [&](const AuditQuery& q) {
+        auto r = fix.audit_store->query(q);
+        REQUIRE(r.has_value());
+        return r->size();
+    };
+
+    httplib::Request bearer;
+    bearer.headers.emplace("Authorization", "Bearer " + *raw);
+
+    httplib::Response r1;
+    CHECK_FALSE(ar.probe_permission(bearer, r1, "Execution", "Execute"));
+    CHECK(count(perm_rows) == 1); // the token caller's denial is on the record
+
+    httplib::Response r2;
+    CHECK_FALSE(ar.probe_fleet_read(bearer, r2, "Infrastructure", "Write").has_value());
+    CHECK(count(fleet_rows) == 1);
+
+    // The same questions from an interactive cookie sign-in add nothing.
+    auto cookie = fix.session_request("cora", auth::Role::user);
+    httplib::Response r3, r4;
+    CHECK_FALSE(ar.probe_permission(cookie, r3, "Execution", "Execute"));
+    CHECK_FALSE(ar.probe_fleet_read(cookie, r4, "Infrastructure", "Write").has_value());
+    CHECK(count(perm_rows) == 1);
+    CHECK(count(fleet_rows) == 1);
+}
+
+TEST_CASE("probe_fleet_read: an elevated session is admitted exactly as the gate admits it, "
+          "with the same scope",
+          "[pg][authz][probe]") {
+    FloorFixture fix;
+    auto req = fix.elevated_session_request("elena");
+    httplib::Response a, b;
+    auto probed = fix.ar->probe_fleet_read(req, a, "Infrastructure", "Read");
+    auto gated = fix.ar->require_fleet_read(req, b, "Infrastructure", "Read");
+    REQUIRE(gated.has_value()); // guard: a vacuous both-denied must not pass
+    REQUIRE(probed.has_value());
+    CHECK(probed->visible_for_query() == gated->visible_for_query());
+}
+
+TEST_CASE("denial_row_may_be_withheld: only an interactive cookie sign-in qualifies",
+          "[authz][probe]") {
+    auto session = [](const char* source, const char* kind) {
+        auth::Session s;
+        s.auth_source = source;
+        s.principal_kind = kind;
+        return s;
+    };
+    CHECK(yuzu::server::denial_row_may_be_withheld(session("local", "user")));
+    CHECK(yuzu::server::denial_row_may_be_withheld(session("oidc", "user")));
+    CHECK(yuzu::server::denial_row_may_be_withheld(session("saml", "user")));
+    // A machine credential or an engine principal keeps its denial rows.
+    CHECK_FALSE(yuzu::server::denial_row_may_be_withheld(session("api_token", "user")));
+    CHECK_FALSE(yuzu::server::denial_row_may_be_withheld(session("mcp_token", "user")));
+    CHECK_FALSE(yuzu::server::denial_row_may_be_withheld(session("engine_token", "engine")));
+    CHECK_FALSE(yuzu::server::denial_row_may_be_withheld(session("local", "engine")));
 }
 
 // ── 10. Securable seeding ─────────────────────────────────────────────────
@@ -580,4 +784,260 @@ TEST_CASE("require_permission: Forensics:Read — RBAC-off admin allowed, RBAC-o
         CHECK_FALSE(fix.ar->require_permission(req, res, "Forensics", "Read"));
         CHECK(res.status == 403);
     }
+}
+
+// ── 12. AuditLog:Read (#5771) — the audit trail's own matrix ──────────────
+//
+// The audit trail was the one evidence store readable by ANY signed-in
+// session on the RBAC-off default. The generic matrix tests above iterate
+// kExpectedFloorPairs, so they already cover the pair; this case pins what is
+// specific to it — the pair-labelled counter and `topology floor:` audit
+// reason — and the RBAC-on legs the floor must leave alone: a seeded holder
+// and a custom grant are still admitted, and a non-holder's denial is an
+// ordinary RBAC denial, never a floored one.
+
+TEST_CASE("require_permission: AuditLog:Read — RBAC-off non-admin floored with the pair's own "
+          "reason and counter; RBAC-on seeded and custom holders still admitted",
+          "[pg][authz][floor]") {
+    FloorFixture fix;
+
+    SECTION("RBAC off: a non-admin is denied; the audit reason and counter name AuditLog:Read") {
+        REQUIRE_FALSE(fix.rbac_store.is_rbac_enabled());
+        auto req = fix.session_request("rita", auth::Role::user);
+        httplib::Response res;
+        CHECK_FALSE(fix.ar->require_permission(req, res, "AuditLog", "Read"));
+        CHECK(res.status == 403);
+
+        auto rows = fix.audit_store->query(AuditQuery{.action = "auth.permission_required", .limit = 1});
+        REQUIRE(rows.has_value());
+        REQUIRE_FALSE(rows->empty());
+        CHECK(rows->front().detail.starts_with(
+            "topology floor: non-admin role denied AuditLog:Read"));
+
+        auto& counter = fix.metrics.counter("yuzu_auth_topology_floor_denied_total",
+                                            {{"permission", "AuditLog:Read"}});
+        CHECK(counter.value() == 1.0);
+    }
+
+    SECTION("RBAC off: an admin is admitted and the counter does not move") {
+        auto req = fix.session_request("adam", auth::Role::admin);
+        httplib::Response res;
+        CHECK(fix.ar->require_permission(req, res, "AuditLog", "Read"));
+        auto& counter = fix.metrics.counter("yuzu_auth_topology_floor_denied_total",
+                                            {{"permission", "AuditLog:Read"}});
+        CHECK(counter.value() == 0.0);
+    }
+
+    SECTION("RBAC on: users holding the seeded Operator and Viewer roles are admitted") {
+        REQUIRE(fix.rbac_store.assign_role({"user", "olivia", "Operator"}).has_value());
+        REQUIRE(fix.rbac_store.assign_role({"user", "vince", "Viewer"}).has_value());
+        fix.rbac_store.set_rbac_enabled(true);
+        for (const char* name : {"olivia", "vince"}) {
+            INFO("user=" << name);
+            auto req = fix.session_request(name, auth::Role::user);
+            httplib::Response res;
+            CHECK(fix.ar->require_permission(req, res, "AuditLog", "Read"));
+        }
+    }
+
+    SECTION("RBAC on: a custom role granted the pair is admitted") {
+        REQUIRE(fix.rbac_store.create_role({"AuditorTest", "d", false, 0}).has_value());
+        REQUIRE(fix.rbac_store.set_permission({"AuditorTest", "AuditLog", "Read", "allow"})
+                    .has_value());
+        REQUIRE(fix.rbac_store.assign_role({"user", "carmen", "AuditorTest"}).has_value());
+        fix.rbac_store.set_rbac_enabled(true);
+        auto req = fix.session_request("carmen", auth::Role::user);
+        httplib::Response res;
+        CHECK(fix.ar->require_permission(req, res, "AuditLog", "Read"));
+    }
+
+    SECTION("RBAC on: a non-holder is denied by the ordinary RBAC branch, not the floor") {
+        fix.rbac_store.set_rbac_enabled(true);
+        auto req = fix.session_request("nell", auth::Role::user);
+        httplib::Response res;
+        CHECK_FALSE(fix.ar->require_permission(req, res, "AuditLog", "Read"));
+        CHECK(res.status == 403);
+
+        auto rows = fix.audit_store->query(AuditQuery{.action = "auth.permission_required", .limit = 1});
+        REQUIRE(rows.has_value());
+        REQUIRE_FALSE(rows->empty());
+        CHECK(rows->front().detail == "RBAC denied AuditLog:Read");
+        auto& counter = fix.metrics.counter("yuzu_auth_topology_floor_denied_total",
+                                            {{"permission", "AuditLog:Read"}});
+        CHECK(counter.value() == 0.0);
+    }
+}
+
+// ── 13. Every REST audit surface, through the real chokepoint (#5771) ─────
+//
+// The floor keys on the (securable, operation) STRING each surface passes to
+// `require_permission`, so a surface re-gated on any other securable would
+// silently escape it. The route tests elsewhere stub the gate; this one wires
+// the REAL `AuthRoutes::require_permission` behind the four REST audit
+// surfaces and checks the acceptance behaviour directly: a non-admin cookie
+// session gets 403 on each while RBAC is off, an admin session is still
+// admitted, and each denial is a FLOORED denial (counter == one per route).
+// The MCP twins are pinned in test_mcp_server.cpp.
+
+TEST_CASE("AuditLog:Read floor: the four REST audit surfaces refuse a non-admin session while "
+          "RBAC is off and admit an admin, through the real require_permission",
+          "[pg][authz][floor]") {
+    FloorFixture fix;
+    REQUIRE_FALSE(fix.rbac_store.is_rbac_enabled());
+
+    auto auth_fn = [&fix](const httplib::Request& req, httplib::Response& res) {
+        return fix.ar->require_auth(req, res);
+    };
+    auto perm_fn = [&fix](const httplib::Request& req, httplib::Response& res,
+                          const std::string& securable, const std::string& operation) {
+        return fix.ar->require_permission(req, res, securable, operation);
+    };
+
+    yuzu::server::test::TestRouteSink sink;
+
+    dashboard_api::Deps deps;
+    deps.auth_fn = auth_fn;
+    deps.perm_fn = perm_fn;
+    deps.visible_agents_json_fn = [](const std::string&) { return nlohmann::json::array(); };
+    deps.rbac_store = &fix.rbac_store;
+    deps.audit_store = fix.audit_store.get();
+    dashboard_api::register_dashboard_api_routes(sink, std::move(deps));
+
+    RestApiV1 api;
+    api.register_routes(
+        sink, auth_fn, perm_fn,
+        [](const httplib::Request&, const std::string&, const std::string&, const std::string&,
+           const std::string&, const std::string&) { return true; },
+        &fix.rbac_store, /*mgmt_store=*/nullptr, /*token_store=*/nullptr,
+        /*quarantine_store=*/nullptr, /*response_store=*/nullptr, /*instruction_store=*/nullptr,
+        /*execution_tracker=*/nullptr, /*schedule_engine=*/nullptr, /*approval_manager=*/nullptr,
+        /*tag_store=*/nullptr, /*audit_store=*/fix.audit_store.get());
+
+    const std::unordered_map<std::string, std::string> user_headers{
+        {"Cookie", fix.session_request("uma", auth::Role::user).get_header_value("Cookie")}};
+    const std::unordered_map<std::string, std::string> admin_headers{
+        {"Cookie", fix.session_request("ada", auth::Role::admin).get_header_value("Cookie")}};
+    REQUIRE_FALSE(user_headers.at("Cookie").empty());
+    REQUIRE_FALSE(admin_headers.at("Cookie").empty());
+
+    const std::vector<std::string> surfaces = {
+        "/api/audit",
+        "/api/v1/audit",
+        "/api/v1/audit/auth-sample",
+        "/api/v1/engine-principals/audit/no-admin",
+    };
+
+    for (const auto& path : surfaces) {
+        INFO("non-admin: " << path);
+        auto res = sink.Get(path, user_headers);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+    }
+    auto& floored = fix.metrics.counter("yuzu_auth_topology_floor_denied_total",
+                                        {{"permission", "AuditLog:Read"}});
+    CHECK(floored.value() == static_cast<double>(surfaces.size()));
+
+    for (const auto& path : surfaces) {
+        INFO("admin: " << path);
+        auto res = sink.Get(path, admin_headers);
+        REQUIRE(res);
+        // Admitted by the gate. The no-admin auditor then answers 503 because
+        // no engine-principal store is wired in this fixture; the point is
+        // that it is not a 401/403.
+        CHECK(res->status != 401);
+        CHECK(res->status != 403);
+    }
+    CHECK(floored.value() == static_cast<double>(surfaces.size())); // admin never bumps it
+}
+
+// ── 14. The floor runs BEFORE the audit filter validation (#5771 x filter parity) ──
+//
+// The audit filters and paging bounds (since/until/target_*/offset) answer 400 on
+// bad input. A non-admin on a default (RBAC-off) install must be refused 403 first,
+// valid filters or not: a 400/200 from the validation layer would tell a caller
+// that has no AuditLog:Read about the query surface and its limits. The admin
+// control proves each malformed query really is a 400 when the gate admits it.
+
+TEST_CASE("AuditLog:Read floor: a non-admin is refused 403 on filtered and malformed audit "
+          "queries, ahead of the 400 validation",
+          "[pg][authz][floor][audit]") {
+    FloorFixture fix;
+    REQUIRE_FALSE(fix.rbac_store.is_rbac_enabled());
+
+    auto auth_fn = [&fix](const httplib::Request& req, httplib::Response& res) {
+        return fix.ar->require_auth(req, res);
+    };
+    auto perm_fn = [&fix](const httplib::Request& req, httplib::Response& res,
+                          const std::string& securable, const std::string& operation) {
+        return fix.ar->require_permission(req, res, securable, operation);
+    };
+
+    yuzu::server::test::TestRouteSink sink;
+
+    dashboard_api::Deps deps;
+    deps.auth_fn = auth_fn;
+    deps.perm_fn = perm_fn;
+    deps.visible_agents_json_fn = [](const std::string&) { return nlohmann::json::array(); };
+    deps.rbac_store = &fix.rbac_store;
+    deps.audit_store = fix.audit_store.get();
+    dashboard_api::register_dashboard_api_routes(sink, std::move(deps));
+
+    RestApiV1 api;
+    api.register_routes(
+        sink, auth_fn, perm_fn,
+        [](const httplib::Request&, const std::string&, const std::string&, const std::string&,
+           const std::string&, const std::string&) { return true; },
+        &fix.rbac_store, /*mgmt_store=*/nullptr, /*token_store=*/nullptr,
+        /*quarantine_store=*/nullptr, /*response_store=*/nullptr, /*instruction_store=*/nullptr,
+        /*execution_tracker=*/nullptr, /*schedule_engine=*/nullptr, /*approval_manager=*/nullptr,
+        /*tag_store=*/nullptr, /*audit_store=*/fix.audit_store.get());
+
+    const std::unordered_map<std::string, std::string> user_headers{
+        {"Cookie", fix.session_request("uma", auth::Role::user).get_header_value("Cookie")}};
+    const std::unordered_map<std::string, std::string> admin_headers{
+        {"Cookie", fix.session_request("ada", auth::Role::admin).get_header_value("Cookie")}};
+    REQUIRE_FALSE(user_headers.at("Cookie").empty());
+    REQUIRE_FALSE(admin_headers.at("Cookie").empty());
+
+    // Each query is a 400 for an admitted caller (bad paging bound, unparseable bound, inverted or
+    // negative window, a NUL in a string filter, target_id without target_type) except the
+    // last, a valid filter.
+    const std::vector<std::pair<std::string, int>> queries = {
+        {"/api/audit?offset=10001", 400},
+        {"/api/audit?since=abc", 400},
+        // PR #5870 review: a decoded NUL would truncate the bound value (the v1/MCP twins refuse
+        // it), and a negative or inverted window is a client error, not a query.
+        {"/api/audit?principal=a%00b", 400},
+        {"/api/audit?action=a%00b", 400},
+        {"/api/audit?target_type=a%00b", 400},
+        {"/api/audit?target_id=a%00b", 400},
+        // Invalid UTF-8 would fail the Postgres bind: a false 503 and a false degrade count.
+        {"/api/audit?principal=%C3%28", 400},
+        {"/api/audit?target_id=%FF", 400},
+        {"/api/audit?since=-1", 400},
+        {"/api/audit?until=-5", 400},
+        {"/api/audit?since=9&until=3", 400},
+        {"/api/v1/audit?offset=10001", 400},
+        {"/api/v1/audit?since=9&until=3", 400},
+        {"/api/v1/audit?target_id=x", 400},
+        {"/api/v1/audit?target_type=Tag&target_id=t1&since=1&until=9&offset=0", 200},
+    };
+
+    for (const auto& [path, admin_status] : queries) {
+        INFO("admin: " << path);
+        auto res = sink.Get(path, admin_headers);
+        REQUIRE(res);
+        CHECK(res->status == admin_status);
+    }
+    auto& floored = fix.metrics.counter("yuzu_auth_topology_floor_denied_total",
+                                        {{"permission", "AuditLog:Read"}});
+    CHECK(floored.value() == 0.0); // the admin control never bumps the floor counter
+
+    for (const auto& [path, admin_status] : queries) {
+        INFO("non-admin: " << path << " (admin status " << admin_status << ")");
+        auto res = sink.Get(path, user_headers);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+    }
+    CHECK(floored.value() == static_cast<double>(queries.size()));
 }

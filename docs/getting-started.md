@@ -20,7 +20,7 @@ Here are the key concepts you will use in this tutorial:
 
 - **Question vs. Action** -- Definitions have a `type` field. A `question` is read-only: it gathers information without modifying endpoint state (list services, read OS info, check disk space). An `action` may modify state (restart a service, install a package, change a registry value). This distinction drives the approval workflow -- questions can auto-execute, while actions can require sign-off.
 
-- **Parameters** -- Typed inputs with validation rules. Parameters are declared with a JSON Schema-style syntax (type, required fields, max length, allowed values) and validated before the command is dispatched to any agent.
+- **Parameters** -- Typed inputs with validation rules. Parameters are declared with a JSON Schema-style syntax (type, required fields, max length, allowed values) and `POST /api/instructions/{id}/execute` validates them before the command is dispatched to any agent (no other dispatch surface does yet).
 
 - **Result Schema** -- Typed output columns (string, int32, int64, bool, datetime) that describe the structure of response data. Typed results enable server-side aggregation (COUNT, SUM, AVG grouped by column) and clean export to CSV, JSON, ClickHouse, or Splunk.
 
@@ -62,8 +62,11 @@ This YAML is the canonical authoring format. Post the file itself: the `yaml_sou
 
 ### Import it via the API
 
+Cookie-session writes to the instruction routes must carry an Origin (or Referer) naming the server; token-authenticated requests do not.
+
 ```bash
 curl -s -X POST http://localhost:8080/api/instructions/yaml \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   --data-urlencode "yaml_source@hello-system-info.yaml"
 ```
@@ -111,6 +114,7 @@ Now dispatch the command to all connected agents:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/command \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -211,6 +215,7 @@ Key additions:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/instructions/yaml \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   --data-urlencode "yaml_source@service-inspect.yaml"
 ```
@@ -225,6 +230,7 @@ Expected response:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/command \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -365,6 +371,15 @@ This downloads a CSV file with headers:
 id,instruction_id,agent_id,timestamp,status,output,error_detail
 ```
 
+An export is capped at 10,000 rows and at 50 MiB of output. A cut CSV ends with one extra record
+beginning `# result_truncated_by_cap` (parse the file as CSV and read the final record before
+trusting a bulk pull; a quoted cell can contain text that looks like it, so do not regex-match
+lines), and a cut JSON export has a top-level `result_truncated_by_cap: true` in the response body
+on this legacy route (under `pagination` on the v1 route). A cut export is also saved under a
+`-truncated` name by `-OJ` and carries `X-Result-Truncated-By-Cap: true`; a plain `-o` keeps neither
+the name nor the header, so add `-D -` to print the headers (`curl -sS -D - -o service-results.csv
+...`).
+
 ### Export as JSON
 
 ```bash
@@ -440,6 +455,7 @@ Key differences from a question:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/instructions/yaml \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   --data-urlencode "yaml_source@service-restart.yaml"
 ```
@@ -508,9 +524,13 @@ Expected response:
 
 **4. Approve it.**
 
+Approving needs a signed-in session cookie from a different user than the submitter (an API token is refused with `403`) and a fresh MFA step-up (an account with no enrolled MFA factor passes the step-up, so enrol your approvers; see #6079). If the server answers `401` with `meta.mfa_step_up_required`, post your code to `/login/mfa/stepup` on the same cookie and retry. A cookie-session `POST` must also carry an `Origin` (or `Referer`) naming the server, as a browser sends; a request with neither is refused with `403`. See [Who can approve](user-manual/instructions.md#who-can-approve).
+
 ```bash
 curl -s -X POST http://localhost:8080/api/approvals/d4e5f6a7-.../approve \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"comment": "Approved for maintenance window"}'
 ```
@@ -529,7 +549,9 @@ If the action should not proceed, reject it instead:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/approvals/d4e5f6a7-.../reject \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"comment": "Not approved -- outside maintenance window"}'
 ```
@@ -582,6 +604,7 @@ The `permissions` block is the key governance feature:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/instruction-sets \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -625,6 +648,7 @@ When creating or updating an instruction definition, set the `instruction_set_id
 
 ```bash
 curl -s -X PUT http://localhost:8080/api/instructions/tutorial.service.inspect \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -673,6 +697,7 @@ Before using a scope expression in a command, you can validate its syntax:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/scope/validate \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"expression": "ostype == \"windows\""}'
@@ -696,6 +721,7 @@ Before dispatching to a large fleet, check how many agents the scope expression 
 
 ```bash
 curl -s -X POST http://localhost:8080/api/scope/estimate \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"expression": "ostype == \"windows\""}'
@@ -715,6 +741,7 @@ Use the `scope` field in the command request to target specific agents:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/command \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -764,6 +791,7 @@ Schedule the service inspect instruction to run every 15 minutes:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/schedules \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -812,9 +840,10 @@ Expected response:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/schedules/f6a7b8c9-.../enable \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
-  -d '{"enabled": "false"}'
+  -d '{"enabled": false}'
 ```
 
 Expected response:
@@ -823,19 +852,23 @@ Expected response:
 {"enabled":false}
 ```
 
+`enabled` must be a JSON boolean (or the integer `0` or `1`); a string such as `"false"` is answered `400` and the schedule is left as it was.
+
 ### Re-enable a schedule
 
 ```bash
 curl -s -X POST http://localhost:8080/api/schedules/f6a7b8c9-.../enable \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
-  -d '{"enabled": "true"}'
+  -d '{"enabled": true}'
 ```
 
 ### Delete a schedule
 
 ```bash
 curl -s -X DELETE http://localhost:8080/api/schedules/f6a7b8c9-... \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
 
@@ -852,10 +885,10 @@ Expected response:
 | `name` | string | Human-readable name for the schedule |
 | `definition_id` | string | ID of the instruction definition to execute |
 | `frequency_type` | string | `"once"`, `"interval"`, `"daily"`, `"weekly"`, `"monthly"` |
-| `interval_minutes` | int | Minutes between executions (for `interval` type) |
+| `interval_minutes` | int | Minutes between executions (for `interval` type), 1-35791394 |
 | `time_of_day` | string | `"HH:MM"` time for daily/weekly/monthly schedules |
 | `day_of_week` | int | 0-6 (Sunday=0) for weekly schedules |
-| `day_of_month` | int | 1-31 for monthly schedules |
+| `day_of_month` | int | 1-28 for monthly schedules |
 | `scope_expression` | string | Scope expression to target agents |
 | `requires_approval` | bool | Whether each scheduled run needs approval |
 
@@ -896,6 +929,8 @@ curl -s "http://localhost:8080/api/responses/services-f1e2d3c4b5a6a7b8?status=1&
 curl -s "http://localhost:8080/api/responses/services-f1e2d3c4b5a6a7b8/export?format=csv" \
   -b "$COOKIE" -o responses.csv
 ```
+
+(A cut export is marked; the first "Export as CSV" section in this guide shows how to tell a cut export from a complete one.)
 
 The CSV file contains one row per agent response with headers:
 
@@ -970,6 +1005,7 @@ Rerun an execution (optionally targeting only failed agents):
 
 ```bash
 curl -s -X POST http://localhost:8080/api/executions/EXECUTION_ID/rerun \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"scope": "failed_only"}'

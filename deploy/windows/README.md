@@ -170,7 +170,9 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
 
 - **Gateway build (de-Shulgi-ified).** `scripts/build_gateway.py` resolves the
   Erlang toolchain from `YUZU_ESCRIPT` / `YUZU_REBAR3` (set by provisioning),
-  then PATH/glob — it no longer assumes Shulgi's `C:\Erlang` junction or the
+  then the pinned OTP Meson resolved at configure (`YUZU_OTP_BIN`, 28.4 or any
+  later 28.x, administrator-owned `C:\Program Files` installs only - never a
+  `C:\Erlang` any user could create), then PATH/glob — it no longer assumes Shulgi's `C:\Erlang` junction or the
   Chocolatey rebar3 path. A box that sets those env vars builds the gateway with
   no filesystem fakery.
 - **Per-agent PostgreSQL (#2094).** Provisioning creates **one cluster per

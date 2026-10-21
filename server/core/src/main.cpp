@@ -8,6 +8,8 @@
 
 #include "gateway_mgmt_stub_pool.hpp" // parse_gateway_cluster_addrs
 #include "gateway_service_impl.hpp"   // detail::kMaxClusterIdLen
+#include "guardian_ingest.hpp"        // detail::create_t_server_logger / set_t_server_logger (#4666 PR-4)
+#include "healthcheck_probe.hpp"      // #5906: --healthcheck run_healthcheck
 #include "insecure_tls_gate.hpp"
 #include "kek_rotate_control.hpp" // detail::kKekMaxLiveVersionsDefault / kek_ceiling_is_risk_acceptance
 #include "key_provider.hpp"
@@ -21,7 +23,10 @@
 
 #include <CLI/CLI.hpp>
 
+#include "oidc_egress_policy.hpp"
 #include "secret_file.hpp"        // --postgres-dsn-file / --oidc-client-secret-file (#5272)
+#include "server_gateway_peer_options.hpp"
+#include "server_guardian_reconcile_options.hpp"
 #include "server_ota_options.hpp"
 #include "shutdown_drain_rules.hpp" // HA WS-8: --shutdown-drain-seconds bound
 #include "stream_budget.hpp" // detail::kMaxHttpWorkerThreads (pool ceiling)
@@ -461,9 +466,11 @@ int main(int argc, char* argv[]) {
                  "Register-bound identity (#1128). SAFE ONLY WITH PER-AGENT CLIENT CERTS — a "
                  "shared fleet-wide cert makes this a session-replay bypass. Default off.")
         ->envname("YUZU_NAT_TRUST_MTLS_IDENTITY");
-    app.add_option("--max-agents", cfg.max_agents, "Maximum concurrent agent connections")
-        ->default_val(10000)
-        ->envname("YUZU_MAX_AGENTS");
+    auto* max_agents_opt =
+        app.add_option("--max-agents", cfg.max_agents,
+                       "[DEPRECATED] No effect (never enforced); will be removed")
+            ->default_val(10000)
+            ->envname("YUZU_MAX_AGENTS");
     app.add_option("--log-level", log_level, "Log level: trace|debug|info|warn|error")
         ->default_val("info")
         ->envname("YUZU_LOG_LEVEL");
@@ -506,6 +513,18 @@ int main(int argc, char* argv[]) {
     // names, defaults, env spellings and validators are pinned by a test —
     // see test_server_ota_options.cpp.
     register_ota_options(app, cfg);
+
+    // Gateway-upstream peer authorization: pins, pin files and the explicit
+    // --insecure-gateway-peer acknowledgement. Registered from
+    // server_gateway_peer_options.hpp so names, env spellings and defaults are pinned
+    // by test_server_gateway_peer_options.cpp. The cross-flag decision (which
+    // combination may boot) is made in ServerImpl::run() after certificate bootstrap.
+    register_gateway_peer_options(app, cfg);
+
+    // Guardian heartbeat-reconcile admission budget (#5513): per-replica time budget, burst and
+    // count ceiling. Registered from server_guardian_reconcile_options.hpp; a non-positive or
+    // non-finite value is refused at startup (guardian_reconcile_options_error, below).
+    register_guardian_reconcile_options(app, cfg);
 
     // MFA / TOTP — SOC 2 CC6.6. See docs/auth-mfa-design.md.
     app.add_option("--mfa-enforcement", cfg.mfa_enforcement,
@@ -681,7 +700,9 @@ int main(int argc, char* argv[]) {
                    "--max-sse-streams, which is what you want; setting it clamps the stream "
                    "target to what your pool can carry. The whole pool is created at BOOT, so "
                    "size the host's process/thread limit (systemd TasksMax, container pids) at "
-                   "or above this number before starting.")
+                   "or above this number before starting. With HTTPS on, the HTTP->HTTPS "
+                   "redirect listener also creates its own fixed pool at boot (at most 64 "
+                   "threads); count them in the same budget.")
         // Ceiling is the real clamp the server applies (kMaxHttpWorkerThreads), so the
         // flag cannot accept a value the pool will silently refuse to honour.
         ->check(CLI::Range(std::size_t{0}, yuzu::server::detail::kMaxHttpWorkerThreads))
@@ -830,8 +851,23 @@ int main(int argc, char* argv[]) {
         ->envname("YUZU_HTTPS_CERT");
     app.add_option("--https-key", cfg.https_key_path, "PEM private key for HTTPS")
         ->envname("YUZU_HTTPS_KEY");
-    app.add_flag("--no-https-redirect", "Disable HTTP→HTTPS redirect")
+    app.add_flag("--no-https-redirect",
+                 "Disable the HTTP→HTTPS redirect listener (and with it the cleartext health "
+                 "probes on --web-port)")
         ->each([&cfg](const std::string&) { cfg.https_redirect = false; });
+
+    // #5906: in-image health probe. Deliberately NO envname on either option: a
+    // stray environment variable must never turn the server into a probe.
+    bool healthcheck = false;
+    std::string healthcheck_path = "/readyz";
+    app.add_flag("--healthcheck", healthcheck,
+                 "Probe this server's health endpoint over the configured listener and exit 0 "
+                 "(HTTP 200) or non-zero; uses the same --no-https/--https-port/--web-port/"
+                 "--web-address/--https-cert/--ca-dir flags and env as the server");
+    app.add_option("--healthcheck-path", healthcheck_path,
+                   "Probe path: /readyz (default) or /livez")
+        ->check(CLI::IsMember({"/readyz", "/livez"}))
+        ->needs("--healthcheck");
 
     // Certificate hot-reload options
     app.add_flag("--no-cert-reload", "Disable automatic certificate hot-reload")
@@ -844,7 +880,7 @@ int main(int argc, char* argv[]) {
 
     // OIDC SSO options
     app.add_option("--oidc-issuer", cfg.oidc_issuer,
-                   "OIDC issuer URL (e.g. https://login.microsoftonline.com/{tenant}/v2.0)")
+                   "OIDC issuer URL (e.g. https://login.microsoftonline.com/<tenant-guid>/v2.0)")
         ->envname("YUZU_OIDC_ISSUER");
     app.add_option("--oidc-client-id", cfg.oidc_client_id, "OIDC client ID (app registration)")
         ->envname("YUZU_OIDC_CLIENT_ID");
@@ -858,7 +894,8 @@ int main(int argc, char* argv[]) {
                    "--oidc-client-secret / YUZU_OIDC_CLIENT_SECRET.")
         ->envname("YUZU_OIDC_CLIENT_SECRET_FILE");
     app.add_option("--oidc-redirect-uri", cfg.oidc_redirect_uri,
-                   "OIDC redirect URI (default: auto-computed from web address/port)")
+                   "OIDC redirect URI (default: http(s)://localhost:<port>/auth/callback; "
+                   "set it explicitly for any real IdP)")
         ->envname("YUZU_OIDC_REDIRECT_URI");
     app.add_option("--oidc-admin-group", cfg.oidc_admin_group,
                    "Entra group object ID that maps to admin role")
@@ -866,6 +903,31 @@ int main(int argc, char* argv[]) {
     app.add_flag("--oidc-skip-tls-verify", cfg.oidc_skip_tls_verify,
                  "Disable TLS certificate verification for OIDC endpoints (INSECURE, dev only)")
         ->envname("YUZU_OIDC_SKIP_TLS_VERIFY");
+    app.add_flag("--oidc-allow-private-networks", cfg.oidc_allow_private_networks,
+                 "Allow the OIDC discovery/JWKS/token requests to connect to loopback, RFC 1918, "
+                 "carrier-grade NAT and IPv6 unique-local addresses (an IdP on the internal "
+                 "network). Link-local and cloud-metadata addresses are refused either way")
+        ->envname("YUZU_OIDC_ALLOW_PRIVATE_NETWORKS");
+    app.add_option("--oidc-nat64-prefix", cfg.oidc_nat64_prefixes,
+                   "Comma-separated NAT64 prefixes (RFC 6052: /32, /40, /48, /56, /64 or /96, "
+                   "e.g. 2001:db8:122:344::/64) used on this network. An IPv6 address inside one "
+                   "is classified by the IPv4 address it embeds, so a translator cannot be used "
+                   "to reach a private or link-local destination. Prefixes announced by the "
+                   "network's DNS64 (RFC 7050) are learned automatically; use this when the "
+                   "network does not announce them. A configured prefix asserts that a NAT64 "
+                   "translator lives there and can permit HTTPS connections to ULA addresses "
+                   "even when --oidc-allow-private-networks is off: declare only actual "
+                   "translation prefixes (always-refused addresses stay blocked). Default: none")
+        ->envname("YUZU_OIDC_NAT64_PREFIXES")
+        ->check(CLI::Validator(
+            [](const std::string& value) -> std::string {
+                return yuzu::server::oidc::egress::parse_nat64_prefix_list(value)
+                           ? std::string{}
+                           : std::string{"expected a comma-separated list of IPv6 prefixes with a "
+                                         "length of 32, 40, 48, 56, 64 or 96 and no bits set "
+                                         "after the prefix (at most 16)"};
+            },
+            "NAT64 PREFIX LIST"));
     // ADR-2001 §1 — selects which validated ID token claim is used as the
     // SCIM-externalId join key at login. "sub" (default) matches Okta's
     // typical externalId; "oid" matches Entra (whose externalId rides the
@@ -971,6 +1033,11 @@ int main(int argc, char* argv[]) {
 
     CLI11_PARSE(app, argc, argv);
 
+    // #5906: probe-and-exit, before any server init (no config, secrets, DB, log or
+    // cert-dir side effects).
+    if (healthcheck)
+        return yuzu::server::healthcheck::run_healthcheck(cfg, healthcheck_path, std::cerr);
+
     // ── Secrets from files (#5272) ──
     // Resolved here, before anything reads cfg. A failure is reported again
     // after the log file is set up (below): a Windows service has no console,
@@ -985,9 +1052,17 @@ int main(int argc, char* argv[]) {
     if (!secret_file_error.empty())
         std::cerr << "Error: " << secret_file_error << "\n";
 
+    // Guardian reconcile admission flags (#5513): refuse a value the budget would otherwise
+    // silently clamp. Reported again after logging is set up, like secret_file_error.
+    const std::string guardian_reconcile_error =
+        yuzu::server::guardian_reconcile_options_error(cfg);
+    if (!guardian_reconcile_error.empty())
+        std::cerr << "Error: " << guardian_reconcile_error << "\n";
+
     // Apply configuration floors ONCE, before anything reads cfg, so the metrics,
     // the settings page and the docs all report the value the server enforces.
     yuzu::server::normalize_ota_options(cfg);
+    yuzu::server::normalize_gateway_peer_options(cfg);
 
     // ── CSRF trusted origins: normalise ONCE, here (#2537) ──
     // Comma-splitting, trimming, lowercasing and default-port stripping happen
@@ -1262,6 +1337,37 @@ int main(int argc, char* argv[]) {
         logger->set_level(spdlog::level::from_str(log_level));
         spdlog::set_default_logger(logger);
     }
+
+    // #4666 PR-4: dedicated bounded async logger for the Guardian T_server diagnostic line
+    // (guardian_ingest.cpp), so a stalled log sink can never block the gRPC ingest thread the
+    // same way the synchronous default logger above still can for every OTHER server log line.
+    // Built over COPIES of the (just-finalised) default logger's own sinks — owned shared_ptrs,
+    // so this stays valid even if the default logger is replaced later — which is also why its
+    // formatter/pattern need no separate wiring here: they reach this logger through those
+    // shared sinks once set_formatter()/set_pattern() run below. Registration is what needs to
+    // happen here, between the default-logger-set step above and the formatter/pattern calls
+    // below: it is what lets a runtime `--log-level` override reach this logger too (see
+    // guardian_ingest.hpp's own comment on create_t_server_logger() for why registration and
+    // formatting are NOT the same reason). Best-effort by construction — neither failure surface
+    // below (pool/thread construction, or a duplicate logger name on register_logger()) ever
+    // fails server boot; each just leaves the T_server line silently skipped.
+    try {
+        std::vector<spdlog::sink_ptr> t_server_sinks(spdlog::default_logger()->sinks());
+        if (auto t_server_logger = yuzu::server::detail::create_t_server_logger(
+                std::move(t_server_sinks), spdlog::level::from_str(log_level))) {
+            spdlog::register_logger(t_server_logger);
+            yuzu::server::detail::set_t_server_logger(std::move(t_server_logger));
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("Guardian T_server: failed to register dedicated async logger ({}); the "
+                     "T_server diagnostic line will be skipped until the next restart",
+                     e.what());
+    } catch (...) {
+        spdlog::warn("Guardian T_server: failed to register dedicated async logger (unknown "
+                     "exception); the T_server diagnostic line will be skipped until the next "
+                     "restart");
+    }
+
     if (log_format == "json") {
         spdlog::set_formatter(std::make_unique<yuzu::JsonLogFormatter>("server"));
     } else {
@@ -1271,6 +1377,10 @@ int main(int argc, char* argv[]) {
     spdlog::info("Yuzu Server v{} ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash);
     if (!secret_file_error.empty()) {
         spdlog::critical("Refusing to start: {}", secret_file_error);
+        return EXIT_FAILURE;
+    }
+    if (!guardian_reconcile_error.empty()) {
+        spdlog::critical("Refusing to start: {}", guardian_reconcile_error);
         return EXIT_FAILURE;
     }
 
@@ -1319,6 +1429,13 @@ int main(int argc, char* argv[]) {
         spdlog::warn("--allow-one-way-tls is deprecated; use --insecure-skip-client-verify "
                      "instead (this flag will be removed in a future release).");
     }
+    // #6165: --max-agents was never enforced. count() > 0 only when the CLI or
+    // YUZU_MAX_AGENTS supplied it, so the default stays silent.
+    if (max_agents_opt->count() > 0) {
+        spdlog::warn("--max-agents / YUZU_MAX_AGENTS is deprecated and has no effect "
+                     "(no agent cap is enforced, and there is no replacement); it will be "
+                     "removed in a future release. See docs/user-manual/upgrading.md.");
+    }
     if (cfg.insecure_skip_client_verify && cfg.tls_enabled) {
         if (!yuzu::server::security::insecure_tls_env_authorized()) {
             spdlog::error("--insecure-skip-client-verify requires YUZU_ALLOW_INSECURE_TLS=1 "
@@ -1366,6 +1483,30 @@ int main(int argc, char* argv[]) {
 
     auto cfg_path =
         config_file.empty() ? auth::default_config_path() : std::filesystem::path(config_file);
+
+    // Canonicalize to an absolute path up front (PR #5107 review finding). A
+    // bare relative `--config yuzu-server.cfg` left `cfg_path.parent_path()`
+    // empty; `Locations{data_dir, auth_config_path.parent_path()}` (server.cpp)
+    // then skipped the config-dir probe for the one-time legacy enrollment
+    // import entirely (WS-6 6.2) — the pre-6.2 code implicitly resolved that
+    // same empty parent against the CWD via plain path concatenation
+    // (`"" / "enrollment-tokens.cfg"`), so this is a silent regression, not a
+    // pre-existing gap: an operator's earlier approve/deny decisions could be
+    // dropped on upgrade with no import ever attempted, no error, and no
+    // log line. `default_config_path()` is always absolute; only an explicit
+    // relative `--config` can hit this. Absolutize before anything derives a
+    // directory from it (`load_config`, `first_run_setup`, `state_dir()`-style
+    // callers, the importer) rather than patching one consumer.
+    {
+        std::error_code ec;
+        auto absolute = std::filesystem::absolute(cfg_path, ec);
+        if (ec) {
+            spdlog::warn("Could not absolutize --config path '{}' ({}); using it as given",
+                         cfg_path.string(), ec.message());
+        } else {
+            cfg_path = std::move(absolute);
+        }
+    }
 
     auth::AuthManager auth_mgr;
     // Idle (inactivity) session timeout — SOC 2 CC6.3. In-memory feature, set
@@ -1689,12 +1830,6 @@ int main(int argc, char* argv[]) {
         }
         std::filesystem::remove(probe, ec); // best-effort cleanup
 
-        auth_mgr.set_data_dir(cfg.data_dir);
-        // Re-load tokens and pending agents from the new data directory.
-        // The initial load_config() loaded them from cfg_path_ parent (the old
-        // location) because set_data_dir() hadn't been called yet.
-        auth_mgr.reload_state();
-
         spdlog::info("Data directory: {}", cfg.data_dir.string());
     }
 
@@ -1907,11 +2042,104 @@ int main(int argc, char* argv[]) {
     // -- Batch token generation mode (exits without starting server) ----------
 
     if (generate_tokens > 0) {
-        auto ttl = gen_ttl_hours > 0 ? std::chrono::seconds(gen_ttl_hours * 3600)
-                                     : std::chrono::seconds(0);
+        // int64 cast: gen_ttl_hours * 3600 can overflow a 32-bit int for a
+        // maliciously/accidentally huge --token-ttl-hours (signed overflow is UB,
+        // not just wrong) — same class of fix as settings_routes.cpp's enrollment
+        // handlers (WS-6 6.2 commit 4). AuthDB::create_token rejects an
+        // out-of-bounds ttl regardless (kMaxEnrollmentTtlSeconds), so this is
+        // belt-and-braces, not a behaviour change for any realistic value.
+        auto ttl = gen_ttl_hours > 0
+                       ? std::chrono::seconds(static_cast<std::int64_t>(gen_ttl_hours) * 3600)
+                       : std::chrono::seconds(0);
 
-        auto tokens =
-            auth_mgr.create_enrollment_tokens_batch(gen_label, generate_tokens, gen_max_uses, ttl);
+        // WS-6 6.2: tokens live in Postgres (shared by every replica), so mint
+        // through the same auth store the server uses. No auth store => fail
+        // closed, like --mfa-reset (a token minted to a per-host file would be
+        // invisible to the running server).
+        if (!auth_db) {
+            spdlog::error("--generate-tokens requires the Postgres auth store; --postgres-dsn is "
+                          "not configured (or could not be opened above).");
+            std::cerr << "error: auth store unavailable\n";
+            return EXIT_FAILURE;
+        }
+        // A privileged mint with no audit trail (PR #5107 review, Should-fix):
+        // the merge-base --generate-tokens path was equally unaudited, so this
+        // doesn't regress prior behaviour, but this block was rewritten in this
+        // PR and open_one_shot_audit is 200 lines away, so fix it here rather
+        // than file a follow-up. Verify the audit store is WRITABLE before
+        // minting anything — same fail-closed posture as --mfa-reset — rather
+        // than minting first and discovering the store is dead afterward.
+        auto audit = open_one_shot_audit(*auth_pg_pool, cfg.audit_retention_days,
+                                         "--generate-tokens", "mint enrollment tokens");
+        if (!audit)
+            return EXIT_FAILURE;
+        const std::string created_by = "cli:" + resolve_os_principal();
+        std::vector<std::string> tokens;
+        std::vector<std::string> token_ids;
+        tokens.reserve(static_cast<size_t>(generate_tokens));
+        token_ids.reserve(static_cast<size_t>(generate_tokens));
+        for (int i = 0; i < generate_tokens; ++i) {
+            const auto label = gen_label.empty() ? std::format("batch-{}", i + 1)
+                                                 : std::format("{}-{}", gen_label, i + 1);
+            auto created = auth_db->create_token(label, gen_max_uses, ttl, created_by);
+            if (!created) {
+                spdlog::error("--generate-tokens: token {} of {} failed to persist ({} minted "
+                              "before the failure remain valid; revoke via the dashboard)",
+                              i + 1, generate_tokens, tokens.size());
+                std::cerr << "error: enrollment token could not be persisted\n";
+                return EXIT_FAILURE;
+            }
+            token_ids.push_back(created->token_id);
+            tokens.push_back(std::move(created->raw_token));
+        }
+        spdlog::info("Batch created {} enrollment tokens (prefix='{}')", tokens.size(), gen_label);
+
+        // One batch audit event, never the raw tokens — only the 8-hex ids
+        // (same `count=N ids=<first 20>` shape settings_routes.cpp's REST twin
+        // uses; capped so a huge --generate-tokens count can't bloat one row).
+        // Same action name as the REST/dashboard batch-create path
+        // (enrollment.bulk_token_create) — one action per semantic operation,
+        // regardless of which entry point minted it.
+        {
+            constexpr std::size_t kMaxListed = 20;
+            std::string detail = "by=" + created_by + " max_uses=" + std::to_string(gen_max_uses) +
+                                 " count=" + std::to_string(token_ids.size());
+            if (!token_ids.empty()) {
+                detail += " ids=";
+                for (std::size_t i = 0; i < token_ids.size() && i < kMaxListed; ++i) {
+                    if (i)
+                        detail += ',';
+                    detail += token_ids[i];
+                }
+                if (token_ids.size() > kMaxListed)
+                    detail += ",...";
+            }
+            yuzu::server::AuditEvent ev;
+            ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+            ev.principal = created_by;
+            ev.principal_role = "cli";
+            ev.action = "enrollment.bulk_token_create";
+            ev.target_type = "EnrollmentToken";
+            ev.target_id = "";
+            ev.result = "success";
+            ev.detail = detail;
+            if (!audit->log(ev)) {
+                // The tokens already persisted and their raw values may already
+                // be about to reach stdout — matching --mfa-reset's H-1
+                // posture, fail loudly and non-zero so the operator/automation
+                // knows the evidence row is missing, rather than silently
+                // shipping unaudited credentials.
+                spdlog::error("--generate-tokens: {} token(s) minted but the audit row failed to "
+                              "persist — record this batch manually in your change-management "
+                              "system NOW",
+                              tokens.size());
+                std::cerr << "error: tokens minted but audit row failed to persist; record this "
+                             "batch manually\n";
+                return EXIT_FAILURE;
+            }
+        }
 
         // Output JSON to stdout for scripting (Ansible, etc.)
         std::cout << "{\"count\":" << tokens.size() << ",\"tokens\":[\n";

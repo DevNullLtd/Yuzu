@@ -84,9 +84,9 @@ on a single change.
 
 The gateway (`gateway/`) is a standalone rebar3 project using Erlang/OTP. See `docs/erlang-gateway-blueprint.md` for the architecture.
 
-- Run EUnit tests: `cd gateway && rebar3 eunit`
-- Run Common Test: `cd gateway && rebar3 ct --dir apps/yuzu_gw/test`
-- Always pass `--dir apps/yuzu_gw/test` with `--suite` flags
+- Run EUnit tests: `cd gateway && rebar3 eunit --dir apps/yuzu_gw/test` (bare `rebar3 eunit` rejects the test modules that have no `src/` counterpart, #337)
+- Run Common Test: `cd gateway && rebar3 ct --dir apps/yuzu_gw/test/ct`
+- For a single CT suite, keep `--dir apps/yuzu_gw/test/ct` and add `--suite <name>`. `ct` does not recurse, so `--dir apps/yuzu_gw/test` finds no suites and passes having run nothing (#4800)
 - Review all Erlang changes with the gateway-erlang agent (`.claude/agents/gateway-erlang.md`)
 
 ## MCP Server
@@ -145,6 +145,23 @@ exactly as it should read in the changelog. Fragments are assembled into
 coding agents): [`changelog.d/README.md`](changelog.d/README.md). Changes with
 no operator-visible effect (pure refactors, CI plumbing, test-only) can skip
 the fragment.
+
+## Documentation drift
+
+A PR that adds a REST route, an MCP tool or a CLI flag must document it in the
+user manual, or the required `CHANGELOG order` check fails and names what is
+missing. A PR that changes code mapped in `scripts/ci/doc-coupling.json` must
+also change one of that area's docs, or say why the docs are still accurate with
+a line in the PR body:
+
+```
+doc-coupling-exempt: <rule-id> — <reason>
+```
+
+The second check is advisory in CI until it is made a required check; the Claude
+Code PR hook applies it locally. How both checks work, and what to do when one
+fails:
+[`docs/docs-drift-gate.md`](docs/docs-drift-gate.md).
 
 ## Coding Standards
 

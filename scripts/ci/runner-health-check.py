@@ -17,7 +17,7 @@ Two consumers (do not duplicate the logic):
    Also emits `linux_pool_healthy` — true iff >=1 runner eligible for the
    [self-hosted, Linux, X64] job pool is online (see LINUX_POOL_LABELS). The
    proto-compat + linux jobs gate on the pool rather than a single named runner,
-   so any free pool member (yuzu-bigtam-* or the Shulgi fallback) keeps them
+   so any free pool member (the yuzu-bigtam-* runners) keeps them
    running, while a wholly-offline pool still skips them fast. Likewise emits
    `weetam_pool_healthy` for the exact [self-hosted, Windows, X64,
    yuzu-weetam-windows] pool used by the Windows jobs.
@@ -61,20 +61,20 @@ RETRY_DELAYS_SECONDS = (1, 2)
 # superset of this set is eligible to run them. In preflight mode the script
 # emits `linux_pool_healthy=true` iff >=1 such runner is online+labelled
 # (fail-closed: zero online -> the Linux jobs skip fast, exactly as the old
-# single-named gate did when that one runner was down). This includes Shulgi
-# (yuzu-wsl2-linux) as a fallback during the BigTam cutover; Shulgi drops out of
-# the pool automatically when it is later removed from the inventory, leaving the
-# yuzu-bigtam-* runners as the pool. Per-runner `<slug>_healthy` outputs are still
+# single-named gate did when that one runner was down). The pool is whatever the
+# inventory declares with these labels, which is now the yuzu-bigtam-* runners
+# (the retired Shulgi runners were removed from the inventory). Per-runner `<slug>_healthy` outputs are still
 # emitted unchanged (the sentinel and any pinned-runner gates rely on them).
 LINUX_POOL_LABELS = frozenset({"self-hosted", "Linux", "X64"})
 
 # The Big Tam Linux pool. The ci.yml `linux` compile job pins
 # runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux] because its toolchain
-# (GCC 15 / Clang 21) exists only on Big Tam's Ubuntu 26.04 — Shulgi (24.04)
-# cannot build it. preflight emits `bigtam_pool_healthy=true` iff >=1 such
+# (GCC 15 / Clang 21) exists only on Big Tam's Ubuntu 26.04 (the retired Shulgi
+# runners were 24.04 and could not build it). preflight emits `bigtam_pool_healthy=true` iff >=1 such
 # runner is online, so the pinned job skips fast (fail-closed) instead of
 # queueing forever against an offline Big Tam. The compiler-agnostic
-# proto-compat job stays on the broader linux_pool gate.
+# proto-compat job gates on linux_pool_healthy and is pinned to the same
+# yuzu-bigtam-linux label, so the two gates now cover the same runners.
 BIGTAM_POOL_LABELS = frozenset({"self-hosted", "Linux", "X64", "yuzu-bigtam-linux"})
 
 # The Wee Tam Windows pool. Both ci.yml and nightly.yml pin this exact label;

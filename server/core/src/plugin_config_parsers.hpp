@@ -3,7 +3,8 @@
 /// @file plugin_config_parsers.hpp
 /// PURE parsing/validation for the plugin config/secret plane + kill switch
 /// (PR1.5b). Zero includes of any store, httplib, or pg header — this file
-/// depends on nothing but the standard library, so `plugin_config_store.cpp`
+/// depends on nothing but the standard library and the pure
+/// `yuzu/protective_actions.hpp` list, so `plugin_config_store.cpp`
 /// and `plugin_config_routes.cpp` share exactly ONE grammar/validation
 /// definition instead of two drifting copies (the class of bug #1647 exists
 /// to prevent for audit helpers; the same reasoning applies to key grammar).
@@ -12,10 +13,13 @@
 /// `<plugin>.<key>` (plugin and key are validated + stored as separate
 /// columns by the store; this header defines the shared identifier grammar
 /// both halves obey). A kill switch is addressed as `<plugin>` (whole-plugin)
-/// or `<plugin>.<action>` (one action) — `kill_switch_scope_key` produces the
-/// SAME canonical text form the store persists as its `scope_key` column, so
-/// the store and the REST layer can never derive two different scope keys
-/// for the same (plugin, action) pair.
+/// or `<plugin>.<action>` (one action), optionally narrowed to one agent OS
+/// with an `@<os>` suffix (`<plugin>[.<action>][@<os>]`; #5294) —
+/// `kill_switch_scope_key` produces the SAME canonical text form the store
+/// persists as its `scope_key` column, so the store and the REST layer can
+/// never derive two different scope keys for the same (plugin, action, os)
+/// triple. A per-OS row only ever narrows: the effective state is the AND of
+/// the plugin/action layer and the OS layer (`resolve_kill_switch`).
 ///
 /// Secret redaction: `redact_secret_for_audit`/`redact_secret_for_log` take
 /// ONLY the (plugin, key) coordinate — never a value parameter — so a secret
@@ -25,8 +29,12 @@
 #include <cctype>
 #include <cstddef>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
+#include <unordered_set>
+
+#include <yuzu/protective_actions.hpp>
 
 namespace yuzu::server::plugin_config {
 
@@ -143,7 +151,17 @@ inline constexpr std::size_t kMaxSecretValueBytes = 64 * 1024;
 struct KillSwitchScope {
     std::string plugin;
     std::string action; ///< "" = whole-plugin
+    std::string os;     ///< "" = all OSes; else one of windows|linux|darwin
 };
+
+/// True iff `s` is an OS value an agent can report: the CLOSED set
+/// `windows|linux|darwin`. Source of truth is `kAgentOs` in
+/// agents/core/src/agent.cpp — adding an agent OS means updating both. A
+/// closed set (not the identifier grammar) so a typo such as `macos` is
+/// refused instead of becoming a silently ineffective row.
+[[nodiscard]] inline bool is_valid_agent_os(std::string_view s) {
+    return s == "windows" || s == "linux" || s == "darwin";
+}
 
 /// True iff `s` is a reserved-namespace plugin name of the form
 /// `__<identifier>__` (e.g. `__guard__`, `__observation__`) — the
@@ -177,33 +195,142 @@ struct KillSwitchScope {
 /// never a dotted key — it names one REST/MCP action, not a nested config
 /// path). The reserved-namespace allowance is scoped to the kill-switch
 /// grammar only: it lets a `system_reserved` dispatch capability such as
-/// `__guard__.push_rules` be explicitly kill-switched (or left alone, which
-/// must mean "not killed" — see `PluginConfigStore::action_allowed`'s
-/// no-row default), and does NOT extend to `is_valid_identifier`/
-/// `parse_plugin_key`, which continue to gate ordinary config/secret rows.
+/// `__guard__.push_rules` have a kill-switch row addressed and stored (or left
+/// alone, which must mean "not killed" — see `PluginConfigStore::action_allowed`'s
+/// no-row default). That pair is PROTECTIVE (`yuzu/protective_actions.hpp`): a
+/// stored row is accepted and displayed but never refuses the push. It does NOT
+/// extend to `is_valid_identifier`/`parse_plugin_key`, which continue to gate
+/// ordinary config/secret rows.
 [[nodiscard]] inline std::optional<KillSwitchScope>
-parse_kill_switch_scope(std::string_view plugin_raw, std::string_view action_raw) {
+parse_kill_switch_scope(std::string_view plugin_raw, std::string_view action_raw,
+                        std::string_view os_raw = "") {
     if (!is_valid_identifier(plugin_raw) && !is_reserved_plugin_name(plugin_raw))
         return std::nullopt;
     if (!action_raw.empty() && !is_valid_identifier(action_raw))
         return std::nullopt;
-    return KillSwitchScope{std::string(plugin_raw), std::string(action_raw)};
+    if (!os_raw.empty() && !is_valid_agent_os(os_raw))
+        return std::nullopt;
+    return KillSwitchScope{std::string(plugin_raw), std::string(action_raw), std::string(os_raw)};
 }
 
 /// The canonical stored/looked-up form: `<plugin>` (whole-plugin) or
-/// `<plugin>.<action>`. Store and route MUST call this — never hand-concat —
-/// so a plugin-level and an action-level row can never collide or diverge.
+/// `<plugin>.<action>`, with `@<os>` appended for a per-OS row (`@` is outside
+/// the identifier grammar, so it never collides with an existing key). Store
+/// and route MUST call this — never hand-concat — so a plugin-level and an
+/// action-level row can never collide or diverge.
 [[nodiscard]] inline std::string kill_switch_scope_key(const KillSwitchScope& scope) {
+    std::string key = scope.action.empty() ? scope.plugin : scope.plugin + "." + scope.action;
+    if (!scope.os.empty())
+        key += "@" + scope.os;
+    return key;
+}
+
+/// True iff a kill-switch row at `scope` (any OS layer) covers a protective
+/// action (`yuzu/protective_actions.hpp`): an action-level row for a protective
+/// pair, or a plugin-level row for a plugin that owns protective actions. Such
+/// a row never stops the protective actions and still gates any non-protective
+/// action the plugin declares (none today: `quarantine` declares exactly the
+/// four protective actions and `__guard__` dispatches only `push_rules`). The
+/// write surfaces use it to label the audit evidence so a stored OFF row is
+/// never read as proof of a stop. One list: both predicates come from the
+/// shared header.
+[[nodiscard]] inline bool kill_switch_row_covers_protective(const KillSwitchScope& scope) {
     if (scope.action.empty())
-        return scope.plugin;
-    return scope.plugin + "." + scope.action;
+        return yuzu::protective::plugin_owns_protective_actions(scope.plugin);
+    return yuzu::protective::is_protective_action(scope.plugin, scope.action);
 }
 
 /// Reason cap — an operator-entered free-text explanation for a kill-switch
 /// flip. Capped so a pathological submission can't bloat the audit/kill-
-/// switch row indefinitely; control characters rejected (it renders in an
+/// switch row indefinitely; control characters other than tab rejected (it renders in an
 /// operator UI and lands in an audit `detail` string verbatim).
 inline constexpr std::size_t kMaxReasonBytes = 512;
+
+/// The most rows `PluginConfigStore::list_config` materialises (the REST and MCP lists truncate
+/// at it, and the System > Plugins panel says "First N shown"). One definition, so the store, the
+/// page and its caption cannot drift apart.
+inline constexpr std::size_t kListRowCap = 5000;
+
+/// The `plugin_config.kill_switch.set` audit detail: `enabled=<bool>`, plus
+/// `, protective_exempt=true` when the row covers a protective action (stored
+/// but never gating dispatch), plus `, reason="<text>"` when the operator gave
+/// one. The reason survives on the live row only until the next flip, so without
+/// it here the audit trail cannot answer "why was this switched off". It is
+/// already validated (<= 512 bytes, no control characters but tab) by
+/// `is_valid_reason`; this re-bounds it anyway so the evidence format never
+/// depends on a caller having validated, flattens tab to a space and backslash-
+/// escapes `\` and `"` so the quoted value cannot be confused with the fields
+/// around it. The cut never lands inside a multi-byte UTF-8 sequence (it backs up
+/// to the previous code point boundary) and a cut reason is flagged with a trailing
+/// `, reason_truncated=true`, so a shortened reason is never read as the whole one.
+/// One definition for the REST and MCP write surfaces so the documented evidence
+/// format cannot drift between them.
+[[nodiscard]] inline std::string kill_switch_set_detail(const KillSwitchScope& scope, bool enabled,
+                                                        std::string_view reason = {}) {
+    std::string detail = enabled ? "enabled=true" : "enabled=false";
+    if (kill_switch_row_covers_protective(scope))
+        detail += ", protective_exempt=true";
+    if (!reason.empty()) {
+        std::size_t keep = reason.size() < kMaxReasonBytes ? reason.size() : kMaxReasonBytes;
+        // A continuation byte (10xxxxxx) at the cut means the cut tears a sequence: back up.
+        while (keep > 0 && keep < reason.size() &&
+               (static_cast<unsigned char>(reason[keep]) & 0xC0) == 0x80)
+            --keep;
+        const bool truncated = keep < reason.size();
+        detail += ", reason=\"";
+        for (const char c : reason.substr(0, keep)) {
+            const auto u = static_cast<unsigned char>(c);
+            if (c == '\\' || c == '"') {
+                detail += '\\';
+                detail += c;
+            } else if (u < 0x20 || u == 0x7F) {
+                detail += ' ';
+            } else {
+                detail += c;
+            }
+        }
+        detail += '"';
+        if (truncated)
+            detail += ", reason_truncated=true";
+    }
+    return detail;
+}
+
+/// One stored kill-switch row of a single plugin, as the resolver sees it.
+struct KillSwitchRowView {
+    std::string_view action; ///< "" = plugin-level
+    std::string_view os;     ///< "" = all OSes
+    bool enabled;
+};
+
+/// Resolves the effective kill-switch state of `action` from the plugin's rows
+/// (rows for a different non-empty action are ignored). Base layer:
+/// row(action,"") ?? row("","") ?? on. If the base layer is OFF the result is
+/// nullopt (killed for everyone). Otherwise, for each OS present in `rows`,
+/// the OS layer is row(action,os) ?? row("",os) ?? on; the result is the set
+/// of OS values whose layer is OFF. Effective = base AND os-layer: a per-OS
+/// row narrows and never widens, and a missing per-OS row falls back to the
+/// plugin/action state.
+[[nodiscard]] inline std::optional<std::unordered_set<std::string>>
+resolve_kill_switch(std::string_view action, std::span<const KillSwitchRowView> rows) {
+    auto exact = [&](std::string_view a, std::string_view os) -> std::optional<bool> {
+        for (const auto& r : rows)
+            if (r.action == a && r.os == os)
+                return r.enabled;
+        return std::nullopt;
+    };
+    const auto base = exact(action, "").value_or(exact("", "").value_or(true));
+    if (!base)
+        return std::nullopt;
+    std::unordered_set<std::string> off;
+    for (const auto& r : rows) {
+        if (r.os.empty() || (!r.action.empty() && r.action != action))
+            continue;
+        if (!exact(action, r.os).value_or(exact("", r.os).value_or(true)))
+            off.emplace(r.os);
+    }
+    return off;
+}
 
 [[nodiscard]] inline bool is_valid_reason(std::string_view reason) {
     if (reason.size() > kMaxReasonBytes)

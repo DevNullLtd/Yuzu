@@ -157,8 +157,9 @@
 /// libyuzu_agent_core.so, and every plugin .so (RTLD_LAZY | RTLD_LOCAL with no
 /// RTLD_DEEPBIND resolves the global/core scope for every plugin) -- so
 /// install()/teardown() as implemented here are already complete for Linux. Windows is
-/// INFERRED to be one registry too (spdlog.dll, dynamic linkage, matching the measured
-/// Linux case) but this has not been directly measured on Windows hardware. macOS is
+/// CONFIRMED to be one registry too (spdlog.dll, dynamic linkage, matching Linux),
+/// measured 2026-10-03 on real MSVC hardware -- see
+/// docs/spark-rebuild-baselines/4666-mi1b-windows-registry-verdict.md. macOS is
 /// MEASURED, on real hardware, to be TWO SEPARATE registries (exe image + this
 /// library's image, since spdlog is statically linked per image there) -- install()
 /// must ALSO be called in the exe image (this function returns the shared_ptr<logger>

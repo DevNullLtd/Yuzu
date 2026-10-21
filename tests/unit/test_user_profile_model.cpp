@@ -41,6 +41,18 @@ TEST_CASE("is_system_sid: a real user SID is not a system SID", "[profiles]") {
     CHECK_FALSE(is_system_sid("S-1-5-80-1234"));
 }
 
+// ── is_profile_backup_entry ───────────────────────────────────────────────
+
+TEST_CASE("is_profile_backup_entry: a `.bak` suffix, any case, on a non-empty key name",
+          "[profiles]") {
+    CHECK(is_profile_backup_entry("S-1-5-21-1-2-3-1001.bak"));
+    CHECK(is_profile_backup_entry("S-1-5-21-1-2-3-1001.BAK"));
+    CHECK_FALSE(is_profile_backup_entry("S-1-5-21-1-2-3-1001"));
+    CHECK_FALSE(is_profile_backup_entry(""));
+    CHECK_FALSE(is_profile_backup_entry(".bak"));
+    CHECK_FALSE(is_profile_backup_entry("S-1-5-18"));
+}
+
 // ── iequals_ascii ─────────────────────────────────────────────────────────
 
 TEST_CASE("iequals_ascii: identical strings match", "[profiles]") {
@@ -143,12 +155,21 @@ TEST_CASE("build_profile_list: system SIDs are filtered out", "[profiles]") {
 TEST_CASE("build_profile_list: duplicate SIDs keep only the first occurrence", "[profiles]") {
     std::vector<RawProfileRecord> records{
         {std::string{kAliceSid}, "C:\\Users\\alice"},
-        {std::string{kAliceSid}, "C:\\Users\\alice-stale-duplicate"},
+        {std::string{kAliceSid}, "C:\\Users\\alice-stale-duplicate"},  // personal-data-ok: synthetic test path
     };
     std::vector<std::string> hku{};
     auto profiles = build_profile_list(records, hku);
     REQUIRE(profiles.size() == 1);
     CHECK(profiles[0].profile_path == "C:\\Users\\alice");
+}
+
+TEST_CASE("build_profile_list: a `.bak` record is kept, not filtered", "[profiles]") {
+    const std::string bak = std::string{kAliceSid} + ".bak";
+    std::vector<RawProfileRecord> records{{bak, "C:\\Users\\alice"}};
+    std::vector<std::string> hku{};
+    auto profiles = build_profile_list(records, hku);
+    REQUIRE(profiles.size() == 1);
+    CHECK(profiles[0].sid == bak);
 }
 
 TEST_CASE("build_profile_list: empty input yields an empty list", "[profiles]") {
@@ -262,10 +283,10 @@ TEST_CASE("render_profile_row: a value containing '|' cannot forge a column", "[
     // covered the unknown-action error string, so a profile name/path
     // containing '|' could inject a synthetic column into the pipe-delimited
     // output. Every field this renderer emits must be sanitised.
-    ProfileInfo info{std::string{kAliceSid}, "ali|ce", "C:\\Users\\a|b", HiveState::loaded};
+    ProfileInfo info{std::string{kAliceSid}, "ali|ce", "C:\\Users\\a|b", HiveState::loaded};  // personal-data-ok: synthetic test path
     auto row = render_profile_row(info);
     CHECK(row.find("ali|ce") == std::string::npos);
-    CHECK(row == std::string{kAliceSid} + "|ali_ce|C:\\Users\\a_b|loaded");
+    CHECK(row == std::string{kAliceSid} + "|ali_ce|C:\\Users\\a_b|loaded");  // personal-data-ok: synthetic test path
 }
 
 TEST_CASE("render_profile_row: exhaustive over every HiveState", "[profiles]") {
@@ -304,6 +325,19 @@ TEST_CASE("render_hive_access_lines: each failure emits exactly one error line",
     auto mf = render_hive_access_lines(HiveAccessStatus::mount_failed, false, "M", kAliceSid);
     REQUIRE(mf.size() == 1);
     CHECK(mf[0] == "error|failed to load hive for sid '" + sid + "'");
+}
+
+TEST_CASE("render_hive_access_lines: a refused hive file emits one error line, after any warning",
+          "[profiles]") {
+    const std::string sid{kAliceSid};
+    const auto fr = render_hive_access_lines(HiveAccessStatus::file_refused, false, "", kAliceSid);
+    REQUIRE(fr.size() == 1);
+    CHECK(fr[0] == "error|hive file refused for sid '" + sid + "'");
+
+    const auto both = render_hive_access_lines(HiveAccessStatus::file_refused, true, "MNT", kAliceSid);
+    REQUIRE(both.size() == 2);
+    CHECK(both[0].starts_with("warning|hive_unload_failed: HKU\\MNT "));
+    CHECK(both[1] == fr[0]);
 }
 
 TEST_CASE("render_hive_access_lines: the unload warning names the ACTUAL mount", "[profiles]") {

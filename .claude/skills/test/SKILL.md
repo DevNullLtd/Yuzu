@@ -13,8 +13,8 @@ Runbook for the Yuzu `/test` pipeline. This skill is a **bash-first orchestrator
 /test                  — default mode (~30-45 min): build + upgrade test + standard gates
 /test --quick          — sanity check (~10 min): build + unit + EUnit + dialyzer (no live stack)
 /test --full           — pre-tag (~60-120 min): adds OTA, sanitizers, perf measurement, coverage enforce
-/test --instructions   — content-suite gate (~5-15 min): exercises all 184 safe + mutating
-                         InstructionDefinitions against a live UAT stack via REST.
+/test --instructions   — content-suite gate (~5-15 min): exercises the safe + mutating
+                         InstructionDefinitions (the runner prints the count) against a live UAT stack via REST.
                          Standalone: brings up Phase 4 stack + the new Phase 5 instructions gate
                          only. Skips build/upgrade/sanitizers/coverage. Use when content
                          changes (yaml under `content/definitions/`) or after touching the
@@ -23,9 +23,9 @@ Runbook for the Yuzu `/test` pipeline. This skill is a **bash-first orchestrator
                        — quarantine ceremony (~30-40s): exercises the security.quarantine
                          cluster (isolate / release / status / whitelist) with the
                          self-disconnect/auto-resume dance. DO NOT RUN ON A REMOTE / SSH-ONLY
-                         HOST — see safety section below. PR C will add hand-written
-                         semantic-correctness tests for the 25 destructive instructions
-                         (`--instructions-destructive`).
+                         HOST — see safety section below. Destructive and forensic
+                         InstructionDefinitions are never run by /test; drive the runner by
+                         hand (see "`--instructions` mode" below).
 /test --force-cleanup  — tear down THIS RUN's dangling test containers before starting
 /test --keep-stack     — leave docker stacks running after the run (debugging)
 ```
@@ -42,14 +42,16 @@ The skill runs on both **Linux** (CI, WSL2) and **macOS** (operator dev box). Th
 - Stack stand-up (Phase 4) calls `scripts/start-UAT.sh` — cross-platform; the historical `start-UAT.sh` name is a back-compat shim.
 - Port checks, disk-free, loadavg/CPU/mem fingerprints all go through `scripts/test/_portable.sh` (lsof + sysctl on macOS, ss + /proc on Linux).
 
+**Security E2E prerequisite:** curl >= 7.68 (>= 7.84 for the Retry-After check; an older curl skips that one assertion, below 7.68 the gate fails with an explicit message).
+
 **macOS prerequisites:** GNU bash 5+ (`brew install bash` — stock /bin/bash 3.2 doesn't support `mapfile`/`declare -A`), kerl-installed Erlang, vcpkg with `VCPKG_ROOT` set, OrbStack or Docker Desktop installed (and launched once so its CLI symlinks populate `~/.orbstack/bin`).
 
 **What skips on macOS without a running Docker daemon:**
 - Phase 1 docker-image-build → SKIP (operator can build locally only what they need)
 - Phase 2 upgrade-test → SKIP via `test-upgrade-stack.sh`'s `docker_available` early-out, gate row records SKIP with operator-readable note
-- Phase 6 sanitizers → still dispatches to the `yuzu-wsl2-linux` self-hosted runner, unaffected by local Docker availability
+- Phase 6 sanitizers → still dispatches to the `yuzu-bigtam-linux` self-hosted pool, unaffected by local Docker availability
 
-Everything else (Phase 0 preflight, Phase 1 C++ + Erlang build, Phase 4 native stack, Phase 5 unit/EUnit/dialyzer/CT/integration/e2e/synthetic-UAT/puppeteer, Phase 7a perf, Phase 7b coverage, Phase 8 teardown) runs natively on macOS.
+Everything else (Phase 0 preflight, Phase 1 C++ + Erlang build, Phase 4 native stack, Phase 5 unit/EUnit/dialyzer/CT/integration/e2e/synthetic-UAT/puppeteer, Phase 7a perf, Phase 8 teardown) runs natively on macOS. Phase 7b coverage is Linux-only: on macOS the gate refuses with a WARN row (#6187).
 
 ## Workflow summary
 
@@ -67,9 +69,10 @@ Phase 4 — Fresh Stack Stand-up  (full-uat at HEAD + native agent — STAYS UP
                                  through Phase 8 so humans can poke at the
                                  stack before /release)
 Phase 5 — Test Gates (parallel) (unit / EUnit / dialyzer / CT / integration /
-                                 e2e-api / e2e-mcp / e2e-security /
-                                 synthetic UAT / puppeteer / instructions)
-Phase 6 — Sanitizers            (--full only — dispatched to yuzu-wsl2-linux runner)
+                                 e2e-api / e2e-mcp / synthetic UAT /
+                                 puppeteer / instructions; e2e-security runs
+                                 alone after the fan-out)
+Phase 6 — Sanitizers            (--full only — dispatched to yuzu-bigtam-linux pool)
 Phase 7b — Coverage             (--full only — enforces tests/coverage-baseline.json)
 Phase 8 — Teardown + Summary    (cleans Phase 2 compose projects + scratch dir,
                                  finalises run row; LEAVES THE UAT ALIVE on
@@ -118,7 +121,7 @@ bash scripts/test/test-db-write.sh run-start \
 
 Record `RUN_ID` in your scratch space so every subsequent gate call can reference it. The DB row is in `RUNNING` state until Phase 8 finalizes it.
 
-> **`--run-id` format.** Valid run ids match `[A-Za-z0-9._-]+` and must not be the bare `.` or `..`. The generated `"$(date +%s)-$$"` always satisfies this, as does a hand-supplied `--run-id manual` for coverage-baseline capture. An invalid run id (path separator, whitespace, shell/control char, `.`/`..`) is **rejected**: `test_db.py` and all three gate scripts print an error to stderr and exit `2`, and the gate scripts surface that as a gate FAIL. This guards the test-runs DB and its log root against path traversal — see the `[Unreleased]` Security entry in `CHANGELOG.md`.
+> **`--run-id` format.** Valid run ids match `[A-Za-z0-9._-]+` and must not be the bare `.` or `..`. The generated `"$(date +%s)-$$"` always satisfies this, as does a hand-supplied `--run-id manual` for coverage-baseline capture. An invalid run id (path separator, whitespace, shell/control char, `.`/`..`) is **rejected** (the Instructions runner is stricter, see "`--instructions` mode"): `test_db.py` and all three gate scripts print an error to stderr and exit `2`, and the gate scripts surface that as a gate FAIL. This guards the test-runs DB and its log root against path traversal — see the `[Unreleased]` Security entry in `CHANGELOG.md`.
 
 ## Phase 0 — Preflight
 
@@ -354,6 +357,8 @@ bash scripts/test/test-db-write.sh gate \
 
 **`start-UAT.sh` correctly returns non-zero on any connectivity test failure** (this is the post-PR1 behavior — earlier versions exited 0 unconditionally, see CHANGELOG `[Unreleased]`). The Phase 4 gate's PASS/FAIL accurately reflects whether the 6 inline connectivity tests passed against the fresh stack. The Phase 5 Synthetic UAT gate runs again standalone with sub-step timing capture into the test-runs DB — both gates are intentional, not a duplicate.
 
+A Phase 4 FAIL whose `fresh-stack.log` says `ports still held` or `survived SIGKILL` means a foreign process holds a UAT port, or a recorded process could not be stopped. It is not a stack defect, and `start-UAT.sh` will not kill it (it only signals PIDs it recorded); the log names the held ports (and the holding process where `lsof` is available).
+
 ## Phase 5 — Test Gates (parallel)
 
 Run all gates concurrently via `&` + `wait`. Each is a self-contained bash invocation that captures its own log to `$LOG_DIR/<gate>.log`. Don't try to collect their stdout — read the log paths in the failure summary instead.
@@ -430,7 +435,7 @@ gate_run "CT suites" "ct.log" \
 
 # Real-upstream CT suite — lives under apps/yuzu_gw/integration_test/
 # (separate dir from the regular test/ tree so CI's `rebar3 ct --dir
-# apps/yuzu_gw/test` discovery does NOT pick it up). Requires:
+# apps/yuzu_gw/test/ct` discovery does NOT pick it up). Requires:
 #   1. A live yuzu-server reachable on 127.0.0.1:50055 (Phase 4 brings
 #      this up via start-UAT.sh).
 #   2. YUZU_GW_TEST_TOKEN env var set to a valid enrollment token, OR
@@ -451,9 +456,6 @@ gate_run "REST API E2E" "e2e-api.log" \
 gate_run "MCP E2E" "e2e-mcp.log" \
     "bash scripts/e2e-mcp-test.sh"
 
-gate_run "Security E2E" "e2e-security.log" \
-    "bash scripts/e2e-security-test.sh"
-
 # Synthetic UAT — Phase 4's start-UAT.sh already ran its own 6
 # tests; this gate runs them again standalone with timing capture into
 # the test-runs DB. Skip if Phase 4 was the source.
@@ -465,25 +467,36 @@ gate_run "Synthetic UAT" "synthetic-uat.log" \
         --gateway-metrics http://localhost:9568 \
         --run-id $RUN_ID --gate-name phase5-synthetic-uat"
 
-# Puppeteer is warn-only — flaky on first run
+# Puppeteer is warn-only — flaky on first run. Its npm dependency is never installed by
+# the pipeline (tests/puppeteer/node_modules is gitignored), so a missing install is
+# recorded as SKIP with the fix, not as a permanent WARN; a WARN means it ran and failed.
 (
     start=$(date +%s)
-    if node tests/puppeteer/dashboard-help-test.mjs > "$LOG_DIR/puppeteer.log" 2>&1; then
-        STATUS=PASS
+    if [[ ! -d tests/puppeteer/node_modules/puppeteer ]]; then
+        bash scripts/test/test-db-write.sh gate \
+            --run-id "$RUN_ID" --phase 5 --gate "Puppeteer" \
+            --status SKIP --duration 0 \
+            --notes "puppeteer not installed; run: (cd tests/puppeteer && npm ci)"
     else
-        STATUS=WARN  # not FAIL — puppeteer is best-effort
+        if node tests/puppeteer/dashboard-help-test.mjs > "$LOG_DIR/puppeteer.log" 2>&1; then
+            STATUS=PASS
+        else
+            STATUS=WARN  # not FAIL — puppeteer is best-effort
+        fi
+        DUR=$(( $(date +%s) - start ))
+        bash scripts/test/test-db-write.sh gate \
+            --run-id "$RUN_ID" --phase 5 --gate "Puppeteer" \
+            --status "$STATUS" --duration "$DUR" --log "puppeteer.log"
     fi
-    DUR=$(( $(date +%s) - start ))
-    bash scripts/test/test-db-write.sh gate \
-        --run-id "$RUN_ID" --phase 5 --gate "Puppeteer" \
-        --status "$STATUS" --duration "$DUR" --log "puppeteer.log"
 ) &
 
 # Instructions content-suite gate — schema-driven REST exerciser.
-# Drives every safe + mutating InstructionDefinition (184 of 217) and
+# Drives every default-risk (safe + mutating) InstructionDefinition and
 # records per-instruction pass/fail/timing into the test-runs DB.
-# Destructive (25), interactive (5), and network-disrupting (3) classes
-# are opt-in via --risks; default-mode invocation excludes them.
+# The destructive, forensic, server-internal, interactive and network-disrupt
+# classes are opt-in via --risks; default-mode invocation excludes them.
+# Destructive and forensic additionally need --target-agent-id, --confirm-target,
+# --run-id, a --params-override file and (off loopback) --allow-remote; /test never runs them.
 gate_run "Instructions" "instructions.log" \
     "bash scripts/test/instructions-tests.sh \
         --dashboard http://localhost:8080 \
@@ -491,6 +504,13 @@ gate_run "Instructions" "instructions.log" \
         --run-id $RUN_ID --gate-name phase5-instructions \
         --output $LOG_DIR/instructions-outcomes.json"
 
+wait
+
+# Security E2E runs AFTER the fan-out, alone. Its Category 7 probe deliberately empties the
+# shared 127.0.0.1 login bucket (start-UAT.sh passes --login-rate-limit 200), which would 429
+# the login of any gate still running. Do not move it back into the fan-out above.
+gate_run "Security E2E" "e2e-security.log" \
+    "bash scripts/e2e-security-test.sh"
 wait
 ```
 
@@ -504,7 +524,7 @@ When the operator runs `/test --instructions`, the orchestration is **truncated*
 - The instruction-engine dispatch path (`workflow_routes.cpp` `POST /api/instructions/:id/execute`, `agent_service_impl.cpp` `cmd_execution_ids_`, response store) was touched.
 - Investigating a content regression flagged by the trend tooling.
 
-Wall clock is dominated by Phase 4 (~60-90s) and the gate itself (5-15 min for 184 instructions at parallelism=4). The gate writes per-instruction timings to `test_timings` so `bash scripts/test/test-db-query.sh --trend timing=phase5-instructions.<id>` shows latency drift over time.
+Wall clock is dominated by Phase 4 (~60-90s) and the gate itself (5-15 min for the runnable instructions at parallelism=4). The gate writes per-instruction timings to `test_timings` so `bash scripts/test/test-db-query.sh --trend timing=phase5-instructions.<id>` shows latency drift over time.
 
 ```bash
 # In --instructions mode:
@@ -512,16 +532,50 @@ if [[ "$MODE" == "instructions" ]]; then
     # Run only Phase 0, 4, the Instructions gate, and Phase 8.
     # Build is not gated — operator should already have $BUILDDIR populated;
     # if not, the start-UAT.sh in Phase 4 will surface the missing binary.
-    bash scripts/test/instructions-tests.sh \
+    start=$(date +%s)
+    if bash scripts/test/instructions-tests.sh \
         --dashboard http://localhost:8080 \
         --user admin --password 'YuzuUatAdmin1!' \
         --run-id "$RUN_ID" --gate-name instructions \
-        --output "$LOG_DIR/instructions-outcomes.json"
+        --output "$LOG_DIR/instructions-outcomes.json" > "$LOG_DIR/instructions.log" 2>&1; then
+        STATUS=PASS
+    else
+        STATUS=FAIL
+    fi
+    bash scripts/test/test-db-write.sh gate \
+        --run-id "$RUN_ID" --phase 5 --gate "Instructions" \
+        --status "$STATUS" --duration $(( $(date +%s) - start )) --log "instructions.log"
     # then jump straight to Phase 8 teardown
 fi
 ```
 
-The gate's exit code is the run's overall_status: 0 → PASS, 1 → FAIL (one or more instruction fail/error), 2 → ABORTED (login or content-dir error).
+The runner's exit code is recorded as the `Instructions` gate row above, and that row sets the run's overall_status: 0 -> PASS; 1 (one or more instruction fail/error, the run stopped early, or a destructive/forensic run executed nothing), 2 (login, content-dir, or targeting/override/pre-flight configuration error, with nothing dispatched) or 130 (the runner was interrupted by Ctrl-C, Ctrl-Break or SIGTERM) -> FAIL. `/test` never selects destructive or forensic.
+
+A destructive or forensic run is opt-in, by hand, and targets exactly one agent on a dedicated disposable stack. It needs `--target-agent-id`, `--confirm-target` (that agent's hostname), `--run-id` and a `--params-override` file, and a loopback `--dashboard` (127.0.0.1, ::1, localhost) unless `--allow-remote` is given. Get the agent id and hostname from the dashboard Devices page or `GET /api/agents`. The account needs `Execution:Execute` (dispatch), `Response:Read` (poll the results) and `Infrastructure:Read` (the agent lookup). The runner runs the definitions one at a time, checks the id and hostname against the server's agent list before any dispatch, writes each dispatch to a manifest file before sending it (created exclusively: an existing path, symlink or FIFO is refused, so rename an earlier run's manifest or pass a new --run-id), and polls each targeted row until every response row is terminal or the poll deadline passes (--poll-timeout; 120 s for these classes unless it is given). The deadline is checked per poll, so it can overrun by up to two polls (one in flight at the deadline plus the one final poll, about 20 s). A RUNNING row exists only for flushed output, so a quiet long-running action shows no rows at all until it finishes. A row passes only if every response row is SUCCESS with no error_detail. A row that ends without a verdict from terminal rows (no rows, rows still running, polls failing for any reason, or a row the runner does not recognise) fails and stops further dispatch, so a following action never overlaps it; a terminal FAILURE/TIMEOUT/REJECTED row is a known outcome and does not stop the run. Ctrl-C, Ctrl-Break (Windows) and SIGTERM stop dispatching (exit 130); a dispatch already claimed is reported as in_flight_unknown (claimed is not sent: the stop is checked at the claim and not again once the connection is open, so a connect or TLS handshake that stalls past the stop can still transmit that one request to the target). `--run-id` must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` (stricter than the generic run-id rule above). After a targeted POST was sent only these mean "not executed": any 4xx, a 503 carrying a recognised pre-dispatch refusal reason, a 202 pending_approval (approval mode always, role-gated for a non-admin caller, or an unrecognised mode; never auto), and a refused connection or unresolvable name. HTTP 200 means the server started it. Everything else is dispatch_unknown and stops the run (do not re-run blindly): a transport failure after send, any other 5xx, any 3xx, any 2xx other than 200 and a pending_approval 202, a 202 without pending_approval, the generic 503 "no agents reached" (it also covers a failed send on the agent stream and names no command id; #6102), and any exception after an accepted POST. Three consecutive 401/403 answers to execute, or 401/403/503 to a targeted poll, also stop the run. Permissions: Execution:Execute to dispatch, Response:Read to poll, Infrastructure:Read for the agent lookup. Exit codes: 0 every dispatched instruction passed (or is pending approval); 1 one or more failed or errored, the run stopped early, or a targeted run executed nothing (every destructive/forensic row skipped or pending approval); 2 a configuration, login or pre-flight error with nothing dispatched, including --poll-timeout below 1 (targeted runs only), --output equal to --manifest, an --output that is a symlink (POSIX only) or not a regular file, a --dashboard URL with userinfo (user:password@) or a backslash, or (targeted runs) an --output or a manifest that already exists; 130 interrupted (Ctrl-C, Ctrl-Break or SIGTERM). A failed write of --output at the end only warns. Note the bash entry takes `--risks` as a comma list while the Python runner takes them space-separated:
+
+```bash
+bash scripts/test/instructions-tests.sh --dashboard http://127.0.0.1:8080 \
+    --user uat-admin --password 'PASSWORD' --risks destructive,forensic \
+    --target-agent-id AGENT_ID --confirm-target HOSTNAME --run-id my-run-1 \
+    --params-override overrides.json --output outcomes.json
+```
+
+`--confirm-target` is a wrong-target typo guard against what the connected server reports. It cannot detect an `ssh -L` tunnel or a port forward to a different stack, and it is not an authorisation or approval control; use a dedicated admin account on a disposable stack. The password on the command line is visible in `ps`, and `http://` with `--allow-remote` sends it in cleartext. If safe/mutating classes are in the same `--risks`, those definitions are still sent to every agent (the run warns on stderr). `--target-agent-id`, `--confirm-target` and `--allow-remote` given with no destructive or forensic class in `--risks` are ignored, with a warning. An untargeted run is stricter than it was before the targeted mode: every request carries a `yuzu-instructions-runner/<run-id>` User-Agent, proxy environment variables are ignored, a redirect on the execute POST is not followed, a missing or malformed `--params-override` (including a duplicate key or a value that is not a string or an integer), a `--run-id` outside the pattern above and a `--dashboard` with userinfo or a backslash exit 2, `--output` refuses a symlink or a multi-link file, and SIGTERM stops the run like Ctrl-C (exit 130); `/test` passes none of the inputs that exit 2.
+
+The eligible ids are the entries classed `destructive` or `forensic` in the `_overrides` of `scripts/test/instructions-risk-classification.json`; each one's required parameters are under `spec.parameters.required` in `content/definitions/*.yaml`. The `--params-override` file is a JSON object keyed by definition id; each value is an object of parameter name to value, strings or integers only (write a boolean as `"true"`/`"false"`; a duplicate key is an error; top-level keys starting with `_` are ignored). A definition with no entry, a missing required parameter, a `server.*` row, or one not eligible on the target's OS is skipped, never guessed:
+
+```json
+{
+  "device.tags.clear": {},
+  "device.filesystem.append": {"path": "/tmp/yuzu_uat_scratch.txt", "content": "x"}
+}
+```
+
+(`device.filesystem.append`: the path must already exist on the target; the path above is for a Unix target, on a Windows target use e.g. `C:\Windows\Temp\yuzu_uat_scratch.txt`.) An empty `{}` is valid only for a definition with no required parameters.
+
+The manifest (`--manifest PATH`, default `instructions-runner-<run-id>.manifest.jsonl` in the current directory): The manifest is an attempt log, not outcome evidence: the first line is run-start, then a dispatch line per attempt (the exact params sent: treat it as sensitive; it is created 0600 on POSIX, at creation only; .gitignore covers only the default name), an accepted line when the server answers it, and a not-sent line when a stop won the race after the dispatch line and the manifest was still open (that POST was never made). The manifest is created exclusively: a path that already exists (an earlier run, a symlink, a FIFO) is refused with exit 2, so rename it or pass a new --run-id. --output is written through an owner-only descriptor (0600 at creation only; an existing file keeps its mode) that refuses a symlink (POSIX only); a targeted run creates it exclusively and refuses an existing one (rename it first: it holds the command_id record of an earlier run); an untargeted run truncates and rewrites an existing --output in place, but only if it is a regular single-link file. A SIGKILL, a double signal in the same instant, or SIGHUP (an ssh drop) can leave only the manifest. --output holds command_id for accepted rows; rows rebuilt at an abort, and answers that land after the manifest was closed, carry no command_id in --output or the manifest: check the target by definition id and timestamp. A closed stdout may still end the process with exit 120 at interpreter flush: --output and the metrics are written first and it fails closed, never a false 0. The stderr list of not-started ids is capped at 30; the rest are in --output and the manifest. Forensic rows read behavioural data from the target, and the responses are stored in the server's response store. Recovery after a stop. In the manifest a dispatch line is an attempt and an accepted line means only that the server answered it (http status and, when given, command_id, execution_id or approval_id): 200 means the server started it; an accepted line with a 5xx status may have run; 202 and 4xx were not executed (an open approval ticket may remain). A dispatch line with no accepted line may or may not have run, unless a not-sent line follows it (a SIGKILL, a double signal in the same instant, or SIGHUP can leave only the manifest and no --output). --output holds command_id for every accepted row, plus the in_flight_unknown and dispatch_unknown rows (a dispatch_unknown row may have no command_id: a POST that failed in flight has none). A definition with no dispatch line was never sent. Check the target by hand (and the dashboard's executions) before retrying. To resume, rename the old manifest and --output first (a targeted run refuses an existing one of either; a new --run-id names a new default manifest), then pass --match with an anchored regex for the remaining ids only after verifying, e.g. --match '^(device\.tags\.clear|device\.filesystem\.append)$' (--only-id takes exactly one id).
+
+Side effects / how to restore (the runner undoes none of them; this list is NOT exhaustive and every destructive/forensic row in the risk table applies): `device.tags.clear` and `agent.storage.clear` delete the target's tags and storage keys with no undo; `crossplatform.tar.rollup` permanently deletes TAR rows past retention, is not recoverable and has no approval gate; `security.certificates.delete` deletes a certificate; `agent.content_dist.stage`/`execute_staged`/`cleanup`/`upload_file` (`execute_staged` RUNS the staged artefact); `crossplatform.printing.clear_queue` is irreversible; `crossplatform.service.set_start_mode`; `device.script_exec.*` runs arbitrary script text; `agent.http_client.download`; `device.wol.wake`; `workflow.config_search_and_replace`; filesystem writes, registry values and the power plan stay changed until you revert them by hand. The destructive `server.*` definitions (for example `server.policy.invalidate_all`) are skipped, never sent. Forensic rows read behavioural data from the target, and the responses are stored in the server's response store. `testing.chargen.start` streams until stopped, so a targeted run skips it (even with an override); start and stop it by hand through the dashboard or REST with `agent_ids`.
 
 ### `--instructions-quarantine` mode (the self-disconnect ceremony)
 
@@ -550,7 +604,7 @@ bash scripts/test/instructions-quarantine.sh \
     --launch-resume      # macOS only — opens a new Terminal window
 ```
 
-This script captures the current Claude session UUID from `~/.claude/projects/-Users-nathan-Yuzu/<uuid>.jsonl` (most recent), backgrounds the survivor via `setsid nohup`, prints PID + state-dir + instructions, and exits 0 immediately. The survivor runs ~30-40s asynchronously.
+This script captures the current Claude session UUID from `~/.claude/projects/-Users-<user>-Yuzu/<uuid>.jsonl` (most recent), backgrounds the survivor via `setsid nohup`, prints PID + state-dir + instructions, and exits 0 immediately. The survivor runs ~30-40s asynchronously.
 
 **During the blackout**, this Claude Code session may lose its connection to api.anthropic.com. The user has three options:
 - Type `/exit` and let the survivor's auto-resume open a new Terminal
@@ -572,7 +626,7 @@ The results document each phase, every probe (with TCP latency), the agent's res
 
 ## Phase 6 — Sanitizers (PR2)
 
-Sanitizer rebuilds are dispatched to the `yuzu-wsl2-linux` self-hosted runner via `workflow_dispatch`. Running them locally would pin the dev box for ~15 min of compile time each; the always-on runner absorbs that cost while the operator continues Phase 5 gates locally.
+Sanitizer rebuilds are dispatched to the `yuzu-bigtam-linux` self-hosted pool via `workflow_dispatch`. Running them locally would pin the dev box for ~15 min of compile time each; the always-on runner absorbs that cost while the operator continues Phase 5 gates locally.
 
 ```bash
 if [[ "$MODE" == "full" ]]; then
@@ -587,7 +641,7 @@ The gate script:
 4. Parses each sanitizer log for `ERROR: AddressSanitizer`, `ERROR: LeakSanitizer`, `WARNING: ThreadSanitizer`, `ThreadSanitizer: data race`, `runtime error:`
 5. Writes two Phase 6 rows to `test_gates`: `Sanitizers (ASan+UBSan)` and `Sanitizers (TSan)`
 
-**Runner-offline path (WARN, not FAIL).** If `yuzu-wsl2-linux` is offline or the dispatch times out, both gates record `WARN` with notes explaining the operator retry path. The skill continues with the rest of the run rather than blocking on CI infrastructure that's out of reach.
+**Runner-offline path (WARN, not FAIL).** If the `yuzu-bigtam-linux` pool is offline or the dispatch times out, both gates record `WARN` with notes explaining the operator retry path. The skill continues with the rest of the run rather than blocking on CI infrastructure that's out of reach.
 
 **Workflow-file requirement.** `workflow_dispatch` evaluates the workflow file on the target ref. If you're dispatching against a commit that doesn't have `sanitizer-tests.yml` yet (e.g. running /test from an older branch), the dispatch will fail hard. The gate treats that as WARN per the offline-runner path.
 
@@ -611,22 +665,22 @@ elif [[ "$MODE" == "default" ]]; then
 fi
 ```
 
-**Coverage enforcement.** The gate parses gcovr `--json-summary` (filter set mirrored from `.github/workflows/ci.yml` so local/CI numbers match Codecov; gate also passes `--native-file meson/native/linux-gcc13.ini` so the compiler matches CI's coverage job), records `branch_coverage_overall` and `line_coverage_overall` metrics, and compares against `tests/coverage-baseline.json`. In `--full` mode the gate fails if branch coverage drops below `baseline.branch_percent - slack_pp` (default 0.5 pp). Default mode records the metric but doesn't enforce — `--report-only` short-circuits the comparison. The default-mode invocation wraps the script in `|| true` so a transient gcovr or build failure writes its own WARN row and does not block the rest of the run; in `--full` mode the gate is called without `|| true`, so build or parse failures surface as FAIL.
+**Coverage enforcement.** The gate parses gcovr `--json-summary` (filter set mirrored from the `.github/workflows/nightly.yml` coverage job so local/CI numbers are comparable; the gate also passes `--native-file meson/native/linux-gcc13.ini` to pin its compiler when it creates the build directory, while nightly's coverage job uses `linux-gcc15.ini`, so compare against `tests/coverage-baseline.json` rather than nightly's absolute figure), records `branch_coverage_overall` and `line_coverage_overall` metrics, and compares against `tests/coverage-baseline.json`. In `--full` mode the gate fails if branch coverage drops below `baseline.branch_percent - slack_pp` (default 0.5 pp). The gate holds a `<build-dir>.lock` for the whole run (a second concurrent run is refused with a WARN row), and a run whose tests failed or timed out, whose libgcov reported counter-write errors, that could not delete every stale `.gcda` before the run, or that left the build filesystem nearly full (`YUZU_COVERAGE_MIN_FREE_KB`) is **inconclusive**: a WARN row (exit 2 in `--full`, 0 under `--report-only`), no `*_coverage_overall` metric, no baseline comparison, and `--capture-baselines` refuses it. A surviving `meson test` on the same build directory (left by a killed gate) is refused too. The gate checks coverage on a **Linux host only**: anywhere else (macOS) it refuses up front with a WARN row, no metric and no comparison, and `--capture-baselines` fails, because the baseline is Linux/gcc data and a macOS run measured an implausibly low figure (#6187). An interrupted run (Ctrl-C, SIGTERM, SIGHUP: exit 130, 143, 129) stops `meson test` and its test processes, waits up to `YUZU_COVERAGE_KILL_GRACE_SECS` (default 30; further signals are ignored meanwhile), logs it and leaves a WARN Coverage row; a process whose identity `ps` cannot prove (busybox) is left running and logged. `YUZU_COVERAGE_TIMEOUT_MULT` (default 3) scales the test timeouts. A stale `<build-dir>.lock` left by a killed gate is cleared on the next run when its holder is dead; a leaked `<build-dir>.lock.takeover` is NOT cleared automatically: when it sits next to a stale lock the run refuses, names the file, and the operator removes it after checking that its holder pid is not running. Give hand-run gates a unique `--run-id`: a second run with the same id truncates the first run's `coverage.log` before it is refused. A failure before the gate starts logging (an unusable `--build-dir`, an option without its value) prints an error and exits 2 with no Coverage row. In default mode a failed gate or metric DB write is only logged (the caller's `|| true` hides the exit code), so the Coverage row can be missing; `--full` and `--capture-baselines` fail instead. A PASS row written after an earlier DB write in the same run failed (a metric, say) is recorded as WARN, so Phase 8 cannot finalise the run as PASS with data missing, and `--capture-baselines` refuses to rewrite the baseline once such a write has failed. **A WARN or inconclusive Coverage row in `--full` means coverage was NOT checked** (Phase 8 does not block on a WARN): read the note, fix the cause, and re-run before relying on it. Default mode records the metric but doesn't enforce — `--report-only` short-circuits the comparison. The default-mode invocation wraps the script in `|| true` so a transient gcovr or build failure writes its own WARN row and does not block the rest of the run; in `--full` mode the gate is called without `|| true`, so build, gcovr or parse failures surface as a WARN row with exit 2.
 
 **Perf is no longer enforced (2026-05-03).** Phase 7a runs `yuzu_gw_perf_SUITE` and records `perf_registration_ops_sec`, `perf_burst_registration_ops_sec`, `perf_heartbeat_queue_ops_sec`, `perf_fanout_*_ms`, `perf_session_cleanup_ms_per_agent`, and `perf_loadavg_pre/post` into the test-runs DB. There is no baseline file and no regression check. The N=300 calibration showed 3 of the 4 throughput/latency metrics are ceiling-bounded with long left tails — neither σ nor %-tolerance bands fit them — so until the gate is rebuilt around percentile primitives the operator does the inspection: `bash scripts/test/test-db-query.sh --trend timing=phase7.perf` for run-over-run movement, `python3 scripts/test/perf-histograms.py tests/perf-baseline-provenance-N300.jsonl` (gitignored scratch tool) for shape comparison against the calibration capture, and the inline histograms in `docs/perf-baseline-calibration-2026-05-03.md` for the empirical reference distributions. Full rationale and the deferred redesign live in the same doc.
 
 **Coverage baseline update workflow.**
 1. Make a change you believe deserves a new coverage baseline (coverage up, or an accepted trade-off).
-2. **Pre-flight**: a clean `meson test -C ${BUILDDIR}-coverage` must pass — the gate refuses `--capture-baselines` with `FAIL: refused --capture-baselines: meson test exit=N` if it doesn't (UP-18 guard protecting you from anchoring a broken-environment baseline).
+2. **Pre-flight**: a clean `meson test -C ${BUILDDIR}-coverage` must pass — the gate refuses `--capture-baselines` (FAIL row, note `refused --capture-baselines: inconclusive run (...)`) if tests fail or time out, libgcov reports counter-write errors, a stale `.gcda` cannot be deleted before the run, or the build filesystem is nearly full (UP-18 guard protecting you from anchoring a broken-environment baseline).
 3. Run `bash scripts/test/coverage-gate.sh --run-id manual --capture-baselines`. The script rewrites the JSON file with current numbers + `captured_at` + `captured_commit` and prints a diff of old-vs-new values before overwrite so you can sanity-check the direction.
 4. `git add tests/coverage-baseline.json` alongside your feature commit. `git blame` is the audit trail.
 5. Do NOT capture a baseline in the middle of an unrelated change — the commit SHA recorded in the baseline becomes the receipt for "this is the code that earned these numbers."
 
 **Coverage baseline refresh cadence.** Recapture at every `vX.Y.0` release tag on the canonical dev box (any Linux with GCC 13). Commit the updated JSON in the release-prep commit. Coverage drift between release trains is informative trend data.
 
-**Seed sentinel (historical, coverage only).** The `__seed: true` sentinel was the PR2 mechanism that kept the coverage gate from silently green-passing while the baseline was a placeholder. The gate still honors it: `__seed: true` forces WARN regardless of measured numbers. The seed phase has concluded — current `tests/coverage-baseline.json` holds real captured numbers (branch 26.8% / line 51.8% on the 5950X) and the sentinel is absent, so enforcement is live. Do **not** re-add `__seed: true` as a "temporary disable" knob; to adjust thresholds, edit `slack_pp` directly and document why in the commit message.
+**Seed sentinel (historical, coverage only).** The `__seed: true` sentinel was the PR2 mechanism that kept the coverage gate from silently green-passing while the baseline was a placeholder. The gate still honors it: `__seed: true` forces WARN regardless of measured numbers. The seed phase has concluded — current `tests/coverage-baseline.json` holds real captured numbers (read the file for the figures; it records no platform, and the gate only measures on Linux) and the sentinel is absent, so enforcement is live. Do **not** re-add `__seed: true` as a "temporary disable" knob; to adjust thresholds, edit `slack_pp` directly and document why in the commit message.
 
-**Concurrent --full runs on the same ref.** The sanitizer workflow's `concurrency: cancel-in-progress: false` group means a second dispatch queues behind the first until it completes (Phase 6 only — coverage/perf run locally and have their own coverage-gate race behavior). If you re-run `/test --full` immediately after a successful run on the same commit, expect Phase 6 to sit queued. Use `--suite asan` or `--suite tsan` on the gate script to halve runtime when re-running a specific finding.
+**Concurrent --full runs on the same ref.** The sanitizer workflow's `concurrency: cancel-in-progress: false` group means a second dispatch queues behind the first until it completes (Phase 6 only — coverage/perf run locally; the coverage gate serialises on its own `<build-dir>.lock`). If you re-run `/test --full` immediately after a successful run on the same commit, expect Phase 6 to sit queued. Use `--suite asan` or `--suite tsan` on the gate script to halve runtime when re-running a specific finding.
 
 ## Phase 8 — Teardown + Summary
 

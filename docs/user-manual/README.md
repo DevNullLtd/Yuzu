@@ -27,10 +27,11 @@ All `curl` examples assume a running Yuzu server at `https://localhost:8080` (HT
 | [Autoruns](autoruns.md) | Persistence-source enumeration ("what starts automatically") across Windows (Run keys, Scheduled Tasks, WMI subscriptions), Linux (cron/systemd timers, XDG autostart), and macOS (launchd, Login Items) — the versioned 34-source catalog, row/status semantics, and real-hardware verification |
 | [Cookbook](cookbook.md) | Practical examples for every plugin -- YAML, Python, CEL, Dashboard UI, and instruction chaining |
 | [Policy Engine](policy-engine.md) | Desired-state rules, triggers, compliance checks, and auto-remediation |
-| [Pre-flight readiness (`/auto`)](preflight.md) | Operator go/no-go checks across a device cohort before a fleet change — app/OS/disk/reboot thresholds, grouped by device, owner-scoped persisted runs with re-dispatch-on-reconnect |
+| [Deployments and pre-flight readiness (`/auto`)](preflight.md) | Operator go/no-go checks across a device cohort before a fleet change — app/OS/disk/reboot thresholds, grouped by device, owner-scoped persisted runs with re-dispatch-on-reconnect |
 | [Guaranteed State (Guardian)](guaranteed-state.md) | Real-time policy enforcement with agent-side guards, events, and remediation (control plane + agent skeleton shipped in v0.12; Windows enforcement lands in Guardian PR 3) |
 | [DEX (Digital Employee Experience)](dex.md) | Read-only fleet-reliability dashboard over the Guardian event store — crash-free rates, 103-signal catalogue, per-app/per-device drill-downs (Windows, macOS, and Linux collectors; Linux covers Performance + storage on headless servers) |
 | [Network Quality](network.md) | Continuous fleet TCP network quality — RTT, retransmit, and throughput (evidence-first; device/app co-occurrence is a later slice). Linux reports all three; Windows reports throughput + retransmit (RTT deferred). A DEX sub-view |
+| [Crypto](crypto.md) | Fleet cryptographic-library inventory (OpenSSL, GnuTLS, NSS and others) from the installed-software sync — which devices carry which library and version. Package-level presence only: no verdicts, and statically linked or bundled copies are not visible |
 | [Metrics](metrics.md) | Prometheus `/metrics` endpoint, label conventions, and Grafana integration |
 | [Server Administration](server-admin.md) | Configuration, TLS, user management, first-run setup, and backup |
 | [TLS policy](tls.md) | Pinned TLS 1.2 cipher allow-list and version floor across the gRPC and HTTPS listeners -- what's pinned, what isn't yet, and what CI proves |

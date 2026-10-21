@@ -72,6 +72,8 @@ EXPECTED_FAMILIES = {
             "server/core/src/network_routes.cpp",
             "server/core/src/network_ui.cpp",
             "server/core/src/network_perf_model.cpp",
+            "server/core/src/discovered_devices_model.hpp",
+            "server/core/src/discovered_devices_model.cpp",
             "server/core/src/network_api.hpp",
             "server/core/src/network_api_local.hpp",
         ],
@@ -127,6 +129,10 @@ EXPECTED_FAMILIES = {
             "server/core/src/workflow_types.hpp",
             "server/core/src/workflow_model.hpp",
             "server/core/src/workflow_model.cpp",
+            "server/core/src/workflow_execution_list_model.hpp",
+            "server/core/src/workflow_execution_list_model.cpp",
+            "server/core/src/list_keyset.hpp",
+            "server/core/src/list_keyset.cpp",
             "server/core/src/workflow_api.hpp",
             "server/core/src/workflow_api_local.hpp",
         ],
@@ -136,6 +142,19 @@ EXPECTED_FAMILIES = {
             "server/core/src/guardian_types.hpp",
             "server/core/src/guardian_api.hpp",
             "server/core/src/guardian_api_local.hpp",
+        ],
+    },
+    "crypto": {
+        "tus": [
+            "server/core/src/crypto_types.hpp",
+            "server/core/src/crypto_library_model.hpp",
+            "server/core/src/crypto_library_model.cpp",
+            "server/core/src/crypto_api.hpp",
+            "server/core/src/crypto_api_local.hpp",
+            "server/core/src/crypto_routes.hpp",
+            "server/core/src/crypto_routes.cpp",
+            "server/core/src/crypto_ui.hpp",
+            "server/core/src/crypto_ui.cpp",
         ],
     },
 }
@@ -178,6 +197,7 @@ EXPECTED_IMPL_TUS = [
     "server/core/src/dex_app_perf_model.cpp",
     "server/core/src/guardian_api.cpp",
     "server/core/src/guardian_model.cpp",
+    "server/core/src/crypto_api.cpp",
 ]
 EXPECTED_IMPL_HTTPLIB_ALLOWED = {"server/core/src/event_bus.hpp"}
 # Abstract-header store-type probe (PR #4582 FIX 3).
@@ -191,6 +211,7 @@ EXPECTED_ABSTRACT_API_HEADERS = [
     "server/core/src/schedule_api.hpp",
     "server/core/src/workflow_api.hpp",
     "server/core/src/guardian_api.hpp",
+    "server/core/src/crypto_api.hpp",
 ]
 EXPECTED_EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AppPerfFleetRow", "AuthDB",
                                     "AgentRegistry", "ExecutionTracker", "PgPool",
@@ -217,6 +238,21 @@ def main() -> int:
     #    from the list) would silently shrink what the gate covers.
     if mod.FAMILIES != EXPECTED_FAMILIES:
         _fail(f"FAMILIES {mod.FAMILIES!r} != frozen {EXPECTED_FAMILIES!r}", failures)
+
+    # 1b. The docstring's family count matches FAMILIES (#6056 review: it read
+    #     "nine" with ten families). Both coverage sentences name the count.
+    words = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six", 7: "seven",
+             8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve", 13: "thirteen",
+             14: "fourteen", 15: "fifteen"}
+    want_word = words.get(len(mod.FAMILIES), str(len(mod.FAMILIES)))
+    doc = mod.__doc__ or ""
+    for phrase in (f"covers {want_word} families", f"checks {want_word} families"):
+        if phrase not in doc:
+            _fail(f"check-seam-closure.py docstring does not say {phrase!r} "
+                  f"(len(FAMILIES) == {len(mod.FAMILIES)})", failures)
+    for fam in mod.FAMILIES:
+        if f"`{fam}`" not in doc:
+            _fail(f"check-seam-closure.py docstring does not name family `{fam}`", failures)
 
     # 2. FORBIDDEN_HEADER_PATTERNS pinned - narrowing a pattern (or dropping
     #    one) would silently stop the gate blocking a real store-layer header.

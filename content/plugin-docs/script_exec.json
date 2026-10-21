@@ -166,7 +166,7 @@
       },
       "default": 300,
       "definition_id": "device.script_exec.bash",
-      "description": "Maximum execution time in seconds. Range: 1-3600. Example: 600.\n",
+      "description": "Maximum execution time in seconds. Range: 1-3600. Example: 600. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute.\n",
       "name": "timeout",
       "required": false,
       "type": "int32"
@@ -200,7 +200,7 @@
       },
       "default": 300,
       "definition_id": "device.script_exec.exec",
-      "description": "Maximum execution time in seconds. Process is terminated if this threshold is exceeded. Range: 1-3600. Example: 600.\n",
+      "description": "Maximum execution time in seconds. Process is terminated if this threshold is exceeded. Range: 1-3600. Example: 600. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute.\n",
       "name": "timeout",
       "required": false,
       "type": "int32"
@@ -223,7 +223,7 @@
       },
       "default": 300,
       "definition_id": "device.script_exec.powershell",
-      "description": "Maximum execution time in seconds. Range: 1-3600. Example: 600.\n",
+      "description": "Maximum execution time in seconds. Range: 1-3600. Example: 600. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute.\n",
       "name": "timeout",
       "required": false,
       "type": "int32"

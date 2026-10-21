@@ -75,9 +75,9 @@ struct BoundedQueryResult {
     bool truncated = false;  // row_cap reached — enumeration did NOT complete
     // Stable error token when the call failed; absent on success. Never a
     // silent empty result on failure — see the token list below.
-    //   com_init_failed | wbem_locator_failed | wmi_connect_failed_<hr> |
-    //   wmi_query_failed_<hr> | wmi_next_timeout | wmi_deadline_exceeded |
-    //   wmi_next_failed_<hr>
+    //   com_init_failed | wbem_locator_failed | wmi_connect_failed_<hr> | wmi_proxy_blanket_failed_<hr> |
+    //   wmi_query_failed_<hr> | wmi_query_failed_no_in_signature | wmi_deadline_exceeded | wmi_next_failed_<hr> |
+    //   wmi_put_param_failed_<hr> | wmi_property_enum_failed_<hr>
     std::optional<std::string> error;
     // Rows read successfully BEFORE the failure that set `error` (the rows themselves are cleared
     // on failure); 0 for a failure before the first row and for a result with no error. The
@@ -102,6 +102,10 @@ inline constexpr const char* kWmiQueryFailedNoInSignature = "wmi_query_failed_no
 inline constexpr const char* kWmiDeadlineExceeded = "wmi_deadline_exceeded";
 inline constexpr const char* kWmiNextFailedPrefix = "wmi_next_failed_";
 inline constexpr const char* kWmiPutParamFailedPrefix = "wmi_put_param_failed_";
+// A FAILED or undocumented-success BeginEnumeration()/Next() result while reading one object's
+// properties (extract_row). Carries the HRESULT; never an `absent` answer (wmi_error_token.hpp: it
+// matches no absent stage).
+inline constexpr const char* kWmiPropertyEnumFailedPrefix = "wmi_property_enum_failed_";
 } // namespace error_tokens
 
 namespace detail {
@@ -128,6 +132,15 @@ inline long clamp_call_timeout_ms(uint32_t next_timeout_ms, uint64_t enumeration
         elapsed_ms >= enumeration_deadline_ms ? 0 : enumeration_deadline_ms - elapsed_ms;
     const uint64_t clamped = remaining_ms < next_timeout_ms ? remaining_ms : next_timeout_ms;
     return static_cast<long>(clamped);
+}
+
+// The ONE place a failed enumeration discards its rows: records how many were read before the
+// failure (rows_before_error -- the stage-aware classifier's input), clears the partial rows so a
+// failed result never reads as data, and sets the error token. Every row-clearing exit calls this.
+inline void fail_enumeration(BoundedQueryResult& r, std::string token) {
+    r.rows_before_error = r.rows.size();
+    r.rows.clear();
+    r.error = std::move(token);
 }
 
 // RAII for the BSTR + VARIANT that IWbemClassObject::Next hands back — own
@@ -175,20 +188,51 @@ inline std::string variant_to_string(const VARIANT& v) {
     }
 }
 
-// Read every non-system property of `obj` into a WmiRow. Shared by the
-// query row loop and exec_object_method's out-params extraction.
-inline void extract_row(IWbemClassObject* obj, WmiRow& row) {
-    obj->BeginEnumeration(WBEM_FLAG_NONSYSTEM_ONLY);
+// Read every non-system property of `obj` into a WmiRow. Shared by the query row loop and
+// exec_object_method's out-params extraction. A template over the object type so the unit test can
+// drive it with a duck-typed fake (IWbemClassObject in production).
+//
+// Returns S_OK, or the FAILED HRESULT of BeginEnumeration() (nothing was started, so
+// EndEnumeration() is NOT called) or of Next() (EndEnumeration() IS called; `row` holds the
+// properties read before the fault). The caller must fail the whole query on a FAILED return: a
+// setup or per-property fault never yields a row with a silently dropped column.
+// Only WBEM_S_NO_MORE_DATA ends the enumeration normally; any other non-S_NO_ERROR return (FAILED
+// or an undocumented success code) is returned so the caller fails the query (#4895, acceptance criterion 3).
+// EndEnumeration()'s own result is ignored: it runs after every property was read and releases the
+// object's cursor only, so it cannot lose data.
+template <class Obj>
+[[nodiscard]] HRESULT extract_row(Obj* obj, WmiRow& row) {
+    HRESULT hr = obj->BeginEnumeration(WBEM_FLAG_NONSYSTEM_ONLY);
+    if (FAILED(hr))
+        return hr;
     while (true) {
         BstrGuard prop_name;
         VariantGuard prop_val;
-        if (obj->Next(0, &prop_name.b, &prop_val.v, nullptr, nullptr) != WBEM_S_NO_ERROR)
-            break;
+        hr = obj->Next(0, &prop_name.b, &prop_val.v, nullptr, nullptr);
+        if (hr != WBEM_S_NO_ERROR)
+            break; // WBEM_S_NO_MORE_DATA: done; FAILED: returned below
         std::string value = variant_to_string(prop_val.v);
         if (!value.empty())
             row.emplace(yuzu::win::from_wide(prop_name.b), std::move(value));
     }
     obj->EndEnumeration();
+    return hr == WBEM_S_NO_MORE_DATA ? S_OK : hr;
+}
+
+// extract_row + append: the single place a non-S_OK extract_row becomes a failed query. On success
+// the row is appended to result.rows and this returns true; on a non-S_OK HRESULT it calls
+// fail_enumeration with `wmi_property_enum_failed_<hr>` (so rows_before_error is recorded before
+// the rows are cleared) and returns false, and the caller returns `result` immediately.
+template <class Obj>
+[[nodiscard]] bool commit_row(Obj* obj, BoundedQueryResult& result) {
+    WmiRow row;
+    const HRESULT hr = extract_row(obj, row);
+    if (hr != S_OK) {
+        fail_enumeration(result, error_tokens::kWmiPropertyEnumFailedPrefix + hr_hex(hr));
+        return false;
+    }
+    result.rows.push_back(std::move(row));
+    return true;
 }
 
 // Bounded connect shared by both public entry points: ComInit + locator +
@@ -266,9 +310,7 @@ inline BoundedQueryResult run_bounded_wmi_query(const std::wstring& wmi_namespac
         // every iteration.
         const ULONGLONG elapsed = GetTickCount64() - start_ticks;
         if (elapsed >= opts.enumeration_deadline_ms) {
-            result.error = error_tokens::kWmiDeadlineExceeded;
-            result.rows_before_error = result.rows.size();
-            result.rows.clear();
+            fail_enumeration(result, error_tokens::kWmiDeadlineExceeded);
             return result;
         }
         // The per-call wait handed to Next() is clamped to whatever remains
@@ -292,17 +334,14 @@ inline BoundedQueryResult run_bounded_wmi_query(const std::wstring& wmi_namespac
             continue;
         }
         if (FAILED(hr) || count == 0 || !raw_obj) {
-            result.error = error_tokens::kWmiNextFailedPrefix + hr_hex(hr);
-            result.rows_before_error = result.rows.size();
-            result.rows.clear();
+            fail_enumeration(result, error_tokens::kWmiNextFailedPrefix + hr_hex(hr));
             return result;
         }
         ComPtr<IWbemClassObject> obj;
         *obj.put() = raw_obj; // adopt ownership from Next()
 
-        WmiRow row;
-        extract_row(obj.get(), row);
-        result.rows.push_back(std::move(row));
+        if (!commit_row(obj.get(), result))
+            return result;
     }
 
     return result;
@@ -316,7 +355,9 @@ inline BoundedQueryResult run_bounded_wmi_query(const std::wstring& wmi_namespac
 /// holds exactly one row: the method's out-parameters (including any
 /// `ReturnValue`), stringified the same way as a query row.
 ///
-/// No production caller today (governance-reviewed, dormant infrastructure).
+/// One production caller today: bitlocker's per-volume GetConversionStatus/GetEncryptionMethod
+/// calls (bitlocker_plugin.cpp), with a compile-time namespace, fixed method names and an object
+/// path from its own Win32_EncryptableVolume enumeration -- no action input reaches this helper.
 /// This helper performs NO namespace/method/object_path allowlisting itself
 /// -- unlike wmi_plugin.cpp's do_query/do_get_instance, which validate
 /// `namespace` against a hardcoded allowlist and `wql` against a SELECT-only
@@ -423,9 +464,8 @@ inline BoundedQueryResult exec_object_method(const std::wstring& wmi_namespace,
             result.error = error_tokens::kWmiNextFailedPrefix + hr_hex(hr);
             return result;
         }
-        WmiRow row;
-        extract_row(out_params.get(), row);
-        result.rows.push_back(std::move(row));
+        if (!commit_row(out_params.get(), result))
+            return result;
         break;
     }
 

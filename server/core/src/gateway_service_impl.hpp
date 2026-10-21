@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include <grpcpp/grpcpp.h>
 #include <spdlog/spdlog.h>
@@ -69,6 +70,33 @@ inline constexpr std::size_t kMaxClusterIdLen = 64;
 // misconfigured values.
 inline constexpr std::size_t kMaxUnmappedClustersWarned = 256;
 
+// #1197: BatchHeartbeatResponse.unknown_session_ids cap. Deliberately smaller
+// than the gateway heartbeat buffer's 10000-entry bound: 4096 ids x 64 B keeps
+// the response at about 260 KiB, far under gRPC's 4 MiB default message limit.
+// The listed subset under truncation is whatever the unordered set yields: do
+// NOT sort it (an omitted id is typically reported again when that agent next
+// heartbeats, so there is no fairness to preserve and a sort would only add
+// cost). Only the LISTED set is capped. The set collected inside BatchHeartbeat
+// is not, and is bounded only by the receive limit (gRPC's 4 MiB default; server
+// code sets no custom limit): capping it would saturate the
+// renew_leases/unknown_session count and make the truncation warn's total
+// inexact.
+inline constexpr int kMaxUnknownSessionIdsPerResponse = 4096;
+
+// #1197: a session_id longer than this that does NOT resolve is counted
+// malformed and never listed or echoed. Mirrors kMaxStreamHomeIdLen
+// (gateway_service_impl.cpp) and sits above the 43-byte "gw-session-" + 32 hex
+// shape this server mints. ProxyRegister now adopts only that exact 43-byte
+// shape and the directory lookup drops ids over 64 bytes (the same bound as
+// GatewayRouteStore's kMaxLookupSessionIdLen), so an over-length id resolves
+// only through a lost-race or degraded-read local hint. A legacy directory row
+// holding a longer id is no longer resolved: its heartbeats are counted
+// malformed and not listed, so its lease lapses and the reaper tombstones it.
+inline constexpr std::size_t kMaxGatewaySessionIdLen = 64;
+
+// Bound on lost_race_sessions_ (see that member's comment for what the clear costs).
+inline constexpr std::size_t kMaxLostRaceSessions = 65536;
+
 class GatewayUpstreamServiceImpl : public gw::GatewayUpstream::Service {
 public:
     GatewayUpstreamServiceImpl(AgentRegistry& registry, EventBus& bus, auth::AuthManager& auth_mgr,
@@ -101,6 +129,8 @@ public:
     void set_proxy_register_interleave_hook_for_test(std::function<void()> hook) {
         proxy_register_interleave_hook_for_test_ = std::move(hook);
     }
+    /// Test-only: lowers the lost_race_sessions_ bound. Call before any RPC.
+    void set_max_lost_race_sessions_for_test(std::size_t cap) { max_lost_race_sessions_ = cap; }
     void set_mgmt_group_store(ManagementGroupStore* store) { mgmt_group_store_ = store; }
     void set_inventory_store(InventoryStore* store) { inventory_store_ = store; }
     void set_software_inventory_store(SoftwareInventoryStore* store) {
@@ -242,8 +272,16 @@ private:
     // benign, expected race loss (see record_directory_desync's header
     // comment). Same lock (sessions_mu_) as gateway_sessions_, entries added
     // at ProxyRegister time and removed together with gateway_sessions_'s
-    // entry on DISCONNECTED.
+    // entry on DISCONNECTED. HA WS-5: membership is also what lets a lost-race
+    // id (which has no directory row of its own) resolve in resolve_sessions,
+    // what exempts its CONNECTED from the stale_connected_session refusal, and
+    // what keeps it out of the renew shortfall. Bounded at
+    // max_lost_race_sessions_: an insert at the bound clears the whole set, so
+    // a lost-race session that is still LIVE then goes through one
+    // listed-unknown -> replay -> refuse cycle (or a refused CONNECTED) and its
+    // agent reconnects fresh. Bounded per session, never a loop.
     std::unordered_set<std::string> lost_race_sessions_;
+    std::size_t max_lost_race_sessions_{kMaxLostRaceSessions};
 
     // HA WS-4 4.4 post-build adversarial review (PR #4636 FortitudeEtc,
     // BLOCKER 1): a per-agent striped lock serializing ProxyRegister's own
@@ -279,6 +317,53 @@ private:
     /// `registration_locks_mu_`, released before the returned mutex is ever
     /// locked).
     std::shared_ptr<std::mutex> registration_lock_for(const std::string& agent_id);
+
+    /// HA WS-5 (#4246 #3): the outcome of resolving gateway-presented
+    /// session ids to agent ids for the session-keyed RPCs (BatchHeartbeat,
+    /// ProxyInventory).
+    struct SessionResolution {
+        /// session_id -> agent_id for every id the caller may act on.
+        std::unordered_map<std::string, std::string> resolved;
+        /// Subset of `resolved` answered by the DIRECTORY (not the local
+        /// hint map): the only ids whose owning replica may be another one.
+        std::unordered_set<std::string> from_store;
+        /// Subset of `from_store` with NO gateway_sessions_ entry on this
+        /// replica (checked under sessions_mu_): the directory knows it but
+        /// this replica never saw its ProxyRegister (server-only restart or
+        /// another replica's session). Ingested and renewed like any resolved
+        /// id, and ALSO listed in unknown_session_ids so the gateway replays
+        /// ProxyRegister and this replica adopts it.
+        std::unordered_set<std::string> store_only;
+        /// More than one directory row carried the id (`session_id` is not
+        /// unique): refused, never guessed at. Neither acted on nor listed
+        /// as unknown (listing would trigger a gateway re-register).
+        std::unordered_set<std::string> ambiguous;
+        /// The directory read degraded: `resolved` then holds only what the
+        /// local gateway_sessions_ hint map knows, and every other id is in
+        /// `unresolved_degraded` — "cannot tell", NOT "unknown".
+        bool degraded{false};
+        std::unordered_set<std::string> unresolved_degraded;
+    };
+
+    /// Resolves `session_ids` (empty ids are skipped) with one batched
+    /// directory read (one lease, chunked statements — see
+    /// GatewayRouteStore::lookup_by_sessions) when a GatewayRouteStore is
+    /// configured — the directory GOVERNS: the
+    /// per-replica gateway_sessions_ map is consulted only for lost-race ids
+    /// (no row under their own id) and, when the read degrades, as a hint
+    /// (the 4.4 F1 rule), which is what lets a replica that did not register
+    /// a session serve its heartbeats. Resolution requires exactly one row
+    /// carrying the session id and deliberately does NOT require the row to
+    /// be `routable`: a heartbeat IS the lease-renewal path, so refusing a
+    /// stale-lease row would strand it (and, after a Postgres blip, force
+    /// every agent in the fleet through a re-register). A tombstoned row
+    /// (session_id NULL) never matches, which is what excludes a zombie
+    /// session after a DISCONNECTED. A session that lost its register_fresh
+    /// epoch race has no row under its own id; it keeps resolving through
+    /// the local map exactly as before. With no store configured the local
+    /// map alone decides (monolith, unchanged). No lock is held across the
+    /// directory call; nothing is backfilled into gateway_sessions_.
+    [[nodiscard]] SessionResolution resolve_sessions(const std::vector<std::string>& session_ids);
 
     /// Test-only, see the setter above and ProxyRegister's firing-point
     /// comment. nullptr (default) in production.

@@ -38,6 +38,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
+#include <vector>
 
 using yuzu::server::FileKeyProvider;
 using yuzu::server::PluginConfigStore;
@@ -549,6 +551,45 @@ TEST_CASE("Wave 8: ServerImpl's boot sequence actually calls "
     CHECK(block.find("Refusing to start") != std::string::npos);
 }
 
+TEST_CASE("Wave 11: ServerImpl's boot sequence actually calls "
+          "seed_kill_switch_default_off(\"remote_access_audit\", ...) and fails the boot "
+          "closed on a seed error — source tripwire against server.cpp, since a full "
+          "ServerImpl construction is not practical at the unit level",
+          "[server][killswitch][source_tripwire]") {
+    std::ifstream input(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(input.is_open());
+    const std::string source{std::istreambuf_iterator<char>(input),
+                             std::istreambuf_iterator<char>()};
+
+    const auto marker = source.find("seed_kill_switch_default_off(\n                    \"remote_access_audit\"");
+    REQUIRE(marker != std::string::npos);
+    const auto block_end = source.find("\n        }\n", marker);
+    REQUIRE(block_end != std::string::npos);
+    const auto block = source.substr(marker, block_end - marker);
+
+    CHECK(block.find("\"remote_access_audit\"") != std::string::npos);
+
+    // The call is gated on the store existing and the boot not already
+    // having failed — never unconditional.
+    const auto guard_start = source.rfind("if (plugin_config_store_ && !startup_failed_)",
+                                          marker);
+    REQUIRE(guard_start != std::string::npos);
+    CHECK(guard_start < marker);
+    // The guard must be this call's own, not an earlier seed's.
+    CHECK(source.substr(guard_start, marker - guard_start).find("seed_kill_switch_default_off") ==
+          std::string::npos);
+
+    CHECK(block.find("startup_failed_ = true;") != std::string::npos);
+    CHECK(block.find("Refusing to start") != std::string::npos);
+
+    // The seed reason is public (it is stored and shown to an operator): the exact text, split
+    // across two source literals, and no roadmap-wave wording.
+    CHECK(block.find("\"default-off: forensics class; enable per PUT \"") != std::string::npos);
+    CHECK(block.find("\"/api/v1/plugin-config/remote_access_audit/kill-switch\"") !=
+          std::string::npos);
+    CHECK(block.find("Wave 11") == std::string::npos);
+}
+
 TEST_CASE("set_kill_switch rejects an invalid reason as InvalidInput",
           "[pg][store][plugin_config][killswitch]") {
     YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
@@ -576,8 +617,9 @@ TEST_CASE("#3265: __guard__.push_rules (a reserved-namespace, system_reserved di
     CHECK(w.store.action_allowed("__guard__", "")); // whole-plugin form too
 }
 
-TEST_CASE("#3265: an explicitly-set kill switch on __guard__/push_rules still blocks the "
-          "dispatch — the reserved-namespace grammar fix must not make the switch INERT",
+TEST_CASE("#3265: an explicitly-set kill switch row on __guard__/push_rules is stored and "
+          "reported by the store accessor — the reserved-namespace grammar fix must not make "
+          "the row unaddressable",
           "[pg][store][plugin_config][killswitch]") {
     YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
     Wired w{db.dsn()};
@@ -586,7 +628,7 @@ TEST_CASE("#3265: an explicitly-set kill switch on __guard__/push_rules still bl
                 .has_value());
     CHECK_FALSE(w.store.action_allowed("__guard__", "push_rules"));
 
-    // Re-enabling restores delivery.
+    // Re-enabling flips the accessor back.
     REQUIRE(
         w.store.set_kill_switch("__guard__", "push_rules", true, "resolved", "alice").has_value());
     CHECK(w.store.action_allowed("__guard__", "push_rules"));
@@ -612,8 +654,10 @@ TEST_CASE("#3265: __guard__.push_rules survives the real classify+finalize dispa
         [](std::string_view, std::string_view, yuzu::server::authz::Operation) { return false; });
     REQUIRE(classified.has_value());
 
-    std::function<bool(std::string_view, std::string_view)> action_allowed =
-        [&w](std::string_view p, std::string_view a) { return w.store.action_allowed(p, a); };
+    yuzu::server::detail::KillSwitchFn action_allowed =
+        [&w](std::string_view p, std::string_view a) {
+            return w.store.kill_switch_decision(p, a);
+        };
 
     auto finalized = yuzu::server::detail::finalize_classified_command(
         *classified, action_allowed, "__guard__", "push_rules", "cmd-1");
@@ -622,9 +666,9 @@ TEST_CASE("#3265: __guard__.push_rules survives the real classify+finalize dispa
     CHECK(finalized->wire().action() == "push_rules");
 }
 
-TEST_CASE("#3265: the real chokepoint composition DOES still deny __guard__.push_rules once an "
-          "operator explicitly sets the kill switch — proving the fix isn't a bypass",
-          "[pg][store][plugin_config][killswitch][dispatch]") {
+TEST_CASE("#3265: a stored kill-switch row for __guard__.push_rules is informational - the real "
+          "chokepoint composition still delivers the push (protective action)",
+          "[pg][store][plugin_config][killswitch][dispatch][protective]") {
     YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
     Wired w{db.dsn()};
     REQUIRE(w.store.set_kill_switch("__guard__", "push_rules", false, "incident", "alice")
@@ -640,13 +684,25 @@ TEST_CASE("#3265: the real chokepoint composition DOES still deny __guard__.push
         [](std::string_view, std::string_view, yuzu::server::authz::Operation) { return true; });
     REQUIRE(classified.has_value());
 
-    std::function<bool(std::string_view, std::string_view)> action_allowed =
-        [&w](std::string_view p, std::string_view a) { return w.store.action_allowed(p, a); };
+    yuzu::server::detail::KillSwitchFn action_allowed =
+        [&w](std::string_view p, std::string_view a) {
+            return w.store.kill_switch_decision(p, a);
+        };
 
+    // The row is real and in force in the store (the display/decision accessors
+    // still read it) ...
+    CHECK_FALSE(w.store.action_allowed("__guard__", "push_rules"));
+
+    // ... but the Guardian rule push is a protective action: enablement never
+    // refuses it, so the real chokepoint composition still finalizes it. This
+    // is the deliberate reversal of the original emergency-stop behaviour
+    // (ADR-3005 dated update); the operator lever is disabling the rules.
     auto finalized = yuzu::server::detail::finalize_classified_command(
         *classified, action_allowed, "__guard__", "push_rules", "cmd-2");
-    REQUIRE_FALSE(finalized.has_value());
-    CHECK(finalized.error().reason == yuzu::server::detail::DispatchDenialReason::KillSwitched);
+    REQUIRE(finalized.has_value());
+    CHECK(finalized->wire().plugin() == "__guard__");
+    CHECK(finalized->wire().action() == "push_rules");
+    CHECK(finalized->kill_switched_os().empty());
 }
 
 // ── Fail-closed evaluation on a degraded store (no live Postgres needed —
@@ -668,8 +724,9 @@ TEST_CASE("A degraded/unopened store makes action_allowed return false, never tr
     CHECK_FALSE(store.action_allowed("firewall", "block"));
     CHECK_FALSE(store.action_allowed("email", ""));
     // #3265 governance Gate 5 (chaos-injector): the reserved-namespace path
-    // inherits the SAME fail-closed collapse under a degraded store — a
-    // transient PG stall during a Guardian push must never read as allowed.
+    // inherits the SAME fail-closed collapse in the ACCESSOR under a degraded
+    // store. The Guardian push itself is a protective action and never reads
+    // this accessor at the dispatch chokepoint.
     CHECK_FALSE(store.action_allowed("__guard__", "push_rules"));
 
     // The display accessor surfaces the degradation as a typed error rather
@@ -688,11 +745,9 @@ TEST_CASE("list_config caps at kListRowCap rows and only flags truncated past th
     YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
     Wired w{db.dsn()};
 
-    // Mirrors plugin_config_store.cpp's anonymous-namespace `kListRowCap`.
-    // Not exposed via the header (deliberately internal/defensive, see the
-    // .cpp's comment) — hardcoded here, so this MUST track that constant if
-    // it ever changes.
-    constexpr int kListRowCap = 5000;
+    // The store's own cap, read from the one shared constant (the Plugins and updates panel's
+    // `row_cap` reads it too), so this test cannot drift from what the store enforces.
+    constexpr int kListRowCap = static_cast<int>(yuzu::server::plugin_config::kListRowCap);
 
     // Bulk-seed exactly kListRowCap rows for one plugin via a single
     // server-side INSERT ... SELECT FROM generate_series, straight through
@@ -746,4 +801,227 @@ TEST_CASE("list_config caps at kListRowCap rows and only flags truncated past th
     auto no_ptr = w.store.list_config("bulkplugin", nullptr);
     REQUIRE(no_ptr.has_value());
     CHECK(no_ptr->size() == static_cast<std::size_t>(kListRowCap));
+}
+
+// ── #5294: per-OS kill-switch rows ───────────────────────────────────────
+
+TEST_CASE("PluginConfigStore: a genuine v1->v2 upgrade keeps an existing plugin-level OFF row "
+          "OFF and reads it back with os=''",
+          "[pg][store][plugin_config][killswitch][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult meta{PQexec(conn.get(), "CREATE TABLE public.schema_meta ("
+                                         "  store       TEXT PRIMARY KEY,"
+                                         "  version     INTEGER NOT NULL,"
+                                         "  upgraded_at BIGINT NOT NULL)")};
+        REQUIRE(meta.ok());
+        PgResult schema{PQexec(conn.get(), "CREATE SCHEMA plugin_config_store")};
+        REQUIRE(schema.ok());
+        // v1 DDL, schema-qualified (copied from migrations() in
+        // plugin_config_store.cpp; a raw PQexec has no migration search_path).
+        PgResult v1{PQexec(
+            conn.get(),
+            "CREATE TABLE plugin_config_store.configs ("
+            "  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+            "  plugin TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL DEFAULT '',"
+            "  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
+            "  updated_by TEXT NOT NULL DEFAULT '', UNIQUE (plugin, key));"
+            "CREATE TABLE plugin_config_store.secrets ("
+            "  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+            "  scope_key TEXT NOT NULL UNIQUE, plugin TEXT NOT NULL, key TEXT NOT NULL,"
+            "  sealed_value BYTEA NOT NULL DEFAULT ''::bytea,"
+            "  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
+            "  updated_by TEXT NOT NULL DEFAULT '', UNIQUE (plugin, key));"
+            "CREATE TABLE plugin_config_store.kill_switches ("
+            "  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+            "  scope_key TEXT NOT NULL UNIQUE, plugin TEXT NOT NULL,"
+            "  action TEXT NOT NULL DEFAULT '', enabled BOOLEAN NOT NULL DEFAULT TRUE,"
+            "  reason TEXT NOT NULL DEFAULT '', set_by TEXT NOT NULL DEFAULT '',"
+            "  updated_at TIMESTAMPTZ NOT NULL DEFAULT now());"
+            "CREATE INDEX kill_switches_plugin_idx ON plugin_config_store.kill_switches (plugin);")};
+        REQUIRE(v1.ok());
+        PgResult stamp{PQexec(conn.get(),
+                              "INSERT INTO public.schema_meta (store, version, upgraded_at) "
+                              "VALUES ('plugin_config_store', 1, extract(epoch FROM now())::bigint)")};
+        REQUIRE(stamp.ok());
+        PgResult seed{PQexec(conn.get(),
+                             "INSERT INTO plugin_config_store.kill_switches "
+                             "(scope_key, plugin, action, enabled, reason, set_by) "
+                             "VALUES ('legacy', 'legacy', '', FALSE, 'pre-v2', 'admin')")};
+        REQUIRE(seed.ok());
+    }
+
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    PluginConfigStore store{pool, codec};
+    REQUIRE(store.is_open());
+
+    CHECK_FALSE(store.action_allowed("legacy", "x"));
+    CHECK_FALSE(store.kill_switch_decision("legacy", "x").has_value());
+    auto entry = store.get_kill_switch("legacy", "");
+    REQUIRE(entry.has_value());
+    CHECK(entry->os.empty());
+    CHECK_FALSE(entry->enabled);
+    CHECK(entry->reason == "pre-v2");
+
+    // The `os` column added by migration v2 is writable on the UPGRADED schema
+    // (the template-backed cases only exercise a freshly-built one).
+    auto written = store.set_kill_switch("legacy", "", true, "per-os", "ops", "windows");
+    REQUIRE(written.has_value());
+    CHECK(written->os == "windows"); // the row written, not the effective state
+    // Effective state: the legacy all-OS OFF row still wins (a per-OS ON never widens).
+    auto win = store.get_kill_switch("legacy", "", "windows");
+    REQUIRE(win.has_value());
+    CHECK(win->os == "windows");
+    CHECK_FALSE(win->enabled);
+    CHECK(win->source == "legacy");
+}
+
+TEST_CASE("PluginConfigStore: a per-OS seed narrows without flipping the plugin-level state, "
+          "and an operator flip survives a re-seed",
+          "[pg][store][plugin_config][killswitch]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
+    Wired w{db.dsn()};
+    REQUIRE(w.store.set_kill_switch("p", "", true, "on", "ops").has_value());
+    REQUIRE(w.store.seed_kill_switch_default_off("p", "new leg ships off", "windows"));
+
+    CHECK(w.store.action_allowed("p", "a"));
+    auto decision = w.store.kill_switch_decision("p", "a");
+    REQUIRE(decision.has_value());
+    CHECK(*decision == std::unordered_set<std::string>{"windows"});
+
+    auto win = w.store.get_kill_switch("p", "", "windows");
+    REQUIRE(win.has_value());
+    CHECK_FALSE(win->enabled);
+    CHECK(win->set_by == "system");
+    CHECK(win->source == "p@windows");
+    auto lin = w.store.get_kill_switch("p", "", "linux");
+    REQUIRE(lin.has_value());
+    CHECK(lin->enabled);
+    // The all-OS view attributes the base layer only: a per-OS OFF row is
+    // never reflected in a GET without os.
+    auto all = w.store.get_kill_switch("p", "");
+    REQUIRE(all.has_value());
+    CHECK(all->enabled);
+
+    REQUIRE(w.store.set_kill_switch("p", "", true, "rollout", "ops", "windows").has_value());
+    CHECK(w.store.kill_switch_decision("p", "a")->empty());
+    REQUIRE(w.store.seed_kill_switch_default_off("p", "again", "windows")); // DO NOTHING
+    CHECK(w.store.kill_switch_decision("p", "a")->empty());
+}
+
+TEST_CASE("PluginConfigStore: a per-OS ON row never widens an OFF plugin row, and get_kill_switch "
+          "attributes to the disabling row",
+          "[pg][store][plugin_config][killswitch]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
+    Wired w{db.dsn()};
+    REQUIRE(w.store.set_kill_switch("p", "", false, "R0", "admin").has_value());
+    REQUIRE(w.store.set_kill_switch("p", "", true, "R1", "ops", "windows").has_value());
+
+    CHECK_FALSE(w.store.kill_switch_decision("p", "a").has_value());
+    auto e = w.store.get_kill_switch("p", "", "windows");
+    REQUIRE(e.has_value());
+    CHECK_FALSE(e->enabled);
+    CHECK(e->reason == "R0");
+    CHECK(e->set_by == "admin");
+    CHECK(e->source == "p");
+    CHECK(e->os == "windows");
+}
+
+TEST_CASE("PluginConfigStore: attribution skips a plugin@os row that an action@os row overrides",
+          "[pg][store][plugin_config][killswitch]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
+    Wired w{db.dsn()};
+    REQUIRE(w.store.set_kill_switch("p", "a", false, "base-off", "base-admin").has_value());
+    REQUIRE(w.store.set_kill_switch("p", "", false, "os-off", "os-admin", "windows").has_value());
+    REQUIRE(w.store.set_kill_switch("p", "a", true, "act-on", "act-admin", "windows").has_value());
+
+    auto e = w.store.get_kill_switch("p", "a", "windows");
+    REQUIRE(e.has_value());
+    CHECK_FALSE(e->enabled);
+    CHECK(e->source == "p.a"); // p@windows is overridden by p.a@windows and decided nothing
+    CHECK(e->reason == "base-off");
+    CHECK(e->set_by == "base-admin");
+}
+
+TEST_CASE("PluginConfigStore: with no per-OS rows no OS is withheld; an action@os row wins over "
+          "a plugin@os row",
+          "[pg][store][plugin_config][killswitch]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
+    Wired w{db.dsn()};
+    REQUIRE(w.store.set_kill_switch("p", "a", false, "x", "ops").has_value());
+    REQUIRE(w.store.set_kill_switch("p", "a", true, "x", "ops").has_value());
+    CHECK(w.store.kill_switch_decision("p", "a")->empty());
+    CHECK(w.store.kill_switch_decision("p", "b")->empty());
+
+    REQUIRE(w.store.seed_kill_switch_default_off("p", "off", "darwin"));
+    CHECK(*w.store.kill_switch_decision("p", "b") == std::unordered_set<std::string>{"darwin"});
+    REQUIRE(w.store.set_kill_switch("p", "b", true, "act", "ops", "darwin").has_value());
+    CHECK(w.store.kill_switch_decision("p", "b")->empty());
+    CHECK(*w.store.kill_switch_decision("p", "c") == std::unordered_set<std::string>{"darwin"});
+}
+
+TEST_CASE("PluginConfigStore: an invalid os is refused and writes no row",
+          "[pg][store][plugin_config][killswitch]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
+    Wired w{db.dsn()};
+    for (const char* bad : {"Windows", "macos"}) {
+        auto r = w.store.set_kill_switch("p", "", false, "x", "ops", bad);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == PluginConfigStore::Error::InvalidInput);
+        CHECK_FALSE(w.store.seed_kill_switch_default_off("p", "x", bad));
+    }
+    CHECK(w.store.kill_switch_decision("p", "a")->empty());
+}
+
+TEST_CASE("PluginConfigStore: a degraded store yields no kill-switch decision (fail closed)",
+          "[server][config][killswitch]") {
+    PgPool bad_pool{{.conninfo = "host=127.0.0.1 port=1 dbname=nonexistent",
+                     .size = 1,
+                     .connect_timeout_s = 1}};
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PluginConfigStore store{bad_pool, codec};
+    REQUIRE_FALSE(store.is_open());
+    CHECK_FALSE(store.kill_switch_decision("firewall", "block").has_value());
+    CHECK_FALSE(store.action_allowed("firewall", "block"));
+}
+
+// An OPEN store whose read fails must collapse to "no decision" too, never to an
+// empty (allowed) OS set. Two distinct failure arms of kill_switch_decision.
+TEST_CASE("PluginConfigStore: an exhausted lease yields no kill-switch decision (fail closed)",
+          "[pg][store][plugin_config][killswitch]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
+    Wired w{db.dsn()};
+    // Fixed bounded cost: with every lease held, the production
+    // `kKillSwitchCheckTimeout` (300 ms) wait can only time out, so the
+    // outcome is deterministic on any machine (no polling, no timing
+    // assumption). This is the "open store, exhausted lease" fail-closed arm;
+    // injecting the timeout would add a production parameter for one test.
+    std::vector<PgPool::Lease> held;
+    for (std::size_t i = 0; i < w.pool.size(); ++i) {
+        auto lease = w.pool.try_acquire_for(std::chrono::milliseconds{1000});
+        REQUIRE(lease);
+        held.push_back(std::move(lease));
+    }
+    REQUIRE(w.store.is_open());
+    // action_allowed is kill_switch_decision(...).has_value(): not re-asserted
+    // here, it would cost a second deterministic 300 ms wait.
+    CHECK_FALSE(w.store.kill_switch_decision("p", "a").has_value());
+}
+
+TEST_CASE("PluginConfigStore: a failed kill-switch query yields no decision (fail closed)",
+          "[pg][store][plugin_config][killswitch]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
+    Wired w{db.dsn()};
+    exec_sql(db.dsn(), "DROP TABLE plugin_config_store.kill_switches");
+    REQUIRE(w.store.is_open());
+    CHECK_FALSE(w.store.kill_switch_decision("p", "a").has_value());
+    CHECK_FALSE(w.store.action_allowed("p", "a"));
 }

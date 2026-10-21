@@ -64,7 +64,15 @@
       "path": "/api/v1/settings/analytics"
     },
     "mcp_twin": null,
-    "status": "exception:#520"
+    "status": "exception:#520 revisit:2027-04-30 deliberate #520 no-MCP decision (tier_allows denies AnalyticsConfig at every tier; REST-only by design); revisit date is a re-confirmation of the standing decision"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/analytics-events",
+    "capability_id": "get.fragments-settings-analytics-events",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "exception:#5955 revisit:2026-11-30 UI-only fragment composed over get.api-analytics-recent; no machine twin yet (ADR-1005, owner-accepted temporary 2026-10-15)"
   },
   {
     "method": "GET",
@@ -75,7 +83,62 @@
       "path": "/api/v1/settings/data-retention"
     },
     "mcp_twin": null,
-    "status": "exception:#520"
+    "status": "exception:#520 revisit:2027-04-30 deliberate #520 no-MCP decision (tier_allows denies ServerConfig at every tier; REST-only by design); revisit date is a re-confirmation of the standing decision"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/developer/api",
+    "capability_id": "get.fragments-settings-developer-api",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/discover/routes"
+    },
+    "mcp_twin": "discover_routes",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/developer/permissions",
+    "capability_id": "get.fragments-settings-developer-permissions",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/discover/permissions"
+    },
+    "mcp_twin": "discover_permissions",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/developer/plugins",
+    "capability_id": "get.fragments-settings-developer-plugins",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/discover/plugin-docs"
+    },
+    "mcp_twin": "resource:yuzu://plugin-docs",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/developer/plugins/observed",
+    "capability_id": "get.fragments-settings-developer-plugins-observed",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/discover/plugins"
+    },
+    "mcp_twin": "discover_plugins",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/developer/routes",
+    "capability_id": "get.fragments-settings-developer-routes",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/discover/routes"
+    },
+    "mcp_twin": "discover_routes",
+    "status": "twinned"
   },
   {
     "method": "GET",
@@ -86,7 +149,15 @@
       "path": "/api/v1/settings/gateway"
     },
     "mcp_twin": null,
-    "status": "exception:#520"
+    "status": "exception:#520 revisit:2027-04-30 deliberate #520 no-MCP decision (tier_allows denies ServerConfig at every tier; REST-only by design); revisit date is a re-confirmation of the standing decision"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/general-runtime",
+    "capability_id": "get.fragments-settings-general-runtime",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "exception:#5955 revisit:2026-11-30 UI-only fragment composed over get.api-config; no machine twin yet (ADR-1005, owner-accepted temporary 2026-10-15)"
   },
   {
     "method": "GET",
@@ -97,7 +168,29 @@
       "path": "/api/v1/settings/https"
     },
     "mcp_twin": null,
-    "status": "exception:#520"
+    "status": "exception:#520 revisit:2027-04-30 deliberate #520 no-MCP decision (tier_allows denies TlsConfig at every tier; REST-only by design); revisit date is a re-confirmation of the standing decision"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/kill-switch",
+    "capability_id": "get.fragments-settings-kill-switch",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/plugin-config/{plugin}/kill-switch"
+    },
+    "mcp_twin": "get_plugin_kill_switch",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/kek",
+    "capability_id": "get.fragments-settings-kek",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/secrets/kek/status"
+    },
+    "mcp_twin": "get_kek_status",
+    "status": "twinned"
   },
   {
     "method": "GET",
@@ -108,7 +201,18 @@
       "path": "/api/v1/settings/mcp"
     },
     "mcp_twin": null,
-    "status": "exception:#520"
+    "status": "exception:#520 revisit:2027-04-30 deliberate #520 no-MCP decision (tier_allows denies ServerConfig at every tier; REST-only by design); revisit date is a re-confirmation of the standing decision"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/plugin-config",
+    "capability_id": "get.fragments-settings-plugin-config",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/plugin-config"
+    },
+    "mcp_twin": "list_plugin_config",
+    "status": "twinned"
   },
   {
     "method": "GET",
@@ -116,10 +220,21 @@
     "capability_id": "get.fragments-settings-plugin-signing",
     "rest_v1_twin": {
       "method": "GET",
-      "path": "/api/v1/agent/plugin-policy"
+      "path": "/api/v2/agent/plugin-policy"
     },
     "mcp_twin": null,
-    "status": "exception:#520"
+    "status": "exception:#520 revisit:2027-04-30 deliberate #520 no-MCP decision (tier_allows denies PluginSigning at every tier; REST-only by design); revisit date is a re-confirmation of the standing decision"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/product-packs",
+    "capability_id": "get.fragments-settings-product-packs",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/product-packs"
+    },
+    "mcp_twin": "list_product_packs",
+    "status": "twinned"
   },
   {
     "method": "GET",
@@ -130,7 +245,7 @@
       "path": "/api/v1/settings/server-config"
     },
     "mcp_twin": null,
-    "status": "exception:#520"
+    "status": "exception:#520 revisit:2027-04-30 deliberate #520 no-MCP decision (tier_allows denies ServerConfig at every tier; REST-only by design); revisit date is a re-confirmation of the standing decision"
   },
   {
     "method": "GET",
@@ -141,6 +256,44 @@
       "path": "/api/v1/settings/tls"
     },
     "mcp_twin": null,
-    "status": "exception:#520"
+    "status": "exception:#520 revisit:2027-04-30 deliberate #520 no-MCP decision (tier_allows denies TlsConfig at every tier; REST-only by design); revisit date is a re-confirmation of the standing decision"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/webhooks",
+    "capability_id": "get.fragments-settings-webhooks",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "exception:#5955 revisit:2026-11-30 UI-only fragment composed over get.api-webhooks; no machine twin yet (ADR-1005, owner-accepted temporary 2026-10-15)"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/webhooks/{param}/deliveries",
+    "capability_id": "get.fragments-settings-webhooks-param-deliveries",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "exception:#5955 revisit:2026-11-30 UI-only fragment composed over get.api-webhooks-param-deliveries; no machine twin yet (ADR-1005, owner-accepted temporary 2026-10-15)"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/offload-targets",
+    "capability_id": "get.fragments-settings-offload-targets",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/offload-targets"
+    },
+    "mcp_twin": "list_offload_targets",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/offload-targets/{param}/deliveries",
+    "capability_id": "get.fragments-settings-offload-targets-param-deliveries",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/offload-targets/{id}/deliveries"
+    },
+    "mcp_twin": "list_offload_target_deliveries",
+    "status": "twinned"
   }
 ]

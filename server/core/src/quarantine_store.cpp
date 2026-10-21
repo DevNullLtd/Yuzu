@@ -1,5 +1,6 @@
 #include "quarantine_store.hpp"
 
+#include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
@@ -350,6 +351,51 @@ std::optional<std::vector<QuarantineRecord>> QuarantineStore::list_quarantined()
         if (note_read_degrade(metrics_, kReasonQueryError, sampler))
             spdlog::warn("QuarantineStore: list_quarantined degraded — query failed: {}",
                         PQerrorMessage(lease.get()));
+        return std::nullopt;
+    }
+    const int rows = PQntuples(res.get());
+    std::vector<QuarantineRecord> out;
+    out.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        out.push_back(read_record(res.get(), i));
+    return out;
+}
+
+std::optional<std::vector<QuarantineRecord>>
+QuarantineStore::list_quarantined_in(const std::vector<std::string>* visible_ids, std::size_t limit) {
+    static DegradeSampler sampler;
+    if (!open_) {
+        if (note_read_degrade(metrics_, kReasonStoreClosed, sampler))
+            spdlog::warn("QuarantineStore: list_quarantined_in degraded — store not open");
+        return std::nullopt;
+    }
+    if (visible_ids && visible_ids->empty())
+        return std::vector<QuarantineRecord>{}; // deny-all: nothing can match, no round trip
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn("QuarantineStore: list_quarantined_in degraded — pool acquire timed out "
+                         "({})",
+                         pool_.last_error());
+        return std::nullopt;
+    }
+
+    std::vector<std::string> params;
+    std::string sql = std::string("SELECT ") + kRecordCols +
+                      " FROM quarantine_store.quarantine_records WHERE status = 'active'";
+    if (visible_ids) {
+        std::vector<std::string_view> views(visible_ids->begin(), visible_ids->end());
+        params.push_back(pg::to_text_array(views));
+        sql += " AND agent_id = ANY($1::text[])";
+    }
+    sql += " ORDER BY quarantined_at DESC, id DESC";
+    if (limit != 0)
+        sql += " LIMIT " + std::to_string(limit);
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK) {
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("QuarantineStore: list_quarantined_in degraded — query failed: {}",
+                         PQerrorMessage(lease.get()));
         return std::nullopt;
     }
     const int rows = PQntuples(res.get());

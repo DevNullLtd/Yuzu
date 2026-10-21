@@ -232,6 +232,7 @@ jobs:
             -Dbuild_tests=true \
             -Db_sanitize=address,undefined \
             -Dcpp_args=-fno-sanitize=null,alignment
+          python3 scripts/ci/assert-gateway-tests.py build-linux-asan
 
       - name: Build
         run: meson compile -C build-linux-asan -j "$YUZU_BUILD_JOBS"
@@ -271,7 +272,7 @@ jobs:
         # timeout, which GitHub Actions reports as CANCELLED, not FAILED - a bare
         # `failure()` would silently drop exactly the artifact this fix adds.
         if: failure() || cancelled()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: meson-testlog-asan
           path: |
@@ -399,6 +400,7 @@ jobs:
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux-tsan \
             -Dbuild_tests=true \
             -Db_sanitize=thread
+          python3 scripts/ci/assert-gateway-tests.py build-linux-tsan
 
       - name: Build
         run: meson compile -C build-linux-tsan -j "$YUZU_BUILD_JOBS"
@@ -497,7 +499,7 @@ jobs:
         # would throw away the very stack capture the step above just took for
         # the stuck-test case. An `always()` here would also upload on green runs.
         if: failure() || cancelled()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: meson-testlog-tsan
           path: |
@@ -667,6 +669,7 @@ jobs:
             -Dbuild_tests=true \
             -Db_sanitize=address \
             -Dcpp_args="-D_DISABLE_STRING_ANNOTATION -D_DISABLE_VECTOR_ANNOTATION"
+          python scripts/ci/assert-gateway-tests.py build-windows-asan
 
       - name: Build
         run: meson compile -C build-windows-asan tests/yuzu_agent_tests -j "$YUZU_BUILD_JOBS"
@@ -727,7 +730,7 @@ jobs:
         # The always() half separately lets a `jobs=windows-asan` recurrence
         # dispatch record a clean run's timings, not only a failing/cancelled one.
         if: failure() || cancelled() || (always() && inputs.jobs == 'windows-asan')
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: meson-testlog-windows-asan
           path: |
@@ -856,6 +859,7 @@ jobs:
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
             -Dbuild_tests=true \
             -Db_coverage=true
+          python3 scripts/ci/assert-gateway-tests.py build-linux-coverage
 
       - name: Build
         run: meson compile -C build-linux-coverage -j "$YUZU_BUILD_JOBS"
@@ -905,7 +909,7 @@ jobs:
           fail_ci_if_error: false
 
       - name: Upload HTML coverage report
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-report
           path: build-linux-coverage/coverage-html/
@@ -918,7 +922,7 @@ jobs:
         # see the same line's comment on the asan leg - a stall here rides the JOB's own
         # timeout, reported as CANCELLED not FAILED, which the deleted step never covered.
         if: failure() || cancelled()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: meson-testlog-coverage
           path: |

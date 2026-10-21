@@ -4,6 +4,10 @@
 **Started:** 2026-04-14
 **Owner:** TBD per tier (see Resume Pointer)
 **Closes:** #363 (rollout completion), #366 follow-up (CODEOWNERS)
+
+> **Update 2026-10-08:** the "strategic escape" to QUIC (P1 #376) referenced below was
+> withdrawn by ADR-0066 — gRPC is the permanent transport and option D is permanent.
+> The references are kept as the historical record.
 **Driver PR (foundation):** #372 (merged 2026-04-14)
 
 ## Why this doc exists
@@ -476,7 +480,7 @@ Append-only. Newest entries at the top. Format:
   was in place): the same `Linux clang-19 debug` code path on job
   `71453384876` completed all 27 steps SUCCESS in 4m 53s including
   `Post Cache ccache` and `Complete job`. Verified the two-part
-  fix is **actually deployed**: `cat /mnt/c/Users/natha/.wslconfig`
+  fix is **actually deployed**: `cat /mnt/c/Users/<user>/.wslconfig`
   shows `vmIdleTimeout=-1` (with the explanatory comment block) and
   `loginctl show-user dornbrn` returns `Linger=yes`. Resume Pointer
   refreshed: removed the "Standing caveat — clang-19 regression on
@@ -731,7 +735,7 @@ Append-only. Newest entries at the top. Format:
   and `grpc` to install successfully, but meson's cmake dep probe
   rejected the install with `gRPC could not be found because dependency
   Protobuf could not be found`. Filesystem inspection via
-  `/mnt/c/Users/natha/inspect-vcpkg.sh` confirmed the debug tree was
+  `/mnt/c/Users/<user>/inspect-vcpkg.sh` confirmed the debug tree was
   wiped by `actions/checkout` on the subsequent debug job before I
   could diagnose the release-side state in detail, but the cmake trace
   pattern (version file loads, but no `protobuf-config.cmake` follows)

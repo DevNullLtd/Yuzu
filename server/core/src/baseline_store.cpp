@@ -7,6 +7,7 @@
 #include "store_errors.hpp"
 #include "utf8_sanitize.hpp"
 
+#include <yuzu/log_token.hpp> // log_key_token
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
@@ -236,6 +237,12 @@ std::expected<std::string, std::string> BaselineStore::create_baseline(const Bas
         }
         return std::unexpected("insert failed: " + std::string(PQresultErrorMessage(res.get())));
     }
+    // A DEPLOYED create changes the deployed set (the Guardian routes only ever create drafts,
+    // so this is a latent path); a draft create must stay silent.
+    if (lifecycle == kBaselineDeployed) {
+        lease.reset(); // no pool lease held while the hook runs
+        notify_baseline_mutation();
+    }
     return id;
 }
 
@@ -365,6 +372,8 @@ std::expected<void, std::string> BaselineStore::update_baseline(const Baseline& 
     }
     if (PQntuples(res.get()) == 0)
         return std::unexpected("not found: baseline_id '" + b.baseline_id + "'");
+    lease.reset(); // no pool lease held while the hook runs
+    notify_baseline_mutation();
     return {};
 }
 
@@ -383,7 +392,28 @@ std::expected<void, std::string> BaselineStore::delete_baseline(const std::strin
         return std::unexpected("delete failed: " + std::string(PQresultErrorMessage(res.get())));
     if (PQntuples(res.get()) == 0)
         return std::unexpected("not found: baseline_id '" + baseline_id + "'");
+    lease.reset(); // no pool lease held while the hook runs
+    notify_baseline_mutation();
     return {};
+}
+
+void BaselineStore::set_on_baseline_mutation(std::function<void()> hook) {
+    on_baseline_mutation_ = std::move(hook);
+}
+
+// Post-mutation hook (#5513): runs AFTER the change committed, with no pool lease held. Never
+// lets an exception escape: the mutation is already durable and the caller must still be told
+// it succeeded.
+void BaselineStore::notify_baseline_mutation() noexcept {
+    if (!on_baseline_mutation_)
+        return;
+    try {
+        on_baseline_mutation_();
+    } catch (const std::exception& e) {
+        spdlog::warn("BaselineStore: baseline-mutation hook threw: {}", ::yuzu::log_key_token(e.what()));
+    } catch (...) {
+        spdlog::warn("BaselineStore: baseline-mutation hook threw a non-std exception");
+    }
 }
 
 // ── Member Guards (M:N) ──────────────────────────────────────────────────────
@@ -771,6 +801,24 @@ std::size_t BaselineStore::baseline_count() const {
                                        std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
         return 0;
+    return static_cast<std::size_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
+}
+
+std::expected<std::size_t, std::string> BaselineStore::deployed_baseline_count_checked() const {
+    if (!open_)
+        return std::unexpected("database not open");
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected("no database connection: " + pool_.last_error());
+    pg::PgResult res =
+        pg::exec_params(lease.get(),
+                        "SELECT COUNT(*) FROM baseline_store.baselines WHERE lifecycle = $1",
+                        std::vector<std::string>{kBaselineDeployed});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
+        spdlog::warn("BaselineStore::deployed_baseline_count_checked: query failed: {}",
+                     ::yuzu::log_key_token(PQresultErrorMessage(res.get())));
+        return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
+    }
     return static_cast<std::size_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
 }
 

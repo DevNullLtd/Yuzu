@@ -6,10 +6,13 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "agent.pb.h"
+#include "crypto_library_model.hpp"
 #include "inventory_ingestion.hpp"
+#include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "software_catalog_rules.hpp"
 #include "software_inventory_store.hpp"
 
 #include "../test_helpers.hpp"
@@ -18,15 +21,25 @@
 
 #include <libpq-fe.h>
 
+#include <algorithm>
+#include <cstdio>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <format>
+#include <limits>
+#include <map>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using yuzu::server::InventoryIngestOutcome;
 using yuzu::server::SoftwareEntry;
+using yuzu::server::SoftwareCursor;
 using yuzu::server::SoftwareFleetQuery;
 using yuzu::server::SoftwareInventoryStore;
 using yuzu::server::pg::PgPool;
@@ -36,8 +49,8 @@ namespace agentpb = yuzu::agent::v1;
 namespace {
 // Pre-migrated template (see PgTestTemplate in test_helpers.hpp): every
 // store-behaviour test clones an already-migrated database instead of
-// re-running the migrations. The two migration-backfill tests (v3 clamp,
-// v5 '' backfill) stay on plain YUZU_REQUIRE_PG_DB — they need to stage a
+// re-running the migrations. The three migration-backfill tests (v3 clamp,
+// v5 '' backfill, v7 extended-row backfill) stay on plain YUZU_REQUIRE_PG_DB — they need to stage a
 // pre-migration schema by hand.
 yuzu::test::PgTestTemplate swinv_tpl{"swinv", [](const std::string& dsn) {
                                          PgPool pool{{.conninfo = dsn, .size = 1}};
@@ -82,7 +95,7 @@ SwinvShared& swinv_shared() {
 }
 
 // Restore the shared DB to its fresh-clone state: TRUNCATE every data table and
-// re-seed the catalog_rollup_meta singleton. Migration v4 seeds id=1 with
+// re-seed the catalog_rollup_meta singleton. Migration v8 seeds id=1 with
 // refreshed_at=0 ("building"); a bare TRUNCATE would drop that row and break the
 // pre-refresh reads (the catalogue tests), so re-insert it. public.schema_meta
 // is deliberately untouched — the clone stays migrated, so the per-test store
@@ -156,6 +169,75 @@ SoftwareEntry full_v2_entry() {
     e.distro_version = "40";
     return e;
 }
+
+// full_v2_entry() plus the stored extended-tail fields. Wire slots 13-14 (install_location,
+// uninstall_string) are reserved and have no member: the server never stores or hashes them.
+SoftwareEntry full_extended_entry() {
+    SoftwareEntry e = full_v2_entry();
+    e.package_id = "bash-5.2.21-3.fc40.x86_64";
+    e.source = "installed_apps.list_inventory";
+    return e;
+}
+
+// Wire record of the first n fields (12 = v2, 16 = extended): 0x1F-separated, 0x1E-terminated.
+// Slots 13-14 are written empty (reserved).
+std::string wire_record(const SoftwareEntry& e, std::size_t n) {
+    static const std::string reserved;
+    const std::string* f[] = {
+        &e.name,   &e.version,          &e.publisher, &e.install_date, &e.kind,      &e.ecosystem,
+        &e.epoch,  &e.release,          &e.arch,      &e.signature_status, &e.distro_id,
+        &e.distro_version, &reserved,   &reserved,    &e.package_id,   &e.source};
+    std::string out;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (i)
+            out += '\x1f';
+        out += *f[i];
+    }
+    return out + '\x1e';
+}
+
+// A 16-field wire record carrying real values in the reserved slots 13-14.
+std::string wire_record_reserved(const SoftwareEntry& e, const std::string& install_location,
+                                 const std::string& uninstall_string) {
+    std::string r = wire_record(e, 12);
+    r.pop_back(); // the 0x1E terminator
+    return r + '\x1f' + install_location + '\x1f' + uninstall_string + '\x1f' + e.package_id +
+           '\x1f' + e.source + '\x1e';
+}
+
+// SERVER CONTRACT PIN (16 fields, slots 13-14 empty). sha256 of wire_record(full_extended_entry(), 16) bytes:
+//   printf 'bash\0375.2.21\037Fedora Project\037Mon 01 Jan 2026\037package\037rpm\0370\0373.fc40\037x86_64\037signed\037fedora\03740\037\037\037bash-5.2.21-3.fc40.x86_64\037installed_apps.list_inventory\036' | shasum -a 256
+// The agent builder (installed_software_canonical_blob) emits this tail; the identical
+// constant and fixture bytes live in tests/unit/test_inventory_sync.cpp, making it the
+// live cross-side pin exactly as kCrossPinHash is.
+constexpr const char* kCrossPinHashExtended =
+    "371b647c95b0f48a039ff98790c6085947ef71fcfd40a399c3cd70d70321291d";
+
+// Ascending tail-order pin: full_extended_entry() and a copy whose source is
+// "installed_apps.list_apps" (sorts first), hashed as the two 16-field records in that
+// order. This pins the source arm's direction; the order-independence and
+// distinctness checks in the hash test prove the other three arms. Recipe as above, two records:
+//   printf '<b: fields 1-15 as above>\037installed_apps.list_apps\036<a: as above>' | shasum -a 256
+constexpr const char* kTailOrderPinHash =
+    "ab2abf993a2b0868b9c69397497799920773fd44c29cde86380e8c4369ccbe8d";
+
+// sha256 of the mixed-shape blob built in the mixed-shape test below (12-field
+// "alpha", 16-field full_extended_entry "bash", 16-field source-only "zed"), computed
+// over the raw wire bytes.
+constexpr const char* kMixedBlobHash =
+    "7b37bca935f3ae92a042949ef4280d69b25edc8ee6e518f993ded0eeec7e76f3";
+
+// sha256 of the raw wire bytes a NEWER agent would claim for a 17-field record: the 16-field
+// full_extended_entry() record with a 17th token "ignored" before the terminator. The server
+// drops the 17th token, so its re-hash differs: a bounded need_full per cycle (ADR-0016's
+// inherited mixed-version trait), never an error loop.
+constexpr const char* kSeventeenFieldHash =
+    "f4a4c78f6118451baca197fb103c1765cf17417429916d0f8a26a45c76082aca";
+
+// sha256 of wire_record_reserved(full_extended_entry(), "/Users/alice/Applications/Bash",
+// "bash --uninstall --key=ABC123"): what an agent that fills slots 13-14 would claim.
+constexpr const char* kReservedValuesHash =
+    "5b66424c685875906e1a9b214bcb5678af4abed07ae3191a3736edc6c008c11f";
 } // namespace
 
 TEST_CASE("SoftwareInventoryStore canonical_hash is the cross-pinned value",
@@ -170,6 +252,57 @@ TEST_CASE("SoftwareInventoryStore canonical_hash is the cross-pinned value",
         {"Acme Reader", "1.2", "Acme", "2026-01-02"},
     };
     CHECK(SoftwareInventoryStore::canonical_hash(e) == kCrossPinHash);
+}
+
+TEST_CASE("server contract pin: 16-field canonical_hash equals kCrossPinHashExtended",
+          "[software_inventory][hash][extended_row]") {
+    CHECK(SoftwareInventoryStore::canonical_hash({full_extended_entry()}) ==
+          kCrossPinHashExtended);
+}
+
+TEST_CASE("hash tail rule: the tail enters the hash only when package_id or source is non-empty",
+          "[software_inventory][hash][extended_row]") {
+    // Same set as the kCrossPinHash case, tail fields all empty: bytes unchanged. Slots
+    // 13-14 are reserved and not stored, so only package_id and source can open the tail.
+    const std::vector<SoftwareEntry> v2 = {
+        {"Zeta", "9", "", ""},
+        full_v2_entry(),
+        {"Acme Reader", "1.2", "Acme", "2026-01-02"},
+    };
+    CHECK(SoftwareInventoryStore::canonical_hash(v2) == kCrossPinHash);
+
+    // Source-only tail changes the hash (all four tail slots written, three empty).
+    auto with_source = v2;
+    with_source[0].source = "installed_apps.list_apps";
+    CHECK(SoftwareInventoryStore::canonical_hash(with_source) != kCrossPinHash);
+
+    // package_id ALONE (source empty) must also enter the hash: pins both arms of the
+    // "package_id or source non-empty" condition, not just source.
+    auto only_pkg = v2;
+    only_pkg[0].package_id = "x-1";
+    const auto h_pkg = SoftwareInventoryStore::canonical_hash(only_pkg);
+    CHECK(h_pkg != kCrossPinHash);
+    CHECK(h_pkg != SoftwareInventoryStore::canonical_hash(with_source));
+
+    // Rows differing ONLY in one stored tail field are distinct (entry_equal) and order
+    // deterministically (entry_less): for every tail field, {b, a} neither collapses to
+    // {a} nor hashes differently from {a, b}.
+    const SoftwareEntry base = full_extended_entry();
+    const auto one = SoftwareInventoryStore::canonical_hash({base});
+    for (auto field : {&SoftwareEntry::package_id, &SoftwareEntry::source}) {
+        SoftwareEntry other = base;
+        other.*field = "zz-different";
+        CHECK(SoftwareInventoryStore::canonical_hash({other, base}) != one);
+        CHECK(SoftwareInventoryStore::canonical_hash({other, base}) ==
+              SoftwareInventoryStore::canonical_hash({base, other}));
+    }
+    // ...and an exact duplicate still collapses.
+    CHECK(SoftwareInventoryStore::canonical_hash({base, base}) == one);
+
+    // Ascending direction of the tail chain, pinned once (see kTailOrderPinHash).
+    SoftwareEntry first = base;
+    first.source = "installed_apps.list_apps";
+    CHECK(SoftwareInventoryStore::canonical_hash({base, first}) == kTailOrderPinHash);
 }
 
 TEST_CASE("SoftwareInventoryStore hash-skip ingest round-trip", "[pg][software_inventory]") {
@@ -458,6 +591,594 @@ TEST_CASE("migration v5 backfills '' into v2 columns for pre-existing rows and r
     CHECK((*got)[0].distro_version.empty());
 }
 
+TEST_CASE("blob contract extended tail: 12-field blob ingests with the tail fields empty",
+          "[pg][software_inventory][extended_row]") {
+    SWINV_SHARED(store, pool);
+    const SoftwareEntry e = full_v2_entry();
+    agentpb::InventoryReport rep;
+    (*rep.mutable_content_hashes())["installed_software"] =
+        SoftwareInventoryStore::canonical_hash({e});
+    (*rep.mutable_plugin_data())["installed_software"] = wire_record(e, 12);
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_inventory_report(store, "agent-e12", rep, ack);
+    CHECK(ack.need_full_size() == 0);
+    auto got = store.get_agent_software("agent-e12");
+    REQUIRE(got.has_value());
+    REQUIRE(got->size() == 1);
+    CHECK((*got)[0].distro_version == "40");
+    CHECK((*got)[0].package_id.empty());
+    CHECK((*got)[0].source.empty());
+
+    // Hash-only report claiming the same hash is a touch, not a need_full.
+    agentpb::InventoryReport ping;
+    (*ping.mutable_content_hashes())["installed_software"] =
+        SoftwareInventoryStore::canonical_hash({e});
+    agentpb::InventoryAck ack2;
+    yuzu::server::ingest_inventory_report(store, "agent-e12", ping, ack2);
+    CHECK(ack2.need_full_size() == 0);
+}
+
+TEST_CASE("blob contract extended tail: 16-field blob ingests and hydrates on both read paths",
+          "[pg][software_inventory][extended_row]") {
+    SWINV_SHARED(store, pool);
+    const SoftwareEntry e = full_extended_entry();
+    agentpb::InventoryReport rep;
+    (*rep.mutable_content_hashes())["installed_software"] = kCrossPinHashExtended;
+    (*rep.mutable_plugin_data())["installed_software"] = wire_record(e, 16);
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_inventory_report(store, "agent-e16", rep, ack);
+    CHECK(ack.need_full_size() == 0);
+
+    auto got = store.get_agent_software("agent-e16");
+    REQUIRE(got.has_value());
+    REQUIRE(got->size() == 1);
+    CHECK((*got)[0].package_id == "bash-5.2.21-3.fc40.x86_64");
+    CHECK((*got)[0].source == "installed_apps.list_inventory");
+
+    SoftwareFleetQuery q;
+    q.agent_id = "agent-e16";
+    auto fl = store.query_software(q);
+    REQUIRE(fl.has_value());
+    REQUIRE(fl->size() == 1);
+    CHECK((*fl)[0].entry.package_id == "bash-5.2.21-3.fc40.x86_64");
+    CHECK((*fl)[0].entry.source == "installed_apps.list_inventory");
+    CHECK((*fl)[0].install_id >= 1);
+
+    // Hash-only ping with the pinned literal: the server's re-hash of the stored 16-field
+    // rows must equal it (touched, not need_full).
+    agentpb::InventoryReport ping;
+    (*ping.mutable_content_hashes())["installed_software"] = kCrossPinHashExtended;
+    agentpb::InventoryAck ack2;
+    yuzu::server::ingest_inventory_report(store, "agent-e16", ping, ack2);
+    CHECK(ack2.need_full_size() == 0);
+}
+
+TEST_CASE("blob contract extended tail: a 17th token is dropped, the 16 fields survive; a newer "
+          "agent's 17-field hash degrades to need_full",
+          "[pg][software_inventory][extended_row]") {
+    // parse_software_blob lives in an anonymous namespace, so this goes through the
+    // ingest seam: a future 17-field row from a newer agent must not break this server.
+    SWINV_SHARED(store, pool);
+    const std::string rec17 = [] {
+        std::string r = wire_record(full_extended_entry(), 16);
+        r.insert(r.size() - 1, "\x1f" "ignored");
+        return r;
+    }();
+    // The newer agent claims the hash of ALL 17 fields (kSeventeenFieldHash), not the
+    // server's 16-field form. A full payload stores regardless of the claimed hash.
+    agentpb::InventoryReport rep;
+    (*rep.mutable_content_hashes())["installed_software"] = kSeventeenFieldHash;
+    (*rep.mutable_plugin_data())["installed_software"] = rec17;
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_inventory_report(store, "agent-e17", rep, ack);
+    CHECK(ack.need_full_size() == 0);
+    auto got = store.get_agent_software("agent-e17");
+    REQUIRE(got.has_value());
+    REQUIRE(got->size() == 1);
+    CHECK((*got)[0].package_id == "bash-5.2.21-3.fc40.x86_64");
+    CHECK((*got)[0].source == "installed_apps.list_inventory");
+    CHECK(SoftwareInventoryStore::canonical_hash(*got) ==
+          SoftwareInventoryStore::canonical_hash({full_extended_entry()}));
+
+    // Bounded mixed-version degradation, pinned so it stays a property: the stored hash is
+    // the server's 16-field recompute, so the 17-field claim never matches and every
+    // hash-only report is answered need_full (about one extra full report per cycle until
+    // the server learns the 17th field). Never an error loop, never corruption.
+    agentpb::InventoryReport ping;
+    (*ping.mutable_content_hashes())["installed_software"] = kSeventeenFieldHash;
+    agentpb::InventoryAck ack2;
+    yuzu::server::ingest_inventory_report(store, "agent-e17", ping, ack2);
+    REQUIRE(ack2.need_full_size() == 1);
+    CHECK(ack2.need_full(0) == "installed_software");
+
+    // A hash-only claim of the 16-field form is accepted (touched).
+    agentpb::InventoryReport ping16;
+    (*ping16.mutable_content_hashes())["installed_software"] = kCrossPinHashExtended;
+    agentpb::InventoryAck ack3;
+    yuzu::server::ingest_inventory_report(store, "agent-e17", ping16, ack3);
+    CHECK(ack3.need_full_size() == 0);
+}
+
+TEST_CASE("blob contract extended tail: slots 13-14 are parsed but neither stored nor hashed",
+          "[pg][software_inventory][extended_row]") {
+    // ADR-0016 section 8 has not been re-opened for install_location / uninstall_string
+    // (#5186), so a value an agent sends in those slots must not reach the database or the
+    // hash. An agent that does fill them gets need_full until the server accepts them.
+    SWINV_SHARED(store, pool);
+    const SoftwareEntry e = full_extended_entry();
+    const std::string path = "/Users/alice/Applications/Bash";
+    const std::string cmd = "bash --uninstall --key=ABC123";
+    agentpb::InventoryReport rep;
+    (*rep.mutable_content_hashes())["installed_software"] = kReservedValuesHash;
+    (*rep.mutable_plugin_data())["installed_software"] = wire_record_reserved(e, path, cmd);
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_inventory_report(store, "agent-reserved", rep, ack);
+    CHECK(ack.need_full_size() == 0);
+
+    // The row stores with the later slots intact, and its re-hash is the reserved-empty form.
+    auto got = store.get_agent_software("agent-reserved");
+    REQUIRE(got.has_value());
+    REQUIRE(got->size() == 1);
+    CHECK((*got)[0].package_id == e.package_id);
+    CHECK((*got)[0].source == e.source);
+    CHECK(SoftwareInventoryStore::canonical_hash(*got) == kCrossPinHashExtended);
+
+    // No value reaches storage: the schema has no such columns, and no stored text holds them.
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult cols = pg::exec_params(
+            lease.get(),
+            "SELECT count(*) FROM information_schema.columns "
+            "WHERE table_schema = 'software_inventory_store' "
+            "AND column_name IN ('install_location', 'uninstall_string')",
+            std::vector<std::string>{});
+        REQUIRE(cols.status() == PGRES_TUPLES_OK);
+        CHECK(std::string(PQgetvalue(cols.get(), 0, 0)) == "0");
+        // Positive control: the same catalog query does see this table's real columns, so the
+        // zero above is not a vacuous result from a wrong schema or table name.
+        pg::PgResult present = pg::exec_params(
+            lease.get(),
+            "SELECT count(*) FROM information_schema.columns "
+            "WHERE table_schema = 'software_inventory_store' "
+            "AND table_name = 'installed_software' AND column_name IN ('package_id', 'source')",
+            std::vector<std::string>{});
+        REQUIRE(present.status() == PGRES_TUPLES_OK);
+        CHECK(std::string(PQgetvalue(present.get(), 0, 0)) == "2");
+        pg::PgResult leak = pg::exec_params(
+            lease.get(),
+            "SELECT count(*) FROM software_inventory_store.installed_software t "
+            "WHERE t::text LIKE '%alice%' OR t::text LIKE '%ABC123%'",
+            std::vector<std::string>{});
+        REQUIRE(leak.status() == PGRES_TUPLES_OK);
+        CHECK(std::string(PQgetvalue(leak.get(), 0, 0)) == "0");
+    }
+
+    // Bounded degradation: the agent's claim includes the values, the server's does not.
+    agentpb::InventoryReport ping;
+    (*ping.mutable_content_hashes())["installed_software"] = kReservedValuesHash;
+    agentpb::InventoryAck ack2;
+    yuzu::server::ingest_inventory_report(store, "agent-reserved", ping, ack2);
+    REQUIRE(ack2.need_full_size() == 1);
+    CHECK(ack2.need_full(0) == "installed_software");
+    // ...while a claim of the reserved-empty form is a touch.
+    agentpb::InventoryReport ping_empty;
+    (*ping_empty.mutable_content_hashes())["installed_software"] = kCrossPinHashExtended;
+    agentpb::InventoryAck ack3;
+    yuzu::server::ingest_inventory_report(store, "agent-reserved", ping_empty, ack3);
+    CHECK(ack3.need_full_size() == 0);
+}
+
+TEST_CASE("blob contract extended tail: values only in slots 13-14 leave the tail unopened",
+          "[pg][software_inventory][extended_row]") {
+    // package_id and source empty, slots 13-14 filled: the server stores a v2 row and hashes
+    // the 12-field form (no tail), so it equals the hash of the same entry with nothing there.
+    SWINV_SHARED(store, pool);
+    const SoftwareEntry e = full_v2_entry(); // package_id / source empty
+    agentpb::InventoryReport rep;
+    (*rep.mutable_content_hashes())["installed_software"] =
+        SoftwareInventoryStore::canonical_hash({e});
+    (*rep.mutable_plugin_data())["installed_software"] =
+        wire_record_reserved(e, "/opt/x", "rm x");
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_inventory_report(store, "agent-slots-only", rep, ack);
+    CHECK(ack.need_full_size() == 0);
+    auto got = store.get_agent_software("agent-slots-only");
+    REQUIRE(got.has_value());
+    REQUIRE(got->size() == 1);
+    CHECK((*got)[0].package_id.empty());
+    CHECK((*got)[0].source.empty());
+    // The stored hash is the 12-field form: a hash-only claim of that form is a touch.
+    agentpb::InventoryReport ping;
+    (*ping.mutable_content_hashes())["installed_software"] =
+        SoftwareInventoryStore::canonical_hash({e});
+    agentpb::InventoryAck ack2;
+    yuzu::server::ingest_inventory_report(store, "agent-slots-only", ping, ack2);
+    CHECK(ack2.need_full_size() == 0);
+}
+
+TEST_CASE("blob contract extended tail: mixed 12/16-field records in one blob re-hash to the raw "
+          "bytes",
+          "[pg][software_inventory][extended_row]") {
+    SWINV_SHARED(store, pool);
+    SoftwareEntry a;
+    a.name = "alpha";
+    a.version = "1.0";
+    a.publisher = "AlphaCo";
+    a.install_date = "2026-01-01";
+    a.kind = "app";
+    SoftwareEntry c;
+    c.name = "zed";
+    c.version = "1";
+    c.source = "installed_apps.list_inventory"; // source-only tail
+    const std::string mixed =
+        wire_record(a, 12) + wire_record(full_extended_entry(), 16) + wire_record(c, 16);
+
+    agentpb::InventoryReport rep;
+    (*rep.mutable_content_hashes())["installed_software"] = kMixedBlobHash;
+    (*rep.mutable_plugin_data())["installed_software"] = mixed;
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_inventory_report(store, "agent-mixed", rep, ack);
+    CHECK(ack.need_full_size() == 0);
+    auto got = store.get_agent_software("agent-mixed");
+    REQUIRE(got.has_value());
+    REQUIRE(got->size() == 3);
+
+    // Hash-only ping with the raw-bytes hash: the server's re-hash of the stored rows
+    // must equal it (touched, not need_full).
+    agentpb::InventoryReport ping;
+    (*ping.mutable_content_hashes())["installed_software"] = kMixedBlobHash;
+    agentpb::InventoryAck ack2;
+    yuzu::server::ingest_inventory_report(store, "agent-mixed", ping, ack2);
+    CHECK(ack2.need_full_size() == 0);
+}
+
+TEST_CASE("query_software q/kind/ecosystem/source filters", "[pg][software_inventory][extended_row]") {
+    SWINV_SHARED(store, pool);
+    SoftwareEntry chrome;
+    chrome.name = "Chrome";
+    chrome.publisher = "Google";
+    chrome.kind = "app";
+    chrome.ecosystem = "windows";
+    chrome.source = "installed_apps.list_apps";
+    REQUIRE(store.apply_installed_software(
+                "agent-f", "", std::vector<SoftwareEntry>{full_extended_entry(), chrome}, 1000) ==
+            InventoryIngestOutcome::kStored);
+    // Wildcard discriminators: '%' and '_' must match literally, so each term hits one row
+    // (an unescaped '100%' also hits "100 Proof"; an unescaped 'a_' also hits "ab").
+    REQUIRE(store.apply_installed_software(
+                "agent-w", "",
+                std::vector<SoftwareEntry>{{"100% Pure", "1", "", ""},
+                                           {"100 Proof", "1", "", ""},
+                                           {"a_b", "1", "", ""},
+                                           {"ab", "1", "", ""}},
+                1000) == InventoryIngestOutcome::kStored);
+
+    auto count = [&](const SoftwareFleetQuery& q) {
+        auto r = store.query_software(q);
+        REQUIRE(r.has_value());
+        return r->size();
+    };
+    SoftwareFleetQuery q;
+    q.q = "fedora"; // publisher, case-insensitive
+    CHECK(count(q) == 1);
+    q.q = "RPM"; // ecosystem, case-insensitive
+    CHECK(count(q) == 1);
+    q.q = "list_inventory"; // source
+    CHECK(count(q) == 1);
+    q.q = "list_"; // both sources
+    CHECK(count(q) == 2);
+    q.q = "no-such-thing";
+    CHECK(count(q) == 0);
+    q.q = "100%"; // literal percent
+    CHECK(count(q) == 1);
+    q.q = "a_"; // literal underscore
+    CHECK(count(q) == 1);
+
+    q = {};
+    q.kind = "app";
+    CHECK(count(q) == 1);
+    q.kind = "ap"; // exact, not substring
+    CHECK(count(q) == 0);
+    q = {};
+    q.ecosystem = "windows";
+    CHECK(count(q) == 1);
+    q.ecosystem = "win";
+    CHECK(count(q) == 0);
+    q = {};
+    q.source = "installed_apps.list_apps";
+    CHECK(count(q) == 1);
+    q.source = "installed_apps";
+    CHECK(count(q) == 0);
+
+    q = {};
+    q.q = "list_";
+    q.name = "Chrome";
+    CHECK(count(q) == 1);
+    q.agent_id = "nobody";
+    CHECK(count(q) == 0);
+}
+
+TEST_CASE("query_software keyset paging walks to an empty page in (name, agent_id, install_id) "
+          "order",
+          "[pg][software_inventory][extended_row]") {
+    SWINV_SHARED(store, pool);
+    auto mk = [](const char* name, const char* ver) {
+        SoftwareEntry e;
+        e.name = name;
+        e.version = ver;
+        e.source = "installed_apps.list_inventory";
+        return e;
+    };
+    REQUIRE(store.apply_installed_software(
+                "agent-a", "", std::vector<SoftwareEntry>{mk("alpha", "1"), mk("bravo", "1"),
+                                                          mk("bravo", "2")},
+                1000) == InventoryIngestOutcome::kStored);
+    REQUIRE(store.apply_installed_software(
+                "agent-b", "", std::vector<SoftwareEntry>{mk("alpha", "1"), mk("charlie", "1")},
+                1000) == InventoryIngestOutcome::kStored);
+    REQUIRE(store.apply_installed_software("agent-c", "",
+                                           std::vector<SoftwareEntry>{mk("bravo", "1")}, 1000) ==
+            InventoryIngestOutcome::kStored);
+
+    // install_id is monotone with insertion above, so heap order would mask a missing
+    // install_id tiebreak. Push agent-a/bravo version '1' past version '2': the walk must
+    // then return '2' before '1'.
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult upd = pg::exec_params(
+            lease.get(),
+            "UPDATE software_inventory_store.installed_software SET install_id = "
+            "install_id + 1000000 WHERE agent_id = 'agent-a' AND name = 'bravo' AND version = '1'",
+            std::vector<std::string>{});
+        REQUIRE(upd.status() == PGRES_COMMAND_OK);
+    }
+
+    // Even row count (6): the last non-empty page is FULL, so only the EMPTY page ends the walk.
+    auto walk = [&](const std::string& filter, std::size_t& pages) {
+        std::vector<yuzu::server::SoftwareFleetRow> seen;
+        std::optional<SoftwareCursor> after;
+        pages = 0;
+        for (;;) {
+            SoftwareFleetQuery q;
+            q.limit = 2;
+            q.q = filter;
+            q.after = after;
+            auto page = store.query_software(q);
+            REQUIRE(page.has_value());
+            ++pages;
+            REQUIRE(pages <= 8); // 6 rows / limit 2 = 4 pages; a non-advancing cursor must not hang
+            if (page->empty())
+                break;
+            for (auto& r : *page)
+                seen.push_back(r);
+            const auto& last = page->back();
+            after = SoftwareCursor{last.entry.name, last.agent_id, last.install_id};
+        }
+        return seen;
+    };
+
+    std::size_t pages = 0;
+    auto seen = walk("", pages);
+    REQUIRE(seen.size() == 6);
+    CHECK(pages == 4); // 3 full pages + the terminating empty page
+    const std::vector<std::pair<std::string, std::string>> expect = {
+        {"alpha", "agent-a"}, {"alpha", "agent-b"}, {"bravo", "agent-a"},
+        {"bravo", "agent-a"}, {"bravo", "agent-c"}, {"charlie", "agent-b"}};
+    for (std::size_t i = 0; i < seen.size(); ++i) {
+        CHECK(seen[i].entry.name == expect[i].first);
+        CHECK(seen[i].agent_id == expect[i].second);
+    }
+    // The same-name pair within agent-a is ordered by install_id (the reordered ids put
+    // version '2' first) and both rows are seen exactly once.
+    CHECK(seen[2].install_id < seen[3].install_id);
+    CHECK(seen[2].entry.version == "2");
+    CHECK(seen[3].entry.version == "1");
+
+    // Filtered walk yields the filtered set exactly once.
+    auto bravo = walk("bravo", pages);
+    CHECK(bravo.size() == 3);
+}
+
+TEST_CASE("query_software skip passes over rows after the keyset position, in SQL",
+          "[pg][software_inventory][extended_row]") {
+    SWINV_SHARED(store, pool);
+    auto mk = [](const char* name) {
+        SoftwareEntry e;
+        e.name = name;
+        e.version = "1";
+        e.source = "installed_apps.list_inventory";
+        return e;
+    };
+    for (const char* agent : {"agent-a", "agent-b", "agent-c", "agent-d"})
+        REQUIRE(store.apply_installed_software(
+                    agent, "", std::vector<SoftwareEntry>{mk("alpha"), mk("bravo")}, 1000) ==
+                InventoryIngestOutcome::kStored);
+    // order: alpha a b c d, bravo a b c d (8 rows)
+    auto ids = [&](const SoftwareFleetQuery& q) {
+        auto page = store.query_software(q);
+        REQUIRE(page.has_value());
+        std::vector<std::string> out;
+        for (const auto& r : *page)
+            out.push_back(r.entry.name + "/" + r.agent_id);
+        return out;
+    };
+    SoftwareFleetQuery q;
+    q.limit = 2;
+    q.skip = 3; // from the start: pass alpha a, b, c
+    CHECK(ids(q) == std::vector<std::string>{"alpha/agent-d", "bravo/agent-a"});
+
+    auto first = store.query_software(SoftwareFleetQuery{.limit = 1});
+    REQUIRE(first.has_value());
+    REQUIRE(first->size() == 1);
+    const auto& a1 = first->front();
+    q.after = SoftwareCursor{a1.entry.name, a1.agent_id, a1.install_id}; // after alpha/agent-a
+    q.skip = 2;                                                           // pass b, c
+    CHECK(ids(q) == std::vector<std::string>{"alpha/agent-d", "bravo/agent-a"});
+
+    q.skip = 100; // past the end: an empty page, not an error
+    CHECK(ids(q).empty());
+
+    q.skip = 1; // composes with the scope push-down: skip counts rows of the filtered set
+    q.agent_ids = std::vector<std::string>{"agent-b", "agent-d"};
+    CHECK(ids(q) == std::vector<std::string>{"alpha/agent-d", "bravo/agent-b"});
+
+    q.agent_ids.reset(); // ...and with the bounded q arm
+    q.q = "bravo";
+    q.after.reset();
+    q.skip = 3;
+    CHECK(ids(q) == std::vector<std::string>{"bravo/agent-d"});
+}
+
+TEST_CASE("migration v7 backfills '' + install_id into pre-existing rows and re-runs "
+          "idempotently",
+          "[pg][software_inventory][extended_row]") {
+    // Reproduce a v6-era table: DROP the five v7 columns, seed a legacy row, rewind
+    // schema_meta to 6, reconstruct so v7 re-adds them over live data. Then rewind again
+    // and reconstruct to prove the migration text is idempotent.
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    {
+        SoftwareInventoryStore s1{pool};
+        REQUIRE(s1.is_open());
+    }
+    auto rewind = [&] {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult back = pg::exec_params(
+            lease.get(),
+            "UPDATE public.schema_meta SET version = 6 WHERE store = 'software_inventory_store'",
+            std::vector<std::string>{});
+        REQUIRE(back.status() == PGRES_COMMAND_OK);
+    };
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult drop = pg::exec_params(
+            lease.get(),
+            "ALTER TABLE software_inventory_store.installed_software "
+            "DROP COLUMN package_id, DROP COLUMN source, DROP COLUMN install_id",
+            std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+        pg::PgResult ins = pg::exec_params(
+            lease.get(),
+            "INSERT INTO software_inventory_store.installed_software "
+            "(agent_id, name, version, publisher, install_date) "
+            "VALUES ('agent-legacy', 'OldApp', '1.0', 'OldCo', '2025-01-01')",
+            std::vector<std::string>{});
+        REQUIRE(ins.status() == PGRES_COMMAND_OK);
+    }
+    rewind();
+    SoftwareInventoryStore store{pool}; // re-runs v7 over the live row
+    REQUIRE(store.is_open());
+
+    SoftwareFleetQuery q;
+    q.agent_id = "agent-legacy";
+    auto rows = store.query_software(q);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].entry.name == "OldApp");
+    CHECK((*rows)[0].entry.package_id.empty());
+    CHECK((*rows)[0].entry.source.empty());
+    CHECK((*rows)[0].install_id >= 1);
+
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult idx = pg::exec_params(
+            lease.get(),
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = 'software_inventory_store' "
+            "AND indexname = 'installed_software_name_idx'",
+            std::vector<std::string>{});
+        REQUIRE(idx.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(idx.get()) == 1);
+        CHECK(std::string(PQgetvalue(idx.get(), 0, 0)).find("install_id") != std::string::npos);
+    }
+
+    rewind();
+    SoftwareInventoryStore again{pool}; // second run over an already-migrated table
+    CHECK(again.is_open());
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult seq = pg::exec_params(
+            lease.get(),
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = 'software_inventory_store' AND c.relkind = 'S' "
+            "AND c.relname LIKE 'installed_software_install_id%'",
+            std::vector<std::string>{});
+        REQUIRE(seq.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(seq.get()) == 1);
+        CHECK(std::string(PQgetvalue(seq.get(), 0, 0)) == "1"); // re-run added no 2nd sequence
+    }
+}
+
+// Post-migration projection check (postgres-store-playbook "Runner guards"). schema_meta stays
+// current while a column a runtime query uses is missing, which models a version stamped by a
+// different binary: PgMigrationRunner::run() sees nothing pending and returns true, so only the
+// constructor's LIMIT 0 projection can refuse to open. Every column of every table in the store
+// schema is renamed away in turn. The columns come from the live catalog, so a column added by a
+// later migration but not to the guard fails here instead of silently weakening it. Renaming it
+// back must reopen the store, which pins the closure on that column and not on some other failure.
+TEST_CASE("SoftwareInventoryStore reports !is_open when any column its queries use is missing "
+          "although schema_meta is current",
+          "[pg][software_inventory][extended_row]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    {
+        SoftwareInventoryStore intact{pool};
+        REQUIRE(intact.is_open()); // control: the guard must not refuse a healthy schema
+    }
+
+    std::vector<std::pair<std::string, std::string>> columns; // (table, column)
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult r =
+            pg::exec_params(lease.get(),
+                            "SELECT table_name, column_name FROM information_schema.columns "
+                            "WHERE table_schema = 'software_inventory_store' "
+                            "ORDER BY table_name, ordinal_position",
+                            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        for (int i = 0; i < PQntuples(r.get()); ++i)
+            columns.emplace_back(PQgetvalue(r.get(), i, 0), PQgetvalue(r.get(), i, 1));
+    }
+    // A catalog read that returned only part of the schema would pass vacuously; name the tables.
+    for (const char* table : {"installed_software", "inventory_state", "catalog_rollup",
+                              "version_rollup", "catalog_rollup_meta"}) {
+        CAPTURE(table);
+        REQUIRE(std::any_of(columns.begin(), columns.end(),
+                            [&](const auto& c) { return c.first == table; }));
+    }
+
+    auto alter = [&](const std::string& sql) {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    };
+
+    for (const auto& [table, column] : columns) {
+        CAPTURE(table, column);
+        const std::string rename_prefix =
+            "ALTER TABLE software_inventory_store.\"" + table + "\" RENAME COLUMN \"";
+        alter(rename_prefix + column + "\" TO \"" + column + "_gone\"");
+        {
+            SoftwareInventoryStore broken{pool};
+            CHECK_FALSE(broken.is_open());
+        }
+        alter(rename_prefix + column + "_gone\" TO \"" + column + "\"");
+        {
+            SoftwareInventoryStore restored{pool};
+            CHECK(restored.is_open());
+        }
+    }
+}
+
 TEST_CASE("ingest boundary-truncates an over-long multibyte field so PG accepts it (UP-10)",
           "[pg][software_inventory][seam][pg-smoke]") {
     // Regression for the UTF-8 byte-cut: a raw field whose multibyte codepoint
@@ -469,7 +1190,7 @@ TEST_CASE("ingest boundary-truncates an over-long multibyte field so PG accepts 
     // name = 1023 'a' + 'é' (0xC3 0xA9) = 1025 bytes; record = name|1|| (0x1F fields,
     // 0x1E terminator; octal \037=0x1F \036=0x1E to avoid greedy \x hex escapes).
     std::string longname = std::string(1023, 'a') + "\xc3\xa9";
-    std::string blob = longname + "\0371\037\037\036";
+    std::string blob = longname + "\037" "1\037\037\036";
     agentpb::InventoryReport rep;
     (*rep.mutable_content_hashes())["installed_software"] = "x"; // recomputed on a full payload
     (*rep.mutable_plugin_data())["installed_software"] = blob;
@@ -625,6 +1346,14 @@ TEST_CASE("reads are AUTHORITATIVE: a degrade returns nullopt, distinct from a t
         q.name = "Chrome";
         CHECK_FALSE(store.query_software(q).has_value());             // degraded → nullopt
         CHECK_FALSE(store.get_agent_software("agent-a").has_value()); // not a silent empty
+        // The rewritten catalogue reads degrade the same way (ADR-0016 §7).
+        CHECK_FALSE(
+            store.software_catalog(yuzu::server::SoftwareCatalogQuery{.q = "x"}).has_value());
+        CHECK_FALSE(store
+                        .software_versions(yuzu::server::SoftwareVersionsQuery{
+                            .name = "x", .ecosystem = "brew"})
+                        .has_value());
+        CHECK_FALSE(store.catalog_rollup_meta().has_value());
     }
 }
 
@@ -1109,15 +1838,15 @@ TEST_CASE("SoftwareInventoryStore catalogue + version aggregates", "[pg][softwar
             }
         CHECK(found_7z);
     }
-    SECTION("name_filter is a case-insensitive substring") {
+    SECTION("q is a case-insensitive substring") {
         yuzu::server::SoftwareCatalogQuery q;
-        q.name_filter = "chrome";
+        q.q = "chrome";
         auto cat = store.software_catalog(q);
         REQUIRE(cat.has_value());
         REQUIRE(cat->size() == 1);
         CHECK((*cat)[0].name == "Google Chrome");
     }
-    SECTION("name_filter matches on PUBLISHER alone, not just the title (round-3 item 8)") {
+    SECTION("q matches on PUBLISHER alone, not just the title (round-3 item 8)") {
         // The store's ILIKE OR spans title AND publisher, one bound param reused in
         // both arms (software_inventory_store.cpp's software_catalog) — a
         // publisher-only substring ("adobe" surfacing every Adobe title) must
@@ -1132,7 +1861,7 @@ TEST_CASE("SoftwareInventoryStore catalogue + version aggregates", "[pg][softwar
         REQUIRE(store.refresh_catalog_rollup());
 
         yuzu::server::SoftwareCatalogQuery q;
-        q.name_filter = "zylofex"; // substring of the publisher only
+        q.q = "zylofex"; // substring of the publisher only
         auto cat = store.software_catalog(q);
         REQUIRE(cat.has_value());
         bool found_one = false, found_two = false;
@@ -1157,7 +1886,7 @@ TEST_CASE("SoftwareInventoryStore catalogue + version aggregates", "[pg][softwar
         CHECK((*cat)[0].name == "Google Chrome");
     }
     SECTION("software_versions = installs per version, most-installed first") {
-        auto v = store.software_versions("Google Chrome", 100);
+        auto v = store.software_versions({.name = "Google Chrome", .limit = 100});
         REQUIRE(v.has_value());
         REQUIRE(v->size() == 2);
         CHECK((*v)[0].version == "126");
@@ -1166,16 +1895,37 @@ TEST_CASE("SoftwareInventoryStore catalogue + version aggregates", "[pg][softwar
         CHECK((*v)[1].device_count == 1);
     }
     SECTION("software_versions empty name → empty value (precondition miss, not degrade)") {
-        auto v = store.software_versions("", 100);
+        auto v = store.software_versions({.name = "", .limit = 100});
         REQUIRE(v.has_value());
         CHECK(v->empty());
     }
     SECTION("software_versions unknown title → empty value, not degrade") {
-        auto v = store.software_versions("Nonexistent App", 100);
+        auto v = store.software_versions({.name = "Nonexistent App", .limit = 100});
         REQUIRE(v.has_value());
         CHECK(v->empty());
     }
 }
+
+namespace {
+// Every KPI field of the meta row is 0 (the "building" sentinel and the refreshed-but-empty
+// fleet both read this way; refreshed_at tells them apart and is asserted by the caller).
+void check_kpis_zero(const yuzu::server::CatalogRollupMeta& m) {
+    CHECK(m.total_titles == 0);
+    CHECK(m.total_devices == 0);
+    CHECK(m.total_publishers == 0);
+    CHECK(m.total_installs == 0);
+    CHECK(m.installs_windows == 0);
+    CHECK(m.installs_macos == 0);
+    CHECK(m.installs_linux == 0);
+    CHECK(m.installs_other == 0);
+    CHECK(m.current_installs == 0);
+    CHECK(m.current_total == 0);
+    CHECK(m.current_titles == 0);
+    CHECK(m.sprawl_titles == 0);
+    CHECK(m.rpm_total == 0);
+    CHECK(m.rpm_unsigned == 0);
+}
+} // namespace
 
 TEST_CASE("SoftwareInventoryStore catalogue rollup is empty + 'building' before first refresh",
           "[pg][software_inventory]") {
@@ -1192,6 +1942,7 @@ TEST_CASE("SoftwareInventoryStore catalogue rollup is empty + 'building' before 
     auto meta = store.catalog_rollup_meta();
     REQUIRE(meta.has_value());
     CHECK(meta->refreshed_at == 0);
+    check_kpis_zero(*meta);
     auto cat = store.software_catalog({});
     REQUIRE(cat.has_value());
     CHECK(cat->empty());
@@ -1220,7 +1971,7 @@ TEST_CASE("SoftwareInventoryStore rollup tables carry the multi-instance unique 
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT count(*) FROM pg_constraint "
-        "WHERE conname IN ('catalog_rollup_name_key', 'version_rollup_nv_key') AND contype = 'u'",
+        "WHERE conname IN ('catalog_rollup_grain_key', 'version_rollup_nv_key') AND contype = 'u'",
         std::vector<std::string>{});
     REQUIRE(res.status() == PGRES_TUPLES_OK);
     REQUIRE(PQntuples(res.get()) == 1);
@@ -1265,4 +2016,2170 @@ TEST_CASE("refresh_catalog_rollup skips (success, no recompute) when a peer hold
     auto meta2 = store.catalog_rollup_meta();
     REQUIRE(meta2.has_value());
     CHECK(meta2->refreshed_at > 0);
+}
+
+// ── M.9 PR-1: exact-distinct grain rollup, filtered reads, KPIs, refresh bounds ───────────
+namespace {
+using yuzu::server::CatalogRollupMeta;
+using yuzu::server::SoftwareCatalogCursor;
+using yuzu::server::SoftwareCatalogQuery;
+using yuzu::server::SoftwareCatalogRow;
+using yuzu::server::SoftwareVersionsQuery;
+using Rows = std::vector<SoftwareEntry>;
+namespace sc = yuzu::server::software_catalog;
+
+constexpr const char* kSrcPkg = "pkg_inventory.packages";
+constexpr const char* kSrcApps = "installed_apps.list_inventory";
+
+SoftwareEntry ent(std::string name, std::string ver, std::string pub = "", std::string kind = "",
+                  std::string eco = "", std::string src = "", std::string sig = "") {
+    SoftwareEntry e;
+    e.name = std::move(name);
+    e.version = std::move(ver);
+    e.publisher = std::move(pub);
+    e.kind = std::move(kind);
+    e.ecosystem = std::move(eco);
+    e.source = std::move(src);
+    e.signature_status = std::move(sig);
+    return e;
+}
+
+void put(SoftwareInventoryStore& store, const std::string& agent, Rows rows) {
+    REQUIRE(store.apply_installed_software(agent, "", std::move(rows), 1) ==
+            InventoryIngestOutcome::kStored);
+}
+
+// d1 carries git via brew AND macos_pkgutil (two sources), d2 via brew, d3 via rpm (unsigned);
+// d1 also carries Chrome. Finest-grain combos: git 3, so 19 rollup rows; Chrome 8.
+void seed_grain_fixture(SoftwareInventoryStore& store) {
+    put(store, "d1",
+        Rows{ent("git", "2.40", "Git SCM", "package", "brew", kSrcPkg),
+             ent("git", "2.40", "Git SCM", "pkg", "macos_pkgutil", kSrcApps),
+             ent("Chrome", "126", "Google", "app", "macos", kSrcApps)});
+    put(store, "d2", Rows{ent("git", "2.39", "Git SCM", "package", "brew", kSrcPkg)});
+    put(store, "d3", Rows{ent("git", "2.41", "Fedora", "package", "rpm", kSrcPkg, "unsigned")});
+    REQUIRE(store.refresh_catalog_rollup());
+}
+
+std::optional<SoftwareCatalogRow> title(SoftwareInventoryStore& s, const std::string& name,
+                                        SoftwareCatalogQuery q = {}) {
+    q.limit = 2000;
+    auto c = s.software_catalog(q);
+    REQUIRE(c.has_value());
+    for (const auto& r : *c)
+        if (r.name == name)
+            return r;
+    return std::nullopt;
+}
+
+// Lease, run one parameterless statement, REQUIRE it succeeded (rows or a command tag).
+pg::PgResult run_sql(PgPool& pool, const std::string& stmt) {
+    auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(lease);
+    pg::PgResult r = pg::exec_params(lease.get(), stmt.c_str(), std::vector<std::string>{});
+    REQUIRE((r.status() == PGRES_TUPLES_OK || r.status() == PGRES_COMMAND_OK));
+    return r;
+}
+
+std::int64_t count_rows(PgPool& pool, const char* table) {
+    auto r = run_sql(pool, std::string("SELECT count(*) FROM software_inventory_store.") + table);
+    return std::stoll(PQgetvalue(r.get(), 0, 0));
+}
+} // namespace
+
+TEST_CASE("catalogue Installs are exact distinct devices under every filter grain",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    seed_grain_fixture(store);
+
+    struct Case {
+        const char *kind, *eco, *src;
+        std::int64_t installs, versions;
+    };
+    const Case cases[] = {
+        {"", "", "", 3, 3},                                   // grain 7, d1 counted once
+        {"package", "", "", 3, 3},                            // 3
+        {"pkg", "", "", 1, 1},                                // 3 (kind)
+        {"", "brew", "", 2, 2},                               // 5
+        {"", "", kSrcApps, 1, 1},                             // 6
+        {"", "", kSrcPkg, 3, 3},                              // 6
+        {"package", "brew", "", 2, 2},                        // 1: kind+ecosystem
+        {"pkg", "macos_pkgutil", "", 1, 1},                   // 1
+        {"package", "", kSrcPkg, 3, 3},                       // 2: kind+source
+        {"pkg", "", kSrcApps, 1, 1},                          // 2
+        {"", "brew", kSrcPkg, 2, 2},                          // 4: ecosystem+source
+        {"pkg", "macos_pkgutil", kSrcApps, 1, 1},             // 0: all three fixed
+    };
+    for (const auto& c : cases) {
+        CAPTURE(c.kind, c.eco, c.src);
+        SoftwareCatalogQuery q;
+        q.kind = c.kind;
+        q.ecosystem = c.eco;
+        q.source = c.src;
+        auto r = title(store, "git", q);
+        REQUIRE(r.has_value());
+        CHECK(r->device_count == c.installs);
+        CHECK(r->version_count == c.versions);
+    }
+    auto all = title(store, "git");
+    REQUIRE(all.has_value());
+    CHECK(all->ecosystems == "brew,macos_pkgutil,rpm");
+    CHECK(all->kinds == "package,pkg");
+    CHECK(all->newest_version == "2.41");
+    SoftwareCatalogQuery kq;
+    kq.kind = "package";
+    auto slice = title(store, "git", kq);
+    REQUIRE(slice.has_value());
+    CHECK(slice->ecosystems == "brew,rpm"); // the filtered slice's own lists
+    CHECK(slice->kinds == "package");
+    // a title absent from a slice is absent, not zero
+    SoftwareCatalogQuery cq;
+    cq.kind = "package";
+    CHECK_FALSE(title(store, "Chrome", cq).has_value());
+
+    // F2: one row per DISTINCT combination per grouping set: git 19, Chrome 8
+    CHECK(count_rows(pool, "catalog_rollup") == 27);
+    auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    CHECK(meta->rpm_total == 1);
+    CHECK(meta->rpm_unsigned == 1);
+}
+
+TEST_CASE("q is literal and title-level and clamped", "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    seed_grain_fixture(store);
+    put(store, "q1",
+        Rows{ent("100% Pure", "1"), ent("100 Proof", "1"), ent("a_b", "1"), ent("ab", "1"),
+             ent("Widget", "1", "Zylofex Systems"), ent(std::string(128, 'a'), "1")});
+    REQUIRE(store.refresh_catalog_rollup());
+    auto names = [&](SoftwareCatalogQuery q) {
+        auto c = store.software_catalog(q);
+        REQUIRE(c.has_value());
+        std::vector<std::string> n;
+        for (const auto& r : *c)
+            n.push_back(r.name);
+        std::sort(n.begin(), n.end());
+        return n;
+    };
+    SoftwareCatalogQuery q;
+    q.q = "100%";
+    CHECK(names(q) == std::vector<std::string>{"100% Pure"}); // % is literal
+    q.q = "a_";
+    CHECK(names(q) == std::vector<std::string>{"a_b"}); // _ is literal: "ab" would match a wildcard
+    q.q = "zylofex"; // publisher-only
+    CHECK(names(q) == std::vector<std::string>{"Widget"});
+    q.q = "pkgutil"; // matches through the title's sources/ecosystems
+    CHECK(names(q) == std::vector<std::string>{"git"});
+    auto g = title(store, "git", q);
+    REQUIRE(g.has_value());
+    CHECK(g->device_count == 3); // a matched title keeps its whole slice
+    q.kind = "package"; // the filtered slice has no pkgutil: git is absent
+    CHECK(names(q).empty());
+    // 300 multibyte bytes are clamped to a valid term, never a degrade
+    SoftwareCatalogQuery big;
+    for (int i = 0; i < 150; ++i)
+        big.q += "\xC3\xA9";
+    CHECK(store.software_catalog(big).has_value());
+    // Invalid UTF-8 is scrubbed before the clamp: a bare invalid byte is a value (not a degrade
+    // -> nullopt via PG 22021), and an all-continuation term filters instead of clamping to ""
+    // and returning the whole catalogue.
+    SoftwareCatalogQuery bad;
+    bad.q = "\xFF";
+    auto bad_page = store.software_catalog(bad);
+    REQUIRE(bad_page.has_value());
+    CHECK(bad_page->empty());
+    SoftwareCatalogQuery conts;
+    conts.q = std::string(200, '\x80');
+    auto conts_page = store.software_catalog(conts);
+    REQUIRE(conts_page.has_value());
+    CHECK(conts_page->empty()); // filtered, not the unfiltered catalogue
+    SoftwareFleetQuery bad_fleet;
+    bad_fleet.q = "\xFF";
+    CHECK(store.query_software(bad_fleet).has_value());
+    SoftwareFleetQuery conts_fleet;
+    conts_fleet.q = std::string(200, '\x80'); // same scrub-before-clamp order on this read
+    auto conts_fleet_rows = store.query_software(conts_fleet);
+    REQUIRE(conts_fleet_rows.has_value());
+    CHECK(conts_fleet_rows->empty());
+    // An embedded NUL would truncate the bound text at the first NUL (a NUL-first q binding as ""
+    // and matching everything); it is scrubbed to U+FFFD on both reads, so each term filters.
+    SoftwareCatalogQuery nul_cat;
+    nul_cat.q = std::string("\0foo", 4);
+    CHECK(names(nul_cat).empty());
+    SoftwareFleetQuery nul_fleet;
+    nul_fleet.q = std::string("\0foo", 4);
+    auto nul_rows = store.query_software(nul_fleet);
+    REQUIRE(nul_rows.has_value());
+    CHECK(nul_rows->empty());
+    // The 128-byte clamp is applied on both reads: a title of 128 'a' queried with 128 'a' + 72
+    // 'z' is found (the term is cut to the 128 'a'); unclamped the term would match nothing.
+    const std::string long_title(128, 'a');
+    SoftwareCatalogQuery clamped;
+    clamped.q = long_title + std::string(72, 'z');
+    CHECK(names(clamped) == std::vector<std::string>{long_title});
+    SoftwareFleetQuery raw;
+    raw.q = long_title + std::string(72, 'z');
+    auto hits = store.query_software(raw);
+    REQUIRE(hits.has_value());
+    REQUIRE(hits->size() == 1);
+    CHECK((*hits)[0].entry.name == long_title);
+}
+
+TEST_CASE("catalogue keyset walk is exact and bounded; rejects a negative cursor",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    // A,B on 3 devices; C,D on 2; E,F on 1 (ties inside each count); C on two versions.
+    for (const char* d : {"k1", "k2", "k3"}) {
+        Rows r{ent("A", "1"), ent("B", "1")};
+        if (std::string(d) != "k3") {
+            r.push_back(ent("C", std::string(d) == "k1" ? "1" : "2"));
+            r.push_back(ent("D", "1"));
+        }
+        if (std::string(d) == "k1") {
+            r.push_back(ent("E", "1"));
+            r.push_back(ent("F", "1"));
+        }
+        put(store, d, std::move(r));
+    }
+    REQUIRE(store.refresh_catalog_rollup());
+    std::vector<std::string> seen;
+    std::optional<SoftwareCatalogCursor> after;
+    int pages = 0;
+    for (;;) {
+        REQUIRE(++pages <= 8);
+        SoftwareCatalogQuery q;
+        q.limit = 2;
+        q.after = after;
+        auto page = store.software_catalog(q);
+        REQUIRE(page.has_value());
+        if (page->empty())
+            break;
+        for (const auto& r : *page)
+            seen.push_back(r.name);
+        after = SoftwareCatalogCursor{page->back().device_count, page->back().name};
+    }
+    CHECK(seen == std::vector<std::string>{"A", "B", "C", "D", "E", "F"});
+    SoftwareCatalogQuery mv;
+    mv.versions_min = 2;
+    auto m = store.software_catalog(mv);
+    REQUIRE(m.has_value());
+    REQUIRE(m->size() == 1);
+    CHECK((*m)[0].name == "C");
+    for (const std::int64_t bad : {std::int64_t{-1}, std::numeric_limits<std::int64_t>::min()}) {
+        SoftwareCatalogQuery q;
+        q.after = SoftwareCatalogCursor{bad, ""};
+        auto r = store.software_catalog(q);
+        REQUIRE(r.has_value()); // precondition miss: empty VALUE, store still open
+        CHECK(r->empty());
+    }
+    CHECK(store.is_open());
+}
+
+TEST_CASE("host catalogue view reads one device and shares the q list representation",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    seed_grain_fixture(store);
+    SoftwareCatalogQuery q;
+    q.agent_id = "d1";
+    auto rows = store.software_catalog(q);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 2);
+    const auto& chrome = (*rows)[0]; // name order
+    const auto& git = (*rows)[1];
+    CHECK(chrome.name == "Chrome");
+    CHECK(git.name == "git");
+    CHECK(git.device_count == 1);
+    CHECK(git.version_count == 1); // d1 carries only 2.40
+    CHECK(git.ecosystems == "brew,macos_pkgutil");
+    CHECK(git.kinds == "package,pkg");
+    CHECK(git.newest_version == "2.41"); // fleet-wide, not d1's
+    q.agent_id = "nobody";
+    auto none = store.software_catalog(q);
+    REQUIRE(none.has_value());
+    CHECK(none->empty());
+
+    // F7: the literal list "brew,macos_pkgutil" matches identically on both paths
+    SoftwareCatalogQuery fq;
+    fq.q = "brew,macos_pkgutil";
+    auto fleet = store.software_catalog(fq);
+    REQUIRE(fleet.has_value());
+    CHECK(fleet->size() == 1);
+    fq.agent_id = "d1";
+    auto host1 = store.software_catalog(fq);
+    REQUIRE(host1.has_value());
+    REQUIRE(host1->size() == 1);
+    CHECK((*host1)[0].name == "git");
+    fq.agent_id = "d2";
+    auto host2 = store.software_catalog(fq);
+    REQUIRE(host2.has_value());
+    CHECK(host2->empty());
+}
+
+TEST_CASE("software_versions fleet/filtered/host paths carry the fleet newest mark",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    put(store, "vA",
+        Rows{ent("git", "2.40", "", "package", "brew", kSrcPkg),
+             ent("git", "2.40", "", "pkg", "macos_pkgutil", kSrcApps)});
+    put(store, "vB", Rows{ent("git", "2.40", "", "package", "brew", kSrcPkg)});
+    put(store, "vC", Rows{ent("git", "2.41", "", "package", "rpm", kSrcPkg)});
+    put(store, "hA", Rows{ent("Host", "1.0")});
+    put(store, "hB", Rows{ent("Host", "2.0")});
+    put(store, "vD", Rows{ent("NoVer", "")});
+    REQUIRE(store.refresh_catalog_rollup());
+
+    auto v = store.software_versions({.name = "git"});
+    REQUIRE(v.has_value());
+    REQUIRE(v->size() == 2); // vA's two sources count once
+    CHECK((*v)[0].version == "2.40");
+    CHECK((*v)[0].device_count == 2);
+    CHECK_FALSE((*v)[0].newest);
+    CHECK((*v)[1].version == "2.41");
+    CHECK((*v)[1].newest);
+
+    auto brew = store.software_versions({.name = "git", .ecosystem = "brew"});
+    REQUIRE(brew.has_value());
+    REQUIRE(brew->size() == 1);
+    CHECK((*brew)[0].device_count == 2);
+    CHECK_FALSE((*brew)[0].newest); // 2.41 is fleet-newest but outside this slice
+    auto rpm = store.software_versions({.name = "git", .ecosystem = "rpm"});
+    REQUIRE(rpm.has_value());
+    REQUIRE(rpm->size() == 1);
+    CHECK((*rpm)[0].newest);
+
+    auto a = store.software_versions({.name = "Host", .agent_id = "hA"});
+    REQUIRE(a.has_value());
+    REQUIRE(a->size() == 1);
+    CHECK((*a)[0].version == "1.0");
+    CHECK_FALSE((*a)[0].newest);
+    auto b = store.software_versions({.name = "Host", .agent_id = "hB"});
+    REQUIRE(b.has_value());
+    REQUIRE(b->size() == 1);
+    CHECK((*b)[0].newest);
+    auto both = store.software_versions({.name = "Host"});
+    REQUIRE(both.has_value());
+    CHECK(both->size() == 2);
+
+    auto nv = store.software_versions({.name = "NoVer"});
+    REQUIRE(nv.has_value());
+    REQUIRE(nv->size() == 1);
+    CHECK_FALSE((*nv)[0].newest); // '' is never newest
+    auto unknown = store.software_versions({.name = "Nope"});
+    REQUIRE(unknown.has_value());
+    CHECK(unknown->empty());
+    auto empty_name = store.software_versions({.name = ""});
+    REQUIRE(empty_name.has_value());
+    CHECK(empty_name->empty());
+}
+
+TEST_CASE("KPI meta is computed by the refresh from one snapshot", "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    seed_grain_fixture(store);
+    // d4: one device on two versions of Dual side by side; d5: NoVer has only an unknown version.
+    put(store, "d4",
+        Rows{ent("Dual", "1.0", "", "package", "brew", kSrcPkg),
+             ent("Dual", "2.0", "", "package", "brew", kSrcPkg)});
+    put(store, "d5", Rows{ent("NoVer", "", "", "package", "brew", kSrcPkg)});
+    REQUIRE(store.refresh_catalog_rollup());
+    auto m = store.catalog_rollup_meta();
+    REQUIRE(m.has_value());
+    CHECK(m->refreshed_at > 0);
+    CHECK(m->total_titles == 4);
+    CHECK(m->total_devices == 5);
+    CHECK(m->total_publishers == 3); // Git SCM, Fedora, Google ('' excluded)
+    // git 3 + Chrome 1 + Dual 1 + NoVer 1 (d4's two Dual versions count once)
+    CHECK(m->total_installs == 6);
+    CHECK(m->installs_windows == 0);
+    CHECK(m->installs_macos == 5);
+    CHECK(m->installs_linux == 1);
+    CHECK(m->installs_other == 0);
+    CHECK(m->installs_windows + m->installs_macos + m->installs_linux + m->installs_other ==
+          m->total_installs);
+    CHECK(m->current_titles == 3);   // NoVer has no known version
+    CHECK(m->current_installs == 3); // git 2.41 (d3), Chrome 126 (d1), Dual 2.0 (d4)
+    CHECK(m->current_total == 5);    // git 3 + Chrome 1 + Dual 1: side-by-side counts once
+    CHECK(m->sprawl_titles == 1);    // git on 3 versions
+    CHECK(m->rpm_total == 1);
+    CHECK(m->rpm_unsigned == 1);
+}
+
+TEST_CASE("Installs-by-OS is exact and the CASE SQL mirrors the C++ table",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    put(store, "o1",
+        Rows{ent("git", "1", "", "package", "brew", kSrcPkg),
+             ent("git", "1", "", "pkg", "macos_pkgutil", kSrcApps)});
+    put(store, "o2", Rows{ent("git", "1", "", "package", "deb", kSrcPkg)});
+    REQUIRE(store.refresh_catalog_rollup());
+    auto m = store.catalog_rollup_meta();
+    REQUIRE(m.has_value());
+    CHECK(m->installs_macos == 1); // o1 once, not once per ecosystem
+    CHECK(m->installs_linux == 1);
+    CHECK(m->installs_windows == 0);
+    CHECK(m->total_installs == 2);
+
+    // The generated CASE maps every published ecosystem to its table family and anything else
+    // ('' / an unknown spelling) to "other".
+    std::string values;
+    for (const auto& e : sc::kEcosystemFamilies)
+        values += "('" + std::string(e.ecosystem) + "'),";
+    values += "(''),('zypper')"; // snap is a published spelling; zypper is not
+    auto r = run_sql(pool, "SELECT ecosystem, " + sc::os_family_case_sql() + " FROM (VALUES " +
+                               values + ") v(ecosystem)");
+    const int published = static_cast<int>(sc::kEcosystemFamilies.size());
+    REQUIRE(PQntuples(r.get()) == published + 2);
+    for (int i = 0; i < published; ++i)
+        CHECK(std::string(PQgetvalue(r.get(), i, 1)) == sc::kEcosystemFamilies[i].family);
+    CHECK(std::string(PQgetvalue(r.get(), published, 1)) == "other");
+    CHECK(std::string(PQgetvalue(r.get(), published + 1, 1)) == "other");
+}
+
+TEST_CASE("a cancelled refresh keeps the last-good rollup", "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    seed_grain_fixture(store);
+    auto before = store.catalog_rollup_meta();
+    REQUIRE(before.has_value());
+    put(store, "c9", Rows{ent("brand-new", "1")});
+    CHECK_FALSE(store.refresh_catalog_rollup([] { return true; }));
+    CHECK(count_rows(pool, "catalog_rollup") == 27);
+    auto after = store.catalog_rollup_meta();
+    REQUIRE(after.has_value());
+    CHECK(after->refreshed_at == before->refreshed_at);
+    CHECK(store.is_open());
+    REQUIRE(store.refresh_catalog_rollup()); // default predicate: not cancellable
+    CHECK(title(store, "brand-new").has_value());
+}
+
+// The first-poll case above never reaches the DELETE. Cancel at the LAST poll instead (just
+// before the meta UPDATE, after catalog_rollup was deleted and re-filled in this transaction):
+// everything must roll back to the previous publication. The poll count is measured from an
+// uncancelled run, so the case follows the code instead of hard-coding a poll index.
+TEST_CASE("a refresh cancelled at its last poll rolls back the delete and re-insert",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    seed_grain_fixture(store);
+    int polls = 0;
+    REQUIRE(store.refresh_catalog_rollup([&] {
+        ++polls;
+        return false;
+    }));
+    REQUIRE(polls > 1);
+    const auto published_rows = count_rows(pool, "catalog_rollup");
+    auto before = store.catalog_rollup_meta();
+    REQUIRE(before.has_value());
+
+    put(store, "c2", Rows{ent("third", "1")});
+    int calls = 0;
+    const int last = polls;
+    CHECK_FALSE(store.refresh_catalog_rollup([&] { return ++calls == last; }));
+    CHECK(calls == last);
+    CHECK(count_rows(pool, "catalog_rollup") == published_rows);
+    CHECK_FALSE(title(store, "third").has_value());
+    auto after = store.catalog_rollup_meta();
+    REQUIRE(after.has_value());
+    CHECK(after->refreshed_at == before->refreshed_at);
+    CHECK(after->total_titles == before->total_titles);
+    CHECK(store.is_open());
+    REQUIRE(store.refresh_catalog_rollup());
+    CHECK(title(store, "third").has_value());
+}
+
+// One snapshot: a peer commit that lands mid-refresh must be wholly absent from this
+// publication (REPEATABLE READ) and wholly present in the next. The cancel predicate is the
+// barrier (no sleeps): at its 6th poll — well after the advisory-lock SELECT and the snapshot —
+// it commits a new title through another pool lease, then lets the refresh continue.
+TEST_CASE("a title committed mid-refresh is absent from this publication and in the next",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    seed_grain_fixture(store);
+    const auto version_rows = count_rows(pool, "version_rollup");
+    auto before = store.catalog_rollup_meta();
+    REQUIRE(before.has_value());
+    int polls = 0;
+    REQUIRE(store.refresh_catalog_rollup([&] {
+        if (++polls == 6)
+            put(store, "late-dev", Rows{ent("LateTitle", "9", "Late", "package", "brew", kSrcPkg)});
+        return false;
+    }));
+    REQUIRE(polls >= 6); // fails loudly if the poll sequence ever shrinks below the barrier
+    CHECK_FALSE(title(store, "LateTitle").has_value());
+    CHECK(count_rows(pool, "catalog_rollup") == 27);
+    CHECK(count_rows(pool, "version_rollup") == version_rows);
+    auto during = store.catalog_rollup_meta();
+    REQUIRE(during.has_value());
+    CHECK(during->total_devices == before->total_devices);
+    CHECK(during->total_titles == before->total_titles);
+    CHECK(during->total_installs == before->total_installs);
+    REQUIRE(store.refresh_catalog_rollup());
+    CHECK(title(store, "LateTitle").has_value());
+    auto next = store.catalog_rollup_meta();
+    REQUIRE(next.has_value());
+    CHECK(next->total_devices == before->total_devices + 1);
+    CHECK(next->total_titles == before->total_titles + 1);
+}
+
+// Production-threshold case (the unit shards otherwise use tiny fixtures): one agent with
+// 10,003 version rows crosses the 10,000-row FETCH boundary and, with 5,001 newest picks, the
+// 5,000-pick flush. Title t04999 has three versions so its rows (9,999-10,001) straddle the
+// boundary and its newest ("3.0") is the row AFTER it. One bulk put + one 10k-row refresh,
+// about a second; no sleeps. kRollupRefreshBudget stays untested by design: it is one
+// steady_clock comparison inside the same abort_requested() lambda the cancel cases exercise.
+TEST_CASE("fleet-newest fold is correct across the FETCH boundary and a mid-loop flush",
+          "[pg][software_inventory]") {
+    constexpr int kTitles = 5001;
+    constexpr int kStraddle = 4999;
+    static_assert(2 * kTitles + 1 > sc::kNewestFetchRows);
+    static_assert(kTitles > static_cast<int>(sc::kNewestFlushRows));
+    SWINV_SHARED(store, pool);
+    Rows rows;
+    rows.reserve(2 * kTitles + 1);
+    for (int i = 0; i < kTitles; ++i) {
+        const auto nm = std::format("t{:05}", i);
+        rows.push_back(ent(nm, "1.0"));
+        rows.push_back(ent(nm, "2.0"));
+        if (i == kStraddle)
+            rows.push_back(ent(nm, "3.0"));
+    }
+    put(store, "big-agent", std::move(rows));
+    REQUIRE(store.refresh_catalog_rollup());
+    auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    CHECK(meta->current_titles == kTitles);
+    SoftwareCatalogQuery q;
+    q.q = "t04999";
+    auto straddling = title(store, "t04999", q);
+    REQUIRE(straddling.has_value());
+    CHECK(straddling->newest_version == "3.0");
+    q.q = "t05000";
+    auto last = title(store, "t05000", q);
+    REQUIRE(last.has_value());
+    CHECK(last->newest_version == "2.0");
+}
+
+// Equivalent spellings compare equal under the catalogue order; the tie goes to the spelling
+// carried by more devices ('1.0' on 5 devices beats '1.0.0' on 1). Plain text order would pick
+// '1.0.0', so this is the case that pins the store-side use of newer_than's tie rule.
+TEST_CASE("equivalent version spellings: the more-installed spelling is the newest mark",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    for (int i = 1; i <= 5; ++i)
+        put(store, "t" + std::to_string(i),
+            Rows{ent("Tie", "1.0", "P", "package", "brew", kSrcPkg)});
+    put(store, "t6", Rows{ent("Tie", "1.0.0", "P", "package", "brew", kSrcPkg)});
+    REQUIRE(store.refresh_catalog_rollup());
+    auto row = title(store, "Tie");
+    REQUIRE(row.has_value());
+    CHECK(row->newest_version == "1.0");
+    auto vers = store.software_versions({.name = "Tie"});
+    REQUIRE(vers.has_value());
+    REQUIRE(vers->size() == 2);
+    int marked = 0;
+    for (const auto& v : *vers)
+        if (v.newest) {
+            ++marked;
+            CHECK(v.version == "1.0");
+        }
+    CHECK(marked == 1);
+    auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    CHECK(meta->current_installs == 5);
+    CHECK(meta->current_total == 6);
+}
+
+TEST_CASE("refreshing an empty fleet is fresh (refreshed_at > 0) with every KPI zero",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    REQUIRE(store.refresh_catalog_rollup());
+    auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    CHECK(meta->refreshed_at > 0); // "refreshed but empty", not "building"
+    check_kpis_zero(*meta);
+    auto cat = store.software_catalog({});
+    REQUIRE(cat.has_value());
+    CHECK(cat->empty());
+}
+
+TEST_CASE("query_software honours version and scope push-down", "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    put(store, "s1", Rows{ent("Tool", "1.0")});
+    put(store, "s2", Rows{ent("Tool", "2.0")});
+    put(store, "s3", Rows{ent("Tool", "")});
+    SoftwareFleetQuery q;
+    q.name = "Tool";
+    auto all = store.query_software(q);
+    REQUIRE(all.has_value());
+    CHECK(all->size() == 3);
+    q.version = "2.0";
+    auto two = store.query_software(q);
+    REQUIRE(two.has_value());
+    REQUIRE(two->size() == 1);
+    CHECK((*two)[0].agent_id == "s2");
+    q.version = ""; // exact empty bucket, distinct from nullopt
+    auto empty_ver = store.query_software(q);
+    REQUIRE(empty_ver.has_value());
+    REQUIRE(empty_ver->size() == 1);
+    CHECK((*empty_ver)[0].agent_id == "s3");
+
+    SoftwareFleetQuery sq;
+    sq.agent_ids = std::vector<std::string>{"s1", "s3"};
+    sq.limit = 1;
+    auto p1 = store.query_software(sq);
+    REQUIRE(p1.has_value());
+    REQUIRE(p1->size() == 1);
+    CHECK((*p1)[0].agent_id == "s1");
+    sq.after = SoftwareCursor{(*p1)[0].entry.name, (*p1)[0].agent_id, (*p1)[0].install_id};
+    auto p2 = store.query_software(sq);
+    REQUIRE(p2.has_value());
+    REQUIRE(p2->size() == 1);
+    CHECK((*p2)[0].agent_id == "s3");
+    sq.after = SoftwareCursor{(*p2)[0].entry.name, (*p2)[0].agent_id, (*p2)[0].install_id};
+    auto p3 = store.query_software(sq);
+    REQUIRE(p3.has_value());
+    CHECK(p3->empty());
+
+    SoftwareFleetQuery deny;
+    deny.agent_ids = std::vector<std::string>{}; // present-empty = deny-all
+    auto none = store.query_software(deny);
+    REQUIRE(none.has_value());
+    CHECK(none->empty());
+    CHECK(store.is_open());
+}
+
+TEST_CASE("migration v8 reshapes a v7-era rollup schema and re-runs idempotently",
+          "[pg][software_inventory]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    {
+        SoftwareInventoryStore s1{pool};
+        REQUIRE(s1.is_open());
+        // Sentinels in the two tables v8 must NOT touch (it only reshapes catalog_rollup/meta).
+        put(s1, "sentinel-dev",
+            Rows{ent("SentinelApp", "7.7", "Sent", "app", "windows", kSrcApps)});
+    }
+    auto exec = [&](const char* stmt) { run_sql(pool, stmt); };
+    exec("INSERT INTO software_inventory_store.version_rollup (name, version, device_count) "
+         "VALUES ('SentinelVR', '1.2.3', 42)");
+    constexpr const char* kSentinelRowSql =
+        "SELECT to_jsonb(i)::text FROM software_inventory_store.installed_software i "
+        "WHERE agent_id = 'sentinel-dev'";
+    const std::string sentinel_row = [&] {
+        auto r = run_sql(pool, kSentinelRowSql);
+        REQUIRE(PQntuples(r.get()) == 1);
+        return std::string(PQgetvalue(r.get(), 0, 0));
+    }();
+    auto check_sentinels = [&] {
+        auto src = run_sql(pool, kSentinelRowSql);
+        REQUIRE(PQntuples(src.get()) == 1);
+        CHECK(std::string(PQgetvalue(src.get(), 0, 0)) == sentinel_row); // whole-row identity
+        auto vr = run_sql(pool, "SELECT device_count FROM software_inventory_store.version_rollup "
+                                "WHERE name = 'SentinelVR' AND version = '1.2.3'");
+        REQUIRE(PQntuples(vr.get()) == 1);
+        CHECK(std::string(PQgetvalue(vr.get(), 0, 0)) == "42");
+    };
+    auto rewind = [&] {
+        exec("UPDATE public.schema_meta SET version = 7 WHERE store = 'software_inventory_store'");
+    };
+    // Stage the v7 shape by hand: UNIQUE(name) rollup + the 4-column meta with a real stamp.
+    exec("DROP TABLE software_inventory_store.catalog_rollup");
+    exec("DROP TABLE software_inventory_store.catalog_rollup_meta");
+    exec("CREATE TABLE software_inventory_store.catalog_rollup (name TEXT NOT NULL, publisher "
+         "TEXT NOT NULL DEFAULT '', device_count BIGINT NOT NULL, version_count BIGINT NOT NULL, "
+         "CONSTRAINT catalog_rollup_name_key UNIQUE (name))");
+    exec("CREATE INDEX catalog_rollup_rank_idx ON software_inventory_store.catalog_rollup "
+         "(device_count DESC, name)");
+    exec("CREATE TABLE software_inventory_store.catalog_rollup_meta (id INT PRIMARY KEY, "
+         "refreshed_at BIGINT NOT NULL DEFAULT 0, total_titles BIGINT NOT NULL DEFAULT 0, "
+         "total_devices BIGINT NOT NULL DEFAULT 0)");
+    exec("INSERT INTO software_inventory_store.catalog_rollup_meta VALUES (1, 99999, 1, 1)");
+    rewind();
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    CHECK(meta->refreshed_at == 0); // honest "building" until the next refresh
+    check_sentinels();
+    {
+        auto r = run_sql(
+            pool,
+            "SELECT count(*) FROM information_schema.columns WHERE table_schema = "
+            "'software_inventory_store' AND ((table_name = 'catalog_rollup' AND column_name IN "
+            "('grain', 'newest_version', 'sources')) OR (table_name = 'catalog_rollup_meta' AND "
+            "column_name = 'total_installs'))");
+        CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == "4");
+    }
+    {
+        // Rollback posture: an OLD binary's refresh INSERT names no grain column. The v8
+        // DEFAULT lands it as the title grain (7) instead of failing NOT NULL.
+        exec("INSERT INTO software_inventory_store.catalog_rollup (name, publisher, "
+             "device_count, version_count) VALUES ('OldShapeTitle', 'p', 3, 1)");
+        auto r = run_sql(pool, "SELECT grain FROM software_inventory_store.catalog_rollup "
+                               "WHERE name = 'OldShapeTitle'");
+        REQUIRE(PQntuples(r.get()) == 1);
+        CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == "7");
+        exec("DELETE FROM software_inventory_store.catalog_rollup WHERE name = 'OldShapeTitle'");
+    }
+    rewind();
+    SoftwareInventoryStore again{pool}; // idempotent re-run
+    REQUIRE(again.is_open());
+    check_sentinels();
+    // The sentinel title would add its own rollup rows to the fixture's 27; drop it first.
+    exec("DELETE FROM software_inventory_store.installed_software WHERE agent_id = 'sentinel-dev'");
+    seed_grain_fixture(again);
+    CHECK(count_rows(pool, "catalog_rollup") == 27);
+    auto built = again.catalog_rollup_meta();
+    REQUIRE(built.has_value());
+    CHECK(built->refreshed_at > 0);
+    {
+        // Rollback posture, the whole loop: the v7 binary's refresh DML, meta upsert and
+        // grain-less read, verbatim, against the v8 tables (the fixture is the source data).
+        // run_sql REQUIRES each statement to succeed.
+        run_sql(pool, "DELETE FROM software_inventory_store.catalog_rollup");
+        run_sql(pool, "INSERT INTO software_inventory_store.catalog_rollup "
+                      "(name, publisher, device_count, version_count) "
+                      "SELECT name, max(publisher), count(DISTINCT agent_id), "
+                      "count(DISTINCT version) "
+                      "FROM software_inventory_store.installed_software GROUP BY name");
+        run_sql(pool, "DELETE FROM software_inventory_store.version_rollup");
+        run_sql(pool, "INSERT INTO software_inventory_store.version_rollup "
+                      "(name, version, device_count) "
+                      "SELECT name, version, count(DISTINCT agent_id) "
+                      "FROM software_inventory_store.installed_software GROUP BY name, version");
+        run_sql(pool,
+                "INSERT INTO software_inventory_store.catalog_rollup_meta "
+                "(id, refreshed_at, total_titles, total_devices) "
+                "VALUES (1, EXTRACT(EPOCH FROM now())::bigint, "
+                "  (SELECT count(*) FROM software_inventory_store.catalog_rollup), "
+                "  (SELECT count(DISTINCT agent_id) FROM "
+                "software_inventory_store.installed_software)) "
+                "ON CONFLICT (id) DO UPDATE SET refreshed_at = EXCLUDED.refreshed_at, "
+                "  total_titles = EXCLUDED.total_titles, total_devices = EXCLUDED.total_devices "
+                "RETURNING id");
+        auto titles = run_sql(pool, "SELECT count(DISTINCT name) FROM "
+                                    "software_inventory_store.installed_software");
+        const std::int64_t n_titles = std::stoll(PQgetvalue(titles.get(), 0, 0));
+        REQUIRE(n_titles > 1);
+        CHECK(count_rows(pool, "catalog_rollup") == n_titles); // one row per title
+        auto off_grain = run_sql(pool, "SELECT count(*) FROM "
+                                       "software_inventory_store.catalog_rollup WHERE grain <> 7");
+        CHECK(std::string(PQgetvalue(off_grain.get(), 0, 0)) == "0");
+        auto meta_row = run_sql(pool, "SELECT total_titles, refreshed_at FROM "
+                                      "software_inventory_store.catalog_rollup_meta WHERE id = 1");
+        REQUIRE(PQntuples(meta_row.get()) == 1);
+        CHECK(std::stoll(PQgetvalue(meta_row.get(), 0, 0)) == n_titles);
+        CHECK(std::stoll(PQgetvalue(meta_row.get(), 0, 1)) > 0);
+        auto old_read = run_sql(pool, "SELECT name, publisher, device_count, version_count "
+                                      "FROM software_inventory_store.catalog_rollup "
+                                      "ORDER BY device_count DESC, name");
+        CHECK(PQntuples(old_read.get()) == n_titles);
+    }
+}
+
+// ── software_catalog_totals ────────────────────────────────────────
+
+TEST_CASE("catalogue totals: unfiltered totals equal the refreshed meta", "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    seed_grain_fixture(store);
+    const auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    const auto t = store.software_catalog_totals({});
+    REQUIRE(t.has_value());
+    CHECK(t->titles == meta->total_titles);
+    CHECK(t->installs == meta->total_installs);
+    // d1 carries two titles, so installs (4) exceeds distinct devices (3): sums per title.
+    CHECK(t->titles == 2);
+    CHECK(t->installs == 4);
+}
+
+TEST_CASE("catalogue totals: filtered totals equal the page-walk over the same filters",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    seed_grain_fixture(store);
+    for (const SoftwareCatalogQuery& base :
+         {SoftwareCatalogQuery{.q = "git"}, SoftwareCatalogQuery{.ecosystem = "brew"},
+          SoftwareCatalogQuery{.source = kSrcApps},
+          SoftwareCatalogQuery{.kind = "package", .versions_min = 2},
+          // host path: the same predicate, one device
+          SoftwareCatalogQuery{.agent_id = "d1"},
+          SoftwareCatalogQuery{.kind = "package", .agent_id = "d1"},
+          SoftwareCatalogQuery{.ecosystem = "brew", .agent_id = "d1"},
+          SoftwareCatalogQuery{.source = kSrcApps, .agent_id = "d1"},
+          SoftwareCatalogQuery{.q = "chrom", .agent_id = "d1"}, SoftwareCatalogQuery{}}) {
+        std::int64_t titles = 0, installs = 0;
+        std::optional<SoftwareCatalogCursor> after;
+        for (int page = 0; page < 10; ++page) {
+            auto q = base;
+            q.limit = 1;
+            q.after = after;
+            auto rows = store.software_catalog(q);
+            REQUIRE(rows.has_value());
+            if (rows->empty())
+                break;
+            titles += static_cast<std::int64_t>(rows->size());
+            for (const auto& r : *rows)
+                installs += r.device_count;
+            after = SoftwareCatalogCursor{rows->back().device_count, rows->back().name};
+        }
+        CAPTURE(base.q, base.ecosystem, base.kind, base.source, base.agent_id, base.versions_min);
+        REQUIRE(titles > 0); // a zero == zero comparison would pass for any totals bug
+        const auto t = store.software_catalog_totals(base);
+        REQUIRE(t.has_value());
+        CHECK(t->titles == titles);
+        CHECK(t->installs == installs);
+        // limit/after are ignored by totals
+        auto paged = base;
+        paged.limit = 1;
+        paged.after = SoftwareCatalogCursor{1, "zzz"};
+        CHECK(store.software_catalog_totals(paged)->titles == titles);
+    }
+    // The filter really narrows: ecosystem=brew drops the rpm-only/macos-only cases.
+    CHECK(store.software_catalog_totals({.ecosystem = "brew"})->installs == 2);
+    CHECK(store.software_catalog_totals({.q = "git"})->installs == 3);
+    // source=installed_apps.list_inventory: git's pkgutil copy (d1) + Chrome (d1).
+    CHECK(store.software_catalog_totals({.source = kSrcApps})->installs == 2);
+    CHECK(store.software_catalog_totals({.source = kSrcApps, .agent_id = "d1"})->titles == 2);
+    CHECK(store.software_catalog_totals({.source = kSrcPkg, .agent_id = "d1"})->titles == 1);
+}
+
+TEST_CASE("catalogue totals + host keyset walk (host `after` lives in HAVING)",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    seed_grain_fixture(store);
+    SoftwareCatalogQuery q;
+    q.agent_id = "d1";
+    const auto t = store.software_catalog_totals(q);
+    REQUIRE(t.has_value());
+    CHECK(t->titles == 2);
+    CHECK(t->installs == 2); // one device: installs == titles by construction
+
+    std::vector<std::string> walked;
+    std::optional<SoftwareCatalogCursor> after;
+    for (int page = 0; page < 5; ++page) {
+        auto pq = q;
+        pq.limit = 1;
+        pq.after = after;
+        auto rows = store.software_catalog(pq);
+        REQUIRE(rows.has_value());
+        if (rows->empty())
+            break;
+        walked.push_back(rows->front().name);
+        after = SoftwareCatalogCursor{rows->front().device_count, rows->front().name};
+    }
+    CHECK(walked == std::vector<std::string>{"Chrome", "git"}); // no duplicate, no skip
+
+    q.versions_min = 2; // d1 carries one version of each title
+    CHECK(store.software_catalog_totals(q)->titles == 0);
+    q.versions_min = 0;
+    q.agent_id = "nobody";
+    CHECK(store.software_catalog_totals(q)->titles == 0);
+}
+
+TEST_CASE("catalogue totals degrade to nullopt and never a zero", "[pg][software_inventory]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    SECTION("schema dropped under an open store") {
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        REQUIRE(pool.valid());
+        SoftwareInventoryStore store{pool};
+        REQUIRE(store.is_open());
+        {
+            auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+            REQUIRE(lease);
+            REQUIRE(pg::exec_params(lease.get(), "DROP SCHEMA software_inventory_store CASCADE",
+                                    std::vector<std::string>{})
+                        .status() == PGRES_COMMAND_OK);
+        }
+        CHECK_FALSE(store.software_catalog_totals({}).has_value());
+    }
+    SECTION("pool starved (the only lease is held)") {
+        PgPool one{{.conninfo = db.dsn(), .size = 1}};
+        REQUIRE(one.valid());
+        SoftwareInventoryStore store{one};
+        REQUIRE(store.is_open());
+        auto held = one.acquire();
+        CHECK_FALSE(store.software_catalog_totals({}).has_value());
+    }
+    SECTION("store not open") {
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        REQUIRE(pool.valid());
+        {
+            auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+            REQUIRE(lease);
+            REQUIRE(pg::exec_params(lease.get(),
+                                    "DELETE FROM public.schema_meta WHERE store = "
+                                    "'software_inventory_store'",
+                                    std::vector<std::string>{})
+                        .status() == PGRES_COMMAND_OK);
+        }
+        SoftwareInventoryStore store{pool}; // the v1 re-run over live tables fails the open
+        REQUIRE_FALSE(store.is_open());
+        CHECK_FALSE(store.software_catalog_totals({}).has_value());
+        CHECK_FALSE(store.software_catalog_totals({.agent_id = "d1"}).has_value());
+    }
+}
+
+TEST_CASE("source_last_seen_bulk returns the receipt time per agent and omits the unreported",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    std::vector<SoftwareEntry> rows = {{"Chrome", "119", "Google", ""}};
+    const std::string h = SoftwareInventoryStore::canonical_hash(rows);
+    REQUIRE(store.apply_installed_software("agent-a", h, rows, 1000) ==
+            InventoryIngestOutcome::kStored);
+    REQUIRE(store.apply_installed_software("agent-b", h, rows, 2000) ==
+            InventoryIngestOutcome::kStored);
+    auto b_before = store.source_last_seen("agent-b", "installed_software");
+    REQUIRE(b_before.has_value());
+    // A hash-only touch never regresses last_seen.
+    REQUIRE(store.apply_installed_software("agent-b", h, std::nullopt, 3000) ==
+            InventoryIngestOutcome::kTouched);
+
+    auto got = store.source_last_seen_bulk("installed_software",
+                                           {"agent-a", "agent-b", "agent-never"});
+    REQUIRE(got.has_value());
+    REQUIRE(got->size() == 2);
+    // last_seen is the SERVER receipt time (#1685), never the caller-supplied timestamp.
+    CHECK(got->at("agent-a") > 1'000'000'000); // a real wall-clock epoch, not the 1000/2000/3000 passed in
+    CHECK(got->at("agent-b") >= *b_before); // the touch never moves it backwards
+    CHECK_FALSE(got->contains("agent-never")); // absent, never a 0
+    // Same datum the Hardware record shows, read one device at a time.
+    for (const char* id : {"agent-a", "agent-b"}) {
+        auto one = store.source_last_seen(id, "installed_software");
+        REQUIRE(one.has_value());
+        CHECK(got->at(id) == *one);
+    }
+    // Another source is a different row set.
+    auto other = store.source_last_seen_bulk("device_ci", {"agent-a"});
+    REQUIRE(other.has_value());
+    CHECK(other->empty());
+}
+
+TEST_CASE("source_last_seen_bulk: empty inputs are a precondition miss, not a degrade",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    auto no_ids = store.source_last_seen_bulk("installed_software", {});
+    REQUIRE(no_ids.has_value());
+    CHECK(no_ids->empty());
+    auto no_source = store.source_last_seen_bulk("", {"agent-a"});
+    REQUIRE(no_source.has_value());
+    CHECK(no_source->empty());
+}
+
+TEST_CASE("source_last_seen_bulk degrades to nullopt, never an empty map", "[pg][software_inventory]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    SECTION("schema dropped under an open store") {
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        REQUIRE(pool.valid());
+        SoftwareInventoryStore store{pool};
+        REQUIRE(store.is_open());
+        {
+            auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+            REQUIRE(lease);
+            REQUIRE(pg::exec_params(lease.get(), "DROP SCHEMA software_inventory_store CASCADE",
+                                    std::vector<std::string>{})
+                        .status() == PGRES_COMMAND_OK);
+        }
+        CHECK_FALSE(store.source_last_seen_bulk("installed_software", {"agent-a"}).has_value());
+    }
+    SECTION("pool starved (the only lease is held)") {
+        PgPool one{{.conninfo = db.dsn(), .size = 1}};
+        REQUIRE(one.valid());
+        SoftwareInventoryStore store{one};
+        REQUIRE(store.is_open());
+        auto held = one.acquire();
+        CHECK_FALSE(store.source_last_seen_bulk("installed_software", {"agent-a"}).has_value());
+    }
+}
+
+TEST_CASE("source_last_seen_bulk: a store that never opened is a degrade", "[pg][software_inventory]") {
+    // DDL, so a private template clone (the macro drops it): nothing to restore if a REQUIRE throws.
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    // Rename a column the open-time projection probes, so a store fails closed (the same
+    // technique the schema-guard test uses).
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "ALTER TABLE software_inventory_store.inventory_state RENAME COLUMN last_seen TO "
+            "last_seen_gone",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    SoftwareInventoryStore broken{pool};
+    REQUIRE_FALSE(broken.is_open());
+    CHECK_FALSE(broken.source_last_seen_bulk("installed_software", {"agent-a"}).has_value());
+}
+
+// ── Name-pattern reads (the /crypto slice's generic store methods) ───────────
+
+namespace {
+
+SoftwareEntry np_entry(std::string name, std::string version, std::string ecosystem = "deb") {
+    SoftwareEntry e;
+    e.name = std::move(name);
+    e.version = std::move(version);
+    e.kind = "package";
+    e.ecosystem = std::move(ecosystem);
+    return e;
+}
+
+void np_seed(SoftwareInventoryStore& store, const std::string& agent,
+             std::vector<SoftwareEntry> rows) {
+    const std::string h = SoftwareInventoryStore::canonical_hash(rows);
+    REQUIRE(store.apply_installed_software(agent, h, std::move(rows), 1000) ==
+            InventoryIngestOutcome::kStored);
+}
+
+// openssl: a1 (libssl3 + openssl, same version), a2, a3 (older); gnutls: a4; a5 carries neither.
+void np_seed_fleet(SoftwareInventoryStore& store) {
+    np_seed(store, "a1", {np_entry("libssl3", "3.0.13"), np_entry("openssl", "3.0.13")});
+    np_seed(store, "a2", {np_entry("LibSSL3", "3.0.13")});
+    np_seed(store, "a3", {np_entry("libssl3", "1.1.1", "rpm")});
+    np_seed(store, "a4", {np_entry("libgnutls30", "3.7.9")});
+    np_seed(store, "a5", {np_entry("curl", "8.0")});
+}
+
+yuzu::server::NamePatternQuery np_query() {
+    yuzu::server::NamePatternQuery q;
+    q.patterns = {"libssl%", "openssl", "libgnutls%"};
+    q.labels = {"openssl", "openssl", "gnutls"};
+    return q;
+}
+
+// First 3 literal characters (unescaped, lowercase ASCII) of a LIKE pattern: the lead the store
+// pre-filters on. Stops at the first unescaped wildcard.
+std::string np_lead(const std::string& pat) {
+    std::string lit;
+    for (std::size_t i = 0; i < pat.size() && lit.size() < 3; ++i) {
+        if (pat[i] == '\\' && i + 1 < pat.size())
+            ++i;
+        else if (pat[i] == '%' || pat[i] == '_')
+            break;
+        lit.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(pat[i]))));
+    }
+    return lit;
+}
+
+template <class Q>
+void np_fill_leads(Q& q) {
+    if (q.leads.size() == q.patterns.size())
+        return;
+    q.leads.clear();
+    for (const auto& p : q.patterns)
+        q.leads.push_back(np_lead(p));
+}
+
+// Force the catalogue's age on the DB clock (the freshness test uses the same clock).
+void np_set_catalogue_age(PgPool& pool, long long age_seconds) {
+    auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(lease);
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "UPDATE software_inventory_store.catalog_rollup_meta SET refreshed_at = "
+        "extract(epoch FROM now())::bigint - $1::bigint WHERE id = 1",
+        std::vector<std::string>{std::to_string(age_seconds)});
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+}
+
+// Step 1 takes its names from the catalogue while it is FRESH and from a live skip-scan
+// otherwise. Every read in these tests first refreshes the catalogue (the seeding helpers do
+// not) so it reads the catalogue path; `stale` then ages it past kCatalogueFreshSeconds so the
+// same data is read down the LIVE path. The source reported must match the one requested.
+std::optional<yuzu::server::NamePatternRollup> np_rollup(SoftwareInventoryStore& store,
+                                                         yuzu::server::NamePatternQuery q,
+                                                         bool stale = false) {
+    np_fill_leads(q);
+    REQUIRE(store.refresh_catalog_rollup());
+    if (stale)
+        np_set_catalogue_age(*swinv_shared().pool, yuzu::server::kCatalogueFreshSeconds + 60);
+    auto r = store.software_name_pattern_rollup(q);
+    if (r && q.agent_ids && q.agent_ids->empty())
+        return r; // deny-all: no SQL, no source
+    if (r)
+        CHECK((r->names_as_of == 0) == stale);
+    return r;
+}
+
+std::optional<yuzu::server::NamePatternDevicesPage>
+np_devices(SoftwareInventoryStore& store, yuzu::server::NamePatternDevicesQuery q,
+           bool stale = false) {
+    np_fill_leads(q);
+    REQUIRE(store.refresh_catalog_rollup());
+    if (stale)
+        np_set_catalogue_age(*swinv_shared().pool, yuzu::server::kCatalogueFreshSeconds + 60);
+    auto r = store.software_name_pattern_devices(q);
+    if (r && !(q.agent_ids && q.agent_ids->empty()))
+        CHECK((r->names_as_of == 0) == stale);
+    return r;
+}
+
+std::int64_t np_label(const yuzu::server::NamePatternRollup& r, std::string_view label) {
+    for (const auto& l : r.label_counts)
+        if (l.label == label)
+            return l.device_count;
+    return -1;
+}
+
+} // namespace
+
+TEST_CASE("name-pattern rollup: per-version counts and one device counts once per label",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    np_seed_fleet(store);
+
+    auto r = np_rollup(store, np_query());
+    REQUIRE(r.has_value());
+    CHECK_FALSE(r->truncated);
+    // a1 carries libssl3 AND openssl: still ONE device for the openssl label.
+    CHECK(np_label(*r, "openssl") == 3);
+    CHECK(np_label(*r, "gnutls") == 1);
+    CHECK(r->total_devices == 4);
+
+    const yuzu::server::NamePatternRollupRow* v3013 = nullptr;
+    const yuzu::server::NamePatternRollupRow* v111 = nullptr;
+    for (const auto& row : r->rows) {
+        if (row.label == "openssl" && row.version == "3.0.13" && row.ecosystem == "deb")
+            v3013 = &row;
+        if (row.label == "openssl" && row.version == "1.1.1" && row.ecosystem == "rpm")
+            v111 = &row;
+    }
+    REQUIRE(v3013);
+    CHECK(v3013->device_count == 2); // a1, a2
+    CHECK(std::ranges::find(v3013->names, "libssl3") != v3013->names.end());
+    CHECK(std::ranges::find(v3013->names, "openssl") != v3013->names.end());
+    // matching is case-insensitive: a2's "LibSSL3" is reported under its stored spelling
+    CHECK(std::ranges::find(v3013->names, "LibSSL3") != v3013->names.end());
+    REQUIRE(v111);
+    CHECK(v111->device_count == 1);
+    CHECK(r->rows.size() == 3); // (openssl,3.0.13,deb) (openssl,1.1.1,rpm) (gnutls,3.7.9,deb)
+    CHECK(r->rows.front().device_count == 2); // most devices first
+
+    SECTION("ecosystem filter narrows every count") {
+        auto q = np_query();
+        q.ecosystem = "rpm";
+        auto f = np_rollup(store, q);
+        REQUIRE(f.has_value());
+        CHECK(np_label(*f, "openssl") == 1);
+        CHECK(np_label(*f, "gnutls") == -1);
+        CHECK(f->total_devices == 1);
+    }
+
+    SECTION("a pattern set matching nothing is an honest zero, not a degrade") {
+        yuzu::server::NamePatternQuery q;
+        q.patterns = {"nosuchpkg%"};
+        q.labels = {"x"};
+        auto f = np_rollup(store, q);
+        REQUIRE(f.has_value());
+        CHECK(f->rows.empty());
+        CHECK(f->label_counts.empty());
+        CHECK(f->total_devices == 0);
+    }
+
+    SECTION("mismatched parallel arrays are refused, not guessed") {
+        auto q = np_query();
+        q.labels.pop_back();
+        CHECK_FALSE(np_rollup(store, q).has_value());
+    }
+
+    SECTION("a lead that is not exactly kNamePatternLeadChars long is refused (a caller bug)") {
+        for (const char* bad : {"li", "libs", ""}) {
+            auto q = np_query();
+            np_fill_leads(q);
+            q.leads[0] = bad;
+            CHECK_FALSE(store.software_name_pattern_rollup(q).has_value());
+            yuzu::server::NamePatternDevicesQuery dq;
+            dq.patterns = q.patterns;
+            dq.leads = q.leads;
+            dq.limit = 10;
+            CHECK_FALSE(store.software_name_pattern_devices(dq).has_value());
+        }
+    }
+}
+
+TEST_CASE("name-pattern rollup: scope is pushed before the grouping",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    np_seed_fleet(store);
+
+    auto q = np_query();
+    q.agent_ids = std::vector<std::string>{"a1", "a3", "a5"};
+    auto r = np_rollup(store, q);
+    REQUIRE(r.has_value());
+    CHECK(np_label(*r, "openssl") == 2); // a2 is out of scope
+    CHECK(np_label(*r, "gnutls") == -1); // a4 is out of scope
+    CHECK(r->total_devices == 2);
+    for (const auto& row : r->rows)
+        CHECK(row.device_count <= 2);
+
+    // present-empty = deny-all: an empty VALUE
+    q.agent_ids = std::vector<std::string>{};
+    auto none = np_rollup(store, q);
+    REQUIRE(none.has_value());
+    CHECK(none->rows.empty());
+    CHECK(none->total_devices == 0);
+
+    // coverage denominator (the rollup's own subquery - the single definition of "reporting")
+    // follows the same scope rule
+    CHECK(r->reporting_agents == 3);
+    q.agent_ids = std::vector<std::string>{"a1", "zz"};
+    auto one = np_rollup(store, q);
+    REQUIRE(one.has_value());
+    CHECK(one->reporting_agents == 1);
+    q.agent_ids = std::nullopt;
+    auto all = np_rollup(store, q);
+    REQUIRE(all.has_value());
+    CHECK(all->reporting_agents == 5);
+}
+
+TEST_CASE("name-pattern reads: LIKE metacharacters in a pattern are literal when escaped",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    np_seed(store, "e1", {np_entry("a_b", "1"), np_entry("axb", "1"), np_entry("100%x", "1"),
+                          np_entry("100zx", "1"), np_entry("a\\b", "1")});
+
+    yuzu::server::NamePatternQuery q;
+    q.patterns = {"a\\_b", "100\\%x", "a\\\\b"};
+    q.labels = {"lit", "lit", "lit"};
+    auto r = np_rollup(store, q);
+    REQUIRE(r.has_value());
+    REQUIRE(r->rows.size() == 1);
+    std::vector<std::string> names = r->rows[0].names;
+    std::ranges::sort(names);
+    CHECK(names == std::vector<std::string>{"100%x", "a\\b", "a_b"}); // not axb / 100zx
+
+    // an UNescaped underscore would be a wildcard: proves the escape is what keeps it literal.
+    // (The 3-character lead is literal, so the wildcard sits after it.)
+    np_seed(store, "e2", {np_entry("abcd", "1"), np_entry("abce", "1"), np_entry("abc", "1")});
+    q.patterns = {"abc_"};
+    q.labels = {"wild"};
+    q.leads.clear();
+    auto w = np_rollup(store, q);
+    REQUIRE(w.has_value());
+    REQUIRE(w->rows.size() == 1);
+    std::vector<std::string> wn = w->rows[0].names;
+    std::ranges::sort(wn);
+    CHECK(wn == std::vector<std::string>{"abcd", "abce"}); // `_` matches exactly one char
+}
+
+TEST_CASE("name-pattern devices: keyset paging; filters and scope",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    np_seed_fleet(store);
+    np_seed(store, "a6", {np_entry("libssl3", "")}); // the empty-version bucket
+
+    yuzu::server::NamePatternDevicesQuery q;
+    q.patterns = {"libssl%", "openssl"}; // a1 matches BOTH patterns on different rows
+
+    SECTION("pages walk every row exactly once, in (agent_id, name, install_id) order") {
+        q.limit = 2;
+        std::vector<std::string> seen;
+        int pages = 0;
+        for (;;) {
+            auto page = np_devices(store, q);
+            REQUIRE(page.has_value());
+            REQUIRE(page->rows.size() <= 2);
+            for (const auto& r : page->rows)
+                seen.push_back(r.agent_id + "/" + r.entry.name);
+            ++pages;
+            if (!page->has_more)
+                break;
+            const auto& last = page->rows.back();
+            q.after = yuzu::server::SoftwareCursor{last.entry.name, last.agent_id, last.install_id};
+            REQUIRE(pages < 10);
+        }
+        CHECK(seen == std::vector<std::string>{"a1/libssl3", "a1/openssl", "a2/LibSSL3",
+                                               "a3/libssl3", "a6/libssl3"});
+        CHECK(pages == 3);
+    }
+
+    SECTION("a row matching two patterns is returned once") {
+        q.patterns = {"libssl%", "lib%"};
+        auto page = np_devices(store, q);
+        REQUIRE(page.has_value());
+        CHECK(std::ranges::count_if(page->rows, [](const auto& r) { return r.agent_id == "a1"; }) == 1);
+    }
+
+    SECTION("version filter: exact, and present-empty is the empty bucket") {
+        q.version = "1.1.1";
+        auto page = np_devices(store, q);
+        REQUIRE(page.has_value());
+        REQUIRE(page->rows.size() == 1);
+        CHECK(page->rows[0].agent_id == "a3");
+        CHECK(page->rows[0].entry.ecosystem == "rpm");
+        CHECK(page->rows[0].entry.kind == "package");
+
+        q.version = "";
+        page = np_devices(store, q);
+        REQUIRE(page.has_value());
+        REQUIRE(page->rows.size() == 1);
+        CHECK(page->rows[0].agent_id == "a6");
+    }
+
+    SECTION("ecosystem filter") {
+        q.ecosystem = "rpm";
+        auto page = np_devices(store, q);
+        REQUIRE(page.has_value());
+        CHECK(page->rows.size() == 1);
+    }
+
+    SECTION("scope: a set narrows the rows AND keeps pages full; empty = deny-all") {
+        q.agent_ids = std::vector<std::string>{"a2", "a3", "a4"};
+        q.limit = 2;
+        auto page = np_devices(store, q);
+        REQUIRE(page.has_value());
+        CHECK(page->rows.size() == 2);
+        CHECK_FALSE(page->has_more); // a2, a3 only (a4 is gnutls)
+        for (const auto& r : page->rows)
+            CHECK(r.agent_id != "a1");
+
+        q.agent_ids = std::vector<std::string>{};
+        page = np_devices(store, q);
+        REQUIRE(page.has_value());
+        CHECK(page->rows.empty());
+        CHECK_FALSE(page->has_more);
+    }
+}
+
+TEST_CASE("name-pattern rollup: the version-row cap sets truncated; never drops silently",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    std::vector<SoftwareEntry> rows;
+    const int n = yuzu::server::kNamePatternRollupRowCap + 5;
+    for (int i = 0; i < n; ++i)
+        rows.push_back(np_entry("libssl3", "v" + std::to_string(i)));
+    np_seed(store, "big", std::move(rows));
+
+    yuzu::server::NamePatternQuery q;
+    q.patterns = {"libssl%"};
+    q.labels = {"openssl"};
+    auto r = np_rollup(store, q);
+    REQUIRE(r.has_value());
+    CHECK(r->truncated);
+    CHECK(r->rows.size() == static_cast<std::size_t>(yuzu::server::kNamePatternRollupRowCap));
+    // the totals still count the whole population, not the capped rows
+    CHECK(np_label(*r, "openssl") == 1);
+    CHECK(r->total_devices == 1);
+}
+
+namespace {
+
+// Run one statement on a leased connection and return column 0 of every row.
+std::vector<std::string> np_column0(PgPool& pool, const std::string& sql,
+                                    const std::vector<std::string>& params = {}) {
+    auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(lease);
+    pg::PgResult r = pg::exec_params(lease.get(), sql.c_str(), params);
+    REQUIRE((r.status() == PGRES_TUPLES_OK || r.status() == PGRES_COMMAND_OK));
+    std::vector<std::string> out;
+    for (int i = 0; i < PQntuples(r.get()); ++i)
+        out.emplace_back(PQgetvalue(r.get(), i, 0));
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("name-pattern step 1: only the chosen source runs - the catalogue scan when fresh; the "
+          "index skip-scan when stale",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    // Enough rows and distinct names that the planner has a real choice.
+    for (int a = 0; a < 60; ++a) {
+        std::vector<SoftwareEntry> rows;
+        for (int k = 0; k < 40; ++k)
+            rows.push_back(np_entry("pkg-" + std::to_string((a * 7 + k) % 300), "1." + std::to_string(k)));
+        rows.push_back(np_entry("libssl3", "3.0"));
+        np_seed(store, "plan-" + std::to_string(a), std::move(rows));
+    }
+    REQUIRE(store.refresh_catalog_rollup());
+    np_column0(pool, "ANALYZE software_inventory_store.installed_software");
+    np_column0(pool, "ANALYZE software_inventory_store.catalog_rollup");
+
+    // EXPLAIN ANALYZE executes the SELECT, so "(never executed)" / loops=0 shows which source
+    // the statement really ran. Same session: BEGIN / SET LOCAL / EXPLAIN / ROLLBACK, so the
+    // planner setting cannot leak into the pool. seqscan off keeps the assertion about the
+    // SHAPE the SQL permits, not about a tiny table's cost estimates.
+    auto explain = [&](std::vector<std::string_view> pats = {"libssl%"},
+                       std::vector<std::string_view> leads = {"lib"}, bool no_nestloop = false) {
+        std::string plan;
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        const std::vector<std::string> none;
+        // ROLLBACK on EVERY exit (a failed REQUIRE throws), so SET LOCAL and the open
+        // transaction can never ride a pooled connection back into another test.
+        struct RollbackGuard {
+            PGconn* conn;
+            ~RollbackGuard() { pg::exec_params(conn, "ROLLBACK", std::vector<std::string>{}); }
+        };
+        REQUIRE(pg::exec_params(lease.get(), "BEGIN", none).status() == PGRES_COMMAND_OK);
+        const RollbackGuard rollback{lease.get()};
+        REQUIRE(pg::exec_params(lease.get(), "SET LOCAL enable_seqscan = off", none).status() ==
+                PGRES_COMMAND_OK);
+        // The hash-join section pins the planner away from a nested loop the literal-lead form
+        // would never choose anyway but a cost-estimate shift could: the non-literal
+        // `length(p.lead)` form is NOT hashable, so it still nested-loops and a revert is caught.
+        if (no_nestloop)
+            REQUIRE(pg::exec_params(lease.get(), "SET LOCAL enable_nestloop = off", none).status() ==
+                    PGRES_COMMAND_OK);
+        const std::string sql =
+            "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) " +
+            SoftwareInventoryStore::name_pattern_matched_names_sql();
+        pg::PgResult r = pg::exec_params(
+            lease.get(), sql.c_str(),
+            std::vector<std::string>{pg::to_text_array(pats), pg::to_text_array(leads)});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        for (int i = 0; i < PQntuples(r.get()); ++i) {
+            plan += PQgetvalue(r.get(), i, 0);
+            plan += '\n';
+        }
+        return plan;
+    };
+    // The plan lines that scan the given relation (matched by a substring of the node text).
+    auto lines_with = [](const std::string& plan, std::string_view what) {
+        std::vector<std::string> out;
+        std::size_t pos = 0;
+        while (pos < plan.size()) {
+            auto nl = plan.find('\n', pos);
+            if (nl == std::string::npos)
+                nl = plan.size();
+            const auto line = plan.substr(pos, nl - pos);
+            if (line.find(what) != std::string::npos)
+                out.push_back(line);
+            pos = nl + 1;
+        }
+        return out;
+    };
+    auto all_never = [](const std::vector<std::string>& ls) {
+        return std::ranges::all_of(
+            ls, [](const std::string& l) { return l.find("never executed") != std::string::npos; });
+    };
+
+    SECTION("fresh catalogue: the catalogue is scanned, the skip-scan never executes") {
+        const auto plan = explain();
+        INFO(plan);
+        const auto cat = lines_with(plan, "on catalog_rollup c"); // not catalog_rollup_meta
+        const auto live = lines_with(plan, "installed_software_name_idx");
+        REQUIRE_FALSE(cat.empty());
+        REQUIRE_FALSE(live.empty()); // the skip-scan is planned ...
+        CHECK_FALSE(all_never(cat)); // ... the catalogue is read ...
+        CHECK(all_never(live));      // ... and the skip-scan is never executed
+        CHECK(plan.find("Recursive Union") != std::string::npos);
+    }
+
+    // The lead comparison must stay a HASH join key: `left(name, <literal>)` is hashable, while
+    // `left(name, length(p.lead))` is not, and Postgres then runs a nested loop of patterns x
+    // distinct names (a fresh ~1M-name catalogue timed out where the literal form took ~0.3 s).
+    SECTION("fresh catalogue: the lead join is a hash join on the literal-length prefix") {
+        std::vector<std::string> owned_pats;
+        std::vector<std::string> owned_leads;
+        for (int i = 0; i < 20; ++i) {
+            owned_leads.push_back("li" + std::to_string(i % 10));
+            owned_pats.push_back(owned_leads.back() + "%");
+        }
+        owned_leads.push_back("lib");
+        owned_pats.push_back("libssl%");
+        const auto plan = explain({owned_pats.begin(), owned_pats.end()},
+                                  {owned_leads.begin(), owned_leads.end()}, /*no_nestloop=*/true);
+        INFO(plan);
+        std::string server_version;
+        {
+            auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+            REQUIRE(lease);
+            pg::PgResult v = pg::exec_params(lease.get(), "SELECT version()",
+                                             std::vector<std::string>{});
+            REQUIRE(v.status() == PGRES_TUPLES_OK);
+            server_version = PQgetvalue(v.get(), 0, 0);
+        }
+        INFO("server: " << server_version); // shown only if an assertion below fails
+        const auto hash_cond = lines_with(plan, "Hash Cond");
+        REQUIRE_FALSE(hash_cond.empty());
+        CHECK(std::ranges::any_of(hash_cond, [](const std::string& l) {
+            return l.find("left") != std::string::npos && l.find("lead") != std::string::npos;
+        }));
+        // The nested-loop form puts the lead comparison in a Join Filter.
+        for (const auto& l : lines_with(plan, "Join Filter"))
+            CHECK(l.find("left") == std::string::npos);
+    }
+
+    SECTION("stale catalogue: the skip-scan walks installed_software_name_idx, the catalogue scan "
+            "never executes") {
+        np_set_catalogue_age(pool, yuzu::server::kCatalogueFreshSeconds + 60);
+        const auto plan = explain();
+        INFO(plan);
+        const auto cat = lines_with(plan, "on catalog_rollup c"); // not catalog_rollup_meta
+        const auto live = lines_with(plan, "installed_software_name_idx");
+        REQUIRE_FALSE(cat.empty());
+        REQUIRE_FALSE(live.empty());
+        CHECK(all_never(cat));
+        CHECK_FALSE(all_never(live));
+    }
+
+    SECTION("never built: also the live path") {
+        {
+            auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+            REQUIRE(lease);
+            REQUIRE(pg::exec_params(lease.get(),
+                                    "UPDATE software_inventory_store.catalog_rollup_meta SET "
+                                    "refreshed_at = 0 WHERE id = 1",
+                                    std::vector<std::string>{})
+                        .status() == PGRES_COMMAND_OK);
+        }
+        const auto plan = explain();
+        INFO(plan);
+        CHECK(all_never(lines_with(plan, "on catalog_rollup c")));
+        CHECK_FALSE(all_never(lines_with(plan, "installed_software_name_idx")));
+    }
+}
+
+TEST_CASE("name-pattern rollup and drill: a confined scope keeps the OFFSET 0 fence and never "
+          "seq-scans installed_software",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    // Many agents, each carrying a few matching names among many others, so the planner has a
+    // real choice between driving from the matched names and scanning installed_software.
+    for (int a = 0; a < 400; ++a) {
+        std::vector<SoftwareEntry> rows;
+        for (int k = 0; k < 60; ++k)
+            rows.push_back(np_entry("pkg-" + std::to_string((a * 7 + k) % 1500), "1." + std::to_string(k)));
+        rows.push_back(np_entry("libssl3", "3.0"));
+        np_seed(store, "fence-" + std::to_string(a), std::move(rows));
+    }
+    // Agents that carry NONE of the family: the worst case for an unfenced drill (the planner
+    // walks the agent index and filters every row of the table).
+    for (int a = 0; a < 5; ++a) {
+        std::vector<SoftwareEntry> rows;
+        for (int k = 0; k < 60; ++k)
+            rows.push_back(np_entry("pkg-" + std::to_string((a * 11 + k) % 1500), "1." + std::to_string(k)));
+        np_seed(store, "nolib-" + std::to_string(a), std::move(rows));
+    }
+    REQUIRE(store.refresh_catalog_rollup());
+    np_column0(pool, "ANALYZE software_inventory_store.installed_software");
+    np_column0(pool, "ANALYZE software_inventory_store.catalog_rollup");
+
+    // enable_seqscan is deliberately left ON: the assertion is about the plan the planner
+    // CHOOSES for a confined scope, not the shape the SQL merely permits.
+    auto explain = [&](const std::string& sql, const std::vector<std::string>& params) {
+        std::string plan;
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        const std::vector<std::string> none;
+        struct RollbackGuard {
+            PGconn* conn;
+            ~RollbackGuard() { pg::exec_params(conn, "ROLLBACK", std::vector<std::string>{}); }
+        };
+        REQUIRE(pg::exec_params(lease.get(), "BEGIN", none).status() == PGRES_COMMAND_OK);
+        const RollbackGuard rollback{lease.get()};
+        pg::PgResult r = pg::exec_params(lease.get(), ("EXPLAIN (COSTS OFF) " + sql).c_str(), params);
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        for (int i = 0; i < PQntuples(r.get()); ++i) {
+            plan += PQgetvalue(r.get(), i, 0);
+            plan += '\n';
+        }
+        return plan;
+    };
+
+    SECTION("rollup") {
+        yuzu::server::NamePatternQuery q;
+        q.patterns = {"libssl%"};
+        q.labels = {"openssl"};
+        q.leads = {"lib"};
+        q.agent_ids = std::vector<std::string>{"fence-1", "fence-2", "fence-3", "fence-4", "fence-5"};
+        q.ecosystem = "deb";
+        const auto [sql, params] = SoftwareInventoryStore::name_pattern_rollup_sql(q);
+
+        // The fence is in the SQL text: the name-driven join sits in an OFFSET 0 subquery and
+        // the scope and ecosystem filters apply OUTSIDE it, before the GROUP BY.
+        const auto off = sql.find("OFFSET 0) j");
+        REQUIRE(off != std::string::npos);
+        CHECK(sql.find("s.agent_id = ANY") == std::string::npos); // never inside the fence
+        CHECK(sql.find("j.agent_id = ANY", off) != std::string::npos);
+
+        const auto plan = explain(sql, params);
+        INFO(plan);
+        // "Subquery Scan on j" is the DISCRIMINATING assertion: without OFFSET 0 the planner
+        // flattens the subquery and the node vanishes (verified by removing the fence). At this
+        // data size the planner does not pick a seq scan even unfenced (it does at 15M rows,
+        // 2.1 s), so the next line is a guard for the large case, not a proof at this size.
+        CHECK(plan.find("Subquery Scan on j") != std::string::npos);
+        CHECK(plan.find("Seq Scan on installed_software") == std::string::npos);
+        CHECK(plan.find("installed_software_name_idx") != std::string::npos); // exact-name join
+        CHECK(plan.find("installed_software_agent_idx") == std::string::npos); // not driven by scope
+    }
+
+    SECTION("drill, scope holding none of the family's devices") {
+        yuzu::server::NamePatternDevicesQuery q;
+        q.patterns = {"libssl%"};
+        q.leads = {"lib"};
+        q.agent_ids = std::vector<std::string>{"nolib-0", "nolib-1", "nolib-2"};
+        q.ecosystem = "deb";
+        q.limit = 100;
+        const auto [sql, params] = SoftwareInventoryStore::name_pattern_devices_sql(q);
+
+        const auto off = sql.find("OFFSET 0) s");
+        REQUIRE(off != std::string::npos);
+        CHECK(sql.find("s0.agent_id = ANY") == std::string::npos); // scope applies outside the fence
+        CHECK(sql.find("s.agent_id = ANY", off) != std::string::npos);
+
+        const auto plan = explain(sql, params);
+        INFO(plan);
+        CHECK(plan.find("Subquery Scan on s") != std::string::npos); // the fence survived planning
+        CHECK(plan.find("Seq Scan on installed_software") == std::string::npos);
+        CHECK(plan.find("installed_software_agent_idx") == std::string::npos); // not driven by scope
+        CHECK(plan.find("installed_software_name_idx") != std::string::npos);
+
+        // And the answer is right: an empty drill for those devices, a full one for others.
+        auto page = np_devices(store, q);
+        REQUIRE(page.has_value());
+        CHECK(page->rows.empty());
+        q.agent_ids = std::vector<std::string>{"fence-1", "nolib-0"};
+        page = np_devices(store, q);
+        REQUIRE(page.has_value());
+        REQUIRE(page->rows.size() == 1);
+        CHECK(page->rows[0].agent_id == "fence-1");
+    }
+}
+
+TEST_CASE("name-pattern reads: one ASCII-only case-fold rule in SQL and in the classifier",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    // Only the ASCII-foldable spellings are a libssl3; the look-alikes must not match.
+    np_seed(store, "f1", {np_entry("libssl3", "3.0")});
+    np_seed(store, "f2", {np_entry("LIBSSL3", "3.0")});
+    np_seed(store, "f3", {np_entry("l\xC4\xB0" "bssl3", "3.0")});             // lİbssl3
+    np_seed(store, "f4", {np_entry("lib\xC5\xBF" "sl3", "3.0")});             // libſsl3
+    np_seed(store, "f5", {np_entry("\xEF\xBD\x8C\xEF\xBD\x89\xEF\xBD\x82\xEF\xBD\x93\xEF\xBD\x93"
+                                   "\xEF\xBD\x8C\xEF\xBC\x93", "3.0")});     // fullwidth
+    np_seed(store, "f6", {np_entry("LibSsL3", "3.0")});
+
+    // The Kelvin sign (U+212A), U+0130 and U+017F fold to ASCII under a Unicode-aware lower():
+    // this test is VACUOUS when the database's lower() does not do that (LC_CTYPE C/POSIX),
+    // because then the unsafe fold and the ASCII-only fold agree. Skip with the reason rather
+    // than pass.
+    if (np_column0(pool, "SELECT (lower(U&'\\212A') = 'k')::text").front() != "true")
+        SKIP("lower() in this database is not Unicode-aware (LC_CTYPE C/POSIX): the look-alike "
+             "folds below would prove nothing");
+    np_seed(store, "k1", {np_entry("keyring", "1.0")});
+    np_seed(store, "k2", {np_entry("\xE2\x84\xAA" "eyring", "1.0")}); // Kelvin sign + "eyring"
+
+    yuzu::server::NamePatternQuery q;
+    q.patterns = {"libssl3%"};
+    q.labels = {"openssl"};
+    for (const bool stale : {false, true}) { // catalogue names, then live skip-scan names
+    INFO("stale=" << stale);
+    auto r = np_rollup(store, q, stale);
+    REQUIRE(r.has_value());
+    CHECK(r->total_devices == 3); // f1, f2, f6
+    CHECK(np_label(*r, "openssl") == 3);
+
+    // The summary's count and the devices walk's union agree.
+    yuzu::server::NamePatternDevicesQuery dq;
+    dq.patterns = q.patterns;
+    dq.limit = 100;
+    auto page = np_devices(store, dq, stale);
+    REQUIRE(page.has_value());
+    std::set<std::string> agents;
+    for (const auto& row : page->rows)
+        agents.insert(row.agent_id);
+    CHECK(agents == std::set<std::string>{"f1", "f2", "f6"});
+    CHECK(static_cast<std::int64_t>(agents.size()) == r->total_devices);
+
+    // The Kelvin look-alike never matches an ASCII pattern, whatever the database's locale.
+    yuzu::server::NamePatternQuery kq;
+    kq.patterns = {"keyring%"};
+    kq.labels = {"x"};
+    auto kr = np_rollup(store, kq, stale);
+    REQUIRE(kr.has_value());
+    CHECK(kr->total_devices == 1); // k1 only, not k2
+    }
+}
+
+TEST_CASE("name-pattern reads: the text[] literal parser handles quoting and malformed input",
+          "[crypto]") {
+    using V = std::vector<std::string>;
+    const auto parse = &SoftwareInventoryStore::parse_name_array_for_test;
+    CHECK(parse("{}") == V{});
+    CHECK(parse("{a}") == V{"a"});
+    CHECK(parse("{a,\"b c\"}") == V{"a", "b c"});
+    CHECK(parse("{\"x\\\"y\"}") == V{"x\"y"});
+    CHECK(parse("{\"p\\\\q\"}") == V{"p\\q"});
+    CHECK(parse("{NULL,\"NULL\"}") == V{"NULL"}); // unquoted NULL skipped, quoted kept
+    CHECK(parse("{\"\"}") == V{""});
+    CHECK(parse("{\"Win64 OpenSSL v3.0, x\"}") == V{"Win64 OpenSSL v3.0, x"});
+    const std::string unit_sep = std::string("a") + '\x1F' + "b";
+    CHECK(parse("{\"" + unit_sep + "\"}") == V{unit_sep});
+    // Malformed input never throws or loops; it yields what parsed so far.
+    CHECK(parse("{\"abc}") == V{"abc"});    // unterminated quote: what parsed
+    CHECK(parse("{\"ab\\}") == V{"ab\\"});  // trailing backslash is kept literally
+    CHECK(parse("a,b") == V{});   // no braces
+    CHECK(parse("{a,b") == V{});  // missing closing brace
+    CHECK(parse("") == V{});
+}
+
+TEST_CASE("name-pattern reads: equal to a plain reference query across scope variants",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    const std::vector<std::string> names = {"libssl3", "LibSSL3", "openssl", "libssl1.1", "libgnutls30",
+                                            "gnutls", "nss", "nss-mdns", "curl", "libcrypto3",
+                                            "win64 openssl v3", "a_b", "100%"};
+    const std::vector<std::string> ecos = {"deb", "rpm", ""};
+    for (int a = 0; a < 25; ++a) {
+        std::vector<SoftwareEntry> rows;
+        for (std::size_t k = 0; k < names.size(); ++k)
+            if ((static_cast<std::size_t>(a) + k) % 3 != 0)
+                rows.push_back(np_entry(names[k], std::to_string((a + k) % 4) + ".0", ecos[(a + k) % 3]));
+        np_seed(store, "q" + std::to_string(100 + a), std::move(rows));
+    }
+    const std::vector<std::string> pats = {"libssl%", "openssl", "libcrypto%", "win64 openssl%",
+                                           "libgnutls%", "gnutls", "nss", "a\\_b"};
+    const std::vector<std::string> labs = {"openssl", "openssl", "openssl", "openssl",
+                                           "gnutls",  "gnutls",  "nss",     "lit"};
+    const std::vector<std::string_view> pv(pats.begin(), pats.end());
+    const std::vector<std::string_view> lv(labs.begin(), labs.end());
+
+    const std::vector<std::optional<std::vector<std::string>>> scopes = {
+        std::nullopt,
+        std::vector<std::string>{"q100", "q105", "q110", "q124", "nope"},
+        std::vector<std::string>{"q101"}};
+    // Every scope x ecosystem runs down BOTH step-1 sources (fresh catalogue, then stale ->
+    // live skip-scan) against the same plain reference: the two paths must be identical.
+    for (const bool stale : {false, true})
+    for (const auto& scope : scopes) {
+        for (const std::optional<std::string>& eco :
+             {std::optional<std::string>{}, std::optional<std::string>{"rpm"}}) {
+            INFO("stale=" << stale);
+            yuzu::server::NamePatternQuery q;
+            q.patterns = pats;
+            q.labels = labs;
+            q.agent_ids = scope;
+            q.ecosystem = eco;
+            const auto got = np_rollup(store, q, stale);
+            REQUIRE(got.has_value());
+
+            std::string ref_where = " WHERE 1=1";
+            std::vector<std::string> params{pg::to_text_array(pv), pg::to_text_array(lv)};
+            if (eco) {
+                params.push_back(*eco);
+                ref_where += " AND s.ecosystem = $" + std::to_string(params.size());
+            }
+            if (scope) {
+                const std::vector<std::string_view> ids(scope->begin(), scope->end());
+                params.push_back(pg::to_text_array(ids));
+                ref_where += " AND s.agent_id = ANY($" + std::to_string(params.size()) + "::text[])";
+            }
+            const std::string from =
+                "FROM software_inventory_store.installed_software s JOIN unnest($1::text[], "
+                "$2::text[]) AS p(pat, label) ON lower(s.name COLLATE \"C\") LIKE p.pat ESCAPE '\\'";
+            const auto ref_rows = np_column0(
+                pool,
+                "SELECT p.label || '|' || s.version || '|' || s.ecosystem || '|' || "
+                "count(DISTINCT s.agent_id) " + from + ref_where +
+                    " GROUP BY p.label, s.version, s.ecosystem ORDER BY 1",
+                params);
+            const auto ref_labels = np_column0(
+                pool,
+                "SELECT p.label || '|' || count(DISTINCT s.agent_id) " + from + ref_where +
+                    " GROUP BY p.label ORDER BY 1",
+                params);
+            const auto ref_total = np_column0(
+                pool, "SELECT count(DISTINCT s.agent_id) " + from + ref_where, params);
+
+            std::vector<std::string> g_rows;
+            for (const auto& r : got->rows)
+                g_rows.push_back(r.label + "|" + r.version + "|" + r.ecosystem + "|" +
+                                 std::to_string(r.device_count));
+            std::ranges::sort(g_rows);
+            std::vector<std::string> g_labels;
+            for (const auto& l : got->label_counts)
+                g_labels.push_back(l.label + "|" + std::to_string(l.device_count));
+            std::ranges::sort(g_labels);
+            auto sorted = [](std::vector<std::string> v) {
+                std::ranges::sort(v);
+                return v;
+            };
+            CHECK(g_rows == sorted(ref_rows));
+            CHECK(g_labels == sorted(ref_labels));
+            REQUIRE(ref_total.size() == 1);
+            CHECK(std::to_string(got->total_devices) == ref_total[0]);
+
+            // Devices walk for one label, paged by 4, equals the reference set in key order.
+            yuzu::server::NamePatternDevicesQuery dq;
+            dq.patterns = {"libssl%", "openssl", "libcrypto%", "win64 openssl%"};
+            dq.agent_ids = scope;
+            dq.ecosystem = eco;
+            dq.limit = 4;
+            std::vector<std::string> walk;
+            for (int guard = 0; guard < 200; ++guard) {
+                const auto page = np_devices(store, dq, stale);
+                REQUIRE(page.has_value());
+                for (const auto& r : page->rows)
+                    walk.push_back(r.agent_id + "|" + r.entry.name + "|" + std::to_string(r.install_id));
+                if (!page->has_more)
+                    break;
+                const auto& last = page->rows.back();
+                dq.after = yuzu::server::SoftwareCursor{.name = last.entry.name,
+                                                        .agent_id = last.agent_id,
+                                                        .install_id = last.install_id};
+            }
+            const std::vector<std::string_view> dpv(dq.patterns.begin(), dq.patterns.end());
+            std::vector<std::string> dparams{pg::to_text_array(dpv)};
+            std::string dwhere;
+            if (eco) {
+                dparams.push_back(*eco);
+                dwhere += " AND s.ecosystem = $" + std::to_string(dparams.size());
+            }
+            if (scope) {
+                const std::vector<std::string_view> ids(scope->begin(), scope->end());
+                dparams.push_back(pg::to_text_array(ids));
+                dwhere += " AND s.agent_id = ANY($" + std::to_string(dparams.size()) + "::text[])";
+            }
+            const auto ref_walk = np_column0(
+                pool,
+                "SELECT s.agent_id || '|' || s.name || '|' || s.install_id FROM "
+                "software_inventory_store.installed_software s WHERE lower(s.name COLLATE \"C\") "
+                "LIKE ANY($1::text[])" + dwhere + " ORDER BY s.agent_id, s.name, s.install_id",
+                dparams);
+            CHECK(walk == ref_walk);
+        }
+    }
+}
+
+TEST_CASE("name-pattern rollup: coverage is counted in the same statement as the numerator",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    np_seed_fleet(store);
+    auto r = np_rollup(store, np_query());
+    REQUIRE(r.has_value());
+    CHECK(r->reporting_agents == 5);
+    CHECK(r->total_devices <= r->reporting_agents);
+
+    auto q = np_query();
+    q.agent_ids = std::vector<std::string>{"a1", "a3", "zz"};
+    r = np_rollup(store, q);
+    REQUIRE(r.has_value());
+    CHECK(r->reporting_agents == 2);
+    CHECK(r->total_devices == 2);
+
+    // A pattern set matching nothing still reports the denominator (the grand-total row exists).
+    yuzu::server::NamePatternQuery none;
+    none.patterns = {"nosuchpkg%"};
+    none.labels = {"x"};
+    r = np_rollup(store, none);
+    REQUIRE(r.has_value());
+    CHECK(r->total_devices == 0);
+    CHECK(r->reporting_agents == 5);
+}
+
+// The per-bucket name list is capped at kNamePatternNamesPerRow (8): one past the cap is read so a
+// cut list says names_truncated, and a bucket holding exactly the cap does not (review #6056).
+TEST_CASE("name-pattern rollup: the 8-name cap per bucket is flagged; never silent",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    static_assert(yuzu::server::kNamePatternNamesPerRow == 8);
+    // bucket (openssl, 3.0, deb): 9 distinct matching names; bucket (openssl, 1.1, deb): exactly 8.
+    for (int i = 0; i < 9; ++i)
+        np_seed(store, "cap-a" + std::to_string(i), {np_entry("libssl3-n" + std::to_string(i), "3.0")});
+    for (int i = 0; i < 8; ++i)
+        np_seed(store, "cap-b" + std::to_string(i), {np_entry("libssl1-n" + std::to_string(i), "1.1")});
+    yuzu::server::NamePatternQuery q;
+    q.patterns = {"libssl%"};
+    q.labels = {"openssl"};
+    const auto r = np_rollup(store, q);
+    REQUIRE(r.has_value());
+    bool saw_nine = false, saw_eight = false;
+    for (const auto& row : r->rows) {
+        INFO(row.version);
+        CHECK(row.names.size() <= 8);
+        if (row.version == "3.0") {
+            saw_nine = true;
+            CHECK(row.names.size() == 8);
+            CHECK(row.names_truncated);
+        } else if (row.version == "1.1") {
+            saw_eight = true;
+            CHECK(row.names.size() == 8);
+            CHECK_FALSE(row.names_truncated);
+        }
+    }
+    CHECK(saw_nine);
+    CHECK(saw_eight);
+}
+
+// Review #6109: a corpus differential between the SQL the /crypto table generates
+// (crypto_library::sql_patterns - escaped LIKE patterns plus 3-character leads) and the C++
+// classifier (crypto_library::classify). The CryptoApi seam re-classifies every name it shows,
+// which would HIDE an over-matching pattern, so this compares at the STORE: for every family the
+// set of names the rollup and the drill return must be exactly the set classify() assigns to it,
+// on the catalogue path and on the live path. A wrong pattern (an unescaped `_`, a lost `%`, a
+// wrong lead, an exact rule emitted as a prefix) changes one side only and fails here.
+TEST_CASE("name-pattern reads: the crypto table's SQL patterns and classify() agree on a corpus",
+          "[pg][software_inventory][crypto]") {
+    namespace cl = yuzu::server::crypto_library;
+    SWINV_SHARED(store, pool);
+    std::set<std::string> corpus;
+    auto mixed = [](std::string s) { // alternate ASCII case: OpEnSsL
+        for (std::size_t i = 0; i < s.size(); i += 2)
+            if (s[i] >= 'a' && s[i] <= 'z')
+                s[i] = static_cast<char>(s[i] - 'a' + 'A');
+        return s;
+    };
+    for (const auto& r : cl::rules()) {
+        const std::string v(r.value);
+        corpus.insert(v);
+        corpus.insert(mixed(v));
+        corpus.insert(v.substr(0, v.size() - 1)); // one short
+        corpus.insert("x" + v);                   // not a prefix of anything
+        for (const char* suffix : {"-dev", "t64", ".so.3", "-1.2_3", "X", "%", "_", "\\"})
+            corpus.insert(v + suffix);
+        if (r.kind == cl::MatchKind::kPrefix)
+            corpus.insert(mixed(v) + "-Dev");
+    }
+    for (const char* near : {
+             "libcrypto++8", "libcrypto++-dev", "nss-mdns", "nss-pam-ldapd", "libnss3x",
+             "libssl-ocaml", "libssl", "libcrypto", "gnutlsx", "mbedtls2", "ab", "op", "x",
+             "libopenssl1x1", "openssl-1x1", "openssl-1%1", "%openssl", "_openssl", "o_enssl",
+             "lib%ssl3", "libssl_3", "\\openssl", "openssl@", "openssl@3", "OPENSSL@3",
+             "l\xC4\xB0" "bssl3",                                 // U+0130: not ASCII-foldable
+             "lib\xC5\xBF" "sl3",                                 // U+017F long s
+             "\xEF\xBD\x8C\xEF\xBD\x89\xEF\xBD\x82ssl3",          // fullwidth "lib" + ssl3
+             "libssl3\xC3\xA9", "\xC3\xA9openssl", "nss\xE2\x80\x8B" // e-acute, zero-width space
+         })
+        corpus.insert(near);
+
+    // One device; every name in its own version bucket, so no 8-name cut can hide a name.
+    std::vector<SoftwareEntry> rows;
+    int i = 0;
+    for (const auto& n : corpus)
+        rows.push_back(np_entry(n, "v" + std::to_string(i++)));
+    REQUIRE(rows.size() < static_cast<std::size_t>(yuzu::server::kNamePatternRollupRowCap));
+    np_seed(store, "corpus", std::move(rows));
+
+    std::map<std::string, std::set<std::string>> expected;
+    std::size_t unmatched = 0;
+    for (const auto& n : corpus) {
+        if (const auto f = cl::classify(n))
+            expected[std::string(*f)].insert(n);
+        else
+            ++unmatched;
+    }
+    // Not vacuous: every family has names, and many names belong to none.
+    for (const auto& f : cl::families())
+        REQUIRE(!expected[std::string(f.id)].empty());
+    REQUIRE(unmatched > 100);
+
+    for (const bool stale : {false, true}) { // catalogue names, then live skip-scan names
+        INFO("stale=" << stale);
+        // The summary path: every rule of every family in one statement.
+        const auto all = cl::sql_patterns();
+        // The helpers' np_fill_leads fallback rebuilds leads when the counts differ; pin them
+        // equal here so it can never mask a lead bug in sql_patterns().
+        REQUIRE(all.leads.size() == all.patterns.size());
+        yuzu::server::NamePatternQuery q;
+        q.patterns = all.patterns;
+        q.labels = all.labels;
+        q.leads = all.leads;
+        const auto r = np_rollup(store, q, stale);
+        REQUIRE(r.has_value());
+        CHECK_FALSE(r->truncated);
+        std::map<std::string, std::set<std::string>> got;
+        for (const auto& row : r->rows) {
+            CHECK_FALSE(row.names_truncated);
+            got[row.label].insert(row.names.begin(), row.names.end());
+        }
+        for (const auto& f : cl::families()) {
+            const std::string id(f.id);
+            INFO("rollup family " << id);
+            CHECK(got[id] == expected[id]);
+        }
+        CHECK(got.size() == cl::families().size()); // no label outside the table
+
+        // The drill path: one family's rules at a time.
+        for (const auto& f : cl::families()) {
+            const std::string id(f.id);
+            INFO("drill family " << id);
+            const auto fam = cl::sql_patterns(id);
+            REQUIRE(fam.leads.size() == fam.patterns.size());
+            yuzu::server::NamePatternDevicesQuery dq;
+            dq.patterns = fam.patterns;
+            dq.leads = fam.leads;
+            dq.limit = yuzu::server::kNamePatternPageMax;
+            const auto page = np_devices(store, dq, stale);
+            REQUIRE(page.has_value());
+            CHECK_FALSE(page->has_more);
+            std::set<std::string> names;
+            for (const auto& row : page->rows)
+                names.insert(row.entry.name);
+            CHECK(names == expected[id]);
+        }
+    }
+}
+
+// Review #6056 (A7): the drill's keyset predicate is evaluated INSIDE the OFFSET 0 fence, in the
+// name-index scan, so a later page does not re-read the rows earlier pages passed. The scope,
+// version and ecosystem filters stay outside the fence (the planner-pathology guard above).
+TEST_CASE("name-pattern drill: a continuation page reads only rows past its cursor",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    constexpr int kAgents = 300;
+    for (int a = 0; a < kAgents; ++a) {
+        char id[32];
+        std::snprintf(id, sizeof id, "ks-%04d", a);
+        np_seed(store, id, {np_entry("libssl3", "3.0"), np_entry("pkg-" + std::to_string(a % 40), "1")});
+    }
+    np_column0(pool, "ANALYZE software_inventory_store.installed_software");
+    yuzu::server::NamePatternDevicesQuery q;
+    q.patterns = {"libssl%"};
+    np_fill_leads(q);
+    q.limit = 100;
+    // Walk with cursors: the pages concatenate to every row exactly once, in order.
+    std::vector<std::string> walked;
+    std::optional<yuzu::server::SoftwareCursor> mid;
+    for (int page_no = 0;; ++page_no) {
+        const auto page = store.software_name_pattern_devices(q);
+        REQUIRE(page.has_value());
+        for (const auto& r : page->rows)
+            walked.push_back(r.agent_id);
+        if (!page->has_more)
+            break;
+        const auto& last = page->rows.back();
+        q.after = yuzu::server::SoftwareCursor{
+            .name = last.entry.name, .agent_id = last.agent_id, .install_id = last.install_id};
+        if (page_no == 1)
+            mid = q.after; // the cursor that starts page 3 (200 rows already passed)
+    }
+    REQUIRE(walked.size() == static_cast<std::size_t>(kAgents));
+    CHECK(std::ranges::is_sorted(walked));
+    CHECK(std::ranges::adjacent_find(walked) == walked.end());
+    REQUIRE(mid.has_value());
+
+    q.after = mid;
+    const auto [sql, params] = SoftwareInventoryStore::name_pattern_devices_sql(q);
+    const auto fence = sql.find("OFFSET 0) s");
+    const auto keyset = sql.find("(s0.agent_id, s0.name, s0.install_id) >");
+    REQUIRE(fence != std::string::npos);
+    REQUIRE(keyset != std::string::npos);
+    CHECK(keyset < fence); // inside the fence
+    CHECK(sql.find("(s.agent_id, s.name, s.install_id) >") == std::string::npos);
+
+    std::string plan;
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(), ("EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) " + sql).c_str(),
+            params);
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        for (int i = 0; i < PQntuples(r.get()); ++i) {
+            plan += PQgetvalue(r.get(), i, 0);
+            plan += '\n';
+        }
+    }
+    INFO(plan);
+    CHECK(plan.find("installed_software_agent_idx") == std::string::npos);
+    // Rows the scans of installed_software produced: only the ~100 past the cursor, never the
+    // 300 the name carries (before the change every page read all 300).
+    double scanned = 0;
+    bool saw_scan = false;
+    std::size_t pos = 0;
+    while (pos < plan.size()) {
+        auto nl = plan.find('\n', pos);
+        if (nl == std::string::npos)
+            nl = plan.size();
+        const std::string line = plan.substr(pos, nl - pos);
+        pos = nl + 1;
+        // The step-2 scan of the drill's rows (alias s0); step 1's skip-scan over the same
+        // index (aliases i / i_1) reads one entry per distinct name and is not counted.
+        const bool is_scan = line.find("Scan") != std::string::npos &&
+                             line.find("installed_software s0") != std::string::npos;
+        if (!is_scan)
+            continue;
+        const auto ar = line.find("actual rows=");
+        const auto lp = line.find("loops=");
+        if (ar == std::string::npos || lp == std::string::npos)
+            continue;
+        saw_scan = true;
+        scanned += std::stod(line.substr(ar + 12)) * std::stod(line.substr(lp + 6));
+    }
+    CHECK(saw_scan);
+    CHECK(scanned <= 110.0);
+}
+
+// A catalogue refreshed over an EMPTY fleet (the boot-time refresh, before any agent reported)
+// must not count as fresh: it has no title rows, so reading names from it would answer an
+// authoritative empty set for up to an hour while agents enrol. total_titles > 0 is part of the
+// freshness predicate (review #6056), so the read falls through to the live skip-scan.
+TEST_CASE("name-pattern reads: a catalogue refreshed over an empty fleet is not fresh",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    REQUIRE(store.refresh_catalog_rollup()); // empty fleet: refreshed_at > 0, total_titles 0
+    const auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    REQUIRE(meta->refreshed_at > 0);
+    REQUIRE(meta->total_titles == 0);
+    np_seed_fleet(store); // rows arrive after the refresh; no second refresh
+    auto q = np_query();
+    np_fill_leads(q);
+    const auto r = store.software_name_pattern_rollup(q);
+    REQUIRE(r.has_value());
+    CHECK(r->names_as_of == 0); // the live source answered
+    CHECK(np_label(*r, "openssl") == 3);
+    CHECK(np_label(*r, "gnutls") == 1);
+    yuzu::server::NamePatternDevicesQuery dq;
+    dq.patterns = {"libssl%"};
+    np_fill_leads(dq);
+    const auto page = store.software_name_pattern_devices(dq);
+    REQUIRE(page.has_value());
+    CHECK(page->names_as_of == 0);
+    CHECK(page->rows.size() == 3); // a1, a2 (LibSSL3), a3
+}
+
+TEST_CASE("name-pattern reads: a deny-all scope is an empty value with no SQL; a backend "
+          "failure is nullopt",
+          "[pg][software_inventory][crypto]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    // A deny-all scope on a healthy store answers an empty value with no SQL (names_as_of 0:
+    // nothing was read).
+    {
+        auto q = np_query();
+        np_fill_leads(q);
+        q.agent_ids = std::vector<std::string>{};
+        const auto r = store.software_name_pattern_rollup(q);
+        REQUIRE(r.has_value());
+        CHECK(r->rows.empty());
+        CHECK(r->names_as_of == 0);
+    }
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult drop = pg::exec_params(lease.get(), "DROP SCHEMA software_inventory_store CASCADE",
+                                            std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+    auto q = np_query();
+    np_fill_leads(q);
+    CHECK_FALSE(store.software_name_pattern_rollup(q).has_value());
+    yuzu::server::NamePatternDevicesQuery dq;
+    dq.patterns = {"libssl%"};
+    np_fill_leads(dq);
+    CHECK_FALSE(store.software_name_pattern_devices(dq).has_value());
+    // A deny-all scope runs no SQL, so even a broken backend answers it with the empty value
+    // (ADR-0033: present-empty is deny-all, not "no filter").
+    q.agent_ids = std::vector<std::string>{};
+    const auto denied = store.software_name_pattern_rollup(q);
+    REQUIRE(denied.has_value());
+    CHECK(denied->rows.empty());
+    dq.agent_ids = std::vector<std::string>{};
+    const auto denied_page = store.software_name_pattern_devices(dq);
+    REQUIRE(denied_page.has_value());
+    CHECK(denied_page->rows.empty());
+
+    // a store that failed to open degrades too
+    SoftwareInventoryStore broken{pool};
+    REQUIRE_FALSE(broken.is_open());
+    dq.agent_ids = std::nullopt;
+    q.agent_ids = std::nullopt;
+    CHECK_FALSE(broken.software_name_pattern_rollup(q).has_value());
+    CHECK_FALSE(broken.software_name_pattern_devices(dq).has_value());
 }

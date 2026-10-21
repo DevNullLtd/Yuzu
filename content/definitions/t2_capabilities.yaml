@@ -65,6 +65,7 @@ spec:
         displayName: Maximum Depth
         description: >
           Maximum directory recursion depth. Default: 5, max: 20.
+          Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute.
         default: 5
         validation:
           minimum: 1
@@ -74,6 +75,7 @@ spec:
         displayName: Maximum Results
         description: >
           Maximum number of matching entries to return. Default: 100, max: 1000.
+          Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute.
         default: 100
         validation:
           minimum: 1
@@ -188,6 +190,7 @@ spec:
         displayName: Maximum Matches
         description: >
           Maximum number of matching lines to return. Default: 100, max: 10000.
+          Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute.
         default: 100
         validation:
           minimum: 1
@@ -694,6 +697,7 @@ spec:
         displayName: Timeout (seconds)
         description: >
           TCP connection timeout per target. Default: 10, min: 1, max: 60.
+          Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute.
         default: 10
         validation:
           minimum: 1
@@ -842,6 +846,7 @@ spec:
         description: >
           Maximum allowed file size in megabytes, checked locally before
           the session opens. Default: 100.
+          Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute.
         default: 100
         validation:
           minimum: 1

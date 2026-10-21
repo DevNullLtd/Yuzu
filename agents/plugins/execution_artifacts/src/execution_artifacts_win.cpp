@@ -56,7 +56,7 @@
  * OUTSIDE this lock (see SCRATCH DIRECTORY below) — neither is
  * privilege-bearing, so neither belongs inside the hold this bound
  * describes. offline_hive_mutex.hpp's own banner documents this as the
- * sixth plugin calling the shared lock directly (the other five go through
+ * plugin that calls the shared lock directly (the others go through
  * with_user_hive()).
  *
  * PROCESS-TOKEN DISCIPLINE (win_profiles.hpp:416-432): PrivilegeScope mutates

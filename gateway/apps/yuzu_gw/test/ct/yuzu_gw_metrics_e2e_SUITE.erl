@@ -42,7 +42,7 @@ init_per_suite(Config) ->
     application:ensure_all_started(telemetry),
     application:ensure_all_started(gproc),
     %% Use long interval so flushes are manual.
-    application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 600000),
+    application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 60000),
     application:set_env(yuzu_gw, max_heartbeat_buffer, 100),
     Config.
 

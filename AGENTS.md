@@ -21,7 +21,7 @@ agent** (ADR-0006), and a compiler-stable plugin ABI.
 ## Target architecture
 
 Operators (agentic AI · browser · REST API · automation) → **Yuzu Server** (REST API v1, HTMX
-dashboard — server-rendered and **dark-theme-only**, Instruction Engine, Policy Engine, Response /
+dashboard — server-rendered, **token-themed** (Slate dark by default; Navy, Jade and three light schemes via `html[data-theme]`), Instruction Engine, Policy Engine, Response /
 Scope / RBAC / Audit, Scheduler, `/metrics`, Management Groups) → gRPC/Protobuf/mTLS bidirectional
 streaming → **Yuzu Agent** per endpoint (Plugin Host over a **stable C ABI**, Trigger Engine, SQLite
 KV, hash-verified content distribution, user interaction on Windows, per-plugin metrics).
@@ -90,8 +90,9 @@ with `git show origin/dev:<path>`, never a working-tree `ls`.
 One row per concern — catastrophic-if-violated invariants, routed doc, loading agents. Split across
 four files solely for the per-file ceiling: the first holds platform/product/data/observability
 concerns, the second auth, access-control, and request-admission chokepoints, the third the
-security-posture plugins (the Wave 8 split), the fourth Forensics / per-user-software-data concerns
-(the Wave 10 split). Same authority as this file.
+read-only security-posture plugin rows and the gateway-upstream peer-authorization row, the fourth
+Forensics / per-user-software-data concerns (the third and fourth are the Wave 8 and Wave 10
+splits). Same authority as this file.
 
 **OPEN AND READ ALL FOUR FILES — they are not auto-loaded on this leg:**
 
@@ -257,11 +258,11 @@ Full contract: **`docs/testing/unit-test-conventions.md`**. The rules most often
 ## Product UI and plugin scope
 
 **`frontend-design` is marketing-only.** Its varied light/dark aesthetic fits a standalone pitch
-surface, not the **dark-theme-only** product. Use it on the Cedar & Vale deck
+surface, not the **token-themed** product. Use it on the Cedar & Vale deck
 (`deploy/docker/cedar-vale/app/`) and future marketing pages. **Never on product UI** —
 `server/core/src/*_ui.cpp`, `server/core/static/*`, including in-product fleet viz (`viz_*_ui.cpp`,
 `yuzu-viz*.js` — product despite the name). Product UI stays HTMX-first, server-rendered,
-dark-theme-only.
+token-themed (colours come from the `--mds-*` tokens in `yuzu.css`, never hard-coded per page). The former dark-theme-only rule was retired by owner ruling on 2026-10-15 (six schemes: three dark, three light).
 
 **No htmx `hx-on`.** Dashboard CSP is `script-src 'self' 'unsafe-inline'` (no `unsafe-eval`); htmx
 compiles `hx-on:*` with `new Function()`, which CSP **blocks at runtime — the handler silently does

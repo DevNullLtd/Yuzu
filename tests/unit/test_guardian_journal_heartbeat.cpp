@@ -7,6 +7,7 @@
 
 #include "guardian_arm_heartbeat.hpp"     // rung 9c PR-3: doc/emitter cross-check union
 #include "guardian_backend.hpp"           // F7, #2298: doc/emitter cross-check union
+#include "guardian_baseline_heartbeat.hpp" // #4045: doc/emitter cross-check union
 #include "guardian_health_heartbeat.hpp"  // F7, #2298: doc/emitter cross-check union
 #include "guardian_io_ceiling_heartbeat.hpp" // rung 9c PR-3: doc/emitter cross-check union
 
@@ -30,6 +31,23 @@ TEST_CASE("journal heartbeat: a quiescent journal emits NO tags (sparse)",
     CHECK(tags.empty()); // every field 0 → nothing to report
 }
 
+TEST_CASE("baseline persist heartbeat: a zero count emits NO tag (sparse)",
+          "[guardian][baseline][heartbeat]") {
+    std::map<std::string, std::string> tags;
+    emit_guardian_baseline_persist_heartbeat_tags(tags, 0);
+    CHECK(tags.empty());
+}
+
+TEST_CASE("baseline persist heartbeat: a nonzero count emits the pinned key (#4045)",
+          "[guardian][baseline][heartbeat]") {
+    std::map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    emit_guardian_baseline_persist_heartbeat_tags(tags, 3);
+    REQUIRE(tags.size() == 2);
+    CHECK(tags.at("yuzu.os") == "linux");
+    CHECK(tags.at("yuzu.guardian_baseline_persist_failures") == "3");
+}
+
 TEST_CASE("journal heartbeat: only non-zero counters are emitted, with the pinned keys",
           "[guardian][journal][heartbeat]") {
     std::map<std::string, std::string> tags;
@@ -48,6 +66,24 @@ TEST_CASE("journal heartbeat: only non-zero counters are emitted, with the pinne
     // A zero field is absent, not "0".
     CHECK(tags.find("yuzu.guardian_journal_batches_written") == tags.end());
     CHECK(tags.find("yuzu.guardian_journal_write_failures") == tags.end());
+}
+
+TEST_CASE("journal heartbeat: send_order_hold_releases is sparse and emits its pinned key (#3972)",
+          "[guardian][journal][heartbeat]") {
+    // Zero: no tag (absent == nothing to report, same as every other counter).
+    std::map<std::string, std::string> none;
+    emit_guardian_journal_heartbeat_tags(none, GuardianJournalStats{});
+    CHECK(none.find("yuzu.guardian_send_order_hold_releases") == none.end());
+
+    // Non-zero: exactly that one tag, with the field's own value (not send_stalls').
+    GuardianJournalStats s;
+    s.send_order_hold_releases = 5;
+    s.send_stalls = 9;
+    std::map<std::string, std::string> tags;
+    emit_guardian_journal_heartbeat_tags(tags, s);
+    REQUIRE(tags.size() == 2);
+    CHECK(tags.at("yuzu.guardian_send_order_hold_releases") == "5");
+    CHECK(tags.at("yuzu.guardian_send_stalls") == "9");
 }
 
 TEST_CASE("journal heartbeat: every field has a distinct key", "[guardian][journal][heartbeat]") {
@@ -100,9 +136,10 @@ TEST_CASE("journal heartbeat: every field has a distinct key", "[guardian][journ
         .lifecycle_backpressure_drops = 29,
         .send_orphan_exceptions = 31,
         .send_stalls = 32,
+        .send_order_hold_releases = 33,
     };
     emit_guardian_journal_heartbeat_tags(tags, s);
-    CHECK(tags.size() == 32);
+    CHECK(tags.size() == 33);
 }
 
 TEST_CASE("journal heartbeat: the capacity/size gauges emit under their pinned keys",
@@ -171,6 +208,7 @@ TEST_CASE("every documented Guardian heartbeat tag is one the emitter actually e
     s.page_read_failures = s.clock_jump_skips = s.gauge_underflow = 1;
     s.send_exceptions = s.lifecycle_backpressure_drops = 1;
     s.send_orphan_exceptions = s.send_stalls = 1;
+    s.send_order_hold_releases = 1;
     emit_guardian_journal_heartbeat_tags(emitted, s);
     // Union in the AGE emitter's keys (item 6 + #2364): its tags share the
     // yuzu.guardian_ namespace this check scrapes, so documenting them without this
@@ -201,6 +239,30 @@ TEST_CASE("every documented Guardian heartbeat tag is one the emitter actually e
     emit_guardian_health_heartbeat_tags(
         emitted, GuardianHealthStats{
                      .unhealthy_suppressed = 1, .unhealthy_refreshed = 1, .priority_demoted = 1});
+    // #5403: metrics.md now names the pending-Spark-Disarm deadline count and age tags, so
+    // union their emitters too (the ages have their own struct + emitter, not GuardianHealthStats fields).
+    emit_guardian_health_heartbeat_tags(emitted, GuardianHealthStats{.disarm_deadline_elapsed = 1});
+    emit_guardian_health_age_tags(
+        emitted, GuardianHealthAgeStats{.disarm_pending_age_seconds = std::uint64_t{1}});
+    // #4472: metrics.md also names the compensation-teardown deadline count and age tags.
+    emit_guardian_health_heartbeat_tags(emitted,
+                                        GuardianHealthStats{.compensation_deadline_elapsed = 1});
+    emit_guardian_health_age_tags(
+        emitted, GuardianHealthAgeStats{.compensation_pending_age_seconds = std::uint64_t{1}});
+    // #5404: metrics.md names the eleven Spark claim-lifecycle tags (all GuardianHealthStats
+    // fields), so union a fully-populated block through the same emitter.
+    emit_guardian_health_heartbeat_tags(
+        emitted, GuardianHealthStats{.orphan_disarms_started = 1,
+                                     .dead_watchers_erased_on_lost = 1,
+                                     .tombstones_released_by_reaper = 1,
+                                     .claim_index_release_failures = 1,
+                                     .claim_drain_failures = 1,
+                                     .retained_tombstones = 1,
+                                     .detach_sweep_left_residue = 1,
+                                     .detach_claim_failures = 1,
+                                     .detach_post_commit_failures = 1,
+                                     .claims_dropped_at_stop = 1,
+                                     .ack_maint_exceptions = 1});
     emit_guardian_backend_heartbeat_tag(emitted, /*prefer_spark=*/true,
                                         GuardianEngine::SparkAvailability::SparkFailed);
     // rung 9c PR-3: union in the arm-ledger + io-ceiling emitters too - both are
@@ -210,16 +272,17 @@ TEST_CASE("every documented Guardian heartbeat tag is one the emitter actually e
     GuardianArmStats arm_s{.pending = 1, .failed = 1};
     emit_guardian_arm_heartbeat_tags(emitted, std::optional{arm_s});
     emit_guardian_io_ceiling_heartbeat_tags(emitted, 1);
+    // #4045: yuzu.guardian_baseline_persist_failures, so a metrics.md mention of it is checked
+    // against its emitter instead of tripping this scrape with no way to satisfy it.
+    emit_guardian_baseline_persist_heartbeat_tags(emitted, 1);
     // Governance fix (Gate 8, doc-scrape false-negative): yuzu.guardian_generation is a
-    // real, always-emitted heartbeat tag (agent.cpp's own inline
-    // tags["yuzu.guardian_generation"] = ..., NOT one of the extracted
-    // guardian_*_heartbeat.hpp emitter functions this test otherwise unions) - a
-    // metrics.md doc edit mentioning it by name (the arm-gauge alerting-hazard note)
-    // tripped this scrape with no way to satisfy it via an emitter call, exactly the
-    // gap this test's own comments already describe closing for yuzu.guardian_backend
-    // (F7/#2298). Inserted directly rather than via an emitter function since none
-    // exists for this one inline tag.
-    emitted["yuzu.guardian_generation"] = "1";
+    // real, always-emitted heartbeat tag - a metrics.md doc edit mentioning it by name (the
+    // arm-gauge alerting-hazard note) trips this scrape unless an emitter call covers it.
+    // #5513: it now has one (emit_guardian_generation_heartbeat_tags, the heartbeat's own
+    // call), so union it with unresolved=true: that also puts the sparse companion
+    // yuzu.guardian_boot_rearm_unresolved in the emitted set, since metrics.md documents it.
+    emit_guardian_generation_heartbeat_tags(emitted, /*reported=*/0,
+                                            /*boot_rearm_unresolved=*/true);
     REQUIRE(emitted.size() > 10); // the emitters really did populate
 
     std::ifstream in(doc);
@@ -244,4 +307,36 @@ TEST_CASE("every documented Guardian heartbeat tag is one the emitter actually e
         INFO("metrics.md documents tag: " << name);
         CHECK(emitted.count(name) == 1);
     }
+}
+
+// ---- #5513 T13: the generation emitter (value + sparse boot re-arm companion) -------------
+
+TEST_CASE("generation heartbeat emitter: unresolved boot re-arm reports 0 and the companion tag",
+          "[guardian][heartbeat][5513]") {
+    std::map<std::string, std::string> tags;
+    emit_guardian_generation_heartbeat_tags(tags, /*reported=*/0, /*boot_rearm_unresolved=*/true);
+    REQUIRE(tags.count("yuzu.guardian_generation") == 1);
+    CHECK(tags.at("yuzu.guardian_generation") == "0");
+    REQUIRE(tags.count(kGuardianBootRearmUnresolvedTag) == 1);
+    CHECK(tags.at(kGuardianBootRearmUnresolvedTag) == "1");
+    CHECK(std::string{kGuardianBootRearmUnresolvedTag} == "yuzu.guardian_boot_rearm_unresolved");
+}
+
+TEST_CASE("generation heartbeat emitter: a resolved agent emits the generation and NO companion",
+          "[guardian][heartbeat][5513]") {
+    std::map<std::string, std::string> tags;
+    emit_guardian_generation_heartbeat_tags(tags, /*reported=*/7, /*boot_rearm_unresolved=*/false);
+    CHECK(tags.at("yuzu.guardian_generation") == "7");
+    CHECK(tags.count(kGuardianBootRearmUnresolvedTag) == 0); // sparse: absent, never "0"
+    CHECK(tags.size() == 1);
+}
+
+TEST_CASE("generation heartbeat emitter: never-pushed (0, resolved) stays distinguishable "
+          "from an unresolved boot re-arm",
+          "[guardian][heartbeat][5513]") {
+    std::map<std::string, std::string> tags;
+    emit_guardian_generation_heartbeat_tags(tags, /*reported=*/0, /*boot_rearm_unresolved=*/false);
+    CHECK(tags.at("yuzu.guardian_generation") == "0");
+    // keyed on the flag, not on reported==0
+    CHECK(tags.count(kGuardianBootRearmUnresolvedTag) == 0);
 }

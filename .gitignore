@@ -3,6 +3,9 @@
 # created by scripts/setup.sh. Legacy names are kept ignored for old checkouts.
 build/
 build-*/
+# The coverage gate's lock files sit beside the build dir (not inside it), so `build-*/` misses them.
+/build-*.lock
+/build-*.lock.takeover
 builddir/
 builddir-*/
 clion-build/
@@ -106,6 +109,7 @@ _build_out.txt
 build_log.txt
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+.serena/
 .mcp.json
 .uat-sanitizer/
 *.local.md
@@ -184,6 +188,8 @@ docs/dex-brd-coverage.md
 # Local-only working directories — scratch notes, throwaway spikes, agent
 # skill-install stray targets, and personal tuning prefs. Never track.
 .scratch/
+# Private local execution evidence may contain authenticated UAT session files.
+/.agent-runs/
 .lora-prefs/
 .agents/
 spike/
@@ -206,3 +212,6 @@ spike/
 # fresh on every run by tests/prometheus/run_promtool_tests.py from the
 # commented block in docs/prometheus/yuzu-alerts.yml - never committed
 tests/prometheus/generated/
+
+# Destructive/forensic dispatch record written by scripts/test/instructions_runner.py (#5261)
+instructions-runner-*.manifest.jsonl

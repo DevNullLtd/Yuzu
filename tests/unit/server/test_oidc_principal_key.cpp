@@ -21,9 +21,11 @@
 #include "rbac_store.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -251,4 +253,122 @@ TEST_CASE("sanitize_detail_value: caps length at a UTF-8 code-point boundary",
 TEST_CASE("sanitize_detail_value: an empty input yields an empty output",
          "[auth][oidc][1837][sanitize]") {
     CHECK(yuzu::server::detail::sanitize_detail_value("").empty());
+}
+
+// ── Log hygiene: the session-created line (#5692 R4-1) ──────────────────────
+//
+// The display name, email and sub are IdP-controlled. Control bytes are caught for `sub` by
+// validate_claims, but a display name or email can carry LF, and a `sub` or name can carry NEL,
+// U+2028 or U+2029, any of which splits a log line. Only the LOG copy is folded; the session, the
+// principal and the stored display name keep the original bytes.
+
+namespace {
+constexpr const char* kLineBreaks = "\xC2\x85\xE2\x80\xA8\xE2\x80\xA9";
+
+void check_no_line_breaks(const std::string& text) {
+    CHECK(text.find("\xC2\x85") == std::string::npos);
+    CHECK(text.find("\xE2\x80\xA8") == std::string::npos);
+    CHECK(text.find("\xE2\x80\xA9") == std::string::npos);
+}
+} // namespace
+
+TEST_CASE("AuthManager: the OIDC session-created log line neutralizes IdP line breaks and "
+          "keeps the original values in the session",
+          "[auth][oidc][log_fold][security]") {
+    AuthManager mgr;
+    const std::string iss = "https://idp.example.com/";
+    const std::string breaks = kLineBreaks;
+    std::string name;
+    std::string email;
+    std::string sub;
+
+    SECTION("a display name with LF, CR and the Unicode breaks") {
+        name = "Zed\nFAKELINE [error] injected\r" + breaks + "x";
+        email = "zed@example.test";
+        sub = "sub-zed";
+    }
+    SECTION("an e-mail (with no display name) with LF and the Unicode breaks") {
+        email = "zed\nFAKELINE [error] injected" + breaks + "@example.test";
+        sub = "sub-zed";
+    }
+    SECTION("a sub with the Unicode breaks (validate_claims lets these through)") {
+        name = "Zed";
+        email = "zed@example.test";
+        sub = "sub" + breaks + "zed";
+    }
+
+    yuzu::test::LogCapture cap;
+    const auto token = mgr.create_oidc_session(name, email, sub, iss);
+    cap.stop();
+    REQUIRE_FALSE(token.empty());
+
+    const auto logs = cap.text();
+    const auto at = logs.find("OIDC session created for");
+    REQUIRE(at != std::string::npos);
+    // The session-created line is ONE physical line: its only LF is the terminator.
+    auto rest = logs.substr(at);
+    // spdlog ends a line with the platform's terminator (CRLF on Windows): drop exactly that one.
+    if (rest.ends_with("\r\n"))
+        rest.resize(rest.size() - 2);
+    else if (rest.ends_with('\n'))
+        rest.pop_back();
+    CHECK(std::count(rest.begin(), rest.end(), '\n') == 0);
+    CHECK(rest.find('\r') == std::string::npos);
+    CHECK(logs.find("\nFAKELINE") == std::string::npos);
+    check_no_line_breaks(logs);
+
+    // The VALUES used for the session are never folded.
+    auto sess = mgr.validate_session(token);
+    REQUIRE(sess.has_value());
+    CHECK(sess->username == "oidc:" + iss + "#" + sub);
+    CHECK(sess->oidc_sub == sub);
+    CHECK(sess->display_name == (name.empty() ? email : name));
+}
+
+TEST_CASE("RbacStore::reconcile_idp_memberships: the principal in its skip log lines is "
+          "neutralized and the call still succeeds",
+          "[auth][oidc][log_fold][security][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    PgPool rbac_pool_{{.conninfo = rbac_db_.dsn(), .size = 4}};
+    REQUIRE(rbac_pool_.valid());
+    RbacStore rbac{rbac_pool_};
+    REQUIRE(rbac.is_open());
+
+    const std::string principal = "oidc:https://idp.example.com/#sub" + std::string(kLineBreaks);
+    yuzu::test::LogCapture cap;
+    // One blank external id and one over-long one: each logs a skip line naming the principal.
+    auto r = rbac.reconcile_idp_memberships(
+        principal, "entra", {{"  ", "blank"}, {std::string(5000, 'g'), "long"}, {"ok-gid", "OK"}});
+    cap.stop();
+    REQUIRE(r.has_value());
+    CHECK(r->added == 1);
+    const auto logs = cap.text();
+    CHECK(logs.find("skipping asserted entry with blank") != std::string::npos);
+    CHECK(logs.find("skipping asserted external_id exceeding") != std::string::npos);
+    check_no_line_breaks(logs);
+}
+
+TEST_CASE("RbacStore::reconcile_idp_memberships: the confused-deputy refusal log neutralizes the "
+          "principal and the IdP-derived group name",
+          "[auth][oidc][log_fold][security][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    PgPool rbac_pool_{{.conninfo = rbac_db_.dsn(), .size = 4}};
+    REQUIRE(rbac_pool_.valid());
+    RbacStore rbac{rbac_pool_};
+    REQUIRE(rbac.is_open());
+
+    const std::string breaks = kLineBreaks;
+    const std::string principal = "oidc:https://idp.example.com/#sub" + breaks;
+    const std::string gid = "g" + breaks + "x";
+    // A pre-existing group of ANOTHER source holding the namespaced name the reconcile derives.
+    REQUIRE(rbac.create_group({.name = "entra:" + gid, .description = "d", .source = "ad"})
+                .has_value());
+    yuzu::test::LogCapture cap;
+    auto r = rbac.reconcile_idp_memberships(principal, "entra", {{gid, "G"}});
+    cap.stop();
+    REQUIRE(r.has_value());
+    CHECK(r->added == 0); // refused, never joined
+    const auto logs = cap.text();
+    CHECK(logs.find("NOT joining") != std::string::npos);
+    check_no_line_breaks(logs);
 }

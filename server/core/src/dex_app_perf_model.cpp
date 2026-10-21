@@ -1,5 +1,6 @@
 #include "dex_app_perf_model.hpp"
 
+#include "dex_json_detail.hpp"
 #include "dex_perf_model.hpp" // kDexCohortFloor — the ONE cohort floor constant
 
 #include <nlohmann/json.hpp>
@@ -7,7 +8,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <map>
+#include <string>
+#include <vector>
+#include <string_view>
 #include <utility>
 
 namespace yuzu::server {
@@ -116,10 +122,10 @@ std::vector<AppPerfTrendPoint> build_trend(const std::vector<AppPerfFleetRow>& r
 }
 
 // Sub-floor suppression: a (version, day) point covering fewer than `floor`
-// devices is de-facto individual behaviour (singling-out — works-council / GDPR
-// needs no name), so its stats are withheld and only the honest device_count
-// survives. Applied to BOTH the fleet and group paths (a niche app on N<floor
-// devices is just as identifying fleet-wide as inside a named group).
+// devices has its stats withheld and only the honest device_count survives.
+// Applied to BOTH the fleet and group paths through the ONE floor constant,
+// which is one device since the 2026-10-14 ruling: only an empty point is
+// suppressed.
 void apply_cohort_floor(std::vector<AppPerfTrendPoint>& points, std::int64_t floor) {
     for (AppPerfTrendPoint& pt : points) {
         if (pt.device_count < floor) {
@@ -139,10 +145,9 @@ void apply_cohort_floor(std::vector<AppPerfTrendPoint>& points, std::int64_t flo
 } // namespace
 
 std::vector<AppPerfTrendPoint> app_perf_fleet_trend(const std::vector<AppPerfFleetRow>& rows) {
-    // The fleet trend floors at kDexCohortFloor too: a sub-floor (version, day) point
-    // singles out one operator's exact CPU/mem even without an agent_id, so it is
-    // withheld (count only) — the same protection the named-group path applies, NOT
-    // a fleet-only exemption (governance compliance-HIGH / sec-MED).
+    // The fleet trend floors at kDexCohortFloor too — the same rule the named-group
+    // path applies, never a fleet-only exemption; one device since the 2026-10-14
+    // ruling, so a sub-floor point is an empty one.
     std::vector<AppPerfTrendPoint> points = build_trend(rows);
     apply_cohort_floor(points, kDexCohortFloor);
     return points;
@@ -351,6 +356,173 @@ std::vector<AppPerfDeviceApp> app_perf_device_summaries(const std::vector<AppPer
                   return x.app_name < y.app_name;
               });
     return apps;
+}
+
+// ── Per-version crash and hang join ──────────────────────────────────────────
+
+namespace {
+
+// Next dot-separated group of a canonical version as a number. Canonical groups
+// are digits only; a stray character ends the group's value rather than
+// throwing, and the value saturates so an absurd group cannot overflow.
+std::int64_t next_group(std::string_view& rest) {
+    const auto dot = rest.find('.');
+    const std::string_view grp = rest.substr(0, dot);
+    rest = dot == std::string_view::npos ? std::string_view{} : rest.substr(dot + 1);
+    std::int64_t v = 0;
+    for (const char c : grp) {
+        if (c < '0' || c > '9')
+            break;
+        if (v > ((std::numeric_limits<std::int64_t>::max)() - 9) / 10)
+            return (std::numeric_limits<std::int64_t>::max)();
+        v = v * 10 + (c - '0');
+    }
+    return v;
+}
+
+} // namespace
+
+bool app_perf_canon_version_less(std::string_view a, std::string_view b) {
+    if (a.empty() || b.empty())
+        return a.empty() && !b.empty();
+    while (!a.empty() || !b.empty()) {
+        const std::int64_t ga = next_group(a);
+        const std::int64_t gb = next_group(b);
+        if (ga != gb)
+            return ga < gb;
+    }
+    return false;
+}
+
+AppPerfNewestVersions app_perf_newest_versions(const std::vector<AppPerfTrendPoint>& points) {
+    AppPerfNewestVersions sel;
+    auto& versions = sel.versions;
+    versions.reserve(points.size());
+    for (const auto& p : points)
+        versions.push_back(p.version);
+    // The final tie-break is byte order, so comparator-equal means byte-equal and
+    // duplicates are adjacent after the sort.
+    std::sort(versions.begin(), versions.end(), [](const std::string& x, const std::string& y) {
+        if (app_perf_canon_version_less(y, x))
+            return true;
+        if (app_perf_canon_version_less(x, y))
+            return false;
+        return x < y;
+    });
+    versions.erase(std::unique(versions.begin(), versions.end()), versions.end());
+    sel.truncated = versions.size() > kAppPerfVersionJoinCap;
+    if (sel.truncated)
+        versions.resize(kAppPerfVersionJoinCap);
+    return sel;
+}
+
+AppPerfFleetReport app_perf_version_failure_join(std::vector<AppPerfTrendPoint> points,
+                                                 const std::vector<AppPerfVersionFailureRow>& failures,
+                                                 int failure_window_days) {
+    AppPerfFleetReport rep;
+    rep.failure_window_days = failure_window_days;
+
+    auto summaries = app_perf_version_summaries(points);
+    // Rows are emitted in the shared selection's order (newest first, capped).
+    const auto sel = app_perf_newest_versions(points);
+    const auto& keep = sel.versions;
+    rep.versions_truncated = sel.truncated;
+    std::map<std::string, std::size_t> summary_index; // tree: agent-controlled keys
+    for (std::size_t i = 0; i < summaries.size(); ++i)
+        summary_index.emplace(summaries[i].version, i);
+    {
+        std::vector<AppPerfVersionSummary> ordered;
+        ordered.reserve(keep.size());
+        for (const auto& v : keep)
+            ordered.push_back(std::move(summaries[summary_index.at(v)]));
+        summaries = std::move(ordered);
+    }
+    rep.points = std::move(points);
+
+    // Agent-controlled keys, so a tree rather than a hash map (as above).
+    std::map<std::string, const AppPerfVersionFailureRow*> by_version;
+    for (const auto& f : failures)
+        by_version.emplace(f.version, &f);
+
+    // Exposed events per row, kept beside the rows for the ratio's second arm.
+    std::vector<std::int64_t> exposed_events(summaries.size(), 0);
+    rep.versions.reserve(summaries.size());
+    for (std::size_t i = 0; i < summaries.size(); ++i) {
+        AppPerfVersionRow row;
+        row.perf = std::move(summaries[i]);
+        AppPerfVersionFailureRow f;
+        if (const auto it = by_version.find(row.perf.version); it != by_version.end())
+            f = *it->second;
+
+        // No device floor on this join (maintainer ruling 2026-10-14): every count
+        // is published at any device count.
+        row.affected_devices = f.affected_devices;
+        row.crashes = f.crashes;
+        row.hangs = f.hangs;
+        row.exposure_devices = f.exposure_devices;
+        if (f.exposure_devices) {
+            exposed_events[i] = f.exposed_crashes + f.exposed_hangs;
+            row.exposed_crashes = f.exposed_crashes;
+            row.exposed_hangs = f.exposed_hangs;
+            // A zero or negative exposure is a refusal (no divide by zero, no
+            // healthy zero), not a failure; a corrupt event count is a failure.
+            if (*f.exposure_devices > 0) {
+                row.failure_rate =
+                    dex_rate(exposed_events[i], static_cast<double>(*f.exposure_devices));
+                if (!row.failure_rate)
+                    ++rep.stat_failures;
+            }
+        }
+        rep.versions.push_back(std::move(row));
+    }
+
+    // Each known version is compared with the next older known version; the
+    // unknown ("") bucket sorts last and takes no part in the chain.
+    for (std::size_t i = 0; i + 1 < rep.versions.size(); ++i) {
+        AppPerfVersionRow& cur = rep.versions[i];
+        const AppPerfVersionRow& prev = rep.versions[i + 1];
+        if (cur.perf.version.empty() || prev.perf.version.empty())
+            continue;
+        cur.previous_version = prev.perf.version;
+        if (!cur.exposure_devices || !prev.exposure_devices || *cur.exposure_devices <= 0 ||
+            *prev.exposure_devices <= 0)
+            continue;
+        cur.failure_rate_ratio =
+            dex_rate_ratio(exposed_events[i], static_cast<double>(*cur.exposure_devices),
+                           exposed_events[i + 1], static_cast<double>(*prev.exposure_devices));
+        // Both arms zero-event, or an arm past the ratio's accuracy limit, are
+        // documented refusals; any other missing ratio is a computation failure.
+        const bool refusal = (exposed_events[i] == 0 && exposed_events[i + 1] == 0) ||
+                             exposed_events[i] > kDexRateRatioMaxEvents ||
+                             exposed_events[i + 1] > kDexRateRatioMaxEvents;
+        if (!cur.failure_rate_ratio && !refusal)
+            ++rep.stat_failures;
+    }
+    return rep;
+}
+
+std::string dex_app_perf_versions_json(const AppPerfFleetReport& report) {
+    json arr = json::array();
+    for (const AppPerfVersionRow& r : report.versions) {
+        json o;
+        o["version"] = r.perf.version;
+        o["latest_day"] = r.perf.latest_day;
+        o["day_count"] = r.perf.day_count;
+        o["device_count"] = r.perf.device_count;
+        o["suppressed"] = r.perf.suppressed;
+        o["affected_devices"] = r.affected_devices;
+        o["crashes"] = r.crashes;
+        o["hangs"] = r.hangs;
+        o["exposure_devices"] = dex_json_detail::opt_i64(r.exposure_devices);
+        o["exposed_crashes"] = dex_json_detail::opt_i64(r.exposed_crashes);
+        o["exposed_hangs"] = dex_json_detail::opt_i64(r.exposed_hangs);
+        o["failure_rate"] = r.failure_rate ? dex_json_detail::interval_json(*r.failure_rate, false) : json(nullptr);
+        o["previous_version"] = r.previous_version.empty() ? json(nullptr) : json(r.previous_version);
+        o["failure_rate_ratio"] =
+            r.failure_rate_ratio ? dex_json_detail::interval_json(*r.failure_rate_ratio, true) : json(nullptr);
+        arr.push_back(std::move(o));
+    }
+    return arr.dump();
 }
 
 // ── MCP-only gap #2: per-device app-perf drill serializer (ADR-0031 WS-A4

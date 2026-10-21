@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Yuzu Backup Script — backs up SQLite databases and configuration files.
+# Yuzu Backup Script — backs up SQLite databases, configuration files and the enablement
+# continuity anchor.
 # Usage: yuzu-backup.sh [--data-dir DIR] [--config-dir DIR] [--output DIR] [--no-color]
 
 DATA_DIR="/var/lib/yuzu"
@@ -98,8 +99,15 @@ for cfg_file in "$CONFIG_DIR"/*.cfg "$CONFIG_DIR"/*.conf; do
     green "  $(basename "$cfg_file") (${SIZE} bytes)"
 done
 
-# Also check for config files alongside the binary (Windows pattern)
-for cfg_file in yuzu-server.cfg enrollment-tokens.cfg pending-agents.cfg; do
+# Also check for config files alongside the binary (Windows pattern).
+# enrollment-tokens.cfg / pending-agents.cfg are HA WS-6 6.2's one-time import
+# source only — a 6.2+ server never writes them (state is Postgres-
+# authoritative, back it up via pg_dump) and renames them to `<name>.cfg.
+# imported` once consumed. This loop still finds them on a PRE-6.2 install (or
+# the renamed `.imported` copies, via the glob below) — kept deliberately, not
+# stale: a backup taken before upgrading to 6.2 is exactly the file this
+# importer reads.
+for cfg_file in yuzu-server.cfg enrollment-tokens.cfg pending-agents.cfg                 enrollment-tokens.cfg.imported pending-agents.cfg.imported; do
     if [[ -f "$DATA_DIR/$cfg_file" ]] && [[ ! -f "$OUTPUT/$cfg_file" ]]; then
         cp "$DATA_DIR/$cfg_file" "$OUTPUT/"
         FILE_COUNT=$((FILE_COUNT + 1))
@@ -107,10 +115,34 @@ for cfg_file in yuzu-server.cfg enrollment-tokens.cfg pending-agents.cfg; do
     fi
 done
 
+# The enablement continuity anchor (ADR-3006) is this host's witness that the enablement store
+# has not gone backwards. It lives in the data directory and is NOT in the pg_dump, so a
+# restore without it reads as unwitnessed.
+echo ""
+echo "--- Continuity anchor ---"
+if [[ -f "$DATA_DIR/enablement-anchor" ]]; then
+    cp "$DATA_DIR/enablement-anchor" "$OUTPUT/"
+    FILE_COUNT=$((FILE_COUNT + 1))
+    green "  enablement-anchor"
+else
+    yellow "  enablement-anchor not found (expected until a server with the enablement store has booted here)"
+fi
+
 # Generate SHA256 manifest
 echo ""
 echo "--- Generating manifest ---"
-(cd "$OUTPUT" && sha256sum * 2>/dev/null || shasum -a 256 * 2>/dev/null) > "$OUTPUT/SHA256SUMS"
+# Enumerate the payload first so neither a stale manifest nor the temp file is hashed, then
+# publish the manifest atomically.
+PAYLOAD=()
+for f in "$OUTPUT"/*; do
+    [[ -f "$f" && "$(basename "$f")" != "SHA256SUMS" ]] && PAYLOAD+=("$(basename "$f")")
+done
+MANIFEST_TMP=$(mktemp "$OUTPUT/.SHA256SUMS.XXXXXX")
+trap 'rm -f "$MANIFEST_TMP"' EXIT
+if [[ ${#PAYLOAD[@]} -gt 0 ]]; then
+    (cd "$OUTPUT" && { sha256sum -- "${PAYLOAD[@]}" 2>/dev/null || shasum -a 256 -- "${PAYLOAD[@]}"; }) > "$MANIFEST_TMP"
+fi
+mv -f "$MANIFEST_TMP" "$OUTPUT/SHA256SUMS"
 green "  SHA256SUMS"
 
 # Summary

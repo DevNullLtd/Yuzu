@@ -94,15 +94,35 @@ tick_cleanup(Pid) ->
 
 tick_emits_agent_count() ->
     %% Wait for at least one tick.
-    timer:sleep(150),
-    Found = ets:lookup(gauge_test_events, [yuzu, gw, agent, count]),
+    Found = await_event([yuzu, gw, agent, count]),
     ?assert(length(Found) > 0),
     [{_, #{count := Count}, _} | _] = Found,
     ?assert(is_integer(Count)).
 
 tick_emits_process_count() ->
-    timer:sleep(150),
-    Found = ets:lookup(gauge_test_events, [yuzu, gw, vm, process_count]),
+    Found = await_event([yuzu, gw, vm, process_count]),
     ?assert(length(Found) > 0),
     [{_, #{count := Count}, _} | _] = Found,
     ?assert(Count > 0).
+
+%% Poll for a telemetry event the gauge's tick records, instead of sleeping a
+%% fixed 150ms and checking once. The tick is an erlang:send_after (50ms here),
+%% and its first act is a synchronous yuzu_gw_registry:agent_count/0 call. Its
+%% telemetry:execute also goes through the meck proxy. On a loaded runner, any
+%% of these can push the first event past 150ms: that failed on macOS CI
+%% (#4841; BigMags shares its CPU between two agents). These tests only claim
+%% "a tick emitted the event", so a generous deadline changes nothing they
+%% assert.
+await_event(Name) ->
+    await_event(Name, erlang:monotonic_time(millisecond) + 2000).
+
+await_event(Name, Deadline) ->
+    case ets:lookup(gauge_test_events, Name) of
+        [] ->
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true -> [];
+                false -> timer:sleep(10), await_event(Name, Deadline)
+            end;
+        Found ->
+            Found
+    end.

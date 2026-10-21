@@ -15,8 +15,8 @@
 ///
 /// Failure posture (ADR-0041), the load-bearing invariant:
 ///  - **Authz reads FAIL CLOSED.** `check_permission` /
-///    `check_scoped_permission` / `holds_permission_via_any_group` /
-///    `check_role_has_permission` keep their `bool`/DENY-on-error contract: a
+///    `check_scoped_permission` / `holds_permission_via_any_group` keep their
+///    `bool`/DENY-on-error contract: a
 ///    store-not-open, pool-acquire timeout, or query error returns `false`
 ///    (deny), NEVER `true`. The list/scope reads return the empty /
 ///    most-restrictive result on degrade. Callers that must distinguish
@@ -43,6 +43,7 @@
 ///    real rows are found, never blocks boot.
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <mutex>
@@ -64,6 +65,16 @@ class PgPool;
 namespace yuzu::server {
 
 class ManagementGroupStore; // forward declaration
+
+/// Error strings the `RbacStore` read accessors return in `std::unexpected` when the read
+/// cannot be answered. They are a CONTRACT with `authz::ceiling_degrade_reason`
+/// (authz_gates.cpp), which maps a failed ceiling read to a `yuzu_server_rbac_read_degrade_total`
+/// reason label by matching these prefixes: every producer and that mapping use these
+/// constants, never a re-typed literal. A failed query is `"query failed: "` followed by the
+/// libpq message and has no constant (it is the label mapping's fallthrough).
+inline constexpr std::string_view kRbacErrStoreNotOpen = "rbac store not open";
+inline constexpr std::string_view kRbacErrPoolAcquireTimeout = "pool acquire timeout";
+inline constexpr std::string_view kRbacErrCircuitBreakerOpen = "circuit breaker open";
 
 struct RbacRole {
     std::string name;
@@ -141,6 +152,48 @@ enum class RbacRegimeAuthority {
                     ///< either of the above
 };
 
+namespace auth {
+enum class Role; // yuzu/server/auth.hpp (the column values 'user' / 'admin')
+}
+
+/// Outcome of `RbacStore::deactivate_account` (#4966). A closed answer, never a flag pair.
+struct AccountDeactivationResult {
+    enum class Kind {
+        kDeactivated,              ///< an active account was soft-deleted and the transaction committed
+        kNotFound,                 ///< unknown or ALREADY inactive: nothing was written (idempotent)
+        kLastAdministratorRefused, ///< removing this member would exhaust a protected population;
+                                   ///< the transaction rolled back, the account is still active
+        kStoreFailure,             ///< pool/txn/query/lock-timeout failure or an unconfirmed commit:
+                                   ///< 503-class. Nothing is promised about the row (see `err`)
+    };
+    Kind kind{Kind::kStoreFailure};
+    std::string err; ///< store-level failure text; empty unless `kind == kStoreFailure`
+};
+
+/// Outcome of `RbacStore::set_local_role` (#4966).
+struct LocalRoleChangeResult {
+    enum class Kind {
+        kChanged,                  ///< the role column was rewritten and the transaction committed
+        kUnchanged,                ///< the row already held the requested role: nothing written
+        kNotFound,                 ///< no such account (an inactive one is found, see below)
+        kInactivePromotionRefused, ///< an INACTIVE account asked to become `admin`: nothing written
+        kLastAdministratorRefused, ///< demoting this ACTIVE admin would leave no active local
+                                   ///< `role='admin'` account; rolled back, the role is unchanged
+        kStoreFailure,             ///< as `AccountDeactivationResult::Kind::kStoreFailure`
+    };
+    Kind kind{Kind::kStoreFailure};
+    std::string err; ///< store-level failure text; empty unless `kind == kStoreFailure`
+};
+
+/// Result of `RbacStore::would_strand_last_administrator`, the read-only advisory twin of the
+/// `deactivate_account` guard. BEST-EFFORT: a point-in-time read per statement, never a lock and
+/// never a guarantee that the write which follows will pass or fail the same way.
+struct WouldStrandResult {
+    bool ok{false};           ///< false: could not be answered (pool/query failure); see `err`
+    bool would_strand{false}; ///< meaningful only when `ok`
+    std::string err;
+};
+
 /// Refusal/failure of `RbacStore::set_rbac_enforcement`.
 struct RbacEnforcementError {
     enum class Kind {
@@ -163,14 +216,33 @@ struct RbacEnforcementError {
     std::string message; ///< human-readable; no caller-supplied text is ever embedded
 };
 
+/// Production bound on every lock wait inside the #4966 account-lifecycle transactions
+/// (`deactivate_account` / `set_local_role`), installed as a transaction-local `lock_timeout`.
+/// `RbacStore`'s constructor takes it as a parameter so a test can shorten it; nothing in
+/// production passes anything but this default.
+inline constexpr std::chrono::milliseconds kDefaultLifecycleLockTimeout{2000};
+/// The accepted range of the lifecycle lock bound; the constructor clamps into it. The floor is
+/// 1 ms because Postgres reads `lock_timeout = 0` as "no bound" and a negative value is a
+/// statement error. The ceiling is 60 s because Postgres rejects a `lock_timeout` above 2^31-1 ms
+/// (a statement error that would fail every guarded write) and because a bound longer than the
+/// pool's own statement bound would pin a pooled connection for no benefit.
+inline constexpr std::chrono::milliseconds kMinLifecycleLockTimeout{1};
+inline constexpr std::chrono::milliseconds kMaxLifecycleLockTimeout{60000};
+
 class RbacStore {
 public:
     /// Borrows the shared pool and runs the `rbac_store` schema migration on a
     /// pinned lease, then seeds defaults + loads the durable enabled flag.
     /// `is_open()` is false if the lease was empty or the migration failed
-    /// (fail-closed — every authz read then DENIES, the right posture for the
-    /// authorization substrate).
-    explicit RbacStore(pg::PgPool& pool);
+    /// (fail-closed, every authz read then DENIES, the right posture for the
+    /// authorization substrate). `lifecycle_lock_timeout` bounds the lock waits of the
+    /// account-lifecycle guard (#4966); the default is the production value and is a constructor
+    /// parameter, never a mutable member, so it is fixed for the store's lifetime. The value is
+    /// clamped into [`kMinLifecycleLockTimeout`, `kMaxLifecycleLockTimeout`] (1 ms to 60000 ms):
+    /// below the floor Postgres would read 0 as "no bound" or reject a negative value, above the
+    /// ceiling it would reject a value over 2^31-1 ms.
+    explicit RbacStore(pg::PgPool& pool, std::chrono::milliseconds lifecycle_lock_timeout =
+                                             kDefaultLifecycleLockTimeout);
     ~RbacStore();
 
     RbacStore(const RbacStore&) = delete;
@@ -288,7 +360,16 @@ public:
     [[nodiscard]] bool rbac_enabled_view_degraded() const;
 
     // ── Roles CRUD ───────────────────────────────────────────────────────
+    /// LEGACY fail-soft: `list_roles_checked().value_or({})`. A degrade reads as
+    /// an empty vector, indistinguishable from "no roles". Prefer the checked read.
     std::vector<RbacRole> list_roles() const;
+
+    /// Authoritative variant: `unexpected(msg)` = closed store, pool-acquire
+    /// timeout or query error (the last two bump
+    /// `yuzu_server_rbac_read_degrade_total{reason}`); a value, possibly empty,
+    /// is a fully-read result.
+    std::expected<std::vector<RbacRole>, std::string> list_roles_checked() const;
+
     std::optional<RbacRole> get_role(const std::string& name) const;
     std::expected<void, std::string> create_role(const RbacRole& role);
     std::expected<void, std::string> update_role(const std::string& name,
@@ -445,8 +526,9 @@ public:
     /// unassigns racing to remove the last two Administrator grants serialize
     /// instead of both observing "1 remaining" and both committing. The
     /// guard does NOT cover an `auth.users` row created concurrently for a
-    /// pre-provisioned grant, nor deactivation of a surviving Administrator
-    /// between the recount and COMMIT (#4966). Every other
+    /// pre-provisioned grant. (Deactivating a surviving Administrator is guarded
+    /// separately by `deactivate_account`, which takes the same grant-row locks in the
+    /// same order.) Every other
     /// role/principal_type combination — including both existing
     /// engine-only callers (the engine-principal unassign in `rest_api_v1.cpp`
     /// and `mcp_server.cpp`) — is unaffected: a pure idempotent DELETE, exactly as
@@ -488,6 +570,29 @@ public:
     std::expected<bool, std::string> provision_first_admin(const std::string& username,
                                                             const std::string& password_hash,
                                                             const std::string& salt_hex);
+
+    /// #4966: the last-Administrator guard for ACCOUNT lifecycle (the sibling of
+    /// `unassign_role`'s grant guard). Soft-deletes the local account `username` unless that would
+    /// remove the last member of a protected population, in ONE transaction. Thin delegation to
+    /// `RbacAdminAuthorityOwner::deactivate_account`, which owns the contract: TWO floors, the
+    /// active local `role='admin'` column population in BOTH regimes and the authenticatable
+    /// Administrator GRANT population under RBAC ON only. Refuses a mutation that removes the
+    /// last member of a protected population; it does NOT prove anyone can still sign in
+    /// (lockout, MFA, sso-only accounts and IdP state are outside it). Applies no cache
+    /// generation: no `principal_roles` / `rbac_meta` row changes. The caller (AuthManager)
+    /// owns the post-commit session wipe and cache erase.
+    [[nodiscard]] AccountDeactivationResult deactivate_account(const std::string& username);
+
+    /// #4966: the guarded role-column write behind `AuthManager::update_role_checked` (the
+    /// demotion twin of `deactivate_account`). Thin delegation to
+    /// `RbacAdminAuthorityOwner::set_local_role`; the column floor applies in both regimes.
+    [[nodiscard]] LocalRoleChangeResult set_local_role(const std::string& username,
+                                                       auth::Role role);
+
+    /// #4966: read-only, lock-free early-refusal check so a caller can decline a deactivation
+    /// BEFORE it does irreversible related work (revoking linked credentials). Best-effort only
+    /// (see `WouldStrandResult`): the guard inside `deactivate_account` stays the authority.
+    [[nodiscard]] WouldStrandResult would_strand_last_administrator(const std::string& username) const;
 
     // ── Groups CRUD (minimal — for future AD/Entra) ──────────────────────
     std::vector<RbacGroup> list_groups() const;
@@ -570,10 +675,21 @@ public:
                                   const std::string& operation,
                                   const ManagementGroupStore* mgmt_store) const;
 
-    /// Check if a specific role grants a permission (for service-scoped token
-    /// validation). FAIL-CLOSED: false on any store error.
-    bool check_role_has_permission(const std::string& role_name, const std::string& securable_type,
-                                   const std::string& operation) const;
+    /// The ONE read deciding whether a role grants a (securable, operation) pair (extend,
+    /// never fork). It reads the single `role_permissions` row for the pair (the table's
+    /// primary key is `(role_name, securable_type, operation)`, so there is at most one):
+    /// `allow` => true; `deny`, any other effect text, or an absent pair => false; a failed
+    /// read => `unexpected(msg)` (never a false allow). `authz::service_ceiling_check`
+    /// delegates here.
+    /// The read goes through the same breaker and short acquire budget as the hot authz
+    /// reads, so a degraded store fails fast instead of pinning a worker: the error is then
+    /// `kRbacErrCircuitBreakerOpen` or `kRbacErrPoolAcquireTimeout` (both map to the
+    /// `pool_acquire_timeout` degrade label in `authz::ceiling_degrade_reason`), or
+    /// `"query failed: ..."`.
+    [[nodiscard]] std::expected<bool, std::string>
+    role_permission_allowed_checked(const std::string& role_name,
+                                    const std::string& securable_type,
+                                    const std::string& operation) const;
 
     /// All effective permissions for a user (for UI display).
     std::vector<Permission> get_effective_permissions(const std::string& username) const;
@@ -583,6 +699,17 @@ public:
     std::vector<std::string> list_operations() const;
 
 private:
+    /// Breaker-gated, `kAuthzAcquireTimeout` read of the one `role_permissions` row for a
+    /// (role, securable, operation) triple, for request-path callers
+    /// (`role_permission_allowed_checked`): the effect text, or `nullopt` when the role has no
+    /// row for the pair. Admin reads keep the wider `get_role_permissions_checked` budget.
+    /// Errors: `kRbacErrStoreNotOpen`, `kRbacErrCircuitBreakerOpen`,
+    /// `kRbacErrPoolAcquireTimeout`, `"query failed: ..."`.
+    std::expected<std::optional<std::string>, std::string>
+    role_permission_effect_authz_checked(const std::string& role_name,
+                                         const std::string& securable_type,
+                                         const std::string& operation) const;
+
     // #2703 Gate 7 item 3 — same shape as PreflightRoutesTestAccess /
     // DashboardResultsColumnsTestAccess: user_rbac_group_names/role_effects_for
     // are legitimately private (internal helpers `resolve_perm_groups` shares),
@@ -594,6 +721,7 @@ private:
     friend struct RbacStoreTestAccess;
 
     pg::PgPool& pool_;
+    const std::chrono::milliseconds lifecycle_lock_timeout_;
     bool open_{false};
     yuzu::MetricsRegistry* metrics_{nullptr};
     // Cached by set_metrics() — see that method's doc comment. Null whenever

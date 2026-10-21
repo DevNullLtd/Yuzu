@@ -63,6 +63,12 @@ Deps make_deps(UploadGrantStore& store, const std::filesystem::path& blob_root,
     deps.list_read_fn = [](const std::string&) {
         return UploadGrantListAuthorization{UploadGrantListDecision::kAdmitAll, {}};
     };
+    // Required at registration. These cases build their sessions without a service scope, so
+    // the closure is never reached; the real deny is exercised in
+    // test_upload_grants_service_scope.cpp.
+    deps.deny_service_scoped_fn = [](const httplib::Request&, httplib::Response&,
+                                     const std::string&, const std::string&, const std::string&,
+                                     const std::string&) { return false; };
     deps.audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
                        const std::string&, const std::string&, const std::string&) { return true; };
     deps.store = &store;
@@ -238,8 +244,14 @@ TEST_CASE("mint returns grant_id + grant_secret once, 201", "[server][routes][up
     REQUIRE(store.is_open());
     yuzu::test::TempDir blob_dir{"yuzu_test_upload_blobs_"};
     TestRouteSink sink;
-    yuzu::server::register_file_retrieval_routes(
-        sink, make_deps(store, blob_dir.path, std::make_shared<std::int64_t>(1000)));
+    auto deps = make_deps(store, blob_dir.path, std::make_shared<std::int64_t>(1000));
+    std::string audited;  // every audit field of every row, concatenated
+    deps.audit_fn = [&audited](const httplib::Request&, const std::string& a, const std::string& r,
+                               const std::string& tt, const std::string& ti, const std::string& d) {
+        audited += a + "|" + r + "|" + tt + "|" + ti + "|" + d + "\n";
+        return true;
+    };
+    yuzu::server::register_file_retrieval_routes(sink, std::move(deps));
 
     auto res = sink.dispatch(
         "POST", "/api/v1/upload-grants",
@@ -249,6 +261,12 @@ TEST_CASE("mint returns grant_id + grant_secret once, 201", "[server][routes][up
     auto j = body_json(res);
     CHECK_FALSE(j["grant_id"].get<std::string>().empty());
     CHECK(j["grant_secret"].get<std::string>().size() == 64);
+    // The body carries the raw one-time secret: no cache or proxy may keep it.
+    CHECK(res->get_header_value("Cache-Control") == "no-store, no-cache, must-revalidate");
+    CHECK(res->get_header_value("Pragma") == "no-cache");
+    // The mint is audited, and the secret is in no audit field.
+    CHECK(audited.find("upload_grant.mint|success") != std::string::npos);
+    CHECK(audited.find(j["grant_secret"].get<std::string>()) == std::string::npos);
 }
 
 TEST_CASE("mint denies when perm_fn refuses", "[server][routes][upload]") {
@@ -929,4 +947,60 @@ TEST_CASE("any request after expiry is 410 expired, even a status poll", "[serve
     REQUIRE(res != nullptr);
     CHECK(res->status == 410);
     CHECK(body_json(res)["error"]["reason"] == "expired");
+}
+
+TEST_CASE("upload-grant mint reads ttl_secs strictly: a wrong type, 0 or a negative value is a "
+          "400 that mints nothing, not the 900 s maximum (#4644)",
+          "[server][routes][upload][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, routes_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::test::TempDir blob_dir{"yuzu_test_upload_blobs_"};
+    auto clock = std::make_shared<std::int64_t>(1000);
+    TestRouteSink sink;
+    yuzu::server::register_file_retrieval_routes(sink, make_deps(store, blob_dir.path, clock));
+
+    const auto post_ttl = [&sink](const std::string& ttl_json) {
+        return sink.dispatch("POST", "/api/v1/upload-grants",
+                             R"({"agent_id":"agent-1","declared_max_size":100,"ttl_secs":)" +
+                                 ttl_json + "}");
+    };
+
+    // Each of these used to be ignored and mint a 900 s grant (the MAXIMUM): a caller who asked
+    // for a short-lived credential silently got the longest one.
+    for (const char* bad : {"0", "-1", "\"60\"", "\"\"", "60.5", "1e3", "true", "null", "[]", "{}",
+                            "9223372036854775808", "18446744073709551615"}) {
+        INFO("ttl_secs=" << bad);
+        auto res = post_ttl(bad);
+        REQUIRE(res != nullptr);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("ttl_secs") != std::string::npos);
+        auto listed = store.list_for_agent();
+        REQUIRE(listed.has_value());
+        CHECK(listed->empty());
+    }
+
+    // A truncated body is refused by the existing JSON check, and nothing is minted either.
+    auto truncated = sink.dispatch("POST", "/api/v1/upload-grants",
+                                   R"({"agent_id":"agent-1","declared_max_size":100,"ttl_secs":60)");
+    REQUIRE(truncated != nullptr);
+    CHECK(truncated->status == 400);
+    CHECK(store.list_for_agent().value().empty());
+
+    // In range is honoured; above the maximum still clamps to it (900); absent is the default.
+    const auto expires = [&](const std::string& ttl_json) {
+        auto res = post_ttl(ttl_json);
+        REQUIRE(res != nullptr);
+        REQUIRE(res->status == 201);
+        return body_json(res)["expires_at"].get<std::int64_t>();
+    };
+    CHECK(expires("60") == 1060);
+    CHECK(expires("100000") == 1900);
+    CHECK(expires("9223372036854775807") == 1900);
+    auto absent = sink.dispatch("POST", "/api/v1/upload-grants",
+                                R"({"agent_id":"agent-1","declared_max_size":100})");
+    REQUIRE(absent != nullptr);
+    CHECK(absent->status == 201);
+    CHECK(body_json(absent)["expires_at"].get<std::int64_t>() == 1900);
 }

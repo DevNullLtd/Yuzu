@@ -1,37 +1,1062 @@
 #!/bin/bash
-# Yuzu Agent macOS post-install script
-# Runs as root after pkgbuild installs files.
+# Promote a fully delivered incoming payload, restoring the previous package
+# state on postinstall failure. The preinstall phase never removes active code.
+set -euo pipefail
 
-set -e
+# One package transition at a time: preinstall, postinstall and uninstall.sh
+# each hold this lock for their whole run, so an uninstall cannot interleave
+# with a promotion (PR #4482 governance ch-3). /var/db is root-only.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+TRANSITION_LOCK=/var/db/.yuzu-agent-transition.lock
+if [[ "${YUZU_PKG_TRANSITION_LOCKED:-}" != 1 ]]; then
+    # Owner-only: a lock file any account can open is one it can hold,
+    # blocking every install and uninstall (PR #4482 governance G8-S2). /var/db
+    # is root-only, so nothing else can place this path.
+    [[ ! -L "$TRANSITION_LOCK" ]] || { echo "ERROR: refusing a symlinked transition lock" >&2; exit 1; }
+    (umask 077; : >> "$TRANSITION_LOCK")
+    chmod 600 "$TRANSITION_LOCK"
+    # Lock this shell's own descriptor, so the lock lasts exactly as long as
+    # this script: with a separate lockf wrapper process, killing the wrapper
+    # released the lock while the script ran on (governance uh8-6). macOS 13
+    # and 14 ship no /usr/bin/lockf at all (measured, #5903), so there perl's
+    # flock on the same descriptor takes the lock; the wrapper form is only the
+    # last resort, and with neither tool the install refuses rather than run
+    # unlocked. 75 is lockf's timeout, kept short so this
+    # message appears well within the time Installer allows a script (sre8-2).
+    exec 9>>"$TRANSITION_LOCK"
+    lock_status=0
+    /usr/bin/lockf -s -t 120 9 2>/dev/null || lock_status=$?
+    if [[ "$lock_status" == 75 ]]; then
+        echo "ERROR: another Yuzu Agent package transition did not finish within 2 minutes; retry" >&2
+        exit 1
+    fi
+    if [[ "$lock_status" != 0 && "$lock_status" != 75 && -x /usr/bin/perl ]]; then
+        # The same descriptor lock through perl's flock, for a lockf without the
+        # descriptor form (governance uh8-6): the wrapper form below can be
+        # released by killing the wrapper while this script runs on.
+        lock_status=0
+        /usr/bin/perl -MFcntl=:flock -e \
+            'open(my $f, ">>&=", 9) or exit 2; for (1 .. 120) { exit 0 if flock($f, LOCK_EX | LOCK_NB); sleep 1 } exit 75' \
+            || lock_status=$?
+        if [[ "$lock_status" == 75 ]]; then
+            echo "ERROR: another Yuzu Agent package transition did not finish within 2 minutes; retry" >&2
+            exit 1
+        fi
+    fi
+    if [[ "$lock_status" != 0 ]]; then
+        [[ -x /usr/bin/lockf ]] || {
+            echo "ERROR: neither /usr/bin/lockf nor /usr/bin/perl can take the install lock on this Mac; nothing was changed" >&2
+            exit 1; }
+        exec 9>&-
+        exec /usr/bin/lockf -k -t 120 "$TRANSITION_LOCK" \
+            /usr/bin/env YUZU_PKG_TRANSITION_LOCKED=1 /bin/bash "$0" "$@"
+    fi
+fi
 
 DATA_DIR="/Library/Application Support/Yuzu"
+APP_ROOT="/Library/Application Support/YuzuAgent"
+LEGACY_APP="$DATA_DIR/YuzuAgent.app"
+LEGACY_TEAM_ID="7RLSYL2JM7"
+LEGACY_APP_ID="7RLSYL2JM7.co.uk.devnullsecurity.yuzu-agent"
+LEGACY_SIGNING_AUTHORITY="Mac Developer: Nathan Dornbrook (YA95685L8R)"
+LEGACY_PROFILE_SHA256="3e764aafaa5cd29398ef6646b98c7b00332404c5ea57f79b92663695acdd70e1"
 LOG_DIR="/Library/Logs/Yuzu"
+CONFIG_DIR="/etc/yuzu-agent"
+CERT_DIR="$CONFIG_DIR/certs"
 PLIST="/Library/LaunchDaemons/com.yuzu.agent.plist"
+INCOMING_PLIST="/Library/LaunchDaemons/.com.yuzu.agent.incoming.plist"
+STATE_DIR="/var/db/yuzu-agent"
+# This package's own root-owned Scripts directory (see preinstall).
+SCRIPT_SRC="$(cd "$(dirname "$0")" && pwd)"
+RECOVERY_FILE="$STATE_DIR/current-recovery"
+LOOSE_BIN="/usr/local/bin"
+DEFAULT_CA="/etc/yuzu/certs/default-ca.pem"
+YUZU_LIB="/usr/local/lib/yuzu"
+PLUGIN_DIR="$YUZU_LIB/plugins"
+INCOMING_PLUGIN_DIR="$YUZU_LIB/.plugins.incoming"
+MODE_FILE="$YUZU_LIB/package-mode"
+INCOMING_MODE_FILE="$YUZU_LIB/.package-mode.incoming"
+MANIFEST="$YUZU_LIB/package-files.list"
+INCOMING_MANIFEST="$YUZU_LIB/.package-files.incoming"
+HASHES="$YUZU_LIB/package-files.sha256"
+INCOMING_HASHES="$YUZU_LIB/.package-files.sha256.incoming"
+APP="$APP_ROOT/YuzuAgent.app"
+INCOMING_APP="$APP_ROOT/.YuzuAgent.incoming.app"
+INCOMING_BUNDLE_ARCHIVE="$YUZU_LIB/.bundle-contents.incoming.zip"
 
-# Create directories
-mkdir -p "${DATA_DIR}" "${LOG_DIR}"
-chmod 750 "${DATA_DIR}"
-chmod 755 "${LOG_DIR}"
+require_trusted_directory() {
+    local path="$1" owner mode
+    [[ -d "$path" && ! -L "$path" ]] || {
+        echo "ERROR: refusing untrusted package directory: $path" >&2; exit 1; }
+    owner="$(stat -f '%u' "$path")"
+    mode="$(stat -f '%Lp' "$path")"
+    [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] || {
+        echo "ERROR: package directory must be root-owned and not group/world writable: $path" >&2; exit 1; }
+    ! acl_grants_write "$path" || {
+        echo "ERROR: an access control list lets another account modify $path; remove it (chmod -N) and retry" >&2; exit 1; }
+}
 
-# Trust-anchor directory for OTA update signature verification (#416/#3807).
-# Its OWN directory, NOT /etc/yuzu/certs: that path is the server's --ca-dir,
-# which the server owns and re-chmods 0700 on boot, so an anchor there is either
-# unwritable by the server or unreadable by the agent. NOTE the LaunchDaemon runs
-# as root, so the agent CAN write this - the mode keeps unprivileged local users
-# out, not the agent itself. See "Signing update binaries" in
-# docs/user-manual/server-admin.md.
-mkdir -p /etc/yuzu-agent/certs
-chown root:wheel /etc/yuzu-agent /etc/yuzu-agent/certs
-chmod 755 /etc/yuzu-agent /etc/yuzu-agent/certs
+ensure_state_dir() {
+    local parent owner group mode
+    parent="$(dirname "$STATE_DIR")"
+    require_trusted_directory "$parent"
+    if [[ -e "$STATE_DIR" || -L "$STATE_DIR" ]]; then
+        [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] || {
+            echo "ERROR: refusing symlinked or non-directory recovery state root" >&2; exit 1; }
+        owner="$(stat -f '%u' "$STATE_DIR")"
+        group="$(stat -f '%g' "$STATE_DIR")"
+        mode="$(stat -f '%Lp' "$STATE_DIR")"
+        [[ "$owner" == 0 && "$group" == 0 && "$mode" == 700 ]] || {
+            echo "ERROR: recovery state root must be root:wheel mode 700" >&2; exit 1; }
+    else
+        mkdir -m 700 "$STATE_DIR"
+        chown root:wheel "$STATE_DIR"
+    fi
+    ! carries_acl "$STATE_DIR" || {
+        echo "ERROR: the recovery state root $STATE_DIR has an access control list, which the installer never sets." >&2
+        echo "       Inspect it (ls -lde $STATE_DIR), remove it (sudo chmod -N $STATE_DIR) and retry. The active service was left unchanged" >&2
+        exit 1; }
+}
 
-# Load the launch daemon (starts the agent)
-if launchctl list com.yuzu.agent &>/dev/null; then
-    launchctl unload "${PLIST}" 2>/dev/null || true
+recovery_path() {
+    local owner group mode pending
+    [[ -f "$RECOVERY_FILE" && ! -L "$RECOVERY_FILE" ]] || {
+        echo "ERROR: refusing missing or symlinked recovery pointer" >&2; return 1; }
+    owner="$(stat -f '%u' "$RECOVERY_FILE")"
+    group="$(stat -f '%g' "$RECOVERY_FILE")"
+    mode="$(stat -f '%Lp' "$RECOVERY_FILE")"
+    [[ "$owner" == 0 && "$group" == 0 && "$mode" == 600 ]] || {
+        echo "ERROR: recovery pointer must be root:wheel mode 600" >&2; return 1; }
+    pending="$(cat "$RECOVERY_FILE")"
+    [[ "$pending" == "$STATE_DIR"/install-recovery.* && -d "$pending" && ! -L "$pending" ]] || {
+        echo "ERROR: refusing recovery path outside the trusted state root" >&2; return 1; }
+    owner="$(stat -f '%u' "$pending")"
+    group="$(stat -f '%g' "$pending")"
+    mode="$(stat -f '%Lp' "$pending")"
+    [[ "$owner" == 0 && "$group" == 0 && "$mode" == 700 ]] || {
+        echo "ERROR: recovery snapshot must be root:wheel mode 700" >&2; return 1; }
+    ! carries_acl "$pending" || {
+        echo "ERROR: recovery snapshot $pending has an access control list, which the installer never sets; remove it (sudo chmod -N) and retry" >&2
+        return 1; }
+    printf '%s\n' "$pending"
+}
+
+preserve_or_create_directory() {
+    local path="$1" mode="$2" parent owner writable
+    if [[ -e "$path" || -L "$path" ]]; then
+        [[ -d "$path" && ! -L "$path" ]] || {
+            echo "ERROR: refusing symlinked or non-directory operational path: $path" >&2; exit 1; }
+        owner="$(stat -f '%u' "$path")"
+        writable="$(stat -f '%Lp' "$path")"
+        [[ "$owner" == 0 && $((8#$writable & 8#022)) == 0 ]] || {
+            echo "ERROR: operational directory must be root-owned and not group/world writable: $path" >&2; exit 1; }
+        return 0
+    fi
+    parent="$(dirname "$path")"
+    # macOS deliberately exposes /etc as the root-owned private/etc alias.
+    # Accept only that exact platform alias; every other symlinked parent stays
+    # subject to require_trusted_directory's no-symlink rule.
+    if [[ "$parent" == "/etc" && -L "$parent" ]]; then
+        [[ "$(readlink "$parent")" == "private/etc" ]] || {
+            echo "ERROR: refusing unexpected /etc alias" >&2; exit 1; }
+        require_trusted_directory "/private/etc"
+    else
+        require_trusted_directory "$parent"
+    fi
+    mkdir -m "$mode" "$path"
+    chown root:wheel "$path"
+}
+
+# The daemon runs as root and opens agent.db, its stores and its log by path, so
+# whoever can create entries in the data or log directory can point a root
+# write anywhere with a symlink. Both must be root-owned, not group/world
+# writable and free of write-granting ACLs; the _yuzu account
+# scripts/install-agent-user.sh provisions for the unprivileged development run
+# is not accepted (PR #4482 review, FortitudeEtc 2026-10-15). Same rule and
+# wording as preinstall.
+operational_directory_trusted() {
+    local path="$1" owner mode
+    owner="$(stat -f '%u' "$path")"
+    mode="$(stat -f '%Lp' "$path")"
+    [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] && ! acl_grants_write "$path"
+}
+
+# $1 is the directory, $2 what it is. Prints the refusal and its remedy.
+refuse_operational_directory() {
+    local path="$1" what="$2"
+    echo "ERROR: the existing $what directory must be root-owned, not group/world writable and without an ACL that lets another account write: $path" >&2
+    echo "       (owner uid $(stat -f '%u' "$path"), mode $(stat -f '%Lp' "$path")). The agent runs as root and writes there." >&2
+    echo "       Do not delete it: the data directory holds the agent's identity and enrolment. Fix the directory itself:" >&2
+    echo "         sudo chown root:wheel \"$path\" && sudo chmod go-w \"$path\" && sudo chmod -N \"$path\"" >&2
+    echo "       and install again; the installer then lists anything inside it to inspect. Never chown -R:" >&2
+    echo "       that makes an entry another account planted look root-owned. The active service was left unchanged." >&2
+}
+
+require_trusted_data_directory() {
+    operational_directory_trusted "$DATA_DIR" || { refuse_operational_directory "$DATA_DIR" data; return 1; }
+}
+
+# The directories alone are not enough: the root daemon opens agent.db, its
+# other stores and its log by name inside them, following symlinks. A symlink,
+# an entry another account owns or can write (mode bits or an ACL), a special
+# file or a hard-linked file could redirect a root write or feed root another
+# account's bytes, and a recursive chown would only make it look root-owned
+# (PR #4482 review, FortitudeEtc 2026-10-15, second round). The legacy
+# development app below the data root is quarantined, never run, by the
+# installer itself, so it is skipped. Lists every offending entry; returns 1 if
+# there is any, or if a directory cannot be inspected.
+reject_untrusted_operational_entries() {
+    local path entry found bad=""
+    for path in "$DATA_DIR" "$LOG_DIR"; do
+        [[ -d "$path" && ! -L "$path" ]] || continue
+        found="$(find "$path" -mindepth 1 \( -path "$LEGACY_APP" -type d -prune \) -o \
+            \( -type l -o ! -user 0 -o -perm -0020 -o -perm -0002 -o \( ! -type f ! -type d \) -o \
+               \( -type f -links +1 \) \) -print)" || {
+            echo "ERROR: cannot inspect $path" >&2; return 1; }
+        [[ -z "$found" ]] || bad="$bad$found"$'\n'
+        # find has no ACL test: check every entry.
+        while IFS= read -r -d '' entry; do
+            ! acl_grants_write "$entry" || bad="$bad$entry (access control list grants write)"$'\n'
+        done < <(find "$path" -mindepth 1 \( -path "$LEGACY_APP" -type d -prune \) -o -print0)
+    done
+    [[ -z "$bad" ]] && return 0
+    echo "ERROR: the agent runs as root and opens files in its data and log directories by name, and these" >&2
+    echo "       entries could have been planted or changed by another account:" >&2
+    printf '%s' "$bad" | while IFS= read -r entry; do echo "         $entry" >&2; done
+    echo "       Remove any symlink, special file or hard link. For a regular file or directory you have" >&2
+    echo "       inspected and trust, run: sudo chown root:wheel <path> && sudo chmod go-w <path> && sudo chmod -N <path>" >&2
+    echo "       Never chown -R: that makes a planted entry look root-owned. Then retry." >&2
+    return 1
+}
+
+# Recovery's start gate: both directories absent, or trusted, and everything in
+# them too. Returns 1 instead of exiting.
+operational_tree_trusted() {
+    local path
+    for path in "$DATA_DIR" "$LOG_DIR"; do
+        [[ -e "$path" || -L "$path" ]] || continue
+        [[ -d "$path" && ! -L "$path" ]] && operational_directory_trusted "$path" || return 1
+    done
+    reject_untrusted_operational_entries
+}
+
+ensure_data_directory() {
+    # FDA/EDR policy may intentionally own an existing data root's contents and
+    # permissions. Never chmod, chown, or replace it; only create the missing
+    # launchd working directory. It is still the root daemon's --data-dir and
+    # WorkingDirectory, so it must meet the same bar as every other operational
+    # directory: a user-created, group/world-writable root is refused, never
+    # silently adopted (PR #4482 review).
+    if [[ -e "$DATA_DIR" || -L "$DATA_DIR" ]]; then
+        [[ -d "$DATA_DIR" && ! -L "$DATA_DIR" ]] || {
+            echo "ERROR: data path is not a real directory: $DATA_DIR" >&2; return 1; }
+        require_trusted_data_directory || return 1
+        return 0
+    fi
+    require_trusted_directory "$(dirname "$DATA_DIR")" || return 1
+    mkdir -m 750 "$DATA_DIR" || return 1
+    chown root:wheel "$DATA_DIR"
+}
+
+# The log directory follows the data directory's rule (governance rd-n3). A
+# missing one is created root:wheel 755.
+require_trusted_log_directory() {
+    if [[ -e "$LOG_DIR" || -L "$LOG_DIR" ]]; then
+        [[ -d "$LOG_DIR" && ! -L "$LOG_DIR" ]] || {
+            echo "ERROR: log path is not a real directory: $LOG_DIR" >&2; return 1; }
+        operational_directory_trusted "$LOG_DIR" || { refuse_operational_directory "$LOG_DIR" log; return 1; }
+        return 0
+    fi
+    require_trusted_directory "$(dirname "$LOG_DIR")" || return 1
+    mkdir -m 755 "$LOG_DIR" || return 1
+    chown root:wheel "$LOG_DIR"
+}
+
+legacy_app_is_managed() {
+    local candidate="$1"
+    [[ -d "$candidate" && ! -L "$candidate" ]] || return 1
+    [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$candidate/Contents/Info.plist" 2>/dev/null || true)" == "${LEGACY_APP_ID#*.}" ]] || return 1
+    codesign --verify --deep --strict --verbose=2 "$candidate" >/dev/null 2>&1 || return 1
+    [[ "$(codesign -dvv "$candidate" 2>&1 | awk -F= '/^TeamIdentifier=/{print $2; exit}')" == "$LEGACY_TEAM_ID" ]] || return 1
+    [[ "$(codesign -dvv "$candidate" 2>&1 | awk -F= '/^Authority=/{print $2; exit}')" == "$LEGACY_SIGNING_AUTHORITY" ]] || return 1
+    [[ -f "$candidate/Contents/embedded.provisionprofile" ]] || return 1
+    [[ "$(shasum -a 256 "$candidate/Contents/embedded.provisionprofile" | awk '{print $1}')" == "$LEGACY_PROFILE_SHA256" ]]
+}
+
+# Mode bits are not the whole story: a macOS ACL can grant another account
+# write access that `chmod go-w` leaves in place, and a file_inherit entry is
+# copied onto code delivered later (PR #4482 governance G8-S7). Exit 0 when an
+# ACL entry allows anyone to modify the path. An unreadable listing counts as a
+# grant.
+acl_grants_write() {
+    local listing
+    listing="$(/bin/ls -lde "$1" 2>/dev/null)" || return 0
+    grep -Eq '^ *[0-9]+: .* allow .*(write|append|add_file|add_subdirectory|delete_child|chown|writesecurity|writeattr|writeextattr)' <<<"$listing"
+}
+
+# Exit 0 when the path carries any ACL entry at all, or its listing cannot be
+# read. The installer creates the recovery state as root with none, and a new
+# entry can only inherit from its parent, so an entry there was added by
+# someone else: it is refused, never stripped, so the evidence stays (PR #4482
+# review, FortitudeEtc 2026-10-15).
+carries_acl() {
+    local listing
+    listing="$(/bin/ls -lde "$1" 2>/dev/null)" || return 0
+    grep -Eq '^ *[0-9]+: ' <<<"$listing"
+}
+
+# An app that fails the legacy-ownership check is never run, restored or deleted:
+# it is moved to a root-only quarantine OUTSIDE the data root and the recovery
+# snapshot, and reported. Keeping it inside the recovery snapshot (as before)
+# blocked every later recovery and install permanently (PR #4482 review).
+# Both lanes run root code from below /usr/local: plugins and the plist merge
+# helper from /usr/local/lib/yuzu, and in the loose lane the daemon itself from
+# /usr/local/bin. /usr/local is shared with other tools (Homebrew on Intel
+# Macs, MDM scripts) and is never chmod/chown-ed by this package, so the chain
+# is checked, not repaired: each existing directory must be real, root-owned
+# and not group/world writable, or a non-root user could rename a directory
+# aside and plant code root then runs (PR #4482 governance sec-2). Returns 1
+# instead of exiting so recovery can decide what to do. $1 is the lane.
+code_directory_chain_trusted() {
+    local lane="${1:-bundle}" path owner mode
+    local paths="/usr/local /usr/local/lib /usr/local/lib/yuzu"
+    [[ "$lane" != loose ]] || paths="$paths $LOOSE_BIN"
+    for path in $paths; do
+        [[ -e "$path" || -L "$path" ]] || continue
+        [[ -d "$path" && ! -L "$path" ]] || return 1
+        owner="$(stat -f '%u' "$path")"
+        mode="$(stat -f '%Lp' "$path")"
+        [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] || return 1
+        ! acl_grants_write "$path" || return 1
+    done
+}
+
+# Fixing a directory's mode does not fix what a non-root user already left in
+# it: a planted yuzu-agent.old is promoted by the updater's rollback and a
+# planted plugin is loaded by the root daemon, which scans the plugin tree
+# recursively (PR #4482 governance ch-4, G8-S1). Every agent code entry in
+# /usr/local/bin (incoming names included, ch-5) and everything below the
+# plugin directory must be root-owned, not group/world writable, and not a
+# symlink. The list is reported even when a directory check also failed: a
+# recursive chown "fix" would make planted files look root-installed.
+reject_untrusted_code_entries() {
+    local entry owner mode bad="" found
+    for entry in "$LOOSE_BIN"/yuzu-agent* "$LOOSE_BIN"/libyuzu_agent_core* \
+                 "$LOOSE_BIN"/.yuzu-* "$LOOSE_BIN"/.libyuzu_agent_core*; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        if [[ -L "$entry" ]]; then
+            bad="$bad$entry"$'\n'; continue
+        fi
+        owner="$(stat -f '%u' "$entry")"
+        mode="$(stat -f '%Lp' "$entry")"
+        if [[ "$owner" != 0 || $((8#$mode & 8#022)) != 0 ]] || acl_grants_write "$entry"; then
+            bad="$bad$entry"$'\n'
+        fi
+    done
+    if [[ -d "$PLUGIN_DIR" && ! -L "$PLUGIN_DIR" ]]; then
+        found="$(find "$PLUGIN_DIR" -mindepth 1 \( -type l -o ! -user 0 -o -perm -0020 -o -perm -0002 \) -print)" || {
+            echo "ERROR: cannot inspect $PLUGIN_DIR" >&2; return 1; }
+        [[ -z "$found" ]] || bad="$bad$found"$'\n'
+        # find has no ACL test (G8-S7): check every entry, the directory included.
+        while IFS= read -r -d '' entry; do
+            ! acl_grants_write "$entry" || bad="$bad$entry (access control list grants write)"$'\n'
+        done < <(find "$PLUGIN_DIR" -print0)
+    fi
+    [[ -z "$bad" ]] && return 0
+    echo "ERROR: refusing to install beside code a non-root account could have written:" >&2
+    printf '%s' "$bad" | while IFS= read -r entry; do echo "         $entry" >&2; done
+    echo "       Inspect each entry and remove anything you did not install as root, then retry." >&2
+    echo "       Do not chown -R these paths: that makes another account's files look root-installed." >&2
+    return 1
+}
+
+# Both checks run and report before either refuses (G8-S1). $1 is the lane.
+require_trusted_code_tree() {
+    local lane="$1" failed=0 directories="/usr/local, /usr/local/lib and /usr/local/lib/yuzu"
+    [[ "$lane" != loose ]] || directories="/usr/local, /usr/local/lib, /usr/local/lib/yuzu and /usr/local/bin"
+    if ! code_directory_chain_trusted "$lane"; then
+        echo "ERROR: $directories must be root-owned and not group/world writable; the active service was left unchanged" >&2
+        failed=1
+    fi
+    reject_untrusted_code_entries || failed=1
+    return "$failed"
+}
+
+quarantine_legacy_app() {
+    local source="$1" quarantine destination
+    [[ -e "$source" || -L "$source" ]] || return 0
+    quarantine="$STATE_DIR/quarantine"
+    if [[ ! -d "$quarantine" ]]; then
+        mkdir -m 700 "$quarantine"
+        chown root:wheel "$quarantine"
+    fi
+    destination="$(mktemp -d "$quarantine/legacy-YuzuAgent.XXXXXX")"
+    mv "$source" "$destination/YuzuAgent.app"
+    echo "WARNING: quarantined an unrecognized legacy YuzuAgent.app at $destination; it was not run, restored or deleted" >&2
+}
+
+retire_legacy_app() {
+    local retired="$recovery/legacy-retired.app"
+    [[ ! -e "$LEGACY_APP" && ! -L "$LEGACY_APP" ]] && return 0
+    # Explicit returns: the caller's `||` turns errexit off in here (uh8r4-5).
+    quarantine_legacy_app "$retired" || return 1   # a leftover from an interrupted earlier run
+    mv "$LEGACY_APP" "$retired" || return 1
+    if legacy_app_is_managed "$retired"; then
+        rm -rf "${retired:?}" || return 1
+        echo "Removed the retired development YuzuAgent.app from $DATA_DIR (its identity was verified)" >&2
+    else
+        # The replacement daemon has already passed health observation: do not
+        # roll back a healthy install because of code the package does not own.
+        quarantine_legacy_app "$retired" || return 1
+    fi
+}
+
+# Every hash file given is a package's record (the old one, the new one, their
+# snapshot copies): a listed plugin is package-owned if its bytes match ANY of
+# them. Recovery after an interruption between moving the new manifest and the
+# new hashes would otherwise keep the new package's plugin (governance uh8-1).
+remove_managed_plugins() {
+    local manifest="$1" relative plugin hashes recorded owned
+    shift
+    [[ -f "$manifest" ]] || return 0
+    while IFS= read -r relative; do
+        [[ "$relative" == plugins/* ]] || continue
+        plugin="${relative#plugins/}"
+        [[ -n "$plugin" && "$plugin" != */* && "$plugin" != .* ]] || {
+            echo "ERROR: invalid package plugin manifest entry" >&2; return 1; }
+        if [[ -e "$PLUGIN_DIR/$plugin" ]]; then
+            recorded=0 owned=0
+            for hashes in "$@"; do
+                [[ -n "$hashes" && -f "$hashes" ]] || continue
+                recorded=1
+                if plugin_hash_matches "$plugin" "$hashes"; then owned=1; break; fi
+            done
+            if [[ "$recorded" == 1 && "$owned" != 1 ]]; then
+                echo "WARNING: kept $PLUGIN_DIR/$plugin: its bytes differ from the package's, so it is not package-owned" >&2
+                continue
+            fi
+        fi
+        rm -f "${PLUGIN_DIR:?}/${plugin:?}" "${PLUGIN_DIR:?}/${plugin:?}.sig"
+    done < "$manifest"
+}
+
+harden_managed_plugins() {
+    local manifest="$1" relative plugin
+    [[ -f "$manifest" ]] || return 0
+    chown root:wheel "$PLUGIN_DIR"
+    chmod 755 "$PLUGIN_DIR"
+    while IFS= read -r relative; do
+        [[ "$relative" == plugins/* ]] || continue
+        plugin="${relative#plugins/}"
+        [[ -n "$plugin" && "$plugin" != */* && "$plugin" != .* ]] || {
+            echo "ERROR: invalid package plugin manifest entry" >&2; return 1; }
+        if [[ -f "$HASHES" ]] && ! plugin_hash_matches "$plugin" "$HASHES"; then
+            echo "ERROR: installed plugin does not match the package's recorded hash: $plugin" >&2
+            return 1
+        fi
+        chown root:wheel "$PLUGIN_DIR/$plugin"
+        chmod -N "$PLUGIN_DIR/$plugin"
+        chmod go-w "$PLUGIN_DIR/$plugin"
+        [[ ! -e "$PLUGIN_DIR/$plugin.sig" ]] || {
+            chown root:wheel "$PLUGIN_DIR/$plugin.sig"
+            chmod -N "$PLUGIN_DIR/$plugin.sig"
+            chmod go-w "$PLUGIN_DIR/$plugin.sig"
+        }
+    done < "$manifest"
+}
+
+# Exit 0: the file's SHA-256 equals the hash recorded at build time.
+plugin_hash_matches() {
+    local plugin="$1" hashes="$2" recorded actual
+    recorded="$(awk -v n="plugins/$plugin" '$2 == n {print $1; exit}' "$hashes")"
+    [[ -n "$recorded" && -f "$PLUGIN_DIR/$plugin" ]] || return 1
+    actual="$(shasum -a 256 "$PLUGIN_DIR/$plugin")" || return 1
+    [[ "${actual%% *}" == "$recorded" ]]
+}
+
+was_managed_plugin() {
+    local plugin="$1"
+    [[ -f "$MANIFEST" ]] && grep -Fqx -- "plugins/$plugin" "$MANIFEST" || return 1
+    # Packages that recorded hashes own the file only while its bytes are theirs.
+    # Older packages recorded names only; their manifests still match by name.
+    [[ ! -f "$HASHES" ]] || plugin_hash_matches "$plugin" "$HASHES"
+}
+
+reject_unmanaged_plugin_collisions() {
+    local incoming_plugin incoming_name
+    for incoming_plugin in "$INCOMING_PLUGIN_DIR"/*; do
+        [[ -e "$incoming_plugin" ]] || continue
+        incoming_name="$(basename "$incoming_plugin")"
+        if [[ "$incoming_name" == *.dylib && -e "$PLUGIN_DIR/$incoming_name" ]] && \
+           ! was_managed_plugin "$incoming_name"; then
+            echo "ERROR: this package's plugin $incoming_name collides with one not installed by a Yuzu package, or changed since; the active service was left unchanged" >&2
+            return 1
+        fi
+    done
+}
+
+# launchctl bootout returns before the job is gone: measured on macOS 15, the
+# agent leaves ~1.3 s after SIGTERM. Wait for it, bounded at 30 s (PR #4482
+# governance g8ch-B1). Returns 1 if it is still loaded.
+stop_service() {
+    local waited=0
+    launchctl print "system/com.yuzu.agent" >/dev/null 2>&1 || return 0
+    launchctl bootout "system/com.yuzu.agent" >/dev/null 2>&1 || true
+    while launchctl print "system/com.yuzu.agent" >/dev/null 2>&1; do
+        [[ "$waited" -lt 60 ]] || return 1
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+}
+
+require_stopped() {
+    stop_service || {
+        echo "ERROR: Yuzu Agent did not unload within 30 seconds; refusing package transition" >&2
+        return 1; }
+}
+
+require_started() {
+    local observation attempt stable=0
+    for attempt in 1 2 3 4 5 6; do
+        observation="$(launchctl print "system/com.yuzu.agent" 2>/dev/null || true)"
+        if grep -Eq 'state = running' <<<"$observation" && \
+           grep -Eq 'pid = [1-9][0-9]*' <<<"$observation"; then
+            stable=$((stable + 1))
+            [[ "$stable" -ge 3 ]] && return 0
+        else
+            stable=0
+        fi
+        sleep 1
+    done
+    echo "ERROR: Yuzu Agent did not remain running after bootstrap" >&2
+    return 1
+}
+
+# --- Service state -------------------------------------------------------------
+# Command substitution, then match throughout: a grep -q closing a pipe early
+# would turn a successful launchctl into a pipefail "failure".
+
+# "Was running" means the same process for two seconds. An unconfigured agent
+# that launchd restarts every ThrottleInterval is briefly "running" too, and
+# must not make this install health-gated (PR #4482 governance xp-17).
+service_pid() {
+    awk '$1 == "pid" && $2 == "=" {print $3; exit}' <<<"$1"
+}
+
+service_running_stably() {
+    local first second
+    first="$(launchctl print "system/com.yuzu.agent" 2>/dev/null)" || return 1
+    [[ "$first" == *"state = running"* && -n "$(service_pid "$first")" ]] || return 1
+    sleep 2
+    second="$(launchctl print "system/com.yuzu.agent" 2>/dev/null)" || return 1
+    [[ "$second" == *"state = running"* && "$(service_pid "$second")" == "$(service_pid "$first")" ]]
+}
+
+service_disabled() {
+    local overrides
+    overrides="$(launchctl print-disabled system 2>/dev/null)" || return 1
+    grep -Eq '"com\.yuzu\.agent" => (true|disabled)' <<<"$overrides"
+}
+
+# The agent refuses to start without a server trust anchor (#1303). A plist with
+# none, and no installed default CA, is an install awaiting configuration.
+service_definition_configured() {
+    local plist="$1" arguments environment
+    [[ -f "$DEFAULT_CA" && ! -L "$DEFAULT_CA" ]] && return 0
+    arguments="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$plist" 2>/dev/null)" || return 1
+    grep -Eq '^ *--(ca-cert|tls-system-roots|no-tls)(=|$)' <<<"$arguments" && return 0
+    environment="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables' "$plist" 2>/dev/null)" || return 1
+    # As the agent reads them: a non-empty CA path, or a truthy system-roots
+    # switch (env_truthy: 1/true/yes/on, any case). YUZU_TLS_SYSTEM_ROOTS=0 is off.
+    grep -Eq '^ *YUZU_CA_CERT = .*[^[:space:]]' <<<"$environment" && return 0
+    grep -Eiq '^ *YUZU_TLS_SYSTEM_ROOTS = *(1|true|yes|on) *$' <<<"$environment"
+}
+
+# Whether a definition makes the agent require plugin signatures, read as the
+# agent's CLI11 parser reads it: a bare --plugin-require-signature is on;
+# --plugin-require-signature=VALUE and YUZU_PLUGIN_REQUIRE_SIGNATURE are off for
+# 0/false/off/no or empty (any case) and on otherwise; the command line, last
+# occurrence, overrides the environment (PR #4482 governance g8b-3).
+# Returns 0 required, 1 not required, 2 unreadable.
+# CLI11 2.6's to_flag_value, which the agent links: 1-9/t/y/+ and
+# true/on/yes/enable are on; 0/f/n/- and false/off/no/disable are off; other
+# integers are on when positive; an empty inline value (`--flag=`) is the flag
+# itself (on), an empty environment value is off. Anything CLI11 would reject
+# counts as on, so the installer refuses rather than guesses (con8-1).
+cli11_flag_value_enabled() {
+    local value source="$2"
+    value="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    if [[ -z "$value" ]]; then
+        [[ "$source" == argument ]]
+        return
+    fi
+    case "$value" in
+        0|f|n|-|false|off|no|disable) return 1 ;;
+        [1-9]|t|y|+|true|on|yes|enable) return 0 ;;
+    esac
+    if [[ "$value" =~ ^[+-]?[0-9]+$ ]]; then
+        [[ "$value" != -* && ! "$value" =~ ^[+]?0+$ ]]
+        return
+    fi
+    return 0
+}
+
+plugin_signatures_required_by() {
+    local plist="$1" arguments line state="" value
+    arguments="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$plist" 2>/dev/null)" || return 2
+    while IFS= read -r line; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        case "$line" in
+            --plugin-require-signature) state=on ;;
+            --plugin-require-signature=*)
+                if cli11_flag_value_enabled "${line#*=}" argument; then state=on; else state=off; fi ;;
+        esac
+    done <<< "$arguments"
+    [[ -z "$state" ]] || { [[ "$state" == on ]]; return; }
+    value="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:YUZU_PLUGIN_REQUIRE_SIGNATURE' "$plist" 2>/dev/null)" || return 1
+    cli11_flag_value_enabled "$value" environment
+}
+
+# The merged incoming definition is always readable; if it is not, assume
+# enforcement and refuse (the safe direction).
+service_definition_requires_plugin_signatures() {
+    local status=0
+    plugin_signatures_required_by "$1" || status=$?
+    [[ "$status" == 0 || "$status" == 2 ]]
+}
+
+# Retained signature enforcement would reject every unsigned plugin of this
+# package after a "successful" upgrade (PR #4482 governance pd-1).
+reject_unsigned_plugins_under_enforcement() {
+    local plugin
+    service_definition_requires_plugin_signatures "$INCOMING_PLIST" || return 0
+    for plugin in "$INCOMING_PLUGIN_DIR"/*.dylib; do
+        [[ -e "$plugin" ]] || continue
+        [[ -f "$plugin.sig" ]] || {
+            echo "ERROR: the existing service requires signed plugins, but this package's $(basename "$plugin") has no signature." >&2
+            echo "       Install a package built with plugin signatures, or remove --plugin-require-signature first. The active service was left unchanged." >&2
+            return 1; }
+    done
+}
+
+# The loose lane's code is delivered into the shared /usr/local/bin before this
+# script runs. Promote it only if its bytes are the ones the package recorded
+# (PR #4482 governance ch-5).
+verify_incoming_loose_code() {
+    local name file recorded actual
+    for name in yuzu-agent libyuzu_agent_core.dylib; do
+        case "$name" in
+            yuzu-agent) file="$LOOSE_BIN/.yuzu-agent.incoming" ;;
+            *) file="$LOOSE_BIN/.libyuzu_agent_core.incoming.dylib" ;;
+        esac
+        # Both are required: yuzu-agent links the shared core (FortitudeEtc
+        # 2026-10-15), and build-pkg.sh refuses to build without it.
+        recorded="$(awk -v n="bin/$name" '$2 == n {print $1; exit}' "$INCOMING_HASHES")"
+        [[ -n "$recorded" ]] || {
+            echo "ERROR: the package recorded no hash for $name; the active service was left unchanged" >&2; return 1; }
+        [[ -f "$file" && ! -L "$file" ]] || { echo "ERROR: incoming $name is missing or not a regular file" >&2; return 1; }
+        actual="$(shasum -a 256 "$file")" || { echo "ERROR: cannot hash incoming $name" >&2; return 1; }
+        [[ "${actual%% *}" == "$recorded" ]] || {
+            echo "ERROR: incoming $name does not match the package; the active service was left unchanged" >&2; return 1; }
+    done
+}
+
+# Recovery writes into and deletes from the code directories before this run's
+# trust checks, so it applies them itself first: every directory it touches for
+# the snapshot's lane must be absent, or real, root-owned, not group/world
+# writable and free of write-granting ACLs. Otherwise it refuses and keeps its
+# pointer for a later run, and never writes or deletes through a directory
+# another account controls (governance S8-1, uh8r3-1). The lane comes from
+# the root-only snapshot alone, never from entries another account could
+# create (S8r4-1, S8r4-2): only a snapshot with loose-lane code makes
+# /usr/local/bin a restore target, and then it must be trusted (uh8r3-4).
+require_trusted_restore_targets() {
+    local recovery="$1" path
+    RESTORE_LANE=bundle
+    [[ ! -d "$recovery/loose" ]] || RESTORE_LANE=loose
+    for path in /usr/local /usr/local/lib "$YUZU_LIB" "$PLUGIN_DIR" "$(dirname "$APP_ROOT")" "$APP_ROOT" \
+                "$(dirname "$PLIST")"; do
+        code_directory_trusted "$path" || {
+            echo "ERROR: an interrupted Yuzu Agent install was not recovered: $path is not a real, root-owned directory protected from other accounts. The agent may be stopped. Make $path root-owned, remove group/world write and any ACL (chmod -N), then install again." >&2
+            return 1; }
+    done
+    [[ "$RESTORE_LANE" != loose ]] || code_directory_trusted "$LOOSE_BIN" || {
+        echo "ERROR: an interrupted Yuzu Agent install was not recovered: $LOOSE_BIN is not a real, root-owned directory protected from other accounts. The agent may be stopped. Fix it, then install again." >&2
+        return 1; }
+}
+
+# A directory a restored agent may run code from: absent, or real, root-owned,
+# not group/world writable and with no write-granting ACL. Returns 1 instead of
+# exiting, for recovery's start decision.
+code_directory_trusted() {
+    local path="$1" owner mode
+    [[ -e "$path" || -L "$path" ]] || return 0
+    [[ -d "$path" && ! -L "$path" ]] || return 1
+    owner="$(stat -f '%u' "$path")"
+    mode="$(stat -f '%Lp' "$path")"
+    [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] || return 1
+    ! acl_grants_write "$path"
+}
+
+# A file the restarted root daemon reads or runs: a regular file, not a
+# symlink, root-owned, not group/world writable and with no write-granting ACL.
+root_file_trusted() {
+    local path="$1" owner mode
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    owner="$(stat -f '%u' "$path")"
+    mode="$(stat -f '%Lp' "$path")"
+    [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] || return 1
+    ! acl_grants_write "$path"
+}
+
+# Recovery restarts only a service that was running when the snapshot was
+# taken. A restored service that will not stay up is reported, never retried
+# forever: the pending install is the remedy (PR #4482 governance sec-1).
+restart_restored_service() {
+    local recovery="$1" lane=bundle program_args program
+    [[ -e "$PLIST" ]] || return 0
+    [[ -e "$recovery/service-was-running" ]] || {
+        echo "WARNING: restored the previous service definition; it was not running before, so it was not started" >&2
+        return 0; }
+    [[ ! -e "$recovery/loose/yuzu-agent" ]] || lane=loose
+    # The same bar as an install (S8-1): the chain, every code entry and plugin,
+    # and the bundle lane's code root.
+    if ! code_directory_chain_trusted "$lane" || ! code_directory_trusted "$APP_ROOT" || \
+       ! reject_untrusted_code_entries; then
+        echo "WARNING: restored the previous agent but did not start it: its code directories or files are not root-owned and protected from other accounts" >&2
+        return 0
+    fi
+    # The data and log checks run after recovery in an install, so recovery runs
+    # them itself before starting root code over them (FortitudeEtc 2026-10-15).
+    if ! operational_tree_trusted; then
+        echo "WARNING: restored the previous agent but did not start it: its data or log directory, or something in it, is not root-owned and protected from other accounts" >&2
+        return 0
+    fi
+    # Read first, then match: a failed read must never look like "not the
+    # legacy program".
+    program_args="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$PLIST")" || {
+        echo "WARNING: could not read the restored service definition, so it was not started" >&2
+        return 0; }
+    if [[ "$program_args" == *"$LEGACY_APP/Contents/MacOS/yuzu-agent"* ]]; then
+        # Never start code from the non-package-owned data root.
+        echo "WARNING: restored the previous legacy service definition but did not start it from non-package-owned data" >&2
+        return 0
+    fi
+    # Started as root, so the definition must run one of the package's two
+    # executables, and neither it nor that executable may be writable by another
+    # account (PR #4482 review, FortitudeEtc 2026-10-15).
+    program="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$PLIST" 2>/dev/null)" || program=""
+    case "$program" in
+        "$LOOSE_BIN/yuzu-agent"|"$APP_ROOT/YuzuAgent.app/Contents/MacOS/yuzu-agent") ;;
+        *)
+            echo "WARNING: restored the previous service definition but did not start it: it does not run the package's agent" >&2
+            return 0 ;;
+    esac
+    if ! root_file_trusted "$PLIST" || ! root_file_trusted "$program"; then
+        echo "WARNING: restored the previous agent but did not start it: its service definition or executable is not root-owned and protected from other accounts" >&2
+        return 0
+    fi
+    launchctl enable "system/com.yuzu.agent" >/dev/null 2>&1 || true
+    if launchctl bootstrap system "$PLIST" && require_started; then
+        # An administrator's disable override is put back for the next boot (sre8-3).
+        if [[ -e "$recovery/service-was-disabled" ]]; then
+            launchctl disable "system/com.yuzu.agent" ||
+                echo "WARNING: could not restore the administrator's disable override; run: launchctl disable system/com.yuzu.agent" >&2
+        fi
+        return 0
+    fi
+    if [[ -e "$recovery/service-was-disabled" ]]; then
+        launchctl disable "system/com.yuzu.agent" || true
+    fi
+    echo "WARNING: restored the previous agent, but it did not stay running. Installing a package is the remedy; recovery is complete." >&2
+}
+
+# Pointer first: an orphaned snapshot is harmless, a pointer to a missing
+# snapshot is not (PR #4482 governance uh-1).
+finish_recovery() {
+    local recovery="$1"
+    rm -f "$RECOVERY_FILE"
+    sync
+    rm -rf "$recovery"
+}
+
+restore_previous() {
+    local recovery phase
+    recovery="$(recovery_path)" || return 1
+    phase="$(cat "$recovery/phase" 2>/dev/null || true)"
+    # Before promotion nothing active has changed: there is nothing to restore.
+    [[ "$phase" == promoting ]] || return 0
+    require_trusted_restore_targets "$recovery" || return 1
+    stop_service || echo "WARNING: Yuzu Agent is still unloading; restoring anyway" >&2
+    # Clear both lanes and the generated plist first: recovery must restore an
+    # exact prior package state, including the prior "no installed agent" case.
+    rm -f "$PLIST" "$MODE_FILE" "$INCOMING_BUNDLE_ARCHIVE"
+    remove_managed_plugins "$MANIFEST" "$HASHES" "$INCOMING_HASHES" \
+        "$recovery/incoming-package-files.sha256" "$recovery/package-files.sha256"
+    remove_managed_plugins "$INCOMING_MANIFEST" "$HASHES" "$INCOMING_HASHES" \
+        "$recovery/incoming-package-files.sha256" "$recovery/package-files.sha256"
+    rm -f "$MANIFEST" "$HASHES"
+    rm -rf "$APP" "$INCOMING_APP"
+    # A bundle-lane snapshot can meet loose code a promotion had already laid
+    # down; remove it only from a trusted /usr/local/bin, otherwise report it.
+    if [[ "$RESTORE_LANE" == loose ]] || code_directory_trusted "$LOOSE_BIN"; then
+        rm -f "$LOOSE_BIN/yuzu-agent" "$LOOSE_BIN/libyuzu_agent_core.dylib" \
+              "$LOOSE_BIN/yuzu-agent.old" "$LOOSE_BIN/.yuzu-update-verified"
+    else
+        echo "WARNING: left any Yuzu agent files in $LOOSE_BIN in place: the directory is not protected from other accounts" >&2
+    fi
+    rm -f /usr/local/lib/libyuzu_agent_core.dylib
+    [[ ! -e "$recovery/LaunchDaemons/com.yuzu.agent.plist" ]] || \
+        ditto "$recovery/LaunchDaemons/com.yuzu.agent.plist" "$PLIST"
+    [[ ! -d "$recovery/YuzuAgent.app" ]] || ditto "$recovery/YuzuAgent.app" "$APP"
+    [[ ! -e "$recovery/loose/yuzu-agent" ]] || \
+        ditto "$recovery/loose/yuzu-agent" "$LOOSE_BIN/yuzu-agent"
+    [[ ! -e "$recovery/loose/libyuzu_agent_core.dylib" ]] || \
+        ditto "$recovery/loose/libyuzu_agent_core.dylib" "$LOOSE_BIN/libyuzu_agent_core.dylib"
+    # A package from before #5144 kept the core dylib in /usr/local/lib.
+    [[ ! -e "$recovery/loose/legacy-lib/libyuzu_agent_core.dylib" ]] || \
+        ditto "$recovery/loose/legacy-lib/libyuzu_agent_core.dylib" /usr/local/lib/libyuzu_agent_core.dylib
+    [[ ! -e "$recovery/package-mode" ]] || ditto "$recovery/package-mode" "$MODE_FILE"
+    [[ ! -e "$recovery/package-files.list" ]] || \
+        ditto "$recovery/package-files.list" "$MANIFEST"
+    [[ ! -e "$recovery/package-files.sha256" ]] || \
+        ditto "$recovery/package-files.sha256" "$HASHES"
+    [[ ! -d "$recovery/yuzu/plugins" ]] || mkdir -p "$PLUGIN_DIR"
+    [[ ! -d "$recovery/yuzu/plugins" ]] || ditto "$recovery/yuzu/plugins" "$PLUGIN_DIR"
+    quarantine_legacy_app "$recovery/legacy-retired.app"
+    sync
+    restart_restored_service "$recovery"
+    finish_recovery "$recovery"
+    echo "ERROR: installation failed; the previous package state was restored" >&2
+}
+
+# A pre-promotion refusal leaves the active service unchanged, but by then
+# Installer has laid down the payload and, upgrading a package that installed to
+# the live paths, may have removed old receipt-listed files the new payload
+# lacks. Put back any live file missing since the snapshot; never overwrite
+# one (PR #4482 governance rd-n2).
+copy_back() {
+    local source="$1" destination="$2"
+    [[ -e "$source" && ! -e "$destination" && ! -L "$destination" ]] || return 0
+    ditto "$source" "$destination" || echo "WARNING: could not restore $destination" >&2
+}
+
+restore_missing_live_files() {
+    local recovery entry
+    recovery="$(recovery_path 2>/dev/null)" || return 0
+    [[ "$(cat "$recovery/phase" 2>/dev/null || true)" == prepared ]] || return 0
+    # Never through a directory another account controls (uh8r3-1); the next
+    # preinstall retries once it is fixed.
+    require_trusted_restore_targets "$recovery" || return 0
+    copy_back "$recovery/LaunchDaemons/com.yuzu.agent.plist" "$PLIST"
+    copy_back "$recovery/YuzuAgent.app" "$APP"
+    copy_back "$recovery/loose/yuzu-agent" "$LOOSE_BIN/yuzu-agent"
+    copy_back "$recovery/loose/libyuzu_agent_core.dylib" "$LOOSE_BIN/libyuzu_agent_core.dylib"
+    copy_back "$recovery/loose/legacy-lib/libyuzu_agent_core.dylib" /usr/local/lib/libyuzu_agent_core.dylib
+    copy_back "$recovery/package-mode" "$MODE_FILE"
+    copy_back "$recovery/package-files.list" "$MANIFEST"
+    copy_back "$recovery/package-files.sha256" "$HASHES"
+    for entry in "$recovery/yuzu/plugins"/*; do
+        [[ -e "$entry" ]] || continue
+        copy_back "$entry" "$PLUGIN_DIR/$(basename "$entry")"
+    done
+}
+
+# Every exit before the end is handled here. Before promotion it is a refusal:
+# restore missing live files only. After promotion it restores the snapshot.
+# An EXIT trap with flags, not an ERR trap: errexit inside a function skips a
+# non-inherited ERR trap, and with `set -E` bash 3.2 also fires it inside
+# command substitutions whose failure is handled, which would run the restore
+# in a subshell. Flags, not $?, decide: bash 3.2 reports $?=0 to an EXIT trap
+# after a `set -u` abort (PR #4482 governance sec-5, uh-3, ch-2).
+INSTALL_COMPLETED=0
+PROMOTION_ARMED=0
+on_exit() {
+    [[ "$INSTALL_COMPLETED" == 1 ]] && return 0
+    if [[ "${PROMOTION_ARMED:-0}" == 1 ]]; then
+        PROMOTION_ARMED=0
+        # If this is the last line in the log, the restore stopped part-way; the
+        # next package run finishes it from the snapshot (governance uh8-5).
+        echo "ERROR: installation failed; restoring the previous package state" >&2
+        restore_previous
+    else
+        restore_missing_live_files
+    fi
+    exit 1
+}
+trap on_exit EXIT
+
+ensure_state_dir
+require_trusted_directory "$APP_ROOT"
+require_trusted_directory "$YUZU_LIB"
+ensure_data_directory || exit 1
+require_trusted_log_directory || exit 1
+reject_untrusted_operational_entries || exit 1
+# Preserve existing operational contents and modes only when their directory is
+# safe for a root daemon.  Fresh installs create the documented external paths.
+preserve_or_create_directory "$CONFIG_DIR" 755
+preserve_or_create_directory "$CERT_DIR" 755
+preserve_or_create_directory "$PLUGIN_DIR" 755
+
+[[ -f "$INCOMING_MODE_FILE" && -f "$INCOMING_PLIST" ]] || {
+    echo "ERROR: package payload is missing incoming mode or LaunchDaemon plist" >&2; exit 1; }
+MODE="$(cat "$INCOMING_MODE_FILE")"
+[[ "$MODE" == "bundle" || "$MODE" == "loose" ]] || {
+    echo "ERROR: invalid incoming package mode" >&2; exit 1; }
+require_trusted_code_tree "$MODE" || exit 1
+[[ -d "$INCOMING_PLUGIN_DIR" && -f "$INCOMING_MANIFEST" ]] || {
+    echo "ERROR: package payload is missing incoming plugin state" >&2; exit 1; }
+# Reject a third-party plugin collision before stopping the current daemon or
+# changing either code lane. A failed preflight leaves the active service alone.
+reject_unmanaged_plugin_collisions || exit 1
+if [[ "$MODE" == "bundle" ]]; then
+    [[ -f "$INCOMING_BUNDLE_ARCHIVE" && ! -L "$INCOMING_BUNDLE_ARCHIVE" ]] || {
+        echo "ERROR: incoming bundle archive is missing or symlinked" >&2; exit 1; }
+    [[ ! -e "$INCOMING_APP" && ! -L "$INCOMING_APP" ]] || {
+        echo "ERROR: incoming bundle extraction path already exists" >&2; exit 1; }
+    bundle_entries="$(/usr/bin/unzip -Z1 "$INCOMING_BUNDLE_ARCHIVE")" || {
+        echo "ERROR: cannot list the incoming bundle archive" >&2; exit 1; }
+    while IFS= read -r entry; do
+        [[ "$entry" == Contents/* && "$entry" != *'/../'* && "$entry" != ../* && "$entry" != */.. ]] || {
+            echo "ERROR: incoming bundle archive has an unsafe entry" >&2; exit 1; }
+    done <<< "$bundle_entries"
+    mkdir -m 755 "$INCOMING_APP"
+    chown root:wheel "$INCOMING_APP"
+    ditto -x -k "$INCOMING_BUNDLE_ARCHIVE" "$INCOMING_APP"
+    [[ -x "$INCOMING_APP/Contents/MacOS/yuzu-agent" ]] || {
+        echo "ERROR: incoming bundle executable is missing" >&2; exit 1; }
+    [[ -z "$(find "$INCOMING_APP" -type l -print -quit)" ]] || {
+        echo "ERROR: incoming bundle contains a symlink" >&2; exit 1; }
+    codesign --verify --deep --strict --verbose=2 "$INCOMING_APP"
+else
+    [[ -x "$LOOSE_BIN/.yuzu-agent.incoming" ]] || {
+        echo "ERROR: incoming loose agent executable is missing" >&2; exit 1; }
+    verify_incoming_loose_code || exit 1
 fi
-launchctl load -w "${PLIST}"
 
-echo "Yuzu Agent installed and started."
-echo "  Data:    ${DATA_DIR}"
-echo "  Logs:    ${LOG_DIR}"
-echo "  Service: launchctl list com.yuzu.agent"
-exit 0
+recovery="$(recovery_path)" || {
+    echo "ERROR: no installation recovery snapshot; the active service was left unchanged" >&2; exit 1; }
+# Merge the operator's settings into the incoming definition before anything is
+# stopped, so a merge failure leaves the active service alone (PR #4482
+# governance ch-1). The helper ships in this package's root-owned Scripts
+# directory, never below /usr/local (sec-2, G8-S3).
+if [[ -f "$recovery/LaunchDaemons/com.yuzu.agent.plist" ]]; then
+    merge_args=(--previous "$recovery/LaunchDaemons/com.yuzu.agent.plist" --destination "$INCOMING_PLIST")
+    [[ "$MODE" != "bundle" ]] || merge_args+=(--force-no-auto-update)
+    merge_result="$(/usr/bin/osascript -l JavaScript "$SCRIPT_SRC/merge-launchd-plist.js" "${merge_args[@]}")" || {
+        echo "ERROR: could not merge the existing service settings; the active service was left unchanged" >&2; exit 1; }
+fi
+# The merge reports when the existing definition could not be read, so its
+# settings were lost (con8-2): a running agent is then not health-gated.
+prior_definition_lost=0
+[[ "${merge_result:-}" != *prior-unreadable* ]] || prior_definition_lost=1
+reject_unsigned_plugins_under_enforcement || exit 1
+# Record what is being replaced: only a running service is health-gated and
+# restarted by recovery.
+if service_running_stably; then : > "$recovery/service-was-running"; else rm -f "$recovery/service-was-running"; fi
+if service_disabled; then : > "$recovery/service-was-disabled"; else rm -f "$recovery/service-was-disabled"; fi
+
+# Recovery needs this package's hash record even if the promotion below is cut
+# short between moving the manifest and moving the hashes (uh8-1).
+[[ ! -f "$INCOMING_HASHES" ]] || ditto "$INCOMING_HASHES" "$recovery/incoming-package-files.sha256"
+printf 'promoting\n' > "$recovery/.phase.new"
+mv -f "$recovery/.phase.new" "$recovery/phase"
+sync
+# All validation is above. From here any exit before the end restores the
+# snapshot (see on_exit).
+PROMOTION_ARMED=1
+require_stopped
+remove_managed_plugins "$MANIFEST" "$HASHES"
+rm -rf "$APP"
+# An updater rollback file belongs to the code being replaced (ch-4, rd-5).
+rm -f "$LOOSE_BIN/yuzu-agent" "$LOOSE_BIN/libyuzu_agent_core.dylib" /usr/local/lib/libyuzu_agent_core.dylib \
+      "$LOOSE_BIN/yuzu-agent.old" "$LOOSE_BIN/.yuzu-update-verified"
+if [[ "$MODE" == "bundle" ]]; then
+    mv "$INCOMING_APP" "$APP"
+    rm -f "$INCOMING_BUNDLE_ARCHIVE"
+else
+    mv "$LOOSE_BIN/.yuzu-agent.incoming" "$LOOSE_BIN/yuzu-agent"
+    [[ ! -e "$LOOSE_BIN/.libyuzu_agent_core.incoming.dylib" ]] || \
+        mv "$LOOSE_BIN/.libyuzu_agent_core.incoming.dylib" "$LOOSE_BIN/libyuzu_agent_core.dylib"
+fi
+mkdir -p "$PLUGIN_DIR"
+for incoming_plugin in "$INCOMING_PLUGIN_DIR"/*; do
+    [[ -e "$incoming_plugin" ]] || continue
+    mv "$incoming_plugin" "$PLUGIN_DIR/"
+done
+rmdir "$INCOMING_PLUGIN_DIR"
+mv "$INCOMING_MANIFEST" "$MANIFEST"
+rm -f "$HASHES"
+[[ ! -f "$INCOMING_HASHES" ]] || mv "$INCOMING_HASHES" "$HASHES"
+mv "$INCOMING_MODE_FILE" "$MODE_FILE"
+mv "$INCOMING_PLIST" "$PLIST"
+
+if [[ "$MODE" == "bundle" ]]; then
+    chown -R root:wheel "$APP"
+    chmod -R -N "$APP"
+    chmod -R go-w "$APP"
+    harden_managed_plugins "$MANIFEST"
+    bundle_args="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$PLIST")"
+    # Explicit: on bash 3.2 a failing [[ ]] does not trigger errexit (G8-S5).
+    [[ "$bundle_args" == *--no-auto-update* ]] || {
+        echo "ERROR: the bundle service definition lacks --no-auto-update" >&2; exit 1; }
+else
+    chown root:wheel "$LOOSE_BIN/yuzu-agent"
+    chmod -N "$LOOSE_BIN/yuzu-agent"
+    chmod go-w "$LOOSE_BIN/yuzu-agent"
+    if [[ -e "$LOOSE_BIN/libyuzu_agent_core.dylib" ]]; then
+        chown root:wheel "$LOOSE_BIN/libyuzu_agent_core.dylib"
+        chmod -N "$LOOSE_BIN/libyuzu_agent_core.dylib"
+        chmod go-w "$LOOSE_BIN/libyuzu_agent_core.dylib"
+    fi
+    harden_managed_plugins "$MANIFEST"
+fi
+sync
+
+# Start decision. Only a service that was running is health-gated, and a
+# failure there restores it. A fresh or stopped install is never rolled back
+# for not running: the agent exits until it is configured (PR #4482
+# governance hp-1, sre-2, hp-2).
+# A running agent's disable override (effective at the next boot) is put back
+# after its restart (g8ch-i5). A running agent whose settings were lost to an
+# unreadable definition is installed but not health-gated: the package default
+# cannot run unconfigured, and rolling back would restore the unreadable
+# definition and leave it stopped anyway (g8ch-M1).
+was_disabled=0
+if service_disabled; then was_disabled=1; fi
+if [[ -e "$recovery/service-was-running" && "$prior_definition_lost" == 0 ]] && \
+   service_definition_configured "$PLIST"; then
+    launchctl enable "system/com.yuzu.agent"
+    launchctl bootstrap system "$PLIST"
+    require_started
+    if [[ "$was_disabled" == 1 ]]; then
+        launchctl disable "system/com.yuzu.agent" ||
+            echo "WARNING: could not restore the administrator's disable override; run: launchctl disable system/com.yuzu.agent" >&2
+    fi
+    outcome="Yuzu Agent installed and started."
+elif [[ -e "$recovery/service-was-running" ]]; then
+    outcome="Yuzu Agent installed but NOT started: the previous service definition could not be read, so its settings were lost. Re-apply --server and a trust anchor to $PLIST, then run: launchctl bootstrap system $PLIST"
+elif [[ "$was_disabled" == 1 ]]; then
+    outcome="Yuzu Agent installed. The service is disabled by an administrator and was not started; to start it run: launchctl enable system/com.yuzu.agent && launchctl bootstrap system $PLIST"
+elif service_definition_configured "$PLIST"; then
+    if launchctl bootstrap system "$PLIST" && require_started; then
+        outcome="Yuzu Agent installed and started."
+    else
+        outcome="Yuzu Agent installed. It was started but did not stay running; see $LOG_DIR/yuzu-agent.stderr.log and $LOG_DIR/yuzu-agent.log."
+    fi
+else
+    outcome="Yuzu Agent installed but not started: no server trust anchor is configured. Add --server and one of --ca-cert, --tls-system-roots (or install $DEFAULT_CA) to $PLIST, then run: launchctl bootstrap system $PLIST"
+fi
+# The previous development bundle lived below the EDR data root. Remove only
+# that package-owned child after the replacement is in place; recovery retains
+# a copy until this transition is fully durable.
+retire_legacy_app || echo "WARNING: could not retire the legacy development app; it was left in place" >&2
+upgraded=0
+# Not after a lost definition: its settings were not preserved (r2-L2).
+[[ ! -e "$recovery/LaunchDaemons/com.yuzu.agent.plist" || "$prior_definition_lost" == 1 ]] || upgraded=1
+PROMOTION_ARMED=0
+finish_recovery "$recovery"
+INSTALL_COMPLETED=1
+echo "$outcome"
+[[ "$upgraded" != 1 ]] || echo "Existing data, logs, trust anchors and service settings were preserved."

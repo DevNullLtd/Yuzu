@@ -22,7 +22,7 @@
    - Percentile strips compare the device's CURRENT heartbeat yuzu.perf_*
      values against the CURRENT fleet/cohort distributions from registry
      state ("now vs now") — no extra federated query, no new storage.
-   - Cohort = the device's value for the operator-chosen tag key (n>=10).
+   - Cohort = the device's value for the operator-chosen tag key (floor: one device).
   DRILL MAP (added 2026-06-12):
    - Each percentile-strip row -> the Performance page scoped to this
      device's cohort (the cohort device list, this device highlighted).

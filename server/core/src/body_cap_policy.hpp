@@ -60,11 +60,13 @@
 /// `Content-Length` — is REFUSED outright rather than admitted up to the
 /// cap. Chunked request bodies are legal HTTP, and this repo does not
 /// control every client that will ever talk to these routes, so the bit
-/// DEFAULTS OFF and is opted into per class, not per table. It is ON only
-/// for `/mcp/`: that surface's own protocol/client contract already requires
-/// `Content-Length` on every framed body (see `web_utils.hpp:577`'s
-/// `mcp_body_unmeasurable` rationale), so refusing an unmeasurable MCP body
-/// costs a conforming client nothing. Every other class below — public REST
+/// DEFAULTS OFF and is opted into per class, not per table. It is ON for
+/// three classes: `/mcp/` (that surface's own protocol/client contract already requires
+/// `Content-Length` on every framed body - see `web_utils.hpp:577`'s
+/// `mcp_body_unmeasurable` rationale - so refusing an unmeasurable MCP body
+/// costs a conforming client nothing), `upload_session`, and `hardware` (the
+/// Hardware CI routes carry only a tiny JSON body from the dashboard and API
+/// callers). Every other class below — public REST
 /// (bundles), SCIM, certificate import (REST + dashboard), the plugin trust
 /// bundle, product-pack/workflow authoring, and the OTA upload — keeps it
 /// OFF and falls back to httplib's 100 MiB backstop for a body it cannot
@@ -481,9 +483,13 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // /api/v1/hardware — the Hardware CI list/record/sync REST v1 twin
     // (hardware_routes.cpp). ANY method: GET /api/v1/hardware and
     // GET /api/v1/hardware/{id} are bodyless list/record reads; only
-    // POST /api/v1/hardware/{id}/sync carries a body, and it is a single
-    // JSON object with one short "source" token (one of 5 fixed literals,
-    // e.g. "installed_software") — a few dozen bytes at most. 4 KiB leaves
+    // POST /api/v1/hardware/{id}/sync and the fleet fan-out POST
+    // /api/v1/hardware/sync carry a body. The first is a single JSON object
+    // with one short "source" token (one of 5 fixed literals, e.g.
+    // "installed_software") — a few dozen bytes at most; the second adds a
+    // "scope" token or a "scope_expression" (the route refuses one over
+    // 1024 characters, so 4 KiB is ample and no separate entry is needed —
+    // it inherits this one by segment-boundary prefix). 4 KiB leaves
     // generous headroom over that real shape while keeping this three orders
     // of magnitude under the 4 MiB catch-all (governance Gate 2: this route
     // had no reviewed entry, per the routed-concern row's requirement that
@@ -512,6 +518,33 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // (different literal prefix) — without its own entry it would fall to
     // the 4 MiB catch-all, which a toggle this small does not need.
     {kBodyCapAnyMethod, "/api/v1/rbac/enforcement", 1u * 1024, false, "rbac_enforcement"},
+
+    // /api/v1/guaranteed-state/policy-generation: the Guardian policy-generation raise
+    // (rest_api_v1.cpp): POST .../raise carries {"target_generation": <integer up to 16
+    // digits>, "acknowledge_rule_set_replaced": true, "acknowledge_empty_rule_set": true}, under
+    // 192 bytes pretty-printed; 1 KiB is over 5x headroom. Its gates (administrator check, MFA step-up) run in the handler, after
+    // httplib buffers the body, so without its own entry the path would fall to the 4 MiB
+    // catch-all. Segment-boundary matching means it does NOT inherit the
+    // guardian_rule_authoring rows above (a different literal prefix).
+    {kBodyCapAnyMethod, "/api/v1/guaranteed-state/policy-generation", 1u * 1024, false,
+     "guardian_policy_generation"},
+
+    // /api/v1/users — the local-account user-management REST v1 subtree
+    // (#5342): POST /api/v1/users/me/password {current_password,
+    // new_password}, POST /api/v1/users/{name}/password {new_password}
+    // (rest_api_v1.cpp register_password_routes), plus the pre-existing
+    // POST /api/v1/users/{name}/unlock (bodyless) and
+    // POST /api/v1/users[/{name}]/elevation-eligibility ({"eligible": bool},
+    // auth_routes.cpp). The largest legitimate body is two passwords at
+    // password_policy.hpp's kMaxPasswordBytes (1024) each — worst-case JSON
+    // escaping (6 bytes per control byte as \u00XX) puts that near 12.3 KiB,
+    // so 16 KiB admits every policy-conformant request with framing headroom
+    // while keeping an unauthenticated flood against this subtree (whose
+    // gates all run in the handler, after httplib buffers the body) 256x
+    // under the 4 MiB catch-all it previously fell to. ANY method: the
+    // bodyless siblings share the prefix (rule 4 in the routed-concern row).
+    // requires_measurable stays OFF per the file-header default.
+    {kBodyCapAnyMethod, "/api/v1/users", 16u * 1024, false, "users"},
 
     // The catch-all default. ANY method, empty prefix — always matches, and
     // always loses a longest-match comparison against every entry above.

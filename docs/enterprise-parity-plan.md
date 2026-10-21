@@ -100,7 +100,7 @@ These commercial-peer features have functional equivalents in Yuzu that are as g
 | System health | `/livez`, `/readyz`, ProcessHealthSampler, Prometheus |
 | License mgmt | LicenseStore (seats, editions, feature flags) |
 | Gateway/DMZ | Erlang/OTP gateway with circuit breaker |
-| OIDC SSO | OidcProvider with PKCE, Entra ID discovery |
+| OIDC SSO | OidcProvider with PKCE and OIDC Discovery; verified end to end against Keycloak 26.4.0 (Linux test host, plain `http` and `https` via a TLS-terminating proxy), Entra ID supported by the standard but not verified by the project |
 | AD/Entra sync | DirectorySync via Microsoft Graph |
 | API tokens | ApiTokenStore + MCP tiers |
 | Software deployment | SoftwareDeploymentStore (stage/deploy/rollback) |
@@ -154,6 +154,7 @@ These are significant capability areas not represented in Yuzu's capability map 
 | G12 | **Process/Provider/Sync Logging** | Separate log views for sync jobs, provider operations, infrastructure | LOW — operational visibility |
 | G13 | **Multi-Database Architecture** | Separate databases for responses, catalog, inventory, SLA, BI | MEDIUM — scale separation |
 | G14 | **System Guardian — Real-Time Agent-Side Guaranteed State** | the category leader's flagship: kernel-event-driven enforcement on Windows (RegNotifyChangeKeyValue, ETW, WFP, SCM), Linux (inotify, netlink, D-Bus, sysctl, audit), macOS (Endpoint Security, fseventsd, launchd). Pre-login activation. Fully offline-capable. Millisecond-level enforcement for event-driven rules. Auditable journal of every detection and remediation. **In flight** — PRs 1-2 shipped (proto, `guaranteed_state_store`, agent `GuardianEngine` scaffolding, `__guard__` dispatch hook); PR 3+ pending per `docs/yuzu-guardian-windows-implementation-plan.md`. PolicyStore alone does *not* deliver this — its 5-minute poll cycle is unacceptable for "this setting must never be in a non-compliant state" use cases (firewall ports, registry-backed security settings, EDR process always-running). Guardian is the agent-side primitive that closes that gap. | **CRITICAL** — this is the headline parity feature for enterprise endpoint management |
+| G15 | **Cryptographic Asset Inventory (CBOM)** | Fleet-wide inventory of cryptographic libraries, certificates, SSH keys and protocol settings, exportable as a cryptographic bill of materials for crypto-agility and post-quantum migration planning. **Partially closed** — crypto-library presence is shipped as the `/crypto` dashboard, REST routes and MCP tools (`docs/user-manual/crypto.md`), server-only over the installed-software inventory and reporting presence and versions without verdicts. Certificate inventory with full X.509 fields, SSH keys, protocol settings and CBOM export are planned (capability-map §41, roadmap Issue 18.8). | MEDIUM — compliance and crypto-agility planning |
 
 ---
 

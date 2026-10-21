@@ -162,7 +162,13 @@ public:
     /// to its own "generous, not a tight fit" contract. 24 gives room for
     /// several more individually-fragmented plugins before this needs raising
     /// again.
-    static constexpr std::size_t kMaxSources = 24;
+    /// Raised 24 to 32 (2026-09-28): the same overlapping-PR pattern repeated
+    /// — privacy_permissions (#5064) and local_security_policy each ship
+    /// their own fragment file and landed via independent PRs off the same
+    /// dev tip, so composing both lands the true count at 25, one over the
+    /// prior ceiling with zero headroom. 32 restores real headroom rather
+    /// than bumping to the bare minimum again.
+    static constexpr std::size_t kMaxSources = 32;
 
     explicit CommandCapabilityRegistry(
         std::initializer_list<std::span<const CommandCapability>> sources) {

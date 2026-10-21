@@ -187,6 +187,31 @@ column). Full design: `docs/auth-architecture.md`'s "Fourth migration (#3789)" /
 `docs/adr/0017-management-group-confinement-list-reads.md`'s "Executions (legacy pre-v1 routes)"
 bullet.
 
+**#3526 / #4753 (executions LIST fragment, `summarize_working_set` `kind=execution`):** the
+dashboard executions LIST fragment (`GET /fragments/executions`) also pushes the caller's scope
+into SQL before its `LIMIT`, through `query_executions_checked`. `get_agent_statuses_checked` and
+`get_agent_statuses_for_executions_checked` take an optional `visible_agents` (`agent_id =
+ANY($n::text[])`): engaged-empty is deny-all, `nullopt` is unfiltered. It bounds the READ only, so
+a confined caller does not pull every agent row of a fleet-wide execution; `execution_visible` and
+`confined_projection` still do the redaction, and the served result is identical because both
+ignore out-of-scope rows. **Never use a filtered read where the complete cohort is needed**
+(`admit_confined_mutation` must see every agent row to decide a mutation). Service-scoped sessions
+get no owner disjunct on the fragment, because a service-scoped token's session username is its
+minter; the other surfaces that read the disjunct still show a minter's executions to a
+service-scoped token (#5557). Full account: `docs/auth-architecture.md`'s "Sixth migration".
+
+**#3526 (per-agent execution-statistics rollup):** REST `GET /api/v1/execution-statistics/agents` and
+MCP `get_execution_statistics_by_agent` gate on `fleet_read_fn` and pass the visible set as
+`ExecutionStatsQuery::visible_agents`, which `ExecutionTracker::try_get_agent_statistics` applies as
+`a.agent_id = ANY(...)` before the GROUP BY and the LIMIT. Present-empty is deny-all and `nullopt` is
+unfiltered, as above; a present-empty set is answered with an empty page without taking a pool lease
+or running a query, but only after the tracker-open check, so a tracker that is not open is still a
+degraded read. The rollup is a bounded read (a row limit, at most 1000), not a complete-cohort
+proof, so **never feed it to `admit_confined_mutation`**. A degraded read (store not open, pool
+timeout, failed statement) is `nullopt` from the `try_get_*` form, which logs a warning naming the
+reader and the cause, and a `503` on REST or a retryable error on MCP, never an empty page. Full
+account: `docs/auth-architecture.md`'s "Execution-statistics per-agent rollup (#3526)".
+
 ## PR 3 — SSE live updates
 
 `ExecutionEventBus` (`server/core/src/execution_event_bus.{hpp,cpp}`) is the
@@ -198,7 +223,7 @@ first, then bus.
 
 ### Publisher invariant
 
-Three `ExecutionTracker` mutators publish onto the bus when set:
+Four `ExecutionTracker` mutators publish onto the bus when set:
 
 - `update_agent_status` → `agent-transition` (one event per agent state
   change; payload is the `AgentExecStatus` JSON).
@@ -207,6 +232,15 @@ Three `ExecutionTracker` mutators publish onto the bus when set:
   `execution-completed` (status=succeeded|completed). The progress event
   precedes the terminal event so an SSE client receives counts then status.
 - `mark_cancelled` → terminal `execution-completed` (status=cancelled).
+- `reap_stuck_running_executions` (#4982 Part B, the clock-guarded background
+  sweep) → terminal `execution-completed` (status=cancelled), same shape as
+  `mark_cancelled`'s row above — it reproduces `mark_cancelled`'s state/event
+  coupling INLINE, inside its own advisory-lock-held transaction, rather than
+  calling `mark_cancelled` itself (never a new taxonomy, satisfying this
+  file's "one bus, one taxonomy" rule). The append sits inside the SAME
+  transaction as the cancelling `UPDATE`, so the clause-3 "outbox appends are
+  atomic inside the paired state-write txn" invariant below holds by the same
+  mechanism `mark_cancelled` already uses.
 
 ### Bounded ring buffer
 
@@ -296,6 +330,12 @@ client SSE listener's binding contract. Renaming any of them is a silent
 regression: the listener falls back to no-op and the drawer freezes
 mid-execution with no error.
 
+The Executions page (`/executions`, `yuzu-operate.js`) is a second client of the same
+stamps. `GET /fragments/executions/{id}/detail?view=page` returns `<div data-slot="selected">`
+followed by `<div data-slot="devices">` (the Device results panel, rendered by
+`render_exec_devices`), keeps every stamp above, and caps the per-device table at 500 rows
+and the collapsed responses list at 50; the drawer's default view is unchanged and uncapped.
+
 ### Audit policy
 
 `execution.live_subscribe` audits on first connect per session-per-execution
@@ -323,9 +363,9 @@ band context.
 
 **Three consumers, one bus, one set of publisher invariants** - the
 publisher list above (`update_agent_status` / `refresh_counts` /
-`mark_cancelled` → `agent-transition` / `execution-progress` /
-`execution-completed`) is the single taxonomy every consumer reads. The
-three live consumers are (1) the dashboard SSE route
+`mark_cancelled` / `reap_stuck_running_executions` → `agent-transition` /
+`execution-progress` / `execution-completed`) is the single taxonomy every
+consumer reads. The three live consumers are (1) the dashboard SSE route
 (`execution.live_subscribe`), (2) the agentic route
 (`api.v1.events.subscribe`, `GET /api/v1/events`), and (3) the **MCP
 progress bridge** (track 2f, `McpStreamBridge`), a *consumer-side
@@ -452,9 +492,13 @@ LISTEN/NOTIFY-plus-cursor-poll loop from it.
   transaction connection**, inside the same `with_txn_for` as the state
   mutation that produced it — the `agent_exec_status` upsert
   (`upsert_agent_status_once`), the aggregate recompute / terminal transition
-  (`refresh_counts_once`), and the cancel (`mark_cancelled`). A failed append
-  returns false, which rolls the whole transaction back, so the store can never
-  hold state without its event or an event without its state. The append takes
+  (`refresh_counts_once`), the cancel (`mark_cancelled`), and (#4982 Part B)
+  the stuck-execution reap sweep's own atomic cancel UPDATE
+  (`reap_stuck_running_executions`), which appends inline inside the SAME
+  advisory-lock-held transaction rather than calling `mark_cancelled`. A
+  failed append returns false, which rolls the whole transaction back, so the
+  store can never hold state without its event or an event without its
+  state. The append takes
   no lease of its own (nesting a pool acquire inside an open `with_txn` would
   deadlock). It is decoupled from `event_bus_`: the durable append happens
   regardless of whether a local SSE bus is attached; only the post-commit

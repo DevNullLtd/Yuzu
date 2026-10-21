@@ -249,6 +249,7 @@ else
     T5_START=$(now_ms)
     HELP_BODY=$(curl -s -b "$COOKIES" --max-time "$TIMEOUT_S" \
         -X POST "$DASHBOARD_URL/api/dashboard/execute" \
+        -H "Origin: $(sed -E 's,^([A-Za-z][A-Za-z0-9+.-]*://)([^/?#@]*@)?([^/?#]*).*,\1\3,' <<< "$DASHBOARD_URL")" \
         -d "instruction=help&scope=__all__" 2>/dev/null || echo "")
     T5_MS=$(elapsed_ms "$T5_START")
     HELP_ROWS=$(echo "$HELP_BODY" | grep -o 'result-row' | wc -l)
@@ -282,6 +283,7 @@ fi
 T6_START=$(now_ms)
 DISPATCH_BODY=$(curl -s -b "$COOKIES" --max-time "$TIMEOUT_S" \
     -X POST "$DASHBOARD_URL/api/command" \
+    -H "Origin: $(sed -E 's,^([A-Za-z][A-Za-z0-9+.-]*://)([^/?#@]*@)?([^/?#]*).*,\1\3,' <<< "$DASHBOARD_URL")" \
     -H "Content-Type: application/json" \
     -d '{"plugin":"os_info","action":"os_name"}' 2>/dev/null || echo "")
 CMD_ID=$(echo "$DISPATCH_BODY" \

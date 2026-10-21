@@ -1,15 +1,32 @@
 // Unified dashboard UI HTML — compiled in its own translation unit to isolate
-// the long raw string literal from MSVC's brace-matching in server.cpp.
+// the long raw string literals from MSVC's brace-matching in server.cpp.
+//
+// The page is a chain of NAMED parts. Each is one raw-string literal pinned
+// under kPartCap by a static_assert (MSVC C2026 caps a literal at 16,380
+// bytes; 15,000 leaves room for a fix-up without a re-split) and the parts
+// are joined once at static init. Add markup to
+// the part it belongs to; when a part nears the cap, cut a new named part
+// rather than growing it.
 
-// NOLINTBEGIN(cert-err58-cpp)
-extern const char* const kDashboardIndexHtml =
-    // Part 1: CSS + HTML markup (split to stay under MSVC's 16380-byte string limit)
-    R"HTM(<!DOCTYPE html>
+#include "app_shell.hpp"
+#include "agent_registry.hpp" // scope_kind_catalog(): the scope bar's reference line
+#include "operate_extras_ui.hpp" // YUZU_OX_CSS, YUZU_OX_SECRET_PARAMS
+#include "web_utils.hpp"
+
+#include <cstddef>
+#include <string>
+
+namespace {
+
+constexpr std::size_t kPartCap = 15000;
+
+// DOCTYPE, head, console CSS
+constexpr char kDashHead[] = R"HTM(<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Yuzu — Dashboard</title>
+  <title>Yuzu — Console</title>
   <link rel="stylesheet" href="/static/yuzu.css">
   <script src="/static/htmx.js"></script>
   <script>htmx.config.useTemplateFragments = true;</script>
@@ -24,495 +41,384 @@ extern const char* const kDashboardIndexHtml =
   <script src="/static/echarts.min.js"></script>
   <script src="/static/yuzu-charts.js"></script>
   <style>
-    body {
-      display: flex; flex-direction: column; height: 100vh;
-      overflow: hidden;
-    }
-    .dashboard-grid {
-      display: grid; flex: 1; min-height: 0;
-      grid-template-rows: auto 1fr auto;
-      grid-template-columns: 220px minmax(0, 1fr) 260px;
-      grid-template-areas:
-        "history instrbar  scope"
-        "history results   scope"
-        "history footer    scope";
-    }
-    /* Grid items default to min-width:auto (= min-content). The instr-bar's
-       nowrap content has a ~920px min-content, which pins the whole grid at
-       ~1400px and pushes the right-hand scope (agent list) column off-screen
-       under body{overflow:hidden} on narrower windows. min-width:0 lets the
-       middle track actually compress so the scope column stays visible.
-       (Responsive breakpoints — hiding the history rail and reflowing to two
-       columns on narrow viewports — live in static/yuzu.css.) */
-    .dashboard-grid > * { min-width: 0; }
+    /* ── Page frame ── The rows are the shared `.dash` grid in yuzu.css
+       ("Dashboard rows (delta 2026-10-14)"); this sheet only styles what is
+       specific to the console. The page scrolls like every other shell page. */
+    .dash-page { padding: 22px 28px 36px; display: flex; flex-direction: column; gap: 22px; }
+    .dash :focus-visible, .modal :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 
-    /* ── Instruction Bar ─────────────────────────────────────── */
-    .instr-bar {
-      grid-area: instrbar;
-      display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;
-      padding: 0.75rem 1rem;
-      border-bottom: 1px solid var(--border);
-      background: var(--surface);
+    /* Panels are bordered regions, not floating cards. */
+    .instr-bar, .results, .history-panel {
+      background: var(--surface); border: 1px solid var(--line);
+      border-radius: var(--rad-panel);
     }
-    .instr-bar label {
-      font-size: 0.8rem; font-weight: 600; color: var(--mds-color-theme-text-tertiary);
-      white-space: nowrap;
+    .results, .history-panel { display: flex; flex-direction: column; }
+    .history-panel { overflow: hidden; }
+    .panel-hd, .results-header, .scope-header, .history-header {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px;
+      padding: 12px 16px; border-bottom: 1px solid var(--line);
+      font-size: 14px; font-weight: 600; color: var(--ink);
     }
-    .instr-bar input[type="text"] {
-      flex: 1; padding: 0.45rem 0.75rem;
-      background: var(--bg); color: var(--fg);
-      border: 1px solid var(--border); border-radius: 0.375rem;
-      font-size: 0.875rem; font-family: var(--mono);
-      outline: none;
+    .results-header h2 { font-size: 14px; font-weight: 600; }
+    .results, .scope-panel, .history-panel { display: flex; flex-direction: column; }
+    .scope-panel, .history-panel { overflow: hidden; }
+    .panel-hd #status-badge { margin-left: auto; }
+
+    /* ── Console (instruction bar) ───────────────────────────── */
+    .instr-body { display: grid; gap: 12px; padding: 16px; }
+    .instr-field { display: flex; flex-direction: column; gap: 5px; }
+    .instr-field label { font-size: 13px; font-weight: 500; color: var(--ink2); }
+    .instr-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    .instr-wrap { position: relative; flex: 1 1 240px; display: flex; }
+    .instr-wrap input[type="text"] {
+      width: 100%; height: var(--ctl); padding: 0 10px;
+      background: var(--bg); color: var(--ink);
+      border: 1px solid var(--line2); border-radius: var(--rad-ctl);
+      font-family: var(--mds-font-family-mono); font-size: 12.5px;
     }
-    .instr-bar input[type="text"]:focus {
-      border-color: var(--accent);
-      box-shadow: 0 0 0 2px var(--mds-color-state-selected);
+    .instr-wrap input[type="text"]::placeholder { color: var(--faint); }
+    .stats { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 13px; color: var(--mut); }
+    /* Server OOB swaps replace these by id (sometimes as <span>), so style by id. */
+    #row-count, #stat-network, #stat-agent, #stat-total { margin-left: 3px; font-weight: 600; color: var(--ink); }
+
+    /* Status badge: the JS writes IDLE / RUNNING / DONE / ERROR, shown sentence-case. */
+    #status-badge {
+      display: inline-block; padding: 1px 8px; border-radius: 3px;
+      font-size: 12.5px; font-weight: 500; white-space: nowrap; text-transform: lowercase;
     }
-    .instr-bar input[type="text"]::placeholder { color: var(--mds-color-theme-outline-secondary); }
-    .instr-wrap { position: relative; flex: 1; display: flex; }
-    .instr-wrap input[type="text"] { width: 100%; }
+    #status-badge::first-letter { text-transform: uppercase; }
+    .badge-idle, .badge-done { color: var(--ok); background: var(--mds-color-bg-success-tinted); }
+    .badge-running { color: var(--info); background: var(--mds-color-bg-info-tinted); }
+    .badge-error { color: var(--bad); background: var(--mds-color-bg-error-tinted); }
+
+    /* Buttons: raised, 1px line, 3px radius; the primary action is the one solid blue. */
+    .instr-bar button, .btn-page, .btn-create-group, .create-group-form button,
+    .history-header button, .density-toggle, .modal .btn-close {
+      display: inline-flex; align-items: center; gap: 6px;
+      height: var(--ctl); padding: 0 14px; white-space: nowrap; cursor: pointer;
+      background: var(--raise); color: var(--ink);
+      border: 1px solid var(--line2); border-radius: var(--rad-ctl);
+      font: inherit; font-weight: 500; transition: background .12s, border-color .12s;
+    }
+    .instr-bar button:hover, .btn-page:hover, .btn-create-group:hover, .create-group-form button:hover,
+    .history-header button:hover, .density-toggle:hover, .modal .btn-close:hover {
+      background: var(--surface2); border-color: var(--mut);
+    }
+    .instr-bar button:disabled { opacity: .4; cursor: not-allowed; }
+    #btn-send, .create-group-form button {
+      background: var(--primary); color: var(--on-primary); border-color: var(--primary); font-weight: 600;
+    }
+    #btn-send:hover, .create-group-form button:hover { background: var(--primary-h); border-color: var(--primary-h); }
+    .btn-page, .btn-create-group, .history-header button, .density-toggle {
+      height: 28px; padding: 0 10px; font-size: 13px;
+    }
+    .density-toggle svg { width: 14px; height: 14px; }
+
+    /* Autocomplete: a pop-over, so it carries the shadow. */
     .ac-list {
-      display: none; position: absolute; top: 100%; left: 0; right: 0;
-      background: var(--surface); border: 1px solid var(--border);
-      border-radius: 0 0 0.375rem 0.375rem; max-height: 280px;
-      overflow-y: auto; z-index: 200; margin-top: 2px;
-      font-family: var(--mono); font-size: 0.825rem;
+      display: none; position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 200;
+      max-height: 280px; overflow-y: auto;
+      background: var(--raise); border: 1px solid var(--line2); border-radius: var(--rad-over);
+      box-shadow: var(--shadow); font-family: var(--mds-font-family-mono); font-size: 12.5px;
     }
     .ac-list.open { display: block; }
     .ac-item {
-      padding: 0.35rem 0.75rem; cursor: pointer; color: var(--fg);
-      border-bottom: 1px solid var(--border); display: flex;
-      justify-content: space-between; align-items: center;
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 8px 12px; cursor: pointer; color: var(--ink); border-bottom: 1px solid var(--line);
     }
-    .ac-item:last-child { border-bottom: none; }
-    .ac-item:hover, .ac-item.sel { background: var(--mds-color-state-active); }
-    .ac-item .ac-desc { color: var(--mds-color-theme-text-tertiary); font-size: 0.75rem; margin-left: 1rem; text-align: right; }
-    .instr-bar button {
-      padding: 0.45rem 1.2rem; font-size: 0.875rem; font-weight: 500;
-      background: var(--accent); color: var(--mds-color-text-on-accent); border: none;
-      border-radius: 0.375rem; cursor: pointer; transition: opacity 0.15s;
-    }
-    .instr-bar button:hover { opacity: 0.85; }
-    .instr-bar button:disabled { opacity: 0.4; cursor: not-allowed; }
-    #status-badge {
-      font-size: 0.7rem; padding: 0.15rem 0.5rem;
-      border-radius: 1rem; font-weight: 600;
-    }
-    .badge-idle     { background: var(--mds-color-theme-outline-secondary); color: var(--mds-color-text-on-accent); }
-    .badge-running  { background: var(--green); color: var(--mds-color-text-on-accent); }
-    .badge-done     { background: var(--green); color: var(--mds-color-text-on-accent); }
-    .badge-error    { background: var(--red); color: var(--mds-color-text-on-accent); }
-    .btn-clear {
-      padding: 0.45rem 0.8rem; font-size: 0.8rem; font-weight: 500;
-      background: var(--surface); color: var(--fg);
-      border: 1px solid var(--border); border-radius: 0.375rem;
-      cursor: pointer; transition: opacity 0.15s;
-    }
-    .btn-clear:hover { opacity: 0.85; }
+    .ac-item:last-child { border-bottom: 0; }
+    .ac-item:hover { background: var(--surface2); }
+    .ac-item.sel { background: var(--mds-color-state-selected); box-shadow: inset 3px 0 0 var(--hl); }
+    .ac-item .ac-desc { margin-left: 16px; text-align: right; font-family: var(--font); font-size: 12.5px; color: var(--mut); }
+)HTM";
+static_assert(sizeof(kDashHead) < kPartCap, "kDashHead must stay under the MSVC raw-string cap: split it");
 
-    /* ── Stats row ───────────────────────────────────────────── */
-    .stats {
-      display: flex; gap: 1.2rem; align-items: center;
-      font-size: 0.75rem; color: var(--mds-color-theme-text-tertiary); white-space: nowrap;
-    }
+// results, history, modal and palette CSS
+constexpr char kDashCss2[] = R"HTM(
 
-    /* ── Results Area ────────────────────────────────────────── */
-    .results {
-      grid-area: results;
-      overflow-y: auto;
-      display: flex; flex-direction: column;
-    }
-    .results-header {
-      display: flex; align-items: center; gap: 0.75rem;
-      padding: 0.5rem 1rem;
-      border-bottom: 1px solid var(--border);
-      background: var(--surface);
-    }
-    .results-header h2 { font-size: 0.85rem; font-weight: 600; }
+    /* ── Results ─────────────────────────────────────────────── */
+    /* The whole results panel scrolls (chart deck, filter bar, table together);
+       it sits under the console in the row grid and is capped so the page keeps
+       scrolling past it to the readout and panels. */
+    .results { min-height: 420px; max-height: 72vh; overflow-y: auto; }
+    .result-context, #result-summary { font-size: 13px; font-weight: 400; color: var(--mut); }
+    .result-context.is-error { color: var(--bad); }
+    #result-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+    .density-toggle { margin-left: auto; }
 
-    /* Chart deck (issue #253 / #587) — one or more chart cards rendered
-       above the filter bar by yuzu-charts.js when the dispatched
-       definition has a spec.visualization. */
+    /* Chart deck (issue #253 / #587) — one or more chart cards rendered above
+       the filter bar by yuzu-charts.js when the dispatched definition has a
+       spec.visualization. The partial-result notice yuzu-charts.js inserts
+       takes a full row of the wrapping deck. */
     .yuzu-chart-deck {
-      display: flex; flex-wrap: wrap; gap: 1rem;
-      padding: 0.75rem 1rem; background: var(--surface);
-      border-bottom: 1px solid var(--border);
+      display: flex; flex-wrap: wrap; gap: 16px; padding: 16px;
+      border-bottom: 1px solid var(--line);
     }
     .yuzu-chart-deck:empty { display: none; }
+    .yuzu-chart-deck > .yuzu-chart-truncated { flex: 0 0 100%; box-sizing: border-box; margin: 0; }
     .yuzu-chart-card {
-      flex: 1 1 360px; min-width: 320px; max-width: 600px; height: 280px;
-      background: var(--bg); border: 1px solid var(--border);
-      border-radius: var(--radius-md); padding: 0.5rem 0.75rem;
-      box-shadow: var(--mds-elevation-1);
+      flex: 1 1 360px; min-width: 320px; max-width: 600px; height: 280px; padding: 8px 12px;
+      background: var(--bg); border: 1px solid var(--line); border-radius: var(--rad-panel);
     }
-    .yuzu-chart-card svg, .yuzu-chart-card canvas {
-      display: block; max-width: 100%;
-    }
+    .yuzu-chart-card svg, .yuzu-chart-card canvas { display: block; max-width: 100%; }
 
     /* Filter bar */
     .filter-bar {
-      display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;
-      padding: 0.4rem 1rem; background: var(--surface);
-      border-bottom: 1px solid var(--border); font-size: 0.75rem;
+      display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px;
+      padding: 10px 16px; border-bottom: 1px solid var(--line); font-size: 13px;
     }
-    .filter-bar label { color: var(--mds-color-theme-text-tertiary); font-weight: 600; font-size: 0.65rem; text-transform: uppercase; }
+    .filter-bar label { font-weight: 500; color: var(--mut); }
     .filter-bar select, .filter-bar input[type="text"], .filter-bar input[type="search"] {
-      background: var(--bg); color: var(--fg); border: 1px solid var(--border);
-      border-radius: 4px; padding: 0.25rem 0.4rem; font-size: 0.75rem;
-      font-family: var(--font-mono);
+      height: 28px; padding: 0 8px; font: inherit; font-size: 13px;
+      background: var(--bg); color: var(--ink);
+      border: 1px solid var(--line2); border-radius: var(--rad-ctl);
     }
-    .filter-bar select:focus, .filter-bar input:focus { border-color: var(--mds-color-theme-accent-primary-normal); outline: none; }
-    /* #2691 (Gate 8 consistency-auditor): a degraded facet-values() read
-       disables the column filter dropdown — give it the same amber degrade
-       treatment as .result-degrade-banner rather than plain browser-default
-       styling, so it doesn't visually read as an unrelated form quirk. */
+    /* #2691: a degraded facet-values() read disables the column filter — same
+       warn treatment as .result-degrade-banner, not a plain form quirk. */
     .filter-bar select:disabled {
-      color: var(--yellow, #ffcc00); border-color: rgba(255, 204, 0, 0.4);
-      background: rgba(255, 204, 0, 0.08); opacity: 1;
+      color: var(--warn); opacity: 1; background: color-mix(in srgb, var(--warn) 12%, transparent);
+      border-color: color-mix(in srgb, var(--warn) 50%, var(--line2));
     }
-
-    /* Sortable column headers */
-    th.sortable { cursor: pointer; user-select: none; }
-    th.sortable:hover { color: var(--mds-color-theme-accent-primary-normal); }
-
-    /* Pagination */
-    #result-pagination {
-      display: flex; align-items: center; gap: 0.5rem;
-      padding: 0.4rem 1rem; font-size: 0.75rem; color: var(--mds-color-theme-text-tertiary);
-    }
-    .btn-page {
-      background: var(--surface); color: var(--fg); border: 1px solid var(--border);
-      border-radius: 4px; padding: 0.2rem 0.5rem; font-size: 0.7rem; cursor: pointer;
-    }
-    .btn-page:hover { border-color: var(--mds-color-theme-accent-primary-normal); color: var(--mds-color-theme-accent-primary-normal); }
-
-    /* Group creation */
-    .btn-create-group {
-      background: var(--green); color: var(--mds-color-text-on-accent); border: none; border-radius: 4px;
-      padding: 0.25rem 0.6rem; font-size: 0.7rem; cursor: pointer; margin-left: 0.5rem;
-    }
-    .btn-create-group:hover { background: var(--mds-color-indicator-success-bright); }
-    .create-group-form {
-      display: flex; align-items: center; gap: 0.5rem;
-      padding: 0.5rem 1rem; font-size: 0.75rem;
-    }
-    .create-group-form input[type="text"] {
-      background: var(--bg); color: var(--fg); border: 1px solid var(--border);
-      border-radius: 4px; padding: 0.3rem 0.5rem; font-size: 0.75rem;
-    }
-    .create-group-form button {
-      background: var(--green); color: var(--mds-color-text-on-accent); border: none; border-radius: 4px;
-      padding: 0.3rem 0.6rem; font-size: 0.75rem; cursor: pointer;
-    }
-    .form-hint { color: var(--mds-color-theme-text-tertiary); font-size: 0.7rem; }
-    .feedback-error { color: var(--mds-color-theme-indicator-error); font-size: 0.75rem; }
-)HTM"
-    // Part 1a: CSS continued (split to stay under MSVC's 16380-byte string
-    // limit — this session's degrade-banner/filter-bar CSS additions pushed
-    // Part 1 over it, CI-measured C2026).
-    R"HTM(
-    /* Scope section headers */
-    .scope-section-header {
-      padding: 0.3rem 0.75rem; font-size: 0.6rem; font-weight: 600;
-      text-transform: uppercase; letter-spacing: 0.05em; color: var(--mds-color-theme-outline-secondary);
-      border-top: 1px solid var(--border); margin-top: 0.25rem;
-    }
-
-    /* HTMX indicator */
     .htmx-indicator { display: none; }
     .htmx-request .htmx-indicator, .htmx-request.htmx-indicator { display: block; }
+    #results-loading { padding: 8px 16px; font-size: 13px; color: var(--mut); }
 
-    .table-wrap {
-      flex: 1; overflow-y: auto;
+    /* Table: sentence-case 12.5px headers on surface2, 1px row rules, hover surface2. */
+    /* Keeps >= 160px even when the chart deck and filter bar fill the panel; the panel then scrolls. */
+    .table-wrap { flex: 1 1 260px; min-height: 160px; overflow: auto; }
+    #results-table { width: 100%; border-collapse: collapse; --cell-y: 11px; }
+    #results-table.compact { --cell-y: 6px; }
+    #results-table thead th {
+      position: sticky; top: 0; z-index: 1; padding: 8px 16px; text-align: left; white-space: nowrap;
+      background: var(--surface2); border-bottom: 1px solid var(--line);
+      font-size: 12.5px; font-weight: 500; color: var(--mut);
     }
-    table {
-      width: 100%; border-collapse: collapse; font-size: 0.8rem;
+    #results-table th.sortable { cursor: pointer; user-select: none; }
+    #results-table th.sortable:hover { color: var(--ink); }
+    #results-table tbody td {
+      padding: var(--cell-y) 16px; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      border-bottom: 1px solid var(--line); font-size: 13.5px; color: var(--ink2);
     }
-    thead th {
-      position: sticky; top: 0; background: var(--surface);
-      text-align: left; padding: 0.45rem 0.6rem;
-      border-bottom: 2px solid var(--border); font-weight: 600;
-      color: var(--mds-color-theme-text-tertiary); text-transform: uppercase; font-size: 0.65rem;
-      letter-spacing: 0.05em;
+    #results-table td.col-agent { width: 10rem; font-weight: 600; color: var(--ink); }
+    #results-table .result-detail td { max-width: none; overflow: visible; white-space: normal; background: var(--bg); }
+    #results-table td.empty-state {
+      max-width: none; padding: 48px 16px; text-align: center; white-space: normal;
+      border-bottom: 0; color: var(--mut);
     }
-    tbody td {
-      padding: 0.3rem 0.6rem; border-bottom: 1px solid var(--border);
-      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-      max-width: 300px;
-    }
-    .result-detail td {
-      white-space: normal; overflow: visible; max-width: none;
-    }
-    tbody tr:hover { background: var(--mds-color-state-hover); }
-    .col-agent {
-      font-family: var(--mono); font-size: 0.7rem;
-      color: var(--yellow); width: 10rem;
-    }
-    .col-mono {
-      font-family: var(--mono); font-size: 0.75rem;
-    }
-    .empty-state {
-      text-align: center; padding: 3rem 1rem; color: var(--mds-color-theme-outline-secondary);
-      font-size: 0.85rem;
-    }
+    #results-table td.empty-state strong { color: var(--ink); }
     /* #2691 finding 7: an honest "store degraded, not zero matches" banner —
-       distinct from .empty-state so it doesn't visually read as "nothing here".
-       Amber, not alarm-red (#2691 Gate 6 enterprise-readiness): this is a
-       "temporarily unavailable, retrying" state, not a confirmed failure —
-       red is reserved for that, so it works against the calm/accurate copy
-       every degrade banner already carries. */
-    .result-degrade-banner {
-      color: var(--yellow, #ffcc00); background: rgba(255, 204, 0, 0.08);
-      border: 1px solid rgba(255, 204, 0, 0.4); border-radius: 0.5rem;
-      padding: 0.6rem 0.9rem; font-size: 0.8rem;
+       warn-toned (temporarily unavailable, retrying), never alarm-red. The td form
+       must outrank #results-table td.empty-state, which the banner row also is. */
+    .result-degrade-banner, #results-table td.result-degrade-banner {
+      padding: 8px 12px; font-size: 13.5px; color: var(--ink2); background: var(--surface2);
+      border: 1px solid color-mix(in srgb, var(--warn) 50%, var(--line2)); border-radius: var(--rad-panel);
+    }
+    /* Collapsed borders: the header rule wins the top edge, so frame the td with an inset shadow. */
+    #results-table td.result-degrade-banner {
+      border: 0; box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn) 50%, var(--line2));
+    }
+    .result-degrade-banner b { color: var(--ink); }
+
+    #result-pagination {
+      display: flex; align-items: center; gap: 8px; padding: 8px 16px;
+      border-top: 1px solid var(--line); font-size: 13px; color: var(--mut);
+    }
+    #result-pagination:empty { display: none; }
+    .create-group-form {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+      padding: 12px 16px; border-top: 1px solid var(--line);
+    }
+    .create-group-form input[type="text"] {
+      height: var(--ctl); padding: 0 10px; font: inherit;
+      background: var(--bg); color: var(--ink);
+      border: 1px solid var(--line2); border-radius: var(--rad-ctl);
+    }
+    .form-hint { font-size: 12.5px; color: var(--mut); }
+    .feedback-error { font-size: 13px; color: var(--bad); }
+
+    /* ── Scope bar and history ───────────────────────────────── */
+    /* The picker is a full-width bar: its list scrolls past six rows. History fills
+       its column beside the console (the row grid sets the height). */
+    .scope-list { max-height: 220px; overflow-y: auto; }
+    .scope-count { font-size: 13px; font-weight: 400; color: var(--mut); }
+    .history-panel { min-height: 160px; }
+    .history-list { flex: 1; min-height: 0; overflow-y: auto; }
+    .scope-section-header {
+      padding: 8px 16px; background: var(--surface2); border-bottom: 1px solid var(--line);
+      font-size: 12.5px; font-weight: 500; color: var(--mut);
+    }
+    .scope-item, .history-item { padding: 9px 16px; cursor: pointer; border-bottom: 1px solid var(--line); }
+    .scope-item { display: flex; flex-direction: column; gap: 2px; }
+    .scope-item:hover, .history-item:hover { background: var(--surface2); }
+    .scope-item.selected, .history-item.active {
+      background: var(--mds-color-state-selected); box-shadow: inset 3px 0 0 var(--hl);
+    }
+    .scope-item-name { font-size: 13.5px; font-weight: 500; color: var(--ink); }
+    .scope-item-all { font-weight: 600; }
+    .scope-item-meta { font-family: var(--mds-font-family-mono); font-size: 11.5px; color: var(--mut); }
+    .scope-item .online-dot { display: inline-block; width: 8px; height: 8px; margin-right: 8px; background: var(--ok); }
+    .history-header button { margin-left: auto; }
+    .history-cmd { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; color: var(--ink); }
+    .history-meta { font-size: 13px; color: var(--mut); }
+    .history-empty { padding: 24px 16px; text-align: center; font-size: 13px; color: var(--mut); }
+
+    .dash-foot {
+      display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px;
+      font-size: 12px; color: var(--faint);
+    }
+    .dash-foot kbd, .cmd-palette-footer kbd {
+      display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: auto;
+      padding: 1px 6px; background: var(--surface2); color: var(--mut);
+      border: 1px solid var(--line2); border-radius: 3px;
+      font-family: var(--mds-font-family-mono); font-size: 11px;
     }
 
-    /* ── Scope Panel ─────────────────────────────────────────── */
-    .scope {
-      grid-area: scope;
-      display: flex; flex-direction: column;
-      border-left: 1px solid var(--border);
-      background: var(--surface);
-    }
-    .scope-header {
-      padding: 0.75rem 1rem;
-      border-bottom: 1px solid var(--border);
-      font-size: 0.8rem; font-weight: 600;
-    }
-    .scope-count {
-      font-weight: 400; color: var(--mds-color-theme-text-tertiary); font-size: 0.7rem;
-      margin-left: 0.5rem;
-    }
-    .scope-list {
-      flex: 1; overflow-y: auto; padding: 0.25rem 0;
-    }
-    .scope-item {
-      display: flex; flex-direction: column; gap: 0.1rem;
-      padding: 0.45rem 1rem; cursor: pointer;
-      border-left: 3px solid transparent;
-      transition: background 0.1s;
-    }
-    .scope-item:hover { background: var(--mds-color-state-hover); }
-    .scope-item.selected {
-      background: var(--mds-color-state-active);
-      border-left-color: var(--accent);
-    }
-    .scope-item-name {
-      font-size: 0.8rem; font-weight: 500;
-    }
-    .scope-item-meta {
-      font-size: 0.65rem; color: var(--mds-color-theme-text-tertiary);
-      font-family: var(--mono);
-    }
-    .scope-item-all {
-      font-weight: 600; color: var(--accent);
-    }
-    .scope-item .online-dot {
-      display: inline-block; width: 6px; height: 6px;
-      border-radius: 50%; background: var(--green);
-      margin-right: 0.35rem; vertical-align: middle;
-    }
-
-    /* ── History Panel ───────────────────────────────────────── */
-    .history {
-      grid-area: history;
-      display: flex; flex-direction: column;
-      border-right: 1px solid var(--border);
-      background: var(--surface);
-    }
-    .history-header {
-      padding: 0.75rem 1rem;
-      border-bottom: 1px solid var(--border);
-      font-size: 0.8rem; font-weight: 600;
-      display: flex; justify-content: space-between; align-items: center;
-    }
-    .history-header button {
-      background: none; border: none; color: var(--mds-color-theme-text-tertiary); cursor: pointer;
-      font-size: 0.7rem; padding: 0.15rem 0.4rem;
-    }
-    .history-header button:hover { color: var(--fg); }
-    .history-list {
-      flex: 1; overflow-y: auto; padding: 0.25rem 0;
-    }
-    .history-item {
-      padding: 0.4rem 1rem; cursor: pointer;
-      border-left: 3px solid transparent;
-      transition: background 0.1s;
-    }
-    .history-item:hover { background: var(--mds-color-state-hover); }
-    .history-item.active {
-      background: var(--mds-color-state-active);
-      border-left-color: var(--accent);
-    }
-    .history-cmd {
-      font-size: 0.78rem; font-family: var(--mono); color: var(--fg);
-      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-    }
-    .history-meta {
-      font-size: 0.6rem; color: var(--mds-color-theme-text-tertiary); margin-top: 0.1rem;
-    }
-    .history-empty {
-      padding: 1.5rem 1rem; text-align: center;
-      font-size: 0.75rem; color: var(--mds-color-theme-outline-secondary);
-    }
-
-    /* ── Footer ──────────────────────────────────────────────── */
-    footer {
-      grid-area: footer;
-      padding: 0.4rem 1rem; border-top: 1px solid var(--border);
-      font-size: 0.7rem; color: var(--mds-color-theme-outline-secondary);
-    }
-
-    /* ── About Modal ─────────────────────────────────────────── */
+    /* ── About modal ─────────────────────────────────────────── */
     .modal-overlay {
-      display: none; position: fixed; inset: 0;
-      background: var(--mds-color-state-overlay-scrim); z-index: 2000;
-      align-items: center; justify-content: center;
+      display: none; position: fixed; inset: 0; z-index: 2000; align-items: center; justify-content: center;
+      background: var(--mds-color-state-overlay-scrim);
     }
     .modal-overlay.open { display: flex; }
     .modal {
-      background: var(--surface); border: 1px solid var(--border);
-      border-radius: 0.75rem; padding: 2rem; width: 380px;
-      text-align: center;
+      width: 380px; max-width: calc(100vw - 32px); padding: 24px;
+      background: var(--raise); border: 1px solid var(--line2); border-radius: var(--rad-over); box-shadow: var(--shadow);
     }
-    .modal h2 { font-size: 1.3rem; margin-bottom: 0.5rem; }
-    .modal .version { font-size: 0.8rem; color: var(--mds-color-theme-text-tertiary); margin-bottom: 1rem; }
-    .modal p { font-size: 0.8rem; color: var(--mds-color-theme-text-tertiary); line-height: 1.5; margin-bottom: 1rem; }
-    .modal .btn-close {
-      padding: 0.4rem 1.5rem; font-size: 0.8rem; font-weight: 500;
-      background: var(--accent); color: var(--mds-color-text-on-accent); border: none;
-      border-radius: 0.375rem; cursor: pointer;
-    }
-  </style>
-</head>
-)HTM"
-    // Split here: chunk 1 (head + <style>) was ~16 KB and bumped against
-    // the MSVC C2026 16380-byte raw-string-literal limit after the round-2
-    // visualization additions. Adjacent string literals concatenate at
-    // compile time, so the runtime HTML is byte-identical.
-    R"HTM(<body>
+    .modal h2 { font-size: 18px; font-weight: 600; }
+    .modal .version { margin: 2px 0 12px; font-size: 13px; color: var(--mut); }
+    .modal p { margin-bottom: 8px; font-size: 13px; line-height: 1.6; color: var(--mut); }
+    .modal a { color: var(--primary); text-decoration: none; }
+    .modal a:hover { text-decoration: underline; }
+    .modal .btn-close { margin-top: 8px; }
 
-  <nav class="nav-bar">
-    <a href="/" class="nav-brand">
-      <svg class="icon"><use href="/static/icons.svg#home"></use></svg> Yuzu
-    </a>
-    <a href="/" class="nav-link active">Dashboard</a>
-    <a href="/instructions" class="nav-link">Instructions</a>
-    <a href="/compliance" class="nav-link">Compliance</a>
-    <a href="/guardian" class="nav-link">Guardian</a>
-    <a href="/dex" class="nav-link">DEX</a>
-    <a href="/tar" class="nav-link">TAR</a>
-    <a href="/hardware" class="nav-link">Hardware</a>
-    <a href="/software" class="nav-link">Software</a>
-    <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
-    <a href="/result-sets" class="nav-link">Result Sets</a>
-    <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>
-    <span class="nav-spacer"></span>
-    <span class="nav-user" id="nav-user"></span>
-    <button class="nav-logout" hx-post="/logout">Logout</button>
-  </nav>
-  <div class="context-bar" id="context-bar">
-    <span class="context-role-badge" id="role-badge"></span>
-    <span class="context-user" id="context-user"></span>
-    <span class="context-spacer"></span>
-    <button class="context-bell" title="Notifications">
-      <svg class="icon"><use href="/static/icons.svg#bell"></use></svg>
-    </button>
+    /* ── Command palette (Ctrl+K): yuzu.css supplies the pop-over, rows and footer;
+       only this page's deltas live here. ── */
+    .cmd-palette { max-width: calc(100vw - 32px); }
+    .cmd-palette-input-row input { min-width: 0; font: inherit; outline: 0; }
+    .cmd-palette-input-row input:focus-visible { outline: 0; }
+    .cmd-section-header {
+      padding: 8px 16px; background: var(--surface2); font-size: 12.5px; font-weight: 500; color: var(--mut);
+      text-transform: none; letter-spacing: 0;
+    }
+    .cmd-result.active { background: var(--mds-color-state-selected); box-shadow: inset 3px 0 0 var(--hl); }
+    .cmd-result-desc { min-width: 0; }
+    .cmd-result-type { height: auto; padding: 1px 8px; border-radius: 3px; font-size: 12.5px; font-weight: 500; }
+  </style>
+)HTM";
+static_assert(sizeof(kDashCss2) < kPartCap, "kDashCss2 must stay under the MSVC raw-string cap: split it");
+
+// the shared Operate-extras style chunk and its two scripts (own part: the chunk's literal is
+// 2.4 KB and kDashCss2 is already 12 KB)
+constexpr char kDashHeadOx[] = R"HTM(  <style>
+)HTM" YUZU_OX_CSS R"HTM(  </style>
+  <script src="/static/yuzu-dialog.js" defer></script>
+  <script src="/static/yuzu-operate-extras.js" defer></script>
+</head>
+)HTM";
+static_assert(sizeof(kDashHeadOx) < kPartCap, "kDashHeadOx must stay under the MSVC raw-string cap: split it");
+
+// shell, page header, scope bar (the kinds line follows at run time)
+constexpr char kDashBodyScope[] = R"HTM(<body data-page="dashboard" data-secret-params=")HTM" YUZU_OX_SECRET_PARAMS R"HTM(">
+
+  <!--yuzu:shell--><!--/yuzu:shell-->
+
+  <main class="dash-page">
+
+  <div class="page-header">
+    <div>
+      <h1>Console</h1>
+      <p class="subtitle">Run an instruction against the fleet and watch responses arrive.</p>
+    </div>
   </div>
 
-  <div class="dashboard-grid">
+  <!-- Rows, top to bottom (design delta 2026-10-14, section 2): scope bar; console
+       beside history; readout; needs attention beside server health; recent events;
+       estate state beside compliance by policy. Rows with no real data source
+       (devices ranking, events by severity, command throughput, activity by hour)
+       are not drawn: no invented figures (P17). -->
+  <div class="dash">
 
-  <!-- ── Instruction Bar ────────────────────────────────────── -->
-  <!-- hx-on::before-request clears the chart deck the instant the
-       operator clicks Send so a stale chart from the previous
-       dispatch can't linger over the new query's results. The new
-       deck is delivered later via the OOB swap from
-       /fragments/results once execution has data to render. -->
-  <form class="instr-bar" id="instr-form"
-        hx-post="/api/dashboard/execute" hx-swap="none"
-        hx-on::before-request="clearChartDeck()">
-    <label>Instruction</label>
-    <div class="instr-wrap">
-      <input type="text" id="instr-input" name="instruction"
-             placeholder="Type a command or 'help'..."
-             autocomplete="off" spellcheck="false"
-             hx-get="/api/help/autocomplete" hx-trigger="input changed delay:150ms"
-             hx-target="#ac-list" hx-swap="innerHTML">
-      <div class="ac-list" id="ac-list"></div>
+  <!-- ── Row 1: Scope bar. The picker fills #scope-list (polled). The reference
+       line under it is the Scope DSL catalogue (/api/v1/discover/scope-kinds),
+       rendered once from the same table so it cannot drift. ───────────── -->
+  <section class="panel scope-bar" aria-label="Scope">
+      <div class="scope-header">
+        Scope <span class="scope-count" id="agent-count">0 agents</span>
+      </div>
+      <div class="ox-panel" id="ox-scope">
+        <h2>Target by scope expression</h2>
+        <div class="ox-pad">
+          <div class="ox-row">
+            <input type="text" id="ox-expr" class="ox-in" spellcheck="false" autocomplete="off"
+                   maxlength="8192" placeholder="ostype == &quot;windows&quot; AND tag:role == &quot;web&quot;"
+                   aria-label="Scope expression">
+          </div>
+          <div class="ox-row">
+            <button type="button" class="ox-btn" id="ox-validate" disabled>Validate</button>
+            <button type="button" class="ox-btn" id="ox-preview" disabled>Preview</button>
+          </div>
+          <div id="ox-expr-out" aria-live="polite"></div>
+        </div>
+      </div>
+      <div class="scope-list" id="scope-list"
+           hx-get="/fragments/scope-list"
+           hx-trigger="load, every 5s, agentChanged from:body"
+           hx-swap="innerHTML">
+      </div>
+)HTM";
+static_assert(sizeof(kDashBodyScope) < kPartCap, "kDashBodyScope must stay under the MSVC raw-string cap: split it");
+
+// row 2: console, results, history
+constexpr char kDashBodyConsole[] = R"HTM(  </section>
+
+  <!-- ── Row 2: Console (results below it) beside History ─────────── -->
+  <div class="rw cons">
+  <div class="col">
+  <!-- ── Console: instruction bar ───────────────────────────── -->
+  <!-- The page script's htmx:beforeRequest listener on this form clears
+       the chart deck the instant the operator clicks Send so a stale
+       chart from the previous dispatch can't linger over the new
+       query's results. The new deck is delivered later via the OOB
+       swap from /fragments/results once execution has data to render. -->
+  <form class="instr-bar panel" id="instr-form"
+        hx-post="/api/dashboard/execute" hx-swap="none">
+    <div class="panel-hd hd">
+      <h2>Console</h2>
+      <span id="status-badge" class="badge-idle">IDLE</span>
     </div>
-    <input type="hidden" name="scope" id="scope-input" value="__all__">
-    <button type="submit" id="btn-send">Send</button>
-    <span id="status-badge" class="badge-idle">IDLE</span>
-    <button type="button" class="btn-clear" onclick="clearResults()">Clear</button>
-    <div class="stats">
-      <span>Rows: <strong id="row-count">0</strong></span>
-      <span>Network: <strong id="stat-network">&mdash;</strong></span>
-      <span>Agent: <strong id="stat-agent">&mdash;</strong></span>
-      <span>Total: <strong id="stat-total">&mdash;</strong></span>
+    <div class="instr-body">
+      <div class="instr-field">
+        <label for="instr-input">Instruction</label>
+        <div class="instr-row">
+          <div class="instr-wrap">
+            <input type="text" id="instr-input" name="instruction"
+                   placeholder="Type a command or 'help'..."
+                   autocomplete="off" spellcheck="false"
+                   hx-get="/api/help/autocomplete" hx-trigger="input changed delay:150ms"
+                   hx-target="#ac-list" hx-swap="innerHTML">
+            <div class="ac-list" id="ac-list"></div>
+          </div>
+          <input type="hidden" name="scope" id="scope-input" value="__all__">
+          <input type="hidden" name="scope_expression" id="ox-scope-expression" value="" disabled>
+          <button type="submit" id="btn-send">Send</button>
+          <button type="button" class="btn-clear" onclick="clearResults()">Clear</button>
+          <button type="button" id="ox-tar-open" title="Run a read-only SQL query against the TAR warehouse on the selected target">Run on TAR history</button>
+        </div>
+      </div>
+      <div class="stats">
+        <span>Rows: <strong id="row-count">0</strong></span>
+        <span>Network: <strong id="stat-network">&mdash;</strong></span>
+        <span>Agent: <strong id="stat-agent">&mdash;</strong></span>
+        <span>Total: <strong id="stat-total">&mdash;</strong></span>
+      </div>
     </div>
   </form>
 
-  <!-- ── About Modal ──────────────────────────────────────── -->
-  <div class="modal-overlay" id="about-modal" onclick="closeAbout(event)">
-    <div class="modal">
-      <h2>Yuzu</h2>
-      <div class="version">Endpoint Management Platform</div>
-      <p id="about-details" style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);line-height:1.7;margin-bottom:0.75rem">
-        Loading...
-      </p>
-      <p style="font-size:0.7rem;margin-bottom:0.75rem">Built with C++23, gRPC, Protobuf, SQLite</p>
-      <p style="font-size:0.7rem;margin-bottom:1rem">
-        <a href="https://github.com/anthropics/yuzu" target="_blank" style="color: var(--mds-color-theme-accent-primary-normal);text-decoration:none">GitHub</a>
-        &nbsp;&middot;&nbsp;
-        <a href="/help" style="color: var(--mds-color-theme-accent-primary-normal);text-decoration:none">Documentation</a>
-      </p>
-      <p style="font-size:0.65rem;color: var(--mds-color-theme-outline-secondary);margin-bottom:1rem">AGPL-3.0-or-later (community) &middot; commercial license available for enterprise edition</p>
-      <button class="btn-close" onclick="closeAbout()">Close</button>
-    </div>
-  </div>
-
-)HTM"
-    // Part 1b: Command palette overlay
-    R"HTM(
-  <!-- ── Command Palette ─────────────────────────────────────── -->
-  <div id="cmd-palette" class="cmd-palette-overlay" style="display:none" onclick="if(event.target===this)cmdPalette.close()">
-    <div class="cmd-palette">
-      <div class="cmd-palette-input-row">
-        <svg class="icon"><use href="/static/icons.svg#search"></use></svg>
-        <input type="text" id="cmd-input" placeholder="Search agents, instructions, settings..." autocomplete="off" spellcheck="false">
-        <span class="cmd-palette-hint">ESC to close</span>
-      </div>
-      <div id="cmd-results" class="cmd-palette-results"></div>
-      <div class="cmd-palette-footer">
-        <span><kbd>&uarr;</kbd><kbd>&darr;</kbd> navigate</span>
-        <span><kbd>&crarr;</kbd> select</span>
-        <span><kbd>esc</kbd> close</span>
-      </div>
-    </div>
-  </div>
-
-)HTM"
-    // Part 2: HTML body continued
-    R"HTM(
-  <!-- ── History Panel ──────────────────────────────────────── -->
-  <div class="history">
-    <div class="history-header">
-      History
-      <button onclick="clearHistory()" title="Clear history">&times; Clear</button>
-    </div>
-    <div class="history-list" id="history-list">
-      <div class="history-empty" id="history-empty">No commands yet</div>
-    </div>
-  </div>
-
   <!-- ── Results ────────────────────────────────────────────── -->
-  <div class="results">
+  <div class="results panel">
     <div class="results-header">
       <h2>Results</h2>
-      <span id="result-context" style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary)"></span>
-      <div id="result-summary" style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary)"></div>
-      <span style="flex:1"></span>
+      <span id="result-context" class="result-context"></span>
+      <div id="result-summary"></div>
       <button class="density-toggle" id="density-toggle" onclick="toggleDensity()" title="Toggle table density">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
           <line x1="2" y1="4" x2="14" y2="4"/><line x1="2" y1="8" x2="14" y2="8"/><line x1="2" y1="12" x2="14" y2="12"/>
@@ -527,7 +433,7 @@ extern const char* const kDashboardIndexHtml =
     <!-- Filter bar — populated by OOB swap after command dispatch -->
     <div id="filter-bar"></div>
     <!-- Loading indicator for HTMX filter/sort requests -->
-    <div id="results-loading" class="htmx-indicator" style="padding:0.5rem;color:var(--muted);font-size:0.75rem">Loading...</div>
+    <div id="results-loading" class="htmx-indicator">Loading...</div>
     <div class="table-wrap" hx-ext="sse" sse-connect="/events">
       <table id="results-table">
         <thead id="results-thead"><tr></tr></thead>
@@ -554,19 +460,73 @@ extern const char* const kDashboardIndexHtml =
     <div id="group-form-slot"></div>
   </div>
 
-  <!-- ── Scope Panel ────────────────────────────────────────── -->
-  <div class="scope">
-    <div class="scope-header">
-      Scope <span class="scope-count" id="agent-count">0 agents</span>
-    </div>
-    <div class="scope-list" id="scope-list"
-         hx-get="/fragments/scope-list"
-         hx-trigger="load, every 5s, agentChanged from:body"
-         hx-swap="innerHTML">
+  </div>
+  <div class="col">
+    <div class="history-panel panel">
+      <div class="history-header hd">
+        History
+        <button onclick="clearHistory()" title="Clear history">&times; Clear</button>
+      </div>
+      <div class="history-list" id="history-list">
+        <div class="history-empty" id="history-empty">No commands yet</div>
+      </div>
     </div>
   </div>
+  </div>
+)HTM";
+static_assert(sizeof(kDashBodyConsole) < kPartCap, "kDashBodyConsole must stay under the MSVC raw-string cap: split it");
 
-  <footer>Yuzu Server &mdash; Dashboard <span style="float:right;color:var(--subtle)">Press <kbd style="display:inline-flex;align-items:center;justify-content:center;min-width:20px;height:18px;padding:0 4px;background:var(--bg);border:1px solid var(--border);border-radius:3px;font-size:0.6rem;font-family:var(--font-sans);color:var(--muted)">Ctrl+K</kbd> to search</span></footer>
+// rows 3-6: readout, attention + health, events, estate + policies
+constexpr char kDashBodyRows[] = R"HTM(
+  <!-- ── Row 3: Readout. The summary fragment replaces this section and swaps
+       Needs attention and Estate state out of band (home_render.hpp). ───── -->
+  <section id="dash-readout" class="readout" aria-label="Estate readout"
+           hx-get="/fragments/dashboard/summary" hx-trigger="load" hx-swap="outerHTML">
+    <div class="ro"><div class="l">Loading</div></div>
+  </section>
+
+  <!-- ── Row 4: Needs attention beside Server health ──────────────── -->
+  <div class="rw">
+    <section id="dash-attention" class="panel">
+      <div class="hd"><h2>Needs attention</h2></div>
+      <div class="pb mut">Loading</div>
+    </section>
+    <section class="panel" id="dash-health" hx-get="/fragments/dashboard/health"
+             hx-trigger="load" hx-swap="outerHTML">
+      <div class="hd"><h2>Server health</h2></div>
+      <div class="pb mut">Loading</div>
+    </section>
+  </div>
+
+  <!-- ── Row 5: Recent events, full width (the audit read) ─────────── -->
+  <div class="rw t1">
+    <section class="panel" id="dash-events" hx-get="/fragments/dashboard/activity"
+             hx-trigger="load" hx-swap="outerHTML">
+      <div class="hd"><h2>Recent events</h2></div>
+      <div class="pb mut">Loading</div>
+    </section>
+  </div>
+
+  <!-- ── Row 6: Estate state beside Compliance by policy (equal columns) ── -->
+  <div class="rw t3">
+    <section id="dash-estate" class="panel">
+      <div class="hd"><h2>Estate state</h2></div>
+      <div class="pb mut">Loading</div>
+    </section>
+    <section class="panel" id="dash-policies" hx-get="/fragments/dashboard/policies"
+             hx-trigger="load" hx-swap="outerHTML">
+      <div class="hd"><h2>Compliance by policy</h2></div>
+      <div class="pb mut">Loading</div>
+    </section>
+  </div>
+
+  <footer class="dash-foot">
+    <span>Yuzu Server &mdash; Console</span>
+    <span>Press <kbd>Ctrl+K</kbd> to search</span>
+  </footer>
+
+  </div><!-- /.dash -->
+  </main>
 
   <!-- HTMX-driven data loaders (no JS fetch calls) -->
   <div id="help-loader" hx-get="/api/help" hx-trigger="load, agentChanged from:body"
@@ -580,10 +540,49 @@ extern const char* const kDashboardIndexHtml =
        hx-trigger="loadHelp from:body">
   </div>
 
-  </div><!-- /.dashboard-grid -->
-)HTM"
-    // Part 2: JavaScript
-    R"HTM(
+)HTM";
+static_assert(sizeof(kDashBodyRows) < kPartCap, "kDashBodyRows must stay under the MSVC raw-string cap: split it");
+
+// about modal, command palette
+constexpr char kDashOverlays[] = R"HTM(  <!-- ── About Modal ──────────────────────────────────────── -->
+  <div class="modal-overlay" id="about-modal" onclick="closeAbout(event)">
+    <div class="modal">
+      <h2>Yuzu</h2>
+      <div class="version">Endpoint Management Platform</div>
+      <p id="about-details">Loading...</p>
+      <p>Built with C++23, gRPC, Protobuf, SQLite</p>
+      <p>
+        <a href="https://github.com/anthropics/yuzu" target="_blank">GitHub</a>
+        &nbsp;&middot;&nbsp;
+        <a href="/help">Documentation</a>
+      </p>
+      <p>AGPL-3.0-or-later (community) &middot; commercial license available for enterprise edition</p>
+      <button class="btn-close" onclick="closeAbout()">Close</button>
+    </div>
+  </div>
+
+  <!-- ── Command Palette ─────────────────────────────────────── -->
+  <div id="cmd-palette" class="cmd-palette-overlay" style="display:none" onclick="if(event.target===this)cmdPalette.close()">
+    <div class="cmd-palette">
+      <div class="cmd-palette-input-row">
+        <svg class="icon"><use href="/static/icons.svg#search"></use></svg>
+        <input type="text" id="cmd-input" placeholder="Search agents, instructions, settings..." autocomplete="off" spellcheck="false">
+        <span class="cmd-palette-hint">ESC to close</span>
+      </div>
+      <div id="cmd-results" class="cmd-palette-results"></div>
+      <div class="cmd-palette-footer">
+        <span><kbd>&uarr;</kbd><kbd>&darr;</kbd> navigate</span>
+        <span><kbd>&crarr;</kbd> select</span>
+        <span><kbd>esc</kbd> close</span>
+      </div>
+    </div>
+  </div>
+
+)HTM";
+static_assert(sizeof(kDashOverlays) < kPartCap, "kDashOverlays must stay under the MSVC raw-string cap: split it");
+
+// state, instruction map
+constexpr char kDashJs1[] = R"HTM(
   <script>
     /* ── State ─────────────────────────────────────────────── */
     var selectedScope = '__all__';
@@ -612,9 +611,11 @@ extern const char* const kDashboardIndexHtml =
     }
 
     /* Column schemas moved server-side — server renders <tr> HTML via SSE */
-)HTM"
-    // Part 3: Helpers and table management
-    R"HTM(
+)HTM";
+static_assert(sizeof(kDashJs1) < kPartCap, "kDashJs1 must stay under the MSVC raw-string cap: split it");
+
+// helpers, detail drawer, density
+constexpr char kDashJs2[] = R"HTM(
     /* ── Helpers ──────────────────────────────────────────── */
     function escapeHtml(s) {
       var d = document.createElement('div');
@@ -672,9 +673,11 @@ extern const char* const kDashboardIndexHtml =
 
     /* Apply saved density on load */
     applyDensity();
-)HTM"
-    // Part 3b: Table management and row operations
-    R"HTM(
+)HTM";
+static_assert(sizeof(kDashJs2) < kPartCap, "kDashJs2 must stay under the MSVC raw-string cap: split it");
+
+// table management, scope selection
+constexpr char kDashJs3[] = R"HTM(
     /* ── Table management ─────────────────────────────────── */
     var currentColumns = [];
 
@@ -732,8 +735,8 @@ extern const char* const kDashboardIndexHtml =
 
     // Drop any chart-card ECharts instances and empty the deck. Called
     // both when the operator clicks Clear and at the start of every new
-    // dispatch (hx-on::before-request on #instr-form) so a stale chart
-    // from the previous query never overlays the new one.
+    // dispatch (the htmx:beforeRequest listener on #instr-form, below)
+    // so a stale chart from the previous query never overlays the new one.
     function clearChartDeck() {
       var host = document.getElementById('chart-deck-host');
       if (!host) return;
@@ -786,8 +789,11 @@ extern const char* const kDashboardIndexHtml =
        POST /api/dashboard/execute returns HX-Trigger: {"loadHelp": true}
        which triggers the declarative #help-trigger element. */
 
-)HTM"
-    R"HTM(
+)HTM";
+static_assert(sizeof(kDashJs3) < kPartCap, "kDashJs3 must stay under the MSVC raw-string cap: split it");
+
+// send, history, autocomplete
+constexpr char kDashJs4[] = R"HTM(
     /* Trigger the HTMX form submission programmatically.
        Called by Enter key, history clicks, and global shortcut. */
     function sendInstruction() {
@@ -795,10 +801,12 @@ extern const char* const kDashboardIndexHtml =
     }
 
     /* ── Command history ─────────────────────────────────── */
-    function addHistory(cmd, scope) {
+    /* masked: the text shown had secret values replaced, so it is not the command that ran and
+       must never be sent again from History. */
+    function addHistory(cmd, scope, masked) {
       var now = new Date();
       var ts = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-      commandHistory.unshift({ cmd: cmd, scope: scope, timestamp: ts });
+      commandHistory.unshift({ cmd: cmd, scope: scope, timestamp: ts, masked: !!masked });
       if (commandHistory.length > 50) commandHistory.length = 50;
       renderHistory();
     }
@@ -823,7 +831,18 @@ extern const char* const kDashboardIndexHtml =
         div.innerHTML = '<div class="history-cmd">' + escapeHtml(h.cmd) + '</div>' +
           '<div class="history-meta">' + escapeHtml(h.timestamp) + ' &middot; ' + escapeHtml(h.scope) + '</div>';
         div.setAttribute('data-cmd', h.cmd);
+        if (h.masked) div.setAttribute('data-masked', '1');
         div.addEventListener('click', function() {
+          if (this.getAttribute('data-masked') === '1') {
+            /* The stored text has the secret values replaced; putting it in the box and
+               sending would send the placeholder as the value. Ask for it to be typed again. */
+            var rc = document.getElementById('result-context');
+            if (rc) {
+              rc.textContent = 'That command had secret values, which History does not keep. Type it again to send it.';
+              rc.className = 'result-context is-error';
+            }
+            return;
+          }
           document.getElementById('instr-input').value = this.getAttribute('data-cmd');
           sendInstruction();
         });
@@ -907,9 +926,11 @@ extern const char* const kDashboardIndexHtml =
         closeAC();
       }
     });
-)HTM"
-    // Part 4: HTMX SSE event hooks + menu JavaScript
-    R"HTM(
+)HTM";
+static_assert(sizeof(kDashJs4) < kPartCap, "kDashJs4 must stay under the MSVC raw-string cap: split it");
+
+// SSE hooks, about modal, toasts
+constexpr char kDashJs5[] = R"HTM(
     /* SSE output rows, row counting, auto-scroll, empty-state removal,
        agent-online/offline → all handled by server OOB swaps + HTMX
        attributes.  No JS event listeners needed. */
@@ -925,21 +946,6 @@ extern const char* const kDashboardIndexHtml =
       if (!e || e.target === document.getElementById('about-modal')) {
         document.getElementById('about-modal').classList.remove('open');
       }
-    }
-
-    /* ── Load current user info (nav bar + context bar) ─── */
-    function loadUserInfo() {
-      fetch('/api/me').then(function(r){return r.json()}).then(function(d){
-        document.getElementById('nav-user').textContent = (d.display_name || d.username);
-        var role = d.rbac_role || d.role;
-        document.getElementById('role-badge').textContent = role;
-        document.getElementById('context-user').textContent = (d.display_name || d.username);
-        document.body.setAttribute('data-role', role);
-        if(d.role !== 'admin' && role !== 'Administrator' && role !== 'PlatformEngineer') {
-          var sl = document.getElementById('nav-settings-link');
-          if(sl) sl.style.display = 'none';
-        }
-      });
     }
 
     /* ── Toast notification system ─────────────────────────── */
@@ -965,9 +971,11 @@ extern const char* const kDashboardIndexHtml =
       var d = e.detail || {};
       showToast(d.message || 'Done', d.level || 'success');
     });
-)HTM"
-    // Part 5: Command palette JavaScript
-    R"HTM(
+)HTM";
+static_assert(sizeof(kDashJs5) < kPartCap, "kDashJs5 must stay under the MSVC raw-string cap: split it");
+
+// command palette
+constexpr char kDashJs6[] = R"HTM(
     /* ── Command Palette ─────────────────────────────────── */
     var cmdPalette = {
       isOpen: false,
@@ -1015,11 +1023,11 @@ extern const char* const kDashboardIndexHtml =
         { name: 'Users', desc: 'Manage user accounts', url: '/settings#users', type: 'Settings' },
         { name: 'Enrollment Tokens', desc: 'Manage enrollment tokens', url: '/settings#tokens', type: 'Settings' },
         { name: 'Pending Agents', desc: 'Approve or deny pending agents', url: '/settings#pending', type: 'Settings' },
-        { name: 'TLS Settings', desc: 'Configure TLS certificates', url: '/settings#tls', type: 'Settings' },
+        { name: 'Security and sign-in', desc: 'Single sign-on, two-factor, HTTPS and agent mTLS', url: '/settings/security', type: 'Settings' },
         { name: 'API Tokens', desc: 'Manage API tokens', url: '/settings#api-tokens', type: 'Settings' }
       ],
       navEntries: [
-        { name: 'Dashboard', desc: 'Main dashboard view', url: '/', type: 'Navigation' },
+        { name: 'Console', desc: 'Main console view', url: '/', type: 'Navigation' },
         { name: 'Instructions', desc: 'Browse instruction definitions', url: '/instructions', type: 'Navigation' },
         { name: 'Inventory', desc: 'Installed software & device inventory', url: '/inventory', type: 'Navigation' },
         { name: 'Settings', desc: 'Server settings', url: '/settings', type: 'Navigation' },
@@ -1222,13 +1230,21 @@ extern const char* const kDashboardIndexHtml =
       }
     });
 
-    /* ── Global Keyboard Shortcuts ───────────────────────── */
+)HTM";
+static_assert(sizeof(kDashJs6) < kPartCap, "kDashJs6 must stay under the MSVC raw-string cap: split it");
+
+// global shortcuts, CSP-safe htmx bindings, init
+constexpr char kDashJs7[] = R"HTM(    /* ── Global Keyboard Shortcuts ───────────────────────── */
     document.addEventListener('keydown', function(e) {
       var tag = (e.target.tagName || '').toLowerCase();
       var isInput = (tag === 'input' || tag === 'textarea' || tag === 'select' || e.target.isContentEditable);
+      /* The scope expression field is text the operator is composing: neither chord may open the
+         palette or send the instruction from inside it. (The command line and the palette's own
+         input keep both: Ctrl+K closes the palette from its box, Ctrl+Enter sends from the line.) */
+      var inExpr = e.target.id === 'ox-expr';
 
       /* Ctrl+K / Cmd+K — open command palette */
-      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'k' && !inExpr) {
         e.preventDefault();
         if (cmdPalette.isOpen) { cmdPalette.close(); } else { cmdPalette.open(); }
         return;
@@ -1250,7 +1266,7 @@ extern const char* const kDashboardIndexHtml =
       }
 
       /* Ctrl+Enter — send current instruction */
-      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && !inExpr) {
         e.preventDefault();
         sendInstruction();
         return;
@@ -1267,8 +1283,8 @@ extern const char* const kDashboardIndexHtml =
     /* ── CSP-safe HTMX bindings ─────────────────────────────
        The dashboard's strict CSP forbids 'unsafe-eval', so HTMX
        features that internally call new Function(...) — namely
-       hx-on:* attributes and hx-vals="js:..." — are blocked at
-       runtime. We re-create each broken handler here using
+       the inline event-handler attributes and hx-vals="js:..." —
+       are blocked at runtime. We re-create each broken handler here using
        addEventListener (covered by 'unsafe-inline') and the
        htmx:configRequest event (no eval). */
 
@@ -1286,11 +1302,28 @@ extern const char* const kDashboardIndexHtml =
       }
     });
 
-    /* instr-form: close autocomplete before submit */
+    /* instr-form: close autocomplete and drop the previous chart deck before
+       submit. Clear the deck only for the form's own request (e.target): the
+       autocomplete input inside it fires bubbling beforeRequest events. */
     var instrForm = document.getElementById('instr-form');
     if (instrForm) {
-      instrForm.addEventListener('htmx:beforeRequest', function() {
+)HTM"
+    // Split here: the instr-form block below pushed this chunk past MSVC's C2026
+    // 16,380-byte raw-string-literal limit. Adjacent literals concatenate at compile time.
+    R"HTM(      /* Fail closed: the fan-out confirmation lives in yuzu-operate-extras.js (and needs
+         YuzuDialog). Until that script sets its ready flag, a Send is held, never sent. */
+      instrForm.addEventListener('htmx:confirm', function(e) {
+        if (e.target !== instrForm || window.__yuzuDashboardConfirmReady) return;
+        e.preventDefault();
+        var c = document.getElementById('result-context');
+        if (c) {
+          c.textContent = 'Send is unavailable: the confirmation dialog did not load. Reload the page.';
+          c.className = 'result-context is-error';
+        }
+      });
+      instrForm.addEventListener('htmx:beforeRequest', function(e) {
         if (typeof closeAC === 'function') closeAC();
+        if (e.target === instrForm) clearChartDeck();
       });
     }
 
@@ -1359,22 +1392,20 @@ extern const char* const kDashboardIndexHtml =
     }
 
     /* ── Init ─────────────────────────────────────────────── */
-    /* Agent list, help data, and user info are loaded by HTMX
-       attributes (hx-trigger="load") — no JS init calls needed
-       except loadUserInfo which updates body data-role. */
-    loadUserInfo();
+    /* Agent list and help data are loaded by HTMX attributes
+       (hx-trigger="load") — no JS init calls needed. The signed-in user is
+       filled by the app shell's own script (app_shell.cpp). */
 
     /* Auto-open command palette if redirected from another page via ?palette=1 */
     if (new URLSearchParams(window.location.search).has('palette')) {
       history.replaceState(null, '', '/');
       setTimeout(function() { cmdPalette.open(); }, 100);
     }
-)HTM"
-    // Split here: the PR2 MFA step-up intercept block pushed this chunk to
-    // ~18.3 KB, over MSVC's C2026 16380-byte raw-string-literal limit.
-    // Adjacent string literals concatenate at compile time, so the runtime
-    // HTML is byte-identical.
-    R"HTM(
+)HTM";
+static_assert(sizeof(kDashJs7) < kPartCap, "kDashJs7 must stay under the MSVC raw-string cap: split it");
+
+// MFA step-up intercept, close
+constexpr char kDashJs8[] = R"HTM(
     /* PR2 — MFA step-up intercept. High-risk REST/Settings handlers return
        401 + A4 envelope `{"error":{...},"meta":{"mfa_step_up_required":true,
        "challenge_url":"/login/mfa/stepup"}}` when the session's
@@ -1428,4 +1459,36 @@ extern const char* const kDashboardIndexHtml =
 </body>
 </html>
 )HTM";
+static_assert(sizeof(kDashJs8) < kPartCap, "kDashJs8 must stay under the MSVC raw-string cap: split it");
+
+// The scope bar's reference line: the ground kinds the picker offers (`__all__`,
+// `group:<name>`, the same two /api/v1/discover/scope-kinds lists) and every
+// attribute kind of the Scope DSL from the resolver's own catalogue, so the line
+// is the `scope.kinds` capability rendered, never a copy that can drift.
+std::string scope_kinds_line() {
+    using yuzu::server::html_escape;
+    std::string out = "    <div class=\"kinds\"><span class=\"k0\">Scope kinds</span>"
+                      "<span>all<b class=\"mono\">__all__</b></span>"
+                      "<span>group<b class=\"mono\">group:&lt;name&gt;</b></span>";
+    for (const auto& k : yuzu::server::detail::scope_kind_catalog())
+        out += "<span>" + html_escape(k.kind) + "<b class=\"mono\">" + html_escape(k.example) +
+               "</b></span>";
+    out += "<span class=\"end\">All Agents targets every enrolled agent</span></div>\n";
+    return out;
+}
+
+// Composed once at static init; one owner string keeps the baked page's source alive.
+// NOLINTBEGIN(cert-err58-cpp)
+const std::string kDashboardTemplateStr = std::string(kDashHead) + kDashCss2 + kDashHeadOx + kDashBodyScope +
+                                          scope_kinds_line() + kDashBodyConsole + kDashBodyRows +
+                                          kDashOverlays + kDashJs1 + kDashJs2 + kDashJs3 + kDashJs4 +
+                                          kDashJs5 + kDashJs6 + kDashJs7 + kDashJs8;
+
+} // namespace
+
+const char* const kDashboardIndexTemplate = kDashboardTemplateStr.c_str();
+
+// The shell (sidebar + header) is rendered into the template once, at static init (app_shell.hpp).
+extern const char* const kDashboardIndexHtml =
+    yuzu::server::shell::bake(kDashboardIndexTemplate, {.active_key = "dashboard"});
 // NOLINTEND(cert-err58-cpp)

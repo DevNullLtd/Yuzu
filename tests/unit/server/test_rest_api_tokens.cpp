@@ -368,6 +368,69 @@ TEST_CASE("REST DELETE /api/v1/tokens: unknown token id returns 404 with no audi
 // relevant failure conditions for token issuance must be auditable.
 // ──────────────────────────────────────────────────────────────────────────
 
+TEST_CASE("REST POST /api/v1/tokens: expires_at is a strict future integer, a bad body or value "
+          "mints nothing (#4644)",
+          "[pg][rest][token][numeric_params]") {
+    RestTokensHarness h;
+    h.session_user = "alice";
+    h.session_role = auth::Role::user;
+
+    const auto minted = [&h] { return h.token_store()->list_tokens("alice").value(); };
+
+    // Each of these used to mint a token (or throw a bare 500): -1 and a value above INT64_MAX
+    // (which wrapped to -1) never expire, 5.5 and 1e3 minted an already-expired token, and a
+    // wrong type, a truncated document or a non-object body threw. Now a 400 that mints nothing.
+    for (const char* bad :
+         {R"({"name":"t","expires_at":-1})", R"({"name":"t","expires_at":9223372036854775808})",
+          R"({"name":"t","expires_at":18446744073709551615})", R"({"name":"t","expires_at":5.5})",
+          R"({"name":"t","expires_at":1e3})", R"({"name":"t","expires_at":"7"})",
+          R"({"name":"t","expires_at":""})", R"({"name":"t","expires_at":null})",
+          R"({"name":"t","expires_at":true})", R"({"name":"t","expires_at":[]})",
+          // A positive epoch in the past would mint a dead token.
+          R"({"name":"t","expires_at":1000})", R"({"name":"t","expires_at":1})",
+          // Wrong-typed siblings and non-object bodies.
+          R"({"name":5,"expires_at":0})", R"({"name":"t","scope_service":1})",
+          R"({"name":"t","mcp_tier":true})", R"({"name":"t","expires_at":0)", "[]", "5",
+          R"("x")", "null", "not json", ""}) {
+        INFO(bad);
+        auto res = h.sink.Post("/api/v1/tokens", bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("\"code\":400") != std::string::npos);
+        CHECK(minted().empty());
+    }
+
+    // A tiered token with a past expiry is refused on the same rule, not minted dead.
+    {
+        auto res = h.sink.Post("/api/v1/tokens",
+                               R"({"name":"t","mcp_tier":"readonly","expires_at":1000})");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(minted().empty());
+    }
+
+    // The documented forms still mint: expires_at omitted, the 0 sentinel (never expires), and a
+    // future epoch (stored verbatim).
+    const int64_t future = static_cast<int64_t>(std::time(nullptr)) + 3600;
+    for (const std::string& ok : {std::string(R"({"name":"omitted"})"),
+                                  std::string(R"({"name":"zero","expires_at":0})"),
+                                  std::string(R"({"name":"future","expires_at":)") +
+                                      std::to_string(future) + "}"}) {
+        INFO(ok);
+        auto res = h.sink.Post("/api/v1/tokens", ok);
+        REQUIRE(res);
+        CHECK(res->status == 201);
+    }
+    const auto rows = minted();
+    REQUIRE(rows.size() == 3);
+    for (const auto& t : rows) {
+        if (t.name == "future")
+            CHECK(t.expires_at == future);
+        else
+            CHECK(t.expires_at == 0);
+    }
+}
+
 TEST_CASE("REST POST /api/v1/tokens: CSPRNG failure emits failure audit (F-002)",
           "[pg][rest][token][csprng][audit]") {
     RestTokensHarness h;
@@ -535,6 +598,45 @@ TEST_CASE("REST POST /api/v1/tokens: success path is unchanged (regression guard
     CHECK(h.audit_log[0].action == "api_token.create");
     CHECK(h.audit_log[0].result == "success");
     CHECK(h.audit_log[0].detail.find("csprng_unavailable") == std::string::npos);
+}
+
+TEST_CASE("REST POST /api/v1/tokens: the 201 carrying the raw token is never cacheable and "
+          "the raw token reaches no audit row",
+          "[pg][rest][token][nostore][audit]") {
+    RestTokensHarness h;
+    h.session_user = "alice";
+    h.session_role = auth::Role::user;
+
+    auto res = h.sink.Post("/api/v1/tokens", R"({"name":"alice-key","expires_at":0})");
+    REQUIRE(res);
+    REQUIRE(res->status == 201);
+
+    // Same contract as the rotate and engine mint routes.
+    CHECK(res->get_header_value("Cache-Control") == "no-store, no-cache, must-revalidate");
+    CHECK(res->get_header_value("Pragma") == "no-cache");
+
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    const std::string raw = body["data"]["token"].get<std::string>();
+    REQUIRE(raw.size() >= 16);
+    REQUIRE_FALSE(h.audit_log.empty());  // the loop below must have a row to inspect
+    for (const auto& a : h.audit_log) {
+        CHECK(a.action.find(raw) == std::string::npos);
+        CHECK(a.target_id.find(raw) == std::string::npos);
+        CHECK(a.detail.find(raw) == std::string::npos);
+    }
+}
+
+TEST_CASE("REST POST /api/v1/tokens: a validation 400 echoes no token",
+          "[pg][rest][token][nostore]") {
+    RestTokensHarness h;
+    h.session_user = "alice";
+    h.session_role = auth::Role::user;
+    // An MCP tier with no expiry is refused before anything is minted.
+    auto res = h.sink.Post("/api/v1/tokens", R"({"name":"k","mcp_tier":"readonly"})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(res->body.find("\"token\"") == std::string::npos);
 }
 
 // ──────────────────────────────────────────────────────────────────────────

@@ -48,7 +48,7 @@ You inherit the **Darwin compatibility guardian** role and extend it to all plat
 |----------|------|-------|
 | macOS | Paths | `/var` → `/private/var` symlink. Always `fs::canonical()` both sides before comparing. |
 | macOS | SQLite | Multi-threaded stores need mutex on `db_` handle. |
-| macOS | Erlang | `rebar3 ct` requires `--dir apps/yuzu_gw/test` with `--suite` flags. |
+| macOS | Erlang | `rebar3 ct` requires `--dir apps/yuzu_gw/test/ct` with `--suite` flags (ct does not recurse; `--dir apps/yuzu_gw/test` finds zero suites, #4800). |
 | Windows | Build | Do NOT use `vcvars64.bat`. Use `setup_msvc_env.sh` only. |
 | Windows | Compiler | Do NOT use Clang from `C:\Program Files\LLVM\bin`. Must be cl.exe / MSVC. |
 | Windows | Crypto | gRPC links OpenSSL (`libssl.lib` + `libcrypto.lib`) on Windows same as every other platform. Despite vcpkg's grpc port flagging "grpc only supports static library linkage", its TLS / JWT / PEM / X.509 code paths have hard references to OpenSSL that no amount of triplet tweaking avoids. See `.claude/agents/build-ci.md` "Windows MSVC static-link history and #375". |
@@ -58,7 +58,7 @@ You inherit the **Darwin compatibility guardian** role and extend it to all plat
 
 ## Reference Documents
 
-CLAUDE.md no longer carries the Windows toolchain commands or path inventory verbatim. Before reviewing any Windows-touching change, **read `docs/windows-build.md`** — it has the MSYS2 bash activation sequence (`setup_msvc_env.sh` + `scripts/ensure-erlang.sh`), the path table (cl.exe, cmake, ninja, python, meson, vcpkg, protoc, grpc_cpp_plugin), the `vcvars64.bat` failure mode, and the "no Clang" rule. Triggered by: any change to `meson.build` Windows branches, `setup_msvc_env.sh`, `.github/workflows/ci.yml` Windows matrix entries, or `vcpkg.json` `windows`/`!windows` platform filters.
+CLAUDE.md no longer carries the Windows toolchain commands or path inventory verbatim. Before reviewing any Windows-touching change, **read `docs/windows-build.md`** — it has the MSYS2 bash activation sequence (`setup_msvc_env.sh`; Meson resolves the gateway's Erlang/OTP itself, and `scripts/ensure-erlang.sh` is only for hand-run `rebar3`/`erl`), the path table (cl.exe, cmake, ninja, python, meson, vcpkg, protoc, grpc_cpp_plugin), the `vcvars64.bat` failure mode, and the "no Clang" rule. Triggered by: any change to `meson.build` Windows branches, `setup_msvc_env.sh`, `.github/workflows/ci.yml` Windows matrix entries, or `vcpkg.json` `windows`/`!windows` platform filters.
 
 ## Review Triggers
 

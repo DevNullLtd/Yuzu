@@ -19,7 +19,8 @@ Companion docs:
   including the option D LNK2038 fix and the four failed approaches that
   preceded it.
 - `docs/windows-build.md` — the canonical Windows build path
-  (MSYS2 bash + `setup_msvc_env.sh` + `scripts/ensure-erlang.sh`).
+  (MSYS2 bash + `setup_msvc_env.sh`; Meson resolves the gateway's Erlang/OTP
+  itself, and `scripts/ensure-erlang.sh` is only for hand-run `rebar3`/`erl`).
 
 ---
 
@@ -62,6 +63,10 @@ For a pool outage, inspect the runner service and host directly using the
 platform-specific sections below. Required-pool outages are intentionally red
 and keep the repository's **no merge to main while `nightly-broken` is open**
 discipline until the next green nightly closes the issue.
+
+There is no Linux fallback runner while Big Tam is down (the Shulgi runners are
+retired); the recovery path is described in the Rollback section of
+`docs/ci-ubuntu-2604-cutover.md`.
 
 ---
 
@@ -146,6 +151,9 @@ error names the cause:
 ---
 
 ## 1. Linux runner `yuzu-wsl2-linux` shows offline / tmux is dying
+
+> **Historical:** `yuzu-wsl2-linux` (Shulgi) is retired and no longer in
+> `.github/runner-inventory.json`. The runbook below is kept only as a record.
 
 **Symptom:**
 
@@ -514,8 +522,7 @@ OR the hand-rolled `find_library()` wiring re-introduces the failure.
 
 **Full history** including every failed approach
 (per-build-type triplets → explicit `CMAKE_BUILD_TYPE` → drop static
-override → option H hybrid) and the strategic escape path (#376 QUIC
-migration if option D ever rots) lives in
+override → option H hybrid) lives in
 `.claude/agents/build-ci.md` under **"Windows MSVC static-link history
 and #375"**. **Read that file before touching the Windows build wiring.**
 
@@ -570,11 +577,11 @@ Full set of candidate corruption paths under `clean: false`:
 - `C:\Windows\System32\config\systemprofile\AppData\Local\vcpkg\` — LOCAL SYSTEM profile cache (mostly registry clone, not archives, but check anyway)
 
 **Fix:** `scripts/ci/recovery/probe-and-nuke-vcpkg-windows.ps1`. Run over
-SSH on the runner as the `natha` interactive user with output redirected
+SSH on the runner as the `<user>` interactive user with output redirected
 to a `.out` file:
 
 ```powershell
-pwsh C:\path\to\Yuzu\scripts\ci\recovery\probe-and-nuke-vcpkg-windows.ps1 >> C:\Users\natha\Nuke-File.out 2>&1
+pwsh C:\path\to\Yuzu\scripts\ci\recovery\probe-and-nuke-vcpkg-windows.ps1 >> $HOME\Nuke-File.out 2>&1
 ```
 
 Outputs structured `KEY: value` inventory before + nuke + after. Preserves

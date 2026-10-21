@@ -413,20 +413,20 @@ struct JitHarness {
     }
 
     void enroll_mfa(const std::string& u) {
-        auto init = auth_db->mfa_init_enrollment(u, "Yuzu");
+        auto init = auth_db->mfa_init_enrollment(u, "Yuzu", std::nullopt);
         REQUIRE(init.has_value());
         auto bytes = mfa::base32_decode(init->secret_base32);
         REQUIRE(bytes.has_value());
         std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
         auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-        REQUIRE(auth_db->mfa_verify_enrollment(u, code).has_value());
+        REQUIRE(auth_db->mfa_verify_enrollment(u, code, std::nullopt).has_value());
     }
 
     // A cookie session for `u`. fresh_mfa=true stamps mfa_verified_at=now so the
     // elevation step-up passes; false leaves the epoch sentinel (stale) to
     // exercise the step-up challenge.
     std::string session_for(const std::string& u, Role r = Role::user, bool fresh_mfa = true) {
-        return auth_mgr.create_local_session(u, r, fresh_mfa);
+        return auth_mgr.create_local_session_for_test(u, r, fresh_mfa);
     }
 
     // An OIDC-authenticated cookie session whose display name is `u`. NOTE: post
@@ -858,6 +858,30 @@ TEST_CASE("revoking eligibility terminates an active elevation", "[pg][jit][rout
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(alice))); // elevation cleared
+}
+
+TEST_CASE("an elevated operator cannot grant elevation eligibility, but can revoke it",
+          "[pg][jit][routes]") {
+    JitHarness h;
+    REQUIRE(h.auth_db->set_elevation_eligible("bob", false).has_value());
+    auto alice = h.session_for("alice");
+    REQUIRE(h.post("/api/v1/elevate", alice, R"({"justification":"x"})")->status == 200);
+    auto res = h.post("/api/v1/users/bob/elevation-eligibility", alice, R"({"eligible":true})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.audit_detail("user.elevation_eligibility.set", "alice") ==
+          "elevated_session_eligibility_grant_blocked");
+    CHECK(h.auth_db->is_elevation_eligible("bob").value() == false);
+    // Revoking stays open to the elevated session.
+    REQUIRE(h.auth_db->set_elevation_eligible("bob", true).has_value());
+    REQUIRE(h.post("/api/v1/users/bob/elevation-eligibility", alice, R"({"eligible":false})")
+                ->status == 200);
+    CHECK(h.auth_db->is_elevation_eligible("bob").value() == false);
+    // An administrator's own role still grants it.
+    auto admin = h.session_for("admin", Role::admin);
+    REQUIRE(h.post("/api/v1/users/bob/elevation-eligibility", admin, R"({"eligible":true})")
+                ->status == 200);
+    CHECK(h.auth_db->is_elevation_eligible("bob").value() == true);
 }
 
 TEST_CASE("an operator cannot set their own elevation eligibility", "[pg][jit][routes]") {

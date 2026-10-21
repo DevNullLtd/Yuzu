@@ -7,10 +7,12 @@ name: Docs Lint
 # check and got wedged forever on a status that never arrived (the
 # path-filtered-required-check trap). The changelog jobs are fast and
 # dependency-light — no build, no vcpkg, no caches — so running them
-# unconditionally is cheap. `prometheus-rules` below is the one exception: it
-# reaches TWO registries — a digest-pinned Prometheus image from Docker Hub and
-# a hash-pinned PyYAML from PyPI — which is why it is a separate job, so an
-# outage at either reds only that check.
+# unconditionally is cheap. Three jobs are the exception, and each is a separate
+# job for the same reason: an outage must red only the check named for it, never
+# the dependency-free changelog jobs. `prometheus-rules` reaches TWO registries:
+# a digest-pinned Prometheus image from Docker Hub and a hash-pinned PyYAML from
+# PyPI. `definition-descriptions` reaches one, a hash-pinned PyYAML from PyPI.
+# `cbom-schema` reaches one too, a hash-pinned jsonschema from PyPI.
 on:
   # No paths filter: the required CHANGELOG-order status must report on every
   # PR. push fires only on mainline branches so a feature/fix branch with an
@@ -37,6 +39,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # Full history: the personal-data guard's baseline ratchet needs
+          # `git merge-base origin/dev HEAD`.
+          fetch-depth: 0
 
       - name: Verify CHANGELOG.md is in reverse chronological order
         run: python3 tests/test_changelog_order.py
@@ -49,6 +54,13 @@ jobs:
       # actually binds.
       - name: Issue-lifecycle docs hygiene (CLAUDE.md cap, do-not-close.txt)
         run: python3 tests/test_issue_docs.py
+
+      # Gateway peer authorization incident advice: every 'restart the gateway'
+      # instruction must carry the #5183 caveat and a conditional marker (a
+      # gateway restart can wedge released agents). Docs-only PRs skip the
+      # meson docs suite, so this runs here on every PR as well.
+      - name: Gateway peer restart-advice lint
+        run: python3 -I tests/test_gateway_peer_restart_advice_lint.py
 
       # ADR-0032 sequencing-interlock merge-gate (WS-0). No engine-path code may
       # merge until the unconditional set (a)-(d)+(h) lands. Governance runs from
@@ -65,6 +77,20 @@ jobs:
       # these constants — a loud, reviewable change, not one silent JSON value.
       - name: Split interlock tripwire self-test
         run: python3 tests/test_split_interlock_tripwire_selftest.py
+
+      # Personal-data guard: no real home paths, SIDs, tailnet IPs, MACs, private
+      # keys, consumer e-mail or tracked session artifacts in this PUBLIC repo.
+      # Pre-existing hits live in scripts/ci/personal-data-baseline.json (counts
+      # only); new hits fail, the baseline may only shrink (--ratchet, merge-base vs
+      # origin/dev, hence fetch-depth 0). See docs/plugin-readme-standard.md rule 5.
+      - name: Personal-data guard
+        # Ratchet against the PR's own target (a hotfix to main compares with main).
+        env:
+          PDG_BASE: origin/${{ github.base_ref || 'dev' }}
+        run: python3 -I scripts/ci/check-personal-data.py --strict-baseline --ratchet
+
+      - name: Personal-data guard self-test
+        run: python3 -I tests/test_check_personal_data_selftest.py
 
       # #1611: keeps the compiled-in TSan suppression in
       # tests/unit/test_runner_main.cpp honest — fails if any first-party code
@@ -167,6 +193,15 @@ jobs:
         run: python3 tests/test_gateway_abi_guard.py
       - name: QA-stack gateway crash signatures
         run: python3 tests/test_qa_stack_crash_pat.py
+      # #5420: the Compose Wizard's generated composes keep /etc/yuzu/certs
+      # writable and persistent in every mode. The test drives generate.js under
+      # node, which the self-hosted docs-suite runners may lack (the meson entry
+      # then skips), so run it here on the hosted image, which ships node, and
+      # fail rather than skip if node is missing.
+      - name: Compose Wizard certs volume (#5420)
+        run: |
+          node --version
+          YUZU_REQUIRE_NODE=1 python3 tests/test_compose_wizard.py
 
       # Changelog promote --append (#5221): folds post-promotion hotfix
       # fragments into an already-promoted release section. Stdlib only.
@@ -186,6 +221,20 @@ jobs:
       # and a release missing one fails before publishing. Stdlib + bash.
       - name: Release artifact gate
         run: python3 tests/test_check_release_artifacts.py
+
+      # Code-to-docs fact parity (docs/docs-drift-gate.md): every /api/vN/
+      # route, MCP tool and server/agent CLI flag is named in the user manual,
+      # ratcheted against a by-name baseline that only
+      # shrinks. Reuses check-api-parity.py's extractors; also self-checks
+      # the doc-coupling manifest that doc-coupling.yml's touch rule reads.
+      # Hosted in this required job so drift blocks merge, and LAST in it so a
+      # drift failure cannot hide a later step's result (the steps above have
+      # no `if:`, so a red step stops the job).
+      - name: Docs drift gate (fact parity)
+        run: python3 -I scripts/ci/check-docs-drift.py
+
+      - name: Docs drift gate self-test
+        run: python3 -I tests/test_docs_drift_selftest.py
 
   # Plugin README touch rule (docs/plugin-readme-standard.md rule 7): a change
   # under agents/plugins/<x>/src/** must also change agents/plugins/<x>/README.md
@@ -258,6 +307,59 @@ jobs:
         run: |
           git fetch --no-tags --depth=1 origin "$BASE_SHA"
           python3 scripts/assemble-changelog.py --guard "$BASE_SHA"
+
+  # CycloneDX 1.7 CBOM export: validate the exporter's committed golden output
+  # (tests/fixtures/cyclonedx/golden/, kept byte-equal to cbom_json by
+  # test_crypto_cbom.cpp) against the vendored official schema. jsonschema is
+  # hash-pinned in requirements-ci.txt. YUZU_REQUIRE_JSONSCHEMA=1 turns the
+  # test's local skip-without-jsonschema into a hard failure here. Its own job
+  # for the same PyPI-outage reason as definition-descriptions below.
+  cbom-schema:
+    name: CBOM schema
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install jsonschema (hash-pinned)
+        run: |
+          python3 -m pip install --user --break-system-packages \
+            --disable-pip-version-check --require-hashes -r requirements-ci.txt
+
+      - name: Validate CBOM goldens against CycloneDX 1.7
+        env:
+          YUZU_REQUIRE_JSONSCHEMA: "1"
+        run: python3 tests/test_cbom_schema.py
+
+  # Definition-description lint: shipped definitions (content/definitions and
+  # content/packs, as embed_content.py walks them) must carry
+  # descriptions an agentic worker can act on (definition, parameters, result
+  # columns), ratcheted against scripts/ci/definition-descriptions-baseline.json.
+  # Needs PyYAML (the content definitions are YAML), installed hash-pinned from
+  # requirements-ci.txt exactly like the prometheus-rules job below. ITS OWN JOB,
+  # deliberately: the install reaches PyPI, and a PyPI outage must red THIS check
+  # under a name that says what broke, not the required "CHANGELOG order" check.
+  # The test is not run with `python3 -I`: the pinned install is `--user`, which
+  # isolated mode ignores.
+  definition-descriptions:
+    name: Definition descriptions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install PyYAML (hash-pinned)
+        run: |
+          python3 -c "import yaml" 2>/dev/null || \
+            python3 -m pip install --user --break-system-packages \
+              --disable-pip-version-check --require-hashes -r requirements-ci.txt
+
+      - name: Definition description lint (ratchet)
+        run: python3 tests/test_definition_descriptions.py
 
   # Prometheus alert rules are code that runs in production and never compiles,
   # so nothing caught a rule that parses perfectly and can still never fire for

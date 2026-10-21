@@ -18,6 +18,7 @@
 #include "guardian_io_ceiling_fleet_tags.hpp" // Guardian io-ceiling fleet telemetry table (rung 9c PR-3)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet telemetry table (#2298 gate 3)
 #include "network_perf_rules.hpp"
+#include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log
 #include "offline_endpoint_store.hpp" // HA WS-5 presence merge (ADR-2002 §7a)
 #include "tar_corruption_audit.hpp" // #1567 tag keys + parse helpers
 #include "spark_fleet_tags.hpp" // SparkEngine fleet telemetry keys + count parse (rung 1)
@@ -26,6 +27,9 @@
 #include "service_scope_policy.hpp" // authz::is_service_tag_key — #3295
 #include "tag_store.hpp"
 #include "web_utils.hpp"
+
+#include <yuzu/server/auth.hpp> // auth::kMaxAgentIdLength
+#include <yuzu/log_token.hpp>
 
 namespace yuzu::server::detail {
 
@@ -57,6 +61,19 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
     session->os = info.platform().os();
     session->arch = info.platform().arch();
     session->agent_version = info.agent_version();
+    // Every spdlog call in THIS function prints the claimed id (via safe_agent_id) and any
+    // agent-supplied free text (tag key, hostname) or store error text neutralised (CWE-117; the
+    // hostname takes the closed-set id fold, the tag key and store error text the key-token fold);
+    // the gateway path reaches here without the direct path's token checks. Both callers read
+    // the enrollment status first (get_pending_status) and return on error; AuthDB refuses any
+    // id with a control byte or ',' there (agent_id_ok). The agent registry's other log lines
+    // that print a session-table id (removal, rollback, session-timeout, sweep and
+    // dispatch-routing lines), and the enrollment store's own agent-id log lines in auth_db.cpp
+    // (the admin-denied warnings and the consumed, added-to-pending, approved, denied and
+    // removed-from-queue lines) and the server's command-forward, asset-tag push and quarantine
+    // dispatch-denied lines in server.cpp, print it as stored: it carries no control byte, but
+    // space and '=' are not neutralised there, so those lines are not wrapped.
+    const std::string safe_agent_id = ::yuzu::log_id_token(info.agent_id());
     // Ingest filter (#3295): validated and non-service, mirroring TagStore's
     // own sync_agent_tags gate (tag_store.cpp) so a service claim or an
     // oversized/malformed key never reaches scope-DSL evaluation via the
@@ -65,7 +82,7 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         if (authz::is_service_tag_key(k)) {
             spdlog::info("AgentRegistry::register_agent({}): dropping self-reported "
                          "'service' tag from session scopable_tags (#3295)",
-                         info.agent_id());
+                         safe_agent_id);
             // Gate 6 hardening: the store-side purge (tag_store.cpp,
             // sync_agent_tags) has yuzu_server_tag_store_agent_service_purge_total;
             // this session-level drop is the ONLY signal for a gateway-proxied
@@ -78,7 +95,7 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         if (!TagStore::validate_key(k) || !TagStore::validate_value(v)) {
             spdlog::info("AgentRegistry::register_agent({}): dropping invalid scopable_tag "
                          "'{}' at ingest",
-                         info.agent_id(), k);
+                         safe_agent_id, ::yuzu::log_key_token(k));
             continue;
         }
         session->scopable_tags[k] = v;
@@ -141,7 +158,7 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         if (!revoked) {
             spdlog::error("AgentRegistry::register_agent: device token revoke-by-device failed "
                           "for '{}', refusing registration: {}",
-                          info.agent_id(), revoked.error());
+                          safe_agent_id, ::yuzu::log_key_token(revoked.error()));
             metrics_
                 .counter("yuzu_agents_registration_refused_total",
                          {{"reason", "device_token_revoke_failed"}})
@@ -183,7 +200,7 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
             spdlog::warn("AgentRegistry::register_agent: superseded by a concurrent "
                          "registration for '{}', not installing (this call's revoke already "
                          "committed)",
-                         info.agent_id());
+                         safe_agent_id);
             metrics_
                 .counter("yuzu_agents_registration_refused_total",
                          {{"reason", "superseded_by_concurrent_registration"}})
@@ -197,8 +214,11 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
     metrics_.counter("yuzu_agents_registered_total").increment();
     metrics_.gauge("yuzu_agents_connected").set(static_cast<double>(agent_count()));
     bus_.publish("agent-online", info.agent_id());
-    spdlog::info("Agent registered: id={}, hostname={}, plugins={}", info.agent_id(),
-                 info.hostname(), info.plugins_size());
+    // The hostname is agent-supplied and sits between two genuine `key=value` tokens, so it takes
+    // the closed-set id fold (space, '=', ',' and every non-ASCII byte become '_'): a hostname such
+    // as `x' plugins=0 id=victim '` cannot close the quote and add a same-line token.
+    spdlog::info("Agent registered: id={}, hostname='{}', plugins={}", safe_agent_id,
+                 ::yuzu::log_id_token(info.hostname()), info.plugins_size());
     return session;
 }
 
@@ -683,7 +703,8 @@ bool gateway_capability_missing(const AgentSession& session, yuzu::MetricsRegist
         .increment();
     spdlog::warn("send_to: refusing to route a dispatch-tagged command to agent {} via gateway "
                  "node '{}' — gateway has not advertised '{}'",
-                 agent_id, session.gateway_node, kGatewayWireCapabilityDispatchTagV1);
+                 agent_id, onbehalf::sanitize_for_log(session.gateway_node, 64),
+                 kGatewayWireCapabilityDispatchTagV1);
     return true;
 }
 
@@ -695,6 +716,13 @@ bool AgentRegistry::send_to(const std::string& agent_id, const ClassifiedCommand
         std::lock_guard lock(mu_);
         auto it = agents_.find(agent_id);
         if (it == agents_.end())
+            return false;
+        // #5294: a per-OS kill-switch OFF row is enforced here, at send time,
+        // so every local-session caller (including send_system_reserved) is
+        // covered and a session registered after the dispatch-time snapshot
+        // is still withheld. The set holds only validated windows|linux|darwin
+        // literals, so an empty/unknown session OS never matches.
+        if (cmd.kill_switched_os().contains(it->second->os))
             return false;
         session = it->second;
     }
@@ -746,6 +774,9 @@ int AgentRegistry::send_to_all(const ClassifiedCommand& cmd) {
         return 0;
     int count = 0;
     for (auto& s : snapshot) {
+        // #5294: mirror send_to()'s send-time per-OS enforcement.
+        if (cmd.kill_switched_os().contains(s->os))
+            continue;
         std::lock_guard slock(s->stream_mu);
         // #1004: mirror send_to() — gateway-pending path wins over any
         // Subscribe stream the gateway may also hold for the agent.
@@ -849,6 +880,27 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // example
         {"example.ping", "Returns a 'pong' response"},
         {"example.echo", "Echoes back the supplied message parameter"},
+        // update_source_trust
+        {"update_source_trust.sources",
+         "Package and update-source trust posture, facts only: Linux apt sources (one-line and "
+         "deb822; signed-by, trusted, and allow-insecure for one-line entries) and apt keyrings; "
+         "read-only, no subprocess; "
+         "other package families are not read, so an empty result on them is not evidence of no "
+         "sources"},
+        {"mgmt_posture.posture",
+         "Management-plane posture, facts only: which plane controls the device (none/ad/ipa on "
+         "Linux from sssd/ipa configuration as written), MDM enrolment on macOS; a refused read is "
+         "reported as permission_denied, never as not-joined; read-only, one bounded argv on macOS"},
+        {"shares.list",
+         "Shares this host serves over SMB/NFS as configured: name, path, ro/rw, anonymous access "
+         "and a few flags, never ACLs or NFS client host lists; configured exports, not the "
+         "mapping/session observations tar mapdrive records; Linux reads /etc/exports, "
+         "/etc/exports.d and /etc/samba/smb.conf, macOS and Windows are planned; read-only"},
+        {"remote_access_audit.list",
+         "SSH inbound-access audit as configured: sshd_config values (Include followed, Match not "
+         "evaluated), per-account authorized_keys key fingerprints with option names, and whether "
+         "sshd is enabled; never a key comment, option value or key-file path; Linux and macOS, "
+         "Windows is planned; read-only, default-off, Forensics:Read single-target"},
         // status
         {"status.version", "Agent version, build number, and git commit hash"},
         {"status.info", "Platform OS, architecture, and hostname"},
@@ -1012,6 +1064,10 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"msi_packages.product_codes",
          "Compact list of installed package identifiers (Windows MSI GUIDs / macOS pkgutil "
          "reverse-domain IDs)"},
+        {"msi_packages.list_inventory",
+         "Machine-context Windows Installer products (product code, name, version, publisher) for "
+         "the daily installed-software inventory; per-user MSI products are never listed; macOS "
+         "and Linux report unsupported"},
         // windows_optional_features
         {"windows_optional_features.list", "List Windows optional OS features with enabled/disabled/pending state (DISM)"},
         {"windows_optional_features.info", "Describe one Windows optional feature: display name, state, restart requirement (DISM)"},
@@ -1021,6 +1077,11 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // platform_security
         {"platform_security.secure_boot", "Report Secure Boot and setup-mode state (efivars on Linux, SecureBoot registry state on Windows; unsupported on macOS)"},
         {"platform_security.code_integrity", "Report code-signing enforcement posture (Linux LSM and lockdown, macOS Gatekeeper and SIP, Windows CI policy and Device Guard)"},
+        // local_security_policy
+        {"local_security_policy.password_policy", "Report local password policy posture: length, age, complexity, history (login.defs/pwquality/pam, pwpolicy, secedit; read-only)"},
+        {"local_security_policy.lockout_policy", "Report local account lockout policy posture: threshold, window, duration (faillock/pam, pwpolicy, secedit; read-only)"},
+        {"local_security_policy.audit_policy", "Report local audit policy posture: auditd rule counts, audit_control flags, secedit legacy audit categories (read-only)"},
+        {"local_security_policy.sudoers", "Report sudoers content: per-entry user, run-as, NOPASSWD tag and command allowlist from /etc/sudoers and /etc/sudoers.d (Linux and macOS, read-only; unsupported on Windows)"},
         // privacy_permissions
         {"privacy_permissions.permissions", "Report per-app sensitive-permission grants: camera, microphone, location, full-disk-access equivalents (read-only)"},
         // system_hardening
@@ -1033,11 +1094,14 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // pkg_inventory
         {"pkg_inventory.managers",
          "List package managers present on the host with manager-level config facts "
-         "(macOS Homebrew prefixes with tap/formula/cask counts; read-only, no subprocess; "
-         "macOS only today, Linux and Windows report unsupported)"},
+         "(macOS Homebrew prefixes; Linux dpkg/apt/rpm/dnf/pacman/apk/snap/flatpak presence "
+         "with apt/snap/flatpak counts; read-only, no subprocess; Windows planned)"},
         {"pkg_inventory.packages",
-         "List macOS Homebrew formulae and casks by name, version and kind (macOS only "
-         "today; the Linux package roster is owned by installed_apps)"},
+         "List macOS Homebrew formulae and casks by name, version and kind (macOS only; "
+         "Linux unsupported by design; installed_apps owns the roster)"},
+        {"pkg_inventory.store_packages",
+         "List installed snaps and flatpak apps/runtimes from the system store (Linux; "
+         "read-only, no subprocess; macOS unsupported by design, Windows planned)"},
         {"sccm.client_version", "Check if SCCM client is installed and report version"},
         {"sccm.site", "Get SCCM site assignment info"},
         // firmware_posture
@@ -1269,7 +1333,7 @@ std::string AgentRegistry::help_html(std::string_view filter) const {
     // OOB side-effects: context label + row count (extracted by HTMX
     // regardless of position, won't break the tbody parse context)
     result += "<span id=\"result-context\" hx-swap-oob=\"innerHTML\" "
-              "style=\"font-size:0.75rem;color:#8b949e\">" +
+              "class=\"result-context\">" +
               esc(context) + "</span>";
     result +=
         "<span id=\"row-count\" hx-swap-oob=\"innerHTML\">" + std::to_string(row_count) + "</span>";
@@ -1473,11 +1537,12 @@ std::string AgentRegistry::palette_html(std::string_view query) const {
 std::vector<std::string> AgentRegistry::all_ids() const {
     // HA WS-5: live_presence() is cached (kPresenceCacheTtl) and runs OFF
     // mu_ — the same rule the evaluate_scope preloads follow, never holding
-    // the registry lock across Postgres I/O. A null presence_store_
-    // (unconfigured) makes this call cost nothing beyond the pointer check;
-    // a configured one (the production default — see live_presence()'s own
-    // doc comment for why this is NOT gated behind an HA-only signal) costs
-    // at most one cached-or-fresh read, never a bare per-call round trip.
+    // the registry lock across Postgres I/O. An empty presence_reader_
+    // (unconfigured) makes this call cost one uncontended mutex acquisition plus
+    // the pointer check; a configured one (the production default — see
+    // live_presence()'s own doc comment for why this is NOT gated behind an
+    // HA-only signal) costs at most one cached-or-fresh read, never a bare
+    // per-call round trip.
     //
     // #4981 PR-1: this method's signature/contract predates the typed
     // PresenceReadError split and stays a plain vector — a degraded read
@@ -1506,6 +1571,18 @@ std::vector<std::string> AgentRegistry::all_ids() const {
     return ids;
 }
 
+std::expected<std::size_t, PresenceReadError> AgentRegistry::known_agent_count() const {
+    auto presence = live_presence(); // cached, runs OFF mu_ (see all_ids)
+    if (!presence)
+        return std::unexpected(presence.error());
+    std::lock_guard lock(mu_);
+    std::size_t n = agents_.size();
+    for (const auto& p : *presence)
+        if (!agents_.contains(p.agent_id))
+            ++n;
+    return n;
+}
+
 std::size_t AgentRegistry::local_agent_count() const {
     std::lock_guard lock(mu_);
     return agents_.size();
@@ -1520,14 +1597,26 @@ bool AgentRegistry::has_remote_presence(const std::vector<std::string>& ids) con
 }
 
 void AgentRegistry::configure_presence(OfflineEndpointStore* store, std::chrono::seconds ttl) {
-    presence_store_ = store;
+    configure_presence(store ? PresenceReadFn{[store](std::chrono::seconds t) {
+                                   return store->query_live_ids(t);
+                               }}
+                             : PresenceReadFn{},
+                       ttl);
+}
+
+void AgentRegistry::configure_presence(PresenceReadFn reader, std::chrono::seconds ttl) {
+    // Wiring and teardown only; locked so a reconfigure can never race an
+    // in-flight read. The cache age resets so the next read hits the new reader.
+    std::lock_guard lock(presence_cache_mu_);
+    presence_reader_ = std::move(reader);
     presence_ttl_ = ttl;
+    presence_cache_at_ = {};
 }
 
 std::expected<std::vector<PresenceIdentity>, PresenceReadError> AgentRegistry::live_presence() const {
-    if (!presence_store_)
-        return std::vector<PresenceIdentity>{};
     std::lock_guard lock(presence_cache_mu_);
+    if (!presence_reader_)
+        return std::vector<PresenceIdentity>{};
     const auto now = std::chrono::steady_clock::now();
     // `presence_cache_at_{}` (default-constructed epoch) is always stale on
     // the first call, so this always fetches at least once before serving a
@@ -1536,7 +1625,7 @@ std::expected<std::vector<PresenceIdentity>, PresenceReadError> AgentRegistry::l
     // not just a success — so a sustained outage pays exactly one real query
     // per kPresenceCacheTtl window, not one per caller.
     if (now - presence_cache_at_ >= kPresenceCacheTtl) {
-        presence_cache_ = presence_store_->query_live_ids(presence_ttl_);
+        presence_cache_ = presence_reader_(presence_ttl_);
         presence_cache_at_ = now;
     }
     return presence_cache_; // copy out under the cache lock, never mu_
@@ -1582,8 +1671,25 @@ std::shared_ptr<AgentSession> AgentRegistry::get_session(const std::string& agen
     return it != agents_.end() ? it->second : nullptr;
 }
 
-std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_view plugin) const {
+bool AgentRegistry::session_is(const std::string& agent_id, const std::string& session_id) const {
+    std::lock_guard lock(mu_);
+    auto it = agents_.find(agent_id);
+    return it != agents_.end() && it->second->session_id == session_id;
+}
+
+std::string AgentRegistry::session_id_of(const std::string& agent_id) const {
+    std::lock_guard lock(mu_);
+    auto it = agents_.find(agent_id);
+    return it != agents_.end() ? it->second->session_id : std::string{};
+}
+
+std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_view plugin,
+                                                                  std::string_view action) const {
     std::unordered_set<std::string> missing;
+    // Protective-action exemption: protective actions are never withheld on
+    // inventory grounds (see the declaration); decided before taking mu_.
+    if (yuzu::protective::is_protective_action(plugin, action))
+        return missing;
     std::lock_guard lock(mu_);
     for (const auto& [id, s] : agents_) {
         if (s->plugin_names.empty())
@@ -1594,32 +1700,159 @@ std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_vi
     return missing;
 }
 
-// Collect every from_result_set:<id> reference in a scope expression so the
-// resolver can preload owner-checked membership once per set. The scope AST is
-// a variant of Condition | Combinator (scope_engine.hpp); walk it recursively.
-static void collect_result_set_ids(const yuzu::scope::Expression& expr,
-                                   std::vector<std::string>& out) {
-    if (const auto* cond = std::get_if<yuzu::scope::Condition>(&expr)) {
-        if (cond->attribute.starts_with("from_result_set:"))
-            out.push_back(cond->attribute.substr(16));
-    } else if (const auto* comb =
-                   std::get_if<std::unique_ptr<yuzu::scope::Combinator>>(&expr)) {
-        if (*comb)
-            for (const auto& child : (*comb)->children)
-                collect_result_set_ids(child, out);
+std::expected<std::unordered_set<std::string>, PresenceReadError>
+AgentRegistry::ids_with_os(const std::unordered_set<std::string>& os_values) const {
+    std::unordered_set<std::string> out;
+    if (os_values.empty())
+        return out;
+    // live_presence() runs OFF mu_ (same discipline as all_ids / evaluate_scope).
+    auto presence = live_presence();
+    if (!presence)
+        return std::unexpected(presence.error());
+    std::lock_guard lock(mu_);
+    for (const auto& [id, s] : agents_) {
+        if (!s->os.empty() && os_values.contains(s->os))
+            out.insert(id);
     }
+    for (const auto& p : *presence) {
+        // Local wins: a session on this replica is judged by its own os.
+        if (!agents_.contains(p.agent_id) && !p.os.empty() && os_values.contains(p.os))
+            out.insert(p.agent_id);
+    }
+    return out;
 }
 
-// props.<key> and tag:<key> collection both use the shared
+// Collect every from_result_set:<id> reference in a scope expression so the
+// resolver can preload owner-checked membership once per set. It goes through
+// the shared yuzu::scope::collect_attribute_suffixes, which decodes the
+// synthetic encodings first: `LEN(from_result_set:x)` and
+// `STARTSWITH(from_result_set:x, p)` carry the attributes `__len:from_result_set:x`
+// and `__startswith:from_result_set:x`, and eval_condition resolves the decoded
+// `from_result_set:x`. A collector that matched the raw attribute would miss
+// those forms, skip both the unresolvable abort and the owner check, and let the
+// empty value be inverted by NOT into membership.
+static void collect_result_set_ids(const yuzu::scope::Expression& expr,
+                                   std::vector<std::string>& out) {
+    yuzu::scope::collect_attribute_suffixes(expr, "from_result_set:", out);
+}
+
+// props.<key> and tag:<key> collection use the same shared
 // yuzu::scope::collect_attribute_suffixes (scope_engine.hpp) — added with
 // ADR-0050 for exactly this preload pattern. Folding props onto it (Gate 7,
 // governance DSL-3/arch-F1) also FIXED a pre-existing defect: the local
 // collector this replaced matched the raw attribute, so `LEN(props.x)` /
 // `STARTSWITH(props.x, …)` (synthetic `__len:`/`__startswith:` encodings)
 // never contributed `x` to the preload and those atoms resolved against
-// nothing. collect_result_set_ids above stays local — it is shape-different
-// (id extraction, not a prefix-suffix walk) and from_result_set: has no
-// synthetic interplay worth encoding.
+// nothing. from_result_set: has the same synthetic forms and goes through the
+// same collector above.
+
+namespace {
+
+using ScopeAttrMap = std::unordered_map<std::string, std::string>;
+using ScopeResultSetMembers = std::unordered_map<std::string, std::unordered_set<std::string>>;
+
+// The identity and pre-resolved store rows ONE agent contributes to scope
+// evaluation. The fleet loop (local sessions AND presence-only ids) and the
+// single-agent evaluator (AgentRegistry::evaluate_scope_for_agent) all build
+// one of these and call resolve_scope_attribute below, so attribute
+// resolution has exactly one implementation.
+//
+// Every member is non-owning and must outlive the resolver call.
+struct ScopeAttributeSource {
+    const std::string& agent_id;
+    const std::string& os;
+    const std::string& hostname;
+    const std::string& arch;
+    const std::string& agent_version;
+    // In-memory scopable_tags of a LOCAL session: the tag:<key> FALLBACK,
+    // consulted only when `store_tags` has no row for the key. Null for a
+    // presence-only (remote-replica) id, which has no AgentSession and so no
+    // fallback source.
+    const ScopeAttrMap* fallback_tags;
+    // This agent's TagStore rows (key -> value). Null = the store holds no
+    // rows for the agent, or no store is wired.
+    const ScopeAttrMap* store_tags;
+    // This agent's CustomPropertiesStore rows (key -> value). Null = none.
+    const ScopeAttrMap* store_props;
+    // Preloaded owner-checked from_result_set:<id> membership. Null = no set
+    // was preloaded (every from_result_set: atom then resolves "").
+    const ScopeResultSetMembers* rs_members;
+};
+
+// DRIFT CONTRACT: every branch below MUST have a matching entry in
+// scope_kind_catalog() (declared just after the AgentRegistry class in
+// agent_registry.hpp) -- that catalog backs GET /api/v1/discover/scope-kinds
+// and its CROSS-CHECK test. Add the branch AND the catalog entry together.
+// This is the ONE attribute resolver: the fleet loop, its presence-only id
+// loop, and evaluate_scope_for_agent all call it, so there is no second copy
+// to keep in step. Presence-only ids differ from local sessions only in the
+// source they pass (`fallback_tags == nullptr`; identity from the presence
+// row), never in the branches.
+std::string resolve_scope_attribute(const ScopeAttributeSource& src, std::string_view key) {
+    // from_result_set:<id> -- composable-scope membership (capability
+    // §30). EXISTS-semantics: "true" iff this device is an owner-checked
+    // member of the preloaded set.
+    if (key.starts_with("from_result_set:")) {
+        if (src.rs_members == nullptr)
+            return {};
+        auto it = src.rs_members->find(std::string(key.substr(16)));
+        return (it != src.rs_members->end() && it->second.contains(src.agent_id)) ? "true"
+                                                                                 : "";
+    }
+    if (key == "ostype")
+        return src.os;
+    if (key == "hostname")
+        return src.hostname;
+    if (key == "arch")
+        return src.arch;
+    if (key == "agent_version")
+        return src.agent_version;
+    // tag:X lookups -- STORE-FIRST (#3295): the preloaded TagStore row (never
+    // a per-attribute store query here; the callers' preload blocks carry the
+    // fail-closed contract) wins when it has a row for this agent, matching
+    // the DEX cohort precedent (server.cpp -- "a rogue agent must not
+    // self-assign" -- same rationale here for dispatch targeting). in-memory
+    // scopable_tags is a FALLBACK only, for agents the store has no row for
+    // at all (gateway-proxied agents never sync -- ProxyRegister has no
+    // TagStore call; tracked as #3372). scopable_tags is validated and
+    // 'service'-filtered at register_agent ingest, so no additional
+    // validation is needed here.
+    if (key.starts_with("tag:")) {
+        const std::string tag_key(key.substr(4));
+        if (src.store_tags != nullptr) {
+            if (auto tag_it = src.store_tags->find(tag_key); tag_it != src.store_tags->end())
+                return tag_it->second;
+        }
+        if (src.fallback_tags != nullptr) {
+            if (auto it = src.fallback_tags->find(tag_key); it != src.fallback_tags->end())
+                return it->second;
+        }
+        return {};
+    }
+    // props.X lookups (custom properties, Phase 7.6) -- served from the
+    // preloaded rows, never a per-attribute store query (see the callers'
+    // preload blocks for the fail-closed contract).
+    if (key.starts_with("props.")) {
+        if (src.store_props != nullptr) {
+            if (auto prop_it = src.store_props->find(std::string(key.substr(6)));
+                prop_it != src.store_props->end())
+                return prop_it->second;
+        }
+        return {};
+    }
+    return {};
+}
+
+// Looks up an id's row set in a fleet-wide `agent_id -> (key -> value)` bulk
+// preload; null when the agent has no rows.
+const ScopeAttrMap*
+find_agent_rows(const std::unordered_map<std::string, ScopeAttrMap>& by_agent,
+                const std::string& id) {
+    auto it = by_agent.find(id);
+    return it != by_agent.end() ? &it->second : nullptr;
+}
+
+} // namespace
 
 std::expected<std::vector<std::string>, ScopeEvalError>
 AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const TagStore* tag_store,
@@ -1817,76 +2050,22 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
     std::vector<std::string> matched;
     std::lock_guard lock(mu_);
     for (const auto& [id, session] : agents_) {
-        // DRIFT CONTRACT: every branch below MUST have a matching entry in
-        // scope_kind_catalog() (declared just after this class in
-        // agent_registry.hpp) — that catalog backs GET /api/v1/discover/scope-kinds
-        // and its CROSS-CHECK test. Add the branch AND the catalog entry together.
-        // HA WS-5 (governance Gate 3 cpp-expert finding, 2026-09-22): the
-        // presence-only resolver a little further down (search "extend the
-        // iteration domain with presence") duplicates this lambda's
-        // ostype/hostname/arch/agent_version/tag:/props./from_result_set:
-        // branches against a PresenceIdentity instead of an AgentSession.
-        // The catalog cross-check test does NOT exercise that second copy —
-        // a new scope-kind branch added HERE without also updating THAT one
-        // silently under-matches presence-only (cross-replica) agents, with
-        // no test failure to catch it. Update both together. #4981 PR-1: this
-        // LOCAL loop runs for BOTH populations unchanged — only the
-        // presence-merge loop below is gated to ScopePopulation::Fleet, since
-        // `presence_rows` is always empty for LocalOnly.
-        auto resolver = [&](std::string_view attr) -> std::string {
-            auto key = std::string(attr);
-            // from_result_set:<id> — composable-scope membership (capability
-            // §30). EXISTS-semantics: "true" iff this device is an owner-checked
-            // member of the preloaded set.
-            if (key.starts_with("from_result_set:")) {
-                auto it = rs_members.find(key.substr(16));
-                return (it != rs_members.end() && it->second.contains(id)) ? "true" : "";
-            }
-            if (key == "ostype")
-                return session->os;
-            if (key == "hostname")
-                return session->hostname;
-            if (key == "arch")
-                return session->arch;
-            if (key == "agent_version")
-                return session->agent_version;
-            // tag:X lookups — STORE-FIRST (#3295): the bulk preload above (never
-            // a per-agent store query here; see the preload block's
-            // fail-closed contract) wins when it has a row for this agent,
-            // matching the DEX cohort precedent (server.cpp — "a rogue agent
-            // must not self-assign" — same rationale here for dispatch
-            // targeting). in-memory scopable_tags is a FALLBACK only, for
-            // agents the store has no row for at all (gateway-proxied agents
-            // never sync — ProxyRegister has no TagStore call; tracked as
-            // #3372). scopable_tags is validated
-            // and 'service'-filtered at register_agent ingest, so no
-            // additional validation is needed here.
-            if (key.starts_with("tag:")) {
-                auto tag_key = key.substr(4);
-                if (auto agent_it = tag_values.find(id); agent_it != tag_values.end()) {
-                    if (auto tag_it = agent_it->second.find(tag_key);
-                        tag_it != agent_it->second.end())
-                        return tag_it->second;
-                }
-                auto it = session->scopable_tags.find(tag_key);
-                if (it != session->scopable_tags.end())
-                    return it->second;
-                return {};
-            }
-            // props.X lookups (custom properties, Phase 7.6) — served from the
-            // bulk preload above, never a per-agent store query (see the
-            // preload block's comment for the fail-closed contract).
-            if (key.starts_with("props.")) {
-                auto prop_key = key.substr(6);
-                auto agent_it = props_values.find(id);
-                if (agent_it != props_values.end()) {
-                    auto prop_it = agent_it->second.find(prop_key);
-                    if (prop_it != agent_it->second.end())
-                        return prop_it->second;
-                }
-                return {};
-            }
-            return {};
+        // Attribute resolution is the shared resolve_scope_attribute above
+        // (see its DRIFT CONTRACT); this loop only supplies the source. #4981
+        // PR-1: this LOCAL loop runs for BOTH populations unchanged -- only
+        // the presence-merge loop below is gated to ScopePopulation::Fleet,
+        // since `presence_rows` is always empty for LocalOnly.
+        const ScopeAttributeSource src{id,
+                                       session->os,
+                                       session->hostname,
+                                       session->arch,
+                                       session->agent_version,
+                                       &session->scopable_tags,
+                                       find_agent_rows(tag_values, id),
+                                       find_agent_rows(props_values, id),
+                                       &rs_members};
+        auto resolver = [&src](std::string_view attr) -> std::string {
+            return resolve_scope_attribute(src, attr);
         };
         if (yuzu::scope::evaluate(expr, resolver)) {
             matched.push_back(id);
@@ -1896,51 +2075,28 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
     // HA WS-5: extend the iteration domain with presence for ids NOT in the
     // local registry (an id in both wins via the loop above and is never
     // considered twice). tag:/props. already resolve correctly for these
-    // ids — tag_values/props_values are id-keyed bulk preloads from
-    // Postgres, not scoped to local agents_ — so only
+    // ids -- tag_values/props_values are id-keyed bulk preloads from
+    // Postgres, not scoped to local agents_ -- so only
     // ostype/hostname/arch/agent_version need a presence-sourced stand-in
     // (no AgentSession exists for a remote-only id). scopable_tags has no
     // presence-backed fallback (that field is agent-self-reported, kept only
     // in-memory on the replica the agent is actually connected to; the
     // store-first tag_values preload above is the one source presence-only
-    // ids can resolve tag: through).
+    // ids can resolve tag: through), hence `fallback_tags == nullptr`.
     for (const auto& p : presence_rows) {
         if (agents_.contains(p.agent_id))
             continue;
-        auto resolver = [&](std::string_view attr) -> std::string {
-            auto key = std::string(attr);
-            if (key.starts_with("from_result_set:")) {
-                auto it = rs_members.find(key.substr(16));
-                return (it != rs_members.end() && it->second.contains(p.agent_id)) ? "true" : "";
-            }
-            if (key == "ostype")
-                return p.os;
-            if (key == "hostname")
-                return p.hostname;
-            if (key == "arch")
-                return p.arch;
-            if (key == "agent_version")
-                return p.agent_version;
-            if (key.starts_with("tag:")) {
-                auto tag_key = key.substr(4);
-                if (auto agent_it = tag_values.find(p.agent_id); agent_it != tag_values.end()) {
-                    if (auto tag_it = agent_it->second.find(tag_key);
-                        tag_it != agent_it->second.end())
-                        return tag_it->second;
-                }
-                return {};
-            }
-            if (key.starts_with("props.")) {
-                auto prop_key = key.substr(6);
-                auto agent_it = props_values.find(p.agent_id);
-                if (agent_it != props_values.end()) {
-                    auto prop_it = agent_it->second.find(prop_key);
-                    if (prop_it != agent_it->second.end())
-                        return prop_it->second;
-                }
-                return {};
-            }
-            return {};
+        const ScopeAttributeSource src{p.agent_id,
+                                       p.os,
+                                       p.hostname,
+                                       p.arch,
+                                       p.agent_version,
+                                       /*fallback_tags=*/nullptr,
+                                       find_agent_rows(tag_values, p.agent_id),
+                                       find_agent_rows(props_values, p.agent_id),
+                                       &rs_members};
+        auto resolver = [&src](std::string_view attr) -> std::string {
+            return resolve_scope_attribute(src, attr);
         };
         if (yuzu::scope::evaluate(expr, resolver)) {
             matched.push_back(p.agent_id);
@@ -1973,6 +2129,99 @@ AgentRegistry::evaluate_scope_local(const yuzu::scope::Expression& expr, const T
     return evaluate_scope_impl(expr, tag_store, props_store, /*rs_store=*/nullptr,
                                /*principal=*/{}, ScopePopulation::LocalOnly,
                                /*touch_referenced_result_sets=*/true);
+}
+
+std::expected<bool, ScopeEvalError>
+AgentRegistry::evaluate_scope_for_agent(const std::string& agent_id,
+                                        const yuzu::scope::Expression& expr,
+                                        const TagStore* tag_store,
+                                        const CustomPropertiesStore* props_store) const {
+    // Structural aborts first, with NO I/O and BEFORE the session lookup, so
+    // they match evaluate_scope_local for any agent id (including one with no
+    // session): a from_result_set: atom can never resolve here (no
+    // ResultSetStore, no principal), and a props.<key> atom with no
+    // CustomPropertiesStore cannot resolve at all. Under NOT either would
+    // otherwise invert to "member".
+    {
+        std::vector<std::string> refs;
+        collect_result_set_ids(expr, refs);
+        if (!refs.empty()) {
+            spdlog::error("AgentRegistry::evaluate_scope_for_agent: scope references "
+                          "from_result_set: but no ResultSetStore is wired to resolve it -- "
+                          "aborting scope evaluation");
+            return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::Unresolvable, {}});
+        }
+    }
+    std::vector<std::string> prop_keys;
+    yuzu::scope::collect_attribute_suffixes(expr, "props.", prop_keys);
+    if (!prop_keys.empty() && props_store == nullptr) {
+        spdlog::error("AgentRegistry::evaluate_scope_for_agent: scope references props.<key> but "
+                      "no CustomPropertiesStore is wired to resolve it -- aborting scope "
+                      "evaluation");
+        return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::Unresolvable, {}});
+    }
+
+    // A malformed id is never a member and must never reach a store: libpq text binds take the
+    // id as a NUL-terminated string, so an id containing a NUL byte is rejected here, before
+    // any store read (defence in depth). The predicate is: empty, > 256 bytes, or an embedded
+    // NUL. The evaluator checks the id itself before any store read and does not rely on the
+    // stores' own guards; this also keeps it from taking the session lookup for such an id.
+    if (agent_id.empty() || agent_id.size() > auth::kMaxAgentIdLength ||
+        agent_id.find('\0') != std::string::npos)
+        return false;
+
+    // Brief mu_ hold for the lookup only. The identity fields of a published
+    // session are immutable (AgentSession IMMUTABILITY CONTRACT), so the
+    // shared_ptr is read lock-free below and mu_ is never held across a store
+    // read.
+    const std::shared_ptr<AgentSession> session = get_session(agent_id);
+    if (!session)
+        return false; // LocalOnly population: only sessions on this replica are members.
+
+    // Same preload conditions and fail-closed contract as evaluate_scope_impl,
+    // but two PK point reads for THIS agent instead of two fleet-wide scans. A
+    // degraded read aborts; it is never "no rows" (under NOT that would invert
+    // to "member").
+    std::unordered_map<std::string, std::string> props_rows;
+    if (!prop_keys.empty()) {
+        auto rows = props_store->get_property_map(agent_id);
+        if (!rows) {
+            spdlog::error("AgentRegistry::evaluate_scope_for_agent: get_property_map degraded -- "
+                          "aborting scope evaluation");
+            return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::StoreDegraded, {}});
+        }
+        props_rows = std::move(*rows);
+    }
+    std::unordered_map<std::string, std::string> tag_rows;
+    {
+        std::vector<std::string> tag_keys;
+        yuzu::scope::collect_attribute_suffixes(expr, "tag:", tag_keys);
+        // A null tag_store with a tag: atom does NOT abort (scopable_tags is
+        // the in-memory fallback source); see evaluate_scope_impl.
+        if (!tag_keys.empty() && tag_store != nullptr) {
+            auto rows = tag_store->get_tag_map(agent_id);
+            if (!rows) {
+                spdlog::error("AgentRegistry::evaluate_scope_for_agent: get_tag_map degraded -- "
+                              "aborting scope evaluation");
+                return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::StoreDegraded, {}});
+            }
+            tag_rows = std::move(*rows);
+        }
+    }
+
+    const ScopeAttributeSource src{agent_id,
+                                   session->os,
+                                   session->hostname,
+                                   session->arch,
+                                   session->agent_version,
+                                   &session->scopable_tags,
+                                   tag_rows.empty() ? nullptr : &tag_rows,
+                                   props_rows.empty() ? nullptr : &props_rows,
+                                   /*rs_members=*/nullptr};
+    auto resolver = [&src](std::string_view attr) -> std::string {
+        return resolve_scope_attribute(src, attr);
+    };
+    return yuzu::scope::evaluate(expr, resolver);
 }
 
 const std::vector<ScopeKindInfo>& scope_kind_catalog() {
@@ -2158,12 +2407,20 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     for (const auto& m : kGuardianJournalAgeMetrics)
         metrics.clear_gauge_family(m.gauge);
     // Guardian M1 health-stream telemetry (#2298 gate 3, item 6d; #2993 added a 4th
-    // family, #4783 added the 5th/6th/7th - legacy-sink loss visibility) - same
+    // family, #4783 added the 5th/6th/7th - legacy-sink loss visibility; #5403, #4472 and
+    // #5404 added the Spark rows; kGuardianHealthMetrics is authoritative for the set) - same
     // absent-not-zero rule and same reason it bites hardest here: the writer is
-    // sparse, so a healthy fleet must see all 7 families ABSENT, never a fabricated
-    // 0; an inert (prefer_spark off) fleet still reports the 3 legacy_sink_* families
-    // live (they don't depend on the Spark flip - see guardian_health_fleet_tags.hpp).
+    // sparse, so a healthy fleet must see every family ABSENT, never a fabricated
+    // 0. The 3 legacy_sink_* families do not depend on the Spark flip (prefer_spark),
+    // so they are live on an inert fleet but still sparse: absent while they read 0
+    // (see guardian_health_fleet_tags.hpp).
     for (const auto& m : kGuardianHealthMetrics)
+        metrics.clear_gauge_family(m.gauge);
+    // #5403, #4472: the Spark claim AGE family (MAX): the pending-Disarm age and the
+    // outstanding-compensation age. Same rule: the writer emits each tag only while one
+    // Disarm (or one compensating teardown) is pending, so a fleet with none pending must read
+    // ABSENT, and a stale series from a sweep that did have one must not outlive it.
+    for (const auto& m : kGuardianHealthAgeMetrics)
         metrics.clear_gauge_family(m.gauge);
     // rung 9c PR-3: the arm-ledger re-statable-gauge pair (Decision 1) and the
     // io-ceiling monitor-only counter (Decision 3, Option B). Same absent-not-
@@ -2283,7 +2540,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     std::array<double, kNGuardianJournalAgeMetrics> gja_max{};
     std::array<bool, kNGuardianJournalAgeMetrics> gja_reported{};
     // Meta-signals ABOUT the rollup (guardian_journal_fleet_tags.hpp). Published
-    // unconditionally, including at 0, unlike the 32 - they are server-owned counts
+    // unconditionally, including at 0, unlike the 33 - they are server-owned counts
     // that always have a true value, so 0 is a measurement, not a fabricated zero.
     // `gj_reporting` is the coverage denominator absence otherwise hides; without it a
     // dark telemetry pipeline is indistinguishable from a healthy quiet fleet.
@@ -2294,7 +2551,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     int gj_tag_rejected = 0;
     // std::string twins of the table's C-string tag keys: get_view takes
     // const std::string&, so passing the char* directly would heap-construct a
-    // temporary key per lookup - 32 per agent per sweep. Built once (same pattern,
+    // temporary key per lookup - 33 per agent per sweep. Built once (same pattern,
     // and the same governance finding, as spark_mech_metric_keys above). It IS
     // registered for static destruction (non-trivial destructor), which is safe only
     // because health_recompute_thread_ - the sole production reader - is joined in
@@ -2319,7 +2576,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     std::array<double, kNGuardianHealthMetrics> gh_sum{};
     std::array<bool, kNGuardianHealthMetrics> gh_reported{};
     // rung 9c PR-3: the arm-ledger pair (Decision 1). SUM accumulate - same
-    // mechanical shape as the 32-row journal counter family (gj_sum above)
+    // mechanical shape as the 33-row journal counter family (gj_sum above)
     // despite being RE-STATABLE gauges rather than monotonic counters on the
     // agent side: this reader only ever sees one CURRENT value per agent per
     // sweep either way, so "sum the current values" is correct regardless of
@@ -2356,6 +2613,20 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             keys[i] = kGuardianHealthMetrics[i].tag;
         return keys;
     }();
+    // #5403, #4472: the health family's AGE rows (kGuardianHealthAgeMetrics) accumulate as
+    // MAX, never SUM, exactly like the journal age family (gja_max): a sum of ages is
+    // meaningless and the question is "how long has the worst endpoint's Disarm (or
+    // compensating teardown) been pending". `reported` gates publish, so
+    // MAX over an empty set is absence, never a fabricated 0.
+    std::array<double, kNGuardianHealthAgeMetrics> gha_max{};
+    std::array<bool, kNGuardianHealthAgeMetrics> gha_reported{};
+    // Same static-destruction-safety rationale as gj_keys above.
+    static const std::array<std::string, kNGuardianHealthAgeMetrics> gha_keys = [] {
+        std::array<std::string, kNGuardianHealthAgeMetrics> keys;
+        for (std::size_t i = 0; i < kNGuardianHealthAgeMetrics; ++i)
+            keys[i] = kGuardianHealthAgeMetrics[i].tag;
+        return keys;
+    }();
     // `yuzu.os` is an agent-CONTROLLED heartbeat tag; using it raw as a metric
     // label lets a malicious/buggy agent spray unbounded {os=...} series (a
     // Prometheus cardinality DoS). Allowlist it to the values a real agent emits
@@ -2372,6 +2643,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     int ota_signature_refusing = 0;
     int tar_db_corruption_agents = 0;               // #1567
     std::map<std::string, int64_t> plugin_init_failed; // #1567: plugin -> agents
+    int sync_skipping = 0; // #5332: agents whose installed_software daily sync is skipping
 
     for (const auto& [id, snap] : snapshots_) {
         ++healthy_count;
@@ -2457,6 +2729,16 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         static const std::string kKeySparkQueuedDropped{kSparkTagQueuedDropped};
         static const std::string kKeySparkConsumerErrors{kSparkTagConsumerErrors};
         static const std::string kKeySparkDisabled{kSparkTagDisabled};
+
+        // #5332: agents whose daily-sync source is skipping (skip_streak > 0). Same
+        // digits-only/>0 rule as the tar total above; its 18-char cap vs the emitter's 6 is
+        // harmless - the value is only counted, never summed or labelled.
+        // One source today (the agent emitter, #5327, is generic over every registered sync
+        // source, but only installed_software sets skip_reason); make this a table when a
+        // second source emits skip_streak.
+        static const std::string kKeySyncSkip{"yuzu.sync.installed_software.skip_streak"};
+        if (parse_tar_corruption_total(get_view(kKeySyncSkip)))
+            ++sync_skipping;
 
         auto os_val = get("yuzu.os");
         if (!os_val.empty())
@@ -2719,6 +3001,24 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         }
         if (health_reported_any)
             ++gh_reporting;
+        // #5403, #4472: the claim ages (pending Disarm, outstanding compensation), MAX
+        // accumulate. Same parse and the same
+        // reject-not-clamp posture as the journal age family: a forged value above the
+        // plausibility ceiling is counted in gh_tag_rejected, never allowed to own the
+        // fleet MAX. DELIBERATELY not fed into health_reported_any/gh_reporting: that
+        // meta-gauge's documented meaning is the counter family's coverage. An absent tag
+        // is skipped and does not contend.
+        for (std::size_t i = 0; i < kNGuardianHealthAgeMetrics; ++i) {
+            const auto raw = get_view(gha_keys[i]);
+            if (raw.empty())
+                continue;
+            if (auto v = parse_guardian_health_count(raw)) {
+                gha_max[i] = std::max(gha_max[i], *v);
+                gha_reported[i] = true;
+            } else {
+                ++gh_tag_rejected;
+            }
+        }
 
         // rung 9c PR-3 (Decision 1): arm-ledger pair. Same absent-vs-rejected
         // split as every family above - an empty view means this agent did not
@@ -2773,6 +3073,11 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // lexicographic order, the remainder summed under plugin="other".
     metrics.gauge("yuzu_fleet_tar_db_corruption_agents")
         .set(static_cast<double>(tar_db_corruption_agents));
+    // #5332: published every sweep, 0 included (a server-owned count over the reporting
+    // population, like yuzu_fleet_tar_db_corruption_agents above), so the fixed label set
+    // needs no clear_gauge_family.
+    metrics.gauge("yuzu_fleet_inventory_sync_skipping", {{"source", "installed_software"}})
+        .set(static_cast<double>(sync_skipping));
     {
         constexpr std::size_t kMaxPluginLabels = 64;
         std::size_t n = 0;
@@ -2909,7 +3214,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
 
     // Guardian journal rollup (#2298 gate 3). Families were cleared at the top, so a
     // signal NOBODY reported this cycle stays ABSENT - never a fabricated 0. On a
-    // healthy, quiescent or inert fleet that is ALL 30, which is the correct reading:
+    // healthy, quiescent or inert fleet that is ALL 33, which is the correct reading:
     // the journal has nothing to report, and "nothing to report" must not be
     // presentable as "checked and clean".
     for (std::size_t i = 0; i < kNGuardianJournalMetrics; ++i)
@@ -2951,6 +3256,10 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     for (std::size_t i = 0; i < kNGuardianHealthMetrics; ++i)
         if (gh_reported[i])
             metrics.gauge(kGuardianHealthMetrics[i].gauge).set(gh_sum[i]);
+    // #5403, #4472: the AGE rows' fleet MAX, same absent-when-unreported rule.
+    for (std::size_t i = 0; i < kNGuardianHealthAgeMetrics; ++i)
+        if (gha_reported[i])
+            metrics.gauge(kGuardianHealthAgeMetrics[i].gauge).set(gha_max[i]);
     metrics.gauge(kGuardianHealthReportingGauge).set(static_cast<double>(gh_reporting));
     metrics.gauge(kGuardianHealthTagRejectedGauge)
         .set(static_cast<double>(gh_tag_rejected));

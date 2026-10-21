@@ -629,6 +629,17 @@ scenario_P1iv() {
   fi
   ok "${name}-stderr: process started and printed the log-file-open fallback warning on stderr"
 
+  # The fallback warning is printed by main() BEFORE make_agent() and the SIGTERM handlers
+  # exist, so signalling on it alone races the handler install (SIGTERM's default action
+  # exits 143). Gate the signal on the agent's own run()-time readiness marker, which is
+  # logged only after the handlers are installed.
+  if ! wait_for_pattern "$AGENT_STDOUT_FILE" "$readiness_marker" 20; then
+    bad "$name" "agent never reached its run()-time readiness marker (handlers not yet installed) after the log-file fallback"
+    dump_case_transcripts "$dir"
+    kill -9 "$pid" 2>/dev/null || true
+    return
+  fi
+
   if wait_for_pattern "$AGENT_STDOUT_FILE" "Failed to open log file" 5; then
     ok "${name}-stdout: the fallback warning also reached the async console sink (stdout)"
   else

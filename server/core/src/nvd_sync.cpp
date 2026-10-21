@@ -254,10 +254,7 @@ void NvdSyncManager::sync_loop() {
         // While the catalog is still backfilling, retry soon (a failed window
         // shouldn't wait the full freshness interval); once complete, settle to
         // the periodic freshness cadence.
-        std::chrono::seconds wait = interval_;
-        if (!backfill_complete() && interval_ > std::chrono::seconds{60}) {
-            wait = std::chrono::seconds{60};
-        }
+        const std::chrono::seconds wait = nvd_sync_wait(interval_, backfill_complete());
 
         std::unique_lock<std::mutex> lock{mu_};
 #ifdef __cpp_lib_jthread

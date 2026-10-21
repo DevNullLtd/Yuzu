@@ -21,17 +21,26 @@
 /// transaction (see the .cpp for why that is a deliberately accepted,
 /// already-reviewed residual, not an oversight).
 ///
+/// #4966 adds the ACCOUNT-lifecycle consumers: `deactivate_account` (the guarded soft delete)
+/// and `set_local_role` (the guarded role-column write), plus the read-only advisory
+/// `would_strand_last_administrator`. `RbacStore::deactivate_account` / `set_local_role` /
+/// `would_strand_last_administrator` delegate here; `AuthManager` reaches them through an
+/// injected `RbacStore*`, never through this class directly.
+///
 /// Lock order (a change that inverts it can deadlock): the `rbac_store.rbac_meta`
 /// rbac_enabled row (`set_enforcement`'s explicit `FOR UPDATE` read takes it
-/// first; `RbacStore::set_rbac_enabled`, the unguarded seed/test primitive,
-/// ALSO takes it — via `write_rbac_enabled_in_txn`'s UPSERT's own implicit
-/// row lock, not a preceding explicit read — same relative order, no
+/// first, as do `deactivate_account` and `set_local_role`;
+/// `RbacStore::set_rbac_enabled`, the unguarded seed/test primitive,
+/// ALSO takes it via `write_rbac_enabled_in_txn`'s UPSERT's own implicit
+/// row lock, not a preceding explicit read, same relative order, no
 /// inversion between the two), then `rbac_store.principal_roles` rows FOR
-/// UPDATE OF pr (unassign always;
-/// `set_enforcement`'s ENABLE direction only), then one `auth.users` row
-/// (unassign only), then the `rbac_meta` write_generation row. A path that
+/// UPDATE OF pr, in `ORDER BY pr.principal_id` order (unassign always;
+/// `deactivate_account` always; `set_enforcement`'s ENABLE direction only), then
+/// one `auth.users` row (unassign, `deactivate_account` and `set_local_role`), then the
+/// `rbac_meta` write_generation row (the grant mutators only: `deactivate_account` and
+/// `set_local_role` change no `principal_roles` row and never bump it). A path that
 /// holds an `auth.users` row lock and then touches those would invert it.
-/// `provision_first_admin` is a DISJOINT lock path — it never touches the
+/// `provision_first_admin` is a DISJOINT lock path: it never touches the
 /// `rbac_enabled` row at all, and its `auth.users` interaction is a plain
 /// INSERT of a NEW row (there is nothing existing to lock; the table is, by
 /// construction, empty at that point), so it cannot participate in the
@@ -43,6 +52,12 @@
 /// whatever `bump_generation_in_txn`
 /// takes on the `write_generation` row. This class never applies the local
 /// cache generation: the caller does that only after a confirmed commit.
+///
+/// The `rbac_enabled` row lock taken by `deactivate_account` / `set_local_role` is load-bearing
+/// as the MUTEX for the lock-free COLUMN-floor recount (the active local admin population is
+/// counted without locking any `auth.users` row), not for reading the regime: every guarded
+/// decreaser of that population holds it, so two of them cannot both pass their recount.
+/// Direct SQL against `auth.users` is break-glass and outside the guarantee.
 
 #include "rbac_store.hpp" // RbacRegimeAuthority
 
@@ -163,11 +178,84 @@ public:
                                                       const std::string& password_hash,
                                                       const std::string& salt_hex) const;
 
+    /// #4966: the guarded soft delete behind `AuthManager::remove_user_checked`. ONE
+    /// transaction, in order:
+    ///   0. a transaction-local `lock_timeout` (`kDefaultLifecycleLockTimeout`, 2000 ms, see rbac_store.hpp), as the FIRST
+    ///      statement, so every lock wait below is bounded;
+    ///   1. `rbac_enabled` FOR UPDATE (fixes the regime for this transaction and serialises every
+    ///      guarded lifecycle write and the enforcement toggle);
+    ///   2. the counted Administrator grant set FOR UPDATE OF pr (`ORDER BY pr.principal_id`), in
+    ///      BOTH regimes, so a concurrent `unassign_role` of any counted grant waits and re-counts;
+    ///   3. the target's OWN grant row FOR UPDATE, before any `auth.users` write (it catches a
+    ///      grant committed after step 2's snapshot, and never inverts the lock order);
+    ///   4. the target's `auth.users` row FOR UPDATE, only when it is an active local `role='admin'`
+    ///      account (the column floor's membership test);
+    ///   5. the soft delete (`auth_sql::soft_delete_user_in_txn`); an unknown or already-inactive
+    ///      account matched nothing, so the transaction commits empty (`kNotFound`);
+    ///   6. GRANT floor, RBAC ON only: a SEPARATE statement (fresh READ COMMITTED snapshot that also
+    ///      sees this transaction's own write) recounts the authenticatable Administrator grants,
+    ///      only when the target was a counted grant or held a grant at all; zero refuses;
+    ///   7. COLUMN floor, BOTH regimes: a separate recount of the active local `role='admin'`
+    ///      accounts, only when the target was one; zero refuses.
+    /// A refusal rolls the whole transaction back (`kLastAdministratorRefused`, the account is
+    /// still active). The floors are independent and a refusal from either aborts. Each rejects
+    /// only a mutation that removes a member of ITS population and leaves it empty: a population
+    /// that is already empty never blocks an unrelated deactivation, and a target outside a
+    /// population is never refused on its account. Why two floors: under RBAC OFF a column admin
+    /// can assign a grant to themselves and enable enforcement in-band, so losing the last grant
+    /// holder is never a strand (and applying the grant floor there would refuse deactivating
+    /// the bootstrap admin, the sole grant holder, while other column admins exist); under ON a
+    /// grant-only holder cannot reach Settings, so the column population cannot be regenerated
+    /// in-band. Neither floor proves anyone can sign in (lockout, MFA, sso-only accounts and IdP
+    /// state are outside it). A PG deadlock-detector or `lock_timeout` abort is `kStoreFailure`,
+    /// never a hang or a half-applied write.
+    /// Not closed (disclosed): a grant INSERTed for the target after step 3 is not seen by this
+    /// transaction; it lands on an account that is inactive once this commits, which
+    /// `kAuthenticatableAdminGrantsFrom` does not count.
+    /// A `username` that `is_valid_username` rejects (empty, over 64 bytes, an embedded NUL or any
+    /// other character outside `[A-Za-z0-9._-]`) can never be a stored account: it answers
+    /// `kNotFound` before any statement runs, as do `set_local_role` and (as "not a member",
+    /// `ok` with `would_strand` false) `would_strand_last_administrator` below.
+    [[nodiscard]] AccountDeactivationResult deactivate_account(const std::string& username) const;
+
+    /// #4966: the guarded role-column write behind `AuthManager::update_role_checked`. ONE
+    /// transaction: the transaction-local `lock_timeout`; `rbac_enabled` FOR UPDATE on EVERY call
+    /// (RBAC ON included; the value is not read, the lock is the point: it serialises this write
+    /// against `deactivate_account` and `set_enforcement`); then the target's `auth.users` row
+    /// FOR UPDATE, which classifies the call (absent = `kNotFound`; already the requested role =
+    /// `kUnchanged`, nothing written; an INACTIVE row asked to become `admin` =
+    /// `kInactivePromotionRefused`, nothing written). The write is
+    /// `auth_sql::set_role_in_txn` (`match_inactive` only when demoting, so an inactive elevated
+    /// account can be demoted but never promoted). Only when an ACTIVE admin was demoted, a
+    /// SEPARATE recount of the active local admins runs after the write; zero rolls it back
+    /// (`kLastAdministratorRefused`). The COLUMN floor only: no `principal_roles` lock is taken,
+    /// because a role write never changes `is_active` and so cannot move the authenticatable
+    /// GRANT population. Lock order `rbac_enabled` -> one `auth.users` row, a strict subsequence
+    /// of the banner order.
+    [[nodiscard]] LocalRoleChangeResult set_local_role(const std::string& username,
+                                                       auth::Role role) const;
+
+    /// #4966: read-only, lock-free, best-effort twin of `deactivate_account`'s two floor checks,
+    /// so a caller can decline BEFORE irreversible related work. It is an early refusal, NOT a
+    /// guarantee that credentials are unchanged afterwards: two admins can both pass it and both
+    /// revoke, one deletion then being refused; a grant removal or a demotion can invalidate a
+    /// pass; the reads are separate autocommit statements on one lease (point-in-time per
+    /// statement, not one snapshot). Reuses the same population readers the guard and
+    /// `regime_authority` use, and the same regime split: the grant floor is evaluated under
+    /// RBAC ON only, the column floor in both.
+    [[nodiscard]] WouldStrandResult would_strand_last_administrator(const std::string& username) const;
+
 private:
     friend class RbacStore;
-    explicit RbacAdminAuthorityOwner(pg::PgPool& pool) : pool_(pool) {}
+    explicit RbacAdminAuthorityOwner(
+        pg::PgPool& pool,
+        std::chrono::milliseconds lifecycle_lock_timeout = kDefaultLifecycleLockTimeout)
+        : pool_(pool), lifecycle_lock_timeout_(lifecycle_lock_timeout) {}
 
     pg::PgPool& pool_;
+    /// The transaction-local `lock_timeout` `deactivate_account` / `set_local_role` install as
+    /// their first statement. Set by `RbacStore` from its own constructor parameter.
+    std::chrono::milliseconds lifecycle_lock_timeout_;
 };
 
 } // namespace yuzu::server

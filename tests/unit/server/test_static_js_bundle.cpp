@@ -16,7 +16,7 @@
  *     regenerates a `*_bundle.cpp` exposing the symbol as a
  *     `std::string` (or `std::string_view` for binary). Symbols covered
  *     here: `kEChartsJs`, `kThreeJs`, `kThreeOrbitControlsJs`,
- *     `kYuzuVizJs`, `kInterVariableWoff2`, `kYuzuCss`, `kYuzuChartsJs`.
+ *     `kYuzuVizJs`, the five `kIbmPlex*Woff2` fonts, `kYuzuCss`, `kYuzuChartsJs`.
  *
  * Plus the page HTML constant `kVizFleetPageHtml` from
  * `server/core/src/viz_page_ui.cpp` (separate TU at namespace scope).
@@ -37,6 +37,10 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <algorithm>
+#include <cmath>
+#include <map>
+#include <regex>
 #include <string>
 #include <string_view>
 
@@ -46,7 +50,7 @@ extern const std::string kSseJs;
 
 // External symbols from build-time embed targets (governance Gate 3 QE-B1):
 //   * kEChartsJs            — embed_js.py over server/core/vendor/echarts.min.js
-//   * kInterVariableWoff2   — embed_binary.py over vendor/inter/InterVariable.woff2
+//   * kIbmPlex*Woff2        — embed_binary.py over vendor/ibm-plex/*.woff2 (one per weight)
 //   * kYuzuCss              — embed_js.py over server/core/static/yuzu.css
 //   * kYuzuChartsJs         — server/core/src/charts_js_bundle.cpp (hand-written)
 namespace yuzu::server {
@@ -54,7 +58,11 @@ extern const std::string kEChartsJs;
 extern const std::string kThreeJs;
 extern const std::string kThreeOrbitControlsJs;
 extern const std::string kYuzuVizJs;
-extern const std::string_view kInterVariableWoff2;
+extern const std::string_view kIbmPlexSans400Woff2;
+extern const std::string_view kIbmPlexSans500Woff2;
+extern const std::string_view kIbmPlexSans600Woff2;
+extern const std::string_view kIbmPlexMono400Woff2;
+extern const std::string_view kIbmPlexMono500Woff2;
 extern const std::string kYuzuCss;
 extern const std::string kYuzuChartsJs;
 } // namespace yuzu::server
@@ -63,6 +71,7 @@ extern const std::string kYuzuChartsJs;
 // yuzu::server like the JS bundles).
 extern const char* const kVizFleetPageHtml;
 extern const char* const kVizHostPageHtml;
+extern const char* const kSettingsGeneralHtml;
 
 using Catch::Matchers::ContainsSubstring;
 
@@ -70,12 +79,12 @@ namespace {
 constexpr std::size_t kExpectedHtmxBytes = 50918;
 constexpr std::size_t kExpectedSseBytes = 8897;
 // Pinned upstream byte counts. If you intentionally update vendor/, bump
-// these in lock-step. ECharts 5.6.0 minified is 1,034,102 bytes; Inter v4.0
-// variable woff2 is 345,588 bytes; Yuzu CSS bundle is content-addressed by
+// these in lock-step. ECharts 5.6.0 minified is 1,034,102 bytes; the IBM Plex
+// Latin1 woff2 files (IBM's @ibm/plex-sans 1.1.0 and @ibm/plex-mono 2.5.0)
+// are pinned per weight in kExpectedPlex below; Yuzu CSS bundle is content-addressed by
 // the source file and approximate-pinned (a 1% drift tolerance lets the
 // design system iterate without re-flowing this file every commit).
 constexpr std::size_t kExpectedEChartsBytes = 1'034'102;
-constexpr std::size_t kExpectedInterWoff2Bytes = 345'588;
 constexpr std::size_t kYuzuCssMinBytes = 20'000;   // ≥20 KB sanity floor
 constexpr std::size_t kYuzuChartsMinBytes = 6'000; // ≥6 KB adapter floor
 // Three.js r168 ES-module minified bundle + OrbitControls ES module
@@ -353,6 +362,40 @@ TEST_CASE("static_js_bundle: kYuzuVizJs declares per-OS palette for linux/darwin
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("darwin:"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("windows:"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("pickOsColor"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("linux:   '#2dd4bf'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("darwin:  '#f5c542'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("macos:   '#f5c542'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("windows: '#4c9aff'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("default: '#9aa2ae'"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs pins the listener coral, talking-socket blue and local edge",
+          "[static-js][viz]") {
+    // Reverting the listener sphere to yellow (or the :port label away from the coral chart
+    // token) must fail loud: the invariants doc and the legend both name these colours.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("color: 0xff6b7a"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("ctx.fillStyle = '#ff6b7a'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("TALKING_SOCKET_COLOR = 0x7ab6ff"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("color: 0xe9ecf0"));
+}
+
+TEST_CASE("static_js_bundle: the Fleet page keeps its error banner and the Host page its Refresh button",
+          "[static-js][viz][page]") {
+    REQUIRE(kVizFleetPageHtml != nullptr);
+    REQUIRE(kVizHostPageHtml != nullptr);
+    const std::string fleet(kVizFleetPageHtml);
+    CHECK_THAT(fleet, ContainsSubstring("id=\"viz-error\" role=\"alert\""));
+    CHECK_THAT(fleet, ContainsSubstring("#viz-error.shown { display: flex; }"));
+    CHECK_THAT(std::string(kVizHostPageHtml), ContainsSubstring("id=\"refresh-btn\""));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs leaves the stage backdrop to the page CSS",
+          "[static-js][viz]") {
+    // The page's .viz-stage rule paints the backdrop so it follows the
+    // theme. That only shows through a transparent renderer, so alpha: true
+    // is load-bearing and the scene must not set an opaque background.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("alpha: true"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, !ContainsSubstring("scene.background ="));
 }
 
 TEST_CASE("static_js_bundle: kYuzuVizJs uses FNV-1a 32-bit hash for stable layout",
@@ -664,19 +707,19 @@ TEST_CASE("static_js_bundle: kYuzuVizJs guards camera position against NaN/Infin
 TEST_CASE("static_js_bundle: kYuzuVizJs declares CATEGORY_PALETTE for the six categories",
           "[static-js][viz][pr7]") {
     // PR 7 category palette. Each colour is a UX contract — it carries
-    // semantic meaning to the operator (browser=blue, db=amber, web=green
+    // semantic meaning to the operator (browser=blue, db=yellow, web=teal
     // etc.) so a stealth refactor that swaps a hex code is a deliberate
     // UX decision worth surfacing in PR review. Pin both the palette
     // constant name and every category=hex pair so a refactor that drops
     // or recolours a category fails this test loud.
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("CATEGORY_PALETTE"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("pickCategoryColor"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("system:   '#6e7681'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("browser:  '#58a6ff'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("database: '#d29922'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("web:      '#56d364'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("runtime:  '#bc8cff'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("other:    '#8b949e'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("system:   '#9aa2ae'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("browser:  '#4c9aff'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("database: '#f5c542'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("web:      '#2dd4bf'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("runtime:  '#a78bfa'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("other:    '#9199a6'"));
 }
 
 TEST_CASE("static_js_bundle: kYuzuVizJs lays processes out on hash(pid|ppid)-mod-bucket grid",
@@ -1018,25 +1061,50 @@ TEST_CASE("viz page: loads yuzu-viz.js as type=module", "[viz][page]") {
     CHECK_THAT(html, ContainsSubstring("<script type=\"module\" src=\"/static/yuzu-viz.js\">"));
 }
 
-TEST_CASE("viz page: nav highlights Fleet Viz when on the page", "[viz][page]") {
+TEST_CASE("viz page: nav highlights Fleet when on the page", "[viz][page]") {
     std::string html(kVizFleetPageHtml);
-    CHECK_THAT(html, ContainsSubstring("href=\"/viz/fleet\" class=\"nav-link active\""));
+    CHECK_THAT(html, ContainsSubstring("class=\"shell-nav on\" href=\"/viz/fleet\" aria-current=\"page\""));
 }
 
-// ── Inter variable webfont (woff2 binary) ───────────────────────────────────
+// ── IBM Plex webfonts (woff2 binary) ────────────────────────────────────────
 
-TEST_CASE("static_js_bundle: kInterVariableWoff2 has expected pinned size", "[static-js][inter]") {
-    CHECK(yuzu::server::kInterVariableWoff2.size() == kExpectedInterWoff2Bytes);
+namespace {
+struct PlexExpectation {
+    const char* name;
+    const std::string_view* bytes;
+    std::size_t size;
+};
+// Pinned to IBM's own prebuilt split Latin1 files: @ibm/plex-sans 1.1.0 and
+// @ibm/plex-mono 2.5.0 (fonts/split/woff2/*-Latin1.woff2). SHA-256 per file is
+// in server/core/vendor/ibm-plex/ibm-plex-NOTICE.txt.
+const PlexExpectation kExpectedPlex[] = {
+    {"sans-400", &yuzu::server::kIbmPlexSans400Woff2, 20'984},
+    {"sans-500", &yuzu::server::kIbmPlexSans500Woff2, 21'960},
+    {"sans-600", &yuzu::server::kIbmPlexSans600Woff2, 22'260},
+    {"mono-400", &yuzu::server::kIbmPlexMono400Woff2, 17'544},
+    {"mono-500", &yuzu::server::kIbmPlexMono500Woff2, 17'868},
+};
+} // namespace
+
+TEST_CASE("static_js_bundle: IBM Plex woff2 fonts have the expected pinned sizes",
+          "[static-js][plex]") {
+    for (const auto& f : kExpectedPlex) {
+        INFO("font: " << f.name);
+        CHECK(f.bytes->size() == f.size);
+    }
 }
 
-TEST_CASE("static_js_bundle: kInterVariableWoff2 begins with WOFF2 magic", "[static-js][inter]") {
-    REQUIRE(yuzu::server::kInterVariableWoff2.size() >= 4);
-    // WOFF2 file format: signature 0x774F4632 ('wOF2') at offset 0.
-    auto sv = yuzu::server::kInterVariableWoff2;
-    CHECK(static_cast<unsigned char>(sv[0]) == 0x77);
-    CHECK(static_cast<unsigned char>(sv[1]) == 0x4F);
-    CHECK(static_cast<unsigned char>(sv[2]) == 0x46);
-    CHECK(static_cast<unsigned char>(sv[3]) == 0x32);
+TEST_CASE("static_js_bundle: IBM Plex woff2 fonts begin with WOFF2 magic", "[static-js][plex]") {
+    for (const auto& f : kExpectedPlex) {
+        INFO("font: " << f.name);
+        REQUIRE(f.bytes->size() >= 4);
+        // WOFF2 file format: signature 0x774F4632 ('wOF2') at offset 0.
+        auto sv = *f.bytes;
+        CHECK(static_cast<unsigned char>(sv[0]) == 0x77);
+        CHECK(static_cast<unsigned char>(sv[1]) == 0x4F);
+        CHECK(static_cast<unsigned char>(sv[2]) == 0x46);
+        CHECK(static_cast<unsigned char>(sv[3]) == 0x32);
+    }
 }
 
 // ── Yuzu Design System CSS bundle ───────────────────────────────────────────
@@ -1054,7 +1122,257 @@ TEST_CASE("static_js_bundle: kYuzuCss carries the design-system token layer",
                ContainsSubstring("--mds-color-theme-accent-primary-normal"));
     CHECK_THAT(yuzu::server::kYuzuCss, ContainsSubstring("--mds-color-chart-1"));
     CHECK_THAT(yuzu::server::kYuzuCss, ContainsSubstring("@font-face"));
-    CHECK_THAT(yuzu::server::kYuzuCss, ContainsSubstring("'Inter'"));
+    CHECK_THAT(yuzu::server::kYuzuCss, ContainsSubstring("'IBM Plex Sans'"));
+    CHECK_THAT(yuzu::server::kYuzuCss, ContainsSubstring("'IBM Plex Mono'"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuCss ships the five alternate colour schemes",
+          "[static-js][yuzu-css][theme]") {
+    // Each scheme is a self-contained html[data-theme] block (same element as :root, so the
+    // short-name aliases re-resolve) that redefines the minimal token set. The picker
+    // (settings_general_ui.cpp) and the boot script name the same six.
+    const std::string_view css = yuzu::server::kYuzuCss;
+    auto block = [&](const std::string& t) {
+        const std::string selector = "html[data-theme=\"" + t + "\"] {";
+        const auto at = css.find(selector);
+        REQUIRE(at != std::string_view::npos);
+        const auto end = css.find('}', at);
+        REQUIRE(end != std::string_view::npos);
+        return std::string(css.substr(at, end - at));
+    };
+    for (const char* t : {"navy", "jade", "light", "light-baby", "light-hot"}) {
+        const auto b = block(t);
+        for (const char* tok :
+             {"color-scheme:", "--mds-color-theme-background-canvas:",
+              "--mds-color-theme-background-solid-primary:", "--mds-color-theme-text-primary:",
+              "--mds-color-theme-text-tertiary:", "--mds-color-theme-accent-primary-normal:",
+              "--mds-color-text-on-accent:", "--raise:", "--faint:", "--hl:", "--focus:",
+              "--mds-color-theme-indicator-error:", "--mds-color-indicator-error-bright:",
+              "--mds-elevation-2:", "--mds-elevation-3:"})
+            CHECK_THAT(b, ContainsSubstring(tok));
+    }
+    // The light family flips the UA colour scheme and puts white on the action colour; the dark
+    // ones keep dark. Slate is the :root and has no block.
+    for (const char* t : {"light", "light-baby", "light-hot"}) {
+        CHECK_THAT(block(t), ContainsSubstring("color-scheme: light;"));
+        CHECK_THAT(block(t), ContainsSubstring("--mds-color-text-on-accent: #ffffff;"));
+    }
+    for (const char* t : {"navy", "jade"})
+        CHECK_THAT(block(t), ContainsSubstring("color-scheme: dark;"));
+    CHECK_THAT(std::string(css), !ContainsSubstring("html[data-theme=\"slate\"]"));
+    // Chart cards lift through one token; slate's value is the :root default.
+    CHECK_THAT(std::string(css), ContainsSubstring("--mds-elevation-2: 0 6px 18px rgba(0,0,0,.35);"));
+}
+
+TEST_CASE("static_js_bundle: the Appearance swatches show each scheme's real colours",
+          "[static-js][yuzu-css][theme]") {
+    // The picker draws six palettes at once, so its swatches carry inline hex (the live tokens
+    // can only show the current one). They are checked against the CSS so they cannot drift.
+    const std::string_view css = yuzu::server::kYuzuCss;
+    const std::string page = kSettingsGeneralHtml;
+    auto decl = [](const std::string& hay, const std::string& name) {
+        const auto at = hay.find(name + ":");
+        REQUIRE(at != std::string::npos);
+        const auto from = hay.find('#', at);
+        return hay.substr(from, 7);
+    };
+    for (const char* t : {"navy", "jade", "light", "light-baby", "light-hot"}) {
+        const auto cs = css.find(std::string("html[data-theme=\"") + t + "\"] {");
+        REQUIRE(cs != std::string_view::npos);
+        const std::string blk(css.substr(cs, css.find('}', cs) - cs));
+        const auto card = page.find(std::string("name=\"theme\" value=\"") + t + "\"");
+        REQUIRE(card != std::string::npos);
+        const std::string row = page.substr(card, page.find("</span></span>", card) - card);
+        CHECK(decl(row, "--bg") == decl(blk, "--mds-color-theme-background-canvas"));
+        CHECK(decl(row, "--surface") == decl(blk, "--mds-color-theme-background-solid-primary"));
+        CHECK(decl(row, "--raise") == decl(blk, "--raise"));
+        CHECK(decl(row, "--primary") == decl(blk, "--mds-color-theme-accent-primary-normal"));
+        CHECK(decl(row, "--hl") == decl(blk, "--hl"));
+        CHECK(decl(row, "--ok") == decl(blk, "--mds-color-theme-indicator-success"));
+    }
+}
+
+// ── Colour-scheme contrast (WCAG 2.x) ───────────────────────────────────────
+// Pure: reads only the embedded stylesheet. A scheme's tokens are :root with the
+// html[data-theme] block laid over it; the short-name aliases (--ink, --surface, --c1 ...)
+// are resolved against that merged map, exactly as the browser resolves them on <html>.
+namespace {
+
+using WcagTokens = std::map<std::string, std::string>;
+
+struct WcagRgb {
+    double r, g, b;
+};
+
+std::string wcag_trim(std::string s) {
+    const auto b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos)
+        return {};
+    const auto e = s.find_last_not_of(" \t\r\n");
+    return s.substr(b, e - b + 1);
+}
+
+// The custom properties declared in the first block that follows `selector`.
+WcagTokens wcag_block(std::string_view css, std::string_view selector) {
+    const auto at = css.find(selector);
+    REQUIRE(at != std::string_view::npos);
+    const auto open = css.find('{', at);
+    const auto close = css.find('}', open);
+    REQUIRE(open != std::string_view::npos);
+    REQUIRE(close != std::string_view::npos);
+    std::string body(css.substr(open + 1, close - open - 1));
+    for (auto c = body.find("/*"); c != std::string::npos; c = body.find("/*")) {
+        const auto e = body.find("*/", c);
+        REQUIRE(e != std::string::npos);
+        body.erase(c, e + 2 - c);
+    }
+    WcagTokens out;
+    for (std::size_t pos = 0;;) {
+        const auto semi = body.find(';', pos);
+        if (semi == std::string::npos)
+            break;
+        const auto decl = body.substr(pos, semi - pos);
+        pos = semi + 1;
+        const auto colon = decl.find(':');
+        if (colon == std::string::npos)
+            continue;
+        const auto name = wcag_trim(decl.substr(0, colon));
+        if (name.starts_with("--"))
+            out[name] = wcag_trim(decl.substr(colon + 1));
+    }
+    return out;
+}
+
+WcagTokens wcag_scheme(std::string_view css, std::string_view scheme) {
+    auto tokens = wcag_block(css, "\n:root {");
+    if (scheme != "slate")
+        for (auto& [k, v] : wcag_block(css, "html[data-theme=\"" + std::string(scheme) + "\"] {"))
+            tokens[k] = std::move(v);
+    return tokens;
+}
+
+WcagRgb wcag_resolve(const WcagTokens& tokens, const std::string& name, int depth = 0) {
+    REQUIRE(depth < 8);
+    const auto it = tokens.find(name);
+    REQUIRE(it != tokens.end());
+    const std::string& v = it->second;
+    if (v.starts_with("var(--")) { // an alias: follow it
+        const auto close = v.find(')');
+        REQUIRE(close != std::string::npos);
+        return wcag_resolve(tokens, v.substr(4, close - 4), depth + 1);
+    }
+    REQUIRE(v.size() == 7); // a literal #rrggbb
+    REQUIRE(v[0] == '#');
+    auto byte = [&](std::size_t i) { return static_cast<double>(std::stoi(v.substr(i, 2), nullptr, 16)); };
+    return {byte(1), byte(3), byte(5)};
+}
+
+double wcag_luminance(const WcagRgb& c) {
+    auto lin = [](double v) {
+        v /= 255.0;
+        return v <= 0.03928 ? v / 12.92 : std::pow((v + 0.055) / 1.055, 2.4);
+    };
+    return 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b);
+}
+
+double wcag_contrast(const WcagRgb& a, const WcagRgb& b) {
+    const double la = wcag_luminance(a), lb = wcag_luminance(b);
+    return (std::max(la, lb) + 0.05) / (std::min(la, lb) + 0.05);
+}
+
+} // namespace
+
+TEST_CASE("static_js_bundle: the contrast calculator matches the WCAG reference values",
+          "[static-js][yuzu-css][theme][contrast]") {
+    CHECK(std::abs(wcag_contrast({0, 0, 0}, {255, 255, 255}) - 21.0) < 1e-9);
+    CHECK(std::abs(wcag_contrast({255, 255, 255}, {255, 255, 255}) - 1.0) < 1e-9);
+    // #767676 on white is the documented 4.54:1 boundary.
+    CHECK(std::abs(wcag_contrast({0x76, 0x76, 0x76}, {255, 255, 255}) - 4.54) < 0.01);
+}
+
+TEST_CASE("static_js_bundle: every colour scheme keeps text; action and heading colours legible",
+          "[static-js][yuzu-css][theme][contrast]") {
+    const std::string_view css = yuzu::server::kYuzuCss;
+    for (const std::string_view scheme : {"slate", "navy", "jade", "light", "light-baby", "light-hot"}) {
+        const auto tokens = wcag_scheme(css, scheme);
+        const bool light = scheme.starts_with("light");
+        auto ratio = [&](const char* fg, const char* bg) {
+            return wcag_contrast(wcag_resolve(tokens, fg), wcag_resolve(tokens, bg));
+        };
+        // Body, secondary, tertiary and hint text on every surface they sit on.
+        for (const char* bg : {"--bg", "--surface", "--surface2", "--raise"})
+            for (const char* fg : {"--ink", "--ink2", "--mut", "--faint"}) {
+                INFO(scheme << ": " << fg << " on " << bg);
+                CHECK(ratio(fg, bg) >= 4.5);
+            }
+        // Link text on the canvas, and the label on a solid action button.
+        INFO(scheme << ": --primary on --bg");
+        CHECK(ratio("--primary", "--bg") >= 4.5);
+        INFO(scheme << ": --on-primary on --primary");
+        CHECK(ratio("--on-primary", "--primary") >= 4.5);
+        // Chart hues 1-5 colour Home's family headings and tile icons and the Trends line, so
+        // they are text on the light schemes (4.5:1); the unchanged dark ones keep the 3:1
+        // non-text minimum.
+        for (const char* fg : {"--c1", "--c2", "--c3", "--c4", "--c5"})
+            for (const char* bg : {"--bg", "--surface"}) {
+                INFO(scheme << ": " << fg << " on " << bg);
+                CHECK(ratio(fg, bg) >= (light ? 4.5 : 3.0));
+            }
+    }
+}
+
+TEST_CASE("static_js_bundle: kYuzuCss variant hovers set an explicit colour and keep a page recolour",
+          "[static-js][yuzu-css]") {
+    // The variant hover rules (0,4,0) outrank a page's own one-class recolour
+    // (instruction_ui.cpp: .btn-danger{background:red;color:dark}). A hover
+    // that omits `color` leaves dark text on a 12% tint (1.25:1), and one
+    // that sets any background turns a green Execute blue. The primary hover
+    // therefore brightens with a filter and touches no background property,
+    // and the design bans gradients, so none may creep back into a hover.
+    // (The cascade itself is observed in a browser, not here; this pins the
+    // shape of the rules.)
+    auto block = [](std::string_view selector) {
+        const std::string& css = yuzu::server::kYuzuCss;
+        const auto at = css.find(selector);
+        REQUIRE(at != std::string::npos);
+        const auto end = css.find('}', at);
+        REQUIRE(end != std::string::npos);
+        return css.substr(at, end - at);
+    };
+    const std::string danger = block(":is(.btn-danger, .btn.danger):hover:not(:disabled) {");
+    CHECK_THAT(danger, ContainsSubstring(" color: var(--bad)"));
+    CHECK_THAT(danger, !ContainsSubstring("gradient"));
+    const std::string primary =
+        block(":is(.btn-primary, .btn-success, .btn.primary):hover:not(:disabled) {");
+    CHECK_THAT(primary, ContainsSubstring(" color: var(--on-primary)"));
+    // 1.1, not 1.2: at 1.2 a page-local green (#3dd68c) clamps to neon #49ffa8
+    // and the unstyled blue drifts towards cyan.
+    CHECK_THAT(primary, ContainsSubstring("filter: brightness(1.1)"));
+    CHECK_THAT(primary, !ContainsSubstring("background"));  // background, -color, -image
+    CHECK_THAT(primary, !ContainsSubstring("gradient"));
+    // The neutral hover (0,3,0) must skip the primary, or its `background`
+    // shorthand repaints a page-recoloured primary.
+    const std::string neutral = block(
+        ":is(.btn, .btn-secondary, .btn-danger, .btn-ghost, .btn-sm):hover:not(:disabled");
+    CHECK_THAT(neutral, ContainsSubstring(".btn-primary, .btn-success, .primary)"));
+    CHECK_THAT(neutral, !ContainsSubstring("gradient"));
+    // An armed button stays solid on hover: its own rule cancels the primary
+    // hover's filter.
+    const std::string armed = block(".btn-confirming.btn-confirming:hover:not(:disabled) {");
+    CHECK_THAT(armed, ContainsSubstring("filter: none"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuCss has no unscoped .scope rule", "[static-js][yuzu-css]") {
+    // The DEX trends OS cards (dex_routes.cpp) carry a bare `.scope` element and
+    // style it themselves (`.gp-oscard .scope`, guardian_page_ui.cpp). A bare
+    // `.scope` selector in the shared sheet reaches that element on every page
+    // that loads it: the old `@media (max-width: 1440px) { .scope { width: 220px
+    // !important } }` pinned the card line to 220 px below 1440 px. The dashboard
+    // panel is `.scope-panel`; `.scope-*` classes are different tokens and stay.
+    // A selector starts after the sheet start, `{`, `}`, `,` or a comment end; `.scope` followed
+    // by `-` or a word character is another class and does not match.
+    const std::regex bare_scope(R"((^|[{},/])\s*\.scope(?![-\w]))");
+    CHECK_FALSE(std::regex_search(yuzu::server::kYuzuCss, bare_scope));
 }
 
 TEST_CASE("static_js_bundle: kYuzuCss has no embedded NULs", "[static-js][yuzu-css]") {
@@ -1086,6 +1404,21 @@ TEST_CASE("static_js_bundle: kYuzuChartsJs reads design-system chart tokens",
                ContainsSubstring("--mds-color-theme-background-solid-primary"));
 }
 
+TEST_CASE("static_js_bundle: kYuzuChartsJs fallbacks are the slate values and the Plex stack",
+          "[static-js][yuzu-charts]") {
+    // tok(name, fallback) only falls back when yuzu.css failed to load, so
+    // nothing else observes these literals. They mirror the slate tokens
+    // (chart-1 blue, chart-grid, chart-tooltip-bg) and the IBM Plex stack.
+    const auto& js = yuzu::server::kYuzuChartsJs;
+    CHECK_THAT(js, ContainsSubstring("#4c9aff"));
+    CHECK_THAT(js, ContainsSubstring("#2a303a"));
+    CHECK_THAT(js, ContainsSubstring("#2b313c"));
+    CHECK_THAT(js, ContainsSubstring("'IBM Plex Sans',system-ui"));
+    // The previous palette and font fallback must be gone.
+    CHECK_THAT(js, !ContainsSubstring("#58a6ff"));
+    CHECK_THAT(js, !ContainsSubstring("BlinkMacSystemFont"));
+}
+
 TEST_CASE("static_js_bundle: kYuzuChartsJs has no embedded NULs", "[static-js][yuzu-charts]") {
     CHECK(yuzu::server::kYuzuChartsJs.find('\0') == std::string::npos);
 }
@@ -1100,6 +1433,57 @@ TEST_CASE("static_js_bundle: kYuzuChartsJs renders an empty-state message on no 
     CHECK_THAT(yuzu::server::kYuzuChartsJs, ContainsSubstring("isEmptyData"));
 }
 
+TEST_CASE("static_js_bundle: kYuzuChartsJs surfaces a cut visualization result in-card",
+          "[static-js][yuzu-charts]") {
+    // The visualization route stamps rows_capped (row cap only) and
+    // result_truncated_by_cap + truncation_cause (row_cap | byte_cap) on a cut
+    // payload. The chart is fetched independently of the results table, so the
+    // adapter is the only place an operator can see that the picture is partial.
+    // Pin that it consumes all three fields and renders the notice with
+    // textContent (never innerHTML) from the payload.
+    const auto& js = yuzu::server::kYuzuChartsJs;
+    CHECK_THAT(js, ContainsSubstring("function truncationNotice"));
+    CHECK_THAT(js, ContainsSubstring("data.result_truncated_by_cap"));
+    CHECK_THAT(js, ContainsSubstring("data.rows_capped"));
+    CHECK_THAT(js, ContainsSubstring("data.truncation_cause"));
+    CHECK_THAT(js, ContainsSubstring("yuzu-chart-truncated"));
+    CHECK_THAT(js, ContainsSubstring("result-degrade-banner"));
+    CHECK_THAT(js, ContainsSubstring("note.textContent = msg"));
+    CHECK_THAT(js, ContainsSubstring("Partial result:"));
+    // The call itself: a defined-but-never-invoked helper must not satisfy this test.
+    // Anchored to a line start so a commented-out call does not satisfy it.
+    CHECK_THAT(js, ContainsSubstring("\n    truncationNotice(target, data);"));
+    // The call must also be REACHED. render() has exactly two legitimate early exits before
+    // it (the null guard and the deferred-until-echarts-loads branch); any further `return`
+    // between the function's opening line and the call would make the notice dead code while
+    // the string checks above stayed green (a `return;` inserted there did exactly that).
+    // Limit, stated plainly: this pins the known set of early exits in the source text. It
+    // does not execute the JS, so a throw or an always-false branch before the call would
+    // not be caught; the ad hoc headless-Chrome check in the commit notes covers behaviour.
+    {
+        const std::string open_marker = "\n  function render(target, data) {";
+        const std::string call_marker = "\n    truncationNotice(target, data);";
+        const auto open_at = js.find(open_marker);
+        const auto call_at = js.find(call_marker);
+        REQUIRE(open_at != std::string::npos);
+        REQUIRE(call_at != std::string::npos);
+        REQUIRE(open_at < call_at);
+        const std::string span = js.substr(open_at, call_at - open_at);
+        std::size_t returns = 0;
+        for (auto at = span.find("return"); at != std::string::npos;
+             at = span.find("return", at + 1))
+            ++returns;
+        CHECK(returns == 2);
+        // And the notice runs before the error and empty-state branches, which return.
+        const auto error_at = js.find("\n    if (data.error) {", call_at);
+        REQUIRE(error_at != std::string::npos);
+        CHECK(call_at < error_at);
+    }
+    // CSP is script-src 'self' 'unsafe-inline' with no unsafe-eval.
+    CHECK_THAT(js, !ContainsSubstring("new Function("));
+    CHECK_THAT(js, !ContainsSubstring("eval("));
+}
+
 // ── Per-host page shell (PR 9-pre, /viz/host/<agent_id>) ────────────────────
 
 TEST_CASE("static_js_bundle: kVizHostPageHtml renders IPC graph mount point", "[viz-host][page]") {
@@ -1111,6 +1495,9 @@ TEST_CASE("static_js_bundle: kVizHostPageHtml renders IPC graph mount point", "[
 TEST_CASE("static_js_bundle: kVizHostPageHtml renders TAR tree mount point", "[viz-host][page]") {
     std::string html(kVizHostPageHtml);
     CHECK_THAT(html, ContainsSubstring("id=\"tar-tree\""));
+    // The pane fills itself over htmx on load; losing either attribute leaves it empty.
+    CHECK_THAT(html, ContainsSubstring("hx-get=\"/fragments/tar/process-tree?device={{AGENT_ID}}\""));
+    CHECK_THAT(html, ContainsSubstring("hx-trigger=\"load\""));
 }
 
 TEST_CASE("static_js_bundle: kVizHostPageHtml binds via data-agent-id attribute",
@@ -1303,6 +1690,21 @@ TEST_CASE("static_js_bundle: kVizHostPageHtml has a resizable splitter persisted
     CHECK_THAT(html, ContainsSubstring("splitter"));
 }
 
+TEST_CASE("static_js_bundle: kVizHostPageHtml clamps the splitter to the fixed chrome",
+          "[viz-host][page][splitter]") {
+    // The splitter, the "Process tree" header and the tree's own padding
+    // cannot shrink, so a bare 0.1-0.9 clamp overflows .vh-main (39 px at
+    // 1440x900 for a stored 0.9). The max ratio is measured from the root,
+    // applied on load (apply), on drag, and on resize; the old literal
+    // upper bound must not return as the only gate.
+    std::string html(kVizHostPageHtml);
+    CHECK_THAT(html, ContainsSubstring("function maxRatio()"));
+    CHECK_THAT(html, ContainsSubstring("r = Math.min(r, maxRatio());"));
+    CHECK_THAT(html, ContainsSubstring("r < maxRatio()"));
+    CHECK_THAT(html, ContainsSubstring("new ResizeObserver(() => apply(ratio)).observe(root);"));
+    CHECK_THAT(html, !ContainsSubstring("r < 0.9"));
+}
+
 TEST_CASE("static_js_bundle: kVizHostPageHtml does not reference any CDN",
           "[viz-host][page][security]") {
     // Sec invariant: no off-box dependency loading. cytoscape must be
@@ -1311,4 +1713,25 @@ TEST_CASE("static_js_bundle: kVizHostPageHtml does not reference any CDN",
     CHECK(html.find("cdn.") == std::string::npos);
     CHECK(html.find("unpkg.") == std::string::npos);
     CHECK(html.find("jsdelivr.") == std::string::npos);
+}
+
+// ── Shared dialog module (yuzu-dialog.js) ───────────────────────────────────
+
+namespace yuzu::server {
+extern const std::string kYuzuDialogJs;
+} // namespace yuzu::server
+
+TEST_CASE("static_js_bundle: kYuzuDialogJs exposes YuzuDialog and carries no markup sink",
+          "[static-js][dialog][security]") {
+    const std::string& js = yuzu::server::kYuzuDialogJs;
+    CHECK(js.size() >= 4000);
+    CHECK(js.find('\0') == std::string::npos);
+    CHECK_THAT(js, ContainsSubstring("window.YuzuDialog"));
+    CHECK_THAT(js, ContainsSubstring("showModal"));
+    CHECK_THAT(js, ContainsSubstring("AbortSignal.timeout(prep.timeoutMs)"));
+    CHECK(js.find("innerHTML") == std::string::npos);
+    CHECK(js.find("insertAdjacentHTML") == std::string::npos);
+    CHECK(js.find("eval(") == std::string::npos);
+    CHECK(js.find("new Function") == std::string::npos);
+    CHECK(js.find("document.write") == std::string::npos);
 }

@@ -219,6 +219,11 @@ public:
 
     bool is_open() const;
 
+    /// The two rotation constants a UI must mirror to draw the right controls. Exposed so the
+    /// Tokens page reads the store's values instead of keeping copies that could drift.
+    static constexpr int64_t rotation_grace_secs() { return kRotationGraceSecs.count(); }
+    static constexpr int64_t overlap_floor_secs() { return kOverlapFloorSecs; }
+
     /// Create a new API token. Returns the raw token string (shown to user once).
     /// If scope_service is non-empty, the token is scoped to that IT service.
     /// If mcp_tier is non-empty, the token is an MCP token with the given tier.
@@ -296,6 +301,15 @@ public:
     /// by the admin console to show live credential counts.
     [[nodiscard]] std::vector<ApiToken>
     list_active_for_principal(const std::string& principal_id) const;
+
+    /// Checked twin of `list_active_for_principal` (#5342 Gate 7): the SAME
+    /// query, but a closed store, a pool-lease timeout or a query failure is
+    /// `unexpected(reason)` instead of an empty vector — so a caller that
+    /// REPORTS the count (the admin password reset's `api_tokens_active`) can
+    /// say "could not confirm" rather than a false "0 active tokens". An empty
+    /// `principal_id` is a genuine empty result (no principal, no tokens).
+    [[nodiscard]] std::expected<std::vector<ApiToken>, std::string>
+    list_active_for_principal_checked(const std::string& principal_id) const;
 
     /// Overlap-pair credential rotation for an engine principal (design doc
     /// §7). `now` is caller-supplied epoch seconds (not read from the wall

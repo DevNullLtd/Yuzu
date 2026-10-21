@@ -2,7 +2,6 @@
 
 #include "plugin_config_parsers.hpp"
 #include "plugin_config_store.hpp"
-#include "rbac_store.hpp" // RbacStore::authorize_list_read / ListReadDecision (ADR-0017)
 #include "rest_a4_envelope.hpp"
 #include "rest_audit.hpp" // detail::emit_behavioral_audit (Sec-Audit-Failed / 503-on-audit-failure, #1647)
 
@@ -192,10 +191,12 @@ nlohmann::json secret_meta_json(const PluginConfigStore::SecretMeta& m) {
 nlohmann::json kill_switch_json(const PluginConfigStore::KillSwitchEntry& e) {
     return {{"plugin", e.plugin},
            {"action", e.action},
+           {"os", e.os},
            {"enabled", e.enabled},
            {"reason", e.reason},
            {"set_by", e.set_by},
-           {"updated_at_ms", e.updated_at_ms}};
+           {"updated_at_ms", e.updated_at_ms},
+           {"source", e.source}};
 }
 
 /// "who" for updated_by/set_by columns — the authenticated session's stable
@@ -211,33 +212,27 @@ void register_plugin_config_routes(HttpRouteSink& sink, Deps deps) {
 
     // ── GET /api/v1/plugin-config ── PluginConfig:Read, ADR-0017 list gate ──
     //
-    // The ADR-0017 admit-then-filter chokepoint (RbacStore::authorize_list_read)
-    // gates this route rather than a bare perm_fn check — required by this
-    // package's spec regardless of the fact that plugin configuration is NOT
-    // agent-scoped data. AdmitAll (global grant, or RBAC loaded-and-disabled)
-    // serves the (optionally ?plugin=-filtered) list; DenyAll is a 403.
-    // AdmitScoped — a management-group-CONFINED grant — is ALSO treated as a
-    // 403 here: `visible_agents` names agent ids, which have no correspondence
-    // to plugin/key rows, so there is no principled way to "filter" this list
-    // by it. Serving it unfiltered under a confined grant would silently
-    // widen a device-scoped grant to fleet-wide platform configuration;
-    // refusing it is the only safe reading.
+    // `list_read_fn` (ADR-0017 admit-then-filter; production binds require_global_list_read) is
+    // this route's SOLE gate — never stacked with `perm_fn`, so the Plugins and updates page, this
+    // route and the MCP `list_plugin_config` tool decide from one authority (elevation admitted,
+    // engine and MCP-tier rules, service-scoped refusal, RBAC, legacy). Plugin configuration is
+    // NOT agent-scoped data: the bound gate refuses (and audits) a management-group-confined
+    // grant rather than filtering it, since serving it unfiltered would silently widen a
+    // device-scoped grant to fleet-wide platform configuration; the `gate.scope` check below is
+    // a belt for a mis-binding. An unwired gate fails closed.
     sink.Get("/api/v1/plugin-config", [deps](const httplib::Request& req, httplib::Response& res) {
-        if (!deps.perm_fn(req, res, "PluginConfig", "Read"))
-            return;
-        auto session = deps.auth_fn(req, res);
-        if (!session)
-            return;
-        if (!deps.rbac_store || !deps.rbac_store->is_open()) {
+        if (!deps.list_read_fn) {
+            spdlog::error("plugin config list: list_read_fn unwired — misconfigured call site; "
+                          "failing closed");
             res.status = 503;
-            res.set_content(error_json_a4(503, "authorization store unavailable",
-                                          make_correlation_id()),
+            res.set_content(error_json_a4(503, "service unavailable", make_correlation_id()),
                             kJson);
             return;
         }
-        auto authz = deps.rbac_store->authorize_list_read(session->username, "PluginConfig",
-                                                           "Read", deps.mgmt_store);
-        if (authz.decision != ListReadDecision::AdmitAll) {
+        const auto gate = deps.list_read_fn(req, res, "PluginConfig", "Read");
+        if (!gate.admitted)
+            return; // the gate rendered its own 401/403/503
+        if (gate.scope) {
             res.status = 403;
             res.set_content(
                 error_json_a4(403, "permission denied: PluginConfig:Read", make_correlation_id(),
@@ -279,7 +274,15 @@ void register_plugin_config_routes(HttpRouteSink& sink, Deps deps) {
                 }
                 const std::string plugin = req.matches[1].str();
                 const std::string action = req.has_param("action") ? req.get_param_value("action") : "";
-                auto entry = deps.store->get_kill_switch(plugin, action);
+                const std::string os = req.has_param("os") ? req.get_param_value("os") : "";
+                // A present-but-empty `?os=` is malformed, not "all OSes":
+                // the parser accepts an empty os as the all-OS row, so an
+                // unvalidated blank would silently widen the target.
+                if (req.has_param("os") && os.empty()) {
+                    write_store_error(res, PluginConfigStore::Error::InvalidInput);
+                    return;
+                }
+                auto entry = deps.store->get_kill_switch(plugin, action, os);
                 if (!entry) {
                     write_store_error(res, entry.error());
                     return;
@@ -325,23 +328,27 @@ void register_plugin_config_routes(HttpRouteSink& sink, Deps deps) {
                 // internally, so the audit row emitted below (before the
                 // mutation — see audit_or_503's doc comment) is never
                 // recorded for an input the store would reject anyway.
-                if (!plugin_config::parse_kill_switch_scope(plugin, action) ||
+                const std::string os = req.has_param("os") ? req.get_param_value("os") : "";
+                const auto scope = plugin_config::parse_kill_switch_scope(plugin, action, os);
+                // Present-but-empty `?os=` must not silently target the all-OS row.
+                if ((req.has_param("os") && os.empty()) || !scope ||
                     !plugin_config::is_valid_reason(reason) ||
                     !plugin_config::is_valid_actor(actor(*session))) {
                     write_store_error(res, PluginConfigStore::Error::InvalidInput);
                     return;
                 }
 
-                const std::string target_id =
-                    action.empty() ? plugin : plugin + "." + action;
+                const std::string target_id = plugin_config::kill_switch_scope_key(*scope);
+                // A row on a protective pair is stored but never gates dispatch;
+                // the detail labels it so the evidence is never read as proof of a stop.
                 const std::string detail_str =
-                    std::string("enabled=") + (enabled ? "true" : "false");
+                    plugin_config::kill_switch_set_detail(*scope, enabled, reason);
                 if (!audit_or_503(deps.audit_fn, req, res, "plugin_config.kill_switch.set",
                                   "PluginConfig", target_id, detail_str))
                     return;
 
                 auto result =
-                    deps.store->set_kill_switch(plugin, action, enabled, reason, actor(*session));
+                    deps.store->set_kill_switch(plugin, action, enabled, reason, actor(*session), os);
                 if (!result) {
                     audit_outcome(deps.audit_fn, req, res, "plugin_config.kill_switch.set", /*ok=*/false,
                                   "PluginConfig", target_id, detail_str);
@@ -350,6 +357,13 @@ void register_plugin_config_routes(HttpRouteSink& sink, Deps deps) {
                 }
                 audit_outcome(deps.audit_fn, req, res, "plugin_config.kill_switch.set", /*ok=*/true, "PluginConfig",
                               target_id, detail_str);
+                // Warn only once the row is stored, so the log never claims a store
+                // that an audit 503 or a failed write prevented.
+                if (plugin_config::kill_switch_row_covers_protective(*scope)) {
+                    spdlog::warn("plugin_config: kill-switch row {} covers a protective action; "
+                                 "stored, never refuses the protective dispatch",
+                                 target_id);
+                }
                 nlohmann::json out = {{"data", kill_switch_json(*result)},
                                       {"meta", {{"api_version", "v1"}}}};
                 res.set_content(out.dump(), kJson);

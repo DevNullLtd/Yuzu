@@ -211,3 +211,116 @@ inside one transaction. The "until then" condition in section 3 (the seam's firs
 therefore run out, since `AppPerfRollup` is that consumer. The rule itself is unchanged: per-store
 classes stay single-schema owners, cross-schema work lives in a query owner, and
 `RbacStore::unassign_role` delegates to the owner rather than issuing `auth` SQL itself.
+
+## Update (2026-09-30) -- a third consumer, and a named exception for a shared-fragment predicate
+
+A third query owner: `CommandDeliveryFinalizationOwner` (`command_delivery_finalization_owner.{hpp,cpp}`,
+#4982), which owns the cross-schema write `CommandOutboxStore::mark_sent_with_target` delegates to —
+the fenced `command_outbox_store.outbox` `pending -> sent` transition and
+`execution_tracker.executions.agents_targeted` commit in one transaction, on one lease, exactly the
+section 3 shape. Nothing about that write needs a new rule; it is recorded here only to keep this
+ADR's consumer list current.
+
+The same class also introduces a second SHAPE this ADR had not previously named:
+`kPendingOutboxNotExistsClause`, a `static constexpr` SQL fragment (not an owner-executed method)
+that spells out, once, what "still owned by the delivery loop" means for a
+`command_outbox_store.outbox` row. `ExecutionTracker::reap_stuck_running_executions` embeds this
+fragment, verbatim, into its own `WHERE` clauses — including the final atomic
+`UPDATE ... WHERE ... RETURNING id` that re-evaluates the full cancel-candidate predicate — and
+executes it on `ExecutionTracker`'s OWN transaction/connection. No `CommandDeliveryFinalizationOwner`
+instance is constructed to use it.
+
+This is a deliberate, narrow exception to section 3's default shape (an owner that takes its OWN
+lease and executes the cross-schema query itself), not a violation of it. The precondition that
+makes it correct: the caller needs the predicate evaluated as part of its OWN atomic check-and-act —
+here, the reaper's cancel-candidate re-check must be evaluated AS PART OF the cancelling `UPDATE`
+itself — on the same connection, inside the same transaction, under the same advisory lock — not as
+a separate read whose answer could go stale before the write commits. (This is evaluation-order
+atomicity, not a shared MVCC snapshot: Postgres READ COMMITTED gives each statement its own
+snapshot, so the predicate's `NOT EXISTS` subqueries still see the data as of the UPDATE's own start,
+not a snapshot shared with any earlier read — the `EvalPlanQual` re-check that protects the UPDATE's
+locked TARGET row does not extend to those subqueries. See `execution_tracker.cpp`'s own comment on
+the atomic cancel UPDATE for the resulting narrow residual.) Answering the predicate on a
+separately-leased owner connection first (the normal section-3 shape) would reopen exactly the TOCTOU
+the atomic re-check exists to close — a row could flip to outbox-pending between the owner's read and
+the reaper's own `UPDATE` committing. A shared text fragment the caller embeds in its own statement
+closes that specific window, because it is evaluated by the SAME statement, on the SAME connection,
+under the SAME advisory lock as the write it gates.
+
+This shape is not new to the codebase: `LeaderElector::epoch_fence_sql()` (`leader_elector.hpp`) is
+the shipped precedent — also "a pure string builder (no connection)" (that header's own words) whose
+SQL executes on a caller's own pooled connection, inside the caller's own claim statement, for the
+identical reason (a standalone fence read would race a handover between the read and the claim
+commit). `kPendingOutboxNotExistsClause` is the second instance of that same pattern.
+
+**When this exception applies, precisely, so a future author cannot cite it as a general escape
+hatch:** ONLY when a caller needs the predicate as one conjunct of its OWN atomic check-and-act
+statement, where a separately-leased read would introduce a check-then-act race the caller's
+transaction is specifically structured to avoid — OR as one conjunct of a preparatory `SELECT` that
+runs inside that SAME transaction, under the SAME lock, directly selecting or counting candidates for
+that same check-and-act, PROVIDED the predicate text is byte-identical to the one the final
+check-and-act re-evaluates atomically. `ExecutionTracker::reap_stuck_running_executions`'s
+candidate-count and candidate-select queries are this second case: preparatory reads under the same
+advisory lock and transaction as the atomic cancel `UPDATE` that re-checks the identical clause (not
+a shared MVCC snapshot — see the note above on READ COMMITTED). It does NOT license a cross-schema
+`SELECT` embedded for convenience, run outside the
+check-and-act's own transaction/lock, or against a predicate the final mutation does not itself
+re-evaluate — nor a fragment a caller could just as well obtain by calling an owner method on its own
+lease. The default in section 3 is still owner-executed, and this exception is for the one case that
+default cannot serve: a predicate that must be evaluated INSIDE somebody else's transaction, not its
+own. Adding a third instance of this shape should point back to this paragraph, not merely to
+`kPendingOutboxNotExistsClause`'s doc comment, so the precondition is re-checked each time rather than
+copied as a template.
+
+## Update (2026-10-04) -- a fourth query owner: CredentialChangeOwner
+
+A fourth query owner: `CredentialChangeOwner` (`credential_change_owner.{hpp,cpp}`, #5342), the ONLY
+writer of an existing local account's `auth.users.password_hash` (the self-service change and the
+administrative reset). One `pool.with_txn_for` on one lease, schema-qualified SQL across three
+schemas: `SELECT ... FROM auth.users ... FOR UPDATE` (classification under the lock), the guarded
+credential `UPDATE` (which also wipes a provisional TOTP secret and, for a reset, clears the
+lockout), `DELETE FROM session_store.sessions`, the success audit row(s) in
+`audit_store.audit_events`, and LAST the `session_store.session_meta` write-generation bump (every
+session create/revoke shares that row, so the owner waits on nothing while holding it). The change, the account's
+sessions, its provisional MFA state, its lockout and the audit evidence therefore commit or abort
+together — there is no compensating write.
+
+Two own-schema seams were extracted so the owner reuses, never copies, each store's statements --
+the same shape `rbac_store_sql_helpers.hpp` gives `RbacAdminAuthorityOwner`:
+
+- `session_store_sql_helpers.hpp` (`session_sql::delete_user_sessions_in_txn`,
+  `session_sql::bump_generation_in_txn`, and their composite `session_sql::invalidate_user_in_txn`)
+  -- the ONE "revoke every session of a user" statement pair; `SessionStore::invalidate_user` runs
+  the composite, the owner runs the two halves split around its audit INSERT.
+- `AuditStore::log_in_txn(PGconn*, const AuditEvent&)` -- the same sanitize + INSERT as
+  `AuditStore::log()` (which is now exactly "lease + `log_in_txn` + `count_committed`"), issued on
+  the caller's open transaction; the caller bumps the success bucket via
+  `AuditStore::count_committed` only after its own commit. This is the audit store's section-3
+  seam: any other mutation whose audit row must commit with it uses `log_in_txn` inside its owner's
+  transaction (#5360 tracks moving the remaining "audit after commit + rollback" routes onto it),
+  never a second INSERT.
+
+Lock order (documented in the owner header; a change inverting it can deadlock): the `auth.users`
+row, then `session_store.sessions` rows, then the `audit_store.audit_events` INSERT, then LAST the
+`session_meta` `write_generation` row. It is acyclic against every other holder because no
+`session_store` transaction touches another schema (nothing holds `session_meta` and then waits on
+`auth.users`), no audit writer touches `session_store`, the locking post-mint re-read
+(`AuthDB::recheck_role_locked`) takes `auth.users` only after its own session INSERT has committed,
+and `RbacAdminAuthorityOwner` takes `principal_roles` before `auth.users` and never a session or
+audit lock. Like the RBAC owner, it is correct only because `AuthDB`, `SessionStore` and
+`AuditStore` share ONE pool/database (ADR-0006); a split onto separate databases fails every
+statement closed, never a silent partial write.
+
+## Update (2026-10-12) -- a fifth query owner: DexAppVersionFailuresOwner
+
+A fifth query owner: `DexAppVersionFailuresOwner` (`dex_app_version_failures_owner.{hpp,cpp}`), the
+read behind the per-version crash and hang join of the fleet app-performance report. It is a READ
+join across `guaranteed_state_store.guardian_observations` and `app_perf_daily_store.app_perf_daily`
+on one lease (`pool.with_txn_for`, `SET LOCAL statement_timeout`, one statement), so the crash and
+hang events and the devices that were sampled for the same version come from one population, one
+window and one snapshot: the rate's numerator (events on exposed devices) and denominator (exposed
+devices) cannot be taken from two stores without risking a version that was sampled on few of its
+devices reading as a regression. A degraded read returns `std::nullopt` (the typed failure the REST
+and MCP surfaces turn into a 503 / internal error), distinct from an engaged empty result. Nothing
+about the rule changes: the owner borrows the pool, issues schema-qualified SQL, and no per-store
+class gained a cross-schema method.

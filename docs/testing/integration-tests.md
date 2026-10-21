@@ -6,7 +6,7 @@ This document describes how to run the end-to-end integration tests for the Yuzu
 
 ### Required
 - Built C++ server and agent: `meson compile -C build-linux`
-- Erlang/OTP 26+ with rebar3
+- Erlang/OTP 28.4 or any later 28.x, with rebar3
 - curl, nc (netcat)
 
 ### Optional
@@ -31,7 +31,7 @@ The primary integration test runs all three components together:
 ```
 
 This test:
-- Starts the C++ server in gateway mode
+- Starts the C++ server in gateway mode, with `--gateway-upstream` and `--insecure-gateway-peer` (the gateway-upstream service refuses to start without gateway peer authorization or that acknowledgement; the flag disables the check, so this script does not exercise it, and `--tls` does not make the gateway hop mutual TLS). A deferred follow-up is to run the `--tls` branch with a real pinned gateway leaf instead of the acknowledgement
 - Starts the Erlang gateway connecting to the server
 - Starts N C++ agents connecting through the gateway
 - Runs ~20 test scenarios covering connectivity, registration, heartbeats, and stability
@@ -177,6 +177,7 @@ open _build/test/cover/index.html
 - Check gateway logs for connection errors
 - Verify enrollment token is valid
 - Check server is in gateway mode (`--gateway-mode`)
+- If a hand-started server exits at boot with a gateway peer authorization error, it needs `--insecure-gateway-peer` (plaintext rig), a gateway key pin, or the generated default certificates; `scripts/integration-test.sh` passes `--insecure-gateway-peer` itself
 
 ### Tests time out
 - Increase timeouts in test configuration
@@ -225,6 +226,7 @@ The MCP server is tested at the unit level via `tests/unit/server/test_mcp_serve
 ```bash
 # Create an MCP token
 curl -X POST http://localhost:8080/api/v1/tokens \
+  -H "Origin: http://localhost:8080" \
   -H "Cookie: $COOKIE" \
   -d '{"name":"mcp-test","mcp_tier":"readonly","expires_in_days":7}'
 
@@ -247,9 +249,9 @@ assert_eq "Test name" "expected" "$actual"
 ### Erlang tests
 1. Add test function to existing `*_tests.erl` or create new module
 2. Add to test fixture list
-3. Run with `rebar3 as test eunit`
+3. Run with `rebar3 as test eunit --dir apps/yuzu_gw/test` (#337)
 
 ### Common Test
 1. Add test function to `*_SUITE.erl`
 2. Add to `all/0` or appropriate group
-3. Run with `rebar3 as test ct`
+3. Run with `rebar3 as test ct --dir apps/yuzu_gw/test/ct` (ct does not recurse; without `--dir` it runs zero suites and still exits 0, #4800)

@@ -84,14 +84,19 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_peripherals.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_printing.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_browser_policy.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_update_source_trust.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_app_control.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_firmware_posture.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_runtimes.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_platform_security.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_browser_inventory.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_local_security_policy.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_privacy_permissions.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_system_hardening.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_pkg_inventory.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_mgmt_posture.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_shares.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_remote_access_audit.hpp",
 ]
 CORE_FILE = "server/core/src/capability_decls/core_dispatch_capabilities.hpp"
 
@@ -220,11 +225,13 @@ def format_gaps(
 
 
 SERVER_CPP = "server/core/src/server.cpp"
+FRAGMENTS_HPP = "server/core/src/capability_fragments.hpp"
+FRAGMENTS_MACRO = "YUZU_ALL_CAPABILITY_FRAGMENTS"
 
 
 def _fragment_accessor(rel: str) -> str:
     """`.../plugin_action_catalogue_disk_actions.hpp` -> the accessor name the
-    production composition site must call."""
+    production composition macro must call."""
     stem = rel.rsplit("/", 1)[-1].removesuffix(".hpp")
     return stem + "()"
 
@@ -232,36 +239,64 @@ def _fragment_accessor(rel: str) -> str:
 class TestProductionCompositionWiring(unittest.TestCase):
     """K3 (external functional review): every catalogue test — C++ and Python —
     composes its OWN list of fragment spans, and the Python gates read the
-    fragment HEADERS. Nothing read `server.cpp`, so deleting the two lines that
-    wire a fragment into the live `CommandCapabilityRegistry` left the entire
-    server suite and both gates green while the plugin's actions classified as
-    Unclassified in production.
+    fragment HEADERS. Nothing read the production composition, so deleting the
+    lines that wire a fragment into the live `CommandCapabilityRegistry` left the
+    entire server suite and both gates green while the plugin's actions classified
+    as Unclassified in production.
+
+    The composition is spelled ONCE, as the `YUZU_ALL_CAPABILITY_FRAGMENTS` macro in
+    `capability_fragments.hpp` (shared by the server's registry and the enablement
+    unit overlay), so the tripwire has two halves: `server.cpp` must include that
+    header and build `capability_registry_` from the macro, and the header must
+    include and name every fragment.
 
     This is a source tripwire, following the precedent at
     `tests/unit/server/test_agent_properties_scope_authz.cpp`. It is deliberately
-    textual: the point is to guard the one file no compiled test observes.
+    textual: the point is to guard the files no compiled test observes.
     """
 
-    def test_every_fragment_is_included_and_composed_in_server_cpp(self) -> None:
+    def test_server_cpp_composes_the_fragment_macro_into_the_registry(self) -> None:
         server = (REPO_ROOT / SERVER_CPP).read_text(encoding="utf-8")
+        self.assertIn(
+            '#include "capability_fragments.hpp"', server,
+            f"{SERVER_CPP} does not #include capability_fragments.hpp, so the macro that "
+            f"spells the catalogue fragments is not in scope there",
+        )
+        # assertIsNotNone, not assertRegex: a miss would print the whole of server.cpp.
+        self.assertIsNotNone(
+            re.search(
+                r"CommandCapabilityRegistry\s+capability_registry_\s*\{\s*"
+                + FRAGMENTS_MACRO + r"\s*\}",
+                server,
+            ),
+            f"{SERVER_CPP} does not build capability_registry_ from {FRAGMENTS_MACRO}, so "
+            f"every action the fragments declare would classify as Unclassified in "
+            f"production while every test stays green",
+        )
+
+    def test_every_fragment_is_included_and_named_in_the_macro(self) -> None:
+        header = (REPO_ROOT / FRAGMENTS_HPP).read_text(encoding="utf-8")
+        define = f"#define {FRAGMENTS_MACRO}"
+        self.assertIn(define, header, f"{FRAGMENTS_HPP} no longer defines {FRAGMENTS_MACRO}")
+        macro_body = header.split(define, 1)[1]
         missing_include: list[str] = []
         missing_compose: list[str] = []
-        for rel in FRAGMENT_FILES:
-            header = rel.rsplit("/", 1)[-1]
-            if f'#include "capability_decls/{header}"' not in server:
-                missing_include.append(header)
-            if _fragment_accessor(rel) not in server:
+        for rel in [CORE_FILE, *FRAGMENT_FILES]:
+            name = rel.rsplit("/", 1)[-1]
+            if f'#include "capability_decls/{name}"' not in header:
+                missing_include.append(name)
+            if _fragment_accessor(rel) not in macro_body:
                 missing_compose.append(_fragment_accessor(rel))
         self.assertEqual(
             [], missing_include,
-            f"{SERVER_CPP} does not #include these catalogue fragments, so their rows "
+            f"{FRAGMENTS_HPP} does not #include these catalogue fragments, so their rows "
             f"cannot reach the production registry: {missing_include}",
         )
         self.assertEqual(
             [], missing_compose,
-            f"{SERVER_CPP} includes but never COMPOSES these fragments into the "
-            f"CommandCapabilityRegistry, so every action they declare classifies as "
-            f"Unclassified in production while every test stays green: {missing_compose}",
+            f"{FRAGMENTS_HPP} includes but never NAMES these fragments in {FRAGMENTS_MACRO}, "
+            f"so every action they declare classifies as Unclassified in production while "
+            f"every test stays green: {missing_compose}",
         )
 
 

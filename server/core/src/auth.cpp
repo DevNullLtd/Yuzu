@@ -1,15 +1,20 @@
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
+#include <yuzu/log_token.hpp> // log_key_token: IdP-controlled values in sign-in log lines
 #include <yuzu/metrics.hpp>
 
 #include "oidc_principal.hpp" // oidc_principal_id — ADR-2001 §5 single principal-string builder
 #include "saml_principal.hpp" // saml_principal_id — ADR-2001 PR4a single principal-string builder
+#include "password_policy.hpp" // #5342 — the ONE local password length policy
 #include "session_store.hpp"  // HA WS-1/1a — durable operator sessions (ADR-2002 §4)
+#include "rbac_store.hpp"                // #4966: the last-Administrator guard (deactivate_account / set_local_role)
+#include "credential_change_owner.hpp" // #5342 — the one-transaction credential change
 
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <chrono>
+#include <format>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -69,8 +74,10 @@ std::int64_t wall_now_ms() {
         .count();
 }
 
+// Saturating (epoch_ms_to_time_point): a bare time_point{milliseconds{ms}} wraps for a large
+// value on a nanosecond system_clock.
 std::chrono::system_clock::time_point tp_from_ms(std::int64_t ms) {
-    return std::chrono::system_clock::time_point{std::chrono::milliseconds{ms}};
+    return epoch_ms_to_time_point(ms);
 }
 
 std::int64_t ms_from_tp(std::chrono::system_clock::time_point tp) {
@@ -282,10 +289,9 @@ bool AuthManager::load_config(const std::filesystem::path& cfg_path) {
         spdlog::info("Loaded {} user(s) from {}", users_.size(), cfg_path.string());
     }
 
-    // Load enrollment tokens and pending agents (each acquires mu_ internally)
-    load_tokens();
-    load_pending();
-
+    // Enrollment tokens + pending agents are NOT loaded here: since WS-6 6.2 they
+    // live only in AuthDB (Postgres). The legacy enrollment-tokens.cfg /
+    // pending-agents.cfg files are read exactly once by the boot importer.
     return has_users;
 }
 
@@ -406,7 +412,7 @@ bool AuthManager::first_run_setup(const std::filesystem::path& cfg_path) {
     std::cout << "║       Yuzu Server — First Run Setup      ║\n";
     std::cout << "╠══════════════════════════════════════════╣\n";
     std::cout << "║  No configuration file found.            ║\n";
-    std::cout << "║  Let's create your initial accounts.     ║\n";
+    std::cout << "║  Let's create the administrator account. ║\n";
     std::cout << "╚══════════════════════════════════════════╝\n\n";
 
     // Admin account
@@ -416,8 +422,13 @@ bool AuthManager::first_run_setup(const std::filesystem::path& cfg_path) {
         return false;
     }
     auto admin_pw = prompt_password("Admin password");
-    if (admin_pw.size() < 12) {
-        std::cerr << "Password must be at least 12 characters.\n";
+    if (const auto verdict = check_password_policy(admin_pw);
+        verdict != PasswordPolicyVerdict::kOk) {
+        if (verdict == PasswordPolicyVerdict::kTooShort)
+            std::cerr << std::format("Password must be at least {} bytes (UTF-8).\n",
+                                     kMinPasswordBytes);
+        else
+            std::cerr << std::format("Password must be at most {} bytes.\n", kMaxPasswordBytes);
         return false;
     }
     auto admin_pw2 = prompt_password("Confirm admin password");
@@ -428,32 +439,10 @@ bool AuthManager::first_run_setup(const std::filesystem::path& cfg_path) {
 
     std::cout << '\n';
 
-    // User account
-    auto user_name = prompt("User account name", "user");
-    if (user_name.empty()) {
-        std::cerr << "Account name cannot be empty.\n";
-        return false;
-    }
-    if (user_name == admin_name) {
-        std::cerr << "User account must differ from admin account.\n";
-        return false;
-    }
-    auto user_pw = prompt_password("User password");
-    if (user_pw.size() < 12) {
-        std::cerr << "Password must be at least 12 characters.\n";
-        return false;
-    }
-    auto user_pw2 = prompt_password("Confirm user password");
-    if (user_pw != user_pw2) {
-        std::cerr << "Passwords do not match.\n";
-        return false;
-    }
-
     // Build and save config
     AuthManager mgr;
     mgr.cfg_path_ = cfg_path;
     mgr.upsert_user(admin_name, admin_pw, Role::admin);
-    mgr.upsert_user(user_name, user_pw, Role::user);
 
     if (!mgr.save_config()) {
         std::cerr << "Failed to write config to " << cfg_path.string() << '\n';
@@ -627,8 +616,8 @@ bool AuthManager::persist_new_session(const std::string& raw_token,
         key = p.token_hash;
         auto r = session_store_->create(p);
         if (!r) {
-            spdlog::error("AuthManager: durable session create failed for '{}': {}", s.username,
-                          r.error().message);
+            spdlog::error("AuthManager: durable session create failed for '{}': {}",
+                          ::yuzu::log_key_token(s.username), r.error().message);
             note_session_store_degrade("create");
             return false; // fail closed — login not honored (ADR-0007)
         }
@@ -708,19 +697,20 @@ bool AuthManager::session_generation_view_stale() const {
 
 std::expected<UserEntry, AuthManager::UserLookupMiss>
 AuthManager::find_user_or_hydrate(const std::string& username) {
-    {
+    if (!auth_db_) {
+        // cfg-file mode: the map IS the truth (unchanged by #5274).
         std::shared_lock lock(mu_);
         auto it = users_.find(username);
         if (it != users_.end())
             return it->second;
+        return std::unexpected(UserLookupMiss::NotFound);
     }
-    if (!auth_db_)
-        return std::unexpected(UserLookupMiss::NotFound); // cfg-file mode: the map IS the truth
 
-    // Cold cache (#4020): the row may exist in AuthDB even though this process
-    // never cached it. Read it OUTSIDE mu_ (durable PG I/O, same lock ordering as
-    // the other AuthDB-first paths). get_user filters is_active, so a
-    // soft-deleted account stays a miss here.
+    // #5274: AuthDB mode is DB-FIRST on every call — the credential is never
+    // read from users_ (see the header doc: a cfg-seeded or other-replica-stale
+    // cache entry would otherwise shadow a password changed in AuthDB). Read
+    // OUTSIDE mu_ (durable PG I/O, same lock ordering as the other AuthDB-first
+    // paths). get_user filters is_active, so a soft-deleted account is a miss.
     auto db_user = auth_db_->get_user(username);
     if (!db_user) {
         // Gate 2/4 re-review follow-up (security-guardian + authdb, converged
@@ -733,9 +723,11 @@ AuthManager::find_user_or_hydrate(const std::string& username) {
         if (db_user.error() == yuzu::server::AuthDBError::UserNotFound ||
             db_user.error() == yuzu::server::AuthDBError::InvalidUsername)
             return std::unexpected(UserLookupMiss::NotFound);
-        spdlog::error("AuthManager: AuthDB lookup for '{}' failed on a cold cache - failing "
-                      "closed (no credential check)",
-                      username);
+        // #5342 Gate 7: this read runs on EVERY credential check now (#5274
+        // made it DB-first), so the old "on a cold cache" wording was false.
+        spdlog::error("AuthManager: AuthDB credential read for '{}' failed - failing closed "
+                      "(transient store error, not a credential verdict)",
+                      ::yuzu::log_key_token(username));
         return std::unexpected(UserLookupMiss::DbError);
     }
 
@@ -745,18 +737,22 @@ AuthManager::find_user_or_hydrate(const std::string& username) {
     // exists (see the no-op comment below).
     db_user->role_version = next_role_version_();
     std::unique_lock lock(mu_);
-    // try_emplace, never insert_or_assign: an upsert_user (new password) or
-    // reactivate_user that landed while the read above was in flight has already
-    // installed a NEWER entry than the row we hold; clobbering it would make the
-    // new password fail until the next restart. Whatever is cached now wins.
-    auto [it, inserted] = users_.try_emplace(username, std::move(*db_user));
-    (void)inserted;
-    return it->second;
+    // #4020 warm-up for the cache's OTHER readers. try_emplace, never
+    // insert_or_assign: a write path (upsert_user / reactivate_user /
+    // commit_password_change) that landed while the read above was in
+    // flight has already installed a NEWER entry than the row we hold, and the
+    // write paths own cache refresh. Nothing here consults the cached
+    // credential any more (#5274), so leaving an existing entry alone is safe.
+    users_.try_emplace(username, *db_user);
+    lock.unlock();
+    // The credential returned is the DB row, never the cached copy (#5274).
+    return std::move(*db_user);
 }
 
-std::optional<Role>
+std::expected<Role, VerifyFailure>
 AuthManager::recheck_role_after_credential_check(const std::string& username, Role pre_check_role,
                                                   [[maybe_unused]] std::uint64_t pre_check_version,
+                                                  const std::string& verified_hash_hex,
                                                   std::string_view context) {
     if (!auth_db_)
         return pre_check_role; // cfg-file mode: users_ IS the truth, nothing to re-check
@@ -780,12 +776,17 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
     // avoid touching both call sites in this same round - cleanup tracked
     // as a follow-up.
     std::optional<Role> result;
-    auto outcome = auth_db_->recheck_role_locked(username, [&](Role db_role) {
+    // #5274: set inside the row lock when the stored hash is no longer the one
+    // the caller verified the supplied password against.
+    bool credential_changed = false;
+    auto outcome = auth_db_->recheck_role_locked(username, [&](Role db_role,
+                                                               const std::string& db_hash) {
         // Invoked while AuthDB holds this row's lock - see the header doc.
         // Lock ORDERING invariant (cpp-expert Gate 8 catch): this is the
         // first place in this file mu_ is acquired from INSIDE an open
-        // AuthDB transaction. Safe only because every AuthDB write this file
-        // makes (update_role/reactivate_user/remove_user) completes its own
+        // AuthDB transaction. Safe only because every DB write this file
+        // makes (update_role_checked/reactivate_user/remove_user_checked, the first and
+        // last through the #4966 owner's guarded transactions) completes its own
         // DB call BEFORE ever touching mu_ (the file-wide "never hold mu_
         // across a DB call" discipline, stated where each of those calls
         // takes mu_) - so no code path can be holding mu_ while ALSO
@@ -797,6 +798,17 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
         // doc): a no-op (nullptr) in production.
         if (role_recheck_inside_lock_hook_for_test_)
             role_recheck_inside_lock_hook_for_test_();
+        // #5274: a password change committed between the caller's DB-first
+        // read (find_user_or_hydrate) and this row lock means the password was
+        // verified against a credential that no longer exists. Deny - no
+        // re-verify against the new hash; the user retries. Checked BEFORE the
+        // cache write so a denied check leaves the cache untouched. The compare
+        // is of two server-held hashes (no secret-dependent timing to protect),
+        // but constant_time_compare costs nothing and keeps the idiom uniform.
+        if (!constant_time_compare(db_hash, verified_hash_hex)) {
+            credential_changed = true;
+            return;
+        }
         std::unique_lock lock(mu_);
         auto it = users_.find(username);
         if (it != users_.end()) {
@@ -805,9 +817,10 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
         }
         // else: the entry vanished from the cache mid-recheck. Provably
         // unreachable today (cpp-expert Gate 8 verified this by tracing):
-        // the only eraser of a specific username is remove_user(), whose own
-        // DB write takes this SAME row lock, so its cache-erase (which runs
-        // strictly after its own DB commit) cannot land before a callback
+        // the only eraser of a specific username is remove_user_checked(),
+        // whose DB write (the owner's `deactivate_account`, the guarded soft
+        // delete, #4966) takes this SAME row lock, so its cache-erase (which
+        // runs strictly after that commit) cannot land before a callback
         // that already observed the row as active. Not a silent bypass if
         // this invariant is ever broken by a future change - `result` still
         // gets set to the DB-confirmed role either way, which is the
@@ -832,64 +845,79 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
             spdlog::warn("{}: user '{}' not active in AuthDB", context, username);
             std::unique_lock lock(mu_);
             users_.erase(username);
-        } else {
-            spdlog::error("{}: AuthDB re-check for '{}' failed (store error, not a removal) - "
-                         "failing closed without touching the cache",
-                         context, username);
+            return std::unexpected(VerifyFailure::kUnknownUser);
         }
-        return std::nullopt;
+        spdlog::error("{}: AuthDB re-check for '{}' failed (store error, not a removal) - "
+                      "failing closed without touching the cache",
+                      context, username);
+        return std::unexpected(VerifyFailure::kStoreUnavailable);
     }
-    return result;
+    if (credential_changed) {
+        spdlog::warn("{}: credential for '{}' changed during verification (a password change "
+                     "committed concurrently) - denying; the user retries",
+                     context, username);
+        if (metrics_)
+            metrics_->counter("yuzu_auth_credential_changed_during_verify_total").increment();
+        return std::unexpected(VerifyFailure::kCredentialChanged);
+    }
+    if (!result) // unreachable: a successful recheck always ran the callback
+        return std::unexpected(VerifyFailure::kStoreUnavailable);
+    return *result;
 }
 
 bool AuthManager::post_mint_role_recheck(const std::string& username, Role minted_role,
+                                         const std::optional<std::string>& expected_hash_hex,
                                          std::string_view context) {
     // #4107 check-then-mint gap (external adversarial review, fjarvis, PR
     // #4076): recheck_role_after_credential_check's row-locked read closes
     // the SAME-process/cross-replica divergence race for the read itself,
-    // but a demotion committing strictly AFTER that read and before this
-    // session's mint completes still lands a session stamped with the
-    // pre-demote role - and that demote's own sweep (update_role's
-    // std::erase_if) already ran before this session existed, so it can't
-    // catch it either.
+    // but a demotion (or, #5342, a credential change) committing strictly
+    // AFTER that read and before this session's mint completes would still
+    // land a session stamped with the pre-change role/credential.
     //
     // Closed here via the SAME pattern this codebase already uses for the
     // structurally identical OIDC/SAML deprovision-race (docs/
     // auth-architecture.md, "post-mint re-check"): mint normally, then
     // immediately re-verify against the authority and revoke-and-deny if it
-    // diverged, rather than serializing the mint inside the row lock.
-    // Serializing was considered and explicitly rejected for that race
-    // class - it would require holding AuthDB's row lock across a
-    // SessionStore call, violating this codebase's "never hold one store's
-    // pool lease while calling another" discipline (docs/
-    // auth-architecture.md §3) - SessionStore's shared write-generation row
-    // is exactly the kind of cross-store lock that could deadlock against
-    // AuthDB's row lock under the wrong interleaving.
+    // diverged, rather than serializing the mint inside the row lock (that
+    // would hold AuthDB's row lock across a SessionStore write — the shared
+    // `session_meta` write-generation row — which is the cross-store lock
+    // nesting docs/auth-architecture.md §3 rejects for this race class).
     //
-    // Ordering proof (why this closes the race rather than merely
-    // narrowing it, for the SAME-PROCESS case): a racing update_role()
-    // commits its AuthDB UPDATE BEFORE taking mu_ to sweep sessions_ (see
-    // update_role's own body). persist_new_session's mint-write and
-    // update_role's sweep both take mu_, so one strictly happens-before
-    // the other. If the mint happens-before the sweep, the sweep (running
-    // after) finds and erases this just-minted session - self-healed. If
-    // the sweep happens-before the mint, the sweep's own UPDATE already
-    // committed before the sweep ran, which is before the mint, which is
-    // before this call - so this call's fresh AuthDB read is guaranteed to
-    // observe it. Cross-replica: this needs no mu_ analogue at all (authdb
-    // Gate 8 correction to an earlier draft of this comment, which wrongly
-    // reached for one) - mu_ is per-process and has no cross-replica
-    // meaning. The actual argument is simpler and stronger: this call's
-    // own SELECT (get_user(), a bare autocommit read, no held transaction)
-    // runs strictly AFTER persist_new_session returns, and ordinary READ
-    // COMMITTED visibility on a single-primary Postgres instance guarantees
-    // it observes any commit that landed before it, regardless of which
-    // connection or replica issued either statement - no replica-local
-    // state or clock needs to agree with any other's. This reasoning
-    // assumes single-primary Postgres; it would need re-deriving under
-    // read-replica routing, the same caveat ADR-2001's own analogous
-    // cross-replica guarantee (docs/adr/2001-scim-oidc-identity-linkage.md,
-    // "Known residuals") flags for its own case.
+    // Ordering proof — LOCK-based (#5342 Gate 8, M1). The re-read below is
+    // `AuthDB::recheck_role_locked`: `SELECT role, password_hash ... FOR
+    // UPDATE`, issued strictly AFTER persist_new_session's INSERT has
+    // COMMITTED (so this session's durable row is visible to every later
+    // statement, on any connection, under READ COMMITTED on single-primary
+    // Postgres). Every writer this check races takes the SAME `auth.users`
+    // row lock for its whole transaction (the owner's `set_local_role` and
+    // `deactivate_account` (#4966), which `update_role_checked` / `remove_user_checked` call;
+    // CredentialChangeOwner's `SELECT ... FOR UPDATE` → UPDATE → DELETE of the
+    // account's sessions → COMMIT). For a credential change W, exactly one of:
+    //   (1) W committed before this FOR UPDATE ran → this read sees the new
+    //       hash → deny + revoke;
+    //   (2) W holds the row lock (its UPDATE ran, not yet committed) → this
+    //       FOR UPDATE WAITS for W's commit, then reads the new hash → deny +
+    //       revoke (a plain read here would have seen the OLD hash past W's
+    //       uncommitted UPDATE while W's session DELETE — which ran before this
+    //       session existed — never sweeps it: the Gate 8 R1 defect);
+    //   (3) W has not yet taken the row lock → this read sees the old hash and
+    //       admits; W's later DELETE runs after this session's INSERT
+    //       committed and therefore sweeps it.
+    // The same three cases cover a demotion (`set_local_role` takes the row lock,
+    // and its own in-memory sweep runs after its commit). The wait in (2) is
+    // bounded by recheck_role_locked's txn-scoped lock_timeout; a timeout is
+    // a store error → deny + revoke (fail closed). This reasoning assumes
+    // single-primary Postgres; it would need re-deriving under read-replica
+    // routing, the same caveat ADR-2001's own analogous cross-replica
+    // guarantee (docs/adr/2001-scim-oidc-identity-linkage.md, "Known
+    // residuals") flags for its own case.
+    //
+    // Lock-order safety: this call holds NO session_store lock while it waits
+    // on `auth.users` (persist_new_session's transaction — and with it the
+    // `session_meta` row lock — has already committed), and the callback does
+    // no I/O and takes no mutex, so it cannot complete a cycle with
+    // CredentialChangeOwner's `auth.users` → `session_store` order.
     //
     // Residual this does NOT close (same one ADR-2001/OIDC's own post-mint
     // recheck discloses for its structurally identical race): a demote
@@ -897,7 +925,8 @@ bool AuthManager::post_mint_role_recheck(const std::string& username, Role minte
     // Set-Cookie actually reaching the client is not observable to this
     // function at all - closing that would mean holding this transaction
     // open all the way to the HTTP response, which is a different, larger
-    // change than a role recheck.
+    // change than a role recheck. (A credential change in that window is
+    // case (3): its DELETE sweeps the session.)
     //
     // wipe_user_sessions_durable/invalidate_user_sessions delete the
     // durable row directly rather than working off a stale local list,
@@ -908,7 +937,26 @@ bool AuthManager::post_mint_role_recheck(const std::string& username, Role minte
     // truth there, nothing to diverge from.
     if (!auth_db_)
         return true;
-    auto post = auth_db_->get_user(username);
+    enum class Divergence { kNone, kRole, kCredential };
+    Divergence divergence = Divergence::kNone;
+    Role db_role_seen = minted_role;
+    auto post = auth_db_->recheck_role_locked(
+        username, [&](Role db_role, const std::string& db_hash) {
+            // Under the row lock: compare only — no I/O, no mutex.
+            db_role_seen = db_role;
+            if (db_role != minted_role) {
+                divergence = Divergence::kRole;
+                return;
+            }
+            // #5342 Gate 7: the credential anchor. The caller verified the
+            // password against `expected_hash_hex`; a session proven with the
+            // OLD credential must not survive a change committed since (an
+            // empty anchor never equals a stored hash, so it DENIES — fail
+            // closed). Two server-held hashes, but constant_time_compare keeps
+            // the idiom uniform.
+            if (expected_hash_hex && !constant_time_compare(db_hash, *expected_hash_hex))
+                divergence = Divergence::kCredential;
+        });
     if (!post) {
         const bool removed = yuzu::server::AuthDBError::UserNotFound == post.error();
         spdlog::warn("{}: post-mint re-check for '{}' {} - revoking the session just minted",
@@ -921,10 +969,22 @@ bool AuthManager::post_mint_role_recheck(const std::string& username, Role minte
         (void)revoke; // best-effort revoke; the mint is already denied to the caller either way
         return false;
     }
-    if (post->role != minted_role) {
+    if (divergence == Divergence::kRole) {
         spdlog::warn("{}: post-mint re-check for '{}' found the role changed {} -> {} during "
                     "the mint (concurrent role-change race) - revoking the session just minted",
-                    context, username, role_to_string(minted_role), role_to_string(post->role));
+                    context, username, role_to_string(minted_role), role_to_string(db_role_seen));
+        auto revoke = invalidate_user_sessions(username);
+        if (metrics_) {
+            metrics_->counter("yuzu_auth_role_recheck_post_mint_denied_total").increment();
+        }
+        (void)revoke;
+        return false;
+    }
+    if (divergence == Divergence::kCredential) {
+        spdlog::warn("{}: post-mint re-check for '{}' found the stored credential changed after "
+                     "the password was verified (concurrent password change/reset) - revoking "
+                     "the session just minted",
+                     context, username);
         auto revoke = invalidate_user_sessions(username);
         if (metrics_) {
             metrics_->counter("yuzu_auth_role_recheck_post_mint_denied_total").increment();
@@ -944,7 +1004,15 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     // 100k iterations runs ~50-150 ms on commodity hardware.
     const auto t_start = std::chrono::steady_clock::now();
 
-    // Cache-or-AuthDB lookup (#4020); a COPY, so PBKDF2 below runs off mu_.
+    // #5342: an over-max password can never match (no setting site accepts
+    // one) — reject without the DB read or PBKDF2, which bounds the hash input.
+    // Never log the length.
+    if (password_exceeds_max(password)) {
+        spdlog::warn("Auth failed: over-length password for '{}'", username);
+        return std::nullopt;
+    }
+
+    // AuthDB-first lookup (#4020/#5274); a COPY, so PBKDF2 below runs off mu_.
     auto entry = find_user_or_hydrate(username);
     if (!entry) {
         if (entry.error() == UserLookupMiss::DbError)
@@ -983,10 +1051,10 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     // Gate 2/3 governance follow-ups — see recheck_role_after_credential_check's
     // doc for the full rationale, including the row-lock serialization #4107
     // added to close the same-process divergence race).
-    auto current_role = recheck_role_after_credential_check(username, entry->role,
-                                                             entry->role_version, "Auth failed");
+    auto current_role = recheck_role_after_credential_check(
+        username, entry->role, entry->role_version, entry->hash_hex, "Auth failed");
     if (!current_role)
-        return std::nullopt;
+        return std::nullopt; // every failure kind denies here (no session; logged by the helper)
     entry->role = *current_role;
 
     auto token = generate_session_token();
@@ -1009,7 +1077,7 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     if (!persist_new_session(token, params))
         return std::nullopt; // durable-write failure → login not honored (ADR-0007)
     // #4107 check-then-mint gap: see post_mint_role_recheck's own doc.
-    if (!post_mint_role_recheck(username, entry->role, "Auth failed"))
+    if (!post_mint_role_recheck(username, entry->role, entry->hash_hex, "Auth failed"))
         return std::nullopt;
 
     spdlog::info("User '{}' authenticated (role={})", username, params.role);
@@ -1024,16 +1092,26 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     return token;
 }
 
-std::optional<Role> AuthManager::verify_password(const std::string& username,
-                                                 const std::string& password) {
+std::expected<VerifiedCredential, VerifyFailure>
+AuthManager::verify_password(const std::string& username, const std::string& password) {
     // Mirrors authenticate() up to the credential check but stops short of
     // session creation. Histogram labels match authenticate() so dashboards
     // continue to roll up "password verify" cost across both call sites.
     const auto t_start = std::chrono::steady_clock::now();
-    auto entry = find_user_or_hydrate(username); // cache-or-AuthDB (#4020), a COPY
+    // #5342: same over-max short-circuit as authenticate() (defence in depth —
+    // AuthRoutes::verify_password_with_lockout already rejects before calling).
+    // An over-max password can never match, so it is a credential verdict.
+    if (password_exceeds_max(password)) {
+        spdlog::warn("verify_password failed: over-length password for '{}'", username);
+        return std::unexpected(VerifyFailure::kBadCredential);
+    }
+    auto entry = find_user_or_hydrate(username); // AuthDB-first (#4020/#5274), a COPY
     if (!entry) {
+        // #5342 Gate 7 (sec-3): a store error is TRANSIENT, never a wrong
+        // password — the caller must not count it toward lockout or audit it
+        // as a failed guess. Logged by the helper; no unknown_user sample.
         if (entry.error() == UserLookupMiss::DbError)
-            return std::nullopt; // fail closed; logged by the helper, not an unknown_user sample
+            return std::unexpected(VerifyFailure::kStoreUnavailable);
         spdlog::warn("verify_password failed: unknown user '{}'", username);
         if (metrics_) {
             const auto elapsed =
@@ -1043,7 +1121,7 @@ std::optional<Role> AuthManager::verify_password(const std::string& username,
                             {{"method", "password"}, {"result", "unknown_user"}})
                 .observe(elapsed);
         }
-        return std::nullopt;
+        return std::unexpected(VerifyFailure::kUnknownUser);
     }
     auto salt = hex_to_bytes(entry->salt_hex);
     auto hash = pbkdf2_sha256(password, salt, kPbkdf2Iterations);
@@ -1057,16 +1135,17 @@ std::optional<Role> AuthManager::verify_password(const std::string& username,
                             {{"method", "password"}, {"result", "bad_password"}})
                 .observe(elapsed);
         }
-        return std::nullopt;
+        return std::unexpected(VerifyFailure::kBadCredential);
     }
     // Re-verify against AuthDB: catches a soft-deleted/removed user AND makes
     // this the authoritative role for the caller (same rationale as
-    // authenticate() — see recheck_role_after_credential_check's doc).
+    // authenticate() — see recheck_role_after_credential_check's doc). Its
+    // failure kinds pass straight through (kUnknownUser / kStoreUnavailable /
+    // kCredentialChanged).
     auto current_role = recheck_role_after_credential_check(
-        username, entry->role, entry->role_version, "verify_password failed");
+        username, entry->role, entry->role_version, entry->hash_hex, "verify_password failed");
     if (!current_role)
-        return std::nullopt;
-    auto role = *current_role;
+        return std::unexpected(current_role.error());
     if (metrics_) {
         const auto elapsed =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
@@ -1075,11 +1154,25 @@ std::optional<Role> AuthManager::verify_password(const std::string& username,
                         {{"method", "password"}, {"result", "success"}})
             .observe(elapsed);
     }
-    return role;
+    // The hash the password was verified against, confirmed still current
+    // under the row lock above — the anchor the rest of this login carries.
+    return VerifiedCredential{*current_role, std::move(entry->hash_hex)};
 }
 
 std::string AuthManager::create_local_session(const std::string& username, Role role,
-                                              bool mfa_verified) {
+                                              bool mfa_verified,
+                                              const std::string& expected_hash_hex) {
+    return mint_local_session(username, role, mfa_verified, expected_hash_hex);
+}
+
+std::string AuthManager::create_local_session_for_test(const std::string& username, Role role,
+                                                       bool mfa_verified) {
+    return mint_local_session(username, role, mfa_verified, std::nullopt);
+}
+
+std::string AuthManager::mint_local_session(const std::string& username, Role role,
+                                            bool mfa_verified,
+                                            const std::optional<std::string>& expected_hash_hex) {
     auto token = generate_session_token();
     yuzu::server::SessionWriteParams params;
     params.username = username;
@@ -1106,7 +1199,10 @@ std::string AuthManager::create_local_session(const std::string& username, Role 
     // regardless of how wide that earlier window was. Same empty-token
     // fail-safe contract as the durable-write-failure branch above: no
     // session, degrades to "not authenticated" at the caller's cookie set.
-    if (!post_mint_role_recheck(username, role, "create_local_session"))
+    // #5342 Gate 7: the same re-read also requires the stored hash to still be
+    // the one the caller verified (`expected_hash_hex`), so the window covers
+    // a credential change exactly as it covers a role change.
+    if (!post_mint_role_recheck(username, role, expected_hash_hex, "create_local_session"))
         return {};
     // Stamp last_login_at on every successful login, not just the
     // MFA-verified TOTP path. The MFA-verified TOTP path already does
@@ -1809,8 +1905,8 @@ std::vector<UserEntry> AuthManager::list_users() const {
 }
 
 bool AuthManager::upsert_user(const std::string& username, const std::string& password, Role role) {
-    if (password.size() < 12)
-        return false; // minimum password length (G2-SEC-A1-003)
+    if (check_password_policy(password) != PasswordPolicyVerdict::kOk)
+        return false; // length policy (G2-SEC-A1-003 minimum, #5342 maximum)
     auto salt = random_bytes(16);
     auto salt_hex = bytes_to_hex(salt);
     auto hash = pbkdf2_sha256(password, salt, kPbkdf2Iterations);
@@ -1856,12 +1952,14 @@ bool AuthManager::upsert_user(const std::string& username, const std::string& pa
     // mode, so a failed durable delete would leave the old-role session live.
     //
     // RETRY-SAFETY CAVEAT (security-guardian Gate 8, LOW/latent): unlike
-    // update_role/remove_user — which re-attempt the wipe unconditionally on a
-    // retry — this path recomputes `role_changed` against the NOW-mutated in-memory
-    // role, so a retry after a wipe failure sees role_changed=false and skips the
-    // wipe. That is safe today ONLY because no production path demotes via
-    // upsert_user (dashboard create 409s on a dup username; role edits route
-    // through update_role; SCIM upserts at a fixed Role::user). A future
+    // update_role_checked (whose repeat call also takes the `Unchanged` branch and so
+    // re-runs the wipe; no route-level retry is promised, see
+    // `UpdateRoleOutcome::UpdatedSessionWipeFailed`), this path recomputes `role_changed`
+    // against the NOW-mutated in-memory role, so a retry after a wipe failure sees
+    // role_changed=false and skips the wipe. That is safe today ONLY because no
+    // production path demotes via upsert_user (dashboard create 409s on a dup
+    // username; role edits route through update_role_checked; SCIM upserts at a
+    // fixed Role::user). A future
     // demote-via-upsert MUST recompute role_changed against the durable/DB row (or
     // wipe unconditionally) before relying on retry to converge.
     if (role_changed && !wipe_user_sessions_durable(username))
@@ -1874,20 +1972,70 @@ bool AuthManager::upsert_user(const std::string& username, const std::string& pa
     return true;
 }
 
-bool AuthManager::remove_user(const std::string& username) {
-    if (auth_db_) {
-        auto result = auth_db_->remove_user(username);
-        if (!result) {
-            spdlog::error("AuthDB remove_user failed for '{}'", username);
-            return false;
-        }
+void AuthManager::note_lifecycle_store_failure(const char* op) const {
+    if (metrics_)
+        metrics_->counter("yuzu_server_rbac_lifecycle_store_failure_total", {{"op", op}})
+            .increment();
+}
 
-        // In-memory cache/session cleanup is a best-effort side effect only —
-        // it must NOT gate the return value. On a cold-booted server users_
-        // may never have been warmed for this username even though the DB row
-        // existed and was just soft-deleted; returning the cache-erase result
-        // in that case falsely reports failure (SCIM deprovision fail-closed
-        // 500 loop on restart). The DB write is authoritative.
+void AuthManager::evict_target_after_indeterminate_write(const std::string& username) {
+    // The guarded write answered StoreFailure: the row MAY have committed (a lost COMMIT ack),
+    // so neither the `users_` entry (a possibly stale role / active flag) nor any session of the
+    // TARGET may keep being served. Fail toward re-authentication, never toward a stale grant:
+    // this evicts only the target's own in-memory state, then makes the durable wipe attempt
+    // (best effort here: the caller already answers StoreFailure, and a retry repeats it).
+    // mu_ is taken only after the owner call returned, never across it.
+    {
+        std::unique_lock lock(mu_);
+        users_.erase(username);
+        std::erase_if(sessions_,
+                      [&](const auto& pair) { return pair.second.username == username; });
+    }
+    if (!wipe_user_sessions_durable(username))
+        spdlog::warn("AuthManager: durable session wipe for '{}' after an indeterminate "
+                     "lifecycle write also failed; a durable session may survive until the "
+                     "operation is retried",
+                     username);
+}
+
+RemoveUserOutcome AuthManager::remove_user_checked(const std::string& username) {
+    if (auth_db_) {
+        // FAIL CLOSED (#4966): an AuthDB without the guard must never reach the unguarded
+        // `AuthDB::remove_user`; server.cpp refuses to boot in this state, so this arm is the
+        // belt for a mis-wired embedder or test.
+        if (lifecycle_guard_unwired(true, rbac_store_ != nullptr)) {
+            spdlog::error("AuthManager::remove_user_checked('{}'): the last-Administrator guard "
+                          "is not wired (no RbacStore) - refusing to deactivate without it",
+                          username);
+            note_lifecycle_store_failure("deactivate");
+            return RemoveUserOutcome::StoreFailure; // nothing was attempted: no eviction
+        }
+        // The guarded write FIRST, with no lock held: mu_ is never held across it (the
+        // file-wide "never hold mu_ across a DB call" discipline, which
+        // recheck_role_after_credential_check's mu_-inside-row-lock acquisition relies on to
+        // stay deadlock-free against the owner's `auth.users` row lock).
+        const auto res = rbac_store_->deactivate_account(username);
+        using Kind = AccountDeactivationResult::Kind;
+        if (res.kind == Kind::kLastAdministratorRefused)
+            return RemoveUserOutcome::LastAdministratorRefused; // nothing changed: no cleanup
+        if (res.kind == Kind::kStoreFailure) {
+            spdlog::error("AuthManager::remove_user_checked: guarded deactivation of '{}' failed: {}",
+                          username, res.err);
+            note_lifecycle_store_failure("deactivate");
+            // The row may or may not be deactivated (a lost COMMIT ack). The target is the
+            // account being removed and its credentials are already revoked at every caller, so
+            // fail toward re-authentication; the answer is still StoreFailure, never success.
+            evict_target_after_indeterminate_write(username);
+            return RemoveUserOutcome::StoreFailure;
+        }
+        const bool deactivated = (res.kind == Kind::kDeactivated);
+
+        // In-memory cache/session cleanup is a best-effort side effect only for the RETURN
+        // VALUE of the cache erase: on a cold-booted server users_ may never have been warmed
+        // for this username even though the DB row existed and was just soft-deleted, and
+        // reporting that as failure would turn a SCIM deprovision into a fail-closed 500 loop
+        // on restart. The DB write is authoritative. It also runs for NotFound, so a repeat after a
+        // failed durable wipe (the row is then already inactive) re-runs the session wipe.
         std::unique_lock lock(mu_);
         users_.erase(username);
         // Invalidate all active sessions belonging to this user
@@ -1895,13 +2043,18 @@ bool AuthManager::remove_user(const std::string& username) {
         std::erase_if(sessions_,
                       [&](const auto& pair) { return pair.second.username == username; });
         lock.unlock();
-        // Fail closed on a durable-wipe error (see wipe_user_sessions_durable):
-        // a removed user's sessions must not survive because the durable delete
-        // was lost — the operator retries (invalidate_user is idempotent).
-        if (!wipe_user_sessions_durable(username))
-            return false;
-
-        return *result;
+        // Fail closed on a durable-wipe error (see wipe_user_sessions_durable): a removed
+        // user's sessions must not survive because the durable delete was lost; the operator
+        // retries (invalidate_user is idempotent). The answer says whether THIS call removed
+        // the row, so the caller never reports an uncommitted removal.
+        if (!wipe_user_sessions_durable(username)) {
+            spdlog::error("AuthManager::remove_user_checked: durable session wipe for '{}' "
+                          "failed ({})",
+                          username, deactivated ? "the account IS deactivated" : "row was already inactive");
+            return deactivated ? RemoveUserOutcome::RemovedSessionWipeFailed
+                               : RemoveUserOutcome::StoreFailure;
+        }
+        return deactivated ? RemoveUserOutcome::Removed : RemoveUserOutcome::NotFound;
     }
 
     std::unique_lock lock(mu_);
@@ -1915,10 +2068,40 @@ bool AuthManager::remove_user(const std::string& username) {
 
     lock.unlock();
     if (erased && !wipe_user_sessions_durable(username)) // no-op (true) w/o store
-        return false;
+        return RemoveUserOutcome::RemovedSessionWipeFailed;
     save_config();
 
-    return erased;
+    return erased ? RemoveUserOutcome::Removed : RemoveUserOutcome::NotFound;
+}
+
+std::optional<bool> AuthManager::would_strand_last_administrator(const std::string& username) const {
+    if (!auth_db_ || !rbac_store_)
+        return std::nullopt;
+    const auto r = rbac_store_->would_strand_last_administrator(username);
+    if (!r.ok) {
+        spdlog::warn("AuthManager::would_strand_last_administrator('{}'): advisory read failed: {}",
+                     username, r.err);
+        note_lifecycle_store_failure("would_strand");
+        return std::nullopt;
+    }
+    return r.would_strand;
+}
+
+std::optional<bool> AuthManager::holds_administrator_grant(const std::string& username) const {
+    if (!rbac_store_)
+        return std::nullopt;
+    const auto roles = rbac_store_->get_principal_roles_checked("user", username);
+    if (!roles) {
+        spdlog::warn("AuthManager::holds_administrator_grant('{}'): grant read failed: {}",
+                     username, roles.error());
+        note_lifecycle_store_failure("grant_read");
+        return std::nullopt;
+    }
+    return std::ranges::any_of(*roles, [](const auto& pr) { return pr.role_name == "Administrator"; });
+}
+
+bool AuthManager::remove_user(const std::string& username) {
+    return remove_user_checked(username) == RemoveUserOutcome::Removed;
 }
 
 bool AuthManager::reactivate_user(const std::string& username) {
@@ -1964,6 +2147,92 @@ bool AuthManager::reactivate_user(const std::string& username) {
     std::unique_lock lock(mu_);
     users_[username] = *entry;
     return true;
+}
+
+// ── Password change / reset (#5342) ─────────────────────────────────────────
+
+yuzu::server::CredentialChangeOutcome
+AuthManager::commit_password_change(const yuzu::server::CredentialChangeRequest& request) {
+    // No owner (cfg-file-only mode, or a server wired without Postgres): there
+    // is no durable credential to change, and a password written only to
+    // users_ + the cfg file would not survive the next seed anyway. Fail
+    // closed, never pretend.
+    if (!credential_change_owner_)
+        return yuzu::server::CredentialChangeOutcome{};
+    // The ONE transaction (credential_change_owner.hpp). No mu_ is held across
+    // it — the file-wide "never hold mu_ across a DB call" discipline, which is
+    // also what keeps recheck_role_after_credential_check's mu_-inside-row-lock
+    // acquisition deadlock-free against this owner's row lock.
+    auto outcome = credential_change_owner_->commit(request);
+    if (outcome.result != yuzu::server::CredentialChangeResult::kOk)
+        return outcome;
+    // Post-commit cache refresh. Credentials only (.role untouched, so the
+    // role_version lockstep invariant needs no new stamp); an uncached username
+    // stays uncached (find_user_or_hydrate is DB-first in this mode). Every
+    // in-memory session of the account goes too — the durable rows were deleted
+    // in the transaction and the bumped write-generation makes every OTHER
+    // replica drop its cached copies on its next refresh.
+    std::unique_lock lock(mu_);
+    if (auto it = users_.find(request.username); it != users_.end()) {
+        it->second.hash_hex = request.new_hash_hex;
+        it->second.salt_hex = request.new_salt_hex;
+    }
+    std::erase_if(sessions_,
+                  [&](const auto& pair) { return pair.second.username == request.username; });
+    return outcome;
+}
+
+std::size_t AuthManager::report_stale_cfg_credentials() {
+    // #5274 boot signal: with AuthDB wired the cfg file is seed-only — the
+    // stored credential always wins (find_user_or_hydrate is DB-first). A cfg
+    // entry whose hash differs from its auth.users row is therefore DEAD
+    // credential material an operator may still believe is live (e.g. after
+    // an in-product password change, the old cfg hash keeps being re-seeded
+    // into users_ at every boot). Say so, by name, once per boot.
+    if (!auth_db_)
+        return 0;
+    std::vector<std::pair<std::string, std::string>> cfg_entries;
+    {
+        std::shared_lock lock(mu_);
+        cfg_entries.reserve(users_.size());
+        for (const auto& [name, entry] : users_)
+            cfg_entries.emplace_back(name, entry.hash_hex);
+    }
+    std::size_t stale = 0;
+    for (const auto& [name, cfg_hash] : cfg_entries) {
+        auto row = auth_db_->get_user(name); // PG I/O outside mu_
+        if (!row) {
+            if (row.error() == yuzu::server::AuthDBError::UserNotFound) {
+                // #5343: a cfg entry with no auth.users row can never sign in
+                // (the cfg is seed-only; only the first admin is provisioned).
+                // Typical sources: a pre-0.15.0 install's second first-run
+                // account / installer /OPERATOR_USER entry that was never
+                // provisioned, or an account since deleted. Not counted as
+                // "stale" (nothing in the store to shadow), and no new gauge.
+                spdlog::warn("#5343 boot check: cfg entry '{}' has no auth.users row (never "
+                             "provisioned - #5343 - or since deleted); cfg is seed-only so it "
+                             "cannot sign in; remove the line, create the account in Settings "
+                             "> User Management",
+                             name);
+            } else if (row.error() != yuzu::server::AuthDBError::InvalidUsername) {
+                spdlog::warn("#5274 boot check: could not read auth.users row for cfg user '{}' "
+                             "(store error) - stale-credential check skipped for it",
+                             name);
+            }
+            continue; // no row: the cfg entry is not shadowing anything
+        }
+        if (!constant_time_compare(row->hash_hex, cfg_hash)) {
+            ++stale;
+            spdlog::warn("#5274 cfg is seed-only; stored credential wins: yuzu-server.cfg still "
+                         "carries a DIFFERENT (stale) password hash for '{}' than the auth store. "
+                         "That cfg password no longer signs in; remove or rotate the cfg entry so "
+                         "nobody relies on it",
+                         name);
+        }
+    }
+    if (metrics_)
+        metrics_->gauge("yuzu_auth_cfg_credentials_stale").set(static_cast<double>(stale));
+    return stale;
 }
 
 std::optional<Role> AuthManager::get_user_role(const std::string& username) const {
@@ -2032,8 +2301,8 @@ std::optional<Role> AuthManager::get_user_role(const std::string& username) cons
             if (db_user.error() != yuzu::server::AuthDBError::UserNotFound &&
                 db_user.error() != yuzu::server::AuthDBError::InvalidUsername) {
                 spdlog::error("get_user_role: AuthDB lookup for '{}' failed (store error, not "
-                             "a genuine miss) - returning nullopt",
-                             username);
+                              "a genuine miss) - returning nullopt",
+                              ::yuzu::log_key_token(username));
                 // Gate 5 chaos-injector CH-3/UP-6 follow-up: a log line alone is
                 // invisible exactly while the store is already stressed (the
                 // scenario that matters). This is the ONLY caller-visible signal
@@ -2058,21 +2327,48 @@ std::optional<Role> AuthManager::get_user_role(const std::string& username) cons
     return it->second.role;
 }
 
-bool AuthManager::update_role(const std::string& username, Role new_role) {
+UpdateRoleOutcome AuthManager::update_role_checked(const std::string& username, Role new_role) {
     if (auth_db_) {
-        auto result = auth_db_->update_role(username, new_role);
-        if (!result) {
-            spdlog::error("AuthDB update_role failed for '{}'", username);
-            return false;
+        // FAIL CLOSED, same as remove_user_checked: never the unguarded AuthDB::update_role.
+        if (lifecycle_guard_unwired(true, rbac_store_ != nullptr)) {
+            spdlog::error("AuthManager::update_role_checked('{}'): the last-Administrator guard "
+                          "is not wired (no RbacStore) - refusing to change the role without it",
+                          username);
+            note_lifecycle_store_failure("set_role");
+            return UpdateRoleOutcome::StoreFailure; // nothing was attempted: no eviction
+        }
+        // The guarded write FIRST, with no lock held (see remove_user_checked).
+        const auto res = rbac_store_->set_local_role(username, new_role);
+        using Kind = LocalRoleChangeResult::Kind;
+        switch (res.kind) {
+        case Kind::kNotFound:
+            spdlog::warn("update_role: user not found: '{}'", username);
+            return UpdateRoleOutcome::NotFound;
+        case Kind::kLastAdministratorRefused:
+            return UpdateRoleOutcome::LastAdministratorRefused; // nothing changed
+        case Kind::kInactivePromotionRefused:
+            spdlog::warn("update_role: refusing to promote inactive account '{}'", username);
+            return UpdateRoleOutcome::InactivePromotionRefused;
+        case Kind::kStoreFailure:
+            spdlog::error("AuthManager::update_role_checked: guarded role write for '{}' failed: {}",
+                          username, res.err);
+            note_lifecycle_store_failure("set_role");
+            // The write MAY have committed (a lost COMMIT ack): do not keep serving the cached
+            // role or a session minted at the old one. Fail toward re-authentication.
+            evict_target_after_indeterminate_write(username);
+            return UpdateRoleOutcome::StoreFailure;
+        case Kind::kChanged:
+        case Kind::kUnchanged:
+            break; // the row now holds new_role: refresh caches and sessions below
         }
 
-        // In-memory cache/session cleanup is a best-effort side effect only —
-        // it must NOT gate the return value. On a cold-booted server users_
-        // may never have been warmed for this username even though the DB row
-        // existed and was just updated; returning the cache-lookup result in
-        // that case falsely reports failure (e.g. an unaudited SCIM role
-        // recompute after restart). The DB write is authoritative — same
-        // pattern as remove_user.
+        // In-memory cache/session cleanup is a best-effort side effect only for the cache
+        // lookup's return value: on a cold-booted server users_ may never have been warmed for
+        // this username even though the DB row existed and was just updated, and reporting that
+        // as failure would be false (e.g. an unaudited SCIM role recompute after restart). The
+        // DB write is authoritative - same pattern as remove_user_checked. Also runs for
+        // Unchanged, so a repeat call re-runs the session wipe (no route-level retry is promised:
+        // see `UpdateRoleOutcome::UpdatedSessionWipeFailed`).
         std::unique_lock lock(mu_);
         auto it = users_.find(username);
         if (it != users_.end()) {
@@ -2085,18 +2381,21 @@ bool AuthManager::update_role(const std::string& username, Role new_role) {
         std::erase_if(sessions_,
                       [&](const auto& pair) { return pair.second.username == username; });
         lock.unlock();
-        // Fail closed on a durable-wipe error — a demoted user's higher-role
-        // session must not survive a lost durable delete (see the helper).
-        if (!wipe_user_sessions_durable(username))
-            return false;
-
-        return true;
+        // Fail closed on a durable-wipe error: a demoted user's higher-role session must not
+        // survive a lost durable delete (see the helper). The role IS changed by now.
+        if (!wipe_user_sessions_durable(username)) {
+            spdlog::error("AuthManager::update_role_checked: durable session wipe for '{}' failed "
+                          "(the role IS changed)",
+                          username);
+            return UpdateRoleOutcome::UpdatedSessionWipeFailed;
+        }
+        return UpdateRoleOutcome::Updated;
     }
 
     std::unique_lock lock(mu_);
     auto it = users_.find(username);
     if (it == users_.end()) {
-        return false;
+        return UpdateRoleOutcome::NotFound;
     }
     it->second.role = new_role;
     it->second.role_version = next_role_version_(); // keeps .role/.role_version paired, same as the AuthDB-backed branch above
@@ -2107,10 +2406,14 @@ bool AuthManager::update_role(const std::string& username, Role new_role) {
 
     lock.unlock();
     if (!wipe_user_sessions_durable(username)) // no-op (true) w/o store
-        return false;
+        return UpdateRoleOutcome::UpdatedSessionWipeFailed;
     save_config();
 
-    return true;
+    return UpdateRoleOutcome::Updated;
+}
+
+bool AuthManager::update_role(const std::string& username, Role new_role) {
+    return update_role_checked(username, new_role) == UpdateRoleOutcome::Updated;
 }
 
 // ── Shared group→role resolution ────────────────────────────────────────────
@@ -2169,12 +2472,18 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
     // authoring) — pass it through; the epoch sentinel maps to 0 (no proof).
     params.mfa_verified_ms_abs = ms_from_tp(mfa_verified_at);
     if (!persist_new_session(token, params)) {
-        spdlog::error("create_oidc_session: durable persist failed for '{}'", stable_username);
+        spdlog::error("create_oidc_session: durable persist failed for '{}'",
+                      ::yuzu::log_key_token(stable_username));
         return {}; // fail-safe empty token (ADR-0007)
     }
 
+    // Display name, email, sub and `iss` are IdP-controlled: fold the LOG copies only (a line
+    // break in one would forge a second log line). The session and the stored row keep the
+    // original bytes.
     spdlog::info("OIDC session created for '{}' (display={}, email={}, sub={}, role={})",
-                 stable_username, resolved_display, email, oidc_sub, role_to_string(role));
+                 ::yuzu::log_key_token(stable_username), ::yuzu::log_key_token(resolved_display),
+                 ::yuzu::log_key_token(email), ::yuzu::log_key_token(oidc_sub),
+                 role_to_string(role));
     return token;
 }
 
@@ -2193,7 +2502,7 @@ void AuthManager::provision_sso_identity(const std::string& principal, const std
     if (!result) {
         spdlog::warn("provision_sso_identity failed for '{}': error={} (login proceeds; this "
                      "principal cannot elevate until a future login provisions it)",
-                     principal, static_cast<int>(result.error()));
+                     ::yuzu::log_key_token(principal), static_cast<int>(result.error()));
         return;
     }
     // governance round (sec-LOW/UP-5) — observable IdP-provisioning volume.
@@ -2319,374 +2628,64 @@ std::string AuthManager::sha256_hex(const std::string& input) {
     return bytes_to_hex(derived);
 }
 
-std::string AuthManager::create_enrollment_token(const std::string& label, int max_uses,
-                                                 std::chrono::seconds ttl) {
-    // Generate a high-entropy raw token
-    auto raw_bytes = random_bytes(32);
-    auto raw_token = bytes_to_hex(raw_bytes);
+// ── Enrollment tokens + pending agents (WS-6 6.2): AuthDB-only, fail-closed ──
 
-    // Hash it for storage (we never store the raw token)
-    auto hash = sha256_hex(raw_token);
-
-    // Token ID = first 8 hex chars of the hash (for display/admin reference)
-    auto token_id = hash.substr(0, 8);
-
-    auto now = std::chrono::system_clock::now();
-
-    EnrollmentToken et;
-    et.token_id = token_id;
-    et.token_hash = hash;
-    et.label = label;
-    et.max_uses = max_uses;
-    et.use_count = 0;
-    et.created_at = now;
-    et.expires_at = (ttl.count() == 0) ? (std::chrono::system_clock::time_point::max)() : now + ttl;
-    et.revoked = false;
-
-    {
-        std::unique_lock lock(mu_);
-        enrollment_tokens_[token_id] = std::move(et);
-    }
-
-    save_tokens();
-
-    spdlog::info("Enrollment token created: id={}, label='{}', max_uses={}, ttl={}s", token_id,
-                 label, max_uses, ttl.count());
-    return raw_token;
+void AuthManager::note_enrollment_store_degrade(const char* op, const char* reason) const {
+    if (metrics_)
+        metrics_->counter("yuzu_auth_enrollment_store_degrade_total",
+                          {{"op", op}, {"reason", reason}})
+            .increment();
 }
 
-std::vector<std::string>
-AuthManager::create_enrollment_tokens_batch(const std::string& label_prefix, int count,
-                                            int max_uses_each, std::chrono::seconds ttl) {
-    std::vector<std::string> tokens;
-    tokens.reserve(static_cast<size_t>(count));
-    for (int i = 0; i < count; ++i) {
-        auto label = label_prefix.empty() ? std::format("batch-{}", i + 1)
-                                          : std::format("{}-{}", label_prefix, i + 1);
-        tokens.push_back(create_enrollment_token(label, max_uses_each, ttl));
+template <typename R, typename Fn>
+std::expected<R, StoreError> AuthManager::enrollment_store_call(const char* op, Fn&& fn) {
+    yuzu::server::AuthDB* db = auth_db_;
+    if (db == nullptr) {
+        // No store attached (shutdown's set_auth_db(nullptr), or never wired):
+        // fail CLOSED with the same typed outage a PG failure yields — never an
+        // empty/absent/rejected value, never a memory fallback.
+        note_enrollment_store_degrade(op, "no_store");
+        return std::unexpected(StoreError::Unavailable);
     }
-    spdlog::info("Batch created {} enrollment tokens (prefix='{}')", count, label_prefix);
-    return tokens;
+    std::expected<R, StoreError> r = std::forward<Fn>(fn)(*db);
+    if (!r && r.error() != StoreError::InvalidInput && r.error() != StoreError::CharsetRefused) {
+        note_enrollment_store_degrade(op, r.error() == StoreError::Unavailable
+                                              ? "pool_acquire_timeout"
+                                              : "query_error");
+    }
+    return r;
 }
 
-bool AuthManager::validate_enrollment_token(const std::string& raw_token) {
-    // W1.4 R2 / UP-H2: read-only observability check. The W1.4 PR1 pass
-    // of this wrapper silently delegated to consume_enrollment_token,
-    // which burned a use on every call — a semantic break with the
-    // function name and the doc comment ("validate, not consume"). A
-    // caller checking "is this token still usable?" would unintentionally
-    // exhaust a max_uses=1 token. The behaviour was acceptable in PR1
-    // because the only callers were tests asserting the exhaustion
-    // behaviour, but a future caller would not know to expect the
-    // mutation. Restored to true read-only.
-    //
-    // Length-bound applied here as well (defence-in-depth) so a caller
-    // of validate can't bypass the consume-path length check.
-    if (raw_token.empty() || raw_token.size() > kMaxEnrollmentTokenLength) {
-        return false;
-    }
-    auto hash = sha256_hex(raw_token);
-    auto now = std::chrono::system_clock::now();
-    std::shared_lock lock(mu_);
-    for (const auto& [_, et] : enrollment_tokens_) {
-        if (!constant_time_compare(et.token_hash, hash))
-            continue;
-        if (et.revoked)
-            return false;
-        if (now > et.expires_at)
-            return false;
-        if (et.max_uses > 0 && et.use_count >= et.max_uses)
-            return false;
-        return true;
-    }
-    return false;
+std::expected<CreatedEnrollmentToken, StoreError>
+AuthManager::create_enrollment_token(const std::string& label, int max_uses,
+                                     std::chrono::seconds ttl, const std::string& created_by) {
+    return enrollment_store_call<CreatedEnrollmentToken>(
+        "create_token", [&](yuzu::server::AuthDB& db) {
+            return db.create_token(label, max_uses, ttl, created_by);
+        });
 }
 
-std::expected<EnrollmentClaim, EnrollmentTokenError>
-AuthManager::consume_enrollment_token(std::string_view raw_token,
-                                      std::string_view consuming_agent_id) {
-    // W1.1 UP-H2: length-bound at the API entry. The same kMaxEnrollment
-    // TokenLength constant guards the handlers (where it converts to a 400/
-    // gRPC INVALID_ARGUMENT) AND this consume function (defence-in-depth,
-    // so an in-process caller can't bypass the handler check and force the
-    // store to SHA-256 a 1 MiB blob). Empty token is also rejected here —
-    // the handler should never call us with an empty token, but it makes
-    // the consume contract self-describing.
-    if (raw_token.empty() || raw_token.size() > kMaxEnrollmentTokenLength) {
-        return std::unexpected(EnrollmentTokenError::invalid_input);
-    }
-
-    auto hash = sha256_hex(std::string{raw_token});
-    auto now = std::chrono::system_clock::now();
-
-    EnrollmentClaim claim;
-    bool consumed = false;
-
-    {
-        // The atomic-claim critical section. Everything from validity check
-        // through ++use_count and last_consumed_by_agent_id write happens
-        // under one unique_lock so no second consumer can interleave between
-        // "this token is valid" and "this token's use_count is now N+1".
-        // Loosening this lock is the bug #827 closes; do not split into a
-        // shared_lock for the SELECT + unique_lock for the UPDATE without
-        // re-reading the issue's race scenario.
-        std::unique_lock lock(mu_);
-
-        for (auto& [id, et] : enrollment_tokens_) {
-            if (!constant_time_compare(et.token_hash, hash))
-                continue;
-
-            if (et.revoked) {
-                spdlog::warn("Enrollment token {} is revoked", id);
-                return std::unexpected(EnrollmentTokenError::revoked);
-            }
-            if (now > et.expires_at) {
-                spdlog::warn("Enrollment token {} has expired", id);
-                return std::unexpected(EnrollmentTokenError::expired);
-            }
-            if (et.max_uses > 0 && et.use_count >= et.max_uses) {
-                // The race-lost case is structurally indistinguishable from a
-                // "stale exhausted" case at this point — both look like
-                // use_count >= max_uses. The handler discriminates via the
-                // `last_consumed_by_agent_id` value (already set by the prior
-                // winner) and emits an audit row naming the winner so the
-                // operator can see the contention. We just classify as
-                // already_consumed and let the handler do the attribution.
-                spdlog::warn("Enrollment token {} exhausted ({}/{}) — race lost or stale", id,
-                             et.use_count, et.max_uses);
-                return std::unexpected(EnrollmentTokenError::already_consumed);
-            }
-
-            // The atomic claim. ++use_count and the agent_id stamp happen
-            // before we drop the lock. The use_count value we return to the
-            // caller is the POST-increment value, so a successful single-use
-            // consume returns use_count_after == 1.
-            ++et.use_count;
-            if (!consuming_agent_id.empty()) {
-                et.last_consumed_by_agent_id.assign(consuming_agent_id.data(),
-                                                    consuming_agent_id.size());
-            }
-
-            claim.token_id = id;
-            claim.max_uses = et.max_uses;
-            claim.use_count_after = et.use_count;
-            claim.single_use = (et.max_uses == 1);
-            consumed = true;
-
-            spdlog::info("Enrollment token {} consumed by '{}' ({}/{})", id,
-                         consuming_agent_id.empty() ? std::string_view{"<unknown>"}
-                                                    : consuming_agent_id,
-                         et.use_count, et.max_uses == 0 ? -1 : et.max_uses);
-            break;
-        }
-    }
-
-    if (!consumed) {
-        spdlog::warn("Enrollment token not found (hash prefix={})", hash.substr(0, 8));
-        return std::unexpected(EnrollmentTokenError::not_found);
-    }
-
-    // W1.4 R2 / UP-C1: persist immediately after the in-memory claim.
-    // The PR1 implementation left persistence to whatever next mutation
-    // (revoke, create, manager destruction) happened to call save_tokens(),
-    // which left a crash-replay window: a server SIGKILL between the
-    // in-memory ++use_count and any disk write meant the next boot's
-    // load_tokens() read use_count=0 and the consumed token would
-    // re-enroll. Now save_tokens() lands before we return, closing the
-    // window to "crash inside save_tokens() itself" (atomic file write
-    // via ofstream::trunc + close, so the on-disk file is either the
-    // pre-consume or post-consume snapshot, never a torn intermediate).
-    //
-    // Lock-release first because save_tokens() acquires shared_lock(mu_)
-    // itself — holding unique_lock across the call would deadlock. Once
-    // the in-memory claim has landed, releasing the unique_lock is safe:
-    // parallel consumers see exhausted, parallel saves serialise via
-    // their own shared_lock so the on-disk snapshot only ever advances.
-    //
-    // Failure handling: do NOT roll back the in-memory consume on save
-    // failure. The agent will be told their token is consumed (success
-    // response in flight) and rolling back would create a different
-    // bug (token reuse under disk-failure injection). Log loudly so SRE
-    // sees it; the prior best-effort behaviour for non-consume paths
-    // (revoke, create) is preserved by the existing save_tokens callers.
-    //
-    // Note on AuthDB: AuthManager has an `auth_db_` member, but
-    // create_enrollment_token never inserts into the AuthDB enrollment
-    // _tokens table — that table is dead. Wiring AuthDB as the source
-    // of truth would require reconciling the AuthDB schema (single-use
-    // only) against the in-memory schema (max_uses, label, revoked)
-    // and porting create_enrollment_token. Out of scope for R2; the
-    // in-memory + file-snapshot path is the production-correct one.
-    if (!save_tokens()) {
-        spdlog::error("Enrollment token {} consume succeeded in-memory but save_tokens "
-                      "failed — on a crash before the next save, the consumed state will "
-                      "be lost and the token may replay",
-                      claim.token_id);
-    }
-    return claim;
+std::expected<ConsumeEnrollResult, StoreError>
+AuthManager::consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
+                                const std::string& hostname, const std::string& os,
+                                const std::string& arch, const std::string& agent_version,
+                                bool enforce_new_id_charset) {
+    return enrollment_store_call<ConsumeEnrollResult>(
+        "consume", [&](yuzu::server::AuthDB& db) {
+            return db.consume_and_enroll(raw_token, agent_id, hostname, os, arch, agent_version,
+                                         enforce_new_id_charset);
+        });
 }
 
-std::string AuthManager::last_consumer_for_token_hash(std::string_view token_hash) const {
-    std::shared_lock lock(mu_);
-    for (const auto& [_, et] : enrollment_tokens_) {
-        if (constant_time_compare(et.token_hash, std::string{token_hash})) {
-            return et.last_consumed_by_agent_id;
-        }
-    }
-    return {};
+std::expected<std::vector<EnrollmentToken>, StoreError> AuthManager::list_enrollment_tokens() {
+    return enrollment_store_call<std::vector<EnrollmentToken>>(
+        "list_tokens", [](yuzu::server::AuthDB& db) { return db.list_tokens(); });
 }
 
-std::vector<EnrollmentToken> AuthManager::list_enrollment_tokens() const {
-    std::shared_lock lock(mu_);
-    std::vector<EnrollmentToken> out;
-    out.reserve(enrollment_tokens_.size());
-    for (const auto& [_, et] : enrollment_tokens_) {
-        out.push_back(et);
-    }
-    return out;
+std::expected<bool, StoreError> AuthManager::revoke_enrollment_token(const std::string& token_id) {
+    return enrollment_store_call<bool>(
+        "revoke_token", [&](yuzu::server::AuthDB& db) { return db.revoke_token(token_id); });
 }
-
-bool AuthManager::revoke_enrollment_token(const std::string& token_id) {
-    {
-        std::unique_lock lock(mu_);
-        auto it = enrollment_tokens_.find(token_id);
-        if (it == enrollment_tokens_.end())
-            return false;
-        it->second.revoked = true;
-    }
-    save_tokens();
-    spdlog::info("Enrollment token {} revoked", token_id);
-    return true;
-}
-
-// ── Enrollment token persistence ────────────────────────────────────────────
-
-bool AuthManager::save_tokens() const {
-    auto path = state_dir() / "enrollment-tokens.cfg";
-
-    std::shared_lock lock(mu_);
-
-#ifndef _WIN32
-    mode_t old_mask = umask(0077);
-#endif
-    std::ofstream f(path, std::ios::trunc);
-#ifndef _WIN32
-    umask(old_mask);
-#endif
-    if (!f.is_open()) {
-        spdlog::error("Cannot write enrollment tokens to {}", path.string());
-        return false;
-    }
-
-    f << "# Yuzu Enrollment Tokens\n";
-    f << "# Version: 1\n";
-    f << "# Format: "
-         "token_id:token_hash:label:max_uses:use_count:created_epoch:expires_epoch:revoked\n\n";
-
-    for (const auto& [id, et] : enrollment_tokens_) {
-        auto created_epoch =
-            std::chrono::duration_cast<std::chrono::seconds>(et.created_at.time_since_epoch())
-                .count();
-        auto expires_epoch =
-            (et.expires_at == (std::chrono::system_clock::time_point::max)())
-                ? int64_t{0}
-                : std::chrono::duration_cast<std::chrono::seconds>(et.expires_at.time_since_epoch())
-                      .count();
-
-        f << et.token_id << ':' << et.token_hash << ':' << et.label << ':' << et.max_uses << ':'
-          << et.use_count << ':' << created_epoch << ':' << expires_epoch << ':'
-          << (et.revoked ? '1' : '0') << '\n';
-    }
-    f.close();
-
-#ifndef _WIN32
-    // Restrict token file to owner-only (0600) — contains token hashes.
-    std::error_code perm_ec;
-    std::filesystem::permissions(
-        path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-        std::filesystem::perm_options::replace, perm_ec);
-    if (perm_ec) {
-        spdlog::warn("Failed to set permissions on {}: {}", path.string(), perm_ec.message());
-    }
-#endif
-
-    return true;
-}
-
-bool AuthManager::load_tokens() {
-    auto path = state_dir() / "enrollment-tokens.cfg";
-
-    std::ifstream f(path);
-    if (!f.is_open())
-        return false;
-
-    std::unique_lock lock(mu_);
-    enrollment_tokens_.clear();
-
-    std::string line;
-    while (std::getline(f, line)) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
-            line.pop_back();
-        if (line.empty())
-            continue;
-        if (line.starts_with("# Version: ")) {
-            try {
-                int ver = std::stoi(line.substr(11));
-                if (ver != 1) {
-                    spdlog::error("Unsupported enrollment-tokens.cfg version {}", ver);
-                    return false;
-                }
-            } catch (const std::exception& e) {
-                spdlog::error("Malformed version line in enrollment-tokens.cfg: {}", e.what());
-                return false;
-            }
-            continue;
-        }
-        if (line[0] == '#')
-            continue;
-
-        std::istringstream ss(line);
-        std::string token_id, token_hash, label, max_uses_s, use_count_s, created_s, expires_s,
-            revoked_s;
-
-        if (!std::getline(ss, token_id, ':'))
-            continue;
-        if (!std::getline(ss, token_hash, ':'))
-            continue;
-        if (!std::getline(ss, label, ':'))
-            continue;
-        if (!std::getline(ss, max_uses_s, ':'))
-            continue;
-        if (!std::getline(ss, use_count_s, ':'))
-            continue;
-        if (!std::getline(ss, created_s, ':'))
-            continue;
-        if (!std::getline(ss, expires_s, ':'))
-            continue;
-        if (!std::getline(ss, revoked_s, ':'))
-            continue;
-
-        EnrollmentToken et;
-        et.token_id = token_id;
-        et.token_hash = token_hash;
-        et.label = label;
-        et.max_uses = std::stoi(max_uses_s);
-        et.use_count = std::stoi(use_count_s);
-        et.created_at =
-            std::chrono::system_clock::time_point(std::chrono::seconds(std::stoll(created_s)));
-        et.expires_at = (expires_s == "0") ? (std::chrono::system_clock::time_point::max)()
-                                           : std::chrono::system_clock::time_point(
-                                                 std::chrono::seconds(std::stoll(expires_s)));
-        et.revoked = (revoked_s == "1");
-
-        enrollment_tokens_[token_id] = std::move(et);
-    }
-
-    spdlog::info("Loaded {} enrollment token(s)", enrollment_tokens_.size());
-    return true;
-}
-
-// ── Pending agents (Tier 1) ─────────────────────────────────────────────────
 
 std::string pending_status_to_string(PendingStatus s) {
     switch (s) {
@@ -2700,231 +2699,82 @@ std::string pending_status_to_string(PendingStatus s) {
     return "unknown";
 }
 
-void AuthManager::add_pending_agent(const std::string& agent_id, const std::string& hostname,
-                                    const std::string& os, const std::string& arch,
-                                    const std::string& agent_version) {
-    {
-        std::unique_lock lock(mu_);
-        // Don't overwrite if already exists
-        if (pending_agents_.contains(agent_id))
-            return;
+namespace {
+PendingAgent make_pending(const std::string& agent_id, const std::string& hostname,
+                          const std::string& os, const std::string& arch,
+                          const std::string& agent_version) {
+    PendingAgent pa;
+    pa.agent_id = agent_id;
+    pa.hostname = hostname;
+    pa.os = os;
+    pa.arch = arch;
+    pa.agent_version = agent_version;
+    pa.status = PendingStatus::pending;
+    return pa;
+}
+} // namespace
 
-        PendingAgent pa;
-        pa.agent_id = agent_id;
-        pa.hostname = hostname;
-        pa.os = os;
-        pa.arch = arch;
-        pa.agent_version = agent_version;
-        pa.requested_at = std::chrono::system_clock::now();
-        pa.status = PendingStatus::pending;
-        pending_agents_[agent_id] = std::move(pa);
-    }
-    save_pending();
-    spdlog::info("Agent {} added to pending approval queue", agent_id);
+std::expected<bool, StoreError>
+AuthManager::add_pending_agent(const std::string& agent_id, const std::string& hostname,
+                               const std::string& os, const std::string& arch,
+                               const std::string& agent_version, bool enforce_new_id_charset) {
+    return enrollment_store_call<bool>("add_pending", [&](yuzu::server::AuthDB& db) {
+        return db.add_pending(make_pending(agent_id, hostname, os, arch, agent_version),
+                              enforce_new_id_charset);
+    });
 }
 
-std::optional<PendingStatus> AuthManager::get_pending_status(const std::string& agent_id) const {
-    std::shared_lock lock(mu_);
-    auto it = pending_agents_.find(agent_id);
-    if (it == pending_agents_.end())
-        return std::nullopt;
-    return it->second.status;
+std::expected<bool, StoreError>
+AuthManager::ensure_enrolled(const std::string& agent_id, const std::string& hostname,
+                             const std::string& os, const std::string& arch,
+                             const std::string& agent_version, const std::string& by,
+                             bool enforce_new_id_charset) {
+    return enrollment_store_call<bool>("ensure_enrolled", [&](yuzu::server::AuthDB& db) {
+        return db.ensure_enrolled(make_pending(agent_id, hostname, os, arch, agent_version), by,
+                                  enforce_new_id_charset);
+    });
 }
 
-std::vector<PendingAgent> AuthManager::list_pending_agents() const {
-    std::shared_lock lock(mu_);
-    std::vector<PendingAgent> out;
-    out.reserve(pending_agents_.size());
-    for (const auto& [_, pa] : pending_agents_) {
-        out.push_back(pa);
-    }
-    return out;
+std::expected<std::optional<PendingStatus>, StoreError>
+AuthManager::get_pending_status(const std::string& agent_id) {
+    return enrollment_store_call<std::optional<PendingStatus>>(
+        "pending_status", [&](yuzu::server::AuthDB& db) { return db.pending_status(agent_id); });
 }
 
-bool AuthManager::approve_pending_agent(const std::string& agent_id) {
-    {
-        std::unique_lock lock(mu_);
-        auto it = pending_agents_.find(agent_id);
-        if (it == pending_agents_.end())
-            return false;
-        it->second.status = PendingStatus::approved;
-    }
-    save_pending();
-    spdlog::info("Agent {} approved for enrollment", agent_id);
-    return true;
+std::expected<std::vector<PendingAgent>, StoreError> AuthManager::list_pending_agents() {
+    return enrollment_store_call<std::vector<PendingAgent>>(
+        "list_pending", [](yuzu::server::AuthDB& db) { return db.list_pending(); });
 }
 
-bool AuthManager::deny_pending_agent(const std::string& agent_id) {
-    {
-        std::unique_lock lock(mu_);
-        auto it = pending_agents_.find(agent_id);
-        if (it == pending_agents_.end())
-            return false;
-        it->second.status = PendingStatus::denied;
-    }
-    save_pending();
-    spdlog::info("Agent {} denied enrollment", agent_id);
-    return true;
+std::expected<PendingTransitionOutcome, StoreError>
+AuthManager::approve_pending_agent(const std::string& agent_id, const std::string& principal) {
+    return enrollment_store_call<PendingTransitionOutcome>(
+        "approve", [&](yuzu::server::AuthDB& db) { return db.approve_pending(agent_id, principal); });
 }
 
-bool AuthManager::ensure_enrolled(const std::string& agent_id, const std::string& hostname,
-                                  const std::string& os, const std::string& arch,
-                                  const std::string& agent_version) {
-    {
-        std::unique_lock lock(mu_);
-        auto it = pending_agents_.find(agent_id);
-        if (it != pending_agents_.end()) {
-            // Never override an explicit admin denial — tokens don't outrank admins
-            if (it->second.status == PendingStatus::denied) {
-                spdlog::warn("ensure_enrolled: agent {} is admin-denied, refusing to override",
-                             agent_id);
-                return false;
-            }
-            it->second.status = PendingStatus::approved;
-        } else {
-            PendingAgent pa;
-            pa.agent_id = agent_id;
-            pa.hostname = hostname;
-            pa.os = os;
-            pa.arch = arch;
-            pa.agent_version = agent_version;
-            pa.requested_at = std::chrono::system_clock::now();
-            pa.status = PendingStatus::approved;
-            pending_agents_[agent_id] = std::move(pa);
-        }
-    }
-    save_pending();
-    return true;
+std::expected<PendingTransitionOutcome, StoreError>
+AuthManager::deny_pending_agent(const std::string& agent_id, const std::string& principal) {
+    return enrollment_store_call<PendingTransitionOutcome>(
+        "deny", [&](yuzu::server::AuthDB& db) { return db.deny_pending(agent_id, principal); });
 }
 
-bool AuthManager::remove_pending_agent(const std::string& agent_id) {
-    {
-        std::unique_lock lock(mu_);
-        if (pending_agents_.erase(agent_id) == 0)
-            return false;
-    }
-    save_pending();
-    return true;
+std::expected<std::vector<std::string>, StoreError>
+AuthManager::approve_all_pending_agents(const std::string& principal) {
+    return enrollment_store_call<std::vector<std::string>>(
+        "bulk_approve",
+        [&](yuzu::server::AuthDB& db) { return db.approve_all_pending(principal); });
 }
 
-// ── Pending agent persistence ───────────────────────────────────────────────
-
-bool AuthManager::save_pending() const {
-    auto path = state_dir() / "pending-agents.cfg";
-
-    std::shared_lock lock(mu_);
-
-#ifndef _WIN32
-    mode_t old_mask = umask(0077);
-#endif
-    std::ofstream f(path, std::ios::trunc);
-#ifndef _WIN32
-    umask(old_mask);
-#endif
-    if (!f.is_open()) {
-        spdlog::error("Cannot write pending agents to {}", path.string());
-        return false;
-    }
-
-    f << "# Yuzu Pending Agents\n";
-    f << "# Version: 1\n";
-    f << "# Format: agent_id:hostname:os:arch:version:requested_epoch:status\n\n";
-
-    for (const auto& [id, pa] : pending_agents_) {
-        auto epoch =
-            std::chrono::duration_cast<std::chrono::seconds>(pa.requested_at.time_since_epoch())
-                .count();
-
-        f << pa.agent_id << ':' << pa.hostname << ':' << pa.os << ':' << pa.arch << ':'
-          << pa.agent_version << ':' << epoch << ':' << pending_status_to_string(pa.status) << '\n';
-    }
-    f.close();
-
-#ifndef _WIN32
-    // Restrict pending-agents file to owner-only (0600).
-    std::error_code perm_ec;
-    std::filesystem::permissions(
-        path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-        std::filesystem::perm_options::replace, perm_ec);
-    if (perm_ec) {
-        spdlog::warn("Failed to set permissions on {}: {}", path.string(), perm_ec.message());
-    }
-#endif
-
-    return true;
+std::expected<std::vector<std::string>, StoreError>
+AuthManager::deny_all_pending_agents(const std::string& principal) {
+    return enrollment_store_call<std::vector<std::string>>(
+        "bulk_deny", [&](yuzu::server::AuthDB& db) { return db.deny_all_pending(principal); });
 }
 
-bool AuthManager::load_pending() {
-    auto path = state_dir() / "pending-agents.cfg";
-
-    std::ifstream f(path);
-    if (!f.is_open())
-        return false;
-
-    std::unique_lock lock(mu_);
-    pending_agents_.clear();
-
-    std::string line;
-    while (std::getline(f, line)) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
-            line.pop_back();
-        if (line.empty())
-            continue;
-        if (line.starts_with("# Version: ")) {
-            try {
-                int ver = std::stoi(line.substr(11));
-                if (ver != 1) {
-                    spdlog::error("Unsupported pending-agents.cfg version {}", ver);
-                    return false;
-                }
-            } catch (const std::exception& e) {
-                spdlog::error("Malformed version line in pending-agents.cfg: {}", e.what());
-                return false;
-            }
-            continue;
-        }
-        if (line[0] == '#')
-            continue;
-
-        std::istringstream ss(line);
-        std::string agent_id, hostname, os, arch, version, epoch_s, status_s;
-
-        if (!std::getline(ss, agent_id, ':'))
-            continue;
-        if (!std::getline(ss, hostname, ':'))
-            continue;
-        if (!std::getline(ss, os, ':'))
-            continue;
-        if (!std::getline(ss, arch, ':'))
-            continue;
-        if (!std::getline(ss, version, ':'))
-            continue;
-        if (!std::getline(ss, epoch_s, ':'))
-            continue;
-        if (!std::getline(ss, status_s, ':'))
-            continue;
-
-        PendingAgent pa;
-        pa.agent_id = agent_id;
-        pa.hostname = hostname;
-        pa.os = os;
-        pa.arch = arch;
-        pa.agent_version = version;
-        pa.requested_at =
-            std::chrono::system_clock::time_point(std::chrono::seconds(std::stoll(epoch_s)));
-
-        if (status_s == "approved")
-            pa.status = PendingStatus::approved;
-        else if (status_s == "denied")
-            pa.status = PendingStatus::denied;
-        else
-            pa.status = PendingStatus::pending;
-
-        pending_agents_[agent_id] = std::move(pa);
-    }
-
-    spdlog::info("Loaded {} pending agent(s)", pending_agents_.size());
-    return true;
+std::expected<RemovePendingOutcome, StoreError>
+AuthManager::remove_pending_agent(const std::string& agent_id) {
+    return enrollment_store_call<RemovePendingOutcome>(
+        "remove", [&](yuzu::server::AuthDB& db) { return db.remove_pending(agent_id); });
 }
 
 } // namespace yuzu::server::auth

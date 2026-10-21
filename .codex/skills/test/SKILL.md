@@ -74,7 +74,7 @@ Wall-clock order is fixed:
 4. Phase 3 OTA: full mode only; may record SKIP if still stubbed.
 5. Phase 7a perf: full mode only, before UAT stack; measure-and-report only.
 6. Phase 4 fresh stack: `bash scripts/start-UAT.sh`; skipped in quick mode.
-7. Phase 5 gates: unit, EUnit, Dialyzer, CT, integration/e2e/synthetic UAT/puppeteer/instructions as applicable.
+7. Phase 5 gates: unit, EUnit, Dialyzer, CT, integration/e2e/synthetic UAT/puppeteer/instructions as applicable. Security E2E runs after the parallel fan-out, alone (its rate-limit probe empties the shared login bucket). Puppeteer records SKIP when `tests/puppeteer/node_modules` is absent.
 8. Phase 6 sanitizers: full mode only, dispatched runner.
 9. Phase 7b coverage: full mode only, enforces `tests/coverage-baseline.json`.
 10. Phase 8 teardown and summary.

@@ -430,7 +430,20 @@ bool AuditStore::log(const AuditEvent& event) {
                       event.action, pool_.last_error());
         return false;
     }
-    PGconn* conn = lease.get();
+    // Autocommit on this lease: the INSERT is its own transaction, so a
+    // successful log_in_txn IS a committed row and the success bucket can be
+    // counted immediately (the in-transaction caller counts after ITS commit).
+    if (!log_in_txn(lease.get(), event))
+        return false;
+    count_committed(event.result);
+    return true;
+}
+
+bool AuditStore::log_in_txn(PGconn* conn, const AuditEvent& event) {
+    if (!open_ || conn == nullptr) {
+        emit_failed_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
 
     const int64_t now = now_epoch();
     const int64_t ts = event.timestamp > 0 ? event.timestamp : now;
@@ -467,18 +480,20 @@ bool AuditStore::log(const AuditEvent& event) {
                       PQerrorMessage(conn));
         return false;
     }
+    return true;
+}
 
+void AuditStore::count_committed(std::string_view result) noexcept {
     // Bucket the write into a Prometheus-friendly counter. Result vocabulary is
     // open-ended at call sites — collapse anything unrecognised into "other".
-    if (event.result == "success")
+    if (result == "success")
         events_success_.fetch_add(1, std::memory_order_relaxed);
-    else if (event.result == "failure")
+    else if (result == "failure")
         events_failure_.fetch_add(1, std::memory_order_relaxed);
-    else if (event.result == "denied")
+    else if (result == "denied")
         events_denied_.fetch_add(1, std::memory_order_relaxed);
     else
         events_other_.fetch_add(1, std::memory_order_relaxed);
-    return true;
 }
 
 uint64_t AuditStore::events_written(const std::string& result) const noexcept {
@@ -533,13 +548,13 @@ std::optional<std::vector<AuditEvent>> AuditStore::query(const AuditQuery& q,
         sql += " AND target_id = $" + std::to_string(idx++);
         binds.push_back(q.target_id);
     }
-    if (q.since > 0) {
+    if (q.since) {
         sql += " AND timestamp >= $" + std::to_string(idx++) + "::bigint";
-        binds.push_back(std::to_string(q.since));
+        binds.push_back(std::to_string(*q.since));
     }
-    if (q.until > 0) {
+    if (q.until) {
         sql += " AND timestamp <= $" + std::to_string(idx++) + "::bigint";
-        binds.push_back(std::to_string(q.until));
+        binds.push_back(std::to_string(*q.until));
     }
     // Prefix OR-group (auth./mfa./session. for the auth-log sample, #4).
     // Prefixes are code-controlled constants; each binds as `<prefix>%`. Any
@@ -588,7 +603,7 @@ std::optional<std::vector<AuditEvent>> AuditStore::query(const AuditQuery& q,
     // `q.offset > 0`, so a negative offset is already inert at this seam.
     const int64_t fetch_limit = q.random_sample ? static_cast<int64_t>(kAuditSampleScanCap)
                                                 : static_cast<int64_t>(std::max(q.limit, 0));
-    sql += " ORDER BY timestamp DESC LIMIT $" + std::to_string(idx++) + "::bigint";
+    sql += " ORDER BY timestamp DESC, id DESC LIMIT $" + std::to_string(idx++) + "::bigint";
     binds.push_back(std::to_string(fetch_limit));
     if (q.offset > 0 && !q.random_sample) {
         sql += " OFFSET $" + std::to_string(idx++) + "::bigint";

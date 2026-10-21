@@ -9,6 +9,11 @@
 #   ./scripts/integration-test.sh --agents 10        # 10 agents
 #   ./scripts/integration-test.sh --agents 100 --tls # 100 agents with mTLS
 #
+# Gateway hop: the server is started with --insecure-gateway-peer in both
+# modes (peer authorization on the gateway-upstream service is acknowledged as
+# disabled, test rig only). The gateway hop is therefore not exercised by this
+# script in either mode; see the comment at the server start below.
+#
 # Prerequisites:
 #   - C++ binaries built:  build-<os>/server/core/yuzu-server
 #                           build-<os>/agents/core/yuzu-agent
@@ -24,15 +29,16 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Ensure `erl` / `escript` / `rebar3` are on PATH before the gateway build
-# step runs. The helper is a no-op if Erlang is already available; otherwise
-# it probes kerl / asdf / Homebrew / MSYS2 and activates the first match.
-# The "28" arg pins the major version tracked by release.yml — keep in
-# sync with erlef/setup-beam otp-version in .github/workflows/release.yml.
+# step runs. The helper is a no-op if a passing Erlang is already first on
+# PATH; otherwise it asks scripts/erlang_toolchain.py find-otp and activates
+# what it picks. The "" arg selects the pinned default (DEFAULT_OTP_VERSION:
+# 28.4 or any later 28.x) and keeps this script's own $1 from being read as a
+# version.
 # shellcheck source=ensure-erlang.sh
-source "$SCRIPT_DIR/ensure-erlang.sh" 28
+source "$SCRIPT_DIR/ensure-erlang.sh" ""
 if ! command -v erl > /dev/null 2>&1; then
     echo "FAIL: erl not on PATH after ensure-erlang.sh (needed for rebar3/escript)" >&2
-    echo "      Install via kerl (kerl install 28.4.2), asdf, Homebrew, or the" >&2
+    echo "      Install via kerl (kerl build-install 28.4.2 28.4.2 ~/.kerl/28.4.2), asdf, Homebrew, or the" >&2
     echo "      MSYS2 Erlang installer, then rerun." >&2
     exit 1
 fi
@@ -416,7 +422,7 @@ if ! $REUSE_STACK; then
     mkdir -p "$SERVER_DATA_DIR"
     SERVER_CFG="$SERVER_DATA_DIR/yuzu-server.cfg"
     log "Running first-run setup to generate server config..."
-    printf 'admin\nadminpassword1\nadminpassword1\nuser\nuserpassword1\nuserpassword1\n' | \
+    printf 'admin\nadminpassword1\nadminpassword1\n' | \
         "$BUILDDIR/server/core/yuzu-server" \
             --config "$SERVER_CFG" \
             --no-tls --no-https --listen "127.0.0.1:$SERVER_AGENT_PORT" \
@@ -463,6 +469,17 @@ fi
 if ! $REUSE_STACK; then
     log "Starting C++ server (ports: agent=$SERVER_AGENT_PORT, mgmt=$SERVER_MGMT_PORT, web=$SERVER_WEB_PORT)..."
 
+    # The gateway-upstream service requires an authorized gateway peer (an
+    # SPKI pin) or an explicit acknowledgement. This script passes the
+    # acknowledgement in BOTH the plaintext and the --tls branch, so peer
+    # authorization on the gateway hop is disabled here and is NOT exercised
+    # by this script. The gateway's generated sys.config below dials the
+    # upstream over a plaintext `http` channel with no client certificate and
+    # no gateway leaf is pinned, so in the --tls branch the flag is passed so
+    # the server boots; --tls covers only the server's own certificate set and
+    # the agent-side flags. Test rig only, not a production pattern. The
+    # server is always the build under test ($BUILDDIR), never a published
+    # release, so the flag form (not the environment form) is correct.
     "$BUILDDIR/server/core/yuzu-server" \
         --config "$SERVER_CFG" \
         --listen "127.0.0.1:$SERVER_AGENT_PORT" \
@@ -471,6 +488,7 @@ if ! $REUSE_STACK; then
         --no-https \
         --gateway-mode \
         --gateway-upstream "127.0.0.1:$SERVER_GW_PORT" \
+        --insecure-gateway-peer \
         $TLS_SERVER_FLAGS \
         > "$WORK_DIR/server.log" 2>&1 &
     SERVER_PID=$!
@@ -725,8 +743,8 @@ log ""
 
 # ── Test 1: Server web UI is reachable ────────────────────────────────
 log "Test: Server web UI"
-HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" "http://127.0.0.1:$SERVER_WEB_PORT/login" || echo "000")
-assert_eq "Server /login returns 200" "200" "$HTTP_CODE"
+HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" "http://127.0.0.1:$SERVER_WEB_PORT/home" || echo "000")
+assert_eq "Server /home (sign-in landing page) returns 200" "200" "$HTTP_CODE"
 
 # ── Test 2: Server shows connected agents ─────────────────────────────
 log "Test: Agent registration through gateway"

@@ -46,6 +46,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu {
@@ -57,6 +58,69 @@ class PgPool;
 }
 
 namespace yuzu::server {
+
+/// Longest facet value, in bytes, that is persisted to `response_facets`. A longer
+/// value is EXCLUDED from the response's facets, never truncated (a prefix would be a
+/// different value than the one the agent reported); the response row, its output and
+/// every other facet still persist. The length is measured on the sanitized value, the
+/// form ingest stores.
+///
+/// Why 2048: `response_facets.value` is in the primary key (response_id, col_idx,
+/// value) and in `idx_facets_query (instruction_id, col_idx, value)`. A btree tuple
+/// over 2704 bytes is refused (PostgreSQL 18.4, 8 KB pages), and one refused row fails
+/// the whole multi-row INSERT, so every facet of the response is lost. Measured against
+/// a copy of both indexes with incompressible values: the largest value that inserts is
+/// about 2680 minus len(instruction_id) bytes (2644 at a 40 byte id, 2620 at 64, 2484 at
+/// 200). A value that compresses well gets past that, because the limit applies to the
+/// COMPRESSED index entry (the "index row requires N bytes, maximum size is 8191"
+/// error): measured on PostgreSQL 18.4 against a copy of both indexes, 99,999 bytes of
+/// repeated text inserted and 499,998 were rejected, while 2,560 bytes of incompressible
+/// text inserted and 2,688 were rejected.
+/// The byte length alone therefore decides here. 2048 leaves about 630 bytes for the
+/// instruction_id, whose length the ingest path does not bound (it is the id the agent
+/// echoes; the longest the server mints is about 60 bytes); a longer id still fails the
+/// facet batch, which is counted as `batch_failed`.
+inline constexpr std::size_t kMaxFacetValueBytes = 2048;
+
+/// The one over-bound rule, on a value already in its stored (sanitized) form. Ingest calls
+/// this directly on the sanitized value.
+inline bool facet_value_over_bound(std::string_view value) noexcept {
+    return value.size() > kMaxFacetValueBytes;
+}
+
+/// The same rule for a filter value a caller typed: it is measured in the form ingest would
+/// store it, so a raw value that the text scrub (each NUL or invalid UTF-8 byte becomes a
+/// 3-byte U+FFFD) grows past the bound is over-bound too. The preview helper and the
+/// dashboard call this one, never `facet_value_over_bound` on a raw filter value.
+bool facet_filter_value_over_bound(std::string_view raw_value);
+
+/// The stored form of a typed filter value: exactly what ingest would persist for the same
+/// bytes (each NUL or invalid UTF-8 byte becomes a 3-byte U+FFFD). The facet lookups bind the
+/// same scrubbed form (they call the same scrub directly, not this wrapper), and any reader that
+/// compares a typed filter against decoded response text in C++ (the dashboard's per-line
+/// re-filter) must compare against this, never the raw value.
+std::string facet_filter_stored_form(std::string_view raw_value);
+
+/// `yuzu_server_response_facets_dropped_total{reason}`: facet rows (distinct
+/// (column, value) pairs) of a response that did not persist, by reason. Counted only
+/// once the response has been stored, and the response row itself is stored in every
+/// counted case. If the SAVEPOINT machinery itself fails (SAVEPOINT creation, or the
+/// ROLLBACK TO after a failed batch), the transaction is aborted and the whole response
+/// is dropped: that is counted by `yuzu_server_response_ingest_dropped_total{query_error}`
+/// only, and no facet counter moves.
+inline constexpr const char* kResponseFacetsDroppedMetric =
+    "yuzu_server_response_facets_dropped_total";
+/// `value_too_long`: excluded because longer than `kMaxFacetValueBytes`.
+inline constexpr const char* kFacetDropValueTooLong = "value_too_long";
+/// `cap`: distinct facets past the per-response cardinality cap.
+inline constexpr const char* kFacetDropCap = "cap";
+/// `batch_failed`: the facet INSERT batch failed and was rolled back to its savepoint,
+/// so none of the response's facets persisted (the response itself committed).
+inline constexpr const char* kFacetDropBatchFailed = "batch_failed";
+
+/// Describe and pre-seed every reason of the facets-dropped counter at zero, so an idle
+/// server exports the series. Called once at startup from `ServerImpl`.
+void seed_response_facet_metrics(yuzu::MetricsRegistry& m);
 
 struct StoredResponse {
     int64_t id{0};
@@ -106,8 +170,14 @@ struct FacetFilter {
 struct ResponseQuery {
     std::string agent_id;
     int status{-1};   // -1 = any
-    int64_t since{0}; // epoch seconds, 0 = no lower bound
-    int64_t until{0}; // epoch seconds, 0 = no upper bound
+    /// Epoch-second bounds, PRESENCE-tracked (#4644): an unset optional is "no bound on that
+    /// side"; a set value is a literal bound (`timestamp >= *since`, `timestamp <= *until`).
+    /// A literal 0 is NOT a sentinel -- the old `int64_t{0}` default made an omitted bound and a
+    /// computed window that collapsed to 0 indistinguishable, so the latter silently returned
+    /// the whole table. The REST/MCP edge rejects `until <= 0`; `since == 0` is a harmless
+    /// literal bound (every stored timestamp is positive).
+    std::optional<int64_t> since;
+    std::optional<int64_t> until;
     int limit{100};
     int offset{0};
 };
@@ -134,6 +204,26 @@ struct ResponseQuery {
 ///                           never a silent unfiltered read (also the fail-closed
 ///                           sink for a corrupt RBAC store / a store-read error).
 using AggregateScope = std::optional<std::vector<std::string>>;
+
+/// Result of `ResponseStore::query_bounded()`: the kept rows plus WHY any rows were
+/// left out. Both flags can be true at once (a byte cut inside a result that also
+/// exceeded the row limit); a caller that needs one cause reports `byte_cap_hit`
+/// first (the tighter, payload-driven bound).
+struct BoundedResponses {
+    std::vector<StoredResponse> rows;
+    /// More matching rows existed beyond `limit` (precise: the store fetched limit+1
+    /// candidate rows to know, so exactly `limit` matching rows is NOT flagged).
+    bool row_cap_hit{false};
+    /// At least one row within `limit` was left out because the cumulative
+    /// `octet_length(output) + octet_length(error_detail)` had already reached the
+    /// payload cap.
+    bool byte_cap_hit{false};
+    /// `PQresultMemorySize()` of the libpq result the query materialised, i.e. what the
+    /// fetch actually held (kept rows' columns plus per-row/field overhead and the two
+    /// `meta` columns). Observability and a test seam for the byte bound; not a request
+    /// limit. 0 when the query returned no rows.
+    std::size_t result_bytes{0};
+};
 
 enum class AggregateOp { Count, Sum, Avg, Min, Max };
 
@@ -171,6 +261,11 @@ public:
     ResponseStore& operator=(const ResponseStore&) = delete;
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
+    /// The retention window this store was constructed with and actually
+    /// enforces (days; <= 0 means "never expire"). Read-only: the value is
+    /// copied at construction and never re-read, so this is the ENFORCED
+    /// figure, which can differ from Config / a stored runtime override.
+    [[nodiscard]] int retention_days() const noexcept { return retention_days_; }
 
     /// Wire a metrics registry for `yuzu_server_response_read_degrade_total{reason,source}`
     /// (degrade-distinguishable reads), `yuzu_server_response_ingest_dropped_total{reason}`
@@ -246,6 +341,29 @@ public:
     [[nodiscard]] std::optional<std::vector<StoredResponse>>
     query(const std::string& instruction_id, const ResponseQuery& q = {},
          const AggregateScope& scope = std::nullopt) const;
+    /// Byte-aware variant of `query()` for the two EXPORT routes (#4703). Same
+    /// predicates, same resolve-then-scope push-down (ADR-0017 INV-3: the scope clause is
+    /// in the WHERE before any cut), but the cut is made IN SQL so neither libpq's
+    /// PGresult nor the parsed vector ever holds more than roughly `max_payload_bytes` of
+    /// `output`+`error_detail` (plus one final row of up to about 4 MiB for text output, about 12 MiB for
+    /// output dense in invalid bytes or NULs: each field is cut to 2 MiB at ingest before invalid bytes
+    /// and NULs become 3-byte U+FFFD; that includes the `error_detail` that
+    /// `finalize_terminal_status` writes for a terminal frame):
+    ///   1. a sizing pass over the (at most limit+1) candidate rows reads only
+    ///      `octet_length(output)+octet_length(error_detail)` -- Postgres answers that
+    ///      from the TOAST pointer without detoasting (measured: 0.05 ms vs 207 ms for
+    ///      `length()` over 400 x 512 KiB rows) -- and a running SUM in export order;
+    ///   2. only rows whose PRECEDING cumulative size is still below the cap are joined
+    ///      back to fetch the full columns (the first row is always kept, so a single row
+    ///      larger than the cap still makes progress).
+    /// Export order is `timestamp DESC, id DESC` (the id tiebreak makes the cut
+    /// deterministic; `query()` orders by timestamp alone, so rows with equal timestamps can come
+    /// back in a different order from the list routes). `q.offset` is ignored. A
+    /// concurrent delete between the two steps is one statement, so the snapshot is
+    /// consistent. Returns nullopt on store-degraded, exactly like `query()`.
+    [[nodiscard]] std::optional<BoundedResponses>
+    query_bounded(const std::string& instruction_id, const ResponseQuery& q,
+                  const AggregateScope& scope, std::size_t max_payload_bytes) const;
     /// Exact-correlation lookup keyed on `execution_id` (PR 2). Empty
     /// `execution_id` is rejected (returns an engaged empty vector, NOT
     /// nullopt) — that sentinel is the legacy path; callers must fall back

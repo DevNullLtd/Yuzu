@@ -38,8 +38,10 @@
  * `nullptr`, i.e. unconditionally).
  */
 
+#include "crypto_library_model.hpp"
 #include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
+#include "software_catalog_rules.hpp" // kEcosystemFamilies: the published ecosystem vocabulary
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -47,6 +49,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <map>
 #include <regex>
 #include <set>
 #include <string>
@@ -162,7 +165,8 @@ void collect_ref_targets(const json& node, std::vector<std::string>& out) {
     }
 }
 
-bool ref_resolves(const json& spec, const std::string& ref) {
+/// The node a "#/a/b/c" ref points at, or nullptr when a part is missing.
+const json* resolve_ref(const json& spec, const std::string& ref) {
     // ref is "#/a/b/c" -> walk spec["a"]["b"]["c"].
     std::string path = ref.substr(1); // drop leading '#'
     const json* node = &spec;
@@ -170,10 +174,67 @@ bool ref_resolves(const json& spec, const std::string& ref) {
         if (part.empty())
             continue;
         if (!node->is_object() || !node->contains(part))
-            return false;
+            return nullptr;
         node = &(*node)[part];
     }
-    return true;
+    return node;
+}
+
+bool ref_resolves(const json& spec, const std::string& ref) {
+    return resolve_ref(spec, ref) != nullptr;
+}
+
+json param(const json& op, const char* name) {
+    // value(), not operator[]: on a const json a missing key asserts and aborts the whole shard.
+    for (const auto& p : op.value("parameters", json::array()))
+        if (p.value("name", "") == name)
+            return p;
+    return json();
+}
+
+/// One `ecosystem` parameter found in a document: where it sits and its resolved schema.
+struct EcosystemParam {
+    std::string where;
+    json schema;
+};
+
+/// Every parameter named `ecosystem` under every path item and operation (path-level
+/// `parameters` included). A Parameter Object or a schema that is a `$ref` is resolved BEFORE the
+/// name check, since a referenced parameter carries no `name` of its own.
+std::vector<EcosystemParam> ecosystem_parameter_schemas(const json& spec) {
+    std::vector<EcosystemParam> found;
+    const auto collect = [&](const json& params, const std::string& where) {
+        if (!params.is_array())
+            return;
+        for (const auto& p : params) {
+            INFO(where);
+            const json* node = &p;
+            if (p.contains("$ref")) {
+                node = resolve_ref(spec, p["$ref"].get<std::string>());
+                REQUIRE(node != nullptr);
+            }
+            if (node->value("name", "") != "ecosystem")
+                continue;
+            json schema = node->value("schema", json::object());
+            if (schema.contains("$ref")) {
+                const json* target = resolve_ref(spec, schema["$ref"].get<std::string>());
+                REQUIRE(target != nullptr);
+                schema = *target;
+            }
+            found.push_back({where, schema});
+        }
+    };
+    for (const auto& [path, item] : spec["paths"].items()) {
+        if (!item.is_object())
+            continue;
+        for (const auto& [key, node] : item.items()) {
+            if (key == "parameters")
+                collect(node, path);
+            else if (node.is_object() && node.contains("parameters"))
+                collect(node["parameters"], key + " " + path);
+        }
+    }
+    return found;
 }
 
 } // namespace
@@ -312,6 +373,251 @@ TEST_CASE("openapi_spec_json(): the app-usage Forensics path is documented (Wave
     CHECK(description.find("all-time") == std::string::npos);
 }
 
+TEST_CASE("openapi_spec_json(): the /crypto reads pin the family enum and the bounds to the model",
+          "[openapi][crypto]") {
+    namespace cl = yuzu::server::crypto_library;
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    json ids = json::array();
+    for (const auto& f : cl::families())
+        ids.push_back(std::string(f.id));
+
+    const auto& summary = spec["paths"]["/crypto/libraries"]["get"];
+    const auto& devices = spec["paths"]["/crypto/libraries/devices"]["get"];
+    const auto& cbom = spec["paths"]["/crypto/cbom"]["get"];
+    CHECK(param(summary, "family")["schema"]["enum"] == ids);
+    CHECK(param(cbom, "family")["schema"]["enum"] == ids);
+    CHECK(param(cbom, "ecosystem")["schema"]["maxLength"] == cl::kEcosystemMaxBytes);
+    CHECK(param(devices, "family")["schema"]["enum"] == ids);
+    CHECK(param(summary, "ecosystem")["schema"]["maxLength"] == cl::kEcosystemMaxBytes);
+    CHECK(param(devices, "ecosystem")["schema"]["maxLength"] == cl::kEcosystemMaxBytes);
+    // The CBOM's Vary header documents what the route actually sets, and its description opens
+    // with what the document IS (library components only).
+    CHECK(cbom["responses"]["200"]["headers"]["Vary"]["schema"]["enum"][0] ==
+          "Authorization, Cookie, X-Yuzu-Token");
+    CHECK(cbom["description"].get<std::string>().find(
+              "Vary: Authorization, Cookie, X-Yuzu-Token") != std::string::npos);
+    CHECK(cbom["description"].get<std::string>().find("cryptographic LIBRARY packages") !=
+          std::string::npos);
+    // The 8-name cap and the every-family store-ceiling flag are stated, not silent.
+    CHECK(summary["description"].get<std::string>().find("package_names_truncated") !=
+          std::string::npos);
+    CHECK(summary["responses"]["200"]["description"].get<std::string>().find(
+              "package_names_truncated") != std::string::npos);
+    CHECK(param(devices, "version")["schema"]["maxLength"] == cl::kVersionMaxBytes);
+    CHECK(param(devices, "cursor")["schema"]["maxLength"] == cl::kCursorMaxBytes);
+    CHECK(param(devices, "limit")["schema"]["maximum"] == cl::kPageMax);
+    CHECK(param(devices, "limit")["schema"]["default"] == cl::kDefaultLimit);
+    // table_version is documented on both answers; a refused cross-version cursor on the drill.
+    CHECK(summary["responses"]["200"]["description"].get<std::string>().find("table_version") !=
+          std::string::npos);
+    CHECK(devices["responses"]["200"]["description"].get<std::string>().find("table_version") !=
+          std::string::npos);
+    CHECK(devices["responses"]["400"]["description"].get<std::string>().find("table_version") !=
+          std::string::npos);
+    // The filter params are EXACT when present (even empty): none says "no filter" for empty.
+    for (const json* op : {&summary, &devices}) {
+        const auto eco = param(*op, "ecosystem")["description"].get<std::string>();
+        CHECK(eco.find("no filter") == std::string::npos);
+        CHECK(eco.find("present") != std::string::npos);
+    }
+    CHECK(param(devices, "version")["description"].get<std::string>().find("present") !=
+          std::string::npos);
+    // The drill echoes the ecosystem filter the way it echoes version; 503 names the admission bound.
+    CHECK(devices["responses"]["200"]["description"].get<std::string>().find("ecosystem|null") !=
+          std::string::npos);
+    for (const json* op : {&summary, &devices}) {
+        // Both 503 causes are named, each with its message; the not-built 503 is gone.
+        const auto d503 = (*op)["responses"]["503"]["description"].get<std::string>();
+        CHECK(d503.find("capacity in use") != std::string::npos);
+        CHECK(d503.find("crypto library read degraded") != std::string::npos);
+        CHECK(d503.find("not built") == std::string::npos);
+        // The names' source is documented on the 200 body and in the description.
+        CHECK((*op)["responses"]["200"]["description"].get<std::string>().find("names_source") !=
+              std::string::npos);
+        CHECK((*op)["description"].get<std::string>().find("names_source") != std::string::npos);
+        CHECK((*op)["description"].get<std::string>().find("live") != std::string::npos);
+    }
+}
+
+TEST_CASE("openapi_spec_json(): the RBAC role reads document 403/404/503 and the retry semantics",
+          "[openapi][rbac]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const auto& paths = spec["paths"];
+
+    auto response_keys = [](const json& op) {
+        std::set<std::string> keys;
+        for (auto it = op["responses"].begin(); it != op["responses"].end(); ++it)
+            keys.insert(it.key());
+        return keys;
+    };
+
+    REQUIRE(paths.contains("/rbac/roles"));
+    const auto& roles = paths["/rbac/roles"]["get"];
+    CHECK(response_keys(roles) == std::set<std::string>{"200", "403", "503"});
+    CHECK(roles.value("description", "").find("retry_after_ms") != std::string::npos);
+
+    REQUIRE(paths.contains("/rbac/roles/{role}/permissions"));
+    const auto& perms = paths["/rbac/roles/{role}/permissions"]["get"];
+    CHECK(response_keys(perms) == std::set<std::string>{"200", "403", "404", "503"});
+    CHECK(perms.value("description", "").find("retry_after_ms") != std::string::npos);
+}
+
+TEST_CASE("openapi_spec_json(): POST /hardware/sync documents the fan-out request and every refusal",
+          "[openapi][hardware][sync_fanout]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const auto& paths = spec["paths"];
+
+    // The collection route is its own path, distinct from the per-device one.
+    REQUIRE(paths.contains("/hardware/sync"));
+    REQUIRE(paths.contains("/hardware/{id}/sync"));
+    REQUIRE(paths["/hardware/sync"].contains("post"));
+    CHECK_FALSE(paths["/hardware/sync"].contains("get"));
+    const auto& op = paths["/hardware/sync"]["post"];
+
+    REQUIRE(op.contains("tags"));
+    CHECK(op["tags"][0] == "Hardware");
+    const std::string description = op.value("description", "");
+    CHECK(description.find("Execution:Execute") != std::string::npos);
+    CHECK(description.find("500") != std::string::npos);
+
+    // Request body: required, JSON, with the three documented properties.
+    REQUIRE(op.contains("requestBody"));
+    CHECK(op["requestBody"]["required"] == true);
+    REQUIRE(op["requestBody"]["content"].contains("application/json"));
+    const auto& props = op["requestBody"]["content"]["application/json"]["schema"]["properties"];
+    REQUIRE(props.contains("scope"));
+    REQUIRE(props.contains("scope_expression"));
+    REQUIRE(props.contains("source"));
+    CHECK(props["scope"]["type"] == "string");
+    CHECK(props["scope_expression"]["type"] == "string");
+    CHECK(props["scope_expression"]["maxLength"] == 1024);
+    CHECK(props["source"]["enum"] == json::array({"installed_software"}));
+    CHECK(props.size() == 3);
+    // Machine-readable bounds and the exactly-one-selector rule, not prose alone.
+    CHECK(props["scope"]["minLength"] == 1);
+    CHECK(props["scope"]["maxLength"] == 256);
+    CHECK(props["scope_expression"]["minLength"] == 1);
+    const auto& req_schema = op["requestBody"]["content"]["application/json"]["schema"];
+    CHECK(req_schema["oneOf"] ==
+          json::array({json{{"required", json::array({"scope"})}},
+                       json{{"required", json::array({"scope_expression"})}}}));
+
+    // Every status the route can answer, no more and no fewer.
+    REQUIRE(op.contains("responses"));
+    std::set<std::string> keys;
+    for (auto it = op["responses"].begin(); it != op["responses"].end(); ++it)
+        keys.insert(it.key());
+    CHECK(keys == std::set<std::string>{"202", "400", "401", "403", "409", "413", "429", "500", "503"});
+    // The 202 shape names the four counts and carries no per-device list.
+    const std::string accepted = op["responses"]["202"].value("description", "");
+    for (const char* field : {"requested", "agents_reached", "skipped_offline", "skipped_version", "command_id"})
+        CHECK(accepted.find(field) != std::string::npos);
+    // skipped_offline is defined as "not reached by this server process", not "disconnected", and
+    // the counts are said not to be a census of the fleet (in the 202 text and the description).
+    CHECK(accepted.find("this server process did not reach") != std::string::npos);
+    CHECK(accepted.find("not the fleet") != std::string::npos);
+    CHECK(description.find("not a census of the fleet") != std::string::npos);
+    CHECK(description.find("the send was refused by the live stream") != std::string::npos);
+    // The 429 leg names its Retry-After and the 413 leg its cap.
+    CHECK(op["responses"]["429"].value("description", "").find("Retry-After") != std::string::npos);
+    CHECK(op["responses"]["413"].value("description", "").find("500") != std::string::npos);
+    // The 429 carries a typed integer Retry-After header; the 202 is a typed envelope; every
+    // refusal body is the A4 error envelope.
+    REQUIRE(op["responses"]["429"].contains("headers"));
+    REQUIRE(op["responses"]["429"]["headers"].contains("Retry-After"));
+    CHECK(op["responses"]["429"]["headers"]["Retry-After"]["schema"]["type"] == "integer");
+    REQUIRE(op["responses"]["202"].contains("content"));
+    const auto& accepted_schema =
+        op["responses"]["202"]["content"]["application/json"]["schema"];
+    REQUIRE(accepted_schema.contains("properties"));
+    REQUIRE(accepted_schema["properties"].contains("data"));
+    CHECK(accepted_schema["required"] == json::array({"data", "meta"}));
+    for (const char* field : {"requested", "agents_reached", "skipped_offline", "skipped_version",
+                              "command_id", "source", "requested_at"})
+        CHECK(accepted_schema["properties"]["data"]["properties"].contains(field));
+    for (const char* code : {"400", "403", "409", "413", "429", "500", "503"}) {
+        REQUIRE(op["responses"][code].contains("content"));
+        CHECK(op["responses"][code]["content"]["application/json"]["schema"]["$ref"] ==
+              "#/components/schemas/A4ErrorEnvelope");
+    }
+}
+
+TEST_CASE("openapi_spec_json(): the kill-switch routes document the per-OS query parameter and "
+          "response shape (#5294)",
+          "[openapi][plugin_config][5294]") {
+    const auto& spec_json = yuzu::server::openapi_spec_json();
+    json spec = json::parse(spec_json, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec["paths"].contains("/plugin-config/{plugin}/kill-switch"));
+    const auto& path_obj = spec["paths"]["/plugin-config/{plugin}/kill-switch"];
+
+    for (const char* method : {"get", "put"}) {
+        INFO("method: " << method);
+        REQUIRE(path_obj.contains(method));
+        const auto& op = path_obj[method];
+
+        const json* os_param = nullptr;
+        for (const auto& p : op["parameters"])
+            if (p.value("name", "") == "os")
+                os_param = &p;
+        REQUIRE(os_param != nullptr);
+        CHECK((*os_param)["in"] == "query");
+        CHECK((*os_param)["required"] == false);
+        CHECK((*os_param)["schema"]["enum"] == json::array({"windows", "linux", "darwin"}));
+
+        const std::string ok = op["responses"]["200"].value("description", "");
+        CHECK(ok.find("os") != std::string::npos);
+        CHECK(ok.find("source") != std::string::npos);
+
+        // The protective-set caveat is part of the published contract.
+        const std::string desc = op.value("description", "");
+        CHECK(desc.find("__guard__.push_rules") != std::string::npos);
+        CHECK(desc.find("unquarantine") != std::string::npos);
+        CHECK(desc.find(std::string(method) == "get" ? "dispatch still proceeds"
+                                                      : "no dispatch effect") !=
+              std::string::npos);
+
+        // ...and so are the parameter-level caveats: GET's `os` description and PUT's
+        // `enabled` property.
+        if (std::string(method) == "get") {
+            const std::string os_desc = (*os_param).value("description", "");
+            CHECK(os_desc.find("never gates dispatch") != std::string::npos);
+        } else {
+            const auto& enabled =
+                op["requestBody"]["content"]["application/json"]["schema"]["properties"]["enabled"];
+            const std::string enabled_desc = enabled.value("description", "");
+            CHECK(enabled_desc.find("no dispatch effect") != std::string::npos);
+        }
+    }
+}
+
+TEST_CASE("openapi_spec_json(): the execution-statistics reads document their degraded-read 503 "
+          "(A4 envelope, retry_after_ms 2000)",
+          "[openapi][execution_statistics]") {
+    const auto& spec_json = yuzu::server::openapi_spec_json();
+    json spec = json::parse(spec_json, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec.contains("paths"));
+
+    for (const char* path : {"/execution-statistics", "/execution-statistics/agents",
+                             "/execution-statistics/definitions", "/statistics"}) {
+        INFO("path: " << path);
+        REQUIRE(spec["paths"].contains(path));
+        const auto& get_op = spec["paths"][path]["get"];
+        REQUIRE(get_op.contains("responses"));
+        REQUIRE(get_op["responses"].contains("503"));
+        const auto& r503 = get_op["responses"]["503"];
+        const std::string desc = r503.value("description", "");
+        CHECK(desc.find("retry_after_ms 2000") != std::string::npos);
+        REQUIRE(r503.contains("content"));
+        CHECK(r503["content"]["application/json"]["schema"]["$ref"] ==
+              "#/components/schemas/A4ErrorEnvelope");
+    }
+}
+
 TEST_CASE("openapi_spec_json(): every $ref (including discriminator.mapping "
           "values) resolves to an existing component",
           "[openapi][refs]") {
@@ -333,4 +639,81 @@ TEST_CASE("openapi_spec_json(): every $ref (including discriminator.mapping "
         unresolved_list += "  " + r + "\n";
     INFO("Unresolved $ref targets:\n" << unresolved_list);
     REQUIRE(unresolved.empty());
+}
+
+TEST_CASE("openapi_spec_json(): every ecosystem parameter and the pipe-list are generated from "
+          "kEcosystemFamilies",
+          "[openapi][software][ecosystem]") {
+    const std::string raw = yuzu::server::openapi_spec_json();
+    json spec = json::parse(raw, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+
+    json table = json::array();
+    std::string pipes;
+    for (const auto& e : yuzu::server::software_catalog::kEcosystemFamilies) {
+        table.push_back(std::string(e.ecosystem));
+        if (!pipes.empty())
+            pipes += '|';
+        pipes += e.ecosystem;
+    }
+    REQUIRE(table.size() > 0);
+    json with_empty = json::array({""});
+    with_empty.insert(with_empty.end(), table.begin(), table.end());
+
+    for (const char* path : {"/inventory/software", "/inventory/software/catalogue",
+                             "/inventory/software/catalogue/versions"}) {
+        INFO(path);
+        CHECK(param(spec["paths"][path]["get"], "ecosystem")["schema"]["enum"] == table);
+    }
+    for (const char* path : {"/crypto/libraries", "/crypto/libraries/devices", "/crypto/cbom"}) {
+        INFO(path);
+        CHECK(param(spec["paths"][path]["get"], "ecosystem")["schema"]["enum"] == with_empty);
+    }
+    // The six pins above fix WHICH routes serve the with-empty form (those where a present-empty
+    // value selects rows with no ecosystem: the /crypto reads); this sweep covers EVERY served
+    // `ecosystem` parameter, so a route added later with a stale or divergent enum fails here. A
+    // table-equal hand-typed array serves the same values and passes: that provenance is
+    // test_software_vocabulary_consistency.py's to catch, in the unexpanded source.
+    const auto params = ecosystem_parameter_schemas(spec);
+    for (const auto& ep : params) {
+        INFO(ep.where);
+        REQUIRE(ep.schema.contains("enum"));
+        CHECK((ep.schema["enum"] == table || ep.schema["enum"] == with_empty));
+    }
+    REQUIRE(params.size() >= 6);
+    CHECK(spec["paths"]["/inventory/software"]["get"]["description"].get<std::string>().find(
+              "ecosystem (" + pipes + ")") != std::string::npos);
+    CHECK(raw.find("@@") == std::string::npos);
+    // The route handler and discover_routes bind this by reference: it must be one stable object.
+    CHECK(&yuzu::server::openapi_spec_json() == &yuzu::server::openapi_spec_json());
+    // The expansion reserves the exact final size; a capacity near 2x would mean the ~400 KB
+    // string grew through a reallocating replace.
+    CHECK(yuzu::server::openapi_spec_json().capacity() - raw.size() < 4096);
+}
+
+TEST_CASE("ecosystem_parameter_schemas(): resolves referenced parameters and schemas and "
+          "path-level parameters",
+          "[openapi][software][ecosystem]") {
+    const json spec = json::parse(R"json({
+      "components": {
+        "parameters": {"Eco": {"name": "ecosystem", "in": "query", "schema": {"enum": ["a"]}}},
+        "schemas": {"EcoS": {"enum": ["b"]}}
+      },
+      "paths": {"/x": {
+        "parameters": [{"name": "ecosystem", "schema": {"enum": ["c"]}}],
+        "get": {"parameters": [{"$ref": "#/components/parameters/Eco"}]},
+        "post": {"parameters": [
+          {"name": "other"},
+          {"name": "ecosystem", "schema": {"$ref": "#/components/schemas/EcoS"}}]}
+      }}
+    })json");
+    const auto found = ecosystem_parameter_schemas(spec);
+    // A name-first filter would skip the referenced parameter and return 2.
+    REQUIRE(found.size() == 3);
+    std::map<std::string, json> by_where;
+    for (const auto& ep : found)
+        by_where[ep.where] = ep.schema.at("enum");
+    CHECK(by_where["/x"] == json::array({"c"}));
+    CHECK(by_where["get /x"] == json::array({"a"}));
+    CHECK(by_where["post /x"] == json::array({"b"}));
 }

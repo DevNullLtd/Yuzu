@@ -215,6 +215,7 @@ cmd_start() {
   local token_html token
   token_html="$(curl -fsS -b "$DEMO_DIR/cookies.txt" \
     -X POST "http://localhost:8080/api/settings/enrollment-tokens" \
+    -H "Origin: http://localhost:8080" \
     -d "label=demo&max_uses=100000&ttl_hours=720")"
   # Prefer the token inside its <code> element; fall back to the first 64-hex run
   # so a stray hex id elsewhere in the HTML can't be mistaken for the token.

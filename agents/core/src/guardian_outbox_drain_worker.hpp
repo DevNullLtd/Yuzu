@@ -65,6 +65,22 @@
  * thread; here the same work is already-async and co-located with the KvStore I/O
  * the drain path does anyway (mark_batch_sent per sent batch).
  *
+ * BASELINE PERSISTENCE (#4045): the worker is also the always-on, connection-independent
+ * caller of the engine-owned GuardianBaselinePersister (guardian_baseline_persister.hpp), which
+ * writes Spark's staged baseline-on-arm captures into the #4021 KV record. One firewalled step
+ * per cycle, ahead of the outbox drain: a capture's compliant-edge enqueue normally wakes this
+ * loop, so the record is usually durable within milliseconds of the capture (see the persister's
+ * LATENCY note for the honest bound), with no new waker and no dependence on server
+ * connectivity (a boot re-arm happens before the network is up; the heartbeat-thread tick
+ * cannot cover it). After a failed pass the step backs off (5 s doubling to 60 s), and every
+ * pass runs under a budget (tuples, failures, wall; see the persister's BOUNDED PASSES), so it
+ * stalls the drain for at most the wall budget plus one in-flight KV write. A pass that ran
+ * out of budget with captures still staged (no failure) makes the loop run again at once
+ * instead of waiting. The pass also polls this worker's stop flag between tuples, so a pass in
+ * flight when stop() joins it ends after at most one more write. Another KvStore caller on this
+ * existing joined thread, alongside the journal; it takes only the persister's leaf
+ * persist_mu_, never mtx_.
+ *
  * THE CENTRAL CONSTRAINT: maintenance must NEVER take the GuardianEngine mtx_.
  * GuardianEngine::stop() holds mtx_ across its whole body AND joins this worker
  * inside it, so an mtx_ acquisition on this thread is a lock-vs-join deadlock.
@@ -73,10 +89,24 @@
  * shape as the enqueue-waker capturing only a shared Signal, never `this`.
  * Shutdown is coordinated purely by atomics: the journal's own stopping_ gate
  * (set FIRST in engine::stop()) plus this worker's stopping flag.
+ *
+ * SEND LANES (#3847, #3972, #3980): the two lanes (lifecycle; compliance + health) each have
+ * their own GuardianOutboxSendExecutor. This worker (a) gates each lane's LAUNCH on the other
+ * lane's older entries with a bounded, counted hold (wrapped_send(); the contract is stated at
+ * GuardianSparkRuntime::drain_bounded()), (b) probes the compliance lane's executor once per
+ * loop cycle so an orphan send on an emptied lane is still stall-counted and reaped
+ * (guardian_outbox_send_executor.hpp probe_orphan()), and (c) bounds its OWN wait with the
+ * send-driven clamps in loop()'s tail - WAIT clamps only, never a wake source. The clamps
+ * compose by minimum: while a send is in flight and its stall is not yet counted the wait is
+ * at most kGuardianSendRecheckInterval (an orphan on an emptied compliance lane instead waits
+ * once for its remaining time to the stall threshold); a counted stall adds no clamp; a held
+ * lane adds min(recheck or periodic, remaining hold). Detail: compute_wait_clamp() and
+ * apply_cross_lane_tail() in the .cpp.
  */
 
 #include <yuzu/plugin.h> // YUZU_EXPORT
 
+#include "guardian_baseline_persister.hpp"  // GuardianBaselinePersister (#4045)
 #include "guardian_outbox.hpp"              // OutboxEntry, SendResult
 #include "guardian_outbox_send_executor.hpp" // GuardianOutboxSendExecutor
 #include "guardian_spark_runtime.hpp"        // GuardianSparkRuntime
@@ -88,6 +118,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <thread>
 
@@ -153,15 +184,32 @@ inline constexpr std::chrono::milliseconds kGuardianDrainMaxWall{2'000};
 inline constexpr std::chrono::milliseconds kGuardianSendOfferWait{200};
 
 /// Internal re-check bound (#3953 item 3): when a send is known in flight on either
-/// lane (GuardianOutboxSendExecutor::has_in_flight_send()), loop()'s own wait is
-/// clamped to at most this, instead of riding out the full periodic bound. Closes the
+/// lane and has NOT yet been counted as a stall (#3980: a counted stall no longer clamps),
+/// loop()'s own wait is clamped to at most this, instead of riding out the full periodic
+/// bound; a compliance send left running on an EMPTIED lane is instead clamped to its
+/// remaining time to the stall threshold (see compute_wait_clamp). Closes the
 /// throughput cliff a send finishing between kGuardianSendOfferWait and the periodic
 /// bound used to hit: detection latency after completion is now bounded by roughly
 /// kGuardianSendOfferWait + this, not by kDefaultPeriodicBoundMs (5s in production).
 /// Deliberately NOT a wake source (no sig_->gen bump, no notify_all) - it only shortens
 /// how long the loop's OWN wait blocks, so it cannot perturb any test whose timing
-/// depends on nothing else waking the loop (see the R4 test's own comment).
+/// depends on nothing else waking the loop (see the R4 test's own comment). The #3972
+/// cross-lane hold reuses this bound while a RUNNING blocker holds a lane, capped by the
+/// remaining hold (apply_cross_lane_tail()); a PENDING blocker that makes no progress is
+/// clamped to min(periodic bound, remaining hold) instead.
 inline constexpr std::chrono::milliseconds kGuardianSendRecheckInterval{200};
+
+/// #3972 cross-lane launch hold and its release allowance. Defaults for the
+/// GuardianMaintenanceConfig knobs below, consumed by wrapped_send()'s symmetric hold.
+/// The values are hardcoded as "1 s" / "64" in the HELP text of
+/// server/core/src/guardian_journal_fleet_tags.hpp, docs/user-manual/metrics.md,
+/// docs/spark-flip-gate.md, docs/yuzu-guardian-design-v1.1.md (the "default H = 1 s, N = 64"
+/// sentence), the GUARANTEE comment in GuardianSparkRuntime::drain_bounded()
+/// (guardian_spark_runtime.cpp) and changelog.d/3972-guardian-outbox-send-order-hold.fixed.md;
+/// they must move together (the default-pin test in test_guardian_outbox_drain_worker.cpp
+/// covers only these two constants).
+inline constexpr std::chrono::milliseconds kGuardianCrossLaneOrderHold{1'000};
+inline constexpr std::size_t kGuardianCrossLaneReleaseAllowance{64};
 
 /// Journal-maintenance knobs for GuardianOutboxDrainWorker. A struct rather than more
 /// positional parameters so the two same-typed intervals cannot be transposed at a call
@@ -177,6 +225,11 @@ struct GuardianMaintenanceConfig {
     /// unenforceable ordering nothing would have caught if reordered (#2298 governance A4).
     /// One allocation, and the whole class of failure goes away.
     std::shared_ptr<GuardianLifecycleJournal> journal{};
+    /// SHARED, may be null (no baseline persistence runs). The engine-owned persister of
+    /// Spark's staged baseline-on-arm captures (#4045), expressed as a typed shared_ptr for the
+    /// same reason as `journal`. The worker is one of its THREE callers; see
+    /// guardian_baseline_persister.hpp. Defaulted, so designated-init users are unaffected.
+    std::shared_ptr<GuardianBaselinePersister> baselines{};
     std::chrono::milliseconds page_interval{kGuardianJournalPageInterval};
     std::chrono::milliseconds prune_interval{kGuardianJournalPruneInterval};
     std::size_t drain_budget{kGuardianDrainBudget};
@@ -196,6 +249,21 @@ struct GuardianMaintenanceConfig {
     /// that depends on the worker running IMMEDIATELY - a hollow pass is the failure mode
     /// there, not a red one.
     bool jitter{false};
+    /// #3980: how long a send may stay in flight before BOTH lane executors count it as a stall
+    /// (GuardianOutboxSendExecutor::kGuardianSendStallThreshold in production). A knob so a test
+    /// can cross it in test time; the executors are built from this value (the ctor parameter,
+    /// not the later-declared maint_).
+    std::chrono::milliseconds send_stall_threshold{
+        GuardianOutboxSendExecutor::kGuardianSendStallThreshold};
+    /// #3972: how long a lane's head may be held behind an OLDER entry (lower OutboxEntry::seq)
+    /// in the other lane before the lane is released to overtake it, and how many entries may
+    /// then overtake before a further hold is needed (see wrapped_send()). Edge values: a
+    /// hold <= 0 means one launch denial and then an immediate release on the next check; an
+    /// allowance of 0 behaves as 1, because the release block sets permitted=true for the
+    /// releasing launch itself whatever the allowance (so 0 and 1 both permit exactly one
+    /// overtaking launch per release).
+    std::chrono::milliseconds cross_lane_order_hold{kGuardianCrossLaneOrderHold};
+    std::size_t cross_lane_release_allowance{kGuardianCrossLaneReleaseAllowance};
 };
 
 /// Which maintenance passes to run this cycle. The CALLER owns cadence - the worker loop
@@ -284,11 +352,27 @@ public:
     /// UNBOUNDED. It has NO production caller by design - the loop body uses the bounded
     /// private drain_bounded(). Deliberately retained rather than deleted because several
     /// tests rely on a synchronous drain, but note it bypasses every limit the worker applies
-    /// in production (count, wall clock, stop predicate), so it must not become a shortcut for
+    /// in production (count, wall clock, stop predicate) and, since it passes the raw send_,
+    /// the executors and the #3972 cross-lane launch hold, so it must not become a shortcut for
     /// production code (#2345 / Sol). Does NOT firewall
     /// exceptions - the worker thread's loop() does (so a test can still observe a
     /// throw, but a bad_alloc on the bare worker thread never terminates the agent).
     void drain_once();
+
+    /// Persist Spark's staged baseline captures (#4045), once, via maint_.baselines (a no-op
+    /// when unset), as a Trigger::Worker pass: it honours the persister's retry backoff,
+    /// polls this worker's stop flag between tuples and yields to a fence / apply_rules waiter.
+    /// Returns the pass outcome (a default Outcome when unset): `budget_exhausted` means it
+    /// ran out of budget with captures still staged and no failure (the loop then runs again
+    /// at once), `yielded` that it deferred (the loop re-checks within
+    /// kGuardianSendRecheckInterval, with no wake needed). loop() runs this every cycle before
+    /// the outbox drain; it is public so a test can drive it synchronously. NOT firewalled
+    /// here (loop() firewalls it and counts into the persister's firewalled_exceptions()).
+    /// Takes the persister's leaf persist_mu_ and never GuardianEngine::mtx_.
+    GuardianBaselinePersister::Outcome persist_staged_baselines_once();
+
+    /// TEST-ONLY: true once stop() has been requested (the flag the baseline pass polls).
+    [[nodiscard]] bool stop_requested_for_test() const noexcept { return stop_requested(); }
 
     /// TEST-ONLY: pin the jitter source so offsets are reproducible. Intended before
     /// start(), but it takes sig_->mu regardless: the RNG is worker-thread state guarded by
@@ -343,7 +427,6 @@ public:
     [[nodiscard]] std::uint64_t journal_maint_exception_count() const noexcept {
         return journal_maint_exceptions_.load(std::memory_order_relaxed);
     }
-
     /// steady_clock ms of the last PAGE maintenance pass that made REPLAY PROGRESS or positively
     /// established there was none, seeded non-zero at start() (flip item 6 / item 14). 0 means
     /// start() has not run - the reader treats that as "no worker", not as an age. The cadence
@@ -409,6 +492,60 @@ public:
         return wrapped_send(entry);
     }
 
+    /// Test-only read-only views of the two lane executors (#3980): lets a test observe
+    /// offer_calls_for_test() / in_flight_snapshot() / active_worker_count() per lane. No
+    /// production caller.
+    [[nodiscard]] const GuardianOutboxSendExecutor& lifecycle_send_exec_for_test() const noexcept {
+        return lifecycle_send_exec_;
+    }
+    [[nodiscard]] const GuardianOutboxSendExecutor& compliance_send_exec_for_test() const noexcept {
+        return compliance_send_exec_;
+    }
+
+    /// Test-only (relaxed atomics, no lock): how many loop() cycles have reached their tail
+    /// (counted BEFORE that cycle's wait is computed), and the wait in ms the loop last handed
+    /// to cv.wait_for (-1 = it has not waited yet; skip_wait cycles do not write it). Together
+    /// they pin the wait CADENCE without sleeping: a clamp that keeps firing shows up as a
+    /// cycle count that keeps advancing. No production caller.
+    [[nodiscard]] std::uint64_t loop_cycles_for_test() const noexcept {
+        return loop_cycles_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::int64_t last_computed_wait_ms_for_test() const noexcept {
+        return last_computed_wait_ms_.load(std::memory_order_relaxed);
+    }
+
+    /// #3972: fleet sum of both lanes' hold RELEASES (a lane waited out cross_lane_order_hold
+    /// behind an older entry in the other lane and was released to overtake up to
+    /// cross_lane_release_allowance entries). One increment per hold expiry (a bounded
+    /// overtake permission; counted even if that call launches nothing). Relaxed atomics, lock-free: safe to read from the heartbeat thread.
+    [[nodiscard]] std::uint64_t cross_lane_order_release_count() const noexcept {
+        return hold_[0].releases.load(std::memory_order_relaxed) +
+               hold_[1].releases.load(std::memory_order_relaxed);
+    }
+
+    /// Test-only per-lane hold diagnostics (relaxed atomics). `lane` is the lane of the HELD
+    /// entry (Health maps to Compliance, as in wrapped_send()). denials: launches actually
+    /// refused by the gate; last_blocker_seq: the seq of the older entry that held it most
+    /// recently; releases: hold expiries on that lane. No production caller.
+    [[nodiscard]] std::uint64_t denials_for_test(OutboxDomain lane) const noexcept {
+        return hold_[lane_of(lane)].denials.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t last_blocker_seq_for_test(OutboxDomain lane) const noexcept {
+        return hold_[lane_of(lane)].last_blocker_seq.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t releases_for_test(OutboxDomain lane) const noexcept {
+        return hold_[lane_of(lane)].releases.load(std::memory_order_relaxed);
+    }
+    /// Test-only: seq == 0 OFFERS on that lane (ordering is not enforced for them), and blocker
+    /// reads on that lane that threw (the hold fails open). Both count offers, not distinct
+    /// entries: a retained head is re-offered on every drain pass. No production caller.
+    [[nodiscard]] std::uint64_t unstamped_for_test(OutboxDomain lane) const noexcept {
+        return hold_[lane_of(lane)].unstamped.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t blocker_read_faults_for_test(OutboxDomain lane) const noexcept {
+        return hold_[lane_of(lane)].blocker_read_faults.load(std::memory_order_relaxed);
+    }
+
     /// Test-only synchronization seam - see the call site in stop() for what race it
     /// exists to make deterministic (#3953 item 6). Production callers never set this.
     void set_stop_race_hook_for_test(std::function<void()> hook) {
@@ -448,29 +585,22 @@ private:
     /// in flight at once - that is the SAME pre-existing, already-disclaimed
     /// contention this whole class's header names ("NOT a fix for stream_write_mu_
     /// contention"), now on two detached threads instead of one; it never touches the
-    /// worker's own thread. The same two-executor split also makes a same-pass
-    /// cross-lane WIRE ORDERING residual reachable (#3953 item 5 / #3972) - see
-    /// GuardianSparkRuntime::drain_bounded()'s own note for the mechanism.
-    [[nodiscard]] SendResult wrapped_send(const OutboxEntry& entry) {
-        // Enumerator-exhaustive, no `default` (#3953 item 4): a new OutboxDomain value
-        // added without updating this routing is at least a silent fall-through into
-        // `compliance_send_exec_` (the pre-switch default), never something crash-safe
-        // to ignore. On GCC/Clang this also warns via -Wswitch (part of warning_level=3,
-        // meson.build) - but this repo builds with werror=false project-wide, so that
-        // warning does not fail CI, and MSVC's equivalent (C4062) is off at this
-        // project's current warning level (no /w14062 or /Wall set anywhere) - governance
-        // Gate 3 cpp-expert finding: do not assume uniform compiler protection here.
-        GuardianOutboxSendExecutor* exec = &compliance_send_exec_;
-        switch (entry.domain) {
-        case OutboxDomain::Lifecycle:
-            exec = &lifecycle_send_exec_;
-            break;
-        case OutboxDomain::Compliance:
-        case OutboxDomain::Health:
-            break;
-        }
-        return exec->offer(entry, send_, kGuardianSendOfferWait).value_or(SendResult::Retain);
-    }
+    /// worker's own thread. The same two-executor split would also make a same-pass
+    /// cross-lane wire reordering reachable (#3953 item 5), which is why the LAUNCH
+    /// is additionally gated here (#3972):
+    ///
+    /// the gate is a bounded, symmetric, seq-ordered hold. An entry is held while the OTHER
+    /// lane has an older entry (lower OutboxEntry::seq) either pending at its head or running
+    /// in its executor; seq == 0 on either side fails open. A lane's hold clock
+    /// (cross_lane_order_hold) runs across ACTUAL launch denials only; on expiry the lane is
+    /// released for cross_lane_release_allowance overtaking launches, cleared the moment the
+    /// lane next finds no blocker or has emptied since the hold began. Each release is counted
+    /// (cross_lane_order_release_count()).
+    /// The gate lives in this wrapper only: drain_once() (test-only) calls the runtime's
+    /// drain() with the raw send and bypasses it. The guarantee, what it does not give, and its
+    /// bounds are stated once, at GuardianSparkRuntime::drain_bounded(); the mechanism is in the
+    /// .cpp.
+    [[nodiscard]] SendResult wrapped_send(const OutboxEntry& entry);
     /// True once stop() has been requested. Lock-free and noexcept BY DESIGN: this is
     /// the one check loop() makes outside a try, and taking a mutex here would let
     /// std::system_error escape the bare worker thread and terminate the agent (the
@@ -481,6 +611,55 @@ private:
     /// One drain pass under the configured count / wall-clock / stop-predicate limits.
     /// `truncated` means entries remain and the loop should re-drain WITHOUT waiting.
     [[nodiscard]] GuardianSparkRuntime::DrainOutcome drain_bounded();
+
+    /// #3972 loop-tail rule, run once per cycle inside loop()'s tail firewall. Folds this pass's
+    /// denials into the next wait: skip_wait only if a denied lane's BLOCKING lane Sent >= 1 this
+    /// pass (real progress, so it cannot busy-loop on a link-down or throwing blocker); else a
+    /// WAIT clamp (never a wake source) of min(recheck, remaining hold) for a running blocker or
+    /// min(periodic, remaining hold) for a pending one that made no progress.
+    void apply_cross_lane_tail(std::optional<std::chrono::milliseconds>& clamp, bool& skip_wait);
+
+    /// The two drain lanes. Health shares the Compliance lane (see wrapped_send()).
+    enum Lane : std::size_t { kLifecycleLane = 0, kComplianceLane = 1 };
+    /// Enumerator-exhaustive, no `default` (#3953 item 4): a new OutboxDomain value added without
+    /// updating this routing warns under -Wswitch on GCC/Clang (this repo builds with
+    /// werror=false project-wide, and MSVC's equivalent C4062 is not enabled, so the warning does
+    /// not fail the build). The trailing return is the pre-switch default for an out-of-range
+    /// value.
+    [[nodiscard]] static constexpr Lane lane_of(OutboxDomain d) noexcept {
+        switch (d) {
+        case OutboxDomain::Lifecycle:
+            return kLifecycleLane;
+        case OutboxDomain::Compliance:
+        case OutboxDomain::Health:
+            return kComplianceLane;
+        }
+        return kComplianceLane;
+    }
+    [[nodiscard]] GuardianOutboxSendExecutor& exec_of(Lane l) noexcept {
+        return l == kLifecycleLane ? lifecycle_send_exec_ : compliance_send_exec_;
+    }
+
+    /// Per-lane #3972 hold state. The non-atomic members are touched only on the drain thread
+    /// (wrapped_send() / the loop tail; a test may drive wrapped_send_for_test() instead of
+    /// start()ing, never both). The atomics are the diagnostics read from other threads.
+    struct LaneHold {
+        std::optional<std::chrono::steady_clock::time_point> held_since; ///< cumulative hold clock
+        std::size_t allowance{0};         ///< overtaking launches left after a release
+        std::uint64_t epoch_at_hold{0};   ///< this lane's empty_epoch at the episode's first denial
+        bool denied_this_pass{false};     ///< per-pass flags, reset in drain_bounded()
+        bool sent_this_pass{false};
+        bool blocker_running_this_pass{false};
+        bool logged_release{false};       ///< log-once latch
+        bool logged_unstamped{false};     ///< log-once latch for the first seq == 0 entry on this lane
+        bool logged_blocker_fault{false}; ///< log-once latch for the first blocker-read throw on this lane
+        std::atomic<std::uint64_t> last_blocker_seq{0};
+        std::atomic<std::uint64_t> denials{0};
+        std::atomic<std::uint64_t> releases{0};
+        std::atomic<std::uint64_t> unstamped{0};            ///< seq == 0 offers (per offer, not per entry; ordering fails open)
+        std::atomic<std::uint64_t> blocker_read_faults{0};  ///< blocker reads that threw (per offer; fails open)
+    };
+    LaneHold hold_[2];
 
     /// Heap sync state shared by the worker thread AND the waker (a
     /// std::function copied into the runtime) - see the class doc for why a
@@ -524,6 +703,10 @@ private:
     /// TEST-ONLY one-shot: make loop()'s tail throw once (item 13). Consumed by exchange, so it
     /// arms a single throw. Default false = inert in production (one relaxed load per cycle).
     std::atomic<bool> inject_loop_tail_throw_{false};
+    /// Test seams (loop_cycles_for_test / last_computed_wait_ms_for_test). Written only by the
+    /// worker thread, read by anyone, relaxed.
+    std::atomic<std::uint64_t> loop_cycles_{0};
+    std::atomic<std::int64_t> last_computed_wait_ms_{-1};
     /// Earliest steady-clock ms at which a pending forced page may be consumed (item 12).
     /// 0 = no deferral. Written under sig_->mu (by notify() and the loop) so the loop can
     /// derive its wait deadline from it without a second synchronisation point.

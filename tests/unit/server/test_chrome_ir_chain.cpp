@@ -133,6 +133,21 @@ struct ChromeIrHarness {
             return {.sent = dispatch_sent, .command_id = "cmd-" + std::to_string(calls.size())};
         };
 
+        // #4983: the generic POST /api/v1/result-sets create route now gates
+        // device_ids[] existence/scope via fleet_read_fn + set_all_agent_ids_fn
+        // whenever device_ids is non-empty — this file's step 1 supplies
+        // "win-1"/"win-2"/"win-3" as the ground set's members, so both must be
+        // wired (unfiltered admit + those three ids known) or step 1 now 503s
+        // (unwired) instead of the lineage/audit/GC chain this file exists to
+        // exercise.
+        RestApiV1::FleetReadFn fleet_read_fn =
+            [](const httplib::Request&, httplib::Response&, const std::string&,
+               const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {.admitted = true, .scope = std::nullopt};
+        };
+        api.set_all_agent_ids_fn(
+            []() -> std::vector<std::string> { return {"win-1", "win-2", "win-3"}; });
+
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr, /*token_store=*/nullptr,
                             /*quarantine_store=*/nullptr, /*response_store=*/nullptr, instr.get(),
@@ -160,7 +175,8 @@ struct ChromeIrHarness {
                             // empty, which is a missing gate and not a synonym.
                             [](const auth::Session&) -> yuzu::server::authz::VisibleSet {
                                 return std::nullopt;
-                            });
+                            },
+                            /*list_read_fn=*/{}, fleet_read_fn);
     }
 
     nlohmann::json post(const std::string& path, const std::string& body, int& status) {

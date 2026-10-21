@@ -1,5 +1,6 @@
 #include "health_routes.hpp"
 
+#include "home_panels_render.hpp"
 #include "http_route_sink.hpp"
 
 #include "agent_registry.hpp"
@@ -34,6 +35,7 @@
 #include "patch_manager.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg_reachability_probe.hpp" // HA WS-8
+#include "enablement_store.hpp"
 #include "plugin_config_store.hpp"
 #include "policy_store.hpp"
 #include "process_health.hpp"
@@ -65,6 +67,8 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server::health {
@@ -86,6 +90,10 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
     if (!deps.deny_service_scoped_fn)
         throw std::invalid_argument(
             "register_health_routes: deps.deny_service_scoped_fn must be bound");
+    if (deps.plaintext_probe_sink && !deps.main_listener_serving_fn)
+        throw std::invalid_argument(
+            "register_health_routes: deps.main_listener_serving_fn must be bound when "
+            "plaintext_probe_sink is set");
 
     // -- Prometheus metrics endpoint ----------------------------------------
     // Per-scrape serialization lock for the NVD failure-count delta loop
@@ -164,8 +172,13 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
     // Mounted on both /health and /api/health (issue #620). The /api alias
     // exists so monitoring integrations that prefix every REST call with
     // /api/ keep working — a side-effect of #401's move from /api/health → /health.
-    auto health_handler = [deps](const httplib::Request& req, httplib::Response& res) {
-        // Resolve auth FIRST so we can gate expensive work on it.
+    //
+    // `health_body` is the ONE body behind every /health alias; its callers
+    // decide `is_authenticated` (main sink: a non-blocking session resolve;
+    // plaintext sink: hard false, #5906).
+    auto health_body = [deps](const httplib::Request&, httplib::Response& res,
+                              bool is_authenticated) {
+        // `is_authenticated` gates the expensive work below.
         // Governance Gate 7 round 2 (security MEDIUM): /health and
         // /api/health are rate-limit-exempt for monitoring stability;
         // the bounded but non-trivial work below (a pending-agents scan
@@ -177,7 +190,6 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         // registry, store ok flags from is_open() (constant-time member
         // checks), and version. Authed callers additionally get
         // pending-agent count, execution stats, and process sampler.
-        bool is_authenticated = static_cast<bool>(deps.resolve_session_fn(req));
 
         auto now = std::chrono::steady_clock::now();
         auto uptime_sec = std::chrono::duration_cast<std::chrono::seconds>(
@@ -342,6 +354,12 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         // WS-3 3.3 (arch-F1/sre-F1): born-on-PG command outbox on the live
         // scheduled-dispatch path — mirrors its /readyz row.
         bool command_outbox_ok = deps.command_outbox_store && deps.command_outbox_store->is_open();
+        // ADR-3006: the enablement tables live in the plugin-config schema, and
+        // both stores are latched at boot like the rows above. The plugin-config store
+        // was /readyz-only until now (the same readyz-vs-healthz drift class), so its
+        // row joins here with the new one.
+        bool plugin_config_store_ok = deps.plugin_config_store && deps.plugin_config_store->is_open();
+        bool enablement_store_ok = deps.enablement_store && deps.enablement_store->is_open();
 
         // Determine overall status
         bool all_stores_ok =
@@ -353,7 +371,7 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             discovery_ok && deployment_ok && quarantine_ok && notification_ok && upload_grant_ok &&
             tag_ok && runtime_config_ok && patch_manager_ok && session_store_ok &&
             directory_sync_ok && workflow_engine_ok && schedule_engine_ok && execution_tracker_ok &&
-            command_outbox_ok;
+            command_outbox_ok && plugin_config_store_ok && enablement_store_ok;
         std::string status = all_stores_ok ? "healthy" : "degraded";
 
         nlohmann::json health = {
@@ -405,11 +423,16 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
               {"workflow_engine", workflow_engine_ok ? "ok" : "error"},
               {"schedule_engine", schedule_engine_ok ? "ok" : "error"},
               {"execution_tracker", execution_tracker_ok ? "ok" : "error"},
-              {"command_outbox_store", command_outbox_ok ? "ok" : "error"}}},
+              {"command_outbox_store", command_outbox_ok ? "ok" : "error"},
+              {"plugin_config_store", plugin_config_store_ok ? "ok" : "error"},
+              {"enablement_store", enablement_store_ok ? "ok" : "error"}}},
             // #401: was hardcoded "0.1.0" — now derived from the
             // meson-generated yuzu/version.hpp so the health endpoint
             // tracks the actual build instead of a stale literal.
             {"version", std::string(yuzu::kVersionString)}};
+        // I/O-free (a cached read): true while the enablement store is declared regressed.
+        health["enablement_regressed"] =
+            deps.enablement_store ? deps.enablement_store->regression().regressed : false;
 
         // TLS posture — intentionally UNAUTHENTICATED: operators and
         // monitoring MUST be able to see when the install is on built-in
@@ -436,17 +459,28 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         // 1h-window loop), system.* (process_health_sampler).
         if (is_authenticated) {
             int pending_count = 0;
+            // WS-6 6.2: an unreadable store is UNKNOWN (JSON null), never 0 — a 0
+            // would tell the operator nothing is awaiting approval when the truth
+            // is that the enrollment store could not be read.
+            bool pending_known = true;
             // `deps.auth_mgr` null-guarded — deliberate non-verbatim
             // addition, same rationale as `default_cert_set` above
             // (`auth_mgr_` was a reference member, never null).
             if (deps.auth_mgr) {
                 auto pending_agents = deps.auth_mgr->list_pending_agents();
-                for (const auto& a : pending_agents) {
-                    if (a.status == auth::PendingStatus::pending)
-                        ++pending_count;
+                if (pending_agents) {
+                    for (const auto& a : *pending_agents) {
+                        if (a.status == auth::PendingStatus::pending)
+                            ++pending_count;
+                    }
+                } else {
+                    pending_known = false;
                 }
             }
-            health["agents"]["pending"] = pending_count;
+            if (pending_known)
+                health["agents"]["pending"] = pending_count;
+            else
+                health["agents"]["pending"] = nullptr;
 
             int in_flight = 0;
             int completed_last_hour = 0;
@@ -490,20 +524,26 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
 
         res.set_content(health.dump(), "application/json");
     };
-    // Both URLs MUST be served by the SAME handler instance — do not split
-    // into two lambda bodies. The unauthenticated `system.*` gating above
-    // is load-bearing and must run identically on both routes; forking the
-    // body invites a future regression where the alias diverges in subtle
-    // ways. Governance Gate 7, architect NICE-2.
+    auto health_handler = [deps, health_body](const httplib::Request& req, httplib::Response& res) {
+        health_body(req, res, static_cast<bool>(deps.resolve_session_fn(req)));
+    };
+    // Every /health alias — main-sink /health and /api/health via health_handler,
+    // plaintext-sink via plain_health — MUST route through the ONE health_body
+    // above; the thin closures differ only in how is_authenticated is derived
+    // (session resolved vs. hard false). Do not fork the body: the
+    // unauthenticated `system.*` gating is load-bearing and must run identically
+    // on every alias. Governance Gate 7, architect NICE-2; extended for the
+    // plaintext sink in #5906.
     sink.Get("/health", health_handler);
     sink.Get("/api/health", health_handler);
 
     // -- Kubernetes probe endpoints (/livez, /readyz) -------------------------
-    sink.Get("/livez", [](const httplib::Request&, httplib::Response& res) {
+    auto livez_handler = [](const httplib::Request&, httplib::Response& res) {
         res.set_content(R"({"status":"ok"})", "application/json");
-    });
+    };
+    sink.Get("/livez", livez_handler);
 
-    sink.Get("/readyz", [deps](const httplib::Request&, httplib::Response& res) {
+    auto readyz_handler = [deps](const httplib::Request&, httplib::Response& res) {
         // NOTE (Gate 3/Gate 2 governance, #2542 PR-10): unlike every other
         // graceful-degrade Deps field in this file, a null `draining` fails
         // OPEN here (falls through to the normal store sweep, i.e. "not
@@ -796,9 +836,13 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             // Wave 7b PR7b.1 execution_artifacts — PluginConfigStore backs the
             // plugin kill switch; action_allowed() fails closed when the store
             // is not open, so a store that failed to open would silently deny
-            // every kill-switched action. Same readyz-vs-healthz drift class
+            // every kill-switched action (never a protective action —
+            // yuzu::protective). Same readyz-vs-healthz drift class
             // the rows above document; boot state only (latched, #3061).
             {"plugin_config_store", deps.plugin_config_store && deps.plugin_config_store->is_open()},
+            // ADR-3006 — the enablement tables ride the plugin-config schema; boot
+            // state only (latched), like the row above.
+            {"enablement_store", deps.enablement_store && deps.enablement_store->is_open()},
         };
 
         // Non-gating (governance Gate 2, 2026-08-16): ADR-0049's own construction
@@ -842,11 +886,27 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             }
         }
 
+        // ONE non-gating `enablement` object (never two members with the same key), from
+        // the I/O-free cache, present in both the ready and the not-ready body whenever
+        // the store is wired. A pending regression, an unwitnessed anchor and report-ahead
+        // endpoints are all visible at once; none of them changes the verdict.
+        std::string enablement_member;
+        if (deps.enablement_store) {
+            const auto st = deps.enablement_store->regression();
+            enablement_member = std::string(",\"enablement\":{\"regression_pending\":") +
+                                (st.regressed ? "true" : "false") +
+                                ",\"anchor_unwitnessed_at_boot\":" +
+                                (st.anchor_unwitnessed ? "true" : "false") +
+                                ",\"report_ahead\":" +
+                                (st.report_ahead_endpoints > 0 ? "true" : "false") + "}";
+        }
+
         if (failed_list.empty()) {
-            res.set_content(degraded_list.empty()
-                                ? R"({"status":"ready"})"
-                                : "{\"status\":\"ready\",\"degraded\":[" + degraded_list + "]}",
-                            "application/json");
+            std::string body = "{\"status\":\"ready\"";
+            if (!degraded_list.empty())
+                body += ",\"degraded\":[" + degraded_list + "]";
+            body += enablement_member + "}";
+            res.set_content(body, "application/json");
         } else {
             res.status = 503;
             std::string body = "{\"status\":\"not ready\",\"failed_stores\":[" + failed_list + "]";
@@ -857,9 +917,90 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
                         yuzu::server::pg_reachability::reason(pg_verdict) + "\"";
             if (!degraded_list.empty())
                 body += ",\"degraded\":[" + degraded_list + "]";
-            body += "}";
+            body += enablement_member + "}";
             res.set_content(body, "application/json");
         }
+    };
+    sink.Get("/readyz", readyz_handler);
+
+    // Plaintext redirect listener probes (#5906): the posture, the no-session rule, the 503
+    // gate and the drain-window caveat are in the AUTH POSTURE banner in health_routes.hpp.
+    if (deps.plaintext_probe_sink) {
+        auto plain_health = [health_body](const httplib::Request& req, httplib::Response& res) {
+            health_body(req, res, /*is_authenticated=*/false);
+        };
+        auto gated = [serving = deps.main_listener_serving_fn](HttpRouteSink::Handler h) {
+            return HttpRouteSink::Handler{
+                [serving, h = std::move(h)](const httplib::Request& req, httplib::Response& res) {
+                    if (!serving()) {
+                        res.status = 503;
+                        res.set_content(
+                            R"({"status":"not ready","reason":"https_listener_not_serving"})",
+                            "application/json");
+                        return;
+                    }
+                    h(req, res);
+                }};
+        };
+        auto& ps = *deps.plaintext_probe_sink;
+        ps.Get("/livez", gated(livez_handler));
+        ps.Get("/readyz", gated(readyz_handler));
+        ps.Get("/health", gated(plain_health));
+        ps.Get("/api/health", gated(plain_health));
+    }
+
+    // -- Dashboard "Server health" panel (HM-2; on Home until the 2026-10-14 delta) --
+    // Lives here so it can call the registered `health_handler` in-process: one
+    // definition of "healthy". Gate order matches /fragments/health/summary
+    // (deny_service_scoped_fn, then auth_fn). Every outcome is a 200 panel note
+    // so htmx swaps it. The JSON is parsed and only seven fields are read;
+    // `system.*`, `tls.*` and `agents.pending` are never rendered.
+    sink.Get("/fragments/dashboard/health", [deps, health_handler](const httplib::Request& req,
+                                                                   httplib::Response& res) {
+        using home_panels::Fact;
+        using home_panels::FactState;
+        using home_panels::HealthPanel;
+        const auto now_secs = std::chrono::duration_cast<std::chrono::seconds>(
+                                  std::chrono::system_clock::now().time_since_epoch())
+                                  .count();
+        auto serve = [&](const Fact<HealthPanel>& f) {
+            res.status = 200;
+            res.set_header("Cache-Control", "no-store");
+            res.set_content(home_panels::render_health_panel(f, now_secs), "text/html; charset=utf-8");
+        };
+        {
+            httplib::Response scratch;
+            if (deps.deny_service_scoped_fn(req, scratch, "dashboard.fragment.access_denied",
+                                            "service-scoped tokens may not read the Dashboard health panel",
+                                            "", "")) {
+                serve(Fact<HealthPanel>::with(FactState::Denied, "an interactive session"));
+                return;
+            }
+        }
+        if (!deps.auth_fn(req, res))
+            return;
+        httplib::Response doc;
+        health_handler(req, doc);
+        // A fresh httplib::Response carries status -1 until the server finalises
+        // it, so "handler wrote a body and no error" is -1 or 200.
+        const bool doc_ok = doc.status == 200 || doc.status == -1;
+        auto panel = doc_ok ? home_panels::parse_health_json(doc.body) : std::nullopt;
+        if (!panel) {
+            serve(Fact<HealthPanel>::with(FactState::Unavailable));
+            return;
+        }
+        // `agents.online` is the same unauthenticated /api/health field and is
+        // exempt from the scope rule. `executions.in_flight` is fleet-wide and
+        // unconfined, so it needs an admitted, unscoped Execution:Read.
+        bool show_exec = false;
+        if (deps.fleet_read_fn) {
+            httplib::Response scratch;
+            const auto gate = deps.fleet_read_fn(req, scratch, "Execution", "Read");
+            show_exec = gate.admitted && !gate.scope.has_value();
+        }
+        if (!show_exec)
+            panel->executions_running.reset();
+        serve(Fact<HealthPanel>::make_ok(std::move(*panel)));
     });
 
     // -- Health summary dashboard fragment (7.2) ----------------------------
@@ -984,6 +1125,55 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         html += "</div>";
         res.set_content(html, "text/html; charset=utf-8");
     });
+}
+
+void install_plaintext_redirect_pre_routing(httplib::Server& srv, std::string web_address,
+                                            int https_port) {
+    srv.set_pre_routing_handler(
+        [web_address = std::move(web_address),
+         https_port](const httplib::Request& req,
+                     httplib::Response& res) -> httplib::Server::HandlerResponse {
+            if (is_plaintext_probe_request(req))
+                return httplib::Server::HandlerResponse::Unhandled;
+            auto host = req.get_header_value("Host");
+            // Strip port from host if present
+            auto colon = host.find(':');
+            if (colon != std::string::npos) {
+                host = host.substr(0, colon);
+            }
+            if (host.empty())
+                host = web_address;
+            auto location = "https://" + host + ":" + std::to_string(https_port) + req.path;
+            if (!req.params.empty()) {
+                location += "?";
+                bool first = true;
+                for (const auto& [k, v] : req.params) {
+                    if (!first)
+                        location += "&";
+                    location += k + "=" + v;
+                    first = false;
+                }
+            }
+            // set_redirect (void in httplib 0.37.1) silently ignores a location carrying a
+            // CR/LF/control byte (a decoded %00 in the path) and leaves the status unset, which
+            // would answer an empty 200.
+            res.set_redirect(location, 301);
+            if (res.status != 301)
+                res.status = 400;
+            return httplib::Server::HandlerResponse::Handled;
+        });
+}
+
+void install_plaintext_post_routing(
+    httplib::Server& srv, security::HeaderBundle headers,
+    std::function<void(const httplib::Request&, const httplib::Response&)> on_response) {
+    srv.set_post_routing_handler(
+        [headers = std::move(headers), on_response = std::move(on_response)](
+            const httplib::Request& req, httplib::Response& res) {
+            headers.apply(res);
+            if (on_response)
+                on_response(req, res);
+        });
 }
 
 } // namespace yuzu::server::health

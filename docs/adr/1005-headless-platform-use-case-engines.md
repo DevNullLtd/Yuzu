@@ -91,7 +91,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
 1. **The in-server dashboard's in-process store access** (`*_ui.cpp`, `/fragments/*`). Grandfathered until the strangler migration reaches each surface. No NEW private seam may be added; new capability on a grandfathered surface must be API-first (Decision 4).
 2. **Server-side NVD sync + CVE matching** (capability-map 9.4, shipped). In-server interpretation by Decision 2's test; grandfathered until re-homed into the first use-case module. The agent-side `vuln_scan` collection plugin is mechanism (Decision 2) and is NOT grandfathered — it stays core. Roadmap phases 18.1 (CVE lifecycle store), 18.2 (auditor-ready compliance bundles), and 18.5 (SBOM CVE linkage) are **boundary-affected**: on acceptance they must be re-evaluated against Decision 2 before implementation. **Extended 2026-07-07:** the ADR-0023 in-server correlation stack (the shipped `NvdDatabase::assess()` and `VulnFindingStore`, and the `VulnCorrelationEngine` + triggers + `Vulnerability:Scan` securable + findings routes that ADR planned — 18.1-flavoured work authored in parallel with this ADR) is **absorbed into this same grandfathered surface**: interim capability, re-homed and deleted by the same strangler sequence. The absorption is **bounded**: it covers ADR-0023's designed scope only (vuln-roadmap M1a/M1b) and it is **placement-only** — Decision 4 (API-first), full governance, ADR-0017 confinement, and ADR-0023's own securable/audit obligations apply to every further in-server vuln PR undiminished. Anything not in this enumeration is **outside the grandfather by default**, classified in governance review, not by the proposing document; for the absorbed M1a/M1b scope the 18.1 re-evaluation above is discharged by this reconciliation, while 18.1-and-beyond work outside that scope still re-evaluates against Decision 2. **Further extended 2026-07-08 — a prospective carve-out, not grandfathering of existing code:** the ADR-4001 vulnerability dashboard (the `/vuln` lens with its `/fragments/vuln/*` surface, the versioned `/api/v1/vuln/*` REST + `query_vulnerabilities` MCP read twins, the `Vulnerability` securable, and the in-server `attack_path_engine`) is absorbed on the same terms — placement-only, bounded to ADR-4001's designed scope, outside-by-default beyond it. Unlike the 0023 extension's shipped components, **every ADR-4001 item is planned/design-only** (ADR-4001 carries `status: accepted` as of 2026-07-09 per the ADR Acceptance Convention, but none of its surfaces exist in code): this section's "pre-existing surfaces" framing does not apply to them — the carve-out pre-authorizes their *future* in-server implementation, activates as each surface ships, and is void for anything ADR-4001's ratification does not carry. Two riders: (a) unlike the legacy un-versioned `/api/nvd/*` routes, 4001's read surfaces are on the **published versioned API contract from birth**, so their Phase-7 re-home requires the full Phase 0.3 deprecation cycle with module-provided equivalents; (b) ADR-4002's scoring substrate is **not** absorbed here — it faces its own Decision 2 boundary review at its own merge. Reconciliation record: execution plan § "Relationship to ADR-0023 and ADR-4001".
 3. Exceptions recorded here accrete into the "exception ledger" the standing review question refers to:
-   - **2026-07-07 (Phase 1 implementation, pre-acceptance — see Binding status above for the pre-acceptance meaning):** the four HTTP liveness/readiness probe paths (`/livez`, `/readyz`, `/health`, `/api/health`) are **exempt from the Interim-rules on-behalf-of rejection**. Rationale (governance Gate 5, CH-3/UP-5): a mesh/SSO proxy that stamps a reserved header on every request must not be able to 403 the probes and crash-loop the pod — a probe performs no identity-bearing action, nothing consumes the header on that path, and a bricked orchestrator would hide the very misconfiguration the guard exists to surface. Every other path rejects. The set is **closed and exact-match** (`req.path ==` equality — `/health/detailed` or a trailing-slash variant does NOT inherit the exemption); any additional exempt path requires its own ledger entry with its own no-identity-bearing-action justification. Implementation **ships with the Phase-1 implementation PR (#1972)** — the pre-routing chokepoint in `server/core/src/server.cpp` plus the "On-behalf-of assertions rejected" section of `docs/auth-architecture.md`; this entry is recorded ahead of that merge as the exception's review trail, and the cross-references resolve once #1972 lands.
+   - **2026-07-07 (Phase 1 implementation, pre-acceptance — see Binding status above for the pre-acceptance meaning):** the four HTTP liveness/readiness probe paths (`/livez`, `/readyz`, `/health`, `/api/health`) are **exempt from the Interim-rules on-behalf-of rejection**. Rationale (governance Gate 5, CH-3/UP-5): a mesh/SSO proxy that stamps a reserved header on every request must not be able to 403 the probes and crash-loop the pod — a probe performs no identity-bearing action, nothing consumes the header on that path, and a bricked orchestrator would hide the very misconfiguration the guard exists to surface. Every other path rejects. The set is **closed and exact-match** (`req.path ==` equality — `/health/detailed` or a trailing-slash variant does NOT inherit the exemption); any additional exempt path requires its own ledger entry with its own no-identity-bearing-action justification. Implementation **ships with the Phase-1 implementation PR (#1972)** — the pre-routing chokepoint in `server/core/src/server.cpp` plus the "On-behalf-of assertions rejected" section of `docs/auth-architecture.md`; this entry is recorded ahead of that merge as the exception's review trail, and the cross-references resolve once #1972 lands. **Amended 2026-10-15 (#5906):** the same closed set is additionally served, to GET and HEAD requests only, on the plaintext HTTP→HTTPS redirect listener (previously every request there answered a `301`), so a container healthcheck can probe without a TLS client. The justification is unchanged — a probe performs no identity-bearing action — and that listener binds session resolution to none, so `/health` and `/api/health` always return the unauthenticated shape there; every other request on it still `301`s to the guarded main listener. `yuzu-server --healthcheck` is a client of these already-exempt paths, not an ingress, and a plain-port `200` means the process is alive and the HTTPS listener is bound.
 
    - **2026-07-14 — class-level entry: Prometheus fleet-gauge families are
      observability, not capability (spark rung 1; retroactively covering
@@ -179,8 +179,12 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        fleet-data destructor as an MCP tool hands an autonomous worker a
        one-call, unrecoverable data-loss primitive. The twin is withheld
        until an MCP destructive-operation gate exists (human confirmation /
-       tier ceiling) that makes a guarded twin safe. Tracked as **#2102**;
-       **revisit by 2027-01-13**.
+       tier ceiling) that makes a guarded twin safe. Recorded in **#2102** (closed
+       2026-07-14); no open issue tracks the work. **Revisit by 2027-01-13**
+       (the date is pinned in the gate, which warns as it nears; whether the
+       revisit happens is not machine-checked). The fragment that probes the
+       `Decommission:Delete` gate, `get.fragments-hardware-ci-stored-data`, is
+       ledgered as `exception:#2102 revisit:2027-01-13`.
      - **Scoped to the destructive verb only — the capability's read half
        has its twin from day one.** `GET /api/v1/sle/agents/{id}` ships
        alongside the MCP twin `query_software_licenses` (ADR-0024
@@ -314,19 +318,49 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        (`scripts/ci/check-api-parity.py`'s `BASELINE_UNTWINNED` moved
        265 → 257) and recording the #520 decision nowhere this ADR's own
        exception-ledger mechanism could see it — an adversarial two-model
-       review (`/home/dgr/advrev-4028`) caught the mislabel independently of
-       the credential-leak finding on the same branch. The rows are now
-       `status: "exception:#520"`, `BASELINE_UNTWINNED` is restored to 265,
+       review (`/home/<user>/advrev-4028`) caught the mislabel independently of
+       the credential-leak finding on the same branch. The rows were then
+       `status: "exception:#520"`, `BASELINE_UNTWINNED` was restored to 265,
        and this entry is the exception-ledger record ADR-1005's own
        Decision 1 requires for it.
-     - **Not a tracked follow-up — revisit only if #520 itself is amended.**
+     - **Not a tracked follow-up: the dated revisit is a re-confirmation
+       date only, and the decision changes only if #520's boundary is
+       amended.**
        Unlike the SCIM entry above, there is no scoped MCP-surface work
        item to point at: adding an MCP twin here means amending #520's
        fleet-management/server-administration boundary, which
-       `docs/mcp-server.md:21` already states explicitly requires "its own
+       the `docs/mcp-server.md` bullet "Server administration surfaces stay
+       REST-only (#520)" already states explicitly requires "its own
        security-guardian-reviewed amendment... not a side effect of a
        routine REST-twin PR." This stands as a standing exception until
-       that amendment happens, not a numbered issue with a revisit date.
+       that amendment happens. As of 2026-10-17 the eight rows are ledgered as
+       `exception:#520 revisit:2027-04-30`: the date is a re-confirmation of
+       the same standing decision, not a work-item deadline, so the dated
+       form does not reverse this entry. (#4031 required a per-route decision
+       and its implementing PR #4176 made the identical call for three
+       REST-only reads: enrollment auto-approve-rules, enrollment
+       pending-agents and settings/oidc, ledgered as
+       `get.fragments-settings-auto-approve`,
+       `get.fragments-settings-pending` and
+       `get.fragments-settings-directory`. They were previously ledgered
+       `twinned` and carry the same `exception:#520 revisit:2027-04-30` as of
+       2026-10-17.) #520 is the closed security issue whose fix drew the
+       MCP-tier boundary, not a decision record: the decision of record is
+       `mcp_policy.hpp`'s `tier_allows` and the `docs/mcp-server.md` bullet
+       "Server administration surfaces stay REST-only (#520)". No open item
+       owns the 2027-04-30 re-confirmation of these eleven rows (nor of the
+       audit-retention read, a twelfth #520 row recorded below): 2027-04-30
+       was chosen when the dated-exceptions change was written (2026-10-16)
+       and accepted by the maintainer in that change's session, and the
+       twelfth row's status text carries the same date from a later ledger
+       reconcile; it is not a recorded ruling, and the gate pins and warns on
+       the date but does not check that the re-confirmation happens. #4031 is
+       open but carries no re-confirmation date. The stored-data row
+       (`get.fragments-hardware-ci-stored-data`) is dated 2027-01-13 from the
+       2026-07-13 SLE-erasure entry, and the admin reset 2027-01-04 from the
+       2026-10-04 passwords entry (earlier ADR text); neither date is a
+       recorded ruling, and the gate pins and warns on both without checking
+       that the revisit happens. #5955 covers only its own 13 rows.
      - **The exception relaxes no control.** Every route requires its
        dedicated RBAC securable (`Read`) and is floored in
        `authz_topology_floor.hpp` so an RBAC-off deployment stays
@@ -494,7 +528,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
 
    - **2026-09-16 — Hardware CI list/record (`GET /api/v1/hardware`,
      `GET /api/v1/hardware/{id}`, `POST /api/v1/hardware/{id}/sync`, PR
-     `feat/hardware-ci-view`).** REST-only, no MCP twin, and absent from
+     `feat/hardware-ci-view`; extended 2026-10-15 with the fleet/group/scope
+     fan-out `POST /api/v1/hardware/sync`, which has its MCP twin
+     `sync_hardware_software` as of the same change; the rest of this row is
+     unchanged).** The list/record/per-device routes are REST-only, no MCP twin, and absent from
      route discovery only in the sense that no `get_hardware_ci`/
      `list_hardware`/equivalent MCP tool exists yet — the REST routes
      themselves ARE in `openapi_spec()` and `GET /api/v1/routes` (A2/A3
@@ -512,13 +549,210 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        NOT part of this gap — they reuse the pre-existing generic
        live-info/bundle dispatch mechanism, which already has its own MCP
        reachability via `execute_instruction`, unaffected by this row.
-     - Scoping and building the list/detail/sync-dispatch MCP twin is out
-       of scope for this PR; tracked as **#4456**. Until it lands, this row
-       stands as the open exception.
+     - The fleet/group/scope fan-out route `POST /api/v1/hardware/sync` has its MCP twin
+       `sync_hardware_software` (owner ruling 2026-10-15: the twin is required, not an
+       exception), sharing the route's cooldown and single in-flight run. Scoping and building
+       the list/detail/per-device-sync MCP twins is out of scope for this PR; tracked as
+       **#4456**. Until it lands, this row stands as the open exception for those routes.
      - Full design record: the round-3 hardware-ci-view plan
        (`docs/user-manual/inventory.md`'s Dashboard section describes the
        shipped REST/HTMX surface); wire reference:
        `docs/user-manual/rest-api.md`'s Hardware section.
+
+   - **2026-10-04 — local password change and admin reset
+     (`POST /api/v1/users/me/password`, `POST /api/v1/users/{name}/password`,
+     #5342).** REST-only, no MCP twin — a "no" on Decision 1/4's
+     both-surfaces requirement, recorded per route as `exception:` rows in
+     `scripts/ci/api-parity/rbac.json` (`docs/api-parity-ledger.md`).
+     Recorded rather than fixed pre-merge because:
+     - **Self-service change — a permanent exception.** An MCP caller is a
+       token, not the human. A token that could change its owner's password
+       turns a token leak into an account takeover (the new password locks
+       the owner out and admits the token holder interactively), so the
+       route refuses every token and MCP session (`403 token_session`) and
+       has no twin to build. Revisit only if MCP gains a human-presence
+       proof that a bearer token cannot replay.
+     - **Admin reset — a tracked follow-up, not a permanent exception.**
+       `UserManagement:Write` is approval-gated at the supervised MCP tier,
+       and an approval ticket persists the tool's `canonical_args` in
+       plaintext (`approvals.scope_expression`) and renders them to
+       approvers, so a password argument would be stored and displayed. The
+       twin to build takes no password argument: a server-generated
+       temporary password with a must-change-at-next-sign-in flag (auth
+       schema v3). Tracked as **#5357**; **revisit by 2027-01-04**. Until it
+       lands, this row stands as the open exception; it is ledgered as
+       `exception:#5357 revisit:2027-01-04`.
+     - **The exception relaxes no control.** Both routes accept interactive
+       dashboard sessions only, require a same-site `Origin`/`Referer` and
+       `Content-Type: application/json`, pass MFA step-up, and commit the
+       credential, the deletion of every session of the account and the
+       audit row in ONE transaction (`CredentialChangeOwner`) — an audit
+       failure makes no change. The admin reset is gated on the A2/A1
+       durable-Administrator predicate (`is_rbac_administrator(kRest)` + the
+       current-regime re-check), not an ordinary permission. A4 envelope
+       and OpenAPI entries hold for both (A2/A3 for the REST half).
+     - Design record: `docs/auth-architecture.md` "Local password change and
+       reset (#5342, #5274)"; wire reference: `docs/user-manual/rest-api.md`
+       (`POST /api/v1/users/me/password`).
+
+   - **2026-10-07 — software title catalogue (`GET /api/v1/inventory/software/catalogue`,
+     `GET /api/v1/inventory/software/catalogue/versions`) and its MCP twins
+     (`query_software_catalogue`, `get_software_versions`).**
+     The REST routes merged first and REST-only, a "no" on Decision 1/4's
+     both-surfaces requirement that was recorded rather than fixed pre-merge;
+     the MCP twins then landed over the same pure model, so both surfaces exist
+     now. What stays an exception:
+     - **A build-order gap that has closed, not a boundary.** The catalogue read
+       surface (shared pure model, totals, cursors, CSV export) landed first so
+       the MCP tools are a thin transport over the same model
+       (`docs/api-twin-recipe.md` Rule 1) instead of a second shaper. The
+       `titles` CSV export is REST-only by design (a download, not a structured
+       tool result).
+     - **#3988's remaining disposition is a decision, not this change's merge.**
+       The open P1 issue #3988 ("Inventory catalogue-grain read ... has no
+       REST/MCP twin") is answered on the twin half by the tools above; its
+       confinement criterion is superseded by the refuse-to-confined ruling.
+       **Revisit by 2026-11-07.**
+     - **The raw route's export is REST-only (`#5699`).**
+       `GET /api/v1/inventory/software?format=csv|json` has no MCP tool: an
+       agent pages the same rows through the cursor on `query_installed_software`,
+       and a bulk file is a human/automation convenience. **Revisit by
+       2026-11-07.**
+     - **The raw route's `q`, `kind`, `ecosystem` and `source` filters are
+       REST-only (`#5699`).** `query_installed_software` takes `name`,
+       `agent_id`, `version`, `limit` and `cursor` only; the parity ledger row
+       stays `twinned` on the paged shape and the gap is recorded in
+       `docs/api-parity-ledger.md`. **Revisit by 2026-11-07.**
+     - **The exception relaxes no control.** The fleet view is gated on a
+       global `Inventory:Read` (the per-device view is admitted in scope),
+       denies service-scoped tokens on the catalogue fleet view (the raw route
+       admits them, confined), audits every
+       served page or file, and answers a degraded read with `503`, never an
+       empty `200`; wire reference: `docs/user-manual/rest-api.md`.
+
+   - **2026-10-15 - temporary UI-only fragment exceptions (Dashboard,
+     Integrations webhooks, General, Access).** The ADR owner (Dave Rae)
+     accepted these server-rendered fragments, which have no REST v1 or MCP
+     twin yet, as temporary exceptions to Decision 4 and Grandfathered
+     surface 1 (#5859, #5872, #5873, #5880). The acceptance is recorded in
+     review text edited into the owner's own reviews of those four pull
+     requests; the label text is dated 2026-10-15 (review text labelled
+     "Decision recorded (owner, 2026-10-15)" on #5859, #5872 and #5873, though
+     the #5859 review itself was submitted 2026-10-14 UTC; "Owner decision (recorded: accepted)" in the
+     approving review of #5880), and restated in the body of #5955 (opened
+     2026-10-16). No ground is recorded beyond "accepted for
+     now". These are review edits by the owner's account, not a signed
+     decision. In the session in which this entry was prepared (2026-10-17)
+     the ADR owner stated that the decision to record this entry as written is
+     final and that no independent review of it is required; the exceptions
+     themselves remain temporary.
+     The exception waives only the requirement of a REST v1 and MCP twin for
+     13 read fragments in this change. It does not waive, and this entry
+     does not assess, the authentication, authorization, audit or
+     confinement requirements on the fragments themselves, which were
+     reviewed in the four pull requests. The exceptions are to be revisited
+     by **2026-11-30**. This is not a general waiver: a new UI-only
+     capability, or any extension, needs its own recorded ruling. The list
+     of record is issue #5955 plus the rows carrying
+     `exception:#5955 revisit:2026-11-30` in `scripts/ci/api-parity/*.json`.
+     The gate requires the dated shape for any new exception and pins every
+     dated exception row in `STRICT_EXCEPTION_PINS` by capability id to its
+     issue and revisit date, so a new, relabelled, re-dated or removed
+     exception, and a pin whose row was twinned or retired, each need a
+     visible edit to that table. The pin is not a ruling: a new or changed
+     exception still needs its own recorded ruling. As of 2026-10-18 a
+     revisit date within 14 days of today, or already past, produces one
+     aggregated warning, never a failure; whether the revisit was done is
+     not machine-checked (#5955 is the reminder for its own rows). The pin
+     binds the capability id, the issue and the date, not the reason text,
+     so rewriting a reason stays review-only (a different route changes the
+     id derived from its method and path, so its pin goes stale; only a
+     different route whose derived id collides with the pinned one escapes).
+     The #520 dating of the twelve #520 rows (three #4031, eight #4028, and
+     `get.fragments-access-audit-retention`; see the #4028 entry) is not
+     part of the 2026-10-15 acceptance. The audit-retention row was recorded
+     in `scripts/ci/api-parity/other.json` by the Audit page parity ledger
+     rows, before this entry's pin table, as a bare `exception:#520` and
+     dated by the later 2026-10-17 ledger reconcile; its status text states
+     the no-MCP decision for its REST twin
+     `GET /api/v1/settings/data-retention` and the 2027-04-30
+     re-confirmation, and this entry records that fact without ruling on it.
+     As of 2026-10-18 five free-form rows remain in a size-pinned set. None
+     carries a machine-checked dated revisit, and none
+     has an open tracker that owns a date: the two NVD fragments
+     (grandfathered surface #2, 2027-Q1 target, #4099 open); the
+     self-service password change (a permanent exception, ADR 2026-10-04);
+     the two TAR process-tree fragments (waiting on a /run twin; #4027
+     closed, #3994 open design issue). The two dashboard api-tokens routes
+     left this set when they were recorded as `twinned` (#6009). Plain growth
+     of the set is machine-caught,
+     while growth paired with a raise of its maximum, a swap or a rebind to a
+     row with the same slug is review-only. These five rows are a disclosed
+     residual not covered by #5955. Nine `twinned-rest-only` rows
+     are open gaps counted by the ratchet, all tracked by #5963 (the hardware
+     list and detail rows also by #4456); the ninth, `get.fragments-access-audit-sample`, was
+     added to #5963 by a comment on 2026-10-18 (it was not in the issue's
+     original table of eight).
+
+   - **2026-10-18 - approving and rejecting is a human-session act: MCP
+     `approve_request` / `reject_request` and the legacy REST
+     `POST /api/approvals/{id}/approve|reject` (#6061).** A "no" on Decision
+     1's both-surfaces requirement, in two parts (MCP and REST), followed by the exception's
+     scope, the MFA caveat and the revisit rule:
+     - **MCP: registered, discoverable, permanently refused.** Both tools stay
+       in `tools/list`, and after the `Approval:Approve` permission check they
+       always answer `-32003` with the message
+       `approver_assurance_required:<reason>` (`non_interactive_session`,
+       `engine_principal` or `non_human_principal`), record no decision and
+       write a `denied` audit row. Listing pending approvals over MCP
+       (`list_pending_approvals`, `get_pending_approval_count`) is unchanged.
+       The reason: ADR-0033 section 4 requires an MFA step-up and a distinct
+       human root for the approver, and section 6 (D8) makes v1 approvals
+       humans-only. A bearer credential is a replayable secret that automation,
+       or the agentic worker that raised the request, can hold. The MCP
+       transport runs no step-up and has no interactive session, so there is no
+       twin to build.
+     - **REST: legacy, cookie-only, no `/api/v1` twin.** The two routes are the
+       unversioned `/api/approvals/{id}/approve|reject` pair that the dashboard
+       Approvals page also drives. They are ledgered in
+       `scripts/ci/api-parity/other.json` as
+       `exception:#6061 revisit:2027-01-18` (they were `planned:#2146`).
+     - **The exception relaxes no control; it makes approval stricter.** It
+       waives only the twin. Authentication, authorization, audit and the
+       reviewer-is-not-the-submitter rule are unchanged or tighter.
+     - **"Fresh MFA step-up" has a known pass-through, tracked in #6079.** The step-up gate
+       (`require_mfa_step_up`) can only ask for a factor the account has, so a local account with no
+       enrolled factor passes it in every `--mfa-enforcement` mode, an OIDC session whose identity
+       provider asserted no `amr` proof passes it unless `--mfa-enforcement=required` (under
+       `admin-only` a non-admin role passes and an admin is refused with a `401` re-sign-in loop), and any session passes it with
+       `--mfa-step-up-window-secs=0`. SAML sessions are refused while step-up is on (#4935), so a
+       SAML-only deployment has no working approver path (known limitation, tracked in #6098).
+       Requiring an enrolled factor of the approver in every mode is #6079; until it ships, this
+       exception rests on the interactive-session and human-principal rules, with the step-up as a
+       strengthening where the account has a factor. Stated plainly: ADR-0033 section 4's step-up
+       clause is met only for approvers whose account has an enrolled factor (or an `amr` proof)
+       until #6079 ships. The base route had no step-up at all before this change, so this is
+       strictly stricter than what it replaces, not a new gap.
+     - **Acceptance.** Acceptor: Dave Rae (maintainer). Date: 2026-10-18. Ruling
+       source: the maintainer ruling in the #6061 work session (epic #6060) to
+       convert the two legacy approve/reject api-parity rows to
+       `exception:#6061 revisit:2027-01-18` and to record this entry. This is
+       a session statement, not a signed decision; the #6079 issue body also
+       records the maintainer's ruling to ship #6061 with the MFA caveat
+       documented.
+     - **Versioning basis.** No `/api/v1` route changes behaviour. The changed REST surface is the unversioned
+       legacy pair above, and the MCP tools keep their names and stay listed. `docs/api-versioning-policy.md`
+       counts a tightened auth requirement as breaking, so the change ships under a Breaking changelog entry
+       that cites #6061 and #4128.
+     - **Revisit 2027-01-18** is a re-confirmation date for a standing
+       decision, not a work-item deadline. The decision changes only if MCP
+       gains a human-presence proof that a bearer token cannot replay, or a
+       later ADR enables non-human approvers as ADR-0033 section 6 describes.
+       The same shape of reasoning is recorded for the self-service password
+       change in the 2026-10-04 entry above.
+     - Design record: `docs/auth-architecture.md` "Approver assurance
+       (maker-checker, #6061)"; operator description:
+       `docs/user-manual/instructions.md` "Who can approve".
 
 ## Interim rules (until the named follow-ups ship)
 

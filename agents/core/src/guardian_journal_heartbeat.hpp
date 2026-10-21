@@ -76,6 +76,12 @@ struct GuardianJournalStats {
     // #3953 items 1+2 (GuardianOutboxSendExecutor, both lanes summed).
     std::uint64_t send_orphan_exceptions{0}; ///< a reclaimed orphan's thrown result, discarded (diagnostic only)
     std::uint64_t send_stalls{0};            ///< a send exceeded its stall threshold before completing/reclaiming
+    // #3972 (GuardianOutboxDrainWorker, both lanes summed). Monitor-only, not a loss channel.
+    /// A lane held behind the other lane's older entry waited out cross_lane_order_hold and was
+    /// released to overtake up to cross_lane_release_allowance entries. One increment per
+    /// hold expiry (a bounded overtake permission; counted at the expiry decision, even when
+    /// that call launches nothing).
+    std::uint64_t send_order_hold_releases{0};
 };
 
 /// Populate `tags` with the (sparse) journal telemetry. `TagMap` is any map with a string
@@ -118,6 +124,7 @@ void emit_guardian_journal_heartbeat_tags(TagMap& tags, const GuardianJournalSta
     put("yuzu.guardian_journal_backpressure_drops", s.lifecycle_backpressure_drops);
     put("yuzu.guardian_send_orphan_exceptions", s.send_orphan_exceptions);
     put("yuzu.guardian_send_stalls", s.send_stalls);
+    put("yuzu.guardian_send_order_hold_releases", s.send_order_hold_releases);
 }
 
 /// AGE gauges (flip item 6 + #2364 step-1) - a SEPARATE struct from GuardianJournalStats

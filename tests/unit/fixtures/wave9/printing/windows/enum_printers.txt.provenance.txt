@@ -6,4 +6,6 @@ command: probe_wave9_print_win.exe, run via the yuzu-wave9-print-probe SYSTEM sc
          section == EnumPrintersW(LOCAL|CONNECTIONS, level 2) == / == GetDefaultPrinterW ==
 note: cl /std:c++latest /EHsc /nologo /W3 probe_wave9_print_win.cpp winspool.lib compiled clean,
       no warnings. Identical output (module names/drivers/ports/status) also captured under the
-      admin SSH identity (DESKTOP-04DNSIG\Alex).
+      admin SSH identity (DESKTOP-04DNSIG\jsmith).
+
+Redacted 2026-10-17: the capturing account name is shown as `jsmith`, and any Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-<RID>; no captured byte other than those was changed.

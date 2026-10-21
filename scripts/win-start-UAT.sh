@@ -304,11 +304,15 @@ start_all() {
     # ── 2. Server ─────────────────────────────────────────────────────────
     echo ""
     echo "[2/4] Starting yuzu-server..."
+    # Plaintext rig: --insecure-gateway-peer explicitly acknowledges that peer
+    # authorization on the gateway-upstream service is disabled. Not for
+    # production.
     "$BUILDDIR/server/core/yuzu-server.exe" \
         --no-tls \
         --no-https \
         --listen 0.0.0.0:50054 \
         --gateway-upstream 0.0.0.0:50055 \
+        --insecure-gateway-peer \
         --gateway-mode \
         --gateway-command-addr localhost:50063 \
         --web-address 0.0.0.0 \
@@ -362,7 +366,8 @@ start_all() {
     local token_html
     token_html=$(curl -s -b "$UAT_DIR/cookies.txt" \
         -X POST http://localhost:8080/api/settings/enrollment-tokens \
-        -d "label=uat-auto&max_uses=1000&ttl=86400")
+        -H "Origin: http://localhost:8080" \
+        -d "label=uat-auto&max_uses=1000&ttl_hours=24")
     local enroll_token
     enroll_token=$(echo "$token_html" | python -c "import sys,re; m=re.search(r'[a-f0-9]{64}', sys.stdin.read()); print(m.group() if m else '')" 2>/dev/null || true)
 
@@ -521,6 +526,7 @@ except: print(0)
     local cmd_resp
     cmd_resp=$(curl -s -m 10 -b "$UAT_DIR/cookies.txt" \
         -X POST http://localhost:8080/api/command \
+        -H "Origin: http://localhost:8080" \
         -H "Content-Type: application/json" \
         -d '{"plugin":"os_info","action":"os_name"}' 2>/dev/null)
     local cmd_id

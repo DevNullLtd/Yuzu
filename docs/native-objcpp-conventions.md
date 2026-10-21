@@ -97,8 +97,14 @@ site (next to `corefoundation_dep`, ~line 348) —
 - `add_languages('objcpp', native: false, required: true)` — a process-global
   language registration; doing it once here means a second `.mm`-consuming
   plugin never needs to repeat (or worry about ordering) its own call.
-- `apple_objcpp_args` — the probed C++23 flag plus `-fvisibility=hidden` and
-  `-fobjc-arc`, computed once.
+- `apple_objcpp_args` — the probed C++23 flag plus `-fvisibility=hidden`,
+  `-fobjc-arc` and `-mmacosx-version-min=13.3`, computed once.
+- `apple_objcpp_link_args` — `-mmacosx-version-min=13.3` for the link. Meson
+  links a target containing a `.mm` TU with the Objective-C++ linker, which the
+  native file's `cpp_link_args` do not reach. Without it the binary's
+  `LC_BUILD_VERSION` minos becomes the SDK version and the plugin fails to load
+  on older macOS releases. The bundle lane's builder refuses such a binary, but
+  the release lane does not check.
 
 — and only the genuinely target-specific parts stay in the plugin's own
 `meson.build`: its `.mm` source list and its own
@@ -112,8 +118,12 @@ elif host_machine.system() == 'darwin'
   foo_deps    += dependency('appleframeworks', modules: ['Whatever'],
                             include_type: 'system')
   foo_objcpp_args += apple_objcpp_args
+  foo_link_args   += apple_objcpp_link_args
 endif
 ```
+
+and the target passes `link_args: foo_link_args` alongside
+`objcpp_args: foo_objcpp_args`.
 
 `agents/plugins/wifi/meson.build` is the worked example — it consumes the
 template exactly this way for `CoreWLAN`/`Foundation`.
@@ -135,14 +145,10 @@ decision, not part of the shared template:
   example of this case** — despite a long-standing myth in this codebase, it
   is not an `.framework` bundle at all (it ships as
   `usr/lib/libEndpointSecurity.tbd` + `usr/include/EndpointSecurity/`, present
-  in BOTH the Command Line Tools and full Xcode SDKs), so probing it via
-  `dependency('appleframeworks', modules: ['EndpointSecurity'])` — as the
-  top-level `meson.build`'s shared ES probe currently does (TAR's own
-  `meson.build` only consumes the shared result, it does not probe itself)
-  — is a probe DEFECT, not a legitimate optional-framework pattern: see
-  `docs/darwin-compat.md`'s EndpointSecurity row and the
-  `feat/macos-spark-a0.5-es-probe` fix slice for the corrected
-  `cxx.find_library()`/`cxx.has_header()` form.
+  in BOTH the Command Line Tools and full Xcode SDKs), so it is probed as a library plus header
+  (`cxx.find_library('EndpointSecurity')` + `cxx.has_header(...)`) at the
+  single top-level probe site in `meson.build`, never as an
+  `appleframeworks` module — see `docs/darwin-compat.md`'s EndpointSecurity row.
 
 ## Coverage
 

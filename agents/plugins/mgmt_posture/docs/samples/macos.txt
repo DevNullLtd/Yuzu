@@ -1,0 +1,9 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-04 · euid 501 (jsmith) · leg-hash 39319322f1b1
+== action=posture
+status|posture|supported|-
+plane|-
+mdm_enrolled|false
+mdm_provider|-
+tenant_id|-
+[result_status] OK / FULL / 
+

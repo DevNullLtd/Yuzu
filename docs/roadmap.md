@@ -112,6 +112,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 6.5 | [#188](https://github.com/Tr3kkR/Yuzu/issues/188) | File System Advanced Operations | Done |
 | | 6.6 | [#192](https://github.com/Tr3kkR/Yuzu/issues/192) | Registry Change Trigger | Done |
 | **7** | 7.1 | [#185](https://github.com/Tr3kkR/Yuzu/issues/185) | Gateway Node Implementation | Done |
+| | 7.1.1 | [#5759](https://github.com/Tr3kkR/Yuzu/issues/5759) | Gateway Adjacency, Load Shedding, and Latency-Based Redistribution (HA WS-15) | Open |
 | | 7.2 | [#187](https://github.com/Tr3kkR/Yuzu/issues/187) | System Health Monitoring and Statistics | Done |
 | | 7.3 | [#190](https://github.com/Tr3kkR/Yuzu/issues/190) | Runtime Configuration API | Done |
 | | 7.4 | [#191](https://github.com/Tr3kkR/Yuzu/issues/191) | System Notifications | Done |
@@ -834,7 +835,7 @@ Remaining work:
 **Files:** `gateway/` (Erlang/OTP, rebar3), `proto/yuzu/gateway/v1/gateway.proto`, `server/core/src/server.cpp` (GatewayUpstream handlers)
 
 ### Issue 7.1.1: Gateway Adjacency, Load Shedding, and Latency-Based Redistribution
-**Capability:** 22.5 | **Scope:** Erlang gateway (`gateway/`)
+**Capability:** 22.5 | **Scope:** Erlang gateway (`gateway/`) | **Issue:** #5759 (HA WS-15, `docs/ha-delivery-matrix.md`)
 **Depends on:** 7.1
 
 Implement cluster-aware agent redistribution so gateway nodes can dynamically
@@ -1582,7 +1583,7 @@ Agent mesh for peer content sharing within subnets:
 **Files:** New `agents/core/src/p2p_mesh.cpp`, `agents/plugins/content_dist/src/content_dist_plugin.cpp`
 
 ### Issue 14.2: Multi-Gateway Topology
-**Capability:** 22.5 (extension) | **Scope:** Gateway + Server | **Status:** Open
+**Capability:** 22.5 (extension) | **Scope:** Gateway + Server | **Status:** Open | **Issue:** #291 (HA WS-13, `docs/ha-delivery-matrix.md`)
 **Depends on:** 7.1, 7.1.1
 
 Server supports multiple concurrent gateway registrations:
@@ -1838,7 +1839,7 @@ CIS Benchmarks, NIST 800-171, SOC 2 evidence-pack templates that compose PolicyS
 ### Issue 18.3: Certificate Lifecycle
 **Capability:** new | **Scope:** Server + agent | **Status:** Proposed
 
-Auto-renewal, expiry alerts, revocation workflow. Extends existing certificate inventory (capability §3.8) with lifecycle.
+Auto-renewal, expiry alerts, revocation workflow. Extends existing certificate inventory (capability §9.8) with lifecycle.
 
 ### Issue 18.4: Secrets-Vault Integration
 **Capability:** new | **Scope:** Server | **Status:** Proposed
@@ -1865,6 +1866,11 @@ TPM, Secure Boot, UEFI verification. Reports posture state into compliance repor
 Bundled/vendored-dependency and embedded-runtime detection (Electron/Chromium, Go/Rust buildinfo,
 filesystem-resident lockfiles) that today's package-manager-based `installed_software` source can't
 see — the generation-side companion to Issue 18.5 (SBOM Ingest). See `docs/adr/0028-*`.
+
+### Issue 18.8: Cryptographic Asset Inventory
+**Capability:** 41.1–41.6 | **Scope:** Server + agent | **Status:** Partial — slice 1 (crypto-library presence) shipped: the `/crypto` dashboard, `GET /api/v1/crypto/libraries[/devices]` and MCP `get_crypto_libraries` / `list_crypto_library_devices`, server-only over the existing ADR-0016 installed-software inventory (`docs/user-manual/crypto.md`); and the library-only CycloneDX 1.7 CBOM export, `GET /api/v1/crypto/cbom` / MCP `export_crypto_cbom` (#6123; library components only, no `purl`). Vendored, statically linked and OS-bundled copies stay invisible to slice 1; Issue 18.7 (agent-side component inventory, ADR-0028) is the planned fix. Planned, not started: fleet certificate inventory with full X.509 fields (extends Issue 18.3's inventory half), SSH keys at rest, SSH login evidence, protocol/configuration settings, and extending the CBOM export beyond library components to certificates, keys, protocols and algorithms.
+
+Fleet inventory of cryptographic material. The product collects and reports facts (presence, versions, fields). Placement is ADR-0070 (`docs/adr/0070-cryptographic-asset-inventory-placement.md`): vulnerable, PQC-readiness, library end-of-life, expiry-risk and framework-mapping verdicts, deprecated or broken algorithms beyond D13's four rules, and revocation status from OCSP or from URLs a certificate supplies belong in a use-case engine behind ADR-1005 Decision 2 and the ADR-0032 interlock. Third-party revocation is core only through operator-registered CRLs (ADR-0070 D5, as amended). There are two built-in exceptions, both planned: those operator-registered CRLs (D5/R1), and ADR-0070 D13's closed set: four named weak-key rules; fixed active, expiry, expired, issued and revoked windows (Yuzu-CA revocations by reason, fleet certificates per operator-registered CRLs), with a 52-week per-week issued and revoked series; a count of registered CRLs past their `nextUpdate` (`crl_past_next_update`); and fleet-wide counts of SSH keys observed in use once slice 3's collection is permitted. Each count names its rule or window and the server time it used, and operators can apply their own thresholds and policy.
 
 ### Out of scope (documented exclusions)
 

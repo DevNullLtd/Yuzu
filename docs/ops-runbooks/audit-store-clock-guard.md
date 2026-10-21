@@ -60,8 +60,12 @@ page: [Limits](../user-manual/audit-log.md#the-retention-clock-guard).
 Not a retention problem, and much louder than one:
 `yuzu_server_audit_emit_failed_total` is rising, so events are not reaching
 PostgreSQL (schema `audit_store`) at all. Behavioural-PII REST routes
-are fail-closed, so they are returning `503` while this persists, and the
-evidence for whatever is happening right now is not being recorded.
+are fail-closed, so they are returning `503` while this persists (as are the audit-first admin
+writes: webhooks, offload targets, directory sync, group mappings, MCP settings, and approval
+approve and reject), and the evidence for whatever is happening right now is not being recorded.
+The response reads (`response.read`, on `/api/responses/*` and `/api/v1/responses/*`) are among them,
+and every served read there adds one audit INSERT, so a polling script on those routes raises audit
+volume; the audit reaper's retention cap is the only backpressure.
 
 Check, in order: `/healthz` `stores.audit` (a failed migration or an
 unreachable `--postgres-dsn` closes the store — the log says so explicitly);
@@ -71,6 +75,57 @@ no local audit file to run out of space on post-cutover); and Postgres errors
 in the server log (`PQerrorMessage` text is included in every `AuditStore`
 error line). Retention alerts may be silent throughout - a closed store does
 not run passes.
+
+**Approval approve and reject are only partly fail-closed.** The `attempted` row
+(`approval.approve` / `approval.reject`, `result=attempted`) is written before the decision: if
+it cannot be stored the route returns `503` with `Sec-Audit-Failed: true`, nothing is applied and
+the request stays pending. The outcome row (`result=success` or `result=denied`) is best effort:
+if only it fails, the response carries no `Sec-Audit-Failed` header and the counter above is the alert
+signal (it is not the only trace: on a connection-pool timeout or an INSERT error the server log also
+carries an `AuditStore::log` error line naming the action and saying the event was lost; a closed audit
+store logs nothing there). A lost `success` row means the decision was applied; a lost `denied` row
+means the store refused the decision, so this request applied nothing and the ticket keeps its prior
+state. That is usually still pending, but the store also refuses a ticket that was already reviewed or
+does not exist, and an update failure cannot prove the update did not commit, so read the ticket's
+real status rather than assuming it is pending. After an incident, find every approval ticket that has
+more `attempted` rows than outcome rows and check that approval's status (the Approvals page, or
+`GET /api/v1/approvals/{id}`) before trusting the audit trail. Compare COUNTS per `target_id`, not
+the mere presence of an outcome row: a ticket can carry several `attempted` rows (a refused attempt,
+such as a self-approval, writes `attempted` then `denied`, and the real reviewer's decision then
+writes its own pair), so a surviving `denied` row would hide a lost `success` row from a per-ticket
+"has any outcome row" test. Count `success` rows plus `denied` rows that are not the
+`approver_assurance:` class refusal (that refusal is written with no `attempted` row). Example
+(timestamps are epoch seconds; set the window to the incident, and leave out the last minute, where a
+request may simply be in flight):
+
+```sql
+SELECT target_id,
+       count(*) FILTER (WHERE result = 'attempted') AS attempted_rows,
+       count(*) FILTER (WHERE result = 'success'
+                           OR (result = 'denied' AND detail NOT LIKE 'approver_assurance:%'))
+                                                    AS outcome_rows
+FROM audit_store.audit_events
+WHERE action IN ('approval.approve', 'approval.reject')
+  AND timestamp >= extract(epoch from now() - interval '24 hours')::bigint
+  AND timestamp <  extract(epoch from now() - interval '1 minute')::bigint
+GROUP BY target_id
+HAVING count(*) FILTER (WHERE result = 'attempted')
+     > count(*) FILTER (WHERE result = 'success'
+                           OR (result = 'denied' AND detail NOT LIKE 'approver_assurance:%'))
+ORDER BY target_id;
+```
+
+Start the window before the first decision on the tickets you care about, and re-run a suspect ticket
+over its whole life: a window that starts inside a ticket's life can cut an early `attempted` row while
+keeping a later outcome row, and that surplus outcome row can offset one lost `success` row. Row
+timestamps are the writing replica's clock, while the window is measured on the database `now()`, so
+widen the window by the observed skew when a clock step or skew is suspected, which is the scenario
+this runbook covers.
+
+A returned ticket is suspect, not proven: an outcome row was lost, or the server stopped between the
+`attempted` row and the decision. Either way the audit trail alone cannot say what happened, so read
+the ticket's real status. See [Audit Log](../user-manual/audit-log.md) (`approval.approve` /
+`approval.reject`).
 
 **If behavioural-data routes are returning 503 but this counter is FLAT**, look
 for a `bad_alloc`-class throw in the audit pipeline instead. That path fails
@@ -371,6 +426,13 @@ migration transaction (ADR-0040), so a missing index means the migration
 itself failed or was interrupted mid-build — not a best-effort background
 build that silently degraded. Treat a missing index as a migration-integrity
 problem, not a performance tuning task.
+
+An exclusive lock on `audit_store.audit_events` (a migration, `VACUUM FULL`, a
+manual `LOCK TABLE`) makes every password change or reset fail closed with 503
+`audit_unavailable` within ~1.5 s (nothing changes; retry after the lock lifts).
+It also stalls every other request that writes an audit row, sign-ins on any
+account included: their audit INSERT waits on the lock for up to the database
+connection's 10 s `lock_timeout`. Schedule it outside sign-in peaks.
 
 ## YuzuAuditRetentionNeverRan
 

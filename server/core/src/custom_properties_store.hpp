@@ -138,12 +138,15 @@ public:
     /// All custom properties for an agent, key-ordered. `std::unexpected` on
     /// a store/pool/query failure — see the type-distinguishable-reads note
     /// above; a caller feeding a scope/dispatch decision off this MUST treat
-    /// `kDegraded` as "cannot evaluate", never as "no properties".
+    /// `kDegraded` as "cannot evaluate", never as "no properties". An invalid
+    /// `agent_id` (empty, over 256 bytes or containing a NUL byte) answers an
+    /// empty list without touching the database.
     [[nodiscard]] std::expected<std::vector<CustomProperty>, CustomPropertiesReadError>
     get_properties(const std::string& agent_id) const;
 
     /// A single property. `nullopt` == read fine, no such property.
-    /// `std::unexpected` == store/pool/query failure.
+    /// `std::unexpected` == store/pool/query failure. An invalid `agent_id`
+    /// answers `nullopt` without touching the database.
     [[nodiscard]] std::expected<std::optional<CustomProperty>, CustomPropertiesReadError>
     get_property(const std::string& agent_id, const std::string& key) const;
 
@@ -161,8 +164,10 @@ public:
 
     /// All properties for an agent as a map (bulk preload for scope
     /// evaluation — see `AgentRegistry::evaluate_scope`). `std::unexpected`
-    /// on a store/pool/query failure; an empty map on success means
-    /// genuinely no properties.
+    /// on a store/pool/query failure; an empty map on success means no
+    /// properties, or an invalid `agent_id` (empty, over 256 bytes or
+    /// containing a NUL byte), which is answered without touching the
+    /// database.
     [[nodiscard]] std::expected<std::unordered_map<std::string, std::string>,
                                 CustomPropertiesReadError>
     get_property_map(const std::string& agent_id) const;
@@ -184,7 +189,9 @@ public:
                                 CustomPropertiesReadError>
     get_values_for_keys(const std::vector<std::string>& keys) const;
 
-    /// Set a property. Validates against schema if one exists.
+    /// Set a property. Validates against schema if one exists. An invalid
+    /// `agent_id` (empty, over 256 bytes or containing a NUL byte) is refused
+    /// with an error.
     std::expected<void, std::string> set_property(const std::string& agent_id,
                                                    const std::string& key,
                                                    const std::string& value,
@@ -193,10 +200,11 @@ public:
     /// Delete a property. Returns false on "not found" AND on a store/query
     /// failure alike (matches the prior SQLite contract's boolean shape —
     /// deletion is not a scope/dispatch-feeding read, so this is not widened
-    /// to a typed error).
+    /// to a typed error). An invalid `agent_id` answers false (not found).
     [[nodiscard]] bool delete_property(const std::string& agent_id, const std::string& key);
 
-    /// Delete all properties for an agent. Best-effort (logged on failure).
+    /// Delete all properties for an agent. Best-effort (logged on failure);
+    /// an invalid `agent_id` is a logged no-op.
     void delete_all_properties(const std::string& agent_id);
 
     // ── Schema CRUD ──────────────────────────────────────────────────────

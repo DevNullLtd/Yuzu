@@ -33,8 +33,10 @@ table disagree, the table wins.
 One thread multiplexes many passes of different classes — `result_set_maint_thread_`
 runs ~11 (the per-replica poll, several advisory-locked reaps, gauge refreshes) and
 `health_recompute_thread_` a cluster of read-only fleet gauges plus a fleet-wide CRL
-re-publish, a per-replica stream teardown, and the two per-replica MCP maintenance
-passes (bridge sweep + session gc). Classifying a thread wholesale would falsely
+re-publish, a per-replica stream teardown, the two per-replica MCP maintenance
+passes (bridge sweep + session gc), and (since #5513) the per-replica, in-memory
+`guardian_reconcile_gate.sweep` of the Guardian heartbeat-reconcile claim table
+(ReplicaSafe: it touches no store and each replica owns its own claims). The same reconcile's policy-generation cache and rule-bundle cache are per-replica in-memory state too: their invalidation hooks (rule and Baseline mutation, and the push fan-out) fire only on the replica that served the mutation, and the other replicas miss a held bundle as soon as they see the new generation (about the generation cache's 2 s TTL plus its idle gap; the bundle is keyed by generation) and rely on its `max_age` (60 s) only when the bump failed. Classifying a thread wholesale would falsely
 certify an unsafe pass riding a mostly-safe thread, so each `kBackgroundJobs` entry is
 one unit of work — with the caveat that the many trivially-identical read-only gauge
 passes on `health_recompute_thread_` are folded into a single
@@ -55,10 +57,11 @@ an earlier revision missed eight of these; later additions are recorded in that 
   `consteval` lookup that makes removing/renaming its table entry a **build failure**
   (the `command_capability.hpp` ExecuteGate precedent): all FencedLeaderOnly and
   DisabledUntilFixed passes (incl. the concurrency reconciler), plus the load-bearing
-  ReplicaSafe ones (the event-outbox poll, the three retention prunes, the app_perf
-  rollup upsert, and the must-run-per-replica / shared-PG-writing passes the sweep
-  added: cert reloader, catalogue rollup, provisional-MFA cleanup, OTA watchdog, MCP
-  projector, MCP bridge sweep + session gc, store-worker delivery pools, the HA WS-8
+  ReplicaSafe ones (the event-outbox poll, the four retention prunes (incl.
+  `offline_endpoint_store.run_retention_prune`, #5678), the app_perf rollup upsert,
+  and the must-run-per-replica / shared-PG-writing passes the sweep added: cert reloader, catalogue rollup, provisional-MFA cleanup, OTA watchdog, MCP
+  projector, MCP bridge sweep + session gc, the Guardian reconcile claim sweep
+  `guardian_reconcile_gate.sweep` (#5513), store-worker delivery pools, the HA WS-8
   Postgres reachability probe).
 - That proves **named⇒classified** for those sites. It does **not** yet prove
   **pass⇒named** for every dispatch site — a `consteval`/CI sweep visiting *all* of
@@ -74,7 +77,9 @@ The three formerly-bare wall-clock prunes — `app_perf_fleet_store`,
 `preflight_run_store`, `deployment_run_store` — now run through the shared
 `pg::run_clock_guarded_prune` helper (`server/core/src/pg/pg_retention_guard.hpp`):
 the full seven-part clock guard + a `pg_try_advisory_xact_lock` making it
-SINGLE-WRITER-safe, reading Postgres `now()` in-SQL (the shared clock). The
+SINGLE-WRITER-safe, reading Postgres `now()` in-SQL (the shared clock). A fourth,
+`offline_endpoint_store.run_retention_prune` (#5678), adopts the same helper on
+`preflight_runner_thread_` (keyed on the PG-authored `last_seen_at`). The
 `concurrency_claims` reconciler gained the same advisory lock, but **not** the shared
 clock — its clock authority stays replica-local and its part-3 sanitiser is
 floors-only, so it is **DisabledUntilFixed**, not ReplicaSafe, until the

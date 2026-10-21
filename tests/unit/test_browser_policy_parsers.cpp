@@ -71,6 +71,7 @@
 #include <array>
 #include <cerrno>
 #include <cstdint>
+#include <format>
 #include <limits>
 #include <string>
 #include <type_traits>
@@ -608,6 +609,24 @@ TEST_CASE("browser_policy: the status row is nine fields, escapes its reason, an
           "status|-|-|-|policies|-|constrained|-|linux:permission_denied,linux:json_unparseable");
     CHECK(split_fields(constrained).size() == 9);
 
+    // Field 7 is the source: "-" on a summary row, the logical path on a per-path row.
+    const auto per_path = format_status_row(
+        kStateConstrained, "linux:json_unparseable", "/etc/opt/chrome/policies/managed/a.json");
+    CHECK(per_path == "status|-|-|-|policies|-|constrained|/etc/opt/chrome/policies/managed/a.json|"
+                      "linux:json_unparseable");
+    CHECK(split_fields(per_path).size() == 9);
+
+    // The source goes through the same wire escaper as every free-text field: a pipe in a file
+    // name cannot shift the field count, and a source past the 64 KiB cap is cut, never wider.
+    const auto piped = format_status_row(kStateConstrained, "linux:oversized", "/etc/a|b.json");
+    CHECK(split_fields(piped).size() == 9);
+    CHECK(piped.find("a\\|b.json") != std::string::npos);
+    const auto huge = format_status_row(kStateConstrained, "linux:oversized",
+                                        std::string(kMaxFieldBytes * 2, '|'));
+    CHECK(split_fields(huge).size() == 9);
+    CHECK(huge.size() < 2 * kMaxFieldBytes + 1024);
+    CHECK(survives_transport(huge));
+
     // The reason is a token list today, but the formatter still owns the wire grammar: a pipe,
     // a NUL or a bad byte in it can neither shift the field count nor truncate the row.
     const auto hostile = format_status_row(kStateConstrained, std::string("a|b\0\xFF", 5));
@@ -969,7 +988,8 @@ constexpr std::string_view kChromeManaged = "/etc/opt/chrome/policies/managed/ch
 struct LegRun {
     int rc = -1;
     std::vector<std::string> rows;  // the `policy|` rows only
-    std::string status_row;         // the in-band `status|` row, or "" when the read completed
+    std::string status_row;         // the in-band summary `status|` row, or "" when the read completed
+    std::vector<std::string> path_rows; // the per-path `status|` rows that follow it
     YuzuResultStatus status = YUZU_RESULT_STATUS_UNDECLARED;
     YuzuResultCompleteness completeness = YUZU_RESULT_COMPLETENESS_UNKNOWN;
     std::string provenance;
@@ -1006,9 +1026,12 @@ LegRun run_leg(const fs::path& root, const WalkLimits& limits = {}) {
         if (line.empty())
             continue;
         if (line.rfind("status|", 0) == 0) {
-            CHECK(out.status_row.empty()); // one outcome row per leg run in this file
-            out.status_row = line;
-            status_row_first = first_line;
+            if (out.status_row.empty()) { // the first status row is the summary
+                out.status_row = line;
+                status_row_first = first_line;
+            } else {
+                out.path_rows.push_back(line); // per-path rows follow the summary
+            }
         } else {
             out.rows.push_back(line);
         }
@@ -1026,6 +1049,7 @@ LegRun run_leg(const fs::path& root, const WalkLimits& limits = {}) {
         CHECK(out.status_row == "status|-|-|-|policies|-|constrained|-|" + out.provenance);
     } else {
         CHECK(out.status_row.empty());
+        CHECK(out.path_rows.empty());
     }
     return out;
 }
@@ -1159,6 +1183,48 @@ TEST_CASE("browser_policy linux: malformed JSON is constrained and never hides i
     CHECK(reason == "linux:json_unparseable");
 }
 
+TEST_CASE("browser_policy linux leg: a failing file gets one per-path status row, after the summary",
+          "[browser_policy][linux][tree]") {
+    yuzu::test::TempDir dir{"yuzu_test_browser_policy_leg_perpath_"};
+    write_file(dir.path, "etc/opt/chrome/policies/managed/a_good.json", R"({"ShowHomeButton": true})");
+    write_file(dir.path, "etc/opt/chrome/policies/managed/b_bad.json", "{ nope");
+    write_file(dir.path, "etc/opt/chrome/policies/managed/c_good.json", R"({"HomepageIsNewTabPage": false})");
+    const auto run = run_leg(dir.path);
+    CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(run.rows.size() == 2); // both siblings' policy rows stand
+    CHECK(run.status_row == "status|-|-|-|policies|-|constrained|-|linux:json_unparseable");
+    REQUIRE(run.path_rows.size() == 1);
+    // The LOGICAL path: the injected temp root never appears.
+    CHECK(run.path_rows[0] == "status|-|-|-|policies|-|constrained|"
+                              "/etc/opt/chrome/policies/managed/b_bad.json|linux:json_unparseable");
+    CHECK(run.path_rows[0].find(dir.path.string()) == std::string::npos);
+}
+
+// MUTATION: drop the cap in mark_result_read, or shift its `>` boundary by one -> more than 64
+// per-path rows, or no `status_rows_capped` token at 65. (Raising the producer-side push guard
+// in linux_policy_rows_at's `fail` is an equivalent mutant on the wire: mark_result_read still
+// caps at 64, so this case cannot see it.)
+TEST_CASE("browser_policy linux leg: per-path status rows are capped, and the summary says so",
+          "[browser_policy][linux][cap]") {
+    yuzu::test::TempDir dir{"yuzu_test_browser_policy_leg_pathcap_"};
+    const auto write_bad = [&](std::size_t count) {
+        for (std::size_t i = 0; i < count; ++i) {
+            write_file(dir.path, std::format("etc/opt/chrome/policies/managed/bad_{:03}.json", i),
+                       "{ nope");
+        }
+    };
+    write_bad(kMaxPathFailureRows); // exactly the cap: every file is named, nothing is dropped
+    auto run = run_leg(dir.path);
+    CHECK(run.path_rows.size() == kMaxPathFailureRows);
+    CHECK(run.provenance == "linux:json_unparseable");
+
+    write_bad(kMaxPathFailureRows + 1); // one over: 64 rows, and the summary says rows were cut
+    run = run_leg(dir.path);
+    CHECK(run.path_rows.size() == kMaxPathFailureRows);
+    CHECK(run.provenance == "linux:json_unparseable,linux:status_rows_capped");
+    CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
+}
+
 TEST_CASE("browser_policy linux: an unreadable policy directory is constrained, siblings survive",
           "[browser_policy][linux][tree]") {
     // Skip if the test happens to run as root (uid 0 / CAP_DAC_OVERRIDE bypass
@@ -1173,10 +1239,12 @@ TEST_CASE("browser_policy linux: an unreadable policy directory is constrained, 
     PermRestore restore{locked};
     REQUIRE(::chmod(locked.c_str(), 0000) == 0);
 
-    std::string reason;
-    const auto rows = lnx::linux_policy_rows_at(dir.path, reason);
+    const auto run = run_leg(dir.path);
+    const auto& rows = run.rows;
     // Listing the locked directory must fail loudly, not read as "no policy".
-    CHECK(reason.find("linux:permission_denied") != std::string::npos);
+    CHECK(run.provenance.find("linux:permission_denied") != std::string::npos);
+    REQUIRE(run.path_rows.size() == 1);
+    CHECK(run.path_rows[0] == "status|-|-|-|policies|-|constrained|/etc/opt/chrome/policies/managed|linux:permission_denied");
     CHECK(count_prefix(rows, "policy|chrome|mandatory|") == 0);
     // The other directories still read.
     CHECK(count_prefix(rows, "policy|chrome|recommended|") == 2);
@@ -1438,6 +1506,8 @@ TEST_CASE("browser_policy linux leg: the row cap is reported, and exactly-at-cap
     CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(run.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     CHECK(run.provenance == "linux:row_cap");
+    REQUIRE(run.path_rows.size() == 1);
+    CHECK(run.path_rows[0] == "status|-|-|-|policies|-|constrained|/etc/opt/chrome/policies/managed/b.json|linux:row_cap");
 
     // The cap is per leg, not per file: it also stops the next vendor/level.
     write_file(dir.path, "etc/opt/edge/policies/managed/e.json", R"({"E": 5})");
@@ -1467,6 +1537,8 @@ TEST_CASE("browser_policy linux leg: a truncated directory listing is reported, 
     CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(run.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     CHECK(run.provenance == "linux:entry_cap"); // the per-directory bound, not the per-leg row cap
+    REQUIRE(run.path_rows.size() == 1); // attributed to the level directory, not a file
+    CHECK(run.path_rows[0] == "status|-|-|-|policies|-|constrained|/etc/opt/chrome/policies/managed|linux:entry_cap");
 }
 
 TEST_CASE("browser_policy linux leg: the file-size cap is exact and reported",
@@ -1486,6 +1558,8 @@ TEST_CASE("browser_policy linux leg: the file-size cap is exact and reported",
     CHECK(run.rows.empty());
     CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(run.provenance == "linux:oversized");
+    REQUIRE(run.path_rows.size() == 1);
+    CHECK(run.path_rows[0] == "status|-|-|-|policies|-|constrained|/etc/opt/chrome/policies/managed/a.json|linux:oversized");
 }
 
 TEST_CASE("browser_policy linux leg: the total read budget is exact and reported",
@@ -1514,6 +1588,8 @@ TEST_CASE("browser_policy linux leg: the total read budget is exact and reported
     CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(run.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     CHECK(run.provenance == "linux:byte_cap"); // the run-wide read bound, not the per-file cap
+    REQUIRE(run.path_rows.size() == 1);
+    CHECK(run.path_rows[0] == "status|-|-|-|policies|-|constrained|/etc/opt/chrome/policies/managed/c.json|linux:byte_cap");
 }
 
 TEST_CASE("browser_policy linux leg: a cap stops the walk, so a later sibling adds no failure token",
@@ -1575,10 +1651,12 @@ TEST_CASE("browser_policy linux leg: a root that is not a directory is constrain
           "[browser_policy][linux][tree]") {
     yuzu::test::TempDir dir{"yuzu_test_browser_policy_leg_fileroot_"};
     write_file(dir.path, "iamafile", "x");
-    std::string reason;
-    const auto rows = lnx::linux_policy_rows_at(dir.path / "iamafile", reason);
-    CHECK(rows.empty());
-    CHECK(reason == "linux:not_a_directory");
+    const fs::path root = dir.path / "iamafile";
+    const auto run = run_leg(root);
+    CHECK(run.rows.empty());
+    CHECK(run.provenance == "linux:not_a_directory");
+    REQUIRE(run.path_rows.size() == 1); // the root itself is never shown: the logical /etc
+    CHECK(run.path_rows[0] == "status|-|-|-|policies|-|constrained|/etc|linux:not_a_directory");
 }
 
 TEST_CASE("browser_policy linux leg: the README's statements about Chromium's looser reader hold",

@@ -239,6 +239,7 @@ jobs:
             -Dbuild_tests=true \
             -Db_sanitize=address,undefined \
             -Dcpp_args=-fno-sanitize=null,alignment
+          python3 scripts/ci/assert-gateway-tests.py build-linux-asan
 
       - name: Build (ASan+UBSan)
         run: meson compile -C build-linux-asan -j "$YUZU_BUILD_JOBS" 2>&1 | tee sanitizer-asan-build.log
@@ -261,7 +262,7 @@ jobs:
 
       - name: Upload ASan artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sanitizer-asan${{ inputs.run_id && format('-{0}', inputs.run_id) || '' }}
           path: |
@@ -391,6 +392,7 @@ jobs:
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux-tsan \
             -Dbuild_tests=true \
             -Db_sanitize=thread
+          python3 scripts/ci/assert-gateway-tests.py build-linux-tsan
 
       - name: Build (TSan)
         run: meson compile -C build-linux-tsan -j "$YUZU_BUILD_JOBS" 2>&1 | tee sanitizer-tsan-build.log
@@ -421,7 +423,7 @@ jobs:
 
       - name: Upload TSan artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sanitizer-tsan${{ inputs.run_id && format('-{0}', inputs.run_id) || '' }}
           path: |

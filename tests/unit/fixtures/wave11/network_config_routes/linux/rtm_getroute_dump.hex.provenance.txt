@@ -1,0 +1,52 @@
+host: Docker Desktop Linux VM, debian:12 container run with --cap-add NET_ADMIN (fresh container, kernel 7.0.12-linuxkit, aarch64)
+identity: root inside the container
+command: python3 raw AF_NETLINK/NETLINK_ROUTE socket; one RTM_GETROUTE request, rtm_family=AF_UNSPEC, NLM_F_REQUEST|NLM_F_DUMP, nlmsg_seq=3; every recv() datagram written as one hex line (chunk boundaries preserved: line 1 = the 2044-byte route datagram, line 2 = the 20-byte NLMSG_DONE)
+date: 2026-10-03
+status: REAL CAPTURE. Routes were created in the container with iproute2 6.1.0 beforehand (dummy0 interface, ifindex 12; lo = 1; eth0 = 11, the container's Docker bridge veth):
+          ip route add 192.0.2.0/24 via 10.77.0.1 metric 50 proto static
+          ip route add 198.51.100.0/24 dev dummy0 scope link
+          ip route add default via 10.77.0.1 dev dummy0 table 100        (custom table)
+          ip route add throw 203.0.113.192/26 table 100
+          ip route add blackhole 203.0.113.0/26 / unreachable 203.0.113.64/26 / prohibit 203.0.113.128/26
+          ip route add 172.16.0.0/16 nexthop via 10.77.0.1 dev dummy0 weight 1 nexthop via 10.77.0.3 dev dummy0 weight 1   (RTA_MULTIPATH, two nexthops)
+          ip route add 10.88.0.0/16 via inet6 fd00:77::9 dev dummy0       (RTA_VIA)
+          ip -6 route add 2001:db8:1::/48 via fd00:77::1 dev dummy0 metric 100 ; ip -6 route add default via fd00:77::1 dev dummy0
+        The dump also holds the kernel's own table-255 (local) routes: 7 IPv4, 4 IPv6 (two local/anycast host routes per address, broadcast routes, ::1, and ff00::/8 multicast), which the decoder must skip.
+        The addresses are RFC 5737 / RFC 3849 / RFC 4193 documentation and private ranges plus the container's own 172.17.0.0/16 bridge. The one other identifier in the capture, the fe80:: address of dummy0 (a random EUI-64 the kernel gave a throwaway interface created for the capture), names no real host.
+expected: 16 rows after filtering (12 IPv4: 2 in table 100, 10 in main; 4 IPv6, all main); 27 route messages total (19 IPv4, 8 IPv6) in the dump before filtering.
+----- ground truth: iproute2's own rendering of the same table state, captured immediately before the dump -----
+# uname -r: 7.0.12-linuxkit
+# ip -V: ip utility, iproute2-6.1.0, libbpf 1.1.2
+# dummy0 ifindex: 12
+# lo ifindex: 1
+# ---- ip -d -4 route show table all
+unicast default via 10.77.0.1 dev dummy0 table 100 proto boot scope global
+throw 203.0.113.192/26 table 100 proto boot scope global
+unicast default via 172.17.0.1 dev eth0 table main proto boot scope global
+unicast 10.77.0.0/24 dev dummy0 table main proto kernel scope link src 10.77.0.2
+unicast 10.88.0.0/16 via inet6 fd00:77::9 dev dummy0 table main proto boot scope global
+unicast 172.16.0.0/16 table main proto boot scope global
+	nexthop via 10.77.0.1 dev dummy0 weight 1
+	nexthop via 10.77.0.3 dev dummy0 weight 1
+unicast 172.17.0.0/16 dev eth0 table main proto kernel scope link src 172.17.0.3
+unicast 192.0.2.0/24 via 10.77.0.1 dev dummy0 table main proto static scope global metric 50
+unicast 198.51.100.0/24 dev dummy0 table main proto boot scope link
+blackhole 203.0.113.0/26 table main proto boot scope global
+unreachable 203.0.113.64/26 table main proto boot scope global
+prohibit 203.0.113.128/26 table main proto boot scope global
+local 10.77.0.2 dev dummy0 table local proto kernel scope host src 10.77.0.2
+broadcast 10.77.0.255 dev dummy0 table local proto kernel scope link src 10.77.0.2
+local 127.0.0.0/8 dev lo table local proto kernel scope host src 127.0.0.1
+local 127.0.0.1 dev lo table local proto kernel scope host src 127.0.0.1
+broadcast 127.255.255.255 dev lo table local proto kernel scope link src 127.0.0.1
+local 172.17.0.3 dev eth0 table local proto kernel scope host src 172.17.0.3
+broadcast 172.17.255.255 dev eth0 table local proto kernel scope link src 172.17.0.3
+# ---- ip -d -6 route show table all
+unicast 2001:db8:1::/48 via fd00:77::1 dev dummy0 table main proto boot scope global metric 100 pref medium
+unicast fd00:77::/64 dev dummy0 table main proto kernel scope global metric 256 pref medium
+unicast fe80::/64 dev dummy0 table main proto kernel scope global metric 256 pref medium
+unicast default via fd00:77::1 dev dummy0 table main proto boot scope global metric 1024 pref medium
+local ::1 dev lo table local proto kernel scope global metric 0 pref medium
+local fd00:77::2 dev dummy0 table local proto kernel scope global metric 0 pref medium
+local fe80::fceb:bdff:fe61:6d56 dev dummy0 table local proto kernel scope global metric 0 pref medium
+multicast ff00::/8 dev dummy0 table local proto kernel scope global metric 256 pref medium

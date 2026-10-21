@@ -76,7 +76,7 @@ Pipe-delimited rows, one per record, discriminated by a literal first field (`us
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `member_name` | string | - | Windows, Linux, macOS | `Alex` | The account (or nested group, on Windows) belonging to the queried group. Values: free text. |
+| `member_name` | string | - | Windows, Linux, macOS | `jsmith` | The account (or nested group, on Windows) belonging to the queried group. Values: free text. |
 | `group_name` | string | - | Windows, Linux, macOS | `Administrators` | The group name from the "group" parameter, echoed back on every row. Values: free text. |
 | `member_type` | string | - | Windows, Linux, macOS | `user` | The kind of membership. Values: user, primary_group (Linux only); Windows: user, group, well_known_group, alias. |
 
@@ -84,7 +84,7 @@ Pipe-delimited rows, one per record, discriminated by a literal first field (`us
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `member_name` | string | - | Windows, Linux, macOS | `Alex` | The name of an account or group belonging to the local admin membership. Values: free text. |
+| `member_name` | string | - | Windows, Linux, macOS | `jsmith` | The name of an account or group belonging to the local admin membership. Values: free text. |
 | `member_type` | string | - | Windows, Linux, macOS | `user` | The kind of member. Values: user (always on Linux/macOS); Windows: user, group, well_known_group, alias, unknown. |
 | `domain_or_group` | string | - | Windows, Linux, macOS | `DESKTOP-04DNSIG` | The domain owning the member (Windows), or the source group/account name (Linux "sudo"/"wheel"/"root", macOS literal "admin"). Values: free text. |
 
@@ -92,7 +92,7 @@ Pipe-delimited rows, one per record, discriminated by a literal first field (`us
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `username` | string | - | Windows, Linux, macOS | `Alex` | The local account's username. Values: free text. |
+| `username` | string | - | Windows, Linux, macOS | `jsmith` | The local account's username. Values: free text. |
 | `enabled` | bool | - | Windows, Linux, macOS | `true` | Whether the account is enabled. Values: true, false. |
 | `last_logon` | string | - | Windows, Linux, macOS | `2026-09-07 11:08:37` | The account's most recent login timestamp, or a sentinel when unknown or never logged in. Values: "YYYY-MM-DD HH:MM:SS", "Never", "unknown". |
 | `description` | string | - | Windows, Linux, macOS | `Built-in account for administering the computer/domain` | The account's comment/description text (Windows comment, macOS RealName, Linux GECOS field), or "-" when empty. Values: free text or "-". |
@@ -102,7 +102,7 @@ Pipe-delimited rows, one per record, discriminated by a literal first field (`us
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `username` | string | - | Windows, Linux, macOS | `alex` | The account name of a currently logged-on user. Values: free text. |
+| `username` | string | - | Windows, Linux, macOS | `jsmith` | The account name of a currently logged-on user. Values: free text. |
 | `domain` | string | - | Windows, Linux, macOS | `local` | The host or domain the session belongs to, or the literal "local" when it has none. Values: hostname/domain or the literal "local". |
 | `logon_type` | string | - | Windows, Linux, macOS | `console` | How the session was established. Values: console, remote, RDP (Windows only). |
 | `session_id` | string | - | Windows, Linux, macOS | `console` | The session's terminal identifier — a utmp line name (Linux), a tty (macOS), or a numeric WTS session ID (Windows). Values: free text. |
@@ -111,7 +111,7 @@ Pipe-delimited rows, one per record, discriminated by a literal first field (`us
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `username` | string | - | Windows, Linux, macOS | `Alex` | The account with the most login events in the examined history, or "unknown" when none could be determined. Values: free text or "unknown". |
+| `username` | string | - | Windows, Linux, macOS | `jsmith` | The account with the most login events in the examined history, or "unknown" when none could be determined. Values: free text or "unknown". |
 | `login_count` | int32 | - | Windows, Linux, macOS | `118` | The number of login events counted for this user; "0" for the Windows ProfileList fallback, which carries no count. Values: integer. |
 | `source` | string | - | Windows, Linux, macOS | `event_log_4624` | How the answer was derived. Values: last (Linux/macOS); event_log_4624, profile_list (Windows); free text on a query failure. |
 
@@ -119,7 +119,7 @@ Pipe-delimited rows, one per record, discriminated by a literal first field (`us
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `username` | string | - | Windows, Linux, macOS | `Alex` | The account named in the record. Values: free text. |
+| `username` | string | - | Windows, Linux, macOS | `jsmith` | The account named in the record. Values: free text. |
 | `event_type` | string | - | Windows, Linux, macOS | `logoff` | Windows: "logon" or "logoff". Linux/macOS: actually the session's tty, not an event-type label — see the plugin README's Caveats. Values: logon, logoff (Windows); a tty name (Linux/macOS). |
 | `logon_type` | string | - | Windows, Linux, macOS | `network` | Windows: the mapped LogonType name or raw numeric code, empty when absent. Linux/macOS: actually last's host/source token, usually empty for a local session. Values: interactive, network, batch, service, unlock, network_cleartext, new_credentials, remote_interactive, cached_interactive, or a raw numeric code (Windows); free text, often empty (Linux/macOS). |
 | `source` | string | - | Windows, Linux, macOS | `-` | Windows: the event's IpAddress, or "-". Linux/macOS: actually the derived console/remote/system classification, not a network source. Values: an IP address or "-" (Windows); console, remote, system (Linux/macOS). |
@@ -131,7 +131,7 @@ Pipe-delimited rows, one per record, discriminated by a literal first field (`us
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `session_id` | string | - | Windows, Linux, macOS | `console` | The session's controlling tty (Linux/macOS) or numeric WTS session ID (Windows). Values: free text. |
-| `username` | string | - | Windows, Linux, macOS | `alex` | The account that owns this session. Values: free text. |
+| `username` | string | - | Windows, Linux, macOS | `jsmith` | The account that owns this session. Values: free text. |
 | `state` | string | - | Windows, Linux, macOS | `Active` | The session's connection state. Values: Active (Linux/macOS, always); Windows: Active, Connected, Disconnected, Idle, Listen, Other. |
 | `client` | string | - | Windows, Linux, macOS | `-` | The remote host the session connects from ('w' FROM column) or the RDP client name on Windows; "-" when none. Values: free text or "-". |
 | `idle` | string | - | Windows, Linux, macOS | `13:35` | Idle time as reported by 'w' on Linux/macOS; always the literal "0" on Windows, where idle-time decoding is unimplemented. Values: free text (Linux/macOS) or the literal "0" (Windows). |
@@ -163,7 +163,7 @@ Pipe-delimited rows, one per record, discriminated by a literal first field (`us
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 5734018da5be
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM (account name redacted to jsmith; account SID replaced with a placeholder) · leg-hash 5734018da5be
 
 ```
 == action=logged_on
@@ -174,7 +174,7 @@ Pipe-delimited rows, one per record, discriminated by a literal first field (`us
 
 == action=local_users
 local_user|Administrator|false|2021-10-14 11:15:58|Built-in account for administering the computer/domain
-local_user|Alex|true|2026-09-07 11:08:37|-
+local_user|jsmith|true|2026-09-07 11:08:37|-
 local_user|CodexSandboxOffline|true|Never|-
 local_user|CodexSandboxOnline|true|Never|-
 local_user|DefaultAccount|false|Never|A user account managed by the system.
@@ -184,30 +184,30 @@ local_user|WDAGUtilityAccount|false|Never|A user account managed and used by the
 
 == action=local_admins
 admin|Administrator|user|DESKTOP-04DNSIG
-admin|Alex|user|DESKTOP-04DNSIG
+admin|jsmith|user|DESKTOP-04DNSIG
 [result_status] UNDECLARED / UNKNOWN
 
 == action=group_members group=Administrators
 group_member|Administrator|Administrators|user
-group_member|Alex|Administrators|user
+group_member|jsmith|Administrators|user
 [result_status] UNDECLARED / UNKNOWN
 
 == action=primary_user
-primary_user|Alex|118|event_log_4624
+primary_user|jsmith|118|event_log_4624
 [result_status] UNDECLARED / UNKNOWN
 
 == action=session_history
-session_history|Alex|logoff|network|-|2026-09-07T10:08:37.8345208Z|4634
+session_history|jsmith|logoff|network|-|2026-09-07T10:08:37.8345208Z|4634
 session_history|sshd_6888|logoff|service|-|2026-09-07T10:08:37.8345130Z|4634
-session_history|Alex|logon|network|-|2026-09-07T10:08:37.5888936Z|4624
-session_history|Alex|logoff|network|-|2026-09-07T10:08:37.5439466Z|4634
-session_history|Alex|logon|network|-|2026-09-07T10:08:37.5436517Z|4624
+session_history|jsmith|logon|network|-|2026-09-07T10:08:37.5888936Z|4624
+session_history|jsmith|logoff|network|-|2026-09-07T10:08:37.5439466Z|4634
+session_history|jsmith|logon|network|-|2026-09-07T10:08:37.5436517Z|4624
 session_history|sshd_6888|logon|service|-|2026-09-07T10:08:37.4636668Z|4624
-session_history|Alex|logoff|network|-|2026-09-07T10:08:06.3059890Z|4634
+session_history|jsmith|logoff|network|-|2026-09-07T10:08:06.3059890Z|4634
 session_history|sshd_4452|logoff|service|-|2026-09-07T10:08:06.3059802Z|4634
-session_history|Alex|logon|network|-|2026-09-07T10:08:06.0444630Z|4624
-session_history|Alex|logoff|network|-|2026-09-07T10:08:05.9047716Z|4634
-session_history|Alex|logon|network|-|2026-09-07T10:08:05.9044759Z|4624
+session_history|jsmith|logon|network|-|2026-09-07T10:08:06.0444630Z|4624
+session_history|jsmith|logoff|network|-|2026-09-07T10:08:05.9047716Z|4634
+session_history|jsmith|logon|network|-|2026-09-07T10:08:05.9044759Z|4624
 session_history|sshd_4452|logon|service|-|2026-09-07T10:08:05.8249284Z|4624
 … 12 of 50 rows shown
 [result_status] UNDECLARED / UNKNOWN
@@ -309,4 +309,5 @@ session_history|error|last command failed
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
 - Tests: `tests/unit/test_users_macos_last.cpp` · `tests/unit/test_users_posix_actions.cpp` · `tests/unit/test_users_win_events.cpp`
 - Privilege row: `docs/agent-privilege-model.md` (no row yet)
+- Changelog: `changelog.d/5872-integrations-directory-users-total.fixed.md`
 <!-- END GENERATED -->

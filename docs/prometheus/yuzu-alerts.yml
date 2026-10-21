@@ -43,7 +43,13 @@ groups:
           description: >-
             The number of connected agents has dropped by more than 20% in the
             last 5 minutes. This may indicate a network outage, server issue,
-            or mass agent failure.
+            or mass agent failure. If the server process restarted while its
+            gateways stayed up, this is expected: the count rebuilds as the
+            gateways replay registrations, which takes about 20 minutes for
+            10,000 agents at a 100 ms round trip. Correlate with the gateway
+            "Registration replay" INFO lines. Do not restart the gateway during
+            that ramp: a restart disconnects every agent the node holds.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/gateway.md#what-happens-when-the-server-restarts"
 
   - name: yuzu-commands
     rules:
@@ -164,10 +170,60 @@ groups:
             a full command-plane outage at rotation cutover. Fix it now (the
             gateway log names the entry).
 
+      # #4632: a request the gateway could not encode never leaves it, so the
+      # server never sees it and the circuit breaker is not touched (request
+      # faults do not count against the breaker). The consequence is that a
+      # SYSTEMATIC local encode failure (every Register answered INTERNAL)
+      # leaves the breaker closed and /readyz ready, and this counter is the
+      # signal for it. The series is pre-seeded at 0 for the RPC names that can
+      # fail to encode locally (register, inventory, notify_stream, guardian;
+      # yuzu_gw_telemetry:declare_metrics/0), so the first increase is visible.
+      # batch_heartbeat marshal failures are counted as code="exception", which
+      # this alert does not cover.
+      # Threshold: increase() >= 10 over 10m, i.e. about ten increases. One
+      # request that fails to encode, or one oversized daily-sync batch, counts
+      # once and must not warn; a systematic encoder fault (every Register failing)
+      # reaches 10 on a gateway fronting about 5 or more agents (one agent
+      # retries about 2.3 times per 10m at its steady 256 s backoff). A small
+      # gateway, or a low-rate RPC (inventory, notify_stream, guardian: the
+      # series is per rpc_name, there is no sum), can fault without reaching it:
+      # for those use the log line "Upstream RPC ... raised" and
+      # yuzu_gw_agents_current. A sustained burst of rejected requests can also
+      # reach 10 in 10m, which is worth a warning. Read the rate, not the
+      # existence.
+      # increase() extrapolates to the window edges, so on a counter already
+      # above zero a burst of nine inside one 10m window can read as 10 and fire.
+      # The promtool cases pin this at their 1m sample spacing; at the shipped
+      # 15 s scrape interval nine reads about 9.2 and stays quiet. Treat the
+      # threshold as "about ten", not "exactly ten".
+      - alert: YuzuGatewayUpstreamEncodeErrors
+        expr: |
+          increase(yuzu_gw_upstream_rpc_errors_total{code="encode"}[10m]) >= 10
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway could not encode about 10 or more {{ $labels.rpc_name }} requests in 10m"
+          description: >-
+            The gateway refused to send about 10 or more requests in 10 minutes
+            because it could not encode them here (a field that is not UTF-8,
+            or a request over the 4 MiB server limit). Such a failure leaves
+            the circuit breaker closed and /readyz ready, so this alert is the
+            signal for a systematic local encode fault (every Register of one
+            kind answered INTERNAL). A lone failure is most likely a single
+            rejected request and does not reach this alert, which needs about
+            10 in 10 minutes (increase() extrapolates, so nine can reach it):
+            read the rate, not the existence. The
+            gateway log line "Upstream RPC ... raised" names the RPC and the
+            error class, never the request.
+
       # HA WS-4 4.2b — `#4246` item #1's alert-rule half. Emitted by the
       # SERVER (gateway_service_impl.cpp's record_route_store_failure), not
       # the Erlang gateway, despite living in this group — it is the same
       # fenced agent->cluster routing-directory concern as the rules above.
+      # NOTE the metric name says "write", but two `op` values are directory
+      # READS: op="session_lookup" (HA WS-5 batched session_id resolution) and
+      # op="cluster_affinity_check" (#4669). Same counter, same pool-health
+      # root cause, so one rule covers reads and writes.
       # `op="register_fresh"` is the fail-CLOSED write (ProxyRegister's
       # fresh-registration branch returns UNAVAILABLE on this); the other
       # five writer SITES (announce_connected, both ProxyRegister renew
@@ -195,9 +251,10 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Gateway routing-directory write degraded (op={{ $labels.op }}, reason={{ $labels.reason }})"
+          summary: "Gateway routing-directory read/write degraded (op={{ $labels.op }}, reason={{ $labels.reason }})"
           description: >-
-            GatewayRouteStore write op="{{ $labels.op }}" has been failing
+            GatewayRouteStore op="{{ $labels.op }}" (a directory write, or
+            for session_lookup / cluster_affinity_check a READ) has been failing
             with reason="{{ $labels.reason }}" (Postgres pool-acquire timeout
             or a query error) for at least 5 minutes. FIRST REMEDIATION: check
             Postgres reachability and connection-pool saturation from the
@@ -213,33 +270,62 @@ groups:
             announce_connected leaves the row NON-ROUTABLE (cluster_id/gateway_node
             NULL) — lease renewal does NOT repopulate placement, so it does NOT
             self-heal on the lease TTL and needs another CONNECTED / agent
-            re-registration to restore routing. A lone fail-open failure is often
+            re-registration to restore routing. op="session_lookup" is the
+            batched READ that resolves gateway session ids (HA WS-5): while it
+            fails, BatchHeartbeat is fail-SOFT (locally hinted pairs are still
+            acked and renewed, unreadable ids with no local hint are neither
+            acked nor listed),
+            ProxyInventory ingests only with a hint, and NotifyStreamStatus
+            CONNECTED is rejected unless the local map vouches for it. A
+            Postgres outage lasting past 270s (90s lease + 180s grace)
+            tombstones rows; recovery is automatic (renew shortfall ->
+            unknown_session -> gateway replays ProxyRegister) and shows as a
+            renew_leases/unknown_session spike. op="cluster_affinity_check" is
+            the READ a NotifyStreamStatus CONNECTED makes before publishing
+            placement (fail-open). A lone fail-open failure is often
             an early low-cost signal of the same shared-store root cause a
             register_fresh failure hits harder. See ADR-2002 §7 "Ship the
             write-failure fail-closed posture" and docs/user-manual/metrics.md's
             Gateway routing directory section. INITIAL threshold, not yet tuned
             against real fleet data.
 
+      # #5686: no alert on yuzu_server_gateway_batch_heartbeat_duration_seconds
+      # or yuzu_server_agent_presence_upsert_skipped_total, by decision: a
+      # threshold needs fleet data (the #913 lesson above). NOT covered by
+      # YuzuGatewayRouteWriteFailed: presence-store failures
+      # (yuzu_server_agent_presence_store_failed_total{op="upsert"}) have no
+      # rule, and a presence upsert gives up at 250 ms against 500 ms for the
+      # route-directory ops, so milder pool saturation or a presence-only
+      # db_error degrades batches without moving that rule. YuzuPgPoolSaturated
+      # and YuzuPgAcquireWaitHigh are the covering pool-level signals. A
+      # presence-refresh ratio rule is a deferred follow-up. Revisit with fleet
+      # data.
+
       # HA WS-4 4.2b Task D's `route_unreadable` — a degraded batched
       # GatewayRouteStore read during confined dispatch (store_unavailable/
       # db_error), the closest available signal to `#4246` item #8's
       # "route-directory desync" alert-rule half. This alert does NOT cover
       # every yuzu_server_gateway_route_desync_total{op,outcome} guard
-      # rejection (session_mismatch/shortfall/unknown_session) — that
+      # rejection (session_mismatch/shortfall/unknown_session/malformed_session_id) — that
       # counter is expected at a low background rate (see its own doc
       # comment) and alerting on it needs real fleet data to set a threshold
       # that doesn't page on a routine post-restart/failover baseline rise;
-      # it remains unalerted this slice. `route_unreadable` fires the
+      # it remains unalerted EXCEPT two expected-zero pairs:
+      # (op="session_lookup", outcome="ambiguous_session") and
+      # (op="proxy_register", outcome="session_held_by_other_agent"), see
+      # YuzuGatewaySessionAmbiguous and YuzuGatewaySessionHeldByOtherAgent
+      # below. `route_unreadable` fires the
       # command outbox's retry-with-backoff path (the SAME reschedule
       # containment_unreadable takes, though the two flags are not otherwise
       # interchangeable — route_unreadable, unlike a fail-closed containment
       # read, does not force sent==0; see ConfinedDispatchOutcome::
       # route_unreadable), so ANY occurrence is worth
-      # surfacing — but FALLBACK-ONLY on today's single-replica monolith
-      # (the reader only ever consults the directory on a local-registry
-      # miss), so this should be rare until the reader becomes behaviorally
-      # live at WS-5. INITIAL / conservative threshold; tune once fleet data
-      # exists.
+      # surfacing. The dispatch reader consults the directory only on a
+      # local-registry miss, so it is rare on one replica. Since HA WS-5
+      # slice 2 a Postgres brownout is ALSO visible in heartbeat ingest
+      # (YuzuGatewayRouteWriteFailed op="session_lookup"), so expect the two
+      # to fire together. INITIAL / conservative threshold; tune once fleet
+      # data exists.
       - alert: YuzuGatewayRouteUnreadable
         expr: |
           increase(yuzu_server_command_outbox_deliver_retry_cause_total{cause="route_unreadable"}[15m]) > 0
@@ -260,6 +346,75 @@ groups:
             and docs/user-manual/metrics.md's Command outbox delivery / Gateway
             routing directory sections. INITIAL threshold, not yet tuned
             against real fleet data.
+
+      # HA WS-5 slice 2 (ADR-2002 §7f) — a presented gateway session_id that
+      # matches MORE than one live directory row. No `for:` (same reasoning as
+      # YuzuGatewayResponseAgentMismatch below): ambiguity means a duplicate
+      # placement or a forged/colliding presented id, never a background-rate
+      # class, so ANY occurrence is actionable. The counter increments on every
+      # heartbeat flush while the duplicate exists, so this fires continuously
+      # and keeps firing for 1h after the duplicate clears. (op,outcome) is
+      # pre-seeded at zero in gateway_service_impl.cpp.
+      - alert: YuzuGatewaySessionAmbiguous
+        expr: |
+          increase(yuzu_server_gateway_route_desync_total{op="session_lookup",outcome="ambiguous_session"}[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A gateway session_id matches more than one route-directory row"
+          description: >-
+            A session_id presented via BatchHeartbeat or ProxyInventory
+            matched more than one non-tombstoned row in
+            gateway_route_store.agent_routes, so the server refused to resolve
+            it (never acked, never listed, never ingested). Causes: a
+            duplicate placement, two concurrent ProxyRegister adopts of one id
+            for different agents (the cross-agent adopt guard is not a lock),
+            or a forged / colliding presented id.
+            FIRST REMEDIATION: the id is not a metric label, so list every
+            shared id from the directory: SELECT session_id,
+            array_agg(agent_id) FROM gateway_route_store.agent_routes WHERE
+            session_id IS NOT NULL GROUP BY session_id HAVING count(*) > 1;
+            The rows belong to different agents (agent_id is the primary key):
+            investigate the ProxyRegister adopt path and the presenting
+            gateway (a forged id is a CC6.6 signal; escalate to security),
+            then restart the affected agents so each re-registers under a new
+            session id. Evidence is
+            metrics and logs only (no audit row). See ADR-2002 §7f and
+            docs/user-manual/metrics.md's Gateway routing directory section.
+
+      # HA WS-5 (ADR-2002 §7f Security notes) — ProxyRegister's replay-ADOPT
+      # decision refused a presented session_id because a DIFFERENT agent's
+      # committed directory row already holds it (the reclaim statement's
+      # NOT EXISTS guard). Kept separate from YuzuGatewaySessionAmbiguous:
+      # nothing became ambiguous (the adopt was refused), so that alert's
+      # duplicate-row query finds nothing and the remediation differs. No
+      # `for:`: expected rate zero, every occurrence is actionable. The pair
+      # is pre-seeded at zero in gateway_service_impl.cpp.
+      - alert: YuzuGatewaySessionHeldByOtherAgent
+        expr: |
+          increase(yuzu_server_gateway_route_desync_total{op="proxy_register",outcome="session_held_by_other_agent"}[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A ProxyRegister replay presented a session_id another agent holds"
+          description: >-
+            A gateway replayed ProxyRegister for one agent presenting a
+            session_id that a different agent's directory row already holds,
+            and the server refused the adopt (FAILED_PRECONDITION; the gateway
+            disconnects that agent so it registers fresh). The expected rate
+            is zero: this means a forged or colliding presented id from a
+            pinned gateway peer, a CC6.6 signal.
+            FIRST REMEDIATION: find the server WARN "ProxyRegister: presented
+            session <id> for agent <agent> is already held by a different
+            agent's directory row" (the id is sanitized and truncated to 64
+            bytes), look up the holder with SELECT agent_id, gateway_node FROM
+            gateway_route_store.agent_routes WHERE session_id = '<id>', identify the
+            presenting gateway from its peer certificate, and escalate to
+            security. The guard only sees committed rows: two concurrent
+            adopts can both land, which YuzuGatewaySessionAmbiguous then
+            catches. Evidence is metrics and logs only (no audit row). See
+            ADR-2002 §7f and docs/user-manual/gateway.md "Forged or colliding
+            session ids".
 
       # HA WS-4 rest-of-4.3 (ADR-2002 §7d) — cross-cluster gateway fan-out.
       # No `for:`, matching YuzuGatewayMgmtAuthRejected's own reasoning
@@ -449,6 +604,112 @@ groups:
             ADR-2002 §7b and docs/user-manual/gateway.md's Prometheus
             Metrics section.
 
+      # -- Gateway-side signals for the gateway-upstream peer authorization ----
+      # These two are scraped from the GATEWAY (job yuzu-gateway), not the server.
+      # They cover what the server-side counter cannot see: a handshake refused
+      # before the guard runs never reaches the service, so
+      # yuzu_server_gateway_peer_denied_total does not count it. Neither gateway
+      # counter is pre-seeded to 0 (yuzu_gw_telemetry.erl declares them without
+      # initial series), so the first occurrence of a label set is a series that
+      # appears at its first value, and increase() cannot see that one step; the
+      # gateway retries a failing call, so a persistent cause produces further
+      # increments and fires, but a single isolated event can be missed.
+      - alert: YuzuGatewayUpstreamAuthRefused
+        # code="16" is the raw grpc-status trailer (a binary digit string, see
+        # yuzu_gw_upstream.erl do_rpc/4 and yuzu_gw_heartbeat_buffer.erl) for
+        # UNAUTHENTICATED. The gateway-upstream service returns UNAUTHENTICATED
+        # from the peer-authorization guard (gateway_peer_guard.cpp), and that is
+        # the only place in the gateway-upstream code that returns it.
+        expr: |
+          sum by (instance, rpc_name) (increase(yuzu_gw_upstream_rpc_errors_total{code="16"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The server refused this gateway's upstream call as unauthenticated ({{ $labels.rpc_name }} on {{ $labels.instance }})"
+          description: >-
+            {{ $labels.instance }} received gRPC status 16 (UNAUTHENTICATED) on
+            {{ $labels.rpc_name }} for at least 2 minutes. On the gateway-upstream
+            service that is the server's peer-authorization guard refusing this
+            gateway's certificate. Look at the server side for the reason:
+            yuzu_server_gateway_peer_denied_total by reason, or the server log
+            line "gateway peer denied" with the spki= prefix of the key the
+            gateway presented, then follow the YuzuGatewayPeerDenied remedies
+            (a pin that does not match the gateway's current certificate key,
+            a certificate that expired while the connection was open, a
+            certificate without serverAuth). Status 16 is an RPC result, not a
+            transport failure, so the gateway does not redial by itself. If the
+            cause was on the server side (a pin or acknowledgement), fix it, restart
+            the serving replicas, and do not restart the gateways first unless the
+            checks below fail, because on agents without the #5183 fix (in no
+            release yet) a gateway restart leaves released agents wedged; see "What
+            happens when the server restarts" in docs/user-manual/gateway.md. Only
+            on a gateway that has the #1197 consumer (#5383) does the gateway then
+            recover through its replay path. Check three separate things: the
+            registration counts with sum(yuzu_gw_agents_current) -
+            sum(yuzu_agents_connected{job="yuzu-server"}) (summed across all gateway
+            nodes and all replicas; the server gauge also counts direct agents and
+            counts registration, not placement), no rise in the raw
+            yuzu_gw_upstream_rpc_errors_total{rpc_name="notify_stream",code="16"} or
+            yuzu_gw_upstream_notify_dropped_total, and a read-only command to a
+            sample agent that returns a result (the exact request is in the
+            runbook). Agreeing counts alone do not prove placement. If the cause is
+            on the gateway side (a certificate that expired or was renewed, a
+            rotated key), the gateway presents its current files only when it
+            redials, and a server restart forces a redial, so first check whether it
+            already has: read yuzu_server_gateway_peer_denied_total and
+            yuzu_gw_upstream_rpc_errors_total{code="16"} twice, a minute apart, and
+            see that they have stopped rising, and compute the SPKI prefix of the
+            certificate file the gateway is configured with. A redial can still
+            present the old certificate for about 2 minutes after the files change
+            (Erlang ssl PEM cache; measured on OTP 28.4.2 with a stub, not on a Yuzu
+            gateway). Restart that gateway node, one at a time, only if denials
+            continue and its agents can take the disconnect, because unless the
+            agents run a build with the #5183 fix (in no release yet) a gateway
+            restart leaves released agents wedged. For placement loss after a
+            refusal window, restart the agent service on the unreachable agents (the
+            observed fix), and restart the gateway node only if many agents behind
+            one node are affected and the checks still fail. This alert stays
+            active for about 6 minutes after the last refusal: check that the
+            counter is flat rather than waiting for it to clear. See
+            docs/user-manual/server-admin.md "Gateway upstream peer authorization".
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#gateway-upstream-peer-authorization"
+
+      - alert: YuzuGatewayUpstreamTlsHandshakeFailures
+        # A TLS handshake refused or failed before any RPC: the layer BELOW the
+        # peer pin. Examples are a gateway that cannot verify the server
+        # certificate, a certificate or CA file that is unreadable or rejected by
+        # the TLS options, and a TLS alert from the server. The server's own
+        # gateway-peer counter does not see these (the call never reaches the
+        # service). The `kind` label is the
+        # TLS alert name (for example unknown_ca, certificate_expired) or
+        # bad_tls_options (yuzu_gw_upstream.erl classify_tls_error/1). It is a
+        # warning although the same cause can be a total outage of that gateway
+        # (no call to the server completes).
+        expr: |
+          sum by (instance, kind) (increase(yuzu_gw_upstream_tls_handshake_failures_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway upstream TLS handshake failures on {{ $labels.instance }} (kind={{ $labels.kind }})"
+          description: >-
+            {{ $labels.instance }} has failed TLS handshakes to the server's
+            gateway-upstream listener (kind={{ $labels.kind }}) for at least 5
+            minutes. The handshake fails below the peer-authorization guard, so
+            the server's yuzu_server_gateway_peer_denied_total does not move and
+            the server writes no audit row for it: the gateway-side counter is the
+            signal. Check that the gateway's certificate and key files are
+            readable and not expired, that the gateway trusts the server's CA, and
+            that its client certificate is one the server's TLS configuration
+            accepts. See
+            the gateway log line "TLS handshake failure" for the underlying
+            term, and "Gateway Disconnections" in
+            docs/operations/troubleshooting.md. This alert stays active for about
+            6 minutes after the last failure: check that the counter is flat
+            rather than waiting for it to clear.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#gateway-upstream-peer-authorization"
+
   - name: yuzu-security
     rules:
       - alert: YuzuOnBehalfAssertionRejected
@@ -485,13 +746,200 @@ groups:
             the proxy. Diagnose via the throttled [ADR-1005] warn lines.
           runbook_url: "https://docs.yuzu.io/runbooks/onbehalf-rejected"
 
+      # -- Gateway-upstream peer authorization --------------------------------
+      # yuzu_server_gateway_peer_denied_total{rpc,reason,event="security"} counts the
+      # calls the gateway-upstream service refused (every closed rpc x reason pair is
+      # pre-seeded to 0 at boot, so increase() sees the first denial). The reasons
+      # split by what they mean:
+      #   * Reasons that are not anonymous refusals (bad_cert,
+      #     no_server_auth_eku, not_pinned, outside_validity, internal_error):
+      #     YuzuGatewayPeerDenied, a warning. The rule lists them positively, so a
+      #     reason added to the closed set later is NOT alerted until it is added
+      #     here (the promtool cases pin the five).
+      #   * Reasons with no usable client certificate (null_context,
+      #     not_authenticated, no_cert): deliberately NOT alerted. They are what a
+      #     port scan, a health probe or a misdirected client produces on a
+      #     listener that does not require a client certificate, so a rule over them
+      #     would page on background noise. The counter still counts every one, and
+      #     they write a log line but no audit row.
+      # Posture: YuzuGatewayPeerAuthzDisabledWithTls.
+      - alert: YuzuGatewayPeerDenied
+        # A certificate reached the gateway-upstream guard and was refused. On a
+        # deployment whose gateway should be connected this means the gateway
+        # presents a key or certificate the server does not accept: a certificate
+        # replaced with a new KEY without updating the pin, a certificate that
+        # expired while the connection was open, a certificate without serverAuth. The gateway receives gRPC status 16
+        # (UNAUTHENTICATED), a non-transport error: it logs `BatchHeartbeat failed
+        # (N in chunk)` (yuzu_gw_heartbeat_buffer.erl) or `Failed to notify stream
+        # status for <agent>` (yuzu_gw_upstream.erl) and counts the failure in
+        # yuzu_gw_upstream_rpc_errors_total{rpc_name,code="16"}. A refused
+        # NotifyStreamStatus is not retried by the gateway.
+        expr: |
+          sum by (instance, reason) (increase(yuzu_server_gateway_peer_denied_total{reason=~"bad_cert|no_server_auth_eku|not_pinned|outside_validity|internal_error"}[5m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway-upstream refused a presented certificate on {{ $labels.instance }} (reason={{ $labels.reason }})"
+          description: >-
+            The gateway-upstream service refused a presented certificate with
+            reason={{ $labels.reason }} for at least 1 minute. Remedy by reason.
+            not_pinned: the presented key is not pinned; confirm the key is the
+            gateway you deployed, then add its pin to --gateway-peer-pin or
+            --gateway-peer-pin-file (explicit pins replace the automatic
+            default-certificate pin) and restart the server: pins are read once
+            at boot. no_server_auth_eku: the wrong certificate is presented (the
+            gateway certificate needs serverAuth AND clientAuth). outside_validity:
+            the certificate is expired or not yet valid; renew it before notAfter
+            (a gateway keeps presenting the certificate it loaded when it last
+            dialled, so a renewed certificate reaches the server only after the
+            gateway redials). bad_cert: the certificate could not be parsed.
+            internal_error: a server-side fault while deciding; check the server
+            log. After a server-side cause is fixed and every serving replica
+            restarted, do not restart the gateways first unless the checks below
+            fail, because on agents without the #5183 fix (in no release yet) a
+            gateway restart leaves released agents wedged; see "What happens when
+            the server restarts" in docs/user-manual/gateway.md. Only on a gateway
+            that has the #1197 consumer (#5383) does the gateway then recover
+            through its replay path. Check three separate things:
+            sum(yuzu_gw_agents_current) - sum(yuzu_agents_connected{job="yuzu-server"}) (all gateway nodes, all replicas; the server gauge also counts
+            direct agents and counts registration, not placement), no rise in the
+            raw
+            yuzu_gw_upstream_rpc_errors_total{rpc_name="notify_stream",code="16"} or
+            yuzu_gw_upstream_notify_dropped_total, and a read-only command to a
+            sample agent that returns a result. If the cause is on the gateway side
+            (outside_validity, or a new certificate key), the gateway presents its
+            current files only when it redials, and a server restart forces a
+            redial: first check whether it already has (the raw counters
+            yuzu_server_gateway_peer_denied_total and
+            yuzu_gw_upstream_rpc_errors_total{code="16"} have stopped rising across
+            two reads a minute apart, and the configured certificate file has the
+            expected SPKI prefix), allowing about 2 minutes after the files change
+            for the Erlang ssl PEM cache (measured on OTP 28.4.2 with a stub, not on
+            a Yuzu gateway). Restart that gateway node, one at a time, only if
+            denials continue and its agents can take the disconnect (the same #5183
+            caveat). The gateway does not retry a refused NotifyStreamStatus.
+            This alert stays active for about 6 minutes after the last denial (the 5-minute increase window plus an evaluation
+            step): check that yuzu_server_gateway_peer_denied_total is flat
+            rather than waiting for the alert to clear. A refusal whose
+            certificate key could be computed also writes a
+            session.gateway_peer_denied audit row (a bounded sample; this counter
+            is the complete count). See docs/user-manual/server-admin.md
+            "Gateway upstream peer authorization".
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#gateway-upstream-peer-authorization"
+
+      - alert: YuzuGatewayPeerDeniedBatchHeartbeat
+        # BatchHeartbeat is the one RPC a gateway sends continuously WHILE AT LEAST
+        # ONE AGENT HEARTBEATS THROUGH IT (the heartbeat buffer flushes on a short
+        # interval and retries a failed chunk; an empty-buffer flush is a no-op, so a
+        # gateway with no agents never emits it), so a certificate-reason denial on
+        # it means the gateway ITSELF is refused, not an occasional stray client:
+        # every call from that gateway fails the same guard, so its registrations
+        # and stream-status notices fail (established agent streams to the gateway
+        # stay up). It is a stricter companion of YuzuGatewayPeerDenied (which fires
+        # at warning on the same series); both are expected to be active together.
+        # The reason list is the same five as YuzuGatewayPeerDenied, and the three
+        # anonymous reasons are deliberately absent for the same reason. `for: 5m`
+        # means a single stray denial (active for about one increase window) does
+        # not page; sustained denials do. Like YuzuGatewayPeerDenied it stays
+        # active for about 6 minutes after the last denial. An operator-side
+        # Alertmanager inhibit rule (source this alert, target
+        # YuzuGatewayPeerDenied, equal: [instance, reason]) pages only on this
+        # one; the gateway-side alerts carry the gateway's instance and cannot
+        # be inhibited that way.
+        expr: |
+          sum by (instance, reason) (increase(yuzu_server_gateway_peer_denied_total{rpc="batch_heartbeat",reason=~"bad_cert|no_server_auth_eku|not_pinned|outside_validity|internal_error"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The gateway itself is refused by the gateway-upstream guard on {{ $labels.instance }} (reason={{ $labels.reason }})"
+          description: >-
+            BatchHeartbeat calls were refused with reason={{ $labels.reason }}
+            for at least 5 minutes on {{ $labels.instance }}. A gateway sends
+            this RPC while at least one agent heartbeats through it, so the
+            gateway itself is being refused: its registrations, inventory and
+            stream-status notifications fail the same check, while established
+            agent streams to the gateway stay up. Find the cause with the
+            YuzuGatewayPeerDenied remedies by reason (not_pinned: the gateway
+            presents a key the server does not pin, for example after a
+            certificate was replaced with a new key; outside_validity: the
+            certificate expired or is not yet valid; no_server_auth_eku: the
+            gateway certificate lacks serverAuth; bad_cert: it could not be
+            parsed; internal_error: check the server log), fix the pin or the
+            certificate, and restart the server replicas if the pin or
+            acknowledgement changed, because pins are read once at boot (a renewal
+            over the same key needs no server restart). For a server-side cause do
+            not restart the gateways first unless the checks fail, because on agents
+            without the #5183 fix (in no release yet) a gateway restart leaves
+            released agents wedged; see "What happens when the server restarts" in
+            docs/user-manual/gateway.md. Compare sum(yuzu_gw_agents_current) -
+            sum(yuzu_agents_connected{job="yuzu-server"}) (all gateway nodes, all
+            replicas; the server gauge also counts direct agents and counts
+            registration, not placement), check for no rise in the raw
+            yuzu_gw_upstream_rpc_errors_total{rpc_name="notify_stream",code="16"} or
+            yuzu_gw_upstream_notify_dropped_total, and send a read-only command to a
+            sample agent and check that it returns a result. For a gateway-side
+            cause (outside_validity, a new certificate key) the gateway presents its
+            current files only when it redials, and a server restart forces a
+            redial: first check whether it already has (the raw counters
+            yuzu_server_gateway_peer_denied_total and
+            yuzu_gw_upstream_rpc_errors_total{code="16"} have stopped rising across
+            two reads a minute apart, and the configured certificate file has the
+            expected SPKI prefix), allowing about 2 minutes after the files change
+            for the Erlang ssl PEM cache (measured on OTP 28.4.2 with a stub, not on
+            a Yuzu gateway). Restart that gateway node, one at a time, only if
+            denials continue and its agents can take the disconnect, because unless
+            the agents run a build with the #5183 fix (in no release yet) a gateway
+            restart leaves released agents wedged.
+            This alert stays
+            active for about 6 minutes after the last denial: check that
+            yuzu_server_gateway_peer_denied_total{rpc="batch_heartbeat"} is flat
+            rather than waiting for it to clear. See
+            docs/user-manual/server-admin.md "Gateway upstream peer authorization".
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#gateway-upstream-peer-authorization"
+
+      - alert: YuzuGatewayPeerAuthzDisabledWithTls
+        # mode="insecure_ack_tls": --insecure-gateway-peer is in force on a server
+        # that has TLS on AND a client CA, i.e. a production-shaped configuration in
+        # which the operator switched off a control that would have worked. A
+        # plaintext development rig is mode="insecure_ack" and deliberately not
+        # alerted (it runs that mode by design), and neither is mode="enforce".
+        expr: |
+          yuzu_server_gateway_peer_authz_mode{mode="insecure_ack_tls"} == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway peer authorization acknowledged-disabled on a TLS server ({{ $labels.instance }})"
+          description: >-
+            --insecure-gateway-peer is set on {{ $labels.instance }}, which has TLS on
+            and a client CA, so a gateway key pin could be enforced. Peer
+            authorization on the gateway-upstream service is disabled on every
+            listener that serves it. Treat this as a time-boxed risk acceptance:
+            record the owner and date, pin the gateway key (--gateway-peer-pin /
+            --gateway-peer-pin-file), remove the flag and restart the server. The
+            boot audit row server.gateway_peer_authz_disabled records when it was
+            started. See docs/user-manual/server-admin.md "Gateway upstream peer
+            authorization".
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#gateway-upstream-peer-authorization"
+
       - alert: YuzuRbacReadDegraded
         # An authorization read against the PostgreSQL rbac_store (ADR-0041)
-        # could not resolve and therefore DENIED (reads fail closed —
-        # deny-on-degrade). Because require_permission / authorize_list_read /
-        # require_fleet_read all route through this store, a degrade denies
-        # authorization FLEET-WIDE —
-        # it is an availability event, not a silent partial outage. /readyz stays
+        # could not resolve and therefore DENIED the request that needed it
+        # (reads fail closed — deny-on-degrade). require_permission /
+        # require_scoped_permission / authorize_list_read / require_fleet_read
+        # all resolve through this store, but WHICH callers a degrade denies
+        # depends on the read that failed: an operator permission check or a
+        # list-read confinement read is denied only on a permission-cache miss
+        # (a decision already cached on that replica is still served), while a
+        # service-scoped API token on a fleet-read or scoped-permission route is
+        # refused (503) whenever the ITServiceOwner ceiling read fails, because
+        # that read runs on every such request. The
+        # counter is per replica (the expr sums across replicas), so one
+        # degraded replica can raise it while others keep answering. It is an
+        # availability event, not a silent partial outage, but it does not by
+        # itself mean every caller is denied. /readyz stays
         # green under pure pool saturation (it trips only on connection failure,
         # to avoid false LB evictions), so this is otherwise dashboard-invisible.
         # reason = pool_acquire_timeout | query_error | generation_refresh_failed.
@@ -510,24 +958,30 @@ groups:
         # this rule exists to prevent, just via a different reason value.
         # Splitting it keeps generation_refresh_failed denial-only. Folding
         # any of the three observe-only reasons into this alert's reason=~match
-        # would page "callers being denied fleet-wide" for a condition that
-        # denies nobody — a false alarm during exactly the kind of incident
-        # this alert exists to page accurately for. If any ever needs its own
-        # alert, it must NOT claim fleet-wide denial.
+        # would page "requests being denied" for a condition that denies
+        # nobody — a false alarm during exactly the kind of incident this
+        # alert exists to page accurately for. If any ever needs its own
+        # alert, it must NOT claim that anything is being denied.
         expr: |
           sum(rate(yuzu_server_rbac_read_degrade_total{reason=~"pool_acquire_timeout|query_error|generation_refresh_failed"}[5m])) by (reason) > 0
         for: 5m
         labels:
           severity: critical
         annotations:
-          summary: "RBAC authorization reads degrading — callers being denied ({{ $labels.reason }})"
+          summary: "RBAC authorization reads degrading — requests that need a failed read are being denied ({{ $labels.reason }})"
           description: >-
             yuzu_server_rbac_read_degrade_total{reason="{{ $labels.reason }}"} is
             non-zero: authorization reads against the PostgreSQL rbac_store are
             failing and therefore DENYING (fail-closed / deny-on-degrade,
-            ADR-0041). Because require_permission / require_scoped_permission /
-            authorize_list_read / require_fleet_read all resolve through this
-            store, operators and agentic callers are being denied fleet-wide. pool_acquire_timeout /
+            ADR-0041). Each failed read denies the request that needed it, so
+            operators, agentic callers and service-scoped tokens are being
+            denied wherever their decision needed a read that failed: an
+            operator permission or list-read check only on a permission-cache
+            miss (a cached decision is still served), a service-scoped token on
+            every fleet-read or scoped-permission request whose ITServiceOwner
+            ceiling read fails (a retryable 503). This does not by itself mean every caller is denied, and the
+            counter is per replica (summed here), so check whether one replica
+            or all are affected. pool_acquire_timeout /
             query_error correlate with yuzu_pg_* saturation or outage;
             generation_refresh_failed means the cross-replica cache-coherence
             token could not be re-read PAST the bounded ~5s stale-serve window
@@ -538,6 +992,57 @@ groups:
             server RbacStore warnings. See docs/auth-architecture.md
             "RbacStore — the authorization substrate".
           runbook_url: "https://docs.yuzu.io/runbooks/rbac-read-degraded"
+
+      - alert: YuzuRbacBreakerOpen
+        # The per-replica authorization fail-fast breaker has stayed open.
+        # It opens after two consecutive failed authorization reads (a pool
+        # acquire timeout or a query error), and while it is open that
+        # replica's authorization reads that miss the permission cache are
+        # refused without touching the pool, apart from one probe per ~1 s
+        # (kRbacGenerationRefreshMs). The service-token ceiling read
+        # (ITServiceOwner) feeds and is shed by the same breaker. Cached
+        # decisions are served for at most ~5 s after the last good refresh
+        # (kRbacStaleServeBoundMs); the cache-coherence refresh goes through
+        # the same breaker, so by the time this alert fires cached decisions
+        # are refused as well. The gauge is published per replica and only
+        # changes when an authorization read reports its outcome, so a
+        # replica that receives no authorization checks keeps its last value.
+        # A breaker that half-opens and closes again within five minutes is
+        # a transient blip and does not page; one that stays open means
+        # authorization reads keep failing. It complements
+        # YuzuRbacReadDegraded (a rate summed across replicas by reason): this
+        # rule names the replica whose breaker is open.
+        expr: |
+          max by (instance) (yuzu_server_rbac_breaker_open) == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RBAC authorization breaker open on {{ $labels.instance }}"
+          description: >-
+            yuzu_server_rbac_breaker_open has been 1 on {{ $labels.instance }}
+            for 5m: authorization reads on this replica keep failing (pool
+            acquire timeout or query error against the PostgreSQL rbac_store),
+            so the fail-fast breaker has not closed. While it is open, this
+            replica refuses (fail closed) the operator permission checks that
+            miss its permission cache and sheds the service-scoped token
+            ceiling reads (a retryable 503), except for about one probe per
+            second; cached decisions are served for at most ~5s after the last
+            good refresh, and the cache-coherence refresh goes through the
+            same breaker, so expect cached decisions to be refused as well.
+            Check Postgres availability and pool
+            saturation (yuzu_pg_*) and the server RbacStore warnings; the
+            breaker closes on its own after the next successful read. The
+            gauge changes only when an authorization read reports its
+            outcome, so a replica that receives no authorization checks keeps
+            its last value after the database recovers; to confirm the
+            recovery, send that replica an authenticated request that makes
+            a permission check; if the first lands inside the ~1 s probe
+            cooldown, send a second a few seconds later. Each check reads
+            the cache-coherence token from the database at most about once
+            per second, and that read reports the outcome. See
+            the RbacStore authorization substrate section of
+            docs/auth-architecture.md.
 
       - alert: YuzuBreakGlassLogin
         # The armed break-glass account passed the password gate under
@@ -783,7 +1288,20 @@ groups:
             create/PATCH/PUT targeted an account the SCIM provenance check
             refused to mutate — either the account was never provisioned by
             SCIM, or it was elevated/promoted outside SCIM's ownership
-            boundary (#2021). A single event is usually a misconfigured IdP
+            boundary (#2021), or a SCIM POST or active:true reactivation
+            named a username that already holds an Administrator grant or
+            whose deactivated record carries a non-user role. That last case
+            also fires for a benign re-enable of an account an operator
+            elevated or granted outside SCIM, on every IdP retry: if the
+            audit row shows an account an operator elevated on purpose, clear
+            the role or grant (rbac.md, "Last-Administrator guard for account
+            deactivation and demotion", the paragraph "Operator remedy");
+            otherwise investigate the IdP. It also fires, and keeps firing
+            while the IdP retries, after a SCIM deactivation whose SCIM
+            mirror write failed (the account is already deactivated, so the
+            retry meets the role guard; SCIM provisioning guide, "Known
+            limits of the Group role recompute", limit 7; #5214). A
+            single event is usually a misconfigured IdP
             attribute mapping; a sustained rate is worth treating as a
             possibly compromised or misbehaving IdP. Correlate via the
             scim provenance-denial audit row for the calling IdP/client.
@@ -1349,11 +1867,14 @@ groups:
             quarantine.reapply verb (system principal, detail carries
             record_id + command_id + trigger=tick|heartbeat, or "CONFIRMED
             record_id=... command_id=..." on success).
+            This alert also fires when the device's agent lacks the
+            quarantine plugin: the dispatch is accepted but never
+            confirmed, so upgrade the agent.
 
       - alert: YuzuDispatchTargetRejected
         expr: |
           sum by (route, reason) (
-            increase(yuzu_server_dispatch_target_rejected_total{reason!~"quarantined|unknown_plugin"}[15m])
+            increase(yuzu_server_dispatch_target_rejected_total{reason!~"quarantined|unknown_plugin|kill_switched_os"}[15m])
           ) > 3
         labels:
           severity: warning
@@ -1394,7 +1915,11 @@ groups:
             it silenced, and take the genuine near-miss signal with it - the
             outcome the >3 threshold above was chosen to avoid. Quarantine
             denials are observed on yuzu_server_quarantine_gate_total and audited
-            as quarantine.dispatch_denied. reason values
+            as quarantine.dispatch_denied. reason="unknown_plugin" (#3511) and
+            reason="kill_switched_os" (#5294) are excluded for the same reason:
+            a withheld dispatch to a plugin absent from the target, or to an OS
+            whose switch is off, is the control working, audited as
+            command.dispatch_withheld. reason values
             "query_truncated"/"poison_excluded"/"parse_error_excluded" (#4496 + follow-up,
             route="result_set_inventory_query") are NOT excluded from the
             expression, unlike quarantined above: a well-formed, correctly-targeted
@@ -2296,7 +2821,8 @@ groups:
       # turned device compliance scores "healthy" (the DEX-score fail-open
       # this counter's guardian_state source also covers) and paged nobody.
       # Two sources on the SAME counter, both keyed by reason
-      # (store_not_open/pool_acquire_timeout/query_error): "guardian_state"
+      # (store_not_open/pool_acquire_timeout/query_error, plus concurrency_budget
+      # on guardian_state for the Apps list's in-flight budget): "guardian_state"
       # is the DEX/observation family (dex_read<>/dex_observation) - these
       # fail SOFT, serving an empty/degraded result rather than an error, so
       # this is the ONLY external signal that anything went wrong; "guardian_rules"
@@ -2319,8 +2845,9 @@ groups:
             yuzu_server_guardian_read_degrade_total{reason="{{ $labels.reason }}",
             source="{{ $labels.source }}"} is non-zero. source="guardian_state"
             means a DEX/observation read (crash summary, top apps, device
-            score inputs, ...) is degrading and fails SOFT - callers keep
-            serving an empty/partial result, so this counter and the sampled
+            score inputs, ...) is degrading and fails SOFT (except the
+            per-device score, catalogue and Apps list reads, which fail closed)
+            - callers keep serving an empty/partial result, so this counter and the sampled
             warn log are the only external tell; do not read a "healthy"
             device compliance score as authoritative while this fires (#4855).
             source="guardian_rules" means an AUTHORITATIVE rule/status read
@@ -2340,11 +2867,122 @@ groups:
             saturation or outage; store_not_open means the store failed to
             open at boot (should not be reachable post-boot given fail-closed
             construction - investigate as a possible regression if seen).
+            reason="concurrency_budget" is not a substrate fault: the Apps
+            list read (GET /api/v1/dex/apps, list_dex_apps) was refused with a
+            retryable 503 because four were already running; look for a
+            caller polling it in parallel.
             See #2659 for the deferred-widening posture behind this metric.
           runbook_url: "https://docs.yuzu.io/runbooks/guardian-read-degraded"
 
+      # The heartbeat reconcile aborts, sending nothing, when a store it depends on
+      # cannot be read, and counts every such abort as
+      # yuzu_server_guardian_reconciles_total{result="degraded"}. The causes are the
+      # policy generation read (the first read before admission and the fresh read
+      # after it), the rule store, the Baseline deployed-set read, a rule bundle load
+      # that timed out waiting for another load or threw, and the tag or property
+      # store during per-agent scope evaluation. YuzuGuardianReadDegraded counts only
+      # the rule store reads of those, and the policy generation read and the Baseline
+      # deployed-set read bump no read-degrade counter at all, so without this rule a
+      # generation or Baseline store outage leaves every behind agent unreconciled with
+      # nothing paging. Overlap with YuzuGuardianReadDegraded (rule store),
+      # YuzuTagStoreReadDegraded and YuzuCustomPropertiesReadDegraded (scope reads) is
+      # deliberate: this one answers "is the reconcile itself failing", the others name
+      # the store. A reconcile that throws out of the hook into the heartbeat handler is
+      # caught there and counted by yuzu_server_guardian_reconcile_exceptions_total, not
+      # by the degraded result, so the rule also fires on that counter: a reconcile that
+      # keeps throwing would otherwise be invisible here. Both counters are pre-seeded to
+      # 0 at boot (see docs/observability-conventions.md), so the first abort or throw
+      # after boot is an increase. sum() makes a multi-replica fleet one signal, and the
+      # two sums carry no labels, so a rise in both is one alert.
+      - alert: YuzuGuardianReconcileDegraded
+        expr: |
+          (sum(increase(yuzu_server_guardian_reconciles_total{result="degraded"}[10m])) > 0)
+          or
+          (sum(increase(yuzu_server_guardian_reconcile_exceptions_total[10m])) > 0)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Guardian heartbeat reconcile is aborting on an unreadable store or throwing"
+          description: >-
+            yuzu_server_guardian_reconciles_total{result="degraded"} or
+            yuzu_server_guardian_reconcile_exceptions_total increased over the last
+            10 minutes: heartbeat reconciles aborted on an unreadable store, or the
+            reconcile hook threw. Either way nothing is sent to the agents concerned
+            (the abort is fail-closed, so a narrowed or empty rule set is never
+            pushed). Agents
+            that are behind the server's policy generation stay behind until the read
+            recovers, and an agent with nothing armed yet receives no rules, unscoped
+            rules included. The counter covers the policy generation read, the rule
+            store, the Baseline deployed-set read, a rule bundle load failure, and the
+            tag or property store read during scope evaluation. Find which: the
+            guaranteed_state.reconcile audit rows with result=degraded and a detail
+            beginning "heartbeat reconcile ABORTED" name the cause ("policy generation
+            unreadable", "rule store degraded", "baseline store degraded", "rule
+            bundle load failed", "scope store degraded"), and the server warn log
+            carries the same. The first policy generation read, before admission,
+            writes no audit row, so a rising counter with no such rows points at that
+            read. A rule store cause also fires YuzuGuardianReadDegraded and a scope
+            cause also fires YuzuTagStoreReadDegraded or
+            YuzuCustomPropertiesReadDegraded; the other causes fire only this alert.
+            When only yuzu_server_guardian_reconcile_exceptions_total rose, the cause
+            is a throw, not a store abort: the server warn line "Heartbeat guardian
+            reconcile threw for agent=..." carries the exception text.
+            Check Postgres reachability and yuzu_pg_* pool saturation first. The
+            agents are retried on later heartbeats, so no operator action is needed
+            once the store recovers.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/guaranteed-state.md#4-push-to-agents"
+
+      # yuzu_server_guardian_agent_generation_ahead_total flags an agent that reports a
+      # policy generation ABOVE the server's, usually because the Guardian state store
+      # was restored to an earlier state or rebuilt while the agents kept the
+      # generation they persisted. Such an agent refuses every full push labelled below
+      # the generation it holds, so rule and Baseline edits stop reaching it, and the
+      # server cannot otherwise see that: the reconcile counts the agent as converged
+      # and sends nothing. The counter is a throttled flag, not a count: at most one
+      # increment per minute per replica, and only after a fresh store read confirms the
+      # agent is ahead. The window must stay well above one minute plus the agent
+      # heartbeat interval (30 s by default) so a sample is not missed; 15m clears about
+      # 15 minutes after the fix. Do not read rate() of this counter as a magnitude.
+      # Blind spot: an agent whose boot re-arm is unresolved reports generation 0 while
+      # it still refuses a lower-labelled push, so it is never counted here (see
+      # guaranteed-state.md, Restoring the policy generation, Detection limits).
+      - alert: YuzuGuardianAgentGenerationAhead
+        expr: |
+          sum(increase(yuzu_server_guardian_agent_generation_ahead_total[15m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "An agent holds a Guardian policy generation above the server's"
+          description: >-
+            yuzu_server_guardian_agent_generation_ahead_total increased over the last
+            15 minutes: at least one agent reports a Guardian policy generation above
+            the server's. That agent refuses every full push labelled below the
+            generation it holds, so rule and Baseline edits are not delivered to it
+            until the server's generation reaches its own. The usual cause is a
+            Guardian state store restored to an earlier state or rebuilt while agents
+            kept their persisted generation. The counter is sampled at most once a
+            minute per replica and does not count agents. The server warn line
+            "Guardian heartbeat reconcile: agent_id=... reports policy generation N
+            above the server's M" names one sampled agent with both numbers; take the
+            highest held generation from several agents' refusal log lines, not one
+            sampled value. Before raising, check that the rule store and the deployed
+            Baselines hold the policy you want enforced fleet-wide, because the raise
+            converges every behind agent to exactly that rule set. Then use the
+            supported raise (POST /api/v1/guaranteed-state/policy-generation/raise or
+            the MCP tool raise_guardian_policy_generation) with a target of the highest
+            held generation plus one. The alert stays firing for about 15 minutes after
+            the fix; confirm with
+            changes(yuzu_server_guardian_agent_generation_ahead_total[3m]) being 0 on
+            every replica rather than by waiting for it to clear. An agent whose boot
+            re-arm is unresolved reports generation 0 and is not counted by this alert.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/guaranteed-state.md#restoring-the-policy-generation"
+
   - name: yuzu-audit
-    # Behavioural-data routes (guardian.device.view, dex.device.view, dex.signal.view)
+    # Behavioural-data routes (guardian.device.view, dex.device.view, dex.signal.view,
+    # dex.perf.device.view, network.device.view, and response.read on the v1 query,
+    # aggregate and export routes and the legacy get, aggregate and export routes)
     # audit-on-open then FAIL CLOSED: if the audit row cannot persist they return 503
     # and serve no PII (CC7.2). yuzu_server_audit_emit_failed_total is the only signal
     # this is happening — without this alert a fleet-polled CMDB (ServiceNow) integration
@@ -2361,14 +2999,32 @@ groups:
           description: >-
             yuzu_server_audit_emit_failed_total is rising. Every REST route that uses
             fail-closed audit-on-open (guardian.device.view, dex.device.view,
-            dex.signal.view, dex.perf.device.view, network.device.view) is returning
-            503 and withholding PII, so a ServiceNow /
-            CMDB poll blackouts fleet-wide. Check audit_store health (/healthz
+            dex.signal.view, dex.perf.device.view, network.device.view, plus
+            response.read on the v1 query, aggregate and export routes and on the
+            legacy get, aggregate and export routes) is returning 503 and withholding PII or response
+            data, so a ServiceNow / CMDB poll blackouts fleet-wide. Set-and-proceed reads, including
+            crypto.libraries.*, keep serving data and do not 503: their REST routes and dashboard
+            fragments set the Sec-Audit-Failed header, their MCP tools set audit_persisted:false,
+            and only the /crypto (crypto.libraries.*) pages also show an on-page "Audit not
+            recorded" notice.
+            Check audit_store health (/healthz
             stores.audit) and free disk / connection saturation on the PostgreSQL
             server (ADR-0040 — audit is Postgres-backed, not a local file). Note: a bad_alloc-class
             throw in the audit pipeline fails closed the same way but does NOT bump this
             counter (it is catch-logged only) — correlate with a spike in 503s on the
-            behavioural routes.
+            behavioural routes. The audit-first admin writes (webhooks, offload targets,
+            directory sync, group mappings, MCP settings) 503 the same way. Upload-grant revoke
+            refuses on both REST (503) and MCP (retryable -32603), so a leaked grant stays
+            redeemable until the outage ends or its TTL expires, whichever is first (#6169).
+            Approval approve and reject (approval.approve, approval.reject) 503 with
+            Sec-Audit-Failed when the "attempted" row fails; then the decision is not applied
+            and the request stays pending. Their outcome rows (success or denied) are best
+            effort: a failed outcome row also moves this counter and the response carries no
+            Sec-Audit-Failed. A lost success row means the decision was applied; a lost denied
+            row means the store refused it, so this request applied nothing and the ticket keeps
+            its prior state (usually pending, but read its status). Check the status of any
+            request that has more "attempted" rows than outcome rows (compare counts per
+            target_id; the example query is in the runbook).
           runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
 
       # #2360 retention clock guard. The guard declines a cleanup pass that would
@@ -3156,7 +3812,13 @@ groups:
         # failure, to avoid false LB evictions), so this is otherwise
         # dashboard-invisible: the store-agnostic yuzu_pg_acquire_timeout_total
         # moves but nothing inventory-specific does (#1675).
-        # reason = store_not_open | pool_acquire_timeout | query_error.
+        # reason = store_not_open | pool_acquire_timeout | query_error, plus
+        # admission_full (source=installed_software only): a /crypto read refused by
+        # its per-process in-flight bound BEFORE any store call. Sustained for 5m
+        # that is saturation of the bound (a poll storm or slow summary reads), which
+        # is worth the same warning. The rule is rate([5m]) > 0 held for 5m, so
+        # refusals recurring within every 5m window keep it firing; a single
+        # isolated burst clears once it leaves the 5m window.
         expr: |
           sum(rate(yuzu_inventory_read_degrade_total[5m])) by (reason, source) > 0
         for: 5m
@@ -3170,9 +3832,18 @@ groups:
             read for the labelled authoritative inventory source returned a
             degrade (no data) rather than a result. pool_acquire_timeout/query_error correlate
             with yuzu_pg_* saturation or outage; store_not_open means the store
-            failed to open at boot. A fleet vulnerability query ("which devices run
-            <CVE>") reads as degraded, NOT "installed nowhere" — do not trust a
-            zero-result inventory answer while this fires.
+            failed to open at boot; admission_full means /crypto reads are being
+            refused because its in-flight bound (two reads) stayed full - check for
+            a poll storm or slow summary reads, not for a database fault. For the
+            store-side reasons (pool_acquire_timeout, query_error, store_not_open) a
+            fleet vulnerability query ("which devices run <CVE>") reads as degraded,
+            NOT "installed nowhere" - do not trust a zero-result inventory answer while
+            one of those fires. admission_full is a shed: a refused /crypto read is an
+            error response, never a zero-result answer. A source=installed_software
+            query_error that fires together with YuzuInventoryCatalogRollupStale or
+            YuzuInventoryCatalogRollupFailing is the /crypto live name scan exceeding
+            its 5s bound (too many distinct package names): retrying will not help, fix
+            the catalogue refresh (see docs/user-manual/crypto.md, "Diagnosing a degrade").
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuMgmtGroupReadDegraded
         # A CONFINEMENT-feeding management-group read (ancestors / descendants /
@@ -3387,7 +4058,10 @@ groups:
             signals. crypto_error means the OIDC client secret cannot be
             decrypted (KEK/DB pairing mismatch) — the next server restart will
             fail closed on this same secret; see "Key management (secrets
-            KEK)" in the server admin guide before it does.
+            KEK)" in the server admin guide before it does. DEX Apps lists
+            refuse with score_policy_unavailable once the dex_score_policy
+            key has been unreadable for over 60 s, or at once when no policy
+            is cached (a restart during the outage, or a concurrent first read).
           runbook_url: "https://docs.yuzu.io/runbooks/runtime-config-read-degraded"
       - alert: YuzuProductPackReadDegraded
         # A product_pack_store list()/get() read degraded and the caller failed
@@ -3566,7 +4240,12 @@ groups:
         # seeded to 0 (epoch 1970, the "building" sentinel) at thread start, so a naive
         # `now - ts` fires immediately on every cold boot; the guard skips the building
         # window. The never-succeeded / ongoing-failure case is covered by the error-rate
-        # alert below, NOT this rule.
+        # alert below, NOT this rule. The 7200 literal is twice the hourly refresh
+        # cadence and equals kCatalogueFreshSeconds (software_inventory_store.hpp,
+        # static_assert-ed against kCatalogueRefreshIntervalSeconds): /crypto reads its
+        # package names live once the catalogue is older than this, so keep them in step.
+        # The alert measures end-of-refresh success while /crypto measures the refresh START
+        # stamp, so the two differ by up to the refresh duration.
         expr: |
           (time() - yuzu_inventory_catalog_rollup_last_success_timestamp) > 7200
           and yuzu_inventory_catalog_rollup_last_success_timestamp > 0
@@ -3581,6 +4260,8 @@ groups:
             installs. Check yuzu_inventory_catalog_rollup_total{outcome="error"} and the
             SoftwareCatalogRollup thread log (Postgres outage or the 60s recompute budget
             exceeded at scale — raise kRollupStatementTimeout or shard the rollup).
+            While it fires, /crypto reads its package names live (slower) if the shared
+            catalogue is also older than two hours; alerts are per replica, the catalogue is shared.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryCatalogRollupFailing
         # Catches the case the staleness alert's `> 0` guard deliberately skips: a server
@@ -3600,6 +4281,8 @@ groups:
             the catalogue has never populated ("building"); otherwise it is frozen at the
             last good rollup. Investigate Postgres availability / the recompute duration
             (yuzu_inventory_catalog_rollup_duration_seconds vs the 60s budget).
+            While it fires, /crypto reads its package names live (slower) if the shared
+            catalogue is also older than two hours; alerts are per replica, the catalogue is shared.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       # YuzuInventoryStaleAgents — SHIPPED DISABLED. The freshness gauge
       # (yuzu_inventory_stale_agents{source}) is exported and graphable, but there
@@ -3861,8 +4544,8 @@ groups:
   #       endpoints and the runbook advice to "identify the reporting agents" is
   #       unactionable without it;
   #   (b) the per-agent axis above (#2083-class work);
-  #   (c) a soak at fleet scale with all 30 families live concurrently with the
-  #       revocation sweep - the heartbeat tag-map grows by up to 30 entries per agent
+  #   (c) a soak at fleet scale with all 33 families live concurrently with the
+  #       revocation sweep - the heartbeat tag-map grows by up to 33 entries per agent
   #       the instant prefer_spark flips, which no pre-cutover soak can observe;
   #   (d) runbooks at the docs.yuzu.io URLs below, which do not exist yet.
   #
@@ -3876,7 +4559,7 @@ groups:
   # alert is the signal; the audit trail is the evidence.
   #
   # PIPELINE HEALTH: yuzu_fleet_guardian_journal_reporting and ..._tag_rejected are
-  # published on EVERY sweep including at 0, unlike the 30 counters. They are the only
+  # published on EVERY sweep including at 0, unlike the 33 counters. They are the only
   # rules here that CAN be sound, because they are server-owned counts rather than fleet
   # sums of agent monotonics. They differ from each other: TagRejected is
   # unconditionally sound, while TelemetryDark is sound only once Guardian is actually
@@ -4182,6 +4865,24 @@ groups:
             `generation_refresh` degrade drops the validate cache past the
             stale-serve bound. Usually PostgreSQL pool saturation / failover —
             correlate with the pool metrics.
+      - alert: YuzuEnrollmentStoreDegraded
+        expr: |
+          increase(yuzu_auth_enrollment_store_degrade_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Durable enrollment store degraded on the auth hot path (op={{ $labels.op }}, reason={{ $labels.reason }})"
+          description: >-
+            An enrollment/pending-agent store operation ({{ $labels.op }}) hit a
+            degraded PostgreSQL read/write for 10m (WS-6 6.2). Every enrollment/
+            pending call fails CLOSED on a degrade — agent `Register` returns
+            gRPC `UNAVAILABLE` instead of silently enrolling/denying, and the
+            admin dashboard/REST surface returns 503 rather than an empty or
+            stale list. Caller-input rejections are not counted here (`reason`
+            is `no_store`/`pool_acquire_timeout`/`query_error`, never a bad-input
+            case). Usually PostgreSQL pool saturation / failover — correlate
+            with the pool metrics.
 
   - name: yuzu-ota
     # Agent OTA pull bounds (#913 per-peer admission, #911 deadlines, #416
@@ -4486,3 +5187,126 @@ groups:
             the DATABASE primary's NTP / clock health; correlate with
             yuzu_exec_correlation_store_degrade_total /
             yuzu_exec_correlation_write_degrade_total.
+
+  - name: yuzu-enablement
+    # ADR-3006 — the durable plugin-enablement store (EnablementStore). Every closed-label
+    # series and every gauge is zero-seeded at boot, so increase() > 0 is
+    # meaningful and absent() stays a real signal. All series are server-side.
+    #
+    # Most of these arm with the later change that issues desired state: until then only
+    # YuzuEnablementRegressed and YuzuEnablementAnchorWriteFailing can fire, and the rest
+    # read as flat zero ("inactive") without being armed. The loader, the registration and
+    # report writers and the unit resolver have no production caller yet.
+    #
+    # Deliberately NOT alerted: yuzu_server_enablement_write_degrade_total and
+    # yuzu_server_enablement_read_degrade_total on their own. A best-effort
+    # registration or read fault is retried by the next event; the
+    # signals that matter operationally are a regression, a rule the
+    # loader refused and a continuity anchor that cannot be written. Also not alerted:
+    # yuzu_server_enablement_anchor_unwitnessed_total, which is expected once on every
+    # fresh install (the manual defines it).
+    rules:
+      # A refused rule is a standing condition (it stays unapplied until it is fixed or
+      # deactivated), so this alerts on the per-load gauge. The counter
+      # yuzu_server_enablement_rules_rejected_total{reason} keeps the rate and the reason.
+      - alert: YuzuEnablementRulesRejected
+        expr: |
+          yuzu_server_enablement_rules_quarantined > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A persisted enablement rule was refused at load and quarantined"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/adr/3005-plugin-config-store.md"
+          description: >-
+            The enablement loader re-reads every stored rule through
+            make_persisted_rule and refused at least one at its last load
+            (the reason is on yuzu_server_enablement_rules_rejected_total:
+            refused = selector, attribute or unit-name shape, provenance = an
+            unknown provenance spelling, caps = an over-cap or malformed row).
+            A refused rule is NOT applied, so the units it names are not
+            switched off by it. The server log carries one line per refused
+            rule naming its (neutralised) id and the reason.
+
+      - alert: YuzuEnablementUnresolvedUnits
+        expr: |
+          yuzu_server_enablement_unresolved_units > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Enablement rules reference units this release does not know"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/adr/3005-plugin-config-store.md"
+          description: >-
+            One or more persisted rules name a unit that this release's
+            capability catalogue knows neither as a unit nor as a recorded
+            non-unit (a unit removed or renamed since the rule was authored).
+            Such a name switches nothing off; the rule's other units still
+            apply. Review the rule or restore the unit. The loader's warn line
+            lists up to 20 of the names.
+
+      - alert: YuzuEnablementRegressed
+        expr: |
+          yuzu_server_enablement_regressed == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The enablement store is declared regressed - issuing desired state is frozen"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#enablement-continuity-anchor"
+          description: >-
+            The continuity anchor (enablement-anchor beside the server data)
+            disagrees with the enablement store. Three causes, named by the
+            reason in the boot log (grep for "declared REGRESSED"):
+            store_id_mismatch (the anchor names a different store while the
+            anchor's counter or the store's counter is above 0: a database
+            replaced, or a cloned image, after desired state was issued;
+            at counter 0 on both sides nothing was ever issued and the
+            server rewrites the anchor instead), store_behind
+            (the store's counter is below the anchor's: a dump older than the
+            anchor) or anchor_unparseable (the file is readable but is not an
+            anchor). While regressed the store issues no desired state and
+            nothing already issued is changed. The declaration is permanent in
+            the product; the runbook gives the exit for this release.
+            /readyz reports enablement.regression_pending.
+
+      - alert: YuzuEnablementReportAhead
+        expr: |
+          yuzu_server_enablement_report_ahead_endpoints > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Endpoints reported an enablement state newer than the store's"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#enablement-continuity-anchor"
+          description: >-
+            One or more endpoints reported an (epoch, counter) above the
+            enablement store's highest. That is the second witness that the
+            database was restored from an older dump (or replaced) while
+            endpoints kept their state. It is surfaced here and on /readyz
+            (enablement.report_ahead); the later change that issues desired
+            state declares the regression from it. Compare with
+            yuzu_server_enablement_regressed.
+
+      # State-shaped on purpose: the anchor is written at boot, so a counter of failures goes
+      # 0 -> 1 before the first scrape and would never show a rise. The gauge is seeded 1 and set
+      # to 0 by a failed write or an anchor that cannot be read, so it is visible from the first
+      # scrape and clears once a later boot writes the anchor.
+      - alert: YuzuEnablementAnchorWriteFailing
+        expr: |
+          yuzu_server_enablement_anchor_writable == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The enablement continuity anchor could not be written"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#enablement-continuity-anchor"
+          description: >-
+            The server could not write the continuity anchor (enablement-anchor
+            in --data-dir): the directory is read-only, full or missing, or
+            the file exists but cannot be read. Until it is fixed this host
+            cannot witness the enablement store, so every boot reads as
+            unwitnessed and a restored older dump would go unnoticed here. The
+            boot log line says which. Make the data directory writable
+            (one persistent data directory per replica; an ephemeral one makes
+            the mechanism inert).

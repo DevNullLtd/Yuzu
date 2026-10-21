@@ -88,7 +88,10 @@ struct DiscoveryScanRouteHarness {
                           const std::string&) -> bool { return true; };
         auto audit_fn = [this](const httplib::Request&, const std::string&,
                                const std::string& result, const std::string&, const std::string&,
-                               const std::string&) { audit_outcomes.push_back(result); };
+                               const std::string&) -> bool {
+            audit_outcomes.push_back(result);
+            return true;
+        };
 
         routes.register_routes(sink, auth_fn, perm_fn, audit_fn,
                                /*directory_sync=*/nullptr, /*patch_manager=*/nullptr,

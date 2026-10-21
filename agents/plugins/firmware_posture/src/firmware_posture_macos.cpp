@@ -12,7 +12,8 @@
  *       node IODeviceTree:/chosen, key `system-firmware-version` = "mBoot-18000.161.10" (CFData,
  *       19 bytes incl. NUL); `firmware-version` there is the same text in a 256-byte buffer.
  *   IORegistryEntryFromPath("IODeviceTree:/")       -> entry, `manufacturer` = "Apple Inc.".
- *   sysctlbyname("hw.model") = "Mac16,10".
+ *   sysctlbyname("hw.model") = "Mac16,10"; sysctlbyname("hw.optional.arm64") = 1 (Intel Macs have
+ *       no such key: ENOENT).
  * The version is an iBoot tag, not a BIOS date; Apple Silicon has no release date.
  *
  * Every io_object_t is adopted by ScopedIOObject and every property (+1 Create Rule) by
@@ -31,7 +32,9 @@
 #include <IOKit/IOKitLib.h>
 #include <sys/sysctl.h>
 
+#include <cerrno>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -63,7 +66,7 @@ DtNode read_node(const char* path, std::initializer_list<const char*> keys) {
     // exhaustion) are indistinguishable AT THIS CALL. Unlike WMI/SMBIOS, this API surface
     // exposes nothing else to check here -- so this shell only records the raw fact
     // (lookup_failed) and leaves the absent-vs-unreadable decision to select_macos_firmware(),
-    // one layer up in the pure core, which resolves it with hw.model as a second signal (only
+    // one layer up in the pure core, which resolves it with hw.optional.arm64 as a second signal (only
     // /rom failing on an Apple Silicon Mac is architecturally expected absence; the same
     // absent-vs-unreadable class was fixed as FV-CODEX-01 on the Windows leg).
     if (!entry) {
@@ -101,6 +104,17 @@ Field sysctl_hw_model() {
     return f;
 }
 
+// hw.optional.arm64 is an int32 present only on Apple Silicon (Intel Macs have no such key:
+// ENOENT = false). Any other failure is nullopt, which select_macos_firmware reads as Intel so
+// an unexplained failure is never an expected absence.
+std::optional<bool> sysctl_hw_optional_arm64() {
+    std::int32_t v = 0;
+    std::size_t len = sizeof v;
+    if (sysctlbyname("hw.optional.arm64", &v, &len, nullptr, 0) == 0) return v != 0;
+    if (errno == ENOENT) return false;
+    return std::nullopt;
+}
+
 } // namespace
 
 int collect_firmware_macos(yuzu::CommandContext& ctx) {
@@ -112,8 +126,9 @@ int collect_firmware_macos(yuzu::CommandContext& ctx) {
         read_node(kDtChosen.data(), {"system-firmware-version", "firmware-version"});
     const DtNode root = read_node(kDtRoot.data(), {"manufacturer"});
     const Field model = sysctl_hw_model();
+    const std::optional<bool> arm64 = sysctl_hw_optional_arm64();
 
-    report.add_all(macos_rows(select_macos_firmware(rom, chosen, root, model), model));
+    report.add_all(macos_rows(select_macos_firmware(rom, chosen, root, arm64), model));
     for (const DtNode* n : {&rom, &chosen, &root})
         for (const auto& k : n->undecodable)
             report.note_failure("iokit:" + k + ":undecodable");
@@ -121,7 +136,7 @@ int collect_firmware_macos(yuzu::CommandContext& ctx) {
     // UNLESS that specific node's absence is architecturally expected (only /rom on Apple
     // Silicon) -- same architecture gate select_macos_firmware() uses for the row's `unreadable`
     // flag, so the token and the row state never disagree.
-    const bool apple_silicon = model.value && is_apple_silicon_model(*model.value);
+    const bool apple_silicon = arm64.value_or(false);
     struct NodeRef {
         const DtNode* n;
         std::string_view path;
@@ -131,6 +146,7 @@ int collect_firmware_macos(yuzu::CommandContext& ctx) {
         if (r.n->lookup_failed && !node_absence_is_expected(r.path, apple_silicon))
             report.note_failure("iokit:" + std::string(r.path) + ":lookup_failed");
     if (model.unreadable) report.note_failure("sysctl:hw_model:unreadable");
+    if (!arm64) report.note_failure("sysctl:hw_optional_arm64:unreadable");
     return finish_report(ctx, report);
 }
 

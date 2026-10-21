@@ -5,6 +5,12 @@
 **Component:** Agent core (sync scheduler) · Server (inventory ingest + Postgres store) · Gateway (proxy)
 **Authors:** Dave Rae
 
+> **Amendment pending: ADR-3006 (plugin management, proposed 2026-10-06).** ADR-3006 sets
+> the direction that `--inventory-disable` stops being the collection toggle: it becomes a
+> one-time starting-state input that the server adopts as a visible off-rule, and each daily-sync
+> source becomes a unit that can be switched off on its own. Nothing has changed in the product
+> yet: until the work that follows ADR-3006 lands, this ADR describes what ships.
+
 ## Context
 
 We are beginning to write endpoint-reported data to the server's **PostgreSQL**
@@ -75,6 +81,18 @@ A small, source-agnostic seam:
   offline) → one catch-up sync after a *short random startup delay* (so a
   mass-deploy or a site's Monday-morning power-on does not herd); otherwise wait
   for the next phase fire.
+
+> **Update (2026-10-04, #5327):** a source whose collect yields nothing records
+> `skip_streak` / `last_skip` in the same `__sync__` KV. A source that opts in
+> (`skip_backoff`; today installed_software only — device_ci dispatches many
+> actions per attempt and software_licensing's single `license_scan.list` is a
+> full scan of every detection surface, so neither retry is cheap) retries after
+> the earlier of the next phase slot and 1 h · 2^(streak-1) while the streak is
+> at most 5, then once per daily slot; the others keep one full interval. The operator-facing schedule is stated once, in
+> `docs/user-manual/inventory.md`. The skip reason reaches the server only as a
+> heartbeat tag, never a report. KV writes are ordered skip fields first
+> (`save_state`), so an interrupted save never advances `next_fire` with the skip
+> unrecorded.
 
 ### 4. Hash-skip conditional protocol
 - The agent **always** sends a per-source `content_hash`; it **omits the full
@@ -206,7 +224,9 @@ Therefore we **coexist, not replace**:
 > gate — a management-group-confined operator now gets a genuinely filtered result
 > instead of a 403, and a service-scoped token gets a filtered result instead of a
 > blanket deny. This closes ADR-0017's PR-D backlog item for these two surfaces; the
-> `/inventory` dashboard Find tab is unmigrated and stays global-gate-only for now.
+> `/inventory` dashboard Find tab is unmigrated and stays global-gate-only for now
+> (that tab's routes were since removed; the equivalent read is the `/software` page's
+> devices expansion, still global-gate-only).
 > See `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`.
 
 ## Consequences
@@ -329,7 +349,8 @@ daily-sync thread).
 originally scoped the DPIA/Workstream-E entry as a "pre-correlation-PR assurance
 item" — written when this data was store-only (central Postgres, no operator
 surface). That framing is now stale: the `/inventory` Devices tab CI columns +
-per-device CI panel (PR2 of this ladder) make serial/system_uuid/primary_mac
+per-device CI panel (PR2 of this ladder; now the Hardware CI list/record — the
+`/inventory` Devices-tab fragments were removed) make serial/system_uuid/primary_mac
 **operator-visible** for the first time, which is a co-determination trigger
 point distinct from mere central storage (works-council review is about
 monitoring *capability becoming exercised*, not just data existing in a DB).
@@ -344,8 +365,8 @@ leaving it as prose here.
 
 **Binding requirement for a future CMDB-correlation PR (unscheduled) — do NOT
 correlate on `"unknown"`.** (Note: the ladder's actual "PR2" — the `/inventory`
-Devices tab CI columns + per-device CI panel — is dashboard-**read**-only; it joins
-purely on `agent_id` and does not implement CMDB correlation/merge, so this
+Devices tab CI columns + per-device CI panel, now the Hardware CI list/record — is
+dashboard-**read**-only; it joins purely on `agent_id` and does not implement CMDB correlation/merge, so this
 requirement does not apply to it and remains open for whichever future PR adds
 cross-device correlation.) When the platform identity subsystem is unavailable, or
 a host genuinely has no SMBIOS serial (many VMs; Linux without the capability),
@@ -399,6 +420,30 @@ ecosystem value, not collected). `version` is now the upstream version with the
 release/revision split into its own field, and rpm `publisher` switches
 VENDOR→PACKAGER — both operator-visible data shifts on Linux fleets.
 
+> **Update (2026-10-04, #5328):** `homebrew` was never emitted as an ecosystem
+> value and is retired. Homebrew (ecosystem `brew`; kind `pkg` for formulae, `app`
+> for casks) and Windows optional features (ecosystem `optional_feature`, kind
+> `feat`) are collected since #5335.
+
+> **Update (2026-10-14):** `pkg_inventory.store_packages` is collected as
+> ecosystems `snap` (kind `app` or `pkg`; version from the mounted revision's
+> `snap.yaml`; release = the revision) and `flatpak` (kind `app` or `pkg`;
+> version empty, a branch being a ref; release = the commit), active rows only;
+> snap/flatpak rows carry no distro fields.
+
+> **Update (2026-10-17):** `msi_packages.list_inventory` is collected as
+> ecosystem `msi`, kind `pkg`, with `package_id` set to the MSI product code
+> exactly as registered (Windows machine install context only; per-user products
+> are never listed by this source). Name, version and publisher come from
+> `InstalledProductName`/`VersionString`/`Publisher`. The product code travels in
+> the blob's extended-tail `package_id` field (the tail appended after the twelve
+> v2 fields); the tail's first two slots, `install_location` and
+> `uninstall_string`, stay reserved and empty (#5186). A `constrained`
+> enumeration, or a product-property read that fails for any reason other than
+> the product not having the property, fails the action and skips the whole
+> cycle, like `pkg_inventory.packages`. The same product also appears as an
+> `installed_apps` `app`/`windows` row; the two are not de-duplicated.
+
 Mechanics:
 
 - The fields ride **inside** the `plugin_data["installed_software"]` blob — no
@@ -406,9 +451,11 @@ Mechanics:
 - Collection is a new `installed_apps` action **`list_inventory`** (13-token
   `inv|` rows); the operator-facing `list`/`query`/`list_per_user` output is a
   stable contract whose fields this ADR left byte-unchanged (rpm `list` keeps
-  VENDOR). On Windows, `get_installed_apps_windows()` feeds `list`, `query` AND
-  the hashed `inv|` rows, so any change to it must be checked against the
-  hashed rows. *Amended 2026-09-21:* `list` gained two trailing columns
+  VENDOR). On Windows, `get_installed_apps_windows()` feeds `list` and `query`, and
+  the hashed `inv|` rows come from the registry walk
+  (`reg_walk::collect_uninstall_apps`), so a change to either must be checked
+  against the hashed rows. *Amended 2026-10-06:* the hashed rows moved off
+  `get_installed_apps_windows()` onto the registry walk. *Amended 2026-09-21:* `list` gained two trailing columns
   (`install_location`, `bundle_id`) under ADR-0028's binding condition. Its
   `app` tag, `name`, `version`, `publisher` and `install_date` keep their
   position and value for every real value; every `list` field is now

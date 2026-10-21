@@ -7,17 +7,17 @@
 #include "../command_capability.hpp"
 
 /// @file plugin_action_catalogue_pkg_inventory.hpp
-/// One fragment of the command capability catalogue: `pkg_inventory`'s two
+/// One fragment of the command capability catalogue: `pkg_inventory`'s three
 /// actions (`agents/plugins/pkg_inventory/src/pkg_inventory_plugin.cpp`).
 /// Classified by READING the implementation, not the name.
 /// `securable`/`operation` reuse an EXISTING `RbacStore` `types[]`/`ops[]`
 /// entry; none is minted here.
 ///
-/// Both actions are ReadOnly/None. Every leg is a zero-subprocess
-/// filesystem read (open/openat/readdir with O_NOFOLLOW over Homebrew
-/// Library/Taps, Cellar and Caskroom directory names; see
-/// pkg_inventory_macos_parsers.hpp; the Linux `managers` leg follows as its
-/// own PR); nothing spawns a package manager, and nothing writes, installs, or
+/// All three actions are ReadOnly/None. Every leg is a zero-subprocess
+/// filesystem read (open/openat/readdir/readlinkat with O_NOFOLLOW over Homebrew
+/// Library/Taps, Cellar and Caskroom directory names, and the Linux snap and
+/// flatpak stores; see pkg_inventory_macos_parsers.hpp and
+/// pkg_inventory_linux_parsers.hpp); nothing spawns a package manager, and nothing writes, installs, or
 /// removes a package.
 ///
 ///   `managers` — which package managers are present on this host, plus
@@ -26,6 +26,9 @@
 ///                directory names). Linux is UNSUPPORTED by construction
 ///                (`installed_apps` owns the Linux roster); Windows is a
 ///                PLANNED placeholder.
+///   `store_packages` — Linux snaps and flatpak apps/runtimes from the system
+///                stores. macOS is UNSUPPORTED by design (`installed_apps`
+///                owns the application list); Windows is PLANNED.
 ///
 /// Grouped under the existing `Inventory` securable — the same
 /// read-only-fact-collection precedent `peripherals.*` and
@@ -34,7 +37,7 @@ namespace yuzu::server::capdecls {
 
 namespace detail {
 
-inline constexpr std::array<CommandCapability, 2> kPluginActionCataloguePkgInventory{{
+inline constexpr std::array<CommandCapability, 3> kPluginActionCataloguePkgInventory{{
     {
         .plugin = "pkg_inventory",
         .action = "managers",
@@ -49,6 +52,17 @@ inline constexpr std::array<CommandCapability, 2> kPluginActionCataloguePkgInven
     {
         .plugin = "pkg_inventory",
         .action = "packages",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Inventory",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Low,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
+    },
+    {
+        .plugin = "pkg_inventory",
+        .action = "store_packages",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
         .securable = "Inventory",

@@ -1,5 +1,7 @@
 #include "webhook_store.hpp"
 
+#include "outbound_url_policy.hpp"
+
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
@@ -312,7 +314,14 @@ WebhookStore::create_webhook(const std::string& url, const std::string& event_ty
                              const std::string& secret, bool enabled) {
     // Validate URL scheme — only http:// and https:// are allowed.
     if (!url.starts_with("http://") && !url.starts_with("https://")) {
-        spdlog::warn("WebhookStore: rejected webhook with invalid URL scheme: {}", url);
+        spdlog::warn("WebhookStore: rejected webhook with invalid URL scheme");
+        return std::unexpected(WebhookWriteError::invalid_url);
+    }
+    // URL and event types reach the audit detail and the analytics stream
+    // verbatim: refuse embedded userinfo (a bearer secret) and control bytes
+    // (audit-row line splitting). The URL is never logged on this path.
+    if (url_has_userinfo(url) || url_has_control_bytes(url) || url_has_control_bytes(event_types)) {
+        spdlog::warn("WebhookStore: rejected webhook with userinfo or control bytes in url/event_types");
         return std::unexpected(WebhookWriteError::invalid_url);
     }
     if (!open_)
@@ -350,7 +359,7 @@ WebhookStore::create_webhook(const std::string& url, const std::string& event_ty
         if (!enc.has_value()) {
             // Encrypt failure aborts here — never write plaintext, never
             // write anything at all (ADR-0010 encrypt-failure semantics).
-            spdlog::error("WebhookStore::create_webhook: secret encrypt failed for {}", url);
+            spdlog::error("WebhookStore::create_webhook: secret encrypt failed for {}", url_log_host(url));
             return std::unexpected(WebhookWriteError::db_error);
         }
         encrypted = std::move(*enc);
@@ -377,8 +386,8 @@ WebhookStore::create_webhook(const std::string& url, const std::string& event_ty
         "RETURNING id",
         params);
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
-        spdlog::error("WebhookStore::create_webhook: insert failed for {}: {}", url,
-                      PQerrorMessage(lease.get()));
+        spdlog::error("WebhookStore::create_webhook: insert failed for {}: {}", url_log_host(url),
+                      first_line(PQerrorMessage(lease.get())));
         return std::unexpected(WebhookWriteError::db_error);
     }
     return id;
@@ -427,12 +436,19 @@ std::optional<std::vector<Webhook>> WebhookStore::list(int limit, int offset) co
     return out;
 }
 
-std::optional<Webhook> WebhookStore::get(int64_t id) const {
-    if (!open_)
+std::optional<Webhook> WebhookStore::get(int64_t id, bool* store_ok) const {
+    if (store_ok)
+        *store_ok = true;
+    if (!open_) {
+        if (store_ok)
+            *store_ok = false;
         return std::nullopt;
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
         spdlog::debug("WebhookStore::get: no connection in time ({})", pool_.last_error());
+        if (store_ok)
+            *store_ok = false;
         return std::nullopt;
     }
     // Never selects `secret` — same rule as list().
@@ -442,8 +458,11 @@ std::optional<Webhook> WebhookStore::get(int64_t id) const {
         "FROM webhook_store.webhooks WHERE id=$1::bigint",
         std::vector<std::string>{std::to_string(id)});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
-        if (res.status() != PGRES_TUPLES_OK)
+        if (res.status() != PGRES_TUPLES_OK) {
             spdlog::debug("WebhookStore::get: query failed: {}", PQerrorMessage(lease.get()));
+            if (store_ok)
+                *store_ok = false;
+        }
         return std::nullopt;
     }
     Webhook w;
@@ -477,9 +496,14 @@ std::expected<bool, WebhookWriteError> WebhookStore::delete_webhook(int64_t id) 
 }
 
 std::vector<WebhookDelivery> WebhookStore::get_deliveries(int64_t webhook_id, int limit) const {
+    return get_deliveries_checked(webhook_id, limit).value_or(std::vector<WebhookDelivery>{});
+}
+
+std::optional<std::vector<WebhookDelivery>>
+WebhookStore::get_deliveries_checked(int64_t webhook_id, int limit) const {
     std::vector<WebhookDelivery> results;
     if (!open_)
-        return results;
+        return std::nullopt;
     if (limit <= 0)
         limit = 50;
     limit = std::min(limit, kListRowCap);
@@ -488,7 +512,7 @@ std::vector<WebhookDelivery> WebhookStore::get_deliveries(int64_t webhook_id, in
     if (!lease) {
         spdlog::debug("WebhookStore::get_deliveries: no connection in time ({})",
                       pool_.last_error());
-        return results;
+        return std::nullopt;
     }
     pg::PgResult res = pg::exec_params(
         lease.get(),
@@ -498,7 +522,7 @@ std::vector<WebhookDelivery> WebhookStore::get_deliveries(int64_t webhook_id, in
         std::vector<std::string>{std::to_string(webhook_id), std::to_string(limit)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("WebhookStore::get_deliveries: query failed: {}", PQerrorMessage(lease.get()));
-        return results;
+        return std::nullopt;
     }
 
     const int rows = PQntuples(res.get());
@@ -571,9 +595,9 @@ void WebhookStore::deliver_single(const WebhookDeliveryTarget& wh, const std::st
         auto dec = secret_codec_.decrypt(
             pg::SecretCodec::SecretId{"webhook_store", "webhooks", "secret", pk}, wh.secret_blob);
         if (!dec.has_value()) {
-            spdlog::warn("WebhookStore: delivery to {} skipped - signing secret unavailable "
-                         "({})",
-                         wh.url, pg::SecretCodec::to_external_error());
+            spdlog::warn("WebhookStore: delivery to {} (webhook {}) skipped - signing secret "
+                         "unavailable ({})",
+                         url_log_host(wh.url), wh.id, pg::SecretCodec::to_external_error());
             if (metrics_)
                 metrics_->counter("yuzu_server_webhook_delivery_secret_unavailable_total")
                     .increment();
@@ -599,25 +623,8 @@ void WebhookStore::deliver_single(const WebhookDeliveryTarget& wh, const std::st
 
     try {
         // Parse the URL to extract scheme, host, port, path
-        std::string url = wh.url;
-        std::string scheme = "http";
-        std::string host_port;
-        std::string path = "/";
-
-        if (url.starts_with("https://")) {
-            scheme = "https";
-            url = url.substr(8);
-        } else if (url.starts_with("http://")) {
-            url = url.substr(7);
-        }
-
-        auto path_pos = url.find('/');
-        if (path_pos != std::string::npos) {
-            host_port = url.substr(0, path_pos);
-            path = url.substr(path_pos);
-        } else {
-            host_port = url;
-        }
+        // One parser for validation and delivery (outbound_url_policy.hpp).
+        const auto [scheme, host_port, path] = url_delivery_parts(wh.url);
 
         httplib::Client cli(scheme + "://" + host_port);
         cli.set_connection_timeout(5);
@@ -637,11 +644,13 @@ void WebhookStore::deliver_single(const WebhookDeliveryTarget& wh, const std::st
             status_code = result->status;
         } else {
             error = "connection_failed";
-            spdlog::warn("WebhookStore: delivery to {} failed: connection error", wh.url);
+            spdlog::warn("WebhookStore: delivery to {} (webhook {}) failed: connection error",
+                         url_log_host(wh.url), wh.id);
         }
     } catch (const std::exception& ex) {
         error = ex.what();
-        spdlog::warn("WebhookStore: delivery to {} failed: {}", wh.url, error);
+        spdlog::warn("WebhookStore: delivery to {} (webhook {}) failed: {}", url_log_host(wh.url),
+                     wh.id, error);
     }
     // `signature` is a hex digest, not secret material — nothing left to
     // wipe here. The SecureBuffer itself was already destroyed (and wiped)
@@ -715,9 +724,9 @@ void WebhookStore::fire_event(const std::string& event_type, const std::string& 
         const bool queued = delivery_pool_.submit(
             [this, wh, event_type, payload_json]() { deliver_single(wh, event_type, payload_json); });
         if (!queued) {
-            spdlog::warn("WebhookStore: dropped delivery to {} - worker pool queue full or "
-                         "server shutting down",
-                         wh.url);
+            spdlog::warn("WebhookStore: dropped delivery to {} (webhook {}) - worker pool queue "
+                         "full or server shutting down",
+                         url_log_host(wh.url), wh.id);
             if (metrics_)
                 metrics_->counter("yuzu_server_webhook_delivery_dropped_total").increment();
         }

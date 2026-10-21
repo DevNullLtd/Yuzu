@@ -52,6 +52,11 @@ static const std::vector<std::string> kAllowedKeys = {
     "dex_blast_cooldown_seconds",    //
     // F2a PR3 cohort metrics export (Settings → DEX alerts; next gauge sweep)
     "dex_cohort_export_key",         // tag key; "" = export disabled (validated on apply)
+    // Customer score policy (tiers, names, weights, per-app overrides).
+    "dex_score_policy",              // JSON document; route-owned - to be written only through
+                                     // the policy route's writer (a later change), which
+                                     // validates it whole; the generic PUT refuses it. Spelled
+                                     // as kDexScorePolicyKey in dex_score_policy_json.hpp.
 };
 
 const std::vector<std::string>& RuntimeConfigStore::allowed_keys() {
@@ -548,6 +553,10 @@ std::expected<void, std::string> RuntimeConfigStore::set(const std::string& key,
             int val = std::stoi(value);
             if (val <= 0)
                 return std::unexpected("value must be a positive integer");
+            if (key == "heartbeat_timeout" && val < kMinHeartbeatTimeoutSeconds)
+                return std::unexpected("heartbeat_timeout must be at least " +
+                                       std::to_string(kMinHeartbeatTimeoutSeconds) +
+                                       " seconds (the default agent heartbeat interval)");
         } catch (...) {
             return std::unexpected("value must be a valid integer");
         }

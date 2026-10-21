@@ -48,6 +48,7 @@
 #include "capability_decls/core_dispatch_capabilities.hpp"
 #include "capability_decls/plugin_action_catalogue_a.hpp"
 #include "command_capability.hpp"
+#include "dispatch_denial_text.hpp"
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "mcp_server_testonly.hpp"
@@ -459,10 +460,18 @@ constexpr TwinRow kExpectedTwins[] = {
     // REST twin gates on).
     {"list_preflight_runs", "Infrastructure", "Read", true},
     {"get_deployment_preview", "SoftwareDeployment", "Read", true},
+    {"list_deployments", "SoftwareDeployment", "Read", true},
+    {"get_deployment", "SoftwareDeployment", "Read", true},
+    // Estate E-2: the discovered-devices read twin, pinned against the REST
+    // GET /api/v1/network/discovered-devices gate in network_routes.cpp.
+    {"list_discovered_devices", "Infrastructure", "Read", true},
+    // The MCP twin of POST /api/v1/hardware/sync (same Execution:Execute gate).
+    {"sync_hardware_software", "Execution", "Execute", false},
     // #4030: executions/workflows/schedules read-twin programme.
     {"list_workflows", "Workflow", "Read", true},
     {"get_workflow", "Workflow", "Read", true},
     {"get_workflow_execution", "Workflow", "Read", true},
+    {"list_workflow_executions", "Workflow", "Read", true},
     // #2146 A2-R1 - pinned against the new GET /api/v1/executions/{id}/children
     // (rest_api_v1.cpp) and legacy GET /api/executions/{id}/children
     // (execution_routes.cpp) handlers' shared (securable, operation) gate.
@@ -536,6 +545,9 @@ constexpr TwinRow kExpectedTwins[] = {
     {"list_guardian_events", "GuaranteedState", "Read", true},
     {"get_guardian_rule_status", "GuaranteedState", "Read", true},
     {"get_guardian_device_guards", "GuaranteedState", "Read", true},
+    // The read-only twin of raise_guardian_policy_generation, pinned against GET
+    // /api/v1/guaranteed-state/policy-generation (the same GuaranteedState:Read gate).
+    {"get_guardian_policy_generation", "GuaranteedState", "Read", true},
     // #2146 Batch B2 — result-set MCP twins, pinned against rest_api_v1.cpp's
     // 12-operation REST v1 result-set API (docs/scope-walking-design.md).
     // The three async dispatch producers + reevaluate share
@@ -604,6 +616,16 @@ constexpr TwinRow kExpectedTwins[] = {
     // twins' tier_allows/perm_fn calls enforce.
     {"list_pending_approvals", "Approval", "Read", true},
     {"get_pending_approval_count", "Approval", "Read", true},
+    // M.9 software catalogue twins, pinned against
+    // GET /api/v1/inventory/software/catalogue{,/versions} (rest_api_v1.cpp): the same
+    // Inventory:Read gate the REST routes take through require_fleet_read.
+    {"query_software_catalogue", "Inventory", "Read", true},
+    {"get_software_versions", "Inventory", "Read", true},
+    // /crypto slice 1 twins, pinned against GET /api/v1/crypto/libraries{,/devices}
+    // (crypto_routes.cpp): the same Inventory:Read gate through fleet_read_fn.
+    {"get_crypto_libraries", "Inventory", "Read", true},
+    {"list_crypto_library_devices", "Inventory", "Read", true},
+    {"export_crypto_cbom", "Inventory", "Read", true},
 };
 
 } // namespace
@@ -672,6 +694,7 @@ TEST_CASE("operator surface MCP twins: every tool satisfies the A5 contract",
             "list_tar_retention_paused",
             "get_guardian_status",
             "list_guardian_rules",
+            "get_guardian_policy_generation",
             "get_pending_approval_count",
         };
         if (!kNoArgTools.contains(expected.tool))
@@ -707,5 +730,101 @@ TEST_CASE("operator surface MCP twins: no MCP tool exists for any agent-authenti
         CHECK(name.find("commit_upload") == std::string::npos);
         CHECK(name.find("cancel_upload") == std::string::npos);
         CHECK(name.find("open_upload") == std::string::npos);
+    }
+}
+
+// ── #6065 PR-Q: the shared dispatch-denial wording ────────────────────────
+//
+// `describe_dispatch_denial` (dispatch_denial_text.hpp) is the ONE helper both
+// POST /api/v1/quarantine (kRest) and MCP's pre-dispatch dry run (kMcp) render
+// a chokepoint denial through. Today the surface argument is accepted and
+// unused, so the two surfaces must agree byte for byte; a later change that
+// differentiates the wording must update this pin deliberately.
+
+namespace {
+
+constexpr detail::DispatchDenialReason kAllDenialReasons[] = {
+    detail::DispatchDenialReason::Unclassified,      detail::DispatchDenialReason::Ambiguous,
+    detail::DispatchDenialReason::AnonymousOperator, detail::DispatchDenialReason::Forbidden,
+    detail::DispatchDenialReason::ApprovalRequired,  detail::DispatchDenialReason::KillSwitched,
+};
+
+detail::DispatchDenial denial_for(detail::DispatchDenialReason reason) {
+    return detail::DispatchDenial{reason, "Security", authz::Operation::Execute};
+}
+
+} // namespace
+
+TEST_CASE("describe_dispatch_denial: REST and MCP wording is byte-identical for every reason "
+          "(#6065 PR-Q)",
+          "[server][routes][mcp][quarantine]") {
+    for (const auto reason : kAllDenialReasons) {
+        CAPTURE(detail::to_string(reason));
+        const auto denial = denial_for(reason);
+        const auto rest = describe_dispatch_denial(reason, "quarantine", "quarantine", denial,
+                                                   DenialSurface::kRest);
+        const auto mcp = describe_dispatch_denial(reason, "quarantine", "quarantine", denial,
+                                                  DenialSurface::kMcp);
+        CHECK(rest.cls == mcp.cls);
+        CHECK(rest.message == mcp.message);
+        CHECK(rest.remediation == mcp.remediation);
+        CHECK_FALSE(rest.message.empty());
+    }
+}
+
+// Pure-move pin: the six strings below are the ones the helper carried while it was an
+// anonymous-namespace local of mcp_server.cpp (origin/dev), copied from THAT source and not
+// from dispatch_denial_text.hpp, so a drift introduced by the move shows up here.
+TEST_CASE("describe_dispatch_denial: the six pre-existing MCP strings are preserved verbatim "
+          "(#6065 PR-Q pure move)",
+          "[server][routes][mcp][quarantine]") {
+    using Reason = detail::DispatchDenialReason;
+    const auto text = [](Reason reason) {
+        return describe_dispatch_denial(reason, "quarantine", "quarantine", denial_for(reason),
+                                        DenialSurface::kMcp);
+    };
+
+    for (const auto reason : {Reason::Unclassified, Reason::Ambiguous}) {
+        CAPTURE(detail::to_string(reason));
+        const auto t = text(reason);
+        CHECK(t.cls == DispatchDenialClass::kInvalidParams);
+        CHECK(t.message == "unknown or ambiguous plugin.action");
+        CHECK(t.remediation == "confirm the plugin/action name via discover_plugins or "
+                               "discover_instructions and re-call");
+    }
+    {
+        const auto t = text(Reason::AnonymousOperator);
+        CHECK(t.cls == DispatchDenialClass::kPermissionDenied);
+        CHECK(t.message ==
+              "dispatch denied: the caller has no resolved identity for Security:Execute");
+        CHECK(t.remediation == "this indicates a server-side identity-derivation fault, not a "
+                               "caller mistake; contact an administrator");
+    }
+    {
+        const auto t = text(Reason::Forbidden);
+        CHECK(t.cls == DispatchDenialClass::kPermissionDenied);
+        CHECK(t.message == "permission denied: Security:Execute");
+        CHECK(t.remediation == "the dispatching caller lacks this grant; request it, or dispatch "
+                               "as a caller who holds it");
+    }
+    {
+        const auto t = text(Reason::ApprovalRequired);
+        CHECK(t.cls == DispatchDenialClass::kPermissionDenied);
+        // The em dash (U+2014, UTF-8 E2 80 94) is part of the pre-existing wire string.
+        CHECK(t.message == "approval required for quarantine.quarantine \xE2\x80\x94 this action "
+                           "requires either an admin caller or a redeemed approval ticket that "
+                           "this dispatch does not carry");
+        CHECK(t.remediation == "re-call using a supervised-tier MCP token, which mints and polls "
+                               "an approval ticket for this class of call, or dispatch as an "
+                               "admin caller");
+    }
+    {
+        const auto t = text(Reason::KillSwitched);
+        CHECK(t.cls == DispatchDenialClass::kPermissionDenied);
+        CHECK(t.message ==
+              "dispatch denied: the per-action kill switch is OFF for quarantine.quarantine");
+        CHECK(t.remediation == "an operator has thrown an emergency stop for this plugin.action "
+                               "(set_plugin_kill_switch / PUT .../kill-switch); it must be "
+                               "re-enabled before this call can dispatch");
     }
 }

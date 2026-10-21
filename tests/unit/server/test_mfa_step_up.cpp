@@ -72,13 +72,13 @@ struct StepUpFixture {
                     .has_value());
 
         // Enroll alice in MFA so mfa_status->enrolled == true.
-        auto init = db->mfa_init_enrollment("alice", "Yuzu");
+        auto init = db->mfa_init_enrollment("alice", "Yuzu", std::nullopt);
         REQUIRE(init.has_value());
         auto bytes = mfa::base32_decode(init->secret_base32);
         REQUIRE(bytes.has_value());
         std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
         auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-        REQUIRE(db->mfa_verify_enrollment("alice", code).has_value());
+        REQUIRE(db->mfa_verify_enrollment("alice", code, std::nullopt).has_value());
 
         audit_fn = [this](const httplib::Request&, const std::string& action,
                           const std::string& result, const std::string& target_type,

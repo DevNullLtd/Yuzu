@@ -41,9 +41,9 @@ namespace yuzu::server::capdecls {
 
 namespace detail {
 
-inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
+inline constexpr std::array<CommandCapability, 35> kPluginActionCatalogueC{{
     // ── network_config (agents/plugins/network_config/src/network_config_plugin.cpp) ──
-    // All six actions only report existing adapter/DNS/proxy configuration —
+    // All seven actions only report existing adapter/DNS/proxy/route configuration —
     // no local or remote state is ever changed.
     {
         .plugin = "network_config",
@@ -98,6 +98,16 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
     {
         .plugin = "network_config",
         .action = "arp",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Infrastructure",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
+    },
+    {
+        .plugin = "network_config",
+        .action = "routes",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
         .securable = "Infrastructure",

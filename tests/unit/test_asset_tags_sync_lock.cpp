@@ -9,7 +9,7 @@
  * PIPE_BUF handshake this file used to rely on (it depended on a fixed,
  * guessable `<dest>.tmp` name). The replacement is a TU-inclusion seam that
  * stands in for `write_state_file_atomic` at its one call site
- * (asset_tags_plugin.cpp:223) only:
+ * (in do_sync, asset_tags_plugin.cpp) only:
  *
  *   1. `asset_tags_store.hpp` is included directly first, so its `#pragma
  *      once` means the include INSIDE asset_tags_plugin.cpp (below) is a

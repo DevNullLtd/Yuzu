@@ -7,7 +7,6 @@
 #
 # Usage (as the installer runs it):
 #   $env:YUZU_SETUP_ADMIN_USER / $env:YUZU_SETUP_ADMIN_PASS          (required)
-#   $env:YUZU_SETUP_OPERATOR_USER / $env:YUZU_SETUP_OPERATOR_PASS    (optional pair)
 #   the installer reads this file as text and runs it as a script block, with
 #   -ConfigPath "<locked dir>\yuzu-server.cfg" -ReasonPath "<file>"
 #
@@ -28,6 +27,13 @@
 # script rules for an install run by an administrator rather than SYSTEM). The
 # installer checks the language mode BEFORE loading this script and stops with
 # its own message; a credential-less upgrade never runs this script at all.
+#
+# FRESH INSTALLS ONLY, in effect: the file it writes only SEEDS the first
+# administrator into an empty auth database (#5274), so the installer refuses
+# a password on an upgrade (exit code 11) and never runs this script then. It
+# writes the administrator ONLY (#5343): a second entry was never provisioned
+# on a PostgreSQL auth store and could not sign in; further accounts are created
+# in Settings > User Management.
 
 param(
     [Parameter(Mandatory=$true)][string]$ConfigPath,
@@ -57,6 +63,16 @@ function Test-Username([string]$Name, [string]$What) {
     if ($Name -match '[:\x00-\x1f\x7f]') { Fail "$What username may not contain ':' or control characters" }
 }
 
+# The server's password policy (server/core/src/password_policy.hpp) caps a
+# password at 1024 BYTES of UTF-8 -- what PBKDF2 hashes, and what
+# Rfc2898DeriveBytes(string, ...) encodes the string as. .Length counts UTF-16
+# code units, so the maximum is measured on the encoded bytes. The minimum stays
+# 12 characters (never fewer than 12 bytes, so never below the server's minimum).
+function Test-Password([string]$Password, [string]$What) {
+    if ([string]::IsNullOrEmpty($Password) -or $Password.Length -lt 12) { Fail "$What password must be at least 12 characters" }
+    if ([System.Text.Encoding]::UTF8.GetByteCount($Password) -gt 1024) { Fail "$What password must be at most 1024 bytes as UTF-8" }
+}
+
 function New-PBKDF2Entry([string]$Username, [string]$Password, [string]$Role) {
     $salt = [byte[]]::new(16)
     $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
@@ -78,11 +94,9 @@ $tmp = $null
 try {
     $adminUser = $env:YUZU_SETUP_ADMIN_USER
     $adminPass = $env:YUZU_SETUP_ADMIN_PASS
-    $opUser = $env:YUZU_SETUP_OPERATOR_USER
-    $opPass = $env:YUZU_SETUP_OPERATOR_PASS
 
     Test-Username $adminUser 'admin'
-    if ([string]::IsNullOrEmpty($adminPass) -or $adminPass.Length -lt 12) { Fail 'admin password must be at least 12 characters' }
+    Test-Password $adminPass 'admin'
 
     $lines = @(
         '# Yuzu Server Configuration',
@@ -92,13 +106,6 @@ try {
         ''
     )
     $lines += New-PBKDF2Entry $adminUser $adminPass 'admin'
-
-    if (-not [string]::IsNullOrEmpty($opUser)) {
-        Test-Username $opUser 'operator'
-        if ($opUser -eq $adminUser) { Fail 'operator username must differ from the admin username' }
-        if ([string]::IsNullOrEmpty($opPass) -or $opPass.Length -lt 12) { Fail 'operator password must be at least 12 characters' }
-        $lines += New-PBKDF2Entry $opUser $opPass 'user'
-    }
 
     $dir = [System.IO.Path]::GetDirectoryName($ConfigPath)
     if (-not [System.IO.Directory]::Exists($dir)) { Fail "the data directory does not exist: $dir" }

@@ -102,7 +102,11 @@ Siblings become compliant store-by-store as they migrate to Postgres.
 | `response_store` | ADR-0039, compliant #2691 — full Facts/classify + `kMaxPlausibleNow` clamp + PG-clock read via the shared `gc_meta` anchor |
 | `ExecutionTracker::concurrency_claims` stale-claim reconciler | ADR-1007 — a persisted anchor + dedup fact-set in `retention_meta` survive restarts, and the whole probe-decide-act sequence is wrapped in one transaction. `would_wipe` is a DELIBERATE non-adoption of part 1 for this small ephemeral table, same reasoning as `api_token_store`'s own DELIBERATE NON-ADOPTION comment. **NOT yet fully seven-part compliant** — part 3 is floors-only (no ahead-of-now clause) and the shared-CLOCK rule is unmet (see the caveat), so it is classed **DisabledUntilFixed** in `background_jobs.hpp`, NOT ReplicaSafe. **SINGLE-WRITER as of WS-10** — a `pg_try_advisory_xact_lock('execution_tracker:concurrency_reconcile')` is now the first in-txn statement (try-and-skip; a lost race skips without advancing the liveness gauge), closing the concurrent-double-reconcile half of the shared gap the note below describes. **Clock-authority caveat (still open):** this pass's `now` is the caller's replica `system_clock`, not PG `now()` in-SQL — and the `concurrency_claims` `expires_at` it compares against is likewise written from `now_epoch()` (replica `system_clock`). So the shared-CLOCK half of the SINGLE-WRITER rule is NOT yet met for this store; a `concurrency_claims` DB-clock-authority migration (WS-1 class, #3715 shape, spanning claim write + extend + reconcile) is a prerequisite before a 2nd replica. Its part-3 sanitiser also floors-only (no ahead-of-now clause) — the same gap WS-10 fixed in the shared `pg::run_clock_guarded_prune`, tracked for this store alongside the clock-authority migration |
 | `app_perf_fleet_store`, `preflight_run_store`, `deployment_run_store` retention prunes | **WS-10 (#2508)** — the three formerly-bare wall-clock deletes now run through the shared `pg::run_clock_guarded_prune` helper (`server/core/src/pg/pg_retention_guard.{hpp,cpp}`): all seven parts + a `pg_try_advisory_xact_lock` (SINGLE-WRITER), reading Postgres `now()` in-SQL (shared clock, #3715). Constants are per-store parameters (`ClockGuardedPruneSpec`), part-6 = **Decline** at each call site (non-regenerable operator/analytics history). ONE reviewed impl parameterised per store, not three hand-copies — the "copy the SHAPE, never the numbers" rule made mechanical |
-| `execution_artifacts` scratch-dir sweep (agent, #4390) | Agent-side, not a store: removes orphaned `execution_artifacts-<32 hex>` scratch directories under `agent.data_dir` whose last-write time is older than one hour (`execution_artifacts_scratch_sweep_win.cpp`). **Part 5 adopted** — four unconditional caps (root entries enumerated, directories removed per pass, wall-time deadline computed once, entries per candidate); truncation is reported as `deferred`, never as done. **Parts 1–4 and 6 DELIBERATELY NOT adopted, recorded here and in the header banner:** the content is a regenerable copy of a system hive that this plugin itself staged — never operator data — so a wrong wall clock can destroy nothing that cannot be re-created by the next dispatch; and liveness of an in-flight dispatch is proven by the OS (the dispatch holds the directory open without `FILE_SHARE_DELETE` and the loaded hive holds the file), not by the clock — the one-hour floor exists only to cover a concurrent dispatch's create-to-open window. Part 7 holds (absolute threshold, equality is fresh). Single-process by construction; no persisted anchor. |
+| `offline_endpoint_store` endpoint prune (#5678 / #1545 UP-4) | All seven parts adopted via the shared `pg::run_clock_guarded_prune`. Timestamp = `last_seen_at` (`(EXTRACT(EPOCH FROM last_seen_at)*1000)::bigint`), which is PG-authored (`now()` in-SQL) on every upsert, so column and cutoff share the PG clock domain: a lagging replica clock cannot expire a live row and a future-stamped one cannot make a dead row immortal. The roster still reads the replica-authored `last_heartbeat_ms`, so the prune cutoff can reach a roster-visible row only under >7 d replica/PG clock disagreement. Window = the roster read window (30 d) + 7 d margin, computed as roster window + `OfflineEndpointStore::kPruneMargin` (37 d). No index on the expression (an hourly seq scan over a fleet-bounded table, bounded by the pool's 30 s statement timeout; revisit past ~5M rows). Part 6 = **Decline**: identity fields regenerate at a connected agent's next heartbeat, but a departed device's last-seen history does not. 7 d big-step floor (hourly cadence; weekend gaps must not decline), 1 d implausibility bound, advisory key `endpoint_state:endpoints_prune`. Runs PER REPLICA on `preflight_runner_thread_`: first pass on the first tick (about a minute after start; the bootstrap decline persists the anchor), then hourly, so the first real delete is the next hourly pass. Each hourly tick drains up to 12 passes of 1000 rows (12,000 rows per replica per hour; the drain stops on the first pass that returns less than the cap, a decline or an error). The xact advisory lock serialises overlapping passes only; staggered replicas each run their own pass, the shared settled marker means one bootstrap decline fleet-wide, and the first deletion can follow the first replica's decline by one stagger interval. The capped DELETE is unordered (shared guard idiom) — safe because every prunable row is already ≥ 7 d past the roster window |
+| `execution_artifacts` scratch-dir sweep (agent, #4390) | Agent-side, not a store: removes orphaned `execution_artifacts-<32 hex>` scratch directories under `agent.data_dir` whose last-write time is older than one hour (`execution_artifacts_scratch_sweep_win.cpp`). **Part 5 adopted** — five unconditional caps, carried per pass in `SweepLimits` (root entries enumerated, directories removed per pass, failures per pass, wall-time deadline computed once, entries per candidate); truncation is reported as `deferred`, never as done. The walk starts at a rotating root-entry index (`pass_counter % n`, #4504), which reduces but does not eliminate the chance that a persistently failing run of early entries delays a removable orphan: the counter is process-local (it resets on restart), advances one per executed pass whatever made the pass stop, and `n` is the count of all root entries, which changes as entries are removed, so no "reached within n passes" bound holds; rotation also covers only the first `max_root_entries` entries the root enumeration returns (a larger `data_dir` reports `deferred` every pass; a resumable enumeration is the upgrade path). **Part 3 PARTIALLY adopted, in-process only (#4503):** forward wall-vs-monotonic step detection and nothing more — no ahead-of-now or negative-reading sanitisation of a stored value, and a future-dated candidate mtime still reads fresh (`agents/shared/wall_clock_step.hpp`). A wall clock that advances more than 60 s faster than the monotonic clock since the previous sample (the `init()` seed, for the first non-startup pass) quarantines sweeping for one hour of monotonic time (a backward step later restored is itself seen as a forward step when the restoration falls on a sampled pass; only the two sampled endpoints are compared, so an excursion of more than an hour that begins and ends between two passes and cumulative sub-tolerance drift are not detected, the protective handle is not held from creation, and a directory created in such an excursion could read stale in the create-to-open window, which fails closed: the creating dispatch fails, a re-dispatch succeeds, the content is a regenerable hive copy; a permanent forward correction is recovered from when the quarantine lapses, no restart), skipped passes are logged; backward steps alone are not acted on (they only make entries look fresher); the startup pass has no prior sample and is accepted as-is (this is the part-6 decision: no in-process dispatch can exist yet at `init()`, so this process has no concurrent writer; a second agent process sharing `agent.data_dir` is not excluded, and the cost there is bounded, the creating dispatch fails closed and the content is a regenerable hive copy). Nothing is persisted. **Parts 1 and 2 not adopted; part 4 not adopted separately (the quarantine window stands in for it as a fail-safe time latch: it skips, never deletes); part 6 decided for the startup pass only; all recorded here and in the header banner:** the content is a regenerable copy of a system hive that this plugin itself staged — never operator data — so a wrong wall clock can destroy nothing that cannot be re-created by the next dispatch; and liveness of an in-flight dispatch is proven by the OS (the dispatch holds the directory open without `FILE_SHARE_DELETE` and the loaded hive holds the file), not by the clock — the one-hour floor exists only to cover a concurrent dispatch's create-to-open window. Part 7 holds (absolute threshold, equality is fresh). Guard state is in-process only (a restart ends any quarantine); no persisted anchor. |
+| `local_security_policy` scratch-dir sweep (agent, Windows) | Agent-side, not a store: removes orphaned `local_security_policy-<32 hex>` scratch directories (a `secedit /export` of the whole SECURITYPOLICY area that a crash left behind) under `agent.data_dir` whose last-write time is older than one hour and whose owner is the agent's own token owner (`local_security_policy_scratch_sweep.hpp`, `local_security_policy_win.cpp`). **Part 5 adopted** — five unconditional caps (root entries enumerated, directories removed per pass, failures per pass, wall-time deadline computed once, entries per candidate); truncation is reported as `deferred`, never as done. **Parts 1–4 and 6 DELIBERATELY NOT adopted, recorded here and in the header banner:** the only thing the sweep can touch is a regenerable copy of the host's own policy that this plugin staged, never operator data, so a wrong wall clock can destroy nothing the next dispatch cannot reproduce (at worst a forward step lets a concurrent sweep contend for the create-to-open window, which fails that dispatch closed as `dest_dir_open_<n>`; the next dispatch succeeds); and liveness of an in-flight dispatch is proven by the OS (the directory is held open without `FILE_SHARE_DELETE`), not by the clock — the one-hour floor only covers the create-to-open window. Part 7 holds (absolute threshold, equality is fresh); a far-future mtime (more than the threshold ahead) also counts as stale, so a clock that ran ahead when a dispatch crashed cannot hide the orphan for as long as the skew — the open handle and the owner gate, not the clock, protect a live directory. The caps are the same values as the `execution_artifacts` sweep, deliberately (identical substrate); the far-future-mtime rule is a deliberate divergence from that sibling, which still reads a future-dated mtime as fresh (the shared-extraction issue #5202 tracks that divergence). Two further divergences from the `execution_artifacts` sweep: this sweep has no in-process clock-step guard (deliberate, per the reasoning above) and no rotating start index, so its failure-capped loop still begins at the first root entry on every pass, the shape #4504 fixed there; both are recorded rather than adopted here. Single-process by construction; no persisted anchor. |
+| Spark claim-lifecycle reaper and orphan-key pass (agent, `guardian_spark_runtime`, #5322) | Agent-side, not a store, and **not a clock-guarded retention pass**; listed here as a recorded disposition, not an adoption. `reap_stranded_claims_locked` pops terminal `Queued` claims and `disarm_orphan_keys_locked` queues a Disarm for a watcher whose index refcount is 0; both run under `registry_mu_` from `expire_overdue_claims()` on the heartbeat. **Parts 1-4, 6 and 7 do not apply:** the state is a monotonic in-memory claim lifecycle with no wall-clock cutoff, no persisted anchor and no age-based delete (a claim is popped because of its state, not its age), and a restart empties it, so a wrong wall clock cannot destroy anything and there is no anchor for part 6 to decide about. **SINGLE-WRITER:** n/a (agent-local, process-local state). **Part 5 (an unconditional per-pass cap) declined:** the bound is structural, not a configured cap: the number of `claims_` entries for the reaper and the number of `keys_` entries for the orphan pass, both walked under `registry_mu_`, with one index-release attempt per terminal tombstone per pass (at most two in the pass that synthesizes the outcome of a head that has none); a partial pass would only lengthen recovery. Recorded in the header banner "Not a clock-guarded retention pass" above `reap_stranded_claims_locked` and `disarm_orphan_keys_locked` in `guardian_spark_runtime.hpp`. |
+| Guardian reconcile claim-map sweep (server, `GuardianReconcileGate::sweep()`, #5513) | Server-side, not a store, and **not a clock-guarded retention pass over durable data**; listed here as a recorded disposition, not an adoption. `sweep()` erases per-agent heartbeat-reconcile claims older than `2 * min_interval` (50 s, `min_interval` being the 25 s per-agent limit) from an in-memory map, called every 15 s from `health_recompute_thread_` on every replica (classified `ReplicaSafe` as `guardian_reconcile_gate.sweep` in `background_jobs.hpp`, never leader-gated). The cutoff is a `steady_clock` reading over no store and no durable data, and a restart empties the map. **Parts 1-4 and 6 do not apply:** there is no wall-clock cutoff, no persisted anchor and nothing durable to destroy, so there is no anchor for part 6 to decide about; a claim older than `min_interval` can no longer rate-limit anything, so deleting it changes no decision, and the `2x` margin only keeps an entry visible slightly longer than it is useful. A clock that jumps cannot cause a wrong bulk delete of live state: `steady_clock` is monotonic, an entry that appears older than it is is merely re-claimed on its next heartbeat, and a clock reading that moves backwards yields a negative age, which is never swept. **Part 5 adopted, as structural caps:** each call erases at most `kDefaultSweepMaxErase` (4096) entries and scans about `kDefaultSweepMaxScan` (16384) units, resuming from a persistent bucket cursor, so one call never holds the mutex for a whole 500,000-entry table; the consequence, estimated (not measured) in the gate header, is that a full cycle over about 500,000 claims takes about 90 ticks (about 20 minutes), so the sweep is a backstop and the bulk of the map is bounded by `decide()` erasing an expired claim when its agent next reports a converged generation. **Part 7 holds:** the threshold is absolute (`2 * min_interval`, never scaled) and an entry whose age is not strictly greater than it is kept. **SINGLE-WRITER:** n/a by design, because the state is per replica (each replica's claim map, budget and caches are its own, with no shared row), so the single-replica form of the rule is correct here. Reasoning recorded in the "RETENTION REASONING" block of `guardian_reconcile_gate.hpp`. |
 
 ### Still issuing bare wall-clock deletes
 
@@ -387,6 +391,292 @@ forward/backward-anomaly decline, unconditional cap) and makes the SAME two carv
 Part (6)'s missing-anchor decision is **PROCEED** (`ResultSetStore`'s answer): a mapping is a
 regenerable observability aid, not compliance evidence, so a from-boot skewed clock deleting a batch
 of already-consumed mappings is an acceptable worst case.
+
+### `ExecutionTracker::reap_stuck_running_executions` (#4982 Part B, fix round 2)
+
+Diverges from this file's two DELETE-based siblings immediately above in kind, not just detail: this
+sweep **MUTATES** live `execution_tracker.executions` rows (cancels a `running`/`agents_targeted=0`
+row past a 30-minute window, excluding anything with a still-`pending` `command_outbox_store.outbox`
+entry) rather than deleting from a regenerable observability table, so its part-1/part-4 choices
+invert theirs:
+
+1. **Would-wipe IS ADOPTED** (unlike `reap_command_execution_mappings`/`reap_event_outbox` above,
+   which decline it). Their tables drain to 100% expiry as ROUTINE behaviour, so a would-wipe verdict
+   there cannot separate a true positive from ordinary drain. This sweep's candidates are the
+   opposite: a healthy fleet's running executions resolve `agents_targeted>0` within seconds, so
+   candidates should always be a SMALL minority of the running population — a pass whose candidates
+   are a LARGE fraction (`kStuckExecWouldWipeRatio = 0.5`, floored at `kStuckExecWouldWipeFloor = 20`
+   total running executions below which the ratio is too noisy to mean anything) is evidence of a
+   systemic bookkeeping bug (e.g. a broad regression in a synchronous dispatch call site's own
+   `set_agents_targeted` call), not a genuine backlog, and acting on it risks mass-cancelling live
+   work.
+4. **Fact-set anomaly dedup IS ADOPTED, at a DELIBERATELY simpler width than `GatewayRouteStore`'s.**
+   The original Part B implementation carved this part out entirely (matching the DELETE-based
+   siblings) — and wedged PERMANENTLY after any routine >24h clock gap (a weekend, a DR failover,
+   extended maintenance) as a result: a decline never advances the primary `stuck_exec_reap_anchor`,
+   so `now_s - anchor` only GROWS on every later pass with no recovery path short of an operator
+   hand-editing `reap_meta`. This is the identical defect class `GatewayRouteStore::reap_stale_routes`
+   above was fixed for (PR #4299). The fix round 2 correction adds a SECOND persisted marker,
+   `stuck_exec_reap_declined = "<anchor>:<direction>"` (direction ∈ forward|backward) — a REPEAT
+   anomaly at the exact SAME (anchor, direction) as a marker armed by a full prior decline pass
+   re-anchors to the CURRENT `now_s` UNCONDITIONALLY and runs the ordinary would-wipe/candidate/cancel
+   logic for that pass (a genuine backlog then drains gradually across passes under the same cap,
+   never trusted all at once); a DIFFERENT-direction anomaly at that frozen anchor, or the very first
+   occurrence of any anomaly, still declines and arms/re-arms the marker against its own (anchor,
+   direction) — mirroring GatewayRouteStore's own direction-keyed fix (a value-only match let an
+   unrelated different-direction anomaly free-ride a frozen anchor and recover against a corrupted
+   reading, that store's round-2 external-review defect).
+
+   **Part-6 recovery mechanism (the doc's own "record which way you went" philosophy, applied to a
+   SECOND question this row's own history raised — not just the missing-anchor one below).**
+   DELIBERATELY OMITTED here: GatewayRouteStore's third marker field, `first_now_ms` (the reading an
+   anomaly was FIRST observed at), which bounds recovery to a real-time-plausible PERSISTENCE INTERVAL
+   rather than a bare (anchor, direction) match — without it, an ε-later second-replica pass reading
+   the SAME frozen marker recovers with zero persistence evidence (that store's own round-4 fix). This
+   gap is real in general but judged SAFE to omit for THIS sweep specifically: a too-eager recovery
+   here can only feed a still-corrupted `now_s` into the SAME would-wipe ratio guard and the SAME
+   unconditional per-pass cap (`kStuckExecReapCap = 500`) this sweep already carries for every
+   accepted pass — a spuriously-huge cutoff makes candidates a LARGE fraction of all running
+   executions (would-wipe's own job to catch) rather than a targeted, silent mass-cancel, and the
+   blast radius is additionally capped at 500 ATOMICALLY-rechecked rows, each individually
+   re-verified against LIVE state at cancel time (the fix round 2 TOCTOU close, below) — never a bare
+   cutoff-matched DELETE/UPDATE the way GatewayRouteStore's own route-tombstone sweep is.
+   GatewayRouteStore has neither safety net for its own sweeps, which is why ITS omission of this
+   field was genuinely unsafe. If a future change ever removes any of these safety nets here, this
+   omission must be re-examined against the same reasoning GatewayRouteStore's own entry above
+   records.
+
+   **Round-3 correction — the would-wipe FLOOR is not a safety net on a recovery pass.** The
+   paragraph above originally claimed the blast radius was bounded "even below the would-wipe
+   floor" by the per-pass cap alone — that was wrong: the floor (`kStuckExecWouldWipeFloor = 20`)
+   exists to SKIP the ratio check entirely on a small running population, so on a fleet with fewer
+   than 20 running executions, a corrupted recovered `now_s` could make its ENTIRE running
+   population look stuck with no ratio check to decline the pass — the 500-row cap does not help
+   here, since the affected population is already smaller than the cap. Fixed by bypassing the
+   would-wipe FLOOR (never the ratio itself) specifically on a pass that took the recovery branch
+   above (`recovering_from_clock_anomaly` in `execution_tracker.cpp`) — a recovered reading is, by
+   construction, one this sweep already judged untrustworthy once, so the small-population
+   noise-floor reasoning that justifies skipping the ratio check on an ORDINARY clean pass does not
+   apply to it. The 50% ratio check is unchanged and still applies on every recovery pass, so the
+   bound this omission now rests on is "at most a minority of the running population, of any size,
+   per recovery pass" — the same bound an above-floor ordinary pass already carries.
+
+   **Round 4/5 note — the floor-bypass residual is scoped to ONLY the recovery pass itself, recorded
+   as an accepted trade-off, not fixed.** Both round-4 adversarial reviewers (graded MEDIUM,
+   non-blocking) flagged that a PERSISTENT, multi-pass corrupt clock on a below-floor fleet re-enters
+   the floor's ordinary ratio-skip on the pass immediately AFTER recovery (the marker is cleared once
+   recovery fires, so a second bad reading right behind the first is not itself covered) — a residual
+   this branch narrows relative to the pre-fix permanent wedge, not one it introduces. The
+   fully-robust fix is the same GatewayRouteStore-style persisted `first_now_ms` distrust window
+   `DELIBERATELY OMITTED` above, spanning multiple passes rather than one; it remains future,
+   separately-scoped work rather than part of this round.
+
+**Claim+mutate atomicity (fix round 2, not a clock-guard part but load-bearing for the SINGLE-WRITER
+rule above).** The original Part B design selected candidates under the advisory lock, then cancelled
+each one via a separate post-commit `mark_cancelled()` call after the lock released — a TOCTOU window
+in which a candidate could receive a genuine dispatch between the select and the cancel (force-
+cancelling a live, still-executing command), and a window in which two replicas could each acquire the
+lock in sequence and both select overlapping candidates, exceeding the declared cap fleet-wide per
+cadence. Fix round 2 moves the ENTIRE claim+mutate sequence — candidate select, would-wipe check, and
+a single atomic `UPDATE ... RETURNING id` re-checking the FULL candidate predicate (not just a
+terminal-status guard) — inside the SAME lock-held transaction, and switches the advisory lock itself
+from blocking to `pg_try_advisory_xact_lock` (all-but-holder skip, matching this store's
+`reap_event_outbox` sibling and `GatewayRouteStore`'s own idiom) so a losing replica's maintenance tick
+is never stalled waiting on it.
+
+**Clock-authority caveat (still open, PR #5226 review round 2, Doomgoose).** This sweep's cutoff is
+PG `now()` read in-SQL, but `dispatched_at` — the column the cutoff is compared against — is written
+from the caller's replica `system_clock` in the common case (`create_execution`'s `now` fallback,
+`execution_tracker.cpp`), not PG `now()`. This is the same clock-domain split the
+`concurrency_claims` reconciler's own caveat above describes, and it is NOT yet met here either —
+unlike that reconciler, though, this sweep stays classed **ReplicaSafe**, not `DisabledUntilFixed`,
+because its blast radius on a multi-replica deployment is independently bounded by the would-wipe
+ratio/floor and the per-pass row cap regardless of which replica's clock a given `dispatched_at` came
+from — a mis-cancelled row is still capped at 500 per pass and still excluded if it carries a real
+agent response. A replica meaningfully behind on `system_clock` can still see a fresh dispatch as
+already past the stuck-exec window sooner than a correctly-clocked replica would. Not fixed; stamping
+`dispatched_at` from PG `now()` at `INSERT` time (mirroring the `concurrency_claims` migration, WS-1
+class, #3715 shape, tracked #4093) is the closing move for both.
+
+Part (6)'s missing-anchor decision is **PROCEED** (`ResultSetStore`'s answer): a dispatch that is
+genuinely still stuck survives to the next pass regardless of whether this one's cutoff arithmetic
+used a fresh or a from-boot-skewed clock, so acting on the first pass against an unverified clock is
+an acceptable worst case, bounded by the same would-wipe/cap guards as any other pass.
+
+**Upstream candidate-predicate race (fix round 3, #4982) — closed at the SOURCE, not by widening the
+predicate.** Fix round 2's atomic `UPDATE ... RETURNING id` above re-checks `status='running' AND
+agents_targeted=0 AND NOT EXISTS <pending outbox row>` at mutation time and calls that the "full
+candidate predicate" (as of round 3 — a governance Gate 2 fix below adds a THIRD clause; read that
+entry too before treating this round-3 description as current) — but that predicate is only trustworthy if a `'sent'` outbox row genuinely
+implies its execution's `agents_targeted` bookkeeping is settled. It was not: `command_outbox_delivery.cpp`
+called `CommandOutboxStore::mark_sent` (outbox `pending → sent`) and
+`ExecutionTracker::set_agents_targeted` as two SEPARATE autocommit statements. Between the two
+commits, a genuinely in-flight, successfully-dispatched command read `state='sent'` (excluded by the
+outbox clause) with `agents_targeted` still 0 (matching the predicate's own clause) — a false
+candidate for a command that was, in truth, still being delivered/executed, force-cancelled with no
+kill RPC ever sent. Fixed by `CommandOutboxStore::mark_sent_with_target`
+(`command_outbox_store.{hpp,cpp}`): the sent-transition and the real `agents_targeted` count now
+commit in ONE cross-schema transaction on this store's own pool — the same single Postgres
+instance/database this reaper's own cross-schema `NOT EXISTS command_outbox_store.outbox` read
+already relies on — so no reader can ever observe the two half-applied. A DB/lease failure on either
+half rolls BOTH back (the occurrence stays `pending`, re-driven next tick; the agent's `command_id`
+dedup, WS-0, absorbs the harmless re-send) rather than leaving `mark_sent` committed with
+`agents_targeted` unset. This is a NEW instance of the general lesson every entry in this file
+teaches: a reaper's own predicate can be perfectly correctly re-checked and still race, if the WRITE
+SIDE it depends on is allowed to commit as two independent halves.
+
+**Corrupt persisted-anchor self-heal (fix round 7, #4982) — closes a permanent wedge distinct from
+the skew-recovery marker above.** The skew-recovery marker (round 2, above) rescues a `now_s` that
+reads implausibly against a PARSEABLE persisted anchor. It cannot rescue an anchor that is itself
+unparseable or negative — that branch returned `clock_anomaly = true` without touching
+`stuck_exec_reap_anchor` or `stuck_exec_reap_declined`, and precedes the skew-marker read entirely, so
+an anchor corrupted by storage damage, a bad migration, or a manual repair gone wrong took that same
+branch on every future pass with no recovery path short of an operator hand-editing `reap_meta` — the
+identical permanent-wedge class this file's `GatewayRouteStore::reap_stale_routes` entry above already
+fixed for its own sibling anchor. Fixed by mirroring that sibling's corrupt-anchor branch exactly: on
+an unparseable/negative persisted anchor, clear `stuck_exec_reap_declined` and re-anchor
+`stuck_exec_reap_anchor` to THIS pass's own already-sanitised `now_s`, in the same transaction,
+declining only that one pass. Deliberately NOT drain-on-repeat, matching the sibling's own reasoning:
+a garbage anchor is not evidence of genuine elapsed downtime the way a persisting skew is, so the
+repaired pass still declines the actual sweep and the NEXT pass is the first to act on the healed
+anchor.
+
+**Real-agent-response exclusion (governance Gate 2 fix, #4982, BLOCKING, security-guardian,
+empirically reproduced) — the candidate predicate gains a THIRD clause.** The round-3 fix above
+closed the race against the WRITE side (`mark_sent`/`set_agents_targeted` committing as two
+halves) for an OUTBOX-originated dispatch. It said nothing about a SYNCHRONOUS REST/MCP dispatch
+that never touches the outbox at all: if that dispatch genuinely reached one or more agents (real
+responses recorded in `agent_exec_status` via `update_agent_status`, independently of
+`agents_targeted`) but the dispatcher's OWN `set_agents_targeted` bookkeeping write failed,
+`agents_targeted` stayed `0` forever — `refresh_counts_once`'s terminal transition requires
+`agents_targeted > 0` to ever fire — and this sweep force-cancelled that row at the 30-minute mark
+regardless of how many agents actually succeeded, since nothing in the predicate checked for a
+real response. Reproduced: 3 genuine `SUCCESS` responses recorded, `agents_targeted` never set,
+the sweep still cancelled the row and published a terminal `execution-completed` event
+misrepresenting a working execution as cancelled.
+
+Fixed by a third shared clause, `kNoAgentResponseExistsClause` (`execution_tracker.cpp`, same
+file-scope anonymous-namespace shape as the window/cap constants above): `NOT EXISTS (SELECT 1
+FROM execution_tracker.agent_exec_status WHERE execution_id = executions.id)`, `AND`-ed into all
+THREE predicate occurrences (the candidate-count SELECT, the candidate-select SELECT, and the
+atomic cancel UPDATE's own re-check). **This does NOT narrow Part B's original scope**: a dispatch
+refused BEFORE any agent was ever reached (a degraded pre-dispatch quota check, zero agents
+matched the target scope, a dispatch exception, a lost `create_pending` race — Part B's actual
+target population) has ZERO `agent_exec_status` rows, so the new clause is vacuously satisfied and
+such a row is still recovered exactly as before. Only a row with at least one genuine per-agent
+response is now additionally excluded — and that exclusion is permanent, by design: leaving a row
+with a real response wedged (the pre-fix behaviour, now narrowed to exactly this population) is
+strictly safer than falsely cancelling it, since there is no repair path today that re-derives
+`agents_targeted` from `agent_exec_status`. Verified bidirectionally: the regression test fails
+(force-cancels the row) with the clause removed from all three sites, and passes with it restored.
+
+### `ApprovalManager` ticket liveness (#6061) - a recorded disposition, not a retention pass
+
+Listed here because the routed trigger fires on any wall-clock cutoff in `approval_manager.cpp`, not
+because the store adopts the apparatus. An approval ticket is "live" while it is `approved`,
+unconsumed and `reviewed_at` lies within `[db_now - 7 days, db_now + 300 s]`. That test is ONE SQL
+predicate (`ticket_live_sql()` in `approval_manager.cpp`, constants `kApprovalTicketTtlSeconds` and
+`kApprovalReviewedAtSlackSeconds` in `approval_manager.hpp`), used by four sites that must never
+disagree: the `consume_ticket` CAS, its diagnostic read, `submit()`'s approved-ticket sweep, and
+`ticket_is_live()`, which `ScheduleRunner` calls before it fires an approved schedule ticket.
+
+- **Anti-fork rule.** `ticket_is_live()` answers liveness ONLY. It carries none of the #2442 origin and
+  submitter binding, and `consume_ticket` stays the sole redemption chokepoint: `ScheduleRunner` never
+  consumes a ticket, it retires one by advancing the schedule. A caller that needs to redeem a ticket
+  calls `consume_ticket`, never `ticket_is_live` followed by its own write.
+- **`ScheduleRunner` and a failing store (known, pre-existing, tracked in #2878).** The comment at the
+  liveness check says a store failure HOLDS the occurrence. That is true only once the first read has
+  succeeded: if `ticket_is_live()` itself cannot read, `fire_with_approval` holds (no advance) and logs
+  a WARN. But the `query()` call that finds the approved ticket in the first place swallows a store
+  error into an empty list, so with the store still failing the runner falls through to raising a fresh
+  approval request; that submit fails too, `fire_with_approval` returns true ("occurrence skipped"),
+  the schedule ADVANCES and the approved occurrence is dropped (a `once` schedule is lost), leaving only a failure audit row and
+  `yuzu_schedule_fire_failures_total`. Do not read "holds the occurrence" as a guarantee for an outage
+  that starts before the ticket lookup.
+- **It is a liveness check and a state transition, not a bulk delete.** The consume is a per-row CAS
+  that refuses and leaves the row untouched. The sweep is `UPDATE ... SET status = 'expired'`, never a
+  `DELETE`; ADR-0065's "Expiry-sweep clock-guard adjudication" (and its 2026-10-18 amendment) records
+  why the seven-part apparatus's trigger is not met for the sweep. Expired rows stay queryable and
+  auditable.
+- **Which timestamps are database time, and which are not.** `reviewed_at`, `consumed_at` and both
+  sweep cutoffs are authored by Postgres `now()` in-SQL (the SessionStore direction, #3715), so for the
+  approved-ticket path the stored value and the cutoff share one clock domain and nothing about that
+  path depends on a replica's `system_clock`. **`submitted_at` is NOT:** `submit_stamp_epoch()` in
+  `approval_manager.cpp` stamps it from the submitting process's `system_clock`, on purpose, because
+  `ScheduleRunner`'s `ticket_is_current` compares it with `ScheduleEngine`'s `last_executed_at` /
+  `created_at`, which are also process-clock stamps; moving only one side to database time would make
+  that comparison cross-clock and let one approval fire more than once. The stale-pending sweep
+  therefore compares a process-clock `submitted_at` with the database's `now()`. Moving
+  `submitted_at` and the `ScheduleEngine` stamps to database time together is tracked in #6096.
+- **Schedule occurrences under submitter/advancer skew (known, pre-existing, narrowed by the 7-day
+  liveness bound, tracked in #6096).** `ticket_is_current` treats an approved ticket as belonging to
+  the next occurrence when its `submitted_at` is later than the schedule's `last_executed_at`. The two
+  stamps come from the clock of whichever server submitted the ticket and whichever advanced the
+  schedule. Only the leader ticks, so they are normally the same server; they differ when leadership
+  moves between the submit and the fire. If the submitter was ahead, a spent ticket still looks newer
+  than its occurrence and a recurring schedule can fire extra times until the ticket ages out (about
+  the skew divided by the schedule interval, minimum interval 60 s); a `once` schedule does not
+  re-fire. If the submitter was behind, a freshly approved ticket looks older than the last run and is
+  ignored: a fresh approval is requested again and the schedule waits. NTP-synchronised hosts differ
+  by milliseconds, so the realistic trigger is broken time sync or a clock step.
+- **Parts 1, 2 and 4 DECLINED for the approved-ticket path; part 3 is not declined (next bullet)**
+  (there is no per-replica clock reading to probe, persist or dedupe, and running the sweep on every
+  replica is safe, so the SINGLE-WRITER caveat does not apply to it). **Parts 1, 2 and 4 are not declined on the premise that nothing depends on a
+  replica's clock for the pending path:** a pending ticket's lifetime is 7 days plus the submitter's
+  clock minus the database's. A submitter 7 days or more behind the database has every ticket it mints
+  swept by the next `submit()` on any replica. A submitter weeks ahead has pending tickets the sweep
+  does not reach until the database clock catches up, and they count against the global cap of 1000
+  pending tickets; once the queue is full `submit()` fails (which also drops a schedule occurrence
+  that needed a fresh ask). The harm is
+  confined to the skewed submitter's own tickets (no caller supplies `submitted_at`; `submit()` takes
+  no timestamp), and healthy NTP-class skew moves a lifetime by milliseconds. Tracked in #6096.
+- **Part 3's "ahead of now" clause is satisfied for `reviewed_at`, by the upper bound; it is not
+  declined.** A lower bound alone honours a far-future `reviewed_at` for as long as the skew lasts and
+  the sweep never reaches it. The 300 s slack is an absolute number chosen for a healthy row (stamped
+  by the database, so never ahead of `now()`) plus statement-boundary jitter; do not copy it to another
+  store. No equivalent upper bound exists for `submitted_at` (see the previous bullet).
+- **Part 5 (cap) NOT adopted for the sweep:** it has no per-pass limit. It runs lazily inside `submit()`
+  and only moves rows already past the lifetime to `expired`, which removes no data.
+- **Part 6 (missing anchor): not applicable,** there is no anchor. **Part 7:** the 7-day lifetime is an
+  absolute duration.
+- **Premise withdrawn.** The earlier reasoning that a 7-day window makes app-clock versus database-clock
+  skew immaterial was wrong (governance ledger `6061-approver-assurance.yut0p2`, UP-3): a `reviewed_at`
+  stamped from a replica's clock and compared with the database's passed the lower bound while it was
+  in the future. Stamping `reviewed_at` in SQL, plus the upper bound, is the fix. The same reasoning
+  still applies to `submitted_at`, which is why it is a named residual (#6096) and not closed. This
+  follows the house rule in `docs/user-manual/server-admin.md` of never comparing an app-host clock to
+  a database-host clock.
+- **Residual, stated plainly.** The database host's own clock is still the authority, and a step in it
+  is not harmless in either direction:
+  - A **forward** step makes live tickets read as past their lifetime, and the sweep that runs while
+    the clock is wrong moves them to `expired` for good.
+  - A **backward** step of more than 300 s makes an approved, unconsumed ticket read as ahead of the
+    database clock when its `reviewed_at` is more than 300 s ahead of the NEW database time (roughly,
+    the tickets reviewed within the last (step size minus 300 s) before the step; older approved
+    tickets stay live), and the approved sweep expires those, **permanently** once it has run. No code path un-expires a ticket, so
+    correcting the clock after an accepted `submit()` has swept them does not restore them. Before that
+    first accepted `submit()`, nothing has been written: the upper bound is a pure predicate, so a held-back
+    ticket is live again once the database clock catches up, and correcting the clock before any approval is
+    submitted preserves it (hold submissions until the clock is right if the query below returns rows). The pending sweep is the one a backward step blunts: its cutoff moves into
+    the past, so it matches fewer rows.
+  - Once swept, the requester must ask again. The only trace of the approved sweep is an info log line
+    ("expired N approved-but-unconsumed approval tickets"); there is no metric or audit row, the consume
+    refusal for such a ticket says it is "past its 7-day lifetime" even when it was in fact ahead of the
+    clock, and `submit()` logs a WARN only when the pending queue is full and the stale-pending sweep
+    expired nothing. Observability for this (distinguishing aged from future-dated, and a counter) is
+    tracked in #6098. This direction is fail-safe (deny), never a way to redeem more.
+  - The query below finds tickets the upper bound is currently holding back (approved, unconsumed,
+    `reviewed_at` ahead of the database clock by more than the slack). It returns rows only until the
+    next accepted `submit()` runs, because that call sweeps them to `expired`; after that they no longer
+    match this query and show as `expired`. A `submit()` refused because the pending queue is full rolls
+    its sweeps back with the rest of its transaction, so the rows persist until a submission is accepted.
+
+  ```sql
+  SELECT id, definition_id, submitted_by, reviewed_at
+  FROM approval_manager.approvals
+  WHERE status = 'approved' AND consumed_at = 0
+    AND reviewed_at > EXTRACT(EPOCH FROM now())::bigint + 300;
+  ```
 
 ### `guardian_lifecycle_journal.cpp`
 

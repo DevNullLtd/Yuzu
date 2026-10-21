@@ -1,0 +1,42 @@
+# family	destination	prefix_len	next_hop	interface_alias	ifindex	metric	protocol	origin
+ipv4	0.0.0.0	0	192.0.2.1	Ethernet	11	0	3	0
+ipv4	100.64.0.12	32	0.0.0.0	Tailscale	6	0	3	0
+ipv4	100.100.100.100	32	0.0.0.0	Tailscale	6	0	3	0
+ipv4	100.64.0.77	32	0.0.0.0	Tailscale	6	0	3	0
+ipv4	100.64.0.21	32	0.0.0.0	Tailscale	6	256	2	0
+ipv4	100.64.0.43	32	0.0.0.0	Tailscale	6	0	3	0
+ipv4	127.0.0.0	8	0.0.0.0	Loopback Pseudo-Interface 1	1	256	2	0
+ipv4	127.0.0.1	32	0.0.0.0	Loopback Pseudo-Interface 1	1	256	2	0
+ipv4	127.255.255.255	32	0.0.0.0	Loopback Pseudo-Interface 1	1	256	2	0
+ipv4	192.0.2.0	24	0.0.0.0	Ethernet	11	256	2	0
+ipv4	192.0.2.131	32	0.0.0.0	Ethernet	11	256	2	0
+ipv4	192.0.2.255	32	0.0.0.0	Ethernet	11	256	2	0
+ipv4	224.0.0.0	4	0.0.0.0	Loopback Pseudo-Interface 1	1	256	2	1
+ipv4	224.0.0.0	4	0.0.0.0	Ethernet	11	256	2	1
+ipv4	224.0.0.0	4	0.0.0.0	WiFi	23	256	2	1
+ipv4	255.255.255.255	32	0.0.0.0	Loopback Pseudo-Interface 1	1	256	2	0
+ipv4	255.255.255.255	32	0.0.0.0	Ethernet	11	256	2	0
+ipv4	255.255.255.255	32	0.0.0.0	WiFi	23	256	2	0
+ipv6	::1	128	::	Loopback Pseudo-Interface 1	1	256	2	0
+ipv6	fd7a:115c:a1e0::	48	fd7a:115c:a1e0::53	Tailscale	6	0	3	0
+ipv6	fd7a:115c:a1e0::53	128	::	Tailscale	6	0	3	0
+ipv6	fd7a:115c:a1e0::77	128	::	Tailscale	6	256	2	0
+ipv6	fe80::	64	::	VPN Adapter	9	256	2	0
+ipv6	fe80::	64	::	Local Area Connection	22	256	2	0
+ipv6	fe80::	64	::	Ethernet 2	21	256	2	0
+ipv6	fe80::	64	::	Ethernet	11	256	2	0
+ipv6	fe80::	64	::	Bluetooth Network Connection	8	256	2	0
+ipv6	fe80::	64	::	WiFi	23	256	2	0
+ipv6	fe80::	64	::	Local Area Connection* 1	20	256	2	0
+ipv6	fe80::	64	::	Local Area Connection* 2	19	256	2	0
+ipv6	fe80::200:5eff:fe00:5301	128	::	Ethernet 2	21	256	2	0
+ipv6	fe80::200:5eff:fe00:5302	128	::	Bluetooth Network Connection	8	256	2	0
+ipv6	fe80::200:5eff:fe00:5303	128	::	Local Area Connection	22	256	2	0
+ipv6	fe80::200:5eff:fe00:5304	128	::	WiFi	23	256	2	0
+ipv6	fe80::200:5eff:fe00:5305	128	::	Local Area Connection* 2	19	256	2	0
+ipv6	fe80::200:5eff:fe00:5306	128	::	Local Area Connection* 1	20	256	2	0
+ipv6	fe80::200:5eff:fe00:5307	128	::	VPN Adapter	9	256	2	0
+ipv6	fe80::200:5eff:fe00:5308	128	::	Ethernet	11	256	2	0
+ipv6	ff00::	8	::	Loopback Pseudo-Interface 1	1	256	2	1
+ipv6	ff00::	8	::	Ethernet	11	256	2	1
+ipv6	ff00::	8	::	WiFi	23	256	2	1

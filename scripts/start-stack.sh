@@ -72,10 +72,14 @@ start_all() {
 
     # 1. Yuzu Server (gRPC on :50051 for gateway upstream, web on :8080)
     echo "[1/5] Starting yuzu-server (gRPC :50051, web :8080)..."
+    # Plaintext rig: --insecure-gateway-peer explicitly acknowledges that peer
+    # authorization on the gateway-upstream service is disabled. Not for
+    # production.
     "$BUILDDIR/server/core/yuzu-server.exe" \
         --no-tls \
         --listen 0.0.0.0:50051 \
         --gateway-upstream 0.0.0.0:50055 \
+        --insecure-gateway-peer \
         --web-port 8080 \
         2>&1 &
     disown
