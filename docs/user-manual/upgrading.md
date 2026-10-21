@@ -229,13 +229,13 @@ changes is which checks run.
   belongs to has been queued, the ticket is marked used (and a rejected ticket is marked used when it skips its
   occurrence), so one approval runs exactly one occurrence whatever the clocks say (#6096). The schedule's own run
   times are still stamped by the server that advances it; they only decide when an occurrence is due.
-- **First tick after upgrading (#6096).** Before this release a spent scheduled ticket was never marked used; it was
-  recognised as spent by its submission time. The first time each schedule is processed after the upgrade, the server
-  marks as used every approved or rejected ticket of that schedule that was submitted at or before the schedule's last
-  run, so none of them can fire again (up to seven days of pre-upgrade tickets). A ticket that was in fact still
-  waiting is affected only if the clocks were skewed across the upgrade; it is then marked used and the schedule asks
-  for a fresh approval. If the database is unavailable during that step, the schedule's occurrence is held and the
-  step is retried on the next tick. Nothing to do; the step is removed one release later.
+- **Scheduled approvals are retired once on upgrade (#6096).** Before this release a spent scheduled ticket was
+  never marked used; it was recognised as spent by comparing clocks. The schema upgrade therefore marks every
+  outstanding approved or rejected ticket that belongs to a schedule as used, once, with no clock comparison. A
+  schedule that was waiting on an approval you had already given (approved but not yet fired when you upgraded)
+  asks again for its next occurrence, and a rejection no longer skips anything. Pending requests, requests from the
+  dashboard and MCP, and tickets already used are untouched. Nothing to do; the step runs once per database and the
+  retired tickets show `schedule:legacy-6096` as the user of the ticket.
 - Tickets already approved when you upgrade keep their original `reviewed_at`; the seven days are counted
   from it.
 

@@ -258,16 +258,18 @@ reasoning and residuals: `docs/clock-guarded-retention.md`, "`ApprovalManager` t
 stale-pending sweep compares database time with database time. The reason it had stayed
 process-stamped, `ScheduleRunner::ticket_is_current` comparing it with `ScheduleEngine`'s
 process-clock `last_executed_at`, is removed rather than worked around: one approval == one
-scheduled run is now a guarded state transition. `ApprovalManager::retire_for_schedule` sets
-`consumed_at` (database time, `consumed_by = 'schedule:<id>'`) with a CAS (`WHERE id AND schedule_id
-AND consumed_at = 0 AND status IN ('approved','rejected') RETURNING`), the runner calls it after the
-occurrence is durably enqueued and before the schedule advances, and a ticket is eligible only while
-`consumed_at = 0`. A retire failure holds the occurrence; the idempotent occurrence key makes the retry
-safe. `consume_ticket` still refuses `kSchedule` origins. `ScheduleEngine`'s own stamps stay process
-clock (due-ness bookkeeping, informational for approvals). A one-time legacy sweep
-(`retire_legacy_spent_for_schedule`, remove one release after it ships) retires tickets the old rule
-had already treated as spent. The ladder is otherwise unchanged. Reasoning:
-`docs/clock-guarded-retention.md`, "`ApprovalManager` ticket liveness".
+scheduled run is now a guarded state transition. `ApprovalManager::retire_schedule_tickets(schedule_id,
+occurrence_key)` is one UPDATE keyed on `consumed_at = 0` that settles every unsettled approved/rejected
+ticket of the schedule (database-time `consumed_at`, `consumed_by = 'schedule:<occurrence key>'`);
+the runner calls it after the occurrence is durably enqueued and before the schedule advances, and a
+ticket is eligible only while `consumed_at = 0`. A retire failure holds the occurrence; the idempotent
+occurrence key makes the retry safe. Retire-ok with a failed advance burns one approval (accepted: a
+fresh ask follows, the outbox key prevents a double run). The retire is deliberately not epoch-fenced
+(see its doc comment). `consume_ticket` still refuses `kSchedule` origins. `ScheduleEngine`'s own
+stamps stay process clock (due-ness bookkeeping, informational for approvals). The approvals ladder
+gains **v2**, a clock-free data migration that retires every pre-upgrade unsettled schedule ticket
+(`consumed_by = 'schedule:legacy-6096'`). Reasoning: `docs/clock-guarded-retention.md`,
+"`ApprovalManager` ticket liveness".
 
 **Correction (adversarial review, 2026-08-31):** "ports shape-preserved" above was true of the two
 `UPDATE` statements themselves but not of their ORDER relative to the pending-count cap check.
