@@ -484,17 +484,23 @@ class WorkflowWiringTests(unittest.TestCase):
             self.job("ci.yml", "linux"),
         )
         self.assertIn("--no-suite docs", self.job("ci.yml", "macos"))
+        # A dual label ('healthcheck CLI contract' is ['server', 'platform']) counts too.
         platform = {
             self.meson_test_name(chunk)
             for chunk in self.meson_test_chunks()
-            if "suite: 'platform'" in chunk
+            if re.search(r"suite:\s*(?:'platform'|\[[^\]]*'platform'[^\]]*\])", chunk)
         }
         self.assertEqual(
             {
                 "'Windows toolchain contract'",
                 "'gateway build wrapper'",
+                "'gateway OTP pin resolution'",
                 "'instructions runner hardening'",
                 "'windows sdk contract'",
+                "'build_examples=false gating smoke test'",
+                "'start-UAT.sh kill_stale scoping (#5333)'",
+                "'capability matrix gate shell tests (#2204 F10)'",
+                "'healthcheck CLI contract (#5906)'",
             },
             platform,
         )

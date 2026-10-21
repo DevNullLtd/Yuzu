@@ -3056,10 +3056,12 @@ test('gateway build wrapper',
 
 # OTP pin resolution (scripts/erlang_toolchain.py find-otp): the selection
 # rules Meson relies on at configure time, against fake installs. Hermetic.
+# platform: OS-contract test, runs on every leg (docs is OS-independent and Linux-only since 2026-10-21);
+# it pins the `erl.exe` resolution scripts/erlang_toolchain.py branches on for win32.
 test('gateway OTP pin resolution',
   _python3_test,
   args: [files('test_erlang_toolchain_otp.py')],
-  suite: 'docs',
+  suite: 'platform',
   timeout: 120,
 )
 
@@ -3560,10 +3562,12 @@ if _bash_test.found()
   # #4262: -Dbuild_examples=false must keep configuring a real build.
   # Configure-only smoke test (no compile) so it stays cheap on every leg;
   # SKIPs cleanly when vcpkg_installed/<triplet> isn't populated yet.
+  # platform: OS-contract test, runs on every leg (docs is OS-independent and Linux-only since 2026-10-21);
+  # it selects the per-OS vcpkg triplet (`uname -s`).
   test('build_examples=false gating smoke test',
     _bash_test,
     args: [files('shell/test_build_examples_gating.sh')],
-    suite: 'docs',
+    suite: 'platform',
     timeout: 120,
   )
   # Registered off Windows only (#5428): both fork hundreds of subshells (about
@@ -3593,10 +3597,12 @@ if _bash_test.found()
     # foreign port holders. Sources the script with kill/ps/pgrep/lsof/docker
     # replaced by functions; spawns and signals nothing. The decoy command line
     # contains yuzu-agent, as the `meson compile` the old pgrep -f killed did.
+    # platform: OS-contract test, runs on every leg that registers it, i.e. Linux and macOS (docs is
+    # OS-independent and Linux-only since 2026-10-21); start-UAT.sh has Darwin-specific branches.
     test('start-UAT.sh kill_stale scoping (#5333)',
       _bash_test,
       args: [files('shell/test_start_uat_kill_stale.sh')],
-      suite: 'docs',
+      suite: 'platform',
       timeout: 60,
     )
   endif
@@ -3631,11 +3637,14 @@ endif
 # deliberately NOT part of this condition (#4262): every real plugin now
 # builds unconditionally under build_agent regardless of build_examples, so
 # capmatrix-gen always has something to inspect once build_agent is on.
+#
+# platform: OS-contract test, runs on every leg (docs is OS-independent and Linux-only since 2026-10-21);
+# it picks .so/.dylib/.dll and loads the real fixture plugins through capmatrix-gen.
 if _bash_test.found() and meson.can_run_host_binaries() and build_agent
   test('capability matrix gate shell tests (#2204 F10)',
     _bash_test,
     args: [files('shell/test_capability_matrix_gate.sh'), meson.project_build_root()],
-    suite: 'docs',
+    suite: 'platform',
     timeout: 120,
     depends: [
       abi3_fixture_plugin,
@@ -3798,13 +3807,15 @@ endif
 # #5906: `yuzu-server --healthcheck` CLI contract against the real binary (no listener, no
 # Postgres): the unit suite covers the probe's rules and transport, only this proves main.cpp
 # runs it before any server init. `yuzu_server_exe` is bound in server/core/meson.build.
-# Suite 'docs': scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a
-# gate labelled 'server' fails that check on the Windows legs.
+# platform: OS-contract test, runs on every leg (docs is OS-independent and Linux-only since 2026-10-21);
+# it drives the native binary (`.exe` probe, MSYS2_ARG_CONV_EXCL, cygpath). Suite 'platform', not a bare
+# 'server': scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a gate
+# labelled only 'server' fails that check on the Windows legs.
 if _bash_test.found() and meson.can_run_host_binaries() and build_server
   test('healthcheck CLI contract (#5906)',
     _bash_test,
     args: [files('shell/test_healthcheck_cli.sh'), meson.project_build_root()],
-    suite: ['server', 'docs'],
+    suite: ['server', 'platform'],
     timeout: 60,
     depends: [yuzu_server_exe],
   )

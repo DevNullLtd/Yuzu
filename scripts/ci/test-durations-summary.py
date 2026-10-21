@@ -14,7 +14,8 @@ would rank nested section timings next to their parent and merge identically
 named sections of different cases. This script therefore keeps a line only when
 its name is a listed test case of that entry (`--list-tests --verbosity quiet`
 is one bare case name per line), and sums those per case across re-entries
-(`runs` = re-entries). An entry whose listing fails degrades to unfiltered
+(`runs` = re-entries). Known limit: a section named exactly like another case of the
+same entry is summed into that case. An entry whose listing fails degrades to unfiltered
 lines, marked `(unfiltered)` in the table.
 
 Reporting only, never a gate (#4884): any failure in the reporting path becomes
@@ -147,7 +148,7 @@ def read_records(path):
 
 def introspect_tests(builddir):
     p = subprocess.run(["meson", "introspect", builddir, "--tests"],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, timeout=60)
     return json.loads(p.stdout) if p.returncode == 0 else []
 
 
@@ -183,6 +184,11 @@ def _checks():
     check("summarise: sectioned case -> one root row, runs=2, secs summed, leaves dropped",
           cs == [("ent", "root", 3.0, 2)])
     check("summarise: entry % from introspect timeout", ents == [("ent", 50.0, 100, 0.5, False)])
+    clash = [{"name": "server - yuzu:ent", "duration": 1.0,
+              "stdout": "1.000 s: other case\n1.000 s: parent\n2.000 s: other case\n"}]
+    _, cs = summarise(clash, tests, {"ent": {"parent", "other case"}}, 25)
+    check("summarise: known limit - a section named like another case of its entry is summed into that case",
+          cs == [("ent", "other case", 3.0, 2), ("ent", "parent", 1.0, 1)])
 
     ents, cs = summarise(recs, tests, {"ent": None}, 25)
     check("summarise: None case set keeps every line and flags (unfiltered)",

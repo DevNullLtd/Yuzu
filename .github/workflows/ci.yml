@@ -272,7 +272,7 @@ jobs:
   #     windows, macos and docs-required-checks `need` this job and read
   #     `needs.preflight-gate.outputs.*`.
   #   preflight       ("Preflight (runner health)") keeps the REQUIRED-CHECK
-  #     name the dev ruleset blocks merges on, and carries the eight source
+  #     name the dev ruleset blocks merges on, and carries the source
   #     gates (shell gate tests, portable paths, API parity, MCP retry hints,
   #     ...). No compile job waits on it; it runs alongside them.
   #

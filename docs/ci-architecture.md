@@ -1819,7 +1819,7 @@ and the ci.yml `preflight-gate` job share `scripts/ci/runner-health-check.py`
 (2026-10-21) so the compile jobs start after a short gate instead of the whole
 serial job: `preflight-gate` ("Preflight (gate)") holds the docs-only
 classification, the pool probe and every output; `preflight` ("Preflight
-(runner health)", the name the dev ruleset requires) holds the eight source
+(runner health)", the name the dev ruleset requires) holds the source
 gates and runs alongside the builds. `preflight` runs under `!cancelled()` and
 its first step fails unless `preflight-gate` succeeded, so a failed gate (or a
 failed `trusted_inputs`, which skips the gate) reds the required check instead
@@ -1895,26 +1895,37 @@ Which contexts are required is a repository ruleset setting ("Protect Main",
 
 The meson `docs` suite is OS-independent (lexical gates, selftests, lint
 tests) and runs on the **Linux leg only**. Its "runs on every leg" premise was
-false at the Python level: four entries pin OS-specific behaviour inside the
-test file itself, not behind a meson guard. Those four carry the `platform`
-suite instead, which every leg runs:
+false at the test-file level: nine entries pin OS-specific behaviour inside the
+test file or script itself, not behind a meson guard. Those nine carry the
+`platform` suite instead, which every leg runs:
 
 | Entry | Why it is OS-contract |
 |---|---|
 | `gateway build wrapper` | the Windows-only taskkill case and win32 branches in `tests/test_build_gateway.py`; its POSIX stdio and Ctrl-C behaviour must also keep running on Linux |
+| `gateway OTP pin resolution` | pins the `erl.exe` resolution that `scripts/erlang_toolchain.py` branches on for win32 (`tests/test_erlang_toolchain_otp.py`) |
 | `instructions runner hardening` | `WindowsConsoleBreak` (win32) next to about two thousand lines of POSIX tests |
 | `windows sdk contract` | exercises the MSYS2 bash setup contract on win32 |
 | `Windows toolchain contract` | registered only where `pwsh` is installed (not the Linux image) |
+| `build_examples=false gating smoke test` | selects the per-OS vcpkg triplet with `uname -s` and configures a real build on each leg |
+| `start-UAT.sh kill_stale scoping (#5333)` | sources `scripts/start-UAT.sh`, the macOS/Linux rig with Darwin branches; registered off Windows, so it runs on Linux and macOS |
+| `capability matrix gate shell tests (#2204 F10)` | picks `.so`/`.dylib`/`.dll` and loads the real fixture plugins through `capmatrix-gen` on each leg |
+| `healthcheck CLI contract (#5906)` | a bash test that drives the real native `yuzu-server` binary (`.exe` probe, `MSYS2_ARG_CONV_EXCL`, `cygpath`); labelled `['server', 'platform']` |
 
 Linux selects `--suite docs … --suite platform`; Windows selects `--suite platform`
 (not `docs`) with `--exclude-suite docs` on its coverage guard; macOS runs
-everything but `--no-suite docs`. The three dual-labelled node tests
-(`['server', 'docs']`) therefore no longer run on Windows or macOS, by intent.
-Before moving an entry, grep the docs-suite tests for a Windows- or
-macOS-positive branch (`skipUnless(... win32`, `if sys.platform == "win32":`
-guarding assertions, an OS-tool `find_program` guard); a `skipIf(win32)` is not
-one. `assert-suite-cover.py` fails the Windows leg on any registered entry that
-is neither selected nor excluded.
+everything but `--no-suite docs`. The two dual-labelled node tests
+(`shell bell script behaviour`, `tokens page rotate behaviour`; `['server', 'docs']`)
+therefore no longer run on Windows or macOS, by intent.
+Before moving an entry, grep the docs-suite tests, Python and shell, for a
+Windows- or macOS-positive branch: `skipUnless(... win32`,
+`if sys.platform == "win32":` guarding assertions, a Python ternary on
+`sys.platform` (`"erl.exe" if sys.platform == "win32" else "erl"`), a shell
+`uname -s` arm, `cygpath` or `MSYS2_*` handling, a `.exe` probe, a per-OS
+triplet or extension select, an OS-tool `find_program` guard, or a test that
+drives a real built binary or plugin on each leg. A `skipIf(win32)` is not one,
+and neither is a fixture string that merely names an OS. `assert-suite-cover.py`
+fails the Windows leg on any registered entry that is neither selected nor
+excluded.
 
 ## Postgres for server tests (`YUZU_TEST_POSTGRES_DSN`)
 
@@ -2260,9 +2271,11 @@ Catch2 prints a duration line at the end of every *section*, with the test
 case's own line last on each re-entry, so the script keeps a line only when its
 name is a listed case of that entry (`--list-tests --verbosity quiet`, one
 spawn per Catch2 entry, 30 s timeout) and sums per case across re-entries
-(`runs` is the number of re-entries). Case identity, not name matching, is what
-keeps a nested section from ranking beside its parent and identically named
-sections of different cases from merging. A failed listing degrades that entry
+(`runs` is the number of re-entries). Section lines whose name is not also a case
+name of that entry are dropped, so a nested section does not rank beside its
+parent; a section that shares its name with another case of the same entry is
+summed into that case (a known limit, pinned by the selftest; Catch2's
+structured reporter is the fix if it ever bites). A failed listing degrades that entry
 to unfiltered lines and marks it `(unfiltered)`. The report is never a gate:
 any failure becomes a `::warning` and exit 0; only `--selftest` (meson test
 `test-durations-summary selftest`) can exit non-zero.
