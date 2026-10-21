@@ -60,6 +60,8 @@
 #include <string_view>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #ifndef YUZU_SERVER_SRC_DIR
 #error                                                                                             \
     "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build (meson.project_source_root() / 'server' / 'core' / 'src') - see the server_test_exe cpp_args block."
@@ -567,4 +569,62 @@ TEST_CASE("MCP dispatch coverage: the ctor feeds the validator from the merged c
     CHECK(code.find(squash("kInvalidParams, \"arguments must be a JSON object\""), lookup) < call_at);
     // ...and it is the only such refusal between the lookup and the guarded call.
     CHECK(code.find(args_check, check_at + 1) > call_at);
+}
+
+// A5 item 2/3/4 (docs/agentic-first-principle.md): the machine-checkable half of the agentic
+// context contract, applied to EVERY registry tool, so a tool added to a new domain file is held
+// to it with no edit here. The prose half (when to use, chaining, what an empty result means)
+// cannot be checked by a program; it is the consistency-auditor's Gate 4 checklist in the same
+// doc. This test is the floor under that review, not a replacement for it.
+TEST_CASE("MCP registry tools: every record carries the A5 machine-checkable context",
+          "[mcp][a5][dispatch_coverage]") {
+    using nlohmann::json;
+    const auto records = yuzu::server::mcp::registry_records_for_test();
+    REQUIRE(!records.empty());
+    // A floor on the description, not a target: a tool that states its purpose, its bounds and
+    // what its result means does not fit in less.
+    constexpr std::size_t kMinDescription = 300;
+    // Pre-existing registry tools below the floor, owned by the A5 backfill (track 2g) rather
+    // than by whichever PR first added this test. An exemption must still be short: once the
+    // description is brought up to the floor the entry fails below and must be deleted, so the
+    // list can only shrink.
+    const std::set<std::string> kShortDescriptionBackfill{"discover_routes"};
+    for (const auto& r : records) {
+        INFO("tool " << r.name);
+        const std::string desc = r.description;
+        if (kShortDescriptionBackfill.contains(r.name))
+            CHECK(desc.size() < kMinDescription);
+        else
+            CHECK(desc.size() >= kMinDescription);
+        if (r.effect == yuzu::server::mcp::ToolEffect::ReadOnly) {
+            std::string lower = desc;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            CHECK(lower.find("read-only") != std::string::npos);
+        }
+
+        const json in = json::parse(r.input_schema_json);
+        REQUIRE(in.is_object());
+        if (in.contains("properties")) {
+            for (const auto& [prop, schema] : in["properties"].items()) {
+                INFO("property " << prop);
+                REQUIRE(schema.contains("type"));
+                CHECK(schema.contains("description"));
+                if (schema.contains("description"))
+                    CHECK(!schema["description"].get<std::string>().empty());
+                const bool is_string = schema["type"] == "string";
+                if (is_string && !schema.contains("enum"))
+                    CHECK(schema.contains("maxLength"));
+                if (schema["type"] == "integer")
+                    CHECK(schema.contains("minimum"));
+            }
+        }
+
+        // A typed output schema: the generic additionalProperties placeholder does not count.
+        const json out = json::parse(r.output_schema_json);
+        REQUIRE(out.is_object());
+        CHECK(out.contains("properties"));
+        if (out.contains("properties"))
+            CHECK(!out["properties"].empty());
+    }
 }

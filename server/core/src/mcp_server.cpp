@@ -28807,6 +28807,10 @@ void dispatch_registry_handler_for_test(ToolHandler handler, const ToolCallConte
     dispatch_registry_handler(handler, "dispatch_registry_handler_for_test", ctx);
 }
 
+std::span<const ToolRecord> registry_records_for_test() {
+    return registered_tool_records();
+}
+
 std::vector<std::string> registry_tool_names_for_test() {
     std::vector<std::string> names;
     for (const auto& r : registered_tool_records())

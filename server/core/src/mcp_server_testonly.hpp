@@ -68,6 +68,11 @@ std::vector<std::string> tool_names_for_test();
 // so the dispatch-coverage test can tell them apart from the legacy chain's tools.
 std::vector<std::string> registry_tool_names_for_test();
 
+// The registry records themselves (name, description, input/output schema JSON, effect),
+// so the A5 context-contract test can check every registry tool, present and future, without
+// listing them by hand. Non-owning views over the constexpr record tables.
+std::span<const ToolRecord> registry_records_for_test();
+
 // Builds the merged catalogue (legacy tables plus `records` in place of the real
 // registry) and discards it. Throws std::logic_error, naming the record and the
 // defect, when a record is malformed (see record_defect() in mcp_tool_registry.hpp);

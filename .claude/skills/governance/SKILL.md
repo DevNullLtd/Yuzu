@@ -1044,8 +1044,12 @@ state, schema, and contract consistency. Check:
    arguable): standard spec annotations (`title`/`readOnlyHint`/
    `destructiveHint`/`idempotentHint`/`openWorldHint`; destructive/
    idempotent semantics machine-readable, never prose-only),
-   decision-grade description (when to use, workflow chaining,
-   empty-result meaning), bounded documented input schema, typed
+   decision-grade description (when to use and which sibling to use
+   instead, workflow chaining, empty-result meaning, snapshot vs live,
+   terminal vs retryable errors: the five-question checklist in
+   `docs/agentic-first-principle.md` §A5 item 2, every claim verified
+   against the code; `[a5]` in `test_mcp_dispatch_coverage.cpp` is the
+   machine floor), bounded documented input schema, typed
    output schema for stable shapes, honest `retry_after_ms` on
    retryable errors; if the PR adds a tool family or reshapes the
    operating model, the `initialize.instructions` blob is updated in
