@@ -757,6 +757,29 @@ public:
                                  const std::string& detail = {},
                                  const std::string& principal_class_override = {});
 
+    /// `audit_log_for_principal` for a SESSION the caller already resolved (#6065 PR-Q,
+    /// `RestApiV1::AuditAsSessionFn`): stamps the session's username, the `principal_role`
+    /// the caller passes (it captures `effective_role` once per request), and the engine
+    /// class when `session.principal_kind == "engine"`, so a row carries the fields
+    /// `make_audit_event` would have stamped for that session without re-resolving the
+    /// request (cookie first, then bearer), which can name a different actor.
+    bool audit_log_for_session(const httplib::Request& req, const auth::Session& session,
+                               const std::string& principal_role, const std::string& action,
+                               const std::string& result, const std::string& target_type = {},
+                               const std::string& target_id = {}, const std::string& detail = {});
+
+    /// The ONE production `RestApiV1::AuditAsSessionFn` (same `std::function` type): a closure
+    /// over `this` that forwards every argument, in order, to `audit_log_for_session`. A
+    /// factory, like `gateless_tier_policy_fn()`, so server.cpp wires this and never a
+    /// hand-rolled lambda whose eight same-typed parameters could be transposed unseen; a
+    /// test drives this very closure through a real `AuditStore`. The `AuthRoutes` must
+    /// outlive every call (it is owned by `ServerImpl`, as for the other `[ar = ...]` writers).
+    using AuditAsSessionFn = std::function<bool(
+        const httplib::Request&, const auth::Session&, const std::string& principal_role,
+        const std::string& action, const std::string& result, const std::string& target_type,
+        const std::string& target_id, const std::string& detail)>;
+    [[nodiscard]] AuditAsSessionFn audit_as_session_fn();
+
     /// The `AuditEvent` `audit_log_for_principal` would write, built WITHOUT
     /// writing it (#5342 Gate 8): the identity/request fields (principal,
     /// role, class, source IP, user agent, session correlator, target) for a
