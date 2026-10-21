@@ -149,16 +149,19 @@ terminal arms, and the gateway-ingest RUNNING and terminal arms),
 `audit_registry_frame` runs immediately before `notify_exec_tracker`: the
 `registry.write` rows a frame owes (`plugin_result_audit.hpp`) are written before
 the tracker advances and before `agent-transition` is published on the
-`ExecutionEventBus`, so an operator watching an execution never sees a mutation
-complete before its audit row exists. The write is synchronous: a failing audit
-write never stops an execution (the failure is reported, then the tracker
-advances), but it can delay that frame by the audit store's write timeout. A new
-site that stores an output-carrying frame needs the same hook in the same place.
+`ExecutionEventBus`. The `responses` row and the SSE output rows are stored and
+published before the hook, so what is guaranteed is the execution's status, not
+the visibility of the output. The write is synchronous (one commit per row): a
+failing audit write never stops an execution (the failure is reported, then the
+tracker advances), but the frame waits for it, for the rows' commit latency and,
+when the store fails, the audit store's write timeout. A new site that stores an
+output-carrying frame needs the same hook in the same place.
 
 Regression pins: `test_plugin_result_audit.cpp` ("the row is written before the
 execution advances ...") pins the gateway RUNNING site at runtime;
 `tests/test_audit_action_stamp_wiring_lexical.py` pins all four sites' order and
-their count (the Subscribe arms have no ordering harness).
+their count (the Subscribe arms and the gateway terminal arm have no runtime
+ordering harness).
 
 ### Partial-index planner contract
 

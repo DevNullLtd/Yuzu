@@ -61,43 +61,98 @@ namespace yuzu::server::detail {
 // Bring html_escape into scope for the HTML rendering methods.
 using yuzu::server::html_escape;
 
-// Persists the `registry.write` audit rows one agent output frame owes (see
-// plugin_result_audit.hpp for the binding: plugin == registry AND the agent-stamped
-// CommandResponse.action is one of the three mutating actions). Called at every site that stores an
-// output-carrying frame -- the agent flushes plugin output in RUNNING frames and its terminal frame
-// carries none, so a terminal-only hook would audit nothing. Returns false when a row failed to
-// persist (the first failure ends the frame: a saturated pool costs ~500 ms per further INSERT, and
-// the caller's trailer already tells the operator); no store (or one that is not open) is a silent
-// no-op like every other audit site here.
-[[nodiscard]] static bool audit_registry_frame(AuditStore* store, const std::string& agent_id,
-                                               const pb::CommandResponse& resp) {
-    if (resp.output().empty() || resp.action().empty() || store == nullptr || !store->is_open())
+// Persists the `registry.write` audit rows one stored output frame owes (see
+// plugin_result_audit.hpp for the binding: a minted registry command id AND an agent-stamped
+// mutating action). Called at every site that stores an output-carrying frame, immediately before
+// `notify_exec_tracker` so the row exists before the execution advances (tests/
+// test_audit_action_stamp_wiring_lexical.py pins the four sites and their order). The agent flushes
+// plugin output in RUNNING frames and its terminal frame carries none, so the terminal sites are
+// defence in depth for an agent that returns output there.
+//
+// The PURE verdict runs first and the store is touched only when the frame owes rows or a flag, so
+// no other frame ever reaches it. The store is held weakly and locked here: process_gateway_response
+// runs on the detached forwarder threads of #3279, which outlive the gRPC drain, and a forwarder
+// that locks the store keeps it alive for exactly this call (set_registry_audit_store). What the
+// store borrows (the pool) is #3279's, unchanged.
+//
+// Every row is charged to a per-agent budget (kRegistryAuditBudget*): a bound per frame is not a
+// bound on frames, and one enrolled agent looping 300-line frames would otherwise write
+// unbounded 365-day evidence. A refused row is counted, never queued; the first failure to persist
+// ends the frame. The hook must not throw into a stream handler or a detached thread, so
+// anything it raises is reported as a failed write.
+bool AgentServiceImpl::audit_registry_frame(const std::string& agent_id,
+                                            const pb::CommandResponse& resp) {
+    if (resp.output().empty() || resp.action().empty())
         return true;
-    const auto plugin = yuzu::server::extract_plugin(resp.command_id());
-    const auto frame = registry_audit_events_for_frame(agent_id, resp.command_id(), plugin,
-                                                       resp.action(), resp.output(),
-                                                       yuzu::server::now_epoch_seconds());
-    // One line per frame, not per row: a registry mutating action whose command_id the server
-    // could not have minted is ignored, and that is the operator's only signal.
-    if (frame.unmintable_id)
-        spdlog::warn("[audit] registry.write frame ignored: command_id is not a server-minted "
-                     "shape (agent={}, {} bytes)",
-                     yuzu::log_id_token(agent_id), resp.command_id().size());
-    // Lines past the per-frame cap are dropped; this line is the only sign of it (the trailer
-    // keeps its meaning: a row failed to persist). The id is mint-shaped here, so safe to log.
-    if (frame.truncated)
-        spdlog::warn("[audit] registry.write frame carried more than {} audit lines; the rest "
-                     "were not recorded (agent={}, command={})",
-                     kMaxRegistryAuditLinesPerFrame, yuzu::log_id_token(agent_id),
-                     yuzu::log_id_token(resp.command_id()));
-    for (std::size_t i = 0; i < frame.events.size(); ++i)
-        if (!store->log(frame.events[i])) {
-            spdlog::warn("[audit] registry.write row failed to persist (agent={}); {} further "
-                         "row(s) of this frame not attempted",
-                         yuzu::log_id_token(agent_id), frame.events.size() - i - 1);
-            return false;
+    const auto frame = registry_audit_events_for_frame(
+        agent_id, resp.command_id(), extract_plugin(resp.command_id()), resp.action(),
+        resp.output(), yuzu::server::now_epoch_seconds());
+    if (frame.events.empty() && !frame.truncated && !frame.unmintable_id)
+        return true;
+    const auto store = registry_audit_store_.lock();
+    if (!store || !store->is_open())
+        return true; // audit off: silent, like every other audit site here
+    // The metric is the complete signal; the log lines below are for a human. Rows for
+    // `suppressed` and `persist_failed`, frames for `unmintable_id` and `truncated`.
+    const auto dropped = [this](const char* reason, std::size_t n) {
+        metrics_.counter("yuzu_server_registry_audit_dropped_total", {{"reason", reason}})
+            .increment(static_cast<double>(n));
+    };
+    std::size_t i = 0;
+    try {
+        if (frame.unmintable_id) {
+            dropped("unmintable_id", 1);
+            spdlog::warn("[audit] registry.write frame ignored: command_id is not a server-minted "
+                         "shape (agent={}, {} bytes)",
+                         yuzu::log_id_token(agent_id), resp.command_id().size());
         }
-    return true;
+        if (frame.truncated) {
+            dropped("truncated", 1);
+            // The id is a minted shape here, so it is safe to log.
+            spdlog::warn("[audit] registry.write frame exceeded the audit bounds (more than {} "
+                         "lines, or a line over {} bytes); the excess was not recorded "
+                         "(agent={}, command={})",
+                         kMaxRegistryAuditLinesPerFrame, kMaxRegistryAuditLineBytes,
+                         yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()));
+        }
+        // Every row is charged, so the budget's window report counts refused ROWS exactly. Once an
+        // agent is over budget every later row of the window is refused too, and none is queued.
+        std::size_t refused = 0;
+        for (; i < frame.events.size(); ++i) {
+            const auto admit = registry_audit_budget_->try_admit(agent_id);
+            if (admit.closed_window_suppressed != 0)
+                spdlog::warn("[audit] registry.write rows refused by the per-agent budget in the "
+                             "last window: {}",
+                             admit.closed_window_suppressed);
+            if (!admit.admitted) {
+                ++refused;
+                continue;
+            }
+            if (!store->log(frame.events[i])) {
+                if (refused != 0)
+                    dropped("suppressed", refused);
+                dropped("persist_failed", frame.events.size() - i);
+                spdlog::warn("[audit] registry.write row failed to persist (agent={}, "
+                             "command={}); {} further row(s) of this frame not attempted",
+                             yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()),
+                             frame.events.size() - i - 1);
+                return false;
+            }
+        }
+        if (refused != 0)
+            dropped("suppressed", refused); // a refusal of the ROWS, never a failure of the write
+        return true;
+    } catch (const std::exception& e) {
+        dropped("persist_failed", frame.events.size() - i);
+        spdlog::error("[audit] registry.write hook threw: {} (agent={}, command={})", e.what(),
+                      yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()));
+        return false;
+    } catch (...) {
+        dropped("persist_failed", frame.events.size() - i);
+        spdlog::error("[audit] registry.write hook threw (agent={}, command={})",
+                      yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()));
+        return false;
+    }
 }
 
 
@@ -115,6 +170,9 @@ AgentServiceImpl::AgentServiceImpl(AgentRegistry& registry, EventBus& bus,
     // bounded even when no operator config is applied and in every test that
     // constructs this service directly. set_ota_bound_config() replaces it.
     set_ota_bound_config(ota_cfg_);
+    registry_audit_budget_ = std::make_unique<DenialAuditBudget>(
+        kRegistryAuditBudgetRows, kRegistryAuditBudgetWindowMs, DenialAuditBudget::NowMsFn{},
+        kRegistryAuditBudgetAgents);
 }
 
 // -- Register -----------------------------------------------------------------
@@ -1379,6 +1437,9 @@ grpc::Status AgentServiceImpl::Subscribe(
 
     // Read loop -- process responses from the agent
     pb::CommandResponse resp;
+    // The audit-failed trailer is added once per stream: AddTrailingMetadata appends to a multimap
+    // for the life of the call, and the trailer is delivered only when the stream closes.
+    bool audit_failed_signalled = false;
     while (stream->Read(&resp)) {
         registry_.touch_activity(agent_id);
 
@@ -1479,8 +1540,10 @@ grpc::Status AgentServiceImpl::Subscribe(
             }
 
             // registry.write audit rows (RUNNING frames carry the plugin output).
-            if (!audit_registry_frame(audit_store_, agent_id, resp))
+            if (!audit_registry_frame(agent_id, resp) && !audit_failed_signalled) {
                 signal_grpc_audit_failed(context);
+                audit_failed_signalled = true;
+            }
 
             // UAT 2026-05-06 #8: notify the executions tracker so the
             // drawer's per-agent KPI table populates and the SSE
@@ -1555,11 +1618,13 @@ grpc::Status AgentServiceImpl::Subscribe(
                 //             insert — would re-create the sentinel.
             }
 
-            // A terminal frame that carries output AND the agent-stamped action (a plugin that
-            // returns its rows only at the end) owes its audit rows too; a frame without the stamp
-            // owes none.
-            if (!audit_registry_frame(audit_store_, agent_id, resp))
+            // A terminal frame that carries output AND the agent-stamped action owes its audit
+            // rows too (defence in depth: this agent's terminal frame carries no output); a frame
+            // without the stamp owes none.
+            if (!audit_registry_frame(agent_id, resp) && !audit_failed_signalled) {
                 signal_grpc_audit_failed(context);
+                audit_failed_signalled = true;
+            }
 
             // UAT 2026-05-06 #8: notify the executions tracker on terminal
             // status so the drawer's per-agent KPI flips to its terminal
@@ -1811,7 +1876,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
 
         // registry.write audit rows. No gRPC context on the gateway path to carry an
         // audit-failed trailer, so a failed write is logged here.
-        if (!audit_registry_frame(audit_store_, agent_id, resp))
+        if (!audit_registry_frame(agent_id, resp))
             spdlog::error("[gateway] registry.write audit row failed to persist (agent={}, "
                           "command={})",
                           yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()));
@@ -1874,7 +1939,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         }
 
         // A terminal frame that carries output owes its audit rows too (see the Subscribe twin).
-        if (!audit_registry_frame(audit_store_, agent_id, resp))
+        if (!audit_registry_frame(agent_id, resp))
             spdlog::error("[gateway] registry.write audit row failed to persist (agent={}, "
                           "command={})",
                           yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()));

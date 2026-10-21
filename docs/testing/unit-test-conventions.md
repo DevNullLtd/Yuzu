@@ -22,7 +22,7 @@ For route-handler tests, `TestRouteSink` (`tests/unit/server/test_route_sink.hpp
 
 ## `ExecutionTracker` in `AgentServiceImpl` — `TrackerScope`
 
-For server tests that need a live `ExecutionTracker` in `AgentServiceImpl`, use the `TrackerScope` RAII helper in `tests/unit/server/test_tracker_scope.hpp` (`test_agent_service_impl.cpp` and `test_plugin_result_audit.cpp` both use it) — takes a `pg::PgPool&` (ADR-0065; PG-backed, not `:memory:` SQLite) and optionally an `ExecutionEventBus*` to attach, calls `set_execution_tracker`, offers `make_exec()` for a running execution row, and nulls the borrowed pointer before the tracker destructs (the production shutdown contract, `agent_service_impl.hpp:113`). It lives in its own server-only header rather than `test_helpers.hpp`, which is also built into the agent tests and cannot include server types.
+For server tests that need a live `ExecutionTracker` in `AgentServiceImpl`, use the `TrackerScope` RAII helper in `tests/unit/server/test_tracker_scope.hpp` (`test_agent_service_impl.cpp` and `test_plugin_result_audit.cpp` both use it) — takes a `pg::PgPool&` (ADR-0065; PG-backed, not `:memory:` SQLite) and optionally an `ExecutionEventBus*` to attach, calls `set_execution_tracker`, offers `make_exec()` for a running execution row, and nulls the borrowed pointer before the tracker destructs (the production shutdown contract, documented on `AgentServiceImpl::set_execution_tracker`). It lives in its own server-only header rather than `test_helpers.hpp`, which is also built into the agent tests and cannot include server types.
 
 ## Exception-safe test cleanup — `ScopeExit`
 

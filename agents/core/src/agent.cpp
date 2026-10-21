@@ -278,7 +278,8 @@ struct CommandContextImpl {
     std::shared_ptr<SubscribeStream> stream;
     std::mutex* write_mu; // protects concurrent stream->Write()
     std::string command_id;
-    // stamped on output + final frames (command_frames.hpp; proto CommandResponse.action)
+    // the dispatched action, stamped on every plugin-output flush; the final frame stamps
+    // cmd.action() itself (command_frames.hpp; proto CommandResponse.action)
     std::string action;
     std::chrono::steady_clock::time_point start_time;
     std::atomic<bool> first_output_sent{false};

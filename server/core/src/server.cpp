@@ -803,6 +803,17 @@ public:
                 metrics_.counter("yuzu_ota_identity_audit_suppressed_total",
                                  {{"rpc", rpc}, {"reason", reason}});
 
+        // registry.write audit evidence NOT recorded (plugin_result_audit.hpp). Pre-seeded so an
+        // alert or dashboard sees zero, not "no data". Units differ by reason: rows for
+        // `suppressed` (refused by the per-agent budget) and `persist_failed`; whole frames for
+        // `unmintable_id` (ignored) and `truncated` (a bound was hit).
+        metrics_.describe("yuzu_server_registry_audit_dropped_total",
+                          "registry.write audit evidence not recorded, by reason: rows for "
+                          "suppressed and persist_failed, frames for unmintable_id and truncated",
+                          "counter");
+        for (auto reason : {"suppressed", "persist_failed", "unmintable_id", "truncated"})
+            metrics_.counter("yuzu_server_registry_audit_dropped_total", {{"reason", reason}});
+
         metrics_.describe("yuzu_ota_download_peers_tracked",
                           "Peers currently tracked by the OTA admission map", "gauge");
         metrics_.gauge("yuzu_ota_download_peers_tracked").set(0.0);
@@ -5603,7 +5614,7 @@ public:
         {
             if (pg_pool_ && !startup_failed_) {
                 audit_store_ =
-                    std::make_unique<AuditStore>(*pg_pool_, cfg_.audit_retention_days);
+                    std::make_shared<AuditStore>(*pg_pool_, cfg_.audit_retention_days);
                 if (!audit_store_->is_open()) {
                     spdlog::error("[PG] Refusing to start: audit store migration/open failed "
                                   "(database reachable but the audit_store schema could not be "
@@ -6263,6 +6274,10 @@ public:
         // agent reached us.
         if (audit_store_ && audit_store_->is_open()) {
             agent_service_.set_audit_store(audit_store_.get());
+            // Weak and write-once: see AgentServiceImpl::set_registry_audit_store. Not cleared in
+            // stop() (clearing a weak_ptr concurrently with lock() is a data race); the owner's
+            // reset() below expires it.
+            agent_service_.set_registry_audit_store(audit_store_);
             if (gateway_service_) {
                 gateway_service_->set_audit_store(audit_store_.get());
             }
@@ -10957,6 +10972,13 @@ public:
         // below), which is why it no longer belongs in this enumeration -
         // response_store_/notification_store_ remain on the raw-pointer
         // pattern, #3279's reach set for them is unchanged.
+        // `audit_store_` JOINED this reach set with the `registry.write` hook
+        // (plugin_result_audit.hpp; process_gateway_response runs it on these same
+        // forwarder threads). It takes the analytics_store_ treatment below: shared_ptr
+        // here, a weak_ptr in agent_service_ locked per frame and only for a frame that
+        // owes audit rows, set once at wiring and never cleared. The object lifetime is
+        // closed structurally; the pg::PgPool& it borrows, and the detached thread
+        // itself, stay #3279's, unchanged.
         // #3279 should be updated to name the (now two-store) reach set,
         // plus &metrics_ (#1422: the same detached forward thread now also
         // increments yuzu_server_gateway_forward_total at each terminal
@@ -22336,7 +22358,9 @@ private:
     /// Born-on-PG campaign persistence for Periodic Access Reviews (SOC 2 CC6.2).
     /// Borrows pg_pool_ → declared after it; reset in stop() before the pool.
     std::unique_ptr<AccessReviewStore> access_review_store_;
-    std::unique_ptr<AuditStore> audit_store_;
+    /// SHARED so the `registry.write` hook can hold it weakly (set_registry_audit_store): a
+    /// detached forwarder thread (#3279) that locks it keeps it alive for its own call.
+    std::shared_ptr<AuditStore> audit_store_;
     /// #5342: one-transaction credential-change query owner. Borrows pg_pool_
     /// and audit_store_ — declared AFTER audit_store_ so it destructs first;
     /// stop() also resets it explicitly (after nulling auth_mgr_'s pointer)

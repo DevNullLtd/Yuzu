@@ -28,8 +28,8 @@ namespace yuzu::test {
 /// unwound from the outside in. Reordering the member declarations or
 /// replacing the user-defined dtor with `= default` would silently break the
 /// contract -- there is no compile-time guard. Mirrors the production
-/// ServerImpl "drain gRPC -> null setter -> reset" shutdown sequence at
-/// agent_service_impl.hpp:113.
+/// ServerImpl "drain gRPC -> null setter -> reset" shutdown sequence, documented
+/// on AgentServiceImpl::set_execution_tracker.
 struct TrackerScope {
     std::unique_ptr<yuzu::server::ExecutionTracker> tracker;
     yuzu::server::detail::AgentServiceImpl* svc{nullptr};

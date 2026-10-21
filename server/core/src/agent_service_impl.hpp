@@ -28,6 +28,7 @@
 #include <yuzu/server/auto_approve.hpp>
 #include "agent.grpc.pb.h"
 #include "agent_registry.hpp"
+#include "bounded_audit_budget.hpp"
 #include "cert_issuance_source.hpp"
 #include "event_bus.hpp"
 #include "ota_transfer_watchdog.hpp"
@@ -207,6 +208,23 @@ public:
     /// dropped audit row surfaces as a counter increment plus an
     /// analytics-event severity escalation, never a silent loss.
     void set_audit_store(AuditStore* store) { audit_store_ = store; }
+    /// The store the `registry.write` audit hook writes to (plugin_result_audit.hpp). Held WEAKLY
+    /// and locked per frame, unlike the raw `audit_store_` above, because the gateway-ingress hook
+    /// runs inside `process_gateway_response`, which is called from detached
+    /// `forward_gateway_pending` threads that outlive the gRPC drain (#3279). A forwarder that
+    /// locks the store keeps it alive for exactly its own call, whatever `stop()` does: the object
+    /// lifetime is closed structurally, the way `analytics_store_` closed it in #3350. This member
+    /// is written ONCE, before any concurrent reader exists, and is never cleared: clearing a
+    /// weak_ptr concurrently with `lock()` is a data race. The owner's `reset()` expires it.
+    void set_registry_audit_store(std::weak_ptr<AuditStore> store) {
+        registry_audit_store_ = std::move(store);
+    }
+    /// Replaces the per-agent `registry.write` row budget (tests inject a small one with a fake
+    /// clock). Call before the service is shared; the default is kRegistryAuditBudget* in
+    /// plugin_result_audit.hpp.
+    void set_registry_audit_budget(std::unique_ptr<DenialAuditBudget> budget) {
+        registry_audit_budget_ = std::move(budget);
+    }
     void set_health_store(AgentHealthStore* store) { health_store_ = store; }
     void set_mgmt_group_store(ManagementGroupStore* store) { mgmt_group_store_ = store; }
     void set_notification_store(NotificationStore* store) { notification_store_ = store; }
@@ -565,6 +583,10 @@ private:
     TagStore* tag_store_{nullptr};
     std::weak_ptr<AnalyticsEventStore> analytics_store_;
     AuditStore* audit_store_{nullptr};
+    /// See set_registry_audit_store: weak, locked per frame, write-once, never cleared.
+    std::weak_ptr<AuditStore> registry_audit_store_;
+    /// Per-agent row budget for the `registry.write` hook; built in the constructor.
+    std::unique_ptr<DenialAuditBudget> registry_audit_budget_;
     AgentHealthStore* health_store_{nullptr};
     ManagementGroupStore* mgmt_group_store_{nullptr};
     NotificationStore* notification_store_{nullptr};
@@ -638,6 +660,14 @@ private:
     /// those methods' doc comments.
     void notify_exec_tracker(const std::string& command_id, const std::string& agent_id,
                              const pb::CommandResponse& resp);
+
+    /// Persists the `registry.write` audit rows one stored output frame owes (see
+    /// plugin_result_audit.hpp for the binding). Called at every site that stores an
+    /// output-carrying frame, immediately before `notify_exec_tracker`, so the row exists before the
+    /// execution advances. Returns false when a row failed to persist (or the hook threw); true
+    /// when nothing was owed, no store is wired, or the rows were written or refused by the budget.
+    [[nodiscard]] bool audit_registry_frame(const std::string& agent_id,
+                                            const pb::CommandResponse& resp);
 
     /// HA WS-1(1b), ADR-2002 section 5: the single chokepoint every
     /// command_id -> execution_id read goes through (response-stamping in

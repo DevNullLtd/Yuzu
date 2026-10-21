@@ -201,7 +201,7 @@ struct GatewayResponseHarness {
 // (test_tracker_scope.hpp) constructs a real ExecutionTracker and wires it via
 // set_execution_tracker; destruction order is managed so the borrowed pointer
 // in svc is nulled before the tracker destructs (mirrors the production
-// shutdown contract documented at agent_service_impl.hpp:113).
+// shutdown contract documented on AgentServiceImpl::set_execution_tracker).
 
 // ── record_execution_id ────────────────────────────────────────────────────
 

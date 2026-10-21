@@ -3,29 +3,38 @@
 /**
  * plugin_result_audit.hpp -- turns the registry plugin's `audit|...` output lines into
  * `registry.write` audit rows. Pure: no I/O, no store call, no clock (the caller passes the time);
- * every rule is pinned by tests/unit/server/test_plugin_result_audit.cpp.
+ * the rules below are exercised by tests/unit/server/test_plugin_result_audit.cpp.
  *
  * THE BINDING. Plugin output is data an endpoint produced, so a line that merely STARTS with
- * `audit|` is evidence of nothing. A row is extracted only when the frame's command_id has a shape
- * the server could have minted AND names the `registry` plugin (ASCII-case-insensitively: the id
- * carries the spelling the operator typed, the agent runs the catalogue's) AND the frame's
- * `CommandResponse.action` (stamped by the AGENT on every ordinary output frame, agents/core/src/
- * agent.cpp CommandContextImpl::action) is one of the three MUTATING actions. A read action's
- * output can never mint a row, and an agent that stamps no action (every agent that predates the
- * stamp) produces none: fail-closed, documented. The binding does not depend on read output being
- * clean: a read action's output is never parsed for `audit|` lines, so the action gate (plugin ==
- * registry AND a stamped mutating action) is the control.
+ * `audit|` is evidence of nothing. A row is extracted only when the frame's command_id is exactly
+ * what the server mints for a registry command (`registry-` plus 16 or 32 lowercase hex digits; the
+ * plugin name keeps the operator's spelling, so it is compared ASCII-case-insensitively) AND the
+ * frame's `CommandResponse.action` (stamped by the AGENT on every plugin-output RUNNING frame and on
+ * the final frame, agents/core/src/agent.cpp CommandContextImpl::action) is one of the three
+ * MUTATING actions. A read action's output can never mint a row, and an agent that stamps no action
+ * (every agent that predates the stamp) produces none: fail-closed, documented. A read action's
+ * output is never parsed for `audit|` lines, so the action gate is the control, not the content.
+ * The rows stay ASSERTED BY THE ENDPOINT: the server checks the shape of the id and the stamped
+ * action, not a dispatch record.
  *
- * BOUNDS. kMaxRegistryAuditLinesPerFrame lines per frame, each cut to kMaxRegistryAuditLineBytes,
- * and a command_id of at most kMaxServerCommandIdBytes (it becomes every row's target_id, and a
- * frame is built whole before the first INSERT, so an unbounded id would be multiplied by the line
- * cap). ROW SHAPE. docs/user-manual/audit-log.md; `result` is the line's own `result=`, never
- * `dry_run=`; `detail` is the trusted `agent=<id>` token FIRST, then the line (a crafted line
- * cannot forge the token for a reader that takes the first match).
+ * BOUNDS. At most kMaxRegistryAuditLinesPerFrame lines per frame, each cut to
+ * kMaxRegistryAuditLineBytes on a character boundary, every control byte neutralised. A frame
+ * over a bound is reported (`truncated`) and the excess is not recorded; a cut line's row carries
+ * the server token `cut=1`. Across frames the caller applies a per-agent budget
+ * (kRegistryAuditBudget*), because a bound per frame is not a bound on frames.
  *
- * FIELD CONTRACT. The `result` is the FIRST `|result=` token of the line, so a producer must not
- * emit a `|` inside a field (a key or value name can hold one): otherwise that text could pick the
- * row's result. The escaping belongs to the producing plugin; this header cannot recover it.
+ * ROW SHAPE. docs/user-manual/audit-log.md. `result` is the FIRST `|result=` token of the WHOLE
+ * line (read before any cut), never `dry_run=`. `detail` is the trusted `agent=<id>` token FIRST,
+ * then `cut=1` when the line was cut, then the line: a crafted line cannot forge a server token for
+ * a reader that takes the first match. `target_type` is `command`, the spelling of the dispatch
+ * rows the `command_id` joins to.
+ *
+ * FIELD CONTRACT (a requirement on the plugin that produces the lines; this header cannot recover
+ * from a violation). One record per line, LF-terminated. No `|`, LF or CR inside a field: a registry
+ * key or value name can hold them, so the producer escapes them (otherwise that text could pick the
+ * row's result or forge a second row). Put `result=` before any caller-sized field: it is read from
+ * the whole line, but a line over the byte bound loses its tail. At most
+ * kMaxRegistryAuditLinesPerFrame lines and kMaxRegistryAuditLineBytes bytes per line.
  */
 
 #include <algorithm>
@@ -34,6 +43,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <yuzu/log_token.hpp>
@@ -52,24 +62,16 @@ inline constexpr std::array<std::string_view, 3> kRegistryMutatingActions{
 
 inline constexpr std::size_t kMaxRegistryAuditLinesPerFrame = 300;
 inline constexpr std::size_t kMaxRegistryAuditLineBytes = 4096;
-inline constexpr std::size_t kMaxServerCommandIdBytes = 160;
-// A generous cap on an endpoint-supplied id, not a bound on every id the server mints (a 128-byte
-// plugin ident plus "-" plus 32 hex is 161). The ids that can name the registry plugin are
-// `<registry>-<16 hex>` (command_routes.cpp) or `<registry>-<32 hex>` (dispatch_confined and the
-// scheduled enqueue in server.cpp): at most 8 + 1 + 32 bytes, and the cap must never drop below it.
-static_assert(kMaxServerCommandIdBytes >= sizeof("registry") - 1 + 1 + 32);
 
-/// The command_id shapes the server mints are `<plugin>-<16 or 32 hex>` or 32 hex, the plugin at
-/// most 128 bytes of [A-Za-z0-9_.-] (command_routes.cpp bad_ident). This tests charset and length
-/// only: the necessary shape of a server-minted id, not proof that one was minted. Anything else
-/// came from the agent, not the server.
-[[nodiscard]] constexpr bool is_server_minted_command_id(std::string_view id) noexcept {
-    return !id.empty() && id.size() <= kMaxServerCommandIdBytes &&
-           std::ranges::all_of(id, [](unsigned char c) {
-               return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-                      c == '_' || c == '.' || c == '-';
-           });
-}
+/// Per-agent row budget (bounded_audit_budget.hpp), applied across frames. Far above the volume of a
+/// legitimate agent (one row per write): its job is to stop an enrolled agent that loops
+/// 300-line frames from writing millions of 365-day evidence rows, not to ration normal use. The
+/// agent table is sized for a fleet-wide change answered inside one window; beyond it, further
+/// agents share one overflow bucket (sampling), and `yuzu_server_registry_audit_dropped_total`
+/// says so.
+inline constexpr std::size_t kRegistryAuditBudgetRows = 600;
+inline constexpr std::int64_t kRegistryAuditBudgetWindowMs = 60'000;
+inline constexpr std::size_t kRegistryAuditBudgetAgents = 262'144;
 
 /// `plugin` is the registry plugin, compared ASCII-case-insensitively (command_routes.cpp mints the
 /// id from the RAW request spelling; classify is case-insensitive, so `Registry` runs the write on
@@ -79,41 +81,23 @@ static_assert(kMaxServerCommandIdBytes >= sizeof("registry") - 1 + 1 + 32);
     return std::ranges::equal(plugin, kName, [](char a, char b) { return (a | 0x20) == b; });
 }
 
-/// The `audit|...` lines of one output frame (output lines are LF-separated), bounded and
-/// neutralised as described above. `*truncated` (when given) is set when a further `audit|` line
-/// was found past kMaxRegistryAuditLinesPerFrame: those lines are dropped, not recorded.
-[[nodiscard]] inline std::vector<std::string>
-extract_registry_audit_lines(std::string_view output, bool* truncated = nullptr) {
-    std::vector<std::string> out;
-    for (std::size_t pos = 0; pos < output.size();) {
-        const std::size_t nl = std::min(output.find('\n', pos), output.size());
-        std::string_view line = output.substr(pos, nl - pos);
-        pos = nl + 1;
-        if (!line.starts_with("audit|"))
-            continue;
-        if (out.size() == kMaxRegistryAuditLinesPerFrame) {
-            if (truncated != nullptr)
-                *truncated = true;
-            break;
-        }
-        if (line.size() > kMaxRegistryAuditLineBytes) {
-            std::size_t cut = kMaxRegistryAuditLineBytes;
-            while (cut > 0 && (static_cast<unsigned char>(line[cut]) & 0xC0) == 0x80)
-                --cut;
-            line = line.substr(0, cut);
-        }
-        std::string s{line};
-        // Every ASCII control byte (CR, NUL, ESC, BEL ...): the log file is an escape-interpreting
-        // sink.
-        std::ranges::replace_if(
-            s, [](unsigned char c) { return c < 0x20 || c == 0x7F; }, '_');
-        out.push_back(std::move(s));
-    }
-    return out;
+/// The command ids the server mints for a registry command: the plugin name as the operator typed
+/// it, `-`, then lowercase hex of 8 bytes (command_routes.cpp, the legacy forwarder in server.cpp)
+/// or 16 bytes (dispatch_confined and the scheduled enqueue in server.cpp). Anything else did not
+/// come from a server dispatch of the registry plugin. A valid shape is still forgeable by an
+/// endpoint (it is only a shape): the rows are asserted by the agent.
+[[nodiscard]] constexpr bool is_minted_registry_command_id(std::string_view id) noexcept {
+    constexpr std::string_view kName = "registry";
+    const std::size_t tail = id.size() > kName.size() + 1 ? id.size() - kName.size() - 1 : 0;
+    return (tail == 16 || tail == 32) && is_registry_plugin(id.substr(0, kName.size())) &&
+           id[kName.size()] == '-' &&
+           std::ranges::all_of(id.substr(kName.size() + 1), [](char c) {
+               return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+           });
 }
 
-/// The value of the line's `result=` field ("" when absent). Fields are `|`-separated tokens that
-/// the plugin guarantees contain no `|`.
+/// The value of the line's `result=` field ("" when absent): the text after the FIRST `|result=` up
+/// to the next `|` or the end of the line.
 [[nodiscard]] inline std::string_view registry_audit_result(std::string_view line) noexcept {
     constexpr std::string_view kKey = "|result=";
     const std::size_t at = line.find(kKey);
@@ -123,35 +107,89 @@ extract_registry_audit_lines(std::string_view output, bool* truncated = nullptr)
     return line.substr(start, std::min(line.find('|', start), line.size()) - start);
 }
 
+/// One `audit|` line, as it will be recorded.
+struct RegistryAuditLine {
+    std::string text;  ///< control bytes neutralised, cut to kMaxRegistryAuditLineBytes
+    bool ok{false};    ///< the whole line's first `|result=` token was `ok` (read before any cut)
+    bool cut{false};   ///< the line was longer than kMaxRegistryAuditLineBytes; `text` is its prefix
+};
+
+struct RegistryAuditLines {
+    std::vector<RegistryAuditLine> lines;
+    bool truncated{false}; ///< `audit|` lines past kMaxRegistryAuditLinesPerFrame were dropped
+};
+
+/// The `audit|...` lines of one output frame (output lines are LF-separated), bounded and
+/// neutralised as described above.
+[[nodiscard]] inline RegistryAuditLines extract_registry_audit_lines(std::string_view output) {
+    RegistryAuditLines out;
+    for (std::size_t pos = 0; pos < output.size();) {
+        const std::size_t nl = std::min(output.find('\n', pos), output.size());
+        std::string_view line = output.substr(pos, nl - pos);
+        pos = nl + 1;
+        if (!line.starts_with("audit|"))
+            continue;
+        if (out.lines.size() == kMaxRegistryAuditLinesPerFrame) {
+            out.truncated = true;
+            break;
+        }
+        RegistryAuditLine l;
+        l.ok = registry_audit_result(line) == "ok";
+        if (line.size() > kMaxRegistryAuditLineBytes) {
+            // Back off to a character boundary: a UTF-8 sequence is at most 4 bytes, so at most 3
+            // continuation bytes precede the cut. Anything longer is not UTF-8 and is cut at the
+            // bound (sanitize_pg_text repairs a split character at INSERT).
+            std::size_t back = 0;
+            while (back < 3 &&
+                   (static_cast<unsigned char>(line[kMaxRegistryAuditLineBytes - back]) & 0xC0) ==
+                       0x80)
+                ++back;
+            if ((static_cast<unsigned char>(line[kMaxRegistryAuditLineBytes - back]) & 0xC0) !=
+                0x80)
+                line = line.substr(0, kMaxRegistryAuditLineBytes - back);
+            else
+                line = line.substr(0, kMaxRegistryAuditLineBytes);
+            l.cut = true;
+        }
+        l.text = std::string{line};
+        // Every ASCII control byte (CR, NUL, ESC, BEL ...): the log file is an escape-interpreting
+        // sink.
+        std::ranges::replace_if(
+            l.text, [](unsigned char c) { return c < 0x20 || c == 0x7F; }, '_');
+        out.lines.push_back(std::move(l));
+    }
+    return out;
+}
+
 [[nodiscard]] inline AuditEvent make_registry_audit_event(std::string_view agent_id,
                                                           std::string_view command_id,
-                                                          std::string_view line,
+                                                          const RegistryAuditLine& line,
                                                           std::int64_t now_epoch_s) {
     AuditEvent ev;
     ev.timestamp = now_epoch_s;
     ev.principal = "agent:" + std::string{agent_id};
     ev.principal_role = "agent";
     ev.action = "registry.write";
-    ev.target_type = "Command";
+    ev.target_type = "command";
     ev.target_id = std::string{command_id};
-    // The trusted token goes FIRST: the line is endpoint text, and a ` agent=<other>` inside it
-    // must not be what a first-match reader finds (the role.elevation.granted convention).
-    ev.detail = "agent=" + yuzu::log_token(agent_id) + " " + std::string{line};
-    ev.result = registry_audit_result(line) == "ok" ? "success" : "failure";
+    // The trusted tokens go FIRST: the line is endpoint text, and a ` agent=<other>` or ` cut=1`
+    // inside it must not be what a first-match reader finds (the role.elevation.granted convention).
+    ev.detail = "agent=" + yuzu::log_token(agent_id) + (line.cut ? " cut=1 " : " ") + line.text;
+    ev.result = line.ok ? "success" : "failure";
     return ev;
 }
 
 /// What one output frame owes the audit log, decided without I/O. The caller persists `events` and
-/// logs the two flags, so it never re-derives the gate.
+/// reports the two flags, so it never re-derives the gate.
 struct RegistryAuditFrame {
     std::vector<AuditEvent> events;
-    bool truncated{false};     ///< audit| lines past kMaxRegistryAuditLinesPerFrame were dropped
-    bool unmintable_id{false}; ///< registry mutating frame, command_id not server-mintable: ignored
+    bool truncated{false};     ///< a bound was hit: lines past the cap dropped, or a line was cut
+    bool unmintable_id{false}; ///< registry mutating frame, command_id not a minted shape: ignored
 };
 
 /// Nothing unless `plugin` is `registry`, `action` is one of the mutating actions and `command_id`
-/// has a shape the server could have minted (a registry mutating frame that fails only the last
-/// test is flagged `unmintable_id`).
+/// is a minted registry id (a registry mutating frame that fails only the last test is flagged
+/// `unmintable_id`).
 [[nodiscard]] inline RegistryAuditFrame
 registry_audit_events_for_frame(std::string_view agent_id, std::string_view command_id,
                                 std::string_view plugin, std::string_view action,
@@ -159,12 +197,17 @@ registry_audit_events_for_frame(std::string_view agent_id, std::string_view comm
     RegistryAuditFrame frame;
     if (!is_registry_plugin(plugin) || !is_registry_mutating_action(action))
         return frame;
-    if (!is_server_minted_command_id(command_id)) {
+    if (!is_minted_registry_command_id(command_id)) {
         frame.unmintable_id = true;
         return frame;
     }
-    for (const auto& line : extract_registry_audit_lines(output, &frame.truncated))
+    const auto extracted = extract_registry_audit_lines(output);
+    frame.truncated = extracted.truncated;
+    frame.events.reserve(extracted.lines.size());
+    for (const auto& line : extracted.lines) {
+        frame.truncated = frame.truncated || line.cut;
         frame.events.push_back(make_registry_audit_event(agent_id, command_id, line, now_epoch_s));
+    }
     return frame;
 }
 

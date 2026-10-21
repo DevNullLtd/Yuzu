@@ -21,18 +21,20 @@ only partly covered. This gate is that coverage. Invariants:
 
   agent_service_impl.cpp
     4. Exactly four `response_store_->store(` calls (a fifth output-storing site needs a hook, or
-       a ruling that it owes none) and exactly four `audit_registry_frame(audit_store_, agent_id,
-       resp)` calls.
+       a ruling that it owes none) and exactly four `audit_registry_frame(agent_id, resp)` calls.
     5. Each hook is IMMEDIATELY followed by its failure signal and then by
        `notify_exec_tracker(resp.command_id(), agent_id, resp);`: the audit row is written
-       before the execution advances. Two Subscribe forms (the audit-failed trailer) and two
-       gateway forms (the error line).
+       before the execution advances. Two Subscribe forms, which add the audit-failed trailer
+       once per stream through `audit_failed_signalled`, and two gateway forms (an error line).
+    6. `audit_failed_signalled` is declared exactly once, BEFORE the Subscribe read loop: declared
+       inside it, it would be re-armed per frame and the trailer would be added per failed frame.
 
 `//` comments are stripped and whitespace runs collapsed before matching, so line wrapping and
-comment text cannot satisfy or break a check. The self-test applies in-memory mutations (a deleted
-stamp call, a deleted initialiser, a hook moved after the notification, a dropped failure signal)
-and requires problems() to be non-empty on each; a mutation whose pattern no longer matches fails
-loudly rather than passing vacuously.
+comment text cannot satisfy or break a check. The gateway error statement is matched as a whole
+(its wording is pinned by the unit test, not here). The self-test applies in-memory mutations (a
+deleted stamp call, a deleted initialiser, a hook moved after the notification, a dropped failure
+signal, a flag that is never set or is re-armed per frame) and requires problems() to be non-empty
+on each; a mutation whose pattern no longer matches fails loudly rather than passing vacuously.
 
 Usage: python3 tests/test_audit_action_stamp_wiring_lexical.py
 """
@@ -65,12 +67,16 @@ AGENT_ONCE = (
     ".action = cmd.action(),",
 )
 
-HOOK = "if (!audit_registry_frame(audit_store_, agent_id, resp))"
+HOOK = "audit_registry_frame(agent_id, resp)"
 NOTIFY = "notify_exec_tracker(resp.command_id(), agent_id, resp);"
-SUBSCRIBE_FORM = f"{HOOK} signal_grpc_audit_failed(context); {NOTIFY}"
-GATEWAY_FORM = (
-    f'{HOOK} spdlog::error("[gateway] registry.write audit row failed to persist (agent={{}}, "'
-    f' "command={{}})", yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id())); {NOTIFY}'
+FLAG_DECL = "bool audit_failed_signalled = false;"
+READ_LOOP = "while (stream->Read(&resp))"
+SUBSCRIBE_FORM = normalise(
+    f"if (!{HOOK} && !audit_failed_signalled) {{ signal_grpc_audit_failed(context);"
+    f" audit_failed_signalled = true; }} {NOTIFY}"
+)
+GATEWAY_RE = re.compile(
+    re.escape(normalise(f"if (!{HOOK}) spdlog::error(")) + r"[^;]*" + re.escape(normalise(f"); {NOTIFY}"))
 )
 
 
@@ -93,17 +99,31 @@ def server_problems(src):
             f"agent_service_impl.cpp: expected exactly 4 `response_store_->store(` sites, found {stores}"
             " (a new output-storing site needs an audit_registry_frame hook before its notify)"
         )
-    hooks = t.count(normalise("audit_registry_frame(audit_store_, agent_id, resp)"))
+    hooks = t.count(normalise(HOOK))
     if hooks != 4:
-        out.append(f"agent_service_impl.cpp: expected exactly 4 audit_registry_frame hook calls, found {hooks}")
-    for name, form in (("Subscribe", SUBSCRIBE_FORM), ("gateway", GATEWAY_FORM)):
-        want = normalise(form)
-        n = t.count(want)
-        if n != 2:
-            out.append(
-                f"agent_service_impl.cpp: expected exactly two {name} hooks of the form"
-                f" `{want}` (found {n}): the row is written before the execution advances"
-            )
+        out.append(f"agent_service_impl.cpp: expected exactly 4 `{HOOK}` hook calls, found {hooks}")
+    subscribe = t.count(SUBSCRIBE_FORM)
+    if subscribe != 2:
+        out.append(
+            f"agent_service_impl.cpp: expected exactly two Subscribe hooks of the form"
+            f" `{SUBSCRIBE_FORM}` (found {subscribe}): the row is written before the execution"
+            " advances, and the trailer is added once per stream"
+        )
+    gateway = len(GATEWAY_RE.findall(t))
+    if gateway != 2:
+        out.append(
+            f"agent_service_impl.cpp: expected exactly two gateway hooks of the form"
+            f" `if (!{HOOK}) spdlog::error(...); {NOTIFY}` (found {gateway}): the row is written"
+            " before the execution advances"
+        )
+    decls = t.count(FLAG_DECL)
+    loops = t.count(normalise(READ_LOOP))
+    if decls != 1 or loops != 1 or t.find(FLAG_DECL) > t.find(normalise(READ_LOOP)):
+        out.append(
+            f"agent_service_impl.cpp: `{FLAG_DECL}` must appear exactly once and BEFORE the single"
+            f" `{READ_LOOP}` (found {decls} declaration(s) and {loops} loop(s)): declared inside the"
+            " loop it would be re-armed per frame"
+        )
     return out
 
 
@@ -115,15 +135,39 @@ AGENT_MUTATIONS = [
     (r'#include "command_frames\.hpp"', ""),
 ]
 SERVER_MUTATIONS = [
-    # a hook deleted
-    (r"if \(!audit_registry_frame\(audit_store_, agent_id, resp\)\)\s*signal_grpc_audit_failed\(context\);", ""),
-    # the Subscribe failure signal dropped
-    (r"(if \(!audit_registry_frame\(audit_store_, agent_id, resp\)\))\s*signal_grpc_audit_failed\(context\);", r"\1 (void)0;"),
-    # a gateway hook moved after the notification
+    # a Subscribe hook deleted
     (
-        r"(if \(!audit_registry_frame\(audit_store_, agent_id, resp\)\)\s*spdlog::error\([^;]*;)(\s*(?://[^\n]*\n\s*)*)(notify_exec_tracker\(resp\.command_id\(\), agent_id, resp\);)",
+        r"if \(!audit_registry_frame\(agent_id, resp\) && !audit_failed_signalled\) \{\s*"
+        r"signal_grpc_audit_failed\(context\);\s*audit_failed_signalled = true;\s*\}",
+        "",
+    ),
+    # the Subscribe failure signal dropped
+    (
+        r"(if \(!audit_registry_frame\(agent_id, resp\) && !audit_failed_signalled\) \{)\s*"
+        r"signal_grpc_audit_failed\(context\);",
+        r"\1 (void)0;",
+    ),
+    # the once-per-stream flag never set
+    (r"\n\s*audit_failed_signalled = true;", ""),
+    # the flag declared inside the loop: re-armed for every frame
+    (
+        r"bool audit_failed_signalled = false;\s*while \(stream->Read\(&resp\)\) \{",
+        "while (stream->Read(&resp)) {\n        bool audit_failed_signalled = false;",
+    ),
+    # a Subscribe hook moved after the notification
+    (
+        r"(if \(!audit_registry_frame\(agent_id, resp\) && !audit_failed_signalled\) \{[^}]*\})"
+        r"(\s*(?://[^\n]*\n\s*)*)(notify_exec_tracker\(resp\.command_id\(\), agent_id, resp\);)",
         r"\3\2\1",
     ),
+    # a gateway hook moved after the notification
+    (
+        r"(if \(!audit_registry_frame\(agent_id, resp\)\)\s*spdlog::error\([^;]*;)"
+        r"(\s*(?://[^\n]*\n\s*)*)(notify_exec_tracker\(resp\.command_id\(\), agent_id, resp\);)",
+        r"\3\2\1",
+    ),
+    # a gateway hook deleted
+    (r"if \(!audit_registry_frame\(agent_id, resp\)\)\s*spdlog::error\([^;]*;", ""),
     # a fifth output-storing site appears
     (r"response_store_->store\(sr\);", "response_store_->store(sr);\nresponse_store_->store(sr);"),
 ]

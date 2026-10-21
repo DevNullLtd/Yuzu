@@ -278,3 +278,51 @@ send_command_stamps_real_command_id_on_not_connected_error_test() ->
         meck:unload(yuzu_gw_router),
         meck:unload(grpcbox_stream)
     end.
+
+%% CommandResponse.action (field 8) must survive the management hop for an ORDINARY (non-Guardian)
+%% response: the server's registry.write audit hook for a gateway-connected agent depends on it.
+%% Drives send_command/2 exactly like the not_connected test above (the router delivers one
+%% command_response and fanout_complete; grpcbox_stream:send/2 is captured), then pushes the
+%% captured message through management_pb, the codec the wire uses, and checks the decoded frame.
+send_command_forwards_the_stamped_action_test() ->
+    catch meck:unload(yuzu_gw_router),
+    catch meck:unload(grpcbox_stream),
+    meck:new(yuzu_gw_router, [non_strict, no_link]),
+    meck:new(grpcbox_stream, [non_strict, no_link]),
+    try
+        FanoutRef = make_ref(),
+        Self = self(),
+        CmdId = <<"registry-0123456789abcdef">>,
+        Frame = #{command_id => CmdId, status => 'RUNNING',
+                  output => <<"audit|op=set_value">>, action => <<"set_value">>},
+        meck:expect(yuzu_gw_router, send_command,
+                    fun(_AgentIds, _CommandReq, _Opts) ->
+                        Self ! {command_response, FanoutRef, <<"agent-1">>, Frame},
+                        Self ! {fanout_complete, FanoutRef, #{}},
+                        {ok, FanoutRef}
+                    end),
+        meck:expect(grpcbox_stream, send,
+                    fun(Msg, _Stream) ->
+                        Self ! {captured_send, Msg},
+                        ok
+                    end),
+
+        Request = #{agent_ids => [<<"agent-1">>],
+                    command => #{command_id => CmdId}},
+        ?assertEqual(ok, yuzu_gw_mgmt_service:send_command(Request, test_stream)),
+
+        receive
+            {captured_send, Msg} ->
+                ?assertEqual(<<"set_value">>,
+                             maps:get(action, maps:get(response, Msg), undefined)),
+                Wire = management_pb:encode_msg(Msg, 'yuzu.server.v1.SendCommandResponse'),
+                Decoded = management_pb:decode_msg(Wire, 'yuzu.server.v1.SendCommandResponse'),
+                ?assertEqual(<<"set_value">>,
+                             maps:get(action, maps:get(response, Decoded), undefined))
+        after 1000 ->
+            ?assert(false)
+        end
+    after
+        meck:unload(yuzu_gw_router),
+        meck:unload(grpcbox_stream)
+    end.
