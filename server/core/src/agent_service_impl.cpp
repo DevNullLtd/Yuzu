@@ -74,22 +74,27 @@ using yuzu::server::html_escape;
     if (resp.output().empty() || resp.action().empty() || store == nullptr || !store->is_open())
         return true;
     const auto plugin = yuzu::server::extract_plugin(resp.command_id());
-    const auto events = registry_audit_events_for_frame(agent_id, resp.command_id(), plugin,
-                                                        resp.action(), resp.output(),
-                                                        yuzu::server::now_epoch_seconds());
+    const auto frame = registry_audit_events_for_frame(agent_id, resp.command_id(), plugin,
+                                                       resp.action(), resp.output(),
+                                                       yuzu::server::now_epoch_seconds());
     // One line per frame, not per row: a registry mutating action whose command_id the server
     // could not have minted is ignored, and that is the operator's only signal.
-    if (events.empty() && is_registry_plugin(plugin) &&
-        is_registry_mutating_action(resp.action()) &&
-        !is_server_minted_command_id(resp.command_id()))
+    if (frame.unmintable_id)
         spdlog::warn("[audit] registry.write frame ignored: command_id is not a server-minted "
                      "shape (agent={}, {} bytes)",
                      yuzu::log_id_token(agent_id), resp.command_id().size());
-    for (std::size_t i = 0; i < events.size(); ++i)
-        if (!store->log(events[i])) {
+    // Lines past the per-frame cap are dropped; this line is the only sign of it (the trailer
+    // keeps its meaning: a row failed to persist). The id is mint-shaped here, so safe to log.
+    if (frame.truncated)
+        spdlog::warn("[audit] registry.write frame carried more than {} audit lines; the rest "
+                     "were not recorded (agent={}, command={})",
+                     kMaxRegistryAuditLinesPerFrame, yuzu::log_id_token(agent_id),
+                     yuzu::log_id_token(resp.command_id()));
+    for (std::size_t i = 0; i < frame.events.size(); ++i)
+        if (!store->log(frame.events[i])) {
             spdlog::warn("[audit] registry.write row failed to persist (agent={}); {} further "
                          "row(s) of this frame not attempted",
-                         yuzu::log_id_token(agent_id), events.size() - i - 1);
+                         yuzu::log_id_token(agent_id), frame.events.size() - i - 1);
             return false;
         }
     return true;

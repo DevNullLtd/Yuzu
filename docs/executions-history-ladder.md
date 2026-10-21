@@ -142,6 +142,24 @@ inserts" cover the two branches; the re-mapping case is pinned by
 "re-mapping a command_id updates the stamp" (terminal under the new
 exec_id falls through to insert because no RUNNING row exists there).
 
+### Audit rows before the execution advances (`registry.write`)
+
+At each of the four sites that store an output frame (the Subscribe RUNNING and
+terminal arms, and the gateway-ingest RUNNING and terminal arms),
+`audit_registry_frame` runs immediately before `notify_exec_tracker`: the
+`registry.write` rows a frame owes (`plugin_result_audit.hpp`) are written before
+the tracker advances and before `agent-transition` is published on the
+`ExecutionEventBus`, so an operator watching an execution never sees a mutation
+complete before its audit row exists. The write is synchronous: a failing audit
+write never stops an execution (the failure is reported, then the tracker
+advances), but it can delay that frame by the audit store's write timeout. A new
+site that stores an output-carrying frame needs the same hook in the same place.
+
+Regression pins: `test_plugin_result_audit.cpp` ("the row is written before the
+execution advances ...") pins the gateway RUNNING site at runtime;
+`tests/test_audit_action_stamp_wiring_lexical.py` pins all four sites' order and
+their count (the Subscribe arms have no ordering harness).
+
 ### Partial-index planner contract
 
 `idx_resp_execution_ts ON responses(execution_id, timestamp) WHERE

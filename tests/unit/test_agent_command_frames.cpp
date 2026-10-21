@@ -1,13 +1,14 @@
 // Pins the agent-side CommandResponse.action stamp (agents/core/src/command_frames.hpp).
 // This TU includes the SAME helper agent.cpp builds its frames with, so a change to the helper is
 // caught here; the server-side ingest tests stamp the action by hand and cannot see an agent-side
-// revert. Not covered: reverting only agent.cpp's call sites while leaving the helper intact.
-
-#include "command_frames.hpp"
+// revert. The call sites in agent.cpp that feed the helper are pinned separately, by
+// tests/test_audit_action_stamp_wiring_lexical.py.
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
+
+#include "command_frames.hpp"
 
 using Resp = ::yuzu::agent::v1::CommandResponse;
 

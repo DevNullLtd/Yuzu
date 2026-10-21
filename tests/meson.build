@@ -3679,6 +3679,18 @@ test('presence departure wiring lexical gate (#5678)',
   timeout: 30,
 )
 
+# registry.write audit wiring: static lexical gate pinning that agent.cpp stamps the dispatched action
+# on every output frame and its terminal frame (the command loop is not constructible from a test), and
+# that each of the four frame-storing sites in agent_service_impl.cpp writes the audit row BEFORE the
+# execution advances (the Subscribe pair has no ordering harness). Carries its own in-memory mutation
+# self-test. No build required. Suite 'docs' for the same reason as the presence gate above.
+test('audit action stamp wiring lexical gate',
+  _python3_test,
+  args: [files('test_audit_action_stamp_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Gateway-upstream peer authorization: static lexical gate pinning that server.cpp registers
 # the gateway-upstream service ONLY through GatewayPeerGuardedService (nothing constructs
 # ServerImpl, so no unit test can see the registration site). Carries its own negative-control

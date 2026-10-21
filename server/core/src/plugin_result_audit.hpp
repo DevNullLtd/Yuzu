@@ -20,7 +20,12 @@
  * and a command_id of at most kMaxServerCommandIdBytes (it becomes every row's target_id, and a
  * frame is built whole before the first INSERT, so an unbounded id would be multiplied by the line
  * cap). ROW SHAPE. docs/user-manual/audit-log.md; `result` is the line's own `result=`, never
- * `dry_run=`.
+ * `dry_run=`; `detail` is the trusted `agent=<id>` token FIRST, then the line (a crafted line
+ * cannot forge the token for a reader that takes the first match).
+ *
+ * FIELD CONTRACT. The `result` is the FIRST `|result=` token of the line, so a producer must not
+ * emit a `|` inside a field (a key or value name can hold one): otherwise that text could pick the
+ * row's result. The escaping belongs to the producing plugin; this header cannot recover it.
  */
 
 #include <algorithm>
@@ -48,13 +53,16 @@ inline constexpr std::array<std::string_view, 3> kRegistryMutatingActions{
 inline constexpr std::size_t kMaxRegistryAuditLinesPerFrame = 300;
 inline constexpr std::size_t kMaxRegistryAuditLineBytes = 4096;
 inline constexpr std::size_t kMaxServerCommandIdBytes = 160;
-// The longest id the server mints is `<plugin>-<16 hex>` (command_routes.cpp: plugin ident capped
-// by kIdentMax = 128, then "-" and 8 random bytes as hex), so the bound must not drop below it.
-static_assert(kMaxServerCommandIdBytes >= 128 + 1 + 16);
+// A generous cap on an endpoint-supplied id, not a bound on every id the server mints (a 128-byte
+// plugin ident plus "-" plus 32 hex is 161). The ids that can name the registry plugin are
+// `<registry>-<16 hex>` (command_routes.cpp) or `<registry>-<32 hex>` (dispatch_confined and the
+// scheduled enqueue in server.cpp): at most 8 + 1 + 32 bytes, and the cap must never drop below it.
+static_assert(kMaxServerCommandIdBytes >= sizeof("registry") - 1 + 1 + 32);
 
-/// The command_id shapes the server mints are `<plugin>-<hex>` or 32 hex, the plugin at most 128
-/// bytes of [A-Za-z0-9_.-] (command_routes.cpp bad_ident). Anything else came from the agent, not
-/// the server.
+/// The command_id shapes the server mints are `<plugin>-<16 or 32 hex>` or 32 hex, the plugin at
+/// most 128 bytes of [A-Za-z0-9_.-] (command_routes.cpp bad_ident). This tests charset and length
+/// only: the necessary shape of a server-minted id, not proof that one was minted. Anything else
+/// came from the agent, not the server.
 [[nodiscard]] constexpr bool is_server_minted_command_id(std::string_view id) noexcept {
     return !id.empty() && id.size() <= kMaxServerCommandIdBytes &&
            std::ranges::all_of(id, [](unsigned char c) {
@@ -72,16 +80,22 @@ static_assert(kMaxServerCommandIdBytes >= 128 + 1 + 16);
 }
 
 /// The `audit|...` lines of one output frame (output lines are LF-separated), bounded and
-/// neutralised as described above.
+/// neutralised as described above. `*truncated` (when given) is set when a further `audit|` line
+/// was found past kMaxRegistryAuditLinesPerFrame: those lines are dropped, not recorded.
 [[nodiscard]] inline std::vector<std::string>
-extract_registry_audit_lines(std::string_view output) {
+extract_registry_audit_lines(std::string_view output, bool* truncated = nullptr) {
     std::vector<std::string> out;
-    for (std::size_t pos = 0; pos < output.size() && out.size() < kMaxRegistryAuditLinesPerFrame;) {
+    for (std::size_t pos = 0; pos < output.size();) {
         const std::size_t nl = std::min(output.find('\n', pos), output.size());
         std::string_view line = output.substr(pos, nl - pos);
         pos = nl + 1;
         if (!line.starts_with("audit|"))
             continue;
+        if (out.size() == kMaxRegistryAuditLinesPerFrame) {
+            if (truncated != nullptr)
+                *truncated = true;
+            break;
+        }
         if (line.size() > kMaxRegistryAuditLineBytes) {
             std::size_t cut = kMaxRegistryAuditLineBytes;
             while (cut > 0 && (static_cast<unsigned char>(line[cut]) & 0xC0) == 0x80)
@@ -120,24 +134,38 @@ extract_registry_audit_lines(std::string_view output) {
     ev.action = "registry.write";
     ev.target_type = "Command";
     ev.target_id = std::string{command_id};
-    ev.detail = std::string{line} + " agent=" + yuzu::log_token(agent_id);
+    // The trusted token goes FIRST: the line is endpoint text, and a ` agent=<other>` inside it
+    // must not be what a first-match reader finds (the role.elevation.granted convention).
+    ev.detail = "agent=" + yuzu::log_token(agent_id) + " " + std::string{line};
     ev.result = registry_audit_result(line) == "ok" ? "success" : "failure";
     return ev;
 }
 
-/// Everything one output frame owes the audit log: nothing unless `plugin` is `registry`, `action`
-/// is one of the mutating actions and `command_id` has a shape the server could have minted.
-[[nodiscard]] inline std::vector<AuditEvent>
+/// What one output frame owes the audit log, decided without I/O. The caller persists `events` and
+/// logs the two flags, so it never re-derives the gate.
+struct RegistryAuditFrame {
+    std::vector<AuditEvent> events;
+    bool truncated{false};     ///< audit| lines past kMaxRegistryAuditLinesPerFrame were dropped
+    bool unmintable_id{false}; ///< registry mutating frame, command_id not server-mintable: ignored
+};
+
+/// Nothing unless `plugin` is `registry`, `action` is one of the mutating actions and `command_id`
+/// has a shape the server could have minted (a registry mutating frame that fails only the last
+/// test is flagged `unmintable_id`).
+[[nodiscard]] inline RegistryAuditFrame
 registry_audit_events_for_frame(std::string_view agent_id, std::string_view command_id,
                                 std::string_view plugin, std::string_view action,
                                 std::string_view output, std::int64_t now_epoch_s) {
-    std::vector<AuditEvent> events;
-    if (!is_registry_plugin(plugin) || !is_registry_mutating_action(action) ||
-        !is_server_minted_command_id(command_id))
-        return events;
-    for (const auto& line : extract_registry_audit_lines(output))
-        events.push_back(make_registry_audit_event(agent_id, command_id, line, now_epoch_s));
-    return events;
+    RegistryAuditFrame frame;
+    if (!is_registry_plugin(plugin) || !is_registry_mutating_action(action))
+        return frame;
+    if (!is_server_minted_command_id(command_id)) {
+        frame.unmintable_id = true;
+        return frame;
+    }
+    for (const auto& line : extract_registry_audit_lines(output, &frame.truncated))
+        frame.events.push_back(make_registry_audit_event(agent_id, command_id, line, now_epoch_s));
+    return frame;
 }
 
 } // namespace yuzu::server

@@ -31,6 +31,7 @@
 #include "plugin_result_audit.hpp"
 #include "test_auth_db_pg_helper.hpp"
 #include "test_principal_lock_gate.hpp"
+#include "test_tracker_scope.hpp"
 #include "web_utils.hpp"
 #include "../test_helpers.hpp"
 #include "../test_log_capture.hpp"
@@ -73,7 +74,7 @@ std::string line_with_result(std::string_view result, std::string_view dry_run =
 
 // ── extraction ───────────────────────────────────────────────────────────
 
-TEST_CASE("registry audit: only audit| lines are extracted, byte-exact",
+TEST_CASE("registry audit: only audit| lines are extracted and byte-exact",
           "[server][registry_audit]") {
     const std::string output = "status|ok\n" + std::string{kOkLine} +
                                "\nwarning|something\nnot-audit|x\n audit|leading space\n";
@@ -83,13 +84,26 @@ TEST_CASE("registry audit: only audit| lines are extracted, byte-exact",
 }
 
 TEST_CASE("registry audit: per-frame bounds and neutralisation", "[server][registry_audit]") {
-    SECTION("301 lines give 300") {
+    SECTION("301 lines give 300 and report that the rest were dropped") {
         std::string output;
         for (int i = 0; i < 301; ++i)
             output += "audit|op=x" + std::to_string(i) + "\n";
-        const auto lines = extract_registry_audit_lines(output);
+        bool truncated = false;
+        const auto lines = extract_registry_audit_lines(output, &truncated);
         CHECK(lines.size() == kMaxRegistryAuditLinesPerFrame);
         CHECK(lines.back() == "audit|op=x299");
+        CHECK(truncated);
+    }
+    SECTION("exactly 300 lines, or 300 followed by other text, is not truncation") {
+        std::string output;
+        for (int i = 0; i < 300; ++i)
+            output += "audit|op=x" + std::to_string(i) + "\n";
+        bool truncated = false;
+        CHECK(extract_registry_audit_lines(output, &truncated).size() == 300);
+        CHECK_FALSE(truncated);
+        output += "status|ok\nnot-audit|x\n";
+        CHECK(extract_registry_audit_lines(output, &truncated).size() == 300);
+        CHECK_FALSE(truncated);
     }
     SECTION("literal line bounds: 4096 bytes is kept whole, 4097 gives exactly 4096") {
         const std::string at_limit = "audit|" + std::string(4090, 'k');
@@ -130,7 +144,7 @@ TEST_CASE("registry audit: per-frame bounds and neutralisation", "[server][regis
     }
 }
 
-TEST_CASE("registry audit: result comes from result=, never from dry_run=",
+TEST_CASE("registry audit: result comes from result= and never from dry_run=",
           "[server][registry_audit]") {
     const auto ev = [](const std::string& l) {
         return make_registry_audit_event("agent-1", "registry-77", l, 1000);
@@ -142,6 +156,11 @@ TEST_CASE("registry audit: result comes from result=, never from dry_run=",
     CHECK(ev(line_with_result("refused", "0")).result == "failure");
     CHECK(ev(line_with_result("failed", "0")).result == "failure");
     CHECK(ev("audit|op=x").result == "failure"); // no result= field: not a success
+    CHECK(ev("audit|op=x|result=ok").result == "success"); // result= as the last field
+    CHECK(ev("audit|op=x|result=").result == "failure");   // present but empty
+    // The FIRST `|result=` decides, which is why the producing plugin must never emit a `|` inside
+    // a field (plugin_result_audit.hpp, FIELD CONTRACT): this pins today's rule, not that input.
+    CHECK(ev("audit|op=x|result=refused|reason=a|result=ok").result == "failure");
 }
 
 TEST_CASE("registry audit: the AuditEvent shape", "[server][registry_audit]") {
@@ -152,11 +171,21 @@ TEST_CASE("registry audit: the AuditEvent shape", "[server][registry_audit]") {
     CHECK(ev.action == "registry.write");
     CHECK(ev.target_type == "Command");
     CHECK(ev.target_id == "registry-77");
-    CHECK(ev.detail == std::string{kOkLine} + " agent=agent-1");
+    // The trusted token comes FIRST and the endpoint's line after it, so a reader that takes the
+    // first `agent=` match (the role.elevation.granted convention) finds the server's.
+    CHECK(ev.detail == "agent=agent-1 " + std::string{kOkLine});
     CHECK(ev.result == "success");
     SECTION("an agent id with spaces or '=' cannot forge a detail token") {
         const auto e2 = make_registry_audit_event("a b=c", "registry-1", kOkLine, 1);
-        CHECK(e2.detail.ends_with(" agent=a_b_c"));
+        CHECK(e2.detail.starts_with("agent=a_b_c audit|"));
+    }
+    SECTION("an agent= token inside the endpoint's own line is never the first one") {
+        const auto e3 = make_registry_audit_event(
+            "agent-1", "registry-77", "audit|op=set_value|result=ok|reason=x agent=evil|new=1", 1);
+        CHECK(e3.detail.starts_with("agent=agent-1 audit|"));
+        CHECK(e3.detail.find("agent=") == 0U);
+        CHECK(e3.detail.find("agent=evil") == e3.detail.rfind("agent="));
+        CHECK(e3.detail.find("agent=evil") > 0U);
     }
 }
 
@@ -166,7 +195,8 @@ TEST_CASE("registry audit: only the three mutating actions of the registry plugi
           "[server][registry_audit]") {
     const std::string output = "status|ok\n" + std::string{kOkLine} + "\n";
     const auto events = [&](std::string_view plugin, std::string_view action) {
-        return registry_audit_events_for_frame("agent-1", "registry-9", plugin, action, output, 5);
+        return registry_audit_events_for_frame("agent-1", "registry-9", plugin, action, output, 5)
+            .events;
     };
     for (const char* a : {"set_value", "delete_value", "delete_key"}) {
         INFO(a);
@@ -191,7 +221,7 @@ TEST_CASE("registry audit: only the three mutating actions of the registry plugi
         const std::string two = std::string{kOkLine} + "\n" + line_with_result("refused") + "\n";
         CHECK(registry_audit_events_for_frame("agent-1", "registry-9", "registry", "delete_key",
                                               two, 5)
-                  .size() == 2);
+                  .events.size() == 2);
     }
     SECTION("the plugin compares ASCII-case-insensitively: a RAW `Registry` request still runs the "
             "write") {
@@ -201,7 +231,7 @@ TEST_CASE("registry audit: only the three mutating actions of the registry plugi
             INFO(id);
             CHECK(registry_audit_events_for_frame("agent-1", id, extract_plugin(id), "set_value",
                                                   output, 5)
-                      .size() == 1);
+                      .events.size() == 1);
         }
         CHECK(events("registr", "set_value").empty());
         CHECK(events("registry ", "set_value").empty());
@@ -216,7 +246,8 @@ TEST_CASE(
     // idx_audit_target_ts.
     const std::string output = std::string{kOkLine} + "\n";
     const auto rows = [&](const std::string& id) {
-        return registry_audit_events_for_frame("agent-1", id, "registry", "set_value", output, 5);
+        return registry_audit_events_for_frame("agent-1", id, "registry", "set_value", output, 5)
+            .events;
     };
     CHECK(rows("registry-9").size() == 1);
     CHECK(rows("0123456789abcdef0123456789abcdef").size() == 1);
@@ -233,6 +264,45 @@ TEST_CASE(
                             "registry-\x1b[2J", "registry-\xC3\xA9"}) {
         INFO(bad);
         CHECK(rows(bad).empty());
+    }
+}
+
+TEST_CASE("registry audit: the frame verdict flags what was ignored or dropped",
+          "[server][registry_audit]") {
+    const std::string one = std::string{kOkLine} + "\n";
+    std::string many;
+    for (int i = 0; i < 301; ++i)
+        many += one;
+    const auto frame = [](std::string_view id, std::string_view plugin, std::string_view action,
+                          const std::string& output) {
+        return registry_audit_events_for_frame("agent-1", id, plugin, action, output, 5);
+    };
+    SECTION("a registry mutating frame whose id the server could not have minted is flagged") {
+        const auto f = frame("registry-9 x", "registry", "set_value", one);
+        CHECK(f.unmintable_id);
+        CHECK(f.events.empty());
+        CHECK_FALSE(f.truncated);
+    }
+    SECTION("a frame that is not registry-and-mutating is never flagged whatever its id") {
+        CHECK_FALSE(frame("registry-9 x", "registry", "get_value", one).unmintable_id);
+        CHECK_FALSE(frame("registry-9 x", "registry", "", one).unmintable_id);
+        CHECK_FALSE(frame("filesystem-9 x", "filesystem", "set_value", one).unmintable_id);
+    }
+    SECTION("a mint-shaped id is not flagged and writes its row") {
+        const auto f = frame("registry-9", "registry", "set_value", one);
+        CHECK_FALSE(f.unmintable_id);
+        CHECK_FALSE(f.truncated);
+        CHECK(f.events.size() == 1);
+    }
+    SECTION("301 audit lines give 300 rows and the truncation flag") {
+        const auto f = frame("registry-9", "registry", "delete_key", many);
+        CHECK(f.events.size() == 300);
+        CHECK(f.truncated);
+        CHECK_FALSE(f.unmintable_id);
+    }
+    SECTION("truncation is only reported for a frame that would have been audited") {
+        CHECK_FALSE(frame("registry-9", "registry", "get_value", many).truncated);
+        CHECK_FALSE(frame("registry-9 x", "registry", "set_value", many).truncated);
     }
 }
 
@@ -323,7 +393,7 @@ struct IngestHarness {
 
 } // namespace
 
-TEST_CASE("registry audit live ingest: a RUNNING frame with output, then the empty terminal, gives "
+TEST_CASE("registry audit live ingest: a RUNNING frame with output then the empty terminal gives "
           "ONE row",
           "[pg][server][registry_audit]") {
     YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
@@ -348,8 +418,7 @@ TEST_CASE("registry audit live ingest: a RUNNING frame with output, then the emp
     CHECK(rows[0].target_type == "Command");
     CHECK(rows[0].target_id == "registry-1700000000");
     CHECK(rows[0].result == "success");
-    CHECK(rows[0].detail.starts_with("audit|op=set_value|hive=HKLM|key=K|name=V|"));
-    CHECK(rows[0].detail.ends_with(" agent=agent-1"));
+    CHECK(rows[0].detail.starts_with("agent=agent-1 audit|op=set_value|hive=HKLM|key=K|name=V|"));
     CHECK(rows[0].detail.find("status|ok") ==
           std::string::npos); // only the audit line, not the output
 }
@@ -480,7 +549,7 @@ TEST_CASE("registry audit live ingest: a store that fails ends the frame at the 
 }
 
 TEST_CASE(
-    "registry audit live ingest: an unmintable command_id warns once per frame, only when the "
+    "registry audit live ingest: an unmintable command_id warns once per frame and only when the "
     "frame was registry-and-mutating",
     "[pg][server][registry_audit]") {
     YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
@@ -512,36 +581,42 @@ TEST_CASE(
     CHECK(h.rows().size() == 1);
 }
 
-TEST_CASE("registry audit live ingest: the row is written before the execution advances, and a "
+TEST_CASE("registry audit live ingest: a frame past the line cap keeps 300 rows and warns once",
+          "[pg][server][registry_audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
+    IngestHarness h(db.dsn());
+    const std::string& agent = kOddAgent;
+    REQUIRE(yuzu::log_id_token(agent) != yuzu::log_token(agent));
+    std::string many;
+    for (int i = 0; i < 301; ++i)
+        many += std::string{kOkLine} + "\n";
+    yuzu::test::LogCapture cap;
+    h.svc.process_gateway_response(
+        agent,
+        IngestHarness::frame("registry-tr1", apb::CommandResponse::RUNNING, "set_value", many));
+    cap.stop();
+    CHECK(h.rows().size() == 300);
+    CHECK(count_of(cap.text(),
+                   "[audit] registry.write frame carried more than 300 audit lines; the rest were "
+                   "not recorded (agent=" +
+                       yuzu::log_id_token(agent) + ", command=registry-tr1)") == 1);
+}
+
+TEST_CASE("registry audit live ingest: the row is written before the execution advances and a "
           "failed write does not stall it",
           "[pg][server][registry_audit]") {
     YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_exec_tpl);
     IngestHarness h(db.dsn());
     ExecutionEventBus exec_bus;
-    ExecutionTracker tracker{h.pool};
-    REQUIRE(tracker.is_open());
-    tracker.set_event_bus(&exec_bus);
-    h.svc.set_execution_tracker(&tracker);
-    struct Unwire { // the borrowed pointer is nulled before `tracker` dies (agent_service_impl.hpp)
-        AgentServiceImpl& svc;
-        ~Unwire() { svc.set_execution_tracker(nullptr); }
-    } unwire{h.svc};
-
-    Execution exec;
-    exec.definition_id = "def-test";
-    exec.scope_expression = "agent_id = 'agent-1'";
-    exec.dispatched_by = "tester";
-    exec.status = "running";
-    exec.agents_targeted = 1;
-    const auto id = tracker.create_execution(exec);
-    REQUIRE(id.has_value());
-    h.svc.record_execution_id("registry-x1", *id);
+    yuzu::test::TrackerScope ts{h.svc, h.pool, &exec_bus};
+    const auto id = ts.make_exec();
+    h.svc.record_execution_id("registry-x1", id);
 
     // The tracker publishes `agent-transition` synchronously from inside the ingest, so the
     // listener sees exactly what a live operator watching the execution would.
     int transitions = 0;
     std::optional<std::size_t> rows_at_first_transition;
-    exec_bus.subscribe(*id, [&](const ExecutionEvent& ev) {
+    exec_bus.subscribe(id, [&](const ExecutionEvent& ev) {
         if (ev.event_type != "agent-transition" || transitions++ != 0)
             return;
         AuditQuery q;
@@ -608,8 +683,11 @@ struct LiveHarness {
                                                               grpc::InsecureChannelCredentials()));
     }
     ~LiveHarness() {
+        // A FINITE deadline, as test_ota_stalled_write.cpp does: a deadline-free Shutdown() waits for
+        // in-flight handlers, so a regression that wedges a Subscribe would hang this suite to its
+        // outer CI timeout instead of failing it.
         if (server)
-            server->Shutdown();
+            server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(5));
     }
 };
 
@@ -653,8 +731,8 @@ bool subscribe_with(LiveHarness& h, const std::string& agent_id,
 } // namespace
 
 TEST_CASE(
-    "registry audit live ingest: a real Subscribe session audits RUNNING output, not the empty "
-    "terminal, and only for mutating actions",
+    "registry audit live ingest: a real Subscribe session audits RUNNING output but not the empty "
+    "terminal and only for mutating actions",
     "[pg][server][registry_audit][subscribe]") {
     YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
     LiveHarness h(db.dsn());
@@ -684,8 +762,7 @@ TEST_CASE(
 }
 
 TEST_CASE("registry audit live ingest: a dropped row sets the audit-failed trailer on the "
-          "Subscribe call, and "
-          "only a frame that owed a row does",
+          "Subscribe call and only a frame that owed a row does",
           "[pg][server][registry_audit][subscribe]") {
     YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
     LiveHarness h(db.dsn());

@@ -4,10 +4,10 @@
 // itself (the agent's call sites are not reachable from a unit test). Why `action` rides on the
 // wire: see CommandResponse.action in proto/yuzu/agent/v1/agent.proto.
 
-#include "agent.pb.h" // ::yuzu::agent::v1::CommandResponse
-
 #include <string>
 #include <utility>
+
+#include "agent.pb.h" // ::yuzu::agent::v1::CommandResponse
 
 namespace yuzu::agent {
 
