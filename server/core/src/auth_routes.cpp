@@ -420,6 +420,11 @@ std::optional<auth::Session> AuthRoutes::synthesize_token_session(const ApiToken
 }
 
 std::optional<auth::Session> AuthRoutes::resolve_session(const httplib::Request& req) {
+    // The credential sources read here (Cookie, Authorization, X-Yuzu-Token) are mirrored by
+    // health::request_carries_credential (health_routes.hpp), which decides whether /health
+    // and /api/health resolve a session or charge the per-source budget. A new credential
+    // source added below must also be added there.
+    //
     // 1. Try session cookie (existing browser auth)
     auto token = extract_session_cookie(req);
     // Guard against oversized cookie values before passing to validate_session (#630).

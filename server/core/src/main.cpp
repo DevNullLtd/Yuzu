@@ -482,7 +482,10 @@ int main(int argc, char* argv[]) {
     app.add_option("--log-max-files", log_max_files, "Max rotated log files (default: 5)")
         ->default_val(5)
         ->envname("YUZU_LOG_MAX_FILES");
-    app.add_option("--rate-limit", rate_limit, "Max API requests/second per IP (default: 100)")
+    app.add_option("--rate-limit", rate_limit,
+                   "Max API requests/second per IP (default: 100). Also the per-source budget "
+                   "for /health and /api/health requests that carry a credential; values "
+                   "below 1 are treated as 1")
         ->default_val(100)
         ->envname("YUZU_RATE_LIMIT");
     app.add_option("--login-rate-limit", login_rate_limit,

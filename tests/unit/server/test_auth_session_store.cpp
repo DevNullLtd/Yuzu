@@ -518,29 +518,41 @@ TEST_CASE("AuthManager+SessionStore: an empty token is refused without touching 
     // is counted as a validate degrade, so a store call shows up as a counter increment.
     drop_session_schema(pool);
     REQUIRE_FALSE(store.read_generation().has_value()); // schema is really gone
-    const std::string needle = R"(yuzu_auth_session_store_degrade_total{op="validate"})";
-    const auto validate_degrades = [&] {
+    // Two store touches are observable: the cache-generation read that precedes a lookup
+    // (`generation_refresh`) and the lookup itself (`validate`). An empty token must reach
+    // neither, so both counters are asserted.
+    const auto degrades = [&](const std::string& op) {
+        const std::string needle =
+            "yuzu_auth_session_store_degrade_total{op=\"" + op + "\"}";
         const auto text = metrics.serialize();
         const auto pos = text.find(needle);
         if (pos == std::string::npos)
             return 0;
         return std::stoi(text.substr(pos + needle.size() + 1));
     };
+    const auto validate_degrades = [&] { return degrades("validate"); };
+    const auto refresh_degrades = [&] { return degrades("generation_refresh"); };
 
     // An empty token (the no-cookie case) never reaches the store.
     CHECK_FALSE(mgr->validate_session("").has_value());
     CHECK(validate_degrades() == 0);
+    CHECK(refresh_degrades() == 0);
 
-    // Positive control: a non-empty token the replica has not seen DOES go to the store, so the
-    // counter above is able to move.
+    // Positive control: a non-empty token the replica has not seen DOES go to the store, so
+    // both counters above are able to move.
     CHECK_FALSE(mgr->validate_session("not-a-session-token").has_value());
     CHECK(validate_degrades() == 1);
+    CHECK(refresh_degrades() == 1);
 
-    // And the empty token still does not move it.
+    // And the empty token still does not move either of them.
     CHECK_FALSE(mgr->validate_session("").has_value());
     CHECK(validate_degrades() == 1);
+    CHECK(refresh_degrades() == 1);
 }
 
+// A behaviour pin only: the legacy in-memory path has no store to touch and an empty token
+// misses its map whether or not validate_session short-circuits it, so this case does not
+// fail if the early return is removed. The store-call coverage above is what guards that.
 TEST_CASE("AuthManager legacy path: an empty token never matches a session",
           "[auth][session]") {
     AuthManager mgr;

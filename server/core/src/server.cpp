@@ -15047,19 +15047,21 @@ private:
             // source-IP bucket with authed REST traffic must not be able to
             // 429-starve the health probe, nor be starved by it). Two gates
             // do apply, in this order:
-            //   1. /health and /api/health only: a per-source budget,
+            //   1. /health and /api/health requests that carry a credential
+            //      header only: a per-source budget,
             //      `health::admit_probe_request`, drawn from the same
             //      `api_rate_limiter_` (`--rate-limit`) under a key of its
             //      own, so the probe and REST traffic from one source never
-            //      share a bucket. /livez and /readyz are not limited.
+            //      share a bucket. Credential-less requests, /livez and
+            //      /readyz are not charged.
             //   2. The body cap (R3, call site 1 of
             //      `enforce_pre_auth_body_cap` above), unconditionally,
             //      before the Unhandled return, precisely because everything
             //      past this point (on-behalf-of, the general rate-limit
-            //      bucket) is skipped for these four paths, before the cap
-            //      reached them too, they were the last unauthenticated
-            //      100 MiB buffer on the server. The plaintext redirect
-            //      listener admits no body at all (is_plaintext_probe_request,
+            //      bucket) is skipped for these four paths. Before the cap
+            //      reached them they were the last unauthenticated 100 MiB
+            //      buffer on the server. The plaintext redirect listener
+            //      admits no body at all (is_plaintext_probe_request,
             //      health_routes.hpp).
             // The rate limit runs before the cap, mirroring the non-probe
             // order below (limiter, then cap).

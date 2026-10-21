@@ -136,6 +136,25 @@ window is 0 or less. Rolling back to the previous release restores the old order
 un-gates the two Settings routes; nothing is migrated. A rollback also removes the new counter and
 window gauge, so both new alerts go silent.
 
+## Behaviour change: /health and /api/health per-source budget
+
+`/health` and `/api/health` now apply a per-source budget to requests that carry a credential header
+(`Cookie`, `Authorization` or `X-Yuzu-Token`):
+
+- **Budget.** The `--rate-limit` value (default 100 requests per second, burst 100; values below 1 are
+  treated as 1), counted per source address (the connection's peer address, so behind a proxy or load
+  balancer all callers share it). The two paths share one bucket per source, and it is separate from
+  the REST budget.
+- **Over the budget** the server answers `429` with `Retry-After: 1` and the standard error envelope
+  (`correlation_id` and `retry_after_ms` included).
+- **Unchanged.** Requests with no credential header are not counted and are never refused by this
+  limit, and `/livez` and `/readyz` are not rate limited. For load balancer and orchestrator checks use
+  `/readyz` (readiness) or `/livez` (liveness).
+- **Tuning.** Raise `--rate-limit` (`YUZU_RATE_LIMIT`) if a monitor that sends a credential polls
+  faster than the default budget allows; the same value also sets the REST budget.
+- **429 body.** The general `--rate-limit` refusal on REST routes now carries `correlation_id` and
+  `retry_after_ms` too; every field it had before is unchanged.
+
 ## Behaviour change: the macOS agent package installs transactionally and can refuse
 
 This applies to every macOS `.pkg`, including the release package.
@@ -6104,7 +6123,7 @@ Three operator-visible behaviour changes ship in the v0.12.0 A3 ladder. None req
 >       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8081/healthz"]
 > ```
 
-**2. `/api/health` is restored as an alias of `/health` (#620).** The pre-#401 endpoint path is back. Monitoring integrations that point at `/api/health` work without reconfiguration; both URLs serve identical JSON. Both are exempt from rate limiting (a follow-up hardening over the bare `/health` behaviour). For load-balancer probes that should drain in-flight traffic before stopping, continue using `/readyz` — `/health` and `/api/health` are intentionally not draining-aware (Kubernetes pattern: liveness/health probes are not draining-aware).
+**2. `/api/health` is restored as an alias of `/health` (#620).** The pre-#401 endpoint path is back. Monitoring integrations that point at `/api/health` work without reconfiguration; both URLs serve identical JSON. Both are exempt from rate limiting (a follow-up hardening over the bare `/health` behaviour; since superseded: credentialed requests to these two paths are now rate limited per source). For load-balancer probes that should drain in-flight traffic before stopping, continue using `/readyz` — `/health` and `/api/health` are intentionally not draining-aware (Kubernetes pattern: liveness/health probes are not draining-aware).
 
 **3. File-logger boot messages are now quieter (#624).** The previous `WARN: Could not create log directory /var/log/yuzu` + `ERROR: file logger setup failed` pair on every container boot is replaced by a single INFO-level line when the default path cannot be created. The Docker server image now pre-creates `/var/log/yuzu` (mode 0750, owned by `yuzu`) so the path is writable out of the box. **If your monitoring previously alerted on the WARN/ERROR lines as a misconfig signal, those signals will no longer fire** — the failure mode is now a single INFO line. Operators who require explicit on-disk logs should pass `--log-file <path>`; explicit-path failures still log at ERROR and are not silently degraded.
 

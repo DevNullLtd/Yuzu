@@ -16,7 +16,7 @@
 ///     the pre-routing exemption that (deliberately) lives in server.cpp,
 ///     not this module.
 ///   - /health, /api/health call ONLY resolve_session_fn (non-blocking), and only
-///     when the request carries a Cookie, Authorization or X-Yuzu-Token header ,
+///     when the request carries a Cookie, Authorization or X-Yuzu-Token header;
 ///     always 200, response SHAPE differs by session presence. A request with no
 ///     credential header makes ZERO resolve_session_fn calls.
 ///   - /fragments/health/summary calls deny_service_scoped_fn THEN auth_fn
@@ -55,6 +55,7 @@
 #include <set>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <string>
 #include <vector>
@@ -710,7 +711,61 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
     std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
     REQUIRE(in.is_open());
     const std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-    CHECK(src.find("register_health_routes(") != std::string::npos);
+
+    // Drop `//` and `/* */` comments first (string, character and raw-string literals are kept
+    // verbatim, so a literal that merely contains `//` is not truncated): a needle that only
+    // survives inside a comment, such as a call that was commented out, must not satisfy the
+    // pin.
+    const auto strip_comments = [](const std::string& in) {
+        std::string out;
+        out.reserve(in.size());
+        const auto is_ident = [](char c) {
+            return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+        };
+        std::size_t i = 0;
+        while (i < in.size()) {
+            const char c = in[i];
+            if (c == '/' && i + 1 < in.size() && in[i + 1] == '/') {
+                while (i < in.size() && in[i] != '\n')
+                    ++i;
+            } else if (c == '/' && i + 1 < in.size() && in[i + 1] == '*') {
+                const auto end = in.find("*/", i + 2);
+                i = end == std::string::npos ? in.size() : end + 2;
+                out.push_back(' ');
+            } else if (c == 'R' && i + 1 < in.size() && in[i + 1] == '"' &&
+                       (i == 0 || !is_ident(in[i - 1]))) {
+                // Raw string: R"delim( ... )delim"
+                const auto open = in.find('(', i + 2);
+                if (open == std::string::npos) {
+                    out.append(in, i, std::string::npos);
+                    break;
+                }
+                const std::string close = ")" + in.substr(i + 2, open - (i + 2)) + "\"";
+                const auto end = in.find(close, open + 1);
+                const auto stop = end == std::string::npos ? in.size() : end + close.size();
+                out.append(in, i, stop - i);
+                i = stop;
+            } else if (c == '"' || (c == '\'' && (i == 0 || !is_ident(in[i - 1])))) {
+                // Ordinary string or character literal (a `'` after an identifier character
+                // is a digit separator, not a literal).
+                std::size_t j = i + 1;
+                while (j < in.size() && in[j] != c) {
+                    if (in[j] == '\\')
+                        ++j;
+                    ++j;
+                }
+                const auto stop = std::min(j + 1, in.size());
+                out.append(in, i, stop - i);
+                i = stop;
+            } else {
+                out.push_back(c);
+                ++i;
+            }
+        }
+        return out;
+    };
+    const std::string code = strip_comments(src);
+    CHECK(code.find("register_health_routes(") != std::string::npos);
 
     // Compare with all whitespace removed so a clang-format re-wrap of a call site
     // can neither redden nor greenwash the tripwire.
@@ -718,9 +773,10 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
         std::erase_if(s, [](unsigned char c) { return std::isspace(c) != 0; });
         return s;
     };
-    const auto flat = squeeze(src);
+    const auto flat = squeeze(code);
     const auto occurrences = [&](const std::string& needle) {
-        const auto n = squeeze(needle);
+        // A needle that spells an inline argument-name comment is compared as code too.
+        const auto n = squeeze(strip_comments(needle));
         std::size_t count = 0;
         for (auto pos = flat.find(n); pos != std::string::npos; pos = flat.find(n, pos + 1))
             ++count;
@@ -747,8 +803,21 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
     // The /health + /api/health per-source budget is checked inside the probe branch, once,
     // on the `--rate-limit` limiter, before the body cap; the general 429 body has one
     // definition (write_rate_limited_response), not a second literal in server.cpp.
-    expect("if (!yuzu::server::health::admit_probe_request(api_rate_limiter_, req, res))", 1,
-           "the pre-routing probe branch applies the /health rate limit");
+    // The refusal must actually end the request: a call whose result is ignored, or whose
+    // `return` was dropped, would still compile and still charge the bucket.
+    expect("if (!yuzu::server::health::admit_probe_request(api_rate_limiter_, req, res)) "
+           "return httplib::Server::HandlerResponse::Handled;",
+           1, "the pre-routing probe branch applies the /health rate limit and returns Handled");
+    // The whole probe branch, contiguous: budget (refusal ends the request), then the body cap
+    // (refusal ends the request), then the exempt-from-the-rest return. This also fixes the
+    // order budget < cap inside the branch rather than somewhere later in the file.
+    expect("if (yuzu::server::health::is_probe_path(req.path)) { "
+           "if (!yuzu::server::health::admit_probe_request(api_rate_limiter_, req, res)) "
+           "return httplib::Server::HandlerResponse::Handled; "
+           "if (enforce_pre_auth_body_cap()) "
+           "return httplib::Server::HandlerResponse::Handled; "
+           "return httplib::Server::HandlerResponse::Unhandled; }",
+           1, "the probe branch is: budget, then body cap, then Unhandled");
     {
         const auto branch = flat.find(squeeze("if (yuzu::server::health::is_probe_path(req.path)) {"));
         const auto gate = flat.find(
@@ -998,10 +1067,15 @@ TEST_CASE("health_routes: /fragments/dashboard/health without a session writes 4
 
 TEST_CASE("health_routes: /fragments/dashboard/health renders real rows, executions row only when unscoped",
           "[server][routes][health_routes][home]") {
+    // Every section sends the credential a real panel request carries (the in-process health
+    // document only includes `executions` for a request that resolves a session), so an
+    // omission below is the panel's own gate decision and not an artefact of a bare request.
+    const std::unordered_map<std::string, std::string> kPanelCredential{
+        {"Cookie", "yuzu_session=abc"}};
     SECTION("unbound fleet gate omits the executions row") {
         Harness h;
         h.wire();
-        auto r = h.sink.dispatch("GET", "/fragments/dashboard/health");
+        auto r = h.sink.Get("/fragments/dashboard/health", kPanelCredential);
         REQUIRE(r);
         CHECK(r->status == 200);
         CHECK(r->body.find("id=\"dash-health\"") != std::string::npos);
@@ -1013,9 +1087,7 @@ TEST_CASE("health_routes: /fragments/dashboard/health renders real rows, executi
         Harness h;
         h.fleet_wired = true;
         h.wire();
-        // A real panel request always carries the credential that admitted it at auth_fn; the
-        // in-process health document only includes `executions` for a request that resolves.
-        auto r = h.sink.Get("/fragments/dashboard/health", {{"Cookie", "yuzu_session=abc"}});
+        auto r = h.sink.Get("/fragments/dashboard/health", kPanelCredential);
         REQUIRE(r);
         CHECK(r->body.find("Executions running") != std::string::npos);
         REQUIRE(h.fleet_calls.size() == 1);
@@ -1026,8 +1098,9 @@ TEST_CASE("health_routes: /fragments/dashboard/health renders real rows, executi
         h.fleet_wired = true;
         h.fleet_scoped = true;
         h.wire();
-        auto r = h.sink.dispatch("GET", "/fragments/dashboard/health");
+        auto r = h.sink.Get("/fragments/dashboard/health", kPanelCredential);
         REQUIRE(r);
+        REQUIRE(h.fleet_calls.size() == 1); // the gate was consulted and its scope decided
         CHECK(r->body.find("Executions running") == std::string::npos);
         CHECK(r->body.find("Agents connected to this server") != std::string::npos);
     }
@@ -1036,8 +1109,9 @@ TEST_CASE("health_routes: /fragments/dashboard/health renders real rows, executi
         h.fleet_wired = true;
         h.fleet_admit = false;
         h.wire();
-        auto r = h.sink.dispatch("GET", "/fragments/dashboard/health");
+        auto r = h.sink.Get("/fragments/dashboard/health", kPanelCredential);
         REQUIRE(r);
+        REQUIRE(h.fleet_calls.size() == 1); // the gate was consulted and refused
         CHECK(r->body.find("Executions running") == std::string::npos);
     }
 }
@@ -1047,7 +1121,9 @@ TEST_CASE("health_routes: /fragments/dashboard/health never renders system, tls 
     Harness h;
     h.fleet_wired = true;
     h.wire();
-    auto r = h.sink.dispatch("GET", "/fragments/dashboard/health");
+    // With a credential the in-process health document does carry those fields, so their
+    // absence from the panel is the panel's own filtering.
+    auto r = h.sink.Get("/fragments/dashboard/health", {{"Cookie", "yuzu_session=abc"}});
     REQUIRE(r);
     for (const char* banned : {"cpu_percent", "rss", "tls", "pending", "command_queue_depth"})
         CHECK(r->body.find(banned) == std::string::npos);
@@ -1065,8 +1141,10 @@ TEST_CASE("health_routes: /fragments/dashboard/health agrees with /api/health on
         Harness h;
         h.pg_probe = probe;
         h.wire();
-        auto doc = h.sink.dispatch("GET", "/api/health");
-        auto panel = h.sink.dispatch("GET", "/fragments/dashboard/health");
+        const std::unordered_map<std::string, std::string> credential{
+            {"Cookie", "yuzu_session=abc"}};
+        auto doc = h.sink.Get("/api/health", credential);
+        auto panel = h.sink.Get("/fragments/dashboard/health", credential);
         REQUIRE(doc);
         REQUIRE(panel);
         const std::string status = json::parse(doc->body)["status"].get<std::string>();
@@ -1078,20 +1156,30 @@ TEST_CASE("health_routes: /fragments/dashboard/health agrees with /api/health on
 }
 
 // ── The per-source rate limit on /health and /api/health ───────────────────
+//
+// Timing note: RateLimiter refills continuously (`rate` tokens per second) and has no
+// injectable clock. Every test below that expects a refusal uses a limiter built with a rate
+// of 1, so a refusal can only turn into an admission if the thread is descheduled for more
+// than a full second between two adjacent calls; a larger rate would shrink that margin to
+// `1/rate` seconds.
 
 namespace {
-httplib::Request probe_request(const char* path, const char* addr = "10.0.0.7") {
+httplib::Request probe_request(const char* path, const char* addr = "10.0.0.7",
+                               bool credential = true) {
     httplib::Request r;
     r.method = "GET";
     r.path = path;
     r.remote_addr = addr;
+    if (credential)
+        r.set_header("Cookie", "yuzu_session=probe");
     return r;
 }
 } // namespace
 
-TEST_CASE("health_routes: a burst over the budget on /health is refused with the standard 429",
+TEST_CASE("health_routes: a credentialed request over the budget on /health is refused with the "
+          "standard 429",
           "[server][routes][health_routes][ratelimit]") {
-    RateLimiter limiter(5);
+    RateLimiter limiter(1);
     for (const char* path : {"/health", "/api/health"}) {
         INFO("path: " << path);
         const auto addr = std::string("10.1.0.") + (path[1] == 'h' ? "1" : "2");
@@ -1104,20 +1192,89 @@ TEST_CASE("health_routes: a burst over the budget on /health is refused with the
             else
                 last = std::move(res);
         }
-        CHECK(admitted == 5);
+        CHECK(admitted == 1);
         // The refusal is the exact response the general limiter sends.
         CHECK(last.status == 429);
+        CHECK(last.get_header_value("Content-Type").find("application/json") !=
+              std::string::npos);
         CHECK(last.get_header_value("Retry-After") == "1");
         const auto body = json::parse(last.body);
         CHECK(body["error"]["code"] == 429);
         CHECK(body["error"]["message"] == "rate limit exceeded");
         CHECK(body["meta"]["api_version"] == "v1");
+        // The full A4 envelope: the body's correlation_id is the X-Correlation-Id header.
+        const auto cid = last.get_header_value("X-Correlation-Id");
+        CHECK_FALSE(cid.empty());
+        REQUIRE(body["error"].contains("correlation_id"));
+        CHECK(body["error"]["correlation_id"] == cid);
+        REQUIRE(body["error"].contains("retry_after_ms"));
+        CHECK(body["error"]["retry_after_ms"] == 1000);
+    }
+}
+
+TEST_CASE("health_routes: write_rate_limited_response keeps a correlation id an earlier gate set",
+          "[server][routes][health_routes][ratelimit]") {
+    httplib::Response res;
+    res.set_header("X-Correlation-Id", "req-upstream-1");
+    write_rate_limited_response(res);
+    CHECK(res.status == 429);
+    CHECK(res.get_header_value("X-Correlation-Id") == "req-upstream-1");
+    CHECK(json::parse(res.body)["error"]["correlation_id"] == "req-upstream-1");
+
+    // Two refusals that mint their own ids do not share one.
+    httplib::Response a;
+    httplib::Response b;
+    write_rate_limited_response(a);
+    write_rate_limited_response(b);
+    CHECK(a.get_header_value("X-Correlation-Id") != b.get_header_value("X-Correlation-Id"));
+}
+
+TEST_CASE("health_routes: a request with no credential header is never charged against the "
+          "probe budget",
+          "[server][routes][health_routes][ratelimit]") {
+    RateLimiter limiter(1);
+    for (const char* path : {"/health", "/api/health"}) {
+        INFO("path: " << path);
+        for (int i = 0; i < 1000; ++i) {
+            httplib::Response res;
+            REQUIRE(health::admit_probe_request(
+                limiter, probe_request(path, "10.3.0.1", /*credential=*/false), res));
+            REQUIRE(res.status == -1); // untouched: no 429, nothing written
+        }
+    }
+    // No bucket was created for the source either: a credential-less caller costs no state.
+    CHECK(limiter.bucket_count() == 0);
+
+    // The same source with a credential IS charged, and its credential-less polling stays
+    // unaffected once that bucket is spent.
+    httplib::Response first;
+    CHECK(health::admit_probe_request(limiter, probe_request("/health", "10.3.0.1"), first));
+    httplib::Response second;
+    CHECK_FALSE(health::admit_probe_request(limiter, probe_request("/health", "10.3.0.1"), second));
+    CHECK(limiter.bucket_count() == 1);
+    httplib::Response bare;
+    CHECK(health::admit_probe_request(
+        limiter, probe_request("/health", "10.3.0.1", /*credential=*/false), bare));
+}
+
+TEST_CASE("health_routes: each credential source counts as a credential for the probe budget",
+          "[server][routes][health_routes][ratelimit]") {
+    for (const char* name : {"Cookie", "Authorization", "X-Yuzu-Token"}) {
+        INFO("header: " << name);
+        RateLimiter limiter(1);
+        auto req = probe_request("/health", "10.3.1.1", /*credential=*/false);
+        req.set_header(name, "x");
+        httplib::Response first;
+        CHECK(health::admit_probe_request(limiter, req, first));
+        httplib::Response second;
+        CHECK_FALSE(health::admit_probe_request(limiter, req, second));
+        CHECK(second.status == 429);
     }
 }
 
 TEST_CASE("health_routes: /livez and /readyz are never charged against the probe budget",
           "[server][routes][health_routes][ratelimit]") {
-    RateLimiter limiter(2);
+    RateLimiter limiter(1);
     for (int i = 0; i < 50; ++i) {
         for (const char* path : {"/livez", "/readyz"}) {
             httplib::Response res;
@@ -1130,31 +1287,30 @@ TEST_CASE("health_routes: /livez and /readyz are never charged against the probe
 
 TEST_CASE("health_routes: the probe budget is a bucket of its own, per source",
           "[server][routes][health_routes][ratelimit]") {
-    RateLimiter limiter(3);
+    RateLimiter limiter(1);
     // Drain one source's probe bucket.
-    for (int i = 0; i < 3; ++i) {
-        httplib::Response res;
-        REQUIRE(health::admit_probe_request(limiter, probe_request("/health", "10.2.0.1"), res));
-    }
+    httplib::Response drain;
+    REQUIRE(health::admit_probe_request(limiter, probe_request("/health", "10.2.0.1"), drain));
     httplib::Response refused;
     CHECK_FALSE(health::admit_probe_request(limiter, probe_request("/health", "10.2.0.1"), refused));
     // /health and /api/health share the one probe bucket for a source.
     httplib::Response alias;
-    CHECK_FALSE(health::admit_probe_request(limiter, probe_request("/api/health", "10.2.0.1"), alias));
-    // The same source's ordinary API budget is untouched by it, and the reverse.
+    CHECK_FALSE(
+        health::admit_probe_request(limiter, probe_request("/api/health", "10.2.0.1"), alias));
+    // The same source's ordinary API budget is untouched by it.
     CHECK(limiter.allow("10.2.0.1"));
     // Another source is unaffected.
     httplib::Response other;
     CHECK(health::admit_probe_request(limiter, probe_request("/health", "10.2.0.2"), other));
     // Draining a source's API bucket does not refuse its probe.
-    for (int i = 0; i < 10; ++i)
-        (void)limiter.allow("10.2.0.3");
+    REQUIRE(limiter.allow("10.2.0.3"));
     CHECK_FALSE(limiter.allow("10.2.0.3"));
     httplib::Response probe;
     CHECK(health::admit_probe_request(limiter, probe_request("/health", "10.2.0.3"), probe));
 }
 
-TEST_CASE("health_routes: a normal probe cadence is never limited at the default --rate-limit",
+TEST_CASE("health_routes: a normal credentialed probe cadence is never limited at the default "
+          "--rate-limit",
           "[server][routes][health_routes][ratelimit]") {
     // The limiter is built from the default `--rate-limit` (100/s per source). A fleet of load
     // balancers behind one NAT address probing every second is tens of requests per second.

@@ -1548,7 +1548,7 @@ std::optional<Session> AuthManager::validate_session(const std::string& token) c
     // token-spray attacks.
     //
     // An empty token is the "request carried no session cookie" value
-    // (AuthRoutes::extract_session_cookie returns ""). It can never match a session ,
+    // (AuthRoutes::extract_session_cookie returns ""). It can never match a session:
     // create_session mints a random token and the store key is its SHA-256, so it is
     // refused here, before the durable path's generation read, cache probe and
     // store lookup, none of which can produce a session for it.

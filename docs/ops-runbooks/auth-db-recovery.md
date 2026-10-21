@@ -976,16 +976,16 @@ after 2 consecutive failures (`pg_reachability_rules.hpp`), so it flips within
 about 10 seconds. In the measurements `/readyz` kept answering `200` for the first
 9 seconds of the stall and `503` after. If no probe succeeds for 15 seconds the
 verdict reads stale, which is also not ready, whatever the failure count says.
-`/health` can hang for up to about 10 seconds (measured, with unauthenticated
-probes). The reason is in the code: `/health` resolves the caller's session
-before it answers (`resolve_session_fn` in `health_routes.cpp`), and a session
-lookup that the in-memory cache cannot answer is a database read, which during a
-stall can wait for the pool's 10 second connect timeout. `/livez` does no session or
-database work. Point **liveness** probes at `/livez` and **readiness**
-probes at `/readyz`. A liveness probe pointed at `/health` can fail repeatedly
-during a database stall (11 consecutive failures at 1 and 2 second probe timeouts
-in the test) and restart a server that would have recovered by itself; the
-restart then makes the incident longer.
+`/health` can wait on the database: it resolves a session only when the request
+carries a credential header (`Cookie`, `Authorization` or `X-Yuzu-Token`;
+`resolve_session_fn` in `health_routes.cpp`), and a session lookup that the
+in-memory cache cannot answer is a database read, which during a stall can wait
+for the pool's 10 second connect timeout (derived from the code; not measured
+on this path). A request with no credential header resolves no session.
+`/livez` does no session or database work. Point **liveness** probes at `/livez`
+and **readiness** probes at `/readyz`, not at `/health`: a liveness probe that
+waits on the database during a stall can fail repeatedly and restart a server
+that would have recovered by itself; the restart then makes the incident longer.
 
 ### Precondition: Postgres must be reachable
 

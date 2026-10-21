@@ -42,8 +42,9 @@ private:
     std::unordered_map<std::string, Bucket> buckets_;
 };
 
-/// The refusal every pre-routing rate-limit site sends: 429, `Retry-After: 1` and the
-/// `rate limit exceeded` JSON body. One definition, so a limited probe path and the general
+/// The refusal every pre-routing rate-limit site sends: 429, `Retry-After: 1` and the A4
+/// error envelope (`rate limit exceeded`, `correlation_id` matching the `X-Correlation-Id`
+/// header, `retry_after_ms` 1000). One definition, so a limited probe path and the general
 /// API path cannot drift apart.
 void write_rate_limited_response(httplib::Response& res);
 
