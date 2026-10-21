@@ -19130,6 +19130,9 @@ private:
                         for (const auto& a : list->approvals)
                             if (a.submitted_at > 0 && (oldest == 0 || a.submitted_at < oldest))
                                 oldest = a.submitted_at;
+                        // Display only (#6096): submitted_at is database time and the panel
+                        // subtracts this process's clock from it, so skew shifts the printed
+                        // age. No decision reads this figure.
                         if (oldest > 0)
                             f.oldest = oldest;
                     }

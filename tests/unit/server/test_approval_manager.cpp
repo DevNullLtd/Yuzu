@@ -20,7 +20,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
 
+#include <atomic>
 #include <cctype>
+#include <cstdlib>
 #include <chrono>
 #include <expected>
 #include <filesystem>
@@ -29,6 +31,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 using namespace yuzu::server;
@@ -1175,11 +1178,11 @@ namespace {
 // ';' (so a ';' inside a SQL literal truncates a statement). The file has none of these; the
 // helper REQUIREs that no char-literal quote or raw string occurs so the day one is added this
 // fails loudly instead of silently mis-scanning.
-std::string approval_manager_code_without_comments() {
+std::string server_code_without_comments(const char* file) {
 #ifndef YUZU_SERVER_SRC_DIR
 #error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
 #endif
-    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "approval_manager.cpp");
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / file);
     REQUIRE(in.is_open());
     const std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     REQUIRE(src.find("'\"'") == std::string::npos);  // no '"' char literal
@@ -1221,6 +1224,10 @@ std::string approval_manager_code_without_comments() {
     return out;
 }
 
+std::string approval_manager_code_without_comments() {
+    return server_code_without_comments("approval_manager.cpp");
+}
+
 std::size_t count_occurrences(const std::string& hay, std::string_view needle) {
     std::size_t n = 0;
     for (auto pos = hay.find(needle); pos != std::string::npos; pos = hay.find(needle, pos + 1))
@@ -1239,51 +1246,46 @@ std::string statement_from(const std::string& code, std::string_view anchor) {
 }
 } // namespace
 
-// G8-QE-1 / R3-QE-1 (UP-3/UP-4 closure evidence). The skew defect cannot be simulated
-// in-process (the database clock is not injectable, and the behavioural tests above run both
-// clocks on one host), so this pins the CAUSE at the source: the review/consume stamps and
-// every expiry cutoff -- review, consume CAS, consume's expiry diagnostic, ticket_is_live(),
-// the shared liveness predicate and both submit() sweeps -- are authored in-SQL from
-// kDbNowEpochSql, and the process clock is read at exactly one documented place (submit()'s
-// submitted_at). Reusing submit_stamp_epoch() for reviewed_at, or adding a second clock read
-// of ANY spelling (the file-wide clock-API ban below), fails here.
-TEST_CASE("ApprovalManager: review and consume stamps and every expiry cutoff are authored "
-          "in-SQL from the database clock; the process clock is read at ONE site "
-          "(UP-3/UP-4 source tripwire)",
+// G8-QE-1 / R3-QE-1 (UP-3/UP-4 closure evidence), tightened by #6096. The skew defect cannot
+// be simulated in-process (the database clock is not injectable, and the behavioural tests
+// above run both clocks on one host), so this pins the CAUSE at the source: EVERY stamp and
+// cutoff -- submitted_at, reviewed_at, consumed_at (consume CAS and the schedule-origin
+// retire), the consume expiry diagnostic, ticket_is_live(), the shared liveness predicate and
+// both submit() sweeps -- is authored in-SQL from kDbNowEpochSql, and approval_manager.cpp
+// reads NO process clock at all. Adding a clock read of ANY spelling fails here.
+TEST_CASE("ApprovalManager: every stamp and expiry cutoff is authored in-SQL from the database "
+          "clock; approval_manager.cpp reads no process clock (UP-3/UP-4/#6096 source tripwire)",
           "[approval_manager][approval]") {
     const std::string code = approval_manager_code_without_comments();
 
-    // (a) The process clock: ONE system_clock read (inside submit_stamp_epoch's body) and
-    // ONE submit_stamp_epoch call site (submit()'s submitted_at), plus the definition.
-    CHECK(count_occurrences(code, "system_clock::now") == 1);
-    CHECK(count_occurrences(code, "::now(") == 1); // no other clock's now() (R3-QE-1)
-    CHECK(count_occurrences(code, "submit_stamp_epoch(") == 2); // definition + the one call
-    // File-wide ban on every other way to read a clock from C++ code or SQL (R3-QE-1): a new
-    // process-clock cutoff cannot slip in under a spelling the exact-match checks above miss.
+    // (a) No process clock. `::now(` catches every chrono clock; the list below catches every
+    // other way to read a clock from C++ code or SQL, so a new cutoff cannot slip in under a
+    // spelling an exact-match check would miss (R3-QE-1).
+    CHECK(count_occurrences(code, "::now(") == 0);
+    CHECK(count_occurrences(code, "submit_stamp_epoch") == 0);
     for (const std::string_view banned :
-         {"steady_clock", "high_resolution_clock", "utc_clock", "tai_clock", "gps_clock",
-          "file_clock", "clock_gettime", "gettimeofday", "time_t", "std::time(", "time(nullptr)",
-          "time(NULL)", "time(0)", "localtime", "gmtime", "clock_timestamp", "current_timestamp",
-          "statement_timestamp", "transaction_timestamp", "localtimestamp"}) {
+         {"system_clock", "steady_clock", "high_resolution_clock", "utc_clock", "tai_clock",
+          "gps_clock", "file_clock", "clock_gettime", "gettimeofday", "time_t", "std::time(",
+          "time(nullptr)", "time(NULL)", "time(0)", "localtime", "gmtime", "clock_timestamp",
+          "current_timestamp", "statement_timestamp", "transaction_timestamp",
+          "localtimestamp"}) {
         INFO("banned clock API: " << banned);
         CHECK(code.find(banned) == std::string::npos);
     }
-    // The one database clock: SQL `now()` appears only in kDbNowEpochSql's own definition
-    // (the C++ `system_clock::now()` call is the one "::now()" subtracted here).
-    CHECK(count_occurrences(code, "now()") - count_occurrences(code, "::now()") == 1);
+    // The one database clock: SQL `now()` appears only in kDbNowEpochSql's own definition.
+    CHECK(count_occurrences(code, "now()") == 1);
     const auto db_now_def = statement_from(code, "constexpr const char* kDbNowEpochSql");
     REQUIRE_FALSE(db_now_def.empty());
     CHECK(db_now_def.find("now()") != std::string::npos);
-    const auto submitted_at = statement_from(code, "const std::string submitted_at");
-    REQUIRE_FALSE(submitted_at.empty());
-    CHECK(submitted_at.find("submit_stamp_epoch(") != std::string::npos);
 
     // (b) The database clock: each stamp / cutoff statement names kDbNowEpochSql (directly or
-    // via the shared liveness predicate) and none of them can reach the process clock.
+    // via the shared liveness predicate).
     const auto review = statement_from(code, "const std::string review_sql");
     const auto consume = statement_from(code, "const std::string consume_sql");
+    const auto retire = statement_from(code, "const std::string retire_sql");
     const auto why = statement_from(code, "const std::string why_sql"); // consume's diagnostic
     const auto db_now = statement_from(code, "const std::string db_now");
+    const auto insert = statement_from(code, "const std::string insert_sql");
     const auto sweep_pending = statement_from(code, "const std::string sweep_pending_sql");
     const auto sweep_approved = statement_from(code, "const std::string sweep_approved_sql");
     const auto live_now = statement_from(code, "const std::string now =");
@@ -1293,57 +1295,244 @@ TEST_CASE("ApprovalManager: review and consume stamps and every expiry cutoff ar
         "const std::string sql = \"SELECT 1 FROM approval_manager.approvals WHERE id = $1 AND \"";
     CHECK(count_occurrences(code, kIsLiveAnchor) == 1);
     const auto is_live = statement_from(code, kIsLiveAnchor);
-    for (const auto* stmt : {&review, &consume, &why, &db_now, &sweep_pending, &sweep_approved,
-                             &live_now, &live_stmt, &is_live})
+    for (const auto* stmt : {&review, &consume, &retire, &why, &db_now, &insert, &sweep_pending,
+                             &sweep_approved, &live_now, &live_stmt, &is_live})
         REQUIRE_FALSE(stmt->empty());
 
     CHECK(review.find("kDbNowEpochSql") != std::string::npos);   // reviewed_at
     CHECK(consume.find("kDbNowEpochSql") != std::string::npos);  // consumed_at
+    CHECK(retire.find("kDbNowEpochSql") != std::string::npos);   // consumed_at, schedule retire
     CHECK(consume.find("ticket_live_sql()") != std::string::npos);
     CHECK(why.find("ticket_live_sql()") != std::string::npos);   // consume's expiry diagnostic
     CHECK(is_live.find("ticket_live_sql()") != std::string::npos); // ticket_is_live()
     CHECK(db_now.find("kDbNowEpochSql") != std::string::npos);   // the pending-sweep cutoff
     CHECK(sweep_pending.find("db_now") != std::string::npos);
+    // submitted_at (#6096): the INSERT concatenates db_now into the VALUES list rather than
+    // binding a C++-authored value, so there is no `submitted_at` parameter left to stamp.
+    CHECK(insert.find("db_now") != std::string::npos);
+    CHECK(insert.find("$9") == std::string::npos);
     CHECK(live_now.find("kDbNowEpochSql") != std::string::npos); // the liveness predicate
     CHECK(live_stmt.find("ticket_live_sql()") != std::string::npos);
     CHECK(sweep_approved.find("live_sql") != std::string::npos); // approved sweep cutoff
-    for (const auto* stmt : {&review, &consume, &why, &db_now, &sweep_pending, &sweep_approved,
-                             &live_now, &live_stmt, &is_live}) {
-        CHECK(stmt->find("submit_stamp_epoch") == std::string::npos);
-        CHECK(stmt->find("system_clock") == std::string::npos);
-    }
 }
 
-// G8-QE-7. submitted_at is DELIBERATELY stamped from the process clock (not database time):
-// ScheduleRunner's occurrence anchor (ticket_is_current) compares it with ScheduleEngine's
-// process-clock last_executed_at/created_at, and moving only one side to database time would
-// make that comparison cross-clock (a spent ticket looking newer than its occurrence, one
-// approval firing more than once). The residual -- a schedule re-fire under process/database
-// skew -- is tracked in #6096. If you are changing this, you are changing that trade-off:
-// move ScheduleEngine's stamps in the same change and update this test consciously.
-TEST_CASE("ApprovalManager: submitted_at is deliberately process-clock stamped (#6096 residual)",
-          "[pg][approval_manager][approval]") {
-    const std::string code = approval_manager_code_without_comments();
-    const auto stamp = statement_from(code, "const std::string submitted_at");
-    REQUIRE_FALSE(stamp.empty());
-    CHECK(stamp.find("submit_stamp_epoch(") != std::string::npos);
-    CHECK(stamp.find("kDbNowEpochSql") == std::string::npos);
+// #6096. The approval path's remaining process-clock reads are an allow-listed, documented
+// set, asserted by exact count so a new site fails loudly. ScheduleEngine's stamps
+// (created_at, last_executed_at, next_execution_at and the due-ness comparison) are
+// process-clock due-ness bookkeeping and are INFORMATIONAL for approvals now: no approval
+// decision compares a ticket's database-authored stamp with them. ScheduleRunner reads the
+// process clock only for the timestamp on its audit rows. If you are adding a read to either
+// file, decide consciously that it cannot feed an approval decision, then bump the count.
+TEST_CASE("Schedule path: the process-clock reads are an allow-listed, documented set "
+          "(#6096)",
+          "[approval_manager][approval][schedule]") {
+    const std::string runner = server_code_without_comments("schedule_runner.cpp");
+    const std::string engine = server_code_without_comments("schedule_engine.cpp");
 
+    // Runner: exactly one clock read (now_epoch(), used only by audit()), called once.
+    CHECK(count_occurrences(runner, "::now(") == 1);
+    CHECK(count_occurrences(runner, "system_clock::now") == 1);
+    CHECK(count_occurrences(runner, "now_epoch(") == 2); // definition + audit()'s timestamp
+    // Engine: exactly one clock read (now_epoch()), called at its four due-ness stamp sites
+    // (next-due computation, create's created_at, evaluate_due, advance's last_executed_at).
+    CHECK(count_occurrences(engine, "::now(") == 1);
+    CHECK(count_occurrences(engine, "system_clock::now") == 1);
+    CHECK(count_occurrences(engine, "now_epoch(") == 5); // definition + four stamp sites
+    for (const auto* code : {&runner, &engine})
+        for (const std::string_view banned :
+             {"steady_clock", "high_resolution_clock", "utc_clock", "tai_clock", "gps_clock",
+              "file_clock", "clock_gettime", "gettimeofday", "std::time(", "time(nullptr)",
+              "time(NULL)", "time(0)", "localtime", "gmtime"}) {
+            INFO("banned clock API: " << banned);
+            CHECK(code->find(banned) == std::string::npos);
+        }
+    // The runner no longer compares a ticket stamp with a schedule stamp at all.
+    CHECK(runner.find("ticket_is_current") == std::string::npos);
+    CHECK(runner.find("submitted_at") == std::string::npos);
+}
+
+// #6096: submitted_at is authored by the DATABASE in submit(), the same clock as every other
+// stamp. The database clock is not injectable, so assert the origin directly: read the
+// database's own clock on a second connection immediately before and after the submit and
+// require the stored stamp inside that window. (A process-clock stamp would also fall in a
+// window on one host, which is why the source tripwire above pins the SQL; this pins the
+// observable behaviour.)
+TEST_CASE("ApprovalManager: submitted_at is authored by the database clock (#6096)",
+          "[pg][approval_manager][approval][6096]") {
     yuzu::test::ApprovalManagerPg mgr_bundle;
     ApprovalManager& mgr = *mgr_bundle;
-    auto epoch = [] {
-        return std::chrono::duration_cast<std::chrono::seconds>(
-                   std::chrono::system_clock::now().time_since_epoch())
-            .count();
+    auto db_epoch = [&] {
+        yuzu::server::pg::PgConn conn{PQconnectdb(mgr_bundle.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{
+            PQexec(conn.get(), "SELECT EXTRACT(EPOCH FROM now())::bigint")};
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        return static_cast<int64_t>(std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10));
     };
-    const int64_t before = epoch();
+    const int64_t before = db_epoch();
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
-    const int64_t after = epoch();
+    const int64_t after = db_epoch();
     REQUIRE(id.has_value());
     auto row = mgr.get(*id);
     REQUIRE(row.has_value());
     CHECK(row->submitted_at >= before);
     CHECK(row->submitted_at <= after);
+}
+
+// #6096: the schedule-origin retire is a guarded CAS.
+TEST_CASE("ApprovalManager::retire_for_schedule: a guarded one-shot transition",
+          "[pg][approval_manager][approval][6096]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+    auto mint = [&](const std::string& schedule_id) {
+        auto id = mgr.submit("def-1", "operator1", "scope", schedule_id, ApprovalOrigin::kSchedule,
+                             "procs", "list");
+        REQUIRE(id.has_value());
+        return *id;
+    };
+
+    SECTION("a pending ticket is not retirable") {
+        const auto id = mint("sched-a");
+        auto r = mgr.retire_for_schedule(id, "sched-a");
+        REQUIRE(r.has_value());
+        CHECK_FALSE(*r);
+        CHECK(mgr.get(id)->consumed_at == 0);
+    }
+
+    SECTION("an approved ticket retires once, by database time, and only for its own schedule") {
+        const auto id = mint("sched-a");
+        REQUIRE(mgr.approve(id, "boss", "ok").has_value());
+
+        auto wrong = mgr.retire_for_schedule(id, "sched-b");
+        REQUIRE(wrong.has_value());
+        CHECK_FALSE(*wrong); // a different schedule cannot retire it
+        CHECK(mgr.get(id)->consumed_at == 0);
+
+        yuzu::server::pg::PgConn conn{PQconnectdb(mgr_bundle.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        auto db_epoch = [&] {
+            yuzu::server::pg::PgResult r{
+                PQexec(conn.get(), "SELECT EXTRACT(EPOCH FROM now())::bigint")};
+            REQUIRE(r.status() == PGRES_TUPLES_OK);
+            return static_cast<int64_t>(std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10));
+        };
+        const int64_t before = db_epoch();
+        auto first = mgr.retire_for_schedule(id, "sched-a");
+        const int64_t after = db_epoch();
+        REQUIRE(first.has_value());
+        CHECK(*first);
+        auto row = mgr.get(id);
+        REQUIRE(row.has_value());
+        CHECK(row->consumed_at >= before);
+        CHECK(row->consumed_at <= after);
+        CHECK(row->consumed_by == "schedule:sched-a");
+        CHECK(row->status == "approved");
+
+        auto again = mgr.retire_for_schedule(id, "sched-a");
+        REQUIRE(again.has_value());
+        CHECK_FALSE(*again); // already retired
+        CHECK(mgr.get(id)->consumed_at == row->consumed_at); // untouched by the loser
+    }
+
+    SECTION("a rejected ticket is retirable too") {
+        const auto id = mint("sched-a");
+        REQUIRE(mgr.reject(id, "boss", "no").has_value());
+        auto r = mgr.retire_for_schedule(id, "sched-a");
+        REQUIRE(r.has_value());
+        CHECK(*r);
+        CHECK(mgr.get(id)->consumed_at != 0);
+    }
+
+    SECTION("an unknown id or an empty argument") {
+        auto none = mgr.retire_for_schedule("no-such-id", "sched-a");
+        REQUIRE(none.has_value());
+        CHECK_FALSE(*none);
+        CHECK_FALSE(mgr.retire_for_schedule("", "sched-a").has_value());
+        CHECK_FALSE(mgr.retire_for_schedule("x", "").has_value());
+    }
+
+    SECTION("two concurrent callers: exactly one wins") {
+        const auto id = mint("sched-a");
+        REQUIRE(mgr.approve(id, "boss", "ok").has_value());
+        std::atomic<int> wins{0};
+        std::atomic<int> errors{0};
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 4; ++i)
+            threads.emplace_back([&] {
+                auto r = mgr.retire_for_schedule(id, "sched-a");
+                if (!r)
+                    ++errors;
+                else if (*r)
+                    ++wins;
+            });
+        for (auto& t : threads)
+            t.join();
+        CHECK(errors.load() == 0);
+        CHECK(wins.load() == 1);
+    }
+
+    SECTION("a store failure is an error, not false") {
+        pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                                .size = 1,
+                                .connect_timeout_s = 1}};
+        ApprovalManager dead{unreachable};
+        CHECK_FALSE(dead.is_open());
+        CHECK_FALSE(dead.retire_for_schedule("x", "y").has_value());
+    }
+
+    SECTION("consume_ticket still refuses a schedule-origin ticket") {
+        const auto id = mint("sched-a");
+        REQUIRE(mgr.approve(id, "boss", "ok").has_value());
+        auto c = mgr.consume_ticket(id, "operator1", {});
+        REQUIRE_FALSE(c.has_value());
+        CHECK(c.error().kind == ConsumeFailure::kForeignOrigin);
+        CHECK(mgr.get(id)->consumed_at == 0);
+    }
+}
+
+// #6096 legacy migration: retires exactly the unconsumed approved/rejected tickets of one
+// schedule submitted at or before the cutoff.
+TEST_CASE("ApprovalManager::retire_legacy_spent_for_schedule: bounded to one schedule and "
+          "the cutoff (#6096)",
+          "[pg][approval_manager][approval][6096]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+    auto mint = [&](const std::string& schedule_id, int64_t submitted_at, bool approve) {
+        auto id = mgr.submit("def-1", "operator1", "scope", schedule_id, ApprovalOrigin::kSchedule,
+                             "procs", "list");
+        REQUIRE(id.has_value());
+        REQUIRE((approve ? mgr.approve(*id, "boss", "ok") : mgr.reject(*id, "boss", "no"))
+                    .has_value());
+        yuzu::server::pg::PgConn conn{PQconnectdb(mgr_bundle.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        auto sql = "UPDATE approval_manager.approvals SET submitted_at = " +
+                   std::to_string(submitted_at) + " WHERE id = '" + *id + "'";
+        yuzu::server::pg::PgResult res{PQexec(conn.get(), sql.c_str())};
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+        return *id;
+    };
+    const auto old_approved = mint("sched-a", 100, true);
+    const auto boundary = mint("sched-a", 200, true);
+    const auto old_rejected = mint("sched-a", 150, false);
+    const auto newer = mint("sched-a", 201, true);
+    const auto other_sched = mint("sched-b", 100, true);
+
+    auto n = mgr.retire_legacy_spent_for_schedule("sched-a", 200);
+    REQUIRE(n.has_value());
+    CHECK(*n == 3);
+    CHECK(mgr.get(old_approved)->consumed_at != 0);
+    CHECK(mgr.get(boundary)->consumed_at != 0); // `<=`, the old rule's strictness
+    CHECK(mgr.get(old_rejected)->consumed_at != 0);
+    CHECK(mgr.get(newer)->consumed_at == 0);
+    CHECK(mgr.get(other_sched)->consumed_at == 0);
+
+    auto again = mgr.retire_legacy_spent_for_schedule("sched-a", 200);
+    REQUIRE(again.has_value());
+    CHECK(*again == 0);
+    auto never_fired = mgr.retire_legacy_spent_for_schedule("sched-b", 0);
+    REQUIRE(never_fired.has_value());
+    CHECK(*never_fired == 0); // a never-advanced schedule has nothing spent
+    CHECK(mgr.get(other_sched)->consumed_at == 0);
 }
 
 TEST_CASE("ApprovalManager::ticket_is_live: the shared liveness predicate",

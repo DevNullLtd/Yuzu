@@ -118,7 +118,10 @@ struct Approval {
     // One-time-consumption stamp for the MCP approval-ticket flow (#289 / Issue
     // 13.5): epoch-seconds when an approved ticket was recalled-and-executed,
     // 0 while unconsumed. SQLite-era additive column (v2); part of the
-    // Postgres v1 DDL from creation (ADR-0065).
+    // Postgres v1 DDL from creation (ADR-0065). Also set (with consumed_by
+    // "schedule:<id>") by retire_for_schedule when a scheduled occurrence settles
+    // an approved or rejected ticket (#6096): a scheduled ticket is eligible
+    // exactly while this is 0.
     int64_t consumed_at{0};
     // WHO consumed the ticket (PR #1796 review H3/N2, SOC-2 CC7.2): the
     // principal whose recall executed the gated tool. Empty while unconsumed.
@@ -560,6 +563,24 @@ public:
     /// (the scheduler) holds the occurrence rather than treating an unreadable ticket as
     /// a dead one. Read-only; consumes nothing.
     [[nodiscard]] std::expected<bool, std::string> ticket_is_live(const std::string& id) const;
+
+    /// The schedule-origin retire (#6096): mark an approved OR rejected ticket spent once
+    /// the ScheduleRunner has settled its occurrence, so a ticket is eligible exactly
+    /// while `consumed_at == 0`. A guarded transition, the schedule-origin twin of
+    /// consume_ticket's CAS (`WHERE id AND schedule_id AND consumed_at = 0 AND status IN
+    /// ('approved','rejected') RETURNING`), stamped from DATABASE time. This is what makes
+    /// one approval == one scheduled run; no clock comparison is involved. true = THIS call
+    /// retired it; false = already retired, wrong schedule, or not approved/rejected; error
+    /// = store failure (the runner then holds the occurrence and retries, which is safe
+    /// because the enqueue is idempotent). consume_ticket still refuses kSchedule origins.
+    [[nodiscard]] std::expected<bool, std::string>
+    retire_for_schedule(const std::string& id, const std::string& schedule_id);
+
+    /// LEGACY-MIGRATION (#6096, remove one release after it ships): retire every
+    /// unconsumed approved/rejected ticket of `schedule_id` submitted at or before
+    /// `last_executed_at` (the pre-#6096 "spent" rule) and return how many. See the .cpp.
+    [[nodiscard]] std::expected<int, std::string>
+    retire_legacy_spent_for_schedule(const std::string& schedule_id, int64_t last_executed_at);
 
     /// consume_ticket with a pre-consume recheck (#2443). A ticket can sit
     /// approved-but-unconsumed for up to the 7-day TTL, so the state its effect

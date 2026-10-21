@@ -63,20 +63,13 @@ std::string redact_id(const std::string& id) {
 // same direction as SessionStore, ADR-2002 s4 / #3715). `now()` is fixed for a
 // transaction, so a statement or sweep sees one reading.
 //
-// `submitted_at` is the ONE deliberate exception, stamped by submit_stamp_epoch()
-// below: ScheduleRunner's occurrence anchor (`ticket_is_current`) compares it with
-// ScheduleEngine's `last_executed_at`/`created_at`, which are process-clock stamps.
-// Moving only one side to database time would make that comparison cross-clock, and
-// a database clock running ahead of the runner would make a spent, approved ticket
-// look newer than its occurrence again -- one approval firing more than once, which
-// is worse than anything this change closes. Follow-up: move ScheduleEngine's stamps
-// to database time, then this one.
-int64_t submit_stamp_epoch() {
-    return std::chrono::duration_cast<std::chrono::seconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
+// `submitted_at` is database time too (#6096): submit() authors it in-SQL from the same
+// expression, so every stamp this store writes and every comparison it makes (the
+// pending-expiry cutoff, the ticket lifetime) is on the one clock. It used to be the
+// one process-clock stamp, kept so ScheduleRunner could compare it with ScheduleEngine's
+// process-clock `last_executed_at`; that comparison is gone. One approval == one
+// scheduled run is now a guarded STATE transition (retire_for_schedule), not a clock
+// comparison, so no reader needs the two clocks to agree.
 constexpr const char* kDbNowEpochSql = "EXTRACT(EPOCH FROM now())::bigint";
 
 // THE ticket-liveness predicate, as a SQL boolean over `reviewed_at`. ONE definition,
@@ -395,9 +388,8 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
     if (!id_r)
         return std::unexpected(id_r.error());
     auto id = *id_r;
-    // Cutoffs come from the database clock (see kDbNowEpochSql above), never from this
-    // process; only submitted_at is process-stamped, for the reason given there.
-    const std::string submitted_at = std::to_string(submit_stamp_epoch());
+    // Cutoffs and every stamp, submitted_at included, come from the database clock (see
+    // kDbNowEpochSql above), never from this process.
     const std::string ttl = std::to_string(kApprovalTicketTtlSeconds);
     const std::string db_now = kDbNowEpochSql;
     const std::string live_sql = ticket_live_sql();
@@ -491,12 +483,12 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
             "(id, definition_id, status, submitted_by, submitted_at, "
             " reviewed_by, reviewed_at, review_comment, scope_expression, schedule_id, origin, "
             " target_plugin, target_action) "
-            "VALUES ($1,$2,'pending',$3,$4,'',0,'',$5,$6,$7,$8,$9)";
+            "VALUES ($1,$2,'pending',$3," + db_now + ",'',0,'',$4,$5,$6,$7,$8)";
         pg::PgResult ins = pg::exec_params(
             conn, insert_sql.c_str(),
-            std::vector<std::string>{id, definition_id, submitted_by, submitted_at,
-                                     scope_expression, schedule_id, to_string(origin),
-                                     target_plugin, target_action});
+            std::vector<std::string>{id, definition_id, submitted_by, scope_expression,
+                                     schedule_id, to_string(origin), target_plugin,
+                                     target_action});
         if (ins.status() != PGRES_COMMAND_OK)
             return false;
         expired_pending_committed = expired_pending;
@@ -1144,6 +1136,78 @@ std::expected<void, std::string> ApprovalManager::set_review_status(const std::s
         return {};
     }
     return std::unexpected("approval already reviewed by another user");
+}
+
+// ---------------------------------------------------------------------------
+// Schedule-origin retire (#6096)
+// ---------------------------------------------------------------------------
+
+std::expected<bool, std::string> ApprovalManager::retire_for_schedule(const std::string& id,
+                                                                      const std::string& schedule_id) {
+    if (!open_)
+        return std::unexpected("database not open");
+    if (id.empty() || schedule_id.empty())
+        return std::unexpected("approval id and schedule id are required");
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected("approval store temporarily unavailable (pool exhausted)");
+
+    // The schedule-origin twin of consume_ticket's CAS: a guarded transition, so exactly
+    // one caller can retire a ticket (RETURNING carries the match, like every store in
+    // this ladder). Deliberately NOT a loosening of consume_ticket, which refuses
+    // kSchedule origins on purpose: this is the only path that settles a scheduled
+    // ticket, and it requires the ticket to belong to the schedule that fired. It does
+    // not check liveness (the runner already did, and a late retire of an expired
+    // ticket is harmless) and accepts a rejected ticket too: a rejected ticket skips one
+    // occurrence and is then spent just as an approved one is. consumed_at is database
+    // time, the clock every other stamp here uses.
+    const std::string retire_sql =
+        std::string("UPDATE approval_manager.approvals SET consumed_at = ") + kDbNowEpochSql +
+        ", consumed_by = $3 WHERE id = $1 AND schedule_id = $2 AND consumed_at = 0 "
+        "AND status IN ('approved','rejected') RETURNING 1";
+    pg::PgResult res = pg::exec_params(lease.get(), retire_sql.c_str(),
+                                       std::vector<std::string>{id, schedule_id,
+                                                                "schedule:" + schedule_id});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ApprovalManager::retire_for_schedule: update failed for id={}: {}",
+                      redact_id(id), PQresultErrorMessage(res.get()));
+        return std::unexpected("approval store temporarily unavailable (retire failed)");
+    }
+    return PQntuples(res.get()) > 0;
+}
+
+// LEGACY-MIGRATION CODE (#6096): remove one release after it ships. Before #6096 a
+// scheduled ticket was never marked spent: the runner treated it as spent when it was
+// submitted at or before the schedule's `last_executed_at` (two process-clock stamps).
+// That rule is gone, so a ticket the old rule had already retired would look unspent on
+// the first tick after an upgrade and fire once more. The runner calls this once per
+// schedule per process, before it reads any ticket, to retire exactly the tickets the old
+// rule retired. It errs toward deny: the only ticket it can retire wrongly is a
+// legitimate unspent one under clock skew, which simply gets a fresh ask.
+std::expected<int, std::string>
+ApprovalManager::retire_legacy_spent_for_schedule(const std::string& schedule_id,
+                                                  int64_t last_executed_at) {
+    if (!open_)
+        return std::unexpected("database not open");
+    if (schedule_id.empty() || last_executed_at <= 0)
+        return 0;
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected("approval store temporarily unavailable (pool exhausted)");
+    const std::string sql =
+        std::string("UPDATE approval_manager.approvals SET consumed_at = ") + kDbNowEpochSql +
+        ", consumed_by = $3 WHERE schedule_id = $1 AND consumed_at = 0 "
+        "AND status IN ('approved','rejected') AND submitted_at <= $2::bigint RETURNING 1";
+    pg::PgResult res = pg::exec_params(
+        lease.get(), sql.c_str(),
+        std::vector<std::string>{schedule_id, std::to_string(last_executed_at),
+                                 "schedule:" + schedule_id});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ApprovalManager::retire_legacy_spent_for_schedule: update failed: {}",
+                      PQresultErrorMessage(res.get()));
+        return std::unexpected("approval store temporarily unavailable (retire failed)");
+    }
+    return PQntuples(res.get());
 }
 
 } // namespace yuzu::server
