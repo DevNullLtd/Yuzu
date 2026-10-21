@@ -24,12 +24,10 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
-#include <memory>
-#include <mutex>
+#include <future>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -515,33 +513,12 @@ TEST_CASE("resolve_enrollment_token: with no path configured nothing is read",
 // its gate, so it CANNOT finish before the deadline whatever the deadline is: the
 // timeout is asserted without any timing assumption.
 
-namespace {
-
-struct Gate {
-    std::mutex mu;
-    std::condition_variable cv;
-    bool open{false};
-    void wait() {
-        std::unique_lock lock(mu);
-        cv.wait(lock, [this] { return open; });
-    }
-    void release() {
-        {
-            std::lock_guard lock(mu);
-            open = true;
-        }
-        cv.notify_all();
-    }
-};
-
-} // namespace
-
 TEST_CASE("resolve_enrollment_token_with: a read that outlasts the deadline is unreadable, "
           "clears the path and leaves the option token",
           "[enrollment][enrollment_token_file]") {
-    const auto gate = std::make_shared<Gate>();
-    const auto blocked = [gate](const std::filesystem::path&) {
-        gate->wait();
+    std::promise<void> gate;
+    const auto blocked = [opened = gate.get_future().share()](const std::filesystem::path&) {
+        opened.wait();
         // What a late-arriving read would have said; nobody may observe it.
         EnrollmentTokenFileRead late;
         late.token = make_hex('9');
@@ -552,7 +529,7 @@ TEST_CASE("resolve_enrollment_token_with: a read that outlasts the deadline is u
     std::filesystem::path path = "ignored-by-the-injected-reader";
     const auto r = yuzu::agent::resolve_enrollment_token_with(token, path, blocked,
                                                               std::chrono::milliseconds{1});
-    gate->release(); // let the abandoned worker finish; its result is discarded
+    gate.set_value(); // let the abandoned worker finish; its result is discarded
     REQUIRE(r.file_outcome.has_value());
     CHECK(*r.file_outcome == TokenFileOutcome::unreadable);
     CHECK(r.file_detail == "timed out");

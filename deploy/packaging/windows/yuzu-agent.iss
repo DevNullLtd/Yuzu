@@ -1052,14 +1052,8 @@ begin
     Exit;
   end;
   { 2. Create the staging directory fresh, beside the destination. The parent
-    exists already (SecureTrustAnchorDir created it, and PrepareToInstall stops
-    before this routine on any refusal there); creating it again is harmless. }
-  if not ForceDirectories(ExpandConstant('{commonappdata}\Yuzu')) then
-  begin
-    Result := 'Could not create the folder for the enrollment token file: ' +
-              ExpandConstant('{commonappdata}\Yuzu') + #13#10#13#10 + StoppedUntouched;
-    Exit;
-  end;
+    exists already: SecureTrustAnchorDir created it, and PrepareToInstall stops
+    before this routine on any refusal there. }
   if not CreateDir(HoldDir) then
   begin
     if IsReparsePoint(HoldDir, Found) then

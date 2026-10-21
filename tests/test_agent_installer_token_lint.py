@@ -121,7 +121,6 @@ def problems(iss: str) -> list:
     else:
         if not in_order(wfn,
                          "IsReparsePoint(Dest",
-                         "ForceDirectories(ExpandConstant('{commonappdata}\\Yuzu'))",
                          "CreateDir(HoldDir)",
                          "HoldDir + '\" /setowner *S-1-5-32-544 /L /C /Q'",
                          "HoldDir + '\" /inheritance:r /grant:r '",
