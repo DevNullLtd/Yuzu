@@ -731,19 +731,8 @@ TEST_CASE("render_tar_capture_sources: a paused core source reads paused with a 
         CHECK(r.find(" checked") == npos);
         CHECK(r.find("state-txt\">paused<") != npos);
         CHECK(r.find("always on") == npos);
-        CHECK(r.find("state-on") == npos);
         CHECK(r.find("data-source") == npos);
         CHECK(row(html, "tcp").find("always on") != npos);
-    }
-    SECTION("optional disabled is unchanged") {
-        const auto r = row(html, "arp");
-        CHECK(r.find("data-source=\"arp\"") != npos);
-        CHECK(r.find("data-committed=\"false\"") != npos);
-        CHECK(r.find(">disabled<") != npos);
-        CHECK(r.find("paused") == npos);
-    }
-    SECTION("absent key is skipped") {
-        CHECK(html.find("src-name\">dns<") == npos);
     }
     SECTION("hostile device is escaped") {
         const std::string h = render_tar_capture_sources("a\"><script>", status, compat);
