@@ -728,7 +728,7 @@ TEST_CASE("render_tar_capture_sources: a paused core source reads paused with a 
         const auto r = row(html, "service");
         CHECK(r.find("tgl locked") != npos);
         CHECK(r.find("type=\"checkbox\" disabled>") != npos);
-        CHECK(r.find(" checked") == npos);
+        CHECK(r.find("checked") == npos);
         CHECK(r.find("state-txt\">paused<") != npos);
         CHECK(r.find("always on") == npos);
         CHECK(r.find("data-source") == npos);
