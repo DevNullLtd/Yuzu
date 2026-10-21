@@ -150,8 +150,9 @@ Structured JSON envelope:
   construction rather than by each remembering. Today the rule replaces the `value=` segment of a
   `target_type="RuntimeConfig"` row naming a secret-valued key: those rows recorded the plaintext
   credential before the write path was fixed, and they are still on disk. A reader therefore never
-  receives the stored bytes for a secret-bearing target. **Any new audit reader must go through
-  `AuditStore::query()`** - reading `audit_events` directly re-opens the disclosure.
+  receives the stored bytes of such a row; every other `detail` is returned as stored (the
+  `registry.write` bullet below says so for its registry values). **Any new audit reader must go
+  through `AuditStore::query()`** - reading `audit_events` directly re-opens the disclosure.
 - **Never add a `detail` filter or free-text search to `AuditQuery`.** It has fields for
   `principal`, `action`, `target_type`, `target_id`, `since`/`until` and `action_prefixes`, and
   deliberately none for `detail`. A `LIKE`/search parameter over `detail` would let any
