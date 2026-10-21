@@ -13,8 +13,8 @@ Hermetic: injected seams, plus one wildcard-bound listener to prove the real
 probe refuses a held port. No epmd, no rebar3, no subprocess.
 """
 import fnmatch
+import functools
 import os
-import random
 import re
 import socket
 import subprocess
@@ -30,23 +30,34 @@ WRAPPER = os.path.join(ROOT, 'scripts', 'test_gateway.py')
 
 
 class PickPortTest(unittest.TestCase):
-    def test_returns_the_first_free_candidate_inside_the_range(self):
+    LOW = ge.PORT_RANGE[0]
+
+    def test_starts_at_the_port_the_pid_maps_to_and_takes_the_first_free_one(self):
         seen = []
 
         def is_free(port):
             seen.append(port)
             return len(seen) == 3
 
-        port = ge.pick_port(is_free, rng=random.Random(7))
-        self.assertEqual(port, seen[2])
-        self.assertEqual(len(seen), 3)
-        for p in seen:
-            self.assertTrue(ge.PORT_RANGE[0] <= p <= ge.PORT_RANGE[1])
+        port = ge.pick_port(is_free, pid=lambda: 100)
+        self.assertEqual(seen, [self.LOW + 100, self.LOW + 101, self.LOW + 102])
+        self.assertEqual(port, self.LOW + 102)
+
+    def test_concurrent_runs_start_at_distinct_ports(self):
+        # Two wrapper processes alive together have different pids, so they cannot pick
+        # one port before either epmd binds (a shared epmd would be killed by the first exit).
+        first = [ge.pick_port(lambda p: True, pid=lambda pid=pid: pid) for pid in (4100, 4104, 4108)]
+        self.assertEqual(len(set(first)), 3)
+
+    def test_the_scan_wraps_at_the_end_of_the_range(self):
+        span = ge.PORT_RANGE[1] - ge.PORT_RANGE[0] + 1
+        seen = []
+        ge.pick_port(lambda p: seen.append(p) or False, pid=lambda: span - 1)
+        self.assertEqual(seen[:2], [ge.PORT_RANGE[1], self.LOW])
 
     def test_gives_up_after_a_bounded_number_of_tries(self):
         calls = []
-        self.assertIsNone(ge.pick_port(lambda p: calls.append(p) or False,
-                                       rng=random.Random(1)))
+        self.assertIsNone(ge.pick_port(lambda p: calls.append(p) or False, pid=lambda: 5))
         self.assertEqual(len(calls), 20)
 
     def test_range_stays_below_every_ephemeral_range(self):
@@ -58,7 +69,10 @@ class PickPortTest(unittest.TestCase):
 class PortProbeTest(unittest.TestCase):
     def test_a_held_port_is_not_free(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
-            held.bind(("", 0))
+            try:
+                held.bind(("", 0))
+            except OSError as exc:  # a sandbox that denies bind cannot run this probe test
+                self.skipTest("cannot bind a socket here: %s" % exc)
             held.listen(1)
             self.assertFalse(ge.port_is_free(held.getsockname()[1]))
 
@@ -66,9 +80,9 @@ class PortProbeTest(unittest.TestCase):
 class IsolateTest(unittest.TestCase):
     def test_sets_a_private_port_when_none_is_configured(self):
         env = {"PATH": "x"}
-        got = ge.isolate(env, is_free=lambda p: True, rng=random.Random(3))
+        got = ge.isolate(env, is_free=lambda p: True, pid=lambda: 3)
         self.assertEqual(env["ERL_EPMD_PORT"], got)
-        self.assertTrue(ge.PORT_RANGE[0] <= int(got) <= ge.PORT_RANGE[1])
+        self.assertEqual(got, str(ge.PORT_RANGE[0] + 3))
         self.assertEqual(env["PATH"], "x")
 
     def test_an_explicit_port_is_the_operators_isolation_and_wins(self):
@@ -79,25 +93,21 @@ class IsolateTest(unittest.TestCase):
 
     def test_an_empty_value_counts_as_unset(self):
         env = {"ERL_EPMD_PORT": ""}
-        got = ge.isolate(env, is_free=lambda p: True, rng=random.Random(4))
+        got = ge.isolate(env, is_free=lambda p: True, pid=lambda: 4)
         self.assertEqual(env["ERL_EPMD_PORT"], got)
         self.assertNotEqual(got, "")
 
     def test_no_free_port_leaves_the_environment_alone(self):
         env = {}
-        self.assertIsNone(ge.isolate(env, is_free=lambda p: False, rng=random.Random(5)))
+        self.assertIsNone(ge.isolate(env, is_free=lambda p: False, pid=lambda: 5))
         self.assertEqual(env, {})
 
-    def test_an_owned_epmd_may_be_killed_while_a_node_is_still_registered(self):
-        # epmd refuses -kill with living nodes unless started relaxed; erl starts it
-        # with this process's env. Measured: refused without it, "Killed" with it.
+    def test_the_kill_check_stays_strict_so_a_cleanup_cannot_take_down_a_shared_epmd(self):
+        # epmd refuses `-kill` while any node is registered unless ERL_EPMD_RELAXED_COMMAND_CHECK
+        # is set (measured). Setting it would let one run's exit kill an epmd another run
+        # still uses; leaving it unset only ever leaves this run's own epmd to the runner.
         env = {}
-        ge.isolate(env, is_free=lambda p: True, rng=random.Random(6))
-        self.assertEqual(env["ERL_EPMD_RELAXED_COMMAND_CHECK"], "1")
-
-    def test_an_explicit_port_does_not_get_the_relaxed_check(self):
-        env = {"ERL_EPMD_PORT": "9999"}
-        ge.isolate(env)
+        ge.isolate(env, is_free=lambda p: True, pid=lambda: 6)
         self.assertNotIn("ERL_EPMD_RELAXED_COMMAND_CHECK", env)
 
 
@@ -131,7 +141,8 @@ class ActivateTest(unittest.TestCase):
 
     def test_the_default_isolation_is_isolate(self):
         env = {}
-        port, said, registered = self.run_activate(env, ge.isolate)
+        port, said, registered = self.run_activate(
+            env, functools.partial(ge.isolate, is_free=lambda p: True))
         self.assertEqual(registered[0][:2], (ge.stop, port))
         self.assertEqual(env["ERL_EPMD_PORT"], port)
 

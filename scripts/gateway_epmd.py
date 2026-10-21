@@ -16,7 +16,6 @@ with injectable seams. Pinned by tests/test_gateway_epmd.py.
 import atexit
 import glob
 import os
-import random
 import shutil
 import socket
 import subprocess
@@ -28,10 +27,16 @@ _MAX_TRIES = 20
 _KILL_TIMEOUT_SECS = 10
 
 
-def pick_port(is_free, rng=random):
-    """First free port among _MAX_TRIES random candidates, else None."""
-    for _ in range(_MAX_TRIES):
-        port = rng.randint(*PORT_RANGE)
+def pick_port(is_free, pid=os.getpid):
+    """First free port scanning up from a start derived from this process's id,
+    else None. epmd binds long after the probe (once the first distributed node
+    starts), so two runs choosing the same free port would share one epmd and one
+    run's exit would kill the other's. Concurrent runs have distinct pids and so
+    start at distinct ports; a busy port only moves the scan to the next one."""
+    span = PORT_RANGE[1] - PORT_RANGE[0] + 1
+    start = pid() % span
+    for i in range(_MAX_TRIES):
+        port = PORT_RANGE[0] + (start + i) % span
         if is_free(port):
             return port
     return None
@@ -48,23 +53,24 @@ def port_is_free(port):
     return True
 
 
-def isolate(env, is_free=port_is_free, rng=random):
+def isolate(env, is_free=port_is_free, pid=os.getpid):
     """Point `env` at a run-private epmd port; return it as a string.
 
     Returns None, leaving `env` alone, when the run keeps the epmd it had: an
     explicit ERL_EPMD_PORT (operator isolation), or no free port found (the
     run falls back to the shared epmd, exactly as before this existed).
+
+    The epmd erl starts here keeps its default strict kill check on purpose:
+    `epmd -kill` is refused while any node is registered, so a cleanup can never
+    take down an epmd another run is using (a leaked peer only leaves this run's
+    epmd for the runner's own orphan cleanup).
     """
     if env.get("ERL_EPMD_PORT"):
         return None
-    port = pick_port(is_free, rng)
+    port = pick_port(is_free, pid)
     if port is None:
         return None
     env["ERL_EPMD_PORT"] = str(port)
-    # The epmd erl auto-starts here inherits this: without it `epmd -kill` is
-    # refused while any node is still registered (a leaked peer), and the
-    # run's epmd would outlive it.
-    env.setdefault("ERL_EPMD_RELAXED_COMMAND_CHECK", "1")
     return str(port)
 
 
