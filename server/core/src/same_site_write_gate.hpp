@@ -97,8 +97,8 @@ inline constexpr std::string_view kSameSiteDeniedCounter = "yuzu_server_csrf_den
 inline constexpr std::string_view kSameSiteDenyMessage = "cross-site request refused";
 inline constexpr std::string_view kSameSiteDenyRemediation =
     "Send an Origin or Referer header naming this site, or authenticate with an API token. "
-    "If the request carries a Sec-Fetch-Site header it must be sent once with the value "
-    "same-origin or none; otherwise remove that header. "
+    "For a read that carries a Sec-Fetch-Site header, send it once with the value "
+    "same-origin or none, or remove it. "
     "Behind a reverse proxy that rewrites Host, declare the public origin with "
     "--csrf-trusted-origin (or YUZU_CSRF_TRUSTED_ORIGIN) and restart; see "
     "docs/user-manual/server-admin.md.";

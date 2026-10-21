@@ -162,7 +162,7 @@ from `server.cpp`'s pre-routing handler.
   Token callers stay exempt. No new refusal reason, metric or alert. Residuals: header
   checks cannot tell a browser's own prefetch, prerender or link preview from a user
   action; a client that sends neither fetch metadata nor `Origin`/`Referer` is refused; and
-  some cookie-reachable reads are outside the list by decision. Rationale: the design record linked at the end of this section.
+  cookie-reachable reads outside the list remain there by decision. Rationale: the design record linked at the end of this section.
 - **Exemptions** are by placement only: the pre-session set in
   `is_login_exempt_path`, the health probes and the metrics endpoint return
   before session resolution and never reach the gate. There is no second list.

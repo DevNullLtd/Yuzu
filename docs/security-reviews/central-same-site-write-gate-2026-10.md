@@ -52,7 +52,7 @@ per-route copies, which stay.
 - **Exemptions** are by placement only: `is_login_exempt_path`'s pre-session set, the health probes
   and the metrics endpoint return before session resolution and never reach the gate. There is no
   second list.
-- **Predicate.** `Origin` and `Referer` only. It calls `browser_write_is_cross_site` and does not
+- **Predicate.** For a write, `Origin` and `Referer` only (a guarded read is decided by fetch metadata first, see below). It calls `browser_write_is_cross_site` and does not
   re-implement it. The refusal reason is derived from which of the two headers are non-empty and
   cannot change the decision. The decision also takes the web listener's TLS state
   (`Config::https_enabled`), passed explicitly with no default. On a listener that terminates TLS
@@ -234,7 +234,7 @@ documented: a proxied deployment WITHOUT a declared `https://` origin still trea
 - Per-route copies stay in place in this change. They fall into two predicate variants: copies of the
   token-exempt predicate (`browser_write_is_cross_site`), which are unreachable in production, and
   copies of the plain `origin_is_same_site` test, which are not token-exempt and so still answer a
-  token caller of those dashboard-panel routes. "Defence in depth" and "token callers are not
+  token caller of those routes. "Defence in depth" and "token callers are not
   affected" are therefore stated with that exception.
 - Scheme-aware same-host comparison: added in the governance fix round per owner instruction. The
   listener's TLS state is a required argument of the decision and the gate (no default), read from

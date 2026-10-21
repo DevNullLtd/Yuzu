@@ -28,7 +28,7 @@
 ///     admits it, any other fetch metadata refuses it, and a request without fetch metadata
 ///     falls back to the Origin and Referer rule. Prefetch and prerender by the user's own
 ///     browser carry same-origin metadata and are not prevented.
-///   - The predicate is Origin and Referer only. It CALLS `browser_write_is_cross_site`
+///   - For a write the predicate is Origin and Referer only. It CALLS `browser_write_is_cross_site`
 ///     (web_utils.hpp) and never re-implements any branch of it. The refusal REASON is derived
 ///     from which headers are non-empty (both empty / Origin non-empty / Origin empty) and
 ///     cannot change the decision.
