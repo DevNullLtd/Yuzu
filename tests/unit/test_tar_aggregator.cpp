@@ -313,6 +313,10 @@ TEST_CASE("TAR source_enabled: the destructive-purge paused-guard predicate (15.
     // targeted, and the flag is already invalid), never wrongly treated as enabled.
     db.set_config("process_enabled", "maybe");
     CHECK_FALSE(source_enabled(db, "process")); // → tar.purge_source ALLOWED (fail-closed)
+
+    // Unreadable flag (closed db / SQL error): do_purge_source branches on
+    // source_enabled_state(), whose nullopt REFUSES (config_unreadable) -- pinned in
+    // "TAR source_enabled_state" below, since the plugin TU is not linked here.
 }
 
 TEST_CASE("TAR paused_at: idempotent re-set leaves the timestamp untouched",
@@ -912,6 +916,38 @@ TEST_CASE("TAR source_enabled: a failed config read fails closed",
     REQUIRE_FALSE(db.is_open());
     CHECK_FALSE(source_enabled(db, "process"));
     CHECK_FALSE(source_enabled(db, "procperf"));
+}
+
+TEST_CASE("TAR source_enabled_state: a failed read is nullopt; absent/stored/errored are confirmed",
+          "[tar][source-enabled][fail-closed][purge]") {
+    // source_enabled() collapses "confirmed disabled" and "flag unreadable" into
+    // false, which is right for a skip-when-false collect gate and wrong for any
+    // site that discards, drains or deletes on false (tar.purge_source, the
+    // process/tcp/module ring drains, the boot-time on_enabled_changed(false)).
+    // Those branch on source_enabled_state(), whose nullopt means "do nothing".
+    // do_purge_source lives in the test-unlinked plugin TU, so this pins the
+    // tri-state it consumes.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-enabled-state-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    // Confirmed-absent row: the registry default (enabled) is a CONFIRMED value.
+    CHECK(source_enabled_state(db, "process") == std::optional<bool>{true});
+    db.set_config("process_enabled", "false");
+    CHECK(source_enabled_state(db, "process") == std::optional<bool>{false});
+    // A non-canonical stored value is "errored": confirmed not-enabled, so a purge
+    // stays allowed exactly as before (the operator-targeted, already-invalid flag).
+    db.set_config("process_enabled", "maybe");
+    CHECK(source_enabled_state(db, "process") == std::optional<bool>{false});
+
+    // A moved-from TarDatabase has no handle (the test_tar_store.cpp idiom), so the
+    // read itself fails: unknown, NOT disabled. Collect gates still read it false.
+    { TarDatabase discard = std::move(db); }
+    REQUIRE_FALSE(db.is_open());
+    CHECK_FALSE(source_enabled_state(db, "process").has_value()); // → tar.purge_source REFUSES
+    CHECK_FALSE(source_enabled(db, "process"));                   // → collect tick skips
 }
 
 TEST_CASE("TAR default-on: the first disable of any source is a real transition",

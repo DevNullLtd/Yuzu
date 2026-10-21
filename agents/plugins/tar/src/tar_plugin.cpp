@@ -59,6 +59,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <string_view>
@@ -951,7 +952,18 @@ public:
                 // is absolute -- NOTHING from a paused window is ever stored --
                 // and the disabled-collect path only skips the tick, it does
                 // not discard what the OS already handed the source.
-                if (!source_enabled(*db_, src->name()))
+                //
+                // An UNREADABLE flag is not a disable: nothing later re-routes
+                // on_enabled_changed(true) (do_configure routes only a canonical
+                // edge, the collect loop only skips), so latching the source off
+                // here would leave it reporting Advanced/0 forever while `status`
+                // says enabled. Throw instead -- the catch below drops the source
+                // loudly, the same outcome as any other start failure.
+                const auto enabled_state = yuzu::tar::source_enabled_state(*db_, src->name());
+                if (!enabled_state)
+                    throw std::runtime_error(
+                        std::format("{}_enabled unreadable at init", src->name()));
+                if (!*enabled_state)
                     src->on_enabled_changed(false);
             } catch (const std::exception& e) {
                 spdlog::error("TAR: cursor source '{}' failed to start: {} -- dropping it",
@@ -1315,7 +1327,8 @@ private:
         // Per-source enable gate (issue #59): if disabled, skip both the
         // diff and the state save so that re-enabling later starts from a
         // clean baseline rather than diffing against a frozen snapshot.
-        const bool process_enabled = source_enabled(*db_, "process");
+        const auto process_state = yuzu::tar::source_enabled_state(*db_, "process");
+        const bool process_enabled = process_state.value_or(false);
         // Forensic-pause contract: the ETW collector owns a live session and keeps
         // filling its ring even while the `process` source is disabled. Unlike the
         // poll (which simply doesn't enumerate), the buffered events SURVIVE — so on
@@ -1325,7 +1338,10 @@ private:
         // Drain-and-DISCARD each disabled tick so nothing from the paused window is
         // ever stored. (Keeps the session warm — no stop/re-arm gap; the kernel
         // session keeps running, events are captured-then-dropped, never inserted.)
-        if (stream_active_ && !process_enabled) {
+        // Discard only on a CONFIRMED disable: an unreadable flag skips this tick
+        // (process_enabled is false) but leaves the ring buffering, so a transient
+        // read failure never destroys events for a source that is actually enabled.
+        if (stream_active_ && process_state.has_value() && !*process_state) {
             proc_stream_->drain();       // flush + discard; never inserted
             pending_stream_evs_.clear(); // and drop any pre-disable insert-retry backlog
         }
@@ -1527,7 +1543,8 @@ private:
         }
 
         // Network diff
-        if (source_enabled(*db_, "tcp")) {
+        const auto tcp_state = yuzu::tar::source_enabled_state(*db_, "tcp");
+        if (tcp_state.value_or(false)) {
             // #538: tcp's diff baseline lives under "network" (see diff_state_key).
             const std::string net_key{yuzu::tar::diff_state_key("tcp")};
             auto current = yuzu::tar::enumerate_connections();
@@ -1722,7 +1739,7 @@ private:
             nstat_tcp_primary_prev_ = nstat_primary;
             total_events += static_cast<int>(typed.size());
             note_health("tcp", yuzu::tar::tcp_tick_status(nstat_insert_failed, "events_recorded"));
-        } else if (nstat_client_) {
+        } else if (nstat_client_ && tcp_state.has_value()) {
             note_health("tcp", "source_disabled");
             // HIGH-4: forensic-pause contract for tcp lifecycle — the nstat
             // client keeps its reader thread running and filling its ring
@@ -1735,7 +1752,9 @@ private:
             // Drop any pre-disable insert-retry backlog too. The client
             // itself stays running (it also feeds netqual, which has its own
             // independent enable gate below) — only the lifecycle ring is
-            // discarded here.
+            // discarded here. Only on a CONFIRMED disable (tcp_state.has_value()):
+            // an unreadable flag skips the tick via the plain branch below and
+            // leaves the ring buffering rather than discarding live lifecycle events.
             nstat_client_->drain();
             pending_nstat_evs_.clear();
         } else {
@@ -1859,7 +1878,8 @@ private:
 
         // M2: module/image loads (Windows ETW), gated by source_enabled
         // (registry default: enabled). The session starts lazily below.
-        const bool module_enabled = source_enabled(*db_, "module");
+        const auto module_state = yuzu::tar::source_enabled_state(*db_, "module");
+        const bool module_enabled = module_state.value_or(false);
         // Lazy start / re-arm: start the session on the first enabled tick (so
         // enabling takes effect next tick — like procperf/netqual, no restart) and
         // re-arm after a transient session death. module_start_failed_ prevents a
@@ -1879,10 +1899,11 @@ private:
             module_start_failed_ = false; // re-enable should retry a previously-failed start
         }
         const char* module_tok = nullptr; // ledger token for this tick (see below)
-        if (module_stream_active_ && !module_enabled) {
+        if (module_stream_active_ && module_state.has_value() && !*module_state) {
             // Disabled mid-run (a true→false toggle): drain-and-discard so the
             // paused window is never stored, keeping the session warm. Mirrors
-            // the process forensic-pause contract.
+            // the process forensic-pause contract. Only on a CONFIRMED disable --
+            // an unreadable flag skips the tick and leaves the ring buffering.
             module_stream_->drain();
             pending_module_evs_.clear();
         } else if (module_stream_active_ && module_enabled) {
@@ -3363,22 +3384,24 @@ private:
         // critical sections and a concurrent `<src>_enabled=true` could commit
         // between them — purging an actively-collecting source (the scan→purge TOCTOU
         // the guard exists to close). Lock order matches do_configure exactly
-        // (collect_mu_ ≺ software_collect_mu_ ≺ TarDatabase::mu_); source_enabled and
+        // (collect_mu_ ≺ software_collect_mu_ ≺ TarDatabase::mu_); source_enabled_state and
         // purge_source take only mu_, which is not held here, so no deadlock/recursion.
         std::lock_guard collect_lock(collect_mu_);
         std::unique_lock<std::mutex> sw_lock;
         if (source == "software")
             sw_lock = std::unique_lock<std::mutex>(software_collect_mu_);
 
-        // source_enabled() reads an unreadable config row as DISABLED (collect gates
-        // fail closed), which for this destructive guard would be fail-open: refuse
-        // unless the flag is confirmed readable.
-        if (!db_->try_get_config(std::format("{}_enabled", source))) {
+        // ONE read, three outcomes: source_enabled() would read an unreadable config
+        // row as DISABLED (collect gates fail closed), which for this destructive
+        // guard would be fail-open -- so refuse unless the flag is confirmed, and
+        // take the confirmation from the same read that decides it.
+        const auto enabled_state = yuzu::tar::source_enabled_state(*db_, source);
+        if (!enabled_state) {
             ctx.write_output(std::format(
                 "error|config_unreadable: cannot confirm {} is disabled; not purging", source));
             return 1;
         }
-        if (source_enabled(*db_, source)) {
+        if (*enabled_state) {
             ctx.write_output(std::format(
                 "error|source_not_paused: {} is enabled; disable it before purging", source));
             return 1;
@@ -3750,17 +3773,9 @@ private:
                 std::unique_lock<std::mutex> sw_lock;
                 if (src_name == "software")
                     sw_lock = std::unique_lock<std::mutex>(software_collect_mu_);
-                // C1 fix: capture the prior tcp enabled state BEFORE applying, so the
-                // R2-3 nstat-ring drain below fires only on an actual enable<->disable
-                // EDGE. An idempotent tcp_enabled=true re-assert (common from
-                // desired-state reconciliation) returns transition_ok==true but is NOT
-                // a pause boundary and must never discard live buffered lifecycle
-                // events (nstat stays primary and the poll is filtered to UDP, so the
-                // loss would be unobservable).
-                const bool tcp_prev_enabled =
-                    (src_name == "tcp") ? source_enabled(*db_, "tcp") : false;
-                // Same capture-before-apply for cursor sources (see the routing
-                // block below): read the prior state while it is still prior.
+                // Capture the prior state BEFORE applying, while it is still prior --
+                // for the tcp nstat drain below (C1 fix) and for the cursor-source
+                // routing block further down.
                 //
                 // Canonicalised the way apply_source_enabled_transition itself
                 // does it, NOT via source_enabled(). The two disagree on a
@@ -3776,6 +3791,15 @@ private:
                 const std::string_view cursor_prev_canon = yuzu::tar::canonical_source_enabled(
                    db_->get_config(std::string(src_name) + "_enabled",
                                    yuzu::tar::source_default_enabled(src_name) ? "true" : "false"));
+                // C1 fix: the R2-3 nstat-ring drain below fires only on an actual
+                // enable<->disable EDGE. An idempotent tcp_enabled=true re-assert
+                // (common from desired-state reconciliation) returns transition_ok==true
+                // but is NOT a pause boundary and must never discard live buffered
+                // lifecycle events (nstat stays primary and the poll is filtered to
+                // UDP, so the loss would be unobservable). Derived from the single
+                // read above, not a second source_enabled() read: a failed read
+                // there would report prev=false and turn that re-assert into an edge.
+                const bool tcp_prev_enabled = (src_name == "tcp") && cursor_prev_canon == "true";
                 transition_ok = yuzu::tar::apply_source_enabled_transition(*db_, src_name, v,
                                                                            now_epoch_seconds());
                 if (transition_ok && v == "false") {
