@@ -5571,17 +5571,12 @@ Catalogue build_catalogue(std::span<const ToolRecord> records) {
                s.find("@ECOSYSTEM_") != std::string_view::npos;
     };
     for (auto& t : c.served) {
-        const std::pair<const char*, const char**> fields[] = {
-            {"description", &t.description},
-            {"input schema", &t.input_schema_json},
-            {"output schema", &t.output_schema_json},
-        };
-        for (const auto& [label, field] : fields) {
-            if (*field == nullptr)
-                continue;
-            const std::string_view text{*field};
+        const auto expand = [&](const char* label, const char*& field) {
+            if (field == nullptr)
+                return;
+            const std::string_view text{field};
             if (!residual(text))
-                continue;
+                return;
             std::string expanded = software_catalog::expand_ecosystem_tokens(text);
             if (residual(expanded))
                 throw std::logic_error(
@@ -5589,8 +5584,11 @@ Catalogue build_catalogue(std::span<const ToolRecord> records) {
                     " still carries an ecosystem token after expansion (a misspelt, single-@ or "
                     "unquoted @@ECOSYSTEM_ token; see software_catalog_rules.hpp "
                     "expand_ecosystem_tokens)");
-            *field = c.expanded_text.emplace_back(std::move(expanded)).c_str();
-        }
+            field = c.expanded_text.emplace_back(std::move(expanded)).c_str();
+        };
+        expand("description", t.description);
+        expand("input schema", t.input_schema_json);
+        expand("output schema", t.output_schema_json);
     }
 
     c.raw_security.reserve(std::size(kToolSecurityRows) + records.size());

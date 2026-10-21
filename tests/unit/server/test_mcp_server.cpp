@@ -39319,20 +39319,6 @@ TEST_CASE("MCP build_catalogue refuses a served text that still carries an ecosy
           "[mcp][software][ecosystem][registry_seam]") {
     using namespace yuzu::server::mcp;
 
-    // Returns the refusal message, or "" when the catalogue builds.
-    const auto refusal = [](ToolRecord r) {
-        const ToolRecord one[] = {r};
-        try {
-            build_catalogue_for_test(one);
-        } catch (const std::logic_error& e) {
-            return std::string(e.what());
-        }
-        return std::string();
-    };
-    const auto contains = [](const std::string& hay, const char* needle) {
-        return hay.find(needle) != std::string::npos;
-    };
-
     SECTION("a well-formed token is expanded, not refused") {
         auto r = good_registry_record();
         r.input_schema_json =
@@ -39342,28 +39328,30 @@ TEST_CASE("MCP build_catalogue refuses a served text that still carries an ecosy
     SECTION("a misspelt token in the input schema names the tool and the field") {
         auto r = good_registry_record();
         r.input_schema_json = R"({"type":"object","properties":{"e":{"enum":["@@ECOSYSTEM_ENM@@"]}}})";
-        const auto msg = refusal(r);
-        CHECK(contains(msg, "MCP tool 'synthetic_tool'"));
-        CHECK(contains(msg, "input schema"));
+        CHECK_THROWS_WITH(build_catalogue_for_test(std::span<const ToolRecord>(&r, 1)),
+                          Catch::Matchers::ContainsSubstring("MCP tool 'synthetic_tool'") &&
+                              Catch::Matchers::ContainsSubstring("input schema"));
     }
     SECTION("a single-@ token is refused") {
         auto r = good_registry_record();
         r.input_schema_json = R"({"type":"object","properties":{"e":{"enum":["@ECOSYSTEM_ENUM@@"]}}})";
-        CHECK(contains(refusal(r), "input schema"));
+        CHECK_THROWS_WITH(build_catalogue_for_test(std::span<const ToolRecord>(&r, 1)),
+                          Catch::Matchers::ContainsSubstring("input schema"));
     }
     SECTION("an unquoted enum token in a description is refused") {
         auto r = good_registry_record();
         r.description = "see @@ECOSYSTEM_ENUM@@";
-        const auto msg = refusal(r);
-        CHECK(contains(msg, "MCP tool 'synthetic_tool'"));
-        CHECK(contains(msg, "description"));
+        CHECK_THROWS_WITH(build_catalogue_for_test(std::span<const ToolRecord>(&r, 1)),
+                          Catch::Matchers::ContainsSubstring("MCP tool 'synthetic_tool'") &&
+                              Catch::Matchers::ContainsSubstring("description"));
     }
     SECTION("the output schema is expanded and guarded too") {
         auto r = good_registry_record();
         r.output_schema_json =
             R"({"type":"object","properties":{"e":{"enum":["@@ECOSYSTEM_ENUM_OR_EMPTY@@"]}}})";
-        CHECK(refusal(r).empty());
+        CHECK_NOTHROW(build_catalogue_for_test(std::span<const ToolRecord>(&r, 1)));
         r.output_schema_json = R"({"type":"object","properties":{"e":{"enum":["@@ECOSYSTEM_X@@"]}}})";
-        CHECK(contains(refusal(r), "output schema"));
+        CHECK_THROWS_WITH(build_catalogue_for_test(std::span<const ToolRecord>(&r, 1)),
+                          Catch::Matchers::ContainsSubstring("output schema"));
     }
 }
