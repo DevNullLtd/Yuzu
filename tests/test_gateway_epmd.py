@@ -18,6 +18,7 @@ pins:
 Hermetic: injected seams, plus one loopback listener to prove the real probe
 refuses a held port. No epmd, no rebar3, no subprocess.
 """
+import fnmatch
 import os
 import random
 import re
@@ -107,22 +108,24 @@ class FindEpmdTest(unittest.TestCase):
                          "/otp/bin/epmd")
         self.assertEqual(asked, [("epmd", "/otp/bin")])
 
-    def test_windows_layout_finds_epmd_under_the_erts_dir_of_the_erl_on_path(self):
-        # Windows OTP: <root>/bin/erl.exe, but epmd.exe only in <root>/erts-<vsn>/bin.
-        root = os.path.join(os.sep, "otp")
+    def test_windows_layout_finds_epmd_exe_not_its_pdb(self):
+        # Windows OTP: <root>/bin/erl.exe, but epmd.exe only in <root>/erts-<vsn>/bin,
+        # beside epmd.pdb, which a bare `epmd*` glob sorts last (this shipped once and
+        # made stop() try to run the symbols file, found on kingsley 2026-10-21).
+        root = os.path.realpath(os.path.join(os.sep, "otp"))
         erl = os.path.join(root, "bin", "erl.exe")
-        want = os.path.join(root, "erts-16.3.1", "bin", "epmd.exe")
-        patterns = []
+        bindir = os.path.join(root, "erts-16.3.1", "bin")
+        want = os.path.join(bindir, "epmd.exe")
+        listing = [os.path.join(bindir, n) for n in
+                   ("epmd.exe", "epmd.pdb", "erl.exe", "erlexec.dll", "epmdx.exe")]
 
         def glob_(pattern):
-            patterns.append(pattern)
-            return [want]
+            return [p for p in listing if fnmatch.fnmatchcase(p, pattern)]
 
         def which(name, path=None):
             return erl if name == "erl" else None
 
         self.assertEqual(ge.find_epmd({"PATH": "x"}, which=which, glob_=glob_), want)
-        self.assertEqual(patterns, [os.path.join(os.path.realpath(root), "erts-*", "bin", "epmd*")])
 
     def test_takes_the_last_of_several_erts_dirs(self):
         hits = ["/otp/erts-15.0/bin/epmd", "/otp/erts-16.3.1/bin/epmd"]

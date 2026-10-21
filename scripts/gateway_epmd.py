@@ -75,7 +75,9 @@ def find_epmd(env, which=shutil.which, glob_=glob.glob):
     if not erl:
         return None
     root = os.path.dirname(os.path.dirname(os.path.realpath(erl)))
-    hits = sorted(glob_(os.path.join(root, "erts-*", "bin", "epmd*")))
+    # Exact names: a bare `epmd*` also matches epmd.pdb in a Windows install.
+    hits = sorted(hit for name in ("epmd", "epmd.exe")
+                  for hit in glob_(os.path.join(root, "erts-*", "bin", name)))
     return hits[-1] if hits else None
 
 
