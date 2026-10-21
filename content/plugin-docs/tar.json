@@ -7,13 +7,13 @@
       ],
       "legs": {
         "linux": {
-          "fallback": "dns opt-in sub-source is PLANNED (no-op) on Linux; arp opt-in sub-source is native (procfs, /proc/net/arp); core process/network/netqual collection is native",
+          "fallback": "dns sub-source is PLANNED (no-op) on Linux; arp sub-source is native (procfs, /proc/net/arp); core process/network/netqual collection is native",
           "mechanism": "procfs",
           "rung": "1",
           "support": "constrained"
         },
         "macos": {
-          "fallback": "process/tcp fall back to a KERN_PROC_ALL/proc_pidfdinfo poll without the Endpoint Security entitlement or nstat root privilege; dns opt-in sub-source is PLANNED (no-op) on macOS; arp opt-in sub-source is native but constrained (route_sysctl, entry_type always 'unknown')",
+          "fallback": "process/tcp fall back to a KERN_PROC_ALL/proc_pidfdinfo poll without the Endpoint Security entitlement or nstat root privilege; dns sub-source is PLANNED (no-op) on macOS; arp sub-source is native but constrained (route_sysctl, entry_type always 'unknown')",
           "mechanism": "endpoint_security+nstat+route_sysctl",
           "rung": "1",
           "support": "constrained"
@@ -57,13 +57,13 @@
       ],
       "legs": {
         "linux": {
-          "fallback": "service enumeration runs bounded argv (rung 2) via the shared subprocess runner; startup_type reads 'unknown'; netconn opt-in source is PLANNED (no-op) on Linux",
+          "fallback": "service enumeration runs bounded argv (rung 2) via the shared subprocess runner; startup_type reads 'unknown'; netconn source is PLANNED (no-op) on Linux",
           "mechanism": "systemctl+utmp",
           "rung": "2",
           "support": "constrained"
         },
         "macos": {
-          "fallback": "service enumeration runs bounded argv (rung 2) via the shared subprocess runner; no startup_type; mapdrive opt-in source is wired but outbound-live-only (getfsstat, no username, no inbound, no history); netconn opt-in source is PLANNED (no-op) on macOS",
+          "fallback": "service enumeration runs bounded argv (rung 2) via the shared subprocess runner; no startup_type; mapdrive source is wired but outbound-live-only (getfsstat, no username, no inbound, no history); netconn source is PLANNED (no-op) on macOS",
           "mechanism": "launchctl+utmpx+getfsstat",
           "rung": "2",
           "support": "constrained"
@@ -656,7 +656,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Recent ARP / neighbour-table activity (ADR-0015) — IP<->MAC bindings per interface with their appeared/removed action. Requires the opt-in `arp` capture source to be enabled on the device.",
+      "description": "Recent ARP / neighbour-table activity (ADR-0015) — IP<->MAC bindings per interface with their appeared/removed action. Requires the `arp` capture source to be enabled on the device (the default).",
       "display_name": "TAR: ARP table (recent)",
       "execute_roles": [
         "endpoint-admin",
@@ -675,7 +675,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Recent DNS resolver-cache state (ADR-0015) — name/record_type/data/TTL with their appeared/removed action. Device-level (no per-process attribution). Requires the opt-in `dns` capture source to be enabled on the device; DNS cache is usage-class telemetry under the works-council posture.",
+      "description": "Recent DNS resolver-cache state (ADR-0015) — name/record_type/data/TTL with their appeared/removed action. Device-level (no per-process attribution). Requires the `dns` capture source to be enabled on the device (the default).",
       "display_name": "TAR: DNS cache (recent)",
       "execute_roles": [
         "endpoint-admin",
@@ -694,7 +694,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Mapped network-share activity (capability-map §3.8) in both directions — outbound (drives this host maps to remote shares) and inbound (remote hosts mapping this host's shares). Live rows carry appeared/removed; historical rows (origin='historical', from registry / fstab / event-log backfill) carry action='historical'. Requires the opt-in `mapdrive` capture source to be enabled on the device; rows expose usernames + share paths (identity/usage- class telemetry under the works-council posture).",
+      "description": "Mapped network-share activity (capability-map §3.8) in both directions — outbound (drives this host maps to remote shares) and inbound (remote hosts mapping this host's shares). Live rows carry appeared/removed; historical rows (origin='historical', from registry / fstab / event-log backfill) carry action='historical'. Requires the `mapdrive` capture source to be enabled on the device (the default); rows expose usernames + share paths.",
       "display_name": "TAR: Mapped drives (recent + historical)",
       "execute_roles": [
         "endpoint-admin",
@@ -898,7 +898,7 @@
     }
   ],
   "description": "Timeline Activity Record -- continuous system state change tracking",
-  "how_it_works": "TAR is the agent's local telemetry warehouse. Four scheduled collectors diff each cycle's OS\nsnapshot against the previous baseline and append change events to a local SQLite database\n(`tar.db`): `collect_fast` (process + network, default 60s), `collect_slow` (service + user\nsession, default 300s), `collect_perf` (device CPU/memory/disk/network counters, default 30s) and\n`collect_software` (installed-software inventory, default hourly) — all four triggers are\nregistered in `init()` (`tar_plugin.cpp:601-644`). `collect_slow` also drives a generic cursor-model\nloop (`tar_plugin.cpp:2122-2130`) over the sources `make_cursor_sources()` constructs\n(`tar_cursor_sources.cpp:30-35`): `power` (sleep/wake/AC-power transitions — Windows\n`PowerRegisterSuspendResumeNotification`/`WM_POWERBROADCAST`, Linux `systemd-logind`\nPrepareForSleep + power-supply sysfs/udev, macOS `pmset -g log` replay) and `removable`\n(removable-media attach/detach plus exec-from-removable correlation — Windows `EvtQuery` over the\nPartition/Diagnostic and Kernel-PnP channels, Linux a udev netlink monitor, macOS DiskArbitration\n`DADiskAppeared`/`Disappeared`; `tar_removable_diskarb.mm`). Both are the first\nworks-council-class sources shipped **on by default** (`tar_schema_registry.cpp:976-992`,\n\"ALEX RULING 2026-09-04\") — every other opt-in source added since 1.5 (procperf, netqual, module,\nsoftware, arp, dns, netconn, mapdrive) still defaults off; the plugin now has 15 registered\ncapture sources, 7 on by default (the five always-on machine-scope sources plus `power` and\n`removable`) and 8 opt-in. `rollup` runs every 15 minutes: it always\naggregates live rows into hourly/daily/monthly tiers first, then unconditionally enforces\nretention on every tier, deleting aged rows (`tar_plugin.cpp:3619-3627`) — the ordering is\nload-bearing and the reason the capability declaration marks this action Destructive/Irreversible.\nReads go through `status` (health + the retention clock-guard counters), `query`/`export` (the\ncore process/network/service/user/software union, or one type behind an explicit filter — arp,\ndns and mapdrive are opt-in PII sources reachable only that way, never the default feed) and `sql`\n(an arbitrary `SELECT` against `$`-prefixed warehouse tables, validated SELECT-only and translated\nto real table names — `tar_sql_executor.cpp:205-244`). `snapshot` forces an out-of-cycle full\ncollection across all four collectors and reports `complete` or `partial|<sources>` if any source\nretained a stale baseline instead. `fleet_snapshot` is a separate on-demand full re-enumeration\nthat bypasses the warehouse entirely, feeding the 3D fleet-topology view. `configure` rewrites\naround 25 collection knobs (retention, intervals, per-source enable flags, redaction patterns).\n`purge_source` deletes every warehouse row for one named source, but only once that source is\nalready disabled — closing the scan-then-purge race a still-collecting source would otherwise hit\n(`tar_plugin.cpp:2987-3031`).\n\nDeliberately not: TAR does not stream events to the server in real time — everything lands in the\nlocal warehouse first and is pulled on `query`/`export`/`sql`/`status`. It does not replay history\nfrom zero when a cursor-model source's log position is lost or wraps — it re-baselines forward and\nrecords a `capture_gap` (`tar_cursor.hpp:25-75`). It never fabricates OS support: a leg without a\nbound mechanism reports `planned`, not a guessed read.",
+  "how_it_works": "TAR is the agent's local telemetry warehouse. Four scheduled collectors diff each cycle's OS\nsnapshot against the previous baseline and append change events to a local SQLite database\n(`tar.db`): `collect_fast` (process + network, default 60s), `collect_slow` (service + user\nsession, default 300s), `collect_perf` (device CPU/memory/disk/network counters, default 30s) and\n`collect_software` (installed-software inventory, default hourly) — all four triggers are\nregistered in `init()` (`tar_plugin.cpp:601-644`). `collect_slow` also drives a generic cursor-model\nloop (`tar_plugin.cpp:2122-2130`) over the sources `make_cursor_sources()` constructs\n(`tar_cursor_sources.cpp:30-35`): `power` (sleep/wake/AC-power transitions — Windows\n`PowerRegisterSuspendResumeNotification`/`WM_POWERBROADCAST`, Linux `systemd-logind`\nPrepareForSleep + power-supply sysfs/udev, macOS `pmset -g log` replay) and `removable`\n(removable-media attach/detach plus exec-from-removable correlation — Windows `EvtQuery` over the\nPartition/Diagnostic and Kernel-PnP channels, Linux a udev netlink monitor, macOS DiskArbitration\n`DADiskAppeared`/`Disappeared`; `tar_removable_diskarb.mm`). The plugin has 16 registered\ncapture sources and every one ships **on by default** on every OS (`default_enabled` in\n`tar_schema_registry.cpp`, enforced by a registry-wide test); an operator can disable any source\nper host with `configure`. `rollup` runs every 15 minutes: it always\naggregates live rows into hourly/daily/monthly tiers first, then unconditionally enforces\nretention on every tier, deleting aged rows (`tar_plugin.cpp:3619-3627`) — the ordering is\nload-bearing and the reason the capability declaration marks this action Destructive/Irreversible.\nReads go through `status` (health + the retention clock-guard counters), `query`/`export` (the\ncore process/network/service/user/software union, or one type behind an explicit filter — arp,\ndns and mapdrive are device-state sources reachable only that way, never the default feed) and `sql`\n(an arbitrary `SELECT` against `$`-prefixed warehouse tables, validated SELECT-only and translated\nto real table names — `tar_sql_executor.cpp:205-244`). `snapshot` forces an out-of-cycle full\ncollection across all four collectors and reports `complete` or `partial|<sources>` if any source\nretained a stale baseline instead. `fleet_snapshot` is a separate on-demand full re-enumeration\nthat bypasses the warehouse entirely, feeding the 3D fleet-topology view. `configure` rewrites\naround 25 collection knobs (retention, intervals, per-source enable flags, redaction patterns).\n`purge_source` deletes every warehouse row for one named source, but only once that source is\nalready disabled — closing the scan-then-purge race a still-collecting source would otherwise hit\n(`tar_plugin.cpp:2987-3031`).\n\nDeliberately not: TAR does not stream events to the server in real time — everything lands in the\nlocal warehouse first and is pulled on `query`/`export`/`sql`/`status`. It does not replay history\nfrom zero when a cursor-model source's log position is lost or wraps — it re-baselines forward and\nrecords a `capture_gap` (`tar_cursor.hpp:25-75`). It never fabricates OS support: a leg without a\nbound mechanism reports `planned`, not a guessed read.",
   "inputs": [
     {
       "constraints": {
@@ -1003,7 +1003,7 @@
       },
       "default": null,
       "definition_id": "crossplatform.tar.configure",
-      "description": "Enable or disable the per-application top-N CPU/working-set sampler (procperf source → $ProcPerf_*). **Off by default** — per-application resource usage reveals which applications run on a device, which is usage-class telemetry under the works-council posture; independent of perf_enabled. Image names only — never command lines. **Enabling this also sends per-app names + versions OFF-DEVICE**: the top-N is synced daily to the central app_perf store (the B1 per-device and B2 fleet views), so it is not local-triage-only. To keep the device fully local, leave this off, or suppress the upload with --inventory-disable / YUZU_AGENT_INVENTORY_DISABLE. Set to \"true\" to opt in. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "description": "Enable or disable the per-application top-N CPU/working-set sampler (procperf source → $ProcPerf_*). **On by default**; independent of perf_enabled. Image names only — never command lines. **This also sends per-app names + versions OFF-DEVICE**: the top-N is synced daily to the central app_perf store (the B1 per-device and B2 fleet views), so it is not local-triage-only. To keep the device fully local, set this to \"false\", or suppress the upload with --inventory-disable / YUZU_AGENT_INVENTORY_DISABLE. Set to \"false\" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
       "name": "procperf_enabled",
       "required": false,
       "type": "string"
@@ -1014,7 +1014,7 @@
       },
       "default": null,
       "definition_id": "crossplatform.tar.configure",
-      "description": "Enable or disable the per-connection TCP-quality sampler (netqual source → $NetQual_Live, plus the per-boot retrospective baseline $NetQual_Boot). **Off by default** — per-connection quality is usage-class telemetry under the works-council posture; only a coarse destination class (loopback/private/public) is stored, raw remote addresses are dropped at the edge. Linux (netlink INET_DIAG) and Windows (TCP ESTATS — ADR-0020); **Windows requires an elevated agent** (non-elevated records nothing and tar.status reports netqual_capture_method=none). macOS is planned. Independent of tcp_enabled. Queried via tar.sql only ($NetQual_Live / $NetQual_Boot); the legacy tar.query / tar.export actions do not surface netqual. Set to \"true\" to opt in. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "description": "Enable or disable the per-connection TCP-quality sampler (netqual source → $NetQual_Live, plus the per-boot retrospective baseline $NetQual_Boot). **On by default**; only a coarse destination class (loopback/private/public) is stored, raw remote addresses are dropped at the edge. Linux (netlink INET_DIAG) and Windows (TCP ESTATS — ADR-0020); **Windows requires an elevated agent** (non-elevated records nothing and tar.status reports netqual_capture_method=none). macOS is planned. Independent of tcp_enabled. Queried via tar.sql only ($NetQual_Live / $NetQual_Boot); the legacy tar.query / tar.export actions do not surface netqual. Set to \"false\" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
       "name": "netqual_enabled",
       "required": false,
       "type": "string"
@@ -1025,7 +1025,7 @@
       },
       "default": null,
       "definition_id": "crossplatform.tar.configure",
-      "description": "Enable or disable the connectivity-transition source (netconn → $NetConn_Live, ADR-0020). **Off by default** — opt-in usage-class telemetry. Windows reads the OS-retained NetworkProfile / NCSI / WLAN-AutoConfig event logs, so the FIRST read backfills connectivity history from BEFORE the source was enabled (bounded by netconn_lookback_seconds; set that to 0 for forward-only). Only closed enum tokens + numeric reason codes are stored — NO SSID, BSSID, profile name, interface GUID, or MAC. Windows-only collector today (Linux journald / macOS oslog planned; the table is queryable-empty there). Queried via tar.sql only ($NetConn_Live); the legacy tar.query / tar.export actions do not surface netconn. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "description": "Enable or disable the connectivity-transition source (netconn → $NetConn_Live, ADR-0020). **On by default**. Windows reads the OS-retained NetworkProfile / NCSI / WLAN-AutoConfig event logs, so the FIRST read backfills connectivity history from BEFORE the source was enabled (bounded by netconn_lookback_seconds; set that to 0 for forward-only). Only closed enum tokens + numeric reason codes are stored — NO SSID, BSSID, profile name, interface GUID, or MAC. Windows-only collector today (Linux journald / macOS oslog planned; the table is queryable-empty there). Queried via tar.sql only ($NetConn_Live); the legacy tar.query / tar.export actions do not surface netconn. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
       "name": "netconn_enabled",
       "required": false,
       "type": "string"
@@ -1047,7 +1047,7 @@
       },
       "default": null,
       "definition_id": "crossplatform.tar.configure",
-      "description": "Enable or disable the image-load / module-stream capture source (module source → $Module_*). **Off by default** — module-load capture is high-volume usage-class telemetry (every library and driver load per process, with a code-signing verdict) under the works-council posture; no command line is ever captured. No data is recorded until a collector for the host's OS ships ($Module_* tables are queryable-empty until then). Set to \"true\" to opt in. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "description": "Enable or disable the image-load / module-stream capture source (module source → $Module_*). **On by default** — module-load capture is high-volume (every library and driver load per process, with a code-signing verdict); no command line is ever captured. No data is recorded until a collector for the host's OS ships ($Module_* tables are queryable-empty until then). Set to \"false\" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
       "name": "module_enabled",
       "required": false,
       "type": "string"
@@ -1058,7 +1058,7 @@
       },
       "default": null,
       "definition_id": "crossplatform.tar.configure",
-      "description": "Enable or disable the software install/uninstall source (software → $Software_*) on this agent. **Off by default** — turn it on per host to record machine-wide installed-software inventory (HKLM Uninstall), which is device asset-management and vulnerability-relevance data and carries NO user identity (machine scope only — no per-user / profile-name data). Names, versions, and publisher only. See process_enabled for the disable semantics (atomic, existing rows remain queryable, clean re-baseline on re-enable). Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "description": "Enable or disable the software install/uninstall source (software → $Software_*) on this agent. **On by default** — records machine-wide installed-software inventory (HKLM Uninstall), which is device asset-management and vulnerability-relevance data and carries NO user identity (machine scope only — no per-user / profile-name data). Names, versions, and publisher only. See process_enabled for the disable semantics (atomic, existing rows remain queryable, clean re-baseline on re-enable). Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
       "name": "software_enabled",
       "required": false,
       "type": "string"
@@ -1080,7 +1080,7 @@
       },
       "default": null,
       "definition_id": "crossplatform.tar.configure",
-      "description": "Enable or disable the ARP / neighbour-table capture source (ADR-0015). Opt-in: \"false\" by default. See process_enabled for semantics. Native on every OS today: GetIpNetTable2 on Windows, /proc/net/arp on Linux, and a route_sysctl dump on macOS (constrained there -- entry_type always reports \"unknown\"). Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "description": "Enable or disable the ARP / neighbour-table capture source (ADR-0015). **On by default.** See process_enabled for semantics. Native on every OS today: GetIpNetTable2 on Windows, /proc/net/arp on Linux, and a route_sysctl dump on macOS (constrained there -- entry_type always reports \"unknown\"). Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
       "name": "arp_enabled",
       "required": false,
       "type": "string"
@@ -1091,7 +1091,7 @@
       },
       "default": null,
       "definition_id": "crossplatform.tar.configure",
-      "description": "Enable or disable the DNS resolver-cache capture source (ADR-0015). Opt-in: \"false\" by default — the DNS cache reveals visited domains (usage-class telemetry under the works-council posture; enabling is audited). Windows-only collector today (Linux/macOS planned). Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "description": "Enable or disable the DNS resolver-cache capture source (ADR-0015). **On by default** — the DNS cache reveals visited domains. Windows-only collector today (Linux/macOS planned). Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
       "name": "dns_enabled",
       "required": false,
       "type": "string"
@@ -1102,7 +1102,7 @@
       },
       "default": null,
       "definition_id": "crossplatform.tar.configure",
-      "description": "Enable or disable the mapped-drive capture source (capability-map §3.8, mapdrive → $MapDrive_*). Records network-share mappings in BOTH directions — outbound (drives this host maps to remote shares) and inbound (remote hosts mapping this host's shares, the lateral-movement signal). Opt-in: \"false\" by default — rows expose usernames and remote share paths (identity/usage-class telemetry under the works-council posture; enabling is audited). Windows + Linux (macOS planned); inbound needs local-admin / Server-Operator on Windows and Samba on Linux and degrades to empty otherwise. NOTE: the one-time HISTORICAL backfill (all PREVIOUSLY mapped drives, from the registry / fstab / event logs) is seeded at agent init, so it materializes on the first agent restart AFTER you enable this. See software_enabled for disable semantics (same opt-in posture; disabling leaves existing rows queryable). Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "description": "Enable or disable the mapped-drive capture source (capability-map §3.8, mapdrive → $MapDrive_*). Records network-share mappings in BOTH directions — outbound (drives this host maps to remote shares) and inbound (remote hosts mapping this host's shares, the lateral-movement signal). **On by default** — rows expose usernames and remote share paths. Windows + Linux (macOS planned); inbound needs local-admin / Server-Operator on Windows and Samba on Linux and degrades to empty otherwise. NOTE: the one-time HISTORICAL backfill (all PREVIOUSLY mapped drives, from the registry / fstab / event logs) is seeded at agent init, so it materializes on the first agent restart AFTER you enable this (or after upgrade, where it is now on by default). See software_enabled for disable semantics (disabling leaves existing rows queryable). Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
       "name": "mapdrive_enabled",
       "required": false,
       "type": "string"
@@ -1113,7 +1113,7 @@
       },
       "default": null,
       "definition_id": "crossplatform.tar.configure",
-      "description": "Enable or disable the sleep/wake/AC-power transition source (power → $Power_Live, cursor-model seam). **ON by default (\"true\")** — the first works-council-class source to ship enabled. Note this is NOT the product's first default-on source: process, tcp, service, user and perf have always been on as machine-scope operational telemetry. Of the eight sources added since 1.5 under the works-council opt-in posture (procperf, netqual, module, software, arp, dns, netconn, mapdrive) every one defaults OFF, and power is the first of THAT class to diverge. The divergence is deliberate, but it does NOT mean the data is low-sensitivity: the SOC 2 data inventory classifies $Power_Live as usage-class / behavioral-adjacent, because the TIMING of sleep/wake and AC events is a presence and working-hours proxy. Treat it as co-determination-relevant and use power_lookback_seconds=0 where a retrospective read is not lawful. The source WILL use a durable log-position cursor (not a snapshot diff), so a restart will resume from where it left off rather than re-scanning; a lost/invalid cursor or a wrapped OS event log will re-baseline forward and record a capture_gap rather than replaying from the beginning. Set to \"false\" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "description": "Enable or disable the sleep/wake/AC-power transition source (power → $Power_Live, cursor-model seam). **ON by default (\"true\")**, like every other capture source. The SOC 2 data inventory classifies $Power_Live as usage-class / behavioral-adjacent, because the TIMING of sleep/wake and AC events is a presence and working-hours proxy. Treat it as co-determination-relevant and use power_lookback_seconds=0 where a retrospective read is not lawful. The source WILL use a durable log-position cursor (not a snapshot diff), so a restart will resume from where it left off rather than re-scanning; a lost/invalid cursor or a wrapped OS event log will re-baseline forward and record a capture_gap rather than replaying from the beginning. Set to \"false\" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
       "name": "power_enabled",
       "required": false,
       "type": "string"
@@ -1135,7 +1135,7 @@
       },
       "default": null,
       "definition_id": "crossplatform.tar.configure",
-      "description": "Enable or disable the removable-media attach/detach source (removable → $Removable_Live, cursor-model seam), including exec_from_removable correlation (a process observed running from a removable volume). **ON by default (\"true\")** — the first works-council-class source to ship enabled, alongside power. This is NOT the product's first default-on source: process, tcp, service, user and perf have always been on as machine-scope operational telemetry. Of the eight sources added since 1.5 under the works-council opt-in posture every one defaults OFF, and removable is one of the first two of THAT class to diverge. The divergence is deliberate and it does NOT mean the data is low-sensitivity — this is the MORE sensitive of the two. The SOC 2 data inventory classifies $Removable_Live as usage/identity-class: it records device vendor, product and SERIAL, plus the executed binary path and pid of any process running from a removable volume. Treat it as co-determination-relevant and set removable_lookback_seconds=0 where a retrospective read of OS-retained removable history is not lawful. The source WILL use the same durable log-position cursor model as power (see power_enabled) — a lost/invalid cursor will re-baseline forward and record a capture_gap rather than replaying history. Queried via tar.sql only ($Removable_Live); the legacy tar.query / tar.export actions do not surface removable. Set to \"false\" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "description": "Enable or disable the removable-media attach/detach source (removable → $Removable_Live, cursor-model seam), including exec_from_removable correlation (a process observed running from a removable volume). **ON by default (\"true\")**, like every other capture source. This is the MORE sensitive of power and removable. The SOC 2 data inventory classifies $Removable_Live as usage/identity-class: it records device vendor, product and SERIAL, plus the executed binary path and pid of any process running from a removable volume. Treat it as co-determination-relevant and set removable_lookback_seconds=0 where a retrospective read of OS-retained removable history is not lawful. The source WILL use the same durable log-position cursor model as power (see power_enabled) — a lost/invalid cursor will re-baseline forward and record a capture_gap rather than replaying history. Queried via tar.sql only ($Removable_Live); the legacy tar.query / tar.export actions do not surface removable. Set to \"false\" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
       "name": "removable_enabled",
       "required": false,
       "type": "string"
@@ -1157,7 +1157,7 @@
       },
       "default": null,
       "definition_id": "crossplatform.tar.configure",
-      "description": "Enable or disable the `usage` derived fold (usage → $Usage_Live / $Usage_Daily), a checked_transaction-based pairing of the process source's started/stopped events into per-executable run/duration aggregates plus a per-day distinct-user count. **ON by default (\"true\")** — joining power/removable as a works-council-class source shipping enabled; process, tcp, service, user and perf are already default-on as machine-scope operational telemetry. The SOC 2 data inventory classifies $Usage_Live/$Usage_Daily as usage-class / behavioral-adjacent: $Usage_Live persists the owning pid and user for each open run, and the per-day username membership (queryable via tar.sql) reveals which applications run on a device, when, and by whom. Treat as co-determination-relevant, same basis as power/removable. Forward-only, no retrospective backfill: disabling and later re-enabling always re-baselines from the moment of re-enable, never a retrospective fold over whatever process history accrued during the disabled window — this is a lifecycle-state-machine property, not a best-effort marker check. Set to \"false\" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "description": "Enable or disable the `usage` derived fold (usage → $Usage_Live / $Usage_Daily), a checked_transaction-based pairing of the process source's started/stopped events into per-executable run/duration aggregates plus a per-day distinct-user count. **ON by default (\"true\")**, like every other capture source. The SOC 2 data inventory classifies $Usage_Live/$Usage_Daily as usage-class / behavioral-adjacent: $Usage_Live persists the owning pid and user for each open run, and the per-day username membership (queryable via tar.sql) reveals which applications run on a device, when, and by whom. Treat as co-determination-relevant, same basis as power/removable. Forward-only, no retrospective backfill: disabling and later re-enabling always re-baselines from the moment of re-enable, never a retrospective fold over whatever process history accrued during the disabled window — this is a lifecycle-state-machine property, not a best-effort marker check. Set to \"false\" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
       "name": "usage_enabled",
       "required": false,
       "type": "string"
@@ -1304,7 +1304,7 @@
       },
       "default": null,
       "definition_id": "crossplatform.tar.query",
-      "description": "Filter results by event type. Valid values: process, network, service, user, software, arp, dns, mapdrive. software joins the default feed once enabled (its collection is off by default — see software_enabled); arp/dns/mapdrive are opt-in device-state / PII sources reached only by an explicit filter — they are excluded from the default (empty-filter) feed. mapdrive (§3.8) returns network-share mappings in both directions, including historical (action='historical') rows. Leave empty to return the core process/network/service/user/software types.\n",
+      "description": "Filter results by event type. Valid values: process, network, service, user, software, arp, dns, mapdrive. software is part of the default feed (see software_enabled); arp/dns/mapdrive are device-state sources reached only by an explicit filter — they are excluded from the default (empty-filter) feed. mapdrive (§3.8) returns network-share mappings in both directions, including historical (action='historical') rows. Leave empty to return the core process/network/service/user/software types.\n",
       "name": "type",
       "required": false,
       "type": "string"
@@ -1378,7 +1378,7 @@
       "constraints": null,
       "default": null,
       "definition_id": "crossplatform.tar.sql",
-      "description": "A SELECT query using $-prefixed table names. Available tables include $Process_Live, $Process_Hourly, $Process_Daily, $Process_Monthly, $TCP_Live, $TCP_Hourly, $TCP_Daily, $TCP_Monthly, $Service_Live, $Service_Hourly, $User_Live, $User_Daily, and the opt-in $ARP_Live/$ARP_Hourly and $DNS_Live/$DNS_Hourly (ADR-0015; require arp_enabled=true / dns_enabled=true, Windows-only today — empty elsewhere).\n",
+      "description": "A SELECT query using $-prefixed table names. Available tables include $Process_Live, $Process_Hourly, $Process_Daily, $Process_Monthly, $TCP_Live, $TCP_Hourly, $TCP_Daily, $TCP_Monthly, $Service_Live, $Service_Hourly, $User_Live, $User_Daily, and $ARP_Live/$ARP_Hourly and $DNS_Live/$DNS_Hourly (ADR-0015; need arp_enabled / dns_enabled left on, Windows-only today — empty elsewhere).\n",
       "name": "sql",
       "required": true,
       "type": "string"
@@ -2803,6 +2803,7 @@
     ],
     "changelog": [
       "changelog.d/2026-10-14-dex-tar-titles.changed.md",
+      "changelog.d/2026-10-21-tar-all-sources-default-on.changed.md",
       "changelog.d/20261014-tar-adhoc-sql-moved.changed.md"
     ],
     "definitions": [
@@ -2909,8 +2910,8 @@
     "**`fleet_snapshot`** feeds the server-side `FleetTopologyStore` on a cache miss, assembling the 3D `/viz/fleet` topology view (`tar.yaml:900-901`); it is not itself a warehouse read.",
     "**`rollup`/`purge_source`** mutate `tar.db` directly (aggregation, retention, source purge) — their effect is visible through later `status`/`query`/`sql` reads, not a separate sink.",
     "**Not consumed by** daily-sync inventory, DEX, or metrics — TAR has no `/metrics` endpoint; `status`'s retention-guard counters are the plugin's only fleet-readable health signal (`tar_plugin.cpp:2424-2431`).",
-    "**Sensitivity.** `user` events name the logged-in account; `process` events carry the invoking user and full command line (redacted only against the configured `*password*`-style substring patterns); `network`/opt-in `arp` events carry remote IP/MAC addresses (device identifiers) and the owning `process_name`; the opt-in `software` source is an installed-software inventory (name/publisher/version) reachable via `query type=software`/`sql`; opt-in `dns`/`mapdrive` add resolved hostnames and mapped-drive usernames/remote hosts; `removable` events name an attached device's vendor/product/serial and its BSD/udev device name.",
-    "**Siblings:** `crossplatform.tar.*` (this plugin) is standalone; the `installed_software` daily-sync source (ADR-0016) is a separate, machine-scope inventory feed, distinct from TAR's opt-in `software` capture source.",
+    "**Sensitivity.** `user` events name the logged-in account; `process` events carry the invoking user and full command line (redacted only against the configured `*password*`-style substring patterns); `network`/`arp` events carry remote IP/MAC addresses (device identifiers) and the owning `process_name`; the `software` source is an installed-software inventory (name/publisher/version) reachable via `query type=software`/`sql`; `dns`/`mapdrive` add resolved hostnames and mapped-drive usernames/remote hosts; `removable` events name an attached device's vendor/product/serial and its BSD/udev device name.",
+    "**Siblings:** `crossplatform.tar.*` (this plugin) is standalone; the `installed_software` daily-sync source (ADR-0016) is a separate, machine-scope inventory feed, distinct from TAR's `software` capture source.",
     "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"crossplatform.tar.status\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`, and `/viz/fleet` for `fleet_snapshot`."
   ]
 }

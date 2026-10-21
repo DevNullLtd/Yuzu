@@ -265,12 +265,10 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
  *   - no transition (idempotent set): leaves `<source>_paused_at` untouched.
  *
  * The default for `<source>_enabled` if not yet set comes from
- * `CaptureSourceDef::default_enabled` (`"true"` for always-on sources, `"false"`
- * for the opt-in module/procperf/netqual). So the first-ever set registers as a
- * transition only when it differs from that default — e.g. the first
- * `module_enabled=false` on a fresh DB is a no-op (module already defaults off)
- * and writes no spurious `paused_at`, whereas the first `process_enabled=false`
- * is a real enabled→disabled transition.
+ * `CaptureSourceDef::default_enabled` (`"true"` for every source). So the
+ * first-ever set registers as a transition only when it differs from that
+ * default — the first `<src>_enabled=false` on a fresh DB is a real
+ * enabled→disabled transition.
  *
  * #538: on the enabled→disabled transition the source's snapshot-diff baseline
  * (`diff_state_key(source)`) is cleared so a later re-enable starts from a clean
@@ -331,6 +329,7 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
  * Reads `<source>_enabled` (defaulting to the source's declared default) and
  * gates on the strict tri-state (#560) — anything the plugin never wrote maps to
  * "errored", which is NOT "true", so the source reads as disabled (fail closed).
+ * A failed config read (closed db, SQL error) also reads as disabled.
  * A never-configured source returns its `source_default_enabled()` default.
  *
  * This is the authoritative paused-guard for the Phase 15.A destructive purge:

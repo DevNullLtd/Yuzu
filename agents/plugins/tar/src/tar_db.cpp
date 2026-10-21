@@ -19,12 +19,14 @@
 #include <sqlite3.h>
 #include <spdlog/spdlog.h>
 
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <format>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
 
 namespace yuzu::tar {
@@ -759,6 +761,88 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
         } else {
             sqlite3_exec(raw_db, "ROLLBACK TO v7_migration", nullptr, nullptr, nullptr);
             sqlite3_exec(raw_db, "RELEASE v7_migration", nullptr, nullptr, nullptr);
+        }
+    }
+
+    // Version 8: every capture source ships enabled. The eight sources that
+    // were formerly opt-in (below) had `<src>_enabled` stored as "false" on
+    // agents that seeded it (or whose operator wrote it); flip that stored
+    // value to "true" ONCE and clear the paused marker, matching the enable
+    // edge of apply_source_enabled_transition (flag + paused_at "0" in one
+    // transaction; that function lives in tar_aggregator and cannot be called
+    // from here — the aggregator depends on this file). Only the literal
+    // "false" is touched: "true" / "errored" / absent rows are left alone, and
+    // the eight already-on sources are not listed so a deliberate pause on
+    // them survives. Version-gated, so an opt-out written after this migration
+    // sticks; any failed step rolls the whole savepoint back and the version
+    // stays 7 (retried on the next open).
+    if (db.schema_version() == 7) {
+        static constexpr std::array<const char*, 8> kFormerlyOptIn = {
+            "procperf", "netqual", "module", "software", "arp", "dns", "netconn", "mapdrive"};
+        std::lock_guard lock(db.mu_);
+        if (sqlite3_exec(raw_db, "SAVEPOINT v8_migration", nullptr, nullptr, nullptr) !=
+            SQLITE_OK) {
+            spdlog::error("TarDatabase: v8 SAVEPOINT failed: {} — schema remains at v7, retried "
+                          "on the next open",
+                          sqlite3_errmsg(raw_db));
+        } else {
+            bool ok = true;
+            std::string failed_step;
+            for (const char* src : kFormerlyOptIn) {
+                const auto key = std::format("{}_enabled", src);
+                sqlite3_stmt* raw = nullptr;
+                if (sqlite3_prepare_v2(raw_db, "SELECT value FROM tar_config WHERE key = ?", -1,
+                                       &raw, nullptr) != SQLITE_OK) {
+                    ok = false;
+                    failed_step = std::format("read {} (prepare): {}", key, sqlite3_errmsg(raw_db));
+                    break;
+                }
+                StmtPtr q(raw);
+                sqlite3_bind_text(q.get(), 1, key.c_str(), static_cast<int>(key.size()),
+                                  SQLITE_STATIC);
+                const int rc = sqlite3_step(q.get());
+                // A SELECT error is never "no row": skipping the flip and stamping v8
+                // would lose the migration for this key permanently.
+                if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
+                    ok = false;
+                    failed_step = std::format("read {} (step): {}", key, sqlite3_errmsg(raw_db));
+                    break;
+                }
+                std::string value;
+                if (rc == SQLITE_ROW) {
+                    const auto* v = reinterpret_cast<const char*>(sqlite3_column_text(q.get(), 0));
+                    if (v)
+                        value = v;
+                }
+                q.reset(); // finalize before writing the same table
+                if (rc == SQLITE_ROW && value == "false") {
+                    if (!db.set_config_locked(key, "true") ||
+                        !db.set_config_locked(std::format("{}_paused_at", src), "0")) {
+                        ok = false;
+                        failed_step = std::format("flip {}", key);
+                        break;
+                    }
+                }
+            }
+            if (ok && !db.set_config_locked("schema_version", "8")) {
+                ok = false;
+                failed_step = "write schema_version";
+            }
+            if (ok && sqlite3_exec(raw_db, "RELEASE v8_migration", nullptr, nullptr, nullptr) !=
+                          SQLITE_OK) {
+                ok = false;
+                failed_step = std::format("RELEASE: {}", sqlite3_errmsg(raw_db));
+            }
+            if (ok) {
+                spdlog::info("TarDatabase: migrated to schema version 8 (capture sources "
+                             "default-on)");
+            } else {
+                spdlog::error("TarDatabase: v8 migration failed at '{}' — rolled back, schema "
+                              "remains at v7, retried on the next open",
+                              failed_step);
+                sqlite3_exec(raw_db, "ROLLBACK TO v8_migration", nullptr, nullptr, nullptr);
+                sqlite3_exec(raw_db, "RELEASE v8_migration", nullptr, nullptr, nullptr);
+            }
         }
     }
 

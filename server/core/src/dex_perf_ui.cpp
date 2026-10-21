@@ -125,9 +125,8 @@ std::string render_dex_procperf_panel(const std::vector<DexProcPerfRow>& rows,
         // cannot distinguish "disabled" from "enabled, no rollup yet". Say both.
         return "<div class=\"gp-note\"><b>No per-app samples in the last 24 hours.</b> "
                "Per-application sampling (<span style=\"font-family:var(--mono)\">"
-               "procperf_enabled</span>) is <b>off by default</b> on every device &mdash; it is a "
-               "separate, usage-class collection because it observes what people run, not just "
-               "how the machine behaves &mdash; or sampling is on but no hourly rollup has "
+               "procperf_enabled</span>) is <b>on by default</b> &mdash; either it has been "
+               "disabled on these devices, or sampling is on but no hourly rollup has "
                "completed yet. Device-level performance above is unaffected either way.</div>";
     }
     std::string h = "<table class=\"gp-table\"><thead><tr><th>Application</th><th>Avg CPU</th>"

@@ -2430,19 +2430,20 @@ New CLI flags (all optional):
   (the secure default) — browser-based MCP clients must be allowlisted
   explicitly. Non-browser clients (which send no `Origin`) need no configuration.
 
-### vNEXT — DEX per-application sampling (`procperf`) is a new opt-in telemetry category
+### vNEXT — DEX per-application sampling (`procperf`) is a new telemetry category
 
 This release adds per-application resource sampling (top-N processes by CPU and
-working set, by image name) to the TAR edge warehouse. **It is off by default**
-(`procperf_enabled=false`) and collects nothing until an operator opts in — it
-is a distinct, usage-class telemetry category subject to works-council / DPA
-review, separate from the device-level performance sampling (`perf_enabled`,
+working set, by image name) to the TAR edge warehouse. **Superseded: it is now
+on by default** (`procperf_enabled=true` on every agent, including a one-time
+reset of any stored `false` at the tar.db schema v8 upgrade — see
+[Upgrading](upgrading.md)); this release originally shipped it off. It is a
+distinct telemetry category, separate from the device-level performance sampling (`perf_enabled`,
 on by default, no per-app identity) that shipped in the prior release **on
 Windows** — on Linux, device-level sampling starts automatically **on upgrade
 to this release** (see the upgrade checklist in the user manual's
 [Upgrading](upgrading.md) page and the TAR manual's upgrade note; opt out per
 host with `perf_enabled=false`). To
-enable per-app sampling, set `procperf_enabled=true` via a TAR `configure`
+disable per-app sampling, set `procperf_enabled=false` via a TAR `configure`
 instruction (fleet-wide or per-device). The data is image names only (no
 command lines), 7-day raw / 31-day hourly retention, and is captured in the
 Workstream E data inventory in `docs/enterprise-readiness-soc2-first-customer.md`.

@@ -2,6 +2,16 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: every TAR capture source is on by default; stored opt-outs reset once (tar.db schema v8)
+
+**What changed.** All 16 TAR capture sources now ship enabled on every OS. Eight of them were off by default before: `procperf`, `netqual`, `module`, `software`, `arp`, `dns`, `netconn` and `mapdrive`. A fresh agent now reports `<source>_enabled|true` in `tar.status` for all of them.
+
+**One-time reset on upgrade.** The first time an upgraded agent starts, it migrates its `tar.db` to schema version 8. For each of the eight sources above whose stored `<source>_enabled` value is `false` (including a value an operator set deliberately), the migration sets it to `true` and clears the source's `<source>_paused_at` marker, in one transaction. A value of `errored` is left alone, as are the stored values of the eight sources that were already on (`process`, `tcp`, `service`, `user`, `perf`, `power`, `removable`, `usage`). If any step fails, the whole migration rolls back and is retried on the next start.
+
+**Opt-outs after the upgrade stick.** The reset runs once. A `<source>_enabled=false` written through `tar.configure` after the upgrade is kept across restarts and further upgrades.
+
+**What to check.** If you had deliberately disabled any of the eight sources, re-apply `<source>_enabled=false` after the upgrade. Expect new collection to begin without operator action: `module` (Windows ETW), the `netconn` and `mapdrive` history backfills (`netconn_lookback_seconds` bounds the first), `procperf` and the daily per-application performance sync it feeds. A source whose `<source>_enabled` row cannot be read is treated as disabled for that tick and its stored rows are kept.
+
 ## ⚠️ Breaking: `POST` and `DELETE /api/v1/quarantine` now apply the dispatch approval check (#6065)
 
 **What changed.** `POST /api/v1/quarantine` (and the dashboard's Quarantine device button, which calls it) now runs the same dispatch approval check as the quarantine plugin's `quarantine` action, after the scoped `Security:Execute` gate and the `whitelist` validation and before any record is written. `DELETE /api/v1/quarantine/{agent_id}` (the Release from quarantine button) now runs the same check for the plugin's `unquarantine` action, after the scoped gate and before the `attempt` audit row and the release. Neither depends on any approval-workflow setting.
@@ -5066,11 +5076,12 @@ Before upgrading any component:
 - [ ] Verify disk space (at least 500 MB free for migration)
 - [ ] Note current version: `yuzu-server --version` / `yuzu-agent --version`
 - [ ] Plan a maintenance window (upgrades take < 5 minutes per component)
-- [ ] **Review new opt-in telemetry:** this release adds DEX per-application
-  performance sampling (`procperf`), a new usage-class data category. It is
-  **off by default** (no action needed to keep it off) — but if you intend to
-  enable it for an EU workforce, treat it as a works-council co-determination
-  trigger. See the *DEX per-application sampling* upgrade note in
+- [ ] **Review new telemetry:** this release adds DEX per-application
+  performance sampling (`procperf`), a new usage-class data category. It
+  shipped **off by default** in that release; it is now on by default (see
+  "Behaviour change: every TAR capture source is on by default" above) —
+  disable it per host with `procperf_enabled=false` if it is not wanted. For an
+  EU workforce, treat it as a works-council co-determination trigger. See the *DEX per-application sampling* upgrade note in
   [Server Administration](server-admin.md#upgrade-notes).
 - [ ] **New device performance sampling on Linux:** this release wires the TAR
   `perf` collector on **Linux**, and because it is default-ON, Linux agents
@@ -5080,9 +5091,9 @@ Before upgrading any component:
   identity, but the project treats the *capability to observe* as the
   works-council co-determination trigger, so EU deployments should note the new
   Linux coverage as they did for the Windows network facts below.
-  Per-application sampling (`procperf`) is now also implemented on Linux but
-  remains **opt-in on every OS** — the works-council posture above applies
-  unchanged. Details and caveats: the upgrade note in
+  Per-application sampling (`procperf`) is now also implemented on Linux
+  (it shipped opt-in on every OS; it is now on by default — see the TAR
+  behaviour change above). Details and caveats: the upgrade note in
   [the TAR user manual](tar.md#performance-impact).
 - [ ] **New network telemetry on Windows:** this release makes **Windows** agents
   emit device-aggregate network facts (throughput + interval retransmit rate) on

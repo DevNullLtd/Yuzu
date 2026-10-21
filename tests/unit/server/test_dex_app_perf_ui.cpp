@@ -373,7 +373,7 @@ TEST_CASE("render_dex_app_perf_trend: device-model cohort filter — selector, "
 TEST_CASE("render_dex_device_app_perf: empty state", "[dex][app_perf][ui]") {
     const auto h = render_dex_device_app_perf({});
     CHECK(has(h, "No application performance history for this device"));
-    CHECK(has(h, "procperf_enabled")); // names the opt-in so the empty state isn't read as a bug
+    CHECK(has(h, "procperf_enabled")); // names the toggle so the empty state isn't read as a bug
 }
 
 TEST_CASE("render_dex_device_app_perf: single-version app collapses to one row",

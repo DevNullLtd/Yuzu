@@ -141,30 +141,22 @@ that is a deployment-tooling change (MSI custom action), not a TAR
 plugin change.
 
 > **Collect gate and retention share `canonical_source_enabled`.** Both
-> `source_enabled()` (`tar_plugin.cpp`) and `run_retention()`
-> (`tar_aggregator.cpp`) decide a source's state via
+> `source_enabled()` (`tar_aggregator.cpp`) and `run_retention()` decide a
+> source's state through it: `run_retention()` calls `source_enabled()` itself,
+> and `source_enabled()` maps the stored value through
 > `canonical_source_enabled(stored_value)`, which maps anything other than the
 > literal `"true"` to non-enabled (`"false"` → disabled, anything else →
 > `"errored"`). This is load-bearing: a value the plugin never writes fails
 > **closed** — collection stops *and* retention preserves the rows — instead of
 > a bare `!= "false"` that would treat a tampered/corrupt value as enabled and
-> let retention delete the paused window (#560). When adding a new always-on
-> capture source, gate collection on `source_enabled(*db_, "<name>")` and do
-> **not** add a parallel `== "false"` retention check — `run_retention` walks
-> `capture_sources()` and gates *every* registered source (including the opt-in
-> ones) through the same canonical helper, so retention is uniform.
->
-> **Caveat for the opt-in collect gates.** The *retention* gate is canonical for
-> all sources, but the *collect* legs of the opt-in privacy sources (`procperf`,
-> `netqual`) deliberately read a raw `db_->get_config("<src>_enabled","false") ==
-> "true"` rather than `source_enabled()` — they default OFF and must not inherit
-> a source's `default_enabled`. That raw `== "true"` is *coincidentally*
-> fail-closed-equivalent to the canonical gate (only the literal `"true"`
-> enables), so an `errored` value still stops collection — but it is a separate
-> code path, not the shared helper. Unifying the opt-in collect gates onto
-> `canonical_source_enabled` is tracked as a follow-up; until then, the perf and
-> always-on collect legs are canonical and the two opt-in legs are raw-but-
-> equivalent.
+> let retention delete the paused window (#560). `source_enabled()` also fails
+> closed on a failed config read (closed database, SQL error): the registry
+> default applies only to a confirmed-absent row. When adding a new capture
+> source, gate collection on `source_enabled(*db_, "<name>")` and do **not** add
+> a parallel `== "true"`/`== "false"` check or a raw `get_config("<src>_enabled",
+> ...)` read — every collect, retention and purge gate for every registered
+> source goes through the one helper, so the registry's `default_enabled` is
+> the only place a default lives.
 >
 > **`paused_at` is cleared on any non-`true` → `true` re-enable.**
 > `apply_source_enabled_transition` (`tar_aggregator.cpp`) canonicalises the
@@ -325,26 +317,17 @@ header):
    operator input to it.
    Declare a row for **every** OS (`kSupported`/`kSupportedConstrained`/`kPlanned`/
    `kUnsupported`) — the schema-invariant test requires it. Add a `rollup_sql`
-   branch per non-live tier. **Privacy-sensitive / usage-class sources are opt-in**
-   (`default_enabled = false`, like `module`/`procperf`/`netqual`/`dns`) under the
-   works-council posture. A source MAY also ship `default_enabled = false` as a
-   cautious roll-out default even when it carries no PII (e.g. `software` —
-   machine-scope asset inventory), letting an operator opt in per host.
-
-   **Amended (Wave 6, operator ruling 2026-09-04).** `power` and `removable`
-   ship `default_enabled = true` — the first *works-council-class* sources to do
-   so (the five machine-scope sources `process`/`tcp`/`service`/`user`/`perf`
-   have always been on; of the eight added since 1.5 under the opt-in
-   posture, every one defaults off) — and, as the
-   roadmap brings each existing source in for change, that source moves to
-   default-on too. The works-council reasoning above is NOT withdrawn: it now
-   attaches to the `<name>_lookback_seconds` control (`0` = forward-only)
-   rather than to the enable flag, and it applies **at upgrade** rather than at
-   an operator's opt-in, which is a stronger obligation, not a weaker one. A
-   default-on source MUST therefore state the divergence plainly in its
-   user-manual page, its changelog fragment, and the SOC 2 data inventory —
-   never only in a code comment. Do not read the paragraph above as licence to
-   ship a new source opt-in without asking; the ruling is the current posture.
+   branch per non-live tier. **Every capture source ships `default_enabled =
+   true`** (Alex ruling 2026-10-21: all sources, every OS, no exceptions). The
+   registry-wide test in `test_tar_schema_registry.cpp` fails any source that
+   declares `false`, so a new source must ship enabled. The retrospective-reach
+   control is the source's `<name>_lookback_seconds` key where one exists
+   (`0` = forward-only), not the enable flag. A default-on source MUST state
+   its default in its user-manual page, its changelog fragment, and the SOC 2
+   data inventory — never only in a code comment. An agent that stored
+   `<name>_enabled = "false"` before a source's default flipped is brought to
+   the new default by a one-time, version-gated `tar.db` migration (see the v8
+   block in `TarDatabase::open`), not by changing the registry alone.
 6. **`tar_plugin.cpp`** — add a leg in `collect_fast_impl` (or `collect_slow_impl`)
    gated on `source_enabled(*db_, "<source>")`: enumerate → diff →
    `typed.empty() ? db_->set_state(key, json) : db_->insert_<src>_events(typed,
@@ -353,8 +336,8 @@ header):
    `error|<src> state_save_failed` (baseline-only) and call
    `note_health(<registry name>, "insert_failed"|"state_save_failed")`; on success
    `note_health(<registry name>, "events_recorded")`. A leg that never calls
-   `note_health` reads `never_ran` in status. For an opt-in source a failure is
-   non-fatal (no `error|` line — don't fail the always-on legs' tick). Add `do_query`/`do_export` `type` branches if the source
+   `note_health` reads `never_ran` in status. For a non-core source (netqual, module, arp, dns, …) a failure is
+   non-fatal (no `error|` line — don't fail the core legs' tick). Add `do_query`/`do_export` `type` branches if the source
    should appear in those actions.
 7. **`agents/plugins/tar/meson.build`** — add the new `.cpp` to the
    `shared_library` sources; add any new Windows import lib (`dnsapi` for DNS).
@@ -367,7 +350,7 @@ header):
    lives in that render function. Device-level panels (no pid) go in the
    process-tree pane (`render_tar_*_panel` + a `tar_tree_routes` fragment).
 10. **Tests** — extend `test_tar_schema_registry.cpp` (every source has all three
-    OS rows; opt-in sources in the `default_enabled=false` cross-check),
+    OS rows; every source in the `default_enabled=true` registry-wide invariant),
     `test_tar_diff.cpp` (appeared/removed + cap), `test_tar_warehouse.cpp` (DDL +
     `$`-name translation + authorizer), and add a `test_tar_<source>.cpp`.
 

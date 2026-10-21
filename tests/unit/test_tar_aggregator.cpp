@@ -419,12 +419,8 @@ TEST_CASE("TAR #538: every snapshot-diff source clears its mapped baseline",
     for (const auto& c : cases) {
         // Distinct {source,state_key} per row and a fresh source each iteration,
         // so a single shared db is safe (no _enabled carry-over between rows).
-        // Seed enabled first: the opt-in sources (arp/dns, default_enabled=false)
-        // would otherwise see their first `=false` as a no-op (already off), so
-        // the disable leg never fires and the baseline is never cleared. Setting
-        // `<source>_enabled=true` makes the subsequent disable a real transition
-        // for every source uniformly.
-        db.set_config(std::format("{}_enabled", c.source), "true");
+        // Every source defaults enabled, so the first `=false` is a real
+        // transition with no seed.
         REQUIRE(db.set_state(c.state_key, R"([{"x":1}])"));
         REQUIRE_FALSE(db.get_state(c.state_key).empty());
 
@@ -882,44 +878,65 @@ TEST_CASE("TAR rollup: $Software live→daily→monthly counts by action",
     CHECK(std::stoll(monthly->rows[0][2]) == 1);
 }
 
-// ── Default-off opt-in sources (review R1 — module/procperf/netqual) ─────────
+// ── Default-on: every source starts enabled ──────────────────────────────────
 
-TEST_CASE("TAR default-off: opt-in source's first disable is a no-op transition",
-          "[tar][module][paused_at][default-off]") {
-    // The required M1 fix: `module` (and procperf/netqual) default DISABLED on a
-    // fresh DB. apply_source_enabled_transition routes the `prev` default through
-    // CaptureSourceDef::default_enabled, so the first-ever `module_enabled=false`
-    // is NOT an enabled→disabled transition and must write NO paused_at — whereas
-    // the same call for the always-on `process` IS a real transition. This is the
-    // testable proxy for "tar.status reports module disabled while default-on
-    // sources stay enabled" (do_status itself reads the same default_enabled
-    // field but is not compiled into the unit-test exe).
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-default-off-"}};
+TEST_CASE("TAR default-on: source_enabled() is true for every registered source on a fresh DB",
+          "[tar][source-enabled][default-on]") {
+    // The testable proxy for the collect-leg gates (tar_plugin.cpp is not linked
+    // into the unit-test exe): every collect/retention/purge gate routes through
+    // source_enabled(), which reads the registry default for a never-configured
+    // source.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-default-on-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    for (const auto& src : capture_sources()) {
+        INFO("source=" << src.name);
+        CHECK(source_enabled(db, src.name));
+    }
+}
+
+TEST_CASE("TAR source_enabled: a failed config read fails closed",
+          "[tar][source-enabled][fail-closed]") {
+    // A moved-from TarDatabase has no handle (the test_tar_store.cpp idiom), so
+    // try_get_config returns an error. get_config() would fall back to the
+    // registry default (true) and read the source as enabled; the gate must
+    // read it as disabled instead.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-read-fail-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    { TarDatabase discard = std::move(db); }
+    REQUIRE_FALSE(db.is_open());
+    CHECK_FALSE(source_enabled(db, "process"));
+    CHECK_FALSE(source_enabled(db, "procperf"));
+}
+
+TEST_CASE("TAR default-on: the first disable of any source is a real transition",
+          "[tar][paused_at][default-on]") {
+    // Every source defaults enabled, so the first-ever `<src>_enabled=false` on
+    // a fresh DB is an enabled->disabled transition and writes paused_at (a
+    // default-off source used to see it as a no-op).
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-default-on-"}};
     auto opened = TarDatabase::open(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
 
     const int64_t t_now = 1'735'689'600;
-
-    // Opt-in sources default false → first disable is idempotent, no paused_at.
-    for (const auto* src : {"module", "procperf", "netqual"}) {
-        INFO("opt-in source=" << src);
-        CHECK_FALSE(source_default_enabled(src));
-        apply_source_enabled_transition(db, src, "false", t_now);
-        CHECK(db.get_config(std::format("{}_paused_at", src), "0") == "0");
+    for (const auto* src : {"module", "procperf", "netqual", "process"}) {
+        INFO("source=" << src);
+        CHECK(source_default_enabled(src));
+        REQUIRE(apply_source_enabled_transition(db, src, "false", t_now));
+        CHECK(db.get_config(std::format("{}_paused_at", src), "0") == std::to_string(t_now));
     }
 
-    // An always-on source defaults true → first disable is a real transition.
-    CHECK(source_default_enabled("process"));
-    apply_source_enabled_transition(db, "process", "false", t_now);
-    CHECK(db.get_config("process_paused_at", "0") == std::to_string(t_now));
-
-    // And enabling an opt-in source IS a transition from its default-off state:
-    // it clears paused_at to "0" (present, not absent).
-    apply_source_enabled_transition(db, "module", "true", t_now + 100);
+    // Enabling from the stored false clears paused_at to "0" (present, not absent).
+    REQUIRE(apply_source_enabled_transition(db, "module", "true", t_now + 100));
     CHECK(db.get_config("module_enabled", "false") == "true");
-    CHECK(db.get_config("module_paused_at", "0") == "0");
+    CHECK(db.get_config("module_paused_at", "x") == "0");
 }
 
 TEST_CASE("TAR retention: a corrupt/errored _enabled value preserves rows, never prunes (#560)",
@@ -1248,7 +1265,6 @@ TEST_CASE("TAR #2361: row-count retention still trims, unguarded, under a bad cl
     constexpr int kBootCeiling = 400;
     constexpr int kOver = 10;
     TarGuardFixture f;
-    f.db->set_config("netqual_enabled", "true"); // opt-in source
     REQUIRE(f.db->execute_sql("BEGIN TRANSACTION"));
     for (int i = 0; i < kBootCeiling + kOver; ++i) {
         REQUIRE(f.db->execute_sql(std::format("INSERT INTO netqual_boot (ts,boot_ts,window_s) "
@@ -1985,7 +2001,6 @@ TEST_CASE("TAR #2361: row-count retention is capped too, so the batch lock stays
     constexpr int kCeiling = 400;
     const int64_t kCap = yuzu::tar::kMaxTarDeletesPerTablePerPass;
     TarGuardFixture f;
-    f.db->set_config("netqual_enabled", "true"); // opt-in source
 
     // Ceiling + cap + 200: one pass can only remove `cap`, leaving 200 excess.
     const int total = static_cast<int>(kCeiling + kCap + 200);

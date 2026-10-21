@@ -20,10 +20,10 @@
 // follows the same pure/impure split. Only the I/O (WNet / NetApi / registry
 // hive loads / subprocess / getfsstat / file reads) is #ifdef-guarded.
 //
-// PII: mapped-drive rows expose usernames + share paths. Per the works-council
-// posture the source is opt-in (default_enabled=false); rows are NOT run through
-// redact_cmdline (cmdline-only; it would mangle UNC paths) — opt-in + audit is
-// the protection, exactly as dns_live does for visited domains.
+// Mapped-drive rows expose usernames + share paths. The source is on by default
+// (default_enabled=true); rows are NOT run through redact_cmdline (cmdline-only;
+// it would mangle UNC paths) — audit is the control, exactly as dns_live does
+// for visited domains.
 
 #include "tar_capture_status.hpp" // classify_subprocess_capture, IncompleteCaptureError, would_exceed_cap
 #include "tar_collectors.hpp"

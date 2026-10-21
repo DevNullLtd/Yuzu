@@ -20,6 +20,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifndef _WIN32
@@ -1371,7 +1372,7 @@ TEST_CASE("TarDatabase: a fresh open creates no tar_events table (#760 UP-8)",
     { TarDatabase discard = std::move(t.db); }
     auto reopened = TarDatabase::open(t.path);
     REQUIRE(reopened.has_value());
-    CHECK(reopened->schema_version() == 7);
+    CHECK(reopened->schema_version() == 8);
     auto q2 = reopened->execute_query(count_sql);
     REQUIRE(q2.has_value());
     CHECK(q2->rows[0][0] == "0");
@@ -1405,7 +1406,7 @@ TEST_CASE("TarDatabase: a pre-v3 database still has tar_events dropped on open",
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 7); // the 2→3→4→5→6→7 walk ran
+        CHECK(db->schema_version() == 8); // the 2→3→4→5→6→7→8 walk ran
         auto q =
             db->execute_query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'tar_events' OR "
                               "name LIKE 'idx_tar_events%'");
@@ -1445,7 +1446,7 @@ TEST_CASE("TarDatabase: schema v5 drops tar_events from an ALREADY-MIGRATED data
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 7);
+        CHECK(db->schema_version() == 8);
         auto q = db->execute_query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'tar_events' "
                                    "OR name LIKE 'idx_tar_events%'");
         REQUIRE(q.has_value());
@@ -1522,7 +1523,7 @@ TEST_CASE("TarDatabase: schema v4 ALTERs version onto a pre-existing procperf ti
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 7); // the v3→v4→v5→v6→v7 walk ran
+        CHECK(db->schema_version() == 8); // the v3→v4→v5→v6→v7→v8 walk ran
 
         // Both tiers now carry `version` (added by the ALTER, not the DDL).
         for (const char* tbl : {"procperf_live", "procperf_hourly"}) {
@@ -1584,7 +1585,7 @@ TEST_CASE("TarDatabase: schema v7 ALTERs is_kthread onto a pre-existing procperf
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 7); // the v6→v7 walk ran
+        CHECK(db->schema_version() == 8); // the v6→v7→v8 walk ran
 
         // Both tiers now carry `is_kthread` (added by the ALTER, not the DDL).
         for (const char* tbl : {"procperf_live", "procperf_hourly"}) {
@@ -2284,4 +2285,142 @@ TEST_CASE("TarDatabase: set_state reports a failed baseline write (#1654)",
     drop_state_fault(t.db);
     CHECK(t.db.set_state("process", "x"));
     CHECK(t.db.get_state("process") == "x");
+}
+
+// ── v7 -> v8: every capture source ships enabled ─────────────────────────────
+namespace {
+
+// Seed a closed tar.db at schema v7 with the given tar_config rows (raw sqlite
+// so no migration or registry default is involved). `extra_sql` runs after the
+// rows are in (used to install a fault-injecting trigger).
+void seed_v7_config(const fs::path& path,
+                    const std::vector<std::pair<std::string, std::string>>& rows,
+                    const char* extra_sql = nullptr) {
+    {
+        auto db = TarDatabase::open(path);
+        REQUIRE(db.has_value());
+    } // closed: lands at the current version
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(path.string().c_str(), &raw) == SQLITE_OK);
+    auto put = [&](const std::string& k, const std::string& v) {
+        const auto sql = "INSERT INTO tar_config (key, value) VALUES ('" + k + "', '" + v +
+                         "') ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+        REQUIRE(sqlite3_exec(raw, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+    };
+    put("schema_version", "7");
+    for (const auto& [k, v] : rows)
+        put(k, v);
+    if (extra_sql)
+        REQUIRE(sqlite3_exec(raw, extra_sql, nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(raw);
+}
+
+void remove_db_files(const fs::path& tmp) {
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    fs::remove(fs::path{tmp.string() + "-wal"}, ec);
+    fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+}
+
+} // namespace
+
+TEST_CASE("TarDatabase: a fresh open lands at schema_version 8", "[tar][store][migration][v8]") {
+    auto t = make_test_db();
+    CHECK(t.db.schema_version() == 8);
+}
+
+TEST_CASE("TarDatabase v7->v8: stored opt-outs of the formerly-off sources flip once",
+          "[tar][store][migration][v8]") {
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_v8_");
+    seed_v7_config(tmp, {{"procperf_enabled", "false"}, {"procperf_paused_at", "1700000000"}});
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        CHECK(db->schema_version() == 8);
+        CHECK(db->get_config("procperf_enabled", "") == "true");
+        CHECK(db->get_config("procperf_paused_at", "") == "0");
+    }
+    remove_db_files(tmp);
+}
+
+TEST_CASE("TarDatabase v7->v8: errored, already-on and absent rows are left alone",
+          "[tar][store][migration][v8]") {
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_v8_");
+    seed_v7_config(tmp, {{"netqual_enabled", "errored"},
+                         {"process_enabled", "false"},
+                         {"process_paused_at", "5"},
+                         {"software_enabled", "true"}});
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        CHECK(db->schema_version() == 8);
+        CHECK(db->get_config("netqual_enabled", "") == "errored");
+        // An already-on source's deliberate pause survives.
+        CHECK(db->get_config("process_enabled", "") == "false");
+        CHECK(db->get_config("process_paused_at", "") == "5");
+        CHECK(db->get_config("software_enabled", "") == "true");
+        // No row stays no row (the registry default supplies "true").
+        CHECK(db->get_config("arp_enabled", "") == "");
+    }
+    remove_db_files(tmp);
+}
+
+TEST_CASE("TarDatabase v7->v8: an opt-out written after the migration sticks",
+          "[tar][store][migration][v8]") {
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_v8_");
+    seed_v7_config(tmp, {{"procperf_enabled", "false"}});
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        REQUIRE(db->get_config("procperf_enabled", "") == "true");
+        REQUIRE(db->set_config("procperf_enabled", "false"));
+    }
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        CHECK(db->schema_version() == 8);
+        CHECK(db->get_config("procperf_enabled", "") == "false");
+    }
+    remove_db_files(tmp);
+}
+
+TEST_CASE("TarDatabase v7->v8: a failed flip rolls the whole migration back and retries",
+          "[tar][store][migration][v8][atomic]") {
+    // The trigger aborts the netqual flip AFTER procperf (earlier in the list)
+    // was already flipped inside the same savepoint: the rollback must undo it,
+    // schema stays at 7, and a reopen with the fault removed completes.
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_v8_");
+    seed_v7_config(tmp,
+                   {{"procperf_enabled", "false"},
+                    {"procperf_paused_at", "7"},
+                    {"netqual_enabled", "false"},
+                    {"netqual_paused_at", "9"}},
+                   "CREATE TRIGGER yuzu_test_v8_abort BEFORE UPDATE ON tar_config "
+                   "WHEN NEW.key = 'netqual_enabled' "
+                   "BEGIN SELECT RAISE(ABORT, 'injected'); END;");
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        CHECK(db->schema_version() == 7);
+        CHECK(db->get_config("procperf_enabled", "") == "false");
+        CHECK(db->get_config("procperf_paused_at", "") == "7");
+        CHECK(db->get_config("netqual_enabled", "") == "false");
+    }
+    {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open(tmp.string().c_str(), &raw) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(raw, "DROP TRIGGER yuzu_test_v8_abort", nullptr, nullptr, nullptr) ==
+                SQLITE_OK);
+        sqlite3_close(raw);
+    }
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        CHECK(db->schema_version() == 8);
+        CHECK(db->get_config("procperf_enabled", "") == "true");
+        CHECK(db->get_config("procperf_paused_at", "") == "0");
+        CHECK(db->get_config("netqual_enabled", "") == "true");
+        CHECK(db->get_config("netqual_paused_at", "") == "0");
+    }
+    remove_db_files(tmp);
 }

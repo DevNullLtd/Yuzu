@@ -398,11 +398,11 @@ std::vector<std::string> load_stabilization_exclusions(yuzu::tar::TarDatabase& d
 //     OS acquisition at all, native in-process on every OS (rung 1).
 //   - collect_fast: process (ETW/Endpoint-Security/procfs) + network
 //     (iphlpapi/procfs/libproc, always the poll — see
-//     effective_network_capture_method) + opt-in netqual are each native
+//     effective_network_capture_method) + netqual are each native
 //     (rung 1) on every OS. macOS's process/tcp legs self-heal to a poll
 //     without the ES entitlement / nstat root privilege
 //     (tar_schema_registry.cpp process/tcp rows: kSupportedConstrained); the
-//     opt-in arp sub-source is now wired natively on both non-Windows legs
+//     arp sub-source is now wired natively on both non-Windows legs
 //     too (tar_arp_collector.cpp: /proc/net/arp on Linux, the shared
 //     route_sysctl_arp.hpp sysctl dump on macOS — constrained there,
 //     entry_type always 'unknown'), while dns remains kPlanned
@@ -410,7 +410,7 @@ std::vector<std::string> load_stabilization_exclusions(yuzu::tar::TarDatabase& d
 //     on those two legs.
 //   - collect_slow: service (SCM native / systemctl+launchctl, rung-2 argv
 //     via the shared subprocess runner) + user (native WTS/utmp/utmpx) +
-//     opt-in netconn/mapdrive. Windows is all native (scm/wts/wnet/wevtapi,
+//     netconn/mapdrive. Windows is all native (scm/wts/wnet/wevtapi,
 //     rung 1). Linux/macOS service enumeration runs bounded argv
 //     (tar_service_collector.cpp, rung 2 — the worst rung actually
 //     exercised on that OS); mapdrive is native getfsstat (rung 1,
@@ -469,13 +469,13 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         "collect_fast",
         {YUZU_SUPPORT_CONSTRAINED, 1, "procfs",
-         "dns opt-in sub-source is PLANNED (no-op) on Linux; arp opt-in sub-source is "
+         "dns sub-source is PLANNED (no-op) on Linux; arp sub-source is "
          "native (procfs, /proc/net/arp); core process/network/netqual collection is "
          "native"},
         {YUZU_SUPPORT_CONSTRAINED, 1, "endpoint_security+nstat+route_sysctl",
          "process/tcp fall back to a KERN_PROC_ALL/proc_pidfdinfo poll without the "
-         "Endpoint Security entitlement or nstat root privilege; dns opt-in sub-source "
-         "is PLANNED (no-op) on macOS; arp opt-in sub-source is native but constrained "
+         "Endpoint Security entitlement or nstat root privilege; dns sub-source "
+         "is PLANNED (no-op) on macOS; arp sub-source is native but constrained "
          "(route_sysctl, entry_type always 'unknown')"},
         {YUZU_SUPPORT_SUPPORTED, 1, "etw+iphlpapi", nullptr},
     },
@@ -483,13 +483,13 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         "collect_slow",
         {YUZU_SUPPORT_CONSTRAINED, 2, "systemctl+utmp",
          "service enumeration runs bounded argv (rung 2) via the shared subprocess "
-         "runner; startup_type reads 'unknown'; netconn opt-in source is PLANNED "
+         "runner; startup_type reads 'unknown'; netconn source is PLANNED "
          "(no-op) on Linux"},
         {YUZU_SUPPORT_CONSTRAINED, 2, "launchctl+utmpx+getfsstat",
          "service enumeration runs bounded argv (rung 2) via the shared subprocess "
-         "runner; no startup_type; mapdrive opt-in source is wired but "
+         "runner; no startup_type; mapdrive source is wired but "
          "outbound-live-only (getfsstat, no username, no inbound, no history); "
-         "netconn opt-in source is PLANNED (no-op) on macOS"},
+         "netconn source is PLANNED (no-op) on macOS"},
         {YUZU_SUPPORT_SUPPORTED, 1, "scm+wts+wnet+wevtapi", nullptr},
     },
     {
@@ -762,30 +762,6 @@ public:
             spdlog::info("TAR: no gap-free process stream active — using snapshot-diff poll");
         }
 
-        // M2: seed the opt-in module_enabled key so the configure / retention /
-        // retention-paused-list machinery (which default a MISSING key to ENABLED
-        // via source_enabled) agrees with the collector's explicit default-off.
-        if (db_->get_config("module_enabled", "").empty()) {
-            db_->set_config("module_enabled", "false");
-        }
-        // #1620: seed the opt-in software_enabled key (the `software` source is
-        // default-off, like module) so the configure / retention /
-        // retention-paused-list machinery (which default a MISSING key to ENABLED
-        // via source_enabled) agrees with the collector's explicit default-off.
-        if (db_->get_config("software_enabled", "").empty()) {
-            db_->set_config("software_enabled", "false");
-        }
-        // ADR-0020: seed the opt-in netconn_enabled key (same rationale as
-        // module/software above — the source is default-off in the registry).
-        if (db_->get_config("netconn_enabled", "").empty()) {
-            db_->set_config("netconn_enabled", "false");
-        }
-        // §3.8: seed the opt-in mapdrive_enabled key (default-off, like module /
-        // software) so source_enabled / retention / configure all agree the source
-        // starts disabled.
-        if (db_->get_config("mapdrive_enabled", "").empty()) {
-            db_->set_config("mapdrive_enabled", "false");
-        }
         // Wave 7 PR7.2b: boot is one of the THREE call sites (boot, configure,
         // fast-tick) that must all reconcile the `usage` fold's lifecycle
         // through this SAME function -- see tar_usage.hpp's file banner for
@@ -817,7 +793,7 @@ public:
         // Cross-platform no-ops where unimplemented (the collectors return
         // nullopt/{} off Windows); failures are warn-and-continue — a
         // diagnostics plugin never fails init over retrospective data.
-        if (db_->get_config("netqual_enabled", "false") == "true") {
+        if (source_enabled(*db_, "netqual")) {
             // One row per boot (the counters are per-boot state); keyed on the
             // boot instant exactly like the proc ETL backfill above, and set
             // ONLY on insert success so a failure retries on the next restart.
@@ -837,7 +813,7 @@ public:
                 }
             }
         }
-        if (db_->get_config("netconn_enabled", "false") == "true" &&
+        if (source_enabled(*db_, "netconn") &&
             db_->get_config("netconn_backfill_hwm", "").empty()) {
             // First-ever read: pull the OS-retained connectivity history from
             // before TAR existed on this box ([t_live - lookback, t_live)).
@@ -850,8 +826,8 @@ public:
             // note): netconn_lookback_seconds bounds how far before enablement
             // the backfill reads. nq_netconn_plan turns lookback==0 into a
             // FORWARD-ONLY plan (read nothing, seed the hwm to t_live) so no
-            // pre-enablement history is read where a works-council/DPO forbids
-            // it; a positive lookback reads [t_live - lookback, t_live).
+            // pre-enablement history is read; a positive lookback reads
+            // [t_live - lookback, t_live).
             const auto plan = yuzu::tar::nq_netconn_plan(/*have_hwm=*/false, 0,
                                                          netconn_lookback_seconds(*db_), t_live);
             if (!plan.read) {
@@ -1252,9 +1228,8 @@ private:
     int64_t usage_last_fold_warn_ts_{0};
 
     // ── M2: gap-free module/image-load stream (Windows ETW; null elsewhere) ───
-    // Unlike the always-on process stream, this is OPT-IN (module_enabled,
-    // default off) and high-volume, so the session is started LAZILY by
-    // collect_fast on the first tick where module_enabled is true (enabling takes
+    // Unlike the process stream, this is high-volume, so the session is
+    // started LAZILY by collect_fast on the first tick where module_enabled is true (enabling takes
     // effect on the next tick — no restart — and a transient session death
     // auto-re-arms). When active, collect_fast drains it; there is NO poll
     // fallback (no snapshot-diff equivalent for image loads). Drained only under
@@ -1767,15 +1742,12 @@ private:
             note_health("tcp", "source_disabled");
         }
 
-        // netqual: per-connection TCP quality (BRD Workstream E). OPT-IN,
-        // default OFF — per-connection destinations are usage-class telemetry
-        // under the works-council posture, so (like procperf) this reads the
-        // explicit "true" rather than source_enabled (which defaults a missing
-        // key to ENABLED). Co-sampled with the tcp leg above: same snap_id + ts
+        // netqual: per-connection TCP quality (BRD Workstream E). Gated by
+        // source_enabled (registry default: enabled). Co-sampled with the tcp leg above: same snap_id + ts
         // so netqual rows join the connection events on snapshot_id. Only the
         // privacy bucket leaves select_netqual_rows; the raw remote address is
         // dropped there and never persisted. Empty off Linux (collector stub).
-        if (db_->get_config("netqual_enabled", "false") == "true") {
+        if (source_enabled(*db_, "netqual")) {
             // netqual_pre: pre-collected by the caller OUTSIDE collect_mu_ (the
             // Windows ESTATS pass is one enable+read syscall pair per tracked
             // connection — same rationale as arp_pre/dns_pre). Inline when null.
@@ -1784,8 +1756,8 @@ private:
             auto rows =
                 yuzu::tar::select_netqual_rows(samples, ts, snap_id, yuzu::tar::kNetQualTopN);
             if (!rows.empty()) {
-                // OPT-IN source: a netqual insert failure must NOT fail the whole
-                // collect_fast tick — the always-on tcp/process legs already
+                // A netqual insert failure must NOT fail the whole
+                // collect_fast tick — the tcp/process legs already
                 // committed, so returning 1 here would misreport a healthy cycle
                 // as failed (and suppress the events_recorded line the server
                 // reads for retention-pause detection). Log and skip instead.
@@ -1803,9 +1775,8 @@ private:
             note_health("netqual", "source_disabled");
         }
 
-        // ARP diff (ADR-0015). Opt-in: default_enabled=false in the registry, so
-        // source_enabled returns false until an operator turns it on. Implemented
-        // on Windows, Linux, and macOS -- see the registry (tar_schema_registry.cpp)
+        // ARP diff (ADR-0015). Gated by source_enabled (registry default:
+        // enabled). Implemented on Windows, Linux, and macOS -- see the registry (tar_schema_registry.cpp)
         // for the platform-specific field constraints. Non-fatal on insert
         // failure — the always-on legs above already committed, so a failure here
         // must not misreport a healthy tick; the diff baseline is advanced ONLY on
@@ -1863,8 +1834,7 @@ private:
             note_health("arp", "source_disabled");
         }
 
-        // DNS-cache diff (ADR-0015). Opt-in (usage-class PII — visited domains).
-        // Device-level resolver-cache state; NOT per-process (no pid). Same
+        // DNS-cache diff (ADR-0015). Device-level resolver-cache state; NOT per-process (no pid). Same
         // non-fatal / advance-on-success discipline as the arp leg.
         if (source_enabled(*db_, "dns")) {
             auto current = dns_pre ? std::move(*dns_pre) : yuzu::tar::enumerate_dns();
@@ -1887,10 +1857,9 @@ private:
             note_health("dns", "source_disabled");
         }
 
-        // M2: module/image loads (Windows ETW). OPT-IN (module_enabled, default
-        // off) — like procperf/netqual this reads the explicit "true" rather than
-        // source_enabled. The session is only running if it was enabled at init.
-        const bool module_enabled = db_->get_config("module_enabled", "false") == "true";
+        // M2: module/image loads (Windows ETW), gated by source_enabled
+        // (registry default: enabled). The session starts lazily below.
+        const bool module_enabled = source_enabled(*db_, "module");
         // Lazy start / re-arm: start the session on the first enabled tick (so
         // enabling takes effect next tick — like procperf/netqual, no restart) and
         // re-arm after a transient session death. module_start_failed_ prevents a
@@ -1946,8 +1915,8 @@ private:
             }
             if (!mrows.empty()) {
                 if (!db_->insert_module_events(mrows)) {
-                    // OPT-IN source: like netqual, do NOT fail the whole tick (the
-                    // always-on legs already committed). Re-queue the filtered
+                    // Like netqual, do NOT fail the whole tick (the
+                    // other legs already committed). Re-queue the filtered
                     // batch for the next tick, bounded, and log.
                     module_tok = "insert_failed";
                     spdlog::error("TAR: module stream insert failed — re-queuing {} events",
@@ -1994,7 +1963,7 @@ private:
     }
 
     int do_collect_fast(yuzu::CommandContext& ctx) {
-        // SRE/UP-1: enumerate the syscall-heavy opt-in network sources (arp via
+        // SRE/UP-1: enumerate the syscall-heavy network sources (arp via
         // GetIpNetTable2; dns via DnsGetCacheDataTable + up to kDnsEntryCap cache-only
         // DnsQuery_W calls) BEFORE taking collect_mu_, so a large host cache cannot
         // stall the always-on process/tcp legs or the fleet-snapshot pump (mirrors
@@ -2002,10 +1971,9 @@ private:
         // run under collect_mu_ inside collect_fast_impl.
         const bool arp_on = source_enabled(*db_, "arp");
         const bool dns_on = source_enabled(*db_, "dns");
-        // netqual is opt-in with an explicit-"true" gate (see the leg) — and its
-        // Windows ESTATS pass is a per-connection enable+read syscall sweep, so
+        // netqual's Windows ESTATS pass is a per-connection enable+read syscall sweep, so
         // it pre-collects lock-free with arp/dns.
-        const bool netqual_on = db_->get_config("netqual_enabled", "false") == "true";
+        const bool netqual_on = source_enabled(*db_, "netqual");
         // arp: precollected through collect_or_retain into an OPTIONAL (not a
         // bare vector) so enumerate_arp()'s incomplete-capture throw (read
         // failure / kernel-truncated parse / entry-cap reached --
@@ -2123,17 +2091,11 @@ private:
             }
         }
 
-        // A2 per-app leg (independent of the device leg's outcome). Unlike the
-        // other TAR sources, procperf defaults OFF (opt-in): per-application
-        // CPU/working-set reveals which applications run on a device, which is
-        // usage-class telemetry under the works-council posture (W0 commits
-        // app_usage-class collectors to default-off pending per-category
-        // toggles + DPO concurrence) — distinct from device-level perf, which
-        // carries no per-app identity and stays default-on. So this gate reads
-        // the explicit "true" rather than going through source_enabled (which
-        // defaults missing keys to enabled). See docs/dex-brd-coverage.md and
-        // memory project-telemetry-privacy-works-council.
-        if (db_->get_config("procperf_enabled", "false") != "true") {
+        // A2 per-app leg (independent of the device leg's outcome). Gated by
+        // source_enabled like every other TAR source (registry default:
+        // enabled); `procperf_enabled=false` switches off per-app sampling
+        // while device-level perf stays on.
+        if (!source_enabled(*db_, "procperf")) {
             note_health("procperf", yuzu::tar::kCollectStatusSourceDisabled);
             ctx.write_output(std::format("tar|collect_procperf|0|{}",
                                          yuzu::tar::kCollectStatusSourceDisabled));
@@ -2160,7 +2122,7 @@ private:
             // commit a post-disable row. Leave prev_proc_ as the disable branch
             // reset it so a later re-enable re-baselines instead of diffing across
             // the opt-out window. (#538)
-            procperf_enabled_now = (db_->get_config("procperf_enabled", "false") == "true");
+            procperf_enabled_now = source_enabled(*db_, "procperf");
             if (procperf_enabled_now) {
                 samples = yuzu::tar::derive_proc_samples(prev_proc_, proc_cur, redaction);
                 prev_proc_ = std::move(proc_cur);
@@ -2299,14 +2261,14 @@ private:
             note_health("user", "source_disabled");
         }
 
-        // netconn: OS-logged connectivity transitions (ADR-0020). OPT-IN with an
-        // explicit-"true" gate like netqual. Incremental read from the high-water
+        // netconn: OS-logged connectivity transitions (ADR-0020). Gated by
+        // source_enabled like netqual. Incremental read from the high-water
         // mark; an EMPTY hwm means "never read" (fresh enable, or the init
         // backfill failed) and triggers the deep lookback — so an operator who
         // enables the source LATER still recovers the OS-retained history. The
         // hwm advances ONLY on success, so a failed tick re-reads the same
-        // window; rows carry the EVENT's own ts. Non-fatal like every opt-in leg.
-        if (db_->get_config("netconn_enabled", "false") == "true") {
+        // window; rows carry the EVENT's own ts. Non-fatal like the netqual leg.
+        if (source_enabled(*db_, "netconn")) {
             // Empty hwm (fresh enable / init backfill failed) -> deep read bounded
             // by the operator-configurable retroactive reach; a set hwm -> forward
             // incremental read [hwm, ts). nq_netconn_plan centralises this AND the
@@ -2314,7 +2276,7 @@ private:
             // window is empty, so the plan reads nothing but STILL seeds the hwm
             // to ts — otherwise the leg would recompute from==ts every tick and
             // never advance (a late enable with lookback=0 would wedge). rows
-            // carry the EVENT's own ts. Non-fatal like every opt-in leg.
+            // carry the EVENT's own ts. Non-fatal like the netqual leg.
             const auto hwm_str = db_->get_config("netconn_backfill_hwm", "");
             bool have_hwm = !hwm_str.empty();
             int64_t hwm = 0;
@@ -2354,9 +2316,9 @@ private:
             note_health("netconn", "source_disabled");
         }
 
-        // §3.8 — mapped-drive diff (both directions). Opt-in (default_enabled=false),
-        // so source_enabled returns false until an operator turns it on. NON-FATAL on
-        // insert failure — the always-on service/user legs above may have already
+        // §3.8 — mapped-drive diff (both directions). Gated by
+        // source_enabled (registry default: enabled). NON-FATAL on
+        // insert failure — the service/user legs above may have already
         // committed, so a failure here must not misreport the tick (do NOT `return
         // 1`); the diff baseline advances ONLY on insert success so a failed insert
         // retries the same deltas next tick. The one-time historical backfill is
@@ -2558,8 +2520,8 @@ private:
     //
     // Scope: MACHINE-WIDE inventory only (HKLM Uninstall). The source carries no
     // user identity — an event is the host's software, never a Windows profile's —
-    // so there is no per-user / NTUSER.DAT / hive-mount path (#1620). The source is
-    // opt-in (default off): an operator turns it on per host.
+    // so there is no per-user / NTUSER.DAT / hive-mount path (#1620). On by
+    // default; an operator can turn it off per host.
     //
     // The enumeration — which on Windows walks the registry — runs OUTSIDE
     // collect_mu_ so a slow registry pass cannot stall collect_fast/slow/
@@ -2708,9 +2670,8 @@ private:
         // from the per-source `*_live` table; an empty table reports 0 / 0.
         for (const auto& src : yuzu::tar::capture_sources()) {
             std::string enabled_key = std::format("{}_enabled", src.name);
-            // Default to the source's declared default (false for opt-in
-            // module/procperf/netqual) so a fresh agent does not misreport an
-            // opt-in source as enabled.
+            // Default to the source's declared default so a fresh agent
+            // reports the registry's value rather than a hard-coded one.
             auto stored = db_->get_config(enabled_key, src.default_enabled ? "true" : "false");
             // #560 — emit a strict tri-state (true/false/errored). do_configure
             // only ever persists "true"/"false"; any other stored value was
@@ -3038,7 +2999,7 @@ private:
                   where + tail;
         } else {
             // No-filter union stays the core event timeline. arp/dns/mapdrive are
-            // opt-in device-state / PII sources — reachable only via an explicit
+            // device-state sources — reachable only via an explicit
             // type filter above or tar.sql, never the default feed.
             sql = "SELECT * FROM ("
                   "SELECT ts, 'process' AS event_type, action, snapshot_id, '' AS detail_json FROM "
@@ -3183,7 +3144,7 @@ private:
         // Pre-enumerate arp/dns/netqual lock-free (same rationale as do_collect_fast).
         const bool arp_on = source_enabled(*db_, "arp");
         const bool dns_on = source_enabled(*db_, "dns");
-        const bool netqual_on = db_->get_config("netqual_enabled", "false") == "true";
+        const bool netqual_on = source_enabled(*db_, "netqual");
         // round 3 (B3-002): names of every enabled source classified
         // incomplete this pass (arp/service/mapdrive) -- accumulated across
         // the arp precollection below AND collect_slow_impl's service/
@@ -3409,6 +3370,14 @@ private:
         if (source == "software")
             sw_lock = std::unique_lock<std::mutex>(software_collect_mu_);
 
+        // source_enabled() reads an unreadable config row as DISABLED (collect gates
+        // fail closed), which for this destructive guard would be fail-open: refuse
+        // unless the flag is confirmed readable.
+        if (!db_->try_get_config(std::format("{}_enabled", source))) {
+            ctx.write_output(std::format(
+                "error|config_unreadable: cannot confirm {} is disabled; not purging", source));
+            return 1;
+        }
         if (source_enabled(*db_, source)) {
             ctx.write_output(std::format(
                 "error|source_not_paused: {} is enabled; disable it before purging", source));
@@ -3818,7 +3787,7 @@ private:
                     // take so a later re-enable diffs against a fresh reading instead
                     // of one from before the pause — otherwise the first
                     // post-re-enable row would cover the entire disabled window (a
-                    // privacy leak on opt-in procperf, and contradicts the
+                    // privacy leak on procperf, and contradicts the
                     // "re-enabling starts from a clean baseline" promise in
                     // docs/user-manual/tar.md). default-constructed → valid=false,
                     // which derive_sample/derive_proc_samples treat as "no baseline"

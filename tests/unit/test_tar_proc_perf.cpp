@@ -360,8 +360,7 @@ TEST_CASE("procperf #538: a reset baseline (post-disable) emits no off-period-sp
     // re-baselines) even though the app accrued CPU during the paused window — so
     // the first post-re-enable row never covers the opt-out window. Without the
     // reset, prev_proc_ would still hold the pre-disable snapshot and this call
-    // would emit a per-app row spanning the gap (the privacy leak on the opt-in
-    // source procperf, off by default for exactly this reason).
+    // would emit a per-app row spanning the gap.
     auto after_gap = snap(100'000);                                 // long pause elapsed
     after_gap.procs.push_back(proc(10, 1, 900 * kSec100ns, 100, "a.exe")); // lots of CPU
 

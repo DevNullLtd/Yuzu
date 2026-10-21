@@ -302,7 +302,7 @@ struct ModuleRow {
 /// PRIVACY — only `remote_bucket` (a coarse destination CLASS: loopback /
 /// private / public / unknown — see remote_bucket() in tar_netqual.hpp) leaves
 /// the connection's destination on the row; the raw remote address / hostname is
-/// NOT stored in this tier. Collection is gated by its own opt-in toggle and a
+/// NOT stored in this tier. Collection is gated by its own toggle and a
 /// per-tick top-N cap (collector slice).
 struct NetQualRow {
     int64_t ts{0};
@@ -333,7 +333,7 @@ struct NetQualRow {
 /// current-loss verdict from their ratio (see NetQualRow above — the
 /// device-aggregate live signal was empirically disproven). Host-wide, no
 /// per-connection or per-process attribution, no addresses: nothing usage-class
-/// on the row, but it ships under netqual's opt-in toggle regardless.
+/// on the row, but it ships under netqual's own toggle regardless.
 struct NetQualBootRow {
     int64_t ts{0};              // t_live: when TAR started observing this boot
     int64_t snapshot_id{0};

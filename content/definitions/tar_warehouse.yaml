@@ -35,9 +35,9 @@ spec:
           A SELECT query using $-prefixed table names. Available tables include
           $Process_Live, $Process_Hourly, $Process_Daily, $Process_Monthly,
           $TCP_Live, $TCP_Hourly, $TCP_Daily, $TCP_Monthly,
-          $Service_Live, $Service_Hourly, $User_Live, $User_Daily, and the opt-in
-          $ARP_Live/$ARP_Hourly and $DNS_Live/$DNS_Hourly (ADR-0015; require
-          arp_enabled=true / dns_enabled=true, Windows-only today — empty elsewhere).
+          $Service_Live, $Service_Hourly, $User_Live, $User_Daily, and
+          $ARP_Live/$ARP_Hourly and $DNS_Live/$DNS_Hourly (ADR-0015; need
+          arp_enabled / dns_enabled left on, Windows-only today — empty elsewhere).
     required: [sql]
 
   result:
@@ -813,8 +813,8 @@ metadata:
   version: 1.0.0
   description: >
     Recent ARP / neighbour-table activity (ADR-0015) — IP<->MAC bindings per
-    interface with their appeared/removed action. Requires the opt-in `arp`
-    capture source to be enabled on the device.
+    interface with their appeared/removed action. Requires the `arp`
+    capture source to be enabled on the device (the default).
   tags: [tar, warehouse, arp, network, forensics]
 
 spec:
@@ -876,8 +876,7 @@ metadata:
   description: >
     Recent DNS resolver-cache state (ADR-0015) — name/record_type/data/TTL with
     their appeared/removed action. Device-level (no per-process attribution).
-    Requires the opt-in `dns` capture source to be enabled on the device; DNS
-    cache is usage-class telemetry under the works-council posture.
+    Requires the `dns` capture source to be enabled on the device (the default).
   tags: [tar, warehouse, dns, network, forensics]
 
 spec:
@@ -941,9 +940,8 @@ metadata:
     outbound (drives this host maps to remote shares) and inbound (remote hosts
     mapping this host's shares). Live rows carry appeared/removed; historical
     rows (origin='historical', from registry / fstab / event-log backfill) carry
-    action='historical'. Requires the opt-in `mapdrive` capture source to be
-    enabled on the device; rows expose usernames + share paths (identity/usage-
-    class telemetry under the works-council posture).
+    action='historical'. Requires the `mapdrive` capture source to be
+    enabled on the device (the default); rows expose usernames + share paths.
   tags: [tar, warehouse, mapdrive, network, lateral-movement, forensics]
 
 spec:
