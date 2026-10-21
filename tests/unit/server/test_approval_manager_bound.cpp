@@ -28,6 +28,7 @@
 #include <array>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <chrono>
 #include <stdexcept>
 #include <thread>
@@ -237,6 +238,25 @@ void in_txn(pg::PgPool& pool, bool commit, F&& body) {
                             std::vector<std::string>{})
                 .status() == PGRES_COMMAND_OK);
 }
+
+// Joins a std::thread on every exit path, running `release` first (whatever the thread is
+// parked on). Not std::jthread: Apple Clang 15's libc++ lacks it.
+struct JoinGuard {
+    std::thread& thread;
+    std::function<void()> release;
+    JoinGuard(std::thread& t, std::function<void()> r) : thread(t), release(std::move(r)) {}
+    JoinGuard(const JoinGuard&) = delete;
+    JoinGuard& operator=(const JoinGuard&) = delete;
+    ~JoinGuard() {
+        try {
+            if (release)
+                release();
+        } catch (...) {
+        }
+        if (thread.joinable())
+            thread.join();
+    }
+};
 
 // The SQLSTATE of a failed statement ("" when there is none).
 std::string sqlstate_of(const pg::PgResult& r) {
@@ -1061,6 +1081,12 @@ TEST_CASE("consume (pooled): a reviewer rewrite committed BETWEEN the integrity 
     std::thread consumer([&] {
         result = mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, {});
     });
+    // A failing REQUIRE below throws; a joinable std::thread destroyed during that unwind
+    // calls std::terminate and takes the whole test binary with it. This releases the writer's
+    // lock first (the consumer is parked on it, so joining without that would hang) and joins.
+    JoinGuard guard{consumer, [&] {
+                        (void)pg::exec_params(x.get(), "ROLLBACK", std::vector<std::string>{});
+                    }};
     // Wait (bounded) until the consumer is parked on the lock, then let X commit.
     bool blocked = false;
     for (int i = 0; i < 200 && !blocked; ++i) {
