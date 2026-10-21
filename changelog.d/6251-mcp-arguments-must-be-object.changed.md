@@ -1,0 +1,1 @@
+- MCP tools served from the `tools/call` registry (today `discover_routes` and the three new hardware and quarantine tools) now refuse an `arguments` value that is not a JSON object (`null`, an array or a scalar) with a `-32602` error and a `denied` audit row, before the tool runs. Omitted `arguments` and `{}` still work, and tools outside the registry are unchanged.

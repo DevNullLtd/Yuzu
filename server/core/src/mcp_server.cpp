@@ -13,6 +13,7 @@
 #include "discovered_devices_model.hpp" // list_discovered_devices shared builders
 #include "mcp_orientation.hpp" // shared initialize.instructions / yuzu://about source (2g PR 1)
 #include "mcp_policy.hpp"
+#include "hardware_routes.hpp"   // HardwareRoutes::*Fn: the static_asserts pinning ToolDeps
 #include "mcp_tool_registry.hpp" // ToolRecord/ToolCallContext: the registry seam (merged by catalogue())
 #include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
 #include "mcp_transport.hpp"     // Streamable HTTP transport pre-checks (2f)
@@ -5472,6 +5473,24 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
 static_assert(std::is_same_v<ToolCallContext::PermFn, McpServer::PermFn>,
               "ToolCallContext::PermFn drifted from McpServer::PermFn (mcp_server.hpp)");
 
+// ToolDeps spells its provider signatures out (mcp_tool_deps.hpp); these pin each
+// to the twin it must share an instance with, so a signature change on either side
+// is a build failure and not a silent copy.
+static_assert(std::is_same_v<ToolDeps::FleetReadFn, McpServer::FleetReadFn>,
+              "ToolDeps::FleetReadFn drifted from McpServer::FleetReadFn (mcp_server.hpp)");
+static_assert(std::is_same_v<ToolDeps::FleetReadFn, HardwareRoutes::FleetReadFn>,
+              "ToolDeps::FleetReadFn drifted from HardwareRoutes::FleetReadFn");
+static_assert(std::is_same_v<ToolDeps::AuditFn, McpServer::AuditFn>,
+              "ToolDeps::AuditFn drifted from McpServer::AuditFn (mcp_server.hpp)");
+static_assert(std::is_same_v<ToolDeps::AuditFn, HardwareRoutes::AuditFn>,
+              "ToolDeps::AuditFn drifted from HardwareRoutes::AuditFn");
+static_assert(std::is_same_v<ToolDeps::RosterFn, HardwareRoutes::RosterFn>,
+              "ToolDeps::RosterFn drifted from HardwareRoutes::RosterFn");
+static_assert(std::is_same_v<ToolDeps::CiDetailFn, HardwareRoutes::CiDetailFn>,
+              "ToolDeps::CiDetailFn drifted from HardwareRoutes::CiDetailFn");
+static_assert(std::is_same_v<ToolDeps::DexScoreFn, HardwareRoutes::DexScoreFn>,
+              "ToolDeps::DexScoreFn drifted from HardwareRoutes::DexScoreFn");
+
 // ── Merged tool catalogue (registry seam) ────────────────────────────────
 //
 // The registry-resident tools (mcp_tools_<domain>.cpp, see mcp_tool_registry.hpp),
@@ -5482,7 +5501,7 @@ static_assert(std::is_same_v<ToolCallContext::PermFn, McpServer::PermFn>,
 std::span<const ToolRecord> registered_tool_records() {
     static const std::vector<ToolRecord> records = [] {
         std::vector<ToolRecord> all;
-        for (const auto span : {discovery_tool_records()})
+        for (const auto span : {discovery_tool_records(), hardware_tool_records(), containment_tool_records()})
             all.insert(all.end(), span.begin(), span.end());
         return all;
     }();
@@ -5499,9 +5518,9 @@ std::span<const ToolRecord> registered_tool_records() {
 //     first-wins collapse (#2423 review F1);
 //   * the DERIVED lookups collapse duplicates, which is safe only because the
 //     validator rejects them before the server serves.
-// Served order is the legacy kTools[] order, then the registry records in
-// registered_tool_records() order. Write-set membership for a registry record
-// is derived (`operation != "Read"`), the validator's own parity rule.
+// Served order is tool-name order (build_catalogue() sorts `served` after merging the
+// legacy kTools[] rows with the registry records). Write-set membership for a
+// registry record is derived (`operation != "Read"`), the validator's own parity rule.
 // All string_views and const char* point at static-storage literals.
 struct Catalogue {
     // Raw sequences, duplicates preserved (validator input).
@@ -5588,6 +5607,14 @@ Catalogue build_catalogue(std::span<const ToolRecord> records) {
     c.handlers.reserve(records.size());
     for (const auto& r : records)
         c.handlers.emplace(r.name, r.handler);
+
+    // tools/list is served in tool-name order, a property of the catalogue so every
+    // consumer (tools/list, tool_names_for_test) agrees and a future migration
+    // from kTools[] to the registry does not move a tool in the list. Only `served`
+    // is sorted: the raw_* sequences stay in insertion order (validator input).
+    std::sort(c.served.begin(), c.served.end(), [](const ToolDef& a, const ToolDef& b) {
+        return std::string_view{a.name} < std::string_view{b.name};
+    });
     return c;
 }
 
@@ -8763,12 +8790,34 @@ McpServer::HandlerFn McpServer::build_handler(
             // Placed AFTER the C8 block on purpose: knownness, C7, service-scope,
             // tier and approval above have already run, so tier-before-RBAC holds for
             // a registry tool exactly as for a legacy one; the handler's own
-            // tier_allows/perm_fn pair runs after them. The #2405 input-schema check
-            // above runs ONLY inside the approval-gated branch: a non-gated registry
-            // handler receives UNVALIDATED args (any JSON value) and must validate
-            // them itself. A legacy tool has no handler here and falls through to the
-            // chain below.
+            // tier_allows/perm_fn pair runs after them (a confined read gated by
+            // ToolDeps::fleet_read_fn runs neither). The #2405 input-schema check
+            // above runs ONLY inside the approval-gated branch; the central check
+            // below guarantees `args` is a JSON object, but a non-gated registry
+            // handler must still validate the keys and values itself. A legacy tool
+            // has no handler here and falls through to the chain below.
             if (const ToolHandler registry_handler = catalogue().handler(tool_name)) {
+                // ONE central shape check for every registry tool: `arguments` must be a
+                // JSON object. Placed after knownness, C7, C8, tier and approval (a
+                // tier-denied caller still gets its tier error first, the #2405 ordering)
+                // and before the context is built, so no handler ever sees a scalar,
+                // array or null `arguments`. This proves is_object() ONLY: it is not the
+                // #2405 schema check, so enum/minimum/maximum in the advertised schema are
+                // still the handler's own job for a non-approval-gated tool. Deliberately
+                // no metric: yuzu_mcp_tool_args_invalid_total bounds `tool` to the
+                // approval-gated set (docs/user-manual/metrics.md).
+                if (!args.is_object()) {
+                    const std::string cid = yuzu::server::detail::make_correlation_id();
+                    const bool audit_ok =
+                        mcp_audit("denied", "arguments must be a JSON object correlation_id=" + cid);
+                    res.set_content(
+                        a4_error(kInvalidParams, "arguments must be a JSON object",
+                                 "pass `arguments` as a JSON object matching this tool's tools/list "
+                                 "inputSchema and re-call",
+                                 -1, cid, audit_ok),
+                        "application/json");
+                    return;
+                }
                 // The two per-request lambdas are bound into std::functions; default
                 // arguments do not survive that, so a handler passes every argument.
                 const ToolCallContext::AuditFn ctx_audit = [&](const std::string& result_status,
@@ -8781,8 +8830,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         return a4_error(code, message, remediation, retry_after_ms, cid_override,
                                         audit_ok);
                     };
-                const ToolCallContext ctx{req,     res,       id,           args,        tier,
-                                          perm_fn, ctx_audit, ctx_a4_error, &tool_result};
+                const ToolCallContext ctx{req,     res,       id,           args,
+                                          tier,    perm_fn,   ctx_audit,    ctx_a4_error,
+                                          &tool_result, &tool_deps_};
                 dispatch_registry_handler(registry_handler, tool_name, ctx);
                 return;
             }
@@ -28687,6 +28737,10 @@ void build_catalogue_for_test(std::span<const ToolRecord> records) {
 
 void dispatch_registry_handler_for_test(ToolHandler handler, const ToolCallContext& ctx) {
     dispatch_registry_handler(handler, "dispatch_registry_handler_for_test", ctx);
+}
+
+std::span<const ToolRecord> registry_records_for_test() {
+    return registered_tool_records();
 }
 
 std::vector<std::string> registry_tool_names_for_test() {
