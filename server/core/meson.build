@@ -623,6 +623,8 @@ yuzu_server_core_lib = static_library(
     'src/access_audit_render.cpp', # Audit and reviews page: pure renderers (log, sample, retention)
     'src/access_audit_ui.cpp', # Audit and reviews page: template
     'src/access_audit_routes.cpp', # Audit and reviews page: /access/audit + fragments + glue
+    'src/access_reviews_render.cpp', # Audit and reviews page: Access reviews renderers
+    'src/access_reviews_routes.cpp', # Audit and reviews page: Access reviews fragments
     'src/login_ui.cpp',
     'src/settings_ui.cpp',
     'src/settings_security_ui.cpp',  # Security and sign-in page (System group)
@@ -935,7 +937,14 @@ yuzu_server_core_lib = static_library(
     'src/crl_publisher.cpp',
     'src/default_certs.cpp',
     'src/ca_routes.cpp',
+    'src/ca_panel_render.cpp',
     'src/kek_routes.cpp',
+    'src/settings_plugins_routes.cpp',
+    'src/settings_plugins_ui.cpp',
+    'src/plugin_page_model.cpp',
+    'src/kek_panel_render.cpp',
+    'src/pki_routes.cpp',
+    'src/settings_pki_ui.cpp',
     'src/security_headers.cpp',
   )],
   include_directories: ['include', '../../common/include'],

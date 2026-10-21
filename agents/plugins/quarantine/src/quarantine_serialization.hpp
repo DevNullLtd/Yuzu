@@ -44,6 +44,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -183,6 +184,16 @@ public:
         return Guard{*this};
     }
 
+    /// How many threads are queued inside try_enter() right now, not counting
+    /// the holder (a ticket is dropped the moment its thread acquires). Exists so
+    /// a test can wait until a contender has really taken its ticket rather than
+    /// until it merely says it is about to (#6220); production code has no use
+    /// for it. Takes the gate's lock and changes nothing.
+    [[nodiscard]] std::size_t waiters_for_test() const {
+        std::lock_guard<std::mutex> lk(m_);
+        return waiting_.size();
+    }
+
 private:
     void leave() noexcept {
         {
@@ -197,7 +208,7 @@ private:
     }
 
     std::chrono::milliseconds wait_budget_;
-    std::mutex m_;
+    mutable std::mutex m_; // mutable: waiters_for_test() is const
     std::condition_variable cv_;
     bool held_ = false;
     std::uint64_t next_ticket_ = 0;

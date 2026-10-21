@@ -161,16 +161,24 @@ static std::string oidc_bind_cookie_clear(bool https) {
            "=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" + (https ? "; Secure" : "");
 }
 
-// Probes (`AuthRoutes::has_permission`) in flight on this thread. While it is non-zero
-// `audit_log` is a no-op that reports success: the probe runs `require_permission` unchanged and
-// only its denial audit row is withheld. thread_local because httplib serves a request start to
-// finish on one thread and `require_permission` is synchronous, so a probe never leaks into
+// A probe (`has_permission`, `probe_admin`, `probe_permission`, `probe_fleet_read`,
+// `probe_global_list_read`) in flight on this thread. It runs its gate unchanged. `require_auth`,
+// the first step of every gate, records the session the GATE authenticated in the innermost scope,
+// and `audit_log` withholds a row ONLY when that session is an interactive cookie sign-in
+// (`denial_row_may_be_withheld`). The decision therefore rests on the one lookup that also
+// decided the verdict: a second lookup (at probe entry, or at the write) can disagree with the
+// gate when a request carries both a cookie and a bearer token and a store flaps in between, and a
+// token caller's denial row must never be withheld. thread_local because httplib serves a request
+// start to finish on one thread and the gates are synchronous, so a probe never leaks into
 // another request's audit writes.
-thread_local int g_audit_probe_depth = 0;
+struct AuditProbeScope;
+thread_local AuditProbeScope* g_probe_scope = nullptr;
 
 struct AuditProbeScope {
-    AuditProbeScope() { ++g_audit_probe_depth; }
-    ~AuditProbeScope() { --g_audit_probe_depth; }
+    std::optional<auth::Session> session; ///< what the gate's `require_auth` resolved, once
+    AuditProbeScope* prev;
+    AuditProbeScope() : prev(g_probe_scope) { g_probe_scope = this; }
+    ~AuditProbeScope() { g_probe_scope = prev; }
     AuditProbeScope(const AuditProbeScope&) = delete;
     AuditProbeScope& operator=(const AuditProbeScope&) = delete;
 };
@@ -237,6 +245,20 @@ std::string AuthRoutes::extract_session_cookie(const httplib::Request& req) {
     pos += prefix.size();
     auto end = cookie.find(';', pos);
     return cookie.substr(pos, end == std::string::npos ? end : end - pos);
+}
+
+std::string AuthRoutes::session_correlator(const httplib::Request& req) {
+    const auto cookie = extract_session_cookie(req);
+    if (cookie.empty())
+        return {};
+    try {
+        return auth::AuthManager::sha256_hex(cookie);
+    } catch (const std::exception& e) {
+        spdlog::debug(
+            "AuthRoutes::session_correlator: session_id digest failed, recording empty: {}",
+            e.what());
+        return {};
+    }
 }
 
 std::string AuthRoutes::url_decode(const std::string& s) {
@@ -610,8 +632,11 @@ auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
 
 std::optional<auth::Session> AuthRoutes::require_auth(const httplib::Request& req,
                                                       httplib::Response& res) {
-    if (auto session = resolve_session(req))
+    if (auto session = resolve_session(req)) {
+        if (g_probe_scope && !g_probe_scope->session)
+            g_probe_scope->session = session; // the gate's own session; see AuditProbeScope
         return session;
+    }
 
     res.status = 401;
     res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
@@ -679,27 +704,50 @@ bool AuthRoutes::has_permission(const httplib::Request& req, const std::string& 
 }
 
 bool AuthRoutes::probe_admin(const httplib::Request& req, httplib::Response& res) {
-    std::optional<AuditProbeScope> probe;
-    if (auto s = resolve_session(req); s && denial_row_may_be_withheld(*s))
-        probe.emplace();
+    AuditProbeScope probe; // not const: require_auth records the gate's session into it
     return require_admin(req, res);
 }
 
 bool AuthRoutes::probe_permission(const httplib::Request& req, httplib::Response& res,
                                   const std::string& securable_type,
                                   const std::string& operation) {
-    std::optional<AuditProbeScope> probe;
-    if (auto s = resolve_session(req); s && denial_row_may_be_withheld(*s))
-        probe.emplace();
+    AuditProbeScope probe; // not const: require_auth records the gate's session into it
     return require_permission(req, res, securable_type, operation);
+}
+
+ListReadGate AuthRoutes::require_global_list_read(const httplib::Request& req,
+                                                  httplib::Response& res,
+                                                  const std::string& securable_type,
+                                                  const std::string& operation) {
+    auto gate = require_list_read(req, res, securable_type, operation);
+    if (!gate.admitted || !gate.scope)
+        return gate;
+    const std::string perm = securable_type + ":" + operation;
+    audit_log(req, "auth.permission_required", "denied", "", "",
+              "management-group-scoped grant cannot read the unscoped list " + perm);
+    const std::string hint = "this list is not agent-scoped: a management-group-scoped " + perm +
+                             " grant is not enough, it needs a global grant";
+    res.status = 403;
+    res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
+                                      detail::A4ErrorOpts{.remediation = hint, .permission = perm}),
+                    "application/json");
+    gate.admitted = false;
+    gate.scope.reset();
+    return gate;
+}
+
+ListReadGate AuthRoutes::probe_global_list_read(const httplib::Request& req,
+                                                httplib::Response& res,
+                                                const std::string& securable_type,
+                                                const std::string& operation) {
+    AuditProbeScope probe; // not const: require_auth records the gate's session into it
+    return require_global_list_read(req, res, securable_type, operation);
 }
 
 std::expected<authz::ListAuthority, authz::GateFailure>
 AuthRoutes::probe_fleet_read(const httplib::Request& req, httplib::Response& res,
                              const std::string& securable_type, const std::string& operation) {
-    std::optional<AuditProbeScope> probe;
-    if (auto s = resolve_session(req); s && denial_row_may_be_withheld(*s))
-        probe.emplace();
+    AuditProbeScope probe; // not const: require_auth records the gate's session into it
     return require_fleet_read(req, res, securable_type, operation);
 }
 
@@ -1380,7 +1428,10 @@ ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib:
     // authorize_list_read here: it has no elevation concept, so an elevated
     // session with zero RBAC grants would otherwise be denied (the
     // regression the first #3038 fix attempt shipped, closed here).
-    if (auth::is_elevated(*session)) {
+    // The service-scope belt require_permission carries is kept on purpose: an elevation must
+    // never let a service-scoped token past the default-deny below (unreachable today, since only
+    // cookie sessions are elevated).
+    if (auth::is_elevated(*session) && session->token_scope_service.empty()) {
         gate.admitted = true;
         return gate; // scope stays nullopt: unfiltered
     }
@@ -1396,7 +1447,8 @@ ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib:
                       "engine principal denied: RBAC store unavailable");
             res.status = 503;
             res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
-                                              detail::A4ErrorOpts{.permission = perm}),
+                                              detail::A4ErrorOpts{.retry_after_ms = 5000,
+                                                                  .permission = perm}),
                             "application/json");
             return gate;
         }
@@ -1507,7 +1559,7 @@ AuditEvent AuthRoutes::make_audit_event(const httplib::Request& req, const std::
         // audited as `admin` (the role it was AUTHORIZED as), not the base role —
         // SOC 2 evidence-integrity (#1748 H1). A no-op for non-elevated sessions.
         event.principal_role = auth::role_to_string(auth::effective_role(*session));
-        event.session_id = extract_session_cookie(req);
+        event.session_id = session_correlator(req);
         // principal_class_of(req) above can only distinguish by credential
         // presentation (bearer token → "agent"), which mislabels an engine
         // principal's bearer-token requests. Re-stamp from the resolved
@@ -1530,8 +1582,9 @@ void AuthRoutes::reap_mfa_pending_locked() {
 bool AuthRoutes::audit_log(const httplib::Request& req, const std::string& action,
                            const std::string& result, const std::string& target_type,
                            const std::string& target_id, const std::string& detail) {
-    if (g_audit_probe_depth > 0)
-        return true; // a has_permission probe: nothing was attempted, so nothing is recorded
+    if (g_probe_scope && g_probe_scope->session &&
+        denial_row_may_be_withheld(*g_probe_scope->session))
+        return true; // an interactive cookie session's probe: nothing was attempted
     if (!audit_store_)
         return true; // audit-off deployment — not a failure relative to config
     auto event = make_audit_event(req, action, result);
@@ -1577,8 +1630,9 @@ AuditEvent AuthRoutes::make_audit_event_for_principal(
                                 ? std::string(principal_class_of(req))
                                 : principal_class_override;
     // Stamped like make_audit_event so a row written by this path carries the same
-    // session correlator. Empty at the pre-session login sites, which is correct there.
-    event.session_id = extract_session_cookie(req);
+    // session correlator: the digest of any cookie the request carries; empty when it
+    // carries none, as at most pre-session login sites.
+    event.session_id = session_correlator(req);
     return event;
 }
 
@@ -1740,29 +1794,8 @@ void AuthRoutes::emit_event(const std::string& event_type, const httplib::Reques
         // session (including an elevated admin's, via role.elevation.granted
         // events). The hash still correlates events from the same session
         // (same cookie -> same hash) without being a redeemable credential.
-        // Guard on the COOKIE, not just the session (governance Gate 3
-        // cpp-expert finding, 2026-08-16): resolve_session() also succeeds
-        // for Bearer/X-Yuzu-Token auth, which carries no cookie —
-        // extract_session_cookie returns "", and sha256_hex("") is a FIXED
-        // constant. Hashing unconditionally would give every token-
-        // authenticated row the SAME non-empty session_id, falsely
-        // correlating unrelated principals as "the same session" — a
-        // regression the pre-hash code didn't have (empty stayed
-        // distinguishably empty). Only hash a real cookie; leave
-        // session_id at its default-empty value otherwise.
-        //
-        // Fail-soft parity (governance Gate 3 cpp-safety finding,
-        // 2026-08-16): sha256_hex can throw on an internal EVP failure
-        // (OOM-class, rare) — this whole function exists so a dropped
-        // analytics event never fails the operation that emitted it.
-        // Degrades to an empty session_id, not a failed request.
-        if (auto cookie = extract_session_cookie(req); !cookie.empty()) {
-            try {
-                ae.session_id = auth::AuthManager::sha256_hex(cookie);
-            } catch (const std::exception& e) {
-                spdlog::debug("AuthRoutes::emit_event: session_id hash failed: {}", e.what());
-            }
-        }
+        // The cookie guard and the fail-soft digest live in session_correlator.
+        ae.session_id = session_correlator(req);
     }
     analytics_store_->emit(std::move(ae));
 }
