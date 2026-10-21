@@ -7,13 +7,16 @@ orphan cleanup kills that epmd under every concurrent job, and their next
 `peer:start_link` times out (the incident and its evidence: the #4853 row of
 docs/erlang-gateway-build.md). isolate() gives each wrapper run its own port
 through ERL_EPMD_PORT; every VM the run starts inherits it, erl starts the
-epmd there on first use, and stop() removes it at exit. An ERL_EPMD_PORT
-already in the environment is the operator's own isolation and wins untouched.
+epmd there on first use, and stop() asks it to exit when the wrapper does (epmd
+refuses while a node is still registered; the runner's orphan cleanup then
+reaps it). An ERL_EPMD_PORT already in the environment is the operator's own
+isolation and wins untouched.
 
 The decision (pick_port) is pure; the OS (port_is_free, stop) is a thin shell
 with injectable seams. Pinned by tests/test_gateway_epmd.py.
 """
 import atexit
+import errno
 import glob
 import os
 import re
@@ -21,37 +24,56 @@ import shutil
 import socket
 import subprocess
 
-# Below every supported OS's ephemeral range (Linux 32768+, Windows/macOS
-# 49152+), so an outgoing connection's source port can never take it.
-PORT_RANGE = (21000, 29999)
+# Below every default ephemeral range (Linux 32768+, Windows/macOS 49152+), so
+# an outgoing connection's source port does not take it. The span (8999) is
+# PRIME on purpose: pid % span then reaches every start port even for Windows
+# pids, which are multiples of 4 (a span of 9000 reached a quarter of them).
+PORT_RANGE = (21000, 29998)
+# Coprime with the span. A scan steps over a run of unusable ports (a Windows
+# excluded-port block) instead of crawling through it one port at a time.
+_SCAN_STRIDE = 101
 _MAX_TRIES = 20
-_KILL_TIMEOUT_SECS = 10
+_KILL_TIMEOUT_SECS = 5
+# A host without IPv6 raises one of these opening or binding the v6 probe.
+_NO_IPV6 = (errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL)
 
 
 def pick_port(is_free, pid=os.getpid):
-    """First free port scanning up from a start derived from this process's id,
-    else None. epmd binds long after the probe (once the first distributed node
-    starts), so two runs choosing the same free port would share one epmd and one
-    run's exit would kill the other's. Concurrent runs have distinct pids and so
-    start at distinct ports; a busy port only moves the scan to the next one.
-    Accepted residual: two live pids 9000 apart start at the same port (1 in
-    9000 per pair), and the probe cannot see an epmd that has not bound yet."""
+    """First free port on a scan that starts at a port derived from this
+    process's id, else None. epmd binds long after the probe (once the first
+    distributed node starts), so two runs choosing the same free port would end
+    up sharing one epmd. Concurrent runs have distinct pids and so start at
+    distinct ports (the prime span makes that hold for any pid stride), and the
+    scan stride keeps their paths apart afterwards.
+    Accepted residual: two live pids exactly one span apart start at the same
+    port, a busy start port can move one scan onto the other's path, and the
+    probe cannot see an epmd that has not bound yet. Sharing is then the
+    pre-change state for that pair, not a new failure."""
     span = PORT_RANGE[1] - PORT_RANGE[0] + 1
     start = pid() % span
     for i in range(_MAX_TRIES):
-        port = PORT_RANGE[0] + (start + i) % span
+        port = PORT_RANGE[0] + (start + i * _SCAN_STRIDE) % span
         if is_free(port):
             return port
     return None
 
 
 def port_is_free(port):
-    """True when nothing listens on `port`. No SO_REUSEADDR on purpose: a bind
-    that would share a live listener must fail on every platform."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+    """True when nothing listens on `port` on IPv4 or IPv6: epmd binds both, and
+    a holder on either stack makes it fail to start there without saying so. No
+    SO_REUSEADDR on purpose: a bind that would share a live listener must fail
+    on every platform. A probe that cannot run at all counts as not free, so a
+    restricted host falls back to the shared epmd instead of aborting the run;
+    a host with no IPv6 has nothing to hold the port there."""
+    for family, host in ((socket.AF_INET, ""), (socket.AF_INET6, "::")):
         try:
-            probe.bind(("", port))
-        except OSError:
+            with socket.socket(family, socket.SOCK_STREAM) as probe:
+                if family == socket.AF_INET6:
+                    probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                probe.bind((host, port))
+        except OSError as exc:
+            if family == socket.AF_INET6 and exc.errno in _NO_IPV6:
+                continue
             return False
     return True
 
@@ -63,10 +85,12 @@ def isolate(env, is_free=port_is_free, pid=os.getpid):
     explicit ERL_EPMD_PORT (operator isolation), or no free port found (the
     run falls back to the shared epmd, exactly as before this existed).
 
-    The epmd erl starts here keeps its default strict kill check on purpose:
-    `epmd -kill` is refused while any node is registered, so a cleanup can never
-    take down an epmd another run is using (a leaked peer only leaves this run's
-    epmd for the runner's own orphan cleanup).
+    The epmd erl later starts on that port keeps its default strict kill check
+    on purpose: `epmd -kill` is refused while any node is registered, so this
+    run's exit-time cleanup does not take down an epmd that another run, which
+    shares the port by the residual pick_port accepts, still has nodes on. (An
+    epmd with no node registered yet is not protected; that is the same
+    residual.) A leaked peer only leaves this run's own epmd to the runner.
     """
     if env.get("ERL_EPMD_PORT"):
         return None
@@ -79,8 +103,8 @@ def isolate(env, is_free=port_is_free, pid=os.getpid):
 
 def find_epmd(env, which=shutil.which, glob_=glob.glob):
     """The epmd on `env`'s PATH, else the one inside the OTP install that PATH's
-    erl belongs to: Windows OTP keeps epmd.exe only under <root>/erts-<vsn>/bin,
-    never in <root>/bin (where erlexec finds it, and PATH does not)."""
+    erl belongs to: Windows OTP keeps epmd.exe only under <root>/erts-<vsn>/bin
+    (where erlexec looks for it); PATH holds only <root>/bin, which has none."""
     path = env.get("PATH")
     found = which("epmd", path=path)
     if found:
@@ -90,8 +114,9 @@ def find_epmd(env, which=shutil.which, glob_=glob.glob):
         return None
     root = os.path.dirname(os.path.dirname(os.path.realpath(erl)))
     # Exact names: a bare `epmd*` also matches epmd.pdb in a Windows install.
+    # The root is escaped: a `[` or `*` in an install path is a path, not a pattern.
     hits = [hit for name in ("epmd", "epmd.exe")
-            for hit in glob_(os.path.join(root, "erts-*", "bin", name))]
+            for hit in glob_(os.path.join(glob.escape(root), "erts-*", "bin", name))]
     return max(hits, key=_erts_version) if hits else None
 
 
@@ -101,20 +126,25 @@ def _erts_version(path):
     return tuple(int(part) for part in m.group(1).split(".")) if m else ()
 
 
-def stop(port, env, which=shutil.which, run=subprocess.run, glob_=glob.glob):
+def stop(port, env, which=shutil.which, run=subprocess.run, glob_=glob.glob, say=print):
     """Best-effort `epmd -port <port> -kill`. Never raises: it runs at exit,
-    where a failure has nobody left to report to. Returns True when the kill
-    was attempted."""
+    where a failure has nobody left to report to. Returns True when epmd
+    accepted the kill. Otherwise (no epmd found, a hung or failed call, or a
+    refusal because a node is still registered) it says that the run's epmd may
+    still be running: nothing else reports it, and on a host with no runner to
+    reap it the epmd and its port would stay until someone removes them."""
     try:
         epmd = find_epmd(env, which, glob_)
-        if not epmd:
-            return False
-        run([epmd, "-port", str(port), "-kill"], env=env, stdin=subprocess.DEVNULL,
+        stopped = bool(epmd) and run(
+            [epmd, "-port", str(port), "-kill"], env=env, stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=_KILL_TIMEOUT_SECS)
-        return True
+            timeout=_KILL_TIMEOUT_SECS).returncode == 0
     except Exception:  # noqa: BLE001 - exit-time cleanup, never fatal
-        return False
+        stopped = False
+    if not stopped:
+        say(f"[test_gateway.py] the run-private epmd on port {port} may still be running; "
+            f"stop it with: epmd -port {port} -kill", flush=True)
+    return stopped
 
 
 def activate(env, register=atexit.register, say=print, isolate_=isolate):
@@ -130,5 +160,5 @@ def activate(env, register=atexit.register, say=print, isolate_=isolate):
         say(f"[test_gateway.py] epmd: using ERL_EPMD_PORT={explicit} from the environment", flush=True)
     else:
         say("[test_gateway.py] epmd: no free private port found, using the shared epmd "
-            "(#4853 can recur)", flush=True)
+            "(another job's cleanup can kill it, #4853)", flush=True)
     return port

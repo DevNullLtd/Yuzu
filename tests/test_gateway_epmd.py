@@ -2,24 +2,28 @@
 """Pin the gateway test wrapper's run-private epmd (#4853, scripts/gateway_epmd.py).
 
   1. the port pick and the isolate() decision (what it sets, what it leaves
-     alone), against injected probes;
-  2. find_epmd() and stop(): where epmd is looked for, and that cleanup can
-     never raise;
+     alone), against injected probes, and the real probe against real sockets;
+  2. find_epmd() and stop(): where epmd is looked for, what is said when it is
+     not stopped, and that cleanup can never raise;
   3. activate(): what a run says and registers for each of the three outcomes;
   4. scripts/test_gateway.py calls activate() on the env it hands to rebar3,
      right after base_env().
 
-Hermetic: injected seams, plus one wildcard-bound listener to prove the real
-probe refuses a held port. No epmd, no rebar3, no subprocess.
+Hermetic: injected seams, plus a few loopback listeners on OS-chosen ports to
+prove the real probe refuses a held port. No epmd, no rebar3, no subprocess.
 """
+import errno
 import fnmatch
 import functools
+import math
 import os
 import re
 import socket
 import subprocess
 import sys
+import types
 import unittest
+from unittest import mock
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 sys.path.insert(0, os.path.join(ROOT, 'scripts'))
@@ -27,12 +31,27 @@ sys.path.insert(0, os.path.join(ROOT, 'scripts'))
 import gateway_epmd as ge  # noqa: E402
 
 WRAPPER = os.path.join(ROOT, 'scripts', 'test_gateway.py')
+SPAN = ge.PORT_RANGE[1] - ge.PORT_RANGE[0] + 1
+
+
+def quiet(*args, **kwargs):
+    """A `say`/`register` stand-in that records nothing."""
+
+
+def free_port_number():
+    """An OS-chosen port nothing holds right now, or a skip if sockets are denied."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("", 0))
+        except OSError as exc:  # a sandbox that denies bind cannot run the real-probe tests
+            raise unittest.SkipTest("cannot bind a socket here: %s" % exc)
+        return s.getsockname()[1]
 
 
 class PickPortTest(unittest.TestCase):
     LOW = ge.PORT_RANGE[0]
 
-    def test_starts_at_the_port_the_pid_maps_to_and_takes_the_first_free_one(self):
+    def test_starts_at_the_port_the_pid_maps_to_and_scans_by_the_stride(self):
         seen = []
 
         def is_free(port):
@@ -40,25 +59,51 @@ class PickPortTest(unittest.TestCase):
             return len(seen) == 3
 
         port = ge.pick_port(is_free, pid=lambda: 100)
-        self.assertEqual(seen, [self.LOW + 100, self.LOW + 101, self.LOW + 102])
-        self.assertEqual(port, self.LOW + 102)
+        step = ge._SCAN_STRIDE
+        self.assertEqual(seen, [self.LOW + 100, self.LOW + 100 + step, self.LOW + 100 + 2 * step])
+        self.assertEqual(port, seen[-1])
 
-    def test_concurrent_runs_start_at_distinct_ports(self):
-        # Two wrapper processes alive together have different pids, so they cannot pick
-        # one port before either epmd binds (a shared epmd would be killed by the first exit).
-        first = [ge.pick_port(lambda p: True, pid=lambda pid=pid: pid) for pid in (4100, 4104, 4108)]
-        self.assertEqual(len(set(first)), 3)
+    def test_with_everything_free_the_default_pid_picks_this_processs_start_port(self):
+        self.assertEqual(ge.pick_port(lambda p: True), self.LOW + os.getpid() % SPAN)
+
+    def test_every_pid_stride_reaches_every_start_port(self):
+        # Windows pids are multiples of 4; a span divisible by 4 would reach a quarter of the
+        # start ports and make two concurrent runs 4x likelier to share one.
+        starts = {ge.pick_port(lambda p: True, pid=lambda pid=pid: pid) for pid in range(0, 4 * SPAN, 4)}
+        self.assertEqual(len(starts), SPAN)
+
+    def test_concurrent_runs_scan_disjoint_ports(self):
+        # Adjacent pids (two jobs starting together) must not converge on one port when a start
+        # port is busy: the stride keeps their scans apart for the whole bounded scan.
+        def scanned(pid):
+            seen = set()
+            ge.pick_port(lambda p: seen.add(p) or False, pid=lambda: pid)
+            return seen
+
+        for other in range(101, 110):
+            self.assertFalse(scanned(100) & scanned(other), other)
+
+    def test_a_block_of_unusable_ports_is_stepped_over(self):
+        # A Windows excluded-port block is a contiguous run; one stride clears a run this wide.
+        start = self.LOW + 400
+        blocked = range(start, start + 100)
+        port = ge.pick_port(lambda p: p not in blocked, pid=lambda: 400)
+        self.assertIsNotNone(port)
+        self.assertNotIn(port, blocked)
 
     def test_the_scan_wraps_at_the_end_of_the_range(self):
-        span = ge.PORT_RANGE[1] - ge.PORT_RANGE[0] + 1
         seen = []
-        ge.pick_port(lambda p: seen.append(p) or False, pid=lambda: span - 1)
-        self.assertEqual(seen[:2], [ge.PORT_RANGE[1], self.LOW])
+        ge.pick_port(lambda p: seen.append(p) or False, pid=lambda: SPAN - 1)
+        self.assertEqual(seen[:2], [ge.PORT_RANGE[1], self.LOW + ge._SCAN_STRIDE - 1])
 
     def test_gives_up_after_a_bounded_number_of_tries(self):
         calls = []
         self.assertIsNone(ge.pick_port(lambda p: calls.append(p) or False, pid=lambda: 5))
         self.assertEqual(len(calls), 20)
+        self.assertEqual(len(set(calls)), 20)  # the stride never revisits a port within the scan
+
+    def test_the_stride_is_coprime_with_the_span(self):
+        self.assertEqual(math.gcd(ge._SCAN_STRIDE, SPAN), 1)
 
     def test_range_stays_below_every_ephemeral_range(self):
         # Linux ephemeral starts at 32768; Windows and macOS at 49152.
@@ -67,6 +112,9 @@ class PickPortTest(unittest.TestCase):
 
 
 class PortProbeTest(unittest.TestCase):
+    def test_a_free_port_is_free(self):
+        self.assertTrue(ge.port_is_free(free_port_number()))
+
     def test_a_held_port_is_not_free(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
             try:
@@ -75,6 +123,36 @@ class PortProbeTest(unittest.TestCase):
                 self.skipTest("cannot bind a socket here: %s" % exc)
             held.listen(1)
             self.assertFalse(ge.port_is_free(held.getsockname()[1]))
+
+    def test_a_port_held_only_on_ipv6_is_not_free(self):
+        # epmd binds both stacks and fails to start, silently, when a foreign process
+        # holds the port on either one; an IPv4-only probe would call the port free.
+        try:
+            held = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            held.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            held.bind(("::", 0))
+        except OSError as exc:
+            self.skipTest("no usable IPv6 here: %s" % exc)
+        with held:
+            held.listen(1)
+            self.assertFalse(ge.port_is_free(held.getsockname()[1]))
+
+    def test_a_probe_that_cannot_open_a_socket_says_not_free_and_never_raises(self):
+        # A restricted host must fall back to the shared epmd, not abort the run.
+        with mock.patch.object(ge.socket, "socket", side_effect=PermissionError(errno.EPERM, "denied")):
+            self.assertFalse(ge.port_is_free(24000))
+
+    def test_a_host_without_ipv6_has_nothing_holding_the_port_there(self):
+        real = socket.socket
+
+        def no_v6(family, *args, **kwargs):
+            if family == socket.AF_INET6:
+                raise OSError(errno.EAFNOSUPPORT, "no IPv6")
+            return real(family, *args, **kwargs)
+
+        port = free_port_number()
+        with mock.patch.object(ge.socket, "socket", side_effect=no_v6):
+            self.assertTrue(ge.port_is_free(port))
 
 
 class IsolateTest(unittest.TestCase):
@@ -102,10 +180,10 @@ class IsolateTest(unittest.TestCase):
         self.assertIsNone(ge.isolate(env, is_free=lambda p: False, pid=lambda: 5))
         self.assertEqual(env, {})
 
-    def test_the_kill_check_stays_strict_so_a_cleanup_cannot_take_down_a_shared_epmd(self):
+    def test_the_kill_check_stays_strict_so_a_cleanup_cannot_take_down_a_registered_epmd(self):
         # epmd refuses `-kill` while any node is registered unless ERL_EPMD_RELAXED_COMMAND_CHECK
         # is set (measured). Setting it would let one run's exit kill an epmd another run
-        # still uses; leaving it unset only ever leaves this run's own epmd to the runner.
+        # still has nodes on; leaving it unset only ever leaves this run's own epmd to the runner.
         env = {}
         ge.isolate(env, is_free=lambda p: True, pid=lambda: 6)
         self.assertNotIn("ERL_EPMD_RELAXED_COMMAND_CHECK", env)
@@ -137,6 +215,7 @@ class ActivateTest(unittest.TestCase):
         port, said, registered = self.run_activate({}, lambda e: None)
         self.assertIsNone(port)
         self.assertIn("using the shared epmd", said[0][0])
+        self.assertIn("#4853", said[0][0])
         self.assertEqual(registered, [])
 
     def test_the_default_isolation_is_isolate(self):
@@ -146,8 +225,31 @@ class ActivateTest(unittest.TestCase):
         self.assertEqual(registered[0][:2], (ge.stop, port))
         self.assertEqual(env["ERL_EPMD_PORT"], port)
 
+    def test_the_defaults_compose_into_a_private_port_for_this_process(self):
+        # The wrapper calls activate(env) on defaults only: the real probe, this pid, isolate.
+        env = {}
+        registered = []
+        port = ge.activate(env, register=lambda *a: registered.append(a), say=quiet)
+        if port is None:
+            self.skipTest("no port could be probed here")
+        self.assertEqual(env["ERL_EPMD_PORT"], port)
+        self.assertTrue(ge.PORT_RANGE[0] <= int(port) <= ge.PORT_RANGE[1])
+        self.assertEqual(registered, [(ge.stop, port, env)])
+
 
 class FindEpmdTest(unittest.TestCase):
+    ROOT = os.path.realpath(os.path.join(os.sep, "otp"))
+
+    def which_erl_only(self, root):
+        erl = os.path.join(root, "bin", "erl")
+        return lambda name, path=None: erl if name == "erl" else None
+
+    @staticmethod
+    def listing(paths):
+        def glob_(pattern):
+            return [p for p in paths if fnmatch.fnmatchcase(p, pattern)]
+        return glob_
+
     def test_prefers_the_epmd_on_the_runs_path(self):
         asked = []
 
@@ -161,70 +263,104 @@ class FindEpmdTest(unittest.TestCase):
         self.assertEqual(asked, [("epmd", "/otp/bin")])
 
     def test_windows_layout_finds_epmd_exe_not_its_pdb(self):
-        # Windows OTP: <root>/bin/erl.exe, but epmd.exe only in <root>/erts-<vsn>/bin,
-        # beside epmd.pdb, which a bare `epmd*` glob sorts last (this shipped once and
-        # made stop() try to run the symbols file, found on kingsley 2026-10-21).
-        root = os.path.realpath(os.path.join(os.sep, "otp"))
-        erl = os.path.join(root, "bin", "erl.exe")
-        bindir = os.path.join(root, "erts-16.3.1", "bin")
+        # Windows OTP: <root>/bin/erl.exe, but epmd.exe only in <root>/erts-<vsn>/bin, beside
+        # epmd.pdb. An earlier revision globbed `epmd*` and made stop() try to run the symbols
+        # file. The look-alikes are listed BEFORE the real file: with equal version keys max()
+        # keeps the first, so a pattern that matches them would return one of them.
+        bindir = os.path.join(self.ROOT, "erts-16.3.1", "bin")
         want = os.path.join(bindir, "epmd.exe")
-        listing = [os.path.join(bindir, n) for n in
-                   ("epmd.exe", "epmd.pdb", "erl.exe", "erlexec.dll", "epmdx.exe")]
+        paths = [os.path.join(bindir, n) for n in
+                 ("epmd.pdb", "epmdx.exe", "erl.exe", "erlexec.dll", "epmd.exe")]
+        got = ge.find_epmd({"PATH": "x"}, which=self.which_erl_only(self.ROOT),
+                           glob_=self.listing(paths))
+        self.assertEqual(got, want)
 
-        def glob_(pattern):
-            return [p for p in listing if fnmatch.fnmatchcase(p, pattern)]
+    def test_takes_the_newest_erts_by_numeric_version_not_by_string_or_first_component(self):
+        # "erts-9.0" sorts after "erts-16.3.1" as a string; "16.10" beats "16.3.1" numerically
+        # but not on the first component alone. A POSIX install is found by the bare name.
+        dirs = ("erts-9.0", "erts-16.3.1", "erts-16.10", "erts-15.2")
+        paths = [os.path.join(self.ROOT, d, "bin", "epmd") for d in dirs]
+        got = ge.find_epmd({}, which=self.which_erl_only(self.ROOT), glob_=self.listing(paths))
+        self.assertEqual(got, os.path.join(self.ROOT, "erts-16.10", "bin", "epmd"))
 
-        def which(name, path=None):
-            return erl if name == "erl" else None
-
-        self.assertEqual(ge.find_epmd({"PATH": "x"}, which=which, glob_=glob_), want)
-
-    def test_takes_the_newest_of_several_erts_dirs_by_version_not_by_string(self):
-        # "erts-9.0" sorts after "erts-16.3.1" as a string; an OTP upgraded in place keeps both.
-        hits = ["/otp/erts-9.0/bin/epmd", "/otp/erts-16.3.1/bin/epmd", "/otp/erts-15.2/bin/epmd"]
-        got = ge.find_epmd({}, which=lambda n, path=None: "/otp/bin/erl" if n == "erl" else None,
-                           glob_=lambda p: list(hits))
-        self.assertEqual(got, "/otp/erts-16.3.1/bin/epmd")
+    def test_an_install_path_with_glob_characters_is_a_path_not_a_pattern(self):
+        root = os.path.realpath(os.path.join(os.sep, "otp[28]"))
+        sibling = os.path.realpath(os.path.join(os.sep, "otp2"))
+        wanted = os.path.join(root, "erts-16.3.1", "bin", "epmd.exe")
+        paths = [wanted, os.path.join(sibling, "erts-1.0", "bin", "epmd.exe")]
+        got = ge.find_epmd({}, which=self.which_erl_only(root), glob_=self.listing(paths))
+        self.assertEqual(got, wanted)
 
     def test_no_erl_and_no_epmd_is_none(self):
         self.assertIsNone(ge.find_epmd({}, which=lambda n, path=None: None,
                                        glob_=lambda p: self.fail("no erl, no glob")))
 
     def test_an_erl_whose_install_has_no_epmd_is_none(self):
-        self.assertIsNone(ge.find_epmd({}, which=lambda n, path=None: "/o/bin/erl" if n == "erl" else None,
+        self.assertIsNone(ge.find_epmd({}, which=self.which_erl_only(self.ROOT),
                                        glob_=lambda p: []))
 
 
 class StopTest(unittest.TestCase):
-    def test_kills_the_run_private_epmd_with_the_runs_env(self):
-        calls = []
-        env = {"PATH": "p", "ERL_EPMD_PORT": "24242"}
+    def stop(self, *, which=lambda name, path=None: "/otp/bin/epmd", run=None, env=None):
+        said, calls = [], []
 
-        def run(args, **kw):
+        def default_run(args, **kw):
             calls.append((args, kw))
+            return types.SimpleNamespace(returncode=0)
 
-        ok = ge.stop("24242", env, which=lambda name, path=None: "/otp/bin/epmd", run=run)
+        ok = ge.stop("24242", {"PATH": "p"} if env is None else env, which=which,
+                     run=run or default_run, glob_=lambda pattern: [],
+                     say=lambda msg, **kw: said.append(msg))
+        return ok, said, calls
+
+    def test_kills_the_run_private_epmd_with_the_runs_env(self):
+        env = {"PATH": "p", "ERL_EPMD_PORT": "24242"}
+        ok, said, calls = self.stop(env=env)
         self.assertTrue(ok)
+        self.assertEqual(said, [])
         self.assertEqual(calls[0][0], ["/otp/bin/epmd", "-port", "24242", "-kill"])
         self.assertIs(calls[0][1]["env"], env)
-        self.assertEqual(calls[0][1]["timeout"], 10)
+        self.assertEqual(calls[0][1]["timeout"], ge._KILL_TIMEOUT_SECS)
+        for stream in ("stdin", "stdout", "stderr"):
+            self.assertIs(calls[0][1][stream], subprocess.DEVNULL, stream)
 
-    def test_no_epmd_anywhere_means_no_call(self):
-        self.assertFalse(ge.stop("24242", {"PATH": "/otp/bin"},
-                                 which=lambda name, path=None: None,
-                                 run=lambda *a, **k: self.fail("no epmd, no call"),
-                                 glob_=lambda pattern: []))
+    def test_epmd_is_looked_up_on_the_runs_own_path(self):
+        asked = []
+
+        def which(name, path=None):
+            asked.append((name, path))
+            return "/otp/bin/epmd" if path == "/run/path" else None
+
+        ok, _, _ = self.stop(which=which, env={"PATH": "/run/path"})
+        self.assertTrue(ok)
+        self.assertEqual(asked, [("epmd", "/run/path")])
+
+    def test_no_epmd_anywhere_means_no_call_and_says_so(self):
+        ok, said, calls = self.stop(which=lambda name, path=None: None)
+        self.assertFalse(ok)
+        self.assertEqual(calls, [])
+        self.assertEqual(len(said), 1)
+        self.assertIn("epmd -port 24242 -kill", said[0])
+
+    def test_a_refused_kill_says_the_epmd_is_still_running(self):
+        # epmd answers `Killing not allowed - living nodes in database.` with rc 1.
+        ok, said, _ = self.stop(run=lambda args, **kw: types.SimpleNamespace(returncode=1))
+        self.assertFalse(ok)
+        self.assertEqual(len(said), 1)
+        self.assertIn("may still be running", said[0])
+        self.assertIn("epmd -port 24242 -kill", said[0])
 
     def test_never_raises(self):
         def boom(args, **kw):
-            raise subprocess.TimeoutExpired(args, 10)
-
-        self.assertFalse(ge.stop("1", {}, which=lambda n, path=None: "/e", run=boom))
+            raise subprocess.TimeoutExpired(args, 5)
 
         def oserr(args, **kw):
             raise OSError("gone")
 
-        self.assertFalse(ge.stop("1", {}, which=lambda n, path=None: "/e", run=oserr))
+        for run in (boom, oserr):
+            ok, said, _ = self.stop(run=run)
+            self.assertFalse(ok)
+            self.assertEqual(len(said), 1)
 
 
 class WrapperWiringTest(unittest.TestCase):
@@ -233,13 +369,20 @@ class WrapperWiringTest(unittest.TestCase):
             self.src = f.read()
 
     def test_activates_the_env_it_hands_to_rebar3_right_after_base_env(self):
-        m = re.search(r"^env = base_env\(\)\n(?:#.*\n)*gateway_epmd\.activate\(env\)\n",
+        # Blank lines and comments may sit between the two; any other statement may not.
+        m = re.search(r"^env = base_env\(\)[ \t]*\n(?:[ \t]*(?:#.*)?\n)*gateway_epmd\.activate\(env\)",
                       self.src, re.M)
         self.assertIsNotNone(m, "test_gateway.py must call gateway_epmd.activate(env) on the "
                                 "base_env() dict, before any suite-specific env is added")
 
+    def test_the_wrapper_imports_the_helper_and_builds_the_env_once(self):
+        self.assertRegex(self.src, r"(?m)^import gateway_epmd\b", "gateway_epmd must be imported")
+        self.assertEqual(len(re.findall(r"^env = base_env\(\)", self.src, re.M)), 1,
+                         "a second base_env() after activate() would drop the private port")
+
     def test_the_streamed_run_uses_that_env(self):
-        self.assertRegex(self.src, r"popen_kwargs = dict\(\n\s+cwd=gateway_dir,\n\s+env=env,")
+        self.assertRegex(self.src, r"popen_kwargs = dict\(\s*cwd=gateway_dir,\s*env=env\b",
+                         "the rebar3 run must be started with the activated env")
 
 
 if __name__ == "__main__":
