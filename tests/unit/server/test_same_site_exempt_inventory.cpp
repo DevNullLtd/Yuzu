@@ -26,14 +26,28 @@
  *
  * LIMITS. Source-text scan: it sees literal paths on `sink.` / `svr.` / `web_server_->`
  * receivers only, so a registration with a computed path or a new receiver spelling is invisible
- * (the sanity floor below catches a scan that finds nothing, not a partial miss), and a mutating
- * GET handler is invisible to both this scan and the gate. The metrics literal here is tied to
- * the production condition by the lexical wiring gate.
+ * (the sanity floor below catches a scan that finds nothing, not a partial miss). The metrics
+ * literal here is tied to the production condition by the lexical wiring gate.
+ *
+ * READS THAT DISPATCH WORK. A GET or HEAD request is gated only when its exact path is in
+ * `kFetchMetadataGuardedPaths` (same_site_write_policy.hpp). The second half of this file checks
+ * that table against the source: every table path must be a live GET registration (no stale
+ * entry), and every GET registration whose handler text contains a dispatch marker must be in the
+ * table or in the small reviewed `kKnownReadOnlyDispatchLike` ledger below (no unlisted new
+ * dispatcher). LIMITS of that half: it is a pure lexical scan. The handler text is the balanced
+ * parenthesis span of the registration call, expanded one hop into same-file functions defined
+ * as `Class::name(...) {...}` that the span calls by name. A handler that reaches a dispatch
+ * only through a computed path, a helper in another file, a second hop, a handler held in a
+ * variable, or a marker spelling not in `kDispatchMarkers` is invisible. A registration whose
+ * path is not a string literal is reported as unscannable when its text carries a marker. The
+ * markers are derived from the existing handlers; a new dispatch entry point must be added to
+ * the list in the same change. Comments are stripped before matching.
  *
  * The scan helpers below are private to this file; a shared scanner may replace them.
  */
 
 #include "health_routes.hpp"
+#include "same_site_write_policy.hpp"
 #include "web_utils.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -45,6 +59,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <regex>
 #include <set>
 #include <sstream>
@@ -216,6 +231,258 @@ std::set<Key> bypassed_keys() {
     return out;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Reads that dispatch work
+// ---------------------------------------------------------------------------------------------
+
+struct GetRegistration {
+    std::string file; // basename
+    int line;
+    std::string path;   // exactly as written in source, or "<computed>"
+    std::string handler; // balanced-paren span of the call, comments stripped, plus one hop
+};
+
+constexpr std::array<std::string_view, 5> kDispatchMarkers{
+    "dispatch_fn_(", "dispatch_confined(", "advance_and_render(", "deployment::advance(",
+    "->dispatch(",
+};
+
+constexpr std::string_view kComputedPath = "<computed>";
+
+struct ReadLedgerRow {
+    std::string_view path; // EXACT registered text
+    std::string_view reason;
+};
+
+// Reviewed GET registrations whose handler text contains a dispatch marker but which are not in
+// the guarded table. A new row needs a one-line reason a reviewer accepted. Empty: every marker
+// hit in the current tree is a table entry.
+constexpr std::array<ReadLedgerRow, 0> kKnownReadOnlyDispatchLike{};
+
+/// Removes `//` comments (to end of line) where the `//` starts a line or follows whitespace, so
+/// a scheme separator inside a string is left alone. Block comments are left as written.
+std::string strip_line_comments(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    std::size_t i = 0;
+    while (i < text.size()) {
+        const bool at_comment = text[i] == '/' && i + 1 < text.size() && text[i + 1] == '/' &&
+                                (i == 0 || std::isspace(static_cast<unsigned char>(text[i - 1])) != 0);
+        if (at_comment) {
+            while (i < text.size() && text[i] != '\n')
+                ++i;
+            continue;
+        }
+        out.push_back(text[i++]);
+    }
+    return out;
+}
+
+/// Index one past the `)` that balances the `(` at `open`, skipping string, raw string and char
+/// literals; npos when unbalanced.
+std::size_t balanced_paren_end(const std::string& text, std::size_t open) {
+    int depth = 0;
+    for (std::size_t j = open; j < text.size(); ++j) {
+        const char c = text[j];
+        if (c == 'R' && j + 2 < text.size() && text[j + 1] == '"' && text[j + 2] == '(' &&
+            (j == 0 || !is_ident_char(text[j - 1]))) {
+            const std::size_t end = text.find(")\"", j + 3);
+            if (end == std::string::npos)
+                return std::string::npos;
+            j = end + 1;
+        } else if (c == '"') {
+            ++j;
+            while (j < text.size() && text[j] != '"')
+                j += (text[j] == '\\' && j + 1 < text.size()) ? 2 : 1;
+        } else if (c == '\'') {
+            ++j;
+            while (j < text.size() && text[j] != '\'')
+                j += (text[j] == '\\' && j + 1 < text.size()) ? 2 : 1;
+        } else if (c == '(') {
+            ++depth;
+        } else if (c == ')') {
+            if (--depth == 0)
+                return j + 1;
+        }
+    }
+    return std::string::npos;
+}
+
+/// Same-file function bodies keyed by unqualified name, for definitions spelled
+/// `Qualifier::name(<params>) [const] [noexcept] {<body>}`. Overloads are concatenated.
+std::map<std::string, std::string> function_bodies(const std::string& text) {
+    std::map<std::string, std::string> out;
+    for (std::size_t at = text.find("::"); at != std::string::npos; at = text.find("::", at + 2)) {
+        std::size_t p = at + 2;
+        const std::size_t name_begin = p;
+        while (p < text.size() && is_ident_char(text[p]))
+            ++p;
+        if (p == name_begin || at == 0 || !is_ident_char(text[at - 1]))
+            continue;
+        std::size_t q = p;
+        while (q < text.size() && std::isspace(static_cast<unsigned char>(text[q])) != 0)
+            ++q;
+        if (q >= text.size() || text[q] != '(')
+            continue;
+        const std::size_t params_end = balanced_paren_end(text, q);
+        if (params_end == std::string::npos)
+            continue;
+        std::size_t r = params_end;
+        for (;;) {
+            while (r < text.size() && std::isspace(static_cast<unsigned char>(text[r])) != 0)
+                ++r;
+            if (text.compare(r, 5, "const") == 0)
+                r += 5;
+            else if (text.compare(r, 8, "noexcept") == 0)
+                r += 8;
+            else
+                break;
+        }
+        if (r >= text.size() || text[r] != '{')
+            continue;
+        int depth = 0;
+        std::size_t e = r;
+        for (; e < text.size(); ++e) {
+            if (text[e] == '{')
+                ++depth;
+            else if (text[e] == '}' && --depth == 0)
+                break;
+        }
+        out[text.substr(name_begin, p - name_begin)] += text.substr(r, e - r);
+    }
+    return out;
+}
+
+/// Identifiers immediately followed (after optional whitespace) by `(`.
+std::set<std::string> called_names(const std::string& text) {
+    std::set<std::string> out;
+    std::size_t i = 0;
+    while (i < text.size()) {
+        if (!is_ident_char(text[i])) {
+            ++i;
+            continue;
+        }
+        const std::size_t b = i;
+        while (i < text.size() && is_ident_char(text[i]))
+            ++i;
+        std::size_t k = i;
+        while (k < text.size() && std::isspace(static_cast<unsigned char>(text[k])) != 0)
+            ++k;
+        if (k < text.size() && text[k] == '(')
+            out.insert(text.substr(b, i - b));
+    }
+    return out;
+}
+
+bool has_dispatch_marker(const std::string& text) {
+    return std::any_of(kDispatchMarkers.begin(), kDispatchMarkers.end(),
+                       [&](std::string_view m) { return text.find(m) != std::string::npos; });
+}
+
+/// Every GET registration in one file's text, on the same three receivers as the mutating scan.
+/// A literal first argument gives the path; any other first argument gives kComputedPath.
+std::vector<GetRegistration> extract_get_registrations(const std::string& file,
+                                                       const std::string& raw_text) {
+    static constexpr std::array<std::string_view, 3> kReceivers{"sink.", "svr.", "web_server_->"};
+    const std::string text = strip_line_comments(raw_text);
+    const auto bodies = function_bodies(text);
+    std::vector<GetRegistration> out;
+    for (const auto recv : kReceivers) {
+        for (std::size_t at = text.find(recv); at != std::string::npos;
+             at = text.find(recv, at + 1)) {
+            if (at > 0 && is_ident_char(text[at - 1]))
+                continue;
+            const std::size_t mpos = at + recv.size();
+            if (text.compare(mpos, 4, "Get(") != 0)
+                continue;
+            const std::size_t open = mpos + 3;
+            const std::size_t end = balanced_paren_end(text, open);
+            if (end == std::string::npos)
+                continue;
+            std::size_t p = open + 1;
+            while (p < text.size() && std::isspace(static_cast<unsigned char>(text[p])) != 0)
+                ++p;
+            std::string path(kComputedPath);
+            if (text.compare(p, 3, "R\"(") == 0) {
+                const std::size_t pe = text.find(")\"", p + 3);
+                if (pe != std::string::npos)
+                    path = text.substr(p + 3, pe - (p + 3));
+            } else if (p < text.size() && text[p] == '"') {
+                std::size_t q = p + 1;
+                while (q < text.size() && text[q] != '"')
+                    q += (text[q] == '\\' && q + 1 < text.size()) ? 2 : 1;
+                if (q < text.size())
+                    path = text.substr(p + 1, q - (p + 1));
+            }
+            std::string handler = text.substr(open, end - open);
+            for (const auto& name : called_names(handler)) {
+                const auto it = bodies.find(name);
+                if (it != bodies.end())
+                    handler += it->second;
+            }
+            const int line = static_cast<int>(std::count(
+                                 text.begin(), text.begin() + static_cast<std::ptrdiff_t>(at),
+                                 '\n')) +
+                             1;
+            out.push_back({file, line, std::move(path), std::move(handler)});
+        }
+    }
+    std::sort(out.begin(), out.end(),
+              [](const GetRegistration& a, const GetRegistration& b) { return a.line < b.line; });
+    return out;
+}
+
+/// Memoized per process; assumes every call passes the same directory.
+const std::vector<GetRegistration>& discover_get_registrations() {
+    static const std::vector<GetRegistration> cached = [] {
+        const fs::path dir(YUZU_SERVER_SRC_DIR);
+        REQUIRE(fs::is_directory(dir));
+        std::vector<GetRegistration> out;
+        for (const auto& entry : fs::recursive_directory_iterator(dir)) {
+            if (!entry.is_regular_file())
+                continue;
+            const auto ext = entry.path().extension();
+            if (ext != ".cpp" && ext != ".inc")
+                continue;
+            std::ifstream in(entry.path(), std::ios::binary);
+            REQUIRE(in.is_open());
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            auto found = extract_get_registrations(entry.path().filename().string(), ss.str());
+            out.insert(out.end(), found.begin(), found.end());
+        }
+        // Sanity floor: a scan that finds almost nothing is broken, not evidence of a small surface.
+        REQUIRE(out.size() >= 200);
+        return out;
+    }();
+    return cached;
+}
+
+bool is_known_read_ledger_path(std::string_view path) {
+    return std::any_of(kKnownReadOnlyDispatchLike.begin(), kKnownReadOnlyDispatchLike.end(),
+                       [&](const ReadLedgerRow& r) { return r.path == path; });
+}
+
+bool is_guarded_table_path(std::string_view path) {
+    return std::find(yuzu::server::kFetchMetadataGuardedPaths.begin(),
+                     yuzu::server::kFetchMetadataGuardedPaths.end(),
+                     path) != yuzu::server::kFetchMetadataGuardedPaths.end();
+}
+
+/// Registrations whose handler text carries a dispatch marker but whose path is neither in the
+/// guarded table nor in the reviewed ledger, as "<file>:<line> <path>".
+std::vector<std::string> unlisted_dispatching_reads(const std::vector<GetRegistration>& regs) {
+    std::vector<std::string> out;
+    for (const auto& r : regs) {
+        if (!has_dispatch_marker(r.handler))
+            continue;
+        if (is_guarded_table_path(r.path) || is_known_read_ledger_path(r.path))
+            continue;
+        out.push_back(r.file + ":" + std::to_string(r.line) + " " + r.path);
+    }
+    return out;
+}
+
 } // namespace
 
 TEST_CASE("same-site inventory: bypassed mutating registrations equal the reviewed ledger",
@@ -314,4 +581,117 @@ TEST_CASE("same-site inventory: the scan helper handles registration spellings",
     CHECK(found[2].method == "DELETE");
     CHECK(found[2].line == 3);
     CHECK(probe_path(found[1].raw_path) == "/c/X");
+}
+
+
+TEST_CASE("same-site inventory: every guarded-table path is a live GET registration",
+          "[csrf][same_site][route_inventory]") {
+    const auto& regs = discover_get_registrations();
+    for (const auto path : yuzu::server::kFetchMetadataGuardedPaths) {
+        CAPTURE(path);
+        const auto live = std::count_if(regs.begin(), regs.end(),
+                                        [&](const GetRegistration& r) { return r.path == path; });
+        CHECK(live >= 1);
+        CHECK(yuzu::server::is_guarded_read("GET", path));
+    }
+}
+
+TEST_CASE("same-site inventory: every dispatching GET registration is guarded or reviewed",
+          "[csrf][same_site][route_inventory]") {
+    const auto unlisted = unlisted_dispatching_reads(discover_get_registrations());
+    for (const auto& s : unlisted)
+        UNSCOPED_INFO("GET registration with a dispatch marker and no table or ledger entry: " << s);
+    CHECK(unlisted.empty());
+}
+
+TEST_CASE("same-site inventory: every table path and ledger row is a dispatching GET registration",
+          "[csrf][same_site][route_inventory]") {
+    const auto& regs = discover_get_registrations();
+    const auto dispatches = [&](std::string_view path) {
+        return std::any_of(regs.begin(), regs.end(), [&](const GetRegistration& r) {
+            return r.path == path && has_dispatch_marker(r.handler);
+        });
+    };
+    for (const auto path : yuzu::server::kFetchMetadataGuardedPaths) {
+        CAPTURE(path);
+        CHECK(dispatches(path));
+    }
+    for (const auto& row : kKnownReadOnlyDispatchLike) {
+        CAPTURE(row.path);
+        CHECK(dispatches(row.path));
+        CHECK_FALSE(is_guarded_table_path(row.path));
+        CHECK_FALSE(row.reason.empty());
+    }
+}
+
+TEST_CASE("same-site inventory: the GET scan sees the surface and the computed-path floor",
+          "[csrf][same_site][route_inventory]") {
+    const auto& regs = discover_get_registrations();
+    std::size_t computed = 0;
+    for (const auto& r : regs) {
+        if (r.path == kComputedPath) {
+            ++computed;
+            // A registration the scan cannot name must not carry a marker: it would be invisible
+            // to the table check.
+            INFO(r.file << ":" << r.line);
+            CHECK_FALSE(has_dispatch_marker(r.handler));
+        }
+    }
+    CAPTURE(regs.size(), computed);
+    CHECK(regs.size() >= 200);
+}
+
+TEST_CASE("same-site inventory: the GET scanner flags an unlisted dispatching handler",
+          "[csrf][same_site][route_inventory]") {
+    const std::string text =
+        "void R::reg(Sink& sink) {\n"
+        "  sink.Get(\"/synthetic/new\", [this](const Req& req, Res& res) {\n"
+        "      const auto out = dispatch_fn_(\"p\", \"a\", {id}, \"\", {});\n"
+        "  });\n"
+        "  sink.Get(\n"
+        "      R\"(/synthetic/regex/([0-9]+))\", [this](const Req&, Res& res) {\n"
+        "      confine->dispatch_confined(x);\n"
+        "  });\n"
+        "  sink.Get(\"/synthetic/quiet\", [](const Req&, Res& res) { res.set_content(\"x\", \"t\"); });\n"
+        "  sink.Get(\"/synthetic/commented\", [](const Req&, Res& res) {\n"
+        "      // dispatch_fn_(\"p\", \"a\")\n"
+        "      res.set_content(\"x\", \"t\");\n"
+        "  });\n"
+        "  sink.Get(\"/synthetic/hop\", [this](const Req&, Res& res) { helper_run(res); });\n"
+        "  sink.Get(computed_path, [this](const Req&, Res& res) { dispatch_fn_(a); });\n"
+        "  sink.Post(\"/synthetic/post\", [this](const Req&, Res&) { dispatch_fn_(a); });\n"
+        "  client.Get(\"/synthetic/client\", [this] { dispatch_fn_(a); });\n"
+        "}\n"
+        "void R::helper_run(Res& res) const { auto o = dispatch_fn_(\"p\", \"a\", {}, \"\", {}); }\n";
+    const auto regs = extract_get_registrations("x.cpp", text);
+    REQUIRE(regs.size() == 6);
+    CHECK(regs[0].path == "/synthetic/new");
+    CHECK(regs[0].line == 2);
+    CHECK(regs[1].path == "/synthetic/regex/([0-9]+)");
+    CHECK(regs[4].path == "/synthetic/hop");
+    CHECK(regs[5].path == kComputedPath);
+    CHECK(has_dispatch_marker(regs[0].handler));
+    CHECK(has_dispatch_marker(regs[1].handler));
+    CHECK_FALSE(has_dispatch_marker(regs[2].handler)); // quiet
+    CHECK_FALSE(has_dispatch_marker(regs[3].handler)); // marker only in a comment
+    CHECK(has_dispatch_marker(regs[4].handler));       // the hop
+    CHECK(has_dispatch_marker(regs[5].handler));       // computed path, still carries a marker
+
+    const auto unlisted = unlisted_dispatching_reads(regs);
+    REQUIRE(unlisted.size() == 4);
+    CHECK(unlisted[0] == "x.cpp:2 /synthetic/new");
+    CHECK(unlisted[1] == "x.cpp:5 /synthetic/regex/([0-9]+)");
+    CHECK(unlisted[2].ends_with(" /synthetic/hop"));
+    CHECK(unlisted[3].ends_with(" <computed>"));
+}
+
+TEST_CASE("same-site inventory: the GET scanner passes a guarded table path",
+          "[csrf][same_site][route_inventory]") {
+    const std::string text =
+        "sink.Get(\"" + std::string(yuzu::server::kFetchMetadataGuardedPaths[0]) +
+        "\", [this](const Req&, Res&) { dispatch_fn_(a); });\n";
+    const auto regs = extract_get_registrations("x.cpp", text);
+    REQUIRE(regs.size() == 1);
+    CHECK(has_dispatch_marker(regs[0].handler));
+    CHECK(unlisted_dispatching_reads(regs).empty());
 }
