@@ -39,6 +39,12 @@ call site would pass every existing test. This gate closes that:
      wires its own closure, can see it. A second definition (a route-local copy) is the drift the
      closure exists to prevent. Same anchored-active-line requirement as clauses 1 and 2.
 
+  5. (#6065 PR-Q, rest-audit-principal-reresolution) `rest_api_v1_->set_audit_as_session_fn(` is
+     called EXACTLY ONCE in server.cpp as an ACTIVE line. The setter's parameter is optional by
+     construction (every other `RestApiV1` rig leaves it unwired), so dropping the call compiles
+     cleanly and every POST and DELETE /api/v1/quarantine then answers 500 -- and no unit test,
+     whose rig wires its own writer, can see it. Same anchored-active-line requirement as above.
+
 Static/text-only, no build required -- a lexical gate, not a semantic one: it cannot see a
 relocation that keeps the same tokens but changes the surrounding control flow, nor a `#if 0` /
 `/* */` block that comments out an entire real site while preserving its exact leading
@@ -69,6 +75,7 @@ POSITIONAL = r"[ \t\r\f\v]*auth_routes_->gateless_tier_policy_fn\(\),"
 CLOSURE_DEF = r"[ \t\r\f\v]*const mcp::McpServer::AuthorizeDispatchFn authorize_dispatch =.*"
 CLOSURE_REST = r"[ \t\r\f\v]*authorize_dispatch\);"
 CLOSURE_MCP = r"[ \t\r\f\v]*mcp_server_->set_authorize_dispatch_fn\(authorize_dispatch\);"
+AUDIT_SESSION = r"[ \t\r\f\v]*rest_api_v1_->set_audit_as_session_fn\("
 
 
 def problems(src):
@@ -80,6 +87,7 @@ def problems(src):
     closure_def = sum(1 for ln in lines if re.fullmatch(CLOSURE_DEF, ln))
     closure_rest = sum(1 for ln in lines if re.fullmatch(CLOSURE_REST, ln))
     closure_mcp = sum(1 for ln in lines if re.fullmatch(CLOSURE_MCP, ln))
+    audit_session = sum(1 for ln in lines if re.fullmatch(AUDIT_SESSION, ln))
     out = []
     if designated != 1:
         out.append("expected exactly 1 designated-init site ('.tier_policy_fn = auth_routes_->gateless_tier_policy_fn(),' "
@@ -103,6 +111,10 @@ def problems(src):
                    f"definition={closure_def}, rest-arg={closure_rest}, mcp-wiring={closure_mcp}. A dropped "
                    "REST argument compiles (the parameter is defaulted) and makes POST and DELETE /api/v1/quarantine "
                    "answer 500; a second definition is a route-local copy that can drift from MCP's.")
+    if audit_session != 1:
+        out.append("expected 'rest_api_v1_->set_audit_as_session_fn(' to be called exactly once in server.cpp as an "
+                   f"active line, found {audit_session}. A dropped call compiles (the setter is optional) and makes "
+                   "POST and DELETE /api/v1/quarantine answer 500; a second call is a second writer that can drift.")
     return out
 
 
@@ -110,6 +122,7 @@ DESIGNATED_LINE = "                            .tier_policy_fn = auth_routes_->g
 POSITIONAL_LINE = "            auth_routes_->gateless_tier_policy_fn(),\n"
 CLOSURE_REST_LINE = "            authorize_dispatch);\n"
 CLOSURE_MCP_LINE = "            mcp_server_->set_authorize_dispatch_fn(authorize_dispatch);\n"
+AUDIT_SESSION_LINE = "        rest_api_v1_->set_audit_as_session_fn(\n"
 LAMBDA = "[](const auto&) { return TierPolicy{}; }"
 
 
@@ -125,7 +138,7 @@ class TierPolicyWiringLexical(unittest.TestCase):
 
     def test_mutations_are_caught(self):
         src = self.src
-        for a in (DESIGNATED_LINE, POSITIONAL_LINE, CLOSURE_REST_LINE, CLOSURE_MCP_LINE):
+        for a in (DESIGNATED_LINE, POSITIONAL_LINE, CLOSURE_REST_LINE, CLOSURE_MCP_LINE, AUDIT_SESSION_LINE):
             n = src.count(a)
             self.assertEqual(n, 1, f"mutation anchor must match exactly once, found {n}; update the constant: {a!r}")
         # (name, mutated source, the clause fragments that must appear; len(p) pins that no other clause fires)
@@ -151,6 +164,15 @@ class TierPolicyWiringLexical(unittest.TestCase):
             ("T7 a route-local second definition appended",
              src + "    const mcp::McpServer::AuthorizeDispatchFn authorize_dispatch = {};\n",
              ["authorizer closure"]),
+            ("T8 session audit writer wiring dropped (compiles: the setter is optional)",
+             src.replace(AUDIT_SESSION_LINE, "        rest_api_v1_->unrelated(\n", 1),
+             ["set_audit_as_session_fn"]),
+            ("T9 session audit writer wiring commented out (anchoring proof)",
+             src.replace(AUDIT_SESSION_LINE, "// " + AUDIT_SESSION_LINE, 1),
+             ["set_audit_as_session_fn"]),
+            ("T10 a second session audit writer appended",
+             src + "        rest_api_v1_->set_audit_as_session_fn(\n",
+             ["set_audit_as_session_fn"]),
         ]
         for name, mutated, present in cases:
             with self.subTest(mutation=name):

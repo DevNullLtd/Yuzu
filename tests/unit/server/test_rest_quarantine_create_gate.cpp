@@ -84,6 +84,7 @@
 
 #include <cctype>
 #include <chrono>
+#include <deque>
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -148,6 +149,16 @@ struct Rig {
     auth::Role session_role{auth::Role::user};
     bool session_elevated{false}; // a live JIT elevation on the session (effective role admin)
     std::vector<std::pair<std::string, std::string>> audits; // "action/result" + detail
+    // The actor each row in `audits` names, index for index. The re-resolving writer
+    // (`audit_fn`) names `audit_resolves_to` when set (a credential that lapsed, or a second
+    // one, between the route's own resolution and the write); the session writer names the
+    // session the route handed it.
+    std::vector<std::string> audit_actors;
+    std::string audit_resolves_to;
+    // When non-empty, each auth_fn call takes its user from the front (then drops it): the
+    // first call is the route's entry, the second its re-resolution.
+    std::deque<std::string> auth_user_queue;
+    bool wire_audit_as_session{true};
 
     std::int64_t command_seq{0};
     std::string last_command_id;
@@ -163,7 +174,7 @@ struct Rig {
         return LeaderElector::Config{.dsn = dsn, .holder_id = std::move(holder)};
     }
 
-    explicit Rig(const std::string& dsn)
+    explicit Rig(const std::string& dsn, bool wire_session_writer = true)
         : pool{{.conninfo = dsn, .size = 8}}, quarantine(pool), responses(pool), rbac(pool),
           mgmt(pool), registry(bus, metrics), elector(elector_cfg(dsn, "holder-a")) {
         REQUIRE(quarantine.is_open());
@@ -171,6 +182,7 @@ struct Rig {
         REQUIRE(rbac.is_open());
         REQUIRE(mgmt.is_open());
         REQUIRE(elector.is_open());
+        wire_audit_as_session = wire_session_writer;
 
         // The agent is reachable on the gateway route: send_to queues onto
         // drain_gateway_pending() with NO gRPC stream, and the queue carries the full
@@ -244,9 +256,9 @@ struct Rig {
 
     // THE session the route's auth_fn returns, and the one the tests assert on: a single
     // builder, so a test can prove the fixture really is (or is not) an effective admin.
-    auth::Session make_session() const {
+    auth::Session make_session(const std::string& user) const {
         auth::Session s;
-        s.username = session_user;
+        s.username = user;
         s.role = session_role;
         if (session_elevated) {
             s.elevated_until = std::chrono::system_clock::now() + std::chrono::hours(1);
@@ -254,6 +266,7 @@ struct Rig {
         }
         return s;
     }
+    auth::Session make_session() const { return make_session(session_user); }
 
     void register_routes() {
         auto auth_fn = [this](const httplib::Request&,
@@ -261,6 +274,11 @@ struct Rig {
             if (session_user.empty()) {
                 res.status = 401;
                 return std::nullopt;
+            }
+            if (!auth_user_queue.empty()) {
+                const std::string user = auth_user_queue.front();
+                auth_user_queue.pop_front();
+                return make_session(user);
             }
             return make_session();
         };
@@ -270,8 +288,19 @@ struct Rig {
                                const std::string& result, const std::string&, const std::string&,
                                const std::string& detail) -> bool {
             audits.emplace_back(action + "/" + result, detail);
+            audit_actors.push_back(audit_resolves_to.empty() ? session_user : audit_resolves_to);
             return true;
         };
+        // The session writer server.cpp binds: the row names the session it is handed.
+        if (wire_audit_as_session)
+            api.set_audit_as_session_fn(
+                [this](const httplib::Request&, const auth::Session& session,
+                       const std::string& action, const std::string& result, const std::string&,
+                       const std::string&, const std::string& detail) -> bool {
+                    audits.emplace_back(action + "/" + result, detail);
+                    audit_actors.push_back(session.username);
+                    return true;
+                });
         // Stand-in, named in the file header.
         RestApiV1::ScopedPermFn scoped_gate_stub =
             [this](const httplib::Request&, httplib::Response& res, const std::string& securable,
@@ -423,6 +452,20 @@ struct Rig {
         auto list = quarantine.list_quarantined();
         REQUIRE(list.has_value());
         return list->size();
+    }
+
+    void clear_audits() {
+        audits.clear();
+        audit_actors.clear();
+    }
+    // Every row written, and the actor each names; `audits` and `audit_actors` stay index-aligned.
+    bool every_audit_names(const std::string& user) const {
+        if (audits.empty() || audits.size() != audit_actors.size())
+            return false;
+        for (const auto& a : audit_actors)
+            if (a != user)
+                return false;
+        return true;
     }
 
     bool has_audit(const std::string& key) const {
@@ -646,7 +689,7 @@ TEST_CASE("quarantine create gate (e): REST and the closure MCP receives return 
     };
     for (const auto& shape : shapes) {
         CAPTURE(shape.label);
-        rig.audits.clear();
+        rig.clear_audits();
         rig.set_rbac(shape.rbac_on);
         rig.as_user(shape.user);
 
@@ -844,7 +887,7 @@ TEST_CASE("quarantine release gate (j): DELETE runs the same chokepoint for quar
         REQUIRE(created->status == 201);
         REQUIRE(rig.quarantined_count() == 1);
     }
-    rig.audits.clear();
+    rig.clear_audits();
 
     SECTION("RBAC on, a non-administrator holding Security:Execute globally: refused "
             "approval_required, the record stays active, no attempt row") {
@@ -919,4 +962,117 @@ TEST_CASE("quarantine release gate (j): DELETE runs the same chokepoint for quar
         CHECK(res->status == 200);
         CHECK(rig.quarantined_count() == 0);
     }
+}
+
+TEST_CASE("quarantine audit identity (k): every row the quarantine routes write names the session "
+          "the route resolved, never a second resolution of the request",
+          "[rest][quarantine][audit][integration][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, create_gate_tpl);
+    Rig rig(db.dsn());
+    REQUIRE(rig.elector.try_acquire());
+    rig.set_rbac(false);
+    rig.as_admin("alice");
+
+    SECTION("POST: the audit write would re-resolve to another principal (a lapsed cookie falling "
+            "through to a bearer token); attempt and success still name the session that created "
+            "the record") {
+        rig.audit_resolves_to = "bob";
+        auto res = rig.post();
+        REQUIRE(res);
+        CHECK(res->status == 201);
+        REQUIRE(rig.has_audit("quarantine.enable/attempt"));
+        REQUIRE(rig.has_audit("quarantine.enable/success"));
+        CHECK(rig.every_audit_names("alice"));
+        auto list = rig.quarantine.list_quarantined();
+        REQUIRE(list.has_value());
+        REQUIRE(list->size() == 1);
+        CHECK((*list)[0].quarantined_by == "alice"); // the record and its evidence agree
+    }
+
+    SECTION("DELETE: the same, for the release rows") {
+        {
+            auto created = rig.post();
+            REQUIRE(created);
+            REQUIRE(created->status == 201);
+        }
+        rig.clear_audits();
+        rig.audit_resolves_to = "bob";
+        auto res = rig.del();
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        REQUIRE(rig.has_audit("quarantine.disable/attempt"));
+        REQUIRE(rig.has_audit("quarantine.disable/success"));
+        CHECK(rig.every_audit_names("alice"));
+    }
+
+    SECTION("a refusal row names the session too (the chokepoint denial)") {
+        rig.as_user("frank");
+        rig.audit_resolves_to = "bob";
+        auto res = rig.post();
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        REQUIRE(rig.has_audit("quarantine.enable/denied"));
+        CHECK(rig.every_audit_names("frank"));
+        CHECK(rig.quarantined_count() == 0);
+    }
+
+    SECTION("POST: a second resolution that names a different principal ends the request at 401 "
+            "before any record, attempt row or dispatch; the refusal row names the first principal") {
+        rig.auth_user_queue = {"alice", "bob"};
+        auto res = rig.post();
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        CHECK(rig.quarantined_count() == 0);
+        CHECK_FALSE(rig.has_audit("quarantine.enable/attempt"));
+        CHECK_FALSE(rig.has_audit("quarantine.enable/success"));
+        CHECK(rig.audit_detail("quarantine.enable/denied") ==
+              "authenticated principal changed during the request");
+        CHECK(rig.every_audit_names("alice"));
+        REQUIRE(rig.leader_tick());
+        CHECK(rig.drain().empty());
+    }
+
+    SECTION("DELETE: the same, and the record stays active") {
+        {
+            auto created = rig.post();
+            REQUIRE(created);
+            REQUIRE(created->status == 201);
+        }
+        rig.clear_audits();
+        rig.auth_user_queue = {"alice", "bob"};
+        auto res = rig.del();
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        CHECK(rig.quarantined_count() == 1);
+        CHECK_FALSE(rig.has_audit("quarantine.disable/attempt"));
+        CHECK_FALSE(rig.has_audit("quarantine.disable/success"));
+        CHECK(rig.audit_detail("quarantine.disable/denied") ==
+              "authenticated principal changed during the request");
+        CHECK(rig.every_audit_names("alice"));
+    }
+}
+
+TEST_CASE("quarantine audit identity (l): an unwired session audit writer answers 500 on both "
+          "routes, never falling back to the re-resolving writer, and changes nothing",
+          "[rest][quarantine][audit][integration][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, create_gate_tpl);
+    Rig rig(db.dsn(), /*wire_session_writer=*/false);
+    rig.set_rbac(false);
+    rig.as_admin("alice");
+
+    auto created = rig.post();
+    REQUIRE(created);
+    CHECK(created->status == 500);
+    CHECK(rig.quarantined_count() == 0);
+    CHECK(rig.audit_detail("quarantine.enable/failure") == "audit identity writer not configured");
+    CHECK_FALSE(rig.has_audit("quarantine.enable/attempt"));
+
+    // Seed a record directly so DELETE has something to (not) release.
+    REQUIRE(rig.quarantine.quarantine_device(kAgent, "alice", "seed", kWhitelist).has_value());
+    auto released = rig.del();
+    REQUIRE(released);
+    CHECK(released->status == 500);
+    CHECK(rig.quarantined_count() == 1);
+    CHECK(rig.audit_detail("quarantine.disable/failure") == "audit identity writer not configured");
+    CHECK_FALSE(rig.has_audit("quarantine.disable/attempt"));
 }

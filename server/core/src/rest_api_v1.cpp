@@ -2712,6 +2712,69 @@ caller_from_session(const auth::Session& sess, const RestApiV1::ExecVisibleFn& e
     return true;
 }
 
+// #6065 PR-Q (rest-audit-principal-reresolution): an `AuditFn` that stamps every row from
+// `session`, the one the route resolved, instead of letting `audit_fn` re-resolve one from
+// the request (cookie first, then bearer). Without it a credential that lapsed between the
+// route's own resolution and the audit write, or a second credential on the same request,
+// made an `attempt` or `success` row name a different actor than `quarantined_by`, with no
+// signal and `Sec-Audit-Failed` unset. `session` is copied: the returned callable may
+// outlive the caller's reference.
+[[nodiscard]] RestApiV1::AuditFn audit_as(const RestApiV1::AuditAsSessionFn& writer,
+                                          const auth::Session& session) {
+    return [writer, session](const httplib::Request& req, const std::string& action,
+                             const std::string& result, const std::string& target_type,
+                             const std::string& target_id, const std::string& detail) {
+        return writer(req, session, action, result, target_type, target_id, detail);
+    };
+}
+
+// The first authentication of a quarantine route, plus the audit writer bound to it. Returns
+// the session, or nullopt once the response is written (401 from `auth_fn`, or the 500 below
+// when the writer is unwired, which is a misconfiguration and must never fall back to the
+// re-resolving `audit_fn`).
+[[nodiscard]] std::optional<auth::Session>
+authenticate_for_quarantine_audit(const httplib::Request& req, httplib::Response& res,
+                                  const RestApiV1::AuthFn& auth_fn,
+                                  const RestApiV1::AuditFn& audit_fn,
+                                  const RestApiV1::AuditAsSessionFn& audit_as_session,
+                                  const std::string& audit_action) {
+    // CDX-P1-02: authenticate first (401 before any store/body work).
+    auto session = auth_fn(req, res);
+    if (!session)
+        return std::nullopt;
+    if (!audit_as_session) {
+        res.status = 500;
+        res.set_content(detail::a4_error(res, "audit identity writer not configured"),
+                        "application/json");
+        audit_fn(req, audit_action, "failure", "Security", "",
+                 "audit identity writer not configured");
+        return std::nullopt;
+    }
+    return session;
+}
+
+// The re-resolution a quarantine route does after its scoped gate must name the SAME
+// principal as the first one: a request whose credentials resolve to two different
+// principals was authorized by one and would be attributed to, and checked at the
+// dispatch chokepoint as, the other. Writes the 401 and a `denied` row (as the first
+// principal) and returns false on a mismatch. The scoped gate resolves the session
+// itself and is not bound here.
+[[nodiscard]] bool same_principal_or_refuse(httplib::Response& res, const RestApiV1::AuditFn& audit,
+                                            const httplib::Request& req,
+                                            const auth::Session& first, const auth::Session& again,
+                                            const std::string& audit_action,
+                                            const std::string& agent_id) {
+    if (again.username == first.username)
+        return true;
+    res.status = 401;
+    res.set_content(detail::a4_error(res, "the authenticated principal changed during the request",
+                                     {.remediation = "retry the request"}),
+                    "application/json");
+    audit(req, audit_action, "denied", "Security", agent_id,
+          "authenticated principal changed during the request");
+    return false;
+}
+
 } // namespace
 
 // Production overload — wraps httplib::Server in an HttplibRouteSink and
@@ -6255,11 +6318,17 @@ void RestApiV1::register_routes(
         });
 
     sink.Post("/api/v1/quarantine", [auth_fn, scoped_perm_fn, audit_fn, quarantine_store,
-                                     authorize_dispatch_fn, exec_visible_fn, metrics_registry](
+                                     authorize_dispatch_fn, exec_visible_fn, metrics_registry,
+                                     audit_as_session = audit_as_session_fn_](
                                         const httplib::Request& req, httplib::Response& res) {
-        // CDX-P1-02: authenticate first (401 before any store/body work).
-        if (!auth_fn(req, res))
+        // CDX-P1-02: authenticate first (401 before any store/body work). Every row this
+        // handler writes after this point is stamped from the session it resolves here
+        // (rebound to the re-resolved one below, which must name the same principal).
+        const auto first = authenticate_for_quarantine_audit(req, res, auth_fn, audit_fn,
+                                                             audit_as_session, "quarantine.enable");
+        if (!first)
             return;
+        RestApiV1::AuditFn audit = audit_as(audit_as_session, *first);
         if (!quarantine_store || !quarantine_store->is_open()) {
             res.status = 503;
             // gov-fix(consistency-auditor, Gate 8): matches this file's own
@@ -6273,7 +6342,7 @@ void RestApiV1::register_routes(
             // known at this point (the body hasn't been parsed), so this is
             // the one quarantine failure path that cannot carry a resource
             // id — audited anyway rather than silently skipped.
-            audit_fn(req, "quarantine.enable", "failure", "Security", "",
+            audit(req, "quarantine.enable", "failure", "Security", "",
                      "service unavailable — store not open");
             return;
         }
@@ -6304,7 +6373,7 @@ void RestApiV1::register_routes(
             res.status = 500;
             res.set_content(detail::a4_error(res, "scope gate not configured"),
                             "application/json");
-            audit_fn(req, "quarantine.enable", "failure", "Security", agent_id,
+            audit(req, "quarantine.enable", "failure", "Security", agent_id,
                      "scope gate not configured");
             return;
         }
@@ -6330,7 +6399,7 @@ void RestApiV1::register_routes(
                                                  "or a token contains a character outside "
                                                  "[0-9A-Fa-f.:]"),
                             "application/json");
-            audit_fn(req, "quarantine.enable", "failure", "Security", agent_id,
+            audit(req, "quarantine.enable", "failure", "Security", agent_id,
                      "whitelist rejected by server-edge validation");
             return;
         }
@@ -6341,6 +6410,10 @@ void RestApiV1::register_routes(
         auto session = auth_fn(req, res);
         if (!session)
             return;
+        if (!same_principal_or_refuse(res, audit, req, *first, *session, "quarantine.enable",
+                                      agent_id))
+            return;
+        audit = audit_as(audit_as_session, *session);
         const std::string by = session->username;
 
         // #6065 PR-Q: the shared dispatch chokepoint's pre-check for
@@ -6348,7 +6421,7 @@ void RestApiV1::register_routes(
         // write: a denial creates no row (not even an attempt row). A copy of the
         // same closure MCP's pre-dispatch dry run holds (server.cpp). Fails CLOSED
         // when unwired, like the scoped gate above.
-        if (refuse_at_dispatch_chokepoint(req, res, audit_fn, authorize_dispatch_fn, *session,
+        if (refuse_at_dispatch_chokepoint(req, res, audit, authorize_dispatch_fn, *session,
                                           exec_visible_fn, metrics_registry, "quarantine.enable",
                                           "quarantine", agent_id))
             return;
@@ -6357,7 +6430,7 @@ void RestApiV1::register_routes(
         // no mutation). The attempt row is written AFTER authorisation and validation and
         // BEFORE the store write, so containment is never changed without a record; the
         // outcome row below says whether it applied (`success` keeps meaning "applied").
-        if (!detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.enable", "attempt",
+        if (!detail::emit_behavioral_audit(audit, req, res, "quarantine.enable", "attempt",
                                            "Security", agent_id, reason)) {
             res.status = 503;
             res.set_content(
@@ -6386,13 +6459,13 @@ void RestApiV1::register_routes(
             // already audits this branch (mcp_audit("failure", ...)) — REST
             // was silently skipping it, the only quarantine failure path with
             // no audit row.
-            (void)detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.enable", "failure",
+            (void)detail::emit_behavioral_audit(audit, req, res, "quarantine.enable", "failure",
                                                 "Security", agent_id, result.error());
             return;
         }
         // The change is made; a lost outcome row is signalled by Sec-Audit-Failed, and the
         // attempt row already records who asked.
-        (void)detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.enable", "success",
+        (void)detail::emit_behavioral_audit(audit, req, res, "quarantine.enable", "success",
                                             "Security", agent_id, reason);
         res.status = 201;
         res.set_content(ok_json(JObj().add("quarantined", true).str()), "application/json");
@@ -6401,11 +6474,16 @@ void RestApiV1::register_routes(
     sink.Delete(
         R"(/api/v1/quarantine/(.+))",
         [auth_fn, scoped_perm_fn, audit_fn, quarantine_store, authorize_dispatch_fn,
-         exec_visible_fn, metrics_registry](const httplib::Request& req,
-                                            httplib::Response& res) {
-            // CDX-P1-02: authenticate first (401 before any store work).
-            if (!auth_fn(req, res))
+         exec_visible_fn, metrics_registry,
+         audit_as_session = audit_as_session_fn_](const httplib::Request& req,
+                                                  httplib::Response& res) {
+            // CDX-P1-02: authenticate first (401 before any store work). Every row below is
+            // stamped from the session resolved here; see the POST route above.
+            const auto first = authenticate_for_quarantine_audit(
+                req, res, auth_fn, audit_fn, audit_as_session, "quarantine.disable");
+            if (!first)
                 return;
+            RestApiV1::AuditFn audit = audit_as(audit_as_session, *first);
             // Extracted before the is_open() check below (pure regex-match
             // read, no failure mode) so a store-outage 503 can still carry
             // the target agent_id in its audit row (gov-fix compliance-officer
@@ -6418,7 +6496,7 @@ void RestApiV1::register_routes(
                 res.set_content(
                     detail::a4_error(res, "service unavailable", {.retry_after_ms = 5000}),
                     "application/json");
-                audit_fn(req, "quarantine.disable", "failure", "Security", agent_id,
+                audit(req, "quarantine.disable", "failure", "Security", agent_id,
                          "service unavailable — store not open");
                 return;
             }
@@ -6430,7 +6508,7 @@ void RestApiV1::register_routes(
                 res.status = 500;
                 res.set_content(detail::a4_error(res, "scope gate not configured"),
                                 "application/json");
-                audit_fn(req, "quarantine.disable", "failure", "Security", agent_id,
+                audit(req, "quarantine.disable", "failure", "Security", agent_id,
                          "scope gate not configured");
                 return;
             }
@@ -6444,13 +6522,17 @@ void RestApiV1::register_routes(
             auto session = auth_fn(req, res);
             if (!session)
                 return;
-            if (refuse_at_dispatch_chokepoint(req, res, audit_fn, authorize_dispatch_fn, *session,
+            if (!same_principal_or_refuse(res, audit, req, *first, *session, "quarantine.disable",
+                                          agent_id))
+                return;
+            audit = audit_as(audit_as_session, *session);
+            if (refuse_at_dispatch_chokepoint(req, res, audit, authorize_dispatch_fn, *session,
                                               exec_visible_fn, metrics_registry,
                                               "quarantine.disable", "unquarantine", agent_id))
                 return;
 
             // ADR-0033 §9: attempt row before the store write, fail closed (see POST above).
-            if (!detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.disable", "attempt",
+            if (!detail::emit_behavioral_audit(audit, req, res, "quarantine.disable", "attempt",
                                                "Security", agent_id, "")) {
                 res.status = 503;
                 res.set_content(
@@ -6472,11 +6554,11 @@ void RestApiV1::register_routes(
                                                  db_error ? detail::A4ErrorOpts{.retry_after_ms = 5000}
                                                            : detail::A4ErrorOpts{}),
                                 "application/json");
-                (void)detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.disable",
+                (void)detail::emit_behavioral_audit(audit, req, res, "quarantine.disable",
                                                     "failure", "Security", agent_id, result.error());
                 return;
             }
-            (void)detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.disable", "success",
+            (void)detail::emit_behavioral_audit(audit, req, res, "quarantine.disable", "success",
                                                 "Security", agent_id, "");
             res.set_content(ok_json(JObj().add("released", true).str()), "application/json");
         });

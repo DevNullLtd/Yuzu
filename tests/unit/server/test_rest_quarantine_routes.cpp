@@ -173,6 +173,15 @@ struct QuarantineRouteHarness {
             audit_calls.push_back({action, result, target_type, target_id, detail});
             return true;
         };
+        // The session writer server.cpp binds (#6065 PR-Q): same recording, same failure
+        // injection, so every existing row assertion holds through it.
+        api.set_audit_as_session_fn([audit_fn](const httplib::Request& req, const auth::Session&,
+                                               const std::string& action, const std::string& result,
+                                               const std::string& target_type,
+                                               const std::string& target_id,
+                                               const std::string& detail) -> bool {
+            return audit_fn(req, action, result, target_type, target_id, detail);
+        });
 
         RestApiV1::ScopedPermFn scoped_fn{};
         if (wire_scope) {

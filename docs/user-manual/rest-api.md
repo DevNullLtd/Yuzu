@@ -2040,7 +2040,14 @@ Quarantine a device.
 > `result=denied` and the reason in `detail`, and increments
 > `yuzu_server_dispatch_denied_total{reason}`. A session that expires between the first
 > authorisation check and the request's second look-up now ends at the `401` instead of
-> writing a record attributed to `system`.
+> writing a record attributed to `system`. The second look-up must also name the same
+> principal as the first: a request whose two look-ups resolve to different principals
+> (for example a session cookie that lapsed and a bearer token on the same request) ends at
+> `401` with a `denied` row naming the first, and writes no record. Every audit row these
+> routes write names the session the route resolved, not a fresh look-up of the request, so
+> the `attempt` and outcome rows name the same account as the record's `quarantined_by`. A
+> server whose audit identity writer is not configured answers `500` on both routes and
+> changes nothing.
 
 **Request body:**
 
