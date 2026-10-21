@@ -1740,6 +1740,7 @@ if build_server
       'unit/server/test_token_rotation_lookup.cpp',   # P2 #11: derive_rotation_successor, DB-free unit coverage
       'unit/server/test_rest_tag_routes.cpp',   # K-05: REST tag-route authz wiring (CDX-03/CDX-R4-02/B4)
       'unit/server/test_rest_quarantine_routes.cpp',   # CDX-P1-02: REST quarantine-route authz wiring
+      'unit/server/test_rest_quarantine_create_gate.cpp', # #6065 PR-Q: REST create gate composed with the real chokepoint + reconciler
       'unit/server/test_rest_api_events.cpp',
       'unit/server/test_openapi_spec_completeness.cpp',   # #3991 F1: ADR-0031 INV-31-4 / #842 unit-test half
       'unit/server/test_rest_software_packages.cpp',
