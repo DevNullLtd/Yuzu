@@ -139,7 +139,7 @@ struct RetryResult {
 namespace detail {
 
 [[nodiscard]] inline bool is_valid_sid_shape(std::string_view sid) {
-    if (!sid.starts_with("S-1-"))
+    if (!sid.starts_with("S-1-") || sid.size() == 4) // "S-1-" alone has no suffix to validate
         return false;
     for (char c : sid.substr(4)) {
         if (!(std::isdigit(static_cast<unsigned char>(c)) || c == '-'))

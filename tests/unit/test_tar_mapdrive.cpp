@@ -901,10 +901,11 @@ TEST_CASE("mapdrive backfill parse_pending_state: a missing or unparsable leadin
 
 TEST_CASE("mapdrive backfill parse_pending_state: malformed segments are dropped, never thrown on",
           "[tar][mapdrive][backfill]") {
-    // Bad SID shape (no S-1- prefix, letters in the suffix), non-numeric/zero/negative count,
-    // and an empty segment are all dropped silently.
+    // Bad SID shape (no S-1- prefix, letters in the suffix, the bare prefix with no suffix at
+    // all), non-numeric/zero/negative count, and an empty segment are all dropped silently.
     const PendingState st = parse_pending_state(
-        "0;not-a-sid:1;S-1-5-abc:1;S-1-5-21-1:0;S-1-5-21-2:-3;S-1-5-21-3:notanumber;;S-1-5-21-4:2",
+        "0;not-a-sid:1;S-1-5-abc:1;S-1-:1;S-1-5-21-1:0;S-1-5-21-2:-3;S-1-5-21-3:notanumber;;"
+        "S-1-5-21-4:2",
         7);
     REQUIRE(st.profiles.size() == 1);
     CHECK(st.profiles[0].sid == "S-1-5-21-4");
@@ -1119,10 +1120,20 @@ TEST_CASE("mapdrive backfill lifecycle: not_found recovers through an incomplete
 
 TEST_CASE("mapdrive backfill retry_due: 0 is always due; below/at-or-above the interval",
           "[tar][mapdrive][backfill]") {
+    // Pin the production constants directly: a drift in either one must fail this file.
+    CHECK(kMapDriveBackfillMaxAttempts == 7);
+    CHECK(kMapDriveBackfillRetryIntervalS == 86400);
+
     CHECK(retry_due(100, 0, 86400));
     CHECK_FALSE(retry_due(100, 50, 86400)); // 50s elapsed, interval not reached
     CHECK_FALSE(retry_due(86400, 0 + 1, 86400)); // 86399 elapsed
-    CHECK(retry_due(86400, 0, 86400)); // exactly the interval
+    CHECK(retry_due(86400, 0, 86400)); // last_ts==0: always due regardless of elapsed time
+
+    // The real >= boundary, isolated from the last_ts==0 shortcut above (a nonzero last_ts
+    // forces the actual elapsed-time comparison, so an off-by-one >/>= regression fails here).
+    CHECK_FALSE(retry_due(kMapDriveBackfillRetryIntervalS, 1, kMapDriveBackfillRetryIntervalS));
+    CHECK(retry_due(kMapDriveBackfillRetryIntervalS + 1, 1, kMapDriveBackfillRetryIntervalS));
+
     CHECK(retry_due(100000, 0, 86400)); // well past it
 }
 
@@ -1224,4 +1235,4 @@ TEST_CASE("mapdrive insert: skip_known_historical adds no duplicate on an identi
     };
     REQUIRE(db.insert_mapdrive_events(retry_again, std::nullopt, true));
     CHECK(count_historical() == "3"); // the live row never counted; one more historical added
-} // __APPLE__
+}
