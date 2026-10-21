@@ -65,6 +65,7 @@
 #include <libpq-fe.h>
 
 #include <algorithm>
+#include <expected>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -290,6 +291,15 @@ struct Harness {
                         const std::string& action) {
                       return compose_arming_check(registry, &rbac, principal, plugin, action);
                   },
+              // #6096: the outbox spent-ticket ledger. This harness's enqueue_fn writes no
+              // outbox row, so the ledger is empty and no occurrence has run.
+              .outbox_occurrences_fn = [](const std::string&)
+                  -> std::expected<std::vector<std::string>, std::string> {
+                  return std::vector<std::string>{};
+              },
+              .outbox_exists_fn = [](const std::string&) -> std::expected<bool, std::string> {
+                  return false;
+              },
           }) {
         tracker.create_tables();
         approvals.create_tables();

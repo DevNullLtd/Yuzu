@@ -1258,23 +1258,30 @@ TEST_CASE("ApprovalManager: every stamp and expiry cutoff is authored in-SQL fro
           "clock; approval_manager.cpp reads no process clock (UP-3/UP-4/#6096 source tripwire)",
           "[approval_manager][approval]") {
     const std::string code = approval_manager_code_without_comments();
+    // Matching is case-insensitive: SQL is case-blind, so `NOW()` or `Current_Timestamp` must
+    // not slip past a lower-case ban. `code` keeps the original case for the named-statement
+    // lookups below, which anchor on camel-case identifiers.
+    std::string lc = code;
+    for (auto& ch : lc)
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
 
     // (a) No process clock. `::now(` catches every chrono clock; the list below catches every
     // other way to read a clock from C++ code or SQL, so a new cutoff cannot slip in under a
     // spelling an exact-match check would miss (R3-QE-1).
-    CHECK(count_occurrences(code, "::now(") == 0);
-    CHECK(count_occurrences(code, "submit_stamp_epoch") == 0);
+    CHECK(count_occurrences(lc, "::now(") == 0);
+    CHECK(count_occurrences(lc, "submit_stamp_epoch") == 0);
     for (const std::string_view banned :
          {"system_clock", "steady_clock", "high_resolution_clock", "utc_clock", "tai_clock",
           "gps_clock", "file_clock", "clock_gettime", "gettimeofday", "time_t", "std::time(",
-          "time(nullptr)", "time(NULL)", "time(0)", "localtime", "gmtime", "clock_timestamp",
-          "current_timestamp", "statement_timestamp", "transaction_timestamp",
-          "localtimestamp"}) {
+          "time(nullptr)", "time(null)", "time(0)", "time(&", "localtime", "gmtime", ".now(",
+          "now (", "clock(", "clock_timestamp", "current_timestamp", "statement_timestamp",
+          "transaction_timestamp", "localtimestamp"}) {
         INFO("banned clock API: " << banned);
-        CHECK(code.find(banned) == std::string::npos);
+        CHECK(lc.find(banned) == std::string::npos);
     }
-    // The one database clock: SQL `now()` appears only in kDbNowEpochSql's own definition.
-    CHECK(count_occurrences(code, "now()") == 1);
+    // The one database clock: SQL `now()` (any case) appears only in kDbNowEpochSql's own
+    // definition.
+    CHECK(count_occurrences(lc, "now()") == 1);
     const auto db_now_def = statement_from(code, "constexpr const char* kDbNowEpochSql");
     REQUIRE_FALSE(db_now_def.empty());
     CHECK(db_now_def.find("now()") != std::string::npos);
@@ -1285,8 +1292,7 @@ TEST_CASE("ApprovalManager: every stamp and expiry cutoff is authored in-SQL fro
     const auto consume = statement_from(code, "const std::string consume_sql");
     const auto retire = statement_from(code, "const std::string retire_sql");
     // The v2 migration's data UPDATE (#6096) is on the same clock and reads no process one.
-    const auto migration_v2 =
-        statement_from(code, "std::string(\"UPDATE approvals SET consumed_at = \")");
+    const auto migration_v2 = statement_from(code, "UPDATE approvals SET consumed_at = ");
     const auto why = statement_from(code, "const std::string why_sql"); // consume's diagnostic
     const auto db_now = statement_from(code, "const std::string db_now");
     const auto insert = statement_from(code, "const std::string insert_sql");
@@ -1343,7 +1349,15 @@ TEST_CASE("Schedule path: the process-clock reads are an allow-listed, documente
     CHECK(count_occurrences(engine, "::now(") == 1);
     CHECK(count_occurrences(engine, "system_clock::now") == 1);
     CHECK(count_occurrences(engine, "now_epoch(") == 5); // definition + four stamp sites
-    for (const auto* code : {&runner, &engine})
+    // Case-insensitive, like the approval_manager.cpp tripwire above.
+    auto lower = [](std::string text) {
+        for (auto& ch : text)
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        return text;
+    };
+    const std::string runner_lc = lower(runner);
+    const std::string engine_lc = lower(engine);
+    for (const auto* code : {&runner_lc, &engine_lc})
         for (const std::string_view banned :
              {"steady_clock", "high_resolution_clock", "utc_clock", "tai_clock", "gps_clock",
               "file_clock", "clock_gettime", "gettimeofday", "std::time(", "time(nullptr)",
@@ -1359,9 +1373,11 @@ TEST_CASE("Schedule path: the process-clock reads are an allow-listed, documente
 // #6096: submitted_at is authored by the DATABASE in submit(), the same clock as every other
 // stamp. The database clock is not injectable, so assert the origin directly: read the
 // database's own clock on a second connection immediately before and after the submit and
-// require the stored stamp inside that window. (A process-clock stamp would also fall in a
-// window on one host, which is why the source tripwire above pins the SQL; this pins the
-// observable behaviour.)
+// require the stored stamp inside that window. PLAIN STATEMENT OF THE LIMIT: on one host a
+// process-clock stamp would also fall inside this window, so THIS test cannot fail on the
+// defect; the source tripwire above (zero process-clock reads in approval_manager.cpp, the
+// INSERT binds no submitted_at parameter) is the guard. This test pins only the observable
+// behaviour and that the stamp is within the database's reading of `now()`.
 TEST_CASE("ApprovalManager: submitted_at is authored by the database clock (#6096)",
           "[pg][approval_manager][approval][6096]") {
     yuzu::test::ApprovalManagerPg mgr_bundle;
@@ -1415,7 +1431,8 @@ TEST_CASE("ApprovalManager::retire_schedule_tickets: settles a schedule's unsett
         REQUIRE(mgr.approve(other, "boss", "ok").has_value());
 
         const int64_t before = db_epoch();
-        auto n = mgr.retire_schedule_tickets("sched-a", "sched-a:42");
+        auto n = mgr.retire_schedule_tickets("sched-a", "sched-a:42",
+                                             {approved, rejected, pending, other});
         const int64_t after = db_epoch();
         REQUIRE(n.has_value());
         CHECK(*n == 2);
@@ -1433,14 +1450,15 @@ TEST_CASE("ApprovalManager::retire_schedule_tickets: settles a schedule's unsett
         CHECK(mgr.get(pending)->status == "pending");
         CHECK(mgr.get(other)->consumed_at == 0);
 
-        auto again = mgr.retire_schedule_tickets("sched-a", "sched-a:43");
+        auto again = mgr.retire_schedule_tickets("sched-a", "sched-a:43",
+                                                 {approved, rejected, pending, other});
         REQUIRE(again.has_value());
         CHECK(*again == 0); // a repeat is not an error and rewrites nothing
         CHECK(mgr.get(approved)->consumed_by == "schedule:sched-a:42");
     }
 
     SECTION("nothing to retire is 0, not an error") {
-        auto n = mgr.retire_schedule_tickets("sched-none", "sched-none:1");
+        auto n = mgr.retire_schedule_tickets("sched-none", "sched-none:1", {"no-such-id"});
         REQUIRE(n.has_value());
         CHECK(*n == 0);
     }
@@ -1449,13 +1467,47 @@ TEST_CASE("ApprovalManager::retire_schedule_tickets: settles a schedule's unsett
         auto id = mgr.submit("def-1", "operator1", "scope", "", ApprovalOrigin::kInstruction);
         REQUIRE(id.has_value());
         REQUIRE(mgr.approve(*id, "boss", "ok").has_value());
-        CHECK_FALSE(mgr.retire_schedule_tickets("", "x:1").has_value()); // refused outright
+        CHECK_FALSE(mgr.retire_schedule_tickets("", "x:1", {*id}).has_value()); // refused outright
         CHECK(mgr.get(*id)->consumed_at == 0);
     }
 
+    SECTION("only the observed ids are settled; empty ids touch nothing") {
+        const auto seen = mint("sched-a");
+        const auto later = mint("sched-a"); // approved after the caller's snapshot
+        REQUIRE(mgr.approve(seen, "boss", "ok").has_value());
+        REQUIRE(mgr.approve(later, "boss", "ok").has_value());
+
+        auto none = mgr.retire_schedule_tickets("sched-a", "sched-a:1", {});
+        REQUIRE(none.has_value());
+        CHECK(*none == 0);
+        CHECK(mgr.get(seen)->consumed_at == 0);
+
+        auto n = mgr.retire_schedule_tickets("sched-a", "sched-a:1", {seen});
+        REQUIRE(n.has_value());
+        CHECK(*n == 1);
+        CHECK(mgr.get(seen)->consumed_at != 0);
+        CHECK(mgr.get(later)->consumed_at == 0); // a stale caller cannot settle a successor
+
+        // A stale replica re-running the same retire cannot settle it either.
+        auto stale = mgr.retire_schedule_tickets("sched-a", "sched-a:1", {seen});
+        REQUIRE(stale.has_value());
+        CHECK(*stale == 0);
+        CHECK(mgr.get(later)->consumed_at == 0);
+    }
+
+    SECTION("ids are escaped, not interpreted") {
+        const auto id = mint("sched-a");
+        REQUIRE(mgr.approve(id, "boss", "ok").has_value());
+        auto n = mgr.retire_schedule_tickets("sched-a", "sched-a:1",
+                                             {"a\"b", "c\\d", "e,f", "{g}", id});
+        REQUIRE(n.has_value()); // no SQL error from hostile element text
+        CHECK(*n == 1);
+        CHECK(mgr.get(id)->consumed_at != 0);
+    }
+
     SECTION("consumed_by is never written empty") {
-        CHECK_FALSE(mgr.retire_schedule_tickets("sched-a", "").has_value());
-        CHECK_FALSE(mgr.retire_schedule_tickets("", "sched-a:1").has_value());
+        CHECK_FALSE(mgr.retire_schedule_tickets("sched-a", "", {"x"}).has_value());
+        CHECK_FALSE(mgr.retire_schedule_tickets("", "sched-a:1", {"x"}).has_value());
     }
 
     SECTION("concurrent callers retire each ticket exactly once between them") {
@@ -1469,7 +1521,7 @@ TEST_CASE("ApprovalManager::retire_schedule_tickets: settles a schedule's unsett
         std::vector<std::thread> threads;
         for (int i = 0; i < 4; ++i)
             threads.emplace_back([&, i] {
-                auto r = mgr.retire_schedule_tickets("sched-a", "sched-a:" + std::to_string(i));
+                auto r = mgr.retire_schedule_tickets("sched-a", "sched-a:" + std::to_string(i), ids);
                 if (!r)
                     ++errors;
                 else
@@ -1487,7 +1539,7 @@ TEST_CASE("ApprovalManager::retire_schedule_tickets: settles a schedule's unsett
                                 .connect_timeout_s = 1}};
         ApprovalManager dead{unreachable};
         CHECK_FALSE(dead.is_open());
-        CHECK_FALSE(dead.retire_schedule_tickets("x", "x:1").has_value());
+        CHECK_FALSE(dead.retire_schedule_tickets("x", "x:1", {"a"}).has_value());
     }
 
     SECTION("consume_ticket still refuses a schedule-origin ticket") {
@@ -1510,7 +1562,7 @@ TEST_CASE("approval_row_json: the list shape is unchanged by settling a schedule
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "boss", "ok").has_value());
     const auto before = approval_row_json(*mgr.get(*id));
-    REQUIRE(mgr.retire_schedule_tickets("sched-a", "sched-a:1").has_value());
+    REQUIRE(mgr.retire_schedule_tickets("sched-a", "sched-a:1", {*id}).has_value());
     const auto after = approval_row_json(*mgr.get(*id));
     CHECK(before == after);
     CHECK(after.size() == 9);
