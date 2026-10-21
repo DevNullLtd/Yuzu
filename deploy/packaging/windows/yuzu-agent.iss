@@ -5,7 +5,7 @@
 ; The resolved token is written to %ProgramData%\Yuzu\enrollment-token (Administrators and
 ; SYSTEM only) and the service is configured with --enrollment-token-file pointing at it, so
 ; the token never sits on the registered service command line. The agent removes the file
-; after its first accepted registration.
+; after its first accepted registration, or when the server refuses the token.
 
 #ifndef AppVersion
   #define AppVersion "0.7.0"

@@ -1,8 +1,9 @@
 /**
  * Pins what Agent::run() does with Config::enrollment_token_file around Register:
- * an accepted registration removes the file, a hard-rejected one leaves it alone, a
- * pending one keeps it until a later accepted registration, and a removal that fails
- * is retried after the next accepted registration rather than given up on.
+ * an accepted registration removes the file, a refusal of the token itself removes it
+ * too, a refusal that is not about the token (an administrator's denial) leaves it
+ * alone, a pending one keeps it until a later accepted registration, and a removal
+ * that fails is retried after the next accepted registration rather than given up on.
  *
  * main() is never linked into a test target, so this is the only test that reaches
  * the removal in agent.cpp. Deleting or moving that block would otherwise keep every
@@ -23,6 +24,7 @@
 
 #include <yuzu/agent/agent.hpp>
 #include <yuzu/agent/subprocess_runner.hpp>
+#include <yuzu/enrollment_token_shape.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -59,7 +61,6 @@ struct Answer {
     std::string enrollment_status;
 
     static Answer accept() { return {true, {}, {}}; }
-    static Answer reject(std::string reason) { return {false, std::move(reason), {}}; }
     // What the server answers while a registration awaits approval, byte for byte
     // (agent_service_impl.cpp / gateway_service_impl.cpp): not accepted, the reason
     // carries no "pending", and the status is what says so.
@@ -245,9 +246,12 @@ TEST_CASE("an accepted registration removes the enrollment token file",
     }
 }
 
-TEST_CASE("a hard-rejected registration leaves the enrollment token file in place",
+// The server's refusal of an agent that is not about the token, byte for byte
+// (agent_service_impl.cpp / gateway_service_impl.cpp): the token may have been valid and
+// its use rolled back, so the file is the only copy of a good credential.
+TEST_CASE("a refusal that is not about the token leaves the enrollment token file in place",
           "[agent][enrollment][enrollment_token_file][grpc]") {
-    LoopbackHarness harness{{Answer::reject("test: registration rejected")}};
+    LoopbackHarness harness{{Answer{false, "enrollment denied by administrator", "denied"}}};
     REQUIRE(harness.server);
     REQUIRE(harness.port != 0);
     TokenFileFixture fixture;
@@ -263,6 +267,31 @@ TEST_CASE("a hard-rejected registration leaves the enrollment token file in plac
         CHECK(fs::exists(fixture.token_file));
     }
     CHECK(fs::exists(fixture.token_file));
+}
+
+// The server's refusal of the token itself, byte for byte (the uniform public message with
+// status "denied"): the file holds a dead credential, so it is removed and the next start
+// registers without it. A terminal reply, so it cannot share a scripted run with the case
+// above.
+TEST_CASE("a refusal of the token removes the enrollment token file",
+          "[agent][enrollment][enrollment_token_file][grpc]") {
+    LoopbackHarness harness{
+        {Answer{false, std::string(yuzu::kEnrollmentTokenRejectionPublicMessage), "denied"}}};
+    REQUIRE(harness.server);
+    REQUIRE(harness.port != 0);
+    TokenFileFixture fixture;
+    REQUIRE(fs::exists(fixture.token_file));
+
+    auto agent = yuzu::agent::Agent::create(fixture.config(harness.port));
+    REQUIRE(agent);
+    {
+        AgentThread runner{*agent};
+        // A refusal makes run() return on its own, after the removal.
+        REQUIRE(runner.finished.wait_for(std::chrono::seconds(30)) ==
+                std::future_status::ready);
+        CHECK(harness.service.registration_count() == 1);
+        CHECK_FALSE(fs::exists(fixture.token_file));
+    }
 }
 
 // A pending answer keeps the file, and a removal that fails is retried after the next

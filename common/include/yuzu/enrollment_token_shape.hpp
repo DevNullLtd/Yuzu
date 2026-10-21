@@ -1,6 +1,7 @@
 #pragma once
 
-// Shared enrollment-token shape predicate + token-file text parser.
+// Shared enrollment-token shape predicate, token-file text parser and the
+// public token-refusal message.
 //
 // `enrollment_token_shape_valid` is the exact wire shape of an enrollment
 // token (64 lowercase hex characters, a 32-byte CSPRNG value). It moved here
@@ -8,6 +9,10 @@
 // a using-declaration) so the agent's token-file reader can gate on exactly
 // the same predicate the server applies at Register, without the agent
 // including any server header.
+//
+// `kEnrollmentTokenRejectionPublicMessage` moved here for the same reason: the
+// agent recognises a refusal of its token by the exact reply the server sends,
+// and compares against the server's own constant, not a copy.
 //
 // Pure: no I/O, no store or wire types, so this stays inside the
 // common/include firewall (CLAUDE.md "Project layout") and both agent and
@@ -19,6 +24,15 @@
 #include <string_view>
 
 namespace yuzu {
+
+/// Public wire message for a refused enrollment token -- one string regardless
+/// of why (unknown, malformed, revoked, expired, exhausted). The Register RPC's
+/// `reject_reason` carries this value verbatim, alongside enrollment_status
+/// "denied". Do not vary it by variant (the wire-collapse contract in
+/// server/core/src/enrollment_token_rejection.hpp, which re-exports this
+/// constant for the server handlers).
+inline constexpr std::string_view kEnrollmentTokenRejectionPublicMessage =
+    "invalid, expired, or exhausted enrollment token";
 
 /// Exact wire shape of an enrollment token: 64 lowercase hex characters (32
 /// CSPRNG bytes). A token that fails it cannot exist, so the server rejects it

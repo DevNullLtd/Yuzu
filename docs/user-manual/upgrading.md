@@ -8,7 +8,7 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 registered service command line. It writes the token to `%ProgramData%\Yuzu\enrollment-token`
 (restricted to Administrators and SYSTEM, owned by Administrators), configures the service with
 `--enrollment-token-file` pointing at that file, and the agent removes the file after its first
-accepted registration. `/TOKEN=<token>` still works; `/TOKEN_FILE=<file>` is new and keeps the
+accepted registration or when the server refuses the token. `/TOKEN=<token>` still works; `/TOKEN_FILE=<file>` is new and keeps the
 token out of Setup's own log too (Setup's command line, and therefore its `/LOG=` log, still
 records a `/TOKEN=` value verbatim if that is the form given). A service registered by this
 installer shows `--enrollment-token-file` and no token value in `sc.exe qc YuzuAgent`.
@@ -45,20 +45,23 @@ Windows agent registered by an earlier installer.
   group- or other-writable, and readable by the agent). Anything else is ignored with a warning in
   the agent log, and the agent registers with `--enrollment-token` / `YUZU_ENROLLMENT_TOKEN` if
   one is set, else without a token (the approval queue).
-- A token file that holds a token the server has expired, revoked or used up is refused at
-  registration on every start until the file is replaced or removed: while a token is presented
-  the agent does not fall back to the approval queue. Do not bake a token file into a golden image
-  or VDI template: each machine started from it registers with a new identity and uses one of the
-  token's uses. Size `max_uses` and the expiry to the rollout window.
+- When the server refuses a token the agent read from the token file (unknown, expired, revoked or
+  used up), the agent removes the file, and on its next start the host registers without a token
+  and joins the approval queue. A refusal that is not about the token, such as an administrator
+  denying the agent, leaves the file in place. To enrol with a token again, supply a current one
+  (run the installer again with `/TOKEN=` or `/TOKEN_FILE=`). Do not bake a token file into a
+  golden image or VDI template: each machine started from it registers with a new identity and
+  uses one of the token's uses. Size `max_uses` and the expiry to the rollout window.
 - For a new unattended install, prefer `/TOKEN_FILE=<file>` over `/TOKEN=` when the token must not
   reach Setup's own log or deployment-tool command-line records (SCCM's AppEnforce.log, Intune).
   An installation that fails after the token file is written leaves the file in place
   (Administrators and SYSTEM only) and the previous service restarts with its previous command
   line; an installation that is refused while the new file is being moved into place leaves no
   token file at all. Either way, run the installer again with the same token. The agent removes
-  whatever is at the token-file path when its first registration is accepted, so when re-staging a
-  token for an agent that already runs with `--enrollment-token-file`, write it only after that
-  agent has registered, or stop the service first.
+  whatever is at the token-file path when its first registration is accepted or the server refuses
+  the token, so when re-staging a token for an agent that already runs with
+  `--enrollment-token-file`, write it only after that agent has registered, or stop the service
+  first.
 
 ## Behaviour change: new enrollment tokens default to 72 hours and 100 uses
 

@@ -163,7 +163,7 @@ together with a token typed in the wizard). Either way, the installer writes it 
 `%ProgramData%\Yuzu\enrollment-token` (Administrators and
 SYSTEM only) and configures the service with `--enrollment-token-file` pointing at
 it — a service registered by this installer no longer carries the token on its
-command line, and the agent removes the file after its first accepted registration.
+command line, and the agent removes the file after its first accepted registration, or when the server refuses the token.
 A service registered by an earlier installer keeps its earlier command line until
 the installer is run again (with the original `/SERVER=` and `/NOTLS`; `sc.exe qc
 YuzuAgent` shows which form a service has). `/TOKEN_FILE=` keeps

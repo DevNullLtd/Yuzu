@@ -406,7 +406,7 @@ int main(int argc, char* argv[]) {
     app.add_option("--enrollment-token-file", cfg.enrollment_token_file,
                    "File holding the enrollment token (first line); a token read from it "
                    "takes precedence over --enrollment-token; removed after the first "
-                   "accepted registration")
+                   "accepted registration or when the server refuses the token")
         ->envname("YUZU_ENROLLMENT_TOKEN_FILE");
     app.add_flag("--debug", "Enable debug mode (diagnostic features)")
         ->each([&cfg](const std::string&) { cfg.debug_mode = true; });
@@ -780,11 +780,11 @@ int main(int argc, char* argv[]) {
     // (a Windows service logs to its file only from that point, so any earlier warning is
     // lost) and before make_agent(). resolve_enrollment_token owns the decision (a token
     // read from the file wins over --enrollment-token / YUZU_ENROLLMENT_TOKEN, and the
-    // path is cleared unless a token was consumed from it, so the first accepted
-    // registration never removes a path the agent took no token from; the removal is by
-    // path, so an object placed there before that registration goes too); this block
-    // only logs the outcome. The read stays before the SCM hand-off so its warnings reach
-    // the log file, but it is NOT unbounded: the reader runs under a 5 s deadline on
+    // path is cleared unless a token was consumed from it, so neither the first accepted
+    // registration nor a refusal of the token removes a path the agent took no token
+    // from; the removal is by path, so an object placed there before either goes too);
+    // this block only logs the outcome. The read stays before the SCM hand-off so its
+    // warnings reach the log file, but it is NOT unbounded: the reader runs under a 5 s deadline on
     // yuzu::shared::bounded_call's detached worker, so an open that never returns (an
     // oplock held on a file another account placed there) costs this start five seconds
     // and a tokenless run, never the 30 s START_PENDING hint (error 1053). It opens the

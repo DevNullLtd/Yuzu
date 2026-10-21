@@ -24,9 +24,9 @@
 // (uid 0 / SYSTEM), by the account the process runs as (euid / token owner), or
 // on Windows by BUILTIN\Administrators; and on POSIX neither group- nor
 // other-writable (the sudoers-source predicate in local_security_policy_legs.hpp).
-// Without this, any account that can create a file in the directory could place a
-// well-formed token there that the server rejects, and the agent would stop on every
-// start.
+// The point is that a file planted by an account that is not allowed to supply a
+// credential for this agent is never read at all: its content is not parsed and its
+// token is not presented to the server.
 // The check runs on the handle/fd that is read, never on the path. Own-user is
 // accepted so the unit tests and an interactive run read their own files; the
 // LocalSystem service therefore accepts only SYSTEM or Administrators.
@@ -349,20 +349,40 @@ struct EnrollmentTokenResolution {
     std::string_view source; ///< the winning source: "file", "option" or "none"
 };
 
+/// True when a Register reply that was not accepted is the server refusing the
+/// enrollment TOKEN itself: status "denied" with exactly the uniform public
+/// message. Every token-caused definitive refusal carries exactly that pair, on the
+/// direct path (agent_service_impl.cpp: an oversize token, and a token that is
+/// unknown, malformed, revoked, expired or exhausted) and on the gateway path
+/// (gateway_service_impl.cpp ProxyRegister, the same two sites).
+///
+/// "enrollment denied by administrator" is deliberately NOT a match: it answers an
+/// agent record an administrator denied, including the case where the token was
+/// valid and its use was rolled back, so the credential is intact and removing the
+/// file would lose it. "awaiting admin approval" carries status "pending" and is not
+/// a refusal. The comparison is exact equality, never a substring, so no
+/// operator-controlled text can match. An agent-id charset refusal and a store
+/// failure are non-OK gRPC statuses and never reach a reply that is classified here.
+[[nodiscard]] constexpr bool is_enrollment_token_refusal(std::string_view enrollment_status,
+                                                         std::string_view reject_reason) noexcept {
+    return enrollment_status == "denied" && reject_reason == kEnrollmentTokenRejectionPublicMessage;
+}
+
 /// The one place that decides which enrollment token the agent registers with and
 /// whether the token file stays a deletion target.
 ///
 /// `token` is the --enrollment-token / YUZU_ENROLLMENT_TOKEN value and
 /// `token_file` the --enrollment-token-file path; both are updated in place.
 /// When the path is set the file is read once, under `deadline`. A token read from
-/// it wins over `token`, and the path is kept so the first accepted registration
-/// can remove the file. On every other outcome (absent, a link or directory, too
-/// large, unreadable or timed out, an untrusted owner, no token in it) the path is
-/// CLEARED, so the agent never removes a path it did not read a token from (the
-/// removal itself is by path, so an object placed there before the first accepted
-/// registration is removed), and the option/env value stands (a service whose
-/// environment still carries the token keeps starting). With no path configured
-/// nothing is read and `token` is left alone.
+/// it wins over `token`, and the path is kept so the first accepted registration, or
+/// the server's refusal of that token (is_enrollment_token_refusal), can remove the
+/// file. On every other outcome (absent, a link or directory, too large, unreadable
+/// or timed out, an untrusted owner, no token in it) the path is CLEARED, so the
+/// agent never removes a path it did not read a token from (the removal itself is by
+/// path, so an object placed there before that accepted registration or refusal is
+/// removed), and the option/env value stands (a service whose environment still
+/// carries the token keeps starting). With no path configured nothing is read and
+/// `token` is left alone.
 ///
 /// The read runs on yuzu::shared::bounded_call's detached worker: past `deadline`
 /// the caller carries on tokenless (outcome unreadable, detail "timed out") and

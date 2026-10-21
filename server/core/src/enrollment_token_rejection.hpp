@@ -105,8 +105,11 @@ using yuzu::enrollment_token_shape_valid;
 /// Public wire message — single string regardless of variant. The Register
 /// RPC's `reject_reason` field gets this value verbatim. Do not vary by
 /// variant under any circumstances (the wire-collapse contract above).
-inline constexpr std::string_view kEnrollmentTokenRejectionPublicMessage =
-    "invalid, expired, or exhausted enrollment token";
+///
+/// Defined in common/include/yuzu/enrollment_token_shape.hpp so the agent can
+/// recognise a refusal of its token by the exact reply the server sends;
+/// re-exported here so every server consumer keeps compiling unchanged.
+using yuzu::kEnrollmentTokenRejectionPublicMessage;
 
 /// Operator-facing variant name. Used in audit `detail` field and as a
 /// Prometheus label value. Free of `:`, `=`, spaces — usable as a label

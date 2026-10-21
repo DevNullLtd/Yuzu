@@ -362,6 +362,34 @@ TEST_CASE("token_file_drive_letter: only a drive-letter root passes",
     CHECK(letter(L"") == '\0');
 }
 
+// ── is_enrollment_token_refusal: which Register replies delete the token file ─
+//
+// Fed the server's own strings: the uniform message is the shared constant the server
+// sends, and "enrollment denied by administrator" / "awaiting admin approval" are the
+// replies that must NOT match (agent_service_impl.cpp, gateway_service_impl.cpp).
+
+TEST_CASE("is_enrollment_token_refusal: only the uniform refusal with status denied matches",
+          "[enrollment][enrollment_token_file]") {
+    using yuzu::agent::is_enrollment_token_refusal;
+    const std::string uniform{yuzu::kEnrollmentTokenRejectionPublicMessage};
+
+    CHECK(is_enrollment_token_refusal("denied", uniform));
+
+    // An administrator's denial: the token may have been valid and its use rolled back.
+    CHECK_FALSE(is_enrollment_token_refusal("denied", "enrollment denied by administrator"));
+    // Pending approval is not a refusal.
+    CHECK_FALSE(is_enrollment_token_refusal("pending", "awaiting admin approval"));
+    CHECK_FALSE(is_enrollment_token_refusal("pending", "still awaiting admin approval"));
+    // Exact equality on both fields.
+    CHECK_FALSE(is_enrollment_token_refusal("", uniform));
+    CHECK_FALSE(is_enrollment_token_refusal("pending", uniform));
+    CHECK_FALSE(is_enrollment_token_refusal("denied", uniform + " "));
+    CHECK_FALSE(
+        is_enrollment_token_refusal("denied", "Invalid, expired, or exhausted enrollment token"));
+    CHECK_FALSE(is_enrollment_token_refusal("denied", "x " + uniform));
+    CHECK_FALSE(is_enrollment_token_refusal("denied", ""));
+}
+
 // ── resolve_enrollment_token: the whole decision main() makes ───────────────
 //
 // main() is never linked into a test target, so this function IS the tested

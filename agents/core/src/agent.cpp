@@ -80,6 +80,8 @@ __declspec(allocate(".CRT$XCB"))
 #include <unistd.h>      // gethostname
 #endif
 
+#include <yuzu/agent/enrollment_token_file.hpp> // is_enrollment_token_refusal
+
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -1693,6 +1695,28 @@ public:
         constexpr auto kRegisterTimeout = std::chrono::seconds{30};
         constexpr int kMaxCsrAttempts = 5; // PKI: bound enrolled-but-no-cert retries
 
+        // Remove the enrollment token file (a non-following, non-recursive delete) and
+        // say what happened; true when it is gone, whether this call removed it or it was
+        // already absent. The path is set only when main() read a token from the file (see
+        // agent.hpp); each caller decides what a failed removal means for it.
+        const auto remove_enrollment_token_file = [this](std::string_view why,
+                                                         std::string_view on_failure) {
+            std::error_code ec;
+            const bool removed = std::filesystem::remove(cfg_.enrollment_token_file, ec);
+            if (ec) {
+                spdlog::warn("Could not remove the enrollment token file {}: {} ({})",
+                             cfg_.enrollment_token_file.string(), ec.message(), on_failure);
+                return false;
+            }
+            if (removed)
+                spdlog::info("Removed the enrollment token file {} {}",
+                             cfg_.enrollment_token_file.string(), why);
+            else
+                spdlog::info("The enrollment token file {} was already gone {}",
+                             cfg_.enrollment_token_file.string(), why);
+            return true;
+        };
+
         while (!stop_requested_.load(std::memory_order_acquire)) {
             if (reconnect_count > 0) {
                 // Exponential backoff: 2^n seconds, capped at 5 minutes
@@ -1875,6 +1899,21 @@ public:
                     }
                     spdlog::error("Server permanently rejected registration: {}",
                                   resp.reject_reason());
+                    // The server refused the token itself (unknown, expired, revoked or
+                    // used up): the file holds a dead credential, so remove it and the
+                    // next start registers without one and joins the approval queue,
+                    // instead of presenting it and being refused on every start. Any
+                    // other refusal (an administrator's denial of this agent, where the
+                    // token was valid and its use was rolled back) keeps the file. The
+                    // path is cleared whatever the outcome; a file that could not be
+                    // removed is presented, refused and retried by the next start.
+                    if (!cfg_.enrollment_token_file.empty() &&
+                        yuzu::agent::is_enrollment_token_refusal(resp.enrollment_status(),
+                                                                 resp.reject_reason())) {
+                        remove_enrollment_token_file("after the server refused the token",
+                                                     "will retry on the next start");
+                        cfg_.enrollment_token_file.clear();
+                    }
                     return; // Hard rejection — no retry
                 }
 
@@ -1887,33 +1926,17 @@ public:
 
                 reconnect_count = 0; // Registration succeeded — reset backoff
 
-                // Remove the token file now that it has done its one job. The
-                // path is set only when main() read a token from it (see
-                // agent.hpp); remove() does not follow a link. A failed remove
-                // keeps the path set so the next accepted Register retries.
+                // Remove the token file now that it has done its one job. A failed
+                // remove keeps the path set so the next accepted Register retries.
                 // cfg_.enrollment_token (in memory) is deliberately left as-is:
                 // clearing it would flip the server's enrollment_method label
                 // on a reconnect from "token" to "approval"
                 // (agent_service_impl.cpp, agent.registered analytics event).
-                if (!cfg_.enrollment_token_file.empty()) {
-                    std::error_code ec;
-                    const bool removed = std::filesystem::remove(cfg_.enrollment_token_file, ec);
-                    if (!ec) {
-                        if (removed)
-                            spdlog::info("Removed the enrollment token file {} after the "
-                                         "accepted registration",
-                                         cfg_.enrollment_token_file.string());
-                        else
-                            spdlog::info("The enrollment token file {} was already gone "
-                                         "after the accepted registration",
-                                         cfg_.enrollment_token_file.string());
-                        cfg_.enrollment_token_file.clear();
-                    } else {
-                        spdlog::warn("Could not remove the enrollment token file {}: {} "
-                                     "(will retry after the next accepted registration)",
-                                     cfg_.enrollment_token_file.string(), ec.message());
-                    }
-                }
+                if (!cfg_.enrollment_token_file.empty() &&
+                    remove_enrollment_token_file("after the accepted registration",
+                                                 "will retry after the next accepted "
+                                                 "registration"))
+                    cfg_.enrollment_token_file.clear();
 
                 // PKI PR3: the server signed our CSR. Persist the leaf + key (0600)
                 // + issuing chain, point the config at it, and rebuild the channel
