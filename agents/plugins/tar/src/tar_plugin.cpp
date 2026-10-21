@@ -904,7 +904,7 @@ public:
                 // §3.8 bounded per-profile retry (related issue #5291): the first pass already
                 // ran -- give its pending list a chance before this tick's own work. Cheap when
                 // nothing is due (phase A's own short lock-and-check).
-                maybe_retry_pending_mapdrive_backfill();
+                retry_pending_mapdrive_backfill();
             } else {
                 // enumerate_mapdrive_history touches the registry / offline hives /
                 // subprocesses and does substantial allocation; a std::bad_alloc (or
@@ -2695,19 +2695,15 @@ private:
                         r.next.profiles.empty() ? std::string{} : format_pending_state(r.next));
     }
 
-    // Phase-A-gated wrapper: cheap (one short lock, one config read) when nothing is due. Call
-    // sites never take collect_mu_ themselves first — see retry_pending_mapdrive_backfill's own
-    // banner for why.
-    void maybe_retry_pending_mapdrive_backfill() { retry_pending_mapdrive_backfill(); }
-
     int do_collect_slow(yuzu::CommandContext& ctx) {
         {
             yuzu::PluginContext pctx{plugin_ctx_};
             reconcile_db_health_publish(pctx);
         }
         // §3.8 bounded mapdrive-backfill retry (related issue #5291): above collect_mu_, same as
-        // init()'s call site, so hive I/O never runs under the shared lock.
-        maybe_retry_pending_mapdrive_backfill();
+        // init()'s call site, so hive I/O never runs under the shared lock. Cheap when nothing is
+        // due (phase A's own short lock-and-check) — see retry_pending_mapdrive_backfill's banner.
+        retry_pending_mapdrive_backfill();
         std::lock_guard lock(collect_mu_);
         return collect_slow_impl(ctx);
     }
