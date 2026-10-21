@@ -1582,6 +1582,11 @@ one log per 60 seconds per reason; the counter records all of them). The per-rou
 earlier releases showed for individual dashboard actions are now produced only for a token caller of a
 route that keeps a non-token-exempt copy of the check.
 
+Cookie-session requests that dispatch work are held to the same rule, but a browser's own requests of
+that kind are decided first by the fetch metadata it sends (`Sec-Fetch-Site: same-origin`), so a proxy
+that rewrites `Host` does not refuse them; only a client that sends no `Sec-Fetch-Site` (a script) falls
+back to the `Origin` or `Referer` comparison that `--csrf-trusted-origin` feeds.
+
 **Alerts.** The shipped `yuzu-web-writes` group in `docs/prometheus/yuzu-alerts.yml` watches the counter:
 `YuzuCookieWritesRefusedSameSite` (warning) fires when at least 3 `origin_mismatch` or `referer_mismatch`
 refusals occur within 15 minutes, which is the signature of a proxy that rewrites `Host`, and

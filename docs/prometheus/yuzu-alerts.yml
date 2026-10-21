@@ -5312,7 +5312,7 @@ groups:
             the mechanism inert).
 
   - name: yuzu-web-writes
-    # Cookie-session writes refused by the pre-routing same-site gate
+    # Cookie-session requests refused by the pre-routing same-site gate
     # (yuzu_server_csrf_denied_total{path_class,reason}). Every path_class x
     # reason series is zero-seeded at boot, so increase() sees the first
     # refusal and an absent() would stay a real signal.
@@ -5331,10 +5331,10 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Cookie-session writes are being refused for a cross-site Origin or Referer"
+          summary: "Cookie-session requests are being refused for a cross-site Origin or Referer"
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#vnext--behind-a-reverse-proxy-declare-your-external-origin-or-csrf-gated-dashboard-actions-keep-failing-2537"
           description: >-
-            Three or more cookie-session writes were refused in 15 minutes
+            Three or more cookie-session requests were refused in 15 minutes
             because the Origin or Referer did not name this site (or a
             --csrf-trusted-origin entry). Two causes: a browser sent a write
             from another site, or a reverse proxy rewrites the Host header and
@@ -5357,10 +5357,10 @@ groups:
           summary: "The same-site write gate failed internally and refused writes"
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#vnext--behind-a-reverse-proxy-declare-your-external-origin-or-csrf-gated-dashboard-actions-keep-failing-2537"
           description: >-
-            The same-site check for cookie-session writes hit an internal
+            The same-site check for cookie-session requests hit an internal
             error and refused the request (it fails closed). A refusal that
             fails inside the gate may have no audit row, so the metric and the
             server log (at most one warning per minute) may be the only
             evidence. Look for
             the gate warning in the server log; a persistent error means
-            cookie-session writes are failing for every operator.
+            cookie-session requests are failing for every operator.

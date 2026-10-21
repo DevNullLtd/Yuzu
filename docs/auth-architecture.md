@@ -129,7 +129,8 @@ of the HA "safe-to-scale" gate. The design:
 
 ## Same-site gate for cookie-session writes
 
-Cookie-session writes require a same-site `Origin` or `Referer`. One decision,
+Cookie-session writes, and cookie-session requests that dispatch work, require a
+same-site `Origin` or `Referer` (or same-origin fetch metadata). One decision,
 `evaluate_same_site_write` (`same_site_write_policy.hpp`), is applied by one
 caller, `apply_same_site_write_gate` (`same_site_write_gate.hpp`), invoked once
 from `server.cpp`'s pre-routing handler.
@@ -144,6 +145,17 @@ from `server.cpp`'s pre-routing handler.
   header presence. A request resolving to `api_token`, `mcp_token` or
   `engine_token` is not gated; one resolving to a cookie source is gated even if
   it also carries a token.
+- **Guarded reads.** Cookie-session requests that dispatch work are held to the same
+  rule whichever method they use. `is_guarded_read(method, path)` (`GET` or `HEAD`, exact
+  path in the reviewed table `kFetchMetadataGuardedPaths`, both in
+  `same_site_write_policy.hpp`) widens the gate's first statement; `OPTIONS` is never
+  guarded and a path off the table is not checked. For a guarded request token sources
+  are admitted; a cookie source is decided by `Sec-Fetch-Site` first (`same-origin` or
+  `none` admitted, any other value refused `origin_mismatch`) and by the `Origin`/`Referer`
+  rule only when that header is absent. No new refusal reason, metric or alert. Residuals:
+  header checks cannot tell a browser's own prefetch, prerender or link preview from a
+  user action, and a client that sends neither fetch metadata nor `Origin`/`Referer` is
+  refused. Rationale: the design record linked at the end of this section.
 - **Exemptions** are by placement only: the pre-session set in
   `is_login_exempt_path`, the health probes and the metrics endpoint return
   before session resolution and never reach the gate. There is no second list.
@@ -177,7 +189,8 @@ from `server.cpp`'s pre-routing handler.
   `tests/test_same_site_wiring_lexical.py` pins the one call site and the early returns
   ahead of it, and `tests/unit/server/test_same_site_exempt_inventory.cpp` fails on a
   mutating registration that a pre-session bypass would carry unless a reviewed entry
-  exists. Design record:
+  exists, and a second scan there fails on a stale table entry or on a read-method
+  registration whose handler dispatches work but is not on the table or a reviewed ledger. Design record:
   [`docs/security-reviews/central-same-site-write-gate-2026-10.md`](security-reviews/central-same-site-write-gate-2026-10.md).
 
 ## Account lockout (SOC 2 CC6.3)

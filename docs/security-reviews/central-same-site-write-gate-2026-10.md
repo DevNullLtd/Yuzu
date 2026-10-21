@@ -1,7 +1,7 @@
 # Design record: central same-site gate for cookie-session writes
 
 **Date:** 2026-10-20
-**Subject:** cookie-session writes require a same-site `Origin` or `Referer`, decided once in the
+**Subject:** cookie-session writes (and cookie-session requests that dispatch work) require a same-site `Origin` or `Referer` (or same-origin fetch metadata), decided once in the
 server's pre-routing handler.
 **Code:** `server/core/src/same_site_write_policy.hpp` (the pure decision and its invariants
 banner), `server/core/src/same_site_write_gate.hpp` (counter, audit row, 403 body), the one call in
@@ -19,6 +19,8 @@ Any request other than `GET`, `HEAD` or `OPTIONS` that is authorised by a cookie
 refused `403` `cross-site request refused` unless it carries an `Origin` or `Referer` naming this
 site or an entry from `--csrf-trusted-origin`. The check is one function with one caller. A
 per-route copy of the same test is defence in depth and serves unit tests that bypass pre-routing.
+Cookie-session requests that dispatch work are held to the same rule by a reviewed list (see
+"Guarded reads"); the sentence above describes the write-method rule.
 
 ## Why a pre-routing chokepoint
 
@@ -46,7 +48,7 @@ per-route copies, which stay.
   `Cookie` or `Authorization` header is present. Token sources are not gated; a request that
   resolves to a cookie source is gated even if it also carries a token.
 - **Methods.** Everything except exactly `GET`, `HEAD` and `OPTIONS` is a write (fail closed). No
-  carve-out for read-only `POST`s.
+  carve-out for read-only `POST`s. The one addition is the guarded-read table below.
 - **Exemptions** are by placement only: `is_login_exempt_path`'s pre-session set, the health probes
   and the metrics endpoint return before session resolution and never reach the gate. There is no
   second list.
@@ -114,8 +116,9 @@ per-route copies, which stay.
 4. `tests/unit/server/test_same_site_exempt_inventory.cpp` evaluates the real pre-session
    predicates over every mutating registration it can see and requires the bypassed set to equal a
    recorded ledger. Source-text scan with documented blind spots: a computed path, a new receiver
-   spelling, a registration made in a `.hpp`, and a mutating `GET` handler are invisible to it (and
-   a mutating `GET` is outside the gate by definition).
+   spelling and a registration made in a `.hpp` are invisible to it. A read-method handler that
+   dispatches work is covered by the guarded-read table instead (see "Guarded reads" below), and
+   its own scan has the limits stated there.
 
 The wiring tripwire first applies line splicing, then counts the gate, session-resolve,
 engine-stash and audit-sink tokens on text with comments removed and string and raw-string literals
@@ -137,6 +140,52 @@ member (a literal there fails it). The live-stack category reads the `csrf.denie
 through the audit API, which also covers an unwired audit sink in the production build. The
 tripwire's blind spots rest on review, on the integration tests that drive the real handler, and
 on the live-stack category above.
+
+## Guarded reads
+
+**Decision (owner, 2026-10-21).** Cookie-session requests that dispatch work are held to the same
+rule as writes even when their method is `GET` or `HEAD`. The owner chose a central, reviewed list
+guarded by the same gate over converting those requests to `POST`.
+
+**Options considered.**
+
+| Option | Outcome |
+|---|---|
+| Central reviewed list guarded by the existing gate (chosen) | One decision, one caller, one counter, audit row and alert set. No route, client or test changes for the dashboard. The list is data, so adding an entry is a one-line reviewed change. |
+| Convert each request to `POST` | Puts the work behind the existing write rule with no new mechanism, but changes the request contract of every dashboard caller and test, and leaves the next such request to be noticed by review alone. Not chosen. |
+| Per-handler checks | Reopens the drift the central gate exists to remove. Not chosen. |
+
+**Mechanism.** `is_guarded_read(method, path)` is true for `GET` or `HEAD` with a path that exactly
+equals an entry of `kFetchMetadataGuardedPaths` (`same_site_write_policy.hpp`); no prefix match, no
+query. `HEAD` is included because the HTTP library routes it to the `GET` handler. `OPTIONS` is never
+guarded. The gate's first statement returns for a request that is neither a write method nor a
+guarded read, so an ordinary read costs one method test and one path-prefix compare. For a guarded
+request the decision is: token sources admitted; otherwise, if `Sec-Fetch-Site` is present, `same-origin`
+or `none` admitted (case-insensitive) and any other value refused with `origin_mismatch`; if it is
+absent, the `Origin`/`Referer` rule applies exactly as for a write (neither header refused as
+`no_origin_no_referer`; otherwise the same-site comparison with trusted origins and the listener's TLS
+state). `Sec-Fetch-Site` is a forbidden header name: a browser sets it on every request and page script
+cannot. `none` is a navigation the user started (typed address, bookmark). `same-site` is refused
+because a sibling origin is not this origin. There is no new refusal reason, metric, label or alert;
+the audit `target_id` is `GET <path>` or `HEAD <path>`.
+
+**Evidence.** The policy truth table covers every table entry for both methods; the pipeline fixture
+registers one guarded canary and asserts refusal shape, counter, audit row, handler not run, admission
+and the fallback cases; `tests/unit/server/test_same_site_exempt_inventory.cpp` fails on a table entry
+that is not a registered `GET` route and on a read-method registration whose handler contains a
+dispatch marker but is on neither the table nor a reviewed ledger (best-effort, lexical: a computed
+path or a dispatch reached through more than one helper hop is invisible to it); the live-stack
+category in `scripts/e2e-security-test.sh` drives one covered request through a real server with a
+cookie session for each fetch-metadata value, the header-less case, the `Referer` fallback, a token
+caller and `HEAD`.
+
+**Residuals, accepted and stated.** Header checks do not distinguish a user action from a prefetch,
+prerender or link preview that the same user's own browser issues on its own initiative: such a
+request carries `same-origin` or `none` and is admitted. A client that sends neither fetch metadata
+nor `Origin`/`Referer` is refused. A request whose path is not on the table is not checked, so
+completeness rests on the tripwire above plus review. Fetch metadata is only as trustworthy as the
+client that sends it; a non-browser client can set any value, which is why this narrows browser-driven
+cross-site requests and is not an authorisation control.
 
 ## Proxy deployments
 
@@ -188,6 +237,8 @@ documented: a proxied deployment WITHOUT a declared `https://` origin still trea
 ## Follow-ups
 
 - Consolidating the per-route copies onto the gate (#5876).
+- A reviewed ledger for read-method handlers that contain a dispatch marker but only read starts
+  empty; entries need a one-line reason.
 - Tuning the alert window and threshold against real traffic.
 - Coalescing `csrf.denied` rows per session or principal (each refusal is one synchronous audit
   write; the per-IP rate limiter is the only flood bound today). Deferred by owner ruling; it trades
