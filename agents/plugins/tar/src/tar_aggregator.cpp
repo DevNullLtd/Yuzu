@@ -424,7 +424,8 @@ std::string_view canonical_source_enabled(std::string_view stored_value) {
 std::optional<bool> source_enabled_state(TarDatabase& db, std::string_view source) {
     auto r = db.try_get_config(std::format("{}_enabled", source));
     if (!r)
-        return std::nullopt; // read failure (logged by try_get_config)
+        return std::nullopt; // read failure: SQL errors are logged by try_get_config; a closed
+                             // store is silent here (run_retention warns once per pass)
     const char* def = source_default_enabled(source) ? "true" : "false";
     return canonical_source_enabled(r->value_or(def)) == "true";
 }

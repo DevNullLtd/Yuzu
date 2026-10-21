@@ -15,11 +15,14 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <chrono>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -2329,21 +2332,47 @@ TEST_CASE("TarDatabase: a fresh open lands at schema_version 8", "[tar][store][m
     CHECK(t.db.schema_version() == 8);
 }
 
-TEST_CASE("TarDatabase v7->v8: stored opt-outs of the formerly-off sources flip once",
+TEST_CASE("TarDatabase v7->v8: stored opt-outs of every formerly-off source flip once",
           "[tar][store][migration][v8]") {
+    // Table-driven over all eight so a dropped or misspelt name in the migration's
+    // literal list fails here. The eight already-on sources are seeded "false" as
+    // negative controls: a deliberate pause on them must survive untouched.
+    static constexpr std::array<std::string_view, 8> kFormerlyOff = {
+        "procperf", "netqual", "module", "software", "arp", "dns", "netconn", "mapdrive"};
+    static constexpr std::array<std::string_view, 8> kAlreadyOn = {
+        "process", "tcp", "service", "user", "perf", "power", "removable", "usage"};
+    std::vector<std::pair<std::string, std::string>> rows;
+    int64_t paused = 1'700'000'000;
+    for (const auto* group : {&kFormerlyOff, &kAlreadyOn}) {
+        for (const auto src : *group) {
+            rows.emplace_back(std::format("{}_enabled", src), "false");
+            rows.emplace_back(std::format("{}_paused_at", src), std::to_string(paused++));
+        }
+    }
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_v8_");
-    seed_v7_config(tmp, {{"procperf_enabled", "false"}, {"procperf_paused_at", "1700000000"}});
+    seed_v7_config(tmp, rows);
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
         CHECK(db->schema_version() == 8);
-        CHECK(db->get_config("procperf_enabled", "") == "true");
-        CHECK(db->get_config("procperf_paused_at", "") == "0");
+        int64_t expect = 1'700'000'000;
+        for (const auto src : kFormerlyOff) {
+            INFO("formerly-off source=" << src);
+            CHECK(db->get_config(std::format("{}_enabled", src), "") == "true");
+            CHECK(db->get_config(std::format("{}_paused_at", src), "") == "0");
+            ++expect;
+        }
+        for (const auto src : kAlreadyOn) {
+            INFO("already-on source=" << src);
+            CHECK(db->get_config(std::format("{}_enabled", src), "") == "false");
+            CHECK(db->get_config(std::format("{}_paused_at", src), "") == std::to_string(expect));
+            ++expect;
+        }
     }
     remove_db_files(tmp);
 }
 
-TEST_CASE("TarDatabase v7->v8: errored, already-on and absent rows are left alone",
+TEST_CASE("TarDatabase v7->v8: errored / already-on / absent rows are left alone",
           "[tar][store][migration][v8]") {
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_v8_");
     seed_v7_config(tmp, {{"netqual_enabled", "errored"},

@@ -1516,7 +1516,10 @@ private:
                 }
             }
         } else {
-            note_health("process", "source_disabled");
+            // An unreadable flag is a skipped tick, not a disable: state_unreadable
+            // is a failure token, source_disabled would reset the failure streak.
+            note_health("process",
+                        process_state.has_value() ? "source_disabled" : "state_unreadable");
         }
 
         // `usage` derived fold (Wave 7 PR7.2b): ONE call, after BOTH process
@@ -1757,7 +1760,7 @@ private:
             nstat_client_->drain();
             pending_nstat_evs_.clear();
         } else {
-            note_health("tcp", "source_disabled");
+            note_health("tcp", tcp_state.has_value() ? "source_disabled" : "state_unreadable");
         }
 
         // netqual: per-connection TCP quality (BRD Workstream E). Co-sampled with
@@ -1968,7 +1971,7 @@ private:
         }
 
         if (!module_enabled) {
-            module_tok = "source_disabled";
+            module_tok = module_state.has_value() ? "source_disabled" : "state_unreadable";
         } else if (!module_tok) {
             const auto st = yuzu::tar::os_support_status("module", yuzu::tar::current_platform_os());
             module_tok = (st == yuzu::tar::OsSupportStatus::kSupported ||

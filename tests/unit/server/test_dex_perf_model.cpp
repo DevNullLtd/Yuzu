@@ -698,6 +698,7 @@ TEST_CASE("procperf render: app drill links + escape + the soft empty state",
     // The SOFT truthful empty state: disabled on the device OR no rollup yet — both said.
     auto empty = render_dex_procperf_panel({}, "7d");
     CHECK(empty.find("on by default") != std::string::npos);
+    CHECK(empty.find("usage-class") == std::string::npos); // the removed opt-in rationale
     CHECK(empty.find("no hourly rollup has completed yet") != std::string::npos);
 }
 

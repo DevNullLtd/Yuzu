@@ -36,7 +36,12 @@ bool one_dx_style(const std::string& h) {
 
 TEST_CASE("render_dex_app_perf_picker: empty state + populated rows + cap note",
           "[dex][app_perf][ui]") {
-    CHECK(has(render_dex_app_perf_picker({}, false, 30), "No application performance history"));
+    const auto empty = render_dex_app_perf_picker({}, false, 30);
+    CHECK(has(empty, "No application performance history"));
+    // The default-on claim is pinned (the heading alone passed on the old copy).
+    CHECK(has(empty, "on by default"));
+    CHECK_FALSE(has(empty, "off by default"));
+    CHECK_FALSE(has(empty, "opt-in"));
 
     std::vector<AppPerfAppSummary> apps = {
         {.app_name = "chrome.exe", .versions = 3, .last_day = 1'700'000'000}};
@@ -374,6 +379,9 @@ TEST_CASE("render_dex_device_app_perf: empty state", "[dex][app_perf][ui]") {
     const auto h = render_dex_device_app_perf({});
     CHECK(has(h, "No application performance history for this device"));
     CHECK(has(h, "procperf_enabled")); // names the toggle so the empty state isn't read as a bug
+    CHECK(has(h, "on by default"));
+    CHECK_FALSE(has(h, "off by default"));
+    CHECK_FALSE(has(h, "opt-in"));
 }
 
 TEST_CASE("render_dex_device_app_perf: single-version app collapses to one row",

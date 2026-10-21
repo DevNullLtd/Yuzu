@@ -1003,8 +1003,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // `record_key` are forensic/value fields only, never identity
         // carriers. Replay idempotence via the UNIQUE record_key index below.
         //
-        // Ships default_enabled = TRUE — see the ALEX RULING note on `power`
-        // above; same divergence, same documentation obligation.
+        // Ships default_enabled = TRUE like every capture source.
         // removable_lookback_seconds (default 604800s, 0 = forward-only)
         // governs historical backfill the same way.
         //

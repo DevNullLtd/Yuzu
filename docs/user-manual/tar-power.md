@@ -10,13 +10,10 @@ different enough from every other TAR source to need its own explanation.
 
 ## It ships default-on
 
-Every other opt-in TAR source (`software`, `ARP`, `DNS`, `mapdrive`, `netconn`)
-defaults to **off** because it is either high-volume, behaviorally sensitive,
-or both. `power` is the deliberate exception: sleep/wake and AC-source events are
-low-volume and directly useful for baseline device-health and
-battery/charging-posture investigations from day one. `power` (and its
-sibling `removable`) therefore ship **enabled by default** — set
+Like every TAR capture source, `power` ships **enabled by default** — set
 `power_enabled=false` to opt out on a host where this is not wanted.
+Sleep/wake and AC-source events are low-volume and directly useful for
+baseline device-health and battery/charging-posture investigations from day one.
 
 Default-on is **not** a finding that these events are privacy-neutral. The
 *timing* of sleep/wake and AC transitions is a presence and working-hours

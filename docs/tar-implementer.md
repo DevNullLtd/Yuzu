@@ -118,7 +118,7 @@ patterns to `kDefaultRedactionPatterns` in `tar_collectors.hpp` rather
 than scrubbing per-callsite.
 
 **Schema versioning.** `tar_db.cpp` runs an idempotent migration at open
-time. Current schema version is **5** (legacy `tar_events` was retired at v3 in
+time. Current schema version is **8** (legacy `tar_events` was retired at v3 in
 PR M14, but `kCreateSchema` kept recreating it on every open — v5 stops that and
 drops it from already-migrated databases, #2093). Bumps go in the same
 function, never in `applies_*` collectors.
@@ -156,7 +156,11 @@ plugin change.
 > a parallel `== "true"`/`== "false"` check or a raw `get_config("<src>_enabled",
 > ...)` read — every collect, retention and purge gate for every registered
 > source goes through the one helper, so the registry's `default_enabled` is
-> the only place a default lives.
+> the only place a default lives. Collect and retention gates use
+> `source_enabled()` (an unreadable flag skips); discard, drain and purge
+> decisions use `source_enabled_state()`, which distinguishes a confirmed
+> `true`/`false` from an unreadable flag so a destructive path never acts on a
+> failed read.
 >
 > **`paused_at` is cleared on any non-`true` → `true` re-enable.**
 > `apply_source_enabled_transition` (`tar_aggregator.cpp`) canonicalises the

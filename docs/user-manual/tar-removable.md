@@ -6,12 +6,9 @@ attached removable volume (`exec_from_removable`). Like every other TAR
 capture source it is **forensic evidence**, not a policy engine — it records
 what happened, it does not block anything.
 
-**This source ships DEFAULT-ON.** Every other TAR capture source added since
-1.5 has shipped opt-in (`<source>_enabled` defaulting to `false`) pending an
-explicit enablement decision. `removable` diverges from that pattern: it is
-enabled out of the box, on every OS, from this release. If your fleet
-standardises on opt-in capture sources, set `removable_enabled=false`
-per-agent or fleet-wide the same way as any other TAR source
+**This source ships enabled by default**, on every OS, like every other TAR
+capture source. To opt out, set `removable_enabled=false` per-agent or
+fleet-wide the same way as any other TAR source
 (`docs/user-manual/tar.md#configuration`).
 
 Default-on is **not** a finding that this source is privacy-neutral. It

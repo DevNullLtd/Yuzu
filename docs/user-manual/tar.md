@@ -108,7 +108,7 @@ Use the `configure` action to adjust TAR behavior.
 | `perf_enabled` | `true` / `false` | `true` | Toggle the device performance sampler on this host |
 | `software_enabled` | `true` / `false` | **`true`** | Toggle the software install/uninstall source (`software` → `$Software_*`) on this host. **On by default**; set to `false` to opt out. On Windows it covers **machine-wide** installs (HKLM) only: **machine scope only, no user identity / no PII** — asset-management and vulnerability-relevance data like Services and User sessions. Disabling leaves existing rows queryable. |
 | `procperf_enabled` | `true` / `false` | **`true`** | Toggle the per-application top-N sampler on this host. **On by default**; set to `false` to opt out. Independent of `perf_enabled` (device-level `perf` carries no per-app identity). |
-| `netqual_enabled` | `true` / `false` | **`false`** | Toggle the per-connection TCP-quality sampler (`netqual` source → `$NetQual_Live`, plus the per-boot retrospective baseline `$NetQual_Boot`) on this host. **On by default**. Only a coarse destination *class* (`loopback`/`private`/`public`) is stored; raw remote addresses are dropped at the edge and never persisted, and the owning process is recorded as its image name only. Linux, and Windows via TCP ESTATS (ADR-0020) — **Windows needs an elevated agent** (non-elevated records nothing; `tar.status` reports `netqual_capture_method|none`). Set to `false` to opt out; independent of `tcp_enabled`. |
+| `netqual_enabled` | `true` / `false` | **`true`** | Toggle the per-connection TCP-quality sampler (`netqual` source → `$NetQual_Live`, plus the per-boot retrospective baseline `$NetQual_Boot`) on this host. **On by default**. Only a coarse destination *class* (`loopback`/`private`/`public`) is stored; raw remote addresses are dropped at the edge and never persisted, and the owning process is recorded as its image name only. Linux, and Windows via TCP ESTATS (ADR-0020) — **Windows needs an elevated agent** (non-elevated records nothing; `tar.status` reports `netqual_capture_method|none`). Set to `false` to opt out; independent of `tcp_enabled`. |
 | `netconn_enabled` | `true` / `false` | **`true`** | Toggle the connectivity-transition source (`netconn` → `$NetConn_Live`, ADR-0020). **On by default**. Windows reads the OS-retained NetworkProfile / NCSI / WLAN-AutoConfig event logs, so the FIRST read backfills history from **before TAR was enabled** (or installed) — network connect/disconnect, internet-capability changes, Wi-Fi connect/fail/disconnect with reason codes. Only closed enum tokens and numeric reason codes are stored: **no SSID, BSSID, profile name, interface GUID, or MAC is ever extracted**. Linux/macOS are planned (schema registered, queryable-empty). Set to `false` to opt out. |
 | `netconn_lookback_seconds` | integer seconds | **`604800`** (7 days) | How far **before enablement** the `netconn` backfill reads OS-retained connectivity history (ADR-0020 privacy note). Because the *timing* of network/Wi-Fi connect/disconnect events is a presence/working-hours proxy — behavioral data even with SSIDs stripped — enabling `netconn` retroactively ingests a window that predates any monitoring disclosure. Set to **`0`** to disable the retrospective read entirely (the source then records only forward connectivity from the moment it is enabled), for jurisdictions or works-council agreements where pre-notice collection is not permitted. Clamped to `[0, 90 days]`. Applies to the first read after enablement (and after a late enable); once caught up the source reads only forward. |
 | `module_enabled` | `true` / `false` | **`true`** | Toggle the image-load / module-stream capture source (`module` source → `$Module_*`). **On by default** — module-load capture is high-volume (every DLL/dylib/`.so` load and driver/kext/kmod load per process, with a code-signing verdict). Loaded-image **directories are captured** (the search-order-hijack signal is the path) but the user-profile segment of a path is scrubbed at the edge (`C:\Users\<redacted>\…`); no command line is ever captured. **No data is recorded until a collector for the host's OS ships** — the `$Module_*` tables are queryable but return zero rows until then (M2 Windows ETW, M4/M5 macOS Endpoint Security, M6 Linux auditd; see [`tar-module-loads.md`](../tar-module-loads.md)). Set to `false` to opt out. |
@@ -131,7 +131,7 @@ Use the `configure` action to adjust TAR behavior.
 - `process_stabilization_exclusions` matching is **case-insensitive substring**, not real glob. Leading and trailing `*` are stripped; `?` and `[abc]` are treated as literals. The **effective substring** (after stripping `*`) must be at least **3 characters** — a shorter one (e.g. `"a"`, or `"*a*"`, which strips to `"a"`) would match almost every process and is **rejected**. Use a longer substring (`"-helper"`, `"chrome-helper"`). Matching is on the **process name only**, so a binary renamed to contain an approved substring evades capture — exclusions are a noise-reduction convenience, **not a threat-hunting control**.
 - `network_capture_method` is validated against the **running host's OS** accept-list, not the union across all platforms — e.g. a Linux agent rejects the Windows-only `iphlpapi`. `polling` is always accepted (the platform default). Run the `compatibility` action to see the live accepted list for a given agent.
 - Disabling a collector (`<source>_enabled=false`) **atomically** stops new captures — the disable runs under the collection lock, so an in-flight cycle either completes before the stop takes effect or observes the disabled flag and skips (no extra snapshot slips through). Existing rows remain queryable. On re-enable the source starts from a **clean baseline**: the snapshot-diff state is cleared on disable, so the first collection cycle after re-enable emits a `started` event for every entity currently running/open (an expected one-time rebaseline, not a real-time burst) and **never** ghost `stopped` events for entities that exited during the pause. If the agent database is momentarily busy and the baseline cannot be cleared, the disable is **refused** — the source stays enabled and `configure` returns an error — so a disabled source can never be left with a stale baseline; retry the disable.
-  - The interval samplers (`perf` and `procperf`) report the **delta** between consecutive readings rather than started/stopped events, and keep that previous reading in memory. Disabling them resets that in-memory baseline under the same collection lock, and the sampler re-checks the disabled flag after taking the lock — so disabling them is equally atomic, and the **first** sample after a re-enable establishes a fresh baseline rather than reporting one row whose averaged rate covers the entire paused window. This matters most for `procperf` (per-application CPU/memory), which is off by default for privacy: no usage row ever spans the period it was disabled.
+  - The interval samplers (`perf` and `procperf`) report the **delta** between consecutive readings rather than started/stopped events, and keep that previous reading in memory. Disabling them resets that in-memory baseline under the same collection lock, and the sampler re-checks the disabled flag after taking the lock — so disabling them is equally atomic, and the **first** sample after a re-enable establishes a fresh baseline rather than reporting one row whose averaged rate covers the entire paused window. This matters most for `procperf` (per-application CPU/memory): no usage row ever spans the period it was disabled.
 
 Example:
 
@@ -335,11 +335,10 @@ configuration table above). `netqual_capture_method` reports the per-connection 
 mechanism actually in effect — `inetdiag` (Linux), `estats` (Windows once the
 elevation gate has latched active), `estats_pending` (Windows, netqual enabled
 but the first collect tick has not yet tested elevation — or netqual is off), or
-`none` (Windows non-elevated after the access-denied latch, macOS) — so "opted in
+`none` (Windows non-elevated after the access-denied latch, macOS) — so "enabled
 but the agent can't collect" is distinguishable from "off", and a non-elevated
-agent never briefly advertises `estats` before flipping to `none`. The
-default-ON sources — `process`, `tcp`, `service`, `user`, and `perf` — report
-`<source>_enabled|true`. `module_live_rows` stays `0` until a collector for the
+agent never briefly advertises `estats` before flipping to `none`.
+`module_live_rows` stays `0` until a collector for the
 host's OS ships; likewise `dns` is **Windows-only today** (planned on
 Linux/macOS), so on a Linux or macOS agent `dns_enabled|true` still reports
 `dns_live_rows|0`. `arp` is wired on every OS (Linux via `/proc/net/arp`; macOS
@@ -473,7 +472,7 @@ The first frame surfaces every device × source pair where the collector has bee
 1. Click **Scan fleet** to dispatch a `tar.status` command to the agents in your management-group scope. The scan-provenance header above the table reports how many agents were dispatched to, how many have responded so far, and how many have all sources collecting normally.
 2. Review the table. A row with a high `live_rows` count or a long pause duration may indicate forensic data accumulating without being queried.
 3. Click **Re-enable** on a row to dispatch `tar.configure` with `<source>_enabled=true` to that single device. The row drops optimistically; click **Refresh** to reconcile against a fresh scan.
-4. Click **Purge data** on a row to **permanently drop** all of that source's stored rows (`<source>_{live,hourly,daily,monthly}`) **without** re-enabling the collector — for "we've preserved what we need; reclaim the disk but keep collection paused." Because this is irreversible you must **type the device hostname** to confirm. The source stays paused and the row remains (with a "Purge dispatched" note); click **Scan fleet** to see the counts drop to zero. If the source was re-enabled since your last scan the agent refuses the purge (`source_not_paused`) and nothing is deleted.
+4. Click **Purge data** on a row to **permanently drop** all of that source's stored rows (`<source>_{live,hourly,daily,monthly}`) **without** re-enabling the collector — for "we've preserved what we need; reclaim the disk but keep collection paused." Because this is irreversible you must **type the device hostname** to confirm. The source stays paused and the row remains (with a "Purge dispatched" note); click **Scan fleet** to see the counts drop to zero. If the source was re-enabled since your last scan the agent refuses the purge (`source_not_paused`) and nothing is deleted. If the agent cannot read the source's enable flag it also refuses (`config_unreadable`: it could not confirm the source is paused) and nothing is deleted.
 
 **Purge is destructive and irreversible.** It drops rows for the named source on the named device only — other sources and other devices are untouched. The typed-hostname confirmation is your last checkpoint; there is no undo.
 
@@ -482,7 +481,7 @@ The first frame surfaces every device × source pair where the collector has bee
 - Viewing the page and the retention-paused list requires `Infrastructure:Read`.
 - **Scan fleet** requires `Execution:Execute` (it dispatches a fleet-wide command).
 - **Re-enable** requires `Execution:Execute` (it dispatches a configure command to a single device).
-- **Purge data** requires `Infrastructure:Delete` — a **higher** tier than Re-enable, because it is destructive. It is management-group scope-checked like Re-enable (out-of-scope `device_id` collapses to the same 404). The "only purge a paused source" rule is enforced **on the agent** (it refuses with `source_not_paused` if the source is enabled), so a source re-enabled between your scan and the purge is never dropped. Requires an agent that supports the `tar.purge_source` action (v0.14.0+); an older agent silently no-ops the purge — verify with a fresh **Scan fleet**.
+- **Purge data** requires `Infrastructure:Delete` — a **higher** tier than Re-enable, because it is destructive. It is management-group scope-checked like Re-enable (out-of-scope `device_id` collapses to the same 404). The "only purge a paused source" rule is enforced **on the agent** (it refuses with `source_not_paused` if the source is enabled, or `config_unreadable` if the enable flag cannot be read so it cannot confirm the source is paused), so a source re-enabled between your scan and the purge is never dropped. Requires an agent that supports the `tar.purge_source` action (v0.14.0+); an older agent silently no-ops the purge — verify with a fresh **Scan fleet**.
 - The per-device **Re-enable** and **Purge data** endpoints are management-group scope-checked — it rejects out-of-scope `device_id` values with the same 404 response as a not-connected agent (no enumeration oracle). The **Scan dispatch and the rendered list**, however, currently gate only on the *global* `Execution:Execute` / `Infrastructure:Read` permission: management-group confinement of these **list/fan-out** views is **not yet effective** (tracked as the ADR-0017 admit-then-filter gate) — under RBAC a confined operator is denied at the global gate rather than shown a narrowed list. When RBAC is **disabled** (the default), reads return the full enrolled fleet; when RBAC is **enabled**, list views require the global permission and per-device routes additionally enforce your management-group role assignments.
 
 **State persistence:** Scan results are held in the server's memory keyed by your username. Restarting the server clears the last-scan reference; click **Scan fleet** again after a restart. Persistence across restarts and multi-server coordination are planned for Phase 15.G operational hardening.
@@ -695,8 +694,9 @@ condition clears.
 > action. A source whose `<source>_enabled` row cannot be read at all is treated as
 > disabled for that tick (fail-closed) and its stored rows are preserved.
 
-> **Upgrade note (device perf sampling; per-app sampling is opt-in).** On
-> upgrade to this release, every Windows agent continues **device** performance
+> **Upgrade note (device perf sampling; per-app sampling is opt-in).**
+> *(Superseded: every capture source now ships on by default — see the v8
+> note above.)* On upgrade to this release, every Windows agent continues **device** performance
 > sampling (`perf_enabled` defaults to `true`, 30-second cadence — unchanged
 > from the prior release). **Linux agents BEGIN device performance sampling on
 > upgrade to this release**: the Linux `perf` collector (procfs) is new, and
@@ -742,7 +742,9 @@ condition clears.
 > `fast_interval` tick (default 60 s) — an empty panel immediately after enabling
 > is expected, not a fault.
 
-> **Upgrade note (new `software` source — OFF by default).** This
+> **Upgrade note (new `software` source — OFF by default).**
+> *(Superseded: every capture source now ships on by default — see the v8
+> note above.)* This
 > release adds the `software` install/uninstall source, which ships **off by
 > default** (opt-in) — a cautious posture for a new capture source. On Windows it
 > captures **machine-wide** inventory (HKLM Uninstall —
@@ -847,7 +849,7 @@ Table names use `$`-prefixed identifiers (e.g., `$Process_Live`) which the agent
 | **NetConn** | `$NetConn_Live` (20000 rows) | — | — | — |
 | **MapDrive** | `$MapDrive_Live` (5000 rows) | `$MapDrive_Hourly` (24h) | — | — |
 
-The `$Module_*` tables are **registered and queryable now (M1), but empty** — they return zero rows until the OS-specific collector ships (M2 Windows ETW, M4/M5 macOS Endpoint Security, M6 Linux auditd) and `module_enabled=true` is set. See [`tar-module-loads.md`](../tar-module-loads.md) for the ladder.
+The `$Module_*` tables are **registered and queryable now (M1), but empty** — they return zero rows until the OS-specific collector ships (M2 Windows ETW, M4/M5 macOS Endpoint Security, M6 Linux auditd). See [`tar-module-loads.md`](../tar-module-loads.md) for the ladder.
 
 The `$Software_*` tables are populated on **Windows** when the source is enabled (the default; disable with `software_enabled=false`); on **Linux/macOS** they are registered and queryable but empty until those collectors ship.
 

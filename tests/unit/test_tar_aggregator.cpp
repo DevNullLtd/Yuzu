@@ -15,6 +15,8 @@
 #include "tar_status_format.hpp"
 #include "test_helpers.hpp"
 
+#include <sqlite3.h> // second connection: selective config-read fault injection
+
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
@@ -24,6 +26,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <filesystem>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -47,6 +50,30 @@ int64_t row_count(TarDatabase& db, const std::string& table) {
     REQUIRE(res.has_value());
     REQUIRE(res->rows.size() == 1);
     return std::stoll(res->rows[0][0]);
+}
+
+// Make ONLY the read of `tar_config.value` for `key` fail (at step, not prepare),
+// from a second connection to the same file, leaving every other key and the
+// warehouse readable. `value` becomes a VIRTUAL generated column whose expression
+// overflows for that one key (row-dependent, so SQLite cannot fold it away -- and the
+// row must therefore exist, which is why a stored value is written first). Its
+// writers then fail at prepare ("cannot INSERT into generated column"), which the
+// retention pass tolerates. Dropping or renaming tar_config instead would fail
+// every read and send run_retention down the first-pass bootstrap decline: a
+// pass that preserves rows for the wrong reason.
+void make_config_key_unreadable(const std::filesystem::path& db_path, const std::string& key) {
+    yuzu::test::SqliteHandleOwner<sqlite3> owner;
+    REQUIRE(sqlite3_open(db_path.string().c_str(), &owner.db) == SQLITE_OK);
+    sqlite3_busy_timeout(owner.db, 5000);
+    const auto sql =
+        std::format("INSERT INTO tar_config (key, value) VALUES ('{0}', 'true') "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value; "
+                    "ALTER TABLE tar_config RENAME COLUMN value TO value_raw; "
+                    "ALTER TABLE tar_config ADD COLUMN value TEXT GENERATED ALWAYS AS "
+                    "(CASE WHEN key = '{0}' THEN abs(-9223372036854775808 + 0 * length(key)) "
+                    "ELSE value_raw END) VIRTUAL;",
+                    key);
+    REQUIRE(sqlite3_exec(owner.db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
 }
 
 // Seed 48 hourly rows centered on t_now so half (h=0..23) fall inside the
@@ -283,12 +310,14 @@ TEST_CASE("TAR paused_at: recovering an errored source via =true clears the time
 
 TEST_CASE("TAR source_enabled: the destructive-purge paused-guard predicate (15.A)",
           "[tar][source-enabled][purge]") {
-    // source_enabled is the authoritative guard for tar.purge_source: the action
-    // refuses unless this returns false (source is paused). Pin the exact predicate
-    // the plugin branches on so a regression that mis-reads the enabled-state — and
-    // would let a purge hit an actively-collecting source, or wrongly refuse a
-    // paused one — is caught here even though do_purge_source itself lives in the
-    // (test-unlinked) plugin TU. Governance B1.
+    // tar.purge_source branches on source_enabled_state(): confirmed enabled ->
+    // source_not_paused, unreadable -> config_unreadable (REFUSES), purge only on a
+    // confirmed disabled. For a confirmed stored value source_enabled() gives the
+    // same answer, so this pins the enabled-state mapping a regression would break
+    // (letting a purge hit an actively-collecting source, or wrongly refusing a
+    // paused one) even though do_purge_source lives in the (test-unlinked) plugin
+    // TU; the unreadable arm is pinned by the source_enabled_state case below.
+    // Governance B1.
     yuzu::test::TempDbFile tmp{std::string_view{"tar-15a-guard-"}};
     auto opened = TarDatabase::open(tmp.path);
     REQUIRE(opened.has_value());
@@ -886,7 +915,7 @@ TEST_CASE("TAR default-on: source_enabled() is true for every registered source 
     // into the unit-test exe): every collect/retention/purge gate routes through
     // source_enabled(), which reads the registry default for a never-configured
     // source.
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-default-on-"}};
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_default_on_"}};
     auto opened = TarDatabase::open(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
@@ -907,7 +936,7 @@ TEST_CASE("TAR source_enabled_state: a failed read is nullopt; absent/stored/err
     // Those branch on source_enabled_state(), whose nullopt means "do nothing".
     // do_purge_source lives in the test-unlinked plugin TU, so this pins the
     // tri-state it consumes.
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-enabled-state-"}};
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_enabled_state_"}};
     auto opened = TarDatabase::open(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
@@ -934,7 +963,7 @@ TEST_CASE("TAR default-on: the first disable of any source is a real transition"
           "[tar][paused_at][default-on]") {
     // Every source defaults enabled, so the first-ever `<src>_enabled=false` on
     // a fresh DB is an enabled->disabled transition and writes paused_at.
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-default-on-"}};
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_default_on_"}};
     auto opened = TarDatabase::open(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
@@ -984,6 +1013,36 @@ TEST_CASE("TAR retention: a corrupt/errored _enabled value preserves rows, never
     auto tcp_remaining = row_count(db, "tcp_hourly");
     CHECK(tcp_remaining > 0); // enabled => aged normally
     CHECK(tcp_remaining < 48);
+}
+
+TEST_CASE("TAR retention: an UNREADABLE enable flag preserves rows and never prunes (#560)",
+          "[tar][retention][source-lifecycle][fail-closed]") {
+    // The case above is a readable-but-corrupt value. Here the READ itself fails
+    // for `process_enabled` only. Retention must treat that as "do not prune"
+    // (the shared source_enabled() gate); a fallback to get_config(.., default
+    // true) would read the failure as the default and prune the forensic window.
+    // tcp is the control: its flag still reads, so it is pruned -- the process
+    // rows survive because of the gate, not because the whole pass bailed.
+    yuzu::tar::RetentionGuardState guard;
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_unreadable_flag_"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    const int64_t t_now = 1'735'689'600 + kHourlyCutoffSec;
+    seed_process_hourly(db, t_now);
+    seed_tcp_hourly(db, t_now);
+    REQUIRE(db.set_config("retention_guard_last_pass", std::to_string(t_now)));
+
+    make_config_key_unreadable(tmp.path, "process_enabled");
+    REQUIRE_FALSE(source_enabled_state(db, "process").has_value()); // the fault bites
+    REQUIRE(source_enabled(db, "tcp"));                             // ...and only there
+
+    run_retention(db, t_now, guard);
+
+    CHECK(row_count(db, "process_hourly") == 48); // unreadable flag => preserved
+    CHECK(row_count(db, "tcp_hourly") < 48);      // control: the pass ran and pruned
 }
 
 TEST_CASE("TAR canonical_source_enabled is a strict tri-state (#560)", "[tar][source-lifecycle]") {
