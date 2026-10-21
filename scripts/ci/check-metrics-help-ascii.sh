@@ -47,8 +47,10 @@
 #       non-ASCII HELP literal is FATAL, not cosmetic: in a string, a code
 #       point above 255 makes prometheus_text_format raise badarg, so every
 #       scrape of :9568/metrics answers HTTP 500 for the whole registry
-#       (#4707, #5177); a non-ASCII binary is instead rejected when the
-#       metric is declared, at gateway start. Scanning it here means the PR
+#       (#4707, #5177). A non-ASCII binary behaves differently: one whose
+#       bytes include 0x80-0x9F (an em dash's UTF-8 does) is rejected when
+#       the metric is declared, at gateway start, and any other renders its
+#       raw bytes. This lint flags all of them. Scanning it here means the PR
 #       fast path catches it without Erlang. Only the tuple's real string
 #       literals are scanned: a `"` in a comment, a quoted atom or a `$"`
 #       literal inside the tuple is never paired with one.
@@ -56,13 +58,19 @@
 #       are NOT parsed: their delimiter/escape rules are where a lexer this
 #       small would mis-parse silently. A file that contains `{help` and
 #       either construct fails LOUDLY instead; extend erl_code_mask first.
-#       Residual: this lint sees only a literal at the `{help, ...}` site. A
-#       `\x{2014}` escape inside a string is ASCII in the source, and a HELP
-#       that is not a literal there (a `?MACRO`, a variable, a helper's
-#       argument, the map form `#{help => ...}`, or a `{'help', ...}` atom
-#       spelling) is not seen at all. Both pass this lint;
+#       Residual: this lint checks only the characters written inside the
+#       string literals of a `{help, ...}` tuple. It does not see:
+#         - an escape inside a string (`\x{2014}`, octal `\351`), which is
+#           ASCII in the source;
+#         - a non-ASCII value written outside a string literal: a `$` char
+#           literal, an integer code point (`[8212]`) or a byte binary
+#           (`<<226,128,148>>`);
+#         - a HELP that is not a literal at the site: a `?MACRO`, a variable,
+#           a helper's argument, the map form `#{help => ...}`, or a
+#           `{'help', ...}` key spelling.
+#       All of these pass this lint;
 #       yuzu_gw_telemetry_tests:metrics_scrape_renders_test_ renders the real
-#       registry and remains the backstop for those.
+#       registry and remains the backstop for them.
 #
 # Usage:
 #   scripts/ci/check-metrics-help-ascii.sh              # scan the real tree
