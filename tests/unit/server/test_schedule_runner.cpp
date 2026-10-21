@@ -140,6 +140,10 @@ struct Harness {
     // Error injection for the ledger reads (the runner must HOLD, never read it as empty).
     bool outbox_read_error{false};
     bool outbox_read_throws{false};
+    bool outbox_exists_error{false};              // only the occurrence_exists read fails
+    std::set<std::string> outbox_error_ids;       // only the ledger read for these approval ids fails
+    std::map<std::string, int> ledger_calls;      // ledger reads per approval id
+    int exists_calls{0};
     // Runs inside enqueue_fn, i.e. AFTER the runner took its ticket snapshot.
     std::function<void()> on_enqueue_hook;
 
@@ -185,9 +189,10 @@ struct Harness {
               .outbox_occurrences_fn =
                   [this](const std::string& approval_id)
                   -> std::expected<std::vector<std::string>, std::string> {
+                  ++ledger_calls[approval_id];
                   if (outbox_read_throws)
                       throw std::runtime_error("ledger boom");
-                  if (outbox_read_error)
+                  if (outbox_read_error || outbox_error_ids.contains(approval_id))
                       return std::unexpected("ledger unavailable");
                   std::vector<std::string> out;
                   for (const auto& [occ, appr] : outbox_rows)
@@ -197,9 +202,10 @@ struct Harness {
               },
               .outbox_exists_fn = [this](const std::string& occurrence_id)
                   -> std::expected<bool, std::string> {
+                  ++exists_calls;
                   if (outbox_read_throws)
                       throw std::runtime_error("ledger boom");
-                  if (outbox_read_error)
+                  if (outbox_read_error || outbox_exists_error)
                       return std::unexpected("ledger unavailable");
                   return outbox_rows.contains(occurrence_id);
               },
@@ -1095,9 +1101,11 @@ TEST_CASE("ScheduleRunner: retire ok but advance failing runs once and advances 
 }
 
 // #6096 outbox guard: a ticket the outbox shows was used by an EARLIER occurrence is never
-// fired, whatever consumed_at says (an old-binary leader fired it without settling it).
-TEST_CASE("ScheduleRunner: an approved ticket already used by an earlier occurrence does not "
-          "fire and is settled later (#6096)",
+// fired, whatever consumed_at says (an old-binary leader fired it without settling it). It is
+// settled on the FIRST tick it is seen (marker "ledger-spent:"), so it neither lingers nor
+// costs a ledger read and a log line on every later tick.
+TEST_CASE("ScheduleRunner: an approved ticket already used by an earlier occurrence is settled "
+          "once, never fired (#6096)",
           "[schedule][runner][approval][pg][6096]") {
     Harness h;
     h.model_outbox = true;
@@ -1111,15 +1119,151 @@ TEST_CASE("ScheduleRunner: an approved ticket already used by an earlier occurre
     CHECK(h.enqueues.empty()); // not fired
     CHECK(h.outbox_rows.size() == 1);
     CHECK(h.get(id).next_execution_at == 1);
-    const std::string p2 = h.only_pending(); // a fresh ask instead
+    auto spent = h.approvals.get(p1);
+    REQUIRE(spent.has_value());
+    CHECK(spent->consumed_at != 0); // settled on the first tick
+    CHECK(spent->consumed_by == "schedule:ledger-spent:" + id + ":1");
+    const std::string p2 = h.only_pending(); // a fresh ask, raised once
     CHECK(p2 != p1);
+    const int reads_after_first = h.ledger_calls[p1];
+    CHECK(reads_after_first >= 1);
+
+    h.runner.tick();
+    h.runner.tick();
+    CHECK(h.ledger_calls[p1] == reads_after_first); // not re-queried on later ticks
+    CHECK(h.approvals.query({.status = "pending"}).size() == 1); // still the one ask
 
     REQUIRE(h.approvals.approve(p2, "boss", "ok").has_value());
-    h.runner.tick(); // fires p2 and settles every observed ticket, p1 included
+    h.runner.tick();
     REQUIRE(h.enqueues.size() == 1);
     CHECK(h.enqueues[0].approval_id == p2);
-    CHECK(h.approvals.get(p1)->consumed_at != 0);
     CHECK(h.approvals.get(p2)->consumed_at != 0);
+}
+
+// The ledger-settle retire failing holds the occurrence: no fresh ask, no advance.
+TEST_CASE("ScheduleRunner: a failed ledger-spent settle holds the occurrence (#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    Harness h;
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+    h.outbox_rows["earlier:occurrence"] = p1;
+
+    h.block_retire();
+    h.runner.tick();
+    CHECK(h.enqueues.empty());
+    CHECK(h.get(id).next_execution_at == 1);
+    CHECK(h.approvals.query({.status = "pending"}).empty()); // no fresh ask while it holds
+    CHECK(h.approvals.get(p1)->consumed_at == 0);
+
+    h.unblock_retire();
+    h.runner.tick();
+    CHECK(h.approvals.get(p1)->consumed_at != 0);
+    (void)h.only_pending();
+}
+
+// A ledger error on a SECOND candidate still holds (the first candidate was fine).
+TEST_CASE("ScheduleRunner: a ledger error on a second candidate holds (#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    Harness h;
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+    // A second approved ticket for the same schedule. Whichever the list returns second must
+    // still be read, and its failure holds the whole occurrence.
+    auto p2 = h.approvals.submit("test.def", "admin", "", id, ApprovalOrigin::kSchedule, "procs",
+                                 "list");
+    REQUIRE(p2.has_value());
+    REQUIRE(h.approvals.approve(*p2, "boss", "ok").has_value());
+    h.outbox_rows["earlier:occurrence"] = p1; // p1 is spent; p2 is the fireable candidate
+    h.outbox_error_ids.insert(*p2);
+    // Make p1 the NEWER ticket so it is read first and p2 is genuinely the second candidate.
+    h.set_submitted_at(p1, h.approvals.get(*p2)->submitted_at + 100);
+
+    h.runner.tick();
+    CHECK(h.enqueues.empty());
+    CHECK(h.get(id).next_execution_at == 1);
+}
+
+// A4: the occurrence key is already in the outbox and nothing is eligible. The observed tickets
+// are settled BEFORE the advance, and a failure to read the outbox or to settle holds.
+TEST_CASE("ScheduleRunner: an unreadable outbox on the already-ran check holds and is counted "
+          "(#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    yuzu::MetricsRegistry metrics;
+    Harness h([](const std::string&, const std::string&, const std::string&) { return true; },
+              nullptr, &metrics);
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    (void)h.only_pending(); // the ask exists; no approved ticket yet
+
+    h.outbox_exists_error = true;
+    const double before = metrics.counter("yuzu_schedule_fire_failures_total").value();
+    h.runner.tick();
+    CHECK(h.exists_calls >= 2);
+    CHECK(metrics.counter("yuzu_schedule_fire_failures_total").value() == before + 1.0);
+    CHECK(h.get(id).next_execution_at == 1);                  // held
+    CHECK(h.approvals.query({.status = "pending"}).size() == 1); // no second ask
+}
+
+TEST_CASE("ScheduleRunner: the already-ran branch settles observed tickets before it advances, "
+          "and a settle failure holds (#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    Harness h;
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+    h.age_review(p1, kApprovalTicketTtlSeconds + 60); // observed, but not live: never eligible
+    h.outbox_rows[id + ":1"] = ""; // this occurrence already ran (a direct fire has no ticket)
+
+    h.block_retire();
+    h.runner.tick(); // A4 reached; the settle fails, so the occurrence is held
+    CHECK(h.get(id).next_execution_at == 1);
+    CHECK(h.approvals.get(p1)->consumed_at == 0);
+
+    h.unblock_retire();
+    h.runner.tick();
+    CHECK(h.approvals.get(p1)->consumed_at != 0); // settled BEFORE the advance
+    CHECK(h.approvals.get(p1)->consumed_by == "schedule:" + id + ":1");
+    CHECK(h.get(id).next_execution_at > 1);
+    CHECK(h.enqueues.empty());
+    CHECK(h.approvals.query({.status = "pending"}).empty()); // no fresh ask
+}
+
+// A rejected skip settles the observed approved tickets too, so a mismatch-skipped approval
+// cannot outlive the skip and fire after the definition is reverted.
+TEST_CASE("ScheduleRunner: a rejected skip also settles an observed approved ticket (#6096)",
+          "[schedule][runner][approval][pg][6096]") {
+    Harness h;
+    h.model_outbox = true;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick();
+    const std::string p1 = h.only_pending();
+    REQUIRE(h.approvals.approve(p1, "boss", "ok").has_value());
+
+    auto def = h.is.get_definition("test.def");
+    REQUIRE((def.has_value() && def->has_value()));
+    InstructionDefinition mutated = **def;
+    mutated.plugin = "script_exec";
+    mutated.action = "bash";
+    REQUIRE(h.is.update_definition(mutated).has_value());
+    h.runner.tick(); // p1 is a mismatch: a fresh ask p2 for the new content
+    const std::string p2 = h.only_pending();
+    REQUIRE(h.approvals.reject(p2, "boss", "no").has_value());
+
+    h.runner.tick(); // the rejection skips the occurrence
+    CHECK(h.enqueues.empty());
+    CHECK(h.get(id).next_execution_at > 1);
+    CHECK(h.approvals.get(p2)->consumed_at != 0);
+    CHECK(h.approvals.get(p1)->consumed_at != 0); // the mismatch-skipped approval, too
+    CHECK(h.approvals.get(p1)->status == "approved");
 }
 
 TEST_CASE("ScheduleRunner: an outbox row for THIS occurrence is the legitimate retry (#6096)",

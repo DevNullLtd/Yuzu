@@ -6,6 +6,7 @@
  *         approve nonexistent.
  */
 
+#include <algorithm>
 #include <array>
 #include "approval_manager.hpp"
 #include "approval_model.hpp"
@@ -1270,13 +1271,17 @@ TEST_CASE("ApprovalManager: every stamp and expiry cutoff is authored in-SQL fro
     // spelling an exact-match check would miss (R3-QE-1).
     CHECK(count_occurrences(lc, "::now(") == 0);
     CHECK(count_occurrences(lc, "submit_stamp_epoch") == 0);
-    for (const std::string_view banned :
-         {"system_clock", "steady_clock", "high_resolution_clock", "utc_clock", "tai_clock",
-          "gps_clock", "file_clock", "clock_gettime", "gettimeofday", "time_t", "std::time(",
-          "time(nullptr)", "time(null)", "time(0)", "time(&", "localtime", "gmtime", ".now(",
-          "now (", "clock(", "clock_timestamp", "current_timestamp", "statement_timestamp",
-          "transaction_timestamp", "localtimestamp"}) {
+    // The haystack is lower-cased, so every needle must be lower case or it can never match.
+    const std::vector<std::string_view> banned_list = {
+        "system_clock", "steady_clock", "high_resolution_clock", "utc_clock", "tai_clock",
+        "gps_clock", "file_clock", "clock_gettime", "gettimeofday", "time_t", "std::time(",
+        "time(nullptr)", "time(null)", "time(0)", "time(&", "localtime", "gmtime", ".now(",
+        "now (", "clock(", "clock_timestamp", "current_timestamp", "statement_timestamp",
+        "transaction_timestamp", "localtimestamp"};
+    for (const std::string_view banned : banned_list) {
         INFO("banned clock API: " << banned);
+        CHECK(std::none_of(banned.begin(), banned.end(),
+                           [](unsigned char ch) { return std::isupper(ch) != 0; }));
         CHECK(lc.find(banned) == std::string::npos);
     }
     // The one database clock: SQL `now()` (any case) appears only in kDbNowEpochSql's own
@@ -1357,11 +1362,15 @@ TEST_CASE("Schedule path: the process-clock reads are an allow-listed, documente
     };
     const std::string runner_lc = lower(runner);
     const std::string engine_lc = lower(engine);
+    const std::vector<std::string_view> banned_list = {
+        "steady_clock", "high_resolution_clock", "utc_clock", "tai_clock", "gps_clock",
+        "file_clock", "clock_gettime", "gettimeofday", "std::time(", "time(nullptr)",
+        "time(null)", "time(0)", "localtime", "gmtime"};
+    for (const std::string_view banned : banned_list)
+        CHECK(std::none_of(banned.begin(), banned.end(),
+                           [](unsigned char ch) { return std::isupper(ch) != 0; }));
     for (const auto* code : {&runner_lc, &engine_lc})
-        for (const std::string_view banned :
-             {"steady_clock", "high_resolution_clock", "utc_clock", "tai_clock", "gps_clock",
-              "file_clock", "clock_gettime", "gettimeofday", "std::time(", "time(nullptr)",
-              "time(NULL)", "time(0)", "localtime", "gmtime"}) {
+        for (const std::string_view banned : banned_list) {
             INFO("banned clock API: " << banned);
             CHECK(code->find(banned) == std::string::npos);
         }
