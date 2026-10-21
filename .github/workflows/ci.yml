@@ -544,6 +544,7 @@ jobs:
           bash tests/shell/test_fork_dynamic_review_validate.sh  # quarantine-ref guard on the hosted fork review (#4471)
           bash tests/shell/test_trusted_fork_purge.sh            # trusted-fork cache-scope purge job (#4471)
           bash tests/shell/test_check_elf_floor.sh               # Linux ELF floor gate, ADR-2003 S0 (builds fixtures with gcc)
+          bash tests/shell/test_pr2_gates.sh CH-18 CH-20 CH-21 CH-22 CH-24  # local coverage gate: fast subset of the mock chaos harness, ~25 s (#5803; the full harness is #6116)
 
       # Prometheus HELP-text ASCII gate (#2128). Source-only, no build deps,
       # so it belongs on the PR fast path beside the shell gate above rather
