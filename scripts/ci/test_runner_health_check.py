@@ -515,11 +515,23 @@ class WorkflowWiringTests(unittest.TestCase):
         # dispatch doesn't comment on the shared nightly-broken issue; !cancelled()
         # (the property this test guards) is still the leading status-check function,
         # unaffected by the AND'd clause after it.
-        self.assertIn(
+        # #4019 added `contains(needs.*.result, 'cancelled')` so a leg that hits its
+        # timeout-minutes (reported `cancelled`, not `failure`) still opens the issue.
+        # It must sit INSIDE the leading !cancelled(): a whole-run cancel by an operator
+        # must still open nothing. Pin both the exact guard and that property.
+        guard = (
             "if: ${{ !cancelled() && inputs.jobs != 'windows-asan' && "
-            "(failure() || needs.preflight.result == 'failure') }}",
-            nightly,
+            "(failure() || contains(needs.*.result, 'cancelled') || "
+            "needs.preflight.result == 'failure') }}"
         )
+        self.assertIn(guard, nightly)
+        # The property, read from the ALERT job's own if: (not from `guard` above), so a
+        # future edit that keeps the text elsewhere but reorders this guard still fails.
+        alert = nightly[nightly.index("\n  alert:\n") :]
+        alert = alert[: alert.index("\n  close-on-green:\n")]
+        alert_if = next(l.strip() for l in alert.splitlines() if l.strip().startswith("if:"))
+        self.assertTrue(alert_if.startswith("if: ${{ !cancelled() && "), alert_if)
+        self.assertIn("contains(needs.*.result, 'cancelled')", alert_if)
 
     def test_sentinel_opens_an_issue_for_untyped_failures(self) -> None:
         sentinel = (ROOT / ".github" / "workflows" / "runner-inventory-sentinel.yml").read_text(
