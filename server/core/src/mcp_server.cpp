@@ -5491,7 +5491,8 @@ std::span<const ToolRecord> registered_tool_records() {
     return records;
 }
 
-// Every consumer of the tool tables reads THIS, never the raw tables, so the
+// Every consumer of the tool tables reads THIS, never the raw tables (except the test hook that
+// returns the unexpanded templates), so the
 // legacy rows and the registry records cannot disagree about what is served,
 // gated, classified or dispatched.
 //
@@ -5543,7 +5544,8 @@ struct Catalogue {
 // `records` is a parameter so a test can hand in a malformed set (the testonly
 // build_catalogue_for_test); production passes registered_tool_records().
 //
-// Refuses a malformed record by THROWING. The catalogue is first built in the
+// Refuses a malformed record, or served text that still carries an ecosystem marker or is
+// not valid JSON after expansion, by THROWING. The catalogue is first built in the
 // ServerImpl constructor (server.cpp calls approval_gated_tool_names()
 // unconditionally, even under --mcp-disable), before and independently of the boot
 // validator, so this check must be self-contained: a null field would otherwise be
@@ -5571,13 +5573,13 @@ Catalogue build_catalogue(std::span<const ToolRecord> records) {
     // sees the expanded text. A marker that survives would be served as a literal enum value, so
     // it refuses to boot naming the tool - this runs in the ServerImpl constructor, before and
     // independently of the McpServer validator, like the record_defect check above.
-    // mcp_server.cpp and the registry files carry no other `@@`.
+    // No other served tool text carries `@@`.
     constexpr auto residual = [](std::string_view s) {
         return s.find("@@") != std::string_view::npos ||
                s.find("@ECOSYSTEM_") != std::string_view::npos;
     };
     for (auto& t : c.served) {
-        const auto expand = [&](const char* label, const char*& field) {
+        const auto expand = [&](const char* label, const char*& field, bool is_json_schema) {
             if (field == nullptr)
                 return;
             const std::string_view text{field};
@@ -5587,14 +5589,20 @@ Catalogue build_catalogue(std::span<const ToolRecord> records) {
             if (residual(expanded))
                 throw std::logic_error(
                     std::string("MCP tool '") + t.name + "' " + label +
-                    " still carries an ecosystem token after expansion (a misspelt, single-@ or "
-                    "unquoted @@ECOSYSTEM_ token; see software_catalog_rules.hpp "
+                    " still carries an `@@` or `@ECOSYSTEM_` marker after expansion (a misspelt, "
+                    "single-@ or unquoted @@ECOSYSTEM_ token; see software_catalog_rules.hpp "
                     "expand_ecosystem_tokens)");
+            // Output schemas are spliced raw into tools/list and parsed nowhere at boot (input
+            // schemas are parsed later by compile_input_schema), so an expansion that yields
+            // malformed JSON is caught here. Never the description: it is prose.
+            if (is_json_schema && !nlohmann::json::accept(expanded))
+                throw std::logic_error(std::string("MCP tool '") + t.name + "' " + label +
+                                       " is not valid JSON after ecosystem token expansion");
             field = c.expanded_text.emplace_back(std::move(expanded)).c_str();
         };
-        expand("description", t.description);
-        expand("input schema", t.input_schema_json);
-        expand("output schema", t.output_schema_json);
+        expand("description", t.description, false);
+        expand("input schema", t.input_schema_json, true);
+        expand("output schema", t.output_schema_json, true);
     }
 
     c.raw_security.reserve(std::size(kToolSecurityRows) + records.size());
@@ -28811,13 +28819,15 @@ std::vector<ToolSchemaRowOwned> input_schemas_for_test() {
 
 std::vector<ToolTextRowOwned> tool_templates_for_test() {
     std::vector<ToolTextRowOwned> out;
-    const auto text = [](const char* p) { return p != nullptr ? std::string(p) : std::string(); };
+    const auto text = [](const char* p) {
+        return p != nullptr ? std::string(p) : std::string();
+    };
     for (const auto& t : kTools)
-        out.push_back({t.name, text(t.description), text(t.input_schema_json),
-                       text(t.output_schema_json)});
+        out.push_back(
+            {t.name, text(t.description), text(t.input_schema_json), text(t.output_schema_json)});
     for (const auto& r : registered_tool_records())
-        out.push_back({r.name, text(r.description), text(r.input_schema_json),
-                       text(r.output_schema_json)});
+        out.push_back(
+            {r.name, text(r.description), text(r.input_schema_json), text(r.output_schema_json)});
     return out;
 }
 

@@ -10,10 +10,11 @@ against the real tree, that:
   1. every published surface equals the agreed vocabulary (EXPECTED_*) — the one prose
      `kind (a|b)` enumeration per source file AND every JSON `enum` array the catalogue
      twins publish for `kind` (MCP input schemas, OpenAPI parameters) and for the OpenAPI
-     `ecosystem`; the ecosystem arrays are generated from kEcosystemFamilies by
-     software_catalog_rules.hpp's expand_ecosystem_tokens, pinned in C++ (the MCP side by
-     test_mcp_server.cpp's template provenance test), and the OpenAPI provenance is read from
-     the document check-api-parity.py decodes, not from bytes;
+     `ecosystem`; the ecosystem arrays are generated from kEcosystemFamilies - the MCP arrays
+     by software_catalog_rules.hpp's expand_ecosystem_tokens, the OpenAPI arrays by
+     rest_api_v1.cpp's copy of it - pinned in C++ (the MCP side by test_mcp_server.cpp's
+     template provenance test), and the OpenAPI provenance is read from the document
+     check-api-parity.py decodes, not from bytes;
   2. the values the agents emit are exactly that vocabulary (emitted == published);
   3. every non-Lane-1 ecosystem and Lane-3 kind is named in `is_os_native`, and `pkg`
      is NOT a kind-level trigger (it is routed by its ecosystem).

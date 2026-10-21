@@ -145,10 +145,11 @@ static_assert(ecosystem_table_well_formed(),
 /// kEcosystemFamilies: `"@@ECOSYSTEM_ENUM@@"` (quotes included) -> the quoted table items,
 /// `"@@ECOSYSTEM_ENUM_OR_EMPTY@@"` -> `"", ` + the items, `@@ECOSYSTEM_LIST@@` (bare) -> the
 /// pipe list. The quotes belong to the two ENUM tokens, so an unquoted enum token is left intact.
-/// A missing or malformed token is not an error here; each consumer guards its own templates (the
-/// OpenAPI completeness test, and build_catalogue()'s boot refusal in mcp_server.cpp).
-/// One allocation, sized to the largest the string reaches (the final size, or the template's
-/// when every substitution shrinks it): reserve() runs on an empty string (no capacity doubling),
+/// A missing or malformed token is not an error here; the consumer guards its template
+/// (build_catalogue()'s boot refusal in mcp_server.cpp).
+/// One allocation, sized to the largest the string reaches (the final size, the template's when
+/// every substitution shrinks it, or a mid-way peak when substitutions mix growing and
+/// shrinking): reserve() runs on an empty string (no capacity doubling),
 /// so the append and the in-place replaces below never reallocate for any well-formed table.
 [[nodiscard]] inline std::string expand_ecosystem_tokens(std::string_view tmpl) {
     const std::string items = ecosystem_json_enum_items();

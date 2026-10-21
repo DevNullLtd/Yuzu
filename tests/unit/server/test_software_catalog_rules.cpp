@@ -195,8 +195,7 @@ TEST_CASE("expand_ecosystem_tokens: each token form expands from the table",
     }
     SECTION("ENUM_OR_EMPTY is the empty string then the table") {
         const auto j = nlohmann::json::parse(
-            expand_ecosystem_tokens(R"({"enum":["@@ECOSYSTEM_ENUM_OR_EMPTY@@"]})"), nullptr,
-            false);
+            expand_ecosystem_tokens(R"({"enum":["@@ECOSYSTEM_ENUM_OR_EMPTY@@"]})"), nullptr, false);
         REQUIRE_FALSE(j.is_discarded());
         auto expected = table;
         expected.insert(expected.begin(), "");
@@ -233,15 +232,14 @@ TEST_CASE("expand_ecosystem_tokens: repeats and mixed kinds; no-op and empty inp
 
 TEST_CASE("expand_ecosystem_tokens: the quoted contract leaves malformed tokens for the guard",
           "[server][software_catalog][ecosystem]") {
-    // The consumer's guard (build_catalogue / the OpenAPI completeness test) decides; the
-    // expander never invents a substitution for a token it cannot match exactly.
+    // The consumer's guard (build_catalogue's boot refusal) decides; the expander never invents
+    // a substitution for a token it cannot match exactly.
     for (const char* bad : {"[@@ECOSYSTEM_ENUM@@]", "[\"@ECOSYSTEM_ENUM@@\"]",
                             "[\"@@ECOSYSTEM_ENM@@\"]", "[\"@@ECOSYSTEM_ENUM_OR_EMPTY@@]"}) {
         INFO(bad);
         CHECK(expand_ecosystem_tokens(bad) == bad);
     }
-    CHECK(expand_ecosystem_tokens("\"@@ECOSYSTEM_LIST@@\"") ==
-          "\"" + ecosystem_pipe_list() + "\"");
+    CHECK(expand_ecosystem_tokens("\"@@ECOSYSTEM_LIST@@\"") == "\"" + ecosystem_pipe_list() + "\"");
     CHECK(expand_ecosystem_tokens("@@ECOSYSTEM_LIST@@") == ecosystem_pipe_list());
 }
 

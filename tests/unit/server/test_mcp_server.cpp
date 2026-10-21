@@ -39249,7 +39249,7 @@ TEST_CASE("MCP ecosystem enums: every served ecosystem property and the pipe lis
     bool pipe_tool_seen = false;
     for (const auto& t : tools) {
         const auto name = t["name"].get<std::string>();
-        const auto& props = t["inputSchema"]["properties"];
+        const auto props = t["inputSchema"].value("properties", nlohmann::json::object());
         const bool empty_form =
             std::ranges::find(kEcosystemWithEmptyTools, name) != kEcosystemWithEmptyTools.end();
         INFO(name);
@@ -39261,7 +39261,7 @@ TEST_CASE("MCP ecosystem enums: every served ecosystem property and the pipe lis
             CHECK(got == (empty_form ? with_empty : table));
         }
         // An output schema is expanded and served too: any ecosystem enum it carries follows
-        // the same rule (none does today; this keeps one from being hand-typed later).
+        // the same rule (none does today; this keeps one from drifting from the table).
         if (t.contains("outputSchema")) {
             std::vector<nlohmann::json> out_enums;
             collect_ecosystem_enums(t["outputSchema"], out_enums);
@@ -39344,7 +39344,8 @@ TEST_CASE("MCP build_catalogue refuses a served text that still carries an ecosy
     }
     SECTION("a misspelt token in the input schema names the tool and the field") {
         auto r = good_registry_record();
-        r.input_schema_json = R"({"type":"object","properties":{"e":{"enum":["@@ECOSYSTEM_ENM@@"]}}})";
+        r.input_schema_json =
+            R"({"type":"object","properties":{"e":{"enum":["@@ECOSYSTEM_ENM@@"]}}})";
         CHECK_THROWS_MATCHES(build_catalogue_for_test(std::span<const ToolRecord>(&r, 1)),
                              std::logic_error,
                              Catch::Matchers::MessageMatches(
@@ -39353,7 +39354,8 @@ TEST_CASE("MCP build_catalogue refuses a served text that still carries an ecosy
     }
     SECTION("a single-@ token is refused") {
         auto r = good_registry_record();
-        r.input_schema_json = R"({"type":"object","properties":{"e":{"enum":["@ECOSYSTEM_ENUM@"]}}})";
+        r.input_schema_json =
+            R"({"type":"object","properties":{"e":{"enum":["@ECOSYSTEM_ENUM@"]}}})";
         CHECK_THROWS_WITH(build_catalogue_for_test(std::span<const ToolRecord>(&r, 1)),
                           Catch::Matchers::ContainsSubstring("input schema"));
     }
@@ -39369,8 +39371,24 @@ TEST_CASE("MCP build_catalogue refuses a served text that still carries an ecosy
         r.output_schema_json =
             R"({"type":"object","properties":{"e":{"enum":["@@ECOSYSTEM_ENUM_OR_EMPTY@@"]}}})";
         CHECK_NOTHROW(build_catalogue_for_test(std::span<const ToolRecord>(&r, 1)));
-        r.output_schema_json = R"({"type":"object","properties":{"e":{"enum":["@@ECOSYSTEM_X@@"]}}})";
+        r.output_schema_json =
+            R"({"type":"object","properties":{"e":{"enum":["@@ECOSYSTEM_X@@"]}}})";
         CHECK_THROWS_WITH(build_catalogue_for_test(std::span<const ToolRecord>(&r, 1)),
                           Catch::Matchers::ContainsSubstring("output schema"));
+    }
+    SECTION("a description with a misspelt token that has no @ECOSYSTEM_ substring is refused") {
+        auto r = good_registry_record();
+        r.description = "x @@ECOSYTEM_ENUM@@";
+        CHECK_THROWS_WITH(build_catalogue_for_test(std::span<const ToolRecord>(&r, 1)),
+                          Catch::Matchers::ContainsSubstring("description"));
+    }
+    SECTION("an expansion that yields malformed JSON in the output schema is refused") {
+        auto r = good_registry_record();
+        // Adjacent tokens expand to `"a", "b""a", "b"`: no residue, but not valid JSON.
+        r.output_schema_json =
+            R"({"type":"object","properties":{"e":{"enum":["@@ECOSYSTEM_ENUM@@""@@ECOSYSTEM_ENUM@@"]}}})";
+        CHECK_THROWS_WITH(build_catalogue_for_test(std::span<const ToolRecord>(&r, 1)),
+                          Catch::Matchers::ContainsSubstring("output schema") &&
+                              Catch::Matchers::ContainsSubstring("not valid JSON"));
     }
 }

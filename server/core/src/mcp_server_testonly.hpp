@@ -7,7 +7,8 @@
 // registry records, see mcp_tool_registry.hpp) so the annotation cross-check
 // test (a separate TU) can assert the served hints without duplicating the
 // maps. Every accessor below returns the MERGED view, not just the legacy
-// tables. Also exposes wrappers that run the REAL
+// tables (except tool_templates_for_test(), which returns the unexpanded
+// templates). Also exposes wrappers that run the REAL
 // C8 dispatch classifier / registration validator (#2383) over synthetic
 // tables, plus the validator's RBAC catalogue mirrors, so drift in any of
 // them cannot silently regress while tests stay green. Relocated out of

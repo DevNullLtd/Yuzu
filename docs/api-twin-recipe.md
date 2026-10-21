@@ -685,7 +685,9 @@ see §5 for which chokepoints apply.
    For a destructive action-twin, also decide `requires_approval()` (§3's "fifth registration
    point") explicitly — it is **not** boot-enforced, so a missed decision here fails silently, not
    loudly. Run the server locally after wiring the four tables — `validate_tool_security_registration`
-   will refuse to boot on any mismatch, which is the fastest way to find a missed table.
+   will refuse to boot on any mismatch, which is the fastest way to find a missed table. A tool
+   with an `ecosystem` enum writes the token, not an array, and joins the closed lists in
+   `test_mcp_server.cpp` (`docs/mcp-server.md`, "Adding a tool (checklist)").
 7. **Audit verb.** Pick (or reuse, if a REST/fragment twin already has one) a `noun.verb` action
    string per `docs/observability-conventions.md`'s audit envelope shape. Apply the correct posture
    per surface (§4) — fail-closed REST, set-and-proceed fragment, `audit_persisted:false` MCP, with
