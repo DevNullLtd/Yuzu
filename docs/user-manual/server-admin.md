@@ -1582,10 +1582,15 @@ one log per 60 seconds per reason; the counter records all of them). The per-rou
 earlier releases showed for individual dashboard actions are now produced only for a token caller of a
 route that keeps a non-token-exempt copy of the check.
 
-Cookie-session requests that dispatch work are held to the same rule, but a browser's own requests of
-that kind are decided first by the fetch metadata it sends (`Sec-Fetch-Site: same-origin`), so a proxy
-that rewrites `Host` does not refuse them; only a client that sends no `Sec-Fetch-Site` (a script) falls
-back to the `Origin` or `Referer` comparison that `--csrf-trusted-origin` feeds.
+Cookie-session requests that dispatch work (the guarded requests) are held to the same rule, but are
+decided first by the fetch metadata a browser sends (`Sec-Fetch-Site: same-origin`), so behind a
+TLS-terminating proxy, where the browser talks to the proxy over HTTPS, a proxy that rewrites `Host`
+does not refuse a browser's own guarded requests. A client that sends no `Sec-Fetch-Site` (a script,
+Safari before 16.4, or a browser talking plain HTTP to a non-loopback address, which sends no fetch
+metadata) falls back to the `Origin` or `Referer` comparison that `--csrf-trusted-origin` feeds. A
+same-origin `GET` carries no `Origin`, so for those clients the guarded requests depend on the
+`Referer` the browser sends; the server's default `Referrer-Policy` supplies it, and a proxy or page
+policy of `no-referrer` would break them. A repeated `Sec-Fetch-Site` header is refused.
 
 **Alerts.** The shipped `yuzu-web-writes` group in `docs/prometheus/yuzu-alerts.yml` watches the counter:
 `YuzuCookieWritesRefusedSameSite` (warning) fires when at least 3 `origin_mismatch` or `referer_mismatch`
@@ -1600,7 +1605,7 @@ and the threshold of 3 are tentative and have not been tuned against fleet data.
   `YUZU_CSRF_TRUSTED_ORIGIN`, restart every server replica; replicas with different values answer the
   same request `200` on one and `403` on another.
 - `/livez` and `/readyz` stay green, so a load-balancer or orchestrator health check never detects it.
-- Reads are not blocked by the check, but a refusal is not free: each one writes an audit row, and
+- Ordinary reads are not blocked by the check (the guarded requests are held to it, as above), but a refusal is not free: each one writes an audit row, and
   behind a proxy every operator shares the proxy's single per-IP rate-limit bucket. With a slow or
   degraded PostgreSQL a burst of refusals can therefore slow other requests down.
 - Bypass path: if you cannot create an API token through the proxy, reach the server directly (for
@@ -1704,7 +1709,7 @@ When no valid entry is configured the server instead prints one line stating the
 
 **What has NOT changed.** A request whose `Origin` already matches `Host` behaves exactly as before, so an unproxied deployment sees no difference for browsers. Leaving the flag unset means same-host only, which is correct for any deployment that does not rewrite `Host`. A request authenticated only by an API, MCP or engine token is not subject to this check.
 
-**What did change.** A cookie-session write that carries neither `Origin` nor `Referer` is refused `403`, including one from curl or other automation; use an API token or send the header.
+**What did change.** A cookie-session write that carries neither `Origin` nor `Referer` is refused `403`, including one from curl or other automation; use an API token or send the header. The guarded requests (cookie-session requests that dispatch work) are refused `403` unless they carry `Sec-Fetch-Site: same-origin` or `none`, or a same-site `Origin` or `Referer`.
 
 **Deliberately not implemented: `X-Forwarded-Host` is never consulted.** Reading it would let
 anyone able to reach the server's port declare their own external hostname and defeat the CSRF

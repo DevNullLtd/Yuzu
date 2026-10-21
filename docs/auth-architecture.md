@@ -152,10 +152,17 @@ from `server.cpp`'s pre-routing handler.
   guarded and a path off the table is not checked. For a guarded request token sources
   are admitted; a cookie source is decided by `Sec-Fetch-Site` first (`same-origin` or
   `none` admitted, any other value refused `origin_mismatch`) and by the `Origin`/`Referer`
-  rule only when that header is absent. No new refusal reason, metric or alert. Residuals:
-  header checks cannot tell a browser's own prefetch, prerender or link preview from a
-  user action, and a client that sends neither fetch metadata nor `Origin`/`Referer` is
-  refused. Rationale: the design record linked at the end of this section.
+  rule only when that header is absent. A repeated `Sec-Fetch-Site` header counts as a
+  non-matching value (`origin_mismatch`). Browsers send fetch metadata only to
+  potentially trustworthy origins (HTTPS, loopback), so a plain-HTTP non-loopback
+  listener, and Safari before 16.4, fall to the `Origin`/`Referer` rule, which for a
+  same-origin `GET` depends on `Referer` (the default `Referrer-Policy` supplies it).
+  The table also holds a v1 REST read that is cookie- and token-reachable; token callers
+  stay exempt. No new refusal reason, metric or alert. Residuals: header checks cannot
+  tell a browser's own prefetch, prerender or link preview from a user action; a client
+  that sends neither fetch metadata nor `Origin`/`Referer` is refused; and a small
+  number of cookie-reachable reads that read secrets-adjacent material or hold stream
+  leases are outside the list by decision. Rationale: the design record linked at the end of this section.
 - **Exemptions** are by placement only: the pre-session set in
   `is_login_exempt_path`, the health probes and the metrics endpoint return
   before session resolution and never reach the gate. There is no second list.

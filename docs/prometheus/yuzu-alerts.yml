@@ -5320,8 +5320,12 @@ groups:
     # Deliberately NOT alerted: reason="no_origin_no_referer". A header-less
     # cookie write is what a curl script reusing a cookie jar sends, and the
     # reason is common and benign at low volume; the two mismatch reasons are
-    # the ones that mean a browser sent a write from another site (or a proxy
-    # rewrote Host without --csrf-trusted-origin).
+    # the ones that mean a browser sent a request from another site (or a proxy
+    # rewrote Host without --csrf-trusted-origin). A refused Sec-Fetch-Site
+    # value also counts as origin_mismatch.
+    #
+    # The rule name YuzuCookieWritesRefusedSameSite is kept from when only
+    # writes were refused; renaming it would break existing consumers.
     rules:
       - alert: YuzuCookieWritesRefusedSameSite
         expr: |
@@ -5331,20 +5335,20 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Cookie-session requests are being refused for a cross-site Origin or Referer"
+          summary: "Cookie-session requests are being refused for a cross-site Origin, Referer or fetch metadata"
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#vnext--behind-a-reverse-proxy-declare-your-external-origin-or-csrf-gated-dashboard-actions-keep-failing-2537"
           description: >-
-            Three or more cookie-session requests were refused in 15 minutes
-            because the Origin or Referer did not name this site (or a
-            --csrf-trusted-origin entry). Two causes: a browser sent a write
-            from another site, or a reverse proxy rewrites the Host header and
-            the server was started without --csrf-trusted-origin (or
-            YUZU_CSRF_TRUSTED_ORIGIN), in which case every dashboard write
-            fails while reads keep working. Each refusal is audited as
-            csrf.denied with the closed reason; this alert sums over path_class,
-            so query yuzu_server_csrf_denied_total by path_class to see which
-            kind of route was targeted. Check the Host and Origin the proxy
-            forwards first.
+            Three or more cookie-session requests were refused in 15 minutes because
+            the Origin or Referer did not name this site (or a --csrf-trusted-origin
+            entry), or because the request's fetch metadata (Sec-Fetch-Site) was not
+            same-origin or none. Three causes: a browser sent a request from another
+            site, a reverse proxy rewrites the Host header and the server was started
+            without --csrf-trusted-origin (or YUZU_CSRF_TRUSTED_ORIGIN), in which case
+            every dashboard write fails, or a client sent a Sec-Fetch-Site value other
+            than same-origin or none. Each refusal is audited as csrf.denied with the
+            closed reason; this alert sums over path_class, so query
+            yuzu_server_csrf_denied_total by path_class to see which kind of route was
+            targeted. Check the Host and Origin the proxy forwards first.
 
       - alert: YuzuSameSiteGateInternalError
         expr: |
@@ -5354,7 +5358,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "The same-site write gate failed internally and refused writes"
+          summary: "The same-site gate failed internally and refused requests"
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#vnext--behind-a-reverse-proxy-declare-your-external-origin-or-csrf-gated-dashboard-actions-keep-failing-2537"
           description: >-
             The same-site check for cookie-session requests hit an internal

@@ -161,29 +161,53 @@ query. `HEAD` is included because the HTTP library routes it to the `GET` handle
 guarded. The gate's first statement returns for a request that is neither a write method nor a
 guarded read, so an ordinary read costs one method test and one path-prefix compare. For a guarded
 request the decision is: token sources admitted; otherwise, if `Sec-Fetch-Site` is present, `same-origin`
-or `none` admitted (case-insensitive) and any other value refused with `origin_mismatch`; if it is
-absent, the `Origin`/`Referer` rule applies exactly as for a write (neither header refused as
+or `none` admitted (case-insensitive) and any other value refused with `origin_mismatch`; a repeated
+`Sec-Fetch-Site` header is treated as a non-matching value and refused with `origin_mismatch` (the HTTP
+library reads the last value, so a first value could otherwise disagree with the one decided on); if the
+header is absent, the `Origin`/`Referer` rule applies exactly as for a write (neither header refused as
 `no_origin_no_referer`; otherwise the same-site comparison with trusted origins and the listener's TLS
-state). `Sec-Fetch-Site` is a forbidden header name: a browser sets it on every request and page script
-cannot. `none` is a navigation the user started (typed address, bookmark). `same-site` is refused
-because a sibling origin is not this origin. There is no new refusal reason, metric, label or alert;
-the audit `target_id` is `GET <path>` or `HEAD <path>`.
+state). `Sec-Fetch-Site` is a forbidden header name: page script cannot set it. A browser sends it only
+to a potentially trustworthy origin (HTTPS or loopback), so a plain-HTTP listener on a non-loopback
+address, and Safari before 16.4, send no fetch metadata and fall to the `Origin`/`Referer` rule. A
+same-origin `GET` carries no `Origin`, so on such a deployment the guarded requests depend on `Referer`;
+the server's own default `Referrer-Policy` (`strict-origin-when-cross-origin`) supplies it, and a proxy
+or page policy of `no-referrer` would break them. A TLS-terminating proxy is unaffected, because the
+browser talks to the proxy over HTTPS. `none` is a navigation the user started (typed address,
+bookmark). `same-site` is refused because a sibling origin is not this origin. There is no new refusal
+reason, metric, label or alert; the audit `target_id` is `GET <path>` or `HEAD <path>`. The audit
+`detail` text is the fixed write wording ("browser write refused") for a guarded request too.
 
 **Evidence.** The policy truth table covers every table entry for both methods; the pipeline fixture
 registers one guarded canary and asserts refusal shape, counter, audit row, handler not run, admission
 and the fallback cases; `tests/unit/server/test_same_site_exempt_inventory.cpp` fails on a table entry
 that is not a registered `GET` route and on a read-method registration whose handler contains a
-dispatch marker but is on neither the table nor a reviewed ledger (best-effort, lexical: a computed
+dispatch or state-change marker but is on neither the table nor a reviewed ledger (best-effort, lexical: a computed
 path or a dispatch reached through more than one helper hop is invisible to it); the live-stack
 category in `scripts/e2e-security-test.sh` drives one covered request through a real server with a
 cookie session for each fetch-metadata value, the header-less case, the `Referer` fallback, a token
-caller and `HEAD`.
+caller, `HEAD`, and the token-reachable v1 read in the table. The policy suite also spells out the
+table content literally, so replacing an entry fails it, and the pipeline fixture checks a repeated
+`Sec-Fetch-Site` header and the path spellings that the router and the gate must decide alike.
+
+**Round-6 additions.** The table gained further requests that persist state or force a refresh when
+read. One of them is a v1 REST route that is both cookie-reachable and token-reachable; token callers
+stay exempt there as everywhere. The cheap prefilter in `is_guarded_read` therefore accepts two path
+prefixes instead of one. The compile-time checks on the table carry messages that explain this coupling. The
+refusal remediation text now mentions fetch metadata.
+
+**Options not taken.** Requiring `Sec-Fetch-Mode: navigate` for the `none` value, so that only a real
+navigation is admitted without an `Origin` or `Referer`, is optional hardening and is not done: it
+would not change the prefetch residual below, and it adds a second header to reason about. Converting
+the guarded requests to `POST` stays the option not chosen above.
 
 **Residuals, accepted and stated.** Header checks do not distinguish a user action from a prefetch,
 prerender or link preview that the same user's own browser issues on its own initiative: such a
 request carries `same-origin` or `none` and is admitted. A client that sends neither fetch metadata
 nor `Origin`/`Referer` is refused. A request whose path is not on the table is not checked, so
-completeness rests on the tripwire above plus review. Fetch metadata is only as trustworthy as the
+completeness rests on the tripwire above plus review. Deliberately outside the list, by decision: a
+small number of cookie-reachable `GET`s that read secrets-adjacent material or hold a stream lease.
+The list covers the requests that dispatch work and the reads known to persist or refresh server
+state; it is not a claim that every state-changing `GET` is guarded. Fetch metadata is only as trustworthy as the
 client that sends it; a non-browser client can set any value, which is why this narrows browser-driven
 cross-site requests and is not an authorisation control.
 
@@ -195,7 +219,7 @@ the flag. A proxy must not inject or rewrite `Origin` or `Referer`, which would 
 There is no kill switch and no observe-only mode. Known consequence, accepted: a deployment whose
 proxy rewrites `Host` and that has no declared origin and no pre-existing API token loses every
 dashboard write, including creating a token, until it restarts with the flag or reaches the server
-directly; sign-in, reads and the health probes keep working, so no probe detects it. The upgrade
+directly; sign-in, ordinary reads and the health probes keep working, so no probe detects it. The upgrade
 section opens with a pre-upgrade checklist for this reason.
 
 The server behind a TLS-terminating proxy listens in plain HTTP and cannot see the public scheme, so
