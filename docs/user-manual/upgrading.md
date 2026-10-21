@@ -223,11 +223,19 @@ changes is which checks run.
   (step size minus 5 minutes) before the step) is expired permanently once an accepted submission has swept it
   (until then correcting the clock restores it), and older approved tickets stay live
   (observability tracked in #6098).
-- Submission time (`submitted_at`) and the schedule's own run stamps still come from the clock of the server that
-  wrote them, not from the database. Keep every server NTP-synchronised. When the server that submitted an approval
-  and the one that advances a recurring schedule disagree about the time (a leader change under clock skew, or a clock
-  step), an approved ticket can be used for an extra occurrence or be ignored and requested again, and a submitter
-  clock far from the database's lengthens or shortens how long its pending requests live. Tracked in #6096.
+- Submission time (`submitted_at`) now also comes from the database, like the review and use times, so a server
+  whose own clock is wrong can no longer lengthen or shorten how long its pending requests live. A recurring
+  schedule no longer decides that an approval is spent by comparing clocks: when the occurrence an approved ticket
+  belongs to has been queued, the ticket is marked used (and a rejected ticket is marked used when it skips its
+  occurrence), so one approval runs exactly one occurrence whatever the clocks say (#6096). The schedule's own run
+  times are still stamped by the server that advances it; they only decide when an occurrence is due.
+- **First tick after upgrading (#6096).** Before this release a spent scheduled ticket was never marked used; it was
+  recognised as spent by its submission time. The first time each schedule is processed after the upgrade, the server
+  marks as used every approved or rejected ticket of that schedule that was submitted at or before the schedule's last
+  run, so none of them can fire again (up to seven days of pre-upgrade tickets). A ticket that was in fact still
+  waiting is affected only if the clocks were skewed across the upgrade; it is then marked used and the schedule asks
+  for a fresh approval. If the database is unavailable during that step, the schedule's occurrence is held and the
+  step is retried on the next tick. Nothing to do; the step is removed one release later.
 - Tickets already approved when you upgrade keep their original `reviewed_at`; the seven days are counted
   from it.
 

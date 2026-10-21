@@ -252,6 +252,23 @@ database cutoff; that residual is tracked in #6096. The conclusion above (a stat
 `'expired'`, never a `DELETE`, so the seven-part apparatus's trigger is not met) stands. Current
 reasoning and residuals: `docs/clock-guarded-retention.md`, "`ApprovalManager` ticket liveness".
 
+**Amendment (2026-10-21, #6096):** the 2026-10-18 amendment's `submitted_at` residual is closed.
+`submit()` now authors `submitted_at` in-SQL from the same `now()` expression as every other stamp
+(`submit_stamp_epoch()` is deleted), so `approval_manager.cpp` reads no process clock and the
+stale-pending sweep compares database time with database time. The reason it had stayed
+process-stamped, `ScheduleRunner::ticket_is_current` comparing it with `ScheduleEngine`'s
+process-clock `last_executed_at`, is removed rather than worked around: one approval == one
+scheduled run is now a guarded state transition. `ApprovalManager::retire_for_schedule` sets
+`consumed_at` (database time, `consumed_by = 'schedule:<id>'`) with a CAS (`WHERE id AND schedule_id
+AND consumed_at = 0 AND status IN ('approved','rejected') RETURNING`), the runner calls it after the
+occurrence is durably enqueued and before the schedule advances, and a ticket is eligible only while
+`consumed_at = 0`. A retire failure holds the occurrence; the idempotent occurrence key makes the retry
+safe. `consume_ticket` still refuses `kSchedule` origins. `ScheduleEngine`'s own stamps stay process
+clock (due-ness bookkeeping, informational for approvals). A one-time legacy sweep
+(`retire_legacy_spent_for_schedule`, remove one release after it ships) retires tickets the old rule
+had already treated as spent. The ladder is otherwise unchanged. Reasoning:
+`docs/clock-guarded-retention.md`, "`ApprovalManager` ticket liveness".
+
 **Correction (adversarial review, 2026-08-31):** "ports shape-preserved" above was true of the two
 `UPDATE` statements themselves but not of their ORDER relative to the pending-count cap check.
 Both Kimi and Codex independently found — and cross-examination confirmed unanimously — that
