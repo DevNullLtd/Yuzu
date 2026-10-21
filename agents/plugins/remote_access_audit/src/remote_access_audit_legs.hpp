@@ -626,6 +626,7 @@ inline ServiceOutcome audit_service_linux(const PosixFs& fs, Tally& t) {
                                                                "ssh.socket", "sshd.socket"};
     ServiceOutcome out;
     bool any_answered = false;
+    bool any_failed = false;
     for (const auto unit : kUnits) {
         ++out.units;
         const auto r = fs.run({"is-enabled", std::string{unit}}, detail::service_options(4, 4096, /*merge_stderr=*/true));
@@ -637,18 +638,23 @@ inline ServiceOutcome audit_service_linux(const PosixFs& fs, Tally& t) {
                 out.state = SourceState::failed;
                 return out;
             }
+            any_failed = true;
             t.emit(out.rows, service_row(unit, "unknown", "systemctl_is_enabled"));
             continue;
         }
         const ServiceFact f = parse_systemctl_is_enabled(r.output, r.exit_code, unit);
-        if (!f.cause.empty())
+        if (!f.cause.empty()) {
             t.acc.add_failure(src_token(fs.os, "service", f.cause));
-        else
+            any_failed = true;
+        } else {
             any_answered = true;
+        }
         t.emit(out.rows, service_row(unit, f.state, "systemctl_is_enabled"));
     }
-    out.state = any_answered ? SourceState::read : SourceState::failed;
-    if (any_answered)
+    // A failed unit query makes the source `failed`, even beside units that answered: the
+    // answered units keep their rows and the failed ones say `unknown`, never `disabled`.
+    out.state = any_answered && !any_failed ? SourceState::read : SourceState::failed;
+    if (out.state == SourceState::read)
         ++t.read_sources;
     return out;
 }
@@ -770,7 +776,9 @@ inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tal
     }
     if (too_many)
         t.acc.add_failure(src_token(os, "homes", "too_many"));
-    if (lerr != 0)
+    // A partial listing (one root listed, another refused) still audits the homes it did list;
+    // the homes source row keeps the error state and token, so the unlisted root stays visible.
+    if (lerr != 0 && homes.empty())
         return out;
 
     if (fs.is_account_home)

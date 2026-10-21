@@ -123,6 +123,12 @@ struct Reader {
                (static_cast<std::uint32_t>(p[2]) << 8) | static_cast<std::uint32_t>(p[3]);
     }
 
+    std::optional<std::uint8_t> u8() {
+        if (left() < 1)
+            return std::nullopt;
+        return static_cast<std::uint8_t>(static_cast<unsigned char>(d[pos++]));
+    }
+
     std::optional<std::uint64_t> u64() {
         const auto hi = u32();
         const auto lo = u32();
@@ -323,8 +329,17 @@ inline bool skip_certificate_body(Reader& r) {
     const auto sig = r.str();
     if (!sig)
         return false;
+    // The signature field is itself a blob: the algorithm string, then the signature payload
+    // string, and nothing after (ssh-keygen -lf: "incomplete message" / "unexpected bytes remain
+    // after decoding"). A security-key (sk-*) algorithm carries its flags byte and counter
+    // after the payload, as ssh-ed25519-sk.c / ssh-ecdsa-sk.c verify them.
     Reader sr{*sig};
-    return sr.str().has_value(); // sshkey_get_sigtype: the signature leads with its type string
+    const auto alg = sr.str();
+    if (!alg || !sr.str())
+        return false;
+    if (alg->starts_with("sk-") && (!sr.u8() || !sr.u32()))
+        return false;
+    return sr.left() == 0;
 }
 
 } // namespace detail
@@ -494,14 +509,18 @@ inline std::optional<KeyOptions> parse_key_options(std::string_view s) {
 
 /// What reading one key off the front of `s[at..]` found. Mirrors sshkey_read: the decoded blob
 /// must be the same KEY TYPE as the token (rsa-sha2-256 and ssh-rsa are one type; an ECDSA token
-/// must name the blob's curve). Unknown types: see detail::is_key_type_name.
+/// must name the blob's curve). A type this table does not know is refused, never fingerprinted
+/// (its blob cannot be decoded completely): see the `unknown_refused` parameter.
 struct ReadKey {
     KeyFacts facts;
-    std::string type_token; ///< as written; a known name, or an unknown type (see unknown)
-    bool unknown = false;   ///< not in the known-name set: fingerprinted over the raw blob
+    std::string type_token; ///< as written, one of the known names
 };
 
-inline std::optional<ReadKey> try_read_key(std::string_view s, std::size_t at) {
+/// `unknown_refused`, when given, is set when the line was refused ONLY because its key type is
+/// unknown (the blob leads with that same name): the caller counts the line malformed and records
+/// why, so an operator can tell it from garbage.
+inline std::optional<ReadKey> try_read_key(std::string_view s, std::size_t at,
+                                           bool* unknown_refused = nullptr) {
     const auto tend = s.find_first_of(" \t", at);
     if (tend == std::string_view::npos)
         return std::nullopt;
@@ -535,18 +554,17 @@ inline std::optional<ReadKey> try_read_key(std::string_view s, std::size_t at) {
         out.facts = std::move(*facts);
         return out;
     }
-    // A type this table does not know (ssh-dss, a newer algorithm): inventoried when the
-    // blob leads with that same name, fingerprinted over the raw blob (which is what
-    // ssh-keygen does for a plain key). A certificate of an unknown type cannot be unwrapped.
-    // The name must also fit detail::is_key_type_name (it is written to the key row verbatim).
-    detail::Reader r{*blob};
-    const auto lead = r.str();
-    if (!lead || *lead != type_token || !detail::is_key_type_name(type_token) ||
-        type_token.find("-cert-v01@openssh.com") != std::string_view::npos)
-        return std::nullopt;
-    out.unknown = true;
-    out.facts.plain_blob = *blob;
-    return out;
+    // A type this table does not know (ssh-dss, a newer algorithm) is refused: its blob cannot be
+    // decoded completely, so it is never fingerprinted or reported as a key. When the blob at
+    // least leads with that same well-formed name the refusal is flagged, so the caller can tell
+    // "unknown type" from garbage (an OpenSSH 10 ssh-keygen -lf refuses such a key too).
+    if (unknown_refused != nullptr) {
+        detail::Reader r{*blob};
+        const auto lead = r.str();
+        *unknown_refused = lead && *lead == type_token && detail::is_key_type_name(type_token) &&
+                           type_token.find("-cert-v01@openssh.com") == std::string_view::npos;
+    }
+    return std::nullopt;
 }
 
 struct KeysParse {
@@ -555,7 +573,7 @@ struct KeysParse {
     std::size_t malformed = 0;
     std::size_t oversized = 0;
     bool truncated = false;       ///< the row budget refused a row
-    bool unknown_type = false;    ///< a key of an unknown type was emitted
+    bool unknown_type = false;    ///< a line of an unknown key type was refused (counted in malformed)
     bool field_oversized = false;
     bool nul_truncated = false;   ///< a line held a NUL byte and was read only up to it, as sshd reads it
 };
@@ -604,20 +622,24 @@ inline void parse_authorized_keys(std::string_view text, std::string_view accoun
             continue;
         }
 
-        std::optional<ReadKey> key = try_read_key(line, pos);
+        bool unknown_refused = false; // refused only for an unknown key type (counted malformed)
+        std::optional<ReadKey> key = try_read_key(line, pos, &unknown_refused);
         KeyOptions opts;
         if (!key) {
             const std::size_t start = pos;
             if (!advance_past_options(line, pos)) {
                 ++out.malformed;
+                out.unknown_type = out.unknown_type || unknown_refused;
                 continue;
             }
             const auto parsed = parse_key_options(line.substr(start, pos - start));
             while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t'))
                 ++pos;
-            key = try_read_key(line, pos);
+            bool unknown_after_options = false;
+            key = try_read_key(line, pos, &unknown_after_options);
             if (!key || !parsed) {
                 ++out.malformed;
+                out.unknown_type = out.unknown_type || unknown_refused || unknown_after_options;
                 continue;
             }
             opts = *parsed;
@@ -642,22 +664,18 @@ inline void parse_authorized_keys(std::string_view text, std::string_view accoun
         flag(opts.has_command, "has_command");
         flag(opts.has_from, "has_from");
         flag(opts.has_principals, "has_principals");
-        flag(key->unknown, "unknown_type");
 
         // Charge the row as it goes on the wire (escaped and cut), never an estimate of its
         // parts: a pipe in the account doubles on the wire. A refusal stops the whole parse
         // and leaves every counter and flag as the last admitted row left it.
         bool row_oversized = false;
         std::string row = key_row(account, kind, key->type_token, fingerprint_sha256(key->facts.plain_blob),
-                                  key->unknown ? std::string{} : std::to_string(key->facts.bits), flags,
-                                  options_field, row_oversized);
+                                  std::to_string(key->facts.bits), flags, options_field, row_oversized);
         if (!budget.charge(row.size() + kRowOverhead)) {
             out.truncated = true;
             return;
         }
         out.field_oversized = out.field_oversized || row_oversized;
-        if (key->unknown)
-            out.unknown_type = true;
         out.rows.push_back(std::move(row));
         ++out.keys;
     }

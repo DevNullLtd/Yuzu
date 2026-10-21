@@ -221,15 +221,27 @@ TEST_CASE("remote_access_audit keys: sk keys and an unknown key type", "[remote_
     expect_one_key(parse(line("sk-ecdsa-sha2-nistp256@openssh.com", b64(skec))),
                    "sk-ecdsa-sha2-nistp256@openssh.com",
                    "SHA256:tiAAyLSt0QcAk3lp7o32Pg2wUDTdMOpLnZEdmyMbmxs", "256");
-    // CONSTRUCTED ssh-dss: not in the known-name set, the blob leads with the same name ->
-    // inventoried over the raw blob, bits "-", flag unknown_type
+    // CONSTRUCTED ssh-dss: not in the known-name set. Its blob cannot be decoded completely, so
+    // the line is REFUSED (counted malformed, no key row, never fingerprinted over an undecoded
+    // blob) and the refusal is flagged unknown_type so it is told apart from garbage.
     const std::string dss = str("ssh-dss") + str("\3") + str("\5") + str("\7") + str("\x0b");
     const auto p = parse(line("ssh-dss", b64(dss)));
-    expect_one_key(p, "ssh-dss", "SHA256:TWzEoKsWgVpo+VaY/iOyY6RIcDMUwAOyQjbtYjEpKkg", "-", "unknown_type");
+    CHECK(p.rows.empty());
+    CHECK(p.kp.keys == 0);
+    CHECK(p.kp.malformed == 1);
     CHECK(p.kp.unknown_type);
-    // an unknown type whose blob names something else, or an unknown certificate type, is malformed
-    CHECK(parse(line("ssh-xyz", b64(dss))).kp.malformed == 1);
-    CHECK(parse(line("ssh-xyz-cert-v01@openssh.com", b64(str("ssh-xyz-cert-v01@openssh.com")))).kp.malformed == 1);
+    // trailing bytes after an unknown type's name are refused the same way, with no row
+    const auto trailing = parse(line("ssh-dss", b64(dss + "trailing")));
+    CHECK(trailing.rows.empty());
+    CHECK(trailing.kp.malformed == 1);
+    // an unknown type whose blob names something else, or an unknown certificate type, is
+    // malformed WITHOUT the unknown-type flag (garbage, not a recognisable unknown type)
+    const auto other = parse(line("ssh-xyz", b64(dss)));
+    CHECK(other.kp.malformed == 1);
+    CHECK_FALSE(other.kp.unknown_type);
+    const auto cert = parse(line("ssh-xyz-cert-v01@openssh.com", b64(str("ssh-xyz-cert-v01@openssh.com"))));
+    CHECK(cert.kp.malformed == 1);
+    CHECK_FALSE(cert.kp.unknown_type);
 }
 
 TEST_CASE("remote_access_audit keys: an option clause is never accepted as an unknown key type",
@@ -244,22 +256,31 @@ TEST_CASE("remote_access_audit keys: an option clause is never accepted as an un
         const auto p = parse(line(clause, b64(str(clause))));
         CHECK(p.kp.rows.empty());
         CHECK(p.kp.malformed == 1);
+        CHECK_FALSE(p.kp.unknown_type); // not a legal type name: garbage, no unknown-type flag
     }
     // outside the type-name grammar: a `/`, a space-free over-length token (65 bytes), a quote
     CHECK(parse(line("ssh/foo", b64(str("ssh/foo")))).kp.malformed == 1);
     CHECK(parse(line(std::string(65, 'a'), b64(str(std::string(65, 'a'))))).kp.malformed == 1);
     CHECK(parse(line("ssh\"x", b64(str("ssh\"x")))).kp.malformed == 1);
-    // positive controls: the longest legal name (64) and a real newer-algorithm name still
-    // inventory, flagged unknown_type, with the fingerprint taken over the raw blob
+    CHECK_FALSE(parse(line("ssh/foo", b64(str("ssh/foo")))).kp.unknown_type);
+    // a legal unknown name (the longest, 64 bytes, and a newer-algorithm name) is refused too:
+    // counted malformed and flagged unknown_type, but NEVER reported as a key row
     const std::string longest(64, 'a');
-    CHECK(parse(line(longest, b64(str(longest)))).kp.keys == 1);
+    const auto lp = parse(line(longest, b64(str(longest))));
+    CHECK(lp.kp.keys == 0);
+    CHECK(lp.rows.empty());
+    CHECK(lp.kp.malformed == 1);
+    CHECK(lp.kp.unknown_type);
     const std::string sk_foo = "sk-foo@openssh.com";
-    const auto ok = parse(line(sk_foo, b64(str(sk_foo) + str("\7"))));
-    REQUIRE(ok.rows.size() == 1);
-    CHECK(ok.kp.malformed == 0);
-    CHECK(ok.kp.unknown_type);
-    CHECK(ok.rows[0][kType] == sk_foo);
-    CHECK(ok.rows[0][kFlags] == "unknown_type");
+    const auto refused = parse(line(sk_foo, b64(str(sk_foo) + str("\7"))));
+    CHECK(refused.rows.empty());
+    CHECK(refused.kp.malformed == 1);
+    CHECK(refused.kp.unknown_type);
+    // behind an option clause the refusal is flagged the same way
+    const auto opt = parse(line("from=\"10.0.0.1\" " + sk_foo, b64(str(sk_foo) + str("\7"))));
+    CHECK(opt.rows.empty());
+    CHECK(opt.kp.malformed == 1);
+    CHECK(opt.kp.unknown_type);
 }
 
 TEST_CASE("remote_access_audit keys: the blob is decoded completely and trailing bytes are refused",
@@ -344,7 +365,8 @@ std::string principals_of(std::size_t n) {
 
 // Each case changes ONE field of the real certificate. MUTATION: dropping the matching check in
 // skip_certificate_body (type 1/2, the 256-principal cap, cstr on key_id/principals, the (name,data)
-// pair read, decode of the CA key as a non-certificate, the signature's type string) flips its case.
+// pair read, decode of the CA key as a non-certificate, the signature's algorithm string, payload
+// string and end-of-field check, or an sk signature's flags and counter) flips its case.
 TEST_CASE("remote_access_audit keys: every certificate field is checked, one mutation per case",
           "[remote_access_audit][keys]") {
     struct Case {
@@ -371,7 +393,22 @@ TEST_CASE("remote_access_audit keys: every certificate field is checked, one mut
         {"the CA key is not a key blob", [](CertParts& c) { c.sigkey = "xx"; }, false},
         {"the CA key has trailing bytes", [kCa](CertParts& c) { c.sigkey = kCa + "\0"s; }, false},
         {"an empty signature (no type string)", [](CertParts& c) { c.sig.clear(); }, false},
-        {"a signature that leads with its type", [](CertParts& c) { c.sig = str("ssh-ed25519") + str(std::string(64, '\2')); }, true},
+        {"a signature of algorithm plus payload", [](CertParts& c) { c.sig = str("ssh-ed25519") + str(std::string(64, '\2')); }, true},
+        // C2: ssh-keygen -lf (OpenSSH 10) rejects each of these ("incomplete message" /
+        // "unexpected bytes remain after decoding"); the type string alone is not enough.
+        {"a signature of only its type string", [](CertParts& c) { c.sig = str("ssh-ed25519"); }, false},
+        {"a signature whose payload is not a string", [](CertParts& c) { c.sig = str("ssh-ed25519") + "\1\2"s; }, false},
+        {"a signature with a truncated payload", [](CertParts& c) { c.sig = str("ssh-ed25519") + u32be(64) + std::string(10, '\2'); }, false},
+        {"a signature with trailing bytes after the payload", [](CertParts& c) { c.sig = str("ssh-ed25519") + str(std::string(64, '\2')) + "\0"s; }, false},
+        // a security-key algorithm carries a flags byte and a counter after the payload
+        {"an sk signature with its flags and counter",
+         [](CertParts& c) { c.sig = str("sk-ssh-ed25519@openssh.com") + str(std::string(64, '\2')) + "\x01" + u32be(5); }, true},
+        {"an sk signature missing its counter",
+         [](CertParts& c) { c.sig = str("sk-ssh-ed25519@openssh.com") + str(std::string(64, '\2')) + "\x01"; }, false},
+        {"an sk signature with trailing bytes after its counter",
+         [](CertParts& c) { c.sig = str("sk-ssh-ed25519@openssh.com") + str(std::string(64, '\2')) + "\x01" + u32be(5) + "x"; }, false},
+        {"a non-sk signature carrying a flags and counter tail",
+         [](CertParts& c) { c.sig = str("ssh-ed25519") + str(std::string(64, '\2')) + "\x01" + u32be(5); }, false},
     };
     for (const auto& tc : cases) {
         INFO(tc.what);

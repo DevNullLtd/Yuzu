@@ -23,4 +23,3 @@ file|jsmith|authorized_keys|read|1|0|0
 key|jsmith|authorized_keys|ssh-ed25519|SHA256:KvyMqQNTYcqLvYhJttCE6h3/AYnkXfjEcQOmEx/Vvsc|256|-|-
 file|root|authorized_keys|refused|-|-|-
 [result_status] CONSTRAINED / PARTIAL / macos:remote_access_audit:homes:permission_denied
-

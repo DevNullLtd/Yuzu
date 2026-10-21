@@ -78,10 +78,10 @@ metadata:
     Key comments, option values, principals and key-file paths are never emitted; the
     account is the home directory's name. A home or file the agent cannot read is reported as
     refused with a reason token (on Linux an unprivileged agent usually cannot open other
-    users' homes, so constrained is the common outcome), never as an empty result. A key row
-    flagged unknown_type records a line present in the file, not a key sshd is known to accept:
-    OpenSSH 10 refuses an unknown type at parse time; whether this host's sshd knows the type
-    is not checked. Reads one machine per request and is off until enabled. The Windows leg is
+    users' homes, so constrained is the common outcome), never as an empty result. A line
+    whose key type this plugin does not know is counted as malformed and never reported as a
+    key (its blob cannot be decoded completely). Reads one machine per request and is off
+    until enabled. The Windows leg is
     planned and not yet read. The first row is a status row stating whether the read was
     complete; if a leg threw after its rows had started, a second unsupported status row
     follows and is the one that counts.
@@ -130,12 +130,12 @@ spec:
         platforms: [linux, darwin]
       - name: field_5
         type: string
-        description: 'file: the number of lines sshd would not accept (unparseable key, unknown option, truncated or trailing-byte blob, RSA under 1024 bits), "-" unless read. key: the key size in bits (RSA modulus, 256 for ed25519, the curve size for ECDSA), "-" for a key of an unknown type.'
+        description: 'file: the number of lines sshd would not accept (unparseable key, unknown option, unknown key type, truncated or trailing-byte blob or certificate signature, RSA under 1024 bits), "-" unless read. key: the key size in bits (RSA modulus, 256 for ed25519, the curve size for ECDSA).'
         example: '256'
         platforms: [linux, darwin]
       - name: field_6
         type: string
-        description: 'file: the number of lines over 16 KiB that were not parsed, "-" unless read. key: comma-separated flags from cert_authority, certificate, has_command, has_from, has_principals, unknown_type, or "-". A row flagged unknown_type records a line present in the file, not a key sshd is known to accept: OpenSSH 10 refuses an unknown type at parse time; whether this host''s sshd knows the type is not checked.'
+        description: 'file: the number of lines over 16 KiB that were not parsed, "-" unless read. key: comma-separated flags from cert_authority, certificate, has_command, has_from, has_principals, or "-".'
         example: has_command,has_from
         platforms: [linux, darwin]
       - name: field_7

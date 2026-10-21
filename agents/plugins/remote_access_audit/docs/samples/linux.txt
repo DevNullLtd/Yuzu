@@ -54,4 +54,3 @@ file|ubuntu|authorized_keys2|absent|-|-|-
 file|ubuntu|custom|read|1|0|0
 key|ubuntu|custom|ssh-ed25519|SHA256:Uc/dY5jcWGbEIlLnEJfWtdNNKWrXJ1m2unP44ggBYfY|256|-|-
 [result_status] CONSTRAINED / PARTIAL / linux:remote_access_audit:keys:malformed,linux:remote_access_audit:keys:oversized_line,linux:remote_access_audit:keys:symlink_refused
-

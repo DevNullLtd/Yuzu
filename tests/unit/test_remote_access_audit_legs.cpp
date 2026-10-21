@@ -882,6 +882,28 @@ TEST_CASE("remote_access_audit legs: service state arms", "[remote_access_audit]
     CHECK(row_with(l.rows, "service|ssh.service|") == "service|ssh.service|unknown|systemctl_is_enabled");
     CHECK(l.rows[2] == "source|service|failed|-");
 
+    // MIXED: one unit answers, the others fail. A failed unit query makes the source `failed`
+    // (clause 5); the unit that answered keeps its row, the failed ones say `unknown`, none `disabled`.
+    f = healthy();
+    f.runner = [](const std::vector<std::string>& args) {
+        if (args[1] == "ssh.service")
+            return ran("enabled\n", 0);
+        return died(yuzu::agent::TerminationReason::deadline);
+    };
+    l = list_posix(f.build());
+    CHECK(l.rows[2] == "source|service|failed|-");
+    CHECK(row_with(l.rows, "service|ssh.service|") == "service|ssh.service|enabled|systemctl_is_enabled");
+    CHECK(row_with(l.rows, "service|sshd.service|") == "service|sshd.service|unknown|systemctl_is_enabled");
+    CHECK(has_token(l, "subprocess_runner:deadline"));
+    CHECK(l.status == StatusState::constrained);
+    // the same when the failing unit printed something unrecognised rather than timing out
+    f.runner = [](const std::vector<std::string>& args) {
+        return args[1] == "ssh.service" ? ran("enabled\n", 0) : ran("flibbertigibbet\n");
+    };
+    l = list_posix(f.build());
+    CHECK(l.rows[2] == "source|service|failed|-");
+    CHECK(has_token(l, "linux:remote_access_audit:service:unrecognised_output"));
+
     f = healthy();
     f.runner = [](const std::vector<std::string>&) {
         auto r = ran("enabled\n");
@@ -934,6 +956,39 @@ TEST_CASE("remote_access_audit legs: malformed lines and unknown key types make 
     auto l = list_posix(f.build());
     CHECK(has_token(l, "linux:remote_access_audit:keys:malformed"));
     CHECK(row_with(l.rows, "file|alice|authorized_keys|") == "file|alice|authorized_keys|read|1|1|0");
+    CHECK(l.status == StatusState::constrained);
+
+    // A key of a type the plugin does not know is refused, counted malformed, never reported as
+    // a key (its blob cannot be decoded completely); the listing says why with its own token.
+    // REAL SHAPE: an ssh-dss line whose blob leads with its own name (constructed blob).
+    f = healthy();
+    f.homes = {home("alice")};
+    f.key_files["/home/alice/.ssh/authorized_keys"] =
+        ok(std::string(kAliceKey) + "ssh-dss AAAAB3NzaC1kc3MAAAABAwAAAAEFAAAAAQcAAAABCw== c\n");
+    l = list_posix(f.build());
+    CHECK(row_with(l.rows, "file|alice|authorized_keys|") == "file|alice|authorized_keys|read|1|1|0");
+    CHECK(kind_rows(l, "key").size() == 1); // only the real key
+    CHECK(has_token(l, "linux:remote_access_audit:keys:unknown_key_type"));
+    CHECK(has_token(l, "linux:remote_access_audit:keys:malformed"));
+    CHECK(l.status == StatusState::constrained);
+    // plain garbage is malformed WITHOUT the unknown-type token
+    f.key_files["/home/alice/.ssh/authorized_keys"] = ok(std::string(kAliceKey) + "this is not a key\n");
+    CHECK_FALSE(has_token(list_posix(f.build()), "linux:remote_access_audit:keys:unknown_key_type"));
+}
+
+TEST_CASE("remote_access_audit legs: a partial homes listing still audits the homes it listed",
+          "[remote_access_audit][legs]") {
+    // One root listed, another refused: the homes source keeps its refused state and token, and
+    // the listed home is still audited (its file and key rows), so evidence is not lost.
+    auto f = healthy();
+    f.homes = {home("alice")};
+    f.key_files["/home/alice/.ssh/authorized_keys"] = ok(kAliceKey);
+    f.homes_err = EACCES;
+    const auto l = list_posix(f.build());
+    CHECK(l.rows[1] == "source|homes|refused|-|-");
+    CHECK(has_token(l, "linux:remote_access_audit:homes:permission_denied"));
+    CHECK(row_with(l.rows, "file|alice|authorized_keys|") == "file|alice|authorized_keys|read|1|0|0");
+    CHECK(kind_rows(l, "key").size() == 1);
     CHECK(l.status == StatusState::constrained);
 }
 
