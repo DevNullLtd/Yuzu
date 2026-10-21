@@ -184,10 +184,13 @@ namespace detail {
 class McpServer {
 public:
     /// C8 fail-closed boot validator (#2383): throws std::runtime_error naming
-    /// the offenders when the served kTools[] names, the kToolSecurity
-    /// registrations, and the kWriteTools read-only guard set disagree — a
-    /// misregistered build refuses to construct (and therefore to boot) instead
-    /// of silently skipping the generic tier+approval gate for the missing tool.
+    /// the offenders when the served tool names (legacy kTools[] plus the
+    /// registry-resident records, merged by mcp_server.cpp's catalogue()), the
+    /// security registrations (catalogue().security), the --mcp-read-only write set
+    /// (catalogue().writes) and the kToolAnnotation key set (#2422) disagree: a misregistered build
+    /// refuses to construct (and therefore to boot) instead of silently skipping the generic
+    /// tier+approval gate for the missing tool. The message is capped at the first offences
+    /// (sorted) plus a count; all are logged individually.
     McpServer();
 
     using AuthFn =
@@ -601,7 +604,8 @@ public:
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
 
     /// #4037 — the injected-callback twin of `AuthRoutes::require_list_read`
-    /// (ADR-0017), backing `get_guardian_status`'s real confinement. Same
+    /// (ADR-0017), backing `get_guardian_status`'s real confinement and
+    /// `list_plugin_config` (which refuses a scoped admission). Same
     /// shape as `RestApiV1::ListReadFn`/`ListReadGate` (auth_routes.hpp) reused
     /// verbatim, not redefined, so the REST `GET /guaranteed-state/status`
     /// list-read gate and this MCP twin cannot drift — server.cpp wires the

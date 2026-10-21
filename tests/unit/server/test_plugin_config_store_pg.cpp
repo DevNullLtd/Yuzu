@@ -706,11 +706,9 @@ TEST_CASE("list_config caps at kListRowCap rows and only flags truncated past th
     YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
     Wired w{db.dsn()};
 
-    // Mirrors plugin_config_store.cpp's anonymous-namespace `kListRowCap`.
-    // Not exposed via the header (deliberately internal/defensive, see the
-    // .cpp's comment) — hardcoded here, so this MUST track that constant if
-    // it ever changes.
-    constexpr int kListRowCap = 5000;
+    // The store's own cap, read from the one shared constant (the Plugins and updates panel's
+    // `row_cap` reads it too), so this test cannot drift from what the store enforces.
+    constexpr int kListRowCap = static_cast<int>(yuzu::server::plugin_config::kListRowCap);
 
     // Bulk-seed exactly kListRowCap rows for one plugin via a single
     // server-side INSERT ... SELECT FROM generate_series, straight through

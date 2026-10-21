@@ -36,6 +36,7 @@
 #include "http_route_sink.hpp"
 
 #include <httplib.h>
+#include <nlohmann/json_fwd.hpp>
 
 #include <cstdint>
 #include <expected>
@@ -85,6 +86,16 @@ namespace yuzu::server {
 /// durably mis-audited every code-signing revocation (gov HIGH-1).
 [[nodiscard]] std::string derive_cert_audit_target_type(CaStore& ca_store,
                                                         const std::string& serial_hex);
+
+/// The CRL figures an inventory consumer needs to judge revocation freshness, as one
+/// flat object: `crl_version`, `crl_published_at`, `crl_next_update` (epoch seconds),
+/// `crl_revoked_count` and `crl_stale`. Every key is always present; a value that could
+/// not be determined is JSON null, never 0/false (null `crl_revoked_count` = a row
+/// published before counts were recorded; null `crl_stale` = the comparison read
+/// failed). Merged into the `meta` of `GET /api/v1/ca/issued` and the payload of MCP
+/// `list_issued_certs`, so the Revocation panel's figures have a public twin
+/// (ADR-1005 Decision 4) and are shared exactly once.
+[[nodiscard]] nlohmann::json crl_figures_json(CaStore& ca_store);
 
 /// Prefix on `IssueCodeSigningFn`'s `unexpected()` when the failure is a
 /// caller-attributable business refusal — no CA root to issue from — rather
@@ -220,8 +231,17 @@ public:
         csrf_trusted_origins_ = std::move(origins);
     }
 
+    /// Whether the caller holds `Security:Read`, decided without writing a response or a denial
+    /// row (`AuthRoutes::has_permission`). The dashboard revoke / import wrappers use it to
+    /// decide whether to append the CA panel to their reply: they are gated on Delete / Write,
+    /// which do not imply Read. Set BEFORE `register_routes`. Leaving it unset fails closed
+    /// (the wrappers return only their banner text).
+    using ReadProbeFn = std::function<bool(const httplib::Request&)>;
+    void set_read_probe(ReadProbeFn probe) { read_probe_ = std::move(probe); }
+
 private:
     std::vector<std::string> csrf_trusted_origins_;
+    ReadProbeFn read_probe_;
 };
 
 } // namespace yuzu::server

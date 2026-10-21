@@ -2204,7 +2204,8 @@ the device if that row cannot be written.
 ### Internal CA
 
 The server's built-in certificate authority (see `docs/pki-architecture.md`) can
-be managed via the **Settings → Internal CA** dashboard panel or the REST
+be managed via the **Settings → Certificates and secrets** page (or the
+**Settings → Internal CA** panel on the Settings page) or the REST
 endpoints below. `root` and `crl` are **public** (clients and browsers need
 them to establish trust / check revocation before they have a session); the
 inventory and revoke endpoints are gated by the `Security` securable.
@@ -2250,6 +2251,19 @@ the CA store is unavailable.
 `meta.next_offset` carries the `offset` to pass for the next page. Iterate until
 `has_more` is `false` (do **not** infer end-of-list from `count < limit`).
 
+`meta` also carries the revocation-list figures, so a client can judge
+revocation freshness without downloading the DER list: `crl_version`,
+`crl_published_at` and `crl_next_update` (epoch seconds), `crl_revoked_count`
+and `crl_stale`. The first four are `null` when no list is published, and
+`crl_revoked_count` is also `null` (never a fabricated `0`) for a list published
+before entry counts were recorded; `0` means a published list with no revoked
+entries. `crl_stale` is `true` when the latest list was not
+built from the current revoked set (a revocation is missing from it, no list is
+published, or its entry count was not recorded), `false` when it covers every
+revocation, and `null` when the comparison read failed. It does not reflect
+expiry: compare `crl_next_update` with the current time. The MCP `list_issued_certs` tool
+returns the same five fields at the top level of its result.
+
 ```json
 {
   "items": [
@@ -2265,7 +2279,9 @@ the CA store is unavailable.
     }
   ],
   "count": 1,
-  "meta": { "api_version": "v1", "limit": 200, "offset": 0, "has_more": false }
+  "meta": { "api_version": "v1", "limit": 200, "offset": 0, "has_more": false,
+            "crl_version": 14, "crl_published_at": 1710849600, "crl_next_update": 1711454400,
+            "crl_revoked_count": 2, "crl_stale": false }
 }
 ```
 
@@ -4036,7 +4052,10 @@ below.
 
 **Responses:** `201` — `{campaign_id, grant_count}`. `400` — invalid JSON,
 or `title` missing/empty. `403` without `AccessReview:Attest` (or an
-engine-classed caller). `503` — the access-review store is unavailable, or
+engine-classed caller), or for a browser (session-cookie) request that
+carries no `Origin`/`Referer` naming this site (audited as `csrf.denied`;
+API-token callers are exempt). `415` — `Content-Type` is not
+`application/json`. `503` — the access-review store is unavailable, or
 the grant-population read failed.
 
 Audited as `access_review.campaign_opened` (`detail` carries
@@ -4112,8 +4131,11 @@ flag ≠ revoke.
 **Responses:** `200` — `{recorded: true}`. `400` — `principal_type`,
 `principal_id`, or `role_name` missing, or `decision` is neither `attested`
 nor `flagged_revoke`. `403` without `AccessReview:Attest` (or an engine-classed
-caller). `404` — no campaign with that id, no such frozen grant in it, or
-the campaign is already closed. `503` — the access-review store is
+caller), or for a browser (session-cookie) request that carries no
+`Origin`/`Referer` naming this site (audited as `csrf.denied`; API-token
+callers are exempt). `404` — no campaign with that id, no such frozen grant in it, or
+the campaign is already closed. `415` — `Content-Type` is not
+`application/json`. `503` — the access-review store is
 unavailable, or a genuine write failure.
 
 **This route is an UPSERT — a second call for the same `(campaign_id,
@@ -4136,9 +4158,11 @@ forces to completion.
 **Permission:** `AccessReview:Attest`.
 
 **Responses:** `200` — `{closed: true}`. `403` without `AccessReview:Attest`
-(or an engine-classed caller). `404` — no campaign with that id, or already
+(or an engine-classed caller), or for a browser (session-cookie) request that
+carries no `Origin`/`Referer` naming this site (audited as `csrf.denied`;
+API-token callers are exempt). `404` — no campaign with that id, or already
 closed. `503` — the access-review store is unavailable, or a genuine write
-failure.
+failure. The route reads no body, so it has no `Content-Type` requirement.
 
 Audited as `access_review.closed`.
 
@@ -4146,17 +4170,30 @@ Audited as `access_review.closed`.
 
 | Action | Description |
 |---|---|
-| `access_review.exported` | Cross-principal grant export pulled via `GET /api/v1/access-reviews/export`. `target_type=AccessReview`, `detail=format=<json\|csv> rows=<N> rbac_enforcement=<value>`. `result=success`. |
-| `access_review.list` | Campaign list pulled via `GET /api/v1/access-reviews`. `target_type=AccessReview`. `result=success`. |
+| `access_review.exported` | Cross-principal grant export pulled via `GET /api/v1/access-reviews/export`. `target_type=AccessReview`, `detail=format=<json\|csv\|view> rows=<N> rbac_enforcement=<value>` (`view` is the dashboard's Current grants panel, `GET /fragments/access/reviews/grants`). `result=success`. |
+| `access_review.list` | Campaign list pulled via `GET /api/v1/access-reviews` or the dashboard fragment `GET /fragments/access/reviews/campaigns`. `target_type=AccessReview`. `result=success`. |
 | `access_review.campaign_opened` | Review campaign opened via `POST /api/v1/access-reviews`. `target_id=<campaign_id>`, `detail=grants=<N> rbac_enforcement=<value>` on success. `result` ∈ {`success`, `failure`}. |
 | `access_review.attested` | Reviewer recorded `decision=attested` via `POST /api/v1/access-reviews/{id}/attestations`. `target_id=<campaign_id>:<principal_type>:<principal_id>:<role_name>`. `result` ∈ {`success`, `failure`}. |
 | `access_review.flagged` | Reviewer recorded `decision=flagged_revoke` via the same endpoint. Same target/result shape as `access_review.attested` — a separate verb so flagged grants are separately countable/alertable. **Evidence only — does not revoke.** |
 | `access_review.closed` | Campaign closed via `POST /api/v1/access-reviews/{id}/close`. `target_id=<campaign_id>`. `result` ∈ {`success`, `failure`}. |
-| `access_review.get` | Campaign evidentiary state read via `GET /api/v1/access-reviews/{id}`. `target_id=<campaign_id>`. `result=success`. |
+| `access_review.get` | Campaign evidentiary state read via `GET /api/v1/access-reviews/{id}` or the dashboard fragment `GET /fragments/access/reviews/campaign`. `target_id=<campaign_id>`. `result=success`. |
 
 Every `access_review.*` verb above additionally records `result=denied`
 (`detail="engine_session_denied"`) when the caller's own session is
 engine-classed — see the "Engine-session denial" note above.
+`access_review.campaign_opened` and `access_review.attested` also record
+`result=denied`, `detail=content_type_not_json` (empty `target_id`) when a
+request is refused with `415`.
+
+The three mutating routes (`POST /api/v1/access-reviews`,
+`POST /api/v1/access-reviews/{id}/attestations` and
+`POST /api/v1/access-reviews/{id}/close`) are called by the dashboard with a
+session cookie, so a cookie-authenticated request must carry an `Origin` (or
+`Referer`) naming this site, or it is refused with `403` before the body is
+read and a `csrf.denied` row is written (`target_type=Endpoint`, `target_id` is
+the route as written above). A request that authenticates with an API token is
+not riding a cookie and is not gated. Behind a proxy that rewrites `Host`, add
+the dashboard origin to `--csrf-trusted-origins`.
 
 MCP twins (JSON only — the REST `?format=csv` export path has no MCP
 equivalent): `export_access_review`, `open_access_review`,
@@ -9194,10 +9231,15 @@ its value. Secret responses carry metadata only.
 Lists plugin config rows (secrets are not included), optionally filtered with `?plugin=<name>` (exact
 match). The list is capped at 5,000 rows. `meta.truncated` is `true` when more rows exist.
 
-**Permission:** `PluginConfig:Read`, checked through the ADR-0017 list gate
-(`authorize_list_read`). Only a global grant, or RBAC loaded and disabled, is admitted. A grant
-confined to a management group is **refused with `403`** rather than narrowed: config rows are not
-per-agent data, so there is nothing to filter them by.
+**Permission:** `PluginConfig:Read`, checked through the ADR-0017 list gate (`require_list_read`),
+which is the route's only authorization check. A global grant, an active just-in-time elevation (full
+administrator for its window, as for every other permission check), or RBAC loaded and disabled is
+admitted. A grant confined to a management group is **refused with `403`** rather than narrowed:
+config rows are not per-agent data, so there is nothing to filter them by, and the refusal is recorded
+as an `auth.permission_required` denial row. A service-scoped token is refused. The MCP
+`list_plugin_config` tool and the System > Plugins and updates panel apply the same list decision; the
+panel additionally requires the administrator role its page gate asks for, so a caller who is not an
+administrator can read this route but not the panel.
 
 ```json
 {
@@ -9209,8 +9251,10 @@ per-agent data, so there is nothing to filter them by.
 }
 ```
 
-**Errors:** `403` (no global `PluginConfig:Read`, or a confined grant), `503` (the plugin config store
-or the authorization store is unavailable).
+**Errors:** `401` (not signed in), `403` (no global `PluginConfig:Read`, a confined grant, a
+service-scoped token, or an authorization store that is closed or degraded, which fails closed),
+`503` (the plugin config store is unavailable, or the authorization store is unavailable to an engine
+principal).
 
 #### `GET /api/v1/plugin-config/{plugin}/{key}`
 
@@ -9322,7 +9366,7 @@ change the switch for one OS only. **Permission:** `PluginConfig:Write`. **Audit
 ```
 
 `enabled` (boolean) is required. `true` allows the plugin or action, which is also the state when no
-row exists. `false` kills it. `reason` is optional, at most 512 bytes. Every dispatch gate that checks
+row exists. `false` kills it. `reason` is optional, at most 512 bytes; it is stored unredacted in the audit log, which every `AuditLog:Read` holder can read for the retention period, so do not put secrets or personal data in it. Every dispatch gate that checks
 this switch fails closed on a store error, so switching it off is a reliable emergency stop.
 **Exception:** a row for a protective action is stored and returned but has no effect on dispatch.
 Its audit detail is marked `protective_exempt=true` and the server logs a warning. To stop Guardian
@@ -10264,7 +10308,7 @@ Audited (`settings.oidc.view`, non-blocking) — IdP/admin-group configuration c
 
 ### Settings — Plugin Code Signing
 
-These endpoints drive the **Settings → Plugin Code Signing** card. The four `/api/settings/plugin-signing/*` routes are admin-only HTMX paths that return fragment HTML; the agent-facing distribution endpoint at `/api/v2/agent/plugin-policy` returns JSON (its predecessor `/api/v1/agent/plugin-policy` is deprecated — see below). See *user-manual/agent-plugins.md → Plugin Code Signing* for the operator workflow and *user-manual/server-admin.md → vNEXT* for the upgrade notes. See also [Settings](#settings) below — `/api/v2/agent/plugin-policy` is plugin-signing's REST read-twin (#4028, #4144); it is documented in both places because it predates the Settings read-twins programme and keeps its original path rather than moving under `/api/v1/settings/...`.
+These endpoints drive the **Plugin Code Signing** card, which appears on **Settings** and on **Settings > Plugins and updates**. The card lists the first 16 of N subjects when the bundle holds more than 16, and uploading over a loaded bundle asks for confirmation. The four `/api/settings/plugin-signing/*` routes are admin-only HTMX paths that return fragment HTML; the agent-facing distribution endpoint at `/api/v2/agent/plugin-policy` returns JSON (its predecessor `/api/v1/agent/plugin-policy` is deprecated — see below). See *user-manual/agent-plugins.md → Plugin Code Signing* for the operator workflow and *user-manual/server-admin.md → vNEXT* for the upgrade notes. See also [Settings](#settings) below — `/api/v2/agent/plugin-policy` is plugin-signing's REST read-twin (#4028, #4144); it is documented in both places because it predates the Settings read-twins programme and keeps its original path rather than moving under `/api/v1/settings/...`.
 
 **`GET /fragments/settings/plugin-signing`** — Render the Plugin Code Signing card fragment.
 
@@ -10652,6 +10696,34 @@ The dashboard view of `GET /api/v1/audit/auth-sample` with the window left open.
 The dashboard view of `GET /api/v1/settings/data-retention` (audit retention only).
 
 - **Permission:** `ServerConfig:Read`.
+
+**`GET /fragments/access/reviews/campaigns`**
+
+The campaign list. Same gate, store read and audit row as `GET /api/v1/access-reviews` (MCP `list_access_reviews`).
+
+- **Permission:** `AccessReview:Read` (admin-only while RBAC is disabled). The Open review and Close controls are drawn only for a caller who also holds `AccessReview:Attest`.
+- **Response (200):** HTML fragment: the table, "No review campaigns yet" when the store answered with none, or a red box with no table when it did not answer.
+- **Response (403):** The gate's own response; an engine-class session is refused exactly as the REST route refuses it (A4 body, `access_review.list` denied with detail `engine_session_denied`).
+- **Audit:** `access_review.list`, `count=<N>`.
+
+**`GET /fragments/access/reviews/campaign?id=<campaign_id>`**
+
+One campaign's frozen grants (undecided first, capped at 1000 rows with a banner) plus its summary card, swapped out of band. Same gate, read and audit row as `GET /api/v1/access-reviews/{id}` (MCP `get_access_review`).
+
+- **Query:** `id` — 1 to 64 of `A-Z a-z 0-9 _ -`. Empty returns the placeholder; any other value is a 200 "No campaign with that id" note and nothing is read or audited.
+- **Response (403):** The gate's own response; an engine-class session is refused exactly as the REST route refuses it (A4 body, `access_review.get` denied with detail `engine_session_denied`).
+- **Audit:** `access_review.get`, `target_id=<campaign_id>`. An unknown campaign and a store fault write none.
+
+**`GET /fragments/access/reviews/grants`**
+
+The live grant population, requested only by the **Show current grants** button. Same gate, read and audit row as `GET /api/v1/access-reviews/export` (MCP `export_access_review`).
+
+- **Response (403):** The gate's own response; an engine-class session is refused exactly as the REST route refuses it (A4 body, `access_review.exported` denied with detail `engine_session_denied`).
+- **Audit:** `access_review.exported`, `detail=format=view rows=<N> rbac_enforcement=<value>`.
+
+Denied-access rows: the campaign list loads itself, so a refused browser session writes none for it; the campaign and grants fragments are requested by a click (or by the `?campaign=<id>` link for the campaign), so a refused caller writes the ordinary permission-denied row. A refused API or MCP token writes one on every fragment.
+
+The page makes every change (open, close, attest, flag) by calling the existing `POST /api/v1/access-reviews` routes; there is no dashboard-only write route. Flag records `flagged_revoke` evidence only and never revokes a grant.
 
 ### Commands
 
