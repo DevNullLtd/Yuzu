@@ -435,7 +435,8 @@ TEST_CASE("remote_access_audit keys: every certificate field is checked, one mut
          [](CertParts& c) { c.sig = str("ssh-ed25519") + str(std::string(64, '\2')) + "\x01" + u32be(5); }, false},
         // KNOWN LIMIT, pinned: a WebAuthn security-key signature carries further fields (origin,
         // client data, extensions) after its flags and counter that this plugin does not decode,
-        // so such a certificate is refused as malformed (README caveat 2 says so).
+        // so such a certificate is refused as malformed (README caveat 2 says so; #6263 tracks
+        // decoding it, and this case flips from refused to accepted when that lands).
         {"a webauthn-sk signature (extra fields not decoded)",
          [](CertParts& c) {
              c.sig = str("webauthn-sk-ecdsa-sha2-nistp256@openssh.com") + str(std::string(64, '\2')) + "\x01" +

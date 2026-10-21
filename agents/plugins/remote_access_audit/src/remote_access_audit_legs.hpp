@@ -242,8 +242,8 @@ struct Tally {
         return true;
     }
 
-    /// Final status: permission_denied only when >=1 source was refused and none was read;
-    /// any token -> constrained; else supported.
+    /// Final status: permission_denied only when >=1 source was refused and no source yielded
+    /// any evidence (`read_sources` is 0); any token -> constrained; else supported.
     Listing finish(std::vector<std::string> rows) {
         Listing l;
         l.rows = std::move(rows);
@@ -655,7 +655,8 @@ inline ServiceOutcome audit_service_linux(const PosixFs& fs, Tally& t) {
     }
     // A failed unit query makes the source `failed`, even beside units that answered: the
     // answered units keep their rows and the failed ones say `unknown`, never `disabled`. An
-    // answered unit still counts toward `read_sources` (see Tally).
+    // answered unit still counts toward `read_sources` (see Tally); a tool that cannot be started
+    // returned above with its rows dropped, and counts nothing.
     out.state = any_answered && !any_failed ? SourceState::read : SourceState::failed;
     if (any_answered)
         ++t.read_sources;
@@ -777,7 +778,7 @@ inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tal
         out.homes_state = lo.state;
         t.note(lo);
         // A partial listing read the roots that did list, so the aggregate is constrained and
-        // never permission_denied (that status means no source was read at all).
+        // never permission_denied (that status means no source yielded any evidence).
         if (!homes.empty())
             ++t.read_sources;
     }

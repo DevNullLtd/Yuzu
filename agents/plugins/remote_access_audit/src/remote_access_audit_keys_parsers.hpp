@@ -332,7 +332,8 @@ inline bool skip_certificate_body(Reader& r) {
     // The signature field is itself a blob: the algorithm string, then the signature payload
     // string, and nothing after (ssh-keygen -lf: "incomplete message" / "unexpected bytes remain
     // after decoding"). A security-key (sk-*) algorithm carries its flags byte and counter
-    // after the payload, as ssh-ed25519-sk.c / ssh-ecdsa-sk.c verify them.
+    // after the payload, as ssh-ed25519-sk.c / ssh-ecdsa-sk.c verify them. A WebAuthn
+    // (webauthn-sk-*) signature carries more fields and is refused here until #6263.
     Reader sr{*sig};
     const auto alg = sr.cstr(); // a C string, as OpenSSH reads it; stricter: any NUL is refused
     if (!alg || !sr.str())

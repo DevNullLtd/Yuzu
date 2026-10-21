@@ -1007,6 +1007,8 @@ TEST_CASE("remote_access_audit legs: partial sources decide the aggregate status
         return died(yuzu::agent::TerminationReason::deadline);
     };
     auto l = list_posix(f.build());
+    CHECK(l.rows[0] == "source|sshd_config|refused|-"); // the premises: a refusal, no other source
+    CHECK(l.rows[1] == "source|homes|absent|-|-");
     CHECK(l.rows[2] == "source|service|failed|-");
     CHECK(row_with(l.rows, "service|ssh.service|") == "service|ssh.service|enabled|systemctl_is_enabled");
     CHECK(has_token(l, "linux:remote_access_audit:sshd_config:permission_denied"));
@@ -1019,8 +1021,20 @@ TEST_CASE("remote_access_audit legs: partial sources decide the aggregate status
         return died(yuzu::agent::TerminationReason::deadline);
     };
     l = list_posix(f.build());
+    CHECK(l.rows[0] == "source|sshd_config|refused|-");
+    CHECK(l.rows[1] == "source|homes|absent|-|-");
     CHECK(l.rows[2] == "source|service|failed|-");
     CHECK(l.status == StatusState::permission_denied);
+
+    // Case A3: every unit answered and the service is the ONLY source read: it counts, so the
+    // refusal reads constrained. MUTATION: counting the service source only when some unit also
+    // failed (`any_answered && any_failed`) turns this into permission_denied.
+    f.runner = healthy().runner;
+    l = list_posix(f.build());
+    CHECK(l.rows[0] == "source|sshd_config|refused|-");
+    CHECK(l.rows[1] == "source|homes|absent|-|-");
+    CHECK(l.rows[2] == "source|service|read|4");
+    CHECK(l.status == StatusState::constrained);
 
     // Case B: nothing else was read, but a partial home listing recovered a readable key file.
     // That is partial evidence, so the aggregate is constrained, not permission_denied.
