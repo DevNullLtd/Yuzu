@@ -293,6 +293,14 @@ TEST_CASE("remote_access_audit keys: an option clause is never accepted as an un
     CHECK(bogus.rows.empty());
     CHECK(bogus.kp.malformed == 1);
     CHECK(bogus.kp.unknown_type);
+    // a leading token that fits the type-name grammar and does NOT parse as options (a recognised
+    // name with trailing garbage), with a blob leading with that same name, is the flag's only
+    // source here: the first read's verdict stands when the options did not parse.
+    // MUTATION: dropping the `!parsed && first.unknown_refused` term turns this red.
+    const auto garbled = parse(line("no-ptyX", b64(str("no-ptyX"))));
+    CHECK(garbled.rows.empty());
+    CHECK(garbled.kp.malformed == 1);
+    CHECK(garbled.kp.unknown_type);
 }
 
 TEST_CASE("remote_access_audit keys: the blob is decoded completely and trailing bytes are refused",
