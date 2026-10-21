@@ -334,7 +334,7 @@ inline bool skip_certificate_body(Reader& r) {
     // after decoding"). A security-key (sk-*) algorithm carries its flags byte and counter
     // after the payload, as ssh-ed25519-sk.c / ssh-ecdsa-sk.c verify them.
     Reader sr{*sig};
-    const auto alg = sr.cstr(); // OpenSSH reads the algorithm as a C string: no embedded NUL
+    const auto alg = sr.cstr(); // a C string, as OpenSSH reads it; stricter: any NUL is refused
     if (!alg || !sr.str())
         return false;
     if (alg->starts_with("sk-") && (!sr.u8() || !sr.u32()))
