@@ -591,6 +591,18 @@ public:
         denial_observer_ = std::move(obs);
     }
 
+    /// TEST SEAM (same precedent as `ApiTokenStore`'s `test_hook_before_*`): called by
+    /// `consume_ticket` at the two points where a concurrent writer could change the row and
+    /// where an interleaving test cannot otherwise stand - between the first read and the
+    /// precondition's fresher read (only when a precondition is supplied), and after every
+    /// check has passed, immediately before the consuming CAS. Never set in production; set
+    /// once before any consume, so it is read without a lock. A hook must not call back into
+    /// this manager's consume path.
+    enum class ConsumeTestStage { kBetweenReads, kBeforeCas };
+    void set_consume_test_hook_for_test(std::function<void(ConsumeTestStage)> hook) {
+        consume_test_hook_ = std::move(hook);
+    }
+
     /// Idempotent no-op kept for call-site compatibility — migration now
     /// runs unconditionally inside the constructor (PgMigrationRunner),
     /// unlike the SQLite era where callers invoked this explicitly.
@@ -879,6 +891,7 @@ private:
     mutable std::mutex mtx_;
     yuzu::MetricsRegistry* metrics_{nullptr};     // borrowed; set_metrics, startup only
     PreconditionDenialObserver denial_observer_;  // set_..._observer, startup only
+    std::function<void(ConsumeTestStage)> consume_test_hook_; // tests only, see the setter
 };
 
 } // namespace yuzu::server

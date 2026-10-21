@@ -1170,6 +1170,238 @@ TEST_CASE("consume: an untouched ticket still consumes with a precondition that 
               .has_value());
 }
 
+// -- consume: the checks and the CAS apply to the SAME examined row (Gate 8 round 3) ------
+//
+// Deterministic interleavings through ApprovalManager's test seam: `kBetweenReads` runs after
+// the first read and before the precondition's fresher read, `kBeforeCas` after every check
+// has passed and immediately before the consuming statement.
+
+namespace {
+
+using Stage = ApprovalManager::ConsumeTestStage;
+
+// Run `change` (autocommit SQL on a second lease) when `stage` is reached, once.
+void interleave(ApprovalManager& mgr, yuzu::test::ApprovalManagerPg& bundle, Stage at,
+                const std::string& sql, const std::string& id,
+                const std::vector<std::string>& extra = {}) {
+    mgr.set_consume_test_hook_for_test([&bundle, at, sql, id, extra](Stage got) {
+        if (got != at)
+            return;
+        std::vector<std::string> params{id};
+        params.insert(params.end(), extra.begin(), extra.end());
+        auto lease = bundle.pool().acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(), sql.c_str(), params).status() == PGRES_COMMAND_OK);
+    });
+}
+
+constexpr const char* kFlipToApproved =
+    "UPDATE approval_manager.approvals SET status = 'approved', "
+    "reviewed_at = extract(epoch from now())::bigint WHERE id = $1";
+
+// A pending bound ticket (alice, excluding carol) after `setup` SQL.
+std::string pending_bound(ApprovalManager& mgr, yuzu::test::ApprovalManagerPg& bundle,
+                          const std::string& setup_sql = {}) {
+    auto id = mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+                               bound_request({"carol"}));
+    REQUIRE(id.has_value());
+    if (!setup_sql.empty())
+        REQUIRE(run_sql(bundle.pool(), setup_sql, {*id}).status() == PGRES_COMMAND_OK);
+    return *id;
+}
+
+void require_refused(ApprovalManager& mgr, const std::string& id, ConsumeFailure kind,
+                     const ConsumePrecondition& pre = {}) {
+    auto r = mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, pre);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().kind == kind);
+    CHECK(r.error().message == kNotConsumableMessage);
+    CHECK(mgr.get(id)->consumed_at == 0);
+}
+
+const ConsumePrecondition kPass = [](const Approval&) -> std::expected<void, std::string> {
+    return {};
+};
+
+} // namespace
+
+TEST_CASE("consume: a row examined as not-approved cannot be spent after a status-only flip "
+          "(CH3-1 cells A1, A2, A4, C)",
+          "[pg][approval_manager][bound][race]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    SECTION("A1: pending, reviewer == submitter") {
+        const auto id = pending_bound(mgr, bundle,
+            "UPDATE approval_manager.approvals SET reviewed_by = 'alice' WHERE id = $1");
+        interleave(mgr, bundle, Stage::kBeforeCas, kFlipToApproved, id);
+        require_refused(mgr, id, ConsumeFailure::kNotConsumable);
+    }
+    SECTION("A2: pending, reviewer is an excluded root") {
+        const auto id = pending_bound(mgr, bundle,
+            "UPDATE approval_manager.approvals SET reviewed_by = 'carol' WHERE id = $1");
+        interleave(mgr, bundle, Stage::kBeforeCas, kFlipToApproved, id);
+        require_refused(mgr, id, ConsumeFailure::kNotConsumable);
+    }
+    SECTION("A4: pending, no reviewer recorded") {
+        const auto id = pending_bound(mgr, bundle);
+        interleave(mgr, bundle, Stage::kBeforeCas, kFlipToApproved, id);
+        require_refused(mgr, id, ConsumeFailure::kNotConsumable);
+    }
+    SECTION("C: rejected by an excluded root, then flipped to approved") {
+        const auto id = pending_bound(mgr, bundle);
+        REQUIRE(mgr.reject(id, "carol", "withdrawn").has_value());
+        interleave(mgr, bundle, Stage::kBeforeCas, kFlipToApproved, id);
+        require_refused(mgr, id, ConsumeFailure::kNotConsumable);
+    }
+    SECTION("an expired row flipped to approved is refused too") {
+        const auto id = pending_bound(mgr, bundle,
+            "UPDATE approval_manager.approvals SET status = 'expired', reviewed_by = 'bob' WHERE id = $1");
+        interleave(mgr, bundle, Stage::kBeforeCas, kFlipToApproved, id);
+        auto r = mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, {});
+        REQUIRE_FALSE(r.has_value());
+        CHECK(mgr.get(id)->consumed_at == 0);
+    }
+}
+
+TEST_CASE("consume: the fix must not turn ordinary refusals into integrity refusals (CH3-2)",
+          "[pg][approval_manager][bound][race]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    int observed = 0;
+    mgr.set_precondition_denial_observer([&](const PreconditionDenial&) { ++observed; });
+
+    // A ticket legitimately REJECTED by an excluded root (allowed: rejecting grants nothing).
+    const auto rejected = pending_bound(mgr, bundle);
+    REQUIRE(mgr.reject(rejected, "carol", "").has_value());
+    require_refused(mgr, rejected, ConsumeFailure::kNotConsumable);          // no precondition
+    require_refused(mgr, rejected, ConsumeFailure::kNotConsumable, kPass);   // with one
+    // Pending and EXPIRED rows are ordinary refusals too, and expired still reaches the
+    // diagnostic read (kExpired, "submit a new request").
+    const auto pending = pending_bound(mgr, bundle);
+    require_refused(mgr, pending, ConsumeFailure::kNotConsumable);
+    const auto expired = pending_bound(mgr, bundle,
+        "UPDATE approval_manager.approvals SET status = 'expired' WHERE id = $1");
+    auto r = mgr.consume_ticket(expired, "alice", ApprovalOrigin::kGuardianDeploy, {});
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().kind == ConsumeFailure::kExpired);
+    CHECK(observed == 0);
+}
+
+TEST_CASE("consume: origin, submitter and integrity are re-checked on the precondition's fresher "
+          "read, not only the first (CH3-1 cells B1, B2)",
+          "[pg][approval_manager][bound][race]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    SECTION("B1: origin rewritten between the reads") {
+        const auto id = approved_bound(mgr);
+        interleave(mgr, bundle, Stage::kBetweenReads,
+                   "UPDATE approval_manager.approvals SET origin = 'mcp' WHERE id = $1", id);
+        auto r = mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, kPass);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == ConsumeFailure::kForeignOrigin);
+        CHECK(mgr.get(id)->consumed_at == 0);
+    }
+    SECTION("B2: submitter rewritten between the reads") {
+        const auto id = approved_bound(mgr);
+        interleave(mgr, bundle, Stage::kBetweenReads,
+                   "UPDATE approval_manager.approvals SET submitted_by = 'mallory' WHERE id = $1", id);
+        auto r = mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, kPass);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == ConsumeFailure::kForeignSubmitter);
+        CHECK(mgr.get(id)->consumed_at == 0);
+    }
+    SECTION("integrity: reviewer becomes an excluded root between the reads") {
+        const auto id = approved_bound(mgr);
+        interleave(mgr, bundle, Stage::kBetweenReads,
+                   "UPDATE approval_manager.approvals SET reviewed_by = 'carol' WHERE id = $1", id);
+        auto r = mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, kPass);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == ConsumeFailure::kForeignOrigin);
+        CHECK(mgr.get(id)->consumed_at == 0);
+    }
+}
+
+TEST_CASE("consume: the CAS pins origin and submitter themselves (a change AFTER every check)",
+          "[pg][approval_manager][bound][race]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    SECTION("origin") {
+        const auto id = approved_bound(mgr);
+        interleave(mgr, bundle, Stage::kBeforeCas,
+                   "UPDATE approval_manager.approvals SET origin = 'mcp' WHERE id = $1", id);
+        require_refused(mgr, id, ConsumeFailure::kNotConsumable);
+    }
+    SECTION("submitted_by") {
+        const auto id = approved_bound(mgr);
+        interleave(mgr, bundle, Stage::kBeforeCas,
+                   "UPDATE approval_manager.approvals SET submitted_by = 'mallory' WHERE id = $1", id);
+        require_refused(mgr, id, ConsumeFailure::kNotConsumable);
+    }
+    SECTION("the same holds on the held overload, in a real transaction") {
+        const auto id = approved_bound(mgr);
+        // Inside the caller's txn the FOR UPDATE lock blocks the second lease's UPDATE, so the
+        // hook would deadlock; the lock IS the protection there, asserted elsewhere. Here only
+        // that the pinned statement is still correct for an untouched row on this overload.
+        in_txn(bundle.pool(), /*commit=*/true, [&](PGconn* conn) {
+            CHECK(mgr.consume_ticket(conn, id, "alice", ApprovalOrigin::kGuardianDeploy, {})
+                      .has_value());
+        });
+    }
+}
+
+TEST_CASE("consume: an absent id is an ordinary not-consumable, with or without a precondition",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    auto r = mgr.consume_ticket("does-not-exist", "alice", ApprovalOrigin::kMcp, {});
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().kind == ConsumeFailure::kNotConsumable);
+    CHECK(r.error().message == kNotConsumableMessage);
+    auto held = mgr.consume_ticket("does-not-exist", "alice", ApprovalOrigin::kMcp, kPass);
+    REQUIRE_FALSE(held.has_value());
+    CHECK(held.error().kind == ConsumeFailure::kNotConsumable);
+}
+
+TEST_CASE("consume: an approved row with NO recorded reviewer is refused, legacy or bound",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    const std::string clear =
+        "UPDATE approval_manager.approvals SET reviewed_by = '' WHERE id = $1";
+
+    SECTION("bound, pooled") {
+        const auto id = approved_bound(mgr);
+        REQUIRE(run_sql(bundle.pool(), clear, {id}).status() == PGRES_COMMAND_OK);
+        require_refused(mgr, id, ConsumeFailure::kForeignOrigin);
+    }
+    SECTION("bound, pooled with a precondition (the fresher read checks it too)") {
+        const auto id = approved_bound(mgr);
+        REQUIRE(run_sql(bundle.pool(), clear, {id}).status() == PGRES_COMMAND_OK);
+        require_refused(mgr, id, ConsumeFailure::kForeignOrigin, kPass);
+    }
+    SECTION("legacy unbound MCP ticket") {
+        const auto id = approved_ticket(mgr, ApprovalOrigin::kMcp, "def-no-reviewer");
+        REQUIRE(run_sql(bundle.pool(), clear, {id}).status() == PGRES_COMMAND_OK);
+        auto r = mgr.consume_ticket(id, "alice", ApprovalOrigin::kMcp, {});
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == ConsumeFailure::kForeignOrigin);
+    }
+    SECTION("held overload") {
+        const auto id = approved_bound(mgr);
+        REQUIRE(run_sql(bundle.pool(), clear, {id}).status() == PGRES_COMMAND_OK);
+        in_txn(bundle.pool(), /*commit=*/false, [&](PGconn* conn) {
+            auto r = mgr.consume_ticket(conn, id, "alice", ApprovalOrigin::kGuardianDeploy, {});
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error().kind == ConsumeFailure::kForeignOrigin);
+        });
+    }
+    SECTION("a ticket approve() produced always has one") {
+        const auto id = approved_bound(mgr);
+        CHECK_FALSE(mgr.get(id)->reviewed_by.empty());
+        CHECK(mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, {}).has_value());
+    }
+}
+
 // -- kPrecondition denial: counted and observed at the store --------------------
 
 namespace {
