@@ -945,7 +945,8 @@ OutboundRead read_user_outbound_history(HKEY user_root, const std::string& profi
                     return result; // per-key cap (a corrupt/huge key must not run unbounded)
                 }
                 RegKeyGuard drive;
-                if (RegOpenKeyExW(net.h, sub, 0, KEY_READ, &drive.h) == ERROR_SUCCESS) {
+                const LONG drive_open_rc = RegOpenKeyExW(net.h, sub, 0, KEY_READ, &drive.h);
+                if (drive_open_rc == ERROR_SUCCESS) {
                     MapDriveHistoryRow r;
                     r.ts = key_last_write_epoch(drive.h);
                     r.entry.direction = "outbound";
@@ -957,6 +958,13 @@ OutboundRead read_user_outbound_history(HKEY user_root, const std::string& profi
                     r.entry.provider = reg_read_sz(drive.h, L"ProviderName");
                     if (!r.entry.remote_path.empty())
                         out.push_back(std::move(r));
+                } else {
+                    // Same accounting as the parent Network open two lines below this loop's
+                    // entry: a failed child open (e.g. ACCESS_DENIED on one drive's key) must
+                    // not read as a clean, complete walk, or the new per-profile retry state
+                    // machine (tar_mapdrive_backfill.hpp) treats this profile as fully resolved
+                    // and never retries it (adversarial review).
+                    note_failure(drive_open_rc);
                 }
                 idx++;
                 len = 256;

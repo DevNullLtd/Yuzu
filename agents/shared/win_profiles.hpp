@@ -456,10 +456,11 @@ struct HiveAccessReport {
 /// deadline-less HiveFileGuard over Win32HiveFileProbe and uses that -- a refused hive file is
 /// reported as file_refused, same as an explicit check would report it. The only opt-out is
 /// `kOfflineHiveFileUnguarded` below; a caller passing it writes a one-line comment naming the
-/// reason (the sole production case today is privacy_permissions_win.cpp, which supplies its own
-/// deadline-bearing check instead -- see that file's banner). A consumer with a run deadline
-/// builds its own guard (the `expired` callback), exactly as privacy_permissions does, rather
-/// than taking the deadline-less default.
+/// reason -- there is no production user of it today, only test fixtures that need an unguarded
+/// mount of a fixture hive the default would correctly refuse. A consumer with a run deadline
+/// instead builds its own guard (the `expired` callback) and stays guarded throughout, exactly as
+/// privacy_permissions does (see that file's banner) -- its own deadline-bearing check in place
+/// of the deadline-less default, never the opt-out.
 struct OfflineHiveFileCheck {
     std::function<std::string(const std::wstring& ntuser_path)> before_load;
     std::function<std::string(const std::wstring& ntuser_path)> after_load;

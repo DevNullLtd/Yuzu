@@ -2610,6 +2610,7 @@ private:
         // the SID list unchanged, so the cost of this claim going nowhere is one day, never an
         // acquisition attempt.
         PendingState state;
+        std::string claimed_pending; // the exact value this claim persisted; re-checked in PHASE C
         {
             std::lock_guard lock(collect_mu_);
             if (!source_enabled(*db_, "mapdrive"))
@@ -2619,7 +2620,8 @@ private:
                 !retry_due(now, state.last_ts, kMapDriveBackfillRetryIntervalS))
                 return;
             state.last_ts = now;
-            if (!db_->set_config("mapdrive_backfill_pending", format_pending_state(state)))
+            claimed_pending = format_pending_state(state);
+            if (!db_->set_config("mapdrive_backfill_pending", claimed_pending))
                 return; // claim write failed; the next due tick tries again
         }
 
@@ -2661,12 +2663,24 @@ private:
             typed.push_back(std::move(ev));
         }
 
-        // PHASE C: commit. Re-check source_enabled: a disable+purge raced the enumeration above,
-        // so this result is stale -- drop it and leave the claimed state exactly as PHASE A left
-        // it (the next enable's first pass starts fresh).
+        // PHASE C: commit. Re-check source_enabled: a plain disable that is STILL in effect here
+        // raced the enumeration above, so this result is stale -- drop it and leave the claimed
+        // state exactly as PHASE A left it (the next enable's first pass starts fresh).
         std::lock_guard lock(collect_mu_);
         if (!source_enabled(*db_, "mapdrive")) {
             spdlog::info("TAR: mapdrive backfill retry result dropped — source disabled mid-retry");
+            return;
+        }
+        // A disable+purge+re-enable fully inside PHASE B's unlocked window defeats the check
+        // above: `mapdrive` reads enabled again by the time we get here, but do_purge_source
+        // also clears this exact key (adversarial review: a stale commit otherwise resurrects
+        // rows the purge just deleted). Nothing else writes `mapdrive_backfill_pending` except
+        // this function's own two phases and the first pass's commit_first_pass, so a value that
+        // no longer matches what PHASE A itself persisted means something else touched it in
+        // between -- drop the stale result rather than overwrite that newer state.
+        if (db_->get_config("mapdrive_backfill_pending", "") != claimed_pending) {
+            spdlog::info("TAR: mapdrive backfill retry result dropped — claim superseded "
+                         "mid-retry (reconfigured or purged)");
             return;
         }
         // skip_known_historical=true: the NOT EXISTS insert makes a repeated attempt over the
@@ -3575,6 +3589,13 @@ private:
             ctx.write_output(std::format("error|{}", res.error()));
             return 1;
         }
+        // The per-profile mapdrive backfill retry (§3.8, related issue #5291) persists its own
+        // pending list in a key this purge does not otherwise touch -- left alone, a still-
+        // pending profile's next retry can re-enumerate and re-insert exactly the rows this
+        // purge just deleted (adversarial review). Never clear mapdrive_backfill_done here: that
+        // would re-run the full first pass and resurrect everything, not just the pending subset.
+        if (source == "mapdrive")
+            db_->set_config("mapdrive_backfill_pending", "");
         ctx.write_output(
             std::format(R"({{"source":"{}","rows_deleted":{},"status":"purged"}})", source, *res));
         return 0;
