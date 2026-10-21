@@ -129,7 +129,7 @@ spec:
         platforms: [linux, darwin]
       - name: field_5
         type: string
-        description: 'file: the number of lines sshd would not accept (unparseable key, unknown option, unknown key type, a truncated or trailing-byte blob, a certificate signature that is truncated or has trailing bytes, RSA under 1024 bits), "-" unless read. key: the key size in bits (RSA modulus, 256 for ed25519, the curve size for ECDSA).'
+        description: 'file: the number of lines this plugin refused as malformed (unparseable key, unknown option, unknown key type, a truncated or trailing-byte blob, a certificate signature that is truncated, has trailing bytes or is a WebAuthn signature it does not decode, RSA under 1024 bits), "-" unless read. key: the key size in bits (RSA modulus, 256 for ed25519, the curve size for ECDSA).'
         example: '256'
         platforms: [linux, darwin]
       - name: field_6
