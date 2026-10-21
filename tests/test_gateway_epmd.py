@@ -227,13 +227,12 @@ class ActivateTest(unittest.TestCase):
 
     def test_the_defaults_compose_into_a_private_port_for_this_process(self):
         # The wrapper calls activate(env) on defaults only: the real probe, this pid, isolate.
+        free_port_number()  # skips where sockets are denied; anywhere else the real probe works
         env = {}
         registered = []
         port = ge.activate(env, register=lambda *a: registered.append(a), say=quiet)
-        if port is None:
-            self.skipTest("no port could be probed here")
+        self.assertEqual(port, str(ge.pick_port(ge.port_is_free)))
         self.assertEqual(env["ERL_EPMD_PORT"], port)
-        self.assertTrue(ge.PORT_RANGE[0] <= int(port) <= ge.PORT_RANGE[1])
         self.assertEqual(registered, [(ge.stop, port, env)])
 
 
