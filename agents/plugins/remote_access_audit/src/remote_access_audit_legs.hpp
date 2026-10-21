@@ -207,6 +207,8 @@ struct Tally {
     yuzu::shared::RowByteBudget budget{kMaxRows, kMaxBytes};
     yuzu::shared::ConstraintAccumulator acc;
     std::vector<std::string> denied;
+    /// Sources that yielded any evidence, in whole or in part (a service source with one answered
+    /// unit, a partial home listing). `finish()` reports permission_denied only when this is 0.
     std::size_t read_sources = 0;
     std::size_t file_attempts = 0;
     bool truncated = false;
@@ -652,9 +654,8 @@ inline ServiceOutcome audit_service_linux(const PosixFs& fs, Tally& t) {
         t.emit(out.rows, service_row(unit, f.state, "systemctl_is_enabled"));
     }
     // A failed unit query makes the source `failed`, even beside units that answered: the
-    // answered units keep their rows and the failed ones say `unknown`, never `disabled`. A unit
-    // that answered is evidence read, so the source counts toward `read_sources` either way (as a
-    // partial home listing does): the aggregate is never `permission_denied` beside an emitted row.
+    // answered units keep their rows and the failed ones say `unknown`, never `disabled`. An
+    // answered unit still counts toward `read_sources` (see Tally).
     out.state = any_answered && !any_failed ? SourceState::read : SourceState::failed;
     if (any_answered)
         ++t.read_sources;

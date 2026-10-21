@@ -1,6 +1,6 @@
 ## Remote Access Audit Definitions
 ## Who can log in to this host over SSH, as CONFIGURED: the sshd_config values that matter for
-## inbound access, a SHA-256 fingerprint of every public key in the authorized_keys of the homes
+## inbound access, a SHA-256 fingerprint of every public key it can decode completely in the authorized_keys of the homes
 ## it walks, and whether the sshd service is enabled. Nothing is changed or fetched.
 ## Plugin: remote_access_audit | Actions: list
 ##
@@ -62,7 +62,7 @@ metadata:
     applied, so this is configured access and not sshd's effective policy; a directive or value
     sshd would refuse is skipped or listed as written with no token, and only an unbalanced
     quote is flagged: sshd -t is the validity check). It reports a
-    SHA-256 fingerprint for every public key in the authorized_keys of the homes it walks (a
+    SHA-256 fingerprint for every public key it can decode completely in the authorized_keys of the homes it walks (a
     certificate reports the fingerprint of the key it carries) with the option names it uses,
     and whether the sshd service is enabled. A login that needs no key is governed by the
     config rows: password, keyboard-interactive and GSSAPI are reported as written; other
