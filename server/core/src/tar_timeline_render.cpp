@@ -27,6 +27,22 @@ std::string plural(std::size_t n, const char* one, const char* many) {
 
 std::string lane_label(const TarTimelineLane& l) { return l.name.empty() ? l.id : l.name; }
 
+/// A lane's capped regions folded into one statement: the region with the earliest coverage
+/// start (first wins a tie), so the row limit and the date in the sentence come from one read.
+/// nullptr when the lane has none. Banner and limits bullet both route through this.
+const TarTimelineRegion* lane_cap(const TarTimelineLane& l) {
+    const TarTimelineRegion* best = nullptr;
+    for (const auto& r : l.regions)
+        if (r.kind == TarRegionKind::capped && (!best || r.coverage_from_ts < best->coverage_from_ts))
+            best = &r;
+    return best;
+}
+
+std::string capped_read_text(const TarTimelineLane& l, const TarTimelineRegion& cap) {
+    return "The read of " + lane_label(l) + " was cut off at " + num(cap.cap_rows) +
+           " rows; nothing before " + iso(cap.coverage_from_ts) + " is shown.";
+}
+
 std::string join(const std::vector<std::string>& v, const char* sep) {
     std::string out;
     for (std::size_t i = 0; i < v.size(); ++i) {
@@ -89,6 +105,10 @@ std::string unreadable_text(TarUnreadableReason r) {
     }
     return "device offline";
 }
+
+/// A paused source whose pause time the agent did not report (a pre-0.12.0 agent): said in
+/// words, never a date placeholder.
+constexpr const char* kPausedUnknown = "Not recorded: the source is paused";
 
 /// What a rolled-up bucket still holds, by source. Never a claim wider than the source.
 std::string holdings(const std::string& source, TarTier tier) {
@@ -279,7 +299,8 @@ std::string region_reason(const TarTimelineRegion& r) {
     case TarRegionKind::pruned:
         return "Pruned";
     case TarRegionKind::paused:
-        return "Paused since " + iso(r.paused_since_ts);
+        return r.paused_since_ts > 0 ? "Paused since " + iso(r.paused_since_ts)
+                                     : std::string(kPausedUnknown);
     case TarRegionKind::not_readable:
         return "Not readable: " + unreadable_text(r.reason);
     case TarRegionKind::capped:
@@ -361,6 +382,8 @@ AtMoment kept_at_moment(const TarTimelineModel& m, const TarKeptRow& row, std::i
         return {"Not recorded", "Source paused since " + iso(row.paused_since_ts), false};
     if (!m.online)
         return {"Not readable: device offline", {}, true};
+    if (row.unreadable) // unmeasured is not pruned: a failed measurement is not "Gone"
+        return {"Not readable: " + unreadable_text(*row.unreadable), {}, true};
     for (TarTier t : kTiers) {
         const TarKeptBand* b = band_for(row, t);
         if (b && b->oldest_ts > 0 && moment >= b->oldest_ts)
@@ -442,7 +465,7 @@ std::pair<std::string, std::string> state_for(const TarTimelineLane& lane,
     case TarRegionKind::paused:
         return {"paused|" + num(r->paused_since_ts),
                 r->paused_since_ts > 0 ? "Not recorded since " + iso(r->paused_since_ts)
-                                       : std::string("Not recorded: the source is paused")};
+                                       : std::string(kPausedUnknown)};
     case TarRegionKind::not_readable:
         return {"unreadable|" + num(static_cast<int>(r->reason)),
                 "Not readable: " + unreadable_text(r->reason)};
@@ -805,12 +828,10 @@ std::string render_timeline_lanes(const TarTimelineModel& m) {
         h += "<div class=\"tl-warn\">Device offline: on-device records are not readable.</div>";
     std::vector<std::string> unreadable_seen; // one banner per distinct (lane, reason)
     for (const auto& g : m.groups)
-        for (const auto& l : g.lanes)
+        for (const auto& l : g.lanes) {
+            if (const auto* cap = lane_cap(l)) // one banner per lane, however many capped stretches
+                h += "<div class=\"tl-warn\">" + esc(capped_read_text(l, *cap)) + "</div>";
             for (const auto& r : l.regions) {
-                if (r.kind == TarRegionKind::capped)
-                    h += "<div class=\"tl-warn\">The read of " + esc(lane_label(l)) +
-                         " was cut off at " + num(r.cap_rows) + " rows; nothing before " +
-                         esc(iso(r.coverage_from_ts)) + " is shown.</div>";
                 // An offline device already said so above; repeating it per lane is noise.
                 if (r.kind != TarRegionKind::not_readable ||
                     (!m.online && r.reason == TarUnreadableReason::offline))
@@ -823,6 +844,7 @@ std::string render_timeline_lanes(const TarTimelineModel& m) {
                 h += "<div class=\"tl-warn\">The read of " + esc(lane_label(l)) +
                      " was not readable: " + esc(unreadable_text(r.reason)) + ".</div>";
             }
+        }
     if (hit_limit)
         h += "<div class=\"tl-warn\">A lane has more items than the render limit (" +
              num(static_cast<std::int64_t>(kTarTimelineMaxBlocksPerLane)) +
@@ -903,9 +925,13 @@ std::string render_timeline_limits(const TarTimelineModel& m, const TarTimelineL
         items.push_back("Process starts and stops come from the Endpoint Security event stream as "
                         "of this read; a stretch recorded while the agent had fallen back to "
                         "polling carries snapshot times.");
-    else
+    else if (m.process_capture_method == "polling")
         items.push_back("Processes are read on the agent's polling interval; a process that starts "
                         "and exits between reads is missed, and start times are snapshot times.");
+    else // empty or unrecognised: the method is unknown, said so and no mechanism is claimed
+        items.push_back("The agent did not state how processes are captured. If it polls, a "
+                        "process that starts and exits between reads is missed and start times "
+                        "are snapshot times.");
     const std::string os = normalize_tar_os(m.os);
     if (os == "windows" || os == "macos")
         items.push_back(std::string("Command lines are not recorded on ") +
@@ -943,10 +969,8 @@ std::string render_timeline_limits(const TarTimelineModel& m, const TarTimelineL
         }
     for (const auto& g : m.groups)
         for (const auto& l : g.lanes)
-            for (const auto& r : l.regions)
-                if (r.kind == TarRegionKind::capped)
-                    li("The read of " + lane_label(l) + " was cut off at " + num(r.cap_rows) +
-                       " rows; nothing before " + iso(r.coverage_from_ts) + " is shown.");
+            if (const auto* cap = lane_cap(l))
+                li(capped_read_text(l, *cap));
     li("The limits shown are the agent's defaults.");
     h += "</ul></div>";
     return h;

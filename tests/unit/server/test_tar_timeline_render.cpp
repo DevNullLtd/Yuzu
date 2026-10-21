@@ -267,7 +267,6 @@ TarTimelineLinks links_full() {
     l.device = "/device?id=agent-1";
     l.choose_device = "/devices";
     l.retention_paused = "/tar#paused";
-    l.retention_settings = "/settings/data";
     return l;
 }
 
@@ -661,6 +660,30 @@ TEST_CASE("tar timeline banners: one per distinct lane and reason, offline not r
     contains(render_timeline_lanes(on), "The read of TCP connections was not readable: device offline.");
 }
 
+TEST_CASE("tar timeline capped: stretches of one lane are one banner and one limits bullet",
+          "[tar][timeline]") {
+    // two adjacent, non-overlapping capped stretches of one lane, and a second capped lane
+    auto m = with_lane(lane("L-p", "process", "proc-a.exe", {},
+                            {capped(W0, W0 + 1200, 10000, W0 + 1200),
+                             capped(W0 + 1200, W0 + 2400, 10000, W0 + 1500),
+                             region(TarRegionKind::exact, W0 + 2400, W1)}));
+    m.groups[0].lanes.push_back(
+        lane("L-t", "tcp", "TCP connections", {}, {capped(W0, W1, 5000, W0 + 3000)}));
+    const std::string first = "The read of proc-a.exe was cut off at 10000 rows; nothing before "
+                              "2026-10-20T09:20:00Z is shown.";
+    const auto lanes = render_timeline_lanes(m);
+    CHECK(count_of(lanes, "tl-warn") == 2); // one per capped lane
+    contains(lanes, "<div class=\"tl-warn\">" + first + "</div>");
+    contains(lanes, "<div class=\"tl-warn\">The read of TCP connections was cut off at 5000 rows; "
+                    "nothing before 2026-10-20T09:50:00Z is shown.</div>");
+    lacks(lanes, "nothing before 2026-10-20T09:25:00Z"); // the later stretch is not a second claim
+    CHECK(count_of(lanes, "tl-rg capped") == 3);         // every stretch still draws its own region
+    const auto limits = render_timeline_limits(m, links_full());
+    CHECK(count_of(limits, "was cut off") == 2);
+    contains(limits, "<li>" + first + "</li>");
+    lacks(limits, "nothing before 2026-10-20T09:25:00Z");
+}
+
 TEST_CASE("tar timeline golden: lanes paused", "[tar][timeline][golden]") {
     auto m = base();
     m.groups[2].lanes[0].regions = {region(TarRegionKind::exact, W0, W0 + 1800),
@@ -669,6 +692,24 @@ TEST_CASE("tar timeline golden: lanes paused", "[tar][timeline][golden]") {
     check_golden("lanes__paused", html);
     contains(html, "Paused since 2026-10-20T09:30:00Z");
     contains(html, "tl-rg paused");
+}
+
+TEST_CASE("tar timeline paused: an unreported pause time is said in words, never a dash",
+          "[tar][timeline]") {
+    // a pre-0.12.0 agent reports a disabled source with a pause time of 0
+    auto m = with_lane(lane("L-svc", "service", "Service changes", {},
+                            {region(TarRegionKind::exact, W0, W0 + 1800), paused(W0 + 1800, W1, 0)}));
+    const auto lanes = render_timeline_lanes(m);
+    contains(lanes, "<b>Not recorded: the source is paused</b>");
+    lacks(lanes, "Paused since");
+    lacks(lanes, "\xE2\x80\x94"); // the em dash format_iso_utc gives a zero time
+    const auto moment = render_timeline_moment(m, W0 + 2000, links_full());
+    contains(moment, "Service changes: Not recorded: the source is paused");
+    lacks(moment, "\xE2\x80\x94");
+    // a known pause time still names it
+    m.groups[0].lanes[0].regions = {region(TarRegionKind::exact, W0, W0 + 1800),
+                                    paused(W0 + 1800, W1, W0 + 1800)};
+    contains(render_timeline_lanes(m), "<b>Paused since 2026-10-20T09:30:00Z</b>");
 }
 
 TEST_CASE("tar timeline golden: lanes pruned", "[tar][timeline][golden]") {
@@ -805,6 +846,45 @@ TEST_CASE("tar timeline kept: the moment column states retention, never a rate o
         lacks(*html, "per day");
         lacks(*html, "rows a day");
     }
+}
+
+TEST_CASE("tar timeline kept: a source the engine could not measure says why, never Gone",
+          "[tar][timeline]") {
+    auto m = kept_model(15 * kDay);
+    // Both rows have no measured band, and the lanes of base() read fine (exact regions), so
+    // the chart cannot lean on a lane: the row itself carries the reason.
+    auto failed = kept("process", "Processes", 100000, {band(TarTier::exact, 0), band(TarTier::hourly, 0)});
+    failed.unreadable = TarUnreadableReason::read_failed;
+    auto too_old = kept("arp", "ARP neighbours", 0, {});
+    too_old.unreadable = TarUnreadableReason::agent_too_old;
+    // control: a measured row with nothing observed this far back is still pruned, i.e. Gone
+    m.kept = {failed, too_old, kept("service", "Services", 20000, {band(TarTier::exact, W1 - kDay)})};
+    const auto html = render_timeline_kept(m);
+    const auto proc = kept_row_html(html, "process");
+    contains(proc, "<span>Not readable: the read failed</span>");
+    lacks(proc, "Gone");
+    const auto arp = kept_row_html(html, "arp");
+    contains(arp, "<span>Not readable: the agent is too old for this read</span>");
+    lacks(arp, "Gone");
+    contains(kept_row_html(html, "service"), "Gone: nothing is kept this far back");
+
+    // the moment panel says the same for a lane carrying the same reason
+    m.groups = {TarTimelineGroup{
+        "G",
+        {lane("L-p", "process", "Processes", {},
+              {unreadable(TarUnreadableReason::read_failed, m.window_from_ts, W1)}),
+         lane("L-a", "arp", "ARP neighbours", {},
+              {unreadable(TarUnreadableReason::agent_too_old, m.window_from_ts, W1)})}}};
+    const auto moment = render_timeline_moment(m, tar_timeline_resolve_moment(m), links_full());
+    contains(moment, "Processes: Not readable: the read failed");
+    contains(moment, "ARP neighbours: Not readable: the agent is too old for this read");
+    lacks(moment, "Gone");
+
+    // a pause and an offline device are said first, as before
+    m.kept[0].paused_since_ts = W1 - 20 * kDay;
+    contains(kept_row_html(render_timeline_kept(m), "process"), "<span>Not recorded</span>");
+    m.online = false;
+    contains(kept_row_html(render_timeline_kept(m), "arp"), "<span>Not readable: device offline</span>");
 }
 
 TEST_CASE("tar timeline retention contract: measured coverage never changes an expiry statement",
@@ -947,15 +1027,27 @@ TEST_CASE("tar timeline golden: limits offline", "[tar][timeline][golden]") {
 
 TEST_CASE("tar timeline limits: the capture claim comes from the method, never from the OS",
           "[tar][timeline]") {
+    const std::string unknown = "The agent did not state how processes are captured. If it polls, a "
+                                "process that starts and exits between reads is missed and start "
+                                "times are snapshot times.";
     auto m = base();
     m.os = "Windows 11";
-    m.process_capture_method.clear(); // unknown
-    lacks(render_timeline_limits(m, links_full()), "event stream");
-    m.process_capture_method = "something-new"; // unrecognised: treated as polled
+    m.process_capture_method.clear(); // unknown: said so, no stream and no polling claimed
+    const auto empty = render_timeline_limits(m, links_full());
+    lacks(empty, "event stream");
+    lacks(empty, escaped("Processes are read on the agent's polling interval"));
+    contains(empty, unknown);
+    m.process_capture_method = "something-new"; // unrecognised: the same, and the value never shows
     const auto html = render_timeline_limits(m, links_full());
     lacks(html, "event stream");
     lacks(html, "something-new");
-    contains(html, escaped("Processes are read on the agent's polling interval"));
+    lacks(html, escaped("Processes are read on the agent's polling interval"));
+    contains(html, unknown);
+    // only the agent saying "polling" asserts polling
+    m.process_capture_method = "polling";
+    const auto polled = render_timeline_limits(m, links_full());
+    contains(polled, escaped("Processes are read on the agent's polling interval"));
+    lacks(polled, "did not state");
 }
 
 // ═══ goldens: moment ══════════════════════════════════════════════════════════════════
@@ -1200,9 +1292,9 @@ TEST_CASE("tar timeline escaping: hostile strings in every dynamic slot", "[tar]
                              "lane-name", "lane-sub", "group-name", "link-device", "link-choose", "link-paused",
                              "link-moment", "link-selected", "paused-label"})
         contains(all, escaped(hostile(slot)));
-    // an unrecognised capture method renders the polled sentence and never the value itself
+    // an unrecognised capture method renders the not-stated sentence and never the value itself
     lacks(all, escaped(hostile("capture")));
-    contains(all, escaped("Processes are read on the agent's polling interval"));
+    contains(all, "The agent did not state how processes are captured.");
 
     // agent_id is shown when the hostname is empty
     m.hostname.clear();

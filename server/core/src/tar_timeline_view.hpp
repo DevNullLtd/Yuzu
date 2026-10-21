@@ -123,6 +123,12 @@ struct TarKeptRow {
     std::int64_t row_limit = 0; ///< exact tier row limit; 0 = time-limited
     std::vector<TarKeptBand> bands;
     std::int64_t paused_since_ts = 0;
+    /// Set when the band measurement for this source could not be made (the read failed, or
+    /// the agent is too old to report per-source coverage). Engine-filled, like regions. It is
+    /// independent of the lanes' regions: a lane can read fine while its bands are unmeasured,
+    /// and a source whose read failed may have no lane in the window. Unset means the bands
+    /// were measured, and a source with none observed is then "nothing is kept this far back".
+    std::optional<TarUnreadableReason> unreadable;
 };
 
 struct TarTimelineModel {
@@ -141,14 +147,14 @@ struct TarTimelineModel {
     std::vector<TarTimelineGroup> groups;
 };
 
-/// Every URL the renderers emit is injected; none is pinned here.
+/// Every URL the renderers emit is injected; none is pinned here. URLs are server-built
+/// relative paths: the renderers escape them for HTML and do not validate a scheme.
 struct TarTimelineLinks {
     std::function<std::string(std::int64_t)> moment;                       ///< moment(ts)
     std::function<std::string(const std::string&, std::int64_t)> selected; ///< selected(id, ts)
     std::string device;
     std::string choose_device;
     std::string retention_paused;
-    std::string retention_settings;
 };
 
 } // namespace yuzu::server
