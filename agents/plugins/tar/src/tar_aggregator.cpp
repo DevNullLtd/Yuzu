@@ -181,12 +181,10 @@ bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
                                      std::string_view new_value, int64_t now_epoch) {
     auto enabled_key = std::format("{}_enabled", source);
     // Default `prev` to the source's declared default so the first-ever set on a
-    // fresh DB is only a transition when it differs from that default. Every
-    // source defaults to enabled, so the first `<src>_enabled=false` on a fresh
-    // DB is a real enabled→disabled transition and writes paused_at. The
-    // `_enabled` flag itself is written
-    // below, inside the one transaction with the baseline clear, so a failed
-    // clear leaves the flag unmoved (#538 ghost-`started` storm unreachable).
+    // fresh DB is only a transition when it differs from that default. The
+    // `_enabled` flag itself is written below, inside the one transaction with
+    // the baseline clear, so a failed clear leaves the flag unmoved (#538
+    // ghost-`started` storm unreachable).
     const char* prev_def = source_default_enabled(source) ? "true" : "false";
     std::string prev = db.get_config(enabled_key, prev_def);
     // Canonicalise `prev` to the strict tri-state before BOTH transition checks
@@ -422,18 +420,13 @@ std::string_view canonical_source_enabled(std::string_view stored_value) {
 // gate so an "errored" source's rows are preserved, not pruned. Also the
 // authoritative paused-guard for the Phase 15.A `tar.purge_source` action.
 //
-// A config READ FAILURE (db closed, prepare/step error) is neither enabled nor
-// disabled: the registry default applies only to a confirmed-absent row.
-// get_config() would return its default on a failed read, which for a default-on
-// source reads as enabled; try_get_config() keeps error / no-row / row distinct
-// (#560). `source_enabled_state` surfaces that third state as nullopt;
-// `source_enabled` collapses it to false (fail closed) for the collect gates.
+// `nullopt` = unreadable flag; source_enabled() fails closed (contract: tar_aggregator.hpp).
 std::optional<bool> source_enabled_state(TarDatabase& db, std::string_view source) {
     auto r = db.try_get_config(std::format("{}_enabled", source));
     if (!r)
         return std::nullopt; // read failure (logged by try_get_config)
-    return canonical_source_enabled(r->value_or(source_default_enabled(source) ? "true" : "false")) ==
-           "true";
+    const char* def = source_default_enabled(source) ? "true" : "false";
+    return canonical_source_enabled(r->value_or(def)) == "true";
 }
 
 bool source_enabled(TarDatabase& db, std::string_view source) {

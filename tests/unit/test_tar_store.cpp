@@ -2386,9 +2386,9 @@ TEST_CASE("TarDatabase v7->v8: an opt-out written after the migration sticks",
 
 TEST_CASE("TarDatabase v7->v8: a failed flip rolls the whole migration back and retries",
           "[tar][store][migration][v8][atomic]") {
-    // The trigger aborts the netqual flip AFTER procperf (earlier in the list)
-    // was already flipped inside the same savepoint: the rollback must undo it,
-    // schema stays at 7, and a reopen with the fault removed completes.
+    // The trigger fails the flip UPDATE after the paused_at upsert already ran
+    // inside the same savepoint: the rollback must undo that, schema stays at 7,
+    // and a reopen with the fault removed completes.
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_v8_");
     seed_v7_config(tmp,
                    {{"procperf_enabled", "false"},

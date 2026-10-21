@@ -777,8 +777,21 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
     // sticks; any failed step rolls the whole savepoint back and the version
     // stays 7 (retried on the next open).
     if (db.schema_version() == 7) {
-        static constexpr std::array<const char*, 8> kFormerlyOptIn = {
-            "procperf", "netqual", "module", "software", "arp", "dns", "netconn", "mapdrive"};
+        static constexpr std::string_view kFormerlyOptIn =
+            "'procperf_enabled','netqual_enabled','module_enabled','software_enabled',"
+            "'arp_enabled','dns_enabled','netconn_enabled','mapdrive_enabled'";
+        // Order matters: the paused_at upsert keys on value = 'false', which the
+        // flip then erases. The SELECT's WHERE also lets SQLite parse ON CONFLICT.
+        const std::array<std::string, 2> steps = {
+            std::format("INSERT INTO tar_config(key, value) "
+                        "SELECT replace(key, '_enabled', '_paused_at'), '0' FROM tar_config "
+                        "WHERE value = 'false' AND key IN ({}) "
+                        "ON CONFLICT(key) DO UPDATE SET value = '0'",
+                        kFormerlyOptIn),
+            std::format("UPDATE tar_config SET value = 'true' "
+                        "WHERE value = 'false' AND key IN ({})",
+                        kFormerlyOptIn)};
+        SqliteErrMsg emsg;
         std::lock_guard lock(db.mu_);
         if (sqlite3_exec(raw_db, "SAVEPOINT v8_migration", nullptr, nullptr, nullptr) !=
             SQLITE_OK) {
@@ -788,40 +801,12 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
         } else {
             bool ok = true;
             std::string failed_step;
-            for (const char* src : kFormerlyOptIn) {
-                const auto key = std::format("{}_enabled", src);
-                sqlite3_stmt* raw = nullptr;
-                if (sqlite3_prepare_v2(raw_db, "SELECT value FROM tar_config WHERE key = ?", -1,
-                                       &raw, nullptr) != SQLITE_OK) {
+            for (const auto& sql : steps) {
+                if (sqlite3_exec(raw_db, sql.c_str(), nullptr, nullptr, emsg.addr()) !=
+                    SQLITE_OK) {
                     ok = false;
-                    failed_step = std::format("read {} (prepare): {}", key, sqlite3_errmsg(raw_db));
+                    failed_step = std::format("flip: {}", emsg.text());
                     break;
-                }
-                StmtPtr q(raw);
-                sqlite3_bind_text(q.get(), 1, key.c_str(), static_cast<int>(key.size()),
-                                  SQLITE_STATIC);
-                const int rc = sqlite3_step(q.get());
-                // A SELECT error is never "no row": skipping the flip and stamping v8
-                // would lose the migration for this key permanently.
-                if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
-                    ok = false;
-                    failed_step = std::format("read {} (step): {}", key, sqlite3_errmsg(raw_db));
-                    break;
-                }
-                std::string value;
-                if (rc == SQLITE_ROW) {
-                    const auto* v = reinterpret_cast<const char*>(sqlite3_column_text(q.get(), 0));
-                    if (v)
-                        value = v;
-                }
-                q.reset(); // finalize before writing the same table
-                if (rc == SQLITE_ROW && value == "false") {
-                    if (!db.set_config_locked(key, "true") ||
-                        !db.set_config_locked(std::format("{}_paused_at", src), "0")) {
-                        ok = false;
-                        failed_step = std::format("flip {}", key);
-                        break;
-                    }
                 }
             }
             if (ok && !db.set_config_locked("schema_version", "8")) {

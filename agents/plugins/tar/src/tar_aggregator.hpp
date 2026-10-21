@@ -339,16 +339,9 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
 [[nodiscard]] std::optional<bool> source_enabled_state(TarDatabase& db, std::string_view source);
 
 /**
- * The collect-time gate: is a capture source actively enabled?
- * `source_enabled_state(...).value_or(false)` -- a failed config read reads as
- * disabled (fail closed), so a collect tick simply skips. A never-configured
- * source returns its `source_default_enabled()` default.
- *
- * Use this only where `false` means "skip": collect/retention gates. The
- * destructive `tar.purge_source` guard and every drain/discard/stop site use
- * `source_enabled_state()` so an unreadable flag never reads as a confirmed
- * disable. Lives here (beside `canonical_source_enabled`, the tri-state authority
- * it wraps) rather than in the plugin so the predicate is directly testable.
+ * Collect-time gate: `source_enabled_state(...).value_or(false)`, so an unreadable flag skips.
+ * Collect/retention gate only (false = skip); drain/discard/purge sites use
+ * `source_enabled_state()`.
  */
 [[nodiscard]] bool source_enabled(TarDatabase& db, std::string_view source);
 

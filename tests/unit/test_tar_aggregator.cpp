@@ -313,10 +313,6 @@ TEST_CASE("TAR source_enabled: the destructive-purge paused-guard predicate (15.
     // targeted, and the flag is already invalid), never wrongly treated as enabled.
     db.set_config("process_enabled", "maybe");
     CHECK_FALSE(source_enabled(db, "process")); // → tar.purge_source ALLOWED (fail-closed)
-
-    // Unreadable flag (closed db / SQL error): do_purge_source branches on
-    // source_enabled_state(), whose nullopt REFUSES (config_unreadable) -- pinned in
-    // "TAR source_enabled_state" below, since the plugin TU is not linked here.
 }
 
 TEST_CASE("TAR paused_at: idempotent re-set leaves the timestamp untouched",
@@ -902,22 +898,6 @@ TEST_CASE("TAR default-on: source_enabled() is true for every registered source 
     }
 }
 
-TEST_CASE("TAR source_enabled: a failed config read fails closed",
-          "[tar][source-enabled][fail-closed]") {
-    // A moved-from TarDatabase has no handle (the test_tar_store.cpp idiom), so
-    // try_get_config returns an error. get_config() would fall back to the
-    // registry default (true) and read the source as enabled; the gate must
-    // read it as disabled instead.
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-read-fail-"}};
-    auto opened = TarDatabase::open(tmp.path);
-    REQUIRE(opened.has_value());
-    TarDatabase db = std::move(*opened);
-    { TarDatabase discard = std::move(db); }
-    REQUIRE_FALSE(db.is_open());
-    CHECK_FALSE(source_enabled(db, "process"));
-    CHECK_FALSE(source_enabled(db, "procperf"));
-}
-
 TEST_CASE("TAR source_enabled_state: a failed read is nullopt; absent/stored/errored are confirmed",
           "[tar][source-enabled][fail-closed][purge]") {
     // source_enabled() collapses "confirmed disabled" and "flag unreadable" into
@@ -953,8 +933,7 @@ TEST_CASE("TAR source_enabled_state: a failed read is nullopt; absent/stored/err
 TEST_CASE("TAR default-on: the first disable of any source is a real transition",
           "[tar][paused_at][default-on]") {
     // Every source defaults enabled, so the first-ever `<src>_enabled=false` on
-    // a fresh DB is an enabled->disabled transition and writes paused_at (a
-    // default-off source used to see it as a no-op).
+    // a fresh DB is an enabled->disabled transition and writes paused_at.
     yuzu::test::TempDbFile tmp{std::string_view{"tar-default-on-"}};
     auto opened = TarDatabase::open(tmp.path);
     REQUIRE(opened.has_value());
@@ -964,7 +943,6 @@ TEST_CASE("TAR default-on: the first disable of any source is a real transition"
     const int64_t t_now = 1'735'689'600;
     for (const auto* src : {"module", "procperf", "netqual", "process"}) {
         INFO("source=" << src);
-        CHECK(source_default_enabled(src));
         REQUIRE(apply_source_enabled_transition(db, src, "false", t_now));
         CHECK(db.get_config(std::format("{}_paused_at", src), "0") == std::to_string(t_now));
     }

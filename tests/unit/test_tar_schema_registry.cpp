@@ -252,7 +252,6 @@ TEST_CASE("TAR schema: software source is registered with three tiers + Windows 
                            [](const CaptureSourceDef& s) { return s.name == "software"; });
     REQUIRE(it != sources.end());
     CHECK(it->dollar_name == "Software");
-    CHECK(it->default_enabled);
 
     // live + daily + monthly, in that declaration order (so run_aggregation rolls
     // daily-from-live before monthly-from-daily within one tick).
@@ -399,7 +398,6 @@ TEST_CASE("TAR schema: netconn source is registered live-only with Windows wevta
                            [](const CaptureSourceDef& s) { return s.name == "netconn"; });
     REQUIRE(it != sources.end());
     CHECK(it->dollar_name == "NetConn");
-    CHECK(it->default_enabled);
 
     REQUIRE(it->granularities.size() == 1);
     CHECK(it->granularities[0].suffix == "live");

@@ -1240,12 +1240,11 @@ private:
     int64_t usage_last_fold_warn_ts_{0};
 
     // ── M2: gap-free module/image-load stream (Windows ETW; null elsewhere) ───
-    // Unlike the process stream, this is high-volume, so the session is
-    // started LAZILY by collect_fast on the first tick where module_enabled is true (enabling takes
-    // effect on the next tick — no restart — and a transient session death
-    // auto-re-arms). When active, collect_fast drains it; there is NO poll
-    // fallback (no snapshot-diff equivalent for image loads). Drained only under
-    // collect_mu_.
+    // Unlike the process stream, this is high-volume, so the session is started
+    // LAZILY by collect_fast on the first enabled tick (enabling takes effect on
+    // the next tick — no restart — and a transient session death auto-re-arms).
+    // When active, collect_fast drains it; there is NO poll fallback (no
+    // snapshot-diff equivalent for image loads). Drained only under collect_mu_.
     std::unique_ptr<yuzu::tar::ImageStreamCollector> module_stream_;
     std::atomic<bool> module_stream_active_{false};
     std::vector<yuzu::tar::ModuleEvent> pending_module_evs_;
@@ -1761,11 +1760,11 @@ private:
             note_health("tcp", "source_disabled");
         }
 
-        // netqual: per-connection TCP quality (BRD Workstream E). Gated by
-        // source_enabled (registry default: enabled). Co-sampled with the tcp leg above: same snap_id + ts
-        // so netqual rows join the connection events on snapshot_id. Only the
-        // privacy bucket leaves select_netqual_rows; the raw remote address is
-        // dropped there and never persisted. Empty off Linux (collector stub).
+        // netqual: per-connection TCP quality (BRD Workstream E). Co-sampled with
+        // the tcp leg above: same snap_id + ts so netqual rows join the connection
+        // events on snapshot_id. Only the privacy bucket leaves select_netqual_rows;
+        // the raw remote address is dropped there and never persisted. Empty off
+        // Linux (collector stub).
         if (source_enabled(*db_, "netqual")) {
             // netqual_pre: pre-collected by the caller OUTSIDE collect_mu_ (the
             // Windows ESTATS pass is one enable+read syscall pair per tracked
@@ -1794,12 +1793,12 @@ private:
             note_health("netqual", "source_disabled");
         }
 
-        // ARP diff (ADR-0015). Gated by source_enabled (registry default:
-        // enabled). Implemented on Windows, Linux, and macOS -- see the registry (tar_schema_registry.cpp)
-        // for the platform-specific field constraints. Non-fatal on insert
-        // failure — the always-on legs above already committed, so a failure here
-        // must not misreport a healthy tick; the diff baseline is advanced ONLY on
-        // success so a failed insert retries the same deltas next tick.
+        // ARP diff (ADR-0015). Implemented on Windows, Linux, and macOS -- see the
+        // registry (tar_schema_registry.cpp) for the platform-specific field
+        // constraints. Non-fatal on insert failure — the always-on legs above
+        // already committed, so a failure here must not misreport a healthy tick;
+        // the diff baseline is advanced ONLY on success so a failed insert retries
+        // the same deltas next tick.
         //
         // enumerate_arp() throws when the platform capture didn't genuinely
         // complete (sysctl/procfs/GetIpNetTable2 read failure, a kernel-
@@ -1853,8 +1852,9 @@ private:
             note_health("arp", "source_disabled");
         }
 
-        // DNS-cache diff (ADR-0015). Device-level resolver-cache state; NOT per-process (no pid). Same
-        // non-fatal / advance-on-success discipline as the arp leg.
+        // DNS-cache diff (ADR-0015). Device-level resolver-cache state; NOT
+        // per-process (no pid). Same non-fatal / advance-on-success discipline as
+        // the arp leg.
         if (source_enabled(*db_, "dns")) {
             auto current = dns_pre ? std::move(*dns_pre) : yuzu::tar::enumerate_dns();
             auto previous = json_to_dns(db_->get_state("dns"));
@@ -1876,8 +1876,7 @@ private:
             note_health("dns", "source_disabled");
         }
 
-        // M2: module/image loads (Windows ETW), gated by source_enabled
-        // (registry default: enabled). The session starts lazily below.
+        // M2: module/image loads (Windows ETW). The session starts lazily below.
         const auto module_state = yuzu::tar::source_enabled_state(*db_, "module");
         const bool module_enabled = module_state.value_or(false);
         // Lazy start / re-arm: start the session on the first enabled tick (so
@@ -2112,10 +2111,9 @@ private:
             }
         }
 
-        // A2 per-app leg (independent of the device leg's outcome). Gated by
-        // source_enabled like every other TAR source (registry default:
-        // enabled); `procperf_enabled=false` switches off per-app sampling
-        // while device-level perf stays on.
+        // A2 per-app leg (independent of the device leg's outcome).
+        // `procperf_enabled=false` switches off per-app sampling while
+        // device-level perf stays on.
         if (!source_enabled(*db_, "procperf")) {
             note_health("procperf", yuzu::tar::kCollectStatusSourceDisabled);
             ctx.write_output(std::format("tar|collect_procperf|0|{}",
@@ -2282,13 +2280,12 @@ private:
             note_health("user", "source_disabled");
         }
 
-        // netconn: OS-logged connectivity transitions (ADR-0020). Gated by
-        // source_enabled like netqual. Incremental read from the high-water
-        // mark; an EMPTY hwm means "never read" (fresh enable, or the init
-        // backfill failed) and triggers the deep lookback — so an operator who
-        // enables the source LATER still recovers the OS-retained history. The
-        // hwm advances ONLY on success, so a failed tick re-reads the same
-        // window; rows carry the EVENT's own ts. Non-fatal like the netqual leg.
+        // netconn: OS-logged connectivity transitions (ADR-0020). Incremental read
+        // from the high-water mark; an EMPTY hwm means "never read" (fresh enable,
+        // or the init backfill failed) and triggers the deep lookback — so an
+        // operator who enables the source LATER still recovers the OS-retained
+        // history. The hwm advances ONLY on success, so a failed tick re-reads the
+        // same window; rows carry the EVENT's own ts. Non-fatal like the netqual leg.
         if (source_enabled(*db_, "netconn")) {
             // Empty hwm (fresh enable / init backfill failed) -> deep read bounded
             // by the operator-configurable retroactive reach; a set hwm -> forward
@@ -2337,8 +2334,7 @@ private:
             note_health("netconn", "source_disabled");
         }
 
-        // §3.8 — mapped-drive diff (both directions). Gated by
-        // source_enabled (registry default: enabled). NON-FATAL on
+        // §3.8 — mapped-drive diff (both directions). NON-FATAL on
         // insert failure — the service/user legs above may have already
         // committed, so a failure here must not misreport the tick (do NOT `return
         // 1`); the diff baseline advances ONLY on insert success so a failed insert
