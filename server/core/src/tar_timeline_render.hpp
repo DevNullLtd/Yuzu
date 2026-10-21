@@ -64,7 +64,9 @@ TarTimelineLayout tar_timeline_layout_lane(const TarTimelineLane& lane, const Ta
 /// The region covering t (from <= t < to; the last region is closed at its end), or
 /// nullptr when no region states coverage for t. A region with to <= from is never drawn and
 /// never matches. Where regions overlap it returns the one the lane draws on top: the latest
-/// start, and for equal starts the later in vector order.
+/// start, and for equal starts the later in vector order. It consults every region of the lane,
+/// including any past the per-lane draw cap (kTarTimelineMaxBlocksPerLane) that the lanes
+/// renderer counts but does not draw.
 const TarTimelineRegion* tar_timeline_region_at(const TarTimelineLane& lane, std::int64_t t);
 
 /// Items present at t, by shape: bar alive (from <= t < to, or open); tick at-or-before t,

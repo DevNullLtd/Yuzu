@@ -206,16 +206,24 @@ struct Tick {
     std::string label;
 };
 
+/// A window that starts after 1970, ends by year 9999 and runs forward. Anything else draws
+/// nothing: nothing valid can be said about it, and one at double resolution would stack every
+/// item at 0%. The ruler, the layout and the "not valid" banner all use this one test.
+bool window_in_range(const TarTimelineModel& m) {
+    return m.window_from_ts > 0 && m.window_to_ts <= kTarTimelineMaxTs &&
+           m.window_to_ts > m.window_from_ts;
+}
+
 /// Tick step by window span, after the design's tick list: 60 s, 5 min, 2 h, 1 d, 3 d, then
 /// month boundaries.
 std::vector<Tick> time_ticks(const TarTimelineModel& m) {
     std::vector<Tick> out;
-    const std::int64_t from = m.window_from_ts, to = m.window_to_ts;
-    // A window outside 1970..9999 draws no ruler (nothing valid can be said about it). Inside it
-    // every branch below is bounded by construction: the linear steps yield at most 73 ticks,
-    // the month branch has its own guard, and no sum or difference below can overflow.
-    if (from <= 0 || to > kTarTimelineMaxTs || to <= from)
+    // Inside a valid window every branch below is bounded by construction: the linear steps
+    // yield at most 73 ticks, the month branch has its own guard, and no sum or difference
+    // below can overflow.
+    if (!window_in_range(m))
         return out;
+    const std::int64_t from = m.window_from_ts, to = m.window_to_ts;
     const std::int64_t span = to - from;
     auto linear = [&](std::int64_t step, auto label) {
         for (std::int64_t x = (from + step - 1) / step * step; x <= to; x += step)
@@ -351,6 +359,9 @@ std::string region_div(const std::string& cls, double left, double width,
 /// there were, and the rest of the window is one `.unstated` stretch that says so.
 std::string render_regions(const TarTimelineLane& lane, const TarTimelineModel& m,
                            std::size_t& omitted) {
+    omitted = 0;
+    if (!window_in_range(m)) // the "not valid" banner says nothing is drawn; that includes this
+        return {};
     std::vector<const TarTimelineRegion*> rs;
     for (const auto& r : lane.regions)
         if (r.to_ts > r.from_ts && r.to_ts > m.window_from_ts && r.from_ts < m.window_to_ts)
@@ -598,7 +609,7 @@ double tar_timeline_pct(const TarTimelineModel& m, std::int64_t ts) {
 
 TarTimelineLayout tar_timeline_layout_lane(const TarTimelineLane& lane, const TarTimelineModel& m) {
     TarTimelineLayout out;
-    if (m.window_to_ts <= m.window_from_ts)
+    if (!window_in_range(m))
         return out;
 
     struct Pre {
@@ -658,10 +669,20 @@ TarTimelineLayout tar_timeline_layout_lane(const TarTimelineLane& lane, const Ta
     auto collapse = [&](std::size_t from, std::size_t to) {
         TarTimelineBlock b;
         double end = pre[from].end;
+        // count is agent data and nothing bounds its magnitude: a negative count adds nothing,
+        // and the sum saturates (said as "at least") instead of overflowing.
+        constexpr std::int64_t kMaxEvents = std::numeric_limits<std::int64_t>::max();
         std::int64_t events = 0;
+        bool saturated = false;
         for (std::size_t i = from; i < to; ++i) {
             end = std::max(end, pre[i].end);
-            events += pre[i].it->count;
+            const std::int64_t c = std::max<std::int64_t>(pre[i].it->count, 0);
+            if (c > kMaxEvents - events) {
+                events = kMaxEvents;
+                saturated = true;
+            } else {
+                events += c;
+            }
         }
         const std::size_t n = to - from;
         switch (pre[from].it->shape) {
@@ -670,7 +691,8 @@ TarTimelineLayout tar_timeline_layout_lane(const TarTimelineLane& lane, const Ta
             b.label = num(static_cast<std::int64_t>(n)) + " events";
             break;
         case TarItemShape::count:
-            b.label = num(static_cast<std::int64_t>(n)) + " buckets, " + num(events) + " events";
+            b.label = num(static_cast<std::int64_t>(n)) + " buckets, " +
+                      (saturated ? "at least " : "") + num(events) + " events";
             break;
         case TarItemShape::column:
             b.label = num(static_cast<std::int64_t>(n)) + " samples";
@@ -908,9 +930,9 @@ std::string render_timeline_lanes(const TarTimelineModel& m) {
         }
 
     // Banners first: a cut-off or unreadable read is said before any lane is drawn.
-    if (m.window_to_ts <= m.window_from_ts)
-        h += "<div class=\"tl-warn\">The time window is not valid: it ends before it starts, so "
-             "nothing can be drawn.</div>";
+    if (!window_in_range(m))
+        h += "<div class=\"tl-warn\">The time window is not valid: it ends before it starts, or "
+             "lies outside the years 1970 to 9999, so nothing can be drawn.</div>";
     if (!m.online)
         h += "<div class=\"tl-warn\">Device offline: on-device records are not readable.</div>";
     std::vector<std::string> unreadable_seen; // one banner per distinct (lane, reason)

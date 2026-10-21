@@ -1450,6 +1450,63 @@ TEST_CASE("tar timeline extreme timestamps: positions stay finite and in range",
         CHECK_FALSE(out.empty());
 }
 
+TEST_CASE("tar timeline collapse: a count sum saturates and says so, never wraps", "[tar][timeline]") {
+    auto m = base();
+    // Eight tiny buckets: `first` in the first, `rest` in each of the other seven.
+    auto collapsed = [&](std::int64_t first, std::int64_t rest) {
+        std::vector<TarTimelineItem> v;
+        for (int i = 0; i < 8; ++i)
+            v.push_back(bucket("b" + std::to_string(i), W0 + i * 20, W0 + i * 20 + 20,
+                               i == 0 ? first : rest));
+        const auto lay = tar_timeline_layout_lane(lane("l", "dns", "d", v), m);
+        REQUIRE(lay.blocks.size() == 1);
+        REQUIRE(lay.blocks[0].collapsed);
+        return lay.blocks[0];
+    };
+    // 8 x 2^60 is one past the largest int64: capped, and the label says it is a lower bound
+    const auto huge = collapsed(std::int64_t{1} << 60, std::int64_t{1} << 60);
+    CHECK(huge.label == "8 buckets, at least 9223372036854775807 events");
+    CHECK(huge.title == huge.label);
+    // a total that lands exactly on the maximum is exact, not "at least"
+    CHECK(collapsed((std::int64_t{1} << 60) - 1, std::int64_t{1} << 60).label ==
+          "8 buckets, 9223372036854775807 events");
+    // a negative count is not a count: it adds nothing and never cancels another bucket
+    CHECK(collapsed(-5, 50).label == "8 buckets, 350 events");
+    CHECK(collapsed(kMin, 50).label == "8 buckets, 350 events");
+    CHECK(collapsed(kMax, kMax).label == "8 buckets, at least 9223372036854775807 events");
+}
+
+TEST_CASE("tar timeline window: one outside 1970..9999 says so and draws nothing", "[tar][timeline]") {
+    struct Win {
+        std::int64_t from, to;
+    };
+    // the top of int64 (both ends are one double), past year 9999, before 1970, and the epoch
+    for (const Win w : {Win{kMax - 1000, kMax}, Win{W0, kYear9999 + 1}, Win{kMin, W1}, Win{0, W1}}) {
+        INFO("window " << w.from << " .. " << w.to);
+        const std::vector<TarTimelineItem> items{bar("a", w.from + 1, w.from + 2), tick("t", w.from + 1)};
+        auto m = with_lane(lane("l", "process", "p", items, {}), "G");
+        m.window_from_ts = w.from;
+        m.window_to_ts = w.to;
+        m.moment_ts = 0;
+        CHECK(tar_timeline_layout_lane(m.groups[0].lanes[0], m).blocks.empty());
+        const auto html = render_timeline_lanes(m);
+        const std::string warn =
+            "<div class=\"tl-warn\">The time window is not valid: it ends before it starts, or lies "
+            "outside the years 1970 to 9999, so nothing can be drawn.</div>";
+        contains(html, warn);
+        CHECK(html.find(warn) < html.find("<div class=\"tl\">"));
+        // the banner is true: no item and no region stretch is drawn
+        CHECK(count_of(html, "<button type=\"button\" class=\"tl-") == 0);
+        lacks(html, "tl-rg");
+    }
+    // a valid window, up to the last representable second, carries no banner
+    auto edge = base();
+    edge.window_from_ts = kYear9999 - 1000;
+    edge.window_to_ts = kYear9999;
+    for (const auto& m : {base(), edge})
+        lacks(render_timeline_lanes(m), "The time window is not valid");
+}
+
 TEST_CASE("tar timeline ruler: a window outside 1970..9999 draws no ruler and always ends",
           "[tar][timeline]") {
     struct Win {
@@ -1537,7 +1594,8 @@ TEST_CASE("tar timeline empty model: every renderer says something", "[tar][time
         CHECK_FALSE(out.empty());
     contains(outs[0], "Unknown device");
     contains(outs[2], "No lanes in this read.");
-    contains(outs[2], "The time window is not valid: it ends before it starts, so nothing can be drawn.");
+    contains(outs[2], "The time window is not valid: it ends before it starts, or lies outside the "
+                      "years 1970 to 9999, so nothing can be drawn.");
     contains(outs[4], "Nothing in this read.");
     contains(outs[5], "That item is not in this read.");
 
@@ -1599,7 +1657,7 @@ TEST_CASE("tar timeline region_at: overlapping, unsorted and zero-length regions
 
     // the moment panel names the region the lane draws, from an unsorted vector
     auto m = with_lane(lane("l", "process", "Processes", {},
-                            {region(TarRegionKind::exact, W0 + 100, W1), pruned_b, exact_a}),
+                            {region(TarRegionKind::exact, W0 + 100, W1), exact_a, pruned_b}),
                        "G");
     contains(render_timeline_lanes(m), "tl-rg pruned");
     contains(render_timeline_moment(m, W0 + 75, links_full()), "Processes: Nothing is kept for this time");
