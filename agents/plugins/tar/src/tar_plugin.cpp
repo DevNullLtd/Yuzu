@@ -3598,8 +3598,17 @@ private:
         // pending profile's next retry can re-enumerate and re-insert exactly the rows this
         // purge just deleted (adversarial review). Never clear mapdrive_backfill_done here: that
         // would re-run the full first pass and resurrect everything, not just the pending subset.
-        if (source == "mapdrive")
-            db_->set_config("mapdrive_backfill_pending", "");
+        // This write's own failure must not report a silent success: the warehouse rows are
+        // already gone (checked above), so a retry only re-attempts this one idempotent write,
+        // never a second deletion -- but reporting "purged" while the pending list still names
+        // the deleted rows reopens the exact resurrection this fix exists to close (governance,
+        // unhappy-path).
+        if (source == "mapdrive" && !db_->set_config("mapdrive_backfill_pending", "")) {
+            ctx.write_output(
+                "error|purge removed the rows but failed to clear the pending backfill retry "
+                "list; retry the purge (the deletion itself is idempotent and will not repeat)");
+            return 1;
+        }
         ctx.write_output(
             std::format(R"({{"source":"{}","rows_deleted":{},"status":"purged"}})", source, *res));
         return 0;

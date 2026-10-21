@@ -188,7 +188,7 @@ TEST_CASE("autoruns plugin windows leg: scheduled tasks and WMI subscriptions ne
 }
 
 namespace {
-/// Every per-profile constraint reason the three hive-dependent win_*_hku sources can append
+/// Every per-profile constraint reason the four hive-dependent win_*_hku sources can append
 /// after `<sid>:` (autoruns_win.cpp's `yuzu::profiles::hive_access_token`, related issue #5291):
 /// the four plain statuses, the timeout literal, or any hive_* guard token -- including
 /// `hive_stat_failed:win32_<n>`, the only one carrying a numeric suffix.
@@ -225,7 +225,8 @@ TEST_CASE("autoruns plugin windows leg: every per-profile hive constraint reason
     CHECK(result.rc == 0);
 
     static const std::set<std::string> kHiveSources = {"win_run_hku", "win_runonce_hku",
-                                                        "win_startup_approved"};
+                                                        "win_startup_approved",
+                                                        "win_startup_folder_user"};
     std::size_t checked = 0;
     for (const auto& row : captured_rows(result.captured)) {
         const auto f = fields_of(row);

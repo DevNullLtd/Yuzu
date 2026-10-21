@@ -678,7 +678,12 @@ three broken legs; it is one chokepoint. See Caveats item 1.
    keeps its first-recorded timestamp, never overwritten by a later retry that re-observes it. A
    ProfileList walk that is itself permanently incomplete (a terminating registry error on every
    attempt) leaves its pending profiles neither resolved nor retried further that run; tracked as
-   a follow-up, not fixed here.
+   a follow-up, not fixed here. An operator purge of this source (`tar.purge_source mapdrive`)
+   also clears the pending-retry list, not just the warehouse rows it deletes — left alone, a
+   still-pending profile's next retry would otherwise re-enumerate and re-insert exactly the rows
+   the purge just removed; the retry's own commit phase separately re-checks that its claim on the
+   pending list is still the one it made before inserting or overwriting anything, so a purge
+   racing an in-flight retry is dropped rather than resurrected either.
 
 ## Source and tests
 
