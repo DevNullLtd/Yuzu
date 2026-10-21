@@ -25,6 +25,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/agent/trigger_engine.hpp>
 #include <yuzu/agent/updater.hpp>
 #include <yuzu/agent/update_signature_mode.hpp>
+#include <yuzu/enrollment_token_shape.hpp>
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
 #include <yuzu/version.hpp>
@@ -79,8 +80,6 @@ __declspec(allocate(".CRT$XCB"))
 #include <sys/utsname.h> // uname (OS version)
 #include <unistd.h>      // gethostname
 #endif
-
-#include <yuzu/agent/enrollment_token_file.hpp> // is_enrollment_token_refusal
 
 #include <array>
 #include <atomic>
@@ -1908,8 +1907,8 @@ public:
                     // path is cleared whatever the outcome; a file that could not be
                     // removed is presented, refused and retried by the next start.
                     if (!cfg_.enrollment_token_file.empty() &&
-                        yuzu::agent::is_enrollment_token_refusal(resp.enrollment_status(),
-                                                                 resp.reject_reason())) {
+                        yuzu::is_enrollment_token_refusal(resp.enrollment_status(),
+                                                          resp.reject_reason())) {
                         remove_enrollment_token_file("after the server refused the token",
                                                      "will retry on the next start");
                         cfg_.enrollment_token_file.clear();

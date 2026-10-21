@@ -11,8 +11,9 @@
 // The reader cases use a few tiny files under a yuzu_test_ TempDir: the
 // never-follow-a-link, the bounded-read, the owner/mode policy and the "no token
 // unless ok" behaviour are kernel/filesystem boundary logic a pure string parser
-// cannot observe. The owner/mode policy itself is a pure function with its own
-// matrix (a foreign owner cannot be created without privilege). The deadline case
+// cannot observe. The POSIX owner/mode policy is a pure function with its own matrix
+// (a foreign owner cannot be created without privilege); the Windows reject arm has a
+// case against the real reader that SKIPs without SeRestorePrivilege. The deadline case
 // injects a reader that cannot return until the test lets it, so the deadline
 // always fires first. No sleeps, no process spawn, no network.
 
@@ -20,6 +21,10 @@
 #include <yuzu/enrollment_token_shape.hpp>
 
 #include "test_helpers.hpp"
+
+#ifdef _WIN32
+#include <win_profiles.hpp> // yuzu::win::PrivilegeScope (the foreign-owner fixture below)
+#endif
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -334,6 +339,39 @@ TEST_CASE("read_enrollment_token_file: a symlink leaf is refused and never follo
     check_token_iff_ok(d);
 }
 
+#else
+
+// The reject arm of the Windows owner policy, against the real reader. Giving a file
+// to another account needs SeRestorePrivilege, which an elevated token holds disabled
+// (the elevated Windows runner runs this case); a token without it SKIPs, never fails.
+TEST_CASE("read_enrollment_token_file: a file owned by another account is untrusted_owner",
+          "[enrollment][enrollment_token_file]") {
+    TokenDir t;
+    const auto p = t.write("token", make_hex('a') + "\n");
+
+    // SeRestorePrivilege is what lets the fixture assign the file to an account that is
+    // neither SYSTEM, Administrators nor this one (the precedent is privacy_permissions'
+    // HiveFileGuard owner test); PrivilegeScope restores the token on scope exit.
+    const yuzu::win::PrivilegeScope restore(L"SeRestorePrivilege");
+    if (!restore.ok())
+        SKIP("assigning a foreign owner needs SeRestorePrivilege: not held here");
+
+    BYTE users[SECURITY_MAX_SID_SIZE];
+    DWORD users_size = sizeof users;
+    if (!CreateWellKnownSid(WinBuiltinUsersSid, nullptr, users, &users_size))
+        SKIP("the BUILTIN\\Users SID cannot be built: error " << GetLastError());
+    std::wstring wpath = p.wstring();
+    const DWORD rc = SetNamedSecurityInfoW(wpath.data(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                                           users, nullptr, nullptr, nullptr);
+    if (rc != ERROR_SUCCESS)
+        SKIP("the file cannot be given to BUILTIN\\Users: error " << rc);
+
+    const auto r = read_enrollment_token_file(p);
+    CHECK(r.outcome == TokenFileOutcome::untrusted_owner);
+    CHECK_FALSE(r.detail.empty());
+    check_token_iff_ok(r);
+}
+
 #endif
 
 // ── token_file_drive_letter: the Windows leg's pure path gate ───────────────
@@ -368,7 +406,12 @@ TEST_CASE("token_file_drive_letter: only a drive-letter root passes",
 
 TEST_CASE("is_enrollment_token_refusal: only the uniform refusal with status denied matches",
           "[enrollment][enrollment_token_file]") {
-    using yuzu::agent::is_enrollment_token_refusal;
+    using yuzu::is_enrollment_token_refusal;
+    // The literal is a wire contract with deployed agents: they recognise a refusal of
+    // their token by this exact reply, so editing the shared constant must fail here
+    // rather than silently stop the removal on every agent already in the field.
+    CHECK(yuzu::kEnrollmentTokenRejectionPublicMessage ==
+          "invalid, expired, or exhausted enrollment token");
     const std::string uniform{yuzu::kEnrollmentTokenRejectionPublicMessage};
 
     CHECK(is_enrollment_token_refusal("denied", uniform));
@@ -419,7 +462,8 @@ TEST_CASE("resolve_enrollment_token: a token read from the file wins and the pat
         CHECK(file_outcome_of(r) == TokenFileOutcome::ok);
         CHECK(token == file_token);
         CHECK(r.source == "file");
-        // Kept: the agent removes this file after the first accepted registration.
+        // Kept: the agent removes this file after the first accepted registration or the
+        // server's refusal of the token.
         CHECK(path == t.at("token"));
     }
 }

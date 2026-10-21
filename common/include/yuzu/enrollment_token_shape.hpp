@@ -1,7 +1,7 @@
 #pragma once
 
-// Shared enrollment-token shape predicate, token-file text parser and the
-// public token-refusal message.
+// Shared enrollment-token shape predicate, token-file text parser, the public
+// token-refusal message and the predicate that recognises it.
 //
 // `enrollment_token_shape_valid` is the exact wire shape of an enrollment
 // token (64 lowercase hex characters, a 32-byte CSPRNG value). It moved here
@@ -11,8 +11,9 @@
 // including any server header.
 //
 // `kEnrollmentTokenRejectionPublicMessage` moved here for the same reason: the
-// agent recognises a refusal of its token by the exact reply the server sends,
-// and compares against the server's own constant, not a copy.
+// agent recognises a refusal of its token by the exact reply the server sends
+// (`is_enrollment_token_refusal`), and compares against the server's own
+// constant, not a copy.
 //
 // Pure: no I/O, no store or wire types, so this stays inside the
 // common/include firewall (CLAUDE.md "Project layout") and both agent and
@@ -33,6 +34,25 @@ namespace yuzu {
 /// constant for the server handlers).
 inline constexpr std::string_view kEnrollmentTokenRejectionPublicMessage =
     "invalid, expired, or exhausted enrollment token";
+
+/// True when a Register reply that was not accepted is the server refusing the
+/// enrollment TOKEN itself: status "denied" with exactly the uniform public
+/// message. Every token-caused definitive refusal carries exactly that pair, on the
+/// direct path (agent_service_impl.cpp: an oversize token, and a token that is
+/// unknown, malformed, revoked, expired or exhausted) and on the gateway path
+/// (gateway_service_impl.cpp ProxyRegister, the same two sites).
+///
+/// "enrollment denied by administrator" is deliberately NOT a match: it answers an
+/// agent record an administrator denied, including the case where the token was
+/// valid and its use was rolled back, so the credential is intact and removing the
+/// file would lose it. "awaiting admin approval" carries status "pending" and is not
+/// a refusal. The comparison is exact equality, never a substring, so no
+/// operator-controlled text can match. An agent-id charset refusal and a store
+/// failure are non-OK gRPC statuses and never reach a reply that is classified here.
+[[nodiscard]] constexpr bool is_enrollment_token_refusal(std::string_view enrollment_status,
+                                                         std::string_view reject_reason) noexcept {
+    return enrollment_status == "denied" && reject_reason == kEnrollmentTokenRejectionPublicMessage;
+}
 
 /// Exact wire shape of an enrollment token: 64 lowercase hex characters (32
 /// CSPRNG bytes). A token that fails it cannot exist, so the server rejects it

@@ -24,12 +24,14 @@
 // (uid 0 / SYSTEM), by the account the process runs as (euid / token owner), or
 // on Windows by BUILTIN\Administrators; and on POSIX neither group- nor
 // other-writable (the sudoers-source predicate in local_security_policy_legs.hpp).
-// The point is that a file planted by an account that is not allowed to supply a
+// The point is that a file placed by an account that is not allowed to supply a
 // credential for this agent is never read at all: its content is not parsed and its
 // token is not presented to the server.
 // The check runs on the handle/fd that is read, never on the path. Own-user is
 // accepted so the unit tests and an interactive run read their own files; the
 // LocalSystem service therefore accepts only SYSTEM or Administrators.
+// Windows checks the owner only: the installer sets the file's DACL itself, and an
+// effective-rights walk over inherited ACEs is surface this reader does not take on.
 //
 // A file longer than the cap is rejected (too_large), never truncated and
 // parsed. Whatever the outcome, `token` holds a value if and only if the
@@ -43,6 +45,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <format>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -64,7 +67,6 @@
 #pragma comment(lib, "advapi32.lib")
 #else
 #include <cerrno>
-#include <cstdio>
 
 #include <posix_secure_read.hpp>
 #include <unistd.h>
@@ -148,16 +150,15 @@ struct TokenFileHandle {
 /// Owner policy over the OPEN file handle: ok if its owner is SYSTEM,
 /// BUILTIN\Administrators or the owner of this process's token; untrusted_owner
 /// otherwise; unreadable if the owner cannot be determined (fail closed). The
-/// handle carries READ_CONTROL (GENERIC_READ includes it).
-[[nodiscard]] inline TokenFileOutcome token_file_owner_check(HANDLE file, std::string& detail) {
+/// second member says why when the outcome is not ok. The handle carries
+/// READ_CONTROL (GENERIC_READ includes it).
+[[nodiscard]] inline std::pair<TokenFileOutcome, std::string> token_file_owner_check(HANDLE file) {
     PSID owner = nullptr;
     PSECURITY_DESCRIPTOR sd = nullptr;
     const DWORD rc = GetSecurityInfo(file, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &owner,
                                      nullptr, nullptr, nullptr, &sd);
-    if (rc != ERROR_SUCCESS) {
-        detail = "GetSecurityInfo error " + std::to_string(rc);
-        return TokenFileOutcome::unreadable;
-    }
+    if (rc != ERROR_SUCCESS)
+        return {TokenFileOutcome::unreadable, "GetSecurityInfo error " + std::to_string(rc)};
     struct SdGuard { // owns the GetSecurityInfo-allocated descriptor `owner` points into
         PSECURITY_DESCRIPTOR p;
         explicit SdGuard(PSECURITY_DESCRIPTOR d) noexcept : p(d) {}
@@ -168,33 +169,32 @@ struct TokenFileHandle {
                 LocalFree(p);
         }
     } sd_guard{sd};
-    if (owner == nullptr || !IsValidSid(owner)) {
-        detail = "the file has no valid owner";
-        return TokenFileOutcome::unreadable;
-    }
+    if (owner == nullptr || !IsValidSid(owner))
+        return {TokenFileOutcome::unreadable, "the file has no valid owner"};
     if (IsWellKnownSid(owner, WinLocalSystemSid) ||
         IsWellKnownSid(owner, WinBuiltinAdministratorsSid))
-        return TokenFileOutcome::ok;
+        return {TokenFileOutcome::ok, {}};
 
     HANDLE raw_token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw_token)) {
-        detail = "OpenProcessToken error " + std::to_string(GetLastError());
-        return TokenFileOutcome::unreadable;
-    }
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw_token))
+        return {TokenFileOutcome::unreadable,
+                "OpenProcessToken error " + std::to_string(GetLastError())};
     const TokenFileHandle token{raw_token};
     DWORD needed = 0;
     GetTokenInformation(token.h, TokenOwner, nullptr, 0, &needed);
     std::vector<BYTE> buf(needed);
-    if (needed == 0 || !GetTokenInformation(token.h, TokenOwner, buf.data(), needed, &needed)) {
-        detail = "GetTokenInformation error " + std::to_string(GetLastError());
-        return TokenFileOutcome::unreadable;
-    }
-    // Lifetime: the PSID points INTO `buf`, which outlives the comparison.
+    if (needed == 0 || !GetTokenInformation(token.h, TokenOwner, buf.data(), needed, &needed))
+        return {TokenFileOutcome::unreadable,
+                "GetTokenInformation error " + std::to_string(GetLastError())};
+    // Lifetime: the PSID points INTO `buf`, which outlives the comparison. Alignment:
+    // vector's storage comes from operator new, aligned for any fundamental type, so
+    // TOKEN_OWNER is readable at buf.data(). Constness: a read-only view, never written
+    // through.
     const PSID self = reinterpret_cast<const TOKEN_OWNER*>(buf.data())->Owner;
     if (EqualSid(owner, self))
-        return TokenFileOutcome::ok;
-    detail = "owned by an account other than SYSTEM, Administrators or this service";
-    return TokenFileOutcome::untrusted_owner;
+        return {TokenFileOutcome::ok, {}};
+    return {TokenFileOutcome::untrusted_owner,
+            "owned by an account other than SYSTEM, Administrators or this service"};
 }
 
 [[nodiscard]] inline RawTokenFile read_token_file_leaf(const std::filesystem::path& p,
@@ -246,9 +246,9 @@ struct TokenFileHandle {
         return out;
     }
     // The owner of the object that will be read, checked before any byte is.
-    if (const auto owner = token_file_owner_check(guard.h, out.detail);
-        owner != TokenFileOutcome::ok) {
+    if (auto [owner, why] = token_file_owner_check(guard.h); owner != TokenFileOutcome::ok) {
         out.outcome = owner;
+        out.detail = std::move(why);
         return out;
     }
     // One byte past the cap tells "exactly the cap" from "longer"; never trust the size field.
@@ -288,12 +288,11 @@ struct TokenFileHandle {
         if (!token_file_posix_trusted(static_cast<std::uint32_t>(fr.owner_uid),
                                       static_cast<std::uint32_t>(fr.mode),
                                       static_cast<std::uint32_t>(::geteuid()))) {
-            char mode[16];
-            std::snprintf(mode, sizeof mode, "%04o", static_cast<unsigned>(fr.mode & 07777));
             out.outcome = TokenFileOutcome::untrusted_owner;
-            out.detail = "owner uid " + std::to_string(static_cast<unsigned long>(fr.owner_uid)) +
-                         ", mode " + mode + " (must be owned by root or this user and not "
-                         "writable by group or other)";
+            out.detail = std::format("owner uid {}, mode {:04o} (must be owned by root or this "
+                                     "user and not writable by group or other)",
+                                     static_cast<unsigned long>(fr.owner_uid),
+                                     static_cast<unsigned>(fr.mode & 07777));
             break;
         }
         out.text = std::move(fr.data);
@@ -348,25 +347,6 @@ struct EnrollmentTokenResolution {
     std::string file_detail; ///< the reader's `detail` (an OS error description), else empty
     std::string_view source; ///< the winning source: "file", "option" or "none"
 };
-
-/// True when a Register reply that was not accepted is the server refusing the
-/// enrollment TOKEN itself: status "denied" with exactly the uniform public
-/// message. Every token-caused definitive refusal carries exactly that pair, on the
-/// direct path (agent_service_impl.cpp: an oversize token, and a token that is
-/// unknown, malformed, revoked, expired or exhausted) and on the gateway path
-/// (gateway_service_impl.cpp ProxyRegister, the same two sites).
-///
-/// "enrollment denied by administrator" is deliberately NOT a match: it answers an
-/// agent record an administrator denied, including the case where the token was
-/// valid and its use was rolled back, so the credential is intact and removing the
-/// file would lose it. "awaiting admin approval" carries status "pending" and is not
-/// a refusal. The comparison is exact equality, never a substring, so no
-/// operator-controlled text can match. An agent-id charset refusal and a store
-/// failure are non-OK gRPC statuses and never reach a reply that is classified here.
-[[nodiscard]] constexpr bool is_enrollment_token_refusal(std::string_view enrollment_status,
-                                                         std::string_view reject_reason) noexcept {
-    return enrollment_status == "denied" && reject_reason == kEnrollmentTokenRejectionPublicMessage;
-}
 
 /// The one place that decides which enrollment token the agent registers with and
 /// whether the token file stays a deletion target.

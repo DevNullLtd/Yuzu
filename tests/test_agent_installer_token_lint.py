@@ -165,6 +165,15 @@ def problems(iss: str) -> list:
             found.append("WriteEnrollmentTokenFile compares drive letters again: the staging "
                          "directory is beside the destination, so the move is a same-volume "
                          "rename by construction")
+        # The location itself is pinned, not only the absence of a drive-letter
+        # comparison: both paths are built from the destination, so moving the
+        # staging directory to the temp folder (a possible cross-volume copy that
+        # takes the destination's inherited permissions) fails here even when no
+        # other predicate changes.
+        if ("HoldDir := Dest + '.stage';" not in wfn
+                or "HoldFile := HoldDir + '\\enrollment-token';" not in wfn):
+            found.append("WriteEnrollmentTokenFile no longer stages beside the destination "
+                         "(the move must be a same-volume rename)")
 
     # 3a. The token's shape is checked (64 lowercase hex) before it is written.
     sfn = routine(clean, "function EnrollmentTokenShapeProblem(")
@@ -284,6 +293,9 @@ class InstallerTokenFileLint(unittest.TestCase):
                 "  HoldDir := Dest + '.stage';",
                 "  HoldDir := ExpandConstant('{tmp}\\enrollment-token.stage');\n"
                 "  if CompareText(ExtractFileDrive(HoldDir), ExtractFileDrive(Dest)) <> 0 then Exit;"),
+            "staging moved to the temp folder (location only)": (
+                "  HoldDir := Dest + '.stage';",
+                "  HoldDir := ExpandConstant('{tmp}\\enrollment-token.stage');"),
             "shape check removed from PrepareToInstall": (
                 "    Result := EnrollmentTokenShapeProblem(Token);\n    if Result <> '' then\n      Exit;\n", ""),
             "shape check accepts uppercase": (

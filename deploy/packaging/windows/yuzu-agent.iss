@@ -976,9 +976,10 @@ begin
 end;
 
 { Best-effort removal of the token staging area: the staged file, then its
-  directory. Used on every refusal path of WriteEnrollmentTokenFile and after
-  the move. A directory that cannot be removed is reported by the next run,
-  which refuses a leftover at that path. }
+  directory. Used on every refusal path of WriteEnrollmentTokenFile once the
+  staging directory exists; after a successful move only the empty directory
+  is left and step 9 removes it directly. A directory that cannot be removed
+  is reported by the next run, which refuses a leftover at that path. }
 procedure DropTokenStaging(const HoldFile, HoldDir: string);
 begin
   DeleteFile(HoldFile);

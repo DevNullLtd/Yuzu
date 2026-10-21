@@ -70,9 +70,10 @@ and 100 uses, on every create surface: the dashboard form, `POST /api/settings/e
 `POST /api/settings/enrollment-tokens/batch` (`ttl_hours` only — its `max_uses` default stays 1),
 and the server CLI `--generate-tokens --token-ttl-hours` (its `--token-max-uses` default also
 stays 1). An explicit `0` still means unlimited uses / no expiry, exactly as before. The CLI now
-refuses a negative `--token-ttl-hours` or `--token-max-uses` (a negative value used to mint a
-token with no expiry / unlimited uses), and its `enrollment.bulk_token_create` audit row now
-records `ttl_s=` and `label=`.
+refuses a negative `--token-ttl-hours` or `--token-max-uses` (a negative `--token-ttl-hours` used
+to mint a token with no expiry, and a negative `--token-max-uses` was refused by the store rather
+than by the option parser), and its `enrollment.bulk_token_create` audit row now records `ttl_s=`
+and `label=`.
 
 **Who is affected.** A script or operator that relies on leaving a limit blank to mean
 unlimited/never-expiring now gets a 72-hour/100-use token instead. A rollout that stages tokens in

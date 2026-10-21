@@ -792,9 +792,10 @@ int main(int argc, char* argv[]) {
     app.add_option("--generate-tokens", generate_tokens,
                    "Generate N enrollment tokens and print to stdout (JSON), then exit");
     app.add_option("--token-label", gen_label, "Label prefix for generated tokens");
-    // Non-negative only: a negative value used to fall through to "no expiry" /
-    // "unlimited" below, the opposite of what a signed number reads as (the REST
-    // twin refuses a negative ttl_hours). 0 is the explicit way to ask for either.
+    // Non-negative only: a negative --token-ttl-hours used to fall through to "no
+    // expiry" below, the opposite of what a signed number reads as (the REST twin
+    // refuses a negative ttl_hours), and a negative --token-max-uses was refused by the
+    // store rather than by the option parser. 0 is the explicit way to ask for either.
     app.add_option("--token-max-uses", gen_max_uses,
                    "Max uses per token (default: 1; 0 = unlimited)")
         ->check(CLI::NonNegativeNumber);
