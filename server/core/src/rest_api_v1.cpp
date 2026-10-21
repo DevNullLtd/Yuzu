@@ -50,6 +50,7 @@
 #include "openapi_spec_access.hpp" // external-linkage accessor for discover_routes.cpp / mcp_server.cpp
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "product_pack_model.hpp" // #4029: shared row/detail builders + error classifiers
+#include "quarantine_read_model.hpp" // quarantine_list_data_json: ordered_json builder shared with the MCP twin
 #include "quarantine_visible.hpp" // quarantine_visible_records: shared admit-then-filter read (REST GET + dashboard fragments)
 #include "quarantine_reapply.hpp" // quarantine_whitelist_tokens_safe / kQuarantineWhitelistMaxLen (#3425 gate3-rest-whitelist-validation-gap)
 #include "result_set_matcher.hpp" // validate_matcher: admission check of a caller matcher (#4644)
@@ -6347,29 +6348,11 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            JArr arr;
-            int64_t visible = 0;
-            for (const auto& r : visible_set.records) {
-                arr.add(JObj()
-                            .add("agent_id", r.agent_id)
-                            .add("status", r.status)
-                            .add("quarantined_by", r.quarantined_by)
-                            .add("quarantined_at", r.quarantined_at)
-                            .add("whitelist", r.whitelist)
-                            .add("reason", r.reason)
-                            // #3425: endpoint-containment confirmation state
-                            // (schema v2) — 0 = never, matching
-                            // quarantined_at's own never-happened shape.
-                            // last_applied_at: a system re-dispatch of the
-                            // stored whitelist was accepted (agents_reached
-                            // > 0), NOT proof of containment.
-                            // last_confirmed_at: a follow-up quarantine.status
-                            // read reported state|active.
-                            .add("last_applied_at", r.last_applied_at)
-                            .add("last_confirmed_at", r.last_confirmed_at));
-                ++visible;
-            }
-            res.set_content(list_json(arr.str(), visible), "application/json");
+            // One builder shared with the MCP twin (quarantine_read_model.hpp): the eight
+            // keys in wire order, byte-pinned by test_rest_quarantine_routes.cpp.
+            const auto data = quarantine_dump(quarantine_list_data_json(visible_set.records));
+            res.set_content(list_json(data, static_cast<int64_t>(visible_set.records.size())),
+                            "application/json");
         });
 
     sink.Post("/api/v1/quarantine", [auth_fn, scoped_perm_fn, audit_fn, quarantine_store,
