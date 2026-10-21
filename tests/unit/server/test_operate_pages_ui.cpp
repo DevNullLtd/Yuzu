@@ -215,7 +215,13 @@ TEST_CASE("operate pages: Approvals copy is exact and claims no second person",
     // The dialog copy does not claim the reviewer saw everything when the summary was cut.
     CHECK(has(js, "d.request && d.shortened === '1' ?"));
     CHECK(has(js, "The summary above is shortened and is for orientation only; it does not show the "));
-    CHECK(has(js, "The summary above is for orientation. What you approve is the whole request, frozen "));
+    CHECK(has(js, "The summary above is for orientation. What you approve is the whole request as "));
+    // The Approve POST carries only a comment and matches id + pending status, so no copy may
+    // promise that the request cannot change after the decision (digest-pinned Approve is a
+    // PR3 entry condition in ADR-1009).
+    CHECK_FALSE(has(js, "cannot change after your decision"));
+    CHECK_FALSE(has(js, "frozen under the digest"));
+    CHECK_FALSE(has(js, "it is frozen on the request"));
     // Never claims the summary IS the whole effect.
     CHECK_FALSE(has(js, "exactly the effect shown"));
     // An unreadable request hides Approve only (#6062): Reject stays so the row can be cleared.

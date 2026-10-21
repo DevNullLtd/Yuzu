@@ -262,11 +262,11 @@
           'The requesting agent must re-call the tool with this approval id for it to run.' :
           d.request && d.shortened === '1' ?
           'The summary above is shortened and is for orientation only; it does not show the ' +
-          'whole request. What you approve is the whole request, frozen under the digest shown; ' +
-          'it cannot change after your decision.' :
+          'whole request. What you approve is the whole request as stored under the digest ' +
+          'shown.' :
           d.request ?
-          'The summary above is for orientation. What you approve is the whole request, frozen ' +
-          'under the digest shown; it cannot change after your decision.' :
+          'The summary above is for orientation. What you approve is the whole request as ' +
+          'stored under the digest shown.' :
           'The parameter values are not stored with this request. You are deciding on the ' +
           'instruction and scope only.') :
         'Your decision and reason are recorded. The requester can read the reason on the request.';
