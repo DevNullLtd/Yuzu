@@ -3002,10 +3002,60 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | Internal CA | `/fragments/settings/ca` | View the built-in Certificate Authority (algorithm, SHA-256 fingerprint, expiry), download the CA certificate + CRL, browse the issued-certificate inventory, and revoke a certificate. `Security:Read` to view, `Security:Delete` to revoke. |
 | Access Reviews | `/fragments/settings/access-reviews` | Periodic access review (SOC 2 CC6.2) convenience panel — pull/download the cross-principal grant export (JSON/CSV), open a new attestation campaign, and record per-grant `attested`/`flagged_revoke` decisions against an open campaign (`/fragments/settings/access-reviews/campaign?id=...`). Gated on `AccessReview:Read` (the write controls appear for a caller who also holds `AccessReview:Attest`), a view over the same `/api/v1/access-reviews*` REST API and its MCP twins — not a separate data path. Unlike the **Audit and reviews** page (`/access/audit`), viewing this panel writes no `access_review.list`, `access_review.get` or `access_review.exported` audit row; the changes made from it are audited by the REST routes it calls. See `docs/auth-architecture.md` "Periodic access reviews". |
 
+### Plugins and updates (System page)
+
+An admin-only page under **Settings** in the sidebar reads the same data as the
+Settings panels and REST routes it sits over (no new write route):
+
+- **Plugins and updates** (`/settings/plugins`): stored plugin configuration
+  (read-only; no agent reads these values yet, and secrets cannot be listed), a
+  kill-switch lookup showing the all-OS layer and each OS layer and which row
+  decided it (the server refuses to *send* commands to a switched-off plugin; it
+  does not recall commands already sent or stop work an agent starts itself),
+  product packs, and the Plugin Code Signing and Agent Updates panels.
+
+The panels apply the page's admin gate and the matching REST route's own
+permission, and show a note (not an empty list) when denied or when the store
+could not be read. The stored-configuration panel decides from the one
+authorization check `GET /api/v1/plugin-config` and the MCP `list_plugin_config`
+tool use (the ADR-0017 list-read gate, which admits an active just-in-time
+elevation and refuses a management-group-confined grant), so the
+panel and those two routes make the same list decision for any principal who
+also passes the page's administrator gate (the REST route and the MCP tool record the
+confined-grant refusal). A panel refused
+for a signed-in browser session leaves no denial row in the audit log (the
+panels load by themselves, so a refusal is not an attempt); an API-token or
+engine caller refused the same panel leaves the usual `auth.admin_required` or
+`auth.permission_required` row. Opening the page itself as a non-administrator
+is audited.
+
+### Certificates and secrets (System page)
+
+An admin-only page under **Settings** in the sidebar reads the same data as the
+Settings panel and REST routes it sits over (no new write route):
+
+- **Certificates and secrets** (`/settings/pki`): the certificate authority
+  (trust mode, algorithm, validity, SHA-256, CA and CSR downloads, enterprise
+  chain import), the revocation list (published time, next update, revoked
+  count, and *Out of date* when a revocation is not on the published list), the
+  issued-certificate inventory (the newest 500) with *Active*, *Expired* and *Revoked* states and
+  a revoke confirmation worded for the certificate's purpose, and a read-only
+  key-encryption-key status panel (active key version, re-wrap state, live key
+  versions, operation lock; `Security:Read`). Key rotation and re-wrap stay on
+  `POST /api/v1/secrets/kek/rotate` and `/rewrap`.
+
+The page itself requires an administrator. Each panel is loaded from its own
+route, which enforces the matching REST permission (`Security:Read`), and the
+page shows a note (not an empty list) when a panel is denied or cannot be read.
+A revocation list whose next-update time has passed shows *Expired list* rather
+than *Current*.
+
 ### Revoking an agent certificate from the dashboard
 
-When the server runs its built-in CA, **Settings → Internal CA** lists every
-issued certificate. To revoke one (e.g. a decommissioned or compromised agent):
+When the server runs its built-in CA, **Settings → Certificates and secrets**
+(or **Settings → Internal CA** on the Settings page) lists the newest 500
+issued certificates; for an older one, find its serial with
+`GET /api/v1/ca/issued?offset=` and revoke it with `POST /api/v1/ca/revoke`. To revoke one (e.g. a decommissioned or compromised agent):
 
 1. Find the agent's row in the inventory (match on **Subject** = `agent_id` or
    the **Serial**).
@@ -3013,7 +3063,8 @@ issued certificate. To revoke one (e.g. a decommissioned or compromised agent):
    stored on the revocation record and audited.
 3. Click **Revoke** and confirm. The panel refreshes in place showing the cert as
    *Revoked* and the public CRL is republished automatically. If that publish
-   fails (the panel does not show this; the REST/MCP revoke response returns
+   fails (the Settings panel does not show this, while Certificates and secrets
+   shows *Out of date*; the REST/MCP revoke response returns
    `crl_republished:false` and a `ca.crl.published` failure is audited), the
    server republishes it on its own: on the next
    15-second freshness tick once the cause clears, or up to about 5 minutes later

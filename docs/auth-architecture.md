@@ -3087,21 +3087,29 @@ ADR-0041, currently at v3).
 
 ## Render-time permission probes (capability hints)
 
-Three `AuthRoutes` methods answer a permission question without writing a denial row, for pages
+Five `AuthRoutes` methods answer a permission question without writing a denial row for an
+interactive sign-in, for pages
 that decide what to DRAW: `has_permission` (the verdict only), `probe_permission` (the verdict
-with the gate's own response kept, so "denied" and "store unavailable" stay distinguishable) and
-`probe_fleet_read` (`require_fleet_read`'s decision and scope). Each runs the gate's own code
-under the thread-local `AuditProbeScope`, which makes `audit_log` a no-op (the `role.elevation.expired` lifecycle row, written through `audit_log_for_principal`, is still written), and withholds the
-denial row **only for an interactive cookie sign-in** (`denial_row_may_be_withheld`: `local`,
-`oidc` or `saml` and not an engine principal). A token or engine caller that reaches such a route
-keeps its row.
+with the gate's own response kept, so "denied" and "store unavailable" stay distinguishable),
+`probe_admin` (`require_admin`'s decision), `probe_fleet_read` (`require_fleet_read`'s decision and
+scope) and `probe_global_list_read` (`require_list_read`'s decision, with a management-group-
+confined admission refused as a denial, for a resource that is not agent-scoped; its loud twin
+`require_global_list_read` is the gate of the plugin-config REST list). Each runs the gate's own
+code under the thread-local `AuditProbeScope`. `require_auth`, the first step of every gate,
+records the session the gate authenticated in that scope, and `audit_log` withholds a row **only
+when that session is an interactive cookie sign-in** (`denial_row_may_be_withheld`: `local`,
+`oidc` or `saml` and not an engine principal). The decision rests on the one lookup that decided
+the verdict, never on a second one; the `role.elevation.expired` lifecycle row, written through
+`audit_log_for_principal`, is still written. A request whose gate session is a token or an engine
+principal keeps its row.
 
 What is withheld is the audit row. The denial counters (`yuzu_auth_topology_floor_denied_total`,
 `yuzu_auth_service_scope_default_denied_total`, `yuzu_server_rbac_read_degrade_total`) still tick,
 and the store's own read telemetry is untouched.
 
 A probe is a rendering hint unless a route deliberately binds it as its gate: the Dashboard panel
-fragments do (a refused sign-in is shown a note and leaves no row), while an action route must
+fragments and the Plugins and updates fragments do (a refused sign-in is shown a note and
+leaves no row), while an action route must
 re-check through `require_permission` or `require_scoped_permission`. An earlier design that
 threaded a `Quiet` argument through `require_permission` was dropped because nothing called it and
 it did not cover `require_fleet_read`.

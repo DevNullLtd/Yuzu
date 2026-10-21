@@ -556,7 +556,7 @@ agent_test_exe = executable(
     'unit/test_privacy_permissions_local_dispatcher.cpp', # Wave 8 PR8.5: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_privacy_permissions_macos_internals.cpp',  # TU-inclusion seam over privacy_permissions_macos.cpp, Apple-only body, unguarded TU
     'unit/test_privacy_permissions_win_internals.cpp',    # TU-inclusion seam over privacy_permissions_win.cpp (Windows-only body, empty TU elsewhere)
-    'unit/test_privacy_permissions_win_walk.cpp',  # fake-registry/fake-probe locks over privacy_permissions_win_walk.hpp + privacy_permissions_hive_guard.hpp, pure, every host
+    'unit/test_privacy_permissions_win_walk.cpp',  # fake-registry/fake-probe locks over privacy_permissions_win_walk.hpp + agents/shared/win_hive_file_guard.hpp, pure, every host
     'unit/test_posix_dir_walk.cpp',     # PR #4154 round-8 remediation: shared capped
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
     'unit/test_posix_secure_read.cpp',  # shared O_NOFOLLOW dir-open + bounded no-follow file read (agents/shared/posix_secure_read.hpp), POSIX-only bodies
@@ -1678,6 +1678,12 @@ if build_server
       'unit/server/test_crl_publisher.cpp', # HA WS-6 CRL follow-ups (#4828/#4831)
       'unit/server/test_kek_routes.cpp', # #2395 track D — KEK rotation REST surface
       'unit/server/test_developer_writes.cpp', # System > Developer and API: Load generator Start/Stop script pins
+      'unit/server/test_plugin_page_model.cpp', # System > Plugins and updates: pure panel goldens
+      'unit/server/test_settings_plugins_page.cpp', # System > Plugins and updates: page pins and fragment gates
+      'unit/server/test_settings_plugins_authz.cpp', # System > Plugins and updates: [pg] the fragments through the REAL probe gates (denial rows: token yes, cookie no)
+      'unit/server/test_ca_panel_render.cpp', # System > Certificates and secrets: pure CA panel goldens
+      'unit/server/test_kek_panel_render.cpp', # System > Certificates and secrets: pure KEK status panel goldens
+      'unit/server/test_settings_pki_page.cpp', # System > Certificates and secrets: page pins, page gate, KEK fragment
       'unit/server/test_kek_op_lock_holder.cpp', # #2530 B6 — advisory-lock holder query
       'unit/server/test_pg_session_advisory_lock.cpp', # #2964 round 3 — PgAdvisoryLockKey + aborted-txn unlock recovery
       'unit/server/test_kek_rotate_control.cpp', # #2530 B3/B4 — rotate control-flow ordering + half-commit classification

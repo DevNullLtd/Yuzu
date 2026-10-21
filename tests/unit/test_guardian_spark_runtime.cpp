@@ -3046,6 +3046,14 @@ TEST_CASE("concurrent attach/detach/evaluate/drain do not race when the backend 
     // Each churner's EXCLUSIVE view of what it left attached. Written only by its owner,
     // read by the main thread after every churner has joined.
     std::array<std::map<std::string, std::string>, kLanes> live; // rid -> key
+    // rids whose MOST RECENT op was an attach that returned "arm timed out" (rid -> key). The
+    // runtime retains such a claim as a wedge and ADOPTS its late success if the rule is still
+    // wanted and no live sibling owns the key (guardian_spark_runtime.cpp, CommitPath::
+    // CallbackAdopt), so after quiescence the rid may or may not be attached. Neither answer is
+    // a defect, and a churner cannot know which it will get (it depends on whether a sibling
+    // claim is live on the key when the late success lands), so these are the ONLY rids the
+    // accounting below does not pin to one answer (#5338).
+    std::array<std::map<std::string, std::string>, kLanes> maybe_adopted;
 
     std::vector<std::thread> workers;
     std::thread releaser;
@@ -3108,19 +3116,27 @@ TEST_CASE("concurrent attach/detach/evaluate/drain do not race when the backend 
                 if (i % 3 == 0) {
                     rt->detach_rule(rid);
                     live[static_cast<std::size_t>(lane)].erase(rid);
+                    maybe_adopted[static_cast<std::size_t>(lane)].erase(rid);
                 } else {
                     const auto spec = spec_for(lane, k);
                     auto res = rt->attach_rule(rid, spec, rule_for(lane, rid), true);
                     if (res) {
                         attach_ok.fetch_add(1);
                         live[static_cast<std::size_t>(lane)][rid] = spark_key(spec);
+                        maybe_adopted[static_cast<std::size_t>(lane)].erase(rid);
                     } else {
                         attach_err.fetch_add(1);
                         // attach_rule ALWAYS tears the prior generation down first
                         // (detach_rule_locked runs in its phase 1, before the arm), so a
                         // failed attach leaves this rid NOT attached - never still
-                        // attached to whatever it had before.
+                        // attached to whatever it had before. The one exception is a
+                        // TIMEOUT: the claim is retained as a wedge and its late success can
+                        // still be adopted, so that rid is neither live nor known-absent.
                         live[static_cast<std::size_t>(lane)].erase(rid);
+                        if (res.error() == "arm timed out")
+                            maybe_adopted[static_cast<std::size_t>(lane)][rid] = spark_key(spec);
+                        else
+                            maybe_adopted[static_cast<std::size_t>(lane)].erase(rid);
                     }
                 }
                 // THE INVARIANT THAT MAKES THE REJECTION ASSERTION REAL: never submit a
@@ -3234,6 +3250,11 @@ TEST_CASE("concurrent attach/detach/evaluate/drain do not race when the backend 
     CHECK(still_armed.size() == rt->armed_key_count());
 
     // ── (d) the churners' exclusive view ──
+    // Every rid the churners can name is pinned EXACTLY: attached iff its last op left it
+    // live. The only rids allowed an either/or answer are those whose last op timed out
+    // (`maybe_adopted`); a late adopted success is then counted in, and its key with it.
+    // Anything else surplus still fails here, and the subscription census above still
+    // fails on a leaked arm.
     std::size_t expected_rules = 0;
     std::set<std::string> expected_keys;
     for (const auto& m : live) {
@@ -3241,7 +3262,25 @@ TEST_CASE("concurrent attach/detach/evaluate/drain do not race when the backend 
         for (const auto& [rid, key] : m)
             expected_keys.insert(key);
     }
-    CHECK(rt->rule_count() == expected_rules);
+    std::size_t adopted = 0;
+    for (int lane = 0; lane < kLanes; ++lane) {
+        const auto& lane_live = live[static_cast<std::size_t>(lane)];
+        const auto& lane_maybe = maybe_adopted[static_cast<std::size_t>(lane)];
+        for (int j = 0; j < kRidsPerLane; ++j) {
+            const std::string rid = "r" + std::to_string(lane) + "_" + std::to_string(j);
+            const bool attached = rt->status_for_rule(rid).has_value();
+            if (const auto m = lane_maybe.find(rid); m != lane_maybe.end()) {
+                if (attached) {
+                    ++adopted;
+                    expected_keys.insert(m->second);
+                }
+            } else {
+                INFO("rid " << rid);
+                CHECK(attached == (lane_live.count(rid) != 0));
+            }
+        }
+    }
+    CHECK(rt->rule_count() == expected_rules + adopted);
     CHECK(rt->armed_key_count() == expected_keys.size());
 
     rt->begin_stop();

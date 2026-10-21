@@ -34,8 +34,9 @@ constexpr std::chrono::milliseconds kKillSwitchCheckTimeout{300};
 
 // Hard cap on rows materialised by list_config (mirrors
 // OfflineEndpointStore::kQueryRowCap — defensive, not expected to bind in
-// practice for a config/secret plane).
-constexpr int kListRowCap = 5000;
+// practice for a config/secret plane). The value lives in plugin_config_parsers.hpp so the
+// page that names it cannot drift from it.
+constexpr int kRowCapInt = static_cast<int>(plugin_config::kListRowCap);
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets search_path to the store schema for
@@ -271,7 +272,7 @@ PluginConfigStore::list_config(std::string_view plugin, bool* truncated) const {
     // Fetch one row PAST the cap so a full page is distinguishable from an
     // exactly-kListRowCap-sized result — the extra row (if any) is dropped
     // below and never returned, it only flips `truncated`.
-    const std::string fetch_limit = std::to_string(kListRowCap + 1);
+    const std::string fetch_limit = std::to_string(kRowCapInt + 1);
     pg::PgResult res =
         plugin.empty()
             ? pg::exec_params(lease.get(),
@@ -289,8 +290,8 @@ PluginConfigStore::list_config(std::string_view plugin, bool* truncated) const {
         return std::unexpected(Error::Unavailable);
 
     int rows = PQntuples(res.get());
-    if (rows > kListRowCap) {
-        rows = kListRowCap;
+    if (rows > kRowCapInt) {
+        rows = kRowCapInt;
         if (truncated != nullptr)
             *truncated = true;
     }
