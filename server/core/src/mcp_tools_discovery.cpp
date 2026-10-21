@@ -18,9 +18,9 @@ namespace {
 
 // discover_routes. The generic gates (knownness, C7, service-scope, tier, approval)
 // have already run by the time this is called; the #2405 input-schema check runs
-// only for approval-gated tools, so a non-gated handler must validate its own
-// arguments (ctx.args may be any JSON value). discover_routes takes none and ignores
-// ctx.args. This body is the former dispatch branch, with the per-request helpers
+// only for approval-gated tools, and the central check guarantees ctx.args is a JSON
+// object but nothing more, so a non-gated handler must validate its own arguments.
+// discover_routes takes none and ignores ctx.args. This body is the former dispatch branch, with the per-request helpers
 // read off the context.
 void handle_discover_routes(const ToolCallContext& ctx) {
     if (!tier_allows(ctx.tier, "Infrastructure", "Read")) {

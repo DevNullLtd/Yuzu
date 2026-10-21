@@ -137,30 +137,6 @@ std::optional<HardwareListQuery> query_from_request(const httplib::Request& req)
     return q;
 }
 
-// Assemble the operator-visible roster: the UNFILTERED roster from RosterFn, scope-
-// filtered by the FleetReadGate's own scope (the SOLE filter — never double up with
-// a second scope predicate). Returns the filtered roster + the drop count.
-std::pair<std::vector<InventoryDeviceRow>, std::size_t>
-scoped_roster(const InventoryDevicesResult& all, const authz::VisibleSet& scope) {
-    std::vector<InventoryDeviceRow> out;
-    std::size_t dropped = 0;
-    out.reserve(all.rows.size());
-    for (const auto& row : all.rows) {
-        if (!authz::in_scope(scope, row.agent_id)) { ++dropped; continue; }
-        out.push_back(row);
-    }
-    return {std::move(out), dropped};
-}
-
-// Audit-trail floor for an id taken raw from a URL: a device id reaches `target_id`
-// on every audit row these routes write and on the permission-denial audit, so ids over
-// kMaxAgentIdLength bytes or carrying a byte below 0x20 (CR/LF) are refused before any
-// audit write. Mirrors viz_routes.cpp's agent_id floor.
-bool id_is_audit_safe(const std::string& id) {
-    return id.size() <= auth::kMaxAgentIdLength &&
-           std::none_of(id.begin(), id.end(), [](unsigned char c) { return c < 0x20; });
-}
-
 } // namespace
 
 HwCiAffordances HardwareRoutes::affordances_for(const httplib::Request& req, const std::string& id,
@@ -754,11 +730,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         const HardwareCiDetail detail = deps_.ci_detail_fn(agent_id);
-        const bool truly_absent = !detail.identity &&
-                                  (!detail.ci.has_value() ? false : !detail.ci->has_value()) &&
-                                  (!detail.software || detail.software->empty()) &&
-                                  (!detail.tags || detail.tags->empty());
-        if (truly_absent && detail.identity_degraded) {
+        const HardwareCiRead read = classify_hardware_ci_read(detail);
+        if (read == HardwareCiRead::RosterUnreadable) {
             // A failed roster read is never a 404 (#5531).
             (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "inventory.device.ci", "failure",
                                                 "Agent", agent_id,
@@ -769,7 +742,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                             "application/json");
             return;
         }
-        if (truly_absent) {
+        if (read == HardwareCiRead::NotFound) {
             res.status = 404;
             res.set_content(detail::a4_error(res, "not found"), "application/json");
             return;
