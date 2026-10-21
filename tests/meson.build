@@ -3481,7 +3481,7 @@ test('gateway wrapper guard selftest',
 # #4853: pins the run-private epmd (scripts/gateway_epmd.py) the gateway test
 # wrapper gives every eunit/ct run, so another job's end-of-job orphan cleanup
 # on a shared self-hosted box cannot kill the epmd the multinode eunit modules'
-# `peer` nodes depend on. Hermetic (injected seams, one held listener), so it
+# `peer` nodes depend on. Hermetic (injected seams, a few held sockets), so it
 # runs on every leg, including ones without Erlang.
 test('gateway private epmd selftest',
   _python3_test,

@@ -9,7 +9,7 @@
   4. scripts/test_gateway.py calls activate() on the env it hands to rebar3,
      right after base_env().
 
-Hermetic: injected seams, plus a few loopback listeners on OS-chosen ports to
+Hermetic: injected seams, plus a few wildcard-bound sockets on OS-chosen ports to
 prove the real probe refuses a held port. No epmd, no rebar3, no subprocess.
 """
 import errno
@@ -39,13 +39,20 @@ def quiet(*args, **kwargs):
 
 
 def free_port_number():
-    """An OS-chosen port nothing holds right now, or a skip if sockets are denied."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    """An OS-chosen port nothing holds right now. Skips where this host cannot
+    bind (a sandbox), on IPv4 or, where it has the stack, IPv6: the real probe
+    needs both, and a test of it cannot say anything there."""
+    port = None
+    for family, host in ((socket.AF_INET, ""), (socket.AF_INET6, "::")):
         try:
-            s.bind(("", 0))
-        except OSError as exc:  # a sandbox that denies bind cannot run the real-probe tests
+            with socket.socket(family, socket.SOCK_STREAM) as s:
+                s.bind((host, 0))
+                port = port or s.getsockname()[1]
+        except OSError as exc:
+            if family == socket.AF_INET6 and exc.errno in ge._NO_IPV6:
+                continue
             raise unittest.SkipTest("cannot bind a socket here: %s" % exc)
-        return s.getsockname()[1]
+    return port
 
 
 class PickPortTest(unittest.TestCase):
@@ -63,10 +70,10 @@ class PickPortTest(unittest.TestCase):
         self.assertEqual(seen, [self.LOW + 100, self.LOW + 100 + step, self.LOW + 100 + 2 * step])
         self.assertEqual(port, seen[-1])
 
-    def test_with_everything_free_the_default_pid_picks_this_processs_start_port(self):
+    def test_with_everything_free_the_default_pid_picks_this_process_start_port(self):
         self.assertEqual(ge.pick_port(lambda p: True), self.LOW + os.getpid() % SPAN)
 
-    def test_every_pid_stride_reaches_every_start_port(self):
+    def test_windows_pid_stride_reaches_every_start_port(self):
         # Windows pids are multiples of 4; a span divisible by 4 would reach a quarter of the
         # start ports and make two concurrent runs 4x likelier to share one.
         starts = {ge.pick_port(lambda p: True, pid=lambda pid=pid: pid) for pid in range(0, 4 * SPAN, 4)}
@@ -121,7 +128,6 @@ class PortProbeTest(unittest.TestCase):
                 held.bind(("", 0))
             except OSError as exc:  # a sandbox that denies bind cannot run this probe test
                 self.skipTest("cannot bind a socket here: %s" % exc)
-            held.listen(1)
             self.assertFalse(ge.port_is_free(held.getsockname()[1]))
 
     def test_a_port_held_only_on_ipv6_is_not_free(self):
@@ -134,7 +140,6 @@ class PortProbeTest(unittest.TestCase):
         except OSError as exc:
             self.skipTest("no usable IPv6 here: %s" % exc)
         with held:
-            held.listen(1)
             self.assertFalse(ge.port_is_free(held.getsockname()[1]))
 
     def test_a_probe_that_cannot_open_a_socket_says_not_free_and_never_raises(self):
@@ -144,15 +149,16 @@ class PortProbeTest(unittest.TestCase):
 
     def test_a_host_without_ipv6_has_nothing_holding_the_port_there(self):
         real = socket.socket
-
-        def no_v6(family, *args, **kwargs):
-            if family == socket.AF_INET6:
-                raise OSError(errno.EAFNOSUPPORT, "no IPv6")
-            return real(family, *args, **kwargs)
-
         port = free_port_number()
-        with mock.patch.object(ge.socket, "socket", side_effect=no_v6):
-            self.assertTrue(ge.port_is_free(port))
+        for code in (errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL):
+            def no_v6(family, *args, code=code, **kwargs):
+                if family == socket.AF_INET6:
+                    raise OSError(code, "no IPv6")
+                return real(family, *args, **kwargs)
+
+            with self.subTest(errno=errno.errorcode[code]), \
+                    mock.patch.object(ge.socket, "socket", side_effect=no_v6):
+                self.assertTrue(ge.port_is_free(port))
 
 
 class IsolateTest(unittest.TestCase):
@@ -203,6 +209,7 @@ class ActivateTest(unittest.TestCase):
         self.assertEqual(said, [("[test_gateway.py] run-private epmd: ERL_EPMD_PORT=24242",
                                  {"flush": True})])
         self.assertEqual(registered, [(ge.stop, "24242", env)])
+        self.assertIs(registered[0][2], env)  # the live env, not a copy a later edit would miss
 
     def test_an_operators_port_is_named_and_never_killed(self):
         env = {"ERL_EPMD_PORT": "9999"}
@@ -218,7 +225,7 @@ class ActivateTest(unittest.TestCase):
         self.assertIn("#4853", said[0][0])
         self.assertEqual(registered, [])
 
-    def test_the_default_isolation_is_isolate(self):
+    def test_a_port_found_by_isolate_sets_the_env_and_registers_cleanup(self):
         env = {}
         port, said, registered = self.run_activate(
             env, functools.partial(ge.isolate, is_free=lambda p: True))
@@ -230,8 +237,11 @@ class ActivateTest(unittest.TestCase):
         free_port_number()  # skips where sockets are denied; anywhere else the real probe works
         env = {}
         registered = []
+        expected = ge.pick_port(ge.port_is_free)
+        if expected is None:
+            self.skipTest("no port in the range can be probed here")
         port = ge.activate(env, register=lambda *a: registered.append(a), say=quiet)
-        self.assertEqual(port, str(ge.pick_port(ge.port_is_free)))
+        self.assertEqual(port, str(expected))
         self.assertEqual(env["ERL_EPMD_PORT"], port)
         self.assertEqual(registered, [(ge.stop, port, env)])
 
@@ -239,9 +249,10 @@ class ActivateTest(unittest.TestCase):
 class FindEpmdTest(unittest.TestCase):
     ROOT = os.path.realpath(os.path.join(os.sep, "otp"))
 
-    def which_erl_only(self, root):
+    def which_erl_only(self, root, on_path=None):
+        """`which` that finds erl, and only erl, and only on the PATH it is given."""
         erl = os.path.join(root, "bin", "erl")
-        return lambda name, path=None: erl if name == "erl" else None
+        return lambda name, path=None: erl if name == "erl" and path == on_path else None
 
     @staticmethod
     def listing(paths):
@@ -270,7 +281,7 @@ class FindEpmdTest(unittest.TestCase):
         want = os.path.join(bindir, "epmd.exe")
         paths = [os.path.join(bindir, n) for n in
                  ("epmd.pdb", "epmdx.exe", "erl.exe", "erlexec.dll", "epmd.exe")]
-        got = ge.find_epmd({"PATH": "x"}, which=self.which_erl_only(self.ROOT),
+        got = ge.find_epmd({"PATH": "x"}, which=self.which_erl_only(self.ROOT, on_path="x"),
                            glob_=self.listing(paths))
         self.assertEqual(got, want)
 
@@ -290,6 +301,23 @@ class FindEpmdTest(unittest.TestCase):
         got = ge.find_epmd({}, which=self.which_erl_only(root), glob_=self.listing(paths))
         self.assertEqual(got, wanted)
 
+    def test_the_erl_that_names_the_install_is_the_one_behind_its_links(self):
+        # A shim directory (a package manager's links) is not the OTP root.
+        shim_erl = os.path.join(os.sep, "shims", "bin", "erl")
+        real_root = os.path.join(self.ROOT, "erts-1.0")  # any directory the link resolves into
+        real_erl = os.path.join(self.ROOT, "bin", "erl")
+        wanted = os.path.join(self.ROOT, "erts-16.3.1", "bin", "epmd")
+        with mock.patch.object(ge.os.path, "realpath", side_effect=lambda p: real_erl if p == shim_erl else p):
+            got = ge.find_epmd({}, which=lambda n, path=None: shim_erl if n == "erl" else None,
+                               glob_=self.listing([wanted, os.path.join(real_root, "bin", "epmd")]))
+        self.assertEqual(got, wanted)
+
+    def test_an_install_root_that_itself_contains_an_erts_name_does_not_tie_every_hit(self):
+        root = os.path.realpath(os.path.join(os.sep, "erts-9", "otp"))
+        paths = [os.path.join(root, d, "bin", "epmd") for d in ("erts-3.0", "erts-16.3.1")]
+        got = ge.find_epmd({}, which=self.which_erl_only(root), glob_=self.listing(paths))
+        self.assertEqual(got, paths[1])
+
     def test_no_erl_and_no_epmd_is_none(self):
         self.assertIsNone(ge.find_epmd({}, which=lambda n, path=None: None,
                                        glob_=lambda p: self.fail("no erl, no glob")))
@@ -300,7 +328,9 @@ class FindEpmdTest(unittest.TestCase):
 
 
 class StopTest(unittest.TestCase):
-    def stop(self, *, which=lambda name, path=None: "/otp/bin/epmd", run=None, env=None):
+    def stop(self, *, which=lambda name, path=None: "/otp/bin/epmd", run=None, env=None,
+             listening=True):
+        """Drive ge.stop with every seam faked; `listening` is whether anything holds the port."""
         said, calls = [], []
 
         def default_run(args, **kw):
@@ -309,7 +339,7 @@ class StopTest(unittest.TestCase):
 
         ok = ge.stop("24242", {"PATH": "p"} if env is None else env, which=which,
                      run=run or default_run, glob_=lambda pattern: [],
-                     say=lambda msg, **kw: said.append(msg))
+                     say=lambda msg, **kw: said.append(msg), is_free=lambda port: not listening)
         return ok, said, calls
 
     def test_kills_the_run_private_epmd_with_the_runs_env(self):
@@ -320,6 +350,7 @@ class StopTest(unittest.TestCase):
         self.assertEqual(calls[0][0], ["/otp/bin/epmd", "-port", "24242", "-kill"])
         self.assertIs(calls[0][1]["env"], env)
         self.assertEqual(calls[0][1]["timeout"], ge._KILL_TIMEOUT_SECS)
+        self.assertLessEqual(ge._KILL_TIMEOUT_SECS, 10)  # the margin under meson's own timeout
         for stream in ("stdin", "stdout", "stderr"):
             self.assertIs(calls[0][1][stream], subprocess.DEVNULL, stream)
 
@@ -334,6 +365,23 @@ class StopTest(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(asked, [("epmd", "/run/path")])
 
+    def test_nothing_listening_means_nothing_to_stop_and_nothing_to_say(self):
+        # A `ct` run starts no distribution, so no epmd ever listened on the run's port; a
+        # kill attempt would fail exactly like a refusal and a message would be false.
+        ok, said, calls = self.stop(listening=False,
+                                    run=lambda args, **kw: self.fail("must not kill"))
+        self.assertTrue(ok)
+        self.assertEqual(said, [])
+
+    def test_the_real_probe_takes_the_string_port_the_wrapper_registers(self):
+        # activate() registers the port as the string isolate() put in the env; the probe wants an int.
+        port = free_port_number()
+        said = []
+        ok = ge.stop(str(port), {"PATH": "p"}, run=lambda *a, **k: self.fail("nothing listens"),
+                     say=lambda *a, **k: said.append(a))
+        self.assertTrue(ok)
+        self.assertEqual(said, [])
+
     def test_no_epmd_anywhere_means_no_call_and_says_so(self):
         ok, said, calls = self.stop(which=lambda name, path=None: None)
         self.assertFalse(ok)
@@ -341,13 +389,21 @@ class StopTest(unittest.TestCase):
         self.assertEqual(len(said), 1)
         self.assertIn("epmd -port 24242 -kill", said[0])
 
+    def test_the_advised_command_names_the_epmd_that_was_found(self):
+        # Windows keeps epmd.exe off PATH, so a bare `epmd` would not run there.
+        found = "C:\\Program Files\\Erlang OTP\\erts-16.3.1\\bin\\epmd.exe"
+        ok, said, _ = self.stop(which=lambda name, path=None: found,
+                                run=lambda args, **kw: types.SimpleNamespace(returncode=1))
+        self.assertFalse(ok)
+        self.assertIn('"%s" -port 24242 -kill' % found, said[0])
+
     def test_a_refused_kill_says_the_epmd_is_still_running(self):
         # epmd answers `Killing not allowed - living nodes in database.` with rc 1.
         ok, said, _ = self.stop(run=lambda args, **kw: types.SimpleNamespace(returncode=1))
         self.assertFalse(ok)
         self.assertEqual(len(said), 1)
         self.assertIn("may still be running", said[0])
-        self.assertIn("epmd -port 24242 -kill", said[0])
+        self.assertIn("-port 24242 -kill", said[0])
 
     def test_never_raises(self):
         def boom(args, **kw):
@@ -365,7 +421,8 @@ class StopTest(unittest.TestCase):
         def closed(msg, **kw):
             raise ValueError("I/O operation on closed file")
 
-        ok = ge.stop("24242", {"PATH": "p"}, which=lambda name, path=None: None, say=closed)
+        ok = ge.stop("24242", {"PATH": "p"}, which=lambda name, path=None: None, say=closed,
+                     is_free=lambda port: False)
         self.assertFalse(ok)
 
 

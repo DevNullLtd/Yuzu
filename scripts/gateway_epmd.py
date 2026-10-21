@@ -45,8 +45,8 @@ def pick_port(is_free, pid=os.getpid):
     up sharing one epmd. Concurrent runs have distinct pids and so start at
     distinct ports (the prime span makes that hold for any pid stride), and the
     scan stride keeps their paths apart afterwards.
-    Accepted residual: two live pids exactly one span apart start at the same
-    port, a busy start port can move one scan onto the other's path, and the
+    Accepted residual: two live pids a whole number of spans apart start at the
+    same port, a busy start port can move one scan onto the other's path, and the
     probe cannot see an epmd that has not bound yet. Sharing is then the
     pre-change state for that pair, not a new failure."""
     span = PORT_RANGE[1] - PORT_RANGE[0] + 1
@@ -60,7 +60,7 @@ def pick_port(is_free, pid=os.getpid):
 
 def port_is_free(port):
     """True when nothing listens on `port` on IPv4 or IPv6: epmd binds both, and
-    a holder on either stack makes it fail to start there without saying so. No
+    a holder on either stack makes it start nowhere, without saying so. No
     SO_REUSEADDR on purpose: a bind that would share a live listener must fail
     on every platform. A probe that cannot run at all counts as not free, so a
     restricted host falls back to the shared epmd instead of aborting the run;
@@ -121,19 +121,27 @@ def find_epmd(env, which=shutil.which, glob_=glob.glob):
 
 
 def _erts_version(path):
-    """(16, 3, 1) for .../erts-16.3.1/bin/epmd.exe, so erts-16 outranks erts-9."""
-    m = re.search(r"erts-([0-9]+(?:\.[0-9]+)*)", path)
+    """(16, 3, 1) for .../erts-16.3.1/bin/epmd.exe, so erts-16 outranks erts-9.
+    Read from the erts directory's own name, not the whole path, so an install
+    root that itself contains `erts-<digits>` cannot tie every hit."""
+    m = re.fullmatch(r"erts-([0-9]+(?:\.[0-9]+)*)", os.path.basename(os.path.dirname(os.path.dirname(path))))
     return tuple(int(part) for part in m.group(1).split(".")) if m else ()
 
 
-def stop(port, env, which=shutil.which, run=subprocess.run, glob_=glob.glob, say=print):
+def stop(port, env, which=shutil.which, run=subprocess.run, glob_=glob.glob, say=print,
+         is_free=port_is_free):
     """Best-effort `epmd -port <port> -kill`. Never raises: it runs at exit,
-    where a failure has nobody left to report to. Returns True when epmd
-    accepted the kill. Otherwise (no epmd found, a hung or failed call, or a
-    refusal because a node is still registered) it says that the run's epmd may
-    still be running: nothing else reports it, and on a host with no runner to
-    reap it the epmd and its port would stay until someone removes them."""
+    where nobody can catch an exception. Returns True when nothing is left to
+    stop: epmd accepted the kill, or nothing listens on the port (a `ct` run
+    starts no distribution, so no epmd was ever started). Otherwise (no epmd
+    found, a hung or failed call, or a refusal because a node is still
+    registered) it says that the run's epmd may still be running, with the
+    command that removes it: nothing else reports it, and on a host with no
+    runner to reap it the epmd and its port would stay until someone does."""
+    epmd = None
     try:
+        if is_free(int(port)):  # the wrapper registers the port as the string it set in env
+            return True
         epmd = find_epmd(env, which, glob_)
         stopped = bool(epmd) and run(
             [epmd, "-port", str(port), "-kill"], env=env, stdin=subprocess.DEVNULL,
@@ -142,9 +150,10 @@ def stop(port, env, which=shutil.which, run=subprocess.run, glob_=glob.glob, say
     except Exception:  # noqa: BLE001 - exit-time cleanup, never fatal
         stopped = False
     if not stopped:
+        command = f'"{epmd}"' if epmd else "epmd"  # Windows keeps epmd.exe off PATH
         try:
             say(f"[test_gateway.py] the run-private epmd on port {port} may still be running; "
-                f"stop it with: epmd -port {port} -kill", flush=True)
+                f"stop it with: {command} -port {port} -kill", flush=True)
         except Exception:  # noqa: BLE001 - a closed stdout at exit has nobody left to tell either
             pass
     return stopped
@@ -162,6 +171,6 @@ def activate(env, register=atexit.register, say=print, isolate_=isolate):
     elif explicit:
         say(f"[test_gateway.py] epmd: using ERL_EPMD_PORT={explicit} from the environment", flush=True)
     else:
-        say("[test_gateway.py] epmd: no free private port found, using the shared epmd "
+        say("[test_gateway.py] epmd: no usable private port found, using the shared epmd "
             "(another job's cleanup can kill it, #4853)", flush=True)
     return port
