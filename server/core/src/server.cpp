@@ -17213,7 +17213,9 @@ private:
                           "Scheduled instruction occurrences dispatched successfully", "counter");
         metrics_.describe("yuzu_schedule_fire_failures_total",
                           "Scheduled occurrences skipped or failed (unknown/disabled definition, "
-                          "dispatch failure, no agents in scope, approval submit failure)",
+                          "dispatch failure, no agents in scope, approval submit failure, or an "
+                          "approval ticket that could not be settled or whose outbox ledger could "
+                          "not be read, which holds the occurrence for a retry)",
                           "counter");
         metrics_.describe("yuzu_schedule_approvals_submitted_total",
                           "Approval tickets submitted by the schedule runner for approval-gated "
@@ -17306,6 +17308,21 @@ private:
                 return yuzu::server::schedule_arming_permitted(capability_registry_,
                                                                rbac_store_.get(), principal,
                                                                plugin, action);
+            },
+            // #6096: the outbox as the spent-ticket ledger (clock-free). A missing store
+            // is an error, not an empty answer, so the runner holds rather than fires.
+            .outbox_occurrences_fn =
+                [this](const std::string& approval_id)
+                -> std::expected<std::vector<std::string>, std::string> {
+                if (!command_outbox_store_)
+                    return std::unexpected("command outbox not available");
+                return command_outbox_store_->occurrences_for_approval(approval_id);
+            },
+            .outbox_exists_fn = [this](const std::string& occurrence_id)
+                -> std::expected<bool, std::string> {
+                if (!command_outbox_store_)
+                    return std::unexpected("command outbox not available");
+                return command_outbox_store_->occurrence_exists(occurrence_id);
             },
             // #3495: lets a shutdown request stop tick() from firing further
             // due schedules once stop_requested_ flips — same field and

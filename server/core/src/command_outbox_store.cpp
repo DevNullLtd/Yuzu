@@ -103,6 +103,12 @@ CREATE TABLE outbox (
 );
 CREATE INDEX outbox_ready_idx ON outbox (next_attempt_at) WHERE state = 'pending';
 )"},
+        // v2 (#6096): schema only, no clock. The schedule runner reads `approval_id` as the
+        // spent-ticket ledger (`occurrences_for_approval`), a lookup by approval id that the
+        // v1 indexes do not serve. Partial, because only approval-gated fires carry one.
+        {2, R"(
+CREATE INDEX outbox_approval_idx ON outbox (approval_id) WHERE approval_id <> '';
+)"},
     };
     return kMigrations;
 }
@@ -247,6 +253,66 @@ CommandOutboxStore::list_pending(int limit) const {
         out.push_back(std::move(c));
     }
     return out;
+}
+
+// Resource ledger (both reads below): one bounded read lease (kReadTimeout) per call,
+// released on scope exit (RAII PgLease); one parameterised statement; the PgResult is RAII;
+// nothing is retained, no thread, no callback.
+std::expected<std::vector<std::string>, std::string>
+CommandOutboxStore::occurrences_for_approval(const std::string& approval_id) const {
+    if (approval_id.empty())
+        return std::unexpected("approval id is required");
+    if (!open_) {
+        count_degrade("occurrences_for_approval", "not_open");
+        return std::unexpected("command outbox not open");
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        count_degrade("occurrences_for_approval", "lease_timeout");
+        return std::unexpected("command outbox temporarily unavailable (pool exhausted)");
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT occurrence_id FROM command_outbox_store.outbox WHERE approval_id = $1",
+        std::vector<std::string>{approval_id});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("CommandOutboxStore::occurrences_for_approval: query failed: {}",
+                      PQresultErrorMessage(res.get()));
+        count_degrade("occurrences_for_approval", "db_error");
+        return std::unexpected("command outbox temporarily unavailable (read failed)");
+    }
+    std::vector<std::string> out;
+    const int rows = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        out.emplace_back(PQgetvalue(res.get(), i, 0));
+    return out;
+}
+
+std::expected<bool, std::string>
+CommandOutboxStore::occurrence_exists(const std::string& occurrence_id) const {
+    if (occurrence_id.empty())
+        return std::unexpected("occurrence id is required");
+    if (!open_) {
+        count_degrade("occurrence_exists", "not_open");
+        return std::unexpected("command outbox not open");
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        count_degrade("occurrence_exists", "lease_timeout");
+        return std::unexpected("command outbox temporarily unavailable (pool exhausted)");
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT 1 FROM command_outbox_store.outbox WHERE occurrence_id = $1",
+        std::vector<std::string>{occurrence_id});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("CommandOutboxStore::occurrence_exists: query failed: {}",
+                      PQresultErrorMessage(res.get()));
+        count_degrade("occurrence_exists", "db_error");
+        return std::unexpected("command outbox temporarily unavailable (read failed)");
+    }
+    return PQntuples(res.get()) > 0;
 }
 
 std::optional<std::int64_t> CommandOutboxStore::count_pending() const {

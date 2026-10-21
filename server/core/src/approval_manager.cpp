@@ -324,8 +324,13 @@ const std::vector<pg::PgMigration>& migrations() {
         // approved/rejected tickets of every schedule, once per database, with no clock
         // comparison: the deny direction (a legitimate approved-but-unfired ticket at upgrade
         // time just gets a fresh ask). Idempotent; a fresh database matches no row.
+        // The runner executes the whole step inside one transaction, so SET LOCAL bounds this
+        // one statement (a large pre-upgrade backlog) without leaking onto the pooled
+        // connection. The row count is the number of unsettled approved/rejected schedule
+        // tickets: bounded by the 7-day ticket life, normally a handful per schedule.
         {2,
-         std::string("UPDATE approvals SET consumed_at = ") + kDbNowEpochSql +
+         std::string("SET LOCAL statement_timeout = '300s';"
+                     "UPDATE approvals SET consumed_at = ") + kDbNowEpochSql +
              ", consumed_by = 'schedule:legacy-6096' WHERE schedule_id <> '' AND "
              "consumed_at = 0 AND status IN ('approved','rejected');"},
     };
@@ -1154,28 +1159,55 @@ std::expected<void, std::string> ApprovalManager::set_review_status(const std::s
 // Schedule-origin retire (#6096)
 // ---------------------------------------------------------------------------
 
+// Resource ledger: one bounded write lease (kWriteTimeout, `try_acquire_for`) released by the
+// RAII lease on every return path; one parameterised statement (the id array is a bound
+// parameter, never spliced into the SQL text); the PgResult is RAII; no thread, callback or
+// retained state, so nothing can leak on the error or exception path.
 std::expected<int, std::string>
 ApprovalManager::retire_schedule_tickets(const std::string& schedule_id,
-                                         const std::string& occurrence_id) {
+                                         const std::string& occurrence_id,
+                                         const std::vector<std::string>& ids) {
     if (!open_)
         return std::unexpected("database not open");
     // consumed_by is the evidence chain (submitted_by -> reviewed_by -> consumed_by), so it
     // must never be written empty: both halves of 'schedule:<occurrence>' are required.
     if (schedule_id.empty() || occurrence_id.empty())
         return std::unexpected("schedule id and occurrence id are required");
+    // Nothing observed, nothing to settle: no statement, no lease.
+    if (ids.empty())
+        return 0;
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)
         return std::unexpected("approval store temporarily unavailable (pool exhausted)");
 
+    // Postgres text[] literal: every element double-quoted, with backslash and double quote
+    // escaped. Ids are generated hex, but this is a general API, so escape regardless.
+    const std::string dq = "\"";
+    std::string array = "{";
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        if (i > 0)
+            array += ",";
+        array += dq;
+        for (const char c : ids[i]) {
+            if (c == dq[0] || c == '\\')
+                array += '\\';
+            array += c;
+        }
+        array += dq;
+    }
+    array += "}";
+
     // One guarded UPDATE keyed on `consumed_at = 0`, so each ticket is retired by exactly one
-    // caller and a repeat matches nothing. Pending tickets are never touched (the status
-    // list). consumed_at is database time, the clock every other stamp here uses.
+    // caller and a repeat matches nothing. Scoped to the ids the caller OBSERVED (`id = ANY`),
+    // so a ticket approved after the caller's snapshot, or a successor occurrence's ticket, is
+    // never touched. Pending tickets are never touched (the status list). consumed_at is
+    // database time, the clock every other stamp here uses.
     const std::string retire_sql =
         std::string("UPDATE approval_manager.approvals SET consumed_at = ") + kDbNowEpochSql +
         ", consumed_by = 'schedule:' || $2::text WHERE schedule_id = $1 AND consumed_at = 0 "
-        "AND status IN ('approved','rejected') RETURNING 1";
+        "AND status IN ('approved','rejected') AND id = ANY($3::text[]) RETURNING 1";
     pg::PgResult res = pg::exec_params(lease.get(), retire_sql.c_str(),
-                                       std::vector<std::string>{schedule_id, occurrence_id});
+                                       std::vector<std::string>{schedule_id, occurrence_id, array});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("ApprovalManager::retire_schedule_tickets: update failed for schedule={}: {}",
                       schedule_id, PQresultErrorMessage(res.get()));
