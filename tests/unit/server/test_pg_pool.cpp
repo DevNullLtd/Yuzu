@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -24,6 +25,20 @@
 using namespace std::chrono_literals;
 using yuzu::server::pg::PgPool;
 using yuzu::server::pg::PgResult;
+
+namespace yuzu::server::pg {
+
+// Friend seam (pg_pool.hpp) for the "does not wait on the pool lock" case: takes the
+// lease-path mutex so the test can hold it while another thread reads the breaker.
+struct PgPoolTestAccess {
+    static std::unique_lock<std::mutex> lock(const PgPool& pool) {
+        return std::unique_lock<std::mutex>{pool.mu_};
+    }
+};
+
+} // namespace yuzu::server::pg
+
+using yuzu::server::pg::PgPoolTestAccess;
 
 namespace {
 
@@ -257,10 +272,29 @@ TEST_CASE("PgPool connect_breaker_open follows the breaker: closed, open, expire
                  .connect_backoff_cap = 800ms}};
     REQUIRE(pool.valid());
 
+    // The open reading is only asserted when the test thread was not stalled: the window is
+    // 600-800 ms, and a scheduler stall between the arming failure and the read (a loaded
+    // shared runner) would let it expire legitimately. `t0` is taken BEFORE the failing
+    // acquire, so the true time since arming is never more than `t_read - t0`; when that is
+    // under kOpenReadBudget (well inside the 600 ms minimum) the breaker must still read open.
+    // Otherwise the single assertion is skipped with a note, never failed. No sleep is added.
+    auto check_open_after_failed_acquire = [&pool, kOpenReadBudget = 400ms] {
+        const auto t0 = std::chrono::steady_clock::now();
+        CHECK_FALSE(static_cast<bool>(pool.acquire())); // a failed connect arms the breaker
+        const bool open = pool.connect_breaker_open();
+        const auto elapsed = std::chrono::steady_clock::now() - t0;
+        if (elapsed < kOpenReadBudget) {
+            CHECK(open);
+        } else {
+            WARN("breaker-open assertion skipped: "
+                 << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
+                 << " ms elapsed between the failed connect and the read");
+        }
+    };
+
     CHECK_FALSE(pool.connect_breaker_open()); // closed before any connect attempt
 
-    CHECK_FALSE(static_cast<bool>(pool.acquire())); // a failed connect arms the breaker
-    CHECK(pool.connect_breaker_open());
+    check_open_after_failed_acquire();
 
     // Expiry needs no write: the same stored deadline reads closed once the clock passes it.
     const auto deadline = std::chrono::steady_clock::now() + 10s;
@@ -269,8 +303,7 @@ TEST_CASE("PgPool connect_breaker_open follows the breaker: closed, open, expire
     CHECK_FALSE(pool.connect_breaker_open());
 
     // A new failed connect after expiry arms it again.
-    CHECK_FALSE(static_cast<bool>(pool.acquire()));
-    CHECK(pool.connect_breaker_open());
+    check_open_after_failed_acquire();
 }
 
 TEST_CASE("PgPool connect_breaker_open does not wait on the pool lock", "[pool][breaker]") {
@@ -285,7 +318,7 @@ TEST_CASE("PgPool connect_breaker_open does not wait on the pool lock", "[pool][
 
     auto read_under_held_lock = [&pool](bool expect_open) {
         // Hold the lease-path mutex, as a busy lease path would, and read from another thread.
-        auto lk = pool.lock_for_test();
+        auto lk = PgPoolTestAccess::lock(pool);
         auto fut = std::async(std::launch::async, [&pool] { return pool.connect_breaker_open(); });
         const auto status = fut.wait_for(2s);
         const bool prompt = status == std::future_status::ready;

@@ -447,6 +447,10 @@ std::size_t PgPool::waiters() const {
     return waiters_;
 }
 
+static_assert(std::atomic<std::chrono::steady_clock::rep>::is_always_lock_free,
+              "connect_breaker_open() reads the breaker deadline through this atomic without "
+              "taking mu_; a non-lock-free atomic would hide a lock behind the load");
+
 bool PgPool::connect_breaker_open() const {
     // Takes no lock by design (see the header): never take `mu_` here.
     const std::chrono::steady_clock::time_point until{std::chrono::steady_clock::duration{

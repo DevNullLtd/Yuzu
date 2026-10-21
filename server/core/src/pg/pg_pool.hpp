@@ -377,14 +377,13 @@ public:
     /// in flight, exactly as it could when it took the lock a moment earlier.
     [[nodiscard]] bool connect_breaker_open() const;
 
-    /// TEST-ONLY seam: take the pool's own `mu_` (the lease-path mutex) and
-    /// hold it for the returned lock's lifetime, so a test can prove a reader
-    /// does not queue behind lease traffic. Never call from production code.
-    [[nodiscard]] std::unique_lock<std::mutex> lock_for_test() const {
-        return std::unique_lock<std::mutex>{mu_};
-    }
-
 private:
+    // Test seam (same shape as RbacStoreTestAccess / EngineLivenessTestAccess):
+    // defined only in tests/unit/server/test_pg_pool.cpp, where it takes `mu_`
+    // so a test can prove connect_breaker_open() does not queue behind lease
+    // traffic. No production code names it.
+    friend struct PgPoolTestAccess;
+
     // Shared BEGIN/run/COMMIT-or-ROLLBACK body for with_txn / with_txn_for, so
     // the PQTRANS_INERROR commit-guard lives in exactly one place.
     bool run_in_txn(Lease lease, const std::function<bool(PGconn*)>& fn);
