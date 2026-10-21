@@ -44,18 +44,25 @@
 #       /include, walked recursively. test/, integration_test/ and _build are
 #       NOT walked -- test metrics are never served on :9568, and a render
 #       test may one day need a deliberately non-ASCII HELP fixture. Here a
-#       non-ASCII HELP literal is FATAL, not cosmetic: a code point above 255
-#       makes prometheus_text_format raise badarg, so every scrape of
-#       :9568/metrics answers HTTP 500 for the whole registry (#4707, #5177).
-#       Scanning it here means the PR fast path catches it without Erlang.
+#       non-ASCII HELP literal is FATAL, not cosmetic: in a string, a code
+#       point above 255 makes prometheus_text_format raise badarg, so every
+#       scrape of :9568/metrics answers HTTP 500 for the whole registry
+#       (#4707, #5177); a non-ASCII binary is instead rejected when the
+#       metric is declared, at gateway start. Scanning it here means the PR
+#       fast path catches it without Erlang. Only the tuple's real string
+#       literals are scanned: a `"` in a comment, a quoted atom or a `$"`
+#       literal inside the tuple is never paired with one.
 #       OTP 27+ triple-quoted strings and sigils (`~"..."`, `~b(...)`, ...)
 #       are NOT parsed: their delimiter/escape rules are where a lexer this
 #       small would mis-parse silently. A file that contains `{help` and
 #       either construct fails LOUDLY instead; extend erl_code_mask first.
-#       Residual: a `\x{2014}` escape or a `?MACRO` HELP is ASCII in the
-#       source and passes this lint; yuzu_gw_telemetry_tests:
-#       metrics_scrape_renders_test_ renders the real registry and remains
-#       the backstop for those.
+#       Residual: this lint sees only a literal at the `{help, ...}` site. A
+#       `\x{2014}` escape inside a string is ASCII in the source, and a HELP
+#       that is not a literal there (a `?MACRO`, a variable, a helper's
+#       argument, the map form `#{help => ...}`, or a `{'help', ...}` atom
+#       spelling) is not seen at all. Both pass this lint;
+#       yuzu_gw_telemetry_tests:metrics_scrape_renders_test_ renders the real
+#       registry and remains the backstop for those.
 #
 # Usage:
 #   scripts/ci/check-metrics-help-ascii.sh              # scan the real tree
@@ -97,6 +104,8 @@ if [ -z "$PYTHON_BIN" ]; then
 fi
 
 "$PYTHON_BIN" - "$REPO_ROOT" "$SELFTEST" <<'PYEOF'
+import contextlib
+import io
 import os
 import re
 import shutil
@@ -106,9 +115,10 @@ import tempfile
 repo_root = sys.argv[1]
 selftest_flag = sys.argv[2] == "1"
 
-# ---- scan surfaces (see the module header for why both are needed) ------
+# ---- scan surfaces (see the module header for why all three are needed) --
 # (a) directories whose *.cpp files are scanned for describe(...) calls only.
 # (b) HELP-table headers scanned WHOLE (every string literal in the file).
+# (c) gateway Erlang roots whose {help, ...} tuples are scanned.
 # Kept in one constant so adding a future HELP table is a one-line change.
 SCAN_TARGETS = {
     "describe_dirs": ["server/core/src", "agents/core/src"],
@@ -279,8 +289,13 @@ def erl_code_mask(text):
     Also returns the code-level constructs this lexer does NOT parse, as
     (offset, kind): a triple-quoted string (a `"` followed by `""`) and a
     sigil (any code-level `~` -- Erlang has no `~` operator, and a format
-    directive like "~s" sits inside a string, which is masked first)."""
+    directive like "~s" sits inside a string, which is masked first).
+    The third return value keeps ONLY the code-level "..." strings (quotes
+    included) and blanks everything else, so a `"` inside a comment, a
+    quoted atom or a `$"` literal can never be paired with a real string
+    when a tuple's literals are extracted."""
     out = list(text)
+    strings_only = [ch if ch == "\n" else " " for ch in text]
     unsupported = []
     i = 0
     n = len(text)
@@ -313,6 +328,8 @@ def erl_code_mask(text):
                     escaped = True
                 elif ch == c:
                     break
+            if c == '"':
+                strings_only[i:end] = text[i:end]
         else:
             i += 1
             continue
@@ -320,14 +337,16 @@ def erl_code_mask(text):
             if out[j] != "\n":
                 out[j] = " "
         i = end
-    return "".join(out), unsupported
+    return "".join(out), unsupported, "".join(strings_only)
 
 
 def find_erl_help_tuples(text, mask):
     """Every `{help, ...}` tuple in `text`, bracket-balanced against `mask`
     (a HELP routinely spans several lines as adjacent literals). Returns
     (line_number_of_tuple_start, byte_offset_of_tuple_start, tuple_text),
-    the slice taken from the ORIGINAL text so its literals are scanned."""
+    the slice taken from `text`. The caller passes erl_code_mask's
+    strings-only view as `text`, so the slice holds the tuple's real string
+    literals and nothing a quote in a comment or atom could mis-pair with."""
     tuples = []
     for m in re.finditer(r"\{\s*help\s*,", mask):
         start = m.start()
@@ -381,23 +400,26 @@ def scan_erl_help_surface(root):
             continue
         if not re.search(r"\{\s*help\b", text):
             continue
-        mask, unsupported = erl_code_mask(text)
+        mask, unsupported, strings_only = erl_code_mask(text)
         if unsupported:
             # A mis-mask anywhere in the file can shift a tuple's boundaries,
             # so any unparsed construct in a file holding `{help` fails it.
             for off, kind in unsupported:
                 line = text.count("\n", 0, off) + 1
                 findings.append((rel, line, 0,
-                                 f"<unsupported OTP 27+ string syntax ({kind}); this lint "
-                                 f"cannot verify HELP text in this file - extend erl_code_mask>"))
+                                 f"<unsupported OTP 27+ string syntax ({kind}); "
+                                 f"scripts/ci/check-metrics-help-ascii.sh cannot verify HELP "
+                                 f"text in this file - extend its erl_code_mask>"))
             continue
-        for line, byte_offset, tuple_text in find_erl_help_tuples(text, mask):
+        for line, byte_offset, tuple_text in find_erl_help_tuples(strings_only, mask):
             tuple_count += 1
             findings.extend(non_ascii_findings(rel, line, byte_offset, tuple_text))
     if root == repo_root and tuple_count == 0 and not findings:
         # The gateway declares its metrics as {help, ...} proplists; finding none
         # means the declaration shape changed under this lint, not a clean tree.
-        findings.append((SCAN_TARGETS["erl_help_dirs"][0], 0, 0, "<no {help, ...} tuple found>"))
+        findings.append((SCAN_TARGETS["erl_help_dirs"][0], 0, 0,
+                         "<no {help, ...} tuple found; the gateway's metric declarations changed "
+                         "shape under scripts/ci/check-metrics-help-ascii.sh - update its surface (c)>"))
     return findings
 
 
@@ -416,7 +438,8 @@ def run_full_scan(root):
                 f"-- see #2128 (gateway .erl: #4845, where it fails every scrape). Normalize this character (e.g. an em dash -> ' - ', an arrow "
                 f"-> '->') rather than adding it to any allowlist; this gate has none by design."
             )
-        print(f"\n{len(findings)} non-ASCII byte(s) found in scanned HELP text.", file=sys.stderr)
+        print(f"\n{len(findings)} finding(s) in scanned HELP text (non-ASCII bytes or scan errors).",
+              file=sys.stderr)
         return 1
     print("check-metrics-help-ascii: clean (no non-ASCII bytes in scanned HELP text).")
     return 0
@@ -677,6 +700,44 @@ def run_selftest():
         f = erl_case("erl_sigil_nohelp", "src", 'greet() -> ~"hello".\n')
         if f:
             print(f"SELFTEST FAILED: .erl sigil without {{help flagged: {f}")
+            return 1
+
+        # A bad character only in the SECOND adjacent literal, in a tuple that
+        # follows a clean one, is flagged on its own line.
+        f = erl_case("erl_later_literal", "src",
+                     'declare() ->\n'
+                     '    prometheus_counter:declare([{name, a}, {help, "clean"}]),\n'
+                     '    prometheus_counter:declare([\n'
+                     '        {name, b},\n'
+                     '        {help, "first part is fine "\n'
+                     '               "second — is not"}]).\n')
+        if not any(ord(ch) == 0x2014 and line == 6 for _r, line, _b, ch in f if len(ch) == 1):
+            print(f"SELFTEST FAILED: .erl second-literal em dash not flagged at line 6: {f}")
+            return 1
+
+        # A `"` inside a comment or a quoted atom within the tuple must not
+        # pair with a real literal and hide the HELP after it.
+        f = erl_case("erl_comment_quote", "src",
+                     'declare() -> prometheus_counter:declare([{name, a},\n'
+                     '    {help, "ok " % it"s fine\n'
+                     '           "bad — x"}]),\n'
+                     '    prometheus_counter:declare([{name, b}, {help, [\'a"b\', "bad — y"]}]).\n')
+        if sum(1 for _r, _l, _b, ch in f if ch == "—") != 2:
+            print(f"SELFTEST FAILED: .erl comment/atom quote hid a HELP literal: {f}")
+            return 1
+
+        # The full scan includes surface (c). Assert on the .erl annotation
+        # itself, not on the exit code: in a fixture root surface (b) always
+        # reports its two HELP tables missing, so rc is 1 either way.
+        full_root = os.path.join(tmp, "erl_full_scan")
+        erl_case("erl_full_scan", "src",
+                 'declare() -> prometheus_counter:declare([{name, a}, {help, "bad — z"}]).\n')
+        full_out = io.StringIO()
+        with contextlib.redirect_stdout(full_out), contextlib.redirect_stderr(io.StringIO()):
+            run_full_scan(full_root)
+        if ("file=gateway/apps/yuzu_gw/src/yuzu_gw_telemetry.erl,line=1::non-ASCII"
+                not in full_out.getvalue()):
+            print(f"SELFTEST FAILED: run_full_scan did not report the seeded .erl: {full_out.getvalue()!r}")
             return 1
 
         print("check-metrics-help-ascii --selftest: all fixtures behaved as expected.")
