@@ -453,7 +453,7 @@ If `tar.db` is corrupt **and** cannot be moved aside (read-only mount, locked fi
 
 ## TAR dashboard page
 
-The Yuzu dashboard includes a dedicated TAR page at `/tar`, reachable from the **TAR** entry in the sidebar's **Posture** group (visible after authentication). The page is the central operator surface for TAR across the fleet. Phase 15.A delivers the retention-paused source list as the first frame; the process tree viewer and the capture sources frame sit below it. Ad-hoc TAR SQL is not on this page: it starts from **Result sets** (`/result-sets`), where **From TAR query** runs a SELECT on a scope and keeps the devices that answer, behind a confirm that shows the SQL.
+The Yuzu dashboard includes a dedicated TAR page at `/tar`, reachable from the **TAR** entry in the sidebar's **Posture** group (visible after authentication). The page is the central operator surface for TAR across the fleet. Phase 15.A delivers the retention-paused source list as the first frame; the process tree viewer and the capture sources frame sit below it. The capture sources frame locks the five core sources (process, tcp, service, user, perf), so pause or resume them with `configure`, and shows each as **always on** while collecting or **paused** once `<source>_enabled=false`. Ad-hoc TAR SQL is not on this page: it starts from **Result sets** (`/result-sets`), where **From TAR query** runs a SELECT on a scope and keeps the devices that answer, behind a confirm that shows the SQL.
 
 ### Retention-paused source list
 

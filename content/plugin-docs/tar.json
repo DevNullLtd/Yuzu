@@ -2803,7 +2803,8 @@
     ],
     "changelog": [
       "changelog.d/2026-10-14-dex-tar-titles.changed.md",
-      "changelog.d/20261014-tar-adhoc-sql-moved.changed.md"
+      "changelog.d/20261014-tar-adhoc-sql-moved.changed.md",
+      "changelog.d/20261021-tar-capture-sources-paused-core.fixed.md"
     ],
     "definitions": [
       "content/definitions/tar.yaml",
