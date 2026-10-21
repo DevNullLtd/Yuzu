@@ -4967,7 +4967,7 @@ void SettingsRoutes::register_routes(
         // shown once in the response and must never reach the audit store.
         audit_fn_(req, "enrollment.token_create", "success", "EnrollmentToken", created->token_id,
                   "by=" + session->username + " max_uses=" + std::to_string(max_uses) +
-                      " ttl_s=" + std::to_string(ttl.count()) + " label=" + label);
+                      " ttl_s=" + std::to_string(ttl.count()) + " label=" + audit_token(label));
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Enrollment token created","level":"success"}})");
         no_store_private(res); // the raw token is in this body
@@ -5109,8 +5109,8 @@ void SettingsRoutes::register_routes(
 
         audit_fn_(req, "enrollment.bulk_token_create", "success", "EnrollmentToken", "",
                   "by=" + session->username + " max_uses=" + std::to_string(max_uses) +
-                      " ttl_s=" + std::to_string(ttl.count()) + " label=" + label + " " +
-                      bulk_audit_detail(token_ids));
+                      " ttl_s=" + std::to_string(ttl.count()) + " label=" + audit_token(label) +
+                      " " + bulk_audit_detail(token_ids));
 
         no_store_private(res); // N raw tokens are in this body
         res.set_content(nlohmann::json({{"count", tokens.size()}, {"tokens", tokens}}).dump(),

@@ -38,20 +38,27 @@ Windows agent registered by an earlier installer.
   with a token typed in the wizard); a `/TOKEN_FILE=` file is missing, not a plain file, unreadable,
   empty or contains NUL bytes; the token is not exactly 64 lowercase hexadecimal characters (a
   list, a JSON document or a URL is refused); or the token file path or its staging path is a link
-  or cannot be written. The `/TOKEN_FILE=` source file itself is left in place; delete it when the
-  deployment is done.
+  or cannot be written, or an `enrollment-token.stage` folder left beside it by an interrupted run
+  is in the way (it may hold a staged token, readable by Administrators and SYSTEM only; delete it
+  and run the installer again; uninstalling removes it when it holds only that staged file). The
+  `/TOKEN_FILE=` source file itself is left in place; delete it when the deployment is done.
 - The agent reads a token file only if it holds a 64-hex token on its first line and is owned by
   SYSTEM or root, Administrators, or the account the agent runs as (on Linux and macOS also not
   group- or other-writable, and readable by the agent). Anything else is ignored with a warning in
   the agent log, and the agent registers with `--enrollment-token` / `YUZU_ENROLLMENT_TOKEN` if
   one is set, else without a token (the approval queue).
 - When the server refuses a token the agent read from the token file (unknown, expired, revoked or
-  used up), the agent removes the file, and on its next start the host registers without a token
-  and joins the approval queue. A refusal that is not about the token, such as an administrator
-  denying the agent, leaves the file in place. To enrol with a token again, supply a current one
-  (run the installer again with `/TOKEN=` or `/TOKEN_FILE=`). Do not bake a token file into a
-  golden image or VDI template: each machine started from it registers with a new identity and
-  uses one of the token's uses. Size `max_uses` and the expiry to the rollout window.
+  used up), the agent removes the file, and its next start registers without the file's token:
+  with an `--enrollment-token` / `YUZU_ENROLLMENT_TOKEN` value if one is set, otherwise without a
+  token, into the approval queue. A file that could not be removed is read and presented again on
+  the next start, so keep it where the agent can delete it. A refusal that is not about the token,
+  such as an administrator denying the agent, leaves the file in place. To enrol with a token
+  again, supply a current one (run the installer again with `/TOKEN=` or `/TOKEN_FILE=`). Do not
+  bake a token file into a golden image or VDI template: each machine started from it registers
+  with a new identity and uses one of the token's uses. A non-persistent image that still carries
+  a token the server has expired, revoked or used up adds a new entry to Pending Agent Approvals
+  on every boot (each boot is a new agent id), and the queue is not capped. Size `max_uses` and
+  the expiry to the rollout window.
 - For a new unattended install, prefer `/TOKEN_FILE=<file>` over `/TOKEN=` when the token must not
   reach Setup's own log or deployment-tool command-line records (SCCM's AppEnforce.log, Intune).
   An installation that fails after the token file is written leaves the file in place

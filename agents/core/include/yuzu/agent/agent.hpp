@@ -46,7 +46,8 @@ struct Config {
     // ONLY while a token was consumed from it; the agent removes that file
     // after the first accepted registration, or when the server refuses the
     // token itself (is_enrollment_token_refusal), so the next start registers
-    // without it. resolve_enrollment_token (called from main()) clears the path
+    // without it when the removal succeeded; otherwise it is presented again.
+    // resolve_enrollment_token (called from main()) clears the path
     // on every other outcome and the agent never removes a path it did not read
     // a token from. The removal is by path (a non-following, non-recursive
     // delete): whatever sits at that path at that moment is removed.

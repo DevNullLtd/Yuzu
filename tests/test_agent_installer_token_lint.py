@@ -19,12 +19,16 @@ What they pin:
   Administrators and SYSTEM, and verified by a read-back (RunAclCheck) and an
   emptiness check BEFORE any file is created in it; the staged file is then
   created EMPTY (inheriting the locked directory), given Administrators as
-  owner and a FILE-level grant (no `(OI)(CI)`, invalid on a file; `/L`, never
-  `/T`), each exit code is checked, and only then is the token written -- no
-  reference to the token precedes the lock. The previous token file is deleted
+  owner, and the directory is read back AGAIN (RunAclCheck 'full': the folder is
+  Users-creatable, so the state the token is written into is verified, before
+  the file-level grant replaces the inherited pair that check requires); then a
+  FILE-level grant (no `(OI)(CI)`, invalid on a file; `/L`, never `/T`), each
+  exit code is checked, and only then is the token written -- no reference to
+  the token precedes the lock. The previous token file is deleted
   only after its replacement is staged and locked, then the staged file is
   moved into place with RenameFile and the staging directory removed. The
-  token is never passed to `Log(`.
+  token is never passed to `Log(`. DropTokenStaging deletes the staged file and
+  then removes its directory (a stale `.stage` blocks every later install).
 - The token must have the shape the server issues (64 lowercase hex): the
   installer checks it between resolving and writing it.
 - ResolveEnrollmentToken checks for a UTF-8 byte order mark in a /TOKEN_FILE=
@@ -36,7 +40,8 @@ What they pin:
   are two `stop YuzuAgent` Execs; a write between them would pass a check
   against the last), so a refusal leaves a running agent running and nothing
   installed.
-- `[UninstallDelete]` removes the token file on uninstall.
+- `[UninstallDelete]` removes the token file on uninstall, and a leftover
+  `enrollment-token.stage` folder when it holds only the staged file.
 
 Each check also runs against a mutated copy of the source and must fail
 there, so a check that has stopped matching anything cannot pass silently.
@@ -129,6 +134,7 @@ def problems(iss: str) -> list:
                          "SaveStringToFile(HoldFile, '', False)",
                          "HoldFile + '\" /setowner *S-1-5-32-544 /L /C /Q'",
                          "ResultCode <> 0",
+                         "RunAclCheck(HoldDir, 'full')",
                          file_grant,
                          "ResultCode <> 0",
                          "SaveStringsToUTF8FileWithoutBOM(HoldFile",
@@ -158,7 +164,7 @@ def problems(iss: str) -> list:
         if re.search(r"Log\([^;]*\bToken\b", wfn):
             found.append("WriteEnrollmentTokenFile passes Token to Log(")
         # Every refusal after the staging directory exists cleans it up.
-        if wfn.count("DropTokenStaging(HoldFile, HoldDir)") < 7:
+        if wfn.count("DropTokenStaging(HoldFile, HoldDir)") < 8:
             found.append("a refusal path of WriteEnrollmentTokenFile no longer removes the "
                          "staging directory")
         if "ExtractFileDrive" in wfn:
@@ -174,6 +180,13 @@ def problems(iss: str) -> list:
                 or "HoldFile := HoldDir + '\\enrollment-token';" not in wfn):
             found.append("WriteEnrollmentTokenFile no longer stages beside the destination "
                          "(the move must be a same-volume rename)")
+
+    # 3-bis. DropTokenStaging deletes the staged file, then removes its directory: losing
+    #    either leaves a stale `.stage` that blocks every later install.
+    dfn = routine(clean, "procedure DropTokenStaging(")
+    if not dfn or not in_order(dfn, "DeleteFile(HoldFile)", "RemoveDir(HoldDir)"):
+        found.append("DropTokenStaging no longer deletes the staged file and then removes its "
+                     "directory")
 
     # 3a. The token's shape is checked (64 lowercase hex) before it is written.
     sfn = routine(clean, "function EnrollmentTokenShapeProblem(")
@@ -206,9 +219,16 @@ def problems(iss: str) -> list:
     if not (0 <= pti.find("WriteEnrollmentTokenFile(") < first_stop):
         found.append("PrepareToInstall writes the token file after the first service stop")
 
-    # 5. [UninstallDelete] removes the token file.
-    if r"{commonappdata}\Yuzu\enrollment-token" not in uninstall_delete_section(iss):
-        found.append("[UninstallDelete] no longer removes the enrollment-token file")
+    # 5. [UninstallDelete] removes the token file, and a leftover staging folder
+    #    (the staged file, then the directory only if it is empty: dirifempty never
+    #    follows a link a user planted at that name).
+    ud_lines = [ln.strip() for ln in uninstall_delete_section(iss).splitlines()]
+    for entry in ('Type: files; Name: "{commonappdata}\\Yuzu\\enrollment-token"',
+                  'Type: files; Name: "{commonappdata}\\Yuzu\\enrollment-token.stage'
+                  '\\enrollment-token"',
+                  'Type: dirifempty; Name: "{commonappdata}\\Yuzu\\enrollment-token.stage"'):
+        if entry not in ud_lines:
+            found.append(f"[UninstallDelete] no longer has: {entry}")
 
     return found
 
@@ -278,6 +298,12 @@ class InstallerTokenFileLint(unittest.TestCase):
                 "'\"' + HoldDir + '\" /setowner *S-1-5-32-544 /L /C /Q'", "'\"' + HoldDir + '\" /L /C /Q'"),
             "directory read-back dropped": (
                 "  Reason := RunAclCheck(HoldDir, 'root');\n", "  Reason := '';\n"),
+            "second directory read-back dropped": (
+                "  Reason := RunAclCheck(HoldDir, 'full');\n", "  Reason := '';\n"),
+            "second read-back moved after the file-level grant": lambda iss: move_block(
+                iss, "  { Read the directory back again", "  Ok := Exec(ExpandConstant('{sys}\\icacls.exe'),\n"
+                "             '\"' + HoldFile + '\" /inheritance:r /grant:r",
+                "  { 6. Only now"),
             "directory emptiness check dropped": (
                 "    Reason := NotFilesOnly(HoldDir, True);\n", "    Reason := '';\n"),
             "staging directory no longer created fresh": (
@@ -307,6 +333,14 @@ class InstallerTokenFileLint(unittest.TestCase):
                 iss.replace(token_block, "", 1).replace(first_stop, first_stop + token_block, 1)),
             "UninstallDelete entry removed": (
                 'Type: files; Name: "{commonappdata}\\Yuzu\\enrollment-token"\n', ""),
+            "UninstallDelete staging file entry removed": (
+                'Type: files; Name: "{commonappdata}\\Yuzu\\enrollment-token.stage\\enrollment-token"\n', ""),
+            "UninstallDelete staging directory entry removed": (
+                'Type: dirifempty; Name: "{commonappdata}\\Yuzu\\enrollment-token.stage"\n', ""),
+            "DropTokenStaging stops deleting the staged file": (
+                "begin\n  DeleteFile(HoldFile);\n  RemoveDir(HoldDir);\nend;", "begin\n  RemoveDir(HoldDir);\nend;"),
+            "DropTokenStaging stops removing the directory": (
+                "begin\n  DeleteFile(HoldFile);\n  RemoveDir(HoldDir);\nend;", "begin\n  DeleteFile(HoldFile);\nend;"),
             "token written when the staged file is created, before the lock": (
                 "SaveStringToFile(HoldFile, '', False)", "SaveStringToFile(HoldFile, Token, False)"),
             "token write block moved before the lock": lambda iss: move_block(

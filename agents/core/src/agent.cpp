@@ -1904,8 +1904,9 @@ public:
                     // instead of presenting it and being refused on every start. Any
                     // other refusal (an administrator's denial of this agent, where the
                     // token was valid and its use was rolled back) keeps the file. The
-                    // path is cleared whatever the outcome; a file that could not be
-                    // removed is presented, refused and retried by the next start.
+                    // path is cleared after the attempt (run() returns next); a file that
+                    // could not be removed is presented, refused and retried by the next
+                    // start.
                     if (!cfg_.enrollment_token_file.empty() &&
                         yuzu::is_enrollment_token_refusal(resp.enrollment_status(),
                                                           resp.reject_reason())) {

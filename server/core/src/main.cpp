@@ -2110,8 +2110,13 @@ int main(int argc, char* argv[]) {
         // regardless of which entry point minted it.
         {
             constexpr std::size_t kMaxListed = 20;
-            std::string detail = "by=" + created_by + " max_uses=" + std::to_string(gen_max_uses) +
-                                 " ttl_s=" + std::to_string(ttl.count()) + " label=" + gen_label +
+            // `by=` and `label=` carry operator text: audit_token() keeps either from
+            // adding a key or a line to the detail (space, `=`, `,` and control bytes
+            // become `_`). The principal column keeps the raw value.
+            std::string detail = "by=" + yuzu::server::audit_token(created_by) +
+                                 " max_uses=" + std::to_string(gen_max_uses) +
+                                 " ttl_s=" + std::to_string(ttl.count()) +
+                                 " label=" + yuzu::server::audit_token(gen_label) +
                                  " count=" + std::to_string(token_ids.size());
             if (!token_ids.empty()) {
                 detail += " ids=";

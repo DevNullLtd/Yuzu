@@ -24,6 +24,8 @@
 // (uid 0 / SYSTEM), by the account the process runs as (euid / token owner), or
 // on Windows by BUILTIN\Administrators; and on POSIX neither group- nor
 // other-writable (the sudoers-source predicate in local_security_policy_legs.hpp).
+// The check reads mode bits only; macOS ACLs are not consulted (the owner rule still
+// applies).
 // The point is that a file placed by an account that is not allowed to supply a
 // credential for this agent is never used: its content is not parsed and its token
 // is not presented to the server. The Windows leg checks the owner before reading a
@@ -100,7 +102,9 @@ enum class TokenFileOutcome {
 struct EnrollmentTokenFileRead {
     std::optional<std::string> token; ///< set if and only if outcome == ok
     TokenFileOutcome outcome{TokenFileOutcome::absent};
-    std::string detail; ///< an OS error description for `unreadable`, else empty
+    /// a short reason for `unreadable` (including "timed out") or `untrusted_owner`
+    /// (owner uid/mode), else empty
+    std::string detail;
 };
 
 namespace detail {
@@ -191,12 +195,13 @@ struct TokenFileHandle {
     // Lifetime: the PSID points INTO `buf`, which outlives the comparison. Alignment:
     // vector's storage comes from operator new, aligned for any fundamental type, so
     // TOKEN_OWNER is readable at buf.data(). Constness: a read-only view, never written
-    // through.
+    // through. Aliasing: TOKEN_OWNER is implicit-lifetime over operator-new storage.
+    // Bounds: GetTokenInformation was sized by `needed` and wrote it.
     const PSID self = reinterpret_cast<const TOKEN_OWNER*>(buf.data())->Owner;
     if (EqualSid(owner, self))
         return {TokenFileOutcome::ok, {}};
     return {TokenFileOutcome::untrusted_owner,
-            "owned by an account other than SYSTEM, Administrators or this service"};
+            "owned by an account other than SYSTEM, Administrators or this process's account"};
 }
 
 [[nodiscard]] inline RawTokenFile read_token_file_leaf(const std::filesystem::path& p,
@@ -346,7 +351,9 @@ read_enrollment_token_file(const std::filesystem::path& p,
 struct EnrollmentTokenResolution {
     /// The token-file read's outcome; nullopt when no token file was configured.
     std::optional<TokenFileOutcome> file_outcome;
-    std::string file_detail; ///< the reader's `detail` (an OS error description), else empty
+    /// the reader's `detail`: a short reason for `unreadable` (including "timed out") or
+    /// `untrusted_owner` (owner uid/mode), else empty
+    std::string file_detail;
     std::string_view source; ///< the winning source: "file", "option" or "none"
 };
 
@@ -388,7 +395,7 @@ resolve_enrollment_token_with(std::string& token, std::filesystem::path& token_f
         }
         out.file_outcome = read->outcome;
         out.file_detail = std::move(read->detail);
-        from_file = read->outcome == TokenFileOutcome::ok;
+        from_file = read->outcome == TokenFileOutcome::ok && read->token.has_value();
         if (from_file)
             token = std::move(*read->token);
         else

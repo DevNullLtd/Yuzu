@@ -13,6 +13,8 @@
 #   # size the TTL to the rollout:
 #   yuzu-server --generate-tokens 1000 --token-label "batch-2026-03" \
 #     --token-ttl-hours 720 > tokens.json
+#   # tokens.json holds raw tokens: create it with mode 0600 for the operator only
+#   # and delete it when the rollout is done.
 #
 #   # Then run the playbook:
 #   ansible-playbook -i inventory yuzu-agent-enroll.yml \

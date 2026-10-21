@@ -32,6 +32,10 @@ namespace yuzu {
 /// "denied". Do not vary it by variant (the wire-collapse contract in
 /// server/core/src/enrollment_token_rejection.hpp, which re-exports this
 /// constant for the server handlers).
+///
+/// Frozen: deployed agents compare their compiled-in copy of this text with the
+/// server's reply to decide whether to remove a token file; rewording it stops
+/// that removal on every agent in the field (fail-safe: the file is kept).
 inline constexpr std::string_view kEnrollmentTokenRejectionPublicMessage =
     "invalid, expired, or exhausted enrollment token";
 

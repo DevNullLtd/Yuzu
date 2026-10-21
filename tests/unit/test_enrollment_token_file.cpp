@@ -582,6 +582,10 @@ TEST_CASE("resolve_enrollment_token_with: a read that outlasts the deadline is u
     CHECK(r.source == "option");
 }
 
+// The production deadline stays well inside the Windows service start deadline: the read runs
+// before the SCM hand-off, so a larger value would let a wedged open eat that budget.
+static_assert(yuzu::agent::kEnrollmentTokenReadDeadline <= std::chrono::seconds{10});
+
 TEST_CASE("resolve_enrollment_token_with: a read that returns in time is used as read",
           "[enrollment][enrollment_token_file]") {
     const std::string file_token = make_hex('8');

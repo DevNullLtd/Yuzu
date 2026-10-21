@@ -207,6 +207,18 @@ AUDIT_OK="$(psql_db "SELECT count(*) FROM audit_store.audit_events WHERE action=
 [ "$AUDIT_OK" = "1" ] && report "the audit row records ttl_s=259200 and the label" 0 \
   || report "the audit row records ttl_s=259200 and the label (got $AUDIT_OK matching rows)" 1
 
+# Operator text in the audit detail is neutralised (audit_token): a label cannot
+# add a `count=`/`ids=` key of its own. Space, `=` and `,` become `_`, so the
+# forged keys never appear and the real `count=1 ids=` pair stays the only one.
+run_gen 1 --token-label 'forge count=9 ids=ffffffff'
+[ "$GOT" = "0" ] && report "generate with a label carrying key=value text -> exit 0" 0 \
+  || report "generate with a label carrying key=value text -> exit 0 (got=$GOT, stderr=$(cat "$TMP/stderr.log"))" 1
+FORGE_NEUTRAL="$(psql_db "SELECT count(*) FROM audit_store.audit_events WHERE action='enrollment.bulk_token_create' AND detail LIKE '% label=forge\\_count\\_9\\_ids\\_ffffffff count=1 ids=%'")"
+FORGE_RAW="$(psql_db "SELECT count(*) FROM audit_store.audit_events WHERE action='enrollment.bulk_token_create' AND detail LIKE '%label=forge count=9%'")"
+{ [ "$FORGE_NEUTRAL" = "1" ] && [ "$FORGE_RAW" = "0" ]; } \
+  && report "a crafted label is neutralised in the audit detail (no forged count=/ids=)" 0 \
+  || report "a crafted label is neutralised in the audit detail (neutral=$FORGE_NEUTRAL raw=$FORGE_RAW)" 1
+
 run_gen 1 --token-label ttl-zero --token-ttl-hours 0
 [ "$GOT" = "0" ] && report "generate with --token-ttl-hours 0 -> exit 0" 0 \
   || report "generate with --token-ttl-hours 0 -> exit 0 (got=$GOT, stderr=$(cat "$TMP/stderr.log"))" 1

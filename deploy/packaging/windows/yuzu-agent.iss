@@ -276,6 +276,8 @@ Type: files; Name: "{app}\plugins\sockwho.dll"
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\logs"
 Type: files; Name: "{commonappdata}\Yuzu\enrollment-token"
+Type: files; Name: "{commonappdata}\Yuzu\enrollment-token.stage\enrollment-token"
+Type: dirifempty; Name: "{commonappdata}\Yuzu\enrollment-token.stage"
 
 [Code]
 var
@@ -1013,9 +1015,16 @@ end;
   the same wording SecureTrustAnchorDir uses, anything else with an instruction
   to delete it. Like a directory a user pre-creates at the destination, a name
   taken this way can stop the install but never redirect the token or make it
-  readable by another account. Not covered, as for the trust-anchor directory: an already-open
-  handle on a path keeps its access (#5258), and %ProgramData%\Yuzu itself is
-  not locked down (#5257).
+  readable by another account.
+
+  Unlike the trust-anchor staging directory, which is in Setup's own protected
+  temp folder, this one is in %ProgramData%\Yuzu, where Users hold inheritable
+  create rights (#5257). So it is read back twice: once while empty, and again
+  once the empty staged file exists (a real directory holding only that plain
+  file, owned by Administrators, with the inherited pair). Not covered: an
+  already-open handle on a path keeps its access (#5258), so this narrows that
+  window and does not close it, and %ProgramData%\Yuzu itself is not locked
+  down (#5257).
 
   Every icacls carries /L (acts on the path itself, never a link's target) and
   none carries /T. The directory is verified by read-back; the file's own
@@ -1110,6 +1119,23 @@ begin
     DropTokenStaging(HoldFile, HoldDir);
     Result := 'The enrollment token file could not be given to Administrators (icacls exit ' +
               'code ' + IntToStr(ResultCode) + ').' + #13#10#13#10 + StoppedUntouched;
+    Exit;
+  end;
+  { Read the directory back again now that the staged file exists: a real
+    directory, exactly Administrators and SYSTEM, every entry a plain file (no
+    link, no hard link) owned by Administrators or SYSTEM with the inherited
+    pair. The first read-back was of an empty directory in a folder where Users
+    may create entries (#5257); this one covers the state the token is written
+    into. It must run before the file-level grant below, which replaces the
+    inherited pair this check requires. }
+  Reason := RunAclCheck(HoldDir, 'full');
+  if (Reason = '') and not FileExists(HoldFile) then
+    Reason := 'the staged file is missing';
+  if Reason <> '' then
+  begin
+    DropTokenStaging(HoldFile, HoldDir);
+    Result := 'The staged enrollment token file could not be verified (' +
+              Reason + ').' + #13#10#13#10 + StoppedUntouched;
     Exit;
   end;
   Ok := Exec(ExpandConstant('{sys}\icacls.exe'),
