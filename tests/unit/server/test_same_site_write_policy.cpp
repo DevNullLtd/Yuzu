@@ -105,7 +105,7 @@ static_assert(!is_guarded_read("GET", "/api/v1/viz"));
 static_assert(!is_guarded_read("GET", "/api/v1/vizx/fleet/topology"));
 static_assert(!is_guarded_read("GET", "/api/v1/something"));
 static_assert(!is_guarded_read("GET", ""));
-static_assert(noexcept(is_guarded_read("GET", "/x")));
+static_assert(noexcept(is_guarded_read(std::string_view{}, std::string_view{})));
 
 TEST_CASE("same-site policy: GET, HEAD and OPTIONS are never gated", "[csrf][same_site]") {
     for (std::string_view m : {"GET", "HEAD", "OPTIONS"}) {
