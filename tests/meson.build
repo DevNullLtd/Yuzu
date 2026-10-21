@@ -554,7 +554,7 @@ agent_test_exe = executable(
     'unit/test_privacy_permissions_local_dispatcher.cpp', # Wave 8 PR8.5: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_privacy_permissions_macos_internals.cpp',  # TU-inclusion seam over privacy_permissions_macos.cpp, Apple-only body, unguarded TU
     'unit/test_privacy_permissions_win_internals.cpp',    # TU-inclusion seam over privacy_permissions_win.cpp (Windows-only body, empty TU elsewhere)
-    'unit/test_privacy_permissions_win_walk.cpp',  # fake-registry/fake-probe locks over privacy_permissions_win_walk.hpp + privacy_permissions_hive_guard.hpp, pure, every host
+    'unit/test_privacy_permissions_win_walk.cpp',  # fake-registry/fake-probe locks over privacy_permissions_win_walk.hpp + agents/shared/win_hive_file_guard.hpp, pure, every host
     'unit/test_posix_dir_walk.cpp',     # PR #4154 round-8 remediation: shared capped
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
     'unit/test_posix_secure_read.cpp',  # shared O_NOFOLLOW dir-open + bounded no-follow file read (agents/shared/posix_secure_read.hpp), POSIX-only bodies
