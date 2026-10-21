@@ -1362,7 +1362,7 @@ static const ToolDef kTools[] = {
      "reviewed_by/reviewed_at/review_comment, reconciled onto the REST twins' fuller field set "
      "(shared builder approval_row_json). A BOUND ticket (a request that freezes the exact "
      "effect for a reviewer, e.g. a Guardian rule deploy) additionally carries request (the "
-     "frozen request as a JSON object, null when unreadable), request_digest (SHA-256 of the "
+     "frozen request as a JSON object, null when there is no readable one), request_digest (SHA-256 of the "
      "exact stored bytes) and excluded_roots (principals barred from approving it); an unbound "
      "ticket carries none of the three, so their ABSENCE means 'binds no request', never 'an empty "
      "request was reviewed'. Same gate (Approval:Read) and same rows as before; this widens what "

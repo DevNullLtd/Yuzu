@@ -252,10 +252,13 @@ inline constexpr std::size_t kMaxExcludedRootBytes = 256;
 
 /// Whether `a`'s STORED state is sound enough for `approve()` to accept (#6062): a stored
 /// request that is readable and bounded and hashes to its digest (or no request and no digest
-/// at all, an unbound ticket), and an excluded-roots list that could be read. The same checks
-/// `approve()` applies before its CAS, factored so the dashboard offers Approve exactly when
-/// the store would not refuse it for these reasons. A reviewer who is themselves excluded or
-/// the submitter is a separate, per-viewer question (`reviewer_is_excluded`).
+/// at all, an unbound ticket), and an excluded-roots list that could be read. The request half is
+/// the very function `approve()` calls (`request_binding_fault`); `approve()` checks the
+/// excluded-roots half itself in `set_review_status`, so the two halves agree because tests pin
+/// them together (see `approval_state_is_approvable` in test_approval_manager_bound.cpp), not by
+/// construction. The dashboard uses this to offer Approve only when the store would not refuse it
+/// for these reasons. A reviewer who is themselves excluded or the submitter is a separate,
+/// per-viewer question (`reviewer_is_excluded`).
 [[nodiscard]] bool approval_state_is_approvable(const Approval& a);
 
 /// THE excluded-reviewer predicate (#6062): is `reviewer` one of the human roots barred

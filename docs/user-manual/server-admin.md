@@ -5237,10 +5237,12 @@ was shown, frozen at submission. It is stored in the `request_json` column as cl
   your data inventory and in any subject-access or erasure process; there is no per-row delete
   route.
 - **Who can read it.** Every principal holding `Approval:Read` (the seeded `Viewer`, `Operator`,
-  `PlatformEngineer` and `Administrator` roles; with RBAC off, every authenticated session) can
+  `PlatformEngineer`, `ITServiceOwner` and `Administrator` roles; with RBAC off, every
+  authenticated session) can
   read it, on the Approvals page and in every approval read response: `GET /api/v1/approvals`,
   `GET /api/v1/approvals/{id}`, the legacy `GET /api/approvals`, and MCP
-  (`list_pending_approvals`). Service-scoped API tokens are refused.
+  (`list_pending_approvals`). A service-scoped API token is refused on all of them, even one whose
+  `ITServiceOwner` ceiling includes `Approval:Read`.
 - **Retention.** It is kept as long as its row, and rows are not pruned. Any future prune is a
   bulk delete on a wall-clock cutoff and falls under the clock-guarded retention rules
   ([`docs/clock-guarded-retention.md`](../clock-guarded-retention.md)).
