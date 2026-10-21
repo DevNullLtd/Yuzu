@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -243,6 +244,61 @@ TEST_CASE("PgPool failed construction", "[pg][pool]") {
         CHECK(pool.open() == 0);
         CHECK(pool.in_use() == 0);
     }
+}
+
+TEST_CASE("PgPool connect_breaker_open follows the breaker: closed, open, expired, re-armed",
+          "[pool][breaker]") {
+    // No Postgres needed: an unconnectable Unix-socket directory fails every connect at once.
+    // A window of 600-800 ms (base == cap, 75-100% jitter) is long enough to read the open
+    // state right after the failure and short enough to wait out.
+    PgPool pool{{.conninfo = unconnectable_conninfo(),
+                 .size = 2,
+                 .connect_backoff_base = 800ms,
+                 .connect_backoff_cap = 800ms}};
+    REQUIRE(pool.valid());
+
+    CHECK_FALSE(pool.connect_breaker_open()); // closed before any connect attempt
+
+    CHECK_FALSE(static_cast<bool>(pool.acquire())); // a failed connect arms the breaker
+    CHECK(pool.connect_breaker_open());
+
+    // Expiry needs no write: the same stored deadline reads closed once the clock passes it.
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (pool.connect_breaker_open() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(10ms);
+    CHECK_FALSE(pool.connect_breaker_open());
+
+    // A new failed connect after expiry arms it again.
+    CHECK_FALSE(static_cast<bool>(pool.acquire()));
+    CHECK(pool.connect_breaker_open());
+}
+
+TEST_CASE("PgPool connect_breaker_open does not wait on the pool lock", "[pool][breaker]") {
+    PgPool pool{{.conninfo = unconnectable_conninfo(),
+                 .size = 2,
+                 .connect_backoff_base = 5000ms,
+                 .connect_backoff_cap = 5000ms}};
+    REQUIRE(pool.valid());
+
+    // Read once while the lock is unheld: closed.
+    CHECK_FALSE(pool.connect_breaker_open());
+
+    auto read_under_held_lock = [&pool](bool expect_open) {
+        // Hold the lease-path mutex, as a busy lease path would, and read from another thread.
+        auto lk = pool.lock_for_test();
+        auto fut = std::async(std::launch::async, [&pool] { return pool.connect_breaker_open(); });
+        const auto status = fut.wait_for(2s);
+        const bool prompt = status == std::future_status::ready;
+        // Release before any assertion can unwind: the future's destructor joins the reader.
+        lk.unlock();
+        REQUIRE(prompt);
+        CHECK(fut.get() == expect_open);
+    };
+
+    read_under_held_lock(false);
+
+    CHECK_FALSE(static_cast<bool>(pool.acquire())); // arm (5 s window, outlives this test)
+    read_under_held_lock(true);
 }
 
 TEST_CASE("PgPool logs a connect failure's libpq text on one line",

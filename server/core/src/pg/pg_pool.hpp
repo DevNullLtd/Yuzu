@@ -29,6 +29,7 @@
 /// (or the DSN's `sslrootcert=`), NOT the Windows certificate store that
 /// `cert_store.cpp` handles — provision the root there when a TLS DSN ships.
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -363,7 +364,25 @@ public:
     /// saturation alone — all leases out but no connect failures — does NOT
     /// arm the breaker, so this never false-trips under load, which a
     /// lease-consuming probe would (gov UP-2).
+    ///
+    /// Takes no lock: reads `connect_blocked_until_rep_` (one relaxed atomic load)
+    /// and the clock, never `mu_`, so a credential-less `/health` poll cannot
+    /// queue behind lease traffic. The result is the same value the
+    /// lock-protected read returned: the breaker is a pure function of the
+    /// stored deadline and `steady_clock::now()`, so expiry needs no write.
+    /// Relaxed is sufficient because the answer is advisory: a caller that was
+    /// itself refused by the breaker (or armed it) read/wrote the deadline
+    /// under `mu_`, which orders the earlier atomic store before this load;
+    /// any other caller can at worst observe a transition that is concurrently
+    /// in flight, exactly as it could when it took the lock a moment earlier.
     [[nodiscard]] bool connect_breaker_open() const;
+
+    /// TEST-ONLY seam: take the pool's own `mu_` (the lease-path mutex) and
+    /// hold it for the returned lock's lifetime, so a test can prove a reader
+    /// does not queue behind lease traffic. Never call from production code.
+    [[nodiscard]] std::unique_lock<std::mutex> lock_for_test() const {
+        return std::unique_lock<std::mutex>{mu_};
+    }
 
 private:
     // Shared BEGIN/run/COMMIT-or-ROLLBACK body for with_txn / with_txn_for, so
@@ -379,6 +398,9 @@ private:
     /// Arm the connect-failure breaker after a failed connect. Caller holds
     /// `mu_`; grows the suppression window exponentially with ±jitter.
     void arm_connect_backoff_locked();
+    /// The ONLY writer of the breaker deadline: stores `connect_blocked_until_`
+    /// and its unlocked mirror together. Caller holds `mu_`.
+    void set_connect_blocked_until_locked(std::chrono::steady_clock::time_point t);
 
     std::string conninfo_;
     std::size_t size_{16};
@@ -405,12 +427,17 @@ private:
     bool shutdown_{false};
     std::string last_error_;
 
-    // Connect-failure circuit breaker (guarded by mu_). connect_blocked_until_
-    // is the steady-clock instant before which no new connect is attempted.
+    // Connect-failure circuit breaker (guarded by mu_, except the unlocked
+    // mirror below). connect_blocked_until_ is the steady-clock instant
+    // before which no new connect is attempted.
     std::chrono::milliseconds backoff_base_{200};
     std::chrono::milliseconds backoff_cap_{5000};
     std::size_t connect_failures_{0};
     std::chrono::steady_clock::time_point connect_blocked_until_{};
+    /// Unlocked mirror of `connect_blocked_until_` (its `time_since_epoch()`
+    /// count) for `connect_breaker_open()`. Written ONLY by
+    /// `set_connect_blocked_until_locked`, under `mu_`; read without it.
+    std::atomic<std::chrono::steady_clock::rep> connect_blocked_until_rep_{0};
     /// Backoff jitter only (not crypto). Seeded from random_device so a fleet
     /// of instances started together decorrelate their reconnect jitter — a
     /// fixed seed gives every instance the identical sequence (gov fjarvis L1).

@@ -226,7 +226,7 @@ PgPool::Lease PgPool::acquire_internal(const std::chrono::steady_clock::time_poi
             // A live connection proves the database is reachable: clear the
             // breaker so recovery is immediate.
             connect_failures_ = 0;
-            connect_blocked_until_ = {};
+            set_connect_blocked_until_locked({});
             ++open_;
             ++leased_;
             // RAII owner before the (SHOULD-not-throw) observer — see the
@@ -261,7 +261,13 @@ void PgPool::arm_connect_backoff_locked() {
     // that all failed at once.
     std::uniform_int_distribution<long long> jitter(window * 3 / 4, window);
     const long long ms = jitter(jitter_rng_);
-    connect_blocked_until_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    set_connect_blocked_until_locked(std::chrono::steady_clock::now() +
+                                     std::chrono::milliseconds(ms));
+}
+
+void PgPool::set_connect_blocked_until_locked(std::chrono::steady_clock::time_point t) {
+    connect_blocked_until_ = t;
+    connect_blocked_until_rep_.store(t.time_since_epoch().count(), std::memory_order_relaxed);
 }
 
 PGconn* PgPool::connect_one() {
@@ -442,8 +448,10 @@ std::size_t PgPool::waiters() const {
 }
 
 bool PgPool::connect_breaker_open() const {
-    std::lock_guard lk{mu_};
-    return std::chrono::steady_clock::now() < connect_blocked_until_;
+    // Takes no lock by design (see the header): never take `mu_` here.
+    const std::chrono::steady_clock::time_point until{std::chrono::steady_clock::duration{
+        connect_blocked_until_rep_.load(std::memory_order_relaxed)}};
+    return std::chrono::steady_clock::now() < until;
 }
 
 void PgPool::set_error(std::string msg) {
