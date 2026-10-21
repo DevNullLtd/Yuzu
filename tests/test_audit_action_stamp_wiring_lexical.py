@@ -31,7 +31,9 @@ coverage. Invariants:
        inside it, it would be re-armed per frame and the trailer would be added per failed frame.
     7. The hook body reads the store only through `registry_audit_store_.lock()`, once: never the
        raw `audit_store_` the other sites use and stop() unwires, which would be a use-after-free
-       on the detached forwarder threads (#3279).
+       on the detached forwarder threads (#3279). It charges each row with the overflow key it
+       computes once per frame; without it agents past the budget's exact table share ONE
+       allowance (a sampling cliff at fleet scale), and no unit test reaches the hook's call.
     8. The constructor builds the budget with `make_registry_audit_budget();`, the one place the
        production numbers meet (a unit test pins them).
 
@@ -84,6 +86,8 @@ NOTIFY = "notify_exec_tracker(resp.command_id(), agent_id, resp);"
 FLAG_DECL = "bool audit_failed_signalled = false;"
 HOOK_SIG = "bool AgentServiceImpl::audit_registry_frame("
 WEAK_LOCK = "registry_audit_store_.lock()"
+OVERFLOW_KEY = "const std::string overflow = registry_audit_overflow_key(agent_id);"
+CHARGE = "registry_audit_budget_->try_admit(agent_id, overflow)"
 BUDGET_CTOR = "registry_audit_budget_ = make_registry_audit_budget();"
 WIRING = "agent_service_.set_registry_audit_store(audit_store_);"
 READ_LOOP = "while (stream->Read(&resp))"
@@ -139,6 +143,11 @@ def server_problems(src):
             f"agent_service_impl.cpp: audit_registry_frame must read the store only through one"
             f" `{WEAK_LOCK}` (never the raw `audit_store_`, which stop() unwires and frees while"
             " detached forwarder threads still run)"
+        )
+    if body is None or any(body.count(normalise(s)) != 1 for s in (OVERFLOW_KEY, CHARGE)):
+        out.append(
+            f"agent_service_impl.cpp: audit_registry_frame must compute `{OVERFLOW_KEY}` once and"
+            f" charge every row with `{CHARGE}`"
         )
     if t.count(normalise(BUDGET_CTOR)) != 1:
         out.append(f"agent_service_impl.cpp: expected exactly one `{BUDGET_CTOR}` in the constructor")
@@ -221,6 +230,8 @@ SERVER_MUTATIONS = [
     (r"response_store_->store\(sr\);", "response_store_->store(sr);\nresponse_store_->store(sr);"),
     # the hook reads the raw store instead of the weak one
     (r"registry_audit_store_\.lock\(\)", "std::shared_ptr<AuditStore>(audit_store_, [](AuditStore*) {})"),
+    # the rows are charged without the overflow key: agents past the exact table share ONE allowance
+    (r"registry_audit_budget_->try_admit\(agent_id, overflow\)", "registry_audit_budget_->try_admit(agent_id)"),
     # the constructor stops building the production budget
     (r"registry_audit_budget_ = make_registry_audit_budget\(\);", ""),
 ]
