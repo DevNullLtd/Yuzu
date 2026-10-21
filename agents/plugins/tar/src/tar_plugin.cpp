@@ -2705,8 +2705,12 @@ private:
         for (const auto& ret : r.retained) {
             spdlog::info("TAR mapdrive backfill: profile {} retained ({})", ret.sid, ret.cause);
         }
-        db_->set_config("mapdrive_backfill_pending",
-                        r.next.profiles.empty() ? std::string{} : format_pending_state(r.next));
+        if (!db_->set_config("mapdrive_backfill_pending", r.next.profiles.empty()
+                                                               ? std::string{}
+                                                               : format_pending_state(r.next)))
+            spdlog::warn("TAR: mapdrive backfill retry committed its rows but failed to persist "
+                         "the updated pending state — the stale claim stands, costing one extra "
+                         "retry interval (quality-engineer)");
     }
 
     int do_collect_slow(yuzu::CommandContext& ctx) {

@@ -1150,7 +1150,14 @@ void enum_registry_outbound_history(MapDriveHistory& h, const std::vector<std::s
             outcome.read_ok = false;
             outcome.token = "read_failed:win32_" + std::to_string(read.rc);
         }
-        outcome.complete = read.complete && !(h.rows.size() >= kMapDriveHistoryCap);
+        // read.complete already reflects this profile's own share of the cap: it shares the
+        // same h.rows reference with the batch-wide cap check below, so a cap hit DURING this
+        // profile's own sections already surfaces here. ANDing the batch-wide cap again marks
+        // the profile whose rows happened to cross it as incomplete even when its own read was
+        // genuinely fine -- apply_outcomes then retries it forever (governance: security-guardian).
+        // The cap-hit-stops-the-walk case below already covers every UNWALKED profile via
+        // h.complete; this profile doesn't need a second, misattributed signal.
+        outcome.complete = read.complete;
         h.profiles.push_back(std::move(outcome));
 
         // A per-profile access failure (hive corrupt, locked, or privileges

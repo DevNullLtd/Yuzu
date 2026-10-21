@@ -1184,7 +1184,7 @@ TEST_CASE("mapdrive backfill commit_first_pass: a failing pending write never wr
 TEST_CASE("mapdrive insert: skip_known_historical adds no duplicate on an identity already "
           "recorded as historical, and keeps that row's first-recorded ts",
           "[tar][mapdrive][backfill][db]") {
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-mapdrive-backfill-"}};
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_mapdrive_backfill_"}};
     auto opened = TarDatabase::open(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
