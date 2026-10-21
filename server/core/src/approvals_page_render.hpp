@@ -67,7 +67,7 @@ struct ApprovalRowView {
 /// Plain-text rendering of a bound ticket's frozen request, for the detail panel and the
 /// decision dialog. Pure; parses defensively and never throws.
 ///
-/// Shape, one fact per line:
+/// Shape, one fact per line, in this ORDER:
 ///   Definition: <name>
 ///   Hash: <hash>
 ///   Targets (<n>):                    (an array: one value per line, indented)
@@ -75,9 +75,16 @@ struct ApprovalRowView {
 ///   Targets: <expression>             (or a single scope-expression string)
 ///   Parameters:
 ///     <key>: <value>
-///   Other fields:
+///   Definition fields:                (any other key inside `definition`)
 ///     <key>: <value>
+///   Other fields:                     (any other top-level key)
+///     <key>: <value>
+///   Shortened: ...                    (only when anything above was cut)
 ///   Digest: sha256:<hex>
+/// Each optional section has its OWN byte budget and says on its own line when it shows fewer
+/// entries than the request holds ("... and N more not shown (section limit)"), so no section
+/// can push another out of the summary: Definition and Hash are always shown, and every
+/// section keeps its heading whatever another one holds.
 /// `definition` ({name, hash}), `targets` and `params` are the recognised keys; every OTHER
 /// top-level key is listed under "Other fields", and every other key inside `definition`
 /// under "Definition fields", so no KEY the ticket binds is hidden from the reviewer (a

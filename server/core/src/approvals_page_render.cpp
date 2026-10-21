@@ -8,6 +8,8 @@
 
 #include <cstddef>
 #include <exception>
+#include <string>
+#include <vector>
 
 namespace yuzu::server::operate_pages {
 
@@ -19,6 +21,15 @@ namespace {
 constexpr std::size_t kSummaryValueBytes = 512;
 constexpr std::size_t kSummaryMaxEntries = 40; // per section
 constexpr std::size_t kSummaryTotalBytes = 6000;
+// Each optional section has its OWN byte budget, so a huge section can never push another
+// out of the summary (a submitter padding the definition fields, say, must not be able to hide
+// the device list or the parameters). Definition and Hash are always shown (two values of at
+// most 512 bytes each); the budgets plus headings, omission notes and the footer sum to under
+// kSummaryTotalBytes, so the total cut below is a safety net that the sections never reach.
+constexpr std::size_t kTargetsBudget = 1700;
+constexpr std::size_t kParamsBudget = 1400;
+constexpr std::size_t kDefinitionFieldsBudget = 600;
+constexpr std::size_t kOtherFieldsBudget = 600;
 
 // A JSON string/number/etc as a reviewer reads it, made DISPLAY-SAFE. Output is pure ASCII
 // (`ensure_ascii`): every non-ASCII character, including bidirectional overrides (U+202E,
@@ -39,31 +50,45 @@ std::string value_text(const nlohmann::json& v, bool& shortened) {
     return truncate_utf8(d, kSummaryValueBytes);
 }
 
-void append_entries(std::string& out, const nlohmann::json& obj, const char* heading,
-                    const char* skip_a, const char* skip_b, const char* skip_c, bool& shortened) {
+// One section: `heading`, then as many of `lines` (each already "  ...\n") as fit the section's
+// own byte budget and entry cap, then an explicit omission note for the rest. The heading is
+// emitted whatever the content, and a section that shows nothing says so, so a reviewer never
+// has to guess whether a section was empty, trimmed or never rendered.
+void append_section(std::string& out, const std::string& heading,
+                    const std::vector<std::string>& lines, std::size_t budget, bool& shortened) {
+    out += heading;
+    std::size_t used = 0;
     std::size_t shown = 0;
-    std::size_t total = 0;
-    std::string body;
+    for (const auto& line : lines) {
+        if (shown >= kSummaryMaxEntries || used + line.size() > budget)
+            break;
+        out += line;
+        used += line.size();
+        ++shown;
+    }
+    if (shown < lines.size()) {
+        out += shown == 0 ? "  ... " + std::to_string(lines.size()) +
+                                " entries, none shown (section limit)\n"
+                          : "  ... and " + std::to_string(lines.size() - shown) +
+                                " more not shown (section limit)\n";
+        shortened = true;
+    }
+}
+
+void append_entries(std::string& out, const nlohmann::json& obj, const char* heading,
+                    const char* skip_a, const char* skip_b, const char* skip_c,
+                    std::size_t budget, bool& shortened) {
+    std::vector<std::string> lines;
     for (auto it = obj.begin(); it != obj.end(); ++it) {
         if ((skip_a && it.key() == skip_a) || (skip_b && it.key() == skip_b) ||
             (skip_c && it.key() == skip_c))
             continue;
-        ++total;
-        if (shown >= kSummaryMaxEntries)
-            continue;
-        ++shown;
-        body += "  " + value_text(nlohmann::json(it.key()), shortened) + ": " +
-                value_text(it.value(), shortened) + "\n";
+        lines.push_back("  " + value_text(nlohmann::json(it.key()), shortened) + ": " +
+                        value_text(it.value(), shortened) + "\n");
     }
-    if (total == 0)
+    if (lines.empty())
         return;
-    out += heading;
-    out += '\n';
-    out += body;
-    if (total > shown) {
-        out += "  ... and " + std::to_string(total - shown) + " more\n";
-        shortened = true;
-    }
+    append_section(out, std::string(heading) + "\n", lines, budget, shortened);
 }
 
 // The visible scope cell is a clipped copy; the full text lives once, in `data-scope`.
@@ -215,25 +240,17 @@ BoundRequestSummary summarize_bound_request_detail(const std::string& request_js
             out += "Definition: (not stated in the request)";
         }
         out += '\n';
-        // Any other key inside `definition` is part of what the ticket binds too.
-        if (definition_object != nullptr)
-            append_entries(out, *definition_object, "Definition fields:", "name", "hash", nullptr,
-                           shortened);
+        // ORDER matters as much as the budgets: the sections a reviewer most needs (what runs,
+        // on which devices, with which parameters) come first, the optional ones after them.
 
         // Targets: an array (one per line) or one scope-expression string.
         if (const auto t = doc.find("targets"); t != doc.end()) {
             if (t->is_array()) {
-                out += "Targets (" + std::to_string(t->size()) + "):\n";
-                std::size_t n = 0;
-                for (const auto& e : *t) {
-                    if (n == kSummaryMaxEntries) {
-                        out += "  ... and " + std::to_string(t->size() - n) + " more\n";
-                        shortened = true;
-                        break;
-                    }
-                    ++n;
-                    out += "  " + value_text(e, shortened) + "\n";
-                }
+                std::vector<std::string> lines;
+                for (const auto& e : *t)
+                    lines.push_back("  " + value_text(e, shortened) + "\n");
+                append_section(out, "Targets (" + std::to_string(t->size()) + "):\n", lines,
+                               kTargetsBudget, shortened);
             } else {
                 out += "Targets: " + value_text(*t, shortened) + "\n";
             }
@@ -244,7 +261,8 @@ BoundRequestSummary summarize_bound_request_detail(const std::string& request_js
         // Parameters: key/value pairs when an object, else the value as-is.
         if (const auto p = doc.find("params"); p != doc.end()) {
             if (p->is_object() && !p->empty())
-                append_entries(out, *p, "Parameters:", nullptr, nullptr, nullptr, shortened);
+                append_entries(out, *p, "Parameters:", nullptr, nullptr, nullptr, kParamsBudget,
+                               shortened);
             else if (p->is_object())
                 out += "Parameters: none\n";
             else
@@ -253,8 +271,14 @@ BoundRequestSummary summarize_bound_request_detail(const std::string& request_js
             out += "Parameters: none stated\n";
         }
 
-        // Everything else the ticket binds, so nothing is hidden from the reviewer.
-        append_entries(out, doc, "Other fields:", "definition", "targets", "params", shortened);
+        // Any other key inside `definition` is part of what the ticket binds too.
+        if (definition_object != nullptr)
+            append_entries(out, *definition_object, "Definition fields:", "name", "hash", nullptr,
+                           kDefinitionFieldsBudget, shortened);
+
+        // Everything else the ticket binds, so no key is hidden from the reviewer.
+        append_entries(out, doc, "Other fields:", "definition", "targets", "params",
+                       kOtherFieldsBudget, shortened);
     } catch (const std::exception&) {
         return {kUnreadable, false, false};
     }

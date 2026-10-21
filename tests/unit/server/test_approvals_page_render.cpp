@@ -602,3 +602,110 @@ TEST_CASE("summarize_bound_request: one field per line, so a value cannot pose a
     // The one genuine Digest line is last and is the real digest.
     CHECK(lines.back() == "Digest: sha256:" + real);
 }
+
+// -- summary section starvation (Gate 8 g8r3-up-1): independent budgets ----------------
+
+namespace {
+
+std::string padded(const std::string& prefix, std::size_t n, std::size_t bytes) {
+    std::string out = "{";
+    for (std::size_t i = 0; i < n; ++i)
+        out += std::string(i ? "," : "") + "\"" + prefix + std::to_string(100 + i) + "\":\"" +
+               std::string(bytes, 'v') + "\"";
+    return out + "}";
+}
+
+// A request in which each named section is either padded to overflow its own budget or small.
+// `scale` is how many entries a padded section holds (kept small enough for all four at once to
+// stay under the 16 KiB request cap, which the summary also enforces).
+std::string starvation_request(bool pad_definition, bool pad_targets, bool pad_params,
+                               bool pad_other, std::size_t def_n, std::size_t tgt_n,
+                               std::size_t par_n, std::size_t oth_n) {
+    std::string def = pad_definition ? padded("df", def_n, 300) : R"({"df":"x"})";
+    // The definition object carries name and hash too.
+    def = R"({"name":"Block RDP","hash":"abc",)" + def.substr(1);
+    std::string targets = "[";
+    const std::size_t n = pad_targets ? tgt_n : 2;
+    for (std::size_t i = 0; i < n; ++i)
+        targets += std::string(i ? "," : "") + "\"host-" + std::to_string(i) + "-" +
+                   (pad_targets ? std::string(500, 't') : "") + "\"";
+    targets += "]";
+    const std::string params = pad_params ? padded("pp", par_n, 400) : R"({"port":3389})";
+    const std::string other = pad_other ? padded("ot", oth_n, 400) : R"({"flag":true})";
+    // `other` keys are merged at the top level.
+    return R"({"definition":)" + def + R"(,"targets":)" + targets + R"(,"params":)" + params + "," +
+           other.substr(1, other.size() - 2) + "}";
+}
+
+} // namespace
+
+TEST_CASE("summarize_bound_request: no section can starve another; each says when it is cut",
+          "[ui][approvals][render][bound]") {
+    const auto digest_of = [](const std::string& t) { return *yuzu::server::sha256_hex(t); };
+    struct Case {
+        const char* name;
+        bool def, targets, params, other;
+        std::size_t def_n, tgt_n, par_n, oth_n;
+    };
+    for (const Case c : {
+             // Each alone, at the size that overflows its budget the most (and, for the
+             // definition, the 40 x 300 bytes of Gate 8's counterexample).
+             Case{"definition fields", true, false, false, false, 40, 0, 0, 0},
+             Case{"targets", false, true, false, false, 0, 12, 0, 0},
+             Case{"parameters", false, false, true, false, 0, 0, 30, 0},
+             Case{"other fields", false, false, false, true, 0, 0, 0, 30},
+             // All four at once, each still over its own budget.
+             Case{"all four at once", true, true, true, true, 12, 5, 8, 8}}) {
+        DYNAMIC_SECTION(c.name << " padded") {
+            const auto req = starvation_request(c.def, c.targets, c.params, c.other, c.def_n,
+                                                c.tgt_n, c.par_n, c.oth_n);
+            REQUIRE(req.size() <= yuzu::server::kMaxRequestJsonBytes);
+            const auto digest = digest_of(req);
+            const auto d = summarize_bound_request_detail(req, digest);
+            REQUIRE(d.readable);
+            // Every essential heading survives whatever the other sections hold.
+            CHECK(d.text.find("Definition: Block RDP\nHash: abc\n") != std::string::npos);
+            CHECK(d.text.find("Targets (") != std::string::npos);
+            CHECK(d.text.find("Parameters:\n") != std::string::npos);
+            CHECK(d.text.find("Definition fields:\n") != std::string::npos);
+            CHECK(d.text.find("Other fields:\n") != std::string::npos);
+            // Small sections are shown IN FULL, not trimmed by a big neighbour.
+            if (!c.params)
+                CHECK(d.text.find("  port: 3389\n") != std::string::npos);
+            if (!c.targets)
+                CHECK(d.text.find("  host-0-\n  host-1-\n") != std::string::npos);
+            if (!c.other)
+                CHECK(d.text.find("  flag: true\n") != std::string::npos);
+            if (!c.def)
+                CHECK(d.text.find("  df: x\n") != std::string::npos);
+            // A padded section says so on its own line.
+            const bool any_padded = c.def || c.targets || c.params || c.other;
+            CHECK(any_padded);
+            CHECK(d.shortened);
+            CHECK(count_of(d.text, "(section limit)") >=
+                  static_cast<std::size_t>(c.def) + c.targets + c.params + c.other);
+            CHECK(d.text.find("Shortened:") != std::string::npos);
+            // The footer is intact and last, and the bound holds.
+            const std::string last = "Digest: sha256:" + digest + "\n";
+            REQUIRE(d.text.size() >= last.size());
+            CHECK(d.text.compare(d.text.size() - last.size(), last.size(), last) == 0);
+            CHECK(d.text.size() <= 6000);
+        }
+    }
+}
+
+TEST_CASE("summarize_bound_request: a section whose first entry alone exceeds its budget still "
+          "keeps its heading and says nothing was shown",
+          "[ui][approvals][render][bound]") {
+    // One target of 500 bytes fits (budget 1700); one definition field of 2 x 512 bytes cannot
+    // fit its 600-byte budget with its key.
+    const std::string key(512, 'k'), val(512, 'v');
+    const std::string req = R"({"definition":{"name":"n","hash":"h","KEY":"VAL"},"targets":["t"],"params":{}})";
+    std::string big = req;
+    big.replace(big.find("KEY"), 3, key);
+    big.replace(big.find("VAL"), 3, val);
+    const auto d = summarize_bound_request_detail(big, "");
+    CHECK(d.text.find("Definition fields:\n  ... 1 entries, none shown (section limit)\n") !=
+          std::string::npos);
+    CHECK(d.text.find("Targets (1):\n  t\n") != std::string::npos);
+}
