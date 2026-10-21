@@ -15,8 +15,10 @@
 ///     deny_service_scoped_fn at all — reachable with no session, matching
 ///     the pre-routing exemption that (deliberately) lives in server.cpp,
 ///     not this module.
-///   - /health, /api/health call ONLY resolve_session_fn (non-blocking) —
-///     always 200, response SHAPE differs by session presence.
+///   - /health, /api/health call ONLY resolve_session_fn (non-blocking), and only
+///     when the request carries a Cookie, Authorization or X-Yuzu-Token header ,
+///     always 200, response SHAPE differs by session presence. A request with no
+///     credential header makes ZERO resolve_session_fn calls.
 ///   - /fragments/health/summary calls deny_service_scoped_fn THEN auth_fn
 ///     (blocking) — one of the two routes in this cluster that gate on a session
 ///     (with /fragments/dashboard/health).
@@ -98,6 +100,7 @@ struct Harness {
     std::string session_username{"alice"};
     bool auth_fn_called{false};
     bool resolve_session_fn_called{false};
+    int resolve_session_calls{0};
 
     bool deny_scoped{false};
     bool deny_scoped_fn_called{false};
@@ -139,6 +142,7 @@ struct Harness {
         deps.resolve_session_fn =
             [this](const httplib::Request&) -> std::optional<auth::Session> {
             resolve_session_fn_called = true;
+            ++resolve_session_calls;
             if (!session_present)
                 return std::nullopt;
             auth::Session s;
@@ -199,6 +203,7 @@ struct Harness {
     void reset_gate_tracking() {
         auth_fn_called = false;
         resolve_session_fn_called = false;
+        resolve_session_calls = 0;
         deny_scoped_fn_called = false;
     }
 };
@@ -474,8 +479,8 @@ TEST_CASE("health_routes: GET /health and GET /api/health are BOTH reachable "
         auto r = h.sink.Get(path);
         REQUIRE(r);
         CHECK(r->status == 200);
-        CHECK(h.resolve_session_fn_called); // non-blocking resolve DOES run
-        CHECK_FALSE(h.auth_fn_called);       // but the blocking gate never does
+        CHECK(h.resolve_session_calls == 0); // no credential header: no session lookup
+        CHECK_FALSE(h.auth_fn_called);       // and the blocking gate never runs
         CHECK_FALSE(h.deny_scoped_fn_called);
         auto body = json::parse(r->body);
         CHECK(body.contains("status"));
@@ -495,7 +500,7 @@ TEST_CASE("health_routes: GET /health with a session gets the heavier "
     Harness h;
     h.wire(); // session_present defaults true
 
-    auto r = h.sink.Get("/health");
+    auto r = h.sink.Get("/health", {{"Cookie", "yuzu_session=abc"}});
     REQUIRE(r);
     CHECK(r->status == 200);
     CHECK(h.resolve_session_fn_called);
@@ -507,6 +512,77 @@ TEST_CASE("health_routes: GET /health with a session gets the heavier "
     CHECK(body["agents"]["pending"].is_null());
     CHECK(body.contains("executions"));
     CHECK(body.contains("system"));
+}
+
+TEST_CASE("health_routes: /health and /api/health resolve a session only for a request that "
+          "carries a credential header",
+          "[server][routes][health_routes]") {
+    Harness h;
+    h.wire(); // a session WOULD resolve, so any skipped call is the guard's doing
+
+    for (const std::string& path : {std::string("/health"), std::string("/api/health")}) {
+        INFO("path: " << path);
+
+        // No credential at all: zero resolve_session_fn calls, unauthenticated body.
+        h.reset_gate_tracking();
+        auto bare = h.sink.Get(path);
+        REQUIRE(bare);
+        CHECK(bare->status == 200);
+        CHECK(h.resolve_session_calls == 0);
+        auto bare_body = json::parse(bare->body);
+        CHECK_FALSE(bare_body["agents"].contains("pending"));
+        CHECK_FALSE(bare_body.contains("executions"));
+        CHECK_FALSE(bare_body.contains("system"));
+
+        // Headers that are not credentials do not count.
+        h.reset_gate_tracking();
+        auto other = h.sink.Get(path, {{"Accept", "application/json"}, {"User-Agent", "probe"}});
+        REQUIRE(other);
+        CHECK(h.resolve_session_calls == 0);
+
+        // Each credential source resolve_session reads still resolves, exactly once, and
+        // gets the authenticated body.
+        const std::vector<std::pair<std::string, std::string>> credentials{
+            {"Cookie", "yuzu_session=abc"},
+            {"Authorization", "Bearer abc"},
+            {"X-Yuzu-Token", "abc"}};
+        for (const auto& [name, value] : credentials) {
+            INFO("header: " << name);
+            h.reset_gate_tracking();
+            auto r = h.sink.Get(path, {{name, value}});
+            REQUIRE(r);
+            CHECK(r->status == 200);
+            CHECK(h.resolve_session_calls == 1);
+            auto body = json::parse(r->body);
+            CHECK(body["agents"].contains("pending"));
+            CHECK(body.contains("executions"));
+            CHECK(body.contains("system"));
+        }
+
+        // A credential that does not resolve still yields the unauthenticated body.
+        h.session_present = false;
+        h.reset_gate_tracking();
+        auto stale = h.sink.Get(path, {{"Cookie", "yuzu_session=stale"}});
+        REQUIRE(stale);
+        CHECK(h.resolve_session_calls == 1);
+        CHECK_FALSE(json::parse(stale->body).contains("system"));
+        h.session_present = true;
+    }
+}
+
+TEST_CASE("health_routes: request_carries_credential matches the three sources resolve_session reads",
+          "[server][routes][health_routes]") {
+    httplib::Request none;
+    CHECK_FALSE(health::request_carries_credential(none));
+    for (const char* name : {"Cookie", "Authorization", "X-Yuzu-Token"}) {
+        INFO("header: " << name);
+        httplib::Request r;
+        r.set_header(name, "x");
+        CHECK(health::request_carries_credential(r));
+    }
+    httplib::Request unrelated;
+    unrelated.set_header("Accept", "*/*");
+    CHECK_FALSE(health::request_carries_credential(unrelated));
 }
 
 TEST_CASE("health_routes: /health and /api/health status flips to 'degraded' "
@@ -668,6 +744,25 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
     // One closed probe set shared by the main pre-routing chokepoint.
     expect("if (yuzu::server::health::is_probe_path(req.path)) {", 1,
            "main pre-routing exempts probes through the one shared predicate");
+    // The /health + /api/health per-source budget is checked inside the probe branch, once,
+    // on the `--rate-limit` limiter, before the body cap; the general 429 body has one
+    // definition (write_rate_limited_response), not a second literal in server.cpp.
+    expect("if (!yuzu::server::health::admit_probe_request(api_rate_limiter_, req, res))", 1,
+           "the pre-routing probe branch applies the /health rate limit");
+    {
+        const auto branch = flat.find(squeeze("if (yuzu::server::health::is_probe_path(req.path)) {"));
+        const auto gate = flat.find(
+            squeeze("if (!yuzu::server::health::admit_probe_request(api_rate_limiter_, req, res))"));
+        const auto cap = flat.find(squeeze("if (enforce_pre_auth_body_cap())"), branch);
+        REQUIRE(branch != std::string::npos);
+        REQUIRE(gate != std::string::npos);
+        REQUIRE(cap != std::string::npos);
+        CHECK(branch < gate);
+        CHECK(gate < cap);
+    }
+    expect("rate limit exceeded", 0, "the 429 body lives only in write_rate_limited_response");
+    expect("write_rate_limited_response(res);", 1,
+           "the general limiter site uses the shared 429 writer");
     // The sink the probes register on must exist before register_health_routes is handed it:
     // deleting the construction leaves a null sink, which silently registers nothing.
     expect("redirect_sink_ = std::make_unique<HttplibRouteSink>(*redirect_server_)", 1,
@@ -918,7 +1013,9 @@ TEST_CASE("health_routes: /fragments/dashboard/health renders real rows, executi
         Harness h;
         h.fleet_wired = true;
         h.wire();
-        auto r = h.sink.dispatch("GET", "/fragments/dashboard/health");
+        // A real panel request always carries the credential that admitted it at auth_fn; the
+        // in-process health document only includes `executions` for a request that resolves.
+        auto r = h.sink.Get("/fragments/dashboard/health", {{"Cookie", "yuzu_session=abc"}});
         REQUIRE(r);
         CHECK(r->body.find("Executions running") != std::string::npos);
         REQUIRE(h.fleet_calls.size() == 1);
@@ -977,6 +1074,95 @@ TEST_CASE("health_routes: /fragments/dashboard/health agrees with /api/health on
         const bool degraded_pill = panel->body.find(">Degraded<") != std::string::npos;
         CHECK(healthy_pill == (status == "healthy"));
         CHECK(degraded_pill == (status != "healthy"));
+    }
+}
+
+// ── The per-source rate limit on /health and /api/health ───────────────────
+
+namespace {
+httplib::Request probe_request(const char* path, const char* addr = "10.0.0.7") {
+    httplib::Request r;
+    r.method = "GET";
+    r.path = path;
+    r.remote_addr = addr;
+    return r;
+}
+} // namespace
+
+TEST_CASE("health_routes: a burst over the budget on /health is refused with the standard 429",
+          "[server][routes][health_routes][ratelimit]") {
+    RateLimiter limiter(5);
+    for (const char* path : {"/health", "/api/health"}) {
+        INFO("path: " << path);
+        const auto addr = std::string("10.1.0.") + (path[1] == 'h' ? "1" : "2");
+        int admitted = 0;
+        httplib::Response last;
+        for (int i = 0; i < 8; ++i) {
+            httplib::Response res;
+            if (health::admit_probe_request(limiter, probe_request(path, addr.c_str()), res))
+                ++admitted;
+            else
+                last = std::move(res);
+        }
+        CHECK(admitted == 5);
+        // The refusal is the exact response the general limiter sends.
+        CHECK(last.status == 429);
+        CHECK(last.get_header_value("Retry-After") == "1");
+        const auto body = json::parse(last.body);
+        CHECK(body["error"]["code"] == 429);
+        CHECK(body["error"]["message"] == "rate limit exceeded");
+        CHECK(body["meta"]["api_version"] == "v1");
+    }
+}
+
+TEST_CASE("health_routes: /livez and /readyz are never charged against the probe budget",
+          "[server][routes][health_routes][ratelimit]") {
+    RateLimiter limiter(2);
+    for (int i = 0; i < 50; ++i) {
+        for (const char* path : {"/livez", "/readyz"}) {
+            httplib::Response res;
+            CHECK(health::admit_probe_request(limiter, probe_request(path), res));
+            CHECK(res.status == -1); // untouched
+        }
+    }
+    CHECK(limiter.bucket_count() == 0);
+}
+
+TEST_CASE("health_routes: the probe budget is a bucket of its own, per source",
+          "[server][routes][health_routes][ratelimit]") {
+    RateLimiter limiter(3);
+    // Drain one source's probe bucket.
+    for (int i = 0; i < 3; ++i) {
+        httplib::Response res;
+        REQUIRE(health::admit_probe_request(limiter, probe_request("/health", "10.2.0.1"), res));
+    }
+    httplib::Response refused;
+    CHECK_FALSE(health::admit_probe_request(limiter, probe_request("/health", "10.2.0.1"), refused));
+    // /health and /api/health share the one probe bucket for a source.
+    httplib::Response alias;
+    CHECK_FALSE(health::admit_probe_request(limiter, probe_request("/api/health", "10.2.0.1"), alias));
+    // The same source's ordinary API budget is untouched by it, and the reverse.
+    CHECK(limiter.allow("10.2.0.1"));
+    // Another source is unaffected.
+    httplib::Response other;
+    CHECK(health::admit_probe_request(limiter, probe_request("/health", "10.2.0.2"), other));
+    // Draining a source's API bucket does not refuse its probe.
+    for (int i = 0; i < 10; ++i)
+        (void)limiter.allow("10.2.0.3");
+    CHECK_FALSE(limiter.allow("10.2.0.3"));
+    httplib::Response probe;
+    CHECK(health::admit_probe_request(limiter, probe_request("/health", "10.2.0.3"), probe));
+}
+
+TEST_CASE("health_routes: a normal probe cadence is never limited at the default --rate-limit",
+          "[server][routes][health_routes][ratelimit]") {
+    // The limiter is built from the default `--rate-limit` (100/s per source). A fleet of load
+    // balancers behind one NAT address probing every second is tens of requests per second.
+    RateLimiter limiter(Config{}.rate_limit);
+    CHECK(Config{}.rate_limit == 100);
+    for (int i = 0; i < 60; ++i) {
+        httplib::Response res;
+        CHECK(health::admit_probe_request(limiter, probe_request("/health", "192.0.2.10"), res));
     }
 }
 
@@ -1060,7 +1246,7 @@ TEST_CASE("health_routes: plaintext /health never resolves a session - even with
     }
 
     // The main sink on the same harness still shows the authenticated-only fields.
-    auto main_r = h.sink.Get("/health");
+    auto main_r = h.sink.Get("/health", {{"Cookie", "yuzu_session=abc"}});
     REQUIRE(main_r);
     auto main_body = json::parse(main_r->body);
     CHECK(main_body.contains("executions"));

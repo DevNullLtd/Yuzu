@@ -17,22 +17,29 @@
 ///
 /// AUTH POSTURE — preserved EXACTLY per route, not uniform across the
 /// cluster (do not "fix" this into one shape):
-///   - `/metrics`, `/health`, `/api/health`, `/livez`, `/readyz` are
-///     UNAUTHENTICATED at the transport level — server.cpp's pre-routing
-///     middleware (the lambda registered via `web_server_->set_pre_routing_
-///     handler_ish`-equivalent block, NOT part of this extraction) exempts
-///     these five paths from session resolution and rate limiting BEFORE
-///     the request ever reaches the handlers this file registers. That
+///   - `/health`, `/api/health`, `/livez` and `/readyz` are UNAUTHENTICATED at the
+///     transport level, server.cpp's pre-routing middleware (the lambda registered
+///     via `web_server_->set_pre_routing_handler`, NOT part of this extraction)
+///     exempts these four paths from the on-behalf-of guard and from the 401 gate
+///     BEFORE the request ever reaches the handlers this file registers. That
 ///     exemption is load-bearing infrastructure (a monitoring probe or an
-///     orchestrator health check must work with no credentials) and stays
-///     in server.cpp, which now calls this header's `is_probe_path` for the probe set.
+///     orchestrator health check must work with no credentials) and stays in
+///     server.cpp, which calls this header's `is_probe_path` for the probe set.
+///     `/health` and `/api/health` ARE rate limited there, through
+///     `admit_probe_request` below, against a per-source bucket of their own;
+///     `/livez` and `/readyz` are not rate limited. (`/metrics` is not a probe
+///     path: it goes through the ordinary rate limiter and the 401 gate, with a
+///     localhost / `--metrics-no-auth` carve-out in server.cpp.)
 ///   - `/health`/`/api/health`'s shared `health_handler` ADDITIONALLY does
 ///     its own optional, non-blocking session resolve
 ///     (`deps.resolve_session_fn`, never writes to `res` on failure) to
 ///     decide whether to include the heavier authenticated-only
-///     `agents.pending`/`executions.*`/`system.*` fields. An unauthenticated
-///     caller still gets 200 with the cheap probe fields — this is NOT a
-///     gate, just a response-shape branch.
+///     `agents.pending`/`executions.*`/`system.*` fields. It does so ONLY when
+///     the request carries a credential (a Cookie, Authorization or
+///     X-Yuzu-Token header, `request_carries_credential`); a request with none
+///     is treated as unauthenticated without touching the session store.
+///     An unauthenticated caller still gets 200 with the cheap probe fields ,
+///     this is NOT a gate, just a response-shape branch.
 ///   - PLAINTEXT REDIRECT LISTENER (#5906): when HTTPS is on, the HTTP->HTTPS
 ///     redirect listener (`--web-port`, 8080 by default) ALSO serves exactly
 ///     `/livez`, `/readyz`, `/health` and `/api/health`, to GET and HEAD
@@ -130,6 +137,7 @@
 ///                                     in-process)
 
 #include "authz_gates.hpp" // authz::FleetReadGate (Dashboard health panel)
+#include "rate_limiter.hpp"
 #include "security_headers.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -222,6 +230,39 @@ namespace health {
 /// the plaintext redirect listener both test membership through it.
 [[nodiscard]] constexpr bool is_probe_path(std::string_view p) {
     return p == "/livez" || p == "/readyz" || p == "/health" || p == "/api/health";
+}
+
+/// True when `/health` or `/api/health` should resolve a session: the request carries at
+/// least one of the three credential sources `AuthRoutes::resolve_session` reads (the
+/// `Cookie`, `Authorization` and `X-Yuzu-Token` headers). A request with none cannot
+/// resolve to a session, so the probe answers it as unauthenticated without a store lookup.
+/// Deliberately coarse (header presence, not a parsed token): a request that does carry a
+/// header still goes through `resolve_session_fn` exactly as before.
+[[nodiscard]] inline bool request_carries_credential(const httplib::Request& req) {
+    return req.has_header("Cookie") || req.has_header("Authorization") ||
+           req.has_header("X-Yuzu-Token");
+}
+
+/// The two probe paths that serve an authenticated body shape and so are rate limited.
+[[nodiscard]] constexpr bool is_rate_limited_probe_path(std::string_view p) {
+    return p == "/health" || p == "/api/health";
+}
+
+/// The per-source rate-limit gate for `/health` and `/api/health`, called by the
+/// pre-routing chokepoint in server.cpp with `api_rate_limiter_` (the `--rate-limit`
+/// limiter, default 100 requests/second per source). The bucket key carries a prefix so
+/// probe traffic and API traffic from one source do not draw on each other's budget: a
+/// monitoring probe behind a shared NAT address is never refused because of REST traffic,
+/// and the reverse. Returns true when the request may proceed; any other path returns true
+/// without touching the limiter. On refusal `res` is filled with the standard 429.
+[[nodiscard]] inline bool admit_probe_request(RateLimiter& limiter, const httplib::Request& req,
+                                              httplib::Response& res) {
+    if (!is_rate_limited_probe_path(req.path))
+        return true;
+    if (limiter.allow("probe:" + req.remote_addr))
+        return true;
+    write_rate_limited_response(res);
+    return false;
 }
 
 /// True for a request the plaintext redirect listener serves instead of

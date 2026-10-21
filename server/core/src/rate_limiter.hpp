@@ -5,6 +5,10 @@
 #include <string>
 #include <unordered_map>
 
+namespace httplib {
+struct Response;
+}
+
 namespace yuzu::server {
 
 /**
@@ -37,5 +41,10 @@ private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, Bucket> buckets_;
 };
+
+/// The refusal every pre-routing rate-limit site sends: 429, `Retry-After: 1` and the
+/// `rate limit exceeded` JSON body. One definition, so a limited probe path and the general
+/// API path cannot drift apart.
+void write_rate_limited_response(httplib::Response& res);
 
 } // namespace yuzu::server

@@ -23,6 +23,8 @@
 
 #include "../test_helpers.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
@@ -499,4 +501,52 @@ TEST_CASE("AuthManager+SessionStore: the validate cache is trusted only after th
         drop_session_schema(pool);
         CHECK_FALSE(a->validate_session(tok).has_value());
     }
+}
+
+TEST_CASE("AuthManager+SessionStore: an empty token is refused without touching the store",
+          "[auth][session_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    auto mgr = make_mgr(store);
+    mgr->set_metrics_registry(&metrics);
+
+    // The observable for "the store was consulted": with the schema gone every lookup fails and
+    // is counted as a validate degrade, so a store call shows up as a counter increment.
+    drop_session_schema(pool);
+    REQUIRE_FALSE(store.read_generation().has_value()); // schema is really gone
+    const std::string needle = R"(yuzu_auth_session_store_degrade_total{op="validate"})";
+    const auto validate_degrades = [&] {
+        const auto text = metrics.serialize();
+        const auto pos = text.find(needle);
+        if (pos == std::string::npos)
+            return 0;
+        return std::stoi(text.substr(pos + needle.size() + 1));
+    };
+
+    // An empty token (the no-cookie case) never reaches the store.
+    CHECK_FALSE(mgr->validate_session("").has_value());
+    CHECK(validate_degrades() == 0);
+
+    // Positive control: a non-empty token the replica has not seen DOES go to the store, so the
+    // counter above is able to move.
+    CHECK_FALSE(mgr->validate_session("not-a-session-token").has_value());
+    CHECK(validate_degrades() == 1);
+
+    // And the empty token still does not move it.
+    CHECK_FALSE(mgr->validate_session("").has_value());
+    CHECK(validate_degrades() == 1);
+}
+
+TEST_CASE("AuthManager legacy path: an empty token never matches a session",
+          "[auth][session]") {
+    AuthManager mgr;
+    CHECK_FALSE(mgr.validate_session("").has_value());
+    const auto token = mgr.create_local_session_for_test("alice", Role::user, /*mfa=*/false);
+    REQUIRE_FALSE(token.empty());
+    CHECK(mgr.validate_session(token).has_value());
+    CHECK_FALSE(mgr.validate_session("").has_value());
 }

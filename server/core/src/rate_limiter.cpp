@@ -1,5 +1,7 @@
 #include "rate_limiter.hpp"
 
+#include <httplib.h>
+
 #include <algorithm>
 
 namespace yuzu::server {
@@ -49,6 +51,14 @@ void RateLimiter::purge_stale() {
 size_t RateLimiter::bucket_count() const {
     std::lock_guard lock(mu_);
     return buckets_.size();
+}
+
+void write_rate_limited_response(httplib::Response& res) {
+    res.status = 429;
+    res.set_header("Retry-After", "1");
+    res.set_content(
+        R"({"error":{"code":429,"message":"rate limit exceeded"},"meta":{"api_version":"v1"}})",
+        "application/json");
 }
 
 } // namespace yuzu::server

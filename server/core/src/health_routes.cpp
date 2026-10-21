@@ -173,22 +173,21 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
     // /api/ keep working — a side-effect of #401's move from /api/health → /health.
     //
     // `health_body` is the ONE body behind every /health alias; its callers
-    // decide `is_authenticated` (main sink: a non-blocking session resolve;
-    // plaintext sink: hard false, #5906).
+    // decide `is_authenticated` (main sink: a non-blocking session resolve, run
+    // only for a request that carries a credential; plaintext sink: hard
+    // false, #5906).
     auto health_body = [deps](const httplib::Request&, httplib::Response& res,
                               bool is_authenticated) {
-        // `is_authenticated` gates the expensive work below.
-        // Governance Gate 7 round 2 (security MEDIUM): /health and
-        // /api/health are rate-limit-exempt for monitoring stability;
-        // the bounded but non-trivial work below (a pending-agents scan
-        // and bounded execution_tracker reads — two PG pool leases,
-        // ADR-0065) must only run for authenticated callers, otherwise
-        // an unauth flood becomes a DoS amplification primitive. Unauth
-        // callers get the cheap
-        // probe response — status, uptime, agent count from in-memory
-        // registry, store ok flags from is_open() (constant-time member
-        // checks), and version. Authed callers additionally get
-        // pending-agent count, execution stats, and process sampler.
+        // `is_authenticated` gates the expensive work below. The bounded but
+        // non-trivial work (a pending-agents scan and bounded execution_tracker
+        // reads: two PG pool leases, ADR-0065) runs only for authenticated
+        // callers. Unauthenticated callers get the probe response: status,
+        // uptime, agent count from the in-memory registry, store ok flags from
+        // is_open() (constant-time member checks), and version. Authenticated
+        // callers additionally get pending-agent count, execution stats, and
+        // process sampler. /health and /api/health are rate limited per source
+        // in server.cpp's pre-routing handler (`health::admit_probe_request`),
+        // so even the authenticated shape is bounded per source.
 
         auto now = std::chrono::steady_clock::now();
         auto uptime_sec = std::chrono::duration_cast<std::chrono::seconds>(
@@ -513,7 +512,12 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         res.set_content(health.dump(), "application/json");
     };
     auto health_handler = [deps, health_body](const httplib::Request& req, httplib::Response& res) {
-        health_body(req, res, static_cast<bool>(deps.resolve_session_fn(req)));
+        // A request with no Cookie, Authorization or X-Yuzu-Token header cannot resolve to a
+        // session, so it is answered as unauthenticated without a session-store lookup. A
+        // request that carries any of them resolves exactly as before.
+        const bool authenticated = health::request_carries_credential(req) &&
+                                   static_cast<bool>(deps.resolve_session_fn(req));
+        health_body(req, res, authenticated);
     };
     // Every /health alias — main-sink /health and /api/health via health_handler,
     // plaintext-sink via plain_health — MUST route through the ONE health_body

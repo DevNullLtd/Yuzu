@@ -728,7 +728,7 @@ TEST_CASE("Pre-routing body cap: a non-chunked Transfer-Encoding does NOT suppre
     //
     // So while the size check was gated on `!unmeasurable`, one header
     // suppressed the cap on all 24 classes that do not set
-    // requires_measurable — including the rate-limit-exempt probe paths —
+    // requires_measurable, including the probe paths ,
     // while httplib went on to read the declared body in full. Production now
     // gates the size check on `content_length_is_authoritative` instead, which
     // asks httplib rather than re-deciding the header.

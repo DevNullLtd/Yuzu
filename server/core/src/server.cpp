@@ -14662,17 +14662,21 @@ private:
             // /api/health) also skip the 401 gate further down, so before
             // this cap existed they were the last unauthenticated 100 MiB
             // buffer on the server — the cap MUST still reach them even
-            // though they are exempt from on-behalf-of and the rate limiter.
-            // A single unconditional placement cannot satisfy that AND the
-            // separate requirement below, which is why this is a callable,
-            // not an inline block:
+            // though they are exempt from on-behalf-of and the general rate
+            // limiter. A single unconditional placement cannot satisfy that
+            // AND the separate requirement below, which is why this is a
+            // callable, not an inline block:
             //
             //   1. Probes are capped — call site 1, inside the probe branch
-            //      just below: for a probe, this cap is the ONLY gate it
-            //      hits, so it runs immediately, before the Unhandled
-            //      return that skips everything else.
-            //   2. Probes stay exempt from on-behalf-of and rate limiting —
-            //      unchanged: the probe branch returns before either runs.
+            //      just below: for a probe, this cap and the /health +
+            //      /api/health per-source budget (`admit_probe_request`,
+            //      checked first) are the only gates it hits, so they run
+            //      immediately, before the Unhandled return that skips
+            //      everything else.
+            //   2. Probes stay exempt from on-behalf-of and from the general
+            //      rate-limit bucket, unchanged: the probe branch returns
+            //      before either runs. /health and /api/health draw on their
+            //      own bucket instead (see the probe branch).
             //   3. Every NON-probe request hits the on-behalf-of guard and
             //      the rate limiter BEFORE this cap — call site 2, after
             //      both, restores the pre-R3 ordering an earlier version of
@@ -15037,21 +15041,28 @@ private:
                 return false;
             };
 
-            // Lightweight probes — capped (R3, call site 1 of
-            // `enforce_pre_auth_body_cap` above), but otherwise always
-            // allowed: no auth, no rate limit. /health and /api/health are
-            // included here (governance Gate 7, unhappy-path UP-1) so
-            // monitoring integrations behind a NAT or sharing a source-IP
-            // bucket with authed REST traffic cannot 429-starve the health
-            // probe. The endpoints themselves are strictly read-only and
-            // documented as unauthenticated. This is the probes' only gate
-            // on the HTTPS listener (the plaintext redirect listener admits
-            // no body at all: is_plaintext_probe_request, health_routes.hpp):
-            // the cap check runs here, unconditionally, before the
-            // Unhandled return, precisely because everything past this
-            // point (on-behalf-of, rate limiting) is skipped for these four
-            // paths — before the cap reached them too, they were the last
-            // unauthenticated 100 MiB buffer on the server.
+            // Lightweight probes, no auth, no on-behalf-of guard, no draw on
+            // the general rate-limit bucket (governance Gate 7, unhappy-path
+            // UP-1: monitoring integrations behind a NAT or sharing a
+            // source-IP bucket with authed REST traffic must not be able to
+            // 429-starve the health probe, nor be starved by it). Two gates
+            // do apply, in this order:
+            //   1. /health and /api/health only: a per-source budget,
+            //      `health::admit_probe_request`, drawn from the same
+            //      `api_rate_limiter_` (`--rate-limit`) under a key of its
+            //      own, so the probe and REST traffic from one source never
+            //      share a bucket. /livez and /readyz are not limited.
+            //   2. The body cap (R3, call site 1 of
+            //      `enforce_pre_auth_body_cap` above), unconditionally,
+            //      before the Unhandled return, precisely because everything
+            //      past this point (on-behalf-of, the general rate-limit
+            //      bucket) is skipped for these four paths, before the cap
+            //      reached them too, they were the last unauthenticated
+            //      100 MiB buffer on the server. The plaintext redirect
+            //      listener admits no body at all (is_plaintext_probe_request,
+            //      health_routes.hpp).
+            // The rate limit runs before the cap, mirroring the non-probe
+            // order below (limiter, then cap).
             // Liveness/readiness probes are EXEMPT from the on-behalf-of guard
             // below — a RECORDED ADR-1005 exception (documented in
             // docs/auth-architecture.md; ledger entry lands with the ADR).
@@ -15062,6 +15073,8 @@ private:
             // path, and a bricked orchestrator hides the misconfiguration the
             // guard exists to surface. Every other path rejects below.
             if (yuzu::server::health::is_probe_path(req.path)) {
+                if (!yuzu::server::health::admit_probe_request(api_rate_limiter_, req, res))
+                    return httplib::Server::HandlerResponse::Handled;
                 if (enforce_pre_auth_body_cap())
                     return httplib::Server::HandlerResponse::Handled;
                 return httplib::Server::HandlerResponse::Unhandled;
@@ -15148,11 +15161,7 @@ private:
                         req.path.ends_with("/password"));
             auto& limiter = is_login ? login_rate_limiter_ : api_rate_limiter_;
             if (!limiter.allow(req.remote_addr)) {
-                res.status = 429;
-                res.set_header("Retry-After", "1");
-                res.set_content(
-                    R"({"error":{"code":429,"message":"rate limit exceeded"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                write_rate_limited_response(res);
                 return httplib::Server::HandlerResponse::Handled;
             }
 
@@ -15175,7 +15184,7 @@ private:
             // Allow unauthenticated access to login pages, health, OIDC flow, and OpenAPI spec.
             // /health and /api/health are ALSO covered by the early-return
             // exemption at the top of this lambda (which additionally skips
-            // rate limiting). They are kept in this list as defense-in-depth
+            // the general rate-limit bucket). They are kept in this list as defense-in-depth
             // — a future contributor narrowing the early-return back to
             // /livez|/readyz alone would silently start requiring auth on
             // /health without this lower entry. Governance Gate 7, security
