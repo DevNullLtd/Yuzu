@@ -1596,11 +1596,30 @@ bool AuthRoutes::audit_log_for_principal(const httplib::Request& req, const std:
                                        target_id, detail, principal_class_override);
     auto ok = audit_store_->log(event);
     if (!ok) {
+        // CWE-117: `target_id` is caller-controlled on the routes that reach this writer
+        // with a request-supplied id (POST and DELETE /api/v1/quarantine), and `principal`
+        // is a pre-auth username at the login sites, so every field is neutralised exactly
+        // as `audit_log` does; the raw value stays in the audit row.
         spdlog::warn("audit_log_for_principal: AuditStore::log failed for action='{}' "
                      "principal='{}' target_id='{}'",
-                     action, principal, target_id);
+                     audit_token(action), audit_token(principal), audit_token(target_id));
     }
     return ok;
+}
+
+bool AuthRoutes::audit_log_for_session(const httplib::Request& req, const auth::Session& session,
+                                       const std::string& principal_role,
+                                       const std::string& action, const std::string& result,
+                                       const std::string& target_type,
+                                       const std::string& target_id, const std::string& detail) {
+    // Same fields `make_audit_event` stamps for a resolved session: the principal, the role
+    // handed in (the caller captures `effective_role` ONCE, so a JIT elevation that lapses
+    // mid-request cannot make the rows of one request disagree), the engine class (an engine
+    // principal audits as "engine", not the "agent" its bearer presentation implies) and, via
+    // `make_audit_event_for_principal`, the session correlator and source fields.
+    return audit_log_for_principal(req, action, result, session.username, principal_role,
+                                   target_type, target_id, detail,
+                                   session.principal_kind == "engine" ? "engine" : std::string{});
 }
 
 void AuthRoutes::record_enroll_credential_changed(const httplib::Request& req,

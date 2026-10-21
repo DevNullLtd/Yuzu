@@ -2024,7 +2024,9 @@ Quarantine a device.
 > | `403` | RBAC on: the caller's own `Security:Execute` grant is not global (for example it is held only through a management group, or the caller is an administrator only through a JIT elevation), **or the RBAC store could not be read** (a transient failure reads the same as a denial) | `forbidden` |
 > | `400` | The `quarantine.quarantine` pair cannot be classified | `unclassified` or `ambiguous` |
 > | `403` | Other chokepoint refusals map the same way (`kill_switched`, `anonymous_operator`); neither is reachable for this pair today, because quarantine is exempt from the per-action kill switch and an unauthenticated request ends at the `401` | `kill_switched`, `anonymous_operator` |
+> | `401` | The request's second session look-up named a different principal than the first (for example a session cookie lapsed and a bearer token for another account is on the same request); written as a `quarantine.enable` row with `result=denied` and `detail` `authenticated principal changed during the request now=<second account>`, naming the first account as the actor | none |
 > | `500` | The dispatch check is not wired on this server (also written as a `quarantine.enable` row with `result=failure`) | none |
+> | `500` | The audit identity writer is not wired on this server (misconfiguration; written as a `quarantine.enable` row with `result=failure` and `detail` `audit identity writer not configured`) | none |
 >
 > Every refusal carries `error.message` and `error.remediation`. For
 > `approval_required` the message states that the action needs an administrator caller or a
@@ -2042,12 +2044,15 @@ Quarantine a device.
 > authorisation check and the request's second look-up now ends at the `401` instead of
 > writing a record attributed to `system`. The second look-up must also name the same
 > principal as the first: a request whose two look-ups resolve to different principals
-> (for example a session cookie that lapsed and a bearer token on the same request) ends at
-> `401` with a `denied` row naming the first, and writes no record. Every audit row these
-> routes write names the session the route resolved, not a fresh look-up of the request, so
-> the `attempt` and outcome rows name the same account as the record's `quarantined_by`. A
-> server whose audit identity writer is not configured answers `500` on both routes and
-> changes nothing.
+> (for example a session cookie that lapsed and a bearer token for another account on the
+> same request) ends at `401` with a `denied` row naming the first, and writes no record.
+> Every audit row the handler writes after its first look-up names the session the route
+> resolved, not a fresh look-up of the request, so the `attempt` and outcome rows name the
+> same account as the record's `quarantined_by`; rows written by the scoped permission gate
+> itself, and the `failure` row for an unwired writer, still come from a look-up of the
+> request. A server whose audit identity writer is not configured answers `500` on both
+> routes and changes nothing. The `denied` rows are best-effort, as for a dispatch-check
+> refusal: a lost write does not change the status.
 
 **Request body:**
 
@@ -2246,6 +2251,10 @@ the dashboard or MCP; an administrator releases it. Running the plugin's `unquar
 ending the record does not release the device from the server's side: the record stays active,
 the lens can keep reading the earlier confirmation, and containment is re-applied at the next
 session change, so an administrator should end the record first.
+
+The `401` for a changed principal, the `500` for an unwired audit identity writer and the
+session-stamped audit rows are exactly as for `POST` above, with the audit verb
+`quarantine.disable`.
 
 **Response:**
 
@@ -3891,8 +3900,8 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
 | `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result` ∈ {`success`, `error`}. Success detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row; the `503` degraded-evaluation case (`policy_evaluator_->evaluate_now` returning an error, e.g. an InstructionStore DB/lease failure per ADR-0058, or #4981 PR-1's scope-evaluation abort) DOES audit, `result=error`, detail = the specific underlying-cause string (not a fixed literal — see the route's own 503 documentation) — matches `policy.remediate`'s own `error`-vs-`denied` convention: an infra degrade is not an operator denial. |
 | `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`, `error`}. Success detail `execution_id=<id> agents=<n>` (`agents` = delivered count, see the route doc); denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents, a target is already claimed for remediation, or a target has reached its fix-retry cap for this policy); `error` is a genuine store/evaluator degrade, distinct from `denied`. |
-| `quarantine.enable` | Device quarantined (`attempt`, `success` or `failure`; `denied` when the dispatch approval check refuses the request, with `reason=<label> securable=<name>` in the detail) |
-| `quarantine.disable` | Device released from quarantine |
+| `quarantine.enable` | Device quarantined (`attempt`, `success` or `failure`; `denied` when the dispatch approval check refuses the request, with `reason=<label> securable=<name>` in the detail, or when the request's two session look-ups named different principals, with `authenticated principal changed during the request now=<account>` in the detail) |
+| `quarantine.disable` | Device released from quarantine (`attempt`, `success` or `failure`; `denied` in the same two cases as `quarantine.enable`) |
 | `ca.cert.issued` | Internal CA signed a per-agent client certificate at enrollment. `target_type=AgentCertificate`, `target_id=<serial>`, `result=success`. Also emitted by `POST /api/v1/ca/issue-code-signing` (gap-matrix #10) / MCP `issue_code_signing_cert`: `target_type=CodeSigningCertificate`, `target_id=<label>` on a rejected request or `<serial_hex>` on success, `detail` carries `purpose=code-signing`; `result=success`, `result=denied` (no CA root, or a bad/unparseable CSR), or `result=failure` (a genuine 5xx — key-load, signing, or `ca_store` write failure). |
 | `ca.cert.revoked` | Certificate revoked via `POST /api/v1/ca/revoke`. `target_type` is derived from the revoked cert's `purpose` — `AgentCertificate` for an agent leaf, `CodeSigningCertificate` for a code-signing leaf (gap-matrix #10), or the neutral `Certificate` when the serial is not found or the `ca_store` read fails; `target_id=<serial>`. `result=success`; `result=denied` with `detail="serial not found or already revoked"` for an unknown/already-revoked serial (reject without state change, matches every destructive sibling); `result=failure` (ADR-0053) for a genuine ca_store DB/lease error — kept distinct from `denied` so a database outage is never audited as a rejected revoke attempt. |
 | `ca.crl.published` | `target_type=Security`. Written on every internal-CA CRL (re)publish — an operator revoke, a subordinate-CA import (REST/MCP/dashboard), or one of three system-initiated triggers (startup, freshness, self-heal); `target_id` and `principal` vary by trigger. `result=success`, or `result=failure` when the CRL could not be rebuilt/recorded (the revocation still stands; the public CRL is momentarily stale). See `docs/user-manual/audit-log.md`'s `ca.crl.published` row for the full trigger/`target_id`/`reason=` breakdown (#4829). |

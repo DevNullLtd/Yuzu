@@ -84,8 +84,8 @@
 
 #include <cctype>
 #include <chrono>
-#include <deque>
 #include <cstdint>
+#include <deque>
 #include <expected>
 #include <functional>
 #include <memory>
@@ -154,10 +154,13 @@ struct Rig {
     // one, between the route's own resolution and the write); the session writer names the
     // session the route handed it.
     std::vector<std::string> audit_actors;
+    std::vector<std::string> audit_roles; // the role each row carries, aligned with `audits`
     std::string audit_resolves_to;
     // When non-empty, each auth_fn call takes its user from the front (then drops it): the
-    // first call is the route's entry, the second its re-resolution.
+    // first call is the route's entry, the second its re-resolution. `auth_elevated_queue`
+    // does the same for a live JIT elevation on that call's session.
     std::deque<std::string> auth_user_queue;
+    std::deque<bool> auth_elevated_queue;
     bool wire_audit_as_session{true};
 
     std::int64_t command_seq{0};
@@ -256,17 +259,17 @@ struct Rig {
 
     // THE session the route's auth_fn returns, and the one the tests assert on: a single
     // builder, so a test can prove the fixture really is (or is not) an effective admin.
-    auth::Session make_session(const std::string& user) const {
+    auth::Session make_session(const std::string& user, bool elevated) const {
         auth::Session s;
         s.username = user;
         s.role = session_role;
-        if (session_elevated) {
+        if (elevated) {
             s.elevated_until = std::chrono::system_clock::now() + std::chrono::hours(1);
             s.steady_elevated_until = std::chrono::steady_clock::now() + std::chrono::hours(1);
         }
         return s;
     }
-    auth::Session make_session() const { return make_session(session_user); }
+    auth::Session make_session() const { return make_session(session_user, session_elevated); }
 
     void register_routes() {
         auto auth_fn = [this](const httplib::Request&,
@@ -278,7 +281,12 @@ struct Rig {
             if (!auth_user_queue.empty()) {
                 const std::string user = auth_user_queue.front();
                 auth_user_queue.pop_front();
-                return make_session(user);
+                bool elevated = session_elevated;
+                if (!auth_elevated_queue.empty()) {
+                    elevated = auth_elevated_queue.front();
+                    auth_elevated_queue.pop_front();
+                }
+                return make_session(user, elevated);
             }
             return make_session();
         };
@@ -287,18 +295,28 @@ struct Rig {
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string&, const std::string&,
                                const std::string& detail) -> bool {
+            // The quarantine routes write through the session writer below; the one row that
+            // may reach this re-resolving writer is the unwired-writer failure row, which has
+            // no session writer to use. Any other row here is the defect this file pins.
+            if (action.rfind("quarantine.", 0) == 0 &&
+                detail != "audit identity writer not configured")
+                FAIL_CHECK("a quarantine row went through the re-resolving audit_fn: "
+                           << action << "/" << result);
             audits.emplace_back(action + "/" + result, detail);
             audit_actors.push_back(audit_resolves_to.empty() ? session_user : audit_resolves_to);
+            audit_roles.push_back({});
             return true;
         };
         // The session writer server.cpp binds: the row names the session it is handed.
         if (wire_audit_as_session)
             api.set_audit_as_session_fn(
                 [this](const httplib::Request&, const auth::Session& session,
-                       const std::string& action, const std::string& result, const std::string&,
-                       const std::string&, const std::string& detail) -> bool {
+                       const std::string& principal_role, const std::string& action,
+                       const std::string& result, const std::string&, const std::string&,
+                       const std::string& detail) -> bool {
                     audits.emplace_back(action + "/" + result, detail);
                     audit_actors.push_back(session.username);
+                    audit_roles.push_back(principal_role);
                     return true;
                 });
         // Stand-in, named in the file header.
@@ -457,6 +475,16 @@ struct Rig {
     void clear_audits() {
         audits.clear();
         audit_actors.clear();
+        audit_roles.clear();
+    }
+    // Every row carries `role` (the role the request was authorized as).
+    bool every_audit_has_role(const std::string& role) const {
+        if (audits.empty() || audits.size() != audit_roles.size())
+            return false;
+        for (const auto& r : audit_roles)
+            if (r != role)
+                return false;
+        return true;
     }
     // Every row written, and the actor each names; `audits` and `audit_actors` stay index-aligned.
     bool every_audit_names(const std::string& user) const {
@@ -1016,6 +1044,30 @@ TEST_CASE("quarantine audit identity (k): every row the quarantine routes write 
         CHECK(rig.quarantined_count() == 0);
     }
 
+    SECTION("a row written before the second resolution (a bad whitelist) names the session too") {
+        rig.audit_resolves_to = "bob";
+        auto res = rig.post("not-an-address!");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        REQUIRE(rig.has_audit("quarantine.enable/failure"));
+        CHECK(rig.every_audit_names("alice"));
+        CHECK(rig.quarantined_count() == 0);
+    }
+
+    SECTION("the rows carry the role of the SECOND resolution, the one the request was "
+            "authorized as: the same user, JIT-elevated between the two look-ups") {
+        rig.as_user("frank");
+        rig.auth_user_queue = {"frank", "frank"};
+        rig.auth_elevated_queue = {false, true};
+        auto res = rig.post();
+        REQUIRE(res);
+        CHECK(res->status == 201); // authorized as an effective administrator
+        REQUIRE(rig.has_audit("quarantine.enable/attempt"));
+        REQUIRE(rig.has_audit("quarantine.enable/success"));
+        CHECK(rig.every_audit_names("frank"));
+        CHECK(rig.every_audit_has_role("admin"));
+    }
+
     SECTION("POST: a second resolution that names a different principal ends the request at 401 "
             "before any record, attempt row or dispatch; the refusal row names the first principal") {
         rig.auth_user_queue = {"alice", "bob"};
@@ -1026,7 +1078,7 @@ TEST_CASE("quarantine audit identity (k): every row the quarantine routes write 
         CHECK_FALSE(rig.has_audit("quarantine.enable/attempt"));
         CHECK_FALSE(rig.has_audit("quarantine.enable/success"));
         CHECK(rig.audit_detail("quarantine.enable/denied") ==
-              "authenticated principal changed during the request");
+              "authenticated principal changed during the request now=bob");
         CHECK(rig.every_audit_names("alice"));
         REQUIRE(rig.leader_tick());
         CHECK(rig.drain().empty());
@@ -1047,7 +1099,7 @@ TEST_CASE("quarantine audit identity (k): every row the quarantine routes write 
         CHECK_FALSE(rig.has_audit("quarantine.disable/attempt"));
         CHECK_FALSE(rig.has_audit("quarantine.disable/success"));
         CHECK(rig.audit_detail("quarantine.disable/denied") ==
-              "authenticated principal changed during the request");
+              "authenticated principal changed during the request now=bob");
         CHECK(rig.every_audit_names("alice"));
     }
 }

@@ -168,6 +168,13 @@ struct QuarantineRouteHarness {
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
+            // The quarantine routes write through the session writer below; the one row
+            // that may reach this re-resolving writer is the unwired-writer failure row, and
+            // this harness always wires a writer. Any quarantine row here is the defect
+            // (rest-audit-principal-reresolution) that every scenario in this file guards.
+            if (action.rfind("quarantine.", 0) == 0)
+                FAIL_CHECK("a quarantine row went through the re-resolving audit_fn: "
+                           << action << "/" << result);
             if (!audit_fail_result.empty() && result == audit_fail_result)
                 return false;
             audit_calls.push_back({action, result, target_type, target_id, detail});
@@ -175,12 +182,16 @@ struct QuarantineRouteHarness {
         };
         // The session writer server.cpp binds (#6065 PR-Q): same recording, same failure
         // injection, so every existing row assertion holds through it.
-        api.set_audit_as_session_fn([audit_fn](const httplib::Request& req, const auth::Session&,
-                                               const std::string& action, const std::string& result,
-                                               const std::string& target_type,
-                                               const std::string& target_id,
-                                               const std::string& detail) -> bool {
-            return audit_fn(req, action, result, target_type, target_id, detail);
+        api.set_audit_as_session_fn([this](const httplib::Request&, const auth::Session&,
+                                           const std::string&, const std::string& action,
+                                           const std::string& result,
+                                           const std::string& target_type,
+                                           const std::string& target_id,
+                                           const std::string& detail) -> bool {
+            if (!audit_fail_result.empty() && result == audit_fail_result)
+                return false;
+            audit_calls.push_back({action, result, target_type, target_id, detail});
+            return true;
         });
 
         RestApiV1::ScopedPermFn scoped_fn{};

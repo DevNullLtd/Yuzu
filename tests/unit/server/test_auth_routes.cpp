@@ -36,6 +36,8 @@
 #include <httplib.h>
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
+#include <spdlog/sinks/ostream_sink.h>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <atomic>
@@ -43,6 +45,7 @@
 #include <filesystem>
 #include <memory>
 #include <shared_mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -2206,5 +2209,116 @@ TEST_CASE("AuthRoutes::gateless_tier_policy_fn — the REAL production "
 
         CHECK(real_production_fn(req, res, session, "Infrastructure", "Write"));
         CHECK(res.status == -1); // nothing written — a genuine pass-through
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #6065 PR-Q (rest-audit-principal-reresolution): AuthRoutes::audit_log_for_session is the ONE
+// writer POST and DELETE /api/v1/quarantine stamp their rows through (server.cpp binds it as
+// RestApiV1::AuditAsSessionFn). Every route test substitutes its own writer, so this is the
+// only place the real fields are pinned: the principal, the role the caller captured, the
+// engine class, and the neutralised failure log (CWE-117).
+// ---------------------------------------------------------------------------
+TEST_CASE("AuthRoutes::audit_log_for_session stamps the session it is handed, the captured role "
+          "and the engine class; a failed write logs neutralised fields",
+          "[pg][auth_routes][audit]") {
+    AuthRoutesFixture fix;
+    yuzu::test::PostgresTestDb audit_db{admin_gate_table_audit_tpl};
+    REQUIRE(audit_db.available());
+    pg::PgPool audit_pool{{.conninfo = audit_db.dsn(), .size = 2}};
+    AuditStore audit_store{audit_pool};
+    REQUIRE(audit_store.is_open());
+    AuthRoutes ar{fix.cfg, fix.auth_mgr, /*rbac_store=*/nullptr, fix.api_tokens.get(),
+                  &audit_store, /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                  fix.analytics.get(), fix.oidc_mu, fix.oidc_provider};
+    httplib::Request req;
+    req.remote_addr = "10.1.2.3";
+
+    auto one_row = [&](const std::string& action) {
+        AuditQuery q;
+        q.action = action;
+        auto rows = audit_store.query(q);
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        return rows->front();
+    };
+
+    SECTION("a human session: the principal, and the role passed in rather than the base role") {
+        auth::Session s;
+        s.username = "alice";
+        s.role = auth::Role::user; // the base role; the caller passes the effective one
+        REQUIRE(ar.audit_log_for_session(req, s, "admin", "quarantine.enable", "attempt",
+                                         "Security", "agent-1", "why"));
+        const auto e = one_row("quarantine.enable");
+        CHECK(e.principal == "alice");
+        CHECK(e.principal_role == "admin");
+        CHECK(e.result == "attempt");
+        CHECK(e.target_type == "Security");
+        CHECK(e.target_id == "agent-1");
+        CHECK(e.detail == "why");
+        CHECK(e.principal_class != "engine");
+    }
+
+    SECTION("an engine session audits as the engine class, not the class its bearer implies") {
+        auth::Session s;
+        s.username = "engine:ci";
+        s.role = auth::Role::user;
+        s.principal_kind = "engine";
+        REQUIRE(ar.audit_log_for_session(req, s, "user", "quarantine.disable", "success",
+                                         "Security", "agent-1", ""));
+        const auto e = one_row("quarantine.disable");
+        CHECK(e.principal == "engine:ci");
+        CHECK(e.principal_class == "engine");
+    }
+
+    SECTION("a failed write logs the principal and target id neutralised, one record, no "
+            "forged line (the persisted row keeps the raw value; here the store is broken)") {
+        {
+            pg::PgConn conn{PQconnectdb(audit_db.dsn().c_str())};
+            REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+            pg::PgResult r{PQexec(conn.get(),
+                                  "ALTER TABLE audit_store.audit_events RENAME TO audit_events_gone")};
+            REQUIRE(r.ok());
+        }
+        // Restores the default logger on every exit path.
+        struct LogSwap {
+            std::ostringstream stream;
+            std::shared_ptr<spdlog::logger> saved{spdlog::default_logger()};
+            LogSwap() {
+                auto sink = std::make_shared<spdlog::sinks::ostream_sink_mt>(stream);
+                auto logger = std::make_shared<spdlog::logger>("audit_session_capture", sink);
+                logger->set_level(spdlog::level::trace);
+                logger->set_pattern("%v");
+                spdlog::set_default_logger(logger);
+            }
+            ~LogSwap() { spdlog::set_default_logger(saved); }
+            LogSwap(const LogSwap&) = delete;
+            LogSwap& operator=(const LogSwap&) = delete;
+        } capture;
+
+        auth::Session s;
+        s.username = "ali\nFORGED-PRINCIPAL";
+        const bool ok = ar.audit_log_for_session(req, s, "user", "quarantine.enable", "failure",
+                                                 "Security", "agent\nFORGED-TARGET", "");
+
+        CHECK_FALSE(ok);
+        const std::string text = capture.stream.str();
+        REQUIRE(text.find("AuditStore::log failed") != std::string::npos);
+        // The record for this write stays ONE line: both hostile fields appear on it
+        // (neutralised in place), and no line of the captured output starts with a hostile
+        // marker, which a raw newline in either field would have produced. (The store logs
+        // its own multi-line error text first, so the whole output is not one line.)
+        std::istringstream lines(text);
+        std::string line;
+        std::string record;
+        while (std::getline(lines, line)) {
+            CHECK(line.rfind("FORGED", 0) == std::string::npos);
+            if (line.find("audit_log_for_principal: AuditStore::log failed") != std::string::npos)
+                record = line;
+        }
+        REQUIRE_FALSE(record.empty());
+        CHECK(record.find("FORGED-PRINCIPAL") != std::string::npos);
+        CHECK(record.find("FORGED-TARGET") != std::string::npos);
+        CHECK(text.find('\r') == std::string::npos);
     }
 }

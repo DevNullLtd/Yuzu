@@ -44,6 +44,9 @@ call site would pass every existing test. This gate closes that:
      construction (every other `RestApiV1` rig leaves it unwired), so dropping the call compiles
      cleanly and every POST and DELETE /api/v1/quarantine then answers 500 -- and no unit test,
      whose rig wires its own writer, can see it. Same anchored-active-line requirement as above.
+     The call must also PRECEDE `rest_api_v1_->register_routes(`: the writer is captured by value
+     there, so a call placed after it keeps the count at one and every unit rig green while
+     production answers 500 on both routes.
 
 Static/text-only, no build required -- a lexical gate, not a semantic one: it cannot see a
 relocation that keeps the same tokens but changes the surrounding control flow, nor a `#if 0` /
@@ -76,6 +79,7 @@ CLOSURE_DEF = r"[ \t\r\f\v]*const mcp::McpServer::AuthorizeDispatchFn authorize_
 CLOSURE_REST = r"[ \t\r\f\v]*authorize_dispatch\);"
 CLOSURE_MCP = r"[ \t\r\f\v]*mcp_server_->set_authorize_dispatch_fn\(authorize_dispatch\);"
 AUDIT_SESSION = r"[ \t\r\f\v]*rest_api_v1_->set_audit_as_session_fn\("
+REGISTER_ROUTES = r"[ \t\r\f\v]*rest_api_v1_->register_routes\("
 
 
 def problems(src):
@@ -88,6 +92,8 @@ def problems(src):
     closure_rest = sum(1 for ln in lines if re.fullmatch(CLOSURE_REST, ln))
     closure_mcp = sum(1 for ln in lines if re.fullmatch(CLOSURE_MCP, ln))
     audit_session = sum(1 for ln in lines if re.fullmatch(AUDIT_SESSION, ln))
+    setter_at = [i for i, ln in enumerate(lines) if re.fullmatch(AUDIT_SESSION, ln)]
+    register_at = [i for i, ln in enumerate(lines) if re.match(REGISTER_ROUTES, ln)]
     out = []
     if designated != 1:
         out.append("expected exactly 1 designated-init site ('.tier_policy_fn = auth_routes_->gateless_tier_policy_fn(),' "
@@ -115,6 +121,10 @@ def problems(src):
         out.append("expected 'rest_api_v1_->set_audit_as_session_fn(' to be called exactly once in server.cpp as an "
                    f"active line, found {audit_session}. A dropped call compiles (the setter is optional) and makes "
                    "POST and DELETE /api/v1/quarantine answer 500; a second call is a second writer that can drift.")
+    if audit_session == 1 and register_at and setter_at[0] > register_at[0]:
+        out.append("'rest_api_v1_->set_audit_as_session_fn(' must be called BEFORE 'rest_api_v1_->register_routes(': "
+                   "the writer is captured by value at registration, so a later call leaves it empty and POST and "
+                   "DELETE /api/v1/quarantine answer 500.")
     return out
 
 
@@ -173,6 +183,9 @@ class TierPolicyWiringLexical(unittest.TestCase):
             ("T10 a second session audit writer appended",
              src + "        rest_api_v1_->set_audit_as_session_fn(\n",
              ["set_audit_as_session_fn"]),
+            ("T11 the writer wired after register_routes (count stays one)",
+             src.replace(AUDIT_SESSION_LINE, "        rest_api_v1_->unrelated(\n", 1) + AUDIT_SESSION_LINE,
+             ["BEFORE"]),
         ]
         for name, mutated, present in cases:
             with self.subTest(mutation=name):

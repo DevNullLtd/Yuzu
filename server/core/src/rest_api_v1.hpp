@@ -798,16 +798,18 @@ public:
     /// credential that lapsed or was revoked between the route's own resolution and the
     /// audit write, or a second credential on the same request, made a row name a
     /// different actor than the record it describes (`rest-audit-principal-reresolution`).
-    /// Wired from `AuthRoutes::audit_log_for_principal` with the session's effective role
-    /// and engine class, so a row carries the fields `make_audit_event` stamps for that
-    /// session. Returns true iff the row persisted (true in audit-off mode). Used by
-    /// `POST` and `DELETE /api/v1/quarantine`: an unwired writer makes both answer 500,
-    /// and neither falls back to the re-resolving `audit_fn`. MUST be called BEFORE
+    /// Wired from `AuthRoutes::audit_log_for_session`, which stamps the principal, the
+    /// `principal_role` passed in, the engine class and the session correlator.
+    /// `principal_role` is the session's effective role, captured ONCE when the route
+    /// binds the writer, so a JIT elevation that lapses mid-request cannot make the rows of
+    /// one request disagree. Returns true iff the row persisted (true in audit-off mode).
+    /// Used by `POST` and `DELETE /api/v1/quarantine`: an unwired writer makes both answer
+    /// 500, and neither falls back to the re-resolving `audit_fn`. MUST be called BEFORE
     /// `register_routes()` (captured by value).
     using AuditAsSessionFn = std::function<bool(
-        const httplib::Request& req, const auth::Session& session, const std::string& action,
-        const std::string& result, const std::string& target_type, const std::string& target_id,
-        const std::string& detail)>;
+        const httplib::Request& req, const auth::Session& session,
+        const std::string& principal_role, const std::string& action, const std::string& result,
+        const std::string& target_type, const std::string& target_id, const std::string& detail)>;
     void set_audit_as_session_fn(AuditAsSessionFn fn) { audit_as_session_fn_ = std::move(fn); }
 
 private:

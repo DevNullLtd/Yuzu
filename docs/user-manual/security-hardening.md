@@ -609,7 +609,7 @@ The dashboard shows and drives quarantine records without a separate page:
 
 **Diagnosing an unexpected `403` on quarantine creation or release.** Search the audit log for action
 `quarantine.enable` (create) or `quarantine.disable` (release), result `denied`, target type `Security`, target id the device's agent id;
-`detail` holds `reason=<label> securable=<name>`. A refusal by the scoped permission gate itself
+`detail` holds `reason=<label> securable=<name>`. A `denied` row whose `detail` is `authenticated principal changed during the request now=<account>` is the `401` for a request whose two session look-ups named different principals, not an approval refusal. A refusal by the scoped permission gate itself
 (the caller has no `Security:Execute` on the device) is audited by that gate, not under
 `quarantine.enable`. `yuzu_server_dispatch_denied_total{reason}` shows the fleet-wide trend only.
 

@@ -730,6 +730,17 @@ public:
                                  const std::string& detail = {},
                                  const std::string& principal_class_override = {});
 
+    /// `audit_log_for_principal` for a SESSION the caller already resolved (#6065 PR-Q,
+    /// `RestApiV1::AuditAsSessionFn`): stamps the session's username, the `principal_role`
+    /// the caller passes (it captures `effective_role` once per request), and the engine
+    /// class when `session.principal_kind == "engine"`, so a row carries the fields
+    /// `make_audit_event` would have stamped for that session without re-resolving the
+    /// request (cookie first, then bearer), which can name a different actor.
+    bool audit_log_for_session(const httplib::Request& req, const auth::Session& session,
+                               const std::string& principal_role, const std::string& action,
+                               const std::string& result, const std::string& target_type = {},
+                               const std::string& target_id = {}, const std::string& detail = {});
+
     /// The `AuditEvent` `audit_log_for_principal` would write, built WITHOUT
     /// writing it (#5342 Gate 8): the identity/request fields (principal,
     /// role, class, source IP, user agent, session correlator, target) for a

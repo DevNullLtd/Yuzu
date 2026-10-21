@@ -1091,10 +1091,10 @@ const std::string& openapi_spec() {
         R"json(,
     "/quarantine": {
       "get": {"summary": "List quarantined devices visible to the caller (admit-then-filter — #1788)", "tags": ["Security"], "responses": {"200": {"description": "List of quarantined devices in the caller's scope"}, "403": {"description": "Requires Security:Read"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable, or a degraded read (ADR-0047) — never rendered as an empty list. Two distinct causes, distinguished by message: store/pool/query failure only increments yuzu_server_quarantine_read_degrade_total; a per-record admit-then-filter anomaly (e.g. transient engine-principal-store outage) does not"}}},
-      "post": {"summary": "Quarantine a device (per-target scoped — #1788; dispatch approval check, #6065)", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "reason": {"type": "string"}, "whitelist": {"type": "string"}}}}}}, "responses": {"201": {"description": "Device quarantined"}, "400": {"description": "agent_id missing/empty, the device is already quarantined, whitelist fails server-edge validation (>512 chars, or a token outside [0-9A-Fa-f.:], <=45 chars/token), or the dispatch approval check cannot classify the quarantine.quarantine pair (reason unclassified or ambiguous; #6065)"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global) AND the dispatch approval check (#6065): with RBAC on, approval_required when the caller's account role is not admin (REST has no approval-ticket path), forbidden when the caller's own Security:Execute grant is not global or the RBAC store could not be read. The body carries message and remediation and no permission field; a refusal writes no record and audits quarantine.enable as denied"}, "500": {"description": "Per-device scope gate not configured, or the dispatch approval check is not wired (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
+      "post": {"summary": "Quarantine a device (per-target scoped — #1788; dispatch approval check, #6065)", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "reason": {"type": "string"}, "whitelist": {"type": "string"}}}}}}, "responses": {"201": {"description": "Device quarantined"}, "400": {"description": "agent_id missing/empty, the device is already quarantined, whitelist fails server-edge validation (>512 chars, or a token outside [0-9A-Fa-f.:], <=45 chars/token), or the dispatch approval check cannot classify the quarantine.quarantine pair (reason unclassified or ambiguous; #6065)"}, "401": {"description": "Not authenticated, or the authenticated principal changed between the route's two session look-ups (retry; #6065)"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global) AND the dispatch approval check (#6065): with RBAC on, approval_required when the caller's account role is not admin (REST has no approval-ticket path), forbidden when the caller's own Security:Execute grant is not global or the RBAC store could not be read. The body carries message and remediation and no permission field; a refusal writes no record and audits quarantine.enable as denied"}, "500": {"description": "Per-device scope gate, the dispatch approval check or the audit identity writer is not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
     },
     "/quarantine/{agent_id}": {
-      "delete": {"summary": "Release a device from quarantine (per-target scoped — #1788; dispatch approval check, #6065)", "tags": ["Security"], "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Device released"}, "400": {"description": "The device is not currently quarantined, or the dispatch approval check cannot classify the quarantine.unquarantine pair (reason unclassified or ambiguous; #6065)"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global) AND the dispatch approval check for quarantine.unquarantine (#6065): with RBAC on, approval_required when the caller's account role is not admin, forbidden when the caller's own Security:Execute grant is not global or the RBAC store could not be read. The body carries message and remediation and no permission field; a refusal leaves the record active and audits quarantine.disable as denied"}, "500": {"description": "Per-device scope gate not configured, or the dispatch approval check is not wired (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
+      "delete": {"summary": "Release a device from quarantine (per-target scoped — #1788; dispatch approval check, #6065)", "tags": ["Security"], "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Device released"}, "400": {"description": "The device is not currently quarantined, or the dispatch approval check cannot classify the quarantine.unquarantine pair (reason unclassified or ambiguous; #6065)"}, "401": {"description": "Not authenticated, or the authenticated principal changed between the route's two session look-ups (retry; #6065)"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global) AND the dispatch approval check for quarantine.unquarantine (#6065): with RBAC on, approval_required when the caller's account role is not admin, forbidden when the caller's own Security:Execute grant is not global or the RBAC store could not be read. The body carries message and remediation and no permission field; a refusal leaves the record active and audits quarantine.disable as denied"}, "500": {"description": "Per-device scope gate, the dispatch approval check or the audit identity writer is not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
     },
     "/rbac/roles": {
       "get": {"summary": "List RBAC roles", "tags": ["RBAC"], "description": "Requires UserManagement:Read. A degraded RBAC store is a retryable 503 (retry_after_ms 5000), never an empty 200 list.", "responses": {"200": {"description": "List of roles"}, "403": {"description": "Requires UserManagement:Read"}, "503": {"description": "RBAC store unavailable; retry after retry_after_ms"}}}
@@ -2721,10 +2721,14 @@ caller_from_session(const auth::Session& sess, const RestApiV1::ExecVisibleFn& e
 // outlive the caller's reference.
 [[nodiscard]] RestApiV1::AuditFn audit_as(const RestApiV1::AuditAsSessionFn& writer,
                                           const auth::Session& session) {
-    return [writer, session](const httplib::Request& req, const std::string& action,
-                             const std::string& result, const std::string& target_type,
-                             const std::string& target_id, const std::string& detail) {
-        return writer(req, session, action, result, target_type, target_id, detail);
+    // The effective role is read ONCE, here: every row of the request is stamped with the
+    // role the request was authorized as, not one re-evaluated at each write.
+    std::string role = auth::role_to_string(auth::effective_role(session));
+    return [writer, session, role = std::move(role)](
+               const httplib::Request& req, const std::string& action, const std::string& result,
+               const std::string& target_type, const std::string& target_id,
+               const std::string& detail) {
+        return writer(req, session, role, action, result, target_type, target_id, detail);
     };
 }
 
@@ -2746,8 +2750,13 @@ authenticate_for_quarantine_audit(const httplib::Request& req, httplib::Response
         res.status = 500;
         res.set_content(detail::a4_error(res, "audit identity writer not configured"),
                         "application/json");
-        audit_fn(req, audit_action, "failure", "Security", "",
-                 "audit identity writer not configured");
+        spdlog::error("{}: audit identity writer not configured; refusing the request",
+                      audit_action);
+        // The one row on these routes written through the re-resolving `audit_fn`: no
+        // session writer exists to stamp it. An empty `audit_fn` is the audit-off mode.
+        if (audit_fn)
+            audit_fn(req, audit_action, "failure", "Security", "",
+                     "audit identity writer not configured");
         return std::nullopt;
     }
     return session;
@@ -2770,8 +2779,11 @@ authenticate_for_quarantine_audit(const httplib::Request& req, httplib::Response
     res.set_content(detail::a4_error(res, "the authenticated principal changed during the request",
                                      {.remediation = "retry the request"}),
                     "application/json");
+    const std::string second = detail::sanitize_detail_value(again.username);
+    spdlog::warn("{}: the authenticated principal changed during the request first={} second={}",
+                 audit_action, detail::sanitize_detail_value(first.username), second);
     audit(req, audit_action, "denied", "Security", agent_id,
-          "authenticated principal changed during the request");
+          "authenticated principal changed during the request now=" + second);
     return false;
 }
 
@@ -6343,7 +6355,7 @@ void RestApiV1::register_routes(
             // the one quarantine failure path that cannot carry a resource
             // id — audited anyway rather than silently skipped.
             audit(req, "quarantine.enable", "failure", "Security", "",
-                     "service unavailable — store not open");
+                  "service unavailable — store not open");
             return;
         }
 
@@ -6374,7 +6386,7 @@ void RestApiV1::register_routes(
             res.set_content(detail::a4_error(res, "scope gate not configured"),
                             "application/json");
             audit(req, "quarantine.enable", "failure", "Security", agent_id,
-                     "scope gate not configured");
+                  "scope gate not configured");
             return;
         }
         if (!scoped_perm_fn(req, res, "Security", "Execute", agent_id))
@@ -6400,7 +6412,7 @@ void RestApiV1::register_routes(
                                                  "[0-9A-Fa-f.:]"),
                             "application/json");
             audit(req, "quarantine.enable", "failure", "Security", agent_id,
-                     "whitelist rejected by server-edge validation");
+                  "whitelist rejected by server-edge validation");
             return;
         }
 
@@ -6497,7 +6509,7 @@ void RestApiV1::register_routes(
                     detail::a4_error(res, "service unavailable", {.retry_after_ms = 5000}),
                     "application/json");
                 audit(req, "quarantine.disable", "failure", "Security", agent_id,
-                         "service unavailable — store not open");
+                      "service unavailable — store not open");
                 return;
             }
 
@@ -6509,7 +6521,7 @@ void RestApiV1::register_routes(
                 res.set_content(detail::a4_error(res, "scope gate not configured"),
                                 "application/json");
                 audit(req, "quarantine.disable", "failure", "Security", agent_id,
-                         "scope gate not configured");
+                      "scope gate not configured");
                 return;
             }
             if (!scoped_perm_fn(req, res, "Security", "Execute", agent_id))
