@@ -237,10 +237,11 @@ older binary ignores, so a rollback starts cleanly. What changes is which checks
   comparison. A schedule that was holding an occurrence for an approval you had already given (approved but not yet
   fired when you upgraded) asks again for that held occurrence, and a rejection you had already given no longer skips
   that occurrence: the schedule asks again. Pending requests, requests from the dashboard and MCP, and tickets
-  already used are untouched. Nothing to do. The step is data only (no table or column changes); it touches at most
-  the schedule tickets of the last 7 days (normally a handful per schedule), runs inside the upgrade transaction with
-  a 300 s statement timeout, and is skipped on every later start. The command outbox also gains a small index on its
-  approval id (`outbox_approval_idx`), built at the same upgrade.
+  already used are untouched. Nothing to do. The step is data only (no table or column changes). It touches
+  every unsettled approved or rejected scheduled ticket, including old rejected ones (rejected tickets never expire
+  and are never swept); that is normally small. It runs inside the upgrade transaction under a 300 s statement
+  timeout and is skipped on every later start. The command outbox also gains a small index on its approval id
+  (`outbox_approval_idx`) at the same upgrade; its build is bounded by the same 300 s timeout.
 - **Where the legacy marker lives (#6096).** The retired tickets carry `consumed_by = 'schedule:legacy-6096'` in
   `approval_manager.approvals`. It is readable only by SQL; no API returns it. To list them:
 
@@ -252,9 +253,11 @@ older binary ignores, so a rollback starts cleanly. What changes is which checks
 - **Mixed versions and rollback for scheduled approvals (#6096).** Recommended practice: drain or stop every replica
   that predates this change before anyone approves scheduled work. The command outbox records which approval ticket
   each scheduled run used, and the new binary refuses to fire a ticket the outbox shows was already used by an
-  earlier occurrence, so a ticket fired by an older leader is inert after the upgrade. Rolling back is safe but
-  restores the older clock-comparison behaviour. After a rollback followed by a second upgrade, run this once,
-  because a rejected ticket spent under the older binary would otherwise skip one occurrence:
+  earlier occurrence, so a ticket fired by an older leader is inert after the upgrade. A rolled-back binary does
+  not consult the outbox ledger or the used marker, so an older binary can re-fire a ticket the new binary marked
+  used (the old clock comparison); rolling back restores the old behaviour, including that exposure. After a rollback
+  followed by a second upgrade, run this once, because a rejected ticket spent under the older binary would
+  otherwise skip one occurrence. It also retires approved-but-unfired scheduled tickets, which then ask again:
 
   ```sql
   UPDATE approval_manager.approvals

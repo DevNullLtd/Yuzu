@@ -270,7 +270,9 @@ outbox schema v2) and refuses one used by an earlier occurrence, which closes mi
 skip-advance re-fires; if the current occurrence is already in the outbox and no ticket is eligible, the
 schedule advances without a fresh ask. Any future outbox reaper must retain rows for at least the 7-day
 ticket life. The retire is deliberately not epoch-fenced (the only fenced write is the outbox INSERT) and
-is safe because it runs only after the occurrence row exists and settles only observed ids; retire-ok
+is safe because, on the enqueue paths, it runs only after the outbox row exists, and on the
+rejected-skip path it is an observed-ids-only CAS from unsettled, so a stale leader can only settle
+tickets it saw (the deny direction); retire-ok
 with a failed advance burns one approval, accepted. `consume_ticket` still refuses `kSchedule` origins.
 `ScheduleEngine`'s own stamps stay process clock (due-ness bookkeeping, informational for approvals).
 The approvals ladder gains **v2**, a clock-free data migration that retires every pre-upgrade

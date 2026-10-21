@@ -112,6 +112,7 @@ Siblings become compliant store-by-store as they migrate to Postgres.
 
 | Store | Notes |
 |---|---|
+| `CommandOutboxStore` (#6096) | No reaper exists today. Its rows are the schedule runner's SPENT-TICKET LEDGER (`approval_id`, read by `occurrences_for_approval`), so any future reaper must retain approval-bearing rows at least 7 days from creation (`kApprovalTicketTtlSeconds`), or a reaped row makes a spent ticket look unspent. Stated at the store header as well. |
 | `ApprovalManager` expiry sweeps (#6061, #6096) | Status transitions to `expired`, never a DELETE. Every stamp and cutoff is Postgres `now()` in-SQL, including `submitted_at` since #6096, so the sweep clock is no longer split between the submitting process and the database. Disposition and residuals: "`ApprovalManager` ticket liveness" below. |
 
 ### Still issuing bare wall-clock deletes
@@ -636,9 +637,9 @@ disagree: the `consume_ticket` CAS, its diagnostic read, `submit()`'s approved-t
   retired the same way after it skips its occurrence. When no ticket is eligible but the occurrence key is
   already in the outbox (retire ok, advance failed), the runner advances without raising a fresh ask. The
   retire is deliberately NOT epoch-fenced: the only fenced write is the outbox INSERT (`ScheduleRunner::tick`
-  is FencedLeaderOnly); the retire only runs after the occurrence row exists (whoever wrote it) and is
-  scoped to the ids it observed, so a stale replica can only settle tickets it saw, each by a CAS from
-  unsettled. `ScheduleEngine`'s own stamps (`created_at`, `last_executed_at`, `next_execution_at`) stay
+  is FencedLeaderOnly); on the enqueue paths the retire only runs after the outbox row exists (whoever
+  wrote it); on the rejected-skip path the retire is an observed-ids-only CAS from unsettled, so a stale
+  leader can only settle tickets it saw (the deny direction). `ScheduleEngine`'s own stamps (`created_at`, `last_executed_at`, `next_execution_at`) stay
   process-clock due-ness bookkeeping and are informational for approvals now; `test_approval_manager.cpp`
   allow-lists the process-clock reads in `schedule_runner.cpp` (the audit timestamp) and
   `schedule_engine.cpp` (the due-ness stamps) by exact count so a new site fails loudly.
@@ -656,12 +657,21 @@ disagree: the `consume_ticket` CAS, its diagnostic read, `submit()`'s approved-t
   spent ticket is not reused. There is deliberately no replay eligibility keyed on `consumed_by` equalling the
   occurrence key. (4) `ScheduleEngine::advance_schedule` returns void and only logs a failure, so the runner
   cannot observe a failed advance; the outbox guard above is what makes that safe.
+- **More accepted LOW items (#6096).** (i) Retired schedule tickets keep status `approved` and are never
+  swept, so they count in the creator's newest-100 `query()` window, and a still-unsettled older ticket can
+  fall out of that window: one wasted approval and a fresh ask (follow-up with the #6098 sweep note).
+  (ii) `consumed_by` names the occurrence that SETTLED a ticket, which for a skipped or mismatched ticket is
+  not the occurrence that used it (the outbox holds the truth); a ticket the outbox ledger showed was used by
+  an earlier occurrence carries the `ledger-spent:` marker. (iii) A stale paused leader's unfenced advance
+  only delays the next run.
 - **One-time legacy migration, clock-free (#6096).** Tickets minted before this change carry no
   `consumed_at`, so they would all look unspent. Approvals schema migration v2 retires every unsettled
   approved/rejected ticket that has a `schedule_id` (`consumed_by = 'schedule:legacy-6096'`), once per
   database, with no comparison between `submitted_at` and `last_executed_at`, under a 300 s statement
-  timeout. The deny direction: a legitimate approved-but-unfired ticket at upgrade time just gets a
-  fresh ask. See the upgrade note in `docs/user-manual/upgrading.md`.
+  timeout (a verified bound: `SET LOCAL` was observed to take effect when sent as one message inside the
+  step's transaction, also over a shorter session-level timeout). It touches every unsettled approved or
+  rejected scheduled ticket, including old rejected ones (rejected tickets never expire and are never swept).
+  The deny direction: a legitimate approved-but-unfired ticket at upgrade time just gets a fresh ask. See the upgrade note in `docs/user-manual/upgrading.md`.
 - **Parts 1, 2 and 4 DECLINED for the approved-ticket and the pending path; part 3 is not declined
   (next bullet)** (there is no per-replica clock reading to probe, persist or dedupe, and running the
   sweep on every replica is safe, so the SINGLE-WRITER caveat does not apply to it). With
