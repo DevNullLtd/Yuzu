@@ -163,11 +163,11 @@ Two headers, split on whether they touch `httplib`:
 
 Every new REST error path goes through `detail::a4_error(res, "...")` or `detail::a4_denial(...)`
 — never a hand-rolled `{"error": "..."}` body. The legacy bare `error_json()` helper is retired
-(#1470; see the comment at `rest_api_v1.cpp:215-218`).
+(#1470; see the comment between `ok_json` and `list_json` in `rest_api_v1.cpp`).
 
 ### Success envelopes
 
-`rest_api_v1.cpp:211` (`ok_json`) and `:220` (`list_json`), both near the top of the file:
+`ok_json` and `list_json` in `rest_api_v1.cpp`, both near the top of the file:
 
 ```cpp
 std::string ok_json(std::string_view data_json) {
@@ -191,18 +191,46 @@ it never reports the page size as a `total` (see `GET /api/v1/deployments`).
 
 ### OpenAPI entry
 
-`openapi_spec()` (`rest_api_v1.cpp:516`) is a hand-maintained raw-string literal (split into
-several `R"json(...)"` segments to stay under MSVC's ~16 KB per-literal cap — see the comment at
-`:1109-1111`), **not** generated from the live route table. `docs/agentic-first-principle.md` §A2
-flags this explicitly: `GET /api/v1/discover/routes` subsets this same document and inherits its
-"can under-report" caveat. Add one `"/<path>": { "get"/"post": {...} }` entry per route, following
-the density of an existing entry in the same tag family — e.g. `/network/fleet`
-(`rest_api_v1.cpp:1107`) for a short read, or `/dex/devices/{id}/app-perf`
-(`rest_api_v1.cpp:1076`) for one that documents its audit/fail-closed posture inline. Match that
-density: summary, tag, a description paragraph naming the required permission and any audit verb,
-full `parameters`, and every realistic `responses` status (200/400/403/503, plus the
-`Sec-Audit-Failed` header block on any audited route — see `/network/devices`'s entry at
-`rest_api_v1.cpp:1113` for the header-documentation shape).
+`openapi_spec()` (in `rest_api_v1.cpp`) is a hand-maintained raw-string literal (split into
+several `R"json(...)"` segments to stay under MSVC's ~16 KB per-literal cap — see the C2026 split
+comment inside the chain), **not** generated from the live route table.
+`docs/agentic-first-principle.md` §A2 flags this explicitly: `GET /api/v1/discover/routes` subsets
+this same document and inherits its "can under-report" caveat. Add one
+`"/<path>": { "get"/"post": {...} }` entry per route, following the density of an existing entry
+in the same tag family — e.g. the `"/network/fleet"` path item for a short read, or the
+`"/dex/devices/{id}/app-perf"` one for one that documents its audit/fail-closed posture inline.
+Match that density: summary, tag, a description paragraph naming the required permission and any
+audit verb, full `parameters`, and every realistic `responses` status (200/400/403/503, plus the
+`Sec-Audit-Failed` header block on any audited route — see the `"/network/devices"` path item for
+the header-documentation shape).
+
+**The `ecosystem` tokens.** Three placeholders in the literal are expanded once, on first use, by
+`expand_ecosystem_tokens()`: `"@@ECOSYSTEM_ENUM@@"` (the software routes),
+`"@@ECOSYSTEM_ENUM_OR_EMPTY@@"` (routes where a present-empty value selects rows with no
+ecosystem — the `/crypto` reads) and `@@ECOSYSTEM_LIST@@` (the `ecosystem (a|b|c)` prose). All
+three are generated from `kEcosystemFamilies` (`software_catalog_rules.hpp`), so a new route with
+an `ecosystem` query parameter uses the token, never a hand-typed array. The enum is written
+`"enum": ["@@ECOSYSTEM_ENUM@@"]` (or the `_OR_EMPTY` token): the brackets are the author's, the
+quotes belong to the token. Two gates hold that, and they guarantee different things:
+
+- `tests/unit/server/test_openapi_spec_completeness.cpp` sweeps every `ecosystem` parameter in the
+  served document (referenced parameters and schemas resolved) and fails one whose enum diverges
+  from the table or the table-plus-empty form; the named route pins fix which routes get which
+  form. That guarantees the **values**.
+- `tests/test_software_vocabulary_consistency.py` fails any `ecosystem` enum in the unexpanded
+  literal that is not one of the two tokens. That guarantees the **provenance**, which the served
+  document cannot show: an array copied from the table is value-identical once served. The gate
+  decodes the literal through `check-api-parity.py`'s lexer and checks, in the decoded document,
+  every parameter named `ecosystem` (schema `$ref`s resolved) and every enum-bearing property keyed
+  `ecosystem`, so spelling, key order and JSON escapes cannot matter, and a parameter with no enum
+  fails too.
+
+The template is `expand_ecosystem_tokens(<literal chain>)`. `scripts/ci/check-api-parity.py` lexes
+this source and accepts exactly one wrapper call around the chain: no nested call, second argument
+or non-literal. The initializer must then be followed by `return spec;` and the function's closing
+`}`, so the document is retained once, never copied into a second static. Comments inside
+`openapi_spec()`, between the chunks and before `return spec;`, are `//` line comments; a `/* */`
+comment there fails the lexer with a named error rather than being read past.
 
 ### `docs/user-manual/rest-api.md` entry
 
@@ -644,8 +672,9 @@ see §5 for which chokepoints apply.
    down, and add a line to `docs/auth-architecture.md`'s RBAC section (the routed-concern doc for
    this area) — `docs/authz-model.md` (ADR-0033 §2's dispatch-visibility model) is a narrower,
    separate document and not the general permission reference.
-5. **OpenAPI entry.** One `"/<path>"` object per route in `openapi_spec()` (`rest_api_v1.cpp:516`),
-   matching an existing entry's density in the same tag family (§2).
+5. **OpenAPI entry.** One `"/<path>"` object per route in `openapi_spec()` (`rest_api_v1.cpp`),
+   matching an existing entry's density in the same tag family (§2). An `ecosystem` parameter's
+   enum is `["@@ECOSYSTEM_ENUM@@"]` (§2, OpenAPI entry).
 6. **MCP registration.** `kTools[]`, `kToolSecurityRows[]`, `kWriteToolsRaw[]` (if non-Read),
    `kToolAnnotation`, plus the `if (tool_name == "...")` dispatch branch (§3), all boot-enforced; or
    one `ToolRecord` (§3, "The registry route", which also lists the header declaration, the
