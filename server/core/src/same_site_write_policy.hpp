@@ -85,11 +85,13 @@ struct SameSiteDecision {
     return !(method == "GET" || method == "HEAD" || method == "OPTIONS");
 }
 
-/// Reviewed set of read paths (exact match, no prefix, no query) that dispatch work and are
-/// held to the same rule as a write. Executable data: a new cookie-reachable GET that
-/// dispatches work needs an entry here (tests/unit/server/test_same_site_exempt_inventory.cpp
-/// is the best-effort tripwire).
-inline constexpr std::array<std::string_view, 7> kFetchMetadataGuardedPaths{
+/// Reviewed set of read paths (exact match, no prefix, no query) that dispatch work or persist
+/// or refresh server state and are held to the same rule as a write. Executable data: a new
+/// cookie-reachable GET that dispatches work or changes state needs an entry here
+/// (tests/unit/server/test_same_site_exempt_inventory.cpp is the best-effort tripwire). A path
+/// reachable with a token as well as a cookie stays open to the token caller (see the
+/// decision below); only a cookie session is held to the rule.
+inline constexpr std::array<std::string_view, 10> kFetchMetadataGuardedPaths{
     "/fragments/device/live/run",
     "/fragments/tar/process-tree/run",
     "/fragments/tar/process-tree/device-net",
@@ -97,15 +99,51 @@ inline constexpr std::array<std::string_view, 7> kFetchMetadataGuardedPaths{
     "/fragments/dex/device/perf",
     "/fragments/dex/device/procperf",
     "/fragments/auto/deploy/result",
+    "/fragments/auto/result",
+    "/fragments/viz/fleet/topology",
+    "/api/v1/viz/fleet/topology",
 };
 
+/// The two leading prefixes `is_guarded_read` uses as its cheap prefilter. Every table entry
+/// must start with one of them, or the prefilter would silently skip that entry.
+inline constexpr std::string_view kGuardedPrefixFragments = "/fragments/";
+inline constexpr std::string_view kGuardedPrefixViz = "/api/v1/viz/";
+
+[[nodiscard]] constexpr bool has_guarded_prefix(std::string_view path) noexcept {
+    return path.starts_with(kGuardedPrefixFragments) || path.starts_with(kGuardedPrefixViz);
+}
+
+static_assert(kFetchMetadataGuardedPaths.size() == 10,
+              "adding or removing a guarded path is a reviewed change: update the pinned count "
+              "and the literal content pin in test_same_site_write_policy.cpp together");
+
+namespace detail {
+[[nodiscard]] constexpr bool guarded_table_is_well_formed() noexcept {
+    for (std::size_t i = 0; i < kFetchMetadataGuardedPaths.size(); ++i) {
+        const auto p = kFetchMetadataGuardedPaths[i];
+        // Every entry must pass the prefilter below, have something after the prefix, and be an
+        // exact path (no trailing slash, no query).
+        if (!has_guarded_prefix(p) || p.back() == '/' || p.find('?') != std::string_view::npos)
+            return false;
+        for (std::size_t j = i + 1; j < kFetchMetadataGuardedPaths.size(); ++j)
+            if (kFetchMetadataGuardedPaths[j] == p)
+                return false;
+    }
+    return true;
+}
+} // namespace detail
+static_assert(detail::guarded_table_is_well_formed(),
+              "every guarded path must start with a prefilter prefix (is_guarded_read skips any "
+              "other), be unique, and be exact: no trailing '/' and no '?'");
+
 /// True for GET or HEAD (httplib routes HEAD to the GET handlers) on a path in the table.
-/// Case-sensitive. The prefix compare keeps the common read to one cheap check.
+/// Case-sensitive. The prefix compare keeps the common read to one cheap check; it is coupled
+/// to the table by the static_assert above.
 [[nodiscard]] constexpr bool is_guarded_read(std::string_view method,
                                              std::string_view path) noexcept {
     if (method != "GET" && method != "HEAD")
         return false;
-    if (!path.starts_with("/fragments/"))
+    if (!has_guarded_prefix(path))
         return false;
     for (const auto p : kFetchMetadataGuardedPaths)
         if (p == path)
@@ -131,9 +169,9 @@ namespace detail {
 /// `Config::csrf_trusted_origins` after `normalise_trusted_origins`. `listener_is_tls` is the
 /// web listener's TLS state (`Config::https_enabled`): it selects the scheme-aware same-host
 /// comparison documented on `origin_is_same_site`. `path` and `sec_fetch_site` (the raw
-/// `Sec-Fetch-Site` value, empty when absent) apply to a guarded read only: a non-empty value
-/// other than same-origin or none is refused, and an empty one falls back to the Origin and
-/// Referer rule. Neither `listener_is_tls`, `path` nor `sec_fetch_site` has a default here, so
+/// `Sec-Fetch-Site` value, empty when absent; the gate passes a fixed non-matching sentinel when
+/// the header is repeated) apply to a guarded read only: a non-empty value other than
+/// same-origin or none is refused, and an empty one falls back to the Origin and Referer rule. Neither `listener_is_tls`, `path` nor `sec_fetch_site` has a default here, so
 /// a new caller must decide them.
 [[nodiscard]] inline SameSiteDecision
 evaluate_same_site_write(std::string_view method, std::string_view auth_source,

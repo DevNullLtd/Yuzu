@@ -97,9 +97,13 @@ inline constexpr std::string_view kSameSiteDeniedCounter = "yuzu_server_csrf_den
 inline constexpr std::string_view kSameSiteDenyMessage = "cross-site request refused";
 inline constexpr std::string_view kSameSiteDenyRemediation =
     "Send an Origin or Referer header naming this site, or authenticate with an API token. "
+    "Browsers send same-origin fetch metadata automatically. "
     "Behind a reverse proxy that rewrites Host, declare the public origin with "
     "--csrf-trusted-origin (or YUZU_CSRF_TRUSTED_ORIGIN) and restart; see "
     "docs/user-manual/server-admin.md.";
+/// Stands in for a repeated `Sec-Fetch-Site` header (httplib decides on the LAST value, so the
+/// gate refuses rather than trust one of several). Never a legal header value.
+inline constexpr std::string_view kSameSiteRepeatedFetchMetadata = "<repeated>";
 /// Last-resort body when the A4 envelope cannot be rendered. Constant, no per-request bytes.
 inline constexpr std::string_view kSameSiteDenyFallbackBody =
     R"({"error":{"code":403,"message":"cross-site request refused"}})";
@@ -205,10 +209,15 @@ apply_same_site_write_gate(const httplib::Request& req, httplib::Response& res,
     };
 
     try {
+        // A repeated Sec-Fetch-Site is decided as a non-matching value: httplib would return
+        // only the last one, which a client could arrange to be benign.
+        const std::string fetch_site = req.get_header_value_count("Sec-Fetch-Site") > 1
+                                           ? std::string(kSameSiteRepeatedFetchMetadata)
+                                           : req.get_header_value("Sec-Fetch-Site");
         const auto decision = evaluate_same_site_write(
             req.method, session.auth_source, req.get_header_value("Host"),
             req.get_header_value("Origin"), req.get_header_value("Referer"), trusted_origins,
-            listener_is_tls, req.path, req.get_header_value("Sec-Fetch-Site"));
+            listener_is_tls, req.path, fetch_site);
         if (!decision.refuse)
             return false;
 

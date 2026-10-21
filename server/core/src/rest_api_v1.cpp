@@ -674,7 +674,7 @@ const std::string& openapi_spec() {
   "info": {
     "title": "Yuzu Server REST API",
     "version": "1.0.0",
-    "description": "Enterprise endpoint management REST API. All endpoints require authentication via session cookie, Bearer token, or X-Yuzu-Token header. Every request other than GET, HEAD or OPTIONS that is authorised by the session cookie must carry an Origin or Referer header naming this site (or a --csrf-trusted-origin entry); otherwise it is refused 403 (A4ErrorEnvelope, message cross-site request refused) before the body is read. Token callers are not affected, except the dashboard-panel routes that keep their own check.",
+    "description": "Enterprise endpoint management REST API. All endpoints require authentication via session cookie, Bearer token, or X-Yuzu-Token header. Every request other than GET, HEAD or OPTIONS that is authorised by the session cookie must carry an Origin or Referer header naming this site (or a --csrf-trusted-origin entry); otherwise it is refused 403 (A4ErrorEnvelope, message cross-site request refused) before the body is read. Token callers are not affected, except the dashboard-panel routes that keep their own check. A small set of cookie-session reads that dispatch work or refresh server state is held to the same rule: it must carry Sec-Fetch-Site same-origin or none, or a same-site Origin or Referer.",
     "contact": {"name": "Yuzu Project"},
     "license": {"name": "AGPL-3.0-or-later", "url": "https://www.gnu.org/licenses/agpl-3.0.html"}
   },
