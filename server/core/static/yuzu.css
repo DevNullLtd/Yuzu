@@ -1006,7 +1006,7 @@ td .sub { display: block; overflow: hidden; text-overflow: ellipsis; color: var(
 .kvl .fp b { word-break: break-all; }
 .pb.hint { color: var(--mut); font-size: 12.5px; }
 
-/* -- TAR timeline (row 1.7): ported from the 15 Oct handover under the .tl- prefix; the highlight token is --hl; the two time chips sit on the surface with an --hl border -- */
+/* -- TAR timeline: ported under the .tl- prefix; the highlight token is --hl; the two time chips sit on the surface with an --hl border -- */
 .tl-top { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 .tl-top .end { margin-left: auto; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .tl-host { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 22px; padding: 14px 18px; }

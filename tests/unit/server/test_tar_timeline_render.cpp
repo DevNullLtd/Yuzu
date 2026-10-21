@@ -1,6 +1,6 @@
 /**
  * @file test_tar_timeline_render.cpp
- * @brief TAR timeline renderer (row 1.7): layout and collapse rules, the honesty copy,
+ * @brief TAR timeline renderer: layout and collapse rules, the honesty copy,
  *        escaping, golden files under tests/unit/server/golden/tar-timeline/, and the
  *        `.tl-` CSS block pin.
  *
@@ -347,6 +347,30 @@ TEST_CASE("tar timeline layout: items outside the window are ignored", "[tar][ti
     CHECK(lay.blocks.empty());
 }
 
+TEST_CASE("tar timeline layout: a one-second item keeps the width floor; the time chips flip at the edges",
+          "[tar][timeline]") {
+    // 1 s of a one-hour window is 0.028%: it draws at the 0.250% floor
+    contains(render_timeline_lanes(with_lane(lane("l", "process", "p", {bar("a", W0 + 600, W0 + 601)}))),
+             "width:0.250%");
+    // the moment chip sits on the side it would otherwise overflow
+    auto m = with_lane(lane("l", "process", "p"));
+    m.moment_ts = W0 + 60;
+    const auto start = render_timeline_lanes(m);
+    contains(start, "<b class=\"s\">");
+    lacks(start, "<b class=\"e\">");
+    m.moment_ts = W1 - 60;
+    const auto end = render_timeline_lanes(m);
+    contains(end, "<b class=\"e\">");
+    lacks(end, "<b class=\"s\">");
+    m.moment_ts = W0 + 1800;
+    const auto mid = render_timeline_lanes(m);
+    lacks(mid, "<b class=\"s\">");
+    lacks(mid, "<b class=\"e\">");
+    // the kept-chart marker chip right-aligns once it is past 55% of the age axis
+    contains(render_timeline_kept(kept_model(15 * kDay)), "<b class=\"r\">");
+    lacks(render_timeline_kept(kept_model(3600)), "<b class=\"r\">");
+}
+
 TEST_CASE("tar timeline collapse: bars collapse at eight, exact count, never 'about'",
           "[tar][timeline]") {
     auto m = base();
@@ -396,6 +420,38 @@ TEST_CASE("tar timeline collapse: a shape change ends the run", "[tar][timeline]
     CHECK(lay.blocks.size() == 8);
     for (const auto& b : lay.blocks)
         CHECK_FALSE(b.collapsed);
+}
+
+TEST_CASE("tar timeline collapse: only a contiguous run collapses", "[tar][timeline]") {
+    auto m = base();
+    // One-second bars, one every 12 s (a 0.3% gap, under the 0.6% block width); `extra_s` more
+    // seconds of silence open before item `gap_at`.
+    auto train = [](int n, int gap_at, int extra_s) {
+        std::vector<TarTimelineItem> v;
+        std::int64_t t = W0;
+        for (int i = 0; i < n; ++i) {
+            if (i == gap_at)
+                t += extra_s;
+            v.push_back(bar("g" + std::to_string(i), t, t + 1));
+            t += 12;
+        }
+        return v;
+    };
+    // nine contiguous: one block
+    auto lay = tar_timeline_layout_lane(lane("l", "process", "p", train(9, -1, 0)), m);
+    REQUIRE(lay.blocks.size() == 1);
+    CHECK(lay.blocks[0].collapsed);
+    CHECK(lay.blocks[0].label == "9 events");
+    // the same nine with a 1.1% gap before the fifth: two runs, each under eight, nothing collapses
+    lay = tar_timeline_layout_lane(lane("l", "process", "p", train(9, 4, 30)), m);
+    CHECK(lay.blocks.size() == 9);
+    for (const auto& b : lay.blocks)
+        CHECK_FALSE(b.collapsed);
+    // sixteen with that gap in the middle: two collapsed runs of eight, never one of sixteen
+    lay = tar_timeline_layout_lane(lane("l", "process", "p", train(16, 8, 30)), m);
+    REQUIRE(lay.blocks.size() == 2);
+    CHECK(lay.blocks[0].label == "8 events");
+    CHECK(lay.blocks[1].label == "8 events");
 }
 
 TEST_CASE("tar timeline collapse: wide items never collapse; the per-lane cap counts the rest",
@@ -483,6 +539,56 @@ TEST_CASE("tar timeline resolve_moment: inside the window, newest boundary, wind
     CHECK(tar_timeline_resolve_moment(m) == W1);
 }
 
+namespace {
+std::vector<std::string> ruler_labels(const std::string& html) {
+    static const std::regex re("<span class=\"tl-tk\" style=\"left:[0-9.]+%\">([^<]*)</span>");
+    std::vector<std::string> out;
+    for (std::sregex_iterator it(html.begin(), html.end(), re), end; it != end; ++it)
+        out.push_back((*it)[1].str());
+    return out;
+}
+} // namespace
+
+TEST_CASE("tar timeline ruler: one window per tick step, exact labels, UTC named once",
+          "[tar][timeline]") {
+    struct Row {
+        const char* name;
+        std::int64_t from, span;
+        std::size_t ticks;
+        std::vector<std::string> first;
+    };
+    const std::int64_t d20_20h = W0 + 11 * 3600; // 2026-10-20T20:00:00Z
+    const std::int64_t nov15 = 1794700800;       // 2026-11-15T00:00:00Z
+    const Row rows[] = {
+        {"60 s step, up to 30 minutes", W0, 1200, 21, {"09:00", "09:01"}},
+        {"5 min step, up to 6 hours", W0, 3 * 3600, 37, {"09:00", "09:05"}},
+        {"2 h step, a midnight tick is a date", d20_20h, 2 * kDay, 25, {"20:00", "22:00", "21 Oct"}},
+        {"daily step, up to 14 days", W0, 7 * kDay, 7, {"Wed 21", "Thu 22"}},
+        {"3 day step, up to 90 days", W0, 30 * kDay, 10, {"22 Oct", "25 Oct"}},
+        {"month boundaries, a January names its year", nov15, 120 * kDay, 4,
+         {"Dec", "Jan 2027", "Feb", "Mar"}},
+    };
+    for (const auto& r : rows) {
+        INFO(r.name);
+        auto m = base();
+        m.window_from_ts = r.from;
+        m.window_to_ts = r.from + r.span;
+        m.moment_ts = r.from + r.span / 2;
+        const auto html = render_timeline_lanes(m);
+        CHECK(count_of(html, "Time (UTC)") == 1);
+        const auto labels = ruler_labels(html);
+        CHECK(labels.size() == r.ticks);
+        for (std::size_t i = 0; i < r.first.size() && i < labels.size(); ++i)
+            CHECK(labels[i] == r.first[i]);
+    }
+    // the month ruler is bounded: a window past two years draws its first 24 months, no more
+    auto long_window = base();
+    long_window.window_from_ts = nov15;
+    long_window.window_to_ts = nov15 + 1100 * kDay;
+    long_window.moment_ts = nov15 + kDay;
+    CHECK(ruler_labels(render_timeline_lanes(long_window)).size() <= 24);
+}
+
 // ═══ goldens: lanes ═══════════════════════════════════════════════════════════════════
 
 TEST_CASE("tar timeline golden: lanes online", "[tar][timeline][golden]") {
@@ -507,6 +613,7 @@ TEST_CASE("tar timeline golden: lanes offline", "[tar][timeline][golden]") {
     check_golden("lanes__offline", html);
     contains(html, "Not readable: device offline");
     contains(html, "Device offline: on-device records are not readable.");
+    CHECK(count_of(html, "tl-warn") == 1); // the device banner says it once; no per-lane repeat
     lacks(html, "Exact");
 }
 
@@ -516,6 +623,11 @@ TEST_CASE("tar timeline golden: lanes read failed", "[tar][timeline][golden]") {
     const auto html = render_timeline_lanes(m);
     check_golden("lanes__read-failed", html);
     contains(html, "Not readable: the read failed");
+    // an online read that failed is said before the chart, naming the lane
+    const std::string warn =
+        "<div class=\"tl-warn\">The read of TCP connections was not readable: the read failed.</div>";
+    contains(html, warn);
+    CHECK(html.find(warn) < html.find("<div class=\"tl\">"));
 }
 
 TEST_CASE("tar timeline golden: lanes agent too old", "[tar][timeline][golden]") {
@@ -524,6 +636,29 @@ TEST_CASE("tar timeline golden: lanes agent too old", "[tar][timeline][golden]")
     const auto html = render_timeline_lanes(m);
     check_golden("lanes__agent-too-old", html);
     contains(html, "Not readable: the agent is too old for this read");
+    const std::string warn = "<div class=\"tl-warn\">The read of CPU was not readable: the agent is "
+                             "too old for this read.</div>";
+    contains(html, warn);
+    CHECK(html.find(warn) < html.find("<div class=\"tl\">"));
+}
+
+TEST_CASE("tar timeline banners: one per distinct lane and reason, offline not repeated per lane",
+          "[tar][timeline]") {
+    // two unreadable stretches of one lane with one reason: one banner
+    auto m = with_lane(lane("l", "tcp", "TCP connections", {},
+                            {unreadable(TarUnreadableReason::read_failed, W0, W0 + 600),
+                             region(TarRegionKind::exact, W0 + 600, W0 + 1800),
+                             unreadable(TarUnreadableReason::read_failed, W0 + 1800, W0 + 3000)}));
+    CHECK(count_of(render_timeline_lanes(m), "was not readable") == 1);
+    // a second reason on the same lane is its own banner
+    m.groups[0].lanes[0].regions.push_back(unreadable(TarUnreadableReason::agent_too_old, W0 + 3000, W1));
+    CHECK(count_of(render_timeline_lanes(m), "was not readable") == 2);
+    // a second lane with the same reason is its own banner
+    m.groups[0].lanes.push_back(lane("l2", "dns", "DNS cache", {}, {unreadable(TarUnreadableReason::read_failed)}));
+    CHECK(count_of(render_timeline_lanes(m), "was not readable: the read failed") == 2);
+    // reason "offline" on an ONLINE model has no device banner above it, so the lane says it
+    auto on = with_lane(lane("l", "tcp", "TCP connections", {}, {unreadable(TarUnreadableReason::offline)}));
+    contains(render_timeline_lanes(on), "The read of TCP connections was not readable: device offline.");
 }
 
 TEST_CASE("tar timeline golden: lanes paused", "[tar][timeline][golden]") {
@@ -917,6 +1052,55 @@ TEST_CASE("tar timeline golden: moment capped", "[tar][timeline][golden]") {
     contains(html, "Processes: The read was cut off at 10000 rows; nothing before 2026-10-20T09:50:00Z is shown");
 }
 
+TEST_CASE("tar timeline moment: a rolled-up process lane says what it no longer holds",
+          "[tar][timeline]") {
+    auto m = with_lane(lane("L-p", "process", "Processes", {bucket("PB", W0, W1, 31)}, {rolled(TarTier::hourly)}),
+                       "Processes");
+    m.groups[0].lanes.push_back(lane("L-d", "dns", "DNS cache", {bucket("DB", W0, W1, 4)}, {rolled(TarTier::hourly)}));
+    const auto html = render_timeline_moment(m, W0 + 1800, links_full());
+    contains(html, "Processes: Hourly roll-up: counts only; parents, process ids and exact times are not kept.");
+    // the same tier for another source is its own line with the plain sentence
+    contains(html, "DNS cache: Hourly roll-up: counts only; exact times are not kept.");
+    CHECK(count_of(html, "Hourly roll-up") == 2);
+    lacks(html, "averages and peaks");
+}
+
+TEST_CASE("tar timeline monthly tier: every surface names it", "[tar][timeline]") {
+    auto m = with_lane(lane("L-dns", "dns", "DNS cache", {bucket("MB", W0, W1, 120, TarTier::monthly)},
+                            {rolled(TarTier::monthly)}),
+                       "Network");
+    m.window_from_ts = W1 - 200 * kDay;
+    m.moment_ts = W1 - 100 * kDay; // only the monthly tier reaches this far back
+    m.kept = {kept("dns", "DNS cache", 0,
+                   {band(TarTier::exact, W1 - kDay, kDay), band(TarTier::hourly, W1 - 10 * kDay, 10 * kDay),
+                    band(TarTier::daily, W1 - 60 * kDay, 60 * kDay),
+                    band(TarTier::monthly, W1 - 400 * kDay, 400 * kDay)})};
+    // lanes: the region reason
+    const auto lanes = render_timeline_lanes(m);
+    contains(lanes, "tl-rg rolled");
+    contains(lanes, "<b>Monthly counts</b>");
+    // moment: the roll-up sentence, and the perf wording names the month
+    contains(render_timeline_moment(m, W0 + 1800, links_full()),
+             "DNS cache: Monthly roll-up: counts only; exact times are not kept.");
+    const auto perf = with_lane(
+        lane("L-perf", "perf", "CPU", {column("K1", W0, W1, 55, TarTier::monthly)}, {rolled(TarTier::monthly)}),
+        "System");
+    contains(render_timeline_moment(perf, W0 + 1800, links_full()),
+             "CPU: Monthly roll-up: averages and peaks for the whole month; the individual samples are not kept.");
+    // selected: the pill and the expiry basis (from_ts + policy_s)
+    const auto sel = render_timeline_selected(m, "MB", W0 + 100, links_full());
+    contains(sel, "<span class=\"pill warn\">Monthly counts</span>");
+    contains(sel, "Pruned after 2027-11-24T09:00:00Z at the earliest (a bucket ages from its start");
+    // kept: the h3 segment runs from the daily tier's reach to the monthly oldest; the column
+    // at the moment names the tier and its configured policy
+    const auto kept_html = render_timeline_kept(m);
+    const auto row = kept_row_html(kept_html, "dns");
+    contains(row, "tl-ks h3\" style=\"left:" + pct3(ax(60 * kDay)) + "%;width:" +
+                      pct3(ax(400 * kDay) - ax(60 * kDay)));
+    contains(row, "<span>Monthly counts</span>");
+    contains(row, "pruned 400 days after each month starts, at the earliest");
+}
+
 // ═══ goldens: selected ════════════════════════════════════════════════════════════════
 
 TEST_CASE("tar timeline golden: selected bar row limited", "[tar][timeline][golden]") {
@@ -1056,20 +1240,12 @@ TEST_CASE("tar timeline honesty: no fleet claim, no guessed figure, no invented 
     }
 }
 
-TEST_CASE("tar timeline msvc cap: the renderers build from short pieces", "[tar][timeline]") {
-    // No fixture or renderer string is a single large literal; the biggest output is built by
-    // concatenation, so it is nowhere near the 16,380-byte raw-literal cap per piece.
-    const auto html = render_timeline_lanes(base());
-    CHECK(html.size() > 1000);
-    CHECK(render_timeline_limits(base(), links_full()).size() > 500);
-}
-
 // ═══ css pin ══════════════════════════════════════════════════════════════════════════
 
 TEST_CASE("tar timeline css: one .tl- block, tokens only, no text on a filled highlight",
           "[tar][timeline][css]") {
     const std::string& css = kYuzuCss;
-    const std::string marker = "/* -- TAR timeline (row 1.7)";
+    const std::string marker = "/* -- TAR timeline:";
     const auto start = css.find(marker);
     REQUIRE(start != std::string::npos);
     const std::string block = css.substr(start);

@@ -1614,7 +1614,7 @@ if build_server
       'unit/server/test_inventory_ci_join.cpp',
       'unit/server/test_software_catalog_rollup.cpp',
       'unit/server/test_tar_process_tree.cpp',
-      'unit/server/test_tar_timeline_render.cpp', # TAR timeline (row 1.7): pure renderer, goldens, CSS pin
+      'unit/server/test_tar_timeline_render.cpp', # TAR timeline: pure renderer, goldens, CSS pin
       'unit/server/test_tar_tree_routes.cpp',
       'unit/server/test_dex_perf_model.cpp',
       # #1845 registry tripwire: pins detail::dex_perf_os_collects to the tar plugin's

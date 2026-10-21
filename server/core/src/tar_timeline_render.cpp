@@ -189,6 +189,10 @@ std::vector<Tick> time_ticks(const TarTimelineModel& m) {
         int year = c.year;
         unsigned month = c.month;
         std::int64_t x = month_start(year, month);
+        // ponytail: at most 24 monthly ticks bound the output against a bad window (the loop
+        // would otherwise walk every month between two arbitrary timestamps); a window past
+        // two years draws its first 24 months only. Thin to every Nth month if such windows
+        // become real.
         for (int guard = 0; guard < 24 && x <= to; ++guard) {
             if (x >= from) {
                 std::string label = kMon[month - 1];
@@ -799,13 +803,26 @@ std::string render_timeline_lanes(const TarTimelineModel& m) {
     // Banners first: a cut-off or unreadable read is said before any lane is drawn.
     if (!m.online)
         h += "<div class=\"tl-warn\">Device offline: on-device records are not readable.</div>";
+    std::vector<std::string> unreadable_seen; // one banner per distinct (lane, reason)
     for (const auto& g : m.groups)
         for (const auto& l : g.lanes)
-            for (const auto& r : l.regions)
+            for (const auto& r : l.regions) {
                 if (r.kind == TarRegionKind::capped)
                     h += "<div class=\"tl-warn\">The read of " + esc(lane_label(l)) +
                          " was cut off at " + num(r.cap_rows) + " rows; nothing before " +
                          esc(iso(r.coverage_from_ts)) + " is shown.</div>";
+                // An offline device already said so above; repeating it per lane is noise.
+                if (r.kind != TarRegionKind::not_readable ||
+                    (!m.online && r.reason == TarUnreadableReason::offline))
+                    continue;
+                const std::string key = lane_label(l) + "|" + num(static_cast<int>(r.reason));
+                if (std::find(unreadable_seen.begin(), unreadable_seen.end(), key) !=
+                    unreadable_seen.end())
+                    continue;
+                unreadable_seen.push_back(key);
+                h += "<div class=\"tl-warn\">The read of " + esc(lane_label(l)) +
+                     " was not readable: " + esc(unreadable_text(r.reason)) + ".</div>";
+            }
     if (hit_limit)
         h += "<div class=\"tl-warn\">A lane has more items than the render limit (" +
              num(static_cast<std::int64_t>(kTarTimelineMaxBlocksPerLane)) +
