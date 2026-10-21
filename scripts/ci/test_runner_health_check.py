@@ -320,6 +320,16 @@ class WorkflowWiringTests(unittest.TestCase):
             raise AssertionError(f"job {name!r} not found in {workflow}")
         return match.group(1)
 
+    @staticmethod
+    def meson_test_chunks() -> list[str]:
+        """tests/meson.build split at every test( call; each chunk starts after it."""
+        text = (ROOT / "tests" / "meson.build").read_text(encoding="utf-8")
+        return re.split(r"(?m)^[ \t]*test\(", text)[1:]
+
+    @staticmethod
+    def meson_test_name(chunk: str) -> str:
+        return re.match(r"\s*('[^']*')", chunk).group(1)
+
     def test_weetam_gate_matches_every_windows_consumer(self) -> None:
         # ci.yml's pool probe lives in the fast `preflight-gate` job (the required
         # `preflight` check carries only the source gates); nightly.yml still has
@@ -430,6 +440,104 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("needs.preflight-gate.outputs.code_changed == 'false'", stub)
         text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         self.assertNotRegex(text, r"needs\.preflight\.outputs\.")
+
+    def test_windows_suite_cover_guards_match_their_selections(self) -> None:
+        """Both Windows Test steps run assert-suite-cover.py over the suites they
+        really select. The pg step must exclude `platform`, or its guard fails the
+        job on every debug/full run (#4884)."""
+        windows = self.job("ci.yml", "windows")
+        steps = [
+            step
+            for step in re.split(r"(?m)^      - ", windows)
+            if "python scripts/ci/assert-suite-cover.py" in step
+        ]
+        expected = (
+            (
+                {"agent", "platform", "proto", "tar", "gateway", "server-nonpg", "server-checks"},
+                {"server-pg", "server-pg-smoke", "docs"},
+            ),
+            (
+                {"server-pg"},
+                {"agent", "docs", "proto", "tar", "gateway", "server-nonpg", "server-checks",
+                 "server-pg-smoke", "platform"},
+            ),
+        )
+        self.assertEqual(len(expected), len(steps))
+        for step, (selected, excluded) in zip(steps, expected):
+            with self.subTest(selected=sorted(selected)):
+                suites = re.search(r"suites=\(([^)]*)\)", step)
+                self.assertIsNotNone(suites)
+                self.assertEqual(selected, set(re.findall(r"--suite (\S+)", suites.group(1))))
+                guard = re.search(
+                    r"python scripts/ci/assert-suite-cover\.py(?:[^\n]*\\\n)*[^\n]*", step
+                )
+                self.assertIsNotNone(guard)
+                self.assertEqual(excluded, set(re.findall(r"--exclude-suite (\S+)", guard.group(0))))
+                # The guard and flake-retry share one list, so neither can drift.
+                self.assertEqual(2, step.count('"${suites[@]}"'))
+
+    def test_per_leg_suite_selectors_and_platform_entries(self) -> None:
+        """docs runs on the Linux leg only; the OS-contract entries live in suite
+        `platform` and run on every leg (#4884)."""
+        self.assertIn(
+            "--suite agent --suite docs --suite proto --suite tar --suite gateway --suite platform",
+            self.job("ci.yml", "linux"),
+        )
+        self.assertIn("--no-suite docs", self.job("ci.yml", "macos"))
+        platform = {
+            self.meson_test_name(chunk)
+            for chunk in self.meson_test_chunks()
+            if "suite: 'platform'" in chunk
+        }
+        self.assertEqual(
+            {
+                "'Windows toolchain contract'",
+                "'gateway build wrapper'",
+                "'instructions runner hardening'",
+                "'windows sdk contract'",
+            },
+            platform,
+        )
+
+    def test_duration_summary_follows_every_flake_retry_test_step(self) -> None:
+        """meson overwrites testlog.json on each invocation, so the summary runs
+        once per flake-retry Test step, against that step's own build dir."""
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertEqual(6, len(re.findall(r"scripts/ci/test-durations-summary\.py --builddir", ci)))
+        for job_name, labels in (
+            ("linux", ["Linux non-pg (cheap suites)", "Linux non-pg (server shards)", "Linux pg shards"]),
+            ("windows", ["Windows non-pg", "Windows pg shards"]),
+            ("macos", ["macOS"]),
+        ):
+            with self.subTest(job=job_name):
+                job = self.job("ci.yml", job_name)
+                summaries = list(
+                    re.finditer(
+                        r'scripts/ci/test-durations-summary\.py --builddir (.+?) --label "([^"]+)"', job
+                    )
+                )
+                self.assertEqual(labels, [m.group(2) for m in summaries])
+                for m in summaries:
+                    runs = re.findall(r"flake-retry\.py --builddir (.+?) --", job[: m.start()])
+                    self.assertTrue(runs)
+                    self.assertEqual(runs[-1], m.group(1))
+
+    def test_catch2_server_and_agent_entries_carry_durations(self) -> None:
+        """The per-case summary reads Catch2's `--durations=yes` (the `=` form is
+        required, see docs/ci-architecture.md). The two exemptions are deliberate:
+        a ~3 s push-only smoke entry and the [tsan-heavy] checkpoints entry."""
+        exempt = {"'server pg smoke'", "'agent tsan-heavy checkpoints'"}
+        seen = set()
+        for chunk in self.meson_test_chunks():
+            m = re.match(r"\s*('[^']*'(?:\s*\+\s*\w+)?)\s*,\s*(server_test_exe|agent_test_exe)\b", chunk)
+            if not m:
+                continue
+            seen.add(m.group(1))
+            if m.group(1) not in exempt:
+                with self.subTest(entry=m.group(1)):
+                    self.assertIn("'--durations=yes'", chunk)
+        self.assertLessEqual(exempt, seen)
+        self.assertGreater(len(seen - exempt), 1)
 
     def test_trusted_fork_secret_and_cache_boundaries_are_explicit(self) -> None:
         wrapper = (ROOT / ".github" / "workflows" / "trusted-fork-ci.yml").read_text(

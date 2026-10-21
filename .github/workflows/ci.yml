@@ -750,8 +750,9 @@ jobs:
       # so a concurrently-queued PR's single Linux leg waits at the
       # RUNNER-ACQUISITION level — below with-test-slot.sh, which only gates
       # contention *inside* a job that already has a runner (docs/ci-architecture.md
-      # "Cross-job"; a PR job was directly observed waiting 35 minutes for a free
-      # runner under the old cap of 3 when other work held the pool). with-test-slot.sh
+      # "Cross-job"). That is the case the former cap of 3 was added for: with all 4
+      # runners claimed at once, a PR job was directly observed waiting 35 minutes for
+      # a free runner. The owner accepts that trade (2026-10-21). with-test-slot.sh
       # (3 slots) still caps the heavy test phases once a runner is held. No-op on
       # `pull_request` events: the exclude below trims that matrix to a single
       # gcc-15/debug leg, so max-parallel never binds there.
@@ -1493,7 +1494,7 @@ jobs:
           # Outside the slot: pure parsing plus a --list-tests spawn per Catch2 entry.
           python3 scripts/ci/test-durations-summary.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --label "Linux pg shards"
 
-      # Sizes the tmpfs PGDATA cap (PR ladder push 3): host RAM and the
+      # Sizes the tmpfs PGDATA cap (#4884): host RAM and the
       # persistent cluster's on-disk size after a full pg run, printed to the
       # step log. Never fails the job. Remove once the cap is recorded in
       # docs/ci-architecture.md "Postgres for server tests".
@@ -2087,7 +2088,7 @@ jobs:
             "${suites[@]}" \
             --exclude-suite agent --exclude-suite docs --exclude-suite proto --exclude-suite tar \
             --exclude-suite gateway --exclude-suite server-nonpg --exclude-suite server-checks \
-            --exclude-suite server-pg-smoke
+            --exclude-suite server-pg-smoke --exclude-suite platform
           # Runs LAST (after the non-pg step above): flake-retry.py /
           # ci-import-junit only import the LAST invocation's testlog.junit.xml
           # into CI telemetry per job — ordering it last means the pg-shard

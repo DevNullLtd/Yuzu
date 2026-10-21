@@ -886,7 +886,7 @@ Big Tam and Wee Tam, and removed from `.github/runner-inventory.json`.
 previously used the bare `[self-hosted, Linux, X64]` label, which Shulgi's WSL2
 runner also carried, so they could land there instead of on Big Tam. The runners
 were deregistered on the GitHub side on 2026-10-03 (per the repo admin). With the pin, `proto-compat` queues (it does not fail) while all four
-Big Tam slots are busy. When no Big Tam runner is online, the preflight job
+Big Tam slots are busy. When no Big Tam runner is online, the `preflight-gate` job
 fails (required pool `bigtam`) and `proto-compat` is skipped.
 
 ### Ubuntu 26.04 migration (Big Tam) — COMPLETE
@@ -1728,7 +1728,7 @@ non-pg baselines (the docs suite left the Windows and macOS legs) and its probe
 output fills the line below.
 
 Probe (push 1, `Postgres container footprint (tmpfs sizing probe)` step):
-host RAM ______ MiB; peak PGDATA per container ______ MiB.
+host RAM: pending (filled by the tmpfs commit from the probe step log); peak PGDATA per container: pending.
 
 Worst-case ceiling by width (14 pg shards, one shared 700 s timeout, every
 shard at its cap; the degenerate figure, not an expected case): np=2 is 7
@@ -1994,7 +1994,7 @@ Resolution order inside the script:
    and the script's 120 s `pg_isready` wait covers it. The change is kept only
    if the pg step's two samples show a gain; reverting is dropping the flag and
    bumping the label again. Docker Linux path only. Probe output and the
-   decision: ______ (filled by the push that applies or declines it).
+   decision: pending — filled by the push that applies or declines it.
 3. **brew** (GHA-hosted macOS, no docker) — `postgresql@18` bottle +
    throwaway trust-auth cluster under `$RUNNER_TEMP` on
    `127.0.0.1:15432`.
@@ -2246,7 +2246,8 @@ per meson entry. Next to it, `scripts/ci/test-durations-summary.py` appends a
 "Test durations — <label>" block to the job summary after each
 `flake-retry.py` invocation in the Linux (three), Windows (two) and macOS (one)
 Test steps: every entry's wall seconds, meson timeout and share of it, then the
-25 slowest Catch2 cases (entry, case, seconds, runs). The case data is Catch2's
+25 slowest Catch2 cases (entry, case, seconds, runs). The push-only `Test (pg smoke)`
+steps are deliberately not summarised: each runs one ~3 s entry. The case data is Catch2's
 own `--durations=yes`, now on the four non-pg server shards, the 14 pg shards
 and the agent shards (the `=` form is required: a space would add a positional
 `yes` that `check-pg-shard-partition.py` rejects as a second spec). It is

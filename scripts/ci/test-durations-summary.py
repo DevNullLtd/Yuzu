@@ -113,9 +113,9 @@ def render(label, entry_rows, case_rows):
 
 # ── thin shell (OS interaction) ──────────────────────────────────────────────
 def list_cases(cmd, run=subprocess.run):
+    """Bare case names a Catch2 entry runs, or None if the listing is unusable."""
     # ponytail: one --list-tests spawn per Catch2 entry (~19); switch to a second
     # xml reporter if the spawns ever matter.
-    """Bare case names a Catch2 entry runs, or None if the listing is unusable."""
     try:
         p = run(list(cmd) + ["--list-tests", "--verbosity", "quiet"],
                 capture_output=True, text=True, timeout=30)
