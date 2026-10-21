@@ -37,6 +37,7 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -45,6 +46,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if defined(__has_feature)
@@ -1068,3 +1070,98 @@ TEST_CASE("same-site pipeline: an ordinary read with cross-site fetch metadata s
     Pipeline f;
     expect_admitted(f, "GET", kCanary, {{"Cookie", kCookieOk}, {"Sec-Fetch-Site", "cross-site"}});
 }
+
+#ifndef _WIN32
+namespace {
+/// A raw GET or HEAD with the given extra header lines (each already CRLF-terminated), so a
+/// test can send a repeated header or a path byte the client library would rewrite.
+std::string raw_read(Pipeline& f, const std::string& method, const std::string& target,
+                     const std::string& header_lines) {
+    return raw_exchange(f.port, method + " " + target + " HTTP/1.1\r\nHost: 127.0.0.1:" +
+                                    std::to_string(f.port) + "\r\nCookie: " + kCookieOk +
+                                    "\r\n" + header_lines + "Connection: close\r\n\r\n");
+}
+} // namespace
+
+TEST_CASE("same-site pipeline: a repeated Sec-Fetch-Site header is refused in either order",
+          "[csrf][same_site][pipeline]") {
+    Pipeline f;
+    const std::string path(kGuardedReadCanary);
+    const std::pair<const char*, const char*> orders[] = {{"same-origin", "cross-site"},
+                                                          {"cross-site", "same-origin"},
+                                                          {"same-origin", "same-origin"},
+                                                          {"none", "same-origin"}};
+    for (const char* m : {"GET", "HEAD"}) {
+        for (const auto& [first, second] : orders) {
+            INFO(m << " " << first << " then " << second);
+            const auto before = snap(f, class_of(m, path), kSameSiteReasonOriginMismatch);
+            const auto reply = raw_read(f, m, path,
+                                        std::string("Sec-Fetch-Site: ") + first +
+                                            "\r\nSec-Fetch-Site: " + second + "\r\n");
+            CHECK(reply.starts_with("HTTP/1.1 403"));
+            CHECK(f.row_count() == before.rows + 1);
+            if (f.row_count() == before.rows + 1) {
+                const auto r = f.row(before.rows);
+                CHECK(r.target_id == std::string(m) + " " + path);
+                CHECK(r.detail == refusal_detail(kSameSiteReasonOriginMismatch));
+            }
+            CHECK(f.handler_hits.load() == before.hits);
+            CHECK(f.gate_rejections.load() == before.gate + 1);
+            CHECK(f.series(class_of(m, path), kSameSiteReasonOriginMismatch) == before.series + 1);
+        }
+    }
+    // The same request with ONE benign value is answered by the handler.
+    const auto before = snap(f);
+    const auto reply = raw_read(f, "GET", path, "Sec-Fetch-Site: same-origin\r\n");
+    CHECK(reply.starts_with("HTTP/1.1 200"));
+    CHECK(f.handler_hits.load() == before.hits + 1);
+    CHECK(f.gate_rejections.load() == before.gate);
+}
+
+TEST_CASE("same-site pipeline: a percent-encoded table path is decided as the path the router runs",
+          "[csrf][same_site][pipeline]") {
+    Pipeline f;
+    const std::string path(kGuardedReadCanary);
+    // Encode the final letter: the router and the gate both see the decoded path.
+    std::string encoded = path;
+    encoded.replace(encoded.size() - 3, 1, "%72");
+    REQUIRE(encoded != path);
+    const std::string cls = class_of("GET", path);
+    {
+        const auto before = snap(f, cls, kSameSiteReasonNoHeaders);
+        const auto reply = raw_read(f, "GET", encoded, "");
+        CHECK(reply.starts_with("HTTP/1.1 403"));
+        CHECK(f.row_count() == before.rows + 1);
+        if (f.row_count() == before.rows + 1)
+            CHECK(f.row(before.rows).target_id == "GET " + path);
+        CHECK(f.handler_hits.load() == before.hits);
+        CHECK(f.series(cls, kSameSiteReasonNoHeaders) == before.series + 1);
+    }
+    {
+        // Same-origin metadata reaches the handler through the encoded form too.
+        const auto before = snap(f);
+        const auto reply = raw_read(f, "GET", encoded, "Sec-Fetch-Site: same-origin\r\n");
+        CHECK(reply.starts_with("HTTP/1.1 200"));
+        CHECK(f.handler_hits.load() == before.hits + 1);
+    }
+}
+
+TEST_CASE("same-site pipeline: near-miss spellings of a table path never reach the handler",
+          "[csrf][same_site][pipeline]") {
+    Pipeline f;
+    const std::string path(kGuardedReadCanary);
+    std::string upper = path;
+    for (auto& c : upper)
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    for (const std::string& target : {path + "/", "/" + path, path + ";x=1", upper}) {
+        INFO(target);
+        const auto before = snap(f);
+        // Cross-site metadata, so a wrongly admitted match would show as a refusal or a hit.
+        const auto reply = raw_read(f, "GET", target, "Sec-Fetch-Site: cross-site\r\n");
+        CHECK(reply.starts_with("HTTP/1.1 404"));
+        CHECK(f.handler_hits.load() == before.hits);
+        CHECK(f.pre_request_hits.load() == before.pre);
+        CHECK(f.row_count() == before.rows);
+    }
+}
+#endif

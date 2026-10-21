@@ -32,6 +32,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::server;
@@ -87,28 +88,21 @@ void require_refuse(const SameSiteDecision& d, std::string_view reason) {
 
 // -- Layer 1: the pure decision ----------------------------------------------------------------
 
-namespace {
-constexpr bool guarded_table_is_well_formed() {
-    for (std::size_t i = 0; i < kFetchMetadataGuardedPaths.size(); ++i) {
-        const auto p = kFetchMetadataGuardedPaths[i];
-        if (!p.starts_with("/fragments/") || p.size() <= 11 || p.back() == '/' ||
-            p.find('?') != std::string_view::npos)
-            return false;
-        for (std::size_t j = i + 1; j < kFetchMetadataGuardedPaths.size(); ++j)
-            if (kFetchMetadataGuardedPaths[j] == p)
-                return false;
-    }
-    return true;
-}
-} // namespace
-static_assert(kFetchMetadataGuardedPaths.size() == 7);
-static_assert(guarded_table_is_well_formed());
+// The table size and shape are also asserted in the policy header; these restate the contract
+// where a failing build points a reader at the tests.
+static_assert(kFetchMetadataGuardedPaths.size() == 10,
+              "the guarded table size is pinned here and by the literal content test below");
+static_assert(yuzu::server::detail::guarded_table_is_well_formed(), "table shape is asserted in the header");
 static_assert(is_guarded_read("GET", kFetchMetadataGuardedPaths[0]));
-static_assert(is_guarded_read("HEAD", kFetchMetadataGuardedPaths[6]));
+static_assert(is_guarded_read("HEAD", kFetchMetadataGuardedPaths[kFetchMetadataGuardedPaths.size() - 1]),
+              "the last table entry must pass the prefilter");
 static_assert(!is_guarded_read("OPTIONS", kFetchMetadataGuardedPaths[0]));
 static_assert(!is_guarded_read("POST", kFetchMetadataGuardedPaths[0]));
 static_assert(!is_guarded_read("get", kFetchMetadataGuardedPaths[0]));
 static_assert(!is_guarded_read("GET", "/fragments/"));
+static_assert(!is_guarded_read("GET", "/api/v1/viz/"));
+static_assert(!is_guarded_read("GET", "/api/v1/viz"));
+static_assert(!is_guarded_read("GET", "/api/v1/vizx/fleet/topology"));
 static_assert(!is_guarded_read("GET", "/api/v1/something"));
 static_assert(!is_guarded_read("GET", ""));
 static_assert(noexcept(is_guarded_read("GET", "/x")));
@@ -881,7 +875,8 @@ TEST_CASE("guarded read: token sources are admitted", "[csrf][same_site]") {
 
 TEST_CASE("guarded read: other reads stay ungated", "[csrf][same_site]") {
     for (std::string_view path :
-         {"/canary/path", "/fragments/canary/other", "/fragments/", "/api/v1/canary", "/", ""}) {
+         {"/canary/path", "/fragments/canary/other", "/fragments/", "/api/v1/canary", "/api/v1/viz",
+          "/api/v1/viz/", "/api/v1/viz/canary", "/api/v1/vizx/fleet/topology", "/", ""}) {
         for (std::string_view m : {"GET", "HEAD", "OPTIONS"}) {
             CAPTURE(path, m);
             require_pass(decide_read(m, "local", path, "cross-site"));
@@ -913,4 +908,75 @@ TEST_CASE("write methods ignore fetch metadata on any path", "[csrf][same_site]"
                    kSameSiteReasonNoHeaders);
     require_pass(decide("POST", "local", kSameOrigin, "", kHost, trusted(), false, "/canary/path",
                         "cross-site"));
+}
+
+TEST_CASE("guarded read: the prefilter admits exactly its two prefixes", "[csrf][same_site]") {
+    REQUIRE(has_guarded_prefix("/fragments/x"));
+    REQUIRE(has_guarded_prefix("/api/v1/viz/x"));
+    REQUIRE_FALSE(has_guarded_prefix("/fragments"));
+    REQUIRE_FALSE(has_guarded_prefix("/api/v1/viz"));
+    REQUIRE_FALSE(has_guarded_prefix("/api/v1/vizx/y"));
+    REQUIRE_FALSE(has_guarded_prefix("/API/v1/viz/x"));
+    REQUIRE_FALSE(has_guarded_prefix("//fragments/x"));
+    // Every table entry passes the prefilter, so none is silently unreachable.
+    for (const auto p : kFetchMetadataGuardedPaths) {
+        CAPTURE(p);
+        REQUIRE(has_guarded_prefix(p));
+    }
+    // A path under the REST prefix that is not in the table is ungated; a table path is guarded.
+    require_pass(decide_read("GET", "local", "/api/v1/viz/canary", "cross-site"));
+    require_pass(decide_read("GET", "local", "/api/v1/viz", "cross-site"));
+    require_pass(decide_read("GET", "local", "/api/v1/vizx/fleet/topology", "cross-site"));
+    require_refuse(decide_read("GET", "local", "/api/v1/viz/fleet/topology", "cross-site"),
+                   kSameSiteReasonOriginMismatch);
+    // The REST path is token-reachable too: a token caller stays exempt.
+    require_pass(decide_read("GET", "api_token", "/api/v1/viz/fleet/topology", "cross-site"));
+}
+
+TEST_CASE("guarded read: the table content is pinned literally", "[csrf][same_site]") {
+    // Executable data. Changing the table is a reviewed change: this list moves with it, so
+    // replacing an entry with a bogus path fails here and not only in the inventory test.
+    constexpr std::array<std::string_view, 10> expected{
+        "/fragments/device/live/run",
+        "/fragments/tar/process-tree/run",
+        "/fragments/tar/process-tree/device-net",
+        "/fragments/tar/capture-sources/load",
+        "/fragments/dex/device/perf",
+        "/fragments/dex/device/procperf",
+        "/fragments/auto/deploy/result",
+        "/fragments/auto/result",
+        "/fragments/viz/fleet/topology",
+        "/api/v1/viz/fleet/topology",
+    };
+    REQUIRE(kFetchMetadataGuardedPaths.size() == expected.size());
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        CAPTURE(i, expected[i]);
+        REQUIRE(kFetchMetadataGuardedPaths[i] == expected[i]);
+    }
+}
+
+TEST_CASE("same-site gate: a repeated fetch-metadata header is refused", "[csrf][same_site]") {
+    const std::string path(kFetchMetadataGuardedPaths[0]);
+    for (const char* m : {"GET", "HEAD"}) {
+        CAPTURE(m);
+        for (const auto& pair : {std::pair<const char*, const char*>{"same-origin", "same-origin"},
+                                 {"same-origin", "cross-site"},
+                                 {"cross-site", "same-origin"},
+                                 {"none", "none"}}) {
+            CAPTURE(pair.first, pair.second);
+            GateRig g(m);
+            g.req.path = path;
+            g.req.headers.emplace("Sec-Fetch-Site", pair.first);
+            g.req.headers.emplace("Sec-Fetch-Site", pair.second);
+            REQUIRE(g.run());
+            REQUIRE(g.res.status == 403);
+            REQUIRE(g.rows.size() == 1);
+            REQUIRE(g.rows[0].detail.find("reason=origin_mismatch") != std::string::npos);
+        }
+        // A single benign value is still admitted.
+        GateRig g(m);
+        g.req.path = path;
+        g.req.set_header("Sec-Fetch-Site", "same-origin");
+        REQUIRE_FALSE(g.run());
+    }
 }

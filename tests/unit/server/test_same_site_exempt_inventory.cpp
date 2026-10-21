@@ -29,19 +29,34 @@
  * (the sanity floor below catches a scan that finds nothing, not a partial miss). The metrics
  * literal here is tied to the production condition by the lexical wiring gate.
  *
- * READS THAT DISPATCH WORK. A GET or HEAD request is gated only when its exact path is in
- * `kFetchMetadataGuardedPaths` (same_site_write_policy.hpp). The second half of this file checks
- * that table against the source: every table path must be a live GET registration (no stale
- * entry), and every GET registration whose handler text contains a dispatch marker must be in the
- * table or in the small reviewed `kKnownReadOnlyDispatchLike` ledger below (no unlisted new
- * dispatcher). LIMITS of that half: it is a pure lexical scan. The handler text is the balanced
- * parenthesis span of the registration call, expanded one hop into same-file functions defined
- * as `Class::name(...) {...}` that the span calls by name. A handler that reaches a dispatch
- * only through a computed path, a helper in another file, a second hop, a handler held in a
- * variable, or a marker spelling not in `kDispatchMarkers` is invisible. A registration whose
- * path is not a string literal is reported as unscannable when its text carries a marker. The
- * markers are derived from the existing handlers; a new dispatch entry point must be added to
- * the list in the same change. Comments are stripped before matching.
+ * READS THAT DISPATCH WORK OR CHANGE STATE. A GET or HEAD request is gated only when its exact
+ * path is in `kFetchMetadataGuardedPaths` (same_site_write_policy.hpp). The second half of this
+ * file checks that table against the source: every table path must be a live GET registration
+ * (no stale entry) whose handler text carries a marker, and every GET registration whose
+ * handler text contains a marker must be in the table or in the small reviewed
+ * `kKnownReadOnlyDispatchLike` ledger below (no unlisted new dispatcher). The markers are
+ * `kDispatchMarkers` (work sent toward agents) and `kStateChangeMarkers` (a read that persists
+ * state or forces a cache refill). The scan also fails when it drops a registration it cannot
+ * span, and when its count falls too far below an independent raw count of `Get(` hits.
+ *
+ * LIMITS of that half: it is a best-effort lexical scan, not an analysis.
+ *   - Receivers: only `sink.`, `svr.` and `web_server_->` are scanned. A registration made on any
+ *     other receiver spelling (`server.`, `srv->`, `route_sink_.`, a reference held in a
+ *     variable, a wrapper such as `gated(...)`, or `std::bind`/a named functor passed as the
+ *     handler) is invisible. The raw-count check catches only a large drift, not one route.
+ *   - Handler text: the balanced parenthesis span of the registration call, expanded ONE hop
+ *     into same-file functions defined as `Class::name(...) {...}` that the span calls by name.
+ *     A handler that reaches a marker only through a computed path, a helper in another file,
+ *     a second hop, a handler held in a variable, or a marker spelling not listed is invisible.
+ *   - Markers: a new dispatch or state-change entry point must be added to the lists in the same
+ *     change. A generic spelling such as a bare `invalidate(` is deliberately not a marker (it
+ *     would match unrelated caches); `->invalidate(` and the others are the narrowest forms the
+ *     current handlers use, so a handler refreshing through a different spelling is invisible.
+ *   - A registration whose path is not a string literal is reported as unscannable when its
+ *     text carries a marker. Comments (`//` and block) are stripped before matching; a marker
+ *     inside a string literal still counts.
+ * Marker candidates beyond the active set were probed against every GET handler in the tree and
+ * none produced a hit outside the table, so the ledger is empty.
  *
  * The scan helpers below are private to this file; a shared scanner may replace them.
  */
@@ -242,9 +257,21 @@ struct GetRegistration {
     std::string handler; // balanced-paren span of the call, comments stripped, plus one hop
 };
 
-constexpr std::array<std::string_view, 5> kDispatchMarkers{
+constexpr std::array<std::string_view, 12> kDispatchMarkers{
     "dispatch_fn_(", "dispatch_confined(", "advance_and_render(", "deployment::advance(",
-    "->dispatch(",
+    "->dispatch(",   "dispatch_fn(",       "cmd_dispatch(",       "command_dispatch_fn",
+    "sync_dispatch_fn(", "send_to(",       "persist_grid(",       "complete_run(",
+};
+
+// Markers for a read that changes server state without dispatching: the persisting helper a
+// polling handler reaches through its renderer (the lower-level persist_grid( and complete_run(
+// markers above sit in another file, beyond the one-hop expansion) and the cache-invalidation
+// call a handler makes when a query flag forces a refill. "->invalidate(" is the
+// narrowest spelling that real code uses; a handler that refreshes through another spelling is
+// invisible (see LIMITS).
+constexpr std::array<std::string_view, 2> kStateChangeMarkers{
+    "persist_and_maybe_complete(",
+    "->invalidate(",
 };
 
 constexpr std::string_view kComputedPath = "<computed>";
@@ -259,21 +286,51 @@ struct ReadLedgerRow {
 // hit in the current tree is a table entry.
 constexpr std::array<ReadLedgerRow, 0> kKnownReadOnlyDispatchLike{};
 
-/// Removes `//` comments (to end of line) where the `//` starts a line or follows whitespace, so
-/// a scheme separator inside a string is left alone. Block comments are left as written.
-std::string strip_line_comments(const std::string& text) {
+/// Removes `//` and `/* ... */` comments, leaving string, raw string and character literals
+/// intact so a comment opener inside a literal (a glob such as "/x/*") is not mistaken for a
+/// comment. Newlines inside removed comments are kept so line numbers still match the source.
+std::string strip_comments(const std::string& text) {
     std::string out;
     out.reserve(text.size());
     std::size_t i = 0;
     while (i < text.size()) {
-        const bool at_comment = text[i] == '/' && i + 1 < text.size() && text[i + 1] == '/' &&
-                                (i == 0 || std::isspace(static_cast<unsigned char>(text[i - 1])) != 0);
-        if (at_comment) {
+        const char c = text[i];
+        if (c == 'R' && i + 2 < text.size() && text[i + 1] == '"' && text[i + 2] == '(' &&
+            (i == 0 || !is_ident_char(text[i - 1]))) {
+            const std::size_t end = text.find(")\"", i + 3);
+            const std::size_t stop = end == std::string::npos ? text.size() : end + 2;
+            out.append(text, i, stop - i);
+            i = stop;
+        } else if (c == '"') {
+            std::size_t j = i + 1;
+            while (j < text.size() && text[j] != '"')
+                j += (text[j] == '\\' && j + 1 < text.size()) ? 2 : 1;
+            const std::size_t stop = std::min(j + 1, text.size());
+            out.append(text, i, stop - i);
+            i = stop;
+        } else if (c == '\'' && !(i > 0 && std::isalnum(static_cast<unsigned char>(text[i - 1])) != 0)) {
+            std::size_t j = i + 1;
+            while (j < text.size() && text[j] != '\'')
+                j += (text[j] == '\\' && j + 1 < text.size()) ? 2 : 1;
+            const std::size_t stop = std::min(j + 1, text.size());
+            out.append(text, i, stop - i);
+            i = stop;
+        } else if (c == '/' && i + 1 < text.size() && text[i + 1] == '/') {
             while (i < text.size() && text[i] != '\n')
                 ++i;
-            continue;
+        } else if (c == '/' && i + 1 < text.size() && text[i + 1] == '*') {
+            const std::size_t end = text.find("*/", i + 2);
+            const std::size_t stop = end == std::string::npos ? text.size() : end + 2;
+            for (std::size_t k = i; k < stop; ++k) {
+                if (text[k] == '\n')
+                    out.push_back('\n');
+            }
+            out.push_back(' ');
+            i = stop;
+        } else {
+            out.push_back(c);
+            ++i;
         }
-        out.push_back(text[i++]);
     }
     return out;
 }
@@ -375,19 +432,44 @@ std::set<std::string> called_names(const std::string& text) {
 }
 
 bool has_dispatch_marker(const std::string& text) {
-    return std::any_of(kDispatchMarkers.begin(), kDispatchMarkers.end(),
-                       [&](std::string_view m) { return text.find(m) != std::string::npos; });
+    const auto hit = [&](std::string_view m) { return text.find(m) != std::string::npos; };
+    return std::any_of(kDispatchMarkers.begin(), kDispatchMarkers.end(), hit) ||
+           std::any_of(kStateChangeMarkers.begin(), kStateChangeMarkers.end(), hit);
+}
+
+constexpr std::array<std::string_view, 3> kGetReceivers{"sink.", "svr.", "web_server_->"};
+
+/// `Get(` occurrences on the scanned receivers in the RAW text (comments included), counted
+/// independently of the extractor so a registration the extractor skips shows up as a gap.
+std::size_t count_raw_get_hits(const std::string& raw_text) {
+    std::size_t n = 0;
+    for (const auto recv : kGetReceivers) {
+        for (std::size_t at = raw_text.find(recv); at != std::string::npos;
+             at = raw_text.find(recv, at + 1)) {
+            if (at > 0 && is_ident_char(raw_text[at - 1]))
+                continue;
+            if (raw_text.compare(at + recv.size(), 4, "Get(") == 0)
+                ++n;
+        }
+    }
+    return n;
 }
 
 /// Every GET registration in one file's text, on the same three receivers as the mutating scan.
-/// A literal first argument gives the path; any other first argument gives kComputedPath.
+/// A literal first argument gives the path; any other first argument gives kComputedPath. A
+/// registration the scan could not span (unbalanced parentheses, an unterminated literal) is
+/// not returned and is added to `*dropped` when given.
 std::vector<GetRegistration> extract_get_registrations(const std::string& file,
-                                                       const std::string& raw_text) {
-    static constexpr std::array<std::string_view, 3> kReceivers{"sink.", "svr.", "web_server_->"};
-    const std::string text = strip_line_comments(raw_text);
+                                                       const std::string& raw_text,
+                                                       std::size_t* dropped = nullptr) {
+    const std::string text = strip_comments(raw_text);
     const auto bodies = function_bodies(text);
     std::vector<GetRegistration> out;
-    for (const auto recv : kReceivers) {
+    const auto drop = [&] {
+        if (dropped != nullptr)
+            ++*dropped;
+    };
+    for (const auto recv : kGetReceivers) {
         for (std::size_t at = text.find(recv); at != std::string::npos;
              at = text.find(recv, at + 1)) {
             if (at > 0 && is_ident_char(text[at - 1]))
@@ -397,22 +479,33 @@ std::vector<GetRegistration> extract_get_registrations(const std::string& file,
                 continue;
             const std::size_t open = mpos + 3;
             const std::size_t end = balanced_paren_end(text, open);
-            if (end == std::string::npos)
+            if (end == std::string::npos) {
+                drop();
                 continue;
+            }
             std::size_t p = open + 1;
             while (p < text.size() && std::isspace(static_cast<unsigned char>(text[p])) != 0)
                 ++p;
             std::string path(kComputedPath);
+            bool unterminated = false;
             if (text.compare(p, 3, "R\"(") == 0) {
                 const std::size_t pe = text.find(")\"", p + 3);
                 if (pe != std::string::npos)
                     path = text.substr(p + 3, pe - (p + 3));
+                else
+                    unterminated = true;
             } else if (p < text.size() && text[p] == '"') {
                 std::size_t q = p + 1;
                 while (q < text.size() && text[q] != '"')
                     q += (text[q] == '\\' && q + 1 < text.size()) ? 2 : 1;
                 if (q < text.size())
                     path = text.substr(p + 1, q - (p + 1));
+                else
+                    unterminated = true;
+            }
+            if (unterminated) {
+                drop();
+                continue;
             }
             std::string handler = text.substr(open, end - open);
             for (const auto& name : called_names(handler)) {
@@ -432,12 +525,18 @@ std::vector<GetRegistration> extract_get_registrations(const std::string& file,
     return out;
 }
 
+struct GetScan {
+    std::vector<GetRegistration> regs;
+    std::size_t dropped = 0;  // registrations the extractor could not span
+    std::size_t raw_hits = 0; // `Get(` on the scanned receivers in raw text, comments included
+};
+
 /// Memoized per process; assumes every call passes the same directory.
-const std::vector<GetRegistration>& discover_get_registrations() {
-    static const std::vector<GetRegistration> cached = [] {
+const GetScan& discover_get_scan() {
+    static const GetScan cached = [] {
         const fs::path dir(YUZU_SERVER_SRC_DIR);
         REQUIRE(fs::is_directory(dir));
-        std::vector<GetRegistration> out;
+        GetScan out;
         for (const auto& entry : fs::recursive_directory_iterator(dir)) {
             if (!entry.is_regular_file())
                 continue;
@@ -448,14 +547,21 @@ const std::vector<GetRegistration>& discover_get_registrations() {
             REQUIRE(in.is_open());
             std::ostringstream ss;
             ss << in.rdbuf();
-            auto found = extract_get_registrations(entry.path().filename().string(), ss.str());
-            out.insert(out.end(), found.begin(), found.end());
+            const std::string raw = ss.str();
+            auto found = extract_get_registrations(entry.path().filename().string(), raw,
+                                                   &out.dropped);
+            out.regs.insert(out.regs.end(), found.begin(), found.end());
+            out.raw_hits += count_raw_get_hits(raw);
         }
         // Sanity floor: a scan that finds almost nothing is broken, not evidence of a small surface.
-        REQUIRE(out.size() >= 200);
+        REQUIRE(out.regs.size() >= 200);
         return out;
     }();
     return cached;
+}
+
+const std::vector<GetRegistration>& discover_get_registrations() {
+    return discover_get_scan().regs;
 }
 
 bool is_known_read_ledger_path(std::string_view path) {
@@ -641,6 +747,63 @@ TEST_CASE("same-site inventory: the GET scan sees the surface and the computed-p
     CHECK(regs.size() >= 200);
 }
 
+TEST_CASE("same-site inventory: the GET scan drops nothing and accounts for every raw hit",
+          "[csrf][same_site][route_inventory]") {
+    const auto& scan = discover_get_scan();
+    // A registration the extractor cannot span is invisible to the table check, so none may be
+    // dropped silently.
+    CAPTURE(scan.dropped);
+    CHECK(scan.dropped == 0);
+    // Raw `Get(` hits on the scanned receivers include commented-out and documentation mentions
+    // the extractor correctly ignores. A bounded gap is that noise; a larger one means the
+    // extractor is skipping live registrations.
+    constexpr std::size_t kCommentTolerance = 4;
+    CAPTURE(scan.raw_hits, scan.regs.size(), kCommentTolerance);
+    CHECK(scan.raw_hits >= scan.regs.size());
+    CHECK(scan.raw_hits - scan.regs.size() <= kCommentTolerance);
+}
+
+TEST_CASE("same-site inventory: comment stripping handles block comments and literals",
+          "[csrf][same_site][route_inventory]") {
+    const std::string text =
+        "sink.Get(\"/synthetic/block\", [this](const Req&, Res& res) {\n"
+        "    /* dispatch_fn_(\"p\", \"a\")\n"
+        "       send_to(x) */\n"
+        "    res.set_content(\"x\", \"t\");\n"
+        "});\n"
+        "sink.Get(\"/synthetic/glob/*\", [this](const Req&, Res& res) {\n"
+        "    dispatch_fn_(a); // trailing\n"
+        "});\n"
+        "/* sink.Get(\"/synthetic/commented-out\", h); */\n"
+        "sink.Get(\"/synthetic/after\", [](const Req&, Res&) {});\n";
+    std::size_t dropped = 0;
+    const auto regs = extract_get_registrations("x.cpp", text, &dropped);
+    REQUIRE(regs.size() == 3);
+    CHECK(dropped == 0);
+    CHECK(regs[0].path == "/synthetic/block");
+    CHECK_FALSE(has_dispatch_marker(regs[0].handler)); // marker only inside a block comment
+    CHECK(regs[1].path == "/synthetic/glob/*");
+    CHECK(has_dispatch_marker(regs[1].handler)); // "/*" inside a literal is not a comment
+    CHECK(regs[2].path == "/synthetic/after");
+    CHECK(regs[2].line == 10); // line numbers survive stripped block comments
+    CHECK(count_raw_get_hits(text) == 4); // the commented-out one is raw noise only
+}
+
+TEST_CASE("same-site inventory: a registration the scan cannot span is counted as dropped",
+          "[csrf][same_site][route_inventory]") {
+    std::size_t dropped = 0;
+    const auto unbalanced =
+        extract_get_registrations("x.cpp", "sink.Get(\"/synthetic/open\", [](const Req&) {\n", &dropped);
+    CHECK(unbalanced.empty());
+    CHECK(dropped == 1);
+
+    dropped = 0;
+    const auto unterminated =
+        extract_get_registrations("x.cpp", "sink.Get(\"/synthetic/unterminated, h);\n", &dropped);
+    CHECK(unterminated.empty());
+    CHECK(dropped == 1);
+}
+
 TEST_CASE("same-site inventory: the GET scanner flags an unlisted dispatching handler",
           "[csrf][same_site][route_inventory]") {
     const std::string text =
@@ -683,6 +846,25 @@ TEST_CASE("same-site inventory: the GET scanner flags an unlisted dispatching ha
     CHECK(unlisted[1] == "x.cpp:5 /synthetic/regex/([0-9]+)");
     CHECK(unlisted[2].ends_with(" /synthetic/hop"));
     CHECK(unlisted[3].ends_with(" <computed>"));
+}
+
+TEST_CASE("same-site inventory: every dispatch marker is detected",
+          "[csrf][same_site][route_inventory]") {
+    std::vector<std::string_view> markers(kDispatchMarkers.begin(), kDispatchMarkers.end());
+    markers.insert(markers.end(), kStateChangeMarkers.begin(), kStateChangeMarkers.end());
+    for (const auto marker : markers) {
+        CAPTURE(marker);
+        // Close the call parenthesis the marker opens so the registration still balances.
+        const std::string text = "sink.Get(\"/synthetic/m\", [](const Req&, Res&) { " +
+                                 std::string(marker) + (marker.back() == '(' ? ")" : "") +
+                                 "; });\n";
+        std::size_t dropped = 0;
+        const auto regs = extract_get_registrations("x.cpp", text, &dropped);
+        REQUIRE(regs.size() == 1);
+        CHECK(dropped == 0);
+        CHECK(has_dispatch_marker(regs[0].handler));
+        CHECK(unlisted_dispatching_reads(regs).size() == 1);
+    }
 }
 
 TEST_CASE("same-site inventory: the GET scanner passes a guarded table path",

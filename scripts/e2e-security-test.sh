@@ -559,7 +559,8 @@ assert_not_contains "/readyz does NOT use error envelope" '"error"' "$READYZ_BOD
 # gate: it drives a REAL server over a REAL socket, so it sees the pre-routing
 # pipeline that the in-process unit fixture only models and that the lexical
 # source check (tests/test_same_site_wiring_lexical.py) can only approximate.
-# Every case asserts BOTH the HTTP status AND the message text, and a transport
+# Every case asserts the HTTP status, and the message text wherever a body exists
+# (a HEAD refusal has none, so its audit row carries the rest); a transport
 # failure (000) is a failure, so none of them can pass vacuously. After the
 # refusals the audit REST API is read back: every refusal must have left one
 # `csrf.denied` row (denied, `<METHOD> <path>` target, closed-set reason, the
@@ -574,6 +575,10 @@ SS_WRITE_BODY='{"this is invalid'     # deterministic non-403 for a same-site ca
 # handler answers 400 before it dispatches anything (admitted calls never start work).
 SS_GUARDED_GET_PATH="/fragments/device/live/run"
 SS_GUARDED_GET_QUERY="?id=e2e-same-site-probe&kind=e2e-no-such-kind"
+# The same rule on the token-reachable (v1) twin of a guarded read. A non-positive machines_max
+# is answered 400 by the handler before it does any work, so an admitted call changes nothing.
+SS_GUARDED_REST_PATH="/api/v1/viz/fleet/topology"
+SS_GUARDED_REST_QUERY="?machines_max=0"
 SS_QUERY=""                           # appended to the URL only (the audit target has no query)
 SS_MESSAGE="cross-site request refused"
 # The gate's own remediation text. The refusal message alone is also emitted by other per-route
@@ -736,6 +741,19 @@ if [[ -n "$ADMIN_PASS" ]]; then
         -b "$COOKIE_JAR" -H "Sec-Fetch-Site: cross-site"
     ss_expect_refused "cookie-session guarded HEAD without fetch metadata, Origin or Referer is refused" no_origin_no_referer \
         -b "$COOKIE_JAR"
+    ss_expect_answered "cookie-session guarded HEAD with same-origin fetch metadata reaches the handler" \
+        -b "$COOKIE_JAR" -H "Sec-Fetch-Site: same-origin"
+
+    # The v1 twin of a guarded read follows the same rule for cookie sessions.
+    SS_METHOD="GET"
+    SS_WRITE_PATH="$SS_GUARDED_REST_PATH"
+    SS_QUERY="$SS_GUARDED_REST_QUERY"
+    ss_expect_refused "cookie-session guarded v1 read with cross-site fetch metadata is refused" origin_mismatch \
+        -b "$COOKIE_JAR" -H "Sec-Fetch-Site: cross-site"
+    ss_expect_refused "cookie-session guarded v1 read without fetch metadata, Origin or Referer is refused" no_origin_no_referer \
+        -b "$COOKIE_JAR"
+    ss_expect_answered "cookie-session guarded v1 read with same-origin fetch metadata reaches the handler" \
+        -b "$COOKIE_JAR" -H "Sec-Fetch-Site: same-origin"
     SS_METHOD="POST"
     SS_WRITE_PATH="/api/command"
     SS_QUERY=""
@@ -833,6 +851,10 @@ if [[ -n "$ADMIN_PASS" ]]; then
         SS_QUERY="$SS_GUARDED_GET_QUERY"
         SS_ADMIT_RE='^400$'
         ss_expect_answered "bearer-token guarded read without fetch metadata, Origin or Referer is not refused by the central check" \
+            -H "Authorization: Bearer ${SS_TOKEN}"
+        SS_WRITE_PATH="$SS_GUARDED_REST_PATH"
+        SS_QUERY="$SS_GUARDED_REST_QUERY"
+        ss_expect_answered "bearer-token guarded v1 read without fetch metadata, Origin or Referer is not refused by the central check" \
             -H "Authorization: Bearer ${SS_TOKEN}"
         SS_METHOD="POST"
         SS_WRITE_PATH="/api/command"
