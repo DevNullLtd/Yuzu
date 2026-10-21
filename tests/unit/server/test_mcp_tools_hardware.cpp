@@ -20,6 +20,7 @@
 #include "mcp_server_testonly.hpp"
 #include "mcp_tool_deps.hpp"
 #include "mcp_tool_registry.hpp"
+#include "test_json_schema_subset.hpp"
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -39,6 +40,7 @@
 using namespace yuzu::server;
 using json = nlohmann::json;
 namespace mcp = yuzu::server::mcp;
+using yuzu::test::schema_violation;
 
 namespace {
 
@@ -301,54 +303,6 @@ bool has(const std::vector<std::string>& v, const std::string& s) {
     return std::find(v.begin(), v.end(), s) != v.end();
 }
 
-// A subset JSON-Schema check sufficient for the output schemas these tools publish: type
-// (string or array of strings), properties (no extra keys), required, items, enum. Returns
-// the first violation, or "" when `v` conforms.
-std::string schema_violation(const json& schema, const json& v, const std::string& path = "") {
-    if (schema.contains("type")) {
-        std::vector<std::string> types;
-        if (schema["type"].is_array())
-            for (const auto& t : schema["type"])
-                types.push_back(t.get<std::string>());
-        else
-            types.push_back(schema["type"].get<std::string>());
-        bool ok = false;
-        for (const auto& t : types) {
-            if ((t == "object" && v.is_object()) || (t == "array" && v.is_array()) ||
-                (t == "string" && v.is_string()) || (t == "integer" && v.is_number_integer()) ||
-                (t == "number" && v.is_number()) || (t == "boolean" && v.is_boolean()) ||
-                (t == "null" && v.is_null()))
-                ok = true;
-        }
-        if (!ok)
-            return path + ": type mismatch, value " + v.dump();
-    }
-    if (schema.contains("enum")) {
-        bool ok = false;
-        for (const auto& e : schema["enum"])
-            ok = ok || e == v;
-        if (!ok)
-            return path + ": not in enum, value " + v.dump();
-    }
-    if (v.is_object() && schema.contains("properties")) {
-        for (const auto& [k, sub] : v.items()) {
-            if (!schema["properties"].contains(k))
-                return path + "/" + k + ": key not declared in the schema";
-            if (auto r = schema_violation(schema["properties"][k], sub, path + "/" + k); !r.empty())
-                return r;
-        }
-        if (schema.contains("required"))
-            for (const auto& req : schema["required"])
-                if (!v.contains(req.get<std::string>()))
-                    return path + ": required key " + req.get<std::string>() + " is missing";
-    }
-    if (v.is_array() && schema.contains("items"))
-        for (std::size_t i = 0; i < v.size(); ++i)
-            if (auto r = schema_violation(schema["items"], v[i], path + "/" + std::to_string(i));
-                !r.empty())
-                return r;
-    return "";
-}
 
 const json& tool_entry(const json& tools_list_result, const std::string& name) {
     for (const auto& t : tools_list_result["result"]["tools"])
@@ -462,7 +416,10 @@ TEST_CASE("mcp hardware twins: a confined caller sees only its scope, and a hidd
     const auto& sc = list["result"]["structuredContent"];
     REQUIRE(sc["devices"].size() == 1);
     CHECK(sc["devices"][0]["agent_id"] == "a");
-    CHECK(sc["devices_omitted"] == 1);
+    // A confined caller is never told how many devices lie outside its scope (an existence
+    // oracle, ADR-0032/0033/0017 INV-3): the count is absent and the status says why.
+    CHECK_FALSE(sc.contains("devices_omitted"));
+    CHECK(sc["scope_basis"] == "authority_scoped");
     CHECK(sc["count"] == 1);
     CHECK(sc["kpis"]["total"] == 1); // KPIs describe the caller's fleet, not the whole one
     CHECK(t.dex_calls_for == std::vector<std::string>{"a"});
@@ -828,12 +785,25 @@ TEST_CASE("mcp hardware twins: list_hardware_ci is the REST data object byte for
             const json mcp = t.call("list_hardware_ci", p.mcp_args);
             REQUIRE_FALSE(mcp.contains("error"));
             const auto& result = mcp["result"];
-            CHECK(result["structuredContent"].dump() == rest.dump());
-            CHECK(result["content"][0]["text"].get<std::string>() == rest.dump());
+            // Global read: the REST bytes exactly. Confined: the REST object with the omitted
+            // count replaced by the scope status, the single deliberate difference.
+            json expected = rest;
+            if (scope_case) {
+                expected.erase("devices_omitted");
+                expected["scope_basis"] = "authority_scoped";
+            }
+            if (!scope_case) {
+                CHECK(result["structuredContent"]["devices_omitted"] == 0);
+                CHECK_FALSE(result["structuredContent"].contains("scope_basis"));
+            }
+            CHECK(result["structuredContent"].dump() == expected.dump());
+            CHECK(result["content"][0]["text"].get<std::string>() == expected.dump());
         }
     }
     CHECK(t.scope.has_value());
-    CHECK(t.call("list_hardware_ci")["result"]["structuredContent"]["devices_omitted"] == 1);
+    const auto confined = t.call("list_hardware_ci")["result"]["structuredContent"];
+    CHECK_FALSE(confined.contains("devices_omitted"));
+    CHECK(confined["scope_basis"] == "authority_scoped");
 }
 
 TEST_CASE("mcp hardware twins: get_hardware_ci is the REST data object byte for byte",
@@ -916,7 +886,8 @@ TEST_CASE("mcp hardware twins: the domain and generic rows carry the REST verbs 
     REQUIRE_FALSE(t.call("list_hardware_ci").contains("error"));
     REQUIRE(t.domain_rows.size() == 1);
     CHECK(t.domain_rows[0] == "inventory.devices|success|Inventory|fleet");
-    CHECK(t.domain_details[0] == "hardware list (MCP): devices=1 omitted=1");
+    // The audit detail carries the scope status, never the hidden-device count.
+    CHECK(t.domain_details[0] == "hardware list (MCP): devices=1 scope=authority_scoped");
     CHECK(t.generic_rows == std::vector<std::string>{"mcp.list_hardware_ci|success"});
 
     // REST writes the same verb, target and detail shape for the same read.
@@ -1123,7 +1094,8 @@ TEST_CASE("mcp hardware twins: a present-empty scope is deny-all, never the whol
     const auto& sc = list["result"]["structuredContent"];
     CHECK(sc["devices"].empty());
     CHECK(sc["count"] == 0);
-    CHECK(sc["devices_omitted"] == 2);
+    CHECK_FALSE(sc.contains("devices_omitted"));
+    CHECK(sc["scope_basis"] == "authority_scoped");
     CHECK(sc["kpis"]["total"] == 0);
     CHECK(t.dex_calls_for.empty());
 

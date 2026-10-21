@@ -26,6 +26,7 @@
 #include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
+#include "test_json_schema_subset.hpp"
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -564,6 +565,58 @@ yuzu::test::PgTestTemplate quarantine_twin_tpl{"quarantinestore", [](const std::
 }};
 
 } // namespace
+
+TEST_CASE("list_quarantined_devices: every served body conforms to the output schema tools/list publishes",
+          "[mcp][quarantine][containment_twin]") {
+    ContainmentHarness h;
+    h.records = {make_record("agent-1", 200, "r", "10.0.0.1"), make_record("agent-2", 100),
+                 make_record("agent-3", 50)};
+    h.records[1].last_applied_at = 1710849600;
+    h.records[1].last_confirmed_at = 1710849675;
+    h.start();
+
+    // The schema as served, not the constant in the .cpp: schema-only drift fails here.
+    httplib::Request lr;
+    lr.method = "POST";
+    lr.path = "/mcp/v1/";
+    lr.body = R"({"jsonrpc":"2.0","method":"tools/list","id":1})";
+    lr.set_header("Content-Type", "application/json");
+    httplib::Response lres;
+    lres.status = 200;
+    h.handler(lr, lres);
+    nlohmann::json schema;
+    for (const auto& t : nlohmann::json::parse(lres.body)["result"]["tools"])
+        if (t["name"] == "list_quarantined_devices")
+            schema = t["outputSchema"];
+    REQUIRE(schema.is_object());
+
+    SECTION("success with records") {
+        const auto res = h.call(nlohmann::json::object());
+        const auto sc = ContainmentHarness::result_of(*res)["structuredContent"];
+        CHECK(yuzu::test::schema_violation(schema, sc) == "");
+        CHECK(sc["count"] == 3);
+    }
+    SECTION("empty list") {
+        h.records.clear();
+        const auto res = h.call(nlohmann::json::object());
+        const auto sc = ContainmentHarness::result_of(*res)["structuredContent"];
+        CHECK(yuzu::test::schema_violation(schema, sc) == "");
+        CHECK(sc["quarantined"].empty());
+    }
+    SECTION("more:true when the limit truncates") {
+        const auto res = h.call({{"limit", 2}});
+        const auto sc = ContainmentHarness::result_of(*res)["structuredContent"];
+        CHECK(yuzu::test::schema_violation(schema, sc) == "");
+        CHECK(sc["more"] == true);
+    }
+    SECTION("audit_persisted:false when the audit row is dropped") {
+        h.audit_succeeds = false;
+        const auto res = h.call(nlohmann::json::object());
+        const auto sc = ContainmentHarness::result_of(*res)["structuredContent"];
+        CHECK(yuzu::test::schema_violation(schema, sc) == "");
+        CHECK(sc["audit_persisted"] == false);
+    }
+}
 
 TEST_CASE("list_quarantined_devices: MCP array equals the REST GET /api/v1/quarantine data array over one real store",
           "[mcp][quarantine][containment_twin][byte_pin][pg]") {
