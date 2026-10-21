@@ -773,6 +773,10 @@ inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tal
         const SrcOutcome lo = classify_read(FileReadLike{{}, ReadErr::io, lerr}, os, "homes");
         out.homes_state = lo.state;
         t.note(lo);
+        // A partial listing read the roots that did list, so the aggregate is constrained and
+        // never permission_denied (that status means no source was read at all).
+        if (!homes.empty())
+            ++t.read_sources;
     }
     if (too_many)
         t.acc.add_failure(src_token(os, "homes", "too_many"));

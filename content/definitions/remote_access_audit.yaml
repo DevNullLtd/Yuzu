@@ -81,10 +81,9 @@ metadata:
     users' homes, so constrained is the common outcome), never as an empty result. A line
     whose key type this plugin does not know is counted as malformed and never reported as a
     key (its blob cannot be decoded completely). Reads one machine per request and is off
-    until enabled. The Windows leg is
-    planned and not yet read. The first row is a status row stating whether the read was
-    complete; if a leg threw after its rows had started, a second unsupported status row
-    follows and is the one that counts.
+    until enabled. The Windows leg is planned and not yet read. The first row is a status row
+    stating whether the read was complete; if a leg threw after its rows had started, a
+    second unsupported status row follows and is the one that counts.
   tags: [remote_access, ssh, security, posture, forensics]
 
 spec:
@@ -130,7 +129,7 @@ spec:
         platforms: [linux, darwin]
       - name: field_5
         type: string
-        description: 'file: the number of lines sshd would not accept (unparseable key, unknown option, unknown key type, truncated or trailing-byte blob or certificate signature, RSA under 1024 bits), "-" unless read. key: the key size in bits (RSA modulus, 256 for ed25519, the curve size for ECDSA).'
+        description: 'file: the number of lines sshd would not accept (unparseable key, unknown option, unknown key type, a truncated or trailing-byte blob, a certificate signature that is truncated or has trailing bytes, RSA under 1024 bits), "-" unless read. key: the key size in bits (RSA modulus, 256 for ed25519, the curve size for ECDSA).'
         example: '256'
         platforms: [linux, darwin]
       - name: field_6

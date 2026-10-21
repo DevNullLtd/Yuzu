@@ -247,7 +247,7 @@ TEST_CASE("remote_access_audit keys: sk keys and an unknown key type", "[remote_
 TEST_CASE("remote_access_audit keys: an option clause is never accepted as an unknown key type",
           "[remote_access_audit][keys]") {
     // RECONSTRUCTION of the hostile shape: the first token is an option clause and the blob
-    // that follows leads with that same token, so the unknown-type fallback would otherwise
+    // that follows leads with that same token, so a path that kept an unknown type would otherwise
     // write the clause (and its value) into the key row's type column verbatim.
     const std::string secret = "PRIVATE_OPTION_VALUE";
     for (const std::string& clause : {"command=\"" + secret + "\"", "from=\"" + secret + "\"",
@@ -397,8 +397,12 @@ TEST_CASE("remote_access_audit keys: every certificate field is checked, one mut
         // C2: ssh-keygen -lf (OpenSSH 10) rejects each of these ("incomplete message" /
         // "unexpected bytes remain after decoding"); the type string alone is not enough.
         {"a signature of only its type string", [](CertParts& c) { c.sig = str("ssh-ed25519"); }, false},
+        // (these two are also refused by the Reader's own bounds; they pin that bound, not C2)
         {"a signature whose payload is not a string", [](CertParts& c) { c.sig = str("ssh-ed25519") + "\1\2"s; }, false},
         {"a signature with a truncated payload", [](CertParts& c) { c.sig = str("ssh-ed25519") + u32be(64) + std::string(10, '\2'); }, false},
+        // OpenSSH reads the algorithm as a C string: an embedded NUL is refused
+        {"a signature algorithm with an embedded NUL",
+         [](CertParts& c) { c.sig = str(std::string("ssh-ed25519\0x", 13)) + str(std::string(64, '\2')); }, false},
         {"a signature with trailing bytes after the payload", [](CertParts& c) { c.sig = str("ssh-ed25519") + str(std::string(64, '\2')) + "\0"s; }, false},
         // a security-key algorithm carries a flags byte and a counter after the payload
         {"an sk signature with its flags and counter",
@@ -409,6 +413,15 @@ TEST_CASE("remote_access_audit keys: every certificate field is checked, one mut
          [](CertParts& c) { c.sig = str("sk-ssh-ed25519@openssh.com") + str(std::string(64, '\2')) + "\x01" + u32be(5) + "x"; }, false},
         {"a non-sk signature carrying a flags and counter tail",
          [](CertParts& c) { c.sig = str("ssh-ed25519") + str(std::string(64, '\2')) + "\x01" + u32be(5); }, false},
+        // KNOWN LIMIT, pinned: a WebAuthn security-key signature carries further fields (origin,
+        // client data, extensions) after its flags and counter that this plugin does not decode,
+        // so such a certificate is refused as malformed (README caveat 2 says so).
+        {"a webauthn-sk signature (extra fields not decoded)",
+         [](CertParts& c) {
+             c.sig = str("webauthn-sk-ecdsa-sha2-nistp256@openssh.com") + str(std::string(64, '\2')) + "\x01" +
+                     u32be(5) + str("https://example.test") + str("{}") + str("");
+         },
+         false},
     };
     for (const auto& tc : cases) {
         INFO(tc.what);

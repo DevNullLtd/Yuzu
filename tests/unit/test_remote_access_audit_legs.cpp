@@ -960,7 +960,7 @@ TEST_CASE("remote_access_audit legs: malformed lines and unknown key types make 
 
     // A key of a type the plugin does not know is refused, counted malformed, never reported as
     // a key (its blob cannot be decoded completely); the listing says why with its own token.
-    // REAL SHAPE: an ssh-dss line whose blob leads with its own name (constructed blob).
+    // CONSTRUCTED: an ssh-dss line whose blob leads with its own name.
     f = healthy();
     f.homes = {home("alice")};
     f.key_files["/home/alice/.ssh/authorized_keys"] =
@@ -989,6 +989,39 @@ TEST_CASE("remote_access_audit legs: a partial homes listing still audits the ho
     CHECK(has_token(l, "linux:remote_access_audit:homes:permission_denied"));
     CHECK(row_with(l.rows, "file|alice|authorized_keys|") == "file|alice|authorized_keys|read|1|0|0");
     CHECK(kind_rows(l, "key").size() == 1);
+    CHECK(l.status == StatusState::constrained);
+}
+
+TEST_CASE("remote_access_audit legs: partial sources decide the aggregate status",
+          "[remote_access_audit][legs]") {
+    // permission_denied means a refusal and NO source read. MUTATION: counting a mixed service
+    // result (one unit answered, another failed) as a read source turns case A into constrained.
+    auto f = healthy();
+    f.config_files["/etc/ssh/sshd_config"] = err(EACCES); // refused
+    f.homes_err = ENOENT;                                  // no home root: absent
+    f.runner = [](const std::vector<std::string>& args) {
+        if (args[1] == "ssh.service")
+            return ran("enabled\n", 0);
+        return died(yuzu::agent::TerminationReason::deadline);
+    };
+    auto l = list_posix(f.build());
+    CHECK(l.rows[2] == "source|service|failed|-");
+    CHECK(has_token(l, "linux:remote_access_audit:sshd_config:permission_denied"));
+    CHECK(l.status == StatusState::permission_denied);
+
+    // Case B: nothing else was read, but a partial home listing recovered a readable key file.
+    // That is partial evidence, so the aggregate is constrained, not permission_denied.
+    // MUTATION: not counting a partial listing as a read source turns this into permission_denied.
+    f = healthy();
+    f.config_files.erase("/etc/ssh/sshd_config"); // absent
+    f.runner = nullptr;                             // systemctl unavailable: the service source fails
+    f.homes = {home("alice")};
+    f.homes_err = EACCES;
+    f.key_files["/home/alice/.ssh/authorized_keys"] = ok(kAliceKey);
+    l = list_posix(f.build());
+    CHECK(l.rows[1] == "source|homes|refused|-|-");
+    CHECK(kind_rows(l, "key").size() == 1);
+    CHECK(has_token(l, "linux:remote_access_audit:homes:permission_denied"));
     CHECK(l.status == StatusState::constrained);
 }
 
