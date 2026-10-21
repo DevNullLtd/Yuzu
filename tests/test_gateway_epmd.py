@@ -361,6 +361,13 @@ class StopTest(unittest.TestCase):
             self.assertFalse(ok)
             self.assertEqual(len(said), 1)
 
+    def test_a_closed_stdout_at_exit_does_not_raise_either(self):
+        def closed(msg, **kw):
+            raise ValueError("I/O operation on closed file")
+
+        ok = ge.stop("24242", {"PATH": "p"}, which=lambda name, path=None: None, say=closed)
+        self.assertFalse(ok)
+
 
 class WrapperWiringTest(unittest.TestCase):
     def setUp(self):

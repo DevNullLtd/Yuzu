@@ -142,8 +142,11 @@ def stop(port, env, which=shutil.which, run=subprocess.run, glob_=glob.glob, say
     except Exception:  # noqa: BLE001 - exit-time cleanup, never fatal
         stopped = False
     if not stopped:
-        say(f"[test_gateway.py] the run-private epmd on port {port} may still be running; "
-            f"stop it with: epmd -port {port} -kill", flush=True)
+        try:
+            say(f"[test_gateway.py] the run-private epmd on port {port} may still be running; "
+                f"stop it with: epmd -port {port} -kill", flush=True)
+        except Exception:  # noqa: BLE001 - a closed stdout at exit has nobody left to tell either
+            pass
     return stopped
 
 
