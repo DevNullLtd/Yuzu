@@ -321,18 +321,24 @@ class WorkflowWiringTests(unittest.TestCase):
         return match.group(1)
 
     def test_weetam_gate_matches_every_windows_consumer(self) -> None:
-        for workflow, job_name in (("ci.yml", "windows"), ("nightly.yml", "windows-asan")):
+        # ci.yml's pool probe lives in the fast `preflight-gate` job (the required
+        # `preflight` check carries only the source gates); nightly.yml still has
+        # the one `preflight` job.
+        for workflow, job_name, gate in (
+            ("ci.yml", "windows", "preflight-gate"),
+            ("nightly.yml", "windows-asan", "preflight"),
+        ):
             with self.subTest(workflow=workflow, job=job_name):
                 job = self.job(workflow, job_name)
                 self.assertRegex(
                     job,
                     r"(?m)^    runs-on: \[self-hosted, Windows, X64, yuzu-weetam-windows\]$",
                 )
-                self.assertIn("needs.preflight.outputs.weetam_pool_healthy == 'true'", job)
+                self.assertIn(f"needs.{gate}.outputs.weetam_pool_healthy == 'true'", job)
 
-        for workflow in ("ci.yml", "nightly.yml"):
+        for workflow, gate in (("ci.yml", "preflight-gate"), ("nightly.yml", "preflight")):
             with self.subTest(workflow=workflow):
-                preflight = self.job(workflow, "preflight")
+                preflight = self.job(workflow, gate)
                 self.assertIn("--require-pool weetam", preflight)
                 self.assertIn("weetam_pool_healthy", preflight)
 
@@ -344,11 +350,11 @@ class WorkflowWiringTests(unittest.TestCase):
                     job,
                     r"(?m)^    runs-on: \[self-hosted, macOS, ARM64, yuzu-bigmags-macos\]$",
                 )
-                self.assertIn("needs.preflight.outputs.bigmags_pool_healthy == 'true'", job)
+                self.assertIn("needs.preflight-gate.outputs.bigmags_pool_healthy == 'true'", job)
 
         for workflow in ("ci.yml",):
             with self.subTest(workflow=workflow):
-                preflight = self.job(workflow, "preflight")
+                preflight = self.job(workflow, "preflight-gate")
                 self.assertIn("--require-pool bigmags", preflight)
                 self.assertIn("bigmags_pool_healthy", preflight)
 
@@ -363,7 +369,7 @@ class WorkflowWiringTests(unittest.TestCase):
                 self.assertIn(name_line, self.job(workflow, "preflight"))
 
     def test_automatic_fork_detection_comes_from_the_event_payload(self) -> None:
-        preflight = self.job("ci.yml", "preflight")
+        preflight = self.job("ci.yml", "preflight-gate")
         self.assertIn(
             "GITHUB_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}",
             preflight,
@@ -376,14 +382,54 @@ class WorkflowWiringTests(unittest.TestCase):
 
     def test_trusted_call_uses_its_input_and_always_verifies_checkout(self) -> None:
         trusted_inputs = self.job("ci.yml", "trusted_inputs")
+        gate = self.job("ci.yml", "preflight-gate")
         preflight = self.job("ci.yml", "preflight")
         self.assertIn('if [[ -z "$APPROVED_SHA" ]]', trusted_inputs)
         self.assertNotIn("EVENT_NAME", trusted_inputs)
         self.assertIn("checkout_sha=$head_sha", trusted_inputs)
         self.assertIn("trusted_execution=true", trusted_inputs)
-        self.assertIn("ref: ${{ github.workflow_sha }}", preflight)
+        self.assertIn("ref: ${{ github.workflow_sha }}", gate)
         self.assertIn("- name: Verify resolved checkout", preflight)
         self.assertNotIn("if: github.event_name == 'workflow_call'", preflight)
+        self.assertNotIn("if: github.event_name == 'workflow_call'", gate)
+
+    def test_ci_preflight_split_wiring(self) -> None:
+        """The required check name stays on `preflight`; the fast `preflight-gate`
+        job feeds every consumer, and `preflight` fails closed on it."""
+        gate = self.job("ci.yml", "preflight-gate")
+        for pool in ("bigtam", "weetam", "bigmags"):
+            self.assertIn(f"--require-pool {pool}", gate)
+        self.assertIn("id: codegate", gate)
+        self.assertIn("id: health", gate)
+        self.assertIn("secrets.RUNNER_INVENTORY_TOKEN", gate)
+        self.assertIn('name: "Preflight (gate)"', gate)
+
+        preflight = self.job("ci.yml", "preflight")
+        self.assertIn('name: "Preflight (runner health)"', preflight)
+        self.assertIn("needs: [trusted_inputs, preflight-gate]", preflight)
+        self.assertIn("if: ${{ !cancelled() }}", preflight)
+        self.assertIn("needs.preflight-gate.result", preflight)
+        # The only step that sees the administration-scoped token is in the gate.
+        self.assertNotIn("secrets.RUNNER_INVENTORY_TOKEN", preflight)
+
+        for job_name, pool in (
+            ("proto-compat", "linux"),
+            ("linux", "bigtam"),
+            ("windows", "weetam"),
+            ("macos", "bigmags"),
+        ):
+            with self.subTest(job=job_name):
+                job = self.job("ci.yml", job_name)
+                self.assertIn("needs: [preflight-gate]", job)
+                self.assertIn(
+                    f"needs.preflight-gate.outputs.{pool}_pool_healthy == 'true'", job
+                )
+                self.assertIn("needs.preflight-gate.outputs.code_changed == 'true'", job)
+        stub = self.job("ci.yml", "docs-required-checks")
+        self.assertIn("needs: [preflight-gate]", stub)
+        self.assertIn("needs.preflight-gate.outputs.code_changed == 'false'", stub)
+        text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertNotRegex(text, r"needs\.preflight\.outputs\.")
 
     def test_trusted_fork_secret_and_cache_boundaries_are_explicit(self) -> None:
         wrapper = (ROOT / ".github" / "workflows" / "trusted-fork-ci.yml").read_text(
@@ -435,7 +481,7 @@ class WorkflowWiringTests(unittest.TestCase):
             with self.subTest(job=job_name):
                 job = self.job("ci.yml", job_name)
                 self.assertIn(
-                    "clean: ${{ needs.preflight.outputs.trusted_execution == 'true' }}",
+                    "clean: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' }}",
                     job,
                 )
                 self.assertIn("VCPKG_BINARY_SOURCES=clear", job)
@@ -502,7 +548,7 @@ class WorkflowWiringTests(unittest.TestCase):
         with self.subTest(job="macos"):
             job = self.job("ci.yml", "macos")
             self.assertNotIn(
-                "clean: ${{ needs.preflight.outputs.trusted_execution == 'true' }}",
+                "clean: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' }}",
                 job,
             )
             self.assertIn("VCPKG_BINARY_SOURCES=clear", job)
