@@ -10,7 +10,17 @@
 ///    that window. A stretch no region covers renders "Coverage not stated"; the renderer
 ///    never assumes a stretch is exact (empty is not exact).
 ///  - Items outside the window are ignored by layout.
-///  - `moment_ts == 0` means "the newest event in the read".
+///  - `moment_ts == 0` means "the newest event boundary in the window" (a bar's start or end, a
+///    tick, a bucket's or sample's start); the renderers resolve it with
+///    tar_timeline_resolve_moment. A route that renders the moment or selected panel passes
+///    the same t it set as `moment_ts` (0 is resolved the same way there).
+///  - The model is bounded by its filler: rows read, lanes, regions per lane, items, facts and
+///    string lengths, and so the rendered bytes. The renderers cap what they draw per lane
+///    (and the selected panel's facts and links) and say so, but they do not bound the model.
+///  - Item ids are unique across the model. An empty id is not selectable, and of two items
+///    with one id the renderer shows the first.
+///  - Within a lane, the region drawn on top where regions overlap is the one that starts
+///    later (a tie goes to the later in vector order); tar_timeline_region_at agrees.
 ///  - TarKeptBand::oldest_ts is MEASURED coverage: the oldest row or bucket the engine
 ///    observed for that tier on this device (0 = none observed). It is an absolute
 ///    boundary, never a duration, and never a projected reach.
@@ -25,7 +35,7 @@
 ///
 /// There is deliberately no fleet, story, server-lane or incident field.
 ///
-/// Design to repo class map (the artboard's three prefixes all became `.tl-`):
+/// Design to repo class map (the design's three prefixes all became `.tl-`):
 ///   .tm-top -> .tl-top   .tm-host -> .tl-host  .tm-ctl -> .tl-ctl  .tm-leg -> .tl-leg
 ///   .tm-b   -> .tl-b     .tm-c    -> .tl-c     .tm-d   -> .tl-d    .tm-k   -> .tl-k
 ///   .tm-t   -> .tl-t     .tl-gap  -> .tl-rg    .tm-sh  -> .tl-sh   .tm-pr  -> .tl-pr
@@ -68,7 +78,7 @@ struct TarTimelineRegion {
 
 /// One drawable thing on a lane.
 struct TarTimelineItem {
-    std::string id;
+    std::string id; ///< unique across the model; empty = not selectable
     TarItemShape shape = TarItemShape::bar;
     std::int64_t from_ts = 0;
     /// bar: 0 = still open at window end. count/column: the bucket or sample end.
@@ -106,7 +116,11 @@ struct TarSourceState {
     std::string source;
     std::string label;
     bool enabled = true;
-    std::int64_t paused_since_ts = 0; ///< 0 = not paused
+    /// Set when the source is paused. A known pause time (`paused_since_ts > 0`) also means
+    /// paused, so only a pause with no reported time needs this.
+    bool paused = false;
+    /// When it was paused; with `paused` set, 0 = since a time the agent did not report.
+    std::int64_t paused_since_ts = 0;
 };
 
 /// Measured coverage and configured policy for one tier of one source.
@@ -122,6 +136,8 @@ struct TarKeptRow {
     std::string label;
     std::int64_t row_limit = 0; ///< exact tier row limit; 0 = time-limited
     std::vector<TarKeptBand> bands;
+    /// As TarSourceState::paused / paused_since_ts.
+    bool paused = false;
     std::int64_t paused_since_ts = 0;
     /// Set when the band measurement for this source could not be made (the read failed, or
     /// the agent is too old to report per-source coverage). Engine-filled, like regions. It is
@@ -139,7 +155,7 @@ struct TarTimelineModel {
     std::int64_t read_ts = 0;
     std::int64_t window_from_ts = 0;
     std::int64_t window_to_ts = 0;
-    std::int64_t moment_ts = 0; ///< 0 = newest event in the read
+    std::int64_t moment_ts = 0; ///< 0 = the newest event boundary in the window (see the contract)
     std::optional<int> poll_interval_s;
     std::string process_capture_method;
     std::vector<TarSourceState> sources;
@@ -148,7 +164,11 @@ struct TarTimelineModel {
 };
 
 /// Every URL the renderers emit is injected; none is pinned here. URLs are server-built
-/// relative paths: the renderers escape them for HTML and do not validate a scheme.
+/// relative paths: the renderers escape them for HTML and do not validate a scheme, so a builder
+/// MUST percent-encode every id it embeds (url_encode / path_segment_ok in web_utils.hpp) and
+/// return a path starting with a single '/'. The ids it is given are unique across the model.
+/// Linking a DNS item to a process is the engine's guarantee through `linked_ids`; the renderer
+/// never joins DNS to a process and does not filter the ids it is given.
 struct TarTimelineLinks {
     std::function<std::string(std::int64_t)> moment;                       ///< moment(ts)
     std::function<std::string(const std::string&, std::int64_t)> selected; ///< selected(id, ts)

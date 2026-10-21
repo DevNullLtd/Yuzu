@@ -16,8 +16,25 @@ namespace {
 
 // ── small helpers ───────────────────────────────────────────────────────────────────
 
+/// The latest instant the renderer will state or lay out as a time (9999-12-31T23:59:59Z).
+/// Past it neither the civil-calendar helpers nor format_iso_utc has a valid answer, so a time
+/// beyond it is never computed with or printed.
+constexpr std::int64_t kTarTimelineMaxTs = 253402300799;
+
+/// The selected panel shows at most this many engine facts and linked items; the rest are
+/// counted ("and N more"), so one runaway item cannot grow the panel without bound.
+constexpr std::size_t kMaxSelectedFacts = 40;
+constexpr std::size_t kMaxSelectedLinks = 24;
+
 std::string esc(const std::string& s) { return html_escape(s); }
-std::string iso(std::int64_t ts) { return format_iso_utc(ts); }
+
+/// A stated time. A time past kTarTimelineMaxTs is said in words, never formatted: the shared
+/// formatter prints a zeroed "1900-01-00" for it, which would read as a date. A time <= 0 keeps
+/// the formatter's "never" dash.
+std::string iso(std::int64_t ts) {
+    return ts > kTarTimelineMaxTs ? std::string("a time outside the recordable range")
+                                  : format_iso_utc(ts);
+}
 std::string num(std::int64_t n) { return std::to_string(n); }
 std::string fix3(double v) { return std::format("{:.3f}", v); }
 
@@ -76,23 +93,24 @@ struct TierText {
 };
 constexpr std::array<TierText, 4> kTierText{{
     {"Exact records", "record", "exact", "l"},
-    {"Hourly counts", "hour", "hourly", "h1"},
-    {"Daily counts", "day", "daily", "h2"},
-    {"Monthly counts", "month", "monthly", "h3"},
+    {"Hourly roll-up", "hour", "hourly", "h1"},
+    {"Daily roll-up", "day", "daily", "h2"},
+    {"Monthly roll-up", "month", "monthly", "h3"},
 }};
 static_assert(static_cast<std::size_t>(TarTier::monthly) + 1 == kTierText.size());
 
-const TierText& tier_text(TarTier t) { return kTierText[static_cast<std::size_t>(t)]; }
+/// A tier value this build does not know (the engine casts an agent-reported byte): said as
+/// unknown, never clamped to a real tier.
+constexpr TierText kTierUnknown{"Roll-up, tier not stated", "record", "rolled-up", "h3"};
+
+const TierText& tier_text(TarTier t) {
+    const auto i = static_cast<std::size_t>(t);
+    return i < kTierText.size() ? kTierText[i] : kTierUnknown;
+}
 std::string tier_label(TarTier t) { return tier_text(t).label; }
 std::string tier_noun(TarTier t) { return tier_text(t).noun; }
 std::string tier_adverb(TarTier t) { return tier_text(t).adverb; }
 std::string tier_seg_class(TarTier t) { return tier_text(t).seg; }
-
-std::string capitalise(std::string s) {
-    if (!s.empty() && s[0] >= 'a' && s[0] <= 'z')
-        s[0] = static_cast<char>(s[0] - 'a' + 'A');
-    return s;
-}
 
 std::string unreadable_text(TarUnreadableReason r) {
     switch (r) {
@@ -106,9 +124,17 @@ std::string unreadable_text(TarUnreadableReason r) {
     return "device offline";
 }
 
-/// A paused source whose pause time the agent did not report (a pre-0.12.0 agent): said in
-/// words, never a date placeholder.
-constexpr const char* kPausedUnknown = "Not recorded: the source is paused";
+/// The tail every paused sentence shares: "since <ISO>", or in words when the agent did not
+/// report when (a pre-0.12.0 agent), never a date placeholder.
+std::string paused_since(std::int64_t ts) {
+    return ts > 0 ? "since " + iso(ts) : std::string("since a time the agent did not report");
+}
+
+/// A source or kept row is paused when it says so, or when it carries a pause time.
+template <class T>
+bool is_paused(const T& x) {
+    return x.paused || x.paused_since_ts > 0;
+}
 
 /// What a rolled-up bucket still holds, by source. Never a claim wider than the source.
 std::string holdings(const std::string& source, TarTier tier) {
@@ -180,13 +206,17 @@ struct Tick {
     std::string label;
 };
 
-/// Tick step by window span, after the artboard's tickList: 60 s, 5 min, 2 h, 1 d, 3 d,
-/// then month boundaries.
+/// Tick step by window span, after the design's tick list: 60 s, 5 min, 2 h, 1 d, 3 d, then
+/// month boundaries.
 std::vector<Tick> time_ticks(const TarTimelineModel& m) {
     std::vector<Tick> out;
-    const std::int64_t from = m.window_from_ts, to = m.window_to_ts, span = to - from;
-    if (span <= 0)
+    const std::int64_t from = m.window_from_ts, to = m.window_to_ts;
+    // A window outside 1970..9999 draws no ruler (nothing valid can be said about it). Inside it
+    // every branch below is bounded by construction: the linear steps yield at most 73 ticks,
+    // the month branch has its own guard, and no sum or difference below can overflow.
+    if (from <= 0 || to > kTarTimelineMaxTs || to <= from)
         return out;
+    const std::int64_t span = to - from;
     auto linear = [&](std::int64_t step, auto label) {
         for (std::int64_t x = (from + step - 1) / step * step; x <= to; x += step)
             out.push_back({x, label(x)});
@@ -299,8 +329,7 @@ std::string region_reason(const TarTimelineRegion& r) {
     case TarRegionKind::pruned:
         return "Pruned";
     case TarRegionKind::paused:
-        return r.paused_since_ts > 0 ? "Paused since " + iso(r.paused_since_ts)
-                                     : std::string(kPausedUnknown);
+        return "Paused " + paused_since(r.paused_since_ts);
     case TarRegionKind::not_readable:
         return "Not readable: " + unreadable_text(r.reason);
     case TarRegionKind::capped:
@@ -317,8 +346,11 @@ std::string region_div(const std::string& cls, double left, double width,
 }
 
 /// Regions as drawn: model regions clipped to the window, with a `.unstated` stretch for
-/// every part of the window no region covers. Exact regions draw nothing but are covered.
-std::string render_regions(const TarTimelineLane& lane, const TarTimelineModel& m) {
+/// every part of the window no region covers. Exact regions draw nothing but are covered. At
+/// most kTarTimelineMaxBlocksPerLane regions draw (by start time); `omitted` is how many more
+/// there were, and the rest of the window is one `.unstated` stretch that says so.
+std::string render_regions(const TarTimelineLane& lane, const TarTimelineModel& m,
+                           std::size_t& omitted) {
     std::vector<const TarTimelineRegion*> rs;
     for (const auto& r : lane.regions)
         if (r.to_ts > r.from_ts && r.to_ts > m.window_from_ts && r.from_ts < m.window_to_ts)
@@ -326,11 +358,13 @@ std::string render_regions(const TarTimelineLane& lane, const TarTimelineModel& 
     std::stable_sort(rs.begin(), rs.end(), [](const auto* a, const auto* b) {
         return a->from_ts < b->from_ts;
     });
+    omitted = rs.size() > kTarTimelineMaxBlocksPerLane ? rs.size() - kTarTimelineMaxBlocksPerLane : 0;
+    rs.resize(rs.size() - omitted);
     std::string h;
     std::int64_t cursor = m.window_from_ts;
-    auto gap = [&](std::int64_t a, std::int64_t b) {
+    auto gap = [&](std::int64_t a, std::int64_t b, const std::string& why = "Coverage not stated") {
         const double l = tar_timeline_pct(m, a);
-        h += region_div("unstated", l, tar_timeline_pct(m, b) - l, "Coverage not stated");
+        h += region_div("unstated", l, tar_timeline_pct(m, b) - l, why);
     };
     for (const auto* r : rs) {
         const std::int64_t a = std::max(r->from_ts, m.window_from_ts);
@@ -344,7 +378,9 @@ std::string render_regions(const TarTimelineLane& lane, const TarTimelineModel& 
         cursor = std::max(cursor, b);
     }
     if (cursor < m.window_to_ts)
-        gap(cursor, m.window_to_ts);
+        gap(cursor, m.window_to_ts,
+            omitted > 0 ? plural(omitted, "more stretch", "more stretches") + ", not drawn"
+                        : "Coverage not stated");
     return h;
 }
 
@@ -356,11 +392,17 @@ std::string plot_left(double f, const char* plus = "") {
 
 // ── kept chart ──────────────────────────────────────────────────────────────────────
 
-/// The artboard's log age axis: 0 at "now", 1 at 480 days.
-double age_axis(std::int64_t age_s) {
+/// The design's log age axis: 0 at "now", 1 at 480 days (the registry's 365-day monthly default
+/// plus headroom, so the oldest band never sits on the axis edge).
+double age_axis(double age_s) {
     constexpr double kHour = 3600.0, kAxMax = 480.0 * 86400.0;
-    const double a = static_cast<double>(std::max<std::int64_t>(age_s, 0));
-    return std::clamp(std::log1p(a / kHour) / std::log1p(kAxMax / kHour), 0.0, 1.0);
+    return std::clamp(std::log1p(std::max(age_s, 0.0) / kHour) / std::log1p(kAxMax / kHour), 0.0, 1.0);
+}
+
+/// How old `ts` is at `read_ts`, in seconds. Subtracted as doubles: both are agent-controlled
+/// and an int64 difference of two of them can overflow.
+double age_of(std::int64_t read_ts, std::int64_t ts) {
+    return std::max(static_cast<double>(read_ts) - static_cast<double>(ts), 0.0);
 }
 
 std::string kept_qualifier(const TarKeptRow& row, const TarKeptBand* band, TarTier tier) {
@@ -378,12 +420,16 @@ struct AtMoment {
 };
 
 AtMoment kept_at_moment(const TarTimelineModel& m, const TarKeptRow& row, std::int64_t moment) {
+    // A pause with no stated time cannot be placed against the moment, so it is not applied
+    // here; the measured bands decide and kept_row_sub says the source is paused.
     if (row.paused_since_ts > 0 && moment >= row.paused_since_ts)
-        return {"Not recorded", "Source paused since " + iso(row.paused_since_ts), false};
+        return {"Not recorded", "Source paused " + paused_since(row.paused_since_ts), false};
+    // Not readable is not Gone: neither the word nor the faint `.gone` style, which says
+    // "nothing is here".
     if (!m.online)
-        return {"Not readable: device offline", {}, true};
-    if (row.unreadable) // unmeasured is not pruned: a failed measurement is not "Gone"
-        return {"Not readable: " + unreadable_text(*row.unreadable), {}, true};
+        return {"Not readable: device offline", {}, false};
+    if (row.unreadable)
+        return {"Not readable: " + unreadable_text(*row.unreadable), {}, false};
     for (TarTier t : kTiers) {
         const TarKeptBand* b = band_for(row, t);
         if (b && b->oldest_ts > 0 && moment >= b->oldest_ts)
@@ -394,31 +440,38 @@ AtMoment kept_at_moment(const TarTimelineModel& m, const TarKeptRow& row, std::i
 
 std::string kept_row_sub(const TarKeptRow& row) {
     const TarKeptBand* ex = band_for(row, TarTier::exact);
+    std::string s;
     if (row.row_limit > 0) {
-        std::string s = num(row.row_limit) + " rows kept";
+        s = num(row.row_limit) + " rows kept";
         if (ex && ex->oldest_ts > 0)
             s += "; exact records reach back to " + iso(ex->oldest_ts) + " on this device";
-        return s;
+    } else if (ex && ex->policy_s > 0) {
+        s = "kept " + span_text(ex->policy_s) + " by default";
+    } else {
+        s = kept_phrase_unknown();
     }
-    if (ex && ex->policy_s > 0)
-        return "kept " + span_text(ex->policy_s) + " by default";
-    return kept_phrase_unknown();
+    // A known pause time is drawn as the "not recorded" segment; an unknown one cannot be
+    // placed on the axis, so it is said here instead.
+    if (row.paused && row.paused_since_ts <= 0)
+        s += "; paused " + paused_since(0);
+    return s;
 }
 
 std::string kept_segments(const TarTimelineModel& m, const TarKeptRow& row) {
     std::string h;
-    auto seg = [&](const std::string& cls, std::int64_t a, std::int64_t b, const std::string& tip,
+    auto seg = [&](const std::string& cls, double a, double b, const std::string& tip,
                    const std::string& text) {
         const double l = age_axis(a) * 100.0;
         h += "<div class=\"tl-ks " + cls + "\" style=\"left:" + fix3(l) + "%;width:" +
              fix3(age_axis(b) * 100.0 - l) + "%\" title=\"" + esc(tip) + "\">" + esc(text) +
              "</div>";
     };
-    std::int64_t start = 0;
-    if (row.paused_since_ts > 0) {
-        const std::int64_t pa = std::max<std::int64_t>(m.read_ts - row.paused_since_ts, 0);
+    double start = 0;
+    if (row.paused_since_ts > 0) { // an unstated pause time cannot be placed: no segment
+        const double pa = age_of(m.read_ts, row.paused_since_ts);
         if (pa > 0) {
-            seg("none", 0, pa, "Nothing recorded since " + iso(row.paused_since_ts), "not recorded");
+            seg("none", 0, pa, "Nothing recorded " + paused_since(row.paused_since_ts),
+                "not recorded");
             start = pa;
         }
     }
@@ -426,7 +479,7 @@ std::string kept_segments(const TarTimelineModel& m, const TarKeptRow& row) {
         const TarKeptBand* b = band_for(row, t);
         if (!b || b->oldest_ts <= 0)
             continue; // none observed: draws nothing
-        const std::int64_t end = std::max<std::int64_t>(m.read_ts - b->oldest_ts, 0);
+        const double end = age_of(m.read_ts, b->oldest_ts);
         if (end <= start)
             continue; // the newer tier already covers this far back
         seg(tier_seg_class(t), start, end, tier_label(t) + ", oldest observed " + iso(b->oldest_ts),
@@ -458,14 +511,12 @@ std::pair<std::string, std::string> state_for(const TarTimelineLane& lane,
         return {"exact-none", "Nothing at this time"};
     case TarRegionKind::rolled_up:
         return {"rolled|" + num(static_cast<int>(r->tier)) + "|" + holdings_category(lane.source),
-                capitalise(tier_adverb(r->tier)) + " roll-up: " + holdings(lane.source, r->tier) +
-                    "."};
+                tier_label(r->tier) + ": " + holdings(lane.source, r->tier) + "."};
     case TarRegionKind::pruned:
         return {"pruned", "Nothing is kept for this time"};
     case TarRegionKind::paused:
         return {"paused|" + num(r->paused_since_ts),
-                r->paused_since_ts > 0 ? "Not recorded since " + iso(r->paused_since_ts)
-                                       : std::string(kPausedUnknown)};
+                "Not recorded " + paused_since(r->paused_since_ts)};
     case TarRegionKind::not_readable:
         return {"unreadable|" + num(static_cast<int>(r->reason)),
                 "Not readable: " + unreadable_text(r->reason)};
@@ -496,7 +547,12 @@ struct Found {
     const TarTimelineItem* item = nullptr;
 };
 
+/// The first item with this id. An empty id matches nothing: such an item has no `data-ref`, so
+/// nothing on the page can select it. Ids are unique across the model by contract (see
+/// TarTimelineItem); the renderer cannot know which of two same-id items was meant.
 Found find_item(const TarTimelineModel& m, const std::string& id) {
+    if (id.empty())
+        return {};
     for (const auto& g : m.groups)
         for (const auto& l : g.lanes)
             for (const auto& it : l.items)
@@ -513,6 +569,10 @@ std::string retention_line(const TarTimelineModel& m, const TarTimelineLane& lan
         return "Kept until newer rows push it past the " + num(row->row_limit) +
                "-row limit; no date can be given";
     if (band && band->policy_s > 0) {
+        // No date is stated rather than a wrapped or out-of-range one: from_ts is agent data, so
+        // the sum is only formed when it provably stays inside 1970..9999 (and cannot overflow).
+        if (it.from_ts <= 0 || band->policy_s > kTarTimelineMaxTs - it.from_ts)
+            return "Pruned " + span_text(band->policy_s) + " after it starts, at the earliest";
         const char* unit = it.shape == TarItemShape::count || it.shape == TarItemShape::column
                                ? "bucket"
                                : "record";
@@ -527,11 +587,13 @@ std::string retention_line(const TarTimelineModel& m, const TarTimelineLane& lan
 // ── layout ──────────────────────────────────────────────────────────────────────────
 
 double tar_timeline_pct(const TarTimelineModel& m, std::int64_t ts) {
-    const std::int64_t span = m.window_to_ts - m.window_from_ts;
-    if (span <= 0)
+    // All in double: the window and ts are agent-controlled, and an int64 difference of two of
+    // them can overflow. A degenerate or inverted window yields 0.
+    const double from = static_cast<double>(m.window_from_ts);
+    const double to = static_cast<double>(m.window_to_ts);
+    if (to <= from)
         return 0.0;
-    const double p = static_cast<double>(ts - m.window_from_ts) * 100.0 / static_cast<double>(span);
-    return std::clamp(p, 0.0, 100.0);
+    return std::clamp((static_cast<double>(ts) - from) * 100.0 / (to - from), 0.0, 100.0);
 }
 
 TarTimelineLayout tar_timeline_layout_lane(const TarTimelineLane& lane, const TarTimelineModel& m) {
@@ -661,16 +723,27 @@ TarTimelineLayout tar_timeline_layout_lane(const TarTimelineLane& lane, const Ta
 }
 
 const TarTimelineRegion* tar_timeline_region_at(const TarTimelineLane& lane, std::int64_t t) {
+    // Only regions the lane draws count (render_regions drops to_ts <= from_ts). Where regions
+    // overlap, the one drawn on top wins: the stable sort by start paints a later start over an
+    // earlier one, and a tie goes to the later region in vector order.
+    auto drawn = [](const TarTimelineRegion& r) { return r.to_ts > r.from_ts; };
+    auto on_top = [](const TarTimelineRegion& r, const TarTimelineRegion* best) {
+        return !best || r.from_ts >= best->from_ts;
+    };
     std::int64_t last_end = std::numeric_limits<std::int64_t>::min();
     for (const auto& r : lane.regions)
-        last_end = std::max(last_end, r.to_ts);
+        if (drawn(r))
+            last_end = std::max(last_end, r.to_ts);
+    const TarTimelineRegion* best = nullptr;
     for (const auto& r : lane.regions)
-        if (r.from_ts <= t && t < r.to_ts)
-            return &r;
+        if (drawn(r) && r.from_ts <= t && t < r.to_ts && on_top(r, best))
+            best = &r;
+    if (best)
+        return best;
     for (const auto& r : lane.regions) // the last region is closed at its end
-        if (r.to_ts == last_end && r.from_ts <= t && t == r.to_ts)
-            return &r;
-    return nullptr;
+        if (drawn(r) && r.to_ts == last_end && r.from_ts <= t && t == r.to_ts && on_top(r, best))
+            best = &r;
+    return best;
 }
 
 std::vector<const TarTimelineItem*> tar_timeline_items_at(const TarTimelineLane& lane,
@@ -727,13 +800,20 @@ std::int64_t tar_timeline_resolve_moment(const TarTimelineModel& m) {
     auto inside = [&](std::int64_t t) { return t >= m.window_from_ts && t <= m.window_to_ts; };
     if (m.moment_ts != 0 && inside(m.moment_ts))
         return m.moment_ts;
+    // The newest event boundary: every item's start, and a closed bar's end. A bucket or sample
+    // end is not one (items_at treats it as exclusive, so nothing would be listed there).
     std::int64_t newest = 0;
+    auto consider = [&](std::int64_t b) {
+        if (b > 0 && inside(b))
+            newest = std::max(newest, b);
+    };
     for (const auto& g : m.groups)
         for (const auto& l : g.lanes)
-            for (const auto& it : l.items)
-                for (std::int64_t b : {it.from_ts, it.to_ts})
-                    if (b > 0 && inside(b))
-                        newest = std::max(newest, b);
+            for (const auto& it : l.items) {
+                consider(it.from_ts);
+                if (it.shape == TarItemShape::bar)
+                    consider(it.to_ts);
+            }
     return newest != 0 ? newest : m.window_to_ts;
 }
 
@@ -755,8 +835,9 @@ std::string render_timeline_device_bar(const TarTimelineModel& m, const TarTimel
     for (const auto& s : m.sources) {
         const std::string label = s.label.empty() ? s.source : s.label;
         std::string chip;
-        if (s.paused_since_ts > 0)
-            chip = "<span class=\"pill warn\">Paused since " + esc(iso(s.paused_since_ts)) + "</span>";
+        if (is_paused(s))
+            chip = "<span class=\"pill warn\">Paused " + esc(paused_since(s.paused_since_ts)) +
+                   "</span>";
         else if (s.enabled)
             chip = "<span class=\"pill ok\">On</span>";
         else
@@ -779,7 +860,7 @@ std::string render_timeline_kept(const TarTimelineModel& m) {
                                                                            {365 * 86400, "1 year"}}};
     std::string ticks, grid;
     for (const auto& [age, label] : kAxis) {
-        const double x = age_axis(age) * 100.0;
+        const double x = age_axis(static_cast<double>(age)) * 100.0;
         ticks += std::string("<span class=\"tl-ktk") + (x > 90.0 ? " end" : "") +
                  "\" style=\"left:" + fix3(x) + "%\">" + label + "</span>";
         grid += "<i style=\"left:" + fix3(x) + "%\"></i>";
@@ -797,7 +878,7 @@ std::string render_timeline_kept(const TarTimelineModel& m) {
              "</div><div class=\"res" + (at.gone ? " gone" : "") + "\"><span>" + esc(at.res) +
              "</span>" + (at.sub.empty() ? "" : "<small>" + esc(at.sub) + "</small>") + "</div></div>";
     }
-    const double mx = age_axis(m.read_ts - moment) * 100.0;
+    const double mx = age_axis(age_of(m.read_ts, moment)) * 100.0;
     h += "<div class=\"tl-kov\"><div class=\"tl-kmk\" style=\"left:" + fix3(mx) + "%\"><b" +
          (mx > 55.0 ? " class=\"r\"" : "") + ">" + esc(iso(moment)) + "</b></div></div>";
     h += "</div>";
@@ -816,14 +897,20 @@ std::string render_timeline_kept(const TarTimelineModel& m) {
 std::string render_timeline_lanes(const TarTimelineModel& m) {
     std::string h;
     std::vector<TarTimelineLayout> layouts;
+    std::vector<std::string> region_html; // per lane, in drawing order
     bool hit_limit = false;
     for (const auto& g : m.groups)
         for (const auto& l : g.lanes) {
             layouts.push_back(tar_timeline_layout_lane(l, m));
-            hit_limit = hit_limit || layouts.back().overflow_count > 0;
+            std::size_t omitted = 0;
+            region_html.push_back(render_regions(l, m, omitted));
+            hit_limit = hit_limit || layouts.back().overflow_count > 0 || omitted > 0;
         }
 
     // Banners first: a cut-off or unreadable read is said before any lane is drawn.
+    if (m.window_to_ts <= m.window_from_ts)
+        h += "<div class=\"tl-warn\">The time window is not valid: it ends before it starts, so "
+             "nothing can be drawn.</div>";
     if (!m.online)
         h += "<div class=\"tl-warn\">Device offline: on-device records are not readable.</div>";
     std::vector<std::string> unreadable_seen; // one banner per distinct (lane, reason)
@@ -841,14 +928,14 @@ std::string render_timeline_lanes(const TarTimelineModel& m) {
                     unreadable_seen.end())
                     continue;
                 unreadable_seen.push_back(key);
-                h += "<div class=\"tl-warn\">The read of " + esc(lane_label(l)) +
-                     " was not readable: " + esc(unreadable_text(r.reason)) + ".</div>";
+                h += "<div class=\"tl-warn\">" + esc(lane_label(l)) + " could not be read: " +
+                     esc(unreadable_text(r.reason)) + ".</div>";
             }
         }
     if (hit_limit)
-        h += "<div class=\"tl-warn\">A lane has more items than the render limit (" +
+        h += "<div class=\"tl-warn\">A lane has more items or stretches than the render limit (" +
              num(static_cast<std::int64_t>(kTarTimelineMaxBlocksPerLane)) +
-             " blocks per lane); the rest are counted but not drawn. Narrow the window.</div>";
+             " per lane); the rest are counted but not drawn. Narrow the window.</div>";
 
     const auto ticks = time_ticks(m);
     h += "<div class=\"tl\"><div class=\"tl-head\"><div class=\"g\">Time (UTC)</div><div class=\"r\">";
@@ -859,6 +946,8 @@ std::string render_timeline_lanes(const TarTimelineModel& m) {
     for (const auto& t : ticks)
         h += "<i style=\"left:" + fix3(tar_timeline_pct(m, t.ts)) + "%\"></i>";
     h += "</div><div class=\"tl-body\">";
+    if (m.groups.empty())
+        h += "<div class=\"tl-empty\">No lanes in this read.</div>";
 
     std::size_t li = 0;
     for (const auto& g : m.groups) {
@@ -882,7 +971,7 @@ std::string render_timeline_lanes(const TarTimelineModel& m) {
                  esc(l.name.empty() ? l.id : l.name) + "</span>";
             if (!l.sub.empty())
                 h += "<span class=\"pid\">" + esc(l.sub) + "</span>";
-            h += "</span></div><div class=\"pl\">" + render_regions(l, m);
+            h += "</span></div><div class=\"pl\">" + region_html[li - 1];
             for (const auto& b : lay.blocks)
                 h += render_block(b);
             if (lay.overflow_count > 0) {
@@ -933,9 +1022,18 @@ std::string render_timeline_limits(const TarTimelineModel& m, const TarTimelineL
                         "process that starts and exits between reads is missed and start times "
                         "are snapshot times.");
     const std::string os = normalize_tar_os(m.os);
-    if (os == "windows" || os == "macos")
-        items.push_back(std::string("Command lines are not recorded on ") +
-                        (os == "windows" ? "Windows" : "macOS") + "; process names only.");
+    if (os == "windows" || os == "macos") {
+        // Neither the event streams nor a poll store arguments, so that much holds on every
+        // path; what else is recorded depends on the live capture method, never on the OS: the
+        // streams give names only, a poll stores the executable's path.
+        std::string s = std::string("Command lines are not recorded on ") +
+                        (os == "windows" ? "Windows" : "macOS");
+        if (m.process_capture_method == "etw" || m.process_capture_method == "endpoint_security")
+            s += "; process names only";
+        else if (m.process_capture_method == "polling")
+            s += "; the executable's path is recorded, not its arguments";
+        items.push_back(s + ".");
+    }
     bool dns = false;
     for (const auto& s : m.sources)
         dns = dns || s.source == "dns";
@@ -958,13 +1056,13 @@ std::string render_timeline_limits(const TarTimelineModel& m, const TarTimelineL
     for (const auto& s : items)
         li(s);
     for (const auto& s : m.sources)
-        if (s.paused_since_ts > 0) {
+        if (is_paused(s)) {
             std::string tail;
             if (!links.retention_paused.empty())
                 tail = " <a class=\"btn link sm\" href=\"" + esc(links.retention_paused) +
                        "\">Open retention-paused sources</a>";
-            li((s.label.empty() ? s.source : s.label) + " has not been recorded since " +
-                   iso(s.paused_since_ts) + "; its earlier records are kept as they were.",
+            li((s.label.empty() ? s.source : s.label) + " is paused " +
+                   paused_since(s.paused_since_ts) + "; its earlier records are kept as they were.",
                tail);
         }
     for (const auto& g : m.groups)
@@ -980,15 +1078,27 @@ std::string render_timeline_limits(const TarTimelineModel& m, const TarTimelineL
 
 std::string render_timeline_moment(const TarTimelineModel& m, std::int64_t t,
                                    const TarTimelineLinks& links) {
+    if (t == 0) // the route owns passing the t it set as model.moment_ts; 0 means "resolve it"
+        t = tar_timeline_resolve_moment(m);
+    // An offline device has no readable record, whatever regions the model carries: every lane
+    // reads "Not readable", never "Nothing at this time".
+    static const TarTimelineRegion kOffline = [] {
+        TarTimelineRegion r;
+        r.kind = TarRegionKind::not_readable;
+        r.reason = TarUnreadableReason::offline;
+        return r;
+    }();
     const TarTimelineAdjacent adj = tar_timeline_adjacent_events(m, t);
     std::string h = "<div><div class=\"tl-det-h\"><b>" + esc(iso(t)) + "</b>" +
                     moment_nav("Previous event", adj.prev, links) +
                     moment_nav("Next event", adj.next, links) + "</div>";
+    if (m.groups.empty())
+        h += "<div class=\"tl-empty\">Nothing in this read.</div>";
     for (const auto& g : m.groups) {
         std::vector<StateLine> lines;
         std::vector<MomentRow> rows;
         for (const auto& l : g.lanes) {
-            const TarTimelineRegion* r = tar_timeline_region_at(l, t);
+            const TarTimelineRegion* r = m.online ? tar_timeline_region_at(l, t) : &kOffline;
             const auto items = tar_timeline_items_at(l, t);
             const bool exact = r && r->kind == TarRegionKind::exact;
             const bool rolled = r && r->kind == TarRegionKind::rolled_up;
@@ -1039,6 +1149,8 @@ std::string render_timeline_moment(const TarTimelineModel& m, std::int64_t t,
 
 std::string render_timeline_selected(const TarTimelineModel& m, const std::string& ref,
                                      std::int64_t t, const TarTimelineLinks& links) {
+    if (t == 0) // as for the moment panel: 0 means "resolve it"
+        t = tar_timeline_resolve_moment(m);
     const Found f = find_item(m, ref);
     if (!f.item)
         return "<div class=\"tl-empty\">That item is not in this read. Click a process, a count, "
@@ -1052,13 +1164,22 @@ std::string render_timeline_selected(const TarTimelineModel& m, const std::strin
     if (it.flagged)
         h += "<span class=\"pill bad\">Flagged</span>";
     h += "</div><div class=\"kvl\">";
-    for (const auto& [k, v] : it.facts)
-        h += "<div><span>" + esc(k) + "</span><b>" + esc(v) + "</b></div>";
+    const std::size_t facts = std::min(it.facts.size(), kMaxSelectedFacts);
+    for (std::size_t i = 0; i < facts; ++i)
+        h += "<div><span>" + esc(it.facts[i].first) + "</span><b>" + esc(it.facts[i].second) +
+             "</b></div>";
+    if (it.facts.size() > facts)
+        h += "<div class=\"tl-none\">and " + num(static_cast<std::int64_t>(it.facts.size() - facts)) +
+             " more</div>";
     h += "<div><span>How long it is kept</span><b>" + esc(retention_line(m, *f.lane, it)) +
          "</b></div></div>";
     if (links.selected) {
         std::string lk;
-        for (const auto& id : it.linked_ids) {
+        // Only the first kMaxSelectedLinks ids are looked up (each lookup scans the model); the
+        // rest are counted by id, whether or not they would resolve.
+        const std::size_t links_shown = std::min(it.linked_ids.size(), kMaxSelectedLinks);
+        for (std::size_t i = 0; i < links_shown; ++i) {
+            const std::string& id = it.linked_ids[i];
             const Found other = find_item(m, id);
             if (!other.item)
                 continue; // engine data, not a failure: an id outside this read is dropped
@@ -1068,6 +1189,9 @@ std::string render_timeline_selected(const TarTimelineModel& m, const std::strin
         }
         if (!lk.empty())
             h += "<div class=\"tl-lk\">" + lk + "</div>";
+        if (it.linked_ids.size() > links_shown)
+            h += "<div class=\"tl-none\">and " +
+                 num(static_cast<std::int64_t>(it.linked_ids.size() - links_shown)) + " more</div>";
     }
     return h;
 }

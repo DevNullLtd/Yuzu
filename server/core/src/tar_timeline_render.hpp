@@ -3,7 +3,8 @@
 /// @file tar_timeline_render.hpp
 /// PURE layout helpers and HTML renderers for the TAR timeline (view-model in
 /// tar_timeline_view.hpp). Every function is a pure function of its arguments: no clock,
-/// no store, no I/O. Every dynamic string is html_escaped; every time is format_iso_utc.
+/// no store, no I/O. Every dynamic string is html_escaped; every stated time is
+/// format_iso_utc (one past year 9999 is said in words); ruler labels are short forms.
 /// Inline `style` attributes carry only renderer-formatted percentages, never model text.
 ///
 /// Retention honesty: expiry statements come only from TarKeptBand::policy_s and
@@ -61,7 +62,9 @@ double tar_timeline_pct(const TarTimelineModel& m, std::int64_t ts);
 TarTimelineLayout tar_timeline_layout_lane(const TarTimelineLane& lane, const TarTimelineModel& m);
 
 /// The region covering t (from <= t < to; the last region is closed at its end), or
-/// nullptr when no region states coverage for t.
+/// nullptr when no region states coverage for t. A region with to <= from is never drawn and
+/// never matches. Where regions overlap it returns the one the lane draws on top: the latest
+/// start, and for equal starts the later in vector order.
 const TarTimelineRegion* tar_timeline_region_at(const TarTimelineLane& lane, std::int64_t t);
 
 /// Items present at t, by shape: bar alive (from <= t < to, or open); tick at-or-before t,
@@ -78,8 +81,8 @@ struct TarTimelineAdjacent {
 /// samples are not events and are ignored.
 TarTimelineAdjacent tar_timeline_adjacent_events(const TarTimelineModel& m, std::int64_t t);
 
-/// moment_ts when inside the window, else the newest item boundary in the window, else
-/// window_to_ts.
+/// moment_ts when inside the window, else the newest event boundary in the window (a bar's
+/// start or end, a tick, a bucket's or sample's start), else window_to_ts.
 std::int64_t tar_timeline_resolve_moment(const TarTimelineModel& m);
 
 /// Host, online pill, OS and per-source chips; the two links render only when injected.
@@ -94,11 +97,14 @@ std::string render_timeline_lanes(const TarTimelineModel& m);
 /// "What this record cannot tell you": every bullet conditional on the model.
 std::string render_timeline_limits(const TarTimelineModel& m, const TarTimelineLinks& links);
 
-/// The moment panel at t: per-lane state, merged where identical.
+/// The moment panel at t: per-lane state, merged where identical. Pass the same t the model
+/// carries as moment_ts; t == 0 is resolved with tar_timeline_resolve_moment, as the lanes and
+/// the kept chart resolve theirs. An offline model reads "Not readable" for every lane.
 std::string render_timeline_moment(const TarTimelineModel& m, std::int64_t t,
                                    const TarTimelineLinks& links);
 
-/// The selected-item panel. An unknown ref renders an explanation, never an empty panel.
+/// The selected-item panel. An unknown or empty ref renders an explanation, never an empty
+/// panel. t is as for render_timeline_moment (0 is resolved).
 std::string render_timeline_selected(const TarTimelineModel& m, const std::string& ref,
                                      std::int64_t t, const TarTimelineLinks& links);
 

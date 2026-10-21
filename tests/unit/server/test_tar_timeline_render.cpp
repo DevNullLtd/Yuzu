@@ -21,6 +21,7 @@
 #include <format>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <regex>
 #include <string>
 #include <vector>
@@ -378,6 +379,14 @@ TEST_CASE("tar timeline collapse: bars collapse at eight, exact count, never 'ab
         seven.push_back(bar("s" + std::to_string(i), W0 + i * 12, W0 + i * 12 + 1));
     CHECK(tar_timeline_layout_lane(lane("l", "process", "p", seven), m).blocks.size() == 7);
 
+    // exactly eight is the threshold: one more tiny bar and the run collapses
+    std::vector<TarTimelineItem> eight = seven;
+    eight.push_back(bar("s7", W0 + 7 * 12, W0 + 7 * 12 + 1));
+    const auto e = tar_timeline_layout_lane(lane("l", "process", "p", eight), m);
+    REQUIRE(e.blocks.size() == 1);
+    CHECK(e.blocks[0].collapsed);
+    CHECK(e.blocks[0].label == "8 events");
+
     for (int i = 0; i < 300; ++i)
         many.push_back(bar("m" + std::to_string(i), W0 + i * 12, W0 + i * 12 + 1));
     const auto lay = tar_timeline_layout_lane(lane("l", "process", "p", many), m);
@@ -466,6 +475,17 @@ TEST_CASE("tar timeline collapse: wide items never collapse; the per-lane cap co
     CHECK(count_of(html, "<button type=\"button\" class=\"tl-b") == 400);
     contains(html, "5 more items, not drawn");
     contains(html, "render limit");
+    // the boundary: 399 and 400 blocks draw in full, 401 counts one and says so
+    for (const int n : {399, 400, 401}) {
+        INFO("blocks: " << n);
+        std::vector<TarTimelineItem> v(wide.begin(), wide.begin() + n);
+        const auto lb = tar_timeline_layout_lane(lane("l", "process", "p", v), m);
+        CHECK(lb.blocks.size() == static_cast<std::size_t>(std::min(n, 400)));
+        CHECK(lb.overflow_count == static_cast<std::size_t>(n > 400 ? n - 400 : 0));
+        const auto page = render_timeline_lanes(with_lane(lane("l", "process", "p", v)));
+        CHECK((page.find("not drawn") != std::string::npos) == (n > 400));
+        CHECK((page.find("render limit") != std::string::npos) == (n > 400));
+    }
     // under the cap: no note, no banner
     lacks(render_timeline_lanes(base()), "not drawn");
     lacks(render_timeline_lanes(base()), "render limit");
@@ -476,10 +496,15 @@ TEST_CASE("tar timeline region_at: boundaries, last region closed, a gap is null
     const auto l = lane("l", "process", "p", {},
                         {region(TarRegionKind::exact, W0, W0 + 1000),
                          region(TarRegionKind::pruned, W0 + 1000, W0 + 2000)});
-    CHECK(tar_timeline_region_at(l, W0)->kind == TarRegionKind::exact);
-    CHECK(tar_timeline_region_at(l, W0 + 999)->kind == TarRegionKind::exact);
-    CHECK(tar_timeline_region_at(l, W0 + 1000)->kind == TarRegionKind::pruned);
-    CHECK(tar_timeline_region_at(l, W0 + 2000)->kind == TarRegionKind::pruned); // closed at the end
+    auto kind_at = [&](std::int64_t t) {
+        const auto* r = tar_timeline_region_at(l, t);
+        REQUIRE(r != nullptr);
+        return r->kind;
+    };
+    CHECK(kind_at(W0) == TarRegionKind::exact);
+    CHECK(kind_at(W0 + 999) == TarRegionKind::exact);
+    CHECK(kind_at(W0 + 1000) == TarRegionKind::pruned);
+    CHECK(kind_at(W0 + 2000) == TarRegionKind::pruned); // closed at the end
     CHECK(tar_timeline_region_at(l, W0 + 2001) == nullptr);
     CHECK(tar_timeline_region_at(l, W0 - 1) == nullptr);
 
@@ -560,6 +585,7 @@ TEST_CASE("tar timeline ruler: one window per tick step, exact labels, UTC named
     const std::int64_t nov15 = 1794700800;       // 2026-11-15T00:00:00Z
     const Row rows[] = {
         {"60 s step, up to 30 minutes", W0, 1200, 21, {"09:00", "09:01"}},
+        {"60 s step, a full 30-minute window", W0, 1800, 31, {"09:00", "09:01"}},
         {"5 min step, up to 6 hours", W0, 3 * 3600, 37, {"09:00", "09:05"}},
         {"2 h step, a midnight tick is a date", d20_20h, 2 * kDay, 25, {"20:00", "22:00", "21 Oct"}},
         {"daily step, up to 14 days", W0, 7 * kDay, 7, {"Wed 21", "Thu 22"}},
@@ -624,7 +650,7 @@ TEST_CASE("tar timeline golden: lanes read failed", "[tar][timeline][golden]") {
     contains(html, "Not readable: the read failed");
     // an online read that failed is said before the chart, naming the lane
     const std::string warn =
-        "<div class=\"tl-warn\">The read of TCP connections was not readable: the read failed.</div>";
+        "<div class=\"tl-warn\">TCP connections could not be read: the read failed.</div>";
     contains(html, warn);
     CHECK(html.find(warn) < html.find("<div class=\"tl\">"));
 }
@@ -635,8 +661,8 @@ TEST_CASE("tar timeline golden: lanes agent too old", "[tar][timeline][golden]")
     const auto html = render_timeline_lanes(m);
     check_golden("lanes__agent-too-old", html);
     contains(html, "Not readable: the agent is too old for this read");
-    const std::string warn = "<div class=\"tl-warn\">The read of CPU was not readable: the agent is "
-                             "too old for this read.</div>";
+    const std::string warn = "<div class=\"tl-warn\">CPU could not be read: the agent is too old for "
+                             "this read.</div>";
     contains(html, warn);
     CHECK(html.find(warn) < html.find("<div class=\"tl\">"));
 }
@@ -648,16 +674,16 @@ TEST_CASE("tar timeline banners: one per distinct lane and reason, offline not r
                             {unreadable(TarUnreadableReason::read_failed, W0, W0 + 600),
                              region(TarRegionKind::exact, W0 + 600, W0 + 1800),
                              unreadable(TarUnreadableReason::read_failed, W0 + 1800, W0 + 3000)}));
-    CHECK(count_of(render_timeline_lanes(m), "was not readable") == 1);
+    CHECK(count_of(render_timeline_lanes(m), "could not be read") == 1);
     // a second reason on the same lane is its own banner
     m.groups[0].lanes[0].regions.push_back(unreadable(TarUnreadableReason::agent_too_old, W0 + 3000, W1));
-    CHECK(count_of(render_timeline_lanes(m), "was not readable") == 2);
+    CHECK(count_of(render_timeline_lanes(m), "could not be read") == 2);
     // a second lane with the same reason is its own banner
     m.groups[0].lanes.push_back(lane("l2", "dns", "DNS cache", {}, {unreadable(TarUnreadableReason::read_failed)}));
-    CHECK(count_of(render_timeline_lanes(m), "was not readable: the read failed") == 2);
+    CHECK(count_of(render_timeline_lanes(m), "could not be read: the read failed") == 2);
     // reason "offline" on an ONLINE model has no device banner above it, so the lane says it
     auto on = with_lane(lane("l", "tcp", "TCP connections", {}, {unreadable(TarUnreadableReason::offline)}));
-    contains(render_timeline_lanes(on), "The read of TCP connections was not readable: device offline.");
+    contains(render_timeline_lanes(on), "TCP connections could not be read: device offline.");
 }
 
 TEST_CASE("tar timeline capped: stretches of one lane are one banner and one limits bullet",
@@ -700,11 +726,11 @@ TEST_CASE("tar timeline paused: an unreported pause time is said in words, never
     auto m = with_lane(lane("L-svc", "service", "Service changes", {},
                             {region(TarRegionKind::exact, W0, W0 + 1800), paused(W0 + 1800, W1, 0)}));
     const auto lanes = render_timeline_lanes(m);
-    contains(lanes, "<b>Not recorded: the source is paused</b>");
-    lacks(lanes, "Paused since");
-    lacks(lanes, "\xE2\x80\x94"); // the em dash format_iso_utc gives a zero time
+    contains(lanes, "<b>Paused since a time the agent did not report</b>");
+    lacks(lanes, "Paused since 20"); // no date
+    lacks(lanes, "\xE2\x80\x94");   // the em dash format_iso_utc gives a zero time
     const auto moment = render_timeline_moment(m, W0 + 2000, links_full());
-    contains(moment, "Service changes: Not recorded: the source is paused");
+    contains(moment, "Service changes: Not recorded since a time the agent did not report");
     lacks(moment, "\xE2\x80\x94");
     // a known pause time still names it
     m.groups[0].lanes[0].regions = {region(TarRegionKind::exact, W0, W0 + 1800),
@@ -738,7 +764,7 @@ TEST_CASE("tar timeline golden: lanes rolled up", "[tar][timeline][golden]") {
                             {rolled(TarTier::hourly)}));
     const auto html = render_timeline_lanes(m);
     check_golden("lanes__rolled-up", html);
-    contains(html, "Hourly counts");
+    contains(html, "Hourly roll-up");
     contains(html, "tl-rg rolled");
 }
 
@@ -786,7 +812,7 @@ TEST_CASE("tar timeline golden: kept online", "[tar][timeline][golden]") {
     contains(proc, "tl-ks l\" style=\"left:0.000%;width:" + pct3(ax(2 * kDay)));
     contains(proc, "tl-ks h1\" style=\"left:" + pct3(ax(2 * kDay)) + "%;width:" + pct3(ax(20 * kDay) - ax(2 * kDay)));
     contains(proc, "tl-ks h2\" style=\"left:" + pct3(ax(20 * kDay)));
-    contains(proc, "Hourly counts"); // the moment is 15 days back: the hourly tier
+    contains(proc, "Hourly roll-up"); // the moment is 15 days back: the hourly tier
     contains(proc, "pruned 20 days after each hour starts, at the earliest");
 
     // arp: time-limited, daily tier at 15 days
@@ -821,6 +847,7 @@ TEST_CASE("tar timeline golden: kept offline", "[tar][timeline][golden]") {
     check_golden("kept__offline", html);
     contains(kept_row_html(html, "process"), "Not readable: device offline");
     contains(kept_row_html(html, "arp"), "Not readable: device offline");
+    lacks(html, "res gone"); // not readable is not Gone: neither the word nor the faint style
 }
 
 TEST_CASE("tar timeline kept: the moment column states retention, never a rate or a remaining span",
@@ -863,10 +890,12 @@ TEST_CASE("tar timeline kept: a source the engine could not measure says why, ne
     const auto proc = kept_row_html(html, "process");
     contains(proc, "<span>Not readable: the read failed</span>");
     lacks(proc, "Gone");
+    lacks(proc, "res gone");
     const auto arp = kept_row_html(html, "arp");
     contains(arp, "<span>Not readable: the agent is too old for this read</span>");
     lacks(arp, "Gone");
     contains(kept_row_html(html, "service"), "Gone: nothing is kept this far back");
+    contains(kept_row_html(html, "service"), "res gone"); // only a true Gone row takes the style
 
     // the moment panel says the same for a lane carrying the same reason
     m.groups = {TarTimelineGroup{
@@ -978,7 +1007,9 @@ TEST_CASE("tar timeline golden: limits windows polling fallback", "[tar][timelin
     limits_always(html);
     contains(html, "a process that starts and exits between reads is missed");
     lacks(html, "event stream");
-    contains(html, "Command lines are not recorded on Windows");
+    contains(html, escaped("Command lines are not recorded on Windows; the executable's path is "
+                           "recorded, not its arguments."));
+    lacks(html, "process names only");
 }
 
 TEST_CASE("tar timeline golden: limits macos polling", "[tar][timeline][golden]") {
@@ -988,10 +1019,14 @@ TEST_CASE("tar timeline golden: limits macos polling", "[tar][timeline][golden]"
     const auto html = render_timeline_limits(m, links_full());
     check_golden("limits__macos-polling", html);
     limits_always(html);
-    contains(html, "Command lines are not recorded on macOS; process names only.");
+    contains(html, escaped("Command lines are not recorded on macOS; the executable's path is "
+                           "recorded, not its arguments."));
+    lacks(html, "process names only");
     lacks(html, "event stream");
     m.process_capture_method = "endpoint_security";
-    contains(render_timeline_limits(m, links_full()), "Endpoint Security event stream");
+    const auto es = render_timeline_limits(m, links_full());
+    contains(es, "Endpoint Security event stream");
+    contains(es, "Command lines are not recorded on macOS; process names only.");
 }
 
 TEST_CASE("tar timeline golden: limits linux unknown poll", "[tar][timeline][golden]") {
@@ -1020,7 +1055,7 @@ TEST_CASE("tar timeline golden: limits offline", "[tar][timeline][golden]") {
     check_golden("limits__offline", html);
     limits_always(html);
     contains(html, "Not readable");
-    contains(html, "Services has not been recorded since 2026-10-17T09:00:00Z");
+    contains(html, "Services is paused since 2026-10-17T09:00:00Z");
     contains(html, "href=\"/tar#paused\"");
     contains(html, "The read of proc-a.exe was cut off at 10000 rows");
 }
@@ -1037,6 +1072,10 @@ TEST_CASE("tar timeline limits: the capture claim comes from the method, never f
     lacks(empty, "event stream");
     lacks(empty, escaped("Processes are read on the agent's polling interval"));
     contains(empty, unknown);
+    // an unknown method says no more about command lines than that they are not recorded
+    contains(empty, "Command lines are not recorded on Windows.");
+    lacks(empty, "process names only");
+    lacks(empty, "path is recorded");
     m.process_capture_method = "something-new"; // unrecognised: the same, and the value never shows
     const auto html = render_timeline_limits(m, links_full());
     lacks(html, "event stream");
@@ -1170,7 +1209,7 @@ TEST_CASE("tar timeline monthly tier: every surface names it", "[tar][timeline]"
     // lanes: the region reason
     const auto lanes = render_timeline_lanes(m);
     contains(lanes, "tl-rg rolled");
-    contains(lanes, "<b>Monthly counts</b>");
+    contains(lanes, "<b>Monthly roll-up</b>");
     // moment: the roll-up sentence, and the perf wording names the month
     contains(render_timeline_moment(m, W0 + 1800, links_full()),
              "DNS cache: Monthly roll-up: counts only; exact times are not kept.");
@@ -1181,7 +1220,7 @@ TEST_CASE("tar timeline monthly tier: every surface names it", "[tar][timeline]"
              "CPU: Monthly roll-up: averages and peaks for the whole month; the individual samples are not kept.");
     // selected: the pill and the expiry basis (from_ts + policy_s)
     const auto sel = render_timeline_selected(m, "MB", W0 + 100, links_full());
-    contains(sel, "<span class=\"pill warn\">Monthly counts</span>");
+    contains(sel, "<span class=\"pill warn\">Monthly roll-up</span>");
     contains(sel, "Pruned after 2027-11-24T09:00:00Z at the earliest (a bucket ages from its start");
     // kept: the h3 segment runs from the daily tier's reach to the monthly oldest; the column
     // at the moment names the tier and its configured policy
@@ -1189,7 +1228,7 @@ TEST_CASE("tar timeline monthly tier: every surface names it", "[tar][timeline]"
     const auto row = kept_row_html(kept_html, "dns");
     contains(row, "tl-ks h3\" style=\"left:" + pct3(ax(60 * kDay)) + "%;width:" +
                       pct3(ax(400 * kDay) - ax(60 * kDay)));
-    contains(row, "<span>Monthly counts</span>");
+    contains(row, "<span>Monthly roll-up</span>");
     contains(row, "pruned 400 days after each month starts, at the earliest");
 }
 
@@ -1222,7 +1261,7 @@ TEST_CASE("tar timeline golden: selected count time limited", "[tar][timeline][g
     check_golden("selected__count-time-limited", html);
     // from_ts + policy_s (31 days): a bucket ages from its start
     contains(html, "Pruned after 2026-11-20T09:00:00Z at the earliest (a bucket ages from its start; the agent prunes on its own tick and may hold it longer)");
-    contains(html, "<span class=\"pill warn\">Daily counts</span>");
+    contains(html, "<span class=\"pill warn\">Daily roll-up</span>");
 }
 
 TEST_CASE("tar timeline golden: selected not found", "[tar][timeline][golden]") {
@@ -1317,6 +1356,25 @@ TEST_CASE("tar timeline honesty: no fleet claim, no guessed figure, no invented 
     models.push_back(off);
     models.push_back(kept_model(15 * kDay));
     models.push_back(kept_model(59 * kDay));
+    // the states the goldens draw: paused (stated and not reported), capped, pruned, rolled up
+    auto paused_m = base();
+    paused_m.groups[2].lanes[0].regions = {region(TarRegionKind::exact, W0, W0 + 1800),
+                                           paused(W0 + 1800, W1, W0 + 1800)};
+    paused_m.sources[4].paused_since_ts = W0 - 3 * kDay;
+    paused_m.sources[3].paused = true;
+    paused_m.kept[2].paused_since_ts = 0;
+    paused_m.kept[2].paused = true;
+    models.push_back(paused_m);
+    auto capped_m = base();
+    capped_m.groups[0].lanes[0].regions = {capped(W0, W0 + 1800, 10000, W0 + 1800),
+                                           region(TarRegionKind::exact, W0 + 1800, W1)};
+    models.push_back(capped_m);
+    auto pruned_m = base();
+    pruned_m.groups[1].lanes[1].regions = {region(TarRegionKind::pruned, W0, W0 + 1800),
+                                           region(TarRegionKind::exact, W0 + 1800, W1)};
+    models.push_back(pruned_m);
+    models.push_back(with_lane(lane("L-dns", "dns", "DNS cache", {bucket("B1", W0, W1, 14)},
+                                    {rolled(TarTier::hourly)})));
     for (const auto& m : models) {
         for (const auto& out : all_outputs(m, links_full())) {
             lacks(out, "devices that answered");
@@ -1332,6 +1390,360 @@ TEST_CASE("tar timeline honesty: no fleet claim, no guessed figure, no invented 
     }
 }
 
+// ═══ extreme and hostile inputs ═══════════════════════════════════════════════════════
+
+namespace {
+constexpr std::int64_t kMin = std::numeric_limits<std::int64_t>::min();
+constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
+constexpr std::int64_t kYear9999 = 253402300799; // 9999-12-31T23:59:59Z, the last time stated
+bool in_percent_range(double v) { return std::isfinite(v) && v >= 0.0 && v <= 100.0; }
+
+TarRegionKind kind_in(const TarTimelineLane& l, std::int64_t t) {
+    const auto* r = tar_timeline_region_at(l, t);
+    REQUIRE(r != nullptr);
+    return r->kind;
+}
+} // namespace
+
+TEST_CASE("tar timeline extreme timestamps: positions stay finite and in range", "[tar][timeline]") {
+    auto m = base();
+    // an item that began before the representable past and ends inside the window
+    const auto early =
+        tar_timeline_layout_lane(lane("l", "process", "p", {bar("early", kMin, W0 + 600)}), m);
+    REQUIRE(early.blocks.size() == 1);
+    CHECK(early.blocks[0].left_pct == 0.0);
+    CHECK(in_percent_range(early.blocks[0].width_pct));
+    CHECK(pct3(early.blocks[0].width_pct) == pct3(tar_timeline_pct(m, W0 + 600)));
+    CHECK(early.blocks[0].cls.find(" cl") != std::string::npos);
+    // ... and one that starts at the far end of time is outside the window
+    CHECK(tar_timeline_layout_lane(lane("l", "process", "p", {bar("late", kMax, 0), tick("t", kMax)}), m)
+              .blocks.empty());
+
+    // a window as wide as int64: every position is finite and in range
+    auto wide = base();
+    wide.window_from_ts = kMin;
+    wide.window_to_ts = kMax;
+    wide.moment_ts = 0;
+    for (const std::int64_t ts : {kMin, W0, kMax})
+        CHECK(in_percent_range(tar_timeline_pct(wide, ts)));
+    CHECK(tar_timeline_pct(wide, kMin) == 0.0);
+    CHECK(tar_timeline_pct(wide, kMax) == 100.0);
+    CHECK(std::abs(tar_timeline_pct(wide, 0) - 50.0) < 0.001);
+    for (const auto& out : all_outputs(wide, links_full()))
+        CHECK_FALSE(out.empty());
+
+    // a window at the very top: its two ends are one double, so it is degenerate, not undefined
+    auto top = base();
+    top.window_from_ts = kMax - 1000;
+    top.window_to_ts = kMax;
+    for (const std::int64_t ts : {kMin, W0, kMax - 500, kMax})
+        CHECK(in_percent_range(tar_timeline_pct(top, ts)));
+    for (const auto& out : all_outputs(top, links_full()))
+        CHECK_FALSE(out.empty());
+
+    // an inverted window draws nothing and does not compute with itself
+    auto inv = base();
+    inv.window_to_ts = inv.window_from_ts - 3600;
+    CHECK(tar_timeline_pct(inv, W0 + 10) == 0.0);
+    CHECK(tar_timeline_layout_lane(lane("l", "process", "p", {bar("a", W0, W0 + 10)}), inv).blocks.empty());
+    for (const auto& out : all_outputs(inv, links_full()))
+        CHECK_FALSE(out.empty());
+}
+
+TEST_CASE("tar timeline ruler: a window outside 1970..9999 draws no ruler and always ends",
+          "[tar][timeline]") {
+    struct Win {
+        std::int64_t from, to;
+    };
+    for (const Win w : {Win{kMax - 1000, kMax}, Win{kMax - 600, kMax - 1}, Win{kMin, kMax},
+                        Win{kMin, kMin + 1000}, Win{0, 600}, Win{W0, kYear9999 + 1}}) {
+        INFO("window " << w.from << " .. " << w.to);
+        auto m = base();
+        m.window_from_ts = w.from;
+        m.window_to_ts = w.to;
+        m.moment_ts = 0;
+        CHECK(ruler_labels(render_timeline_lanes(m)).empty());
+    }
+    // the last representable second is inside the guard: a short window there still draws
+    auto edge = base();
+    edge.window_from_ts = kYear9999 - 1000;
+    edge.window_to_ts = kYear9999;
+    edge.moment_ts = 0;
+    const auto labels = ruler_labels(render_timeline_lanes(edge));
+    CHECK_FALSE(labels.empty());
+    CHECK(labels.size() <= 31);
+}
+
+TEST_CASE("tar timeline selected: retention never states a wrapped or out-of-range date",
+          "[tar][timeline]") {
+    auto model = [](std::int64_t from_ts) {
+        auto m = with_lane(lane("L", "arp", "ARP neighbours", {bar("it", from_ts, 0)}), "G");
+        m.kept = {kept("arp", "ARP neighbours", 0, {band(TarTier::exact, W0 - kDay, kDay)})};
+        return m;
+    };
+    // before the representable past, no start at all, at the far end, and an expiry past year 9999
+    for (const std::int64_t from : {kMin, std::int64_t{0}, kMax, kYear9999 - 10}) {
+        INFO("item start " << from);
+        const auto sel = render_timeline_selected(model(from), "it", W0, links_full());
+        contains(sel, "Pruned 1 day after it starts, at the earliest");
+        lacks(sel, "Pruned after");
+        lacks(sel, "1900-");
+    }
+    // control: an ordinary start still gets the dated sentence
+    contains(render_timeline_selected(model(W0), "it", W0, links_full()),
+             "Pruned after 2026-10-21T09:00:00Z at the earliest (a record ages from its start");
+}
+
+TEST_CASE("tar timeline times: one past year 9999 is said in words, never as 1900-", "[tar][timeline]") {
+    auto m = kept_model(15 * kDay);
+    m.read_ts = kMax;
+    // the exact band reaches back further than the pause, so both segments draw
+    m.kept = {kept("process", "Processes", 100000, {band(TarTier::exact, kMax / 4)}, kMax / 2)};
+    const auto html = render_timeline_kept(m);
+    contains(html, "oldest observed a time outside the recordable range");
+    contains(html, "exact records reach back to a time outside the recordable range on this device");
+    lacks(html, "1900-");
+    // the playhead chip, the device bar chip and a limits bullet say the same
+    auto top = base();
+    top.window_from_ts = kMax - 1000;
+    top.window_to_ts = kMax;
+    top.moment_ts = kMax;
+    top.sources[4].paused_since_ts = kMax;
+    std::string all;
+    for (const auto& s : all_outputs(top, links_full()))
+        all += s;
+    contains(render_timeline_lanes(top), "a time outside the recordable range</b>");
+    contains(all, "Services <span class=\"pill warn\">Paused since a time outside the recordable range</span>");
+    lacks(all, "1900-");
+}
+
+TEST_CASE("tar timeline moment: an offline device reads Not readable whatever the regions say",
+          "[tar][timeline]") {
+    auto m = base();
+    m.online = false; // the engine left every lane's exact region in place
+    const auto html = render_timeline_moment(m, W0 + 1800, links_full());
+    CHECK(count_of(html, "Not readable: device offline") == 3); // one merged line per group
+    lacks(html, "Nothing at this time");
+    lacks(html, "class=\"tl-pr");
+    // the same model online lists its items, so the guard is what changed the answer
+    m.online = true;
+    contains(render_timeline_moment(m, W0 + 1800, links_full()), "class=\"tl-pr");
+}
+
+TEST_CASE("tar timeline empty model: every renderer says something", "[tar][timeline]") {
+    const TarTimelineModel empty; // no groups, offline, a zero-width window
+    const auto outs = all_outputs(empty, links_full());
+    for (const auto& out : outs)
+        CHECK_FALSE(out.empty());
+    contains(outs[0], "Unknown device");
+    contains(outs[2], "No lanes in this read.");
+    contains(outs[2], "The time window is not valid: it ends before it starts, so nothing can be drawn.");
+    contains(outs[4], "Nothing in this read.");
+    contains(outs[5], "That item is not in this read.");
+
+    // an online, valid window with no lanes says only the lane part
+    auto none = base();
+    none.groups.clear();
+    const auto lanes = render_timeline_lanes(none);
+    contains(lanes, "<div class=\"tl-empty\">No lanes in this read.</div>");
+    lacks(lanes, "The time window is not valid");
+    contains(render_timeline_moment(none, W0 + 1800, links_full()), "<div class=\"tl-empty\">Nothing in this read.</div>");
+
+    // an inverted or zero-width window is said before the chart
+    for (const std::int64_t to : {W0 - 60, W0}) {
+        auto inv = base();
+        inv.window_to_ts = to;
+        const auto html = render_timeline_lanes(inv);
+        const std::string warn = "<div class=\"tl-warn\">The time window is not valid";
+        contains(html, warn);
+        CHECK(html.find(warn) < html.find("<div class=\"tl\">"));
+    }
+    lacks(render_timeline_lanes(base()), "The time window is not valid");
+}
+
+TEST_CASE("tar timeline region_at: overlapping, unsorted and zero-length regions agree with the lane",
+          "[tar][timeline]") {
+    const auto exact_a = region(TarRegionKind::exact, W0, W0 + 100);
+    const auto pruned_b = region(TarRegionKind::pruned, W0 + 50, W0 + 100);
+    for (const bool pruned_first : {false, true}) {
+        INFO("pruned region first in the vector: " << pruned_first);
+        std::vector<TarTimelineRegion> rs{exact_a, pruned_b};
+        if (pruned_first)
+            std::swap(rs[0], rs[1]);
+        const auto l = lane("l", "process", "p", {}, rs);
+        CHECK(kind_in(l, W0 + 25) == TarRegionKind::exact);
+        CHECK(kind_in(l, W0 + 75) == TarRegionKind::pruned);  // the later start is drawn on top
+        CHECK(kind_in(l, W0 + 100) == TarRegionKind::pruned); // closed end: the same winner
+    }
+    // equal starts: the later region in vector order is drawn on top
+    for (const bool pruned_last : {false, true}) {
+        std::vector<TarTimelineRegion> rs{region(TarRegionKind::exact, W0, W0 + 100),
+                                          region(TarRegionKind::pruned, W0, W0 + 100)};
+        if (!pruned_last)
+            std::swap(rs[0], rs[1]);
+        CHECK(kind_in(lane("l", "process", "p", {}, rs), W0 + 10) ==
+              (pruned_last ? TarRegionKind::pruned : TarRegionKind::exact));
+    }
+    // a region at its own instant (to <= from) is never drawn, so it never answers, in either order
+    for (const bool zero_first : {false, true}) {
+        std::vector<TarTimelineRegion> rs{region(TarRegionKind::exact, W0, W0 + 1000),
+                                          region(TarRegionKind::paused, W0 + 1000, W0 + 1000)};
+        if (zero_first)
+            std::swap(rs[0], rs[1]);
+        const auto l = lane("l", "process", "p", {}, rs);
+        CHECK(kind_in(l, W0 + 500) == TarRegionKind::exact);
+        CHECK(kind_in(l, W0 + 1000) == TarRegionKind::exact);
+    }
+    CHECK(tar_timeline_region_at(lane("l", "process", "p", {}, {region(TarRegionKind::paused, W0 + 10, W0 + 10)}),
+                                 W0 + 10) == nullptr);
+
+    // the moment panel names the region the lane draws, from an unsorted vector
+    auto m = with_lane(lane("l", "process", "Processes", {},
+                            {region(TarRegionKind::exact, W0 + 100, W1), pruned_b, exact_a}),
+                       "G");
+    contains(render_timeline_lanes(m), "tl-rg pruned");
+    contains(render_timeline_moment(m, W0 + 75, links_full()), "Processes: Nothing is kept for this time");
+    lacks(render_timeline_moment(m, W0 + 25, links_full()), "Nothing is kept for this time");
+}
+
+TEST_CASE("tar timeline selected: an empty ref selects nothing, an id-less item has no data-ref",
+          "[tar][timeline]") {
+    auto m = with_lane(lane("l", "process", "p", {bar("", W0 + 100, W0 + 200, "no-id"), bar("x", W0 + 300, W0 + 400)}));
+    contains(render_timeline_selected(m, "", W0, links_full()), "That item is not in this read.");
+    lacks(render_timeline_selected(m, "", W0, links_full()), "no-id");
+    const auto lanes = render_timeline_lanes(m);
+    contains(lanes, ">no-id</button>");
+    CHECK(count_of(lanes, "data-ref=") == 1); // only "x" can be selected
+}
+
+TEST_CASE("tar timeline moment and selected: t == 0 resolves the way the playhead does", "[tar][timeline]") {
+    auto m = base();
+    m.moment_ts = 0; // resolves to W0 + 3000, where P2 starts
+    const auto moment = render_timeline_moment(m, 0, links_full());
+    contains(moment, "<b>2026-10-20T09:50:00Z</b>");
+    lacks(moment, "\xE2\x80\x94");
+    contains(render_timeline_lanes(m), "<b>2026-10-20T09:50:00Z</b>");
+    contains(render_timeline_selected(m, "P2", 0, links_full()),
+             "href=\"/tar/selected?ref=P1&amp;t=" + std::to_string(W0 + 3000) + "\"");
+}
+
+TEST_CASE("tar timeline resolve_moment: a bucket's end is not an event boundary", "[tar][timeline]") {
+    auto m = with_lane(lane("L", "dns", "DNS cache",
+                            {tick("T", W0 + 2000, "files.example.net"), bucket("BK", W0 + 1500, W0 + 3000, 7)}));
+    m.moment_ts = 0;
+    CHECK(tar_timeline_resolve_moment(m) == W0 + 2000); // not the bucket's end at W0 + 3000
+    const auto html = render_timeline_moment(m, tar_timeline_resolve_moment(m), links_full());
+    contains(html, "files.example.net");
+    lacks(html, "Nothing at this time");
+    // a bucket's start still counts, as a sample's does
+    auto starts = with_lane(lane("L", "perf", "CPU", {tick("T", W0 + 1000), column("K", W0 + 1500, W0 + 1530, 5)}));
+    starts.moment_ts = 0;
+    CHECK(tar_timeline_resolve_moment(starts) == W0 + 1500);
+    // a closed bar counts at both ends; an open one at its start only
+    auto bars = with_lane(lane("L", "process", "p", {bar("b", W0 + 100, W0 + 900), bar("o", W0 + 400, 0)}));
+    bars.moment_ts = 0;
+    CHECK(tar_timeline_resolve_moment(bars) == W0 + 900);
+}
+
+TEST_CASE("tar timeline caps: facts, links, regions and an unknown tier are bounded and say so",
+          "[tar][timeline]") {
+    // facts: the first 40 render, then the exact remainder
+    auto big = bar("big", W0 + 100, W0 + 200);
+    for (int i = 0; i < 41; ++i)
+        big.facts.push_back({"k" + std::to_string(i), "v" + std::to_string(i)});
+    const auto sel = render_timeline_selected(with_lane(lane("L", "process", "p", {big})), "big", W0, links_full());
+    contains(sel, "<span>k39</span>");
+    lacks(sel, "<span>k40</span>");
+    contains(sel, "<div class=\"tl-none\">and 1 more</div>");
+    big.facts.pop_back(); // exactly 40: nothing is dropped, nothing is said
+    lacks(render_timeline_selected(with_lane(lane("L", "process", "p", {big})), "big", W0, links_full()), "tl-none");
+
+    // links: the first 24 ids are looked up, then the exact remainder
+    std::vector<TarTimelineItem> items;
+    auto hub = bar("hub", W0 + 100, W0 + 200);
+    for (int i = 0; i < 25; ++i) {
+        items.push_back(bar("n" + std::to_string(i), W0 + 300 + i, W0 + 400 + i));
+        hub.linked_ids.push_back("n" + std::to_string(i));
+    }
+    items.push_back(hub);
+    const auto linked = render_timeline_selected(with_lane(lane("L", "process", "p", items)), "hub", W0, links_full());
+    CHECK(count_of(linked, "<a class=\"btn sm\"") == 24);
+    lacks(linked, "ref=n24&amp;");
+    contains(linked, "<div class=\"tl-none\">and 1 more</div>");
+    items.back().linked_ids.pop_back();
+    const auto linked24 = render_timeline_selected(with_lane(lane("L", "process", "p", items)), "hub", W0, links_full());
+    CHECK(count_of(linked24, "<a class=\"btn sm\"") == 24);
+    lacks(linked24, "tl-none");
+
+    // regions: 400 draw, the rest of the window is one stretch that counts what was left out
+    std::vector<TarTimelineRegion> rs;
+    for (int i = 0; i < 401; ++i)
+        rs.push_back(region(TarRegionKind::pruned, W0 + i * 5, W0 + i * 5 + 5));
+    const auto over = render_timeline_lanes(with_lane(lane("L", "process", "p", {}, rs)));
+    CHECK(count_of(over, "tl-rg pruned") == 400);
+    contains(over, "<b>1 more stretch, not drawn</b>");
+    contains(over, "render limit");
+    rs.pop_back(); // exactly 400: all drawn, none left out
+    const auto exact = render_timeline_lanes(with_lane(lane("L", "process", "p", {}, rs)));
+    CHECK(count_of(exact, "tl-rg pruned") == 400);
+    lacks(exact, "not drawn");
+    lacks(exact, "render limit");
+    rs.pop_back(); // 399
+    CHECK(count_of(render_timeline_lanes(with_lane(lane("L", "process", "p", {}, rs))), "tl-rg pruned") == 399);
+
+    // an unknown tier is stated as unknown on every surface that names a tier, never clamped
+    for (const auto tier : {static_cast<TarTier>(7), static_cast<TarTier>(-1)}) {
+        auto m = with_lane(lane("L-dns", "dns", "DNS cache", {bucket("BK", W0, W1, 5, tier)}, {rolled(tier)}),
+                           "Network");
+        contains(render_timeline_lanes(m), "<b>Roll-up, tier not stated</b>");
+        contains(render_timeline_moment(m, W0 + 1800, links_full()),
+                 "DNS cache: Roll-up, tier not stated: counts only; exact times are not kept.");
+        contains(render_timeline_selected(m, "BK", W0 + 100, links_full()),
+                 "<span class=\"pill warn\">Roll-up, tier not stated</span>");
+    }
+}
+
+// ═══ paused with no reported time ═════════════════════════════════════════════════════
+
+TEST_CASE("tar timeline golden: device bar paused, time not reported", "[tar][timeline][golden]") {
+    auto m = base();
+    m.sources[4].paused = true; // a pre-0.12.0 agent: paused, no time
+    m.sources[2].enabled = false;
+    m.sources[2].paused = true; // paused is what is said, not Off
+    const auto html = render_timeline_device_bar(m, TarTimelineLinks{});
+    check_golden("device-bar__paused-unknown", html);
+    contains(html, "Services <span class=\"pill warn\">Paused since a time the agent did not report</span>");
+    contains(html, "DNS cache <span class=\"pill warn\">Paused since a time the agent did not report</span>");
+    lacks(html, "Services <span class=\"pill ok\">On</span>");
+    lacks(html, "\xE2\x80\x94");
+}
+
+TEST_CASE("tar timeline golden: kept paused, time not reported", "[tar][timeline][golden]") {
+    auto m = kept_model(15 * kDay);
+    m.kept[2].paused = true; // the service row of base(): paused, no time
+    m.kept[2].paused_since_ts = 0;
+    const auto html = render_timeline_kept(m);
+    check_golden("kept__paused-unknown", html);
+    const auto svc = kept_row_html(html, "service");
+    contains(svc, "; paused since a time the agent did not report");
+    lacks(svc, "tl-ks none"); // nothing is placed on the axis that the model does not state
+    // the moment is decided by the measured bands: a pause it cannot place is not applied
+    contains(svc, "<span>Exact records</span>");
+    lacks(svc, "Not recorded");
+    // a row that is not paused says nothing of it
+    lacks(kept_row_html(html, "process"), "paused");
+}
+
+TEST_CASE("tar timeline golden: limits paused, time not reported", "[tar][timeline][golden]") {
+    auto m = base();
+    m.sources[4].paused = true;
+    const auto html = render_timeline_limits(m, links_full());
+    check_golden("limits__paused-unknown", html);
+    limits_always(html);
+    contains(html, "Services is paused since a time the agent did not report; its earlier records are kept as they were.");
+    contains(html, "href=\"/tar#paused\"");
+}
+
 // ═══ css pin ══════════════════════════════════════════════════════════════════════════
 
 TEST_CASE("tar timeline css: one .tl- block, tokens only, no text on a filled highlight",
@@ -1340,9 +1752,12 @@ TEST_CASE("tar timeline css: one .tl- block, tokens only, no text on a filled hi
     const std::string marker = "/* -- TAR timeline:";
     const auto start = css.find(marker);
     REQUIRE(start != std::string::npos);
-    const std::string block = css.substr(start);
+    // Bounded at the next appended block, so a later block's own rules are not scanned here.
+    const auto end = css.find("/* -- ", start + marker.size());
+    const std::string block = css.substr(start, end == std::string::npos ? std::string::npos : end - start);
     CHECK(count_of(css, marker) == 1);
-    for (const char* banned : {"#", "gradient", "var(--accent)", ".dp-", ".tm-", ".split", "blur(", "<style"})
+    for (const char* banned : {"#", "gradient", "var(--accent)", ".dp-", ".tm-", ".split", "blur(", "<style",
+                               "url(", "@import"})
         CHECK(count_of(block, banned) == 0);
     contains(block, "color-mix(");
     contains(block, "var(--hl)");
