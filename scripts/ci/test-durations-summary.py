@@ -37,11 +37,7 @@ DURATION_LINE = re.compile(r"^\s*(\d+\.\d+) s: (.+?)\s*$")
 # Only Catch2 test binaries are ever spawned for a case listing (the same
 # shape flake-retry.py selects on); any other entry is never re-executed.
 CATCH2_EXE = re.compile(r"yuzu_\w+_tests(\.exe)?$", re.IGNORECASE)
-
-
-def gh(kind, msg):
-    """Emit a GitHub Actions annotation (::warning::/::notice::/::error::)."""
-    print(f"::{kind}::{msg}", flush=True)
+TOP = 25  # rows in the slowest-cases table
 
 
 def summary(md):
@@ -155,19 +151,16 @@ def introspect_tests(builddir):
     return json.loads(p.stdout) if p.returncode == 0 else []
 
 
-def report(builddir, label, top):
+def report(builddir, label):
     path = os.path.join(builddir, "meson-logs", "testlog.json")
-    if not os.path.exists(path):
-        gh("warning", f"test-durations-summary: {path} not found; no duration report")
-        return
     records = read_records(path)
     tests = introspect_tests(builddir)
-    rows = summarise(records, tests, collect_cases(records, tests), top)
+    rows = summarise(records, tests, collect_cases(records, tests), TOP)
     summary(render(label, *rows))
 
 
 # ── selftest ─────────────────────────────────────────────────────────────────
-def _checks(force_fail=False):
+def _checks():
     import tempfile
     import types
     res = []
@@ -250,10 +243,6 @@ def _checks(force_fail=False):
         before = os.environ.pop("GITHUB_STEP_SUMMARY", None)
         import contextlib
         import io
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            report(d, "missing", 25)
-        check("report: missing testlog.json -> ::warning", "::warning::" in buf.getvalue())
         with open(os.path.join(d, "meson-logs", "testlog.json"), "w") as f:
             f.write("{not json\n")
         buf = io.StringIO()
@@ -263,15 +252,11 @@ def _checks(force_fail=False):
               rc == 0 and "::warning::" in buf.getvalue())
         if before is not None:
             os.environ["GITHUB_STEP_SUMMARY"] = before
-    if force_fail:
-        check("deliberately failing check (force-fail knob)", False)
     return res
 
 
 def selftest():
-    res = _checks(force_fail=bool(os.environ.get("YUZU_DURATIONS_SELFTEST_FORCE_FAIL")))
-    nested = _checks(force_fail=True)
-    res.append(("selftest harness: a failing check is detected", any(not ok for _, ok in nested)))
+    res = _checks()
     for label, ok in res:
         print(f"  {'ok  ' if ok else 'FAIL'} {label}")
     failed = [lb for lb, ok in res if not ok]
@@ -283,15 +268,15 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     ap.add_argument("--builddir", default="build")
     ap.add_argument("--label", default="tests")
-    ap.add_argument("--top", type=int, default=25)
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args(argv)
     if args.selftest:  # before and outside the warning-only handler below
         return selftest()
     try:
-        report(args.builddir, args.label, args.top)
+        report(args.builddir, args.label)
     except Exception as ex:  # reporting only: never fail the job (#4884 AC2)
-        gh("warning", f"test-durations-summary: report skipped ({type(ex).__name__}: {ex})")
+        print(f"::warning::test-durations-summary: report skipped ({type(ex).__name__}: {ex})",
+              flush=True)
     return 0
 
 

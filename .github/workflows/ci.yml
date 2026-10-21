@@ -1504,7 +1504,7 @@ jobs:
           for c in $(docker ps --format '{{.Names}}' | grep '^yuzu-ci-postgres'); do
             echo "$c"
             docker exec "$c" du -sm /var/lib/postgresql || true
-          done || true
+          done
 
       # #3443 Phase 2: the 3 non-primary Linux push legs (pg_mode=smoke) run
       # this small tagged subset INSTEAD of the 14-shard server-pg suite
