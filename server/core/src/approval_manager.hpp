@@ -122,7 +122,8 @@ struct Approval {
     // means "settled", not "an approved ticket was recalled-and-executed": it is set,
     // for approved and rejected tickets alike, by retire_schedule_tickets when the
     // occurrence the ticket decided has been queued or skipped. A scheduled ticket
-    // is eligible exactly while this is 0.
+    // needs this to be 0, which is necessary but not sufficient: the outbox ledger also
+    // decides (see ScheduleRunner).
     int64_t consumed_at{0};
     // WHO consumed the ticket (PR #1796 review H3/N2, SOC-2 CC7.2): the
     // principal whose recall executed the gated tool. Empty while unconsumed.
@@ -569,7 +570,8 @@ public:
 
     /// The schedule-origin retire (#6096): settle the approved or rejected tickets `ids` of
     /// `schedule_id` once the ScheduleRunner has settled an occurrence, so a scheduled
-    /// ticket is eligible exactly while `consumed_at == 0`. One guarded UPDATE keyed on
+    /// ticket needs `consumed_at == 0` to be eligible (necessary but not sufficient: the outbox
+    /// ledger also decides). One guarded UPDATE keyed on
     /// `consumed_at = 0` (not a read followed by a write) and on `id = ANY(ids)`, stamped from
     /// DATABASE time, with `consumed_by = 'schedule:' + occurrence_id`
     /// (`schedule_id:next_execution_at`, the outbox key) so the evidence chain is never empty.
@@ -591,11 +593,11 @@ public:
     /// replay eligibility keyed on `consumed_by` equalling the occurrence key.
     ///
     /// Deliberately NOT epoch-fenced. The only fenced write is the outbox INSERT
-    /// (`ScheduleRunner::tick` is FencedLeaderOnly). The retire only runs after the occurrence
-    /// row exists (Enqueued or AlreadyEnqueued, whoever wrote it), and it is scoped to observed
-    /// ids, so a paused ex-leader's late retire can at worst settle a ticket it had already
-    /// seen and that the occurrence row already accounts for. Fencing it would only turn a
-    /// harmless late settle into an extra held tick.
+    /// (`ScheduleRunner::tick` is FencedLeaderOnly). On the enqueue paths the retire only runs
+    /// after the outbox row exists (Enqueued or AlreadyEnqueued, whoever wrote it). On the
+    /// rejected-skip path there is no outbox row; the retire is an observed-ids-only CAS from
+    /// unsettled, so a stale leader can only settle tickets it saw (the deny direction).
+    /// Fencing it would only turn a harmless late settle into an extra held tick.
     ///
     /// A store failure is an error, not 0: the runner then holds the occurrence and retries,
     /// which is safe because the enqueue is idempotent. `consume_ticket` still refuses

@@ -106,7 +106,13 @@ CREATE INDEX outbox_ready_idx ON outbox (next_attempt_at) WHERE state = 'pending
         // v2 (#6096): schema only, no clock. The schedule runner reads `approval_id` as the
         // spent-ticket ledger (`occurrences_for_approval`), a lookup by approval id that the
         // v1 indexes do not serve. Partial, because only approval-gated fires carry one.
-        {2, R"(
+        // The plain CREATE INDEX scans the whole table, which nothing prunes, so it would run
+        // under the pool's 30 s statement timeout. The runner sends a step as one message
+        // inside the step's transaction, and SET LOCAL was verified to take effect in that
+        // shape, so the bound is 300 s for this statement only and does not leak onto the
+        // pooled connection.
+        {2, std::string("SET LOCAL statement_timeout = '300s';") +
+                R"(
 CREATE INDEX outbox_approval_idx ON outbox (approval_id) WHERE approval_id <> '';
 )"},
     };
@@ -273,7 +279,8 @@ CommandOutboxStore::occurrences_for_approval(const std::string& approval_id) con
     }
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "SELECT occurrence_id FROM command_outbox_store.outbox WHERE approval_id = $1",
+        "SELECT occurrence_id FROM command_outbox_store.outbox WHERE approval_id = $1 "
+        "AND approval_id <> ''", // literal predicate: always matches outbox_approval_idx
         std::vector<std::string>{approval_id});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("CommandOutboxStore::occurrences_for_approval: query failed: {}",

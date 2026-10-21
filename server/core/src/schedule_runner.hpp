@@ -48,9 +48,10 @@
 ///
 /// Advance discipline: every non-approval outcome advances the schedule
 /// (fire-and-advance — a missed/failed occurrence is recorded and skipped,
-/// never retried into a backlog). Only a pending approval, a ticket that
-/// could not be settled (retire failure or exception), or an unreadable
-/// outbox ledger holds a schedule at its due time (#6096).
+/// never retried into a backlog). Among others (a failed or fenced-out
+/// enqueue, a definition-store read failure), a pending approval, a ticket
+/// that could not be settled (retire failure or exception), or an
+/// unreadable outbox ledger holds a schedule at its due time (#6096).
 ///
 /// Arming re-check (D7, PLAN-003) — a schedule can sit dormant for months
 /// between occurrences, long enough for the authority it was armed under to
@@ -173,8 +174,10 @@ private:
 
     // #6096: settle (retire) the tickets observed this tick after an occurrence is queued or
     // skipped. false = hold the occurrence (store error or exception).
+    // `key` is the occurrence key stored as `consumed_by` ("ledger-spent:<key>" marks tickets
+    // the outbox ledger showed were used by an earlier occurrence).
     bool settle_tickets(const InstructionSchedule& s, const std::vector<std::string>& observed,
-                        const std::string& decided_by);
+                        const std::string& decided_by, const std::string& key);
     std::expected<std::vector<std::string>, std::string>
     outbox_occurrences_for(const std::string& approval_id);
     std::expected<bool, std::string> outbox_has_occurrence(const std::string& key);

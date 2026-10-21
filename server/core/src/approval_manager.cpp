@@ -1,5 +1,6 @@
 #include "approval_manager.hpp"
 
+#include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
@@ -324,10 +325,12 @@ const std::vector<pg::PgMigration>& migrations() {
         // approved/rejected tickets of every schedule, once per database, with no clock
         // comparison: the deny direction (a legitimate approved-but-unfired ticket at upgrade
         // time just gets a fresh ask). Idempotent; a fresh database matches no row.
-        // The runner executes the whole step inside one transaction, so SET LOCAL bounds this
-        // one statement (a large pre-upgrade backlog) without leaking onto the pooled
-        // connection. The row count is the number of unsettled approved/rejected schedule
-        // tickets: bounded by the 7-day ticket life, normally a handful per schedule.
+        // The runner sends the step as one message inside the step's transaction, and SET
+        // LOCAL was verified to take effect in that shape (also over a shorter session-level
+        // timeout), so this one statement is bounded at 300 s without leaking onto the pooled
+        // connection. It touches EVERY unsettled approved or rejected scheduled ticket,
+        // including old rejected ones (rejected tickets never expire and are never swept);
+        // normally small, and bounded by that timeout.
         {2,
          std::string("SET LOCAL statement_timeout = '300s';"
                      "UPDATE approvals SET consumed_at = ") + kDbNowEpochSql +
@@ -1180,22 +1183,9 @@ ApprovalManager::retire_schedule_tickets(const std::string& schedule_id,
     if (!lease)
         return std::unexpected("approval store temporarily unavailable (pool exhausted)");
 
-    // Postgres text[] literal: every element double-quoted, with backslash and double quote
-    // escaped. Ids are generated hex, but this is a general API, so escape regardless.
-    const std::string dq = "\"";
-    std::string array = "{";
-    for (std::size_t i = 0; i < ids.size(); ++i) {
-        if (i > 0)
-            array += ",";
-        array += dq;
-        for (const char c : ids[i]) {
-            if (c == dq[0] || c == '\\')
-                array += '\\';
-            array += c;
-        }
-        array += dq;
-    }
-    array += "}";
+    // pg::to_text_array double-quotes and escapes every element, so ids are bound as data.
+    const std::string array = pg::to_text_array(
+        std::vector<std::string_view>(ids.begin(), ids.end()));
 
     // One guarded UPDATE keyed on `consumed_at = 0`, so each ticket is retired by exactly one
     // caller and a repeat matches nothing. Scoped to the ids the caller OBSERVED (`id = ANY`),
