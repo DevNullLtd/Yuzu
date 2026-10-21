@@ -54,7 +54,6 @@ Usage:
     test_gateway.py <gateway_dir> eunit   # EUnit tests
     test_gateway.py <gateway_dir> ct      # Common Test suites
 """
-import atexit
 import os
 import queue
 import re
@@ -150,10 +149,7 @@ env = base_env()
 # `peer` nodes, and on a shared self-hosted box another job's end-of-job orphan
 # cleanup kills the box-wide epmd under them (a `peer:start_link` timeout in a
 # test the job never touched). See scripts/gateway_epmd.py.
-_epmd_port = gateway_epmd.isolate(env)
-if _epmd_port:
-    print(f"[test_gateway.py] run-private epmd: ERL_EPMD_PORT={_epmd_port}", flush=True)
-    atexit.register(gateway_epmd.stop, _epmd_port, env)
+gateway_epmd.activate(env)
 if suite == "ct":
     env["YUZU_PERF_AGENTS"] = "10"
     env["YUZU_PERF_HEARTBEATS"] = "100"

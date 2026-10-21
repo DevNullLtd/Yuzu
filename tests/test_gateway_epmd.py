@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
-"""Pin the gateway test wrapper's run-private epmd (#4853).
-
-The multinode eunit modules boot Erlang distribution and `peer` nodes through
-the host's one epmd. On the shared self-hosted Windows box the runner's
-"Complete job" step kills that epmd as an orphan whenever ANY job on the box
-completes, so a concurrent job's next `peer:start_link` times out (two PRs'
-Windows legs on 2026-10-21, 28-50 s after another job on the box finished).
-scripts/gateway_epmd.py gives each wrapper run its own ERL_EPMD_PORT; this file
-pins:
+"""Pin the gateway test wrapper's run-private epmd (#4853, scripts/gateway_epmd.py).
 
   1. the port pick and the isolate() decision (what it sets, what it leaves
      alone), against injected probes;
-  2. stop() as best-effort cleanup that can never raise;
-  3. scripts/test_gateway.py really calls isolate() on the env it hands to
-     rebar3, right after base_env(), and registers stop() for exit.
+  2. find_epmd() and stop(): where epmd is looked for, and that cleanup can
+     never raise;
+  3. activate(): what a run says and registers for each of the three outcomes;
+  4. scripts/test_gateway.py calls activate() on the env it hands to rebar3,
+     right after base_env().
 
-Hermetic: injected seams, plus one loopback listener to prove the real probe
-refuses a held port. No epmd, no rebar3, no subprocess.
+Hermetic: injected seams, plus one wildcard-bound listener to prove the real
+probe refuses a held port. No epmd, no rebar3, no subprocess.
 """
 import fnmatch
 import os
@@ -92,7 +86,54 @@ class IsolateTest(unittest.TestCase):
     def test_no_free_port_leaves_the_environment_alone(self):
         env = {}
         self.assertIsNone(ge.isolate(env, is_free=lambda p: False, rng=random.Random(5)))
-        self.assertNotIn("ERL_EPMD_PORT", env)
+        self.assertEqual(env, {})
+
+    def test_an_owned_epmd_may_be_killed_while_a_node_is_still_registered(self):
+        # epmd refuses -kill with living nodes unless started relaxed; erl starts it
+        # with this process's env. Measured: refused without it, "Killed" with it.
+        env = {}
+        ge.isolate(env, is_free=lambda p: True, rng=random.Random(6))
+        self.assertEqual(env["ERL_EPMD_RELAXED_COMMAND_CHECK"], "1")
+
+    def test_an_explicit_port_does_not_get_the_relaxed_check(self):
+        env = {"ERL_EPMD_PORT": "9999"}
+        ge.isolate(env)
+        self.assertNotIn("ERL_EPMD_RELAXED_COMMAND_CHECK", env)
+
+
+class ActivateTest(unittest.TestCase):
+    def run_activate(self, env, isolate_):
+        said, registered = [], []
+        port = ge.activate(env, register=lambda *a: registered.append(a),
+                           say=lambda msg, **kw: said.append((msg, kw)), isolate_=isolate_)
+        return port, said, registered
+
+    def test_an_owned_port_is_announced_flushed_and_registered_for_cleanup(self):
+        env = {"PATH": "p"}
+        port, said, registered = self.run_activate(env, lambda e: "24242")
+        self.assertEqual(port, "24242")
+        self.assertEqual(said, [("[test_gateway.py] run-private epmd: ERL_EPMD_PORT=24242",
+                                 {"flush": True})])
+        self.assertEqual(registered, [(ge.stop, "24242", env)])
+
+    def test_an_operators_port_is_named_and_never_killed(self):
+        env = {"ERL_EPMD_PORT": "9999"}
+        port, said, registered = self.run_activate(env, lambda e: None)
+        self.assertIsNone(port)
+        self.assertIn("ERL_EPMD_PORT=9999 from the environment", said[0][0])
+        self.assertEqual(registered, [])
+
+    def test_falling_back_to_the_shared_epmd_is_said_not_silent(self):
+        port, said, registered = self.run_activate({}, lambda e: None)
+        self.assertIsNone(port)
+        self.assertIn("using the shared epmd", said[0][0])
+        self.assertEqual(registered, [])
+
+    def test_the_default_isolation_is_isolate(self):
+        env = {}
+        port, said, registered = self.run_activate(env, ge.isolate)
+        self.assertEqual(registered[0][:2], (ge.stop, port))
+        self.assertEqual(env["ERL_EPMD_PORT"], port)
 
 
 class FindEpmdTest(unittest.TestCase):
@@ -179,14 +220,11 @@ class WrapperWiringTest(unittest.TestCase):
         with open(WRAPPER, encoding="utf-8") as f:
             self.src = f.read()
 
-    def test_isolates_the_env_it_hands_to_rebar3_right_after_base_env(self):
-        m = re.search(r"^env = base_env\(\)\n(?:#.*\n)*_epmd_port = gateway_epmd\.isolate\(env\)\n",
+    def test_activates_the_env_it_hands_to_rebar3_right_after_base_env(self):
+        m = re.search(r"^env = base_env\(\)\n(?:#.*\n)*gateway_epmd\.activate\(env\)\n",
                       self.src, re.M)
-        self.assertIsNotNone(m, "test_gateway.py must call gateway_epmd.isolate(env) on the "
+        self.assertIsNotNone(m, "test_gateway.py must call gateway_epmd.activate(env) on the "
                                 "base_env() dict, before any suite-specific env is added")
-
-    def test_registers_stop_for_exit_with_the_same_env(self):
-        self.assertIn("atexit.register(gateway_epmd.stop, _epmd_port, env)", self.src)
 
     def test_the_streamed_run_uses_that_env(self):
         self.assertRegex(self.src, r"popen_kwargs = dict\(\n\s+cwd=gateway_dir,\n\s+env=env,")

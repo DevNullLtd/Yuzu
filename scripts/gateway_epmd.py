@@ -13,6 +13,7 @@ already in the environment is the operator's own isolation and wins untouched.
 The decision (pick_port) is pure; the OS (port_is_free, stop) is a thin shell
 with injectable seams. Pinned by tests/test_gateway_epmd.py.
 """
+import atexit
 import glob
 import os
 import random
@@ -60,6 +61,10 @@ def isolate(env, is_free=port_is_free, rng=random):
     if port is None:
         return None
     env["ERL_EPMD_PORT"] = str(port)
+    # The epmd erl auto-starts here inherits this: without it `epmd -kill` is
+    # refused while any node is still registered (a leaked peer), and the
+    # run's epmd would outlive it.
+    env.setdefault("ERL_EPMD_RELAXED_COMMAND_CHECK", "1")
     return str(port)
 
 
@@ -95,3 +100,20 @@ def stop(port, env, which=shutil.which, run=subprocess.run, glob_=glob.glob):
         return True
     except Exception:  # noqa: BLE001 - exit-time cleanup, never fatal
         return False
+
+
+def activate(env, register=atexit.register, say=print, isolate_=isolate):
+    """What the wrapper does with the run's env: isolate it, say which epmd the
+    run uses (the one thing a reader of a red log needs), and register the exit
+    cleanup for a port this run owns. Returns the owned port or None."""
+    explicit = env.get("ERL_EPMD_PORT")
+    port = isolate_(env)
+    if port:
+        say(f"[test_gateway.py] run-private epmd: ERL_EPMD_PORT={port}", flush=True)
+        register(stop, port, env)
+    elif explicit:
+        say(f"[test_gateway.py] epmd: using ERL_EPMD_PORT={explicit} from the environment", flush=True)
+    else:
+        say("[test_gateway.py] epmd: no free private port found, using the shared epmd "
+            "(#4853 can recur)", flush=True)
+    return port
