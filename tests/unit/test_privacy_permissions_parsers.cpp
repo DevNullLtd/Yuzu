@@ -24,6 +24,11 @@
 
 using namespace yuzu::privacy_permissions;
 
+// The guard lives in yuzu::win; this file spells its names win::X.
+namespace yuzu::privacy_permissions::win {
+using namespace ::yuzu::win;
+}
+
 namespace {
 
 std::size_t field_count(const std::string& row) {
@@ -837,6 +842,7 @@ TEST_CASE("win::classify_hive_file: a stock hive is accepted; each refusal fires
         deep.depth = win::kMaxHivePathDepth + 1;
         CHECK(token(deep) == "hive_path_too_deep");
         deep.depth = win::kMaxHivePathDepth;
+        CHECK(win::kMaxHivePathDepth == 32);
         CHECK(token(deep) == "<accepted>");
         auto anc = stock();
         anc.ancestor_reparse = true;
@@ -871,6 +877,7 @@ TEST_CASE("win::classify_hive_file: a stock hive is accepted; each refusal fires
         big.size = win::kMaxHiveBytes + 1;
         CHECK(token(big) == "hive_oversized");
         big.size = win::kMaxHiveBytes;
+        CHECK(win::kMaxHiveBytes == 536870912ull); // 512 MiB
         CHECK(token(big) == "<accepted>");
     }
     SECTION("sidecar facts") {
@@ -1121,6 +1128,13 @@ TEST_CASE("win::assemble_windows_rows: each hive-access outcome is its own row, 
         p.profile_path_unreadable = true;
         only(unreachable(HiveAccessStatus::not_found), p);
         CHECK(row_raw("alice:profile_path_unreadable") == 1);
+    }
+    SECTION("a hive-file refusal whose unload also failed reports both") {
+        auto rd = unreachable(HiveAccessStatus::file_refused, "hive_identity_changed");
+        rd.unload_failed = true;
+        only(rd);
+        CHECK(row_raw("alice:hive_identity_changed") == 1);
+        CHECK(run.acc.reason().find("alice:hive_unload_failed") != std::string::npos);
     }
     SECTION("a failed unload after a good read adds a token, never a row") {
         auto rd = reachable_allow();

@@ -140,8 +140,9 @@ inline constexpr std::array<RequirementEdge, 2> kRequirements{{
 }};
 
 // matrix: docs/os-capability-matrix.md generated block (2026-10-06; shares.list,
-// pkg_inventory.store_packages and msi_packages.list_inventory added 2026-10-17), 232 rows.
-inline constexpr std::array<UnitOsRow, 232> kUnitOs{{
+// pkg_inventory.store_packages, msi_packages.list_inventory and remote_access_audit.list added
+// 2026-10-17/19), 233 rows.
+inline constexpr std::array<UnitOsRow, 233> kUnitOs{{
     {"agent_actions", "set_log_level", kWin | kLin | kMac},
     {"agent_actions", "info", kWin | kLin | kMac},
     {"agent_logging", "get_log", kWin | kLin | kMac},
@@ -312,6 +313,8 @@ inline constexpr std::array<UnitOsRow, 232> kUnitOs{{
     {"services", "list", kWin | kLin | kMac},
     {"services", "running", kWin | kLin | kMac},
     {"services", "set_start_mode", kWin | kLin | kMac},
+    // remote_access_audit: Linux is constrained, macOS supported, Windows `planned` (applicable).
+    {"remote_access_audit", "list", kWin | kLin | kMac},
     // shares: the macOS and Windows legs are `planned`, which is applicable (not unsupported).
     {"shares", "list", kWin | kLin | kMac},
     {"software_actions", "list_upgradable", kWin | kLin | kMac},
