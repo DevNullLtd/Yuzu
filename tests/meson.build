@@ -3682,8 +3682,10 @@ test('presence departure wiring lexical gate (#5678)',
 # registry.write audit wiring: static lexical gate pinning that agent.cpp stamps the dispatched action
 # on every output frame and its terminal frame (the command loop is not constructible from a test), and
 # that each of the four frame-storing sites in agent_service_impl.cpp writes the audit row BEFORE the
-# execution advances (the Subscribe pair has no ordering harness). Carries its own in-memory mutation
-# self-test. No build required. Suite 'docs' for the same reason as the presence gate above.
+# execution advances (the Subscribe arms and the gateway terminal arm have no runtime ordering test),
+# that the hook reads the store only through its weak reference and server.cpp wires it exactly once.
+# Carries its own in-memory mutation self-test. No build required. Suite 'docs' for the same reason as
+# the presence gate above.
 test('audit action stamp wiring lexical gate',
   _python3_test,
   args: [files('test_audit_action_stamp_wiring_lexical.py')],

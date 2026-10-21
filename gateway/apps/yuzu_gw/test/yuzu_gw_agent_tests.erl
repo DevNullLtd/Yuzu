@@ -207,7 +207,7 @@ streaming_keeps_running() ->
 %% CommandResponse.action (field 8) is what the server's registry.write audit hook keys on for a
 %% gateway-connected agent, so an ordinary response frame must reach the waiting caller with it
 %% intact, on a RUNNING frame and on the terminal one. The Guardian-shaped wire test does not cover
-%% this hop (plugin "__guard__" frames never reach handle_stream_response/2).
+%% this hop (unsolicited "__guard__" frames carry no command_id and are intercepted before it).
 streaming_forwards_action() ->
     {Pid, _} = start_agent(<<"sfa-1">>, self()),
     FanoutRef = make_ref(),

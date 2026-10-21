@@ -10,7 +10,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <cstdio>
+#include <format>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <random>
@@ -66,9 +67,7 @@ const std::string kOddAgent = "agent \xC3\xA9";
 /// A command id of the shape the server mints for a command: `<plugin>-<16 hex>`
 /// (command_routes.cpp). `plugin` keeps whatever spelling the operator typed.
 std::string rid(unsigned n, std::string_view plugin = "registry") {
-    char hex[17];
-    std::snprintf(hex, sizeof hex, "%016x", n);
-    return std::string{plugin} + "-" + hex;
+    return std::string{plugin} + "-" + std::format("{:016x}", n);
 }
 
 /// ... and the `<plugin>-<32 hex>` shape dispatch_confined and the scheduled enqueue mint.
@@ -103,7 +102,8 @@ RegistryAuditLine only_line(std::string_view text) {
 TEST_CASE("registry audit: only audit| lines are extracted and byte-exact",
           "[server][registry_audit]") {
     const std::string output = "status|ok\n" + std::string{kOkLine} +
-                               "\nwarning|something\nnot-audit|x\n audit|leading space\n";
+                               "\nwarning|something\nnot-audit|x\n audit|leading space\n"
+                               "auditx|no pipe after the word\naudit\n";
     const auto r = extract_registry_audit_lines(output);
     REQUIRE(r.lines.size() == 1);
     CHECK(r.lines[0].text == kOkLine);
@@ -159,10 +159,16 @@ TEST_CASE("registry audit: per-frame bounds and neutralisation", "[server][regis
             CHECK(l.cut);
         }
     }
-    SECTION("bytes that are not UTF-8 are cut at the bound and not walked back to the start") {
-        const auto l =
-            only_line("audit|" + std::string(kMaxRegistryAuditLineBytes - 5, '\x80') + "tail");
-        CHECK(l.text.size() == kMaxRegistryAuditLineBytes);
+    SECTION("bytes that are not UTF-8 are cut at the bound and not walked back") {
+        // Continuation bytes with no lead byte, and a lead byte followed by FOUR continuation bytes
+        // (no UTF-8 sequence has that many): the cut is at the bound itself in both.
+        const std::string run(kMaxRegistryAuditLineBytes - 5, '\x80');
+        const auto bare = only_line("audit|" + run + "tail");
+        CHECK(bare.text == "audit|" + run.substr(0, kMaxRegistryAuditLineBytes - 6));
+        const auto four = only_line("audit|" + std::string(kMaxRegistryAuditLineBytes - 10, 'k') +
+                                    "\xF0\x80\x80\x80\x80tail");
+        CHECK(four.text.size() == kMaxRegistryAuditLineBytes);
+        CHECK(four.cut);
     }
     SECTION("each of 0x00-0x1F except LF, and 0x7F, becomes '_'; every printable ASCII byte and "
             "UTF-8 is kept") {
@@ -183,28 +189,45 @@ TEST_CASE("registry audit: per-frame bounds and neutralisation", "[server][regis
 
 TEST_CASE("registry audit: arbitrary endpoint bytes never break the extractor's bounds",
           "[server][registry_audit]") {
-    // A seeded, deterministic property check over bytes an endpoint controls: whatever arrives, at
-    // most 300 lines, none longer than 4096 bytes, each an `audit|` line with no control byte left.
+    // A seeded, deterministic property check over bytes an endpoint controls. Even frames are
+    // random bytes with a rare LF, so a line can pass the byte bound; odd frames are many short
+    // audit lines, so a frame can pass the line cap. Whatever arrives: at most 300 lines, none
+    // longer than 4096 bytes, each an `audit|` line with no control byte left. The run must also
+    // have REACHED both bounds, or the checks pass without testing anything.
     std::mt19937 rng(0x5eed);
     bool ok = true;
-    for (int i = 0; i < 200 && ok; ++i) {
+    std::size_t cut_lines = 0;
+    std::size_t capped_frames = 0;
+    for (int i = 0; i < 60 && ok; ++i) {
         std::string out;
-        for (unsigned parts = rng() % 12; parts > 0; --parts) {
-            if (rng() % 3 != 0)
-                out += "audit|";
-            for (unsigned n = rng() % 5000; n > 0; --n)
-                out.push_back(static_cast<char>(rng() & 0xFF));
-            out.push_back('\n');
+        if (i % 2 == 0) {
+            for (unsigned parts = 1 + rng() % 4; parts > 0; --parts) {
+                if (rng() % 3 != 0)
+                    out += "audit|";
+                for (unsigned n = rng() % 12000; n > 0; --n) {
+                    const char c = static_cast<char>(rng() & 0xFF);
+                    out.push_back(rng() % 8192 == 0 ? '\n' : (c == '\n' ? '\r' : c));
+                }
+                out.push_back('\n');
+            }
+        } else {
+            for (unsigned n = 250 + rng() % 150; n > 0; --n)
+                out += "audit|op=" + std::to_string(rng()) + "\n";
         }
         const auto r = extract_registry_audit_lines(out);
+        capped_frames += r.truncated ? 1U : 0U;
         ok = r.lines.size() <= kMaxRegistryAuditLinesPerFrame;
-        for (const auto& l : r.lines)
+        for (const auto& l : r.lines) {
+            cut_lines += l.cut ? 1U : 0U;
             ok = ok && l.text.size() <= kMaxRegistryAuditLineBytes &&
                  l.text.starts_with("audit|") &&
                  std::ranges::none_of(l.text,
                                       [](unsigned char c) { return c < 0x20 || c == 0x7F; });
+        }
     }
     CHECK(ok);
+    CHECK(cut_lines > 0);
+    CHECK(capped_frames > 0);
 }
 
 TEST_CASE("registry audit: result comes from result= and never from dry_run=",
@@ -260,6 +283,11 @@ TEST_CASE("registry audit: the AuditEvent shape", "[server][registry_audit]") {
     SECTION("an agent id with spaces or '=' cannot forge a detail token") {
         const auto e2 = make_registry_audit_event("a b=c", rid(1), only_line(kOkLine), 1);
         CHECK(e2.detail.starts_with("agent=a_b_c audit|"));
+    }
+    SECTION("the id token is log_token's, which keeps the bytes log_id_token would replace") {
+        REQUIRE(yuzu::log_token(kOddAgent) != yuzu::log_id_token(kOddAgent));
+        const auto e5 = make_registry_audit_event(kOddAgent, rid(1), only_line(kOkLine), 1);
+        CHECK(e5.detail.starts_with("agent=" + yuzu::log_token(kOddAgent) + " audit|"));
     }
     SECTION("an agent= token inside the endpoint's own line is never the first one") {
         const auto e3 = make_registry_audit_event(
@@ -348,7 +376,7 @@ TEST_CASE("registry audit: only an id of the exact shape the server mints can mi
             CHECK(frame(rid(9, spelling)).events.size() == 1);
     }
     SECTION("every other shape mints nothing and is reported") {
-        const std::vector<std::string> bad{
+        std::vector<std::string> bad{
             "",
             "registry",
             "registry-",
@@ -368,7 +396,17 @@ TEST_CASE("registry audit: only an id of the exact shape the server mints can mi
             "registry-\x1b[2J0123456789a",
             "registry-\xC3\xA9"
             "0123456789abcdef",
+            "registrz-0123456789abcdef", // one byte off the plugin name
         };
+        // A bad character first, in the middle and last of both widths: the neighbours of the three
+        // hex ranges, an upper-case digit and a space.
+        for (const std::size_t width : {std::size_t{16}, std::size_t{32}})
+            for (const char c : std::string_view{"/:@`gAF "})
+                for (const std::size_t at : {std::size_t{0}, width / 2, width - 1}) {
+                    std::string tail(width, '0');
+                    tail[at] = c;
+                    bad.push_back("registry-" + tail);
+                }
         for (const auto& id : bad) {
             INFO("[" << id << "]");
             const auto f = frame(id);
@@ -455,6 +493,44 @@ TEST_CASE("registry audit: the mutating-action list matches the capability catal
     CHECK(mutating_rows == kRegistryMutatingActions.size());
 }
 
+// ── the per-agent budget ─────────────────────────────────────────────────
+
+TEST_CASE("registry audit budget: 600 rows per agent per window, keyed on the whole agent id",
+          "[server][registry_audit]") {
+    std::int64_t now_ms = 5'000;
+    const auto budget = make_registry_audit_budget([&now_ms] { return now_ms; });
+    const auto admit = [&](const std::string& id) {
+        return budget->try_admit(id, registry_audit_overflow_key(id)).admitted;
+    };
+    SECTION("the documented numbers: 600 rows, then refused, a window later again") {
+        for (int i = 0; i < 600; ++i)
+            REQUIRE(admit("agent-a"));
+        CHECK_FALSE(admit("agent-a"));
+        CHECK(admit("agent-b")); // another agent has its own allowance
+        now_ms += 59'999;
+        CHECK_FALSE(admit("agent-a"));
+        now_ms += 1;
+        CHECK(admit("agent-a"));
+    }
+    SECTION("ids that share their first 96 bytes, or 255, are different agents") {
+        // The shared primitive keys on 96 bytes by default; an agent id runs to 256.
+        for (const std::size_t size : {std::size_t{100}, std::size_t{256}}) {
+            const std::string a = std::string(size - 1, 'k') + 'a';
+            const std::string b = std::string(size - 1, 'k') + 'b';
+            for (int i = 0; i < 600; ++i)
+                REQUIRE(admit(a));
+            CHECK_FALSE(admit(a));
+            CHECK(admit(b));
+        }
+    }
+    SECTION("agents past the exact table are spread over many allowances, not pooled in one") {
+        std::size_t refused = 0;
+        for (std::size_t i = 0; i < kRegistryAuditBudgetAgents + 40'000; ++i)
+            refused += admit("agent-" + std::to_string(i)) ? 0U : 1U;
+        CHECK(refused == 0);
+    }
+}
+
 // ── the live ingest (gateway ingress) ────────────────────────────────────
 
 namespace {
@@ -478,8 +554,9 @@ yuzu::test::PgTestTemplate registry_audit_exec_tpl{
     }};
 
 /// MEMBER ORDER LOAD-BEARING (see GatewayResponseHarness in test_agent_service_impl.cpp): `svc`
-/// borrows `audit` (a raw pointer, and a weak one for the registry hook), so `audit` and its pool
-/// are declared BEFORE it and outlive it.
+/// holds `audit` weakly and locks it per frame, so `audit` and its pool are declared BEFORE it and
+/// outlive it. Only the weak reference is wired: a hook that read the raw `audit_store_` instead
+/// would find nothing and write no row, which every positive case here would notice.
 struct IngestHarness {
     yuzu::MetricsRegistry metrics;
     EventBus bus;
@@ -499,7 +576,6 @@ struct IngestHarness {
     explicit IngestHarness(const std::string& dsn) : pool({.conninfo = dsn, .size = 4}) {
         audit = std::make_shared<AuditStore>(pool);
         REQUIRE(audit->is_open());
-        svc.set_audit_store(audit.get());
         svc.set_registry_audit_store(audit);
     }
     static apb::CommandResponse frame(const std::string& command_id,
@@ -635,7 +711,6 @@ TEST_CASE("registry audit live ingest: no audit store means no audit work and no
                          auto_approve,
                          metrics,
                          /*gateway_mode=*/false};
-    svc.set_audit_store(nullptr);
 
     yuzu::test::LogCapture cap;
     svc.process_gateway_response("agent-1",
@@ -657,9 +732,10 @@ TEST_CASE("registry audit live ingest: a store its owner has reset is neither us
           "[pg][server][registry_audit]") {
     YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
     IngestHarness h(db.dsn());
-    // What ServerImpl::stop() does: unwire the raw pointer, then drop the owning reference. The
-    // service keeps only the weak reference, which now expires.
-    h.svc.set_audit_store(nullptr);
+    // What ServerImpl::stop() does to the owner: drop the owning reference. The service keeps only
+    // the weak reference, which now expires. (This shows an expired store is handled; that a hook
+    // cannot outlive the object is structural: the weak member, locked per frame, which the lexical
+    // gate pins.)
     h.audit.reset();
     yuzu::test::LogCapture cap;
     h.svc.process_gateway_response(
@@ -742,6 +818,95 @@ TEST_CASE("registry audit live ingest: a row that fails after earlier ones keeps
     CHECK(h.dropped("persist_failed") == 2.0); // the failed row and the one not attempted
     CHECK(count_of(cap.text(), "(agent=agent-1, command=" + rid(0xb1) +
                                    "); 1 further row(s) of this frame not attempted") == 1);
+}
+
+namespace {
+
+/// Four rows from one agent; the budget admits ONE row per window and its clock raises on the THIRD
+/// call. Row 0 is written, row 1 is refused, row 2 raises: rows 2 and 3 are owed and lost. `threw`
+/// completes the error line the hook logs for what was raised.
+void check_a_raising_hook(const std::string& dsn, const std::function<void()>& raise,
+                          const std::string& threw) {
+    int clock_calls = 0; // outlives the harness: the budget's clock reads it
+    IngestHarness h(dsn);
+    h.svc.set_registry_audit_budget(std::make_unique<DenialAuditBudget>(
+        /*max_rows=*/1, /*window_ms=*/60'000,
+        [&] {
+            if (++clock_calls == 3)
+                raise();
+            return std::int64_t{1'000};
+        },
+        /*max_keys=*/8));
+    const std::string one{kOkLine};
+    yuzu::test::LogCapture cap;
+    h.svc.process_gateway_response(
+        "agent-1", IngestHarness::frame(rid(0xa2), apb::CommandResponse::RUNNING, "set_value",
+                                        one + "\n" + one + "\n" + one + "\n" + one));
+    cap.stop();
+    CHECK(h.rows().size() == 1);
+    CHECK(h.dropped("suppressed") == 1.0);     // row 1
+    CHECK(h.dropped("persist_failed") == 2.0); // rows 2 and 3
+    const std::string text = cap.text();
+    const std::string ids = " (agent=agent-1, command=" + rid(0xa2) + ")";
+    CHECK(count_of(text, "[audit] registry.write hook threw" + threw + ids) == 1);
+    // The hook returned false, so the gateway site reports the gap.
+    CHECK(count_of(text, "[gateway] registry.write audit row failed to persist" + ids) == 1);
+}
+
+} // namespace
+
+TEST_CASE("registry audit live ingest: a std::exception inside the hook is a failed write with "
+          "every row accounted for",
+          "[pg][server][registry_audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
+    check_a_raising_hook(db.dsn(), [] { throw std::runtime_error("clock failed"); },
+                         ": clock failed");
+}
+
+TEST_CASE("registry audit live ingest: something that is not a std::exception inside the hook is "
+          "the same",
+          "[pg][server][registry_audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
+    check_a_raising_hook(db.dsn(), [] { throw 42; }, "");
+}
+
+TEST_CASE("registry audit live ingest: a frame's rows are written, refused or lost, and the three "
+          "add up",
+          "[pg][server][registry_audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
+    std::int64_t now_ms = 1'000; // outlive the harness: the budget's clock reads them
+    int clock_calls = 0;
+    IngestHarness h(db.dsn());
+    // One row per agent per window, and the window rolls over on the THIRD call: row 0 is written,
+    // row 1 refused, row 2 admitted in the next window and then refused by the store (the CHECK
+    // below), row 3 not attempted.
+    h.svc.set_registry_audit_budget(std::make_unique<DenialAuditBudget>(
+        /*max_rows=*/1, /*window_ms=*/60'000,
+        [&] {
+            if (++clock_calls == 3)
+                now_ms += 60'000;
+            return now_ms;
+        },
+        /*max_keys=*/8));
+    yuzu::test::SqlFault fault(
+        h.pool,
+        "ALTER TABLE audit_store.audit_events ADD CONSTRAINT registry_audit_boom CHECK (detail NOT "
+        "LIKE '%boom%')",
+        "ALTER TABLE audit_store.audit_events DROP CONSTRAINT registry_audit_boom");
+    fault.arm();
+    const std::string one{kOkLine};
+    yuzu::test::LogCapture cap;
+    h.svc.process_gateway_response(
+        "agent-1",
+        IngestHarness::frame(rid(0xb2), apb::CommandResponse::RUNNING, "set_value",
+                             one + "\n" + one + "\naudit|op=set_value|key=boom|result=ok\n" + one));
+    cap.stop();
+    fault.repair();
+    CHECK(h.rows().size() == 1);
+    CHECK(h.dropped("suppressed") == 1.0);     // row 1
+    CHECK(h.dropped("persist_failed") == 2.0); // row 2, which failed, and row 3, not attempted
+    CHECK(count_of(cap.text(), "in the last window: 1") == 1);
+    CHECK(count_of(cap.text(), "); 1 further row(s) of this frame not attempted") == 1);
 }
 
 TEST_CASE(
@@ -843,14 +1008,15 @@ TEST_CASE("registry audit live ingest: a per-agent budget caps the rows an agent
     send("agent-b", 4); // another agent has its own allowance
     CHECK(h.rows().size() == 3 + 2);
     CHECK(h.dropped("suppressed") == 3.0);
-    // A refusal of rows is not a failure of the write: no error line, no failed-write count.
-    CHECK(cap.text().find("failed to persist") == std::string::npos);
+    // A refusal of rows is not a failure of the write: no failed-write count (and, below, no
+    // error line).
     CHECK(h.dropped("persist_failed") == 0.0);
 
     // A window later the agent writes again, and the window that closed is reported once.
     now_ms += 60'000;
     send("agent-a", 5);
     cap.stop();
+    CHECK(cap.text().find("failed to persist") == std::string::npos);
     CHECK(h.rows().size() == 3 + 2 + 2);
     CHECK(count_of(cap.text(), "[audit] registry.write rows refused by the per-agent budget in the "
                                "last window: 3") == 1);
@@ -861,6 +1027,9 @@ TEST_CASE("registry audit live ingest: the row is written before the execution a
           "[pg][server][registry_audit]") {
     YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_exec_tpl);
     IngestHarness h(db.dsn());
+    // Declared before the bus: the listener below captures them.
+    int transitions = 0;
+    std::optional<std::size_t> rows_at_first_transition;
     ExecutionEventBus exec_bus;
     yuzu::test::TrackerScope ts{h.svc, h.pool, &exec_bus};
     const auto id = ts.make_exec();
@@ -868,8 +1037,6 @@ TEST_CASE("registry audit live ingest: the row is written before the execution a
 
     // The tracker publishes `agent-transition` synchronously from inside the ingest, so the
     // listener sees exactly what a live operator watching the execution would.
-    int transitions = 0;
-    std::optional<std::size_t> rows_at_first_transition;
     exec_bus.subscribe(id, [&](const ExecutionEvent& ev) {
         if (ev.event_type != "agent-transition" || transitions++ != 0)
             return;
@@ -927,7 +1094,6 @@ struct LiveHarness {
         auth_mgr.set_auth_db(auth_db.get());
         audit = std::make_shared<AuditStore>(pool);
         REQUIRE(audit->is_open());
-        svc.set_audit_store(audit.get());
         svc.set_registry_audit_store(audit);
         grpc::ServerBuilder builder;
         builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);

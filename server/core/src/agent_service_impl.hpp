@@ -215,12 +215,13 @@ public:
     /// locks the store keeps it alive for exactly its own call, whatever `stop()` does: the object
     /// lifetime is closed structurally, the way `analytics_store_` closed it in #3350. This member
     /// is written ONCE, before any concurrent reader exists, and is never cleared: clearing a
-    /// weak_ptr concurrently with `lock()` is a data race. The owner's `reset()` expires it.
+    /// weak_ptr concurrently with `lock()` is a data race. The owner's `reset()` expires it once
+    /// the calls that hold a lock on it return.
     void set_registry_audit_store(std::weak_ptr<AuditStore> store) {
         registry_audit_store_ = std::move(store);
     }
     /// Replaces the per-agent `registry.write` row budget (tests inject a small one with a fake
-    /// clock). Call before the service is shared; the default is kRegistryAuditBudget* in
+    /// clock). Call before the service is shared; the default is make_registry_audit_budget() in
     /// plugin_result_audit.hpp.
     void set_registry_audit_budget(std::unique_ptr<DenialAuditBudget> budget) {
         registry_audit_budget_ = std::move(budget);

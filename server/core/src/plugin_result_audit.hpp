@@ -10,7 +10,8 @@
  * what the server mints for a registry command (`registry-` plus 16 or 32 lowercase hex digits; the
  * plugin name keeps the operator's spelling, so it is compared ASCII-case-insensitively) AND the
  * frame's `CommandResponse.action` (stamped by the AGENT on every plugin-output RUNNING frame and on
- * the final frame, agents/core/src/agent.cpp CommandContextImpl::action) is one of the three
+ * the terminal frame: stamp_output_frame / stamp_final_frame in agents/core/src/command_frames.hpp,
+ * called from agent.cpp) is one of the three
  * MUTATING actions. A read action's output can never mint a row, and an agent that stamps no action
  * (every agent that predates the stamp) produces none: fail-closed, documented. A read action's
  * output is never parsed for `audit|` lines, so the action gate is the control, not the content.
@@ -18,10 +19,11 @@
  * action, not a dispatch record.
  *
  * BOUNDS. At most kMaxRegistryAuditLinesPerFrame lines per frame, each cut to
- * kMaxRegistryAuditLineBytes on a character boundary, every control byte neutralised. A frame
- * over a bound is reported (`truncated`) and the excess is not recorded; a cut line's row carries
- * the server token `cut=1`. Across frames the caller applies a per-agent budget
- * (kRegistryAuditBudget*), because a bound per frame is not a bound on frames.
+ * kMaxRegistryAuditLineBytes on a UTF-8 character boundary (bytes that are not UTF-8 are cut at the
+ * bound), every control byte neutralised. A frame over a bound is reported (`truncated`) and the
+ * excess is not recorded; a cut line's row carries the server token `cut=1`. Across frames the
+ * caller applies a per-agent budget (kRegistryAuditBudget*), because a bound per frame is not a
+ * bound on frames.
  *
  * ROW SHAPE. docs/user-manual/audit-log.md. `result` is the FIRST `|result=` token of the WHOLE
  * line (read before any cut), never `dry_run=`. `detail` is the trusted `agent=<id>` token FIRST,
@@ -31,16 +33,26 @@
  *
  * FIELD CONTRACT (a requirement on the plugin that produces the lines; this header cannot recover
  * from a violation). One record per line, LF-terminated. No `|`, LF or CR inside a field: a registry
- * key or value name can hold them, so the producer escapes them (otherwise that text could pick the
- * row's result or forge a second row). Put `result=` before any caller-sized field: it is read from
- * the whole line, but a line over the byte bound loses its tail. At most
- * kMaxRegistryAuditLinesPerFrame lines and kMaxRegistryAuditLineBytes bytes per line.
+ * key or value name can hold them, so the producer REPLACES or percent-encodes them (a
+ * backslash-escaped `|` is still a `|` to this parser, so text after it could pick the row's
+ * result or forge a second row). Put `result=` before any caller-sized field: it is read from the
+ * whole line, but a line over the byte bound loses its tail. At most kMaxRegistryAuditLinesPerFrame
+ * lines and kMaxRegistryAuditLineBytes bytes per line. A recursive delete is ONE record per
+ * operation (the counts ride in fields): the frame and budget bounds assume it.
+ *
+ * BEFORE A PLUGIN EMITS (the emitting change owes these; none is code in this header): publish the
+ * `audit|` grammar and the contract above in the plugin README; decide how `old=` and `new=` render
+ * secret-class values (the rows are readable by every role holding AuditLog:Read or
+ * Response:Read); state the minimum agent version in upgrading.md (an agent without the action
+ * stamp produces no rows); then drop the "dormant" wording from the documents.
  */
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -49,6 +61,7 @@
 #include <yuzu/log_token.hpp>
 
 #include "audit_store.hpp"
+#include "bounded_audit_budget.hpp"
 
 namespace yuzu::server {
 
@@ -63,15 +76,45 @@ inline constexpr std::array<std::string_view, 3> kRegistryMutatingActions{
 inline constexpr std::size_t kMaxRegistryAuditLinesPerFrame = 300;
 inline constexpr std::size_t kMaxRegistryAuditLineBytes = 4096;
 
-/// Per-agent row budget (bounded_audit_budget.hpp), applied across frames. Far above the volume of a
-/// legitimate agent (one row per write): its job is to stop an enrolled agent that loops
-/// 300-line frames from writing millions of 365-day evidence rows, not to ration normal use. The
-/// agent table is sized for a fleet-wide change answered inside one window; beyond it, further
-/// agents share one overflow bucket (sampling), and `yuzu_server_registry_audit_dropped_total`
-/// says so.
+/// Per-agent row budget (bounded_audit_budget.hpp), applied across frames and kept PER SERVER
+/// PROCESS (each replica has its own; a restart resets it). Far above the volume of a legitimate
+/// agent (about one row per command): its job is to stop an enrolled agent that loops 300-line
+/// frames from writing millions of 365-day evidence rows, not to ration normal use. A fixed
+/// window, so a boundary can admit up to twice the rows. The first kRegistryAuditBudgetAgents
+/// agents of a window each have an allowance; later agents are spread over
+/// kRegistryAuditOverflowBuckets shared allowances by a hash of the id, so a fleet-wide change
+/// answered by far more agents than the table holds, at about one row each, still loses nothing;
+/// an agent that loops rows in that region exhausts the allowance it shares. Every refused row is
+/// counted (`yuzu_server_registry_audit_dropped_total{reason="suppressed"}`).
 inline constexpr std::size_t kRegistryAuditBudgetRows = 600;
 inline constexpr std::int64_t kRegistryAuditBudgetWindowMs = 60'000;
 inline constexpr std::size_t kRegistryAuditBudgetAgents = 262'144;
+inline constexpr std::size_t kRegistryAuditOverflowBuckets = 65'536;
+/// The budget treats two keys that share this many leading bytes as ONE agent, so it covers a whole
+/// agent id (auth::kMaxAgentIdLength, 256; asserted where both are visible).
+inline constexpr std::size_t kRegistryAuditBudgetKeyBytes = 256;
+
+static_assert(kRegistryAuditBudgetRows >= kMaxRegistryAuditLinesPerFrame,
+              "one full frame must fit the budget");
+static_assert(kRegistryAuditOverflowBuckets <= kRegistryAuditBudgetAgents,
+              "a named overflow allowance is only creatable below the table bound");
+
+/// The overflow allowance an agent past the exact table is charged to: `~<hash of the id modulo
+/// kRegistryAuditOverflowBuckets>`. It only decides who shares an allowance; it is not a defence
+/// against an id chosen to collide.
+[[nodiscard]] inline std::string registry_audit_overflow_key(std::string_view agent_id) {
+    return "~" +
+           std::to_string(std::hash<std::string_view>{}(agent_id) % kRegistryAuditOverflowBuckets);
+}
+
+/// The budget the registry hook charges every row to; the one place the constants above meet.
+[[nodiscard]] inline std::unique_ptr<DenialAuditBudget>
+make_registry_audit_budget(DenialAuditBudget::NowMsFn now = {}) {
+    return std::make_unique<DenialAuditBudget>(kRegistryAuditBudgetRows,
+                                               kRegistryAuditBudgetWindowMs, std::move(now),
+                                               kRegistryAuditBudgetAgents,
+                                               kRegistryAuditBudgetKeyBytes);
+}
 
 /// `plugin` is the registry plugin, compared ASCII-case-insensitively (command_routes.cpp mints the
 /// id from the RAW request spelling; classify is case-insensitive, so `Registry` runs the write on

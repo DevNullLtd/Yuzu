@@ -10972,19 +10972,21 @@ public:
         // below), which is why it no longer belongs in this enumeration -
         // response_store_/notification_store_ remain on the raw-pointer
         // pattern, #3279's reach set for them is unchanged.
-        // `audit_store_` JOINED this reach set with the `registry.write` hook
-        // (plugin_result_audit.hpp; process_gateway_response runs it on these same
-        // forwarder threads). It takes the analytics_store_ treatment below: shared_ptr
-        // here, a weak_ptr in agent_service_ locked per frame and only for a frame that
-        // owes audit rows, set once at wiring and never cleared. The object lifetime is
-        // closed structurally; the pg::PgPool& it borrows, and the detached thread
-        // itself, stay #3279's, unchanged.
         // #3279 should be updated to name the (now two-store) reach set,
         // plus &metrics_ (#1422: the same detached forward thread now also
         // increments yuzu_server_gateway_forward_total at each terminal
         // outcome - cpp-safety Gate 8: destruction order puts metrics_
         // strictly after the pre-existing capture targets, so its dangle
         // window is a subset of theirs; same envelope, not widened).
+        //
+        // `audit_store_` is NOT in that enumeration. The `registry.write` hook
+        // (plugin_result_audit.hpp; process_gateway_response runs it on these same
+        // forwarder threads) takes the analytics_store_ treatment below: shared_ptr here,
+        // a weak_ptr in agent_service_ locked per frame and only for a frame that owes
+        // audit rows, set once at wiring and never cleared. The object lifetime is closed
+        // structurally. The pg::PgPool& it borrows and the detached thread itself stay
+        // #3279's, and the gap between lock() and the pool's acquire is small in
+        // practice, not zero, like analytics_store_'s.
         //
         // HA WS-4 4.3 (cpp-safety Gate 3, pre-push): #3279's reach set also
         // now includes a raw `Stub*` resolved from gw_mgmt_pool_

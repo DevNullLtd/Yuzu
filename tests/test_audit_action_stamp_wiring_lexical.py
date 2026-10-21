@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Static lexical gate over the registry.write audit wiring: the agent's action stamp and the
-server's four ingest hooks.
+"""Static lexical gate over the registry.write audit wiring: the agent's action stamp, the
+server's four ingest hooks and the weak store they write to.
 
 Neither half has a unit seam that reaches the production call sites. agent.cpp's command loop
 (the CommandContextImpl built for a gRPC command, its output flush, its terminal frame) is not
@@ -8,8 +8,9 @@ constructible from a test; the helpers in command_frames.hpp are pinned by
 test_agent_command_frames.cpp, but deleting the call to them, or the `.action = cmd.action()`
 that feeds them, leaves every unit test green while no frame is ever stamped, so no
 `registry.write` row is ever minted. On the server the four hooks sit beside the four places a
-frame is stored; the Subscribe pair has no ordering harness, and the gateway terminal pair is
-only partly covered. This gate is that coverage. Invariants:
+frame is stored; the Subscribe arms and the gateway terminal arm have no runtime ordering test
+(docs/executions-history-ladder.md), and no unit test reads server.cpp. This gate is that
+coverage. Invariants:
 
   agent.cpp
     1. `command_frames.hpp` is included once.
@@ -28,6 +29,16 @@ only partly covered. This gate is that coverage. Invariants:
        once per stream through `audit_failed_signalled`, and two gateway forms (an error line).
     6. `audit_failed_signalled` is declared exactly once, BEFORE the Subscribe read loop: declared
        inside it, it would be re-armed per frame and the trailer would be added per failed frame.
+    7. The hook body reads the store only through `registry_audit_store_.lock()`, once: never the
+       raw `audit_store_` the other sites use and stop() unwires, which would be a use-after-free
+       on the detached forwarder threads (#3279).
+    8. The constructor builds the budget with `make_registry_audit_budget();`, the one place the
+       production numbers meet (a unit test pins them).
+
+  server.cpp
+    9. `agent_service_.set_registry_audit_store(audit_store_);` appears exactly once and the setter
+       is called nowhere else: deleting the line turns every row off silently, and clearing a weak
+       pointer that a forwarder may be locking is a data race (the #3350 precedent).
 
 `//` comments are stripped and whitespace runs collapsed before matching, so line wrapping and
 comment text cannot satisfy or break a check. The gateway error statement is matched as a whole
@@ -46,6 +57,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 AGENT = ROOT / "agents" / "core" / "src" / "agent.cpp"
 SERVER = ROOT / "server" / "core" / "src" / "agent_service_impl.cpp"
+MAIN = ROOT / "server" / "core" / "src" / "server.cpp"
 TAG = "test_audit_action_stamp_wiring_lexical"
 HINT = (
     " (this gate pins the registry.write audit wiring; if the command loop or the frame-storing"
@@ -70,6 +82,10 @@ AGENT_ONCE = (
 HOOK = "audit_registry_frame(agent_id, resp)"
 NOTIFY = "notify_exec_tracker(resp.command_id(), agent_id, resp);"
 FLAG_DECL = "bool audit_failed_signalled = false;"
+HOOK_SIG = "bool AgentServiceImpl::audit_registry_frame("
+WEAK_LOCK = "registry_audit_store_.lock()"
+BUDGET_CTOR = "registry_audit_budget_ = make_registry_audit_budget();"
+WIRING = "agent_service_.set_registry_audit_store(audit_store_);"
 READ_LOOP = "while (stream->Read(&resp))"
 SUBSCRIBE_FORM = normalise(
     f"if (!{HOOK} && !audit_failed_signalled) {{ signal_grpc_audit_failed(context);"
@@ -90,9 +106,42 @@ def agent_problems(src):
     return out
 
 
+def hook_body(t):
+    """The normalised body of audit_registry_frame (the braces in its string literals balance)."""
+    at = t.find(normalise(HOOK_SIG))
+    start = t.find("{", t.find(")", at)) if at >= 0 else -1
+    depth = 0
+    for i in range(start, len(t)) if start >= 0 else ():
+        depth += (t[i] == "{") - (t[i] == "}")
+        if depth == 0:
+            return t[start : i + 1]
+    return None
+
+
+def main_problems(src):
+    t = normalise(src)
+    wired, calls = t.count(normalise(WIRING)), t.count("set_registry_audit_store(")
+    if wired == 1 and calls == 1:
+        return []
+    return [
+        f"server.cpp: expected exactly one `{WIRING}` and no other call of set_registry_audit_store"
+        f" (found {wired} and {calls} call(s)): without the wiring no row is written, and clearing"
+        " a weak pointer that a forwarder thread may be locking is a data race"
+    ]
+
+
 def server_problems(src):
     t = normalise(src)
     out = []
+    body = hook_body(t)
+    if body is None or body.count(WEAK_LOCK) != 1 or re.search(r"(?<![A-Za-z0-9_])audit_store_", body):
+        out.append(
+            f"agent_service_impl.cpp: audit_registry_frame must read the store only through one"
+            f" `{WEAK_LOCK}` (never the raw `audit_store_`, which stop() unwires and frees while"
+            " detached forwarder threads still run)"
+        )
+    if t.count(normalise(BUDGET_CTOR)) != 1:
+        out.append(f"agent_service_impl.cpp: expected exactly one `{BUDGET_CTOR}` in the constructor")
     stores = t.count("response_store_->store(")
     if stores != 4:
         out.append(
@@ -170,6 +219,19 @@ SERVER_MUTATIONS = [
     (r"if \(!audit_registry_frame\(agent_id, resp\)\)\s*spdlog::error\([^;]*;", ""),
     # a fifth output-storing site appears
     (r"response_store_->store\(sr\);", "response_store_->store(sr);\nresponse_store_->store(sr);"),
+    # the hook reads the raw store instead of the weak one
+    (r"registry_audit_store_\.lock\(\)", "std::shared_ptr<AuditStore>(audit_store_, [](AuditStore*) {})"),
+    # the constructor stops building the production budget
+    (r"registry_audit_budget_ = make_registry_audit_budget\(\);", ""),
+]
+MAIN_MUTATIONS = [
+    # the wiring line deleted
+    (r"agent_service_\.set_registry_audit_store\(audit_store_\);", ""),
+    # the weak pointer cleared at shutdown (a data race against lock())
+    (
+        r"(agent_service_\.set_registry_audit_store\(audit_store_\);)",
+        r"\1\n    agent_service_.set_registry_audit_store({});",
+    ),
 ]
 
 
@@ -177,9 +239,10 @@ class AuditActionStampWiringLexical(unittest.TestCase):
     def setUp(self):
         self.agent = AGENT.read_text(encoding="utf-8")
         self.server = SERVER.read_text(encoding="utf-8")
+        self.main = MAIN.read_text(encoding="utf-8")
 
     def test_source_is_clean(self):
-        p = agent_problems(self.agent) + server_problems(self.server)
+        p = agent_problems(self.agent) + server_problems(self.server) + main_problems(self.main)
         for m in p:
             print(f"\n::error::{TAG}: {m}{HINT}", file=sys.stderr)
         self.assertEqual(p, [])
@@ -188,6 +251,7 @@ class AuditActionStampWiringLexical(unittest.TestCase):
         for label, src, muts, check in (
             ("agent.cpp", self.agent, AGENT_MUTATIONS, agent_problems),
             ("agent_service_impl.cpp", self.server, SERVER_MUTATIONS, server_problems),
+            ("server.cpp", self.main, MAIN_MUTATIONS, main_problems),
         ):
             for i, (pat, repl) in enumerate(muts, 1):
                 with self.subTest(file=label, mutation=i, pattern=pat):

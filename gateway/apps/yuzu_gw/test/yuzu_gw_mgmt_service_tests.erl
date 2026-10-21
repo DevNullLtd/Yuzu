@@ -316,6 +316,9 @@ send_command_forwards_the_stamped_action_test() ->
                 ?assertEqual(<<"set_value">>,
                              maps:get(action, maps:get(response, Msg), undefined)),
                 Wire = management_pb:encode_msg(Msg, 'yuzu.server.v1.SendCommandResponse'),
+                %% Field 8, length-delimited (tag 66), 9 bytes: encode and decode share one module,
+                %% so the round trip alone would not notice the field being renumbered.
+                ?assertNotEqual(nomatch, binary:match(Wire, <<66, 9, "set_value">>)),
                 Decoded = management_pb:decode_msg(Wire, 'yuzu.server.v1.SendCommandResponse'),
                 ?assertEqual(<<"set_value">>,
                              maps:get(action, maps:get(response, Decoded), undefined))
