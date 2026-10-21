@@ -21,23 +21,14 @@ namespace yuzu::server {
 
 namespace {
 
+// The audit row's timestamp is the ONE process-clock read in this file. No approval
+// decision depends on a clock any more (#6096): a ticket is eligible while its
+// `consumed_at` is 0 and is retired by a guarded database transition after it settles an
+// occurrence (ApprovalManager::retire_for_schedule).
 int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
-}
-
-// Tickets submitted before this occurrence became the current one are stale:
-// a rejected ticket from a PREVIOUS occurrence must not skip this one, and a
-// long-spent approved ticket must not fire it. Once a schedule has advanced,
-// only tickets submitted STRICTLY after the advance count — that strictness
-// is the one-approval == one-run guarantee (advance stamps
-// last_executed_at, retiring the ticket that settled the occurrence, even
-// within the same second). A never-advanced schedule accepts any ticket
-// since its creation (`>=` — create and submit can share a second).
-bool ticket_is_current(const Approval& a, const InstructionSchedule& s) {
-    return s.last_executed_at > 0 ? a.submitted_at > s.last_executed_at
-                                  : a.submitted_at >= s.created_at;
 }
 
 } // namespace
@@ -189,9 +180,9 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
     // classify`'s own independent-field shape eliminates that class.
 
     // 1) An APPROVED ticket for THIS schedule's occurrence, for THIS exact
-    //    target → fire. The caller advances the schedule on our true return,
-    //    which retires the ticket via the occurrence anchor (see
-    //    ticket_is_current) — approve == at most one scheduled run. Single
+    //    target → fire, then retire the ticket (consumed_at, database time) before
+    //    returning true so the caller advances — approve == at most one scheduled
+    //    run, by state and not by comparing clocks (#6096). Single
     //    tick thread, so no concurrent-fire race. Matching on
     //    a.schedule_id == s.id (M-02, #1806) is required, not just
     //    belt-and-suspenders: without it, two schedules sharing (creator,
@@ -213,10 +204,38 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
     // is not new information (step 2 below already suppresses the
     // resubmission that would otherwise duplicate-ask).
     std::string mismatch_audit_detail;
+
+    // LEGACY-MIGRATION (#6096, remove one release after it ships): tickets the pre-#6096
+    // clock rule had already retired carry no `consumed_at`, so they would look unspent
+    // below and fire one more time. Retire them once per schedule per process, BEFORE any
+    // ticket is read (and so before this process submits one for the schedule). Done
+    // lazily per schedule rather than as one boot-time pass: a legacy ticket only matters
+    // when its schedule next fires, and this needs no schedule enumeration (which is
+    // capped) and no ticket listing (also capped, newest 100). A store failure holds this
+    // occurrence rather than risk the extra run; the sweep retries next tick.
+    if (!legacy_swept_.contains(s.id)) {
+        const auto swept = d_.approval_manager->retire_legacy_spent_for_schedule(
+            s.id, s.last_executed_at);
+        if (!swept) {
+            spdlog::warn("schedule_runner: schedule '{}' (id={}) legacy ticket sweep failed ({}) "
+                         "— holding the occurrence",
+                         s.name, s.id, swept.error());
+            return false;
+        }
+        if (*swept > 0)
+            spdlog::info("schedule_runner: schedule '{}' (id={}) retired {} pre-upgrade spent "
+                         "approval ticket(s)",
+                         s.name, s.id, *swept);
+        legacy_swept_.insert(s.id);
+    }
+
     auto approved = d_.approval_manager->query({.status = "approved", .submitted_by = s.created_by});
     for (const auto& a : approved) {
+        // Eligible = THIS schedule's, unspent (consumed_at == 0), for the same definition
+        // and scope. A retired ticket is skipped silently: that is the normal state of
+        // every earlier occurrence's ticket.
         if (a.definition_id != s.definition_id || a.scope_expression != s.scope_expression ||
-            a.schedule_id != s.id || !ticket_is_current(a, s))
+            a.schedule_id != s.id || a.consumed_at != 0)
             continue;
         // LIFETIME (#6061, governance SG-2): an approved ticket is a live one-time
         // capability and dies at the same moment consume_ticket() would refuse it. This
@@ -263,7 +282,23 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
         // outcome as the settle signal — a degraded enqueue returns false so the
         // caller does NOT advance; the approved ticket stays valid and the next
         // tick re-enqueues the same (idempotent) occurrence.
-        return enqueue_occurrence(s, plugin, action, a.id);
+        if (!enqueue_occurrence(s, plugin, action, a.id))
+            return false;
+        // The occurrence is durably queued (Enqueued or AlreadyEnqueued): spend the
+        // ticket BEFORE the caller advances (#6096). Never earlier: a retire that
+        // preceded a failed enqueue would lose the fire. A retire failure holds the
+        // occurrence; the next tick re-enqueues the same key (AlreadyEnqueued, no second
+        // run) and retries the retire. `false` from the retire means a concurrent
+        // retire already settled it, which is the state we wanted.
+        const auto retired = d_.approval_manager->retire_for_schedule(a.id, s.id);
+        if (!retired) {
+            count("yuzu_schedule_fire_failures_total");
+            spdlog::warn("schedule_runner: schedule '{}' (id={}) approval {} could not be "
+                         "retired ({}) — holding the occurrence",
+                         s.name, s.id, a.id, retired.error());
+            return false;
+        }
+        return true;
     }
 
     // 2) A PENDING ticket for THIS schedule → the occurrence waits (no
@@ -284,13 +319,24 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
     for (const auto& a : rejected) {
         if (a.definition_id != s.definition_id || a.scope_expression != s.scope_expression ||
             a.schedule_id != s.id || a.target_plugin != plugin || a.target_action != action ||
-            !ticket_is_current(a, s))
+            a.consumed_at != 0)
             continue;
         spdlog::info("schedule_runner: schedule '{}' (id={}) occurrence skipped — approval {} "
                      "rejected by {}",
                      s.name, s.id, a.id, a.reviewed_by);
         audit(s, "instruction.schedule_fired", "denied",
               "approval_rejected approval_id=" + a.id + " schedule_id=" + s.id);
+        // Spend the rejected ticket so it skips exactly this one occurrence (#6096). A
+        // retire failure holds the occurrence (re-audited next tick, the lesser harm than
+        // a rejection that could skip a second occurrence).
+        const auto retired = d_.approval_manager->retire_for_schedule(a.id, s.id);
+        if (!retired) {
+            count("yuzu_schedule_fire_failures_total");
+            spdlog::warn("schedule_runner: schedule '{}' (id={}) rejected approval {} could not "
+                         "be retired ({}) — holding the occurrence",
+                         s.name, s.id, a.id, retired.error());
+            return false;
+        }
         return true;
     }
 
