@@ -576,7 +576,7 @@ strictly safer than falsely cancelling it, since there is no repair path today t
 `agents_targeted` from `agent_exec_status`. Verified bidirectionally: the regression test fails
 (force-cancels the row) with the clause removed from all three sites, and passes with it restored.
 
-### `ApprovalManager` ticket liveness (#6061) - a recorded disposition, not a retention pass
+### `ApprovalManager` ticket liveness (#6061, #6096) - a recorded disposition, not a retention pass
 
 Listed here because the routed trigger fires on any wall-clock cutoff in `approval_manager.cpp`, not
 because the store adopts the apparatus. Every stamp this store writes (`submitted_at`, `reviewed_at`,
@@ -616,35 +616,51 @@ disagree: the `consume_ticket` CAS, its diagnostic read, `submit()`'s approved-t
   the stored value and the cutoff share one clock domain and nothing in the approval path depends on a
   replica's `system_clock`. `submitted_at` used to be the one process-clock stamp, kept that way for
   `ScheduleRunner`'s clock comparison; that comparison no longer exists.
-- **One approval == one scheduled run is a guarded state transition, not a clock comparison
-  (#6096).** `ScheduleRunner` treats a ticket as eligible only while its `consumed_at` is 0. After it
-  has durably enqueued the occurrence (`Enqueued` or the idempotent `AlreadyEnqueued`) and BEFORE the
-  schedule advances, it calls `ApprovalManager::retire_schedule_tickets(schedule_id, occurrence_key)`,
-  one UPDATE (`WHERE schedule_id AND consumed_at = 0 AND status IN ('approved','rejected')`,
-  `consumed_at` on database time, `consumed_by = 'schedule:<occurrence key>'`, never empty) that settles
-  EVERY unsettled approved/rejected ticket of the schedule, so an approved ticket the runner skipped for a
-  target mismatch cannot fire a later occurrence after the definition is reverted. Pending tickets are
-  never touched. A retire store failure HOLDS the occurrence; the next tick re-enqueues the same
-  occurrence key (idempotent) and retries the retire, so a failure between the enqueue and the retire can
-  neither lose the fire nor run it twice. A rejected ticket is retired the same way after it skips its
-  occurrence. The retire is deliberately NOT epoch-fenced: it only runs after the occurrence row exists
-  (whoever wrote it) and a stale replica's retire is an idempotent CAS to the same state;
-  `ScheduleRunner::tick` is FencedLeaderOnly and the only fenced write is the outbox INSERT.
-  **Accepted limitation:** retire-ok followed by a failed schedule advance burns one approval. The next
-  tick finds no eligible ticket and raises a fresh ask; the outbox key still prevents a double run (and
-  the fresh approval is then absorbed by the same occurrence key). There is deliberately no replay
-  eligibility keyed on `consumed_by` equalling the occurrence key. `ScheduleEngine`'s own stamps
-  (`created_at`, `last_executed_at`, `next_execution_at`) stay process-clock due-ness bookkeeping and
-  are informational for approvals now; `test_approval_manager.cpp` allow-lists the process-clock reads in
-  `schedule_runner.cpp` (the audit timestamp) and `schedule_engine.cpp` (the due-ness stamps) by exact
-  count so a new site fails loudly.
+- **One approval == at most one scheduled run is state plus a clock-free ledger, not a clock comparison
+  (#6096).** `ScheduleRunner` treats a ticket as eligible only while its `consumed_at` is 0. Before it fires
+  an eligible ticket it asks the command outbox which occurrences already used it
+  (`CommandOutboxStore::occurrences_for_approval`, a lookup by `approval_id`, indexed by
+  `outbox_approval_idx`); a row for a DIFFERENT occurrence means the ticket was already spent, whatever
+  `consumed_at` says, and it is skipped. A row for THIS occurrence is the legitimate retry (`AlreadyEnqueued`,
+  retire, advance). After the occurrence is durably enqueued (`Enqueued` or `AlreadyEnqueued`) and BEFORE the
+  schedule advances, the runner calls `ApprovalManager::retire_schedule_tickets(schedule_id, occurrence_key,
+  ids)`: one UPDATE (`WHERE schedule_id AND consumed_at = 0 AND status IN ('approved','rejected') AND id =
+  ANY(ids)`, `consumed_at` on database time, `consumed_by = 'schedule:<occurrence key>'`, never empty). `ids`
+  are the unsettled tickets of that schedule the runner OBSERVED in its own snapshot this tick (matched,
+  mismatch-skipped, expired-unswept, outbox-spent; on a rejected skip, the rejected ones too), so an approved
+  mismatch-skipped ticket is retired with the one that fired (otherwise it could fire a LATER occurrence after
+  the definition is reverted) while a ticket approved after the snapshot, or a successor occurrence's ticket,
+  is never touched. Pending tickets are never touched. A retire store failure or exception HOLDS the
+  occurrence; the next tick re-enqueues the same occurrence key (idempotent) and retries the retire, so a
+  failure between the enqueue and the retire can neither lose the fire nor run it twice. A rejected ticket is
+  retired the same way after it skips its occurrence. When no ticket is eligible but the occurrence key is
+  already in the outbox (retire ok, advance failed), the runner advances without raising a fresh ask. The
+  retire is deliberately NOT epoch-fenced: the only fenced write is the outbox INSERT (`ScheduleRunner::tick`
+  is FencedLeaderOnly); the retire only runs after the occurrence row exists (whoever wrote it) and is
+  scoped to the ids it observed, so a stale replica can only settle tickets it saw, each by a CAS from
+  unsettled. `ScheduleEngine`'s own stamps (`created_at`, `last_executed_at`, `next_execution_at`) stay
+  process-clock due-ness bookkeeping and are informational for approvals now; `test_approval_manager.cpp`
+  allow-lists the process-clock reads in `schedule_runner.cpp` (the audit timestamp) and
+  `schedule_engine.cpp` (the due-ness stamps) by exact count so a new site fails loudly.
+- **The outbox `approval_id` is now a spent-ticket ledger: any future outbox reaper must retain rows at least
+  as long as the 7-day ticket lifetime** (`kApprovalTicketTtlSeconds`), or a reaped row makes a spent ticket
+  look unspent. Today no reaper exists; the requirement is also stated at
+  `CommandOutboxStore::occurrences_for_approval`. An unreadable ledger HOLDS the occurrence, and an unwired
+  ledger seam fails closed.
+- **Accepted LOW items (#6096), recorded so a reviewer does not re-open them.** (1) An approval can carry across
+  a skipped occurrence within its 7-day life (an occurrence skipped for a disabled definition or a denied
+  arming check does not settle the approved ticket waiting for it, so that ticket can fire at the next
+  occurrence); it still yields at most one run per approval. (2) While a retire keeps failing, each held tick
+  creates and cancels one execution row (per-tick churn). (3) Retire ok followed by a failed advance burns one
+  approval: the occurrence already ran, the schedule advances on the next tick without a fresh ask, and the
+  spent ticket is not reused. There is deliberately no replay eligibility keyed on `consumed_by` equalling the
+  occurrence key. (4) `ScheduleEngine::advance_schedule` returns void and only logs a failure, so the runner
+  cannot observe a failed advance; the outbox guard above is what makes that safe.
 - **One-time legacy migration, clock-free (#6096).** Tickets minted before this change carry no
   `consumed_at`, so they would all look unspent. Approvals schema migration v2 retires every unsettled
   approved/rejected ticket that has a `schedule_id` (`consumed_by = 'schedule:legacy-6096'`), once per
-  database, with no comparison between `submitted_at` and `last_executed_at`. An earlier draft swept at
-  runtime on every restart by comparing the database-time `submitted_at` with the process-clock
-  `last_executed_at`; that is the cross-clock comparison this change removes, so it was dropped for the
-  migration. The deny direction: a legitimate approved-but-unfired ticket at upgrade time just gets a
+  database, with no comparison between `submitted_at` and `last_executed_at`, under a 300 s statement
+  timeout. The deny direction: a legitimate approved-but-unfired ticket at upgrade time just gets a
   fresh ask. See the upgrade note in `docs/user-manual/upgrading.md`.
 - **Parts 1, 2 and 4 DECLINED for the approved-ticket and the pending path; part 3 is not declined
   (next bullet)** (there is no per-replica clock reading to probe, persist or dedupe, and running the

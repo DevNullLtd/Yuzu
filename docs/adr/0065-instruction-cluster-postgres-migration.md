@@ -257,19 +257,26 @@ reasoning and residuals: `docs/clock-guarded-retention.md`, "`ApprovalManager` t
 (`submit_stamp_epoch()` is deleted), so `approval_manager.cpp` reads no process clock and the
 stale-pending sweep compares database time with database time. The reason it had stayed
 process-stamped, `ScheduleRunner::ticket_is_current` comparing it with `ScheduleEngine`'s
-process-clock `last_executed_at`, is removed rather than worked around: one approval == one
-scheduled run is now a guarded state transition. `ApprovalManager::retire_schedule_tickets(schedule_id,
-occurrence_key)` is one UPDATE keyed on `consumed_at = 0` that settles every unsettled approved/rejected
-ticket of the schedule (database-time `consumed_at`, `consumed_by = 'schedule:<occurrence key>'`);
-the runner calls it after the occurrence is durably enqueued and before the schedule advances, and a
-ticket is eligible only while `consumed_at = 0`. A retire failure holds the occurrence; the idempotent
-occurrence key makes the retry safe. Retire-ok with a failed advance burns one approval (accepted: a
-fresh ask follows, the outbox key prevents a double run). The retire is deliberately not epoch-fenced
-(see its doc comment). `consume_ticket` still refuses `kSchedule` origins. `ScheduleEngine`'s own
-stamps stay process clock (due-ness bookkeeping, informational for approvals). The approvals ladder
-gains **v2**, a clock-free data migration that retires every pre-upgrade unsettled schedule ticket
-(`consumed_by = 'schedule:legacy-6096'`). Reasoning: `docs/clock-guarded-retention.md`,
-"`ApprovalManager` ticket liveness".
+process-clock `last_executed_at`, is removed rather than worked around: one approval == at most one
+scheduled run is now a guarded state transition plus a clock-free ledger. `ApprovalManager::
+retire_schedule_tickets(schedule_id, occurrence_key, ids)` is one UPDATE keyed on `consumed_at = 0`
+and scoped to the ticket ids the runner observed in its own snapshot (database-time `consumed_at`,
+`consumed_by = 'schedule:<occurrence key>'`); the runner calls it after the occurrence is durably
+enqueued and before the schedule advances, and a ticket is eligible only while `consumed_at = 0`. A
+retire failure or exception holds the occurrence; the idempotent occurrence key makes the retry safe.
+The command outbox is the spent-ticket ledger: before firing, the runner reads which occurrences
+already used the ticket (`CommandOutboxStore::occurrences_for_approval`, new `outbox_approval_idx`,
+outbox schema v2) and refuses one used by an earlier occurrence, which closes mixed-version and
+skip-advance re-fires; if the current occurrence is already in the outbox and no ticket is eligible, the
+schedule advances without a fresh ask. Any future outbox reaper must retain rows for at least the 7-day
+ticket life. The retire is deliberately not epoch-fenced (the only fenced write is the outbox INSERT) and
+is safe because it runs only after the occurrence row exists and settles only observed ids; retire-ok
+with a failed advance burns one approval, accepted. `consume_ticket` still refuses `kSchedule` origins.
+`ScheduleEngine`'s own stamps stay process clock (due-ness bookkeeping, informational for approvals).
+The approvals ladder gains **v2**, a clock-free data migration that retires every pre-upgrade
+unsettled schedule ticket (`consumed_by = 'schedule:legacy-6096'`). The paragraph above
+supersedes the 2026-10-18 amendment's `submitted_at` sentence. Reasoning and accepted LOW items:
+`docs/clock-guarded-retention.md`, "`ApprovalManager` ticket liveness".
 
 **Correction (adversarial review, 2026-08-31):** "ports shape-preserved" above was true of the two
 `UPDATE` statements themselves but not of their ORDER relative to the pending-count cap check.
