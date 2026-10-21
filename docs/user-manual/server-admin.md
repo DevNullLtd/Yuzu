@@ -359,6 +359,37 @@ separately.
 
 ## Upgrade Notes
 
+### vNEXT — the offline user-hive file check is now the default for autoruns, installed_apps, license_scan, registry and tar (related issue #5291; breaking for fleets with non-standard profile roots)
+
+**What changed.** Agent plugins that mount a logged-out Windows profile's `NTUSER.DAT` offline (to
+read its `HKEY_USERS` hive without a live session) have always run a file-level check against that
+hive — the path must not cross a UNC/non-fixed-drive or a reparse-point ancestor, and the file
+itself must be a regular file owned by the profile, LocalSystem or Administrators. Before this
+change only one plugin (`privacy_permissions`) opted into that check; the other five production
+callers (`autoruns`, `installed_apps`, `license_scan`, `registry`, and TAR's mapped-drive-history
+collector) mounted with no check at all. The check is now the default for all of them.
+
+**Who this affects.** A profile hive that fails the check — most commonly an FSLogix, UWP-container
+or other non-persistent-image profile root, or any profile directory not owned by its own
+user/LocalSystem/Administrators — now surfaces as a named, unreadable-source row instead of being
+silently mounted and read: `autoruns list`/`catalog` and `installed_apps list_per_user` name the
+specific refusal reason per profile; `license_scan list` reports the aggregate reason
+`hive_file_refused` on its `per_user_hives` probe status (the specific per-profile reason goes to
+the agent log only); `registry` answers its existing hive-file-refused error (unchanged wording,
+no reason suffix); TAR's mapped-drive history retries an affected profile individually, up to 7
+attempts over 24 h apart, before giving up on that profile. A fleet with many such profiles (e.g. a
+VDI/FSLogix rollout) may see these constraint rows appear for a noticeable fraction of devices
+right after upgrading.
+
+**What to do.** No action is required — this is a fail-closed tightening of an existing check's
+reach, not a new restriction with a workaround; a profile that reads fine today under the new
+default was never at risk from it. Automation that treats one of the five affected plugins'
+previously-silent success as a guarantee (a script that only checks for a non-empty `list` row
+count, a SIEM rule that alerts only on an explicit error) should instead treat a
+`hive_*`/`hive_file_refused`/hive-file-refused row the same way it already treats any other
+named per-profile constraint from these plugins (`not_found`, `privilege_missing`, `mount_failed`)
+— none of these are new categories of outcome, only a more specific one for this particular cause.
+
 ### vNEXT - Integrations writes need a same-site Origin on a cookie session, write an `attempted` audit row first, and store no destination URL (breaking for cookie-reusing scripts)
 
 `POST`/`DELETE /api/webhooks`, `POST`/`DELETE /api/v1/offload-targets`, `POST /api/directory/sync`, `PUT /api/directory/group-mappings` and `POST /api/settings/mcp` now answer `403` to a request authenticated by a **session cookie** that carries no `Origin`/`Referer`, or one naming another site. A script that reuses a login cookie jar (`curl -b`) must switch to an API token (token callers are not gated) or send a same-site `Origin`; behind a proxy that rewrites `Host`, declare the external origin with `--csrf-trusted-origin` as described above. Each of these writes also records a `result=attempted` audit row before it changes anything and answers `503` with `Sec-Audit-Failed: true` when that row cannot be stored; during an audit-store outage they are unavailable, deleting a webhook or offload target included (the MCP switches can still be turned off with `--mcp-disable` and a restart; check `/healthz` `stores.audit` and the `YuzuAuditPersistFailures` alert). SIEM rules that filter `result != success` will now also see the `attempted` rows. Webhook and offload audit rows record `url=<scheme>://<host>[:<port>] url_fp=<12 hex>` instead of the full URL, and their log lines name the host (and the webhook or target id where one exists), never the URL; rows written by earlier builds keep the full URL, so rotate any hook URL that appears in one.

@@ -25,6 +25,7 @@
 // redact_cmdline (cmdline-only; it would mangle UNC paths) — opt-in + audit is
 // the protection, exactly as dns_live does for visited domains.
 
+#include "bounded_wait.hpp" // yuzu::shared::bounded_call_ex — ../../shared include dir
 #include "tar_capture_status.hpp" // classify_subprocess_capture, IncompleteCaptureError, would_exceed_cap
 #include "tar_collectors.hpp"
 
@@ -920,9 +921,29 @@ struct OutboundRead {
     long rc = 0;
 };
 
+// The complete, self-contained outcome of one profile's bounded with_user_hive attempt --
+// returned BY VALUE from bounded_call_ex's lambda rather than written through captured
+// references, since a timed-out call's detached thread may still be running (and touching
+// whatever it captured) long after enum_registry_outbound_history has moved on to the next
+// profile or returned outright. `rows` is this profile's own share only; the caller splices it
+// into the shared accumulator itself, only once the call has actually completed.
+struct BoundedProfileRead {
+    yuzu::win::HiveAccessStatus status = yuzu::win::HiveAccessStatus::mount_failed;
+    yuzu::win::HiveAccessReport report;
+    OutboundRead read;
+    std::vector<MapDriveHistoryRow> rows;
+};
+
 // Read the three per-user outbound artifacts under an opened user-root hive key.
+// `cap_baseline` is the batch-wide row count accumulated by OTHER profiles before this one
+// started (0 for a caller with no such notion). `out` is this call's own, typically fresh,
+// accumulator -- bounded_call_ex's detached-thread safety means it can no longer be the shared
+// batch accumulator directly (see enum_registry_outbound_history), so the per-key cap checks
+// below compare `cap_baseline + out.size()` to keep the SAME batch-wide ceiling this function
+// always enforced, not a reset-per-profile one.
 OutboundRead read_user_outbound_history(HKEY user_root, const std::string& profile_user,
-                                        std::vector<MapDriveHistoryRow>& out) {
+                                        std::vector<MapDriveHistoryRow>& out,
+                                        std::size_t cap_baseline = 0) {
     OutboundRead result;
     const auto note_failure = [&](long rc) {
         if (rc != ERROR_FILE_NOT_FOUND && result.rc == 0)
@@ -940,7 +961,7 @@ OutboundRead read_user_outbound_history(HKEY user_root, const std::string& profi
             LONG enum_rc;
             while ((enum_rc = RegEnumKeyExW(net.h, idx, sub, &len, nullptr, nullptr, nullptr,
                                             nullptr)) == ERROR_SUCCESS) {
-                if (out.size() >= kMapDriveHistoryCap) {
+                if (cap_baseline + out.size() >= kMapDriveHistoryCap) {
                     result.complete = false;
                     return result; // per-key cap (a corrupt/huge key must not run unbounded)
                 }
@@ -988,7 +1009,7 @@ OutboundRead read_user_outbound_history(HKEY user_root, const std::string& profi
             DWORD vidx = 0, vlen = 128;
             LONG er = ERROR_SUCCESS;
             for (;; vidx++, vlen = 128) {
-                if (out.size() >= kMapDriveHistoryCap) {
+                if (cap_baseline + out.size() >= kMapDriveHistoryCap) {
                     result.complete = false;
                     return result; // per-key cap
                 }
@@ -1029,7 +1050,7 @@ OutboundRead read_user_outbound_history(HKEY user_root, const std::string& profi
             LONG enum_rc;
             while ((enum_rc = RegEnumKeyExW(mp.h, idx, sub, &len, nullptr, nullptr, nullptr,
                                             nullptr)) == ERROR_SUCCESS) {
-                if (out.size() >= kMapDriveHistoryCap) {
+                if (cap_baseline + out.size() >= kMapDriveHistoryCap) {
                     result.complete = false;
                     return result; // per-key cap
                 }
@@ -1073,6 +1094,23 @@ OutboundRead read_user_outbound_history(HKEY user_root, const std::string& profi
 // tar_plugin.cpp's retry_pending_mapdrive_backfill) -- a requested SID the ProfileList no longer
 // contains simply gets no ProfileHiveOutcome, which is exactly how apply_outcomes
 // (tar_mapdrive_backfill.hpp) tells "vanished" from "not reached" (h.complete carries the rest).
+// with_user_hive's default offline-hive guard is deliberately deadline-less (agents/shared/
+// win_profiles.hpp), and RegLoadKeyW has no native timeout -- a profile on an unresponsive network
+// share can hang here forever. Before the per-profile retry (related issue #5291) that was a
+// one-shot risk at init(); the retry now re-attempts specifically the profiles already known to be
+// problematic, on a recurring cadence, from the SAME single-threaded dispatch that also runs TAR's
+// other four interval triggers including retention -- an uncancellable hang here would wedge all
+// of them indefinitely, with no self-recovery (governance Gate 6, sre). bounded_call_ex (this
+// plugin's first consumer of the shared primitive; see dism_bounded_call.hpp/power_health_plugin.cpp
+// for the established pattern) bounds the WAIT, not the call: the mount runs on a detached thread,
+// and the dispatching thread gives up and moves on after kHiveMountBoundMs, leaving an actually-
+// hung thread to finish (or not) on its own, still holding the process-wide offline-hive mutex --
+// that residual (another with_user_hive caller blocking behind it) is narrower and pre-existing for
+// every caller of this mutex, not something this one call site can fix.
+constexpr std::chrono::milliseconds kHiveMountBoundMs{30000}; // generous for a legitimately slow
+                                                              // network-share read; see dism's 17s
+                                                              // for a comparable Windows API bound
+
 void enum_registry_outbound_history(MapDriveHistory& h, const std::vector<std::string>* only_sids) {
     const auto disc = yuzu::win::enumerate_profile_list();
     h.complete = profile_list_complete(disc.root_rc, disc.last_rc, disc.probe_rc);
@@ -1112,14 +1150,47 @@ void enum_registry_outbound_history(MapDriveHistory& h, const std::vector<std::s
                 continue;
         }
 
-        yuzu::win::HiveAccessReport report;
-        OutboundRead read; // stays default (complete=true, rc=0) when fn is never called
-        const auto status = yuzu::win::with_user_hive(
-            profile.sid, profile.profile_path,
-            [&](HKEY root) {
-                read = read_user_outbound_history(root, profile.profile_name, h.rows);
-            },
-            &report);
+        // Copied by value, never captured by reference: a TimedOut result means the detached
+        // thread below is still running (possibly for a long time, possibly forever) and must
+        // not depend on `profile`/`profiles`/`h` surviving past this scope. `cap_baseline` is a
+        // plain snapshot, not a reference, so passing it along stays safe for the same reason.
+        const std::string sid = profile.sid;
+        const std::string path = profile.profile_path;
+        const std::string pname = profile.profile_name;
+        const std::size_t cap_baseline = h.rows.size();
+        auto bounded = yuzu::shared::bounded_call_ex(
+            kHiveMountBoundMs, [sid, path, pname, cap_baseline]() -> BoundedProfileRead {
+                BoundedProfileRead r;
+                r.status = yuzu::win::with_user_hive(
+                    sid, path,
+                    [&](HKEY root) {
+                        r.read = read_user_outbound_history(root, pname, r.rows, cap_baseline);
+                    },
+                    &r.report);
+                return r;
+            });
+
+        if (bounded.status != yuzu::shared::BoundedCallStatus::Completed) {
+            // TimedOut (the mount is still running, detached, on its own time -- never joined,
+            // never touched again) or Rejected (the shared outstanding-call ceiling was already
+            // full, so no thread was even spawned). Either way this profile is unresolved this
+            // attempt, same as any other failure: bump it through the normal retry path rather
+            // than blocking the caller, which is the one thing that must never happen here.
+            ProfileHiveOutcome outcome;
+            outcome.sid = profile.sid;
+            outcome.status = yuzu::win::HiveAccessStatus::mount_failed;
+            outcome.token = bounded.status == yuzu::shared::BoundedCallStatus::TimedOut
+                               ? "timeout"
+                               : "mount_failed";
+            outcome.complete = true; // nothing about this profile's cap/completeness changed
+            h.profiles.push_back(std::move(outcome));
+            continue;
+        }
+        BoundedProfileRead& result = *bounded.value;
+        h.rows.insert(h.rows.end(), result.rows.begin(), result.rows.end());
+        const yuzu::win::HiveAccessReport& report = result.report;
+        const OutboundRead& read = result.read;
+        const auto status = result.status;
 
         // A leaked mount is system-wide and locks NTUSER.DAT until something
         // releases it. This collector has no per-row diagnostic channel, so it
@@ -1150,12 +1221,15 @@ void enum_registry_outbound_history(MapDriveHistory& h, const std::vector<std::s
             outcome.read_ok = false;
             outcome.token = "read_failed:win32_" + std::to_string(read.rc);
         }
-        // read.complete already reflects this profile's own share of the cap: it shares the
-        // same h.rows reference with the batch-wide cap check below, so a cap hit DURING this
-        // profile's own sections already surfaces here. ANDing the batch-wide cap again marks
-        // the profile whose rows happened to cross it as incomplete even when its own read was
-        // genuinely fine -- apply_outcomes then retries it forever (governance: security-guardian).
-        // The cap-hit-stops-the-walk case below already covers every UNWALKED profile via
+        // read.complete already reflects this profile's own share of the cap: cap_baseline
+        // (this profile's starting offset into the batch-wide count) makes its three inner
+        // checks compare against the SAME cumulative total the stop-the-walk check below uses,
+        // even though `out`/`r.rows` above is this call's own local accumulator, not h.rows
+        // directly -- bounded_call_ex's detached-thread safety rules out sharing h.rows itself
+        // (governance Gate 6, sre). ANDing the batch-wide cap again here would mark the profile
+        // whose rows happened to cross it as incomplete even when its own read was genuinely
+        // fine -- apply_outcomes then retries it forever (governance: security-guardian). The
+        // cap-hit-stops-the-walk case below already covers every UNWALKED profile via
         // h.complete; this profile doesn't need a second, misattributed signal.
         outcome.complete = read.complete;
         h.profiles.push_back(std::move(outcome));
