@@ -286,6 +286,41 @@ struct ReadLedgerRow {
 // hit in the current tree is a table entry.
 constexpr std::array<ReadLedgerRow, 0> kKnownReadOnlyDispatchLike{};
 
+/// A C++ raw string literal starting at `i` (`R"delim(...)delim"`, optionally behind a `u8`, `u`,
+/// `U` or `L` prefix; delimiter up to 16 characters). `stop` is one past the closing quote, or
+/// the end of the text when the literal is unterminated.
+struct RawLiteral {
+    bool is_raw = false;
+    bool terminated = false;
+    std::size_t stop = 0;
+};
+
+RawLiteral raw_literal_at(const std::string& text, std::size_t i) {
+    RawLiteral out;
+    if (i + 2 >= text.size() || text[i] != 'R' || text[i + 1] != '"')
+        return out;
+    if (i > 0 && is_ident_char(text[i - 1])) {
+        std::size_t b = i;
+        while (b > 0 && is_ident_char(text[b - 1]))
+            --b;
+        const std::string_view prefix(text.data() + b, i - b);
+        if (prefix != "u8" && prefix != "u" && prefix != "U" && prefix != "L")
+            return out;
+    }
+    std::size_t d = i + 2;
+    while (d < text.size() && d - (i + 2) <= 16 && text[d] != '(' && text[d] != ')' &&
+           text[d] != '"' && text[d] != '\\' && !std::isspace(static_cast<unsigned char>(text[d])))
+        ++d;
+    if (d >= text.size() || text[d] != '(' || d - (i + 2) > 16)
+        return out;
+    const std::string closer = ")" + text.substr(i + 2, d - (i + 2)) + "\"";
+    const std::size_t end = text.find(closer, d + 1);
+    out.is_raw = true;
+    out.terminated = end != std::string::npos;
+    out.stop = out.terminated ? end + closer.size() : text.size();
+    return out;
+}
+
 /// Removes `//` and `/* ... */` comments, leaving string, raw string and character literals
 /// intact so a comment opener inside a literal (a glob such as "/x/*") is not mistaken for a
 /// comment. Newlines inside removed comments are kept so line numbers still match the source.
@@ -295,12 +330,9 @@ std::string strip_comments(const std::string& text) {
     std::size_t i = 0;
     while (i < text.size()) {
         const char c = text[i];
-        if (c == 'R' && i + 2 < text.size() && text[i + 1] == '"' && text[i + 2] == '(' &&
-            (i == 0 || !is_ident_char(text[i - 1]))) {
-            const std::size_t end = text.find(")\"", i + 3);
-            const std::size_t stop = end == std::string::npos ? text.size() : end + 2;
-            out.append(text, i, stop - i);
-            i = stop;
+        if (const RawLiteral raw = raw_literal_at(text, i); raw.is_raw) {
+            out.append(text, i, raw.stop - i);
+            i = raw.stop;
         } else if (c == '"') {
             std::size_t j = i + 1;
             while (j < text.size() && text[j] != '"')
@@ -341,12 +373,10 @@ std::size_t balanced_paren_end(const std::string& text, std::size_t open) {
     int depth = 0;
     for (std::size_t j = open; j < text.size(); ++j) {
         const char c = text[j];
-        if (c == 'R' && j + 2 < text.size() && text[j + 1] == '"' && text[j + 2] == '(' &&
-            (j == 0 || !is_ident_char(text[j - 1]))) {
-            const std::size_t end = text.find(")\"", j + 3);
-            if (end == std::string::npos)
+        if (const RawLiteral raw = raw_literal_at(text, j); raw.is_raw) {
+            if (!raw.terminated)
                 return std::string::npos;
-            j = end + 1;
+            j = raw.stop - 1;
         } else if (c == '"') {
             ++j;
             while (j < text.size() && text[j] != '"')
@@ -787,6 +817,26 @@ TEST_CASE("same-site inventory: comment stripping handles block comments and lit
     CHECK(regs[2].path == "/synthetic/after");
     CHECK(regs[2].line == 10); // line numbers survive stripped block comments
     CHECK(count_raw_get_hits(text) == 4); // the commented-out one is raw noise only
+}
+
+TEST_CASE("same-site inventory: custom-delimiter raw strings do not hide later registrations",
+          "[csrf][same_site][route_inventory]") {
+    const std::string text =
+        "const char* a = R\"json(\"/*\" // not a comment (x))json\";\n"
+        "const char* b = u8R\"d(\"/*\")d\";\n"
+        "sink.Get(\"/synthetic/after-raw\", [this](const Req&, Res&) {\n"
+        "    dispatch_fn_(a);\n"
+        "});\n"
+        "const char* c = R\"x(\n/* never closed in the literal )\" still literal)x\";\n"
+        "sink.Get(\"/synthetic/last\", [](const Req&, Res&) {});\n";
+    std::size_t dropped = 0;
+    const auto regs = extract_get_registrations("x.cpp", text, &dropped);
+    REQUIRE(regs.size() == 2);
+    CHECK(dropped == 0);
+    CHECK(regs[0].path == "/synthetic/after-raw");
+    CHECK(has_dispatch_marker(regs[0].handler));
+    CHECK(regs[1].path == "/synthetic/last");
+    CHECK(count_raw_get_hits(text) == 2);
 }
 
 TEST_CASE("same-site inventory: a registration the scan cannot span is counted as dropped",

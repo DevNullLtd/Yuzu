@@ -764,6 +764,7 @@ TEST_CASE("same-site pipeline: the refusal is the A4 envelope", "[csrf][same_sit
     CHECK(j["meta"]["api_version"] == "v1");
     CHECK_FALSE(j["error"]["remediation"].get<std::string>().empty());
     CHECK(contains(j["error"]["remediation"].get<std::string>(), "--csrf-trusted-origin"));
+    CHECK(contains(j["error"]["remediation"].get<std::string>(), "Sec-Fetch-Site"));
 }
 
 TEST_CASE("same-site pipeline: each refusal is counted exactly once on its own series",
