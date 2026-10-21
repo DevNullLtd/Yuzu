@@ -3,8 +3,9 @@
 /// @file software_catalog_rules.hpp
 /// Pure decision core for the Software catalogue rollup (M.9 PR-1): the grain mask,
 /// the OS-family table (and the OpenAPI/MCP ecosystem renderers `ecosystem_json_enum_items()` /
-/// `ecosystem_pipe_list()` generated from it, plus `expand_ecosystem_tokens()` shared by the
-/// OpenAPI document and the MCP tool catalogue), the catalogue's own TRANSITIVE version order, the
+/// `ecosystem_pipe_list()` generated from it, plus `expand_ecosystem_tokens()`, used by the MCP
+/// tool catalogue; rest_api_v1.cpp keeps its own copy until a REST-only follow-up), the
+/// catalogue's own TRANSITIVE version order, the
 /// streaming fleet-newest fold, search hygiene and the refresh/search bounds. No libpq,
 /// no clock, no I/O — the store (`software_inventory_store.cpp`) owns every statement and
 /// feeds this header plain values, so the unit suite never touches a database for any of it.
@@ -45,8 +46,8 @@ struct EcosystemFamily {
     std::string_view family; ///< windows | macos | linux; any other ecosystem is "other"
 };
 
-/// Row order is the published order of the OpenAPI ecosystem enums; a mid-table insert shifts
-/// positions, so say so in the changelog.
+/// Row order is the published order of the OpenAPI and MCP ecosystem enums; a mid-table insert
+/// shifts positions, so say so in the changelog.
 inline constexpr std::array<EcosystemFamily, 12> kEcosystemFamilies{{
     {"windows", "windows"},
     {"optional_feature", "windows"},
@@ -114,8 +115,8 @@ static_assert(ecosystem_table_well_formed(),
     return sql;
 }
 
-/// JSON array items (no brackets, table order) for the OpenAPI `ecosystem` enums. Every literal
-/// comes from the constexpr table (never input).
+/// JSON array items (no brackets, table order) for the OpenAPI and MCP `ecosystem` enums. Every
+/// literal comes from the constexpr table (never input).
 [[nodiscard]] inline std::string ecosystem_json_enum_items() {
     std::string out;
     for (const auto& e : kEcosystemFamilies) {
@@ -128,7 +129,8 @@ static_assert(ecosystem_table_well_formed(),
     return out;
 }
 
-/// `a|b|c` list (table order) for the OpenAPI /inventory/software description.
+/// `a|b|c` list (table order) for the OpenAPI /inventory/software and MCP query_installed_software
+/// descriptions.
 [[nodiscard]] inline std::string ecosystem_pipe_list() {
     std::string out;
     for (const auto& e : kEcosystemFamilies) {

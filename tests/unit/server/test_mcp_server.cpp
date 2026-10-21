@@ -98,6 +98,7 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers.hpp>        // REQUIRE_THROWS_WITH (#2383)
+#include <catch2/matchers/catch_matchers_exception.hpp> // MessageMatches (M.10b)
 #include <catch2/matchers/catch_matchers_string.hpp> // ContainsSubstring (#2383)
 
 #include "agent.pb.h" // yuzu::agent::v1::AgentInfo (discover_plugins test)
@@ -39200,7 +39201,7 @@ TEST_CASE("MCP sync_hardware_software: every Runner refusal maps to the intended
     }
 }
 
-// ── M.10b: the ecosystem enums and the pipe list are generated from kEcosystemFamilies ──────────
+// ── M.10b: ecosystem enums and pipe list are generated from kEcosystemFamilies ──────────────
 namespace {
 constexpr std::array<std::string_view, 5> kEcosystemEnumTools{
     "query_software_catalogue", "get_software_versions", "get_crypto_libraries",
@@ -39249,14 +39250,23 @@ TEST_CASE("MCP ecosystem enums: every served ecosystem property and the pipe lis
     for (const auto& t : tools) {
         const auto name = t["name"].get<std::string>();
         const auto& props = t["inputSchema"]["properties"];
-        if (props.is_object() && props.contains("ecosystem") && props["ecosystem"].contains("enum")) {
+        const bool empty_form =
+            std::ranges::find(kEcosystemWithEmptyTools, name) != kEcosystemWithEmptyTools.end();
+        INFO(name);
+        if (props.is_object() && props.contains("ecosystem") &&
+            props["ecosystem"].contains("enum")) {
             seen.insert(name);
             const auto got = props["ecosystem"]["enum"].get<std::vector<std::string>>();
-            const bool empty_form =
-                std::ranges::find(kEcosystemWithEmptyTools, name) != kEcosystemWithEmptyTools.end();
-            INFO(name);
             // Exact vector equality: order is pinned to the table.
             CHECK(got == (empty_form ? with_empty : table));
+        }
+        // An output schema is expanded and served too: any ecosystem enum it carries follows
+        // the same rule (none does today; this keeps one from being hand-typed later).
+        if (t.contains("outputSchema")) {
+            std::vector<nlohmann::json> out_enums;
+            collect_ecosystem_enums(t["outputSchema"], out_enums);
+            for (const auto& e : out_enums)
+                CHECK(e.get<std::vector<std::string>>() == (empty_form ? with_empty : table));
         }
         if (name == "query_installed_software") {
             pipe_tool_seen = true;
@@ -39265,6 +39275,8 @@ TEST_CASE("MCP ecosystem enums: every served ecosystem property and the pipe lis
         }
     }
     CHECK(pipe_tool_seen);
+    // Other prose naming ecosystems (the snap/flatpak sentences) stays hand-written by
+    // decision and is not scanned; only the pipe list above is generated.
     const std::set<std::string> expected(kEcosystemEnumTools.begin(), kEcosystemEnumTools.end());
     CHECK(seen == expected);
 }
@@ -39286,18 +39298,23 @@ TEST_CASE("MCP ecosystem provenance: the unexpanded templates carry only the gen
     std::size_t token_mentions = 0;
     bool pipe_tool_seen = false;
     for (const auto& r : rows) {
-        const auto in = nlohmann::json::parse(r.input_schema_json, nullptr, false);
         INFO(r.name);
-        REQUIRE_FALSE(in.is_discarded());
-        std::vector<nlohmann::json> enums;
-        collect_ecosystem_enums(in, enums);
-        for (const auto& e : enums) {
-            ++sites;
-            names.insert(r.name);
-            const bool empty_form =
-                std::ranges::find(kEcosystemWithEmptyTools, r.name) != kEcosystemWithEmptyTools.end();
-            CHECK(e == nlohmann::json::array(
-                           {empty_form ? "@@ECOSYSTEM_ENUM_OR_EMPTY@@" : "@@ECOSYSTEM_ENUM@@"}));
+        const bool empty_form =
+            std::ranges::find(kEcosystemWithEmptyTools, r.name) != kEcosystemWithEmptyTools.end();
+        // Input and (when present) output schema: an ecosystem enum is a generator token in both.
+        for (const auto* schema : {&r.input_schema_json, &r.output_schema_json}) {
+            if (schema->empty())
+                continue;
+            const auto doc = nlohmann::json::parse(*schema, nullptr, false);
+            REQUIRE_FALSE(doc.is_discarded());
+            std::vector<nlohmann::json> enums;
+            collect_ecosystem_enums(doc, enums);
+            for (const auto& e : enums) {
+                ++sites;
+                names.insert(r.name);
+                CHECK(e == nlohmann::json::array({empty_form ? "@@ECOSYSTEM_ENUM_OR_EMPTY@@"
+                                                             : "@@ECOSYSTEM_ENUM@@"}));
+            }
         }
         if (r.name == "query_installed_software") {
             pipe_tool_seen = true;
@@ -39328,13 +39345,15 @@ TEST_CASE("MCP build_catalogue refuses a served text that still carries an ecosy
     SECTION("a misspelt token in the input schema names the tool and the field") {
         auto r = good_registry_record();
         r.input_schema_json = R"({"type":"object","properties":{"e":{"enum":["@@ECOSYSTEM_ENM@@"]}}})";
-        CHECK_THROWS_WITH(build_catalogue_for_test(std::span<const ToolRecord>(&r, 1)),
-                          Catch::Matchers::ContainsSubstring("MCP tool 'synthetic_tool'") &&
-                              Catch::Matchers::ContainsSubstring("input schema"));
+        CHECK_THROWS_MATCHES(build_catalogue_for_test(std::span<const ToolRecord>(&r, 1)),
+                             std::logic_error,
+                             Catch::Matchers::MessageMatches(
+                                 Catch::Matchers::ContainsSubstring("MCP tool 'synthetic_tool'") &&
+                                 Catch::Matchers::ContainsSubstring("input schema")));
     }
     SECTION("a single-@ token is refused") {
         auto r = good_registry_record();
-        r.input_schema_json = R"({"type":"object","properties":{"e":{"enum":["@ECOSYSTEM_ENUM@@"]}}})";
+        r.input_schema_json = R"({"type":"object","properties":{"e":{"enum":["@ECOSYSTEM_ENUM@"]}}})";
         CHECK_THROWS_WITH(build_catalogue_for_test(std::span<const ToolRecord>(&r, 1)),
                           Catch::Matchers::ContainsSubstring("input schema"));
     }

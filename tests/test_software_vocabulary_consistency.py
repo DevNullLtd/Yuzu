@@ -49,9 +49,10 @@ MANUAL = "docs/user-manual/inventory.md"
 CPE_HDR = "server/core/src/cpe_normalize.hpp"
 
 LITERAL_RE = re.compile(r'\b(kind|ecosystem)\s*=\s*"([a-z_]+)"')
-# The two generator tokens (software_catalog_rules.hpp expand_ecosystem_tokens, shared by the
-# OpenAPI document and the MCP catalogue): the only enum an OpenAPI `ecosystem` parameter may
-# carry in the source literal. (The MCP side is held by test_mcp_server.cpp.)
+# The two generator tokens (software_catalog_rules.hpp expand_ecosystem_tokens, used by the MCP
+# tool catalogue; rest_api_v1.cpp keeps its own copy until a REST-only follow-up): the only enum
+# an OpenAPI `ecosystem` parameter may carry in the source literal. (The MCP side is held by
+# test_mcp_server.cpp.)
 ECOSYSTEM_TOKENS = (["@@ECOSYSTEM_ENUM@@"], ["@@ECOSYSTEM_ENUM_OR_EMPTY@@"])
 
 

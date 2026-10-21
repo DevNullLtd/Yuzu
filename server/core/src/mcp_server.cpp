@@ -5522,9 +5522,15 @@ struct Catalogue {
 
     // Owns every served text build_catalogue() expanded from a token template; `served` points
     // into it. A deque's push_back never relocates and a container move keeps element addresses
-    // (C++17 [container.reqmts]), so the pointers survive the return from build_catalogue(). Do
-    // not copy a temporary Catalogue (the copy's `served` would point at the original's storage).
+    // (C++17 [container.reqmts]), so the pointers survive the return from build_catalogue().
+    // Copying is deleted: a copy's `served` would point at the original's storage.
     std::deque<std::string> expanded_text;
+
+    Catalogue() = default;
+    Catalogue(const Catalogue&) = delete;
+    Catalogue& operator=(const Catalogue&) = delete;
+    Catalogue(Catalogue&&) = default;
+    Catalogue& operator=(Catalogue&&) = default;
 
     // The registry handler for `tool_name`, or nullptr when the tool is not
     // registry-resident (every legacy tool).

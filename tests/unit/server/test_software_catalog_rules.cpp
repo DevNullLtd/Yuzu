@@ -210,7 +210,7 @@ TEST_CASE("expand_ecosystem_tokens: each token form expands from the table",
     }
 }
 
-TEST_CASE("expand_ecosystem_tokens: repeats, mixed kinds, no-op and empty",
+TEST_CASE("expand_ecosystem_tokens: repeats and mixed kinds; no-op and empty input",
           "[server][software_catalog][ecosystem]") {
     const std::string tmpl = R"(a "@@ECOSYSTEM_ENUM@@" b "@@ECOSYSTEM_ENUM_OR_EMPTY@@" c )"
                              R"("@@ECOSYSTEM_ENUM@@" d @@ECOSYSTEM_LIST@@ e @@ECOSYSTEM_LIST@@)";
