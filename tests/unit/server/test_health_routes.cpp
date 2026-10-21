@@ -50,6 +50,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -692,6 +693,177 @@ TEST_CASE("health_routes: /fragments/health/summary renders the WARN strip "
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Source-text pin helpers. `strip_comments` drops `//` and `/* */` comments from C++ source
+// (string, character and raw-string literals are kept verbatim, so a literal that merely
+// contains `//` is not truncated) so a pin cannot be satisfied by commented-out code. It
+// understands: ordinary strings with escapes; raw strings with an optional encoding prefix
+// (`R"`, `u8R"`, `uR"`, `UR"`, `LR"`); character literals with an optional encoding prefix
+// (`'x'`, `L'x'`, `u'x'`, `U'x'`, `u8'x'`); digit separators (`1'000`), which are not
+// character literals; and a `//` comment continued onto the next line by a trailing
+// backslash. It is a lexer for the shapes this repo uses, not a full preprocessor; the
+// self-test case below states exactly which shapes are covered.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace {
+
+bool is_ident_char(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+}
+
+// The identifier run that ends just before index `i` (empty when in[i-1] is not an
+// identifier character).
+std::string ident_run_before(const std::string& in, std::size_t i) {
+    std::size_t k = i;
+    while (k > 0 && is_ident_char(in[k - 1]))
+        --k;
+    return in.substr(k, i - k);
+}
+
+// True when the run is empty or is exactly an encoding prefix, i.e. a following `R"` or `'`
+// opens a literal rather than continuing an identifier or a number.
+bool opens_literal(const std::string& run) {
+    return run.empty() || run == "u8" || run == "u" || run == "U" || run == "L";
+}
+
+std::string strip_comments(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    std::size_t i = 0;
+    while (i < in.size()) {
+        const char c = in[i];
+        if (c == '/' && i + 1 < in.size() && in[i + 1] == '/') {
+            // Line comment; a trailing backslash (optionally before a CR) continues it.
+            while (i < in.size()) {
+                if (in[i] == '\n') {
+                    const bool continued = (i >= 1 && in[i - 1] == '\\') ||
+                                           (i >= 2 && in[i - 1] == '\r' && in[i - 2] == '\\');
+                    if (!continued)
+                        break;
+                }
+                ++i;
+            }
+        } else if (c == '/' && i + 1 < in.size() && in[i + 1] == '*') {
+            const auto end = in.find("*/", i + 2);
+            i = end == std::string::npos ? in.size() : end + 2;
+            out.push_back(' ');
+        } else if (c == 'R' && i + 1 < in.size() && in[i + 1] == '"' &&
+                   opens_literal(ident_run_before(in, i))) {
+            // Raw string: R"delim( ... )delim" (any encoding prefix is already in `out`).
+            const auto open = in.find('(', i + 2);
+            if (open == std::string::npos) {
+                out.append(in, i, std::string::npos);
+                break;
+            }
+            const std::string close = ")" + in.substr(i + 2, open - (i + 2)) + "\"";
+            const auto end = in.find(close, open + 1);
+            const auto stop = end == std::string::npos ? in.size() : end + close.size();
+            out.append(in, i, stop - i);
+            i = stop;
+        } else if (c == '"' || (c == '\'' && opens_literal(ident_run_before(in, i)))) {
+            // Ordinary string or character literal. A `'` inside an identifier or number
+            // (`1'000`) is a digit separator, not a literal.
+            std::size_t j = i + 1;
+            while (j < in.size() && in[j] != c) {
+                if (in[j] == '\\')
+                    ++j;
+                ++j;
+            }
+            const auto stop = std::min(j + 1, in.size());
+            out.append(in, i, stop - i);
+            i = stop;
+        } else {
+            out.push_back(c);
+            ++i;
+        }
+    }
+    return out;
+}
+
+std::string squeeze_ws(std::string s) {
+    std::erase_if(s, [](unsigned char c) { return std::isspace(c) != 0; });
+    return s;
+}
+
+std::string read_server_src(const char* file) {
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / file);
+    REQUIRE(in.is_open());
+    return std::string{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+} // namespace
+
+TEST_CASE("health_routes: the source-text pin lexer strips comments and keeps literals",
+          "[server][routes][health_routes]") {
+    const auto check = [](const std::string& in, const std::string& want) {
+        INFO("input: " << in);
+        CHECK(strip_comments(in) == want);
+    };
+
+    SECTION("a line comment is dropped, the newline stays") {
+        check("a; // c\nb;\n", "a; \nb;\n");
+    }
+    SECTION("// inside an ordinary string is kept; the real comment after it is dropped") {
+        check("x = \"a // b\"; // c\n", "x = \"a // b\"; \n");
+    }
+    SECTION("an escaped quote does not end a string early") {
+        check("x = \"a\\\" // b\"; // c\n", "x = \"a\\\" // b\"; \n");
+    }
+    SECTION("a block comment becomes one space; /* */ inside a string is kept") {
+        check("s = \"/* x */\" /* real */ y;", "s = \"/* x */\"   y;");
+        check("/* a // b */ c", "  c");
+    }
+    SECTION("a raw string holding quotes and // is kept whole") {
+        // Both an odd and an even number of quotes: with an odd number, reading the raw
+        // string as an ordinary one would leave a quote open and swallow the real comment
+        // boundary, so the output would differ.
+        check("auto s = R\"x(he said \"hi\" // not)x\"; // c\nint y;",
+              "auto s = R\"x(he said \"hi\" // not)x\"; \nint y;");
+        check("auto s = R\"x(a \" // not)x\"; // c\nint y;",
+              "auto s = R\"x(a \" // not)x\"; \nint y;");
+    }
+    SECTION("an encoding-prefixed raw string is a raw string") {
+        for (const char* prefix : {"u8R", "uR", "UR", "LR"}) {
+            // One quote inside: only a correct raw-string read keeps the quotes balanced.
+            const std::string in =
+                std::string("auto s = ") + prefix + "\"(a \" // z)\"; // c\nint y;";
+            const std::string want =
+                std::string("auto s = ") + prefix + "\"(a \" // z)\"; \nint y;";
+            check(in, want);
+        }
+    }
+    SECTION("an identifier ending in R is not a raw string prefix") {
+        // `fooR"` is the identifier `fooR` followed by an ordinary string; the quote inside
+        // the ordinary string's escape must not be read as a raw delimiter.
+        check("fooR\"a\\\"b\" // c\n", "fooR\"a\\\"b\" \n");
+    }
+    SECTION("digit separators are not character literals") {
+        check("int n = 1'000'000; // c\n", "int n = 1'000'000; \n");
+        check("int h = 0xFF'FF; // c\n", "int h = 0xFF'FF; \n");
+    }
+    SECTION("a character literal holding a quote does not open a string") {
+        check("char q = '\"'; // c\n", "char q = '\"'; \n");
+    }
+    SECTION("an encoding-prefixed character literal holding a quote is a literal") {
+        for (const char* prefix : {"L", "u", "U", "u8"}) {
+            const std::string in = std::string("auto q = ") + prefix + "'\"'; // c\nint y;";
+            const std::string want = std::string("auto q = ") + prefix + "'\"'; \nint y;";
+            check(in, want);
+        }
+    }
+    SECTION("a // comment continued by a trailing backslash swallows the next line") {
+        check("a // c \\\n still comment\nb\n", "a \nb\n");
+        check("a // c \\\r\n still comment\r\nb\n", "a \nb\n");
+        // A backslash that is not the last character on the line does not continue it.
+        check("a // c \\ x\nb\n", "a \nb\n");
+    }
+    SECTION("an unterminated block comment drops the rest of the input") {
+        check("a /* never closed", "a  ");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Wiring tripwire: every case above proves register_health_routes' OWN
 // handlers are correct, but nothing above reads server.cpp — a future edit
 // that drops the production `register_health_routes(...)` call at
@@ -705,74 +877,17 @@ TEST_CASE("health_routes: /fragments/health/summary renders the WARN strip "
 TEST_CASE("health_routes: wiring -- server.cpp still calls "
           "register_health_routes and wires the plaintext probe listener",
           "[server][routes][health_routes]") {
-#ifndef YUZU_SERVER_SRC_DIR
-#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
-#endif
-    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
-    REQUIRE(in.is_open());
-    const std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    const std::string src = read_server_src("server.cpp");
 
-    // Drop `//` and `/* */` comments first (string, character and raw-string literals are kept
-    // verbatim, so a literal that merely contains `//` is not truncated): a needle that only
-    // survives inside a comment, such as a call that was commented out, must not satisfy the
-    // pin.
-    const auto strip_comments = [](const std::string& in) {
-        std::string out;
-        out.reserve(in.size());
-        const auto is_ident = [](char c) {
-            return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
-        };
-        std::size_t i = 0;
-        while (i < in.size()) {
-            const char c = in[i];
-            if (c == '/' && i + 1 < in.size() && in[i + 1] == '/') {
-                while (i < in.size() && in[i] != '\n')
-                    ++i;
-            } else if (c == '/' && i + 1 < in.size() && in[i + 1] == '*') {
-                const auto end = in.find("*/", i + 2);
-                i = end == std::string::npos ? in.size() : end + 2;
-                out.push_back(' ');
-            } else if (c == 'R' && i + 1 < in.size() && in[i + 1] == '"' &&
-                       (i == 0 || !is_ident(in[i - 1]))) {
-                // Raw string: R"delim( ... )delim"
-                const auto open = in.find('(', i + 2);
-                if (open == std::string::npos) {
-                    out.append(in, i, std::string::npos);
-                    break;
-                }
-                const std::string close = ")" + in.substr(i + 2, open - (i + 2)) + "\"";
-                const auto end = in.find(close, open + 1);
-                const auto stop = end == std::string::npos ? in.size() : end + close.size();
-                out.append(in, i, stop - i);
-                i = stop;
-            } else if (c == '"' || (c == '\'' && (i == 0 || !is_ident(in[i - 1])))) {
-                // Ordinary string or character literal (a `'` after an identifier character
-                // is a digit separator, not a literal).
-                std::size_t j = i + 1;
-                while (j < in.size() && in[j] != c) {
-                    if (in[j] == '\\')
-                        ++j;
-                    ++j;
-                }
-                const auto stop = std::min(j + 1, in.size());
-                out.append(in, i, stop - i);
-                i = stop;
-            } else {
-                out.push_back(c);
-                ++i;
-            }
-        }
-        return out;
-    };
+    // Comments are dropped first so a needle that only survives inside a comment, such as a
+    // call that was commented out, cannot satisfy the pin. The lexer has its own self-test
+    // below.
     const std::string code = strip_comments(src);
     CHECK(code.find("register_health_routes(") != std::string::npos);
 
     // Compare with all whitespace removed so a clang-format re-wrap of a call site
     // can neither redden nor greenwash the tripwire.
-    const auto squeeze = [](std::string s) {
-        std::erase_if(s, [](unsigned char c) { return std::isspace(c) != 0; });
-        return s;
-    };
+    const auto squeeze = [](std::string s) { return squeeze_ws(std::move(s)); };
     const auto flat = squeeze(code);
     const auto occurrences = [&](const std::string& needle) {
         // A needle that spells an inline argument-name comment is compared as code too.
@@ -809,8 +924,9 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
            "return httplib::Server::HandlerResponse::Handled;",
            1, "the pre-routing probe branch applies the /health rate limit and returns Handled");
     // The whole probe branch, contiguous: budget (refusal ends the request), then the body cap
-    // (refusal ends the request), then the exempt-from-the-rest return. This also fixes the
-    // order budget < cap inside the branch rather than somewhere later in the file.
+    // (refusal ends the request), then the exempt-from-the-rest return. Being one contiguous
+    // needle that must occur exactly once, it also fixes the order branch < budget < cap, so
+    // no separate position comparison is needed.
     expect("if (yuzu::server::health::is_probe_path(req.path)) { "
            "if (!yuzu::server::health::admit_probe_request(api_rate_limiter_, req, res)) "
            "return httplib::Server::HandlerResponse::Handled; "
@@ -818,17 +934,6 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
            "return httplib::Server::HandlerResponse::Handled; "
            "return httplib::Server::HandlerResponse::Unhandled; }",
            1, "the probe branch is: budget, then body cap, then Unhandled");
-    {
-        const auto branch = flat.find(squeeze("if (yuzu::server::health::is_probe_path(req.path)) {"));
-        const auto gate = flat.find(
-            squeeze("if (!yuzu::server::health::admit_probe_request(api_rate_limiter_, req, res))"));
-        const auto cap = flat.find(squeeze("if (enforce_pre_auth_body_cap())"), branch);
-        REQUIRE(branch != std::string::npos);
-        REQUIRE(gate != std::string::npos);
-        REQUIRE(cap != std::string::npos);
-        CHECK(branch < gate);
-        CHECK(gate < cap);
-    }
     expect("rate limit exceeded", 0, "the 429 body lives only in write_rate_limited_response");
     expect("write_rate_limited_response(res);", 1,
            "the general limiter site uses the shared 429 writer");
@@ -930,6 +1035,133 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
     // stop() must stop the redirect listener, or its thread never returns and every shutdown
     // burns the whole 15 s bound before the force-exit.
     expect("redirect_server_->stop();", 1, "stop() stops the redirect listener");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Credential-source pin. `health::request_carries_credential` decides which /health and
+// /api/health requests resolve a session and are charged against the per-source budget; it
+// must name exactly the headers `AuthRoutes::resolve_session` reads. The behavioural case
+// above checks that the three known names count; it cannot notice a FOURTH header being
+// added to resolve_session. This case reads both sources as text (comments stripped by the
+// lexer pinned above) and compares the header names they read.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace {
+
+// Body (outer braces excluded) of the one function in comment-stripped `code` whose
+// definition contains `signature`; nullopt when it is absent, ambiguous or unbalanced.
+// String and character literals are skipped while counting braces; raw strings are not
+// handled, which is fine for the small bodies this is pointed at.
+std::optional<std::string> function_body(const std::string& code, const std::string& signature) {
+    const auto at = code.find(signature);
+    if (at == std::string::npos || code.find(signature, at + 1) != std::string::npos)
+        return std::nullopt;
+    const auto open = code.find('{', at + signature.size());
+    if (open == std::string::npos)
+        return std::nullopt;
+    int depth = 0;
+    for (std::size_t i = open; i < code.size(); ++i) {
+        const char c = code[i];
+        if (c == '"' || (c == '\'' && opens_literal(ident_run_before(code, i)))) {
+            std::size_t j = i + 1;
+            while (j < code.size() && code[j] != c) {
+                if (code[j] == '\\')
+                    ++j;
+                ++j;
+            }
+            i = j;
+        } else if (c == '{') {
+            ++depth;
+        } else if (c == '}' && --depth == 0) {
+            return code.substr(open + 1, i - open - 1);
+        }
+    }
+    return std::nullopt;
+}
+
+// Lower-cased header names a function body reads through `get_header_value*(` or
+// `has_header(`. A call whose argument is not a string literal, or any direct use of the
+// header map, is reported as a marker no expected set contains, so it fails loudly.
+std::set<std::string> header_names_read(const std::string& body) {
+    std::set<std::string> names;
+    const auto lower = [](std::string v) {
+        std::transform(v.begin(), v.end(), v.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        return v;
+    };
+    for (const std::string call : {"get_header_value", "has_header"}) {
+        for (auto pos = body.find(call); pos != std::string::npos; pos = body.find(call, pos + 1)) {
+            // Skip the rest of an identifier such as get_header_value_count, then whitespace.
+            auto k = pos + call.size();
+            while (k < body.size() && is_ident_char(body[k]))
+                ++k;
+            while (k < body.size() && std::isspace(static_cast<unsigned char>(body[k])) != 0)
+                ++k;
+            if (k >= body.size() || body[k] != '(') {
+                names.insert("<unrecognised use of " + call + ">");
+                continue;
+            }
+            ++k;
+            while (k < body.size() && std::isspace(static_cast<unsigned char>(body[k])) != 0)
+                ++k;
+            const auto close = k < body.size() && body[k] == '"' ? body.find('"', k + 1)
+                                                                 : std::string::npos;
+            if (close == std::string::npos)
+                names.insert("<non-literal argument to " + call + ">");
+            else
+                names.insert(lower(body.substr(k + 1, close - k - 1)));
+        }
+    }
+    for (const char* raw : {".headers", "get_header_map"}) {
+        if (body.find(raw) != std::string::npos)
+            names.insert(std::string("<direct use of ") + raw + ">");
+    }
+    return names;
+}
+
+std::string join_names(const std::set<std::string>& names) {
+    std::string out;
+    for (const auto& n : names)
+        out += (out.empty() ? "" : ", ") + n;
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("health_routes: resolve_session and request_carries_credential read the same credential "
+          "headers",
+          "[server][routes][health_routes]") {
+    const std::set<std::string> expected{"cookie", "authorization", "x-yuzu-token"};
+    const std::string how_to_fix =
+        "Update BOTH AuthRoutes::resolve_session (auth_routes.cpp) and "
+        "health::request_carries_credential (health_routes.hpp), then this test's expected set.";
+
+    const auto auth_code = strip_comments(read_server_src("auth_routes.cpp"));
+    const auto resolve = function_body(
+        auth_code, "AuthRoutes::resolve_session(const httplib::Request& req)");
+    REQUIRE(resolve.has_value()); // signature moved or renamed: re-point this pin
+    const auto cookie_fn = function_body(
+        auth_code, "AuthRoutes::extract_session_cookie(const httplib::Request& req)");
+    REQUIRE(cookie_fn.has_value());
+    const auto health_code = strip_comments(read_server_src("health_routes.hpp"));
+    const auto probe_fn = function_body(
+        health_code, "request_carries_credential(const httplib::Request& req)");
+    REQUIRE(probe_fn.has_value());
+
+    // resolve_session reads the cookie only through extract_session_cookie, which itself
+    // must read nothing but the Cookie header.
+    CHECK(resolve->find("extract_session_cookie(") != std::string::npos);
+    const auto cookie_reads = header_names_read(*cookie_fn);
+    INFO("extract_session_cookie reads: " << join_names(cookie_reads) << ". " << how_to_fix);
+    CHECK(cookie_reads == std::set<std::string>{"cookie"});
+
+    auto resolve_reads = header_names_read(*resolve);
+    resolve_reads.insert("cookie"); // via extract_session_cookie, checked above
+    INFO("resolve_session reads: " << join_names(resolve_reads) << ". " << how_to_fix);
+    CHECK(resolve_reads == expected);
+
+    const auto probe_reads = header_names_read(*probe_fn);
+    INFO("request_carries_credential names: " << join_names(probe_reads) << ". " << how_to_fix);
+    CHECK(probe_reads == expected);
 }
 
 // ---------------------------------------------------------------------------

@@ -5,6 +5,7 @@
 #include <httplib.h>
 
 #include <algorithm>
+#include <cstdint>
 
 namespace yuzu::server {
 

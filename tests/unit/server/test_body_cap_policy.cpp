@@ -441,7 +441,9 @@ TEST_CASE("resolve_body_cap: requires_measurable is ON for /mcp/, upload_session
 // `enforce_pre_auth_body_cap` is invoked inside server.cpp's probe branch
 // (the shape mirrored here) and again after the on-behalf-of guard and rate
 // limiter for every other route. The second call site is not modelled: those
-// two guards are out of this fixture's scope.
+// two guards are out of this fixture's scope. The probe-branch call in server.cpp is
+// pinned by the source-text wiring case in test_health_routes.cpp; the non-probe call
+// site is pinned by neither file.
 #ifndef YUZU_TSAN_BUILD
 
 namespace {

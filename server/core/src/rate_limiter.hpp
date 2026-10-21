@@ -15,7 +15,8 @@ namespace yuzu::server {
  * Token bucket rate limiter keyed by client IP.
  *
  * Each IP gets a bucket that refills at `rate` tokens/second up to `rate` max.
- * Stale buckets (no request for 60s) are purged periodically.
+ * `purge_stale()` drops buckets idle for 60s, but it currently has no production caller,
+ * so per-source entries are retained until the server restarts.
  */
 class RateLimiter {
 public:

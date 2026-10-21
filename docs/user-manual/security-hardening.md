@@ -215,7 +215,7 @@ Configure API and login rate limits:
 yuzu-server --rate-limit 100 --login-rate-limit 10
 ```
 
-- `--rate-limit` — Maximum API requests per second per IP (default: 100). It is also the per-source budget for `/health` and `/api/health` requests that carry a credential header; values below 1 are treated as 1
+- `--rate-limit`: Maximum API requests per second per IP (default: 100). It is also the per-source budget for `/health` and `/api/health` requests that carry a credential header; values below 1 are treated as 1
 - `--login-rate-limit` — Maximum login attempts per second per IP (default: 10)
 
 Clients exceeding the limit receive `429 Too Many Requests` with a `Retry-After: 1` header.

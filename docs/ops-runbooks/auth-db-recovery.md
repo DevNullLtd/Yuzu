@@ -980,8 +980,11 @@ verdict reads stale, which is also not ready, whatever the failure count says.
 carries a credential header (`Cookie`, `Authorization` or `X-Yuzu-Token`;
 `resolve_session_fn` in `health_routes.cpp`), and a session lookup that the
 in-memory cache cannot answer is a database read, which during a stall can wait
-for the pool's 10 second connect timeout (derived from the code; not measured
-on this path). A request with no credential header resolves no session.
+for the pool's 10 second connect timeout when it has to open a connection
+(derived from the code; not measured on this path). That figure is not an upper
+bound: a request that already holds a database connection waits until the stall
+ends (see the first bullet of the list above; measured there for gated requests,
+not on this path). A request with no credential header resolves no session.
 `/livez` does no session or database work. Point **liveness** probes at `/livez`
 and **readiness** probes at `/readyz`, not at `/health`: a liveness probe that
 waits on the database during a stall can fail repeatedly and restart a server

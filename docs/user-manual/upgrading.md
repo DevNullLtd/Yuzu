@@ -147,13 +147,21 @@ window gauge, so both new alerts go silent.
   the REST budget.
 - **Over the budget** the server answers `429` with `Retry-After: 1` and the standard error envelope
   (`correlation_id` and `retry_after_ms` included).
+- **What counts as a credential.** A request is charged by the presence of a `Cookie`,
+  `Authorization` or `X-Yuzu-Token` header, whether or not the credential is valid. A credentialed
+  monitor behind a shared address shares the budget with every credentialed request from that address,
+  so load balancer and orchestrator checks should use `/readyz` (readiness) or `/livez` (liveness).
 - **Unchanged.** Requests with no credential header are not counted and are never refused by this
-  limit, and `/livez` and `/readyz` are not rate limited. For load balancer and orchestrator checks use
-  `/readyz` (readiness) or `/livez` (liveness).
+  limit, and `/livez` and `/readyz` are not rate limited.
+- **Observability.** A refused health request is counted only in
+  `yuzu_http_requests_total{status="429"}`, which carries no path or source label, and is not logged;
+  a path-labelled counter is planned follow-up work. Per-source budget entries are kept until the
+  server restarts; purging them is also planned follow-up work.
 - **Tuning.** Raise `--rate-limit` (`YUZU_RATE_LIMIT`) if a monitor that sends a credential polls
   faster than the default budget allows; the same value also sets the REST budget.
-- **429 body.** The general `--rate-limit` refusal on REST routes now carries `correlation_id` and
-  `retry_after_ms` too; every field it had before is unchanged.
+- **429 body.** Every pre-routing rate-limit refusal (the general `--rate-limit` bucket, the login
+  bucket `--login-rate-limit` and this health budget) now carries `correlation_id` and
+  `retry_after_ms`; every field those refusals had before is unchanged.
 
 ## Behaviour change: the macOS agent package installs transactionally and can refuse
 
@@ -6123,7 +6131,7 @@ Three operator-visible behaviour changes ship in the v0.12.0 A3 ladder. None req
 >       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8081/healthz"]
 > ```
 
-**2. `/api/health` is restored as an alias of `/health` (#620).** The pre-#401 endpoint path is back. Monitoring integrations that point at `/api/health` work without reconfiguration; both URLs serve identical JSON. Both are exempt from rate limiting (a follow-up hardening over the bare `/health` behaviour; since superseded: credentialed requests to these two paths are now rate limited per source). For load-balancer probes that should drain in-flight traffic before stopping, continue using `/readyz` — `/health` and `/api/health` are intentionally not draining-aware (Kubernetes pattern: liveness/health probes are not draining-aware).
+**2. `/api/health` is restored as an alias of `/health` (#620).** The pre-#401 endpoint path is back. Monitoring integrations that point at `/api/health` work without reconfiguration; both URLs serve identical JSON. Both are exempt from rate limiting (a follow-up hardening over the bare `/health` behaviour; since superseded: credentialed requests to these two paths are now rate limited per source). For load-balancer probes that should drain in-flight traffic before stopping, continue using `/readyz`. `/health` and `/api/health` are intentionally not draining-aware (Kubernetes pattern: liveness/health probes are not draining-aware).
 
 **3. File-logger boot messages are now quieter (#624).** The previous `WARN: Could not create log directory /var/log/yuzu` + `ERROR: file logger setup failed` pair on every container boot is replaced by a single INFO-level line when the default path cannot be created. The Docker server image now pre-creates `/var/log/yuzu` (mode 0750, owned by `yuzu`) so the path is writable out of the box. **If your monitoring previously alerted on the WARN/ERROR lines as a misconfig signal, those signals will no longer fire** — the failure mode is now a single INFO line. Operators who require explicit on-disk logs should pass `--log-file <path>`; explicit-path failures still log at ERROR and are not silently degraded.
 

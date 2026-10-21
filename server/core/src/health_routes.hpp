@@ -252,13 +252,20 @@ namespace health {
 /// The per-source rate-limit gate for `/health` and `/api/health`, called by the
 /// pre-routing chokepoint in server.cpp with `api_rate_limiter_` (the `--rate-limit`
 /// limiter, default 100 requests/second per source). Only a request that carries a
-/// credential header (`request_carries_credential`) is charged: those are the requests
-/// that reach a session-store lookup. A request with none is answered from in-memory
-/// state and returns true without touching the limiter, so a credential-less monitor
-/// behind a shared address is never throttled. The bucket key carries a prefix so probe
-/// traffic and API traffic from one source do not draw on each other's budget. Returns
-/// true when the request may proceed; any other path returns true without touching the
-/// limiter. On refusal `res` is filled with the standard 429 (A4 envelope).
+/// credential header (`request_carries_credential`) is charged. The check is on header
+/// presence, whether or not the credential is valid, and is coarse by design: a `Cookie`
+/// without a `yuzu_session=` value or a non-Bearer `Authorization` header is charged
+/// although it never reaches the session store (the empty-token guard makes the rest
+/// cheap). A request with none is answered from in-memory state and returns true without
+/// touching the limiter, so a credential-less monitor behind a shared address is never
+/// throttled. The bucket key carries a prefix so probe traffic and API traffic from one
+/// source do not draw on each other's budget. Returns true when the request may proceed;
+/// any other path returns true without touching the limiter. On refusal `res` is filled
+/// with the standard 429 (A4 envelope).
+///
+/// Residual: the limiter keeps one entry per source address and `RateLimiter::purge_stale`
+/// has no production caller, so entries are retained until the server restarts. Purging
+/// them is planned follow-up work.
 ///
 /// A new credential source added to `AuthRoutes::resolve_session` must also be added to
 /// `request_carries_credential`, otherwise requests using it are neither charged here nor
