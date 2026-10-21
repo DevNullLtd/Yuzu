@@ -232,9 +232,9 @@ public:
     /// tags — see `HardwareCiDetail`) — ONE closure shared verbatim by the dashboard
     /// fragment and the REST twin, so the two can never disagree on what "the CI
     /// record" contains. The Installed-software and Tags lenses render straight off
-    /// this same struct rather than issuing a second per-lens fetch. NOTE: there is
-    /// no MCP twin yet (no `get_hardware_ci` tool exists) — tracked as a follow-up,
-    /// not yet an ADR-1005 exception-ledger entry (governance Gate 3 finding).
+    /// this same struct rather than issuing a second per-lens fetch. The MCP twin
+    /// `get_hardware_ci` (mcp_tools_hardware.cpp) calls this same closure through
+    /// `mcp::ToolDeps`, so the REST and MCP records cannot diverge.
     using CiDetailFn = std::function<HardwareCiDetail(const std::string& agent_id)>;
 
     /// One connected agent's advertised plugins/actions — `nullopt` when the agent
