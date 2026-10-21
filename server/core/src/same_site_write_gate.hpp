@@ -7,8 +7,9 @@
 /// the same function. It owns the decision call (same_site_write_policy.hpp), the bounded
 /// counter, the throttled warning, the `csrf.denied` audit row, the A4 403 body and the
 /// `Sec-Audit-Failed` header, inside one whole-body `try/catch(...)`. Its first statement is
-/// the method check: a read method returns false before the `try` and before any header is
-/// copied, so a read pays nothing.
+/// the method check: an ordinary read returns false before the `try` and before any header is
+/// copied, so a read pays nothing. A read on a guarded path (`is_guarded_read`) is decided like
+/// a write.
 ///
 /// Contract:
 ///   - Returns true when the request was refused and `res` is populated; false otherwise.
@@ -172,8 +173,8 @@ apply_same_site_write_gate(const httplib::Request& req, httplib::Response& res,
                            std::span<const std::string> trusted_origins, bool listener_is_tls,
                            yuzu::MetricsRegistry& metrics, const SameSitePrincipalAuditFn& audit,
                            const SameSiteFaultHook* fault_hook = nullptr) noexcept {
-    // First statement, before the try and before any header copy: a read method is never gated.
-    if (!is_same_site_write_method(req.method))
+    // First statement, before the try and before any header copy: an ordinary read is never gated.
+    if (!is_same_site_write_method(req.method) && !is_guarded_read(req.method, req.path))
         return false;
 
     bool audit_attempted = false;
@@ -207,7 +208,7 @@ apply_same_site_write_gate(const httplib::Request& req, httplib::Response& res,
         const auto decision = evaluate_same_site_write(
             req.method, session.auth_source, req.get_header_value("Host"),
             req.get_header_value("Origin"), req.get_header_value("Referer"), trusted_origins,
-            listener_is_tls);
+            listener_is_tls, req.path, req.get_header_value("Sec-Fetch-Site"));
         if (!decision.refuse)
             return false;
 

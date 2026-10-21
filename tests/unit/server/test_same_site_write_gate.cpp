@@ -82,6 +82,8 @@ constexpr const char* kFragmentCanary = "/fragments/canary";
 // A second body-cap path class, so per-class counter series are told apart.
 constexpr const char* kOtherClassCanary = "/api/v1/hardware/canary";
 constexpr const char* kOwnCheckCanary = "/api/v1/canary-own-check";
+// One entry of the guarded-read table stands in for the whole set (the policy test loops over it).
+constexpr std::string_view kGuardedReadCanary = kFetchMetadataGuardedPaths[0];
 
 constexpr const char* kCookieOk = "yuzu_session=cookie-ok";
 constexpr const char* kCookieSaml = "yuzu_session=cookie-saml";
@@ -201,6 +203,7 @@ struct Pipeline {
         svr.Patch(kCanary, ok);
         svr.Delete(kCanary, ok);
         svr.Options(kCanary, ok);
+        svr.Get(std::string(kGuardedReadCanary), ok);
         svr.Post(kFragmentCanary, ok);
         svr.Post(kOtherClassCanary, ok);
         svr.Post(std::string(kPreSessionPath), ok);
@@ -987,3 +990,81 @@ TEST_CASE("same-site pipeline: oversized and control-byte headers are refused wi
 }
 
 #endif // YUZU_TSAN_BUILD
+
+// -- Guarded reads -----------------------------------------------------------------------------
+
+TEST_CASE("same-site pipeline: a guarded read with cross-site fetch metadata is refused",
+          "[csrf][same_site][pipeline]") {
+    Pipeline f;
+    const std::string path(kGuardedReadCanary);
+    for (const char* sfs : {"cross-site", "same-site", "garbage"}) {
+        INFO(sfs);
+        expect_refused(f, "GET", path, {{"Cookie", kCookieOk}, {"Sec-Fetch-Site", sfs}},
+                       kSameSiteReasonOriginMismatch);
+    }
+    // A same-site Origin does not rescue a refusing fetch-metadata value.
+    expect_refused(f, "GET", path,
+                   {{"Cookie", kCookieOk}, {"Sec-Fetch-Site", "cross-site"}, {"Origin", f.origin()}},
+                   kSameSiteReasonOriginMismatch);
+}
+
+TEST_CASE("same-site pipeline: a guarded read with same-origin or none metadata is admitted",
+          "[csrf][same_site][pipeline]") {
+    Pipeline f;
+    const std::string path(kGuardedReadCanary);
+    for (const char* sfs : {"same-origin", "none", "Same-Origin"})
+        expect_admitted(f, "GET", path, {{"Cookie", kCookieOk}, {"Sec-Fetch-Site", sfs}});
+}
+
+TEST_CASE("same-site pipeline: a guarded read without fetch metadata falls back to Origin and Referer",
+          "[csrf][same_site][pipeline]") {
+    Pipeline f;
+    const std::string path(kGuardedReadCanary);
+    expect_refused(f, "GET", path, kCookie, kSameSiteReasonNoHeaders);
+    expect_refused(f, "GET", path, {{"Cookie", kCookieOk}, {"Origin", "http://evil.example"}},
+                   kSameSiteReasonOriginMismatch);
+    expect_refused(f, "GET", path, {{"Cookie", kCookieOk}, {"Referer", "http://evil.example/"}},
+                   kSameSiteReasonRefererMismatch);
+    expect_admitted(f, "GET", path, {{"Cookie", kCookieOk}, {"Origin", f.origin()}});
+    expect_admitted(f, "GET", path, {{"Cookie", kCookieOk}, {"Referer", f.origin() + "/page"}});
+}
+
+TEST_CASE("same-site pipeline: a token caller is admitted on a guarded read",
+          "[csrf][same_site][pipeline]") {
+    Pipeline f;
+    const std::string path(kGuardedReadCanary);
+    expect_admitted(f, "GET", path, {{"Authorization", "Bearer tok-ok"}});
+    expect_admitted(f, "GET", path,
+                    {{"Authorization", "Bearer tok-ok"}, {"Sec-Fetch-Site", "cross-site"}});
+    expect_admitted(f, "GET", path, {{"Authorization", "Bearer tok-engine"}});
+}
+
+TEST_CASE("same-site pipeline: HEAD on a guarded read is refused like GET",
+          "[csrf][same_site][pipeline]") {
+    Pipeline f;
+    const std::string path(kGuardedReadCanary);
+    const std::string cls = class_of("HEAD", path);
+    const auto before = snap(f, cls, kSameSiteReasonOriginMismatch);
+    yuzu::test::expect_pre_routing_rejection(
+        [&] {
+            return f.send("HEAD", path, {{"Cookie", kCookieOk}, {"Sec-Fetch-Site", "cross-site"}});
+        },
+        403, f.gate_rejections);
+    CHECK(f.row_count() == before.rows + 1);
+    if (f.row_count() == before.rows + 1) {
+        const auto r = f.row(before.rows);
+        CHECK(r.action == "csrf.denied");
+        CHECK(r.target_id == "HEAD " + path);
+        CHECK(r.detail == refusal_detail(kSameSiteReasonOriginMismatch));
+    }
+    CHECK(f.handler_hits.load() == before.hits);
+    CHECK(f.total() == before.total + 1);
+    CHECK(f.series(cls, kSameSiteReasonOriginMismatch) == before.series + 1);
+    expect_admitted(f, "HEAD", path, {{"Cookie", kCookieOk}, {"Sec-Fetch-Site", "same-origin"}});
+}
+
+TEST_CASE("same-site pipeline: an ordinary read with cross-site fetch metadata stays ungated",
+          "[csrf][same_site][pipeline]") {
+    Pipeline f;
+    expect_admitted(f, "GET", kCanary, {{"Cookie", kCookieOk}, {"Sec-Fetch-Site", "cross-site"}});
+}

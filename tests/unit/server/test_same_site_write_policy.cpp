@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -52,8 +53,17 @@ const std::vector<std::string>& trusted() {
 
 SameSiteDecision decide(std::string_view method, std::string_view source, std::string_view origin,
                       std::string_view referer, std::string_view host = kHost,
-                      const std::vector<std::string>& tr = trusted(), bool tls = false) {
-    return evaluate_same_site_write(method, source, host, origin, referer, tr, tls);
+                      const std::vector<std::string>& tr = trusted(), bool tls = false,
+                      std::string_view path = "/canary/path", std::string_view sfs = "") {
+    return evaluate_same_site_write(method, source, host, origin, referer, tr, tls, path, sfs);
+}
+
+// A guarded read: GET/HEAD on a table path, decided with the given fetch metadata.
+SameSiteDecision decide_read(std::string_view method, std::string_view source,
+                             std::string_view path, std::string_view sfs,
+                             std::string_view origin = "", std::string_view referer = "",
+                             bool tls = false) {
+    return decide(method, source, origin, referer, kHost, trusted(), tls, path, sfs);
 }
 
 // A cookie-session POST on a listener that terminates TLS itself.
@@ -76,6 +86,32 @@ void require_refuse(const SameSiteDecision& d, std::string_view reason) {
 } // namespace
 
 // -- Layer 1: the pure decision ----------------------------------------------------------------
+
+namespace {
+constexpr bool guarded_table_is_well_formed() {
+    for (std::size_t i = 0; i < kFetchMetadataGuardedPaths.size(); ++i) {
+        const auto p = kFetchMetadataGuardedPaths[i];
+        if (!p.starts_with("/fragments/") || p.size() <= 11 || p.back() == '/' ||
+            p.find('?') != std::string_view::npos)
+            return false;
+        for (std::size_t j = i + 1; j < kFetchMetadataGuardedPaths.size(); ++j)
+            if (kFetchMetadataGuardedPaths[j] == p)
+                return false;
+    }
+    return true;
+}
+} // namespace
+static_assert(kFetchMetadataGuardedPaths.size() == 7);
+static_assert(guarded_table_is_well_formed());
+static_assert(is_guarded_read("GET", kFetchMetadataGuardedPaths[0]));
+static_assert(is_guarded_read("HEAD", kFetchMetadataGuardedPaths[6]));
+static_assert(!is_guarded_read("OPTIONS", kFetchMetadataGuardedPaths[0]));
+static_assert(!is_guarded_read("POST", kFetchMetadataGuardedPaths[0]));
+static_assert(!is_guarded_read("get", kFetchMetadataGuardedPaths[0]));
+static_assert(!is_guarded_read("GET", "/fragments/"));
+static_assert(!is_guarded_read("GET", "/api/v1/something"));
+static_assert(!is_guarded_read("GET", ""));
+static_assert(noexcept(is_guarded_read("GET", "/x")));
 
 TEST_CASE("same-site policy: GET, HEAD and OPTIONS are never gated", "[csrf][same_site]") {
     for (std::string_view m : {"GET", "HEAD", "OPTIONS"}) {
@@ -670,6 +706,38 @@ TEST_CASE("same-site gate: a read method returns before any work", "[csrf][same_
     }
 }
 
+TEST_CASE("same-site gate: a guarded read is decided from fetch metadata, not skipped",
+          "[csrf][same_site]") {
+    for (const char* m : {"GET", "HEAD"}) {
+        CAPTURE(m);
+        const std::string path(kFetchMetadataGuardedPaths[0]);
+        {
+            GateRig g(m);
+            g.req.path = path;
+            g.req.set_header("Sec-Fetch-Site", "cross-site");
+            REQUIRE(g.run());
+            REQUIRE(g.res.status == 403);
+            REQUIRE(g.rows.size() == 1);
+            REQUIRE(g.rows[0].target_id == std::string(m) + " " + path);
+            REQUIRE(g.total() == 1.0);
+        }
+        {
+            GateRig g(m);
+            g.req.path = path;
+            g.req.set_header("Sec-Fetch-Site", "same-origin");
+            REQUIRE_FALSE(g.run());
+            REQUIRE(g.rows.empty());
+            REQUIRE(g.total() == 0.0);
+        }
+        {
+            GateRig g(m, "api_token");
+            g.req.path = path;
+            g.req.set_header("Sec-Fetch-Site", "cross-site");
+            REQUIRE_FALSE(g.run());
+        }
+    }
+}
+
 // -- The log throttle ---------------------------------------------------------------------------
 
 namespace {
@@ -727,4 +795,122 @@ TEST_CASE("same-site log throttle: the never-logged sentinel is not a valid cloc
     REQUIRE_FALSE(t.allow(0, kNeverSentinel));
     REQUIRE(t.allow(0, 5 * kSec));
     REQUIRE_FALSE(t.allow(0, 6 * kSec));
+}
+
+// -- Guarded reads -----------------------------------------------------------------------------
+
+TEST_CASE("guarded read: predicate is exact-path and GET/HEAD only", "[csrf][same_site]") {
+    for (const auto p : kFetchMetadataGuardedPaths) {
+        CAPTURE(p);
+        REQUIRE(is_guarded_read("GET", p));
+        REQUIRE(is_guarded_read("HEAD", p));
+        for (std::string_view m : {"OPTIONS", "POST", "PUT", "DELETE", "PATCH", "get", ""})
+            REQUIRE_FALSE(is_guarded_read(m, p));
+        // Exact match: a trailing slash, a query-like suffix, a longer path or a prefix is not it.
+        REQUIRE_FALSE(is_guarded_read("GET", std::string(p) + "/"));
+        REQUIRE_FALSE(is_guarded_read("GET", std::string(p) + "?id=1"));
+        REQUIRE_FALSE(is_guarded_read("GET", std::string(p) + "x"));
+        REQUIRE_FALSE(is_guarded_read("GET", std::string(p).substr(0, p.size() - 1)));
+        REQUIRE_FALSE(is_guarded_read("GET", "/" + std::string(p)));
+        std::string upper(p);
+        std::transform(upper.begin(), upper.end(), upper.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+        REQUIRE_FALSE(is_guarded_read("GET", upper));
+    }
+}
+
+TEST_CASE("guarded read: cookie sources and fetch metadata", "[csrf][same_site]") {
+    for (const auto path : kFetchMetadataGuardedPaths) {
+        for (std::string_view m : {"GET", "HEAD"}) {
+            for (std::string_view src : {"local", "oidc", "saml", ""}) {
+                CAPTURE(path, m, src);
+                for (std::string_view ok : {"same-origin", "none", "Same-Origin", "NONE"})
+                    require_pass(decide_read(m, src, path, ok));
+                // Admitted metadata wins even when a foreign Origin is also present.
+                require_pass(decide_read(m, src, path, "same-origin", kForeignOrigin));
+                for (std::string_view bad :
+                     {"cross-site", "same-site", "garbage", "same-origin ", " none", "CROSS-SITE",
+                      "same-origin,none", "null"})
+                    require_refuse(decide_read(m, src, path, bad), kSameSiteReasonOriginMismatch);
+                // A refusing value is not rescued by a same-site Origin or Referer.
+                require_refuse(decide_read(m, src, path, "cross-site", kSameOrigin),
+                               kSameSiteReasonOriginMismatch);
+                require_refuse(decide_read(m, src, path, "same-site", "", "http://yuzu.example:8080/x"),
+                               kSameSiteReasonOriginMismatch);
+
+                // No fetch metadata: the Origin and Referer rule.
+                require_refuse(decide_read(m, src, path, ""), kSameSiteReasonNoHeaders);
+                require_pass(decide_read(m, src, path, "", kSameOrigin));
+                require_pass(decide_read(m, src, path, "", "", "http://yuzu.example:8080/page"));
+                require_refuse(decide_read(m, src, path, "", kForeignOrigin),
+                               kSameSiteReasonOriginMismatch);
+                require_refuse(decide_read(m, src, path, "", "", "http://evil.example/page"),
+                               kSameSiteReasonRefererMismatch);
+                require_pass(decide_read(m, src, path, "", "https://console.example"));
+            }
+        }
+    }
+}
+
+TEST_CASE("guarded read: TLS listener variants of the header fallback", "[csrf][same_site]") {
+    const auto path = kFetchMetadataGuardedPaths[0];
+    // Fetch metadata is scheme-blind; only the fallback consults the listener scheme.
+    require_pass(decide_read("GET", "local", path, "same-origin", "", "", /*tls=*/true));
+    require_pass(decide_read("GET", "local", path, "none", "", "", /*tls=*/true));
+    require_refuse(decide_read("GET", "local", path, "cross-site", "https://yuzu.example:8080", "",
+                               /*tls=*/true),
+                   kSameSiteReasonOriginMismatch);
+    require_pass(decide_read("GET", "local", path, "", "https://yuzu.example:8080", "", true));
+    require_refuse(decide_read("GET", "local", path, "", "http://yuzu.example:8080", "", true),
+                   kSameSiteReasonOriginMismatch);
+    require_refuse(decide_read("HEAD", "local", path, "", "", "http://yuzu.example:8080/x", true),
+                   kSameSiteReasonRefererMismatch);
+    require_refuse(decide_read("GET", "local", path, "", "", "", true), kSameSiteReasonNoHeaders);
+}
+
+TEST_CASE("guarded read: token sources are admitted", "[csrf][same_site]") {
+    for (const auto path : kFetchMetadataGuardedPaths)
+        for (std::string_view m : {"GET", "HEAD"})
+            for (std::string_view src : kTokenAuthSources) {
+                CAPTURE(path, m, src);
+                require_pass(decide_read(m, src, path, ""));
+                require_pass(decide_read(m, src, path, "cross-site", kForeignOrigin));
+                require_pass(decide_read(m, src, path, "garbage"));
+            }
+}
+
+TEST_CASE("guarded read: other reads stay ungated", "[csrf][same_site]") {
+    for (std::string_view path :
+         {"/canary/path", "/fragments/canary/other", "/fragments/", "/api/v1/canary", "/", ""}) {
+        for (std::string_view m : {"GET", "HEAD", "OPTIONS"}) {
+            CAPTURE(path, m);
+            require_pass(decide_read(m, "local", path, "cross-site"));
+            require_pass(decide_read(m, "local", path, "", kForeignOrigin));
+            require_pass(decide_read(m, "local", path, ""));
+        }
+    }
+    // OPTIONS is never guarded, even on a table path.
+    for (const auto path : kFetchMetadataGuardedPaths)
+        require_pass(decide_read("OPTIONS", "local", path, "cross-site"));
+}
+
+TEST_CASE("guarded read: a table path with a write method keeps the write rules",
+          "[csrf][same_site]") {
+    for (const auto path : kFetchMetadataGuardedPaths) {
+        CAPTURE(path);
+        // Fetch metadata does not rescue or refuse a write.
+        require_refuse(decide_read("POST", "local", path, "same-origin"), kSameSiteReasonNoHeaders);
+        require_refuse(decide_read("POST", "local", path, "none", kForeignOrigin),
+                       kSameSiteReasonOriginMismatch);
+        require_pass(decide_read("POST", "local", path, "cross-site", kSameOrigin));
+        require_pass(decide_read("POST", "api_token", path, ""));
+    }
+}
+
+TEST_CASE("write methods ignore fetch metadata on any path", "[csrf][same_site]") {
+    require_refuse(decide("POST", "local", "", "", kHost, trusted(), false, "/canary/path",
+                          "same-origin"),
+                   kSameSiteReasonNoHeaders);
+    require_pass(decide("POST", "local", kSameOrigin, "", kHost, trusted(), false, "/canary/path",
+                        "cross-site"));
 }

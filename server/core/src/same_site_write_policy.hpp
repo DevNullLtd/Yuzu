@@ -23,7 +23,11 @@
 ///     early `Unhandled` return beyond the pinned exempt returns.
 ///   - Methods: everything except exactly GET, HEAD and OPTIONS is a write (fail closed on
 ///     anything else). httplib already refuses an unknown verb before pre-routing runs, so the
-///     fail-closed branch here is belt and braces.
+///     fail-closed branch here is belt and braces. A GET or HEAD on a path in
+///     `kFetchMetadataGuardedPaths` is held to the same rule: same-origin or none fetch metadata
+///     admits it, any other fetch metadata refuses it, and a request without fetch metadata
+///     falls back to the Origin and Referer rule. Prefetch and prerender by the user's own
+///     browser carry same-origin metadata and are not prevented.
 ///   - The predicate is Origin and Referer only. It CALLS `browser_write_is_cross_site`
 ///     (web_utils.hpp) and never re-implements any branch of it. The refusal REASON is derived
 ///     from which headers are non-empty (both empty / Origin non-empty / Origin empty) and
@@ -81,21 +85,81 @@ struct SameSiteDecision {
     return !(method == "GET" || method == "HEAD" || method == "OPTIONS");
 }
 
+/// Reviewed set of read paths (exact match, no prefix, no query) that dispatch work and are
+/// held to the same rule as a write. Executable data: a new cookie-reachable GET that
+/// dispatches work needs an entry here (tests/unit/server/test_same_site_exempt_inventory.cpp
+/// is the best-effort tripwire).
+inline constexpr std::array<std::string_view, 7> kFetchMetadataGuardedPaths{
+    "/fragments/device/live/run",
+    "/fragments/tar/process-tree/run",
+    "/fragments/tar/process-tree/device-net",
+    "/fragments/tar/capture-sources/load",
+    "/fragments/dex/device/perf",
+    "/fragments/dex/device/procperf",
+    "/fragments/auto/deploy/result",
+};
+
+/// True for GET or HEAD (httplib routes HEAD to the GET handlers) on a path in the table.
+/// Case-sensitive. The prefix compare keeps the common read to one cheap check.
+[[nodiscard]] constexpr bool is_guarded_read(std::string_view method,
+                                             std::string_view path) noexcept {
+    if (method != "GET" && method != "HEAD")
+        return false;
+    if (!path.starts_with("/fragments/"))
+        return false;
+    for (const auto p : kFetchMetadataGuardedPaths)
+        if (p == path)
+            return true;
+    return false;
+}
+
+namespace detail {
+[[nodiscard]] constexpr bool ascii_ieq(std::string_view a, std::string_view lower) noexcept {
+    if (a.size() != lower.size())
+        return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const char c = (a[i] >= 'A' && a[i] <= 'Z') ? static_cast<char>(a[i] - 'A' + 'a') : a[i];
+        if (c != lower[i])
+            return false;
+    }
+    return true;
+}
+} // namespace detail
+
 /// THE decision. `auth_source` is the resolved session's source; `host`, `origin` and `referer`
 /// are the raw header values (empty when absent); `trusted_origins` is
 /// `Config::csrf_trusted_origins` after `normalise_trusted_origins`. `listener_is_tls` is the
 /// web listener's TLS state (`Config::https_enabled`): it selects the scheme-aware same-host
-/// comparison documented on `origin_is_same_site`. It has NO default here, so a new caller must
-/// decide it.
+/// comparison documented on `origin_is_same_site`. `path` and `sec_fetch_site` (the raw
+/// `Sec-Fetch-Site` value, empty when absent) apply to a guarded read only: a non-empty value
+/// other than same-origin or none is refused, and an empty one falls back to the Origin and
+/// Referer rule. Neither `listener_is_tls`, `path` nor `sec_fetch_site` has a default here, so
+/// a new caller must decide them.
 [[nodiscard]] inline SameSiteDecision
 evaluate_same_site_write(std::string_view method, std::string_view auth_source,
                          std::string_view host, std::string_view origin, std::string_view referer,
-                         std::span<const std::string> trusted_origins, bool listener_is_tls) {
-    if (!is_same_site_write_method(method))
-        return {};
-    if (!browser_write_is_cross_site(auth_source, host, origin, referer, trusted_origins,
-                                       listener_is_tls))
-        return {};
+                         std::span<const std::string> trusted_origins, bool listener_is_tls,
+                         std::string_view path, std::string_view sec_fetch_site) {
+    if (is_same_site_write_method(method)) {
+        if (!browser_write_is_cross_site(auth_source, host, origin, referer, trusted_origins,
+                                           listener_is_tls))
+            return {};
+    } else {
+        if (!is_guarded_read(method, path))
+            return {};
+        if (auth_source == "api_token" || auth_source == "mcp_token" ||
+            auth_source == "engine_token")
+            return {};
+        if (!sec_fetch_site.empty()) {
+            if (detail::ascii_ieq(sec_fetch_site, "same-origin") ||
+                detail::ascii_ieq(sec_fetch_site, "none"))
+                return {};
+            return {true, kSameSiteReasonOriginMismatch};
+        }
+        if (!browser_write_is_cross_site(auth_source, host, origin, referer, trusted_origins,
+                                           listener_is_tls))
+            return {};
+    }
     if (origin.empty() && referer.empty())
         return {true, kSameSiteReasonNoHeaders};
     if (!origin.empty())
