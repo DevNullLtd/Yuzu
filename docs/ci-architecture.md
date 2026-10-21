@@ -858,7 +858,8 @@ tooling, not a CI gate (the CI coverage job is `nightly.yml`'s, with its own gco
 invocation). Its behaviour (build-dir lock, inconclusive runs, DB-write handling, the
 Linux-only refusal, option and baseline validation) is pinned by the mock-based harness
 `tests/shell/test_pr2_gates.sh`. Preflight's "Shell gate tests" step runs the fast
-scenarios only, `CH-18 CH-20 CH-21 CH-22 CH-24` (about 25 s, bash and python3 only). The
+scenarios only, `CH-18 CH-20 CH-21 CH-22 CH-24` (about 25 s; bash, python3 with sqlite3, procps
+and findutils, all on the hosted image; the fixtures stub `ps`, `find` and `ln`). The
 slow scenarios (`CH-19`, the process-tree kill, about 2.5 minutes; `CH-23`, signal bursts,
 about 35 s) and the rest of the harness are not in CI yet; wiring them into a nightly job,
 and hardening them for the shared-identity runner pools, is #6116.
