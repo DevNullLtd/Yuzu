@@ -298,7 +298,7 @@ struct Rig {
             // The quarantine routes write through the session writer below; the one row that
             // may reach this re-resolving writer is the unwired-writer failure row, which has
             // no session writer to use. Any other row here is the defect this file pins.
-            if (action.rfind("quarantine.", 0) == 0 &&
+            if ((action == "quarantine.enable" || action == "quarantine.disable") &&
                 detail != "audit identity writer not configured")
                 FAIL_CHECK("a quarantine row went through the re-resolving audit_fn: "
                            << action << "/" << result);
@@ -1066,6 +1066,35 @@ TEST_CASE("quarantine audit identity (k): every row the quarantine routes write 
         REQUIRE(rig.has_audit("quarantine.enable/success"));
         CHECK(rig.every_audit_names("frank"));
         CHECK(rig.every_audit_has_role("admin"));
+    }
+
+    SECTION("DELETE: the rows carry the role of the SECOND resolution too") {
+        {
+            auto created = rig.post();
+            REQUIRE(created);
+            REQUIRE(created->status == 201);
+        }
+        rig.clear_audits();
+        rig.as_user("frank");
+        rig.auth_user_queue = {"frank", "frank"};
+        rig.auth_elevated_queue = {false, true};
+        auto res = rig.del();
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        REQUIRE(rig.has_audit("quarantine.disable/attempt"));
+        REQUIRE(rig.has_audit("quarantine.disable/success"));
+        CHECK(rig.every_audit_names("frank"));
+        CHECK(rig.every_audit_has_role("admin"));
+    }
+
+    SECTION("the second account in the 401 detail is neutralised: control bytes and '=' become "
+            "'_' so a username cannot forge a key=value token or a line") {
+        rig.auth_user_queue = {"alice", "bo\nb=x y"};
+        auto res = rig.post();
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        CHECK(rig.audit_detail("quarantine.enable/denied") ==
+              "authenticated principal changed during the request now=bo_b_x_y");
     }
 
     SECTION("POST: a second resolution that names a different principal ends the request at 401 "

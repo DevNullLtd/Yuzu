@@ -20728,18 +20728,10 @@ private:
         // #6065 PR-Q (rest-audit-principal-reresolution): POST and DELETE
         // /api/v1/quarantine stamp every audit row from the session they resolved, not from
         // a second resolution of the request that could name a different actor.
-        // AuthRoutes::audit_log_for_session stamps the principal, the effective role the
-        // route captured once, the engine class and the session correlator. MUST run BEFORE
-        // register_routes().
-        rest_api_v1_->set_audit_as_session_fn(
-            [ar = auth_routes_.get()](const httplib::Request& req, const auth::Session& session,
-                                      const std::string& principal_role,
-                                      const std::string& action, const std::string& result,
-                                      const std::string& target_type,
-                                      const std::string& target_id, const std::string& detail) {
-                return ar->audit_log_for_session(req, session, principal_role, action, result,
-                                                 target_type, target_id, detail);
-            });
+        // AuthRoutes::audit_as_session_fn() is the one factory (a test drives that closure):
+        // it stamps the principal, the effective role the route captured per binding, the
+        // engine class and the session correlator. MUST run BEFORE register_routes().
+        rest_api_v1_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());
         // #6065 PR-Q: the dispatch-chokepoint pre-check closure, defined ONCE and
         // handed to BOTH REST (POST and DELETE /api/v1/quarantine, the trailing register_routes
         // param) and MCP (set_authorize_dispatch_fn, wired further below), so the two

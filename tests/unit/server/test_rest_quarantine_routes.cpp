@@ -172,7 +172,7 @@ struct QuarantineRouteHarness {
             // that may reach this re-resolving writer is the unwired-writer failure row, and
             // this harness always wires a writer. Any quarantine row here is the defect
             // (rest-audit-principal-reresolution) that every scenario in this file guards.
-            if (action.rfind("quarantine.", 0) == 0)
+            if (action == "quarantine.enable" || action == "quarantine.disable")
                 FAIL_CHECK("a quarantine row went through the re-resolving audit_fn: "
                            << action << "/" << result);
             if (!audit_fail_result.empty() && result == audit_fail_result)

@@ -1613,13 +1613,22 @@ bool AuthRoutes::audit_log_for_session(const httplib::Request& req, const auth::
                                        const std::string& target_type,
                                        const std::string& target_id, const std::string& detail) {
     // Same fields `make_audit_event` stamps for a resolved session: the principal, the role
-    // handed in (the caller captures `effective_role` ONCE, so a JIT elevation that lapses
-    // mid-request cannot make the rows of one request disagree), the engine class (an engine
-    // principal audits as "engine", not the "agent" its bearer presentation implies) and, via
-    // `make_audit_event_for_principal`, the session correlator and source fields.
+    // handed in (the caller captures `effective_role` once per binding), the engine class (an
+    // engine principal audits as "engine", not the "agent" its bearer presentation implies)
+    // and, via `make_audit_event_for_principal`, the session correlator and source fields.
     return audit_log_for_principal(req, action, result, session.username, principal_role,
                                    target_type, target_id, detail,
                                    session.principal_kind == "engine" ? "engine" : std::string{});
+}
+
+AuthRoutes::AuditAsSessionFn AuthRoutes::audit_as_session_fn() {
+    return [this](const httplib::Request& req, const auth::Session& session,
+                  const std::string& principal_role, const std::string& action,
+                  const std::string& result, const std::string& target_type,
+                  const std::string& target_id, const std::string& detail) {
+        return audit_log_for_session(req, session, principal_role, action, result, target_type,
+                                     target_id, detail);
+    };
 }
 
 void AuthRoutes::record_enroll_credential_changed(const httplib::Request& req,

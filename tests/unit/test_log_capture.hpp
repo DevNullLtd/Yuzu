@@ -64,6 +64,10 @@ struct LogCapture {
             return;
         spdlog::set_default_logger(prev_);
         spdlog::set_level(prev_level_);
+        // set_default_logger registered the capture logger under its name; its sink holds a
+        // reference to `oss_`, so leaving it in the registry would let a later flush_all or
+        // shutdown touch a destroyed stream.
+        spdlog::drop("test_log_capture");
         stopped_ = true;
     }
 

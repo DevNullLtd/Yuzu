@@ -2721,8 +2721,8 @@ caller_from_session(const auth::Session& sess, const RestApiV1::ExecVisibleFn& e
 // outlive the caller's reference.
 [[nodiscard]] RestApiV1::AuditFn audit_as(const RestApiV1::AuditAsSessionFn& writer,
                                           const auth::Session& session) {
-    // The effective role is read ONCE, here: every row of the request is stamped with the
-    // role the request was authorized as, not one re-evaluated at each write.
+    // The effective role is read once per binding, here, not re-evaluated at each write: a
+    // JIT elevation that lapses between two rows of one binding cannot make them disagree.
     std::string role = auth::role_to_string(auth::effective_role(session));
     return [writer, session, role = std::move(role)](
                const httplib::Request& req, const std::string& action, const std::string& result,
@@ -2734,8 +2734,9 @@ caller_from_session(const auth::Session& sess, const RestApiV1::ExecVisibleFn& e
 
 // The first authentication of a quarantine route, plus the audit writer bound to it. Returns
 // the session, or nullopt once the response is written (401 from `auth_fn`, or the 500 below
-// when the writer is unwired, which is a misconfiguration and must never fall back to the
-// re-resolving `audit_fn`).
+// when the writer is unwired, which is a misconfiguration: the request never falls back to the
+// re-resolving `audit_fn`, and the one `failure` row that records it is the only row written
+// through it).
 [[nodiscard]] std::optional<auth::Session>
 authenticate_for_quarantine_audit(const httplib::Request& req, httplib::Response& res,
                                   const RestApiV1::AuthFn& auth_fn,
@@ -2779,9 +2780,11 @@ authenticate_for_quarantine_audit(const httplib::Request& req, httplib::Response
     res.set_content(detail::a4_error(res, "the authenticated principal changed during the request",
                                      {.remediation = "retry the request"}),
                     "application/json");
-    const std::string second = detail::sanitize_detail_value(again.username);
+    // `audit_token` first (control bytes, space, `=` and `,` become `_`, so a username cannot
+    // forge a key=value token), then `sanitize_detail_value` for its length cap.
+    const std::string second = detail::sanitize_detail_value(audit_token(again.username));
     spdlog::warn("{}: the authenticated principal changed during the request first={} second={}",
-                 audit_action, detail::sanitize_detail_value(first.username), second);
+                 audit_action, detail::sanitize_detail_value(audit_token(first.username)), second);
     audit(req, audit_action, "denied", "Security", agent_id,
           "authenticated principal changed during the request now=" + second);
     return false;

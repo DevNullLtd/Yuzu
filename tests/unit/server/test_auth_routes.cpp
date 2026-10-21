@@ -28,6 +28,7 @@
 #include "service_scope_policy.hpp"
 #include "tag_store.hpp"
 #include "../test_helpers.hpp" // YUZU_REQUIRE_PG_DB_TPL / PgTestTemplate / TempDbFile
+#include "../test_log_capture.hpp" // yuzu::test::LogCapture / stray_control_bytes
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/server.hpp>
@@ -36,8 +37,6 @@
 #include <httplib.h>
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
-#include <spdlog/sinks/ostream_sink.h>
-#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <atomic>
@@ -2219,7 +2218,7 @@ TEST_CASE("AuthRoutes::gateless_tier_policy_fn — the REAL production "
 // only place the real fields are pinned: the principal, the role the caller captured, the
 // engine class, and the neutralised failure log (CWE-117).
 // ---------------------------------------------------------------------------
-TEST_CASE("AuthRoutes::audit_log_for_session stamps the session it is handed, the captured role "
+TEST_CASE("AuthRoutes::audit_as_session_fn stamps the session it is handed, the captured role "
           "and the engine class; a failed write logs neutralised fields",
           "[pg][auth_routes][audit]") {
     AuthRoutesFixture fix;
@@ -2231,8 +2230,12 @@ TEST_CASE("AuthRoutes::audit_log_for_session stamps the session it is handed, th
     AuthRoutes ar{fix.cfg, fix.auth_mgr, /*rbac_store=*/nullptr, fix.api_tokens.get(),
                   &audit_store, /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
                   fix.analytics.get(), fix.oidc_mu, fix.oidc_provider};
+    // THE production writer: server.cpp hands exactly this closure to RestApiV1, so a
+    // transposed argument anywhere on the path shows up in the row asserted below.
+    const auto write = ar.audit_as_session_fn();
     httplib::Request req;
     req.remote_addr = "10.1.2.3";
+    req.set_header("User-Agent", "audit-session-test/1");
 
     auto one_row = [&](const std::string& action) {
         AuditQuery q;
@@ -2243,12 +2246,13 @@ TEST_CASE("AuthRoutes::audit_log_for_session stamps the session it is handed, th
         return rows->front();
     };
 
-    SECTION("a human session: the principal, and the role passed in rather than the base role") {
+    SECTION("a human session: the principal, the role passed in rather than the base role, and "
+            "each target field in its own column") {
         auth::Session s;
         s.username = "alice";
         s.role = auth::Role::user; // the base role; the caller passes the effective one
-        REQUIRE(ar.audit_log_for_session(req, s, "admin", "quarantine.enable", "attempt",
-                                         "Security", "agent-1", "why"));
+        REQUIRE(write(req, s, "admin", "quarantine.enable", "attempt", "Security", "agent-1",
+                      "why"));
         const auto e = one_row("quarantine.enable");
         CHECK(e.principal == "alice");
         CHECK(e.principal_role == "admin");
@@ -2256,6 +2260,8 @@ TEST_CASE("AuthRoutes::audit_log_for_session stamps the session it is handed, th
         CHECK(e.target_type == "Security");
         CHECK(e.target_id == "agent-1");
         CHECK(e.detail == "why");
+        CHECK(e.source_ip == "10.1.2.3");
+        CHECK(e.user_agent == "audit-session-test/1");
         CHECK(e.principal_class != "engine");
     }
 
@@ -2264,8 +2270,7 @@ TEST_CASE("AuthRoutes::audit_log_for_session stamps the session it is handed, th
         s.username = "engine:ci";
         s.role = auth::Role::user;
         s.principal_kind = "engine";
-        REQUIRE(ar.audit_log_for_session(req, s, "user", "quarantine.disable", "success",
-                                         "Security", "agent-1", ""));
+        REQUIRE(write(req, s, "user", "quarantine.disable", "success", "Security", "agent-1", ""));
         const auto e = one_row("quarantine.disable");
         CHECK(e.principal == "engine:ci");
         CHECK(e.principal_class == "engine");
@@ -2280,29 +2285,16 @@ TEST_CASE("AuthRoutes::audit_log_for_session stamps the session it is handed, th
                                   "ALTER TABLE audit_store.audit_events RENAME TO audit_events_gone")};
             REQUIRE(r.ok());
         }
-        // Restores the default logger on every exit path.
-        struct LogSwap {
-            std::ostringstream stream;
-            std::shared_ptr<spdlog::logger> saved{spdlog::default_logger()};
-            LogSwap() {
-                auto sink = std::make_shared<spdlog::sinks::ostream_sink_mt>(stream);
-                auto logger = std::make_shared<spdlog::logger>("audit_session_capture", sink);
-                logger->set_level(spdlog::level::trace);
-                logger->set_pattern("%v");
-                spdlog::set_default_logger(logger);
-            }
-            ~LogSwap() { spdlog::set_default_logger(saved); }
-            LogSwap(const LogSwap&) = delete;
-            LogSwap& operator=(const LogSwap&) = delete;
-        } capture;
+        yuzu::test::LogCapture capture{spdlog::level::warn};
 
         auth::Session s;
         s.username = "ali\nFORGED-PRINCIPAL";
-        const bool ok = ar.audit_log_for_session(req, s, "user", "quarantine.enable", "failure",
-                                                 "Security", "agent\nFORGED-TARGET", "");
+        const bool ok = write(req, s, "user", "quarantine.enable", "failure", "Security",
+                              "agent\nFORGED-TARGET", "");
+        capture.stop(); // restore and quiesce before reading the text
 
         CHECK_FALSE(ok);
-        const std::string text = capture.stream.str();
+        const std::string text = capture.text();
         REQUIRE(text.find("AuditStore::log failed") != std::string::npos);
         // The record for this write stays ONE line: both hostile fields appear on it
         // (neutralised in place), and no line of the captured output starts with a hostile
@@ -2319,6 +2311,6 @@ TEST_CASE("AuthRoutes::audit_log_for_session stamps the session it is handed, th
         REQUIRE_FALSE(record.empty());
         CHECK(record.find("FORGED-PRINCIPAL") != std::string::npos);
         CHECK(record.find("FORGED-TARGET") != std::string::npos);
-        CHECK(text.find('\r') == std::string::npos);
+        CHECK(yuzu::test::stray_control_bytes(text) == 0);
     }
 }

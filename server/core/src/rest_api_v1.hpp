@@ -798,14 +798,17 @@ public:
     /// credential that lapsed or was revoked between the route's own resolution and the
     /// audit write, or a second credential on the same request, made a row name a
     /// different actor than the record it describes (`rest-audit-principal-reresolution`).
-    /// Wired from `AuthRoutes::audit_log_for_session`, which stamps the principal, the
-    /// `principal_role` passed in, the engine class and the session correlator.
-    /// `principal_role` is the session's effective role, captured ONCE when the route
-    /// binds the writer, so a JIT elevation that lapses mid-request cannot make the rows of
-    /// one request disagree. Returns true iff the row persisted (true in audit-off mode).
-    /// Used by `POST` and `DELETE /api/v1/quarantine`: an unwired writer makes both answer
-    /// 500, and neither falls back to the re-resolving `audit_fn`. MUST be called BEFORE
-    /// `register_routes()` (captured by value).
+    /// Wired from `AuthRoutes::audit_as_session_fn()` (which stamps the principal, the
+    /// `principal_role` passed in, the engine class and the session correlator).
+    /// `principal_role` is the session's effective role, captured once per binding: the
+    /// route binds at its first look-up and again at its second, so a row written between
+    /// the two (a 503, a 400) carries the first look-up's role and every row after carries
+    /// the second's, the session the dispatch check authorizes. Returns true iff the row
+    /// persisted (true in audit-off mode). Used by `POST` and `DELETE /api/v1/quarantine`:
+    /// an unwired writer makes both answer 500, and neither uses the re-resolving `audit_fn`
+    /// for the request; the single `failure` row that records the unwired writer is the only
+    /// row written through it. MUST be called BEFORE `register_routes()` (captured by
+    /// value).
     using AuditAsSessionFn = std::function<bool(
         const httplib::Request& req, const auth::Session& session,
         const std::string& principal_role, const std::string& action, const std::string& result,

@@ -2018,13 +2018,18 @@ Quarantine a device.
 > must be an administrator in that sense **and** hold `Security:Execute` globally in
 > their own right; a live JIT elevation supplies the first condition, not the second.
 >
+> Statuses these routes can answer beyond the usual `400` (body) and `503` (store), in the order
+> a request meets them (the `500` for an unwired audit identity writer comes first, right after
+> authentication; the `401` for a changed principal comes at the second look-up, after the
+> scoped gate and `whitelist` validation):
+>
 > | Status | When | Reason label (audit `detail`, metric) |
 > |---|---|---|
 > | `403` | RBAC on: the caller holds `Security:Execute` globally but is not an administrator (account role `user`, no live JIT elevation) | `approval_required` |
 > | `403` | RBAC on: the caller's own `Security:Execute` grant is not global (for example it is held only through a management group, or the caller is an administrator only through a JIT elevation), **or the RBAC store could not be read** (a transient failure reads the same as a denial) | `forbidden` |
 > | `400` | The `quarantine.quarantine` pair cannot be classified | `unclassified` or `ambiguous` |
 > | `403` | Other chokepoint refusals map the same way (`kill_switched`, `anonymous_operator`); neither is reachable for this pair today, because quarantine is exempt from the per-action kill switch and an unauthenticated request ends at the `401` | `kill_switched`, `anonymous_operator` |
-> | `401` | The request's second session look-up named a different principal than the first (for example a session cookie lapsed and a bearer token for another account is on the same request); written as a `quarantine.enable` row with `result=denied` and `detail` `authenticated principal changed during the request now=<second account>`, naming the first account as the actor | none |
+> | `401` | The request's second session look-up named a different principal than the first (for example a session cookie lapsed and a bearer token for another account is on the same request); written as a `quarantine.enable` row with `result=denied` and `detail` `authenticated principal changed during the request now=<second account>` (the account name has control bytes, spaces, commas, `=` and `;` replaced by `_` and is cut at 128 bytes), naming the first account as the actor | none |
 > | `500` | The dispatch check is not wired on this server (also written as a `quarantine.enable` row with `result=failure`) | none |
 > | `500` | The audit identity writer is not wired on this server (misconfiguration; written as a `quarantine.enable` row with `result=failure` and `detail` `audit identity writer not configured`) | none |
 >
