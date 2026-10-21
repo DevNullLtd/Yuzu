@@ -16,6 +16,7 @@ with injectable seams. Pinned by tests/test_gateway_epmd.py.
 import atexit
 import glob
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -32,7 +33,9 @@ def pick_port(is_free, pid=os.getpid):
     else None. epmd binds long after the probe (once the first distributed node
     starts), so two runs choosing the same free port would share one epmd and one
     run's exit would kill the other's. Concurrent runs have distinct pids and so
-    start at distinct ports; a busy port only moves the scan to the next one."""
+    start at distinct ports; a busy port only moves the scan to the next one.
+    Accepted residual: two live pids 9000 apart start at the same port (1 in
+    9000 per pair), and the probe cannot see an epmd that has not bound yet."""
     span = PORT_RANGE[1] - PORT_RANGE[0] + 1
     start = pid() % span
     for i in range(_MAX_TRIES):
@@ -87,9 +90,15 @@ def find_epmd(env, which=shutil.which, glob_=glob.glob):
         return None
     root = os.path.dirname(os.path.dirname(os.path.realpath(erl)))
     # Exact names: a bare `epmd*` also matches epmd.pdb in a Windows install.
-    hits = sorted(hit for name in ("epmd", "epmd.exe")
-                  for hit in glob_(os.path.join(root, "erts-*", "bin", name)))
-    return hits[-1] if hits else None
+    hits = [hit for name in ("epmd", "epmd.exe")
+            for hit in glob_(os.path.join(root, "erts-*", "bin", name))]
+    return max(hits, key=_erts_version) if hits else None
+
+
+def _erts_version(path):
+    """(16, 3, 1) for .../erts-16.3.1/bin/epmd.exe, so erts-16 outranks erts-9."""
+    m = re.search(r"erts-([0-9]+(?:\.[0-9]+)*)", path)
+    return tuple(int(part) for part in m.group(1).split(".")) if m else ()
 
 
 def stop(port, env, which=shutil.which, run=subprocess.run, glob_=glob.glob):

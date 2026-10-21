@@ -179,11 +179,12 @@ class FindEpmdTest(unittest.TestCase):
 
         self.assertEqual(ge.find_epmd({"PATH": "x"}, which=which, glob_=glob_), want)
 
-    def test_takes_the_last_of_several_erts_dirs(self):
-        hits = ["/otp/erts-15.0/bin/epmd", "/otp/erts-16.3.1/bin/epmd"]
+    def test_takes_the_newest_of_several_erts_dirs_by_version_not_by_string(self):
+        # "erts-9.0" sorts after "erts-16.3.1" as a string; an OTP upgraded in place keeps both.
+        hits = ["/otp/erts-9.0/bin/epmd", "/otp/erts-16.3.1/bin/epmd", "/otp/erts-15.2/bin/epmd"]
         got = ge.find_epmd({}, which=lambda n, path=None: "/otp/bin/erl" if n == "erl" else None,
-                           glob_=lambda p: list(reversed(hits)))
-        self.assertEqual(got, hits[-1])
+                           glob_=lambda p: list(hits))
+        self.assertEqual(got, "/otp/erts-16.3.1/bin/epmd")
 
     def test_no_erl_and_no_epmd_is_none(self):
         self.assertIsNone(ge.find_epmd({}, which=lambda n, path=None: None,
