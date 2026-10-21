@@ -1044,6 +1044,16 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
 // above checks that the three known names count; it cannot notice a FOURTH header being
 // added to resolve_session. This case reads both sources as text (comments stripped by the
 // lexer pinned above) and compares the header names they read.
+//
+// Known limits of this pin:
+//  - It sees only header reads written directly in the bodies of resolve_session and
+//    extract_session_cookie. A header read made through a new helper function or macro is
+//    not seen, and the mirror comment inside resolve_session is the remaining guard. The
+//    req-argument check below narrows this (a new helper taking `req` fails the pin) but
+//    cannot close it (a helper reached through a captured or stored request is not seen).
+//  - A `//` comment ending with a backslash plus trailing whitespace is not treated as a
+//    line continuation by strip_comments.
+//  - function_body does not skip raw string literals when it counts braces.
 // ═══════════════════════════════════════════════════════════════════════════
 namespace {
 
@@ -1118,6 +1128,48 @@ std::set<std::string> header_names_read(const std::string& body) {
     return names;
 }
 
+// Names of the functions a body passes the request `req` to as an argument: for each use of
+// the identifier `req` that is not a member access (`req.`), the identifier before the
+// nearest unmatched '(' to its left. A use with no enclosing call is reported as
+// "<not a call argument>" so it fails loudly.
+std::set<std::string> req_argument_callees(const std::string& body) {
+    std::set<std::string> callees;
+    for (auto pos = body.find("req"); pos != std::string::npos; pos = body.find("req", pos + 1)) {
+        const bool starts_ident = pos == 0 || !is_ident_char(body[pos - 1]);
+        const auto end = pos + 3;
+        if (!starts_ident || (end < body.size() && is_ident_char(body[end])))
+            continue;
+        auto after = end;
+        while (after < body.size() && std::isspace(static_cast<unsigned char>(body[after])) != 0)
+            ++after;
+        if (after < body.size() && body[after] == '.')
+            continue; // member access: header_names_read covers the header reads
+        int depth = 0;
+        std::size_t open = std::string::npos;
+        for (std::size_t i = pos; i > 0; --i) {
+            const char c = body[i - 1];
+            if (c == ')') {
+                ++depth;
+            } else if (c == '(' && depth-- == 0) {
+                open = i - 1;
+                break;
+            }
+        }
+        if (open == std::string::npos) {
+            callees.insert("<not a call argument>");
+            continue;
+        }
+        auto name_end = open;
+        while (name_end > 0 && std::isspace(static_cast<unsigned char>(body[name_end - 1])) != 0)
+            --name_end;
+        auto name_begin = name_end;
+        while (name_begin > 0 && is_ident_char(body[name_begin - 1]))
+            --name_begin;
+        callees.insert(body.substr(name_begin, name_end - name_begin));
+    }
+    return callees;
+}
+
 std::string join_names(const std::set<std::string>& names) {
     std::string out;
     for (const auto& n : names)
@@ -1158,6 +1210,17 @@ TEST_CASE("health_routes: resolve_session and request_carries_credential read th
     resolve_reads.insert("cookie"); // via extract_session_cookie, checked above
     INFO("resolve_session reads: " << join_names(resolve_reads) << ". " << how_to_fix);
     CHECK(resolve_reads == expected);
+
+    // A helper that takes the request could read a header this pin cannot see. The only
+    // functions resolve_session may hand `req` to: extract_session_cookie (checked above) and
+    // audit_log_for_principal (builds an audit row; reads User-Agent and, through
+    // extract_session_cookie, the session cookie, and no other credential header).
+    const std::set<std::string> req_callees_allowed{"extract_session_cookie",
+                                                    "audit_log_for_principal"};
+    const auto req_callees = req_argument_callees(*resolve);
+    INFO("resolve_session passes req to: " << join_names(req_callees) << ". " << how_to_fix);
+    for (const auto& callee : req_callees)
+        CHECK(req_callees_allowed.count(callee) == 1);
 
     const auto probe_reads = header_names_read(*probe_fn);
     INFO("request_carries_credential names: " << join_names(probe_reads) << ". " << how_to_fix);

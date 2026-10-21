@@ -173,8 +173,8 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
     // /api/ keep working — a side-effect of #401's move from /api/health → /health.
     //
     // `health_body` is the ONE body behind every /health alias; its callers
-    // decide `is_authenticated` (main sink: a session resolve (a store lookup,
-    // run only when the request carries a credential); plaintext sink: hard
+    // decide `is_authenticated` (main sink: a session resolve, which is a store
+    // lookup and runs only when the request carries a credential; plaintext sink: hard
     // false, #5906).
     auto health_body = [deps](const httplib::Request&, httplib::Response& res,
                               bool is_authenticated) {

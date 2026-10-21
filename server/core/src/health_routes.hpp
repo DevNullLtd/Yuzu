@@ -256,7 +256,7 @@ namespace health {
 /// presence, whether or not the credential is valid, and is coarse by design: a `Cookie`
 /// without a `yuzu_session=` value or a non-Bearer `Authorization` header is charged
 /// although it never reaches the session store (the empty-token guard makes the rest
-/// cheap). A request with none is answered from in-memory state and returns true without
+/// cheap). A request with none is answered without a session-store lookup and returns true without
 /// touching the limiter, so a credential-less monitor behind a shared address is never
 /// throttled. The bucket key carries a prefix so probe traffic and API traffic from one
 /// source do not draw on each other's budget. Returns true when the request may proceed;
