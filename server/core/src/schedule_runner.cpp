@@ -187,7 +187,7 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
 
     // 1) An APPROVED ticket for THIS schedule's occurrence, for THIS exact
     //    target → fire, then retire the ticket (consumed_at, database time) before
-    //    returning true so the caller advances — approve == at most one scheduled
+    //    returning true so the caller advances; approve == at most one scheduled
     //    run, by state and not by comparing clocks (#6096). Single
     //    tick thread, so no concurrent-fire race. Matching on
     //    a.schedule_id == s.id (M-02, #1806) is required, not just
@@ -278,7 +278,7 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
         if (!retired) {
             count("yuzu_schedule_fire_failures_total");
             spdlog::warn("schedule_runner: schedule '{}' (id={}) approval {} could not be "
-                         "retired ({}) — holding the occurrence",
+                         "retired ({}); holding the occurrence",
                          s.name, s.id, a.id, retired.error());
             return false;
         }
@@ -318,7 +318,7 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
         if (!retired) {
             count("yuzu_schedule_fire_failures_total");
             spdlog::warn("schedule_runner: schedule '{}' (id={}) rejected approval {} could not "
-                         "be retired ({}) — holding the occurrence",
+                         "be retired ({}); holding the occurrence",
                          s.name, s.id, a.id, retired.error());
             return false;
         }

@@ -702,7 +702,7 @@ TEST_CASE("ScheduleRunner: rejecting the ticket skips the occurrence and re-asks
     CHECK(h.enqueues.empty());
     CHECK(h.get(id).next_execution_at > 1);
 
-    // Next occurrence: the rejected ticket was retired when it skipped — a fresh ask goes out.
+    // Next occurrence: the rejected ticket was retired when it skipped; a fresh ask goes out.
     h.force_due(id);
     h.runner.tick();
     CHECK(h.enqueues.empty());
