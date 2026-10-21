@@ -91,9 +91,8 @@ extract_registry_audit_lines(std::string_view output) {
         std::string s{line};
         // Every ASCII control byte (CR, NUL, ESC, BEL ...): the log file is an escape-interpreting
         // sink.
-        for (char& c : s)
-            if (static_cast<unsigned char>(c) < 0x20 || c == 0x7F)
-                c = '_';
+        std::ranges::replace_if(
+            s, [](unsigned char c) { return c < 0x20 || c == 0x7F; }, '_');
         out.push_back(std::move(s));
     }
     return out;

@@ -52,6 +52,17 @@ constexpr std::string_view kOkLine =
     "verify=ok|dry_run=-|counted_keys=-|counted_values=-|capped=-|sid=-|old_state=present|"
     "old_type=REG_DWORD|old=01000000|new=02000000";
 
+// A space and a non-ASCII byte: only log_id_token maps both, so a sink that printed the raw id or
+// used the looser log_token would log a different agent.
+const std::string kOddAgent = "agent \xC3\xA9";
+
+std::size_t count_of(const std::string& text, const std::string& needle) {
+    std::size_t n = 0;
+    for (auto at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1))
+        ++n;
+    return n;
+}
+
 std::string line_with_result(std::string_view result, std::string_view dry_run = "-") {
     return "audit|op=delete_key|hive=HKLM|key=K|name=-|type=-|len=-|result=" + std::string{result} +
            "|reason=-|verify=-|dry_run=" + std::string{dry_run} +
@@ -90,12 +101,6 @@ TEST_CASE("registry audit: per-frame bounds and neutralisation", "[server][regis
         REQUIRE(cut.size() == 1);
         CHECK(cut[0].size() == 4096);
     }
-    SECTION("a 5 KiB line is cut to 4096 bytes") {
-        const std::string big = "audit|" + std::string(5000, 'k');
-        const auto lines = extract_registry_audit_lines(big);
-        REQUIRE(lines.size() == 1);
-        CHECK(lines[0].size() == kMaxRegistryAuditLineBytes);
-    }
     SECTION("the cut never lands inside a multi-byte character") {
         // 4091 ASCII bytes after "audit|" puts the next 2-byte character straddling byte 4096.
         std::string s = "audit|" + std::string(kMaxRegistryAuditLineBytes - 6 - 1, 'k');
@@ -103,15 +108,6 @@ TEST_CASE("registry audit: per-frame bounds and neutralisation", "[server][regis
         const auto lines = extract_registry_audit_lines(s);
         REQUIRE(lines.size() == 1);
         CHECK(lines[0].size() == kMaxRegistryAuditLineBytes - 1);
-    }
-    SECTION("every ASCII control byte becomes '_' (CR, NUL, ESC, BEL, DEL ...); LF is the line "
-            "separator") {
-        const std::string out =
-            std::string{"audit|a\rb"} + '\0' + "c\x1b" + "d\a" + "e\x7f" + "f\naudit|g\n";
-        const auto lines = extract_registry_audit_lines(out);
-        REQUIRE(lines.size() == 2);
-        CHECK(lines[0] == "audit|a_b_c_d_e_f");
-        CHECK(lines[1] == "audit|g");
     }
     SECTION("each of 0x00-0x1F except LF, and 0x7F, becomes '_'; every printable ASCII byte and "
             "UTF-8 is kept") {
@@ -453,9 +449,7 @@ TEST_CASE("registry audit live ingest: a store that fails ends the frame at the 
     const auto before = h.audit->emit_failed_count();
     const std::string one{kOkLine};
     const std::string three = one + "\n" + one + "\n" + one;
-    // A space and a non-ASCII byte: only log_id_token maps both, so a sink that printed the raw
-    // id or used the looser log_token would log a different agent.
-    const std::string agent = "agent \xC3\xA9";
+    const std::string& agent = kOddAgent;
     const std::string who = yuzu::log_id_token(agent);
     REQUIRE(who != yuzu::log_token(agent));
     yuzu::test::LogCapture cap;
@@ -473,12 +467,7 @@ TEST_CASE("registry audit live ingest: a store that fails ends the frame at the 
     CHECK(h.rows().empty());
 
     const std::string text = cap.text();
-    const auto count = [&](const std::string& needle) {
-        std::size_t n = 0;
-        for (auto at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1))
-            ++n;
-        return n;
-    };
+    const auto count = [&](const std::string& needle) { return count_of(text, needle); };
     // The early-out warning: once per frame, naming the agent and the two rows that were not
     // attempted.
     CHECK(count("[audit] registry.write row failed to persist (agent=" + who +
@@ -496,9 +485,7 @@ TEST_CASE(
     "[pg][server][registry_audit]") {
     YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
     IngestHarness h(db.dsn());
-    // A space and a non-ASCII byte: the logged id must be the log_id_token form (log_token passes
-    // bytes >= 0x80 through).
-    const std::string agent = "agent \xC3\xA9";
+    const std::string& agent = kOddAgent;
     REQUIRE(yuzu::log_id_token(agent) != yuzu::log_token(agent));
     const std::string ignored =
         "[audit] registry.write frame ignored: command_id is not a server-minted shape "
@@ -510,12 +497,8 @@ TEST_CASE(
                                                                    apb::CommandResponse::RUNNING,
                                                                    action, std::string{kOkLine}));
         cap.stop();
-        std::size_t n = 0;
         const std::string text = cap.text();
-        for (auto at = text.find("registry.write frame ignored"); at != std::string::npos;
-             at = text.find("registry.write frame ignored", at + 1))
-            ++n;
-        return std::pair{n, text};
+        return std::pair{count_of(text, "registry.write frame ignored"), text};
     };
 
     const auto bad = warns("registry-9 x", "set_value"); // 12 bytes
