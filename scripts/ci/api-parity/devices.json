@@ -97,8 +97,8 @@
       "method": "GET",
       "path": "/api/v1/hardware/{param}"
     },
-    "mcp_twin": null,
-    "status": "twinned-rest-only"
+    "mcp_twin": "get_hardware_ci",
+    "status": "twinned"
   },
   {
     "method": "GET",
@@ -148,8 +148,8 @@
       "method": "GET",
       "path": "/api/v1/hardware"
     },
-    "mcp_twin": null,
-    "status": "twinned-rest-only"
+    "mcp_twin": "list_hardware_ci",
+    "status": "twinned"
   },
   {
     "method": "GET",
@@ -167,8 +167,8 @@
       "method": "GET",
       "path": "/api/v1/quarantine"
     },
-    "mcp_twin": null,
-    "status": "twinned-rest-only"
+    "mcp_twin": "list_quarantined_devices",
+    "status": "twinned"
   },
   {
     "method": "GET",

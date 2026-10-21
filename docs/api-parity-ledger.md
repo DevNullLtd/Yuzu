@@ -192,7 +192,7 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 
 | Domain | Rows | Twinned | Untwinned |
 |---|---:|---:|---:|
-| devices | 21 | 8 | 13 |
+| devices | 21 | 11 | 10 |
 | inventory | 4 | 4 | 0 |
 | dex | 27 | 18 | 9 |
 | guardian | 18 | 8 | 10 |
@@ -216,11 +216,11 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | enrollment | 21 | 4 | 17 |
 | crypto | 2 | 2 | 0 |
 | other | 82 | 17 | 65 |
-| **Total** | **341** | **113** | **228** |
+| **Total** | **341** | **116** | **225** |
 
-Registered `/api/vN/*` routes: 256. OpenAPI `paths` entries: 255. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 196.
+Registered `/api/vN/*` routes: 256. OpenAPI `paths` entries: 255. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 199.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 228. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 174.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 225. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 174.
 
 <!-- END GENERATED -->
 
