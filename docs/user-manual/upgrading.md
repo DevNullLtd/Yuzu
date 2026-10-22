@@ -4040,10 +4040,14 @@ a rollback is genuinely needed.
   up to 5 s waiting on the NVD-sync background thread, up to 15 s waiting on
   the HTTP listener thread (#2703 Gate 7 item 2), and (#3261 governance
   hardening) up to 60 s waiting for WebhookStore and OffloadTargetStore to
-  drain their delivery queues — the last of which runs the two stores
+  drain their delivery queues — that stage runs the two stores
   CONCURRENTLY, not sequentially, so it adds 60 s to the total rather than
-  120 s. Stacked, this can reach **~115 s** in the worst case if more than
-  one stage is genuinely wedged; the total and each stage's own bound are
+  120 s, and, as a separate stage right before the audit store is released,
+  up to 15 s waiting for a `registry.write` audit write that a gateway
+  forwarder thread has in flight (milliseconds unless the database is stuck
+  or slow: a connect or a lock wait can use the whole bound). Stacked, this can reach
+  **~130 s** in the worst case if more than one stage is genuinely wedged;
+  the total and each stage's own bound are
   unchanged by the reorder, only their relative sequence is. **(#3495) The policy
   evaluation, pre-flight runner, quarantine containment reconciler, and
   schedule tick background threads' gRPC dispatch calls now ride on the
@@ -4051,7 +4055,7 @@ a rollback is genuinely needed.
   `ServerImpl::stop()` now cancels in-flight gRPC RPCs before joining those
   four threads (previously it cancelled them after, so a thread genuinely
   blocked inside a gRPC stream write had no bound at
-  all — not covered by the ~115 s figure, and not fixable by raising the
+  all — not covered by the ~130 s figure, and not fixable by raising the
   grace period, since nothing in `stop()` would ever reach the cancellation
   that unblocks it). This is a strictly protective fix — no grace-period
   change is needed on upgrade, whether or not you ever hit the pre-#3495
@@ -4069,18 +4073,19 @@ a rollback is genuinely needed.
   `terminationGracePeriodSeconds` is **30**), and a pod with slow-draining
   work in more than one of those stages can be `SIGKILL`ed mid-sequence
   before the server finishes its own bounded teardown. Raise the grace
-  period to comfortably exceed ~115 s rather than relying on the platform
+  period to comfortably exceed ~130 s rather than relying on the platform
   default. **Two things a longer grace period does NOT fix:** (1) the 30 s
   drain window re-queries `execution_tracker_` for
   `running` executions on each of its one-second iterations — so it also
   picks up work that starts mid-drain, not just what was already running
   when `SIGTERM` arrived — but it never stops the HTTP listener from
   ACCEPTING new requests during that window, so a request that lands late in
-  the drain is not bounded by the ~115 s figure at all; raising the grace
+  the drain is not bounded by the ~130 s figure at all; raising the grace
   period does not close this gap, because the gap is about admission, not
-  about how long the drain itself waits. (2) if the 15 s HTTP-listener bound
-  or the 60 s WebhookStore/OffloadTargetStore bound IS exceeded, the server
-  force-exits (`std::_Exit(1)`) on its OWN internal schedule, independent of
+  about how long the drain itself waits. (2) if the 15 s HTTP-listener bound,
+  the 60 s WebhookStore/OffloadTargetStore bound or the 15 s `registry.write`
+  audit-write bound IS exceeded, the server force-exits (`std::_Exit(1)`) on
+  its OWN internal schedule, independent of
   whatever grace period the orchestrator was configured with — a longer
   external grace period only prevents the orchestrator from `SIGKILL`ing
   the process BEFORE that internal bound fires; it cannot prevent or delay
