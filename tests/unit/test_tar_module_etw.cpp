@@ -403,6 +403,17 @@ bool opens_by_name(const std::wstring& win32) {
     return true;
 }
 
+// An empty file: the link cases aim every link at a DECOY like this one inside the temp root, never
+// at a real system path, so no cleanup bug, however it recurses, can reach outside the temp root.
+bool make_sentinel(const std::wstring& path) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+    CloseHandle(h);
+    return true;
+}
+
 // First boot-critical system binary with an embedded Authenticode signature (kernel32.dll is
 // catalog-signed and verifies as unsigned by this path), as {Win32 path, NT path}.
 std::optional<std::pair<std::wstring, std::string>> first_signed_candidate() {
@@ -428,8 +439,10 @@ TEST_CASE("Windows module drain: a FILE symlink is refused while the name still 
           "[tar][module][etw][windows]") {
     yuzu::test::TempDir dir{"yuzu_test_tar_nolink_"};
     std::filesystem::create_directories(dir.path);
-    const std::wstring link = (dir.path / L"k32_link.dll").wstring();
-    if (!make_link(link, system_dir() + L"\\kernel32.dll", false))
+    const std::wstring target = (dir.path / L"decoy.dll").wstring();
+    REQUIRE(make_sentinel(target));
+    const std::wstring link = (dir.path / L"decoy_link.dll").wstring();
+    if (!make_link(link, target, false))
         SKIP("account cannot create symbolic links");
     REQUIRE(opens_by_name(link));
     CHECK_FALSE(open_local_image_no_reparse(nt_path_of(link)));
@@ -438,16 +451,18 @@ TEST_CASE("Windows module drain: a FILE symlink is refused while the name still 
 TEST_CASE("Windows module drain: an ancestor DIRECTORY symlink is refused",
           "[tar][module][etw][windows]") {
     yuzu::test::TempDir dir{"yuzu_test_tar_nolink_"};
-    std::filesystem::create_directories(dir.path);
-    const std::wstring link_dir = (dir.path / L"sys32_link").wstring();
-    if (!make_link(link_dir, system_dir(), true))
+    const std::filesystem::path decoy_dir = dir.path / L"decoy_dir";
+    std::filesystem::create_directories(decoy_dir);
+    REQUIRE(make_sentinel((decoy_dir / L"kernel32.dll").wstring()));
+    const std::wstring link_dir = (dir.path / L"decoy_dir_link").wstring();
+    if (!make_link(link_dir, decoy_dir.wstring(), true))
         SKIP("account cannot create symbolic links");
     struct LinkGuard { // removes the link itself, whatever the standard library does with it
         const std::wstring& dir;
         ~LinkGuard() { RemoveDirectoryW(dir.c_str()); }
     } guard{link_dir};
     REQUIRE(opens_by_name(link_dir + L"\\kernel32.dll"));
-    // The LINK's own NT path plus the leaf, not the resolved System32 path.
+    // The LINK's own NT path plus the leaf, not the decoy's resolved path.
     CHECK_FALSE(open_local_image_no_reparse(nt_path_of(link_dir) + "\\kernel32.dll"));
 }
 
