@@ -424,9 +424,8 @@ TEST_CASE("a running worker pages AND ships a durable batch in one wake (no seco
     rig.persist("r1");
 
     CollectingSink sink;
-    // A long periodic bound: if the paged entry needed a SECOND wake to ship, this test
-    // would time out. try_page_batch does not fire the enqueue waker, so shipping within
-    // one wake is exactly the post-page re-drain C0 adds.
+    // A long periodic bound. try_page_batch does not fire the enqueue waker; running
+    // maintenance ahead of the drain (C0) is what ships a paged entry within the same wake.
     GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/60'000,
                                      {.journal = rig.journal});
     worker.start();
@@ -434,9 +433,22 @@ TEST_CASE("a running worker pages AND ships a durable batch in one wake (no seco
     // 30 s, not the 5 s default: this waits on a real journal scan plus a send, and under a
     // sanitizer build sharing a box with the rest of the suite that overran 5 s in one full
     // TSan run out of two (isolated, it passes 5/5). The deadline is only there to stop a
-    // never-shipping worker hanging the suite - what the test asserts is that ONE wake
-    // suffices, which a longer deadline does not weaken.
-    CHECK(spin_until([&] { return sink.count() == 1; }, 30s));
+    // never-shipping worker hanging the suite; a longer one does not weaken what is asserted.
+    //
+    // `>= 1`, NOT `== 1` (#5644). The worker can legitimately ship this entry TWICE: the
+    // boot cycle (force_page_ is seeded true) pages and ships it, and when notify() lands
+    // after that cycle consumed the seed, the second cycle runs a forced page and re-offers
+    // the entry (redelivery is at-least-once by design; the server dedupes by event_id).
+    // Both passes can complete between two 1 ms polls, so a poll delayed on a loaded box
+    // saw 2 and never saw 1 again: the old `== 1` timed out after 30 s with sink.count() ==
+    // 2, about 1 failed run in 640 under heavy parallel load, in a bimodal fast / 30 s
+    // pattern (a starved scheduler would show a long tail, not a cliff).
+    //
+    // This asserts only that the entry ships. It does not by itself discriminate "one wake"
+    // from "two": notify() always supplies a second cycle, so a regression that shipped only
+    // on that cycle would also pass. That gap is pre-existing and tracked as a follow-up (a
+    // no-notify test with a long periodic bound).
+    CHECK(spin_until([&] { return sink.count() >= 1; }, 30s));
     worker.stop();
 }
 
