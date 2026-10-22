@@ -240,12 +240,15 @@ struct Approval {
     /// acts on `excluded_roots` must refuse on this flag too.
     bool excluded_roots_unreadable{false};
     /// The row's Postgres version stamp (`xmin::text`) and tuple position (`ctid::text`) as of
-    /// the read that produced this `Approval`; both empty for a value built any other way. An
-    /// UPDATE by another transaction moves `xmin`, and any UPDATE at all (a second write by the
-    /// same transaction included) moves `ctid`, so `consume_ticket` pins its consuming statement
-    /// to the pair it examined (see the pin comment in approval_manager.cpp). VACUUM FULL and
-    /// CLUSTER also move `ctid`, which can refuse a consume once; a retry clears it. Opaque:
-    /// compare for equality, nothing else; neither is part of any API shape.
+    /// the read that produced this `Approval`; both empty for a value built any other way. For
+    /// DML, an UPDATE by another transaction moves `xmin`, and any UPDATE at all (a second write
+    /// at the same (sub)transaction level included) moves `ctid`, so `consume_ticket` pins its
+    /// consuming statement to the pair it examined (see the pin comment in approval_manager.cpp,
+    /// including what it does not detect: the holding transaction's own CLUSTER, rewriting ALTER
+    /// TABLE or TRUNCATE plus re-insert, and a 32-bit xid wraparound). VACUUM FULL and CLUSTER
+    /// can also move `ctid`, which can refuse a consume once; when the other writer was only
+    /// such maintenance or a no-op rewrite, a retry clears it. Opaque: compare for equality,
+    /// nothing else; neither is part of any API shape.
     std::string row_version;
     std::string row_position;
 };
@@ -614,8 +617,9 @@ public:
     /// read without a lock, so it is installed (and cleared) only while no consume runs on
     /// another thread: tests install it per case or section on the test thread. A hook must not
     /// call back into this manager's consume path. On the held overload the hook runs under the
-    /// row lock: SQL on a SECOND lease that touches the row would wait on it forever, so a hook
-    /// there writes through the caller's own connection instead.
+    /// row lock: SQL on a SECOND lease that touches the row waits on it until the pool's
+    /// lock_timeout (10 s by default, with a 30 s statement_timeout) ends it with an error, so
+    /// a hook there writes through the caller's own connection instead.
     enum class ConsumeTestStage { kBetweenReads, kBeforeCas };
     void set_consume_test_hook_for_test(std::function<void(ConsumeTestStage)> hook) {
         consume_test_hook_ = std::move(hook);
@@ -861,7 +865,7 @@ public:
     ///
     /// Postgres aborts a transaction on any failed statement, so a kStoreError caused
     /// by a failed SQL statement leaves the caller's transaction unusable until it
-    /// rolls back. A kStoreError that never reached Postgres (null `conn`, database
+    /// rolls back. A kStoreError in which no SQL statement failed (null `conn`, database
     /// not open, an empty id or `consumed_by`, a precondition that threw, a digest
     /// that could not be computed) leaves it usable; the caller must still roll
     /// back on ANY error, which is the rule that needs no such distinction. A

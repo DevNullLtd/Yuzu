@@ -1442,17 +1442,21 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
         return std::unexpected(ConsumeError{ConsumeFailure::kNotConsumable, kNotConsumableMessage});
     // The consuming CAS is PINNED to the row it examined. Two layers:
     //
-    //  1. The ROW VERSION: `xmin::text` AND `ctid::text`, both taken from the last read. A
-    //     statement pinned to the examined version can only consume the very tuple the checks
-    //     saw. `xmin` names the transaction that wrote the version, so an UPDATE by ANOTHER
-    //     transaction (any column, any values, a no-op rewrite included) moves it. A second
-    //     write by the SAME transaction does NOT move it (every version a transaction writes
-    //     carries its xid), which is the held overload's case when the caller's own transaction
-    //     already wrote the row, or when its precondition or the test hook writes it through
-    //     the held connection; each such write puts the row in a new tuple, so `ctid` moves
-    //     where `xmin` cannot. Together they close the classes the per-column pins below cannot
-    //     enumerate (consumed_at, reviewed_at, definition_id, scope_expression, target_*,
-    //     schedule_id, and any column added later).
+    //  1. The ROW VERSION: `xmin::text` AND `ctid::text`, both taken from the last read. For DML
+    //     (INSERT/UPDATE/DELETE), a statement pinned to the examined pair can only consume the
+    //     tuple the checks saw. `xmin` names the (sub)transaction that wrote the version, so an
+    //     UPDATE by ANOTHER transaction (any column, any values, a no-op rewrite included) moves
+    //     it. A second write at the SAME (sub)transaction level keeps it (every version written
+    //     at one level carries that level's xid), which is the held overload's case when the
+    //     caller's own transaction already wrote the row, or when its precondition or the test
+    //     hook writes it through the held connection; each such write puts the row in a new
+    //     tuple, so `ctid` moves where `xmin` cannot. A write after a SAVEPOINT carries the
+    //     subtransaction's xid and moves `xmin` too, which only refuses more. Neither value
+    //     alone is a version: a plain VACUUM between two other transactions' writes can put the
+    //     new tuple back in the examined slot, and only `xmin` then tells them apart. Together
+    //     they close the classes the per-column pins below cannot enumerate (consumed_at,
+    //     reviewed_at, definition_id, scope_expression, target_*, schedule_id, and any column
+    //     added later).
     //  2. The explicit columns the checks read - status, reviewer, frozen request, digest,
     //     excluded roots, origin, submitter - as bound parameters. Implied by (1) for a row that
     //     is the same tuple, and kept as defence in depth, so a regression in the version pin
@@ -1471,12 +1475,23 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
     // for a row that changed between statements - an old-build replica, a stray UPDATE, a
     // restore - not a boundary against a principal with database write access: a plain UPDATE
     // cannot choose the version it writes, but a writer who can replace the row wholesale
-    // (a restore) or work below SQL is outside what it can tell. It fails CLOSED in two more
-    // directions: a no-op rewrite (`SET reviewed_by = reviewed_by`) is a new version, so it
-    // refuses a ticket whose content did not change; and VACUUM FULL or CLUSTER, which rewrite
-    // the table and so move `ctid`, refuse a consume whose read and CAS straddle them. In both a
-    // retry reads the new version and succeeds. VACUUM FREEZE changes neither `xmin::text` nor
-    // `ctid`, so it refuses nothing.
+    // (a restore) or work below SQL is outside what it can tell. `xmin` is the raw 32-bit xid
+    // with no epoch, so even the pair is bounded by it: a different writer that received the
+    // very same xid after a wraparound and reused the same slot would match.
+    //
+    // NOT DETECTED, for the HELD overload only: a table-rewriting statement issued by the
+    // holding transaction itself between the read and the CAS - CLUSTER, an ALTER TABLE that
+    // rewrites the table, TRUNCATE followed by a re-insert - can leave a changed row at the
+    // examined (xmin, ctid). A held-overload caller must therefore never run DDL on its
+    // connection inside the redeeming transaction (ADR-1009, PR3 entry conditions). The only
+    // production caller today is the pooled overload, which cannot reach this.
+    //
+    // It also fails CLOSED in two more directions, each a refusal that is wrong about the
+    // ticket: a no-op rewrite (`SET reviewed_by = reviewed_by`) is a new version, and VACUUM FULL
+    // or CLUSTER can move `ctid` of an unchanged row. After either, a retry reads the new
+    // version and succeeds. (When the other writer is a concurrent consume or a real edit, the
+    // refusal is correct and a retry is refused again.) VACUUM FREEZE changes neither
+    // `xmin::text` nor `ctid`, so it refuses nothing.
     //
     // Under the held overload's FOR UPDATE inside a real transaction no OTHER transaction can
     // move the row, but the caller's own transaction can (see layer 1); on an AUTOCOMMIT
