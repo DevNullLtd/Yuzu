@@ -1418,7 +1418,17 @@ natural receiver for M's heaviest clause, a pairing that rule does not name.
 No shard count changes (14 pg, 4 non-pg), the `[pg]` and non-pg populations
 are exact partitions before and after (5792 and 6732 cases on the measured
 binary), and pg B's priority is now 186. Windows MSVC measurements of this
-change: PENDING (kingsley run).
+change (kingsley, one process per shard, one sample, not a like-for-like
+comparison with the CI shard times): non-pg A 67.0 s, B 142.2 s, C 91.1 s,
+D 0.55 s (D was 110 s in CI before the scan change); `[oidc]` alone is 61.5 s
+there, five times its macOS cost, and is most of C. pg B 120.7 s, M 386.1 s.
+Candidate re-cuts were measured and not adopted, because each cuts the longest
+shard by under the 25% rule: moving `[rest]` from non-pg B to C gives B 121.2 s
+and C 110.5 s (-15%), and moving `[pg][auth_db]` from pg M to B gives B 205.4 s
+and M 319.0 s (-17%). The pre-move shards were not re-run on Windows, so the
+pg move's own Windows effect is not measured; re-cut from the per-case
+durations the CI job summary now carries. The tar spin fix (#5170) was not
+measured on Windows either, and nothing here claims it.
 
 **Drift risk — automated (#3443 Phase 1, 2026-08-26):** this used to hardcode
 the 10 pg shard names and the 3 non-pg server test names directly in `ci.yml`,

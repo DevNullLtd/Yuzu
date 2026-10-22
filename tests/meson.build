@@ -2161,8 +2161,13 @@ if build_server
   # filter edit: B 4783 -> 4493, C 1139 -> 1429 (+290 = the four tags), D 24, A
   # 786; the non-pg total (6732) is unchanged, no case lost or duplicated.
   # D's priority drops 48 -> 10 (now the lightest; A 20, C 45, B 50 stay distinct).
-  # Windows MSVC debug per-tag and per-shard seconds: PENDING (kingsley run, to be
-  # recorded here); keep or adjust the tag set by the >25% ranking rule.
+  # Windows MSVC debug (kingsley, 2026-10-22, one process per shard run back to
+  # back, one sample): A 67.0 s, B 142.2 s, C 91.1 s, D 0.55 s; the four moved tags
+  # alone: [oidc] 61.5 s, [retention] 8.2 s, [readyz] 4.5 s, [tls] 5.9 s (so
+  # [oidc] is 5x its macOS cost and is most of C). D was 110 s in CI before the
+  # scan change (different harness, so not a like-for-like delta). B is still the
+  # non-pg floor. A candidate that also moves [rest] from B to C measured B 121.2 s,
+  # C 110.5 s (max -15%); it is under the >25% ranking rule, so the tag set stays.
   test('server unit tests shard A', server_test_exe,
        args: ['~[pg][auth],~[pg][mcp]'], suite: ['server', 'server-nonpg'], timeout: 600,
        priority: 20)
@@ -2445,10 +2450,16 @@ if build_server
   # survive an all-skip); M keeps its own. This departs from the docs'
   # pairing rule on purpose, see docs/ci-architecture.md (2026-10-22). Priority B
   # 120 -> 186 (above M's 185; all 14 stay distinct).
-  # Windows MSVC per-case durations of the readyz cases and B/M shard seconds:
-  # PENDING (kingsley run, to be recorded here). The move stands only if Windows B
-  # and M end within 25% of each other and both below the pre-move Windows maximum
-  # of the two (M, 239 s); otherwise re-pick from the Windows per-tag sums.
+  # Windows MSVC (kingsley, 2026-10-22, one process per shard, one sample): B
+  # 120.7 s, M 386.1 s. The pre-move shards were not re-run in that harness, so
+  # the stated test (B and M within 25% of each other, both under the pre-move
+  # Windows maximum, M 239 s in CI) cannot be passed or failed from this data:
+  # B and M are 3.2x apart and 386 s is a serial wall on a different box than
+  # the CI figure. A candidate that moves the [pg][auth_db] clause from M to B
+  # measured B 205.4 s, M 319.0 s (max -17%, under the >25% rule), so the layout
+  # stays. M starts first (priority 185 and B's 186 lead the queue), so it is not
+  # the last finisher of the Windows pg step; the per-case durations that PR #6324
+  # adds to the job summary are what to re-cut from next.
   test('server pg unit tests shard B', server_test_exe,
        args: ['[pg][rbac_store]~[routes]~[store]~[token],[pg][readyz]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]'],
        suite: ['server', 'server-pg'], timeout: 700, priority: 186)
