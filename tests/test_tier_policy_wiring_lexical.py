@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""#5047 static lexical gate over server/core/src/server.cpp's two TierPolicyFn wiring sites, plus
-(clause 4, #6065 PR-Q) the one-definition-two-uses wiring of the dispatch authorizer closure.
+"""#5047 static lexical gate over server/core/src/server.cpp's three TierPolicyFn wiring sites, plus
+(clause 5, #6065 PR-Q) the one-definition-two-uses wiring of the dispatch authorizer closure.
 
 AuthRoutes::gateless_tier_policy_fn() (auth_routes.hpp) is the SOLE production factory for a
-gate-less-route TierPolicyFn -- both server.cpp sites' own comments say so explicitly: "never
+gate-less-route TierPolicyFn -- the result-set sites' own comments say so explicitly: "never
 re-inline this as a local lambda; a second copy is exactly how the original clause-5 violation
 this belt exists to prevent could recur unreviewed at a 9th call site."
 
 The unit test in test_auth_routes.cpp ("gateless_tier_policy_fn -- the REAL production
 TierPolicyFn...") drives the factory directly and proves its OUTPUT is correct, but it cannot
 observe whether server.cpp actually calls the factory -- a reverted call site (back to a
-hand-rolled lambda naming .permission, reopening the clause-5 gap) or a new undocumented third
+hand-rolled lambda naming .permission, reopening the clause-5 gap) or a new undocumented
 call site would pass every existing test. This gate closes that:
 
   1. `result_set::Deps`'s designated-init field (the dashboard-fragment wiring,
@@ -24,13 +24,19 @@ call site would pass every existing test. This gate closes that:
      appends `authorize_dispatch` after it, so the line ends in a comma, not `);`. The only other
      active line of this shape is clause 1's, which carries the `.tier_policy_fn = ` prefix and
      so cannot satisfy this anchored pattern.
-  3. The literal substring `auth_routes_->gateless_tier_policy_fn()` appears in server.cpp
-     EXACTLY TWICE, total -- DELIBERATELY a broad, unanchored substring count (not just the sum
-     of clauses 1+2): it exists to catch a brand-new third call site written in some OTHER shape
-     neither clause 1 nor 2 would recognise. The trade-off: an unrelated comment that happens to
+  3. `CryptoRoutes::Deps`'s LAST designated-init field (the /crypto dashboard layout routes,
+     GET/PUT /api/v1/crypto/dashboard/layout -- the caller's OWN layout, keyed by the session
+     username, so there is no securable grant to admit against: a gate-less route like the
+     result-set family, ADR-0070 widget dashboard) reads
+     `.tier_policy_fn = auth_routes_->gateless_tier_policy_fn()});` -- exactly once, same
+     anchored-active-line requirement. The `});` close distinguishes it from clause 1's `,`.
+  4. The literal substring `auth_routes_->gateless_tier_policy_fn()` appears in server.cpp
+     EXACTLY THREE TIMES, total -- DELIBERATELY a broad, unanchored substring count (not just the
+     sum of clauses 1-3): it exists to catch a brand-new fourth call site written in some OTHER
+     shape none of clauses 1-3 would recognise. The trade-off: an unrelated comment that happens to
      quote the literal string would also trip this clause -- a false RED, never a false GREEN.
 
-  4. (#6065 PR-Q) The dispatch-chokepoint pre-check closure is defined ONCE in server.cpp
+  5. (#6065 PR-Q) The dispatch-chokepoint pre-check closure is defined ONCE in server.cpp
      (`const mcp::McpServer::AuthorizeDispatchFn authorize_dispatch =`) and used EXACTLY twice,
      both as ACTIVE lines: as REST's trailing `register_routes` argument (`authorize_dispatch);`)
      and in `set_authorize_dispatch_fn(authorize_dispatch)`. The REST parameter is defaulted so
@@ -39,7 +45,7 @@ call site would pass every existing test. This gate closes that:
      wires its own closure, can see it. A second definition (a route-local copy) is the drift the
      closure exists to prevent. Same anchored-active-line requirement as clauses 1 and 2.
 
-  5. (#6065 PR-Q, rest-audit-principal-reresolution)
+  6. (#6065 PR-Q, rest-audit-principal-reresolution)
      `rest_api_v1_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());` is called
      EXACTLY ONCE in server.cpp as an ACTIVE line: the production writer is the AuthRoutes
      factory (whose closure a test drives through a real AuditStore), never a hand-rolled lambda
@@ -54,9 +60,9 @@ call site would pass every existing test. This gate closes that:
 Static/text-only, no build required -- a lexical gate, not a semantic one: it cannot see a
 relocation that keeps the same tokens but changes the surrounding control flow, nor a `#if 0` /
 `/* */` block that comments out an entire real site while preserving its exact leading
-whitespace and text -- both stay review-enforced concerns clauses 1/2's anchoring cannot reach.
+whitespace and text -- both stay review-enforced concerns clauses 1-3's anchoring cannot reach.
 
-Known limitation (NICE, not fixed): clause 3 only catches a new call that reuses the
+Known limitation (NICE, not fixed): clause 4 only catches a new call that reuses the
 gateless_tier_policy_fn() literal. A wholly new gate-less route wired with its OWN fresh inline
 lambda -- one that never references gateless_tier_policy_fn() at all -- is invisible to this
 gate; that class of regression stays a plain-review concern.
@@ -78,6 +84,8 @@ TAG = "test_tier_policy_wiring_lexical"
 CALL = "auth_routes_->gateless_tier_policy_fn()"
 DESIGNATED = r"[ \t\r\f\v]*\.tier_policy_fn = auth_routes_->gateless_tier_policy_fn\(\),"
 POSITIONAL = r"[ \t\r\f\v]*auth_routes_->gateless_tier_policy_fn\(\),"
+CRYPTO = r"[ \t\r\f\v]*\.tier_policy_fn = auth_routes_->gateless_tier_policy_fn\(\)\}\);"
+EXPECTED_TOTAL = 3
 CLOSURE_DEF = r"[ \t\r\f\v]*const mcp::McpServer::AuthorizeDispatchFn authorize_dispatch =.*"
 CLOSURE_REST = r"[ \t\r\f\v]*authorize_dispatch\);"
 CLOSURE_MCP = r"[ \t\r\f\v]*mcp_server_->set_authorize_dispatch_fn\(authorize_dispatch\);"
@@ -86,11 +94,12 @@ REGISTER_ROUTES = r"[ \t\r\f\v]*rest_api_v1_->register_routes\("
 
 
 def problems(src):
-    """One message per violated clause, in clause order (1, 2, 3); [] when clean."""
+    """One message per violated clause, in clause order (1 to 6); [] when clean."""
     lines = src.split("\n")
     total = sum(1 for ln in lines if CALL in ln)
     designated = sum(1 for ln in lines if re.fullmatch(DESIGNATED, ln))
     positional = sum(1 for ln in lines if re.fullmatch(POSITIONAL, ln))
+    crypto = sum(1 for ln in lines if re.fullmatch(CRYPTO, ln))
     closure_def = sum(1 for ln in lines if re.fullmatch(CLOSURE_DEF, ln))
     closure_rest = sum(1 for ln in lines if re.fullmatch(CLOSURE_REST, ln))
     closure_mcp = sum(1 for ln in lines if re.fullmatch(CLOSURE_MCP, ln))
@@ -106,12 +115,16 @@ def problems(src):
         out.append("expected exactly 1 positional-arg site ('auth_routes_->gateless_tier_policy_fn(),' -- the REST "
                    f"rest_api_v1_->register_routes(...) wiring), found {positional}. A reversion to a hand-rolled "
                    "lambda here reopens the #5047 clause-5 gap on /api/v1/result-sets.")
-    if total != 2:
-        out.append("expected the literal 'auth_routes_->gateless_tier_policy_fn()' to appear EXACTLY TWICE in "
-                   f"server.cpp (the two known call sites), found {total}. A count above 2 means an undocumented "
+    if crypto != 1:
+        out.append("expected exactly 1 crypto-layout site ('.tier_policy_fn = auth_routes_->gateless_tier_policy_fn()});' "
+                   f"-- the CryptoRoutes::Deps wiring), found {crypto}. A reversion to a hand-rolled lambda here "
+                   "reopens the #5047 clause-5 gap on /api/v1/crypto/dashboard/layout.")
+    if total != EXPECTED_TOTAL:
+        out.append("expected the literal 'auth_routes_->gateless_tier_policy_fn()' to appear EXACTLY THREE TIMES in "
+                   f"server.cpp (the three known call sites), found {total}. A count above 3 means an undocumented "
                    "new call site was added outside this gate's knowledge -- extend this script in the same change, "
-                   "per gateless_tier_policy_fn()'s own doc comment (auth_routes.hpp: 'both server.cpp wiring "
-                   "sites call this SAME function').")
+                   "per gateless_tier_policy_fn()'s own doc comment (auth_routes.hpp: 'every server.cpp wiring "
+                   "site calls this SAME function').")
     if (closure_def, closure_rest, closure_mcp) != (1, 1, 1):
         out.append("expected the dispatch authorizer closure to be defined exactly once "
                    "('const mcp::McpServer::AuthorizeDispatchFn authorize_dispatch =') and used exactly once as "
@@ -138,6 +151,7 @@ def problems(src):
 
 DESIGNATED_LINE = "                            .tier_policy_fn = auth_routes_->gateless_tier_policy_fn(),\n"
 POSITIONAL_LINE = "            auth_routes_->gateless_tier_policy_fn(),\n"
+CRYPTO_LINE = "                               .tier_policy_fn = auth_routes_->gateless_tier_policy_fn()});\n"
 CLOSURE_REST_LINE = "            authorize_dispatch);\n"
 CLOSURE_MCP_LINE = "            mcp_server_->set_authorize_dispatch_fn(authorize_dispatch);\n"
 AUDIT_SESSION_LINE = "        rest_api_v1_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());\n"
@@ -156,23 +170,29 @@ class TierPolicyWiringLexical(unittest.TestCase):
 
     def test_mutations_are_caught(self):
         src = self.src
-        for a in (DESIGNATED_LINE, POSITIONAL_LINE, CLOSURE_REST_LINE, CLOSURE_MCP_LINE, AUDIT_SESSION_LINE):
+        for a in (DESIGNATED_LINE, POSITIONAL_LINE, CRYPTO_LINE, CLOSURE_REST_LINE, CLOSURE_MCP_LINE, AUDIT_SESSION_LINE):
             n = src.count(a)
             self.assertEqual(n, 1, f"mutation anchor must match exactly once, found {n}; update the constant: {a!r}")
         # (name, mutated source, the clause fragments that must appear; len(p) pins that no other clause fires)
         cases = [
             ("T1 designated reverted to a lambda",
              src.replace(DESIGNATED_LINE, DESIGNATED_LINE.replace(CALL, LAMBDA), 1),
-             ["designated-init", "EXACTLY TWICE"]),
+             ["designated-init", "EXACTLY THREE"]),
             ("T2 designated line commented out (anchoring proof: clause 1 only)",
              src.replace(DESIGNATED_LINE, "// " + DESIGNATED_LINE, 1),
              ["designated-init"]),
             ("T3 positional reverted to a lambda",
              src.replace(POSITIONAL_LINE, POSITIONAL_LINE.replace(CALL, LAMBDA), 1),
-             ["positional-arg", "EXACTLY TWICE"]),
-            ("T4 third call appended (clause 3 only)",
+             ["positional-arg", "EXACTLY THREE"]),
+            ("T4 fourth call appended (clause 4 only)",
              src + "    auth_routes_->gateless_tier_policy_fn();\n",
-             ["EXACTLY TWICE"]),
+             ["EXACTLY THREE"]),
+            ("T14 crypto layout site reverted to a lambda",
+             src.replace(CRYPTO_LINE, CRYPTO_LINE.replace(CALL, LAMBDA), 1),
+             ["crypto-layout", "EXACTLY THREE"]),
+            ("T15 crypto layout site commented out (anchoring proof: clause 3 only)",
+             src.replace(CRYPTO_LINE, "// " + CRYPTO_LINE, 1),
+             ["crypto-layout"]),
             ("T5 REST trailing authorize_dispatch argument dropped (compiles: the param is defaulted)",
              src.replace(CLOSURE_REST_LINE, "            );\n", 1),
              ["authorizer closure"]),

@@ -546,6 +546,14 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // requires_measurable stays OFF per the file-header default.
     {kBodyCapAnyMethod, "/api/v1/users", 16u * 1024, false, "users"},
 
+    // /api/v1/crypto — the /crypto REST v1 subtree. The only body-bearing route is
+    // PUT /api/v1/crypto/dashboard/layout {"widgets":[ids]}: at most 64 catalogue ids of at most
+    // 64 bytes (crypto_widget_catalogue.hpp kMaxLayoutWidgets / kWidgetIdMaxBytes), about 4.4 KiB
+    // even fully escaped. Mirrors the handler's own kLayoutBodyMaxBytes (16 KiB) exactly - the
+    // ca_revoke two-authority-split precedent. ANY method: every sibling is a bodyless GET and
+    // shares the prefix (rule 4 in the routed-concern row).
+    {kBodyCapAnyMethod, "/api/v1/crypto", 16u * 1024, false, "crypto"},
+
     // The catch-all default. ANY method, empty prefix — always matches, and
     // always loses a longest-match comparison against every entry above.
     // Ordinary JSON/form traffic (most REST mutation routes) lands here.

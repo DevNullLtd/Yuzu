@@ -811,6 +811,7 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
 #include "pg/pg_exec.hpp"               // exec_params — degrade the store in the [pg] degrade test
 #include "pg/pg_pool.hpp"               // PgPool for the query_installed_software [pg] test
 #include "crypto_library_model.hpp" // /crypto slice 1 twins: families() pins the schema enum
+#include "crypto_widget_catalogue.hpp" // /crypto widget twins: the closed window set pins the days enum
 #include "crypto_api_local.hpp"     // make_local_crypto_api: the present-empty-scope no-SQL pin
 #include "software_catalogue_model.hpp"  // kScopePushdownMaxIds / the catalogue twins
 #include "software_catalog_rules.hpp"   // kSearchMaxBytes / kEcosystemFamilies (tool schema pins)
@@ -1180,6 +1181,10 @@ struct McpTestServer {
     /// /crypto slice 1: the injected CryptoApi seam (a test double). Unset leaves the seam null,
     /// so get_crypto_libraries / list_crypto_library_devices answer an internal error.
     std::shared_ptr<const yuzu::server::CryptoApi> crypto_api_for_test;
+    /// /crypto widgets: the availability callback (list_crypto_widgets, and list_issued_certs'
+    /// filtered R2 withhold). Unset leaves it unwired, so those paths answer an internal error
+    /// (fail closed).
+    yuzu::server::mcp::McpServer::CryptoAccessFn crypto_access_fn_for_test;
 
     /// #2146 Batch B1: optionally wire a fan-out stub so push_guardian_rules
     /// can be exercised end-to-end (records the (scope, full_sync) args and
@@ -1788,6 +1793,8 @@ private:
 
         if (crypto_api_for_test)
             mcp.set_crypto_api(crypto_api_for_test);
+        if (crypto_access_fn_for_test)
+            mcp.set_crypto_access_fn(crypto_access_fn_for_test);
 
         handler = mcp.build_handler(
             std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), std::move(agents_fn),
@@ -24375,6 +24382,55 @@ public:
         devices_queries.push_back(q);
         return devices;
     }
+
+    // ── Dashboard widget methods (recorded so a test can pin user isolation and as_of) ──
+    std::expected<yuzu::server::CaCertStats, CryptoReadError> stats{yuzu::server::CaCertStats{}};
+    std::expected<yuzu::server::CaCertPage, CryptoReadError> certs{yuzu::server::CaCertPage{}};
+    std::expected<yuzu::server::CryptoDashboardLayout, CryptoReadError> layout{
+        yuzu::server::CryptoDashboardLayout{{"ca.active"}, false, 3, 0}};
+    std::optional<CryptoReadError> set_error;
+    /// When set, the real seam's version rule applies: expected_version (omitted = 0, a first
+    /// save only - H1) must equal this stored version (0 = nothing stored), else kConflict.
+    std::optional<std::int64_t> stored_version;
+    mutable std::vector<std::optional<std::int64_t>> stats_as_of;
+    mutable std::vector<yuzu::server::CaCertQuery> cert_queries;
+    mutable std::vector<std::string> layout_reads;
+    mutable std::vector<std::pair<std::string, std::vector<std::string>>> layout_writes;
+    mutable std::vector<std::optional<std::int64_t>> layout_expected;
+
+    std::expected<yuzu::server::CaCertStats, CryptoReadError>
+    ca_stats(std::optional<std::int64_t> as_of) const override {
+        stats_as_of.push_back(as_of);
+        return stats;
+    }
+    std::expected<yuzu::server::CaCertPage, CryptoReadError>
+    ca_certificates(const yuzu::server::CaCertQuery& q) const override {
+        cert_queries.push_back(q);
+        if (!certs)
+            return certs;
+        auto p = *certs;
+        p.query = q;
+        return p;
+    }
+    std::expected<yuzu::server::CryptoDashboardLayout, CryptoReadError>
+    dashboard_layout(const std::string& username) const override {
+        layout_reads.push_back(username);
+        return layout;
+    }
+    std::expected<yuzu::server::CryptoDashboardLayout, CryptoReadError>
+    set_dashboard_layout(const std::string& username, const std::vector<std::string>& widgets,
+                         std::optional<std::int64_t> expected) const override {
+        layout_writes.emplace_back(username, widgets);
+        layout_expected.push_back(expected);
+        if (set_error)
+            return std::unexpected(*set_error);
+        if (stored_version && expected.value_or(0) != *stored_version) {
+            CryptoReadError e{CryptoReadError::Kind::kConflict, "the layout changed"};
+            e.version = *stored_version;
+            return std::unexpected(e);
+        }
+        return yuzu::server::CryptoDashboardLayout{widgets, false, 4, 0};
+    }
 };
 
 std::shared_ptr<FakeMcpCryptoApi> crypto_fake_with_data() {
@@ -39461,6 +39517,528 @@ TEST_CASE("MCP sync_hardware_software: every Runner refusal maps to the intended
                               !body["error"]["data"]["retry_after_ms"].is_null();
         CHECK(has_hint == c.hint);
     }
+}
+
+
+// ── /crypto dashboard widget twins (ADR-0070 D13, R2) ───────────────────────────────────────
+namespace {
+namespace cw = yuzu::server::crypto_widgets;
+
+const std::vector<std::string> kCryptoWidgetTools{
+    "list_crypto_widgets", "get_crypto_dashboard_layout", "set_crypto_dashboard_layout",
+    "get_crypto_ca_stats"};
+
+yuzu::server::CaCertStats widget_stats() {
+    yuzu::server::CaCertStats s;
+    s.as_of = 1792368000;
+    s.active = 2;
+    for (const int d : cw::kExpiringWindowDays)
+        s.expiring.push_back({d, 1});
+    for (const int d : cw::kExpiredWindowDays)
+        s.expired.push_back({d, 0});
+    for (const int d : cw::kRevokedWindowDays)
+        s.revoked.push_back({d, 1, 2, 3});
+    s.issued = {7, 1};
+    yuzu::server::CaWeekCount w;
+    w.week_start = cw::week_start_of(s.as_of);
+    w.label = cw::iso_week_label(w.week_start);
+    w.issued = 1;
+    w.partial = true;
+    s.weeks.push_back(w);
+    return s;
+}
+
+nlohmann::json raw_tool_call(McpTestServer& ts, const std::string& name, const std::string& args,
+                             int* status = nullptr) {
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":{"name":")" + name +
+                       R"(","arguments":)" + args + "}}");
+    REQUIRE(res);
+    if (status)
+        *status = res->status;
+    return res->body.empty() ? nlohmann::json{} : nlohmann::json::parse(res->body, nullptr, false);
+}
+
+// A fleet-read twin that admits but confines the caller to one device.
+yuzu::server::authz::FleetReadGate confined_gate(const httplib::Request&, httplib::Response&,
+                                                 const std::string&, const std::string&) {
+    return {true, yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-1"}}};
+}
+} // namespace
+
+TEST_CASE("MCP crypto widget twins: tools/list - four tools, A5 annotations, typed schemas",
+          "[mcp][crypto][widgets]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    int found = 0;
+    for (const auto& t : body["result"]["tools"]) {
+        const auto name = t["name"].get<std::string>();
+        CHECK(name != "list_crypto_ca_certificates"); // removed: the drill is list_issued_certs
+        if (std::ranges::find(kCryptoWidgetTools, name) == kCryptoWidgetTools.end())
+            continue;
+        ++found;
+        INFO(name);
+        CHECK_FALSE(t["outputSchema"]["properties"].empty());
+        CHECK_FALSE(t["outputSchema"]["required"].empty());
+        if (name == "set_crypto_dashboard_layout") {
+            // B7: it overwrites the previous layout - destructive to that layout, idempotent.
+            CHECK(t["annotations"]["destructiveHint"] == true);
+            CHECK(t["annotations"]["idempotentHint"] == true);
+            CHECK(t["annotations"]["readOnlyHint"] == false);
+            CHECK(t["inputSchema"]["properties"].contains("expected_version"));
+            CHECK(t["inputSchema"]["properties"]["widgets"]["maxItems"] == 64);
+        } else {
+            CHECK(t["annotations"]["readOnlyHint"] == true);
+            CHECK(t["annotations"]["destructiveHint"] == false);
+        }
+        if (name == "get_crypto_ca_stats") {
+            const auto& p = t["outputSchema"]["properties"];
+            CHECK(p.contains("expiring_within_days"));
+            CHECK(p.contains("expired_within_days"));
+            CHECK(p.contains("revoked_within_days"));
+            CHECK_FALSE(p.contains("expiring")); // D10: no bare verdict-shaped names
+            CHECK_FALSE(p.contains("expired"));
+            CHECK_THAT(t["description"].get<std::string>(),
+                       Catch::Matchers::ContainsSubstring("Inventory:Read"));
+        }
+    }
+    CHECK(found == 4);
+}
+
+TEST_CASE("MCP crypto widget twins: list_crypto_widgets draws availability via ONE callback",
+          "[mcp][crypto][widgets]") {
+    McpTestServer ts;
+    int probes = 0;
+    ts.crypto_access_fn_for_test = [&](const httplib::Request&, cw::WidgetGate g,
+                                       const std::string&, const std::string&) {
+        ++probes;
+        // A confined Inventory:Read holder: library widgets admitted, CA counts withheld, no
+        // Security:Read for the drill.
+        if (g == cw::WidgetGate::kFleetRead)
+            return cw::Access::kAvailable;
+        if (g == cw::WidgetGate::kFleetWideOnly)
+            return cw::Access::kConfined;
+        return cw::Access::kRefused;
+    };
+    ts.start();
+    auto body = mcp_tool_call(ts, "list_crypto_widgets", "{}");
+    INFO(body.dump());
+    REQUIRE_FALSE(body.contains("error"));
+    const auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["window_set"] == std::string(cw::kWindowSetVersion));
+    for (const auto& w : sc["widgets"]) {
+        if (w["group"] == "Crypto libraries") {
+            CHECK(w["available"] == true);
+        } else {
+            CHECK(w["available"] == false);
+            CHECK(w["availability"] == "confined");
+            CHECK(w["drill_available"] == false);
+        }
+    }
+    CHECK(probes == 3); // one per distinct (gate, securable, operation)
+    CHECK(mcp_audits(ts, "mcp.list_crypto_widgets|success") == 1);
+
+    CHECK(mcp_tool_call(ts, "list_crypto_widgets", R"({"x":1})")["error"]["code"] ==
+          yuzu::server::mcp::kInvalidParams);
+    McpTestServer bare;
+    bare.start();
+    CHECK(mcp_tool_call(bare, "list_crypto_widgets", "{}")["error"]["code"] ==
+          yuzu::server::mcp::kInternalError);
+}
+
+TEST_CASE("MCP crypto widget twins: layout read and write are the session user's own, versioned",
+          "[mcp][crypto][widgets]") {
+    auto fake = std::make_shared<FakeMcpCryptoApi>();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.mock_username = "alice";
+    ts.start();
+    auto got = mcp_tool_call(ts, "get_crypto_dashboard_layout", "{}");
+    INFO(got.dump());
+    REQUIRE_FALSE(got.contains("error"));
+    CHECK(got["result"]["structuredContent"]["widgets"] == nlohmann::json::array({"ca.active"}));
+    CHECK(got["result"]["structuredContent"]["version"] == 3);
+    CHECK(fake->layout_reads == std::vector<std::string>{"alice"});
+
+    auto set = mcp_tool_call(ts, "set_crypto_dashboard_layout",
+                             R"({"widgets":["ca.revoked_7d","lib.families_table"],"expected_version":3})");
+    INFO(set.dump());
+    REQUIRE_FALSE(set.contains("error"));
+    CHECK(set["result"]["structuredContent"]["version"] == 4);
+    REQUIRE(fake->layout_writes.size() == 1);
+    CHECK(fake->layout_writes[0].first == "alice");
+    CHECK(fake->layout_expected[0] == std::optional<std::int64_t>{3});
+    CHECK(mcp_audits(ts, "crypto.dashboard.layout.update|attempted") == 1);
+    CHECK(mcp_audits(ts, "crypto.dashboard.layout.update|success") == 1);
+
+    // Omitted expected_version reaches the seam as "omitted" (a first save only, H1).
+    (void)mcp_tool_call(ts, "set_crypto_dashboard_layout", R"({"widgets":[]})");
+    REQUIRE(fake->layout_expected.size() == 2);
+    CHECK_FALSE(fake->layout_expected[1].has_value());
+}
+
+TEST_CASE("MCP crypto widget twins: a save without expected_version is a first save only",
+          "[mcp][crypto][widgets]") {
+    // H1 (owner decision 2026-10-19): no stored row -> the first write lands; a stored row ->
+    // the same non-retryable conflict as a stale version, naming the stored version.
+    {
+        auto fake = std::make_shared<FakeMcpCryptoApi>();
+        fake->stored_version = 0;
+        McpTestServer ts;
+        ts.crypto_api_for_test = fake;
+        ts.start();
+        auto ok = mcp_tool_call(ts, "set_crypto_dashboard_layout", R"({"widgets":["ca.active"]})");
+        INFO(ok.dump());
+        REQUIRE_FALSE(ok.contains("error"));
+        CHECK(mcp_audits(ts, "crypto.dashboard.layout.update|success") == 1);
+    }
+    {
+        auto fake = std::make_shared<FakeMcpCryptoApi>();
+        fake->stored_version = 6;
+        McpTestServer ts;
+        ts.crypto_api_for_test = fake;
+        ts.start();
+        auto body = mcp_tool_call(ts, "set_crypto_dashboard_layout", R"({"widgets":["ca.active"]})");
+        INFO(body.dump());
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK((!body["error"].contains("data") || body["error"]["data"]["retry_after_ms"].is_null()));
+        CHECK_THAT(body["error"]["data"]["remediation"].get<std::string>(),
+                   Catch::Matchers::ContainsSubstring("6"));
+        CHECK(mcp_audits(ts, "crypto.dashboard.layout.update|failure") == 1);
+    }
+}
+
+TEST_CASE("MCP crypto widget twins: set layout - strict args, no write", "[mcp][crypto][widgets]") {
+    auto fake = std::make_shared<FakeMcpCryptoApi>();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    for (const char* args :
+         {R"({})", R"({"widgets":"ca.active"})", R"({"widgets":[1]})",
+          R"({"widgets":["ca.active"],"username":"bob"})", R"({"widgets":["nope"]})",
+          R"({"widgets":["ca.active","ca.active"]})", R"({"widgets":[],"expected_version":-1})",
+          R"({"widgets":[],"expected_version":"3"})"}) {
+        INFO(args);
+        auto body = raw_tool_call(ts, "set_crypto_dashboard_layout", args);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    CHECK(fake->layout_writes.empty());
+    CHECK(mcp_audits(ts, "crypto.dashboard.layout.update|attempted") == 0);
+}
+
+TEST_CASE("MCP crypto widget twins: set layout - conflict, corrupt, outcome unknown, degrade",
+          "[mcp][crypto][widgets]") {
+    using K = CryptoReadError::Kind;
+    struct Case {
+        K kind;
+        int code;
+        bool retry;
+        const char* tag;
+    };
+    for (const auto& c : {Case{K::kConflict, yuzu::server::mcp::kInvalidParams, false, "outcome=conflict"},
+                          Case{K::kCorrupt, yuzu::server::mcp::kInternalError, false, "outcome=corrupt"},
+                          Case{K::kOutcomeUnknown, yuzu::server::mcp::kInternalError, true, "outcome=unknown"},
+                          Case{K::kDegraded, yuzu::server::mcp::kInternalError, true, "outcome=degraded"}}) {
+        INFO(c.tag);
+        auto fake = std::make_shared<FakeMcpCryptoApi>();
+        CryptoReadError e{c.kind, c.kind == K::kOutcomeUnknown ? "save outcome unknown — reload to check" : "x",
+                          yuzu::server::CryptoReadCause::kStoreDegraded};
+        e.version = 7;
+        fake->set_error = e;
+        McpTestServer ts;
+        ts.crypto_api_for_test = fake;
+        ts.start();
+        auto body = mcp_tool_call(ts, "set_crypto_dashboard_layout", R"({"widgets":["ca.active"]})");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == c.code);
+        const bool hint = body["error"].contains("data") &&
+                          !body["error"]["data"]["retry_after_ms"].is_null();
+        CHECK(hint == c.retry);
+        if (c.kind == K::kConflict || c.kind == K::kCorrupt)
+            CHECK_THAT(body["error"]["data"]["remediation"].get<std::string>(),
+                       Catch::Matchers::ContainsSubstring("7"));
+        CHECK(mcp_audits(ts, "crypto.dashboard.layout.update|failure") == 1);
+    }
+    // No audit row, no mutation.
+    auto fake = std::make_shared<FakeMcpCryptoApi>();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.audit_succeeds_ = false;
+    ts.start();
+    auto body = mcp_tool_call(ts, "set_crypto_dashboard_layout", R"({"widgets":["ca.active"]})");
+    REQUIRE(body.contains("error"));
+    CHECK(fake->layout_writes.empty());
+}
+
+TEST_CASE("MCP crypto widget twins: a corrupt stored layout is non-retryable on read",
+          "[mcp][crypto][widgets]") {
+    auto fake = std::make_shared<FakeMcpCryptoApi>();
+    CryptoReadError e{CryptoReadError::Kind::kCorrupt, "the stored layout cannot be read"};
+    e.version = 9;
+    fake->layout = std::unexpected(e);
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    auto body = mcp_tool_call(ts, "get_crypto_dashboard_layout", "{}");
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+    CHECK_THAT(body["error"]["data"]["remediation"].get<std::string>(),
+               Catch::Matchers::ContainsSubstring("expected_version=9"));
+}
+
+TEST_CASE("MCP crypto widget twins: layouts unavailable since boot carry no retry hint",
+          "[mcp][crypto][widgets]") {
+    // ADR-0071 degrade posture: a layout store that did not open at boot lasts until a
+    // restart, so neither tool may tell an agent to retry.
+    auto fake = std::make_shared<FakeMcpCryptoApi>();
+    CryptoReadError e{CryptoReadError::Kind::kDegraded,
+                      "dashboard layouts unavailable: the layout store did not open at server "
+                      "start",
+                      yuzu::server::CryptoReadCause::kStoreDegraded};
+    e.unavailable_until_restart = true;
+    fake->layout = std::unexpected(e);
+    fake->set_error = e;
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    for (const auto& [tool, args] :
+         {std::pair<std::string, std::string>{"get_crypto_dashboard_layout", "{}"},
+          {"set_crypto_dashboard_layout", R"({"widgets":["ca.active"]})"}}) {
+        auto body = mcp_tool_call(ts, tool, args);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK_THAT(body["error"]["data"]["remediation"].get<std::string>(),
+                   Catch::Matchers::ContainsSubstring("restarted"));
+    }
+}
+
+TEST_CASE("MCP crypto widget twins: read-only tier cannot set a layout; reads stay open",
+          "[mcp][crypto][widgets]") {
+    auto fake = std::make_shared<FakeMcpCryptoApi>();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start("readonly");
+    auto set = raw_tool_call(ts, "set_crypto_dashboard_layout", R"({"widgets":["ca.active"]})");
+    REQUIRE(set.contains("error"));
+    CHECK(fake->layout_writes.empty());
+    CHECK_FALSE(mcp_tool_call(ts, "get_crypto_dashboard_layout", "{}").contains("error"));
+}
+
+TEST_CASE("MCP crypto widget twins: service-scoped token denied every widget tool",
+          "[mcp][crypto][widgets][security]") {
+    auto fake = std::make_shared<FakeMcpCryptoApi>();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.crypto_access_fn_for_test = [](const httplib::Request&, cw::WidgetGate, const std::string&,
+                                      const std::string&) { return cw::Access::kAvailable; };
+    ts.mock_token_scope_service = "printers";
+    ts.start();
+    for (const auto& tool : kCryptoWidgetTools) {
+        INFO(tool);
+        const std::string args = tool == "set_crypto_dashboard_layout" ? R"({"widgets":[]})" : "{}";
+        auto body = raw_tool_call(ts, tool, args);
+        CHECK((body.is_discarded() || body.contains("error")));
+        // M5: the C8 default-deny refusal is audited as the tool's own `denied` row.
+        CHECK(mcp_audits(ts, "mcp." + std::string(tool) + "|denied") == 1);
+    }
+    CHECK(fake->layout_reads.empty());
+    CHECK(fake->layout_writes.empty());
+    CHECK(fake->stats_as_of.empty());
+}
+
+TEST_CASE("MCP crypto widget twins: Yuzu-issued stats - Inventory:Read, unpinned, D13 shape",
+          "[mcp][crypto][widgets]") {
+    auto fake = std::make_shared<FakeMcpCryptoApi>();
+    fake->stats = widget_stats();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    std::vector<std::string> gates;
+    ts.fleet_read_fn_for_test = [&](const httplib::Request&, httplib::Response&,
+                                    const std::string& s, const std::string& o) {
+        gates.push_back(s + ":" + o);
+        return yuzu::server::authz::FleetReadGate{true, std::nullopt};
+    };
+    ts.start();
+    auto body = mcp_tool_call(ts, "get_crypto_ca_stats", "{}");
+    INFO(body.dump());
+    REQUIRE_FALSE(body.contains("error"));
+    CHECK(gates == std::vector<std::string>{"Inventory:Read"});
+    REQUIRE(fake->stats_as_of.size() == 1);
+    CHECK_FALSE(fake->stats_as_of[0].has_value()); // the database clock, never the replica's
+    const auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["as_of"] == 1792368000);
+    CHECK(sc["expiring_within_days"].size() == 6);
+    CHECK(sc["revoked_within_days"].size() == 4 * 3); // three buckets per window
+    for (const auto& c : sc["revoked_within_days"]) {
+        CHECK(c.contains("rule_id"));
+        CHECK(c.contains("criterion"));
+        CHECK(c.contains("rule_set_version"));
+        CHECK(c.contains("threshold"));
+        CHECK(c.contains("bucket"));
+        CHECK(c["as_of"] == 1792368000);
+    }
+    CHECK(sc["weeks"][0]["partial"] == true);
+    CHECK(mcp_audits(ts, "crypto.ca.stats.view|success") == 1);
+    CHECK(mcp_tool_call(ts, "get_crypto_ca_stats", R"({"x":1})")["error"]["code"] ==
+          yuzu::server::mcp::kInvalidParams);
+}
+
+TEST_CASE("MCP crypto widget twins: a confined caller is withheld the Yuzu-issued counts (R2)",
+          "[mcp][crypto][widgets][security]") {
+    auto fake = std::make_shared<FakeMcpCryptoApi>();
+    fake->stats = widget_stats();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.fleet_read_fn_for_test = confined_gate;
+    ts.start();
+    auto body = mcp_tool_call(ts, "get_crypto_ca_stats", "{}");
+    INFO(body.dump());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK_FALSE(body["error"]["data"].contains("permission"));
+    CHECK(fake->stats_as_of.empty());
+    CHECK(mcp_audits(ts, "crypto.ca.stats.view|denied") == 1);
+}
+
+TEST_CASE("MCP crypto widget twins: a degraded Yuzu-issued read is retryable, never zeros",
+          "[mcp][crypto][widgets]") {
+    auto fake = std::make_shared<FakeMcpCryptoApi>();
+    fake->stats = std::unexpected(CryptoReadError{CryptoReadError::Kind::kDegraded,
+                                                  "Yuzu CA read degraded",
+                                                  yuzu::server::CryptoReadCause::kStoreDegraded});
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    auto body = mcp_tool_call(ts, "get_crypto_ca_stats", "{}");
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    CHECK(mcp_audits(ts, "mcp.get_crypto_ca_stats|failure") == 1);
+    McpTestServer bare;
+    bare.start();
+    CHECK(mcp_tool_call(bare, "get_crypto_ca_stats", "{}")["error"]["code"] ==
+          yuzu::server::mcp::kInternalError);
+}
+
+TEST_CASE("MCP crypto twins: a pool too small for the read carries no retry hint and names the flag",
+          "[mcp][crypto][widgets][cbom]") {
+    // R2-2: --postgres-pool-size below the library / Yuzu-issued minimum refuses the read until a
+    // restart, so no tool may tell an agent to retry; the remediation names the flag. The
+    // transient admission refusal stays retryable (the capacity test above).
+    CryptoReadError e{CryptoReadError::Kind::kDegraded,
+                      "crypto library reads (and the CBOM export) refused: the server's Postgres "
+                      "pool is smaller than 2 connections; restart the server with "
+                      "--postgres-pool-size 2 or more",
+                      yuzu::server::CryptoReadCause::kStoreDegraded};
+    e.unavailable_until_restart = true;
+    auto fake = std::make_shared<FakeMcpCryptoApi>();
+    fake->summary = std::unexpected(e);
+    fake->devices = std::unexpected(e);
+    fake->stats = std::unexpected(e);
+    fake->certs = std::unexpected(e);
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.crypto_access_fn_for_test = [](const httplib::Request&, cw::WidgetGate, const std::string&,
+                                      const std::string&) { return cw::Access::kAvailable; };
+    ts.start();
+    for (const auto& [tool, args] : std::vector<std::pair<std::string, std::string>>{
+             {"get_crypto_libraries", "{}"},
+             {"list_crypto_library_devices", R"({"family":"nss"})"},
+             {"export_crypto_cbom", "{}"},
+             {"get_crypto_ca_stats", "{}"},
+             {"list_issued_certs", R"({"kind":"active"})"}}) {
+        auto body = mcp_tool_call(ts, tool, args);
+        INFO(tool << " " << body.dump());
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK_THAT(body["error"]["data"]["remediation"].get<std::string>(),
+                   Catch::Matchers::ContainsSubstring("--postgres-pool-size"));
+    }
+}
+
+TEST_CASE("MCP list_issued_certs filtered: the rows behind a count, strict, pinned, audited",
+          "[mcp][crypto][widgets][ca]") {
+    auto fake = std::make_shared<FakeMcpCryptoApi>();
+    yuzu::server::CaCertPage page;
+    page.as_of = 1792368000;
+    page.total = 2;
+    page.truncated = true;
+    page.next_cursor = "c1:opaque";
+    page.rows.push_back({"0A", "CN=a", "", "agent", 1, 2, "revoked", 3, "superseded", "", ""});
+    fake->certs = page;
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.crypto_access_fn_for_test = [](const httplib::Request&, cw::WidgetGate, const std::string&,
+                                      const std::string&) { return cw::Access::kAvailable; };
+    ts.start();
+    auto body = mcp_tool_call(ts, "list_issued_certs",
+                              R"({"kind":"revoked","days":30,"bucket":"superseded","limit":1})");
+    INFO(body.dump());
+    REQUIRE_FALSE(body.contains("error"));
+    REQUIRE(fake->cert_queries.size() == 1);
+    CHECK(fake->cert_queries[0].kind == yuzu::server::CaCertKind::kRevoked);
+    CHECK(fake->cert_queries[0].bucket == yuzu::server::RevokedBucket::kSuperseded);
+    CHECK_FALSE(fake->cert_queries[0].as_of.has_value());
+    const auto& sc = body["result"]["structuredContent"];
+    // H2: keyset paging - next_cursor, never an offset, on a filtered call.
+    CHECK(sc["next_cursor"] == "c1:opaque");
+    CHECK_FALSE(sc.contains("offset"));
+    CHECK_FALSE(sc.contains("next_offset"));
+    CHECK(sc["filter"]["as_of"] == 1792368000);
+    CHECK(sc["filter"]["bucket"] == "superseded");
+    CHECK(sc["items"][0]["revocation_reason"] == "superseded");
+    CHECK(mcp_audits(ts, "crypto.ca.certificates.view|success") == 1);
+
+    // The next page passes the cursor through to the seam (which decodes and binds it).
+    auto next = mcp_tool_call(ts, "list_issued_certs",
+                              R"({"kind":"revoked","days":30,"bucket":"superseded","cursor":"c1:opaque"})");
+    INFO(next.dump());
+    REQUIRE_FALSE(next.contains("error"));
+    REQUIRE(fake->cert_queries.size() == 2);
+    CHECK(fake->cert_queries[1].cursor == "c1:opaque");
+
+    for (const char* bad : {R"({"kind":"weak"})", R"({"kind":"expiring","days":45})",
+                            R"({"kind":"active","days":7})", R"({"kind":"active","limit":501})",
+                            R"({"kind":"active","bucket":"other"})",
+                            R"({"kind":"revoked","days":7,"bucket":"compromise"})",
+                            R"({"kind":"issued_week","week":"2026-W99"})",
+                            R"({"kind":"active","as_of":-1})", R"({"kind":"active","as_of":"x"})",
+                            R"({"kind":"active","offset":0})", R"({"kind":"active","cursor":""})",
+                            R"({"kind":"active","cursor":7})"}) {
+        INFO(bad);
+        auto r = raw_tool_call(ts, "list_issued_certs", bad);
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    CHECK(fake->cert_queries.size() == 2);
+
+    // A cursor the seam refuses (tampered / another filter) is invalid-params, naming it.
+    fake->certs = std::unexpected(CryptoReadError{CryptoReadError::Kind::kInvalid, "invalid cursor"});
+    auto tampered = raw_tool_call(ts, "list_issued_certs", R"({"kind":"active","cursor":"c1:zz"})");
+    REQUIRE(tampered.contains("error"));
+    CHECK(tampered["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK_THAT(tampered["error"]["message"].get<std::string>(),
+               Catch::Matchers::ContainsSubstring("cursor"));
+}
+
+TEST_CASE("MCP list_issued_certs filtered: a confined Security:Read holder is withheld",
+          "[mcp][crypto][widgets][ca][security]") {
+    auto fake = std::make_shared<FakeMcpCryptoApi>();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.crypto_access_fn_for_test = [](const httplib::Request&, cw::WidgetGate, const std::string&,
+                                      const std::string&) { return cw::Access::kConfined; };
+    ts.start();
+    auto body = mcp_tool_call(ts, "list_issued_certs", R"({"kind":"active"})");
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(fake->cert_queries.empty());
+    CHECK(mcp_audits(ts, "crypto.ca.certificates.view|denied") == 1);
 }
 
 // ── M.10b: ecosystem enums and pipe list are generated from kEcosystemFamilies ──────────────

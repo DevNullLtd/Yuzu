@@ -283,7 +283,7 @@ Routes that parse strictly (the response routes are listed in
 | Dashboard fragments | `GET /fragments/results`: `page`, `per_page`; the three software inventory fragments (`/fragments/inventory/software`, `/software/devices`, `/software/versions`): a malformed `limit` answers `200` with an `inv-caveat` note, not a JSON `400` (htmx drops `4xx` bodies), and the store is not read; a well-formed `limit` is validated and then ignored, because these fragments use a fixed page size; the DEX perf devices fragment and the network quality devices fragment: `limit`; the hardware list fragment and `GET /api/v1/hardware`: `offset`, `limit` (a negative value is refused too, it used to be clamped to `0`); the hardware sync poll: `await_since` (a malformed freshness bound used to read as "no bound", so a stale snapshot could be served as fresh); `GET /fragments/tar/process-tree/detail`: `node` (`stoul` read `-1` as the largest node id and `5x` as `5`) |
 | Delivery and list routes | `GET /api/notifications`: `limit`, `offset` (a negative value is `400` too, where the store answered an empty `200`); `GET /api/webhooks/{id}/deliveries` and `GET /api/v1/offload-targets/{id}/deliveries`: `limit`; `GET /api/v1/ca/issued`: `limit`, `offset`; `GET /api/v1/preflight/runs`: `limit`; the pre-flight run form: `min_gib` and `window` (a malformed value is `400`; a negative `min_gib` is `400` too) and the version thresholds `app_min`, `app_max` and `os_min` (empty, or a dotted-decimal version with an optional `-beta` / `+build` suffix; anything else is `400`, see [Pre-flight readiness checks](preflight.md)); `GET /api/v1/result-sets` and `GET /api/v1/result-sets/{id}/members`: `limit` (trailing characters are `400`, not their numeric prefix; an integer outside the route's page range still uses the default page size); `GET /api/v1/dex/signals/{obs_type}`, `GET /api/v1/dex/perf/devices` and `GET /api/v1/network/devices`: `limit`; `GET /api/v1/guaranteed-state/events`: `limit` and `offset` (a negative value is `400` too; both are parsed before the `dex.device.view` audit row is written, so a `400` leaves no access row) |
 | Event streams | `GET /api/v1/events`: `since` (a non-negative integer; a malformed value is `400`, answered before the stream budget is touched). A malformed `Last-Event-ID` **header** on `GET /api/v1/events` or the workflow execution stream is served **live only**: nothing buffered is replayed (never the whole ring buffer) and it is not a `400`, because the header is browser-supplied inference and a `400` would fail a reconnect. The cursor is parsed strictly, so `-1` and `5abc` are never accepted as a position (`5abc` used to replay from position 5; `-1` wrapped past every event and also replayed nothing, so that input's outcome is unchanged); valid ids replay exactly as before. A rejected `?since` leaves no success audit row, because it is parsed before the audit write |
-| Settings forms | `POST /api/settings/dex-alerts/blast` (`min_devices`, `window_seconds`, `cooldown_seconds`): a malformed value is `400` and nothing is saved (it used to persist the clamped minimum); `POST /api/settings/enrollment-tokens` and `/batch` (`max_uses`, `ttl_hours`, `count`): `0x5` used to read as `0`, and `max_uses` `0` means unlimited, so a mistyped limit minted an unlimited token (only an **empty** field, or a value that parses to a literal `0` such as `0`, `-0` or `00`, means unlimited or no expiry now; on `/batch` an empty `max_uses` defaults to `1`, not unlimited; a **negative** `ttl_hours` is refused with `400` because it would compute `0`, a token that never expires); the API-token create form `ttl_hours` (the same `0x5` read as a token that never expires; it is refused with the form's usual `200` feedback span, `Invalid TTL value.`, a negative value too, and nothing is minted); the OTA package `rollout_pct` on upload and on the rollout route (an out-of-range integer on upload is clamped to 0..100 as before): a malformed value used to become `100`, a full-fleet rollout. **Behaviour change on the rollout change route only:** an empty `rollout_pct` and a value above `100` are also `400` there (an empty value used to mean `100` and a larger one was clamped to `100`), while a negative value still clamps to `0` (the least exposure); the upload route is unchanged. Each enrollment and OTA `400` also sets an error toast (`HX-Trigger`), because the dashboard drops `4xx` bodies |
+| Settings forms | `POST /api/settings/dex-alerts/blast` (`min_devices`, `window_seconds`, `cooldown_seconds`): a malformed value is `400` and nothing is saved (it used to persist the clamped minimum); `POST /api/settings/enrollment-tokens` and `/batch` (`max_uses`, `ttl_hours`, `count`): `0x5` used to read as `0`, and `max_uses` `0` means unlimited, so a mistyped limit minted an unlimited token (only a value that parses to a literal `0` such as `0`, `-0` or `00` means unlimited or no expiry; an **empty** field takes the default of 100 uses and 72 hours, and on `/batch` an empty `max_uses` defaults to `1` and an empty `ttl_hours` to 72 hours; a **negative** `ttl_hours` is refused with `400` because it would compute `0`, a token that never expires); the API-token create form `ttl_hours` (the same `0x5` read as a token that never expires; it is refused with the form's usual `200` feedback span, `Invalid TTL value.`, a negative value too, and nothing is minted); the OTA package `rollout_pct` on upload and on the rollout route (an out-of-range integer on upload is clamped to 0..100 as before): a malformed value used to become `100`, a full-fleet rollout. **Behaviour change on the rollout change route only:** an empty `rollout_pct` and a value above `100` are also `400` there (an empty value used to mean `100` and a larger one was clamped to `100`), while a negative value still clamps to `0` (the least exposure); the upload route is unchanged. Each enrollment and OTA `400` also sets an error toast (`HX-Trigger`), because the dashboard drops `4xx` bodies |
 | JSON request bodies (security-gating numbers) | `POST /api/v1/tokens` `expires_at` (a negative value or one above 9223372036854775807 minted a token that never expires, `5.5` or `1e3` an already-expired one, and a wrong type threw a bare `500`; now `400`, and `0` or omitted still means never expires); `POST /api/v1/tokens/{id}/rotate` and `POST /api/v1/engine-principals/{id}/credentials/rotate` `overlap_secs` (a truncated or non-object body used to rotate with the 7-day default; now `400`, and an empty body still takes the default); `POST /api/v1/guaranteed-state/rules` `version` (`5.5` was stored as `5` and a wrong type threw; now `400`); `POST /api/v1/upload-grants` `ttl_secs` (a wrong type, `0` or a negative value was ignored and the grant got the 900 s maximum; now `400`); `POST /api/settings/enrollment-tokens/batch` `count`, `max_uses`, `ttl_hours` (a JSON number was silently ignored, so the documented example minted single-use tokens that never expire; now a JSON integer **and** a numeric string are both read, an empty string keeps the default, and a float, boolean, `null`, overflow or a truncated or non-object body is `400` and mints nothing). The `ip_subnet` auto-approve rule value is validated when it is added (`POST /api/settings/auto-approve`, `400` for anything but an IPv4 address or `a.b.c.d/0` to `/32`) |
 
 On the query-parameter routes in the table above, a parameter that is **present but empty** (`?limit=`) is malformed, not absent (`GET /api/v1/audit` `limit` included). Two exceptions. The software list and catalogue routes (`GET /api/v1/inventory/software` and `/software/catalogue`, and the three software fragments) share one parser in which an EMPTY `limit=` means the default; a non-empty malformed or overflowing `limit` is still refused (`400` on the REST routes, a `200` `inv-caveat` note on the fragments). And the auth-sample export: a present but empty `from` or `to` on `GET /api/v1/audit/auth-sample` is accepted as unbounded on that side. The admin forms are different: an EMPTY form field means that field's default.
@@ -2362,6 +2362,82 @@ returns the same five fields at the top level of its result.
 ```
 
 The MCP `list_issued_certs` tool mirrors this contract (same `has_more` / `next_offset`).
+
+The unfiltered call above is not written to the audit log and is not withheld from a
+management-group-confined caller (a known gap, unchanged by the filtered form below).
+
+**Filtered: the certificates behind one `/crypto` count (ADR-0070 R2, R8).** When any of `kind`,
+`days`, `week`, `bucket`, `as_of` or `cursor` is present, the route lists exactly the certificates behind
+one Yuzu-issued count of [`GET /api/v1/crypto/ca/stats`](#get-apiv1cryptocastats), with the same
+predicate. **Permission:** `Security:Read`, and a caller whose view of the fleet is confined is
+refused `403` with no `permission` field (`Yuzu-issued certificate figures are not available to
+this account: ...`), whatever the parameters. The input is strict, and each malformed parameter is
+a `400` whose message names it:
+
+| Parameter | Type | Description |
+|---|---|---|
+| `kind` | string | **Required** in this form: `active`, `expiring`, `expired`, `revoked`, `issued`, `issued_week` or `revoked_week` |
+| `days` | integer | Required for `expiring` (3, 7, 14, 21, 30, 60), `expired` and `revoked` (7, 30, 60, 90) and `issued` (7); refused on other kinds |
+| `week` | string | ISO week `YYYY-Www` (for example `2026-W43`); required for `issued_week` and `revoked_week`, refused on other kinds. A week that does not exist (`2026-W00`, `2027-W53`) is refused |
+| `bucket` | string | `superseded`, `unpublished` or `other`; optional, `revoked` and `revoked_week` only. Omitted lists every reason |
+| `as_of` | integer | Epoch seconds to measure the first page against (for example a `/crypto/ca/stats` count's `as_of`). Accepted from 7 days before the **database** clock up to 5 minutes after it, checked in the read's own transaction; omitted = the database clock now. A continuation page carries its `as_of` in `cursor`; an `as_of` sent beside a cursor must equal it. See [Pinned `as_of`](crypto.md#pinned-as_of-and-keyset-paging) |
+| `limit` | integer | 1 to 500, default 100 (refused outside the range, not clamped) |
+| `cursor` | string | The previous page's `next_cursor` (opaque, at most 512 bytes). Bound to `kind`, `days`, `week` and `bucket`: a cursor that is malformed, edited or issued for another filter is a `400` naming `cursor` |
+
+A parameter repeated with differing values is a `400`. **`offset` is refused in this form** (`400`
+naming it): the filtered list pages by keyset cursor only. `limit` or `offset` alone does not
+select this form (the unfiltered list above keeps its `offset` paging).
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://yuzu.example.com/api/v1/ca/issued?kind=revoked&days=30&bucket=superseded"
+```
+
+```json
+{
+  "items": [
+    {
+      "serial_hex": "3A4B5C6D...",
+      "subject": "agent-prod-01",
+      "san": "URI:yuzu://<ca-fp>/agent/agent-prod-01",
+      "purpose": "agent",
+      "status": "revoked",
+      "not_after": 1821657600,
+      "issued_at": 1790121600,
+      "revoked_at": 1791590400,
+      "revocation_reason": "superseded",
+      "issued_by": "agent:agent-prod-01",
+      "issuer_key_id": "ab12..."
+    }
+  ],
+  "count": 1,
+  "filter": {
+    "kind": "revoked", "days": 30, "week": null, "week_start": null, "bucket": "superseded",
+    "rule_id": "yuzu_ca_revoked_superseded",
+    "criterion": "Revoked after as_of - 30 days and on or before as_of, reason recorded as superseded (replaced by a same-key successor)",
+    "rule_set_version": "crypto_widget_windows_v1",
+    "as_of": 1792396800, "as_of_iso": "2026-10-19T08:00:00Z", "total": 1,
+    "scope_note": "Counts certificates Yuzu's own CA issued only (agent, server, gateway, HTTPS and code-signing); certificates on your devices are not covered."
+  },
+  "next_cursor": null,
+  "meta": { "api_version": "v1", "limit": 100, "has_more": false }
+}
+```
+
+`filter.total` counts every match at `filter.as_of`; when `meta.has_more` is `true`,
+`next_cursor` is set: request the next page with `cursor=<next_cursor>` (and the same `kind`,
+`days`, `week`, `bucket`). The cursor carries the position of the last certificate served and
+the walk's `as_of`, so every page is measured against the same time and starts strictly after
+that certificate: a certificate revoked between pages never makes the walk skip another (an
+offset would). `next_cursor` is `null` on the last page. Order: expiring soonest first, expired and revoked most recent first, the
+rest newest-issued first. Every filtered call is audited `crypto.ca.certificates.view`
+(set-and-proceed: `audit_persisted: false` in the body and `Sec-Audit-Failed: true` when the row
+is lost; a confined refusal is a `denied` row). Errors: `400` (each malformed parameter, named),
+`401`, `403` (no `Security:Read`, or a confined caller), `503` + `retry_after_ms: 5000` (`Yuzu CA
+read degraded`, `crypto read capacity in use; retry`, or `access check unavailable`; never an
+empty list), and `503` **without** `retry_after_ms` (`filtered certificate list unavailable`: the
+server was built without the `/crypto` seam, a wiring fault that lasts until a restart). MCP
+twin: `list_issued_certs` with the same arguments.
 
 #### `POST /api/v1/ca/revoke`
 
@@ -7644,7 +7720,7 @@ A parameter repeated with differing values, an unknown `family`, a value that is
 | 400 | Parameter repeated with differing values, malformed parameter, unknown `family`, invalid UTF-8, over-long value |
 | 401 | Unauthenticated |
 | 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
-| 503 | `crypto library read degraded` (the inventory read failed or ran past its 5 s bound) or `crypto read capacity in use; retry` (the server bounds concurrent reads per process): `retry_after_ms: 5000` either way; **never an empty 200**. An absent inventory store or an unwired gate (server misconfiguration) is a `503` without `retry_after_ms` |
+| 503 | `crypto library read degraded` (the inventory read failed or ran past its 5 s bound) or `crypto read capacity in use; retry` (the server bounds concurrent reads per process): `retry_after_ms: 5000` either way; **never an empty 200**. An absent inventory store or an unwired gate (server misconfiguration) is a `503` without `retry_after_ms`. A server whose Postgres pool is smaller than 2 connections refuses these reads with a `503` and **no** `retry_after_ms` (`crypto library reads (and the CBOM export) refused: the server's Postgres pool is smaller than 2 connections; restart the server with --postgres-pool-size 2 or more`): a retry fails the same way until that restart. |
 
 #### `GET /api/v1/crypto/libraries/devices`
 
@@ -7694,7 +7770,7 @@ The devices (and matching package rows) behind one family, optionally one versio
 | 400 | `family` missing or unknown, parameter repeated with differing values, malformed parameter, invalid `limit`, over-long or non-UTF-8 value, or a refused cursor (including one from another `table_version`, or a cursor issued on live names when the catalogue is now in use) |
 | 401 | Unauthenticated |
 | 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
-| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty 200**. An absent store or an unwired gate is a `503` without `retry_after_ms` |
+| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty 200**. An absent store or an unwired gate is a `503` without `retry_after_ms`. A server whose Postgres pool is smaller than 2 connections refuses these reads with a `503` and **no** `retry_after_ms` (`crypto library reads (and the CBOM export) refused: the server's Postgres pool is smaller than 2 connections; restart the server with --postgres-pool-size 2 or more`): a retry fails the same way until that restart. |
 
 #### `GET /api/v1/crypto/cbom`
 
@@ -7749,7 +7825,138 @@ A CycloneDX **1.7** inventory of the cryptographic *library* packages installed 
 | 400 | Repeated parameter with differing values, unknown `family`, invalid UTF-8 or over-long value |
 | 401 | Unauthenticated |
 | 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
-| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty BOM**. An absent store, an unwired gate or a failure minting the serial number is a `503` too; the serial is minted before the inventory read, so that last failure takes no read slot and writes no audit row |
+| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty BOM**. An absent store, an unwired gate or a failure minting the serial number is a `503` too; the serial is minted before the inventory read, so that last failure takes no read slot and writes no audit row. A server whose Postgres pool is smaller than 2 connections refuses these reads with a `503` and **no** `retry_after_ms` (`crypto library reads (and the CBOM export) refused: the server's Postgres pool is smaller than 2 connections; restart the server with --postgres-pool-size 2 or more`): a retry fails the same way until that restart. |
+
+#### Dashboard widgets (ADR-0070 D13)
+
+The `/crypto` page is a per-operator widget dashboard (see [crypto.md](crypto.md#the-dashboard)). These routes serve the widget catalogue, the caller's own layout and the Yuzu-issued certificate counts; MCP twins `list_crypto_widgets`, `get_crypto_dashboard_layout`, `set_crypto_dashboard_layout` and `get_crypto_ca_stats`. The certificates behind a count are served by the filtered [`GET /api/v1/ca/issued`](#get-apiv1caissued) (MCP `list_issued_certs`). Every route answers `Cache-Control: no-store, private` and `Vary: Authorization, Cookie, X-Yuzu-Token`. The Yuzu-issued figures read **Yuzu's own internal CA** only, never certificates found on fleet devices (ADR-0070 D6). Facts only: the only built-in checks are the D13 named windows, each returned with its criterion and computed at read time against `as_of`, the database clock (ADR-0070 R4, R5), over the closed window set `crypto_widget_windows_v1` (active; expiring 3/7/14/21/30/60 days; expired 7/30/60/90; revoked 7/30/60/90 in three reason buckets; issued 7; 52 ISO weeks, the current partial week included); nothing grades a certificate.
+
+##### `GET /api/v1/crypto/widgets`
+
+The widget catalogue. Authentication only; not audited. `data`: `window_set`, `default_layout` (ids), `max_layout_widgets` (64), `scope_note` and `widgets[]` with `id`, `title`, `kind` (`number`, `bar`, `line`, `table`), `group`, `gate` (`fleet_read`: library widgets, answered over the caller's scope; `fleet_wide_only`: Yuzu-issued counts, withheld from a confined caller), `securable`, `operation` (`Inventory`/`Read` for every widget), `criterion` (what the widget counts, in words), `drill`, `available` and `availability` (`available`, `not_available`, `confined` or `access_check_unavailable`) and, for Yuzu-issued widgets, `ca_kind`, `days`, `drill_securable`/`drill_operation` (`Security`/`Read`) and `drill_available`. `available` and `drill_available` decide what to draw only: they come from the same non-auditing check the data routes would apply, and grant nothing. Errors: `401`, `503` (server misconfiguration).
+
+##### `GET /api/v1/crypto/dashboard/layout`
+
+The caller's OWN layout, keyed by the session user name (never another operator's). Authentication only; not audited. A service-scoped API token is refused `403` (`service-scoped tokens may not read or change a dashboard layout`, no `permission` field; audited `crypto.dashboard.layout.access_denied`), and an MCP-tier token is held to its tier's `Infrastructure:Read`. `data`: `widgets` (catalogue ids this server knows, in display order), `is_default` (`true` when the widgets are the default and no other-version ids are kept), `version` (the stored version, `0` when nothing is stored), `preserved_unknown` (stored ids this server version does not know: kept on every save, not listed) and `max_layout_widgets`.
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" https://yuzu.example.com/api/v1/crypto/dashboard/layout
+```
+
+```json
+{
+  "data": {
+    "widgets": ["lib.devices_reporting", "ca.active", "ca.expiring_30d"],
+    "is_default": false,
+    "version": 7,
+    "preserved_unknown": 0,
+    "max_layout_widgets": 64
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+Errors: `401`, `403`, `422` (the stored layout is damaged: not retryable, the `X-Crypto-Layout-Version` header carries its version; a `PUT` with `expected_version` set to that version replaces it), `503` + `retry_after_ms: 5000` (`dashboard layout read degraded`; never the default served in its place), and `503` without `retry_after_ms` when the layout store did not open at server start (`dashboard layouts unavailable: the layout store did not open at server start; saved layouts return after a restart with the store fixed`).
+
+##### `PUT /api/v1/crypto/dashboard/layout`
+
+Replace the caller's own layout. Body: `widgets` (at most 64 catalogue ids, no repeats; an empty list is valid) and optional `expected_version` (an integer, `0` or more); no other key. With `expected_version` the save is refused `409` unless the stored version is still that value (`0` = only if nothing is stored). Omit it only for a first save: without it the save succeeds only when nothing is stored, and over a stored layout (a damaged one included) it is the same `409` with `X-Crypto-Layout-Version` carrying the stored version. Ids stored by another server version are kept after yours (see `preserved_unknown`). Same caller rules as the GET (service-scoped token `403`, audited as a `crypto.dashboard.layout.update` `denied` row; MCP-tier token held to `Infrastructure:Write`). A cookie-authenticated browser write must name this site (`Origin`/`Referer`), else `403` and a `csrf.denied` row. Audited `crypto.dashboard.layout.update`: an `attempted` row first (if it cannot be written the layout is not changed: `503`, `Sec-Audit-Failed: true`), then `success` or `failure`.
+
+```bash
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"widgets":["lib.devices_reporting","ca.active","ca.expiring_30d"],"expected_version":7}' \
+  https://yuzu.example.com/api/v1/crypto/dashboard/layout
+```
+
+```json
+{
+  "data": {
+    "widgets": ["lib.devices_reporting", "ca.active", "ca.expiring_30d"],
+    "is_default": false,
+    "version": 8,
+    "preserved_unknown": 0,
+    "max_layout_widgets": 64
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`data` carries `audit_persisted: false` (and the response `Sec-Audit-Failed: true`) when the outcome row could not be written. The body cap is 16 KiB, enforced before the body is read; an over-cap body is refused with the pre-auth cap's `413` envelope:
+
+```json
+{
+  "error": {
+    "code": 413,
+    "message": "request body exceeds this route's size cap",
+    "correlation_id": "req-18f2a1c3d-2a",
+    "retry_after_ms": null,
+    "remediation": "reduce the request body size; see docs/user-manual/rest-api.md for the per-route limit"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+| Status | Condition |
+|---|---|
+| 400 | Malformed body, unknown or repeated id, too many ids, a bad `expected_version`, or another key (the message names the position, never the value) |
+| 401 | Unauthenticated |
+| 403 | Service-scoped token, MCP tier below `Infrastructure:Write`, or a cross-site cookie write |
+| 409 | `expected_version` is stale, or omitted while a layout is stored (`the layout changed since it was loaded (another tab or client saved first); reload it and save again`). `X-Crypto-Layout-Version` carries the stored version (`0` when another save landed during this one). Not retryable as sent: read the layout again, then save |
+| 413 | Body over 16 KiB |
+| 503 | `retry_after_ms: 5000`: `dashboard layout save failed` (store degraded), or `save outcome unknown — reload to check` (the connection dropped after the save was sent; the `failure` audit row says `outcome=unknown`; read the layout to see what was stored). Without `retry_after_ms`: the layout store did not open at server start, or the audit `attempted` row could not be written |
+
+##### `GET /api/v1/crypto/ca/stats`
+
+Every Yuzu-issued count against one `as_of`. **Permission:** `Inventory:Read`, and only for an unconfined view of the fleet (ADR-0070 R2): a management-group-confined caller (or one whose service-scoped token confines it) is refused `403` with `Yuzu-issued certificate figures are not available to this account: its view of the fleet is confined, and these are fleet-wide figures.` and no `permission` field (no grant would admit it), audited as a `crypto.ca.stats.view` `denied` row. Every call reads at request time (never cached), bounded by the `/crypto` read admission limit (see [crypto.md](crypto.md#yuzu-issued-certificates)). Audited `crypto.ca.stats.view` on every call (set-and-proceed: `audit_persisted: false` + `Sec-Audit-Failed: true` when the row is lost).
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" https://yuzu.example.com/api/v1/crypto/ca/stats
+```
+
+Response (trimmed: one entry of each array shown):
+
+```json
+{
+  "data": {
+    "scope": "yuzu_issued",
+    "scope_note": "Counts certificates Yuzu's own CA issued only (agent, server, gateway, HTTPS and code-signing); certificates on your devices are not covered.",
+    "window_edge_note": "as_of is the database clock; issued and revoked times are recorded from the issuing server's clock, so a window edge is accurate only to the servers' clock synchronisation.",
+    "rule_set_version": "crypto_widget_windows_v1",
+    "as_of": 1792396800,
+    "as_of_iso": "2026-10-19T08:00:00Z",
+    "active": {"rule_id": "yuzu_ca_active", "criterion": "Status active, issued on or before as_of, notAfter on or after as_of (valid through notAfter, inclusive)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 412},
+    "expiring_within_days": [
+      {"rule_id": "yuzu_ca_expiring", "criterion": "Status active, notAfter from as_of through as_of + 30 days (valid through notAfter, inclusive)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 9, "threshold": 30}
+    ],
+    "expired_within_days": [
+      {"rule_id": "yuzu_ca_expired", "criterion": "Status active, notAfter from as_of - 7 days up to, not including, as_of", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 0, "threshold": 7}
+    ],
+    "revoked_within_days": [
+      {"rule_id": "yuzu_ca_revoked_superseded", "criterion": "Revoked after as_of - 30 days and on or before as_of, reason recorded as superseded (replaced by a same-key successor)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 31, "threshold": 30, "bucket": "superseded"}
+    ],
+    "issued_within_days": {"rule_id": "yuzu_ca_issued", "criterion": "Issued after as_of - 7 days and on or before as_of, excluding unpublished (recorded, never delivered)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 14, "threshold": 7},
+    "week_basis": "last 52 ISO weeks (UTC, Monday start); the current week is partial",
+    "weeks": [
+      {"week": "2026-W43", "week_start": 1792368000, "partial": true,
+       "issued": {"rule_id": "yuzu_ca_issued_week", "criterion": "Issued in ISO week 2026-W43 (Monday 00:00 UTC start) up to as_of, excluding unpublished (recorded, never delivered)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 3, "week": "2026-W43"},
+       "revoked": [
+         {"rule_id": "yuzu_ca_revoked_week_superseded", "criterion": "Revoked in ISO week 2026-W43 (Monday 00:00 UTC start) up to as_of, reason recorded as superseded (replaced by a same-key successor)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 2, "week": "2026-W43", "bucket": "superseded"}
+       ]}
+    ]
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+- Every count object carries `rule_id`, `criterion`, `rule_set_version`, `as_of` and `count`, plus `threshold` (windowed counts: the window length in days, the ADR-0070 D10 condition-1 field), `week` (per-week counts) and `bucket` (revoked counts). These are counts of certificates, never labels.
+- `expiring_within_days` has one entry per window (3, 7, 14, 21, 30, 60), `expired_within_days` one per window (7, 30, 60, 90). `revoked_within_days` has three entries per window, one per bucket: `superseded`, `unpublished`, `other` (any other recorded reason, including an operator-typed reason stored as `operator-supplied: <text>`). They are never summed.
+- Expiring and expired cover status `active` only; a revoked certificate counts only in the revoked windows (R11). Issued excludes `unpublished` certificates (never delivered).
+- `weeks` has 52 entries, oldest first, zero-filled, ending with the week containing `as_of`, which has `partial: true`. `week_start` is that ISO week's Monday 00:00 UTC.
+- Recompute any count with `Security:Read` from the [filtered `GET /api/v1/ca/issued`](#get-apiv1caissued) with the count's `kind`, `days`/`week`, `bucket` and `as_of`.
+
+Errors: `401`, `403` (no `Inventory:Read`, written by the gate, or a confined caller, above), `503` + `retry_after_ms: 5000` (`Yuzu CA read degraded` or `crypto read capacity in use; retry`; never zeros), and `503` with **no** `retry_after_ms` when the server's Postgres pool is smaller than 4 connections (`Yuzu-issued certificate reads refused: ... restart the server with --postgres-pool-size 4 or more`; a retry fails the same way until that restart). The filtered `GET /api/v1/ca/issued` answers the same refusal the same way.
+
+The `/fragments/crypto/dashboard`, `/fragments/crypto/widget/{id}` and `/fragments/crypto/ca/certificates` fragments render the same data for the page (always HTTP 200, a note on refusal and a banner on degrade) and write the same audit verbs; for a service-scoped token, or an MCP token whose tier refuses the layout read, `/fragments/crypto/dashboard` draws the default layout read-only and never reads the minting operator's saved layout (the layout routes refuse the same tokens); the dashboard fragment writes one row per source per draw (see [crypto.md](crypto.md#audit)). `/fragments/crypto/ca/certificates` is the page's twin of the filtered `GET /api/v1/ca/issued` and needs `Security:Read`.
 
 ---
 
@@ -10149,7 +10356,7 @@ App-centric stability list — every application with a Windows crash/hang signa
 - **Query parameters:** `window` — one of `24h`/`7d`/`30d`/`all` (default `7d`); an off-enum value is rejected with `400`.
 - **Response:** `data` object `{window, population, population_basis, apps_total, apps_truncated, policy, apps[]}`. `apps[]` holds the 100 applications affecting the most Windows devices (then crashes plus hangs, then name), listed by activity (crashes plus hangs descending, then name in byte order, not database collation); `apps_total` counts every application with a Windows crash or hang signal in the window and `apps_truncated` is `true` when the cut dropped any. Each `{subject, profile, crashes, hangs, distinct_devices, distinct_devices_online, last_seen, share_affected, rate_per_1000, score, versions[], version_count, versions_truncated}`. `versions[]` (up to 20, ordered by devices affected descending, then version; `""` is the unknown-version bucket) carries the same figures plus `version`; `versions_truncated` is `true` when that cut dropped any. A full response is about 1.2 MB at 100 applications with 20 versions each; MCP clients should request it only when the per-version rows are needed. `crashes`, `hangs` and `distinct_devices` are window-wide. `share_affected`, `rate_per_1000` and `score` are over one population, the Windows devices online now: `distinct_devices_online` is how many of the affected devices are online now (`null` when no fleet source is wired, because membership is then unknown), `share_affected` is that count over the population (95 percent Wilson interval), `rate_per_1000` is those devices' events per 1,000 online devices (exact interval), and the score's inputs are the same online devices' figures. A device that crashed and then went offline is therefore in the counts and in `distinct_devices`, not in the share or rate, and the **score is withheld as `offline_affected`** when it would otherwise be published and `distinct_devices` exceeds `distinct_devices_online`, because a score built from the online devices alone would read healthy for an application that takes its devices offline. Read `distinct_devices_online` against `distinct_devices` before trusting a low share: figures over "online now" vary with the time of day (laptops overnight, weekends) for the same window. Expect this often: on a fleet with laptops or off-hours devices most applications with several affected devices will show a withheld score at any given moment, so use the share and rate, read against `distinct_devices_online` / `distinct_devices`, until an offline-aware score is decided (#5894). The online devices' events are not published separately; the rate is derived from them. `share_affected` carries `reliable: false` under 20 online affected devices and `rate_per_1000` under 20 online events. `score` is the transparent stability score `{score, band, withheld, deductions[]}`; the version-regression deduction is always `assessed: false` here.
 - **Score policy:** `policy` names the score policy every figure in the response was scored under: `{source, revision, fault, tiers}`. `source` is `default` (nothing stored, or a stored policy was refused) or `custom`; `revision` identifies the stored policy document (`default` when none is stored); `tiers` holds `excellent`, `good`, `fair` and `poor`, each `{edge, name}`, where `edge` is the lowest score in that tier and `name` its display name (a label for people: key on `score.band`, whose tokens never change). Poor's edge is the fixed `0`, not a stored value. Each application's `profile` is `override` when a per-application override shaped its tiers or weights and `default` otherwise; its versions inherit it and carry no `profile` of their own, and `tiers` shows the global policy. A change to the stored policy typically reaches every server instance within 5 seconds: each instance refreshes it from the store at most every 5 seconds while it serves requests, through one store read at a time, and the policy in use is up to 60 seconds old when the store is unreadable. A request arriving mid-refresh is scored under the last good policy while that is under 60 seconds old, so it never waits on that read (with no usable policy, it answers the `503` below at once). An invalid stored policy is never half-applied: the shipped defaults score and `fault` says why (`source` is `default`). If the stored policy cannot be read, the last good one is used for up to 60 seconds, after which the read fails as below. The response `tiers` is a read-model projection (`tiers.<tier>.{edge,name}`), not the shape of the stored document (`tiers.edges`, `tiers.names`); weights and per-application override values are not echoed. The policy is read-only on this surface; its own route (`PUT /api/v1/dex/score-policy`) is coming and is not yet available, so every response currently reports `source: "default"`. The cohort floor and the statistics are not part of the policy.
-- **Score policy faults:** when a stored policy document is refused, `policy.fault` holds one of `unparseable at <path>: <message>` (the document is not the expected shape, for example `unparseable at tiers.edges.great: unknown key`), `unparseable at document: not valid JSON`, `oversized at document: more than 262144 bytes`, or `<token> at <path>` where `<token>` is one of `edge_out_of_range`, `edge_not_display_exact`, `edges_not_descending`, `edge_gap_below_minimum`, `name_invalid`, `weight_invalid`, `weight_sum_above_maximum`, `override_key_invalid`, `override_key_duplicate` or `too_many_overrides` (`<path>` names the offending part, for example `overrides[3].weights`, and an unknown key is shown with control characters replaced and capped at 256 bytes). These tokens are stable. Today a refused document can occur only after a direct database write to the `dex_score_policy` row, because nothing in the product writes it yet. The shipped defaults score in the meantime; remove the row (key `dex_score_policy` in the `runtime_config_store.runtime_config` table, a direct database change, since no route removes it) rather than editing it in place. A `503` whose message ends `(score_policy_unavailable)` means the runtime-config store could not be read for more than 60 seconds or, with no usable policy cached, that the first read failed or is still in flight (a restart during the outage, or a concurrent first read), in which case the `503` answers at once: check PostgreSQL health and `yuzu_server_runtime_config_read_degrade_total{reason}`. The token `score_policy_unavailable` is stable.
+- **Score policy faults:** when a stored policy document is refused, `policy.fault` holds one of `unparseable at <path>: <message>` (the document is not the expected shape, for example `unparseable at tiers.edges.great: unknown key`), `unparseable at document: not valid JSON`, `oversized at document: more than 262144 bytes`, `unsupported_version at version: N above the supported <V>` (`N` is the document's `version`, newer than the `<V>` this build supports: the shipped defaults score and none of the document is applied), or `<token> at <path>` where `<token>` is one of `edge_out_of_range`, `edge_not_display_exact`, `edges_not_descending`, `edge_gap_below_minimum`, `name_invalid`, `weight_invalid`, `weight_sum_above_maximum`, `override_key_invalid`, `override_key_duplicate` or `too_many_overrides` (`<path>` names the offending part, for example `overrides[3].weights`, and an unknown key is shown with control characters replaced and capped at 256 bytes). These tokens are stable. Today a refused document can occur only after a direct database write to the `dex_score_policy` row, because nothing in the product writes it yet. For `unsupported_version`, leave the row alone: a newer release wrote it, so finish the rolling upgrade (or upgrade this instance) and the document is applied; removing it would destroy a valid policy. For every other fault the shipped defaults score in the meantime; remove the row (key `dex_score_policy` in the `runtime_config_store.runtime_config` table, a direct database change, since no route removes it) rather than editing it in place. A `503` whose message ends `(score_policy_unavailable)` means the runtime-config store could not be read for more than 60 seconds or, with no usable policy cached, that the first read failed or is still in flight (a restart during the outage, or a concurrent first read), in which case the `503` answers at once: check PostgreSQL health and `yuzu_server_runtime_config_read_degrade_total{reason}`. The token `score_policy_unavailable` is stable.
 - **Population and scope:** counts are Windows-scoped and `population` is the number of Windows devices online now (`population_basis: "windows_online"`; `null` = no fleet source wired (unknown); `0` = no Windows device online now). With an unknown or zero population there is no share and no rate, and the score is withheld as `no_population`. The share is a proportion over that one population: its numerator is drawn from the same online devices the population counts, so the affected set can never exceed it. No device floor applies: figures are published at any device count.
 - **Failure:** a failed store read, a stored score policy that cannot be read within its 60-second staleness bound (the message ends `(score_policy_unavailable)`) or a read over its concurrency budget returns `503` with `retry_after_ms: 2000`, never an empty list. The builder also refuses a policy that fails validation (the message ends `(score_policy_invalid)`); that is defence in depth, because a stored policy that fails validation is replaced by the shipped defaults before it reaches the builder. The read holds a database connection for several seconds on a large window, so at most four run at once per server; a fifth answers `503` immediately (counted on `yuzu_server_guardian_read_degrade_total{reason="concurrency_budget"}`) and the caller retries.
 - No per-agent identity (a distinct-device **count** per app, never an `agent_id`) — not audited.
