@@ -681,7 +681,6 @@ TEST_CASE("rbac_enforcement_label: cached-enabled short-circuits past a stale vi
     // technique the sibling rbac_enforcement_in_effect staleness test uses.
     auto held = pool_b.acquire();
     REQUIRE(held);
-    // Ages replica_b's refresh gate, last-success and breaker-probe readings by 5200 ms
     replica_b.age_refresh_state_for_test(std::chrono::milliseconds(5200));
 
     // The view is now genuinely stale — proven directly, bypassing
@@ -2766,7 +2765,6 @@ TEST_CASE("RbacStore: rbac_enforcement_in_effect fails closed when a generation 
 
     // Clear replica_b's refresh gate so its next read genuinely attempts a
     // durable re-read rather than serving its just-constructed cache.
-    // Ages replica_b's refresh gate, last-success and breaker-probe readings by 1100 ms
     replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
 
     // Starve replica_b's own pool for the rest of the test: every subsequent
@@ -2797,7 +2795,6 @@ TEST_CASE("RbacStore: rbac_enforcement_in_effect fails closed when a generation 
     // refresh rather than serving the gated fast path) and, combined with
     // the ~1.1-1.35s already elapsed, pushes total elapsed time since
     // construction past kRbacStaleServeBoundMs (5000ms) with margin.
-    // Ages replica_b's refresh gate, last-success and breaker-probe readings by 4200 ms
     replica_b.age_refresh_state_for_test(std::chrono::milliseconds(4200));
 
     // Pre-fix (adversarial-review round): is_rbac_enabled() correctly stayed
@@ -2849,7 +2846,6 @@ TEST_CASE("RbacStore: rbac_enabled_view_degraded fails closed on elapsed time al
     // maybe_refresh_generation() -- replica_b's pool is left healthy and
     // untouched throughout, so if the old `!generation_valid_`-only check
     // were still in place, nothing in this test would ever flip it.
-    // Ages replica_b's refresh gate, last-success and breaker-probe readings by 5200 ms
     replica_b.age_refresh_state_for_test(std::chrono::milliseconds(5200));
 
     // Called directly (bypassing maybe_refresh_generation() entirely, unlike
@@ -2892,12 +2888,10 @@ TEST_CASE("RbacStore: a warm permission cache survives a generation-refresh "
 
     // Clear the refresh gate, let replica_b observe the durable enable +
     // grant, and genuinely populate perm_cache_ with an ALLOW.
-    // Ages replica_b's refresh gate, last-success and breaker-probe readings by 1100 ms
     replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     REQUIRE(replica_b.check_permission("bob", "Infrastructure", "Read"));
 
     // Starve the pool and force one failed refresh attempt inside the bound.
-    // Ages replica_b's refresh gate, last-success and breaker-probe readings by 1100 ms
     replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     auto held = pool_b.acquire();
     REQUIRE(held);
@@ -2941,7 +2935,6 @@ TEST_CASE("RbacStore: a warm permission cache is NOT served once the "
 
     // Clear the refresh gate, let replica_b observe the durable enable +
     // grant, and genuinely populate perm_cache_ with an ALLOW.
-    // Ages replica_b's refresh gate, last-success and breaker-probe readings by 1100 ms
     replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     REQUIRE(replica_b.check_permission("bob", "Infrastructure", "Read"));
 
@@ -2955,7 +2948,6 @@ TEST_CASE("RbacStore: a warm permission cache is NOT served once the "
     // 5000ms bound, not merely combine with an earlier one to reach it.
     auto held = pool_b.acquire();
     REQUIRE(held);
-    // Ages replica_b's refresh gate, last-success and breaker-probe readings by 5200 ms
     replica_b.age_refresh_state_for_test(std::chrono::milliseconds(5200));
 
     // Past the bound, with the pool starved: the previously-cached ALLOW
@@ -2995,7 +2987,6 @@ TEST_CASE("RbacStore: fail-fast breaker denies without a pool touch once "
     // Clear the refresh gate opened at construction so the first starved
     // call below genuinely attempts a fresh refresh rather than serving the
     // gated fast path.
-    // Ages replica_b's refresh gate, last-success and breaker-probe readings by 1100 ms
     replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
 
     auto held = pool_b.acquire();
@@ -3029,7 +3020,6 @@ TEST_CASE("RbacStore: fail-fast breaker denies without a pool touch once "
     // the starved connection so the next attempt (the half-open probe) can
     // genuinely succeed and reset the streak to 0 — an open->closed
     // transition, so the gauge goes back to 0.
-    // Ages replica_b's refresh gate, last-success and breaker-probe readings by 1100 ms
     replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     held.reset();
     CHECK(replica_b.check_permission("bob", "Infrastructure", "Read"));
@@ -3075,8 +3065,7 @@ TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
                                      // breaker test — construction's own read
                                      // (if any) must not touch the counter.
 
-    // Ages replica_b's refresh gate, last-success and breaker-probe readings by 1100 ms
-    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
+    replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100)); // clear the refresh gate
 
     auto held = pool_b.acquire();
     REQUIRE(held);
@@ -3465,7 +3454,6 @@ TEST_CASE("RbacStore: generation-refresh-failed degrade records the correct "
     replica_b.set_metrics(&metrics);
 
     // Genuinely populate replica_b's cache with a confirmed-good refresh.
-    // Ages replica_b's refresh gate, last-success and breaker-probe readings by 1100 ms
     replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     REQUIRE(replica_b.check_permission("bob", "Infrastructure", "Read"));
     // check_permission's own success path never fires a degrade — sanity
@@ -3484,7 +3472,6 @@ TEST_CASE("RbacStore: generation-refresh-failed degrade records the correct "
     // perm_cache_), so it's served from cache and never reaches
     // check_permission's OWN pool-fallback branch — only
     // maybe_refresh_generation()'s degrade fires.
-    // Ages replica_b's refresh gate, last-success and breaker-probe readings by 1100 ms
     replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     auto held = pool_b.acquire();
     REQUIRE(held);
@@ -3502,7 +3489,6 @@ TEST_CASE("RbacStore: generation-refresh-failed degrade records the correct "
     // check_permission's own (still-starved) pool-fallback branch — that
     // fires its own pool_acquire_timeout degrade too, a different reason
     // label from the two asserted below, so it doesn't affect them.
-    // Ages replica_b's refresh gate, last-success and breaker-probe readings by 4200 ms
     replica_b.age_refresh_state_for_test(std::chrono::milliseconds(4200));
     CHECK_FALSE(replica_b.check_permission("bob", "Infrastructure", "Read"));
     CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
@@ -3667,7 +3653,6 @@ TEST_CASE("RbacStore: a refresh finding rbac_enabled's row absent (write_generat
     // refresh rather than serving the gated fast path, then trigger one.
     // Construction already counted as a genuine completed refresh, so
     // replica_b is not degraded yet at this point.
-    // Ages replica_b's refresh gate, last-success and breaker-probe readings by 1100 ms
     replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     REQUIRE_FALSE(replica_b.rbac_enabled_view_degraded());
     (void)replica_b.is_rbac_enabled(); // triggers maybe_refresh_generation()
@@ -3682,16 +3667,12 @@ TEST_CASE("RbacStore: a refresh finding rbac_enabled's row absent (write_generat
     // subsequent round can ever confirm rbac_enabled either. Each call
     // below re-triggers maybe_refresh_generation() (past its own 1s gate),
     // finding the same absent row every time.
-    // Ages replica_b's refresh gate, last-success and breaker-probe readings by 1100 ms
     replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     (void)replica_b.is_rbac_enabled();
-    // Ages replica_b's refresh gate, last-success and breaker-probe readings by 1100 ms
     replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     (void)replica_b.is_rbac_enabled();
-    // Ages replica_b's refresh gate, last-success and breaker-probe readings by 1100 ms
     replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
     (void)replica_b.is_rbac_enabled();
-    // Ages replica_b's refresh gate, last-success and breaker-probe readings by 1100 ms
     replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
 
     // THE FIX: the view is now degraded -- pre-fix, last_successful_refresh_ms_
@@ -4376,7 +4357,6 @@ TEST_CASE("RbacStore Gate7-Fix7: the gauge is published on replica_b's ADOPT pat
 
     // Clear the 1s stampede gate so replica_b's next check genuinely attempts
     // a refresh rather than serving its just-constructed cache.
-    // Ages replica_b's refresh gate, last-success and breaker-probe readings by 1100 ms
     replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
 
     // Drives maybe_refresh_generation() -> the adopt branch's
@@ -4453,7 +4433,6 @@ TEST_CASE("RbacStore: rbac_enabled adoption is generation-gated — a refresh ca
 
     // Clear the 1s stampede gate so the next check genuinely attempts a
     // refresh rather than serving the gated fast path.
-    // Ages replica_b's refresh gate, last-success and breaker-probe readings by 1100 ms
     replica_b.age_refresh_state_for_test(std::chrono::milliseconds(1100));
 
     // THE FIX: replica_b's own cached_generation_ is already at G (from its

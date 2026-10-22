@@ -1799,18 +1799,13 @@ TEST_CASE("TAR #2361: a rolled-back retention pass does not discard another writ
     std::mutex ack_mu;
     std::condition_variable ack_cv;
     std::vector<int> acknowledged;
-    // #5170: this loop takes TarDatabase::mu_ (an unfair std::mutex) back-to-back
-    // with no pause, and run_retention's execute_atomic_batch waits on the same mutex.
-    // On a loaded box (four runner agents share one) that spin can keep the batch from
-    // ever acquiring mu_, so the test hangs instead of failing. Two bounds, both
-    // chosen to keep the burst density the ~1-in-5 detection above depends on:
-    //   - yield() after each write hands the CPU on without a timer wait. A per-write
-    //     sleep was rejected: it caps the writer at tens of writes per second on
-    //     Windows' timer granularity and takes the detection rate to ~0.
-    //   - kMaxProbeWrites bounds the total. Past it the writer stops re-taking mu_ and
-    //     waits (1 ms naps) for `stop`, so retention can never be starved indefinitely.
-    // The ceiling is far above what retention's window needs; the assertions below are
-    // unchanged (every acknowledged key must survive).
+    // #5170: back-to-back set_config calls re-take TarDatabase::mu_ (an unfair
+    // std::mutex) with no pause, and run_retention's execute_atomic_batch waits on
+    // the same mutex; on a loaded box the writer can starve it and the test hangs.
+    // yield() hands the CPU on without throttling the burst the ~1-in-5 detection
+    // above depends on (a per-write sleep would, at Windows' timer granularity);
+    // kMaxProbeWrites stops the writer re-taking mu_ past a ceiling retention never
+    // needs, so it can never be starved indefinitely.
     constexpr int kMaxProbeWrites = 50000;
     std::thread writer([&] {
         int n = 0;
