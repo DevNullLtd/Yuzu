@@ -2160,7 +2160,8 @@ if build_server
   # now 5.6 s and no longer a floor. B's four heaviest independent tags move to C
   # as `~[pg]~[auth]~[mcp][tag]` clauses and B and D gain the matching `~[tag]`
   # suffix: [oidc] 12.1 s, [retention] 8.0 s, [readyz] 5.6 s, [tls] 5.2 s.
-  # After: A 14.3 s (filter untouched: the 27 s above was box load), B 38.4 s,
+  # After: A 14.3 s (filter untouched: the 27 s above included about 12 s of the idle, elevation
+  # and posture sleeps that the seams removed), B 38.4 s,
   # C 37.9 s, D 5.6 s. --list-tests counts on one binary, before -> after this
   # filter edit: B 4783 -> 4493, C 1139 -> 1429 (+290 = the four tags), D 24, A
   # 786; the non-pg total (6732) is unchanged, no case lost or duplicated.
@@ -2168,10 +2169,12 @@ if build_server
   # Windows MSVC debug (kingsley, 2026-10-22, one process per shard run back to
   # back, one sample): A 67.0 s, B 142.2 s, C 91.1 s, D 0.55 s; the four moved tags
   # alone: [oidc] 61.5 s, [retention] 8.2 s, [readyz] 4.5 s, [tls] 5.9 s (so
-  # [oidc] is 5x its macOS cost and is most of C). D was 110 s in CI before the
-  # scan change (different harness, so not a like-for-like delta). B is still the
+  # [oidc] is 5x its macOS cost and is most of C). D was 124-131 s on the Windows
+  # build host before the scan change (#4882; a different harness, so not a
+  # like-for-like delta). B is still the
   # non-pg floor. A candidate that also moves [rest] from B to C measured B 121.2 s,
-  # C 110.5 s (max -15%); it is under the >25% ranking rule, so the tag set stays.
+  # C 110.5 s (max -15%); it is under the 25% bar (a re-cut must cut the longest shard by more than a
+  # quarter to be worth its churn), so the tag set stays.
   test('server unit tests shard A', server_test_exe,
        args: ['~[pg][auth],~[pg][mcp]', '--durations=yes'], suite: ['server', 'server-nonpg'], timeout: 600,
        priority: 20)
@@ -2444,7 +2447,7 @@ if build_server
   # 2026-10-22 (#2600; test hot spots): shard M's `[pg][readyz]` clause moved onto
   # shard B VERBATIM, every exclusion kept. Measured on braga (macOS debug, one
   # shard at a time): M 208 s and B 109 s. M's readyz clause alone is about 65 s
-  # (PgReachabilityProbe connect-deadline cases) and 43.6 s of B was real sleeping
+  # (PgReachabilityProbe connect-deadline cases) and about 42 s of B was real sleeping
   # in [rbac_store] cases, which RbacStore::age_refresh_state_for_test (and the
   # other *_for_test deadline seams, see the test files) replaced. After: B 135.0 s,
   # M 119.8 s (A 82.5 s, H 116.6 s, K 32.9 s, N 97.8 s, whose filters are untouched). --list-tests:
@@ -2460,10 +2463,11 @@ if build_server
   # Windows maximum, M 239 s in CI) cannot be passed or failed from this data:
   # B and M are 3.2x apart and 386 s is a serial wall on a different box than
   # the CI figure. A candidate that moves the [pg][auth_db] clause from M to B
-  # measured B 205.4 s, M 319.0 s (max -17%, under the >25% rule), so the layout
-  # stays. M starts first (priority 185 and B's 186 lead the queue), so it is not
-  # the last finisher of the Windows pg step; the per-case durations that PR #6324
-  # adds to the job summary are what to re-cut from next.
+  # measured B 205.4 s, M 319.0 s (max -17%, under the 25% bar), so the layout
+  # stays. Priority only orders starts: nine pg shards outrank both B and M, which
+  # start 10th and 11th at width 6, so whether M is the last finisher on Windows is
+  # unmeasured; the per-case durations that PR #6324 added to the job summary are
+  # what to re-cut from next.
   test('server pg unit tests shard B', server_test_exe,
        args: ['[pg][rbac_store]~[routes]~[store]~[token],[pg][readyz]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]~[password]', '--durations=yes'],
        suite: ['server', 'server-pg'], timeout: 700, priority: 186)

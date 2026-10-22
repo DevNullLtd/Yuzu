@@ -2781,7 +2781,7 @@ TEST_CASE("RbacStore: rbac_enforcement_in_effect fails closed when a generation 
     REQUIRE(held);
 
     // Bounded stale-serve (#2703 Gate 7, operator-adjudicated): this FIRST
-    // failed refresh attempt lands at roughly construction + 1.1s (the ageing
+    // failed refresh attempt lands at roughly construction + 1.1s (the aging
     // above) + <=0.25s (this call's own blocking kAuthzAcquireTimeout) — well
     // inside kRbacStaleServeBoundMs (5000ms) of replica_b's last confirmed-
     // good refresh (its own construction). This is the whole point of the
@@ -2790,7 +2790,7 @@ TEST_CASE("RbacStore: rbac_enforcement_in_effect fails closed when a generation 
     // store-level degrade), only the generation view is briefly unconfirmed.
     CHECK_FALSE(rbac_enforcement_in_effect(&replica_b));
 
-    // Push past the bound by ageing replica_b's readings — comfortably clears both
+    // Push past the bound by aging replica_b's readings — comfortably clears both
     // the 1s stampede gate (so the next call genuinely attempts a fresh
     // refresh rather than serving the gated fast path) and, combined with
     // the ~1.1-1.35s already elapsed, pushes total elapsed time since
@@ -2939,12 +2939,12 @@ TEST_CASE("RbacStore: a warm permission cache is NOT served once the "
     REQUIRE(replica_b.check_permission("bob", "Infrastructure", "Read"));
 
     // Starve the pool, then push wall time past kRbacStaleServeBoundMs
-    // (5000ms) by ageing replica_b's readings before the next call. Unlike the
+    // (5000ms) by aging replica_b's readings before the next call. Unlike the
     // sibling rbac_enforcement_in_effect fail-closed test above (whose
     // 4200ms works because its baseline is CONSTRUCTION, never updated since
     // every refresh attempt after it fails), this test's baseline is the
     // SUCCESSFUL warming call just above -- last_successful_refresh_ms_ was
-    // genuinely updated to ~now there, so the ageing alone must exceed the
+    // genuinely updated to ~now there, so the aging alone must exceed the
     // 5000ms bound, not merely combine with an earlier one to reach it.
     auto held = pool_b.acquire();
     REQUIRE(held);
@@ -3483,7 +3483,7 @@ TEST_CASE("RbacStore: generation-refresh-failed degrade records the correct "
                           {{"reason", "generation_refresh_failed"}})
               .value() == 0.0); // the denying reason must NOT fire while still tolerated
 
-    // Push past the bound by ageing replica_b's readings (mirrors the existing
+    // Push past the bound by aging replica_b's readings (mirrors the existing
     // rbac_enforcement_in_effect fail-closed test's technique). This second
     // failed refresh drops the cache, so THIS call also falls through to
     // check_permission's own (still-starved) pool-fallback branch — that

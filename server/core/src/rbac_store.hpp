@@ -705,7 +705,7 @@ public:
     /// `breaker_last_probe_started_ms_` (under `breaker_mtx_`) `elapsed` into the
     /// past — two sequential lock scopes, never nested. It ages only the object it is
     /// called on (a second replica sharing the database is a separate instance with
-    /// its own readings), and it never touches `generation_valid_`: ageing that would
+    /// its own readings), and it never touches `generation_valid_`: aging that would
     /// turn a "stale by elapsed time" case into an "invalid view" case and hide the
     /// #2703 bound logic the case exists to prove. Production code MUST NOT call
     /// this — no caller in `server/core/src/**` references it.

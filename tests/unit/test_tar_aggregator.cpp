@@ -1801,9 +1801,11 @@ TEST_CASE("TAR #2361: a rolled-back retention pass does not discard another writ
     std::vector<int> acknowledged;
     // #5170: back-to-back set_config calls re-take TarDatabase::mu_ (an unfair
     // std::mutex) with no pause, and run_retention's execute_atomic_batch waits on
-    // the same mutex; on a loaded box the writer can starve it and the test hangs.
+    // the same mutex; on a loaded box the writer is thought to starve it (the cause
+    // is inferred from the #5170 hang, not measured) and the test hangs.
     // yield() hands the CPU on without throttling the burst the ~1-in-5 detection
-    // above depends on (a per-write sleep would, at Windows' timer granularity);
+    // above depends on (a per-write sleep would, at Windows' timer granularity; the
+    // effect of yield() on that detection is not measured on Windows);
     // kMaxProbeWrites stops the writer re-taking mu_ past a ceiling retention never
     // needs, so it can never be starved indefinitely.
     constexpr int kMaxProbeWrites = 50000;
