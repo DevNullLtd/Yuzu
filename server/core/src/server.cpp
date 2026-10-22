@@ -198,6 +198,7 @@
 #include "auth_routes.hpp"
 #include "compliance_api_local.hpp" // ADR-0031 WS-A4: core-only compliance/policy seam factory
 #include "compliance_routes.hpp"
+#include "crypto_access.hpp" // /crypto availability composition (M4, unit-tested)
 #include "crypto_api_local.hpp" // /crypto slice 1: make_local_crypto_api (core-only store-backed factory)
 #include "crypto_dashboard_layout_store.hpp" // /crypto widgets: per-operator layout (born-on-PG, ADR-0071)
 #include "crypto_layout_erasure.hpp" // ADR-0071: erase-failure reason set + mapping
@@ -2183,10 +2184,11 @@ public:
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
                           "(store_not_open/pool_acquire_timeout/query_error, plus "
-                          "admission_full for installed_software: a /crypto read refused by "
-                          "its in-flight bound before any store call) and source "
+                          "admission_full for installed_software and ca_issued: a /crypto read "
+                          "refused by its in-flight bound before any store call) and source "
                           "(installed_software/device_ci/software_licensing/product_registry/"
-                          "app_usage/generic - generic is the ADR-0037 InventoryStore). /readyz "
+                          "app_usage/generic - generic is the ADR-0037 InventoryStore - and "
+                          "ca_issued/crypto_layout, the /crypto Yuzu-issued and layout reads). /readyz "
                           "stays green under pure pool saturation, so "
                           "this is the read-path degrade signal",
                           "counter");
@@ -2194,6 +2196,13 @@ public:
         // present on a healthy server (the three store-side reasons are emitted on demand).
         metrics_.counter("yuzu_inventory_read_degrade_total",
                          {{"reason", "admission_full"}, {"source", "installed_software"}});
+        metrics_.counter("yuzu_inventory_read_degrade_total",
+                         {{"reason", "admission_full"}, {"source", "ca_issued"}});
+        // The /crypto layout reads and saves (L10): pre-seeded so a dashboard can tell "no
+        // degrade" from "series absent" before the first fault.
+        for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
+            metrics_.counter("yuzu_inventory_read_degrade_total",
+                             {{"reason", reason}, {"source", "crypto_layout"}});
         // ADR-0071 deprovision erasure of /crypto dashboard layouts (M1): best-effort, so a
         // failure is counted and alerted (YuzuCryptoLayoutEraseFailed), never a failed deprovision.
         // The reason set and mapping live in crypto_layout_erasure.hpp (one copy, unit-tested).
@@ -7685,9 +7694,10 @@ public:
         // /crypto dashboard widget layouts — born-on-Postgres (ADR-0071), one row per
         // operator. DELIBERATE EXCEPTION to the ADR-0007/0008 fail-closed boot (owner
         // decision 2026-10-19): a layout is a loss-tolerant UI preference, so a store
-        // that cannot open DEGRADES — the pointer is reset, the server boots, every
-        // reader of the store treats null as "layouts unavailable" until a restart, and
-        // /readyz names the store under "degraded" without leaving rotation. Never set
+        // that cannot open DEGRADES — the pointer is reset, the server boots, the layout
+        // routes answer 503 "layouts unavailable" (not retryable: it lasts until a
+        // restart), the dashboard draws the default layout with a notice, and /readyz
+        // names the store under "degraded" without leaving rotation. Never set
         // startup_failed_ here. No legacy SQLite predecessor, so nothing to detect.
         if (pg_pool_ && !startup_failed_) {
             crypto_dashboard_layout_store_ = std::make_unique<CryptoDashboardLayoutStore>(*pg_pool_);
@@ -10771,8 +10781,8 @@ public:
         if (gateway_service_)
             gateway_service_->set_software_inventory_store(nullptr);
         software_inventory_store_.reset();
-        // The /crypto layout store: used only by the deprovision erasure hook, whose callers (the
-        // web worker pool) were joined above. Before the pool (ADR-0012 destruct-before-pool).
+        // The /crypto layout store: borrowed only by crypto_api_, whose callers (the web worker
+        // pool) were joined above. Before the pool (ADR-0012 destruct-before-pool).
         crypto_dashboard_layout_store_.reset();
         agent_service_.set_app_perf_daily_store(nullptr);
         if (gateway_service_)
@@ -12376,6 +12386,19 @@ private:
             .counter(std::string(crypto_layout_erasure::kMetric),
                      {{"reason", std::string(reason)}})
             .increment();
+    }
+
+    /// The ONE /crypto availability callback (ADR-0070 R2; fix-spec B1): CryptoRoutes, the
+    /// filtered GET /api/v1/ca/issued and the MCP server all receive THIS function, so the REST
+    /// widget list, the dashboard and list_crypto_widgets cannot draw different answers. Fleet
+    /// gate classes ask the NON-auditing fleet-read probe (a confined caller has a present
+    /// VisibleSet); the global class asks the non-auditing has_permission. Never a grant.
+    yuzu::server::crypto_widgets::Access crypto_access(const httplib::Request& req,
+                                                       yuzu::server::crypto_widgets::WidgetGate gate,
+                                                       const std::string& securable,
+                                                       const std::string& operation) {
+        // The composition lives in crypto_access.hpp so it is unit-tested (M4).
+        return crypto_access_for(*auth_routes_, req, gate, securable, operation);
     }
 
     /// #1788: the per-caller Execution:Execute visible set (nullopt == unfiltered),
@@ -19058,20 +19081,49 @@ private:
                 },
                 .audit_fn = audit_fn});
 
-        // CryptoRoutes — /crypto, /fragments/crypto/*, GET /api/v1/crypto/* (slice 1:
-        // crypto-library presence from the installed_software inventory). ONE CryptoApi
-        // instance backs the page, the REST routes and the MCP twins (set_crypto_api below).
-        // Built only when the software-inventory store exists; without it the routes are
-        // registered with a null seam and answer 503 / the degrade banner, never an empty page.
-        if (software_inventory_store_) {
+        // CryptoRoutes — /crypto, /fragments/crypto/*, /api/v1/crypto/* (crypto-library
+        // presence from the installed_software inventory, the Yuzu-issued certificate widgets
+        // over ca_store_, and the per-operator widget layout). ONE CryptoApi instance backs the
+        // page, the REST routes and the MCP twins (set_crypto_api below). Built whenever ANY
+        // backing store exists; a missing store degrades only the methods that read it (503 /
+        // the degrade banner), never an empty answer and never the other methods.
+        if (software_inventory_store_ || ca_store_ || crypto_dashboard_layout_store_) {
             crypto_device_api_ = device_api;
-            crypto_api_ = make_local_crypto_api(*software_inventory_store_, crypto_device_api_.get());
+            // Admission is narrowed to a quarter of the pool (B9); the unconfined library summary
+            // is shared for a minute (B8) - the Yuzu-issued stats read never is (ADR-0070: bounded
+            // by admission, not a cached count); every Yuzu-issued / layout shed and degrade is
+            // counted with closed labels (B10).
+            crypto_api_ = make_local_crypto_api(LocalCryptoApiDeps{
+                .software = software_inventory_store_.get(),
+                .devices = crypto_device_api_.get(),
+                .ca = ca_store_.get(),
+                .layouts = crypto_dashboard_layout_store_.get(),
+                .pool_size = pg_pool_ ? static_cast<int>(pg_pool_->size()) : 0,
+                .shared_read_ttl = std::chrono::seconds(60),
+                .note_degrade =
+                    [this](std::string_view source, std::string_view reason) {
+                        metrics_
+                            .counter("yuzu_inventory_read_degrade_total",
+                                     {{"reason", std::string(reason)}, {"source", std::string(source)}})
+                            .increment();
+                    }});
         }
         crypto_routes_ = std::make_unique<CryptoRoutes>();
-        crypto_routes_->register_routes(*web_server_, CryptoRoutes::Deps{.auth_fn = auth_fn,
-                                                                         .fleet_read_fn = fleet_read_fn,
-                                                                         .api = crypto_api_,
-                                                                         .audit_fn = audit_fn});
+        crypto_routes_->register_routes(
+            *web_server_,
+            CryptoRoutes::Deps{.auth_fn = auth_fn,
+                               .fleet_read_fn = fleet_read_fn,
+                               .api = crypto_api_,
+                               .audit_fn = audit_fn,
+                               .perm_fn = perm_fn,
+                               .access_fn =
+                                   [this](const httplib::Request& req,
+                                          crypto_widgets::WidgetGate g, const std::string& type,
+                                          const std::string& op) {
+                                       return crypto_access(req, g, type, op);
+                                   },
+                               .write_gate = WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins},
+                               .tier_policy_fn = auth_routes_->gateless_tier_policy_fn()});
 
         // HardwareRoutes — /hardware (ServiceNow-style CI list + record).
         // Software lives at /software; /inventory redirects here.
@@ -20048,6 +20100,14 @@ private:
         // #2537: same ordering rule as DashboardRoutes above — register_routes
         // copies the list into its handler captures, so it must be set first.
         ca_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
+        // ADR-0070 R2-2: the filtered GET /api/v1/ca/issued reads through the SAME CryptoApi
+        // instance and is withheld from a confined caller via the SAME availability callback.
+        ca_routes_->set_filtered_issued(CaRoutes::FilteredIssuedDeps{
+            .api = crypto_api_,
+            .confinement_fn = [this](const httplib::Request& req) {
+                return crypto_access(req, crypto_widgets::WidgetGate::kFleetWideOnly, "Inventory",
+                                     "Read");
+            }});
         ca_routes_->set_read_probe([this](const httplib::Request& req) {
             return auth_routes_->has_permission(req, "Security", "Read");
         });
@@ -21658,6 +21718,14 @@ private:
             // page or the REST twins. Null (no inventory store) -> the tools answer an
             // internal error, never an empty result.
             mcp_server_->set_crypto_api(crypto_api_);
+            // /crypto widgets: list_crypto_widgets' availability, get_crypto_ca_stats' R2
+            // withhold and list_issued_certs' filtered form use the SAME callback as the REST
+            // routes and the dashboard.
+            mcp_server_->set_crypto_access_fn(
+                [this](const httplib::Request& req, crypto_widgets::WidgetGate g,
+                       const std::string& type, const std::string& op) {
+                    return crypto_access(req, g, type, op);
+                });
             // #4037 — the SAME list_read_fn lambda wired into the REST
             // registration's trailing list_read_fn param below, so the REST
             // GET /guaranteed-state/status and MCP get_guardian_status twins
@@ -23065,8 +23133,8 @@ private:
     // are reset (the same join-before-reset contract as every other route owner here).
     std::shared_ptr<DeviceApi> crypto_device_api_;
     // Per-operator /crypto widget layouts — born-on-Postgres (ADR-0071). Declared after
-    // pg_pool_ so it destructs before the pool; the deprovision erasure hook borrows it (same
-    // join-before-reset contract as the stores above).
+    // pg_pool_ so it destructs before the pool; crypto_api_ borrows it (same join-before-reset
+    // contract as the stores above).
     std::unique_ptr<CryptoDashboardLayoutStore> crypto_dashboard_layout_store_;
     std::shared_ptr<CryptoApi> crypto_api_;
     std::unique_ptr<CryptoRoutes> crypto_routes_;
