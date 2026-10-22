@@ -152,6 +152,7 @@ TEST_CASE("rundown gate: entrants racing one close are drained or refused and ne
     std::atomic<bool> drained{false};
     std::atomic<bool> stop{false}; // a broken gate that never refuses must fail, not hang
     std::atomic<int> admitted_after_drain{0};
+    std::atomic<int> seen_closed{0};
     const auto signal_first = [&] {
         if (!first_signalled.exchange(true))
             first_in.count_down();
@@ -162,7 +163,9 @@ TEST_CASE("rundown gate: entrants racing one close are drained or refused and ne
             go.arrive_and_wait();
             for (;;) {
                 const auto in = gate.try_enter();
-                (void)gate.closed(); // polled while close() runs, so a data race on the flag shows
+                // Polled while close() runs, so a data race on the flag shows. The result is
+                // consumed: a discarded load is deleted by the optimiser above -O0.
+                seen_closed.fetch_add(gate.closed() ? 1 : 0);
                 if (!in) {
                     signal_first(); // a gate that refuses before any close must not hang the test
                     return;
