@@ -387,14 +387,19 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 #
 # 228 -> 225 (Seam PR2): the three hardware rows (get.fragments-hardware-list, -hardware-ci,
 # -hardware-quarantine) gained MCP twins (list_hardware_ci, get_hardware_ci, list_quarantined_devices).
-BASELINE_UNTWINNED = 225
+#
+# 225 -> 214 (ledger reconcile, ADR-1005 2026-10-22 entry): 11 stale rows flipped to `twinned` (both twins
+# already existed). The other 78 reclassified rows (exception, retire, composed-of) stay untwinned by design,
+# so only the flips move this number; they left the generic placeholder (see BASELINE_GENERIC_PLANNED).
+BASELINE_UNTWINNED = 214
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
 # issue. Bidirectional like BASELINE_UNTWINNED: lower it in the same change that removes rows.
+# 174 -> 85 (ledger reconcile, ADR-1005 2026-10-22 entry): 89 rows moved to twinned, exception, retire or composed-of.
 GENERIC_PLANNED_STATUS = "planned:#2146"
 GENERIC_PLANNED_ISSUE = 2146
-BASELINE_GENERIC_PLANNED = 174
+BASELINE_GENERIC_PLANNED = 85
 
 # A revisit date outside this window is a typo (9999-12-31), a shape error. A date at or before
 # today + REVISIT_WARN_DAYS only produces ONE aggregated warning, never a failure.
@@ -443,6 +448,55 @@ STRICT_EXCEPTION_PINS = {
     # #6061: approve/reject is a human-session act, MCP approve_request/reject_request permanently refuse (ADR-1005 exception entry).
     "post.api-approvals-param-approve": (6061, "2027-01-18"),
     "post.api-approvals-param-reject": (6061, "2027-01-18"),
+# #5955: further temporary owner-accepted UI-only fragments, recorded by the 2026-10-22 ledger reconcile (ADR-1005).
+    "get.api-chargen-status": (5955, "2026-11-30"),
+    "get.api-help-autocomplete": (5955, "2026-11-30"),
+    "get.api-help-palette": (5955, "2026-11-30"),
+    "get.fragments-device-live": (5955, "2026-11-30"),
+    "get.fragments-dex-device-perf-result": (5955, "2026-11-30"),
+    "get.fragments-dex-device-procperf-result": (5955, "2026-11-30"),
+    "get.fragments-results-filter-bar": (5955, "2026-11-30"),
+    "post.api-export-json-to-csv": (5955, "2026-11-30"),
+    "post.fragments-instructions-yaml-preview": (5955, "2026-11-30"),
+# #4099: NVD routes grandfathered by ADR-1005 (surface 2, strangler deprecation); ADR-1005 2026-10-22 entry.
+    "get.api-nvd-status": (4099, "2027-03-31"),
+    "post.api-nvd-match": (4099, "2027-03-31"),
+    "post.api-nvd-sync": (4099, "2027-03-31"),
+# #6325: legacy admin-plane rows whose REST v1 twin is deferred to the 2027-Q1 re-home (MCP excluded by #520); ADR-1005 2026-10-22 entry.
+    "delete.api-settings-auto-approve-param": (6325, "2027-03-31"),
+    "delete.api-settings-enrollment-tokens-param": (6325, "2027-03-31"),
+    "delete.api-settings-pending-agents-param": (6325, "2027-03-31"),
+    "delete.api-settings-updates-param-param-param": (6325, "2027-03-31"),
+    "get.fragments-settings-dex-alerts": (6325, "2027-03-31"),
+    "get.fragments-settings-mfa": (6325, "2027-03-31"),
+    "get.fragments-settings-tokens": (6325, "2027-03-31"),
+    "get.fragments-settings-updates": (6325, "2027-03-31"),
+    "post.api-settings-auto-approve": (6325, "2027-03-31"),
+    "post.api-settings-auto-approve-mode": (6325, "2027-03-31"),
+    "post.api-settings-auto-approve-param-toggle": (6325, "2027-03-31"),
+    "post.api-settings-cert-paste": (6325, "2027-03-31"),
+    "post.api-settings-dex-alerts-blast": (6325, "2027-03-31"),
+    "post.api-settings-dex-alerts-cohort-export": (6325, "2027-03-31"),
+    "post.api-settings-dex-alerts-routing": (6325, "2027-03-31"),
+    "post.api-settings-enrollment-tokens": (6325, "2027-03-31"),
+    "post.api-settings-enrollment-tokens-batch": (6325, "2027-03-31"),
+    "post.api-settings-mcp": (6325, "2027-03-31"),
+    "post.api-settings-mfa-disable": (6325, "2027-03-31"),
+    "post.api-settings-mfa-init": (6325, "2027-03-31"),
+    "post.api-settings-mfa-recovery-codes": (6325, "2027-03-31"),
+    "post.api-settings-mfa-verify": (6325, "2027-03-31"),
+    "post.api-settings-oidc": (6325, "2027-03-31"),
+    "post.api-settings-oidc-test": (6325, "2027-03-31"),
+    "post.api-settings-pending-agents-bulk-approve": (6325, "2027-03-31"),
+    "post.api-settings-pending-agents-bulk-deny": (6325, "2027-03-31"),
+    "post.api-settings-pending-agents-param-approve": (6325, "2027-03-31"),
+    "post.api-settings-pending-agents-param-deny": (6325, "2027-03-31"),
+    "post.api-settings-plugin-signing-clear": (6325, "2027-03-31"),
+    "post.api-settings-plugin-signing-require": (6325, "2027-03-31"),
+    "post.api-settings-plugin-signing-upload": (6325, "2027-03-31"),
+    "post.api-settings-updates-param-param-param-rollout": (6325, "2027-03-31"),
+    "post.api-settings-updates-upload": (6325, "2027-03-31"),
+    "post.api-settings-users": (6325, "2027-03-31"),
 }
 
 # `exception:` rows must read `exception:#<issue> revisit:<YYYY-MM-DD> <reason>`. The rows named

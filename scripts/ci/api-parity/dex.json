@@ -5,7 +5,7 @@
     "capability_id": "post.api-settings-dex-alerts-blast",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#6325 revisit:2027-03-31 DEX alert settings are REST-only ServerConfig:Write (#520); REST v1 twin deferred (ADR-1005 legacy admin-plane inventory)"
   },
   {
     "method": "POST",
@@ -13,7 +13,7 @@
     "capability_id": "post.api-settings-dex-alerts-cohort-export",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#6325 revisit:2027-03-31 DEX alert settings are REST-only ServerConfig:Write (#520); REST v1 twin deferred (ADR-1005 legacy admin-plane inventory)"
   },
   {
     "method": "POST",
@@ -21,7 +21,7 @@
     "capability_id": "post.api-settings-dex-alerts-routing",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#6325 revisit:2027-03-31 DEX alert settings are REST-only ServerConfig:Write (#520); REST v1 twin deferred (ADR-1005 legacy admin-plane inventory)"
   },
   {
     "method": "GET",
@@ -125,7 +125,7 @@
     "capability_id": "get.fragments-dex-device-perf-result",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#5955 revisit:2026-11-30 */result polling fragment (accepted UI-only exception, #5955); data reachable through the dispatch twin's bounded poll and GET /api/v1/responses/{id}"
   },
   {
     "method": "GET",
@@ -141,7 +141,7 @@
     "capability_id": "get.fragments-dex-device-procperf-result",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#5955 revisit:2026-11-30 */result polling fragment (accepted UI-only exception, #5955); data reachable through the dispatch twin's bounded poll and GET /api/v1/responses/{id}"
   },
   {
     "method": "GET",
@@ -259,7 +259,7 @@
     "capability_id": "get.fragments-settings-dex-alerts",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#6325 revisit:2027-03-31 DEX alert settings are REST-only ServerConfig:Write (#520); REST v1 twin deferred (ADR-1005 legacy admin-plane inventory)"
   },
   {
     "method": "GET",

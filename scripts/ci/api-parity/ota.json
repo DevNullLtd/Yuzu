@@ -5,7 +5,7 @@
     "capability_id": "get.api-deployment-jobs",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "retire"
   },
   {
     "method": "POST",
@@ -13,7 +13,7 @@
     "capability_id": "post.api-deployment-jobs",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "retire"
   },
   {
     "method": "DELETE",
@@ -21,7 +21,7 @@
     "capability_id": "delete.api-deployment-jobs-param",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "retire"
   },
   {
     "method": "GET",
@@ -29,7 +29,7 @@
     "capability_id": "get.api-deployment-jobs-param",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "retire"
   },
   {
     "method": "GET",
@@ -56,7 +56,7 @@
     "capability_id": "get.api-patches",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "retire"
   },
   {
     "method": "POST",
@@ -64,7 +64,7 @@
     "capability_id": "post.api-patches-deploy",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "retire"
   },
   {
     "method": "GET",
@@ -72,7 +72,7 @@
     "capability_id": "get.api-patches-deployments",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "retire"
   },
   {
     "method": "GET",
@@ -80,7 +80,7 @@
     "capability_id": "get.api-patches-deployments-param",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "retire"
   },
   {
     "method": "POST",
@@ -88,7 +88,7 @@
     "capability_id": "post.api-patches-deployments-param-cancel",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "retire"
   },
   {
     "method": "POST",
@@ -96,7 +96,7 @@
     "capability_id": "post.api-settings-updates-upload",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred (ADR-1005 legacy admin-plane inventory); MCP excluded by #520"
   },
   {
     "method": "DELETE",
@@ -104,7 +104,7 @@
     "capability_id": "delete.api-settings-updates-param-param-param",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred (ADR-1005 legacy admin-plane inventory); MCP excluded by #520"
   },
   {
     "method": "POST",
@@ -112,7 +112,7 @@
     "capability_id": "post.api-settings-updates-param-param-param-rollout",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred (ADR-1005 legacy admin-plane inventory); MCP excluded by #520"
   },
   {
     "method": "GET",
@@ -120,6 +120,6 @@
     "capability_id": "get.fragments-settings-updates",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred (ADR-1005 legacy admin-plane inventory); MCP excluded by #520"
   }
 ]

@@ -754,6 +754,61 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        (maker-checker, #6061)"; operator description:
        `docs/user-manual/instructions.md` "Who can approve".
 
+   - **2026-10-22 - API-parity ledger reconcile: owner rulings on 89 `planned`
+     rows.** The ADR owner (Dave Rae) ruled on 89 rows that were still `planned`
+     in `scripts/ci/api-parity/*.json` and whose twin was not being built. The
+     rulings are recorded here and in #6325 and #6326; like the earlier entries they are session
+     statements, not signed decisions. Ledger-only: no route, tool or
+     authorization behavior changes. The gate (`STRICT_EXCEPTION_PINS` in
+     `scripts/ci/check-api-parity.py`) pins each new dated exception by
+     capability id, and the pin is not itself a ruling; this entry is the
+     ruling the pins cite.
+     - **Legacy admin-plane rows: 34 time-boxed exceptions,
+       `exception:#6325 revisit:2027-03-31`.** The rows are the MFA, OIDC, TLS
+       certificate, plugin-signing, MCP enablement, enrollment-token and
+       pending-agent, OTA update-setting, DEX alert-setting and create-user
+       routes of the legacy `/api/settings/*` admin plane (the 2026-09 class
+       entry above). The list of record is #6325 plus the rows carrying
+       `exception:#6325` in `scripts/ci/api-parity/*.json`. The REST v1
+       deferral and the MCP exclusion are separate decisions: the MCP
+       exclusion is permanent and is justified by #520 alone (see the #4028
+       entry above and `mcp_policy.hpp`), which does not justify the missing
+       REST v1 route; the REST v1 twin is deferred to the revisit date.
+       `POST /api/settings/users` (create-user) is in this set and keeps
+       #5357 for its password argument (see the 2026-10-04 entry): a password
+       must not travel in an approval ticket's persisted arguments.
+     - **NVD routes: 3 time-boxed exceptions,
+       `exception:#4099 revisit:2027-03-31`.** `GET /api/nvd/status`,
+       `POST /api/nvd/sync` and `POST /api/nvd/match` are grandfathered
+       surface 2. Their disposition is the strangler deprecation tracked in
+       #4099, so the routes are slated for deprecation rather than for a twin,
+       and no new row is added to the grandfather set.
+     - **UI-only fragments: 9 temporary exceptions,
+       `exception:#5955 revisit:2026-11-30`**, in addition to the 13 accepted
+       on 2026-10-15 (this entry is the separate recorded ruling that entry
+       requires): `get.api-chargen-status`, `post.api-export-json-to-csv`,
+       `get.api-help-autocomplete`, `get.api-help-palette`,
+       `post.fragments-instructions-yaml-preview`,
+       `get.fragments-results-filter-bar`,
+       `get.fragments-dex-device-perf-result`,
+       `get.fragments-dex-device-procperf-result` and
+       `get.fragments-device-live`. The 2026-10-15 waiver scope and its
+       non-waiver of authentication, authorization, audit and confinement
+       apply unchanged. #5955's title and body still count 13; the rows are
+       the list of record.
+     - **Retired rows: 11 marked `retire`; routes stay live.** The four
+       `/api/deployment-jobs` rows and the five `/api/patches` rows (deploy,
+       deployments list, detail and cancel, plus the list) have no working
+       feature behind them and get no twin. The routes keep answering until
+       #6326 removes them, with a deprecation notice period to be decided
+       there. Two further rows are marked `retire` on the same reconcile,
+       `POST /api/scope/estimate` and `POST /api/settings/tls`; #6326 does
+       not cover them.
+     - **Corrections, not exceptions.** 11 rows already had a REST v1 twin and
+       an MCP tool and flip from `planned` to `twinned`; 21 UI fragments
+       become `composed-of:` an existing capability. Neither needs a ruling:
+       they correct a ledger that had fallen behind the code.
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.

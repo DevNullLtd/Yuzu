@@ -27,7 +27,7 @@
     "capability_id": "post.api-settings-users",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#6325 revisit:2027-03-31 create-user carries a password argument: REST v1 twin deferred, MCP excluded (#5357)"
   },
   {
     "method": "DELETE",
@@ -75,7 +75,7 @@
     "capability_id": "get.fragments-settings-tokens",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred (ADR-1005 legacy admin-plane inventory); MCP excluded by #520"
   },
   {
     "method": "GET",

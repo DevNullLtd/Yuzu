@@ -5,7 +5,7 @@
     "capability_id": "post.api-settings-cert-paste",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred (ADR-1005 legacy admin-plane inventory); MCP excluded by #520"
   },
   {
     "method": "POST",
@@ -13,7 +13,7 @@
     "capability_id": "post.api-settings-cert-upload",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "composed-of:post.api-settings-cert-paste"
   },
   {
     "method": "POST",
@@ -21,7 +21,7 @@
     "capability_id": "post.api-settings-mcp",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred (ADR-1005 legacy admin-plane inventory); MCP excluded by #520"
   },
   {
     "method": "POST",
@@ -29,7 +29,7 @@
     "capability_id": "post.api-settings-plugin-signing-clear",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred (ADR-1005 legacy admin-plane inventory); MCP excluded by #520"
   },
   {
     "method": "POST",
@@ -37,7 +37,7 @@
     "capability_id": "post.api-settings-plugin-signing-require",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred (ADR-1005 legacy admin-plane inventory); MCP excluded by #520"
   },
   {
     "method": "POST",
@@ -45,7 +45,7 @@
     "capability_id": "post.api-settings-plugin-signing-upload",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred (ADR-1005 legacy admin-plane inventory); MCP excluded by #520"
   },
   {
     "method": "POST",
@@ -53,7 +53,7 @@
     "capability_id": "post.api-settings-tls",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "retire"
   },
   {
     "method": "GET",

@@ -195,11 +195,11 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | devices | 21 | 11 | 10 |
 | inventory | 4 | 4 | 0 |
 | dex | 27 | 18 | 9 |
-| guardian | 18 | 8 | 10 |
+| guardian | 18 | 10 | 8 |
 | tar | 12 | 3 | 9 |
 | auto-preflight | 4 | 1 | 3 |
 | auto-deploy | 6 | 3 | 3 |
-| auto-verify | 3 | 0 | 3 |
+| auto-verify | 3 | 1 | 2 |
 | network | 3 | 2 | 1 |
 | viz | 2 | 2 | 0 |
 | executions | 6 | 0 | 6 |
@@ -209,18 +209,18 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | settings | 30 | 11 | 19 |
 | rbac | 17 | 5 | 12 |
 | auth-mfa | 7 | 0 | 7 |
-| engine-principals | 3 | 0 | 3 |
+| engine-principals | 3 | 1 | 2 |
 | access-reviews | 5 | 3 | 2 |
 | ca-pki | 3 | 2 | 1 |
 | ota | 15 | 1 | 14 |
 | enrollment | 21 | 4 | 17 |
 | crypto | 2 | 2 | 0 |
-| other | 82 | 17 | 65 |
-| **Total** | **341** | **116** | **225** |
+| other | 82 | 24 | 58 |
+| **Total** | **341** | **127** | **214** |
 
 Registered `/api/vN/*` routes: 256. OpenAPI `paths` entries: 255. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 199.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 225. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 174.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 214. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 85.
 
 <!-- END GENERATED -->
 
