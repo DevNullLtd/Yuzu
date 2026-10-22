@@ -10985,7 +10985,7 @@ public:
         // shared_ptr here, a weak_ptr in agent_service_ locked per frame and only for a
         // frame that owes audit rows, set once at wiring and never cleared. That is NOT
         // enough for the pg::PgPool& the store borrows. analytics_store_'s emit() enqueues
-        // and returns, so a latch that refuses new entrants leaves a gap of nanoseconds;
+        // and returns, so a latch that refuses new entrants leaves only a short gap;
         // the registry hook holds its strong reference across up to 300 synchronous
         // writes, each of which leases the pool, so a forwarder BETWEEN two rows is
         // invisible to ~PgPool and would lease a pool being destroyed. The hook therefore
@@ -11228,8 +11228,8 @@ public:
         // already inside stops before its next row), then wait for the hooks that are inside
         // to leave: only then is it safe to reset the store and, below, the pool. Late on
         // purpose, so the frames that arrive during the delivery drain above are still
-        // audited. 15s is the 4s lease wait (`kWriteTimeout`, audit_store.cpp) plus the 10s
-        // connect that a lease started just inside that deadline may still run
+        // audited. 15s is the 4s lease wait (`kWriteTimeout`, audit_store.cpp) and 1s of
+        // slack, plus the 10s connect that a lease started just inside that deadline may still run
         // (PgPool::Options::connect_timeout_s, the default when the DSN sets none): a DSN
         // with a longer connect_timeout, or a host list, can keep a started connect past
         // this bound, and so can a row whose INSERT is already running and waits on a lock

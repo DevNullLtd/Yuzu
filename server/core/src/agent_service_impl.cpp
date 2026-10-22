@@ -173,10 +173,10 @@ bool AgentServiceImpl::audit_registry_frame(const std::string& agent_id,
             // check may still start its lease after stop() closes the gate; that is safe because
             // this call's entry is still counted and stop() waits for it before it resets the
             // store and the pool. What the close does guarantee is that no row that has not yet
-            // passed this check starts a lease, so the drain is bounded by one row. The rows from
-            // this one on are lost, and counted as such. A row the budget refused above never
-            // gets here: it never leases, so the close changes nothing for it (it stays
-            // `suppressed`).
+            // passed this check starts a lease, so the drain is bounded by one row per hook
+            // inside the gate. The rows from this one on are lost, and counted as such. A row
+            // the budget refused above never gets here: it never leases, so the close changes
+            // nothing for it (it stays `suppressed`).
             if (registry_audit_gate_.closed()) {
                 const std::size_t not_attempted = owed - done;
                 book_rows();
@@ -1929,7 +1929,8 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         }
 
         // registry.write audit rows. No gRPC context on the gateway path to carry an
-        // audit-failed trailer: the hook has logged and counted any failure itself.
+        // audit-failed trailer: the hook has logged any failure (and counted the rows it
+        // knows) itself.
         (void)audit_registry_frame(agent_id, resp);
 
         // UAT 2026-05-06 #8: gateway-streamed RUNNING — notify tracker.
@@ -1990,7 +1991,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         }
 
         // A terminal frame that carries output owes its audit rows too (see the Subscribe twin;
-        // the hook has logged and counted any failure itself).
+        // the hook has logged any failure and counted the rows it knows itself).
         (void)audit_registry_frame(agent_id, resp);
 
         // UAT 2026-05-06 #8: gateway-streamed terminal — notify tracker.

@@ -3774,11 +3774,12 @@ a rollback is genuinely needed.
   up to 5 s waiting on the NVD-sync background thread, up to 15 s waiting on
   the HTTP listener thread (#2703 Gate 7 item 2), and (#3261 governance
   hardening) up to 60 s waiting for WebhookStore and OffloadTargetStore to
-  drain their delivery queues — the last of which runs the two stores
+  drain their delivery queues — that stage runs the two stores
   CONCURRENTLY, not sequentially, so it adds 60 s to the total rather than
-  120 s, and, right before the audit store is released, up to 15 s waiting
-  for a `registry.write` audit write that a gateway forwarder thread has in
-  flight (zero unless the database is stuck). Stacked, this can reach
+  120 s), and, as a separate stage right before the audit store is released,
+  up to 15 s waiting for a `registry.write` audit write that a gateway
+  forwarder thread has in flight (milliseconds unless the database is stuck
+  or slow: a connect or a lock wait can use the whole bound). Stacked, this can reach
   **~130 s** in the worst case if more than one stage is genuinely wedged;
   the total and each stage's own bound are
   unchanged by the reorder, only their relative sequence is. **(#3495) The policy

@@ -62,6 +62,11 @@ TEST_CASE("rundown gate: wait_idle reports whether anyone is still inside and 0 
         REQUIRE(in);
         gate.close();
         CHECK_FALSE(gate.wait_idle(0ms)); // one is inside
+        // A positive bound that expires with an entrant still inside is false too, not "idle":
+        // stop() proceeds to reset the store and the pool on true, so this is the answer that
+        // keeps it from running past a hook. The entry is held, so the result cannot be true and
+        // nothing here depends on how long the wait took.
+        CHECK_FALSE(gate.wait_idle(5ms));
     }
     CHECK(gate.wait_idle(0ms)); // and it left
 }
@@ -157,6 +162,7 @@ TEST_CASE("rundown gate: entrants racing one close are drained or refused and ne
             go.arrive_and_wait();
             for (;;) {
                 const auto in = gate.try_enter();
+                (void)gate.closed(); // polled while close() runs, so a data race on the flag shows
                 if (!in) {
                     signal_first(); // a gate that refuses before any close must not hang the test
                     return;

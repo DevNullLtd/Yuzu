@@ -217,7 +217,10 @@ public:
     /// the way `analytics_store_` closed it in #3350. That does NOT cover the `pg::PgPool&` the
     /// store borrows: the hook holds the store across up to 300 writes, each of which leases the
     /// pool, so a forwarder between two rows would lease a pool `stop()` is destroying. The hook
-    /// therefore runs inside the rundown gate below. This member is written ONCE, before any
+    /// therefore runs inside the rundown gate below, and the gate (not this weak_ptr) is what holds
+    /// `stop()` back until the hook has left; the weak_ptr stays because it costs nothing and
+    /// keeps the object lifetime correct on its own if the gate goes when #3279 joins the
+    /// forwarders. This member is written ONCE, before any
     /// concurrent reader exists, and is never cleared: clearing a weak_ptr concurrently with
     /// `lock()` is a data race.
     void set_registry_audit_store(std::weak_ptr<AuditStore> store) {
@@ -686,8 +689,9 @@ private:
     /// execution advances. Returns false when a row failed to persist (or the hook threw, or
     /// shutdown closed it mid-frame); true when nothing was owed, shutdown had already closed the
     /// hook, no store is wired, or the rows were written or refused by the budget. The hook logs
-    /// and counts every failure itself, so a caller only needs the signal: the Subscribe sites add
-    /// the audit-failed trailer once per stream, and the gateway sites, which have none, ignore it.
+    /// every failure itself and counts every failure whose rows it knows, so a caller only needs
+    /// the signal: the Subscribe sites add the audit-failed trailer once per stream, and the
+    /// gateway sites, which have none, ignore it.
     [[nodiscard]] bool audit_registry_frame(const std::string& agent_id,
                                             const pb::CommandResponse& resp);
 

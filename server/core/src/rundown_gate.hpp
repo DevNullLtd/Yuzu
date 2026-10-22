@@ -29,7 +29,7 @@
 ///
 /// close() never waits, so it is safe to call from inside the guarded code itself (the unit tests
 /// close from the audit budget's injected clock); wait_idle() from there would wait for its own
-/// entry, so it takes a bound and a 0 ms bound never blocks.
+/// entry, so it takes a bound; a 0 ms bound never blocks.
 ///
 /// NOT a fix for #3279 (join or drain the detached workers), only a hook-local rundown for the one
 /// borrow that crosses the pool: when #3279 lands this class has no user and goes.
@@ -94,7 +94,8 @@ public:
     /// Wait up to `bound` for every registered Entry to be destroyed. True when none is left,
     /// false at the deadline (some entrant is still inside: the owner must not reset what it
     /// borrows) and on any failure to wait. Call close() first; an entrant that registers after a
-    /// true result is possible until then.
+    /// true result is possible until close() has run. Pass a finite, modest bound: the deadline
+    /// arithmetic of some standard libraries overflows on std::chrono::milliseconds::max().
     [[nodiscard]] bool wait_idle(std::chrono::milliseconds bound) noexcept {
         try {
             std::unique_lock lock(mu_);

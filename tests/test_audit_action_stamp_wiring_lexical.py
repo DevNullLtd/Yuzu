@@ -59,10 +59,12 @@ Invariants:
    12. `agent_service_.set_registry_audit_store(audit_store_);` appears exactly once and the setter
        is called nowhere else: deleting the line turns every row off silently, and clearing a weak
        pointer that a forwarder may be locking is a data race (the #3350 precedent).
-   13. In stop(), `agent_service_.close_registry_audit();` then `if (!agent_service_.
-       wait_registry_audit_idle(` appear exactly once each, in that order, and both BEFORE the one
-       `audit_store_.reset();`; the `std::_Exit(1);` sits inside the block the wait guards (on its
-       timeout the process exits rather than go on); and the bound is the declared
+   13. In stop(), `agent_service_.close_registry_audit();` then the whole statement `if (!agent_
+       service_.wait_registry_audit_idle(kRegistryAuditRundownBound)) {` (the argument is the
+       declared bound, not a literal) appear exactly once each, in that order, and both BEFORE the
+       one `audit_store_.reset();`; the `std::_Exit(1);` is a top-level statement that ends the
+       block the wait guards (on its timeout the process exits rather than go on; an `_Exit`
+       nested in an `if (false)` does not count); and the bound is the declared
        `std::chrono::seconds(15)` that the documents quote. Reset the store or the pool while a
        forwarder is between two rows and the next row leases a pool that is going: the wait is
        what makes that impossible.
@@ -124,7 +126,7 @@ ENTER_GUARD = "if (!in_flight) return true;"
 CLOSED_CHECK = "registry_audit_gate_.closed()"
 STORE_LOG = "store->log("
 CLOSE_CALL = "agent_service_.close_registry_audit();"
-WAIT_COND = "if (!agent_service_.wait_registry_audit_idle("
+WAIT_COND = "if (!agent_service_.wait_registry_audit_idle(kRegistryAuditRundownBound)) {"
 EXIT_CALL = "std::_Exit(1);"
 STORE_RESET = "audit_store_.reset();"
 BOUND_DECL = "static constexpr auto kRegistryAuditRundownBound = std::chrono::seconds(15);"
@@ -200,7 +202,7 @@ def main_problems(src):
     if (
         (n_close, n_wait, n_reset) != (1, 1, 1)
         or not 0 <= c < w < r
-        or EXIT_CALL not in block
+        or not re.search(r"(?:;|#endif) " + re.escape(EXIT_CALL) + r" \}$", block)
         or t.count(normalise(BOUND_DECL)) != 1
     ):
         out.append(
@@ -399,6 +401,18 @@ SERVER_MUTATIONS = [
         r"(if \(registry_audit_gate_\.closed\(\)\) \{.*?return false;\s*\})",
         "\\2\n            \\1",
     ),
+    # the per-row check moved after the lease it must precede
+    (
+        r"(?s)(if \(registry_audit_gate_\.closed\(\)\) \{.*?return false;\s*\})(\s*)"
+        r"(if \(!store->log\(frame\.events\[done\]\)\) \{.*?return false;\s*\})",
+        "\\3\\2\\1",
+    ),
+    # a second lease site in the row loop
+    (
+        r"if \(!store->log\(frame\.events\[done\]\)\) \{",
+        "(void)store->log(frame.events[done]);\n            "
+        "if (!store->log(frame.events[done])) {",
+    ),
     # the hook closes the gate itself
     (
         r"if \(registry_audit_gate_\.closed\(\)\) \{",
@@ -510,6 +524,16 @@ MAIN_MUTATIONS = [
     ),
     # the documented bound changed without the documents
     (r"std::chrono::seconds\(15\);", "std::chrono::seconds(150);"),
+    # the wait given a literal instead of the declared bound
+    (
+        r"wait_registry_audit_idle\(kRegistryAuditRundownBound\)\) \{",
+        "wait_registry_audit_idle(std::chrono::seconds(600))) {",
+    ),
+    # the force-exit nested where it can never run
+    (
+        r"(?s)(wait_registry_audit_idle\(kRegistryAuditRundownBound\)\) \{.*?)(std::_Exit\(1\);)(\s*\})",
+        r"\1if (false) { \2 }\3",
+    ),
     # the wait's result ignored
     (
         r"if \(!agent_service_\.wait_registry_audit_idle\(kRegistryAuditRundownBound\)\)",

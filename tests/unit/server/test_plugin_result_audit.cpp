@@ -1030,6 +1030,39 @@ TEST_CASE("registry audit live ingest: a row the budget refuses stays suppressed
     CHECK(h.svc.wait_registry_audit_idle(std::chrono::milliseconds{0}));
 }
 
+TEST_CASE("registry audit live ingest: rows refused before a shutdown close stay suppressed and the "
+          "rows after it are counted lost",
+          "[pg][server][registry_audit][rundown]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
+    int clock_calls = 0; // outlives the harness: the budget's clock reads it
+    IngestHarness h(db.dsn());
+    // One row per 1 s window. Row 0 is written (call 1), row 1 is refused (call 2), and the clock
+    // closes the hook on call 3 while moving into a new window, so row 2 is admitted and then
+    // finds the gate closed. The closed branch must book what it has not attempted (rows 2 and 3)
+    // as lost to the shutdown and keep the earlier refusal as `suppressed`: the three counters
+    // plus the written row add up to the four rows the frame owed.
+    h.svc.set_registry_audit_budget(std::make_unique<DenialAuditBudget>(
+        /*max_rows=*/1, /*window_ms=*/1'000,
+        [&] {
+            ++clock_calls;
+            if (clock_calls == 3)
+                h.svc.close_registry_audit();
+            return clock_calls <= 2 ? std::int64_t{1'000} : std::int64_t{3'000};
+        },
+        /*max_keys=*/8));
+    const std::string one{kOkLine};
+    yuzu::test::LogCapture cap;
+    h.svc.process_gateway_response(
+        "agent-1", IngestHarness::frame(rid(0xc5), apb::CommandResponse::RUNNING, "set_value",
+                                        one + "\n" + one + "\n" + one + "\n" + one));
+    cap.stop();
+    CHECK(h.rows().size() == 1);
+    CHECK(h.dropped("suppressed") == 1.0);
+    CHECK(h.dropped("persist_failed") == 2.0);
+    CHECK(count_of(cap.text(), "; 2 row(s) not recorded") == 1);
+    CHECK(h.svc.wait_registry_audit_idle(std::chrono::milliseconds{0}));
+}
+
 TEST_CASE("registry audit live ingest: a frame after the shutdown close records and counts nothing",
           "[pg][server][registry_audit][rundown]") {
     YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
