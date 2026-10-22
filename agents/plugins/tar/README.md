@@ -682,10 +682,10 @@ three broken legs; it is one chokepoint. See Caveats item 1.
    no new mount is started while it is still running, so no profile is charged for waiting behind
    it. Because any mount thread, abandoned or not, can still be running plugin code when the agent
    shuts down, the plugin module is pinned in memory before the first mount and stays loaded for
-   the life of the process. If the pin cannot be taken (logged at error level, until the agent is
-   restarted) no mount is attempted, live profiles included, and every profile is retried later.
-   The retry's insert is duplicate-free against what is
-   already recorded (`mapdrive_live`'s `origin='historical'` rows): a mapping already recorded
+   the life of the process. If the pin cannot be taken (logged at error level), no hive is read
+   until the agent is restarted, live profiles included, and every profile stays pending. While an
+   abandoned mount is still running, later runs read no hive either and charge no profile. The
+   retry's insert is duplicate-free against what is already recorded (`mapdrive_live`'s `origin='historical'` rows): a mapping already recorded
    keeps its first-recorded timestamp, never overwritten by a later retry that re-observes it. A
    ProfileList walk that is itself permanently incomplete (a terminating registry error on every
    attempt) leaves its pending profiles neither resolved nor retried further that run; tracked as

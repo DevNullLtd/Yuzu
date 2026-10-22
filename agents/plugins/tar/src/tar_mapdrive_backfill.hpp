@@ -19,7 +19,8 @@
  * duplicate SIDs collapse to the highest count.
  *
  * kMapDriveBackfillMaxAttempts is the TOTAL number of acquisitions per SID, first pass included
- * (the init-time backfill's attempt is attempt 1) -- so the default of 7 means six further
+ * (the init-time backfill's attempt is attempt 1; a profile the first pass did not try starts at
+ * 0 and is charged only for mounts actually made) -- so the default of 7 means six further
  * retries, kMapDriveBackfillRetryIntervalS apart, before an entry is abandoned WITHOUT a further
  * acquisition attempt: retry_sids never selects an exhausted entry, and apply_outcomes abandons
  * one on sight, whether or not this run's outcome set says anything about it.
@@ -145,8 +146,11 @@ struct RetryAbandoned {
 
 /// sid retained unchanged (no bump) because this run did not try it: `cause` is
 /// "profile_list_incomplete" when the ProfileList walk itself was cut short (absence proves
-/// nothing about this profile), or the token of an outcome with attempted == false (the mount
-/// was refused by the ceiling or skipped after an earlier timeout).
+/// nothing about this profile), or the token of an outcome with attempted == false:
+/// mount_rejected (the shared ceiling refused the call), skipped_after_timeout or
+/// skipped_after_rejection (an earlier profile stopped the walk), pin_failed (the plugin could
+/// not be pinned, so nothing was read) or prior_mount_still_running (an earlier walk's abandoned
+/// worker has not returned).
 struct RetryRetained {
     std::string sid;
     std::string cause;

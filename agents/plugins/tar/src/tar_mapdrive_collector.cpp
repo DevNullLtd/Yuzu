@@ -1116,9 +1116,9 @@ bool pin_plugin_module() noexcept {
                                    GET_MODULE_HANDLE_EX_FLAG_PIN,
                                reinterpret_cast<LPCWSTR>(&pin_plugin_module), &module))
             return true;
-        spdlog::error("TAR mapdrive: could not pin the plugin module (GetLastError {}); hive "
-                      "mounts are not attempted, because a detached mount thread must not outlive "
-                      "an unload",
+        spdlog::error("TAR mapdrive: could not pin the plugin module (GetLastError {}); no hive "
+                      "is read (live or offline) until the agent restarts, because a detached "
+                      "mount thread must not outlive an unload",
                       GetLastError());
         return false;
     }();

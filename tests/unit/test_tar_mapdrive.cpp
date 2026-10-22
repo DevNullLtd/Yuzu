@@ -1347,6 +1347,10 @@ TEST_CASE("mapdrive backfill parse_pending_state: a zero and a positive count fo
     REQUIRE(st.profiles.size() == 2);
     CHECK(st.profiles[0].attempts == 3);
     CHECK(st.profiles[1].attempts == 0);
+    // And in the other order: the zero must not overwrite the positive count.
+    const PendingState rev = parse_pending_state("0;S-1-5-21-1:3;S-1-5-21-1:0", 7);
+    REQUIRE(rev.profiles.size() == 1);
+    CHECK(rev.profiles[0].attempts == 3);
 }
 
 TEST_CASE("mapdrive backfill initial_pending: an outcome that was not attempted is never "

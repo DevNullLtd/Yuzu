@@ -3,8 +3,9 @@
 
 enum_registry_outbound_history (agents/plugins/tar/src/tar_mapdrive_collector.cpp, Windows only)
 abandons a mount thread that outlives its bound; that thread keeps running TAR code and nothing
-joins it. The only thing between it and an unmapped module is the pin taken on the timeout, and
-the Windows bodies cannot run in the unit suites (the decision policy itself is unit-tested in
+joins it, and so does a worker that COMPLETES (it destroys its plugin-resident closure after
+publishing the result). The only thing between them and an unmapped module is the pin taken before
+the first mount, and the Windows bodies cannot run in the unit suites (the decision policy itself is unit-tested in
 test_tar_mapdrive.cpp), so this pins the wiring lexically. Invariants:
 
   1. pin_plugin_module pins by address: GET_MODULE_HANDLE_EX_FLAG_PIN | ..._FROM_ADDRESS, with
@@ -74,6 +75,8 @@ def problems(collector_src, plugin_src):
     if pin is None:
         out.append("pin_plugin_module() is missing")
     else:
+        if "return true;" not in pin or "return false;" not in pin:
+            out.append("pin_plugin_module() must return true on success and false on failure")
         for tok in ("GET_MODULE_HANDLE_EX_FLAG_PIN", "GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS",
                     "&pin_plugin_module)"):
             if tok not in pin:
@@ -99,8 +102,12 @@ def problems(collector_src, plugin_src):
             out.append("the walk no longer asks decide_mount_call")
         if not re.search(r"mounts_halted = decision\.halt_walk;", walk):
             out.append("the timeout branch no longer halts the walk")
-        if not re.search(r"outcome\.attempted = decision\.attempted;", walk):
-            out.append("the timeout/rejection outcome no longer carries decision.attempted")
+        if not re.search(r"outcome\.status = yuzu::win::HiveAccessStatus::mount_failed; "
+                         r"outcome\.token = cause; outcome\.attempted = decision\.attempted; "
+                         r"outcome\.complete = true; h\.profiles\.push_back\(std::move\(outcome\)\); "
+                         r"mounts_halted = decision\.halt_walk; .*?continue; \}", walk):
+            out.append("the timeout/rejection branch must record a mount_failed outcome carrying "
+                       "decision.attempted, halt the walk and continue")
         if not re.search(r"const MountWorkerGuard \w+;[^}]*?with_user_hive\(", walk):
             out.append("the mount worker closure no longer counts itself in flight")
         halted = re.search(r"if \(mounts_halted\) \{ ProfileHiveOutcome skipped;([^{}]*?)"
@@ -186,12 +193,15 @@ class TarMapdrivePinLexical(unittest.TestCase):
                 mutate(c, "skipped.token = halted_token;", "skipped.token = halted_token;"),
                 "h.profiles.push_back(std::move(skipped));\n            continue;",
                 "h.profiles.push_back(std::move(skipped));"), p),
-            "halted check moved past the mount": (mutate(
-                mutate(c, "if (mounts_halted) {\n            // Not tried",
-                          "if (false) {\n            // Not tried"),
-                "auto bounded = yuzu::shared::bounded_call_ex(",
-                "if (mounts_halted) { h.profiles.push_back(ProfileHiveOutcome{}); continue; }\n"
-                "        auto bounded = yuzu::shared::bounded_call_ex("), p),
+            "a mount is started before the halted block": (mutate(
+                c, "if (mounts_halted) {\n            // Not tried",
+                   "{ auto early = yuzu::shared::bounded_call_ex(kHiveMountBoundMs, [] { return 0; });"
+                   " (void)early; }\n        if (mounts_halted) {\n            // Not tried"), p),
+            "pin returns true on failure": (mutate(
+                c, "        return false;\n    }();", "        return true;\n    }();"), p),
+            "timeout outcome loses its halt": (mutate(
+                c, "h.profiles.push_back(std::move(outcome));\n            mounts_halted =",
+                   "h.profiles.push_back(std::move(outcome));\n            (void)"), p),
             "row_cap label dropped": (mutate(c, '"row_cap"', '"ok"'), p),
             "MountPoints2 failure no longer skips": (mutate(
                 c, "note_failure(sk_rc);\n                        idx++;", "idx++;"), p),
