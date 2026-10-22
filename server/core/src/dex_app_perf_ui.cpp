@@ -266,7 +266,7 @@ std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& app
                                "report retained daily summaries. Per-application sampling "
                                "(procperf_enabled) is on by default; a device appears after its "
                                "first completed UTC day, so check procperf_enabled on any device "
-                               "that never does.");
+                               "that never appears.");
 
     // -- Controls: search, platform, sort — CSP-safe (htmx core attrs only, no
     // hx-on). Each control's hx-get carries every OTHER current param so a

@@ -1807,7 +1807,7 @@ private:
 
         // ARP diff (ADR-0015). Implemented on Windows, Linux, and macOS -- see the
         // registry (tar_schema_registry.cpp) for the platform-specific field
-        // constraints. Non-fatal on insert failure — the always-on legs above
+        // constraints. Non-fatal on insert failure — the core legs above
         // already committed, so a failure here must not misreport a healthy tick;
         // the diff baseline is advanced ONLY on success so a failed insert retries
         // the same deltas next tick.
@@ -2000,7 +2000,7 @@ private:
         // SRE/UP-1: enumerate the syscall-heavy network sources (arp via
         // GetIpNetTable2; dns via DnsGetCacheDataTable + up to kDnsEntryCap cache-only
         // DnsQuery_W calls) BEFORE taking collect_mu_, so a large host cache cannot
-        // stall the always-on process/tcp legs or the fleet-snapshot pump (mirrors
+        // stall the core process/tcp legs or the fleet-snapshot pump (mirrors
         // do_collect_perf's lock-free counter read). The diff/insert/state-save still
         // run under collect_mu_ inside collect_fast_impl.
         const bool arp_on = source_enabled(*db_, "arp");

@@ -526,8 +526,8 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // injection, and BYOVD surface $Process cannot answer. `module_dir` IS
         // captured (the hijack signal is the path, not a command line — a narrow,
         // deliberate divergence from the names-only process posture; no cmdline).
-        // M1 registers the schema queryable-empty; collectors are kPlanned until
-        // M2 (Windows ETW), M4/M5 (macOS ES), M6 (Linux auditd kmod). The high-
+        // M1 registered the schema queryable-empty; the Windows collector (M2, ETW)
+        // has shipped, macOS ES (M4/M5) and Linux auditd kmod (M6) are kPlanned. The high-
         // volume edge risk-filter that really bounds module_live ships with the
         // first collector; own `module_enabled` toggle, on by default.
         {

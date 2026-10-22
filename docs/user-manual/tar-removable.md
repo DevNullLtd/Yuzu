@@ -13,9 +13,9 @@ fleet-wide the same way as any other TAR source
 
 Default-on is **not** a finding that this source is privacy-neutral. It
 records vendor/product/serial and executed-binary paths — identity and
-usage-class data — so the works-council posture applies in full. Under the
-Wave 6 ruling (`docs/tar-implementer.md`) that posture attaches to the
-**lookback control** rather than to the enable flag: set
+usage-class data — so the works-council posture applies in full. Because every
+TAR source ships enabled, that posture attaches to the **lookback control**
+rather than to the enable flag: set
 `removable_lookback_seconds=0` for forward-only collection on a host where a
 retrospective read of the OS's retained removable history is not lawful.
 Because the obligation now lands at *upgrade* rather than at an operator's

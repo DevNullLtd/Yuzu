@@ -83,6 +83,8 @@ ModuleSignVerdict SigningCache::get(const std::string& full_path, std::int64_t m
 #include <wintrust.h>
 #include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 
+#include "tar_local_image_path.hpp" // refuse network-path images (see image_path_is_local)
+
 #include <atomic>
 #include <cstring> // std::memset (stale-session props reset)
 #include <thread>
@@ -148,6 +150,15 @@ std::string nt_path_to_win32(const std::string& p) {
 }
 
 std::string wide_to_utf8(const std::wstring& w) { return yuzu::win::from_wide(w.c_str()); }
+
+// True when `p` (UTF-8, as delivered, BEFORE nt_path_to_win32) is on a local fixed volume
+// and so safe to hand to the file/trust APIs; see tar_local_image_path.hpp. The only
+// Windows API here is GetDriveTypeW on the 3-char drive root (drive-letter forms only).
+bool image_path_is_local(const std::string& p) {
+    const std::string root = drive_root_of(p);
+    const unsigned drive_type = root.empty() ? 0U : GetDriveTypeW(utf8_to_wide(root).c_str());
+    return is_local_fixed_image_path(p, drive_type);
+}
 
 // Read a named UInt32 property from a decoded event. Returns false if absent.
 bool prop_u32(EVENT_RECORD* rec, const wchar_t* name, std::uint32_t& out) {
@@ -518,15 +529,24 @@ std::vector<ModuleEvent> ModuleEtwCollector::drain() {
             full.push_back('\\');
         }
         full += e.module_name;
-        // Convert the NT device path to a Win32 path the file/trust APIs accept
-        // (governance HIGH) — used for stat, verify, AND the cache key (so the
-        // key is the path actually verified).
-        const std::string vpath = nt_path_to_win32(full);
-        const std::wstring wvpath = utf8_to_wide(vpath);
-        const std::int64_t mtime = wvpath.empty() ? 0 : file_mtime_unix(wvpath);
-        const ModuleSignVerdict v = sign_cache_.get(vpath, mtime, &verify_image_signature_win);
-        e.signed_state = v.state;
-        e.signer = v.signer;
+        if (!image_path_is_local(full)) {
+            // Not a local fixed volume (UNC / \Device\Mup / a network drive): the agent runs
+            // as LocalSystem, so opening it would authenticate the machine account to that
+            // host and could stall this drain (it runs under collect_mu_). Open NOTHING (not
+            // even GetFileAttributesExW): keep the row with an unknown verdict.
+            e.signed_state = ModuleSignedState::kUnknown;
+            e.signer.clear();
+        } else {
+            // Convert the NT device path to a Win32 path the file/trust APIs accept
+            // (governance HIGH) — used for stat, verify, AND the cache key (so the
+            // key is the path actually verified).
+            const std::string vpath = nt_path_to_win32(full);
+            const std::wstring wvpath = utf8_to_wide(vpath);
+            const std::int64_t mtime = wvpath.empty() ? 0 : file_mtime_unix(wvpath);
+            const ModuleSignVerdict v = sign_cache_.get(vpath, mtime, &verify_image_signature_win);
+            e.signed_state = v.state;
+            e.signer = v.signer;
+        }
         // Privacy edge-drop AFTER signing (governance BLOCKING): the stored dir
         // must never carry a username.
         e.module_dir = redact_module_dir(e.module_dir);

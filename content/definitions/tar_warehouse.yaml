@@ -37,7 +37,8 @@ spec:
           $TCP_Live, $TCP_Hourly, $TCP_Daily, $TCP_Monthly,
           $Service_Live, $Service_Hourly, $User_Live, $User_Daily, and
           $ARP_Live/$ARP_Hourly and $DNS_Live/$DNS_Hourly (ADR-0015; need
-          arp_enabled / dns_enabled left on, Windows-only today — empty elsewhere).
+          arp_enabled / dns_enabled left on; $ARP_* is collected on Windows, Linux and
+          macOS (constrained), $DNS_* on Windows only today — empty elsewhere).
     required: [sql]
 
   result:

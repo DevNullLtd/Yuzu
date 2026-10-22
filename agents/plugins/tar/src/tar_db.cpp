@@ -825,11 +825,38 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
                 spdlog::error("TarDatabase: v8 migration failed at '{}' — rolled back, schema "
                               "remains at v7, retried on the next open",
                               failed_step);
-                sqlite3_exec(raw_db, "ROLLBACK TO v8_migration", nullptr, nullptr, nullptr);
-                sqlite3_exec(raw_db, "RELEASE v8_migration", nullptr, nullptr, nullptr);
+                const int rollback_rc =
+                    sqlite3_exec(raw_db, "ROLLBACK TO v8_migration", nullptr, nullptr, nullptr);
+                const int release_rc =
+                    sqlite3_exec(raw_db, "RELEASE v8_migration", nullptr, nullptr, nullptr);
+                if (rollback_rc != SQLITE_OK || release_rc != SQLITE_OK) {
+                    // An open savepoint would leave every later write uncommitted until
+                    // close. A plain ROLLBACK ends it; with no transaction open it fails
+                    // harmlessly, so its result is ignored.
+                    spdlog::error("TarDatabase: v8 rollback incomplete (ROLLBACK TO rc={}, "
+                                  "RELEASE rc={}): {} — ending the transaction",
+                                  rollback_rc, release_rc, sqlite3_errmsg(raw_db));
+                    sqlite3_exec(raw_db, "ROLLBACK", nullptr, nullptr, nullptr);
+                }
             }
         }
     }
+
+#ifndef _WIN32
+    // Owner-only (0600) on the db and its WAL sidecars, as command_dedup_store does
+    // (security-hardening.md "chmod 600 *.db"): the packaged state directory is not a
+    // confidentiality boundary (agent-privilege-model.md), and tar.db now holds every
+    // capture source. Best-effort per file (-wal/-shm may not exist yet); a chmod failure
+    // never fails an otherwise-healthy open. SQLite derives later -wal/-shm modes from the
+    // db file. POSIX mode bits only: the Windows state-directory ACL is a packaging item.
+    for (const char* suffix : {"", "-wal", "-shm"}) {
+        std::error_code pec;
+        std::filesystem::permissions(path.string() + suffix,
+                                     std::filesystem::perms::owner_read |
+                                         std::filesystem::perms::owner_write,
+                                     std::filesystem::perm_options::replace, pec);
+    }
+#endif
 
     // Open a dedicated read-only, authorizer-sandboxed connection for untrusted
     // operator SQL (the tar.sql action). On this handle writes are structurally

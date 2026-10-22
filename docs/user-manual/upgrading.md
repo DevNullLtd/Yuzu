@@ -6,11 +6,13 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **What changed.** All 16 TAR capture sources now ship enabled on every OS. Eight of them were off by default before: `procperf`, `netqual`, `module`, `software`, `arp`, `dns`, `netconn` and `mapdrive`. A fresh agent now reports `<source>_enabled|true` in `tar.status` for all of them.
 
-**One-time reset on upgrade.** The first time an upgraded agent starts, it migrates its `tar.db` to schema version 8. For each of the eight sources above whose stored `<source>_enabled` value is `false` (including a value an operator set deliberately), the migration sets it to `true` and clears the source's `<source>_paused_at` marker, in one transaction. A value of `errored` is left alone, as are the stored values of the eight sources that were already on (`process`, `tcp`, `service`, `user`, `perf`, `power`, `removable`, `usage`). If any step fails, the whole migration rolls back and is retried on the next start.
+**Before you upgrade, if you paused any of the eight on purpose** (for example to preserve evidence): run `tar.status` on that agent and record its `config|<source>_enabled|false` lines, and export what you need with `tar.query` or `tar.sql`. The reset re-enables the source, and retention skips only disabled sources, so the exemption ends with it: from the first rollup pass after the upgrade (rollups run every 15 minutes) rows older than their tier cutoff start being pruned, and that cannot be undone. Re-applying `<source>_enabled=false` after the upgrade does not bring them back.
+
+**One-time reset on upgrade.** The first time an upgraded agent starts, it migrates its `tar.db` to schema version 8. For each of the eight sources above whose stored `<source>_enabled` value is `false` (including a value an operator set deliberately), the migration sets it to `true` and clears the source's `<source>_paused_at` marker, in one transaction. A value of `errored` (any stored value other than exactly `true` or `false`) is left alone, as are the stored values of the eight sources that were already on (`process`, `tcp`, `service`, `user`, `perf`, `power`, `removable`, `usage`). If any step fails, the agent logs `TarDatabase: v8 migration failed at` followed by the failing step, rolls the whole migration back and retries it on the next start; until a start succeeds the old stored values stay in force.
 
 **Opt-outs after the upgrade stick.** The reset runs once. A `<source>_enabled=false` written through `tar.configure` after the upgrade is kept across restarts and further upgrades.
 
-**What to check.** If you had deliberately disabled any of the eight sources, re-apply `<source>_enabled=false` after the upgrade. Expect new collection to begin without operator action: `module` (Windows ETW), the `netconn` and `mapdrive` history backfills (`netconn_lookback_seconds` bounds the first), `procperf` and the daily per-application performance sync it feeds. A source whose `<source>_enabled` row cannot be read is treated as disabled for that tick and its stored rows are kept.
+**What to expect.** New collection begins without operator action for `procperf` (and the daily per-application performance sync it feeds), `netqual`, `module` (Windows ETW), `software`, `arp`, `dns`, `netconn` and `mapdrive` (`netconn` and `mapdrive` also run history backfills; `netconn_lookback_seconds` bounds the first). A source whose `<source>_enabled` row cannot be read is treated as disabled for that tick and its stored rows are kept.
 
 ## ⚠️ Breaking: `POST` and `DELETE /api/v1/quarantine` now apply the dispatch approval check (#6065)
 
@@ -5077,8 +5079,8 @@ Before upgrading any component:
 - [ ] Note current version: `yuzu-server --version` / `yuzu-agent --version`
 - [ ] Plan a maintenance window (upgrades take < 5 minutes per component)
 - [ ] **Review new telemetry:** this release adds DEX per-application
-  performance sampling (`procperf`), a new usage-class data category. It
-  shipped **off by default** in that release; it is now on by default (see
+  performance sampling (`procperf`), a new usage-class data category. The
+  release that introduced `procperf` shipped it **off by default**; it is now on by default (see
   "Behaviour change: every TAR capture source is on by default" above) —
   disable it per host with `procperf_enabled=false` if it is not wanted. For an
   EU workforce, treat it as a works-council co-determination trigger. See the *DEX per-application sampling* upgrade note in

@@ -355,6 +355,8 @@ std::optional<ProcCounter> parse_linux_pid_stat(std::uint32_t pid, std::string_v
 #include <ctime>
 #include <vector>
 
+#include "tar_local_image_path.hpp" // refuse network-path images in resolve_one_version
+
 namespace yuzu::tar {
 
 namespace {
@@ -452,6 +454,17 @@ std::string resolve_one_version(std::uint32_t pid, std::int64_t create_time_100n
     WCHAR path[MAX_PATH * 2];
     DWORD path_len = static_cast<DWORD>(std::size(path));
     if (!::QueryFullProcessImageNameW(proc.h, 0, path, &path_len))
+        return {};
+
+    // Never open a network image: GetFileVersionInfo* below would read it as LocalSystem
+    // (machine-account auth to the share's host, an SMB stall on this thread). A UNC or
+    // non-fixed-drive path takes the unknown-version bucket ("") like any other failure.
+    // The only Windows API added is GetDriveTypeW on the 3-char drive root.
+    const std::string path_utf8 = yuzu::win::from_wide(path, static_cast<int>(path_len));
+    const std::string root = drive_root_of(path_utf8);
+    const unsigned drive_type =
+        root.empty() ? 0U : ::GetDriveTypeW(yuzu::win::to_wide(root).c_str());
+    if (!is_local_fixed_image_path(path_utf8, drive_type))
         return {};
 
     DWORD ignored = 0;

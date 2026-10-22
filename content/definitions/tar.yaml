@@ -532,9 +532,10 @@ spec:
           Enable or disable the image-load / module-stream capture source (module
           source → $Module_*). **On by default** — module-load capture is
           high-volume (every library and driver load per process, with a
-          code-signing verdict); no command line is ever captured. No data is
-          recorded until a collector for the host's OS ships ($Module_* tables
-          are queryable-empty until then). Set to "false" to opt out. Requires
+          code-signing verdict); no command line is ever captured. Windows
+          records image loads today (ETW); the Linux and macOS collectors are
+          planned, and there the $Module_* tables are queryable-empty. Set to
+          "false" to opt out. Requires
           agent v0.12.0+; older agents silently ignore. Valid: "true" | "false".
         validation:
           pattern: "^(true|false)$"
@@ -805,7 +806,7 @@ spec:
       - name: events_recorded
         type: int32
         description: >-
-          Count of change events this tick appended to the warehouse. Carried as the third field of the actual response line `tar|collect_fast|<events_recorded>|<token>`, where <token> is one of source_disabled / unsupported_platform / baseline / sample_recorded / cursor_advanced / cursor_lost / capture_incomplete / counters_unavailable. Values: non-negative integer.
+          Count of change events this tick appended to the warehouse. Carried as the third field of the actual response line `tar|collect_fast|<events_recorded>|<token>`, where <token> is one of source_disabled / unsupported_platform / baseline / sample_recorded / cursor_advanced / cursor_lost / capture_incomplete / counters_unavailable / state_unreadable. Values: non-negative integer.
         example: "-"
         platforms: [windows, linux, darwin]
 

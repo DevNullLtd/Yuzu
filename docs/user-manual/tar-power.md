@@ -18,9 +18,8 @@ baseline device-health and battery/charging-posture investigations from day one.
 Default-on is **not** a finding that these events are privacy-neutral. The
 *timing* of sleep/wake and AC transitions is a presence and working-hours
 proxy, exactly as connectivity history is, so the same works-council posture
-as `netconn` applies in full. Under the Wave 6 ruling
-(`docs/tar-implementer.md`) that posture attaches to the **lookback control**
-rather than to the enable flag: set `power_lookback_seconds=0` for
+as `netconn` applies in full. Because every TAR source ships enabled, that posture
+attaches to the **lookback control** rather than to the enable flag: set `power_lookback_seconds=0` for
 forward-only collection on a host where a retrospective read of the OS's
 retained power log is not lawful. Because the obligation now lands at
 *upgrade* rather than at an operator's opt-in, it is a stronger duty to
