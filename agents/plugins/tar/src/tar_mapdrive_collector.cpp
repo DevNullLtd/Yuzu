@@ -386,6 +386,20 @@ std::string word_after(const std::string& line, const std::string& marker) {
     return buf;
 }
 
+// Windows inbound-logon history query (wevtutil qe Security ... /c:N /f:text):
+// the event count and the runner's output cap must agree, or a normal Security
+// log truncates the capture and the whole backfill is thrown away as incomplete.
+// Defined here, outside the _WIN32 leg, so the pin below compiles on every host.
+// Measured live on kingsley 2026-10-22 (31,362-record Security log): one /f:text
+// 4624 rendering averages 2.62 KB, so 500 events = 1.3 MB. The 8 KiB per-event
+// figure is a documented worst case (~3x the measured average), not a measurement.
+constexpr unsigned kWinInboundLogonEventCount = 500;
+constexpr std::size_t kWinRenderedLogonEventMaxBytes = 8u * 1024;
+constexpr std::size_t kWinInboundLogonOutputCap = 8u * 1024 * 1024;
+static_assert(kWinInboundLogonEventCount * kWinRenderedLogonEventMaxBytes <=
+                  kWinInboundLogonOutputCap,
+              "wevtutil /c count must fit the runner output cap");
+
 } // namespace
 
 // Collapse duplicate history rows by mapping identity, preferring the smallest
@@ -1089,9 +1103,10 @@ std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
     enum_registry_outbound_history(rows);
     // Inbound history: Security event log 4624 (successful logon), filtered to
     // logon_type=3 (network) by the parser. Query 4624 ONLY — 4634 (logoff) is
-    // not parsed, so including it would waste up to half the newest-first /c:5000
+    // not parsed, so including it would waste up to half the newest-first event
     // budget on events we discard, halving the effective backfill depth. Bounded
-    // read; constant query (no interpolation). Empty on access denial.
+    // read; constant query (the only formatted part is the compile-time event
+    // count). Empty on access denial.
     //
     // The \" quotes the old shell string wrapped around the XPath were
     // SHELL-level protection (so the space-and-bracket-laden filter survived
@@ -1104,12 +1119,20 @@ std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
                                      "qe",
                                      "Security",
                                      "/q:*[System[(EventID=4624)]]",
-                                     "/c:5000",
+                                     std::format("/c:{}", kWinInboundLogonEventCount),
                                      "/f:text",
                                      "/rd:true"};
     auto run = yuzu::agent::run_bounded_subprocess(
         argv, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(15),
-                                             .output_cap_bytes = 8u * 1024 * 1024});
+                                             .output_cap_bytes = kWinInboundLogonOutputCap});
+    // Count/cap relation, measured live on kingsley 2026-10-22 (31,362-record
+    // Security log): /c:5000 rendered 13.1 MB, over the 8 MiB cap, so the former
+    // call always tripped output_truncated and never recorded a row; /c:500
+    // renders ~1.3 MB; wevtutil alone ~0.3 s to a file, the runner's capture adds
+    // build-dependent time (~4 s per fresh data dir in a Debug build on one host,
+    // Release not measured). kWinInboundLogonEventCount is pinned against the
+    // cap by the static_assert beside the constants.
+    //
     // zero_exit_required=true is ASSUMED from documented wevtutil behaviour
     // (`wevtutil qe` exits 0 on a successful query including zero matching
     // events, non-zero on a channel/query error), NOT independently verified
