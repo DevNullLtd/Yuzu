@@ -38,6 +38,7 @@
 #include <catch2/interfaces/catch_interfaces_capture.hpp>
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -213,8 +214,8 @@ struct WiringServer {
     // The httplib::Request address each handler saw (compared, never dereferenced).
     std::atomic<const void*> rotate_req_addr{nullptr};
     std::atomic<const void*> raise_req_addr{nullptr};
-    std::atomic<std::size_t> raise_thread{0};
-    std::atomic<std::size_t> unclassified_thread{0};
+    std::atomic<std::thread::id> raise_thread{};
+    std::atomic<std::thread::id> unclassified_thread{};
     std::atomic<const void*> unclassified_req_addr{nullptr};
 
     yuzu::MetricsRegistry metrics;
@@ -292,7 +293,7 @@ struct WiringServer {
                                                  httplib::Response& res) {
             raise_handler_calls.fetch_add(1);
             raise_req_addr.store(&req);
-            raise_thread.store(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+            raise_thread.store(std::this_thread::get_id());
             // The production shape of a kRequired handler with no class guard of its own: resolve
             // the session, consume the central pass for it, otherwise evaluate that session afresh
             // (`require_mfa_step_up` is decide + effects + render over a real store; this stub
@@ -335,7 +336,7 @@ struct WiringServer {
                      unclassified_handler_calls.fetch_add(1);
                      unclassified_req_addr.store(&req);
                      unclassified_saw_binding.store(detail::tls_step_up_pass().bound);
-                     unclassified_thread.store(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+                     unclassified_thread.store(std::this_thread::get_id());
                      const auto handler_session = resolver(req);
                      unclassified_resolved.store(handler_session.has_value());
                      unclassified_consumed_rotate_pass.store(
@@ -1201,13 +1202,17 @@ TEST_CASE("wiring: every resolution after the central check yields the principal
         // Read from the worker's own thread_local, so a leaked binding is seen whatever address
         // the second request was served at.
         CHECK_FALSE(s.unclassified_saw_binding.load());
-        // A leaked binding is only visible when both requests ran on one worker thread.
+        // A leaked binding is only visible when both requests ran on one worker thread. One
+        // keep-alive connection is normally served by one worker, but that is httplib's
+        // behaviour, not a contract, so a different thread is reported rather than asserted. The
+        // deterministic pins are the unit-level lifecycle cases in test_step_up_gate.cpp.
         if (s.raise_thread.load() != s.unclassified_thread.load())
             WARN("the two requests were served by different worker threads in this build, so this "
                  "case did not exercise the same-thread premise (the unit-level case does)");
-        // Whether the two requests land on one httplib::Request address is the allocator's choice
-        // (see the keep-alive case above); a leaked binding is only visible when they do, so say
-        // so when they do not. The same-address sequence is pinned at the unit level.
+        // The `httplib::Request` is a stack local per request, so on one connection its address is
+        // normally the same, but a build may place it differently (a sanitizer's stack handling,
+        // say). The resolution check above needs the same address, so say so when it differs; the
+        // stash read above does not.
         if (s.raise_req_addr.load() != s.unclassified_req_addr.load())
             WARN("the two requests were served at different httplib::Request addresses in this "
                  "build, so this case did not exercise the same-address premise");
@@ -1619,11 +1624,15 @@ TEST_CASE("wiring: server.cpp clears the pass stash at the pre-routing top and p
     CHECK(stage < post_routing);
 
     // Post-routing: the finish call sits in the post-routing handler, after the handler's
-    // first-local scope guard and before the response headers are written.
+    // first-local scope guard, before the quota-slot release and before the response headers are
+    // written, so the stash and the binding are cleared before any later code in the lambda runs.
     CHECK(post_routing < finish);
     const auto guard = src.find("} engine_class_stash_clear;", post_routing);
     REQUIRE(guard != std::string::npos);
     CHECK(guard < finish);
+    const auto post_quota_reset = src.find("detail::tls_quota_slot().reset();", post_routing);
+    REQUIRE(post_quota_reset != std::string::npos);
+    CHECK(finish < post_quota_reset);
     const auto headers = src.find("security_headers.apply(res);", finish);
     REQUIRE(headers != std::string::npos);
     CHECK(finish < headers);
@@ -1631,47 +1640,120 @@ TEST_CASE("wiring: server.cpp clears the pass stash at the pre-routing top and p
 
 namespace {
 
+bool is_ident_char(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+}
+
+struct Stripped {
+    std::string text;
+    bool clean{true}; // false if the scan ended inside a comment, string or character literal
+};
+
 // Source text with comments removed and string and character literals blanked, so a mention in a
-// comment or a message cannot count as a call.
-std::string strip_comments_and_literals(const std::string& in) {
-    std::string out;
+// comment or a message cannot count as a call. A character literal opens only when the preceding
+// identifier run is empty or one of the encoding prefixes (a digit separator, as in 120'000, is
+// not one), and a raw string (`R"delim( ... )delim"`, with the u8/u/U/L prefixes) ends at its own
+// delimiter, not at the next quote.
+Stripped strip_comments_and_literals(const std::string& in) {
+    Stripped r;
+    auto& out = r.text;
     out.reserve(in.size());
-    for (std::size_t i = 0; i < in.size();) {
+    const auto n = in.size();
+    const auto ident_before = [&](std::size_t i) {
+        auto b = i;
+        while (b > 0 && is_ident_char(in[b - 1]))
+            --b;
+        return in.substr(b, i - b);
+    };
+    for (std::size_t i = 0; i < n;) {
         const char c = in[i];
-        if (c == '/' && i + 1 < in.size() && in[i + 1] == '/') {
-            while (i < in.size() && in[i] != '\n')
+        if (c == '/' && i + 1 < n && in[i + 1] == '/') {
+            while (i < n && in[i] != '\n')
                 ++i;
-        } else if (c == '/' && i + 1 < in.size() && in[i + 1] == '*') {
-            i += 2;
-            while (i + 1 < in.size() && !(in[i] == '*' && in[i + 1] == '/'))
+        } else if (c == '/' && i + 1 < n && in[i + 1] == '*') {
+            const auto end = in.find("*/", i + 2);
+            if (end == std::string::npos) {
+                r.clean = false;
+                break;
+            }
+            out += ' ';
+            i = end + 2;
+        } else if (c == '"') {
+            const auto id = ident_before(i);
+            if (id == "R" || id == "u8R" || id == "uR" || id == "UR" || id == "LR") {
+                const auto open = in.find('(', i + 1);
+                if (open == std::string::npos || open - (i + 1) > 16) {
+                    r.clean = false;
+                    break;
+                }
+                const std::string close = ")" + in.substr(i + 1, open - (i + 1)) + "\"";
+                const auto end = in.find(close, open + 1);
+                if (end == std::string::npos) {
+                    r.clean = false;
+                    break;
+                }
+                out += "\"\"";
+                i = end + close.size();
+            } else {
                 ++i;
-            i += 2;
-        } else if (c == '"' || c == '\'') {
-            out += c;
-            ++i;
-            while (i < in.size() && in[i] != c) {
-                if (in[i] == '\\')
+                while (i < n && in[i] != '"') {
+                    if (in[i] == '\\')
+                        ++i;
                     ++i;
+                }
+                if (i >= n) {
+                    r.clean = false;
+                    break;
+                }
+                out += "\"\"";
                 ++i;
             }
-            out += c;
-            ++i;
+        } else if (c == '\'') {
+            const auto id = ident_before(i);
+            if (!id.empty() && id != "L" && id != "u" && id != "U" && id != "u8") {
+                out += c; // a digit separator, not a literal
+                ++i;
+            } else {
+                ++i;
+                while (i < n && in[i] != '\'') {
+                    if (in[i] == '\\')
+                        ++i;
+                    ++i;
+                }
+                if (i >= n) {
+                    r.clean = false;
+                    break;
+                }
+                out += "''";
+                ++i;
+            }
         } else {
             out += c;
             ++i;
         }
     }
-    return out;
+    return r;
 }
 
-// Member-call sites of `name(`: occurrences directly preceded by `.` or `->`. A declaration or a
-// `Class::name(` definition is not a call site.
+// Member-call sites of `name`: the whole identifier, then optional whitespace and `(`, directly
+// after `.` or `->` (whitespace, including newlines, allowed around the name). A declaration, a
+// `Class::name(` definition and a longer identifier ending in `name` are not call sites.
 std::size_t member_calls_of(const std::string& code, std::string_view name) {
     std::size_t n = 0;
-    const std::string needle = std::string(name) + "(";
-    for (auto at = code.find(needle); at != std::string::npos; at = code.find(needle, at + 1)) {
-        const bool dot = at >= 1 && code[at - 1] == '.';
-        const bool arrow = at >= 2 && code[at - 1] == '>' && code[at - 2] == '-';
+    for (auto at = code.find(name); at != std::string::npos; at = code.find(name, at + 1)) {
+        const auto end = at + name.size();
+        if (end < code.size() && is_ident_char(code[end]))
+            continue;
+        auto k = end;
+        while (k < code.size() && std::isspace(static_cast<unsigned char>(code[k])) != 0)
+            ++k;
+        if (k >= code.size() || code[k] != '(')
+            continue;
+        auto b = at;
+        while (b > 0 && std::isspace(static_cast<unsigned char>(code[b - 1])) != 0)
+            --b;
+        const bool dot = b >= 1 && code[b - 1] == '.';
+        const bool arrow = b >= 2 && code[b - 1] == '>' && code[b - 2] == '-';
         if (dot || arrow)
             ++n;
     }
@@ -1695,14 +1777,69 @@ std::string body_of(const std::string& code, std::string_view signature) {
     return {};
 }
 
+std::string read_file(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
 } // namespace
+
+// The stripper behind the validator floor below. A desync (a digit separator read as the start of
+// a character literal, a raw string ended at an inner quote) would hide a real call from the floor
+// without any other symptom, so each failure mode has its own case.
+TEST_CASE("wiring: the validator floor's source stripper handles digit separators, raw strings and "
+          "split calls",
+          "[stepup][wiring][lexical][stepbind]") {
+    const auto count = [](const std::string& src, std::string_view name = "validate_session") {
+        const auto stripped = strip_comments_and_literals(src);
+        CHECK(stripped.clean);
+        return member_calls_of(stripped.text, name);
+    };
+
+    SECTION("a digit separator does not open a character literal") {
+        CHECK(count("int n = 120'000; a.validate_session(n); char c = 'z';") == 1);
+        CHECK(count("auto x = 1'000'000; b->validate_session(x); auto y = 0xFF'FF;") == 1);
+    }
+    SECTION("a raw string ends at its own delimiter, whatever quotes it holds") {
+        CHECK(count(R"TEST(auto s = R"x(he said "hi" and 'it's)x"; a.validate_session(1);)TEST") == 1);
+        CHECK(count(R"TEST(auto s = u8R"(a "q" b)"; a.validate_session(1);)TEST") == 1);
+    }
+    SECTION("text inside a raw string, a string or a comment is not a call") {
+        CHECK(count(R"TEST(auto s = R"(a.validate_session(1))";)TEST") == 0);
+        CHECK(count("auto s = \"a.validate_session(1)\";") == 0);
+        CHECK(count("// a.validate_session(1)\n/* b->validate_session(2) */") == 0);
+    }
+    SECTION("a call split across lines, or with a space before the parenthesis, counts") {
+        CHECK(count("a\n  .validate_session\n  (x);") == 1);
+        CHECK(count("a->validate_session (x);") == 1);
+        CHECK(count("a  .  validate_session(x);") == 1);
+    }
+    SECTION("only member calls of the whole identifier count") {
+        CHECK(count("validate_session(x);") == 0);
+        CHECK(count("a.revalidate_session(x);") == 0);
+        CHECK(count("std::optional<S> AuthManager::validate_session(const T& t) const {}") == 0);
+        CHECK(count("a.validate_token_checked(x);", "validate_token") == 0);
+        CHECK(count("a.validate_token_checked(x);", "validate_token_checked") == 1);
+    }
+    SECTION("a quote in a character literal or an apostrophe in a comment does not desync") {
+        CHECK(count("char q = '\"'; a.validate_session(1);") == 1);
+        CHECK(count("auto w = L'\"'; a.validate_session(1);") == 1);
+        CHECK(count("// don't\na.validate_session(1);") == 1);
+        CHECK(count("auto s = \"it's\"; a.validate_session(1);") == 1);
+    }
+    SECTION("an unterminated construct is reported, not silently accepted") {
+        CHECK_FALSE(strip_comments_and_literals("a.validate_session(1); /* open").clean);
+        CHECK_FALSE(strip_comments_and_literals("auto s = \"open").clean);
+        CHECK_FALSE(strip_comments_and_literals("auto s = R\"x(open").clean);
+    }
+}
 
 // A direct credential validator in server/core/src decides a principal WITHOUT passing through
 // `AuthRoutes::resolve_session`, so it is not covered by the per-request principal binding. The
 // documented direct validators are listed here with the reason each does not authorise a gated
 // (kRequired) handler. A new one fails this test: route it through `resolve_session`, or add it
-// here with its reason. It is a source-text floor over member calls of `validate_session(` and
-// `validate_token(` (not `validate_token_checked(`, and not other types' free functions).
+// here with its reason. It is a source-text floor over member calls of `validate_session(`,
+// `validate_token(` and `validate_token_checked(` (not other types' free functions).
 TEST_CASE("wiring: every direct session or token validator is either the resolve_session walk or a "
           "documented non-gated call site",
           "[stepup][wiring][lexical][stepbind]") {
@@ -1710,6 +1847,7 @@ TEST_CASE("wiring: every direct session or token validator is either the resolve
     struct Count {
         std::size_t session{0};
         std::size_t token{0};
+        std::size_t token_checked{0};
     };
     std::map<std::string, Count> found;
     std::size_t files = 0;
@@ -1718,47 +1856,53 @@ TEST_CASE("wiring: every direct session or token validator is either the resolve
         if (!entry.is_regular_file() || (ext != ".cpp" && ext != ".hpp"))
             continue;
         ++files;
-        std::ifstream in(entry.path(), std::ios::binary);
-        const std::string code = strip_comments_and_literals(
-            std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()));
-        Count c{member_calls_of(code, "validate_session"), member_calls_of(code, "validate_token")};
-        if (c.session != 0 || c.token != 0)
-            found[fs::relative(entry.path(), YUZU_SERVER_SRC_DIR).generic_string()] = c;
+        const auto rel = fs::relative(entry.path(), YUZU_SERVER_SRC_DIR).generic_string();
+        const auto stripped = strip_comments_and_literals(read_file(entry.path()));
+        // A scan that ended inside a comment or literal desynced, and everything after the
+        // desync point is unscanned.
+        INFO("stripper desynced on " << rel);
+        REQUIRE(stripped.clean);
+        Count c{member_calls_of(stripped.text, "validate_session"),
+                member_calls_of(stripped.text, "validate_token"),
+                member_calls_of(stripped.text, "validate_token_checked")};
+        if (c.session != 0 || c.token != 0 || c.token_checked != 0)
+            found[rel] = c;
     }
     REQUIRE(files > 100); // the scan really walked the tree
 
-    const auto auth_code = [] {
-        std::ifstream in(std::string(YUZU_SERVER_SRC_DIR) + "/auth_routes.cpp", std::ios::binary);
-        return strip_comments_and_literals(
-            std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()));
-    }();
+    const auto auth_code =
+        strip_comments_and_literals(read_file(std::string(YUZU_SERVER_SRC_DIR) + "/auth_routes.cpp"))
+            .text;
     // The credential walk behind resolve_session: the one place the cookie and token credentials
     // are validated for a request, bound by `resolve_session`'s wrapper.
     const auto walk = body_of(auth_code, "AuthRoutes::resolve_session_unbound(");
     CHECK(member_calls_of(walk, "validate_session") == 1);
     CHECK(member_calls_of(walk, "validate_token") == 2);
+    CHECK(member_calls_of(walk, "validate_token_checked") == 0);
 
     // Everything else, by file. auth_routes.cpp (outside the walk): revalidate_stream (stream
-    // liveness, not a handler gate), the login and SSO callbacks that mint a session (pre-session),
-    // POST /api/v1/elevate (kOwnGate) and POST /api/v1/elevate/revoke (kExempt), all validating
-    // their own cookie only. settings_routes.cpp: the MFA enrolment confirm (kExempt), which
-    // compares the cookie session's username and auth source with the resolved session before
-    // stamping proof on it. scim_routes.cpp: the SCIM bearer store (SCIM rows are kExempt).
+    // liveness, not a handler gate; its token check is the one `validate_token_checked`), the
+    // login and SSO callbacks that mint a session (pre-session), POST /api/v1/elevate (kOwnGate)
+    // and POST /api/v1/elevate/revoke (kExempt), all validating their own cookie only.
+    // settings_routes.cpp: the MFA enrolment confirm (kExempt), which compares the cookie
+    // session's username and auth source with the resolved session before stamping proof on it.
+    // scim_routes.cpp: the SCIM bearer store (SCIM rows are kExempt).
     std::map<std::string, Count> allowed{
-        {"auth_routes.cpp", {1 + 5, 2}},
-        {"settings_routes.cpp", {1, 0}},
-        {"scim_routes.cpp", {0, 1}},
+        {"auth_routes.cpp", {1 + 5, 2, 1}},
+        {"settings_routes.cpp", {1, 0, 0}},
+        {"scim_routes.cpp", {0, 1, 0}},
     };
     for (const auto& [file, c] : found) {
         INFO("file: " << file << " (validate_session calls " << c.session << ", validate_token calls "
-                      << c.token << "). A new direct validator is not covered by the "
-                                    "one-principal-per-request binding: route it through AuthRoutes::resolve_session, or add "
-                                    "it to this allowlist with the reason it does not authorise a "
-                                    "gated handler.");
+                      << c.token << ", validate_token_checked calls " << c.token_checked
+                      << "). A new direct validator is not covered by the one-principal-per-request "
+                         "binding: route it through AuthRoutes::resolve_session, or add it to this "
+                         "allowlist with the reason it does not authorise a gated handler.");
         const auto it = allowed.find(file);
         REQUIRE(it != allowed.end());
         CHECK(c.session == it->second.session);
         CHECK(c.token == it->second.token);
+        CHECK(c.token_checked == it->second.token_checked);
     }
     for (const auto& [file, c] : allowed) {
         INFO("allowlisted file no longer has these calls: " << file);

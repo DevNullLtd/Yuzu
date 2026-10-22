@@ -15542,9 +15542,10 @@ private:
 
             // Step-up chokepoint: a pass that the in-handler gate never spent, on a 2xx
             // response, is counted as handler_skipped (report-only); always clears the stash,
-            // the per-request principal binding included. It is noexcept and runs BEFORE the
-            // quota-slot release below, so the stash and the binding are cleared even if that
-            // release throws.
+            // the per-request principal binding included. It is noexcept and runs before any
+            // later code in this lambda (the quota-slot release, the response headers), so the
+            // stash and the binding are cleared first. The lexical test in test_step_up_wiring.cpp
+            // pins this order.
             detail::finish_step_up_pass(req, res, &metrics_);
 
             // Per-principal quota (PR 4.4) — release the concurrency slot
