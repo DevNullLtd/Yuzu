@@ -31,6 +31,7 @@
 #include "instruction_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
+#include "test_forensics_tier_fixture.hpp"
 #include "test_route_sink.hpp"
 #include "test_export_cap_guard.hpp"
 
@@ -79,11 +80,15 @@ struct FragmentResultsHarness {
     // `sink` is declared LAST so it is destroyed FIRST, while the
     // `DashboardRoutes` whose `this` its handlers captured is still alive.
     yuzu::MetricsRegistry metrics;
+    // #4990: the caller's Forensics visibility (admin by default so the cases that are not about
+    // the tier keep their meaning). Declared before `routes`: the resolver borrows it.
+    yuzu::server::test::ForensicsCaller forensics;
     DashboardRoutes routes;
     yuzu::server::test::TestRouteSink sink;
 
     explicit FragmentResultsHarness(ResponseStore* response_store,
                                     InstructionStore* instruction_store = nullptr) {
+        yuzu::server::test::wire_forensics(routes, forensics);
         auto auth_fn = [](const httplib::Request&,
                           httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
@@ -956,4 +961,183 @@ TEST_CASE("/fragments/results: a malformed page or per_page is a 400 and valid v
     REQUIRE(ok);
     CHECK(ok->status == 200);
     CHECK(contains(ok->body, "page fragment output"));
+}
+
+// ── #4990: the Forensics tier on the results fragment, its facet options and the group count ────
+//
+// Real PG-backed store, the exact rendered HTML, and an ordinary-plugin control row in every case:
+// a stub that only recorded the filter it was handed would stay green with the SQL clause deleted.
+
+namespace {
+// Rows carry a distinctive output token so absence is checkable in the markup. The filterable
+// column is the plugin's second ("Category" for vuln_scan): Forensics rows reuse the SAME column
+// layout so one filter reaches both tiers.
+void put_tier_row(ResponseStore& rs, const std::string& command_id, const std::string& agent,
+                  const std::string& plugin, const std::string& token) {
+    StoredResponse r;
+    r.instruction_id = command_id;
+    r.agent_id = agent;
+    r.received_at_ms = 1000;
+    r.status = 0;
+    r.plugin = plugin;
+    r.output = "high|" + token + "|title|detail\n";
+    rs.store(r);
+}
+
+const auto admit_all = [](const httplib::Request&, httplib::Response&, const std::string&,
+                          const std::string&) -> yuzu::server::authz::FleetReadGate {
+    return {true, std::nullopt};
+};
+} // namespace
+
+TEST_CASE("/fragments/results: Forensics rows follow the caller's Forensics visibility",
+          "[pg][server][dashboard][fragment][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-tier-1";
+    put_tier_row(rs, command_id, "agent-a", yuzu::server::test::kForensicsPlugin, "TOKEN-FORENSICS-A");
+    put_tier_row(rs, command_id, "agent-b", yuzu::server::test::kForensicsPlugin, "TOKEN-FORENSICS-B");
+    put_tier_row(rs, command_id, "agent-a", yuzu::server::test::kOrdinaryPlugin, "TOKEN-ORDINARY-A");
+    put_tier_row(rs, command_id, "agent-c", yuzu::server::test::kOrdinaryPlugin, "TOKEN-ORDINARY-C");
+
+    FragmentResultsHarness h(&rs);
+    h.routes.set_fleet_read_fn(admit_all);
+    const std::string url = "/fragments/results?command_id=" + command_id + "&plugin=vuln_scan";
+
+    SECTION("a caller without Forensics:Read sees exactly the ordinary rows") {
+        h.forensics.viewer();
+        auto res = h.get(url);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "TOKEN-ORDINARY-A"));
+        CHECK(contains(res->body, "TOKEN-ORDINARY-C"));
+        CHECK_FALSE(contains(res->body, "TOKEN-FORENSICS"));
+        CHECK(contains(res->body, "2 agents"));
+    }
+    SECTION("a global Forensics:Read sees every row") {
+        h.forensics.admin();
+        auto res = h.get(url);
+        REQUIRE(res);
+        CHECK(contains(res->body, "TOKEN-FORENSICS-A"));
+        CHECK(contains(res->body, "TOKEN-FORENSICS-B"));
+        CHECK(contains(res->body, "TOKEN-ORDINARY-A"));
+        CHECK(contains(res->body, "TOKEN-ORDINARY-C"));
+        CHECK(contains(res->body, "4 agents"));
+    }
+    SECTION("a scoped Forensics:Read sees only that agent's Forensics rows") {
+        h.forensics.scoped({"agent-b"});
+        auto res = h.get(url);
+        REQUIRE(res);
+        CHECK(contains(res->body, "TOKEN-FORENSICS-B"));
+        CHECK_FALSE(contains(res->body, "TOKEN-FORENSICS-A"));
+        CHECK(contains(res->body, "TOKEN-ORDINARY-A"));
+        CHECK(contains(res->body, "TOKEN-ORDINARY-C"));
+    }
+    SECTION("a filtered read goes through the same tier (the facet-index path)") {
+        // agent-b answered only through a Forensics plugin. The filter value itself is echoed in
+        // the page's own links (it is the request's parameter), so the row is asserted by its agent.
+        h.forensics.admin();
+        auto admin = h.get(url + "&f_category=TOKEN-FORENSICS-B");
+        REQUIRE(admin);
+        CHECK(contains(admin->body, "agent-b"));
+        h.forensics.viewer();
+        auto res = h.get(url + "&f_category=TOKEN-FORENSICS-B");
+        REQUIRE(res);
+        CHECK_FALSE(contains(res->body, "agent-b"));
+        auto ok = h.get(url + "&f_category=TOKEN-ORDINARY-A");
+        REQUIRE(ok);
+        CHECK(contains(ok->body, "TOKEN-ORDINARY-A"));
+    }
+}
+
+TEST_CASE("/fragments/results/filter-bar: facet options never offer a Forensics value to a caller "
+          "without Forensics:Read",
+          "[pg][server][dashboard][fragment][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-tier-facet";
+    put_tier_row(rs, command_id, "agent-a", yuzu::server::test::kForensicsPlugin, "TOKEN-FORENSICS-A");
+    put_tier_row(rs, command_id, "agent-c", yuzu::server::test::kOrdinaryPlugin, "TOKEN-ORDINARY-C");
+
+    FragmentResultsHarness h(&rs);
+    const std::string url =
+        "/fragments/results/filter-bar?command_id=" + command_id + "&plugin=vuln_scan";
+
+    h.forensics.viewer();
+    auto viewer = h.get(url);
+    REQUIRE(viewer);
+    REQUIRE(viewer->status == 200);
+    CHECK(contains(viewer->body, "TOKEN-ORDINARY-C"));
+    CHECK_FALSE(contains(viewer->body, "TOKEN-FORENSICS-A"));
+
+    h.forensics.admin();
+    auto admin = h.get(url);
+    REQUIRE(admin);
+    CHECK(contains(admin->body, "TOKEN-ORDINARY-C"));
+    CHECK(contains(admin->body, "TOKEN-FORENSICS-A"));
+}
+
+TEST_CASE("/fragments/results: an unwired Forensics resolver or plugin set fails closed",
+          "[pg][server][dashboard][fragment][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-tier-unwired";
+    put_tier_row(rs, command_id, "agent-a", yuzu::server::test::kForensicsPlugin, "TOKEN-FORENSICS-A");
+    put_tier_row(rs, command_id, "agent-c", yuzu::server::test::kOrdinaryPlugin, "TOKEN-ORDINARY-C");
+    const std::string url = "/fragments/results?command_id=" + command_id + "&plugin=vuln_scan";
+
+    SECTION("no resolver: present-empty, ordinary rows still shown") {
+        FragmentResultsHarness h(&rs);
+        h.routes.set_forensics_visibility_fn({});
+        h.routes.set_fleet_read_fn(admit_all);
+        auto res = h.get(url);
+        REQUIRE(res);
+        CHECK(contains(res->body, "TOKEN-ORDINARY-C"));
+        CHECK_FALSE(contains(res->body, "TOKEN-FORENSICS-A"));
+    }
+    SECTION("no plugin set: every row refused") {
+        FragmentResultsHarness h(&rs);
+        h.routes.set_forensics_plugin_set(nullptr);
+        h.routes.set_fleet_read_fn(admit_all);
+        auto res = h.get(url);
+        REQUIRE(res);
+        CHECK_FALSE(contains(res->body, "TOKEN-ORDINARY-C"));
+        CHECK_FALSE(contains(res->body, "TOKEN-FORENSICS-A"));
+    }
+}
+
+TEST_CASE("/fragments/create-group-form: the matching-agent count excludes Forensics rows the "
+          "caller may not read",
+          "[pg][server][dashboard][fragment][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-tier-count";
+    // Three agents answered with the same value: two through a Forensics plugin, one ordinary.
+    put_tier_row(rs, command_id, "agent-a", yuzu::server::test::kForensicsPlugin, "same-value");
+    put_tier_row(rs, command_id, "agent-b", yuzu::server::test::kForensicsPlugin, "same-value");
+    put_tier_row(rs, command_id, "agent-c", yuzu::server::test::kOrdinaryPlugin, "same-value");
+
+    FragmentResultsHarness h(&rs);
+    const std::string url = "/fragments/create-group-form?command_id=" + command_id +
+                            "&plugin=vuln_scan&f_category=same-value";
+
+    h.forensics.viewer();
+    auto viewer = h.get(url);
+    REQUIRE(viewer);
+    REQUIRE(viewer->status == 200);
+    CHECK(contains(viewer->body, "1 agent"));
+    CHECK_FALSE(contains(viewer->body, "3 agents"));
+
+    h.forensics.admin();
+    auto admin = h.get(url);
+    REQUIRE(admin);
+    CHECK(contains(admin->body, "3 agents"));
 }

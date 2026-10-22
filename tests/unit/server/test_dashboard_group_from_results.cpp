@@ -60,6 +60,7 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "response_store.hpp"
+#include "test_forensics_tier_fixture.hpp"
 #include "test_mgmt_group_pg_helper.hpp"
 #include "test_route_sink.hpp"
 
@@ -148,6 +149,9 @@ struct GroupFromResultsHarness {
     std::unique_ptr<ResponseStore> rs_;
     yuzu::test::ManagementGroupStorePg mg_bundle;
     ManagementGroupStore& mg = *mg_bundle;
+    // #4990: the caller's Forensics visibility (admin by default so the cases that are not about
+    // the tier keep their meaning). Declared before `routes`: the resolver borrows it.
+    yuzu::server::test::ForensicsCaller forensics;
     DashboardRoutes routes;
     yuzu::server::test::TestRouteSink sink;
 
@@ -237,6 +241,7 @@ struct GroupFromResultsHarness {
 
         if (!csrf_trusted_origins.empty())
             routes.set_csrf_trusted_origins(std::move(csrf_trusted_origins));
+        yuzu::server::test::wire_forensics(routes, forensics);
 
         routes.register_routes(
             sink, auth_fn, perm_fn, audit_fn, rs_.get(), &mg,
@@ -361,6 +366,82 @@ TEST_CASE("group-from-results: an all-dropped scope falls into the existing "
           "scope_dropped=2 surface=group_from_results");
 
     CHECK_FALSE(h.mg.find_group_by_name("alldropped-group").has_value());
+}
+
+// ── (2a) #4990: the Forensics tier narrows the membership this materialises ───────────────────────
+
+TEST_CASE("group-from-results: agents matched only through Forensics rows the caller may not read "
+          "are not materialised, and look like no match",
+          "[pg][server][dashboard][group_from_results][security][forensics]") {
+    GroupFromResultsHarness h;
+    // agent-A and agent-B match through a Forensics plugin; agent-C through an ordinary one.
+    for (const char* agent : {"agent-A", "agent-B"}) {
+        StoredResponse r;
+        r.instruction_id = kCommandId;
+        r.agent_id = agent;
+        r.status = 1;
+        r.plugin = yuzu::server::test::kForensicsPlugin;
+        r.output = "high|cat-a|title|detail\n";
+        h.rs().store(r);
+    }
+    {
+        StoredResponse r;
+        r.instruction_id = kCommandId;
+        r.agent_id = "agent-C";
+        r.status = 1;
+        r.plugin = yuzu::server::test::kOrdinaryPlugin;
+        r.output = "high|cat-a|title|detail\n";
+        h.rs().store(r);
+    }
+
+    SECTION("without Forensics:Read the membership is exactly the ordinary match") {
+        h.forensics.viewer();
+        auto res = h.post(GroupFromResultsHarness::form_body("tier-viewer-group"));
+        CHECK(res->status == 200);
+        auto group = h.mg.find_group_by_name("tier-viewer-group");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-C"});
+    }
+    SECTION("a global Forensics:Read materialises every match") {
+        h.forensics.admin();
+        auto res = h.post(GroupFromResultsHarness::form_body("tier-admin-group"));
+        CHECK(res->status == 200);
+        auto group = h.mg.find_group_by_name("tier-admin-group");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) ==
+              std::set<std::string>{"agent-A", "agent-B", "agent-C"});
+    }
+    SECTION("a scoped Forensics:Read adds only that agent's Forensics match") {
+        h.forensics.scoped({"agent-B"});
+        auto res = h.post(GroupFromResultsHarness::form_body("tier-scoped-group"));
+        CHECK(res->status == 200);
+        auto group = h.mg.find_group_by_name("tier-scoped-group");
+        REQUIRE(group.has_value());
+        CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-B", "agent-C"});
+    }
+}
+
+TEST_CASE("group-from-results: when every match is a Forensics row the caller may not read, the "
+          "answer is the ordinary 422 and no group exists",
+          "[pg][server][dashboard][group_from_results][security][forensics]") {
+    GroupFromResultsHarness h;
+    StoredResponse r;
+    r.instruction_id = kCommandId;
+    r.agent_id = "agent-A";
+    r.status = 1;
+    r.plugin = yuzu::server::test::kForensicsPlugin;
+    r.output = "high|cat-a|title|detail\n";
+    h.rs().store(r);
+
+    h.forensics.viewer();
+    auto res = h.post(GroupFromResultsHarness::form_body("tier-none-group"));
+    CHECK(res->status == 422);
+    // Byte-identical to the genuine-empty body: nothing distinguishes a filtered match.
+    CHECK(res->body ==
+          "<span class=\"feedback-error\">No agents match the current filters.</span>");
+    CHECK_FALSE(h.mg.find_group_by_name("tier-none-group").has_value());
+    // The filtered row leaves no scope-drop trace either.
+    CHECK(h.audits_for("response.read", "denied") == 0);
 }
 
 // -- (2b) #5623: an empty match with a filter over the ingest bound says so --

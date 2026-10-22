@@ -228,8 +228,8 @@ public:
         CallerFn caller_fn;
         ApprovalManager* approval_manager{nullptr};
         ResponseStore* response_store{nullptr};
-        /// #4990: `ServerImpl::forensics_plugin_set_` (null in tests that predate the tier). Feeds
-        /// the `ResponseTierFilter` the drawer's response reads take.
+        /// #4990: `ServerImpl::forensics_plugin_set_` (null = unwired: the drawer's response reads then
+        /// refuse every row, see `tier_filter_for`). Feeds the `ResponseTierFilter` they take.
         const ForensicsPluginSet* forensics_plugins{nullptr};
         /// #4990: who may read Forensics-plugin rows (see `forensics_visibility.hpp`). Unwired
         /// (empty) resolves to present-empty at the use site.

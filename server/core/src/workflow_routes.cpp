@@ -73,11 +73,16 @@ struct PageResponses {
     operate_pages::ResponsesState state{operate_pages::ResponsesState::kOk};
 };
 
-PageResponses collect_page_responses(ResponseStore* store, const ResponseTierFilter& tier,
-                                     const Execution& exec,
+PageResponses collect_page_responses(ResponseStore* store, bool may_read_responses,
+                                     const ResponseTierFilter& tier, const Execution& exec,
                                      const std::vector<AgentExecStatus>& visible_agents,
                                      const authz::VisibleSet& scope) {
     PageResponses out;
+    // #4990: no Response:Read => no store read, no rows and no count (the section says why).
+    if (!may_read_responses) {
+        out.state = operate_pages::ResponsesState::kNeedsResponseRead;
+        return out;
+    }
     if (!store || !store->is_open()) {
         out.state = operate_pages::ResponsesState::kUnavailable;
         return out;
@@ -220,6 +225,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     auto* approval_manager = deps.approval_manager;
     auto* response_store = deps.response_store;
     const auto* forensics_plugins = deps.forensics_plugins; // #4990
+    auto forensics_visibility_fn = deps.forensics_visibility_fn; // #4990
     auto* execution_event_bus = deps.execution_event_bus;
     auto* metrics = deps.metrics;
     auto* capability_registry = deps.capability_registry; // BR-001
@@ -641,9 +647,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get(
         R"(/fragments/executions/([A-Za-z0-9_-]{1,128})/detail)",
         [auth_fn, fleet_read_fn, audit_fn, probe_perm_fn, execution_tracker, instruction_store,
-         response_store, forensics_plugins](const httplib::Request& req, httplib::Response& res) {
-            // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
-            const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins);
+         response_store, forensics_plugins, forensics_visibility_fn](
+            const httplib::Request& req, httplib::Response& res) {
             // #1712 / #3290 Phase 2 — migrated onto require_fleet_read
             // (fleet_read_fn), mirroring query_installed_software / the REST
             // /api/v1/inventory/software twin exactly: the gate is now the
@@ -673,6 +678,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             auto session = auth_fn(req, res);
             if (!session)
                 return;
+            // #4990: the gate above is Execution:Read, a lower tier than the Response:Read the
+            // stored output needs. The responses section is therefore served only to a caller who
+            // also holds Response:Read (the quiet probe never writes a response; an unwired probe
+            // is "not proven" = no responses section), and then only the rows the Forensics
+            // filter permits. The Execution:Read gate.scope keeps driving the confined-projection
+            // redaction and the row scope filter below, so the effective row scope is the meet.
+            const bool may_read_responses = probe_perm_fn && probe_perm_fn(req, "Response", "Read");
+            // Not derived when the section is withheld: nothing below reads the store then.
+            const auto tier = may_read_responses
+                                  ? tier_filter_for(req, forensics_visibility_fn, forensics_plugins)
+                                  : ResponseTierFilter::refuse_unwired();
             if (!execution_tracker) {
                 res.status = 503;
                 res.set_content("<div class=\"empty-state\">Tracker not available</div>",
@@ -827,7 +843,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 for (const auto& a : agents)
                     devs.rows.push_back({a.agent_id, a.status, a.error_detail, a.exit_code,
                                          a.dispatched_at, a.completed_at});
-                auto pr = collect_page_responses(response_store, tier, exec, agents, gate.scope);
+                auto pr = collect_page_responses(response_store, may_read_responses, tier, exec, agents,
+                                                 gate.scope);
                 devs.responses = std::move(pr.rows);
                 devs.responses_total = pr.total;
                 devs.responses_state = pr.state;
@@ -1101,7 +1118,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
             // -- Responses (collapsed) ---------------------------------------
             html += "<div class=\"per-agent-responses-wrap\">";
-            if (response_store && response_store->is_open()) {
+            if (!may_read_responses) {
+                // #4990: no rows, no count, and no store read.
+                html += "<details class=\"per-agent-responses\"><summary>Responses</summary>"
+                        "<div class=\"empty-state\">Viewing responses requires the "
+                        "<b>Response:Read</b> permission.</div></details>";
+            } else if (response_store && response_store->is_open()) {
                 ResponseQuery rq;
                 rq.since = exec.dispatched_at;
                 rq.until = exec.completed_at > 0 ? exec.completed_at : now_epoch_seconds();

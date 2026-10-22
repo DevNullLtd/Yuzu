@@ -378,6 +378,13 @@ std::string render_exec_devices(const ExecDevicesView& v) {
                    std::to_string(sorted.size()) + " reporting devices, failures first.</div>";
     }
 
+    if (v.responses_state == ResponsesState::kNeedsResponseRead) {
+        // #4990: no count either; a count of rows the caller may not read is itself a disclosure.
+        out += "<details class=\"resp\"><summary>Responses</summary>"
+               "<div class=\"empty-state\">Viewing responses requires the <b>Response:Read</b> "
+               "permission.</div></details></div>";
+        return out;
+    }
     out += "<details class=\"resp\"><summary>Show responses (" +
            std::to_string(v.responses_total) + ")</summary>";
     if (v.responses_state == ResponsesState::kUnavailable) {

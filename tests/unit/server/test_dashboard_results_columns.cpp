@@ -31,6 +31,7 @@
 #include "instruction_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
+#include "test_forensics_tier_fixture.hpp"
 #include "test_route_sink.hpp"
 #include "url_attr_scan.hpp"
 
@@ -79,6 +80,9 @@ yuzu::test::PgTestTemplate dashboard_cols_instr_tpl{
 // register_routes' own parameter instead of this friend seam.
 struct DashboardResultsColumnsTestAccess {
     DashboardRoutes routes;
+    // #4990: these renderer-level cases are not about the Forensics tier (the route-level cases in
+    // test_dashboard_results_fragment.cpp are), so the default reads every row; a tier case sets it.
+    ResponseTierFilter tier = ResponseTierFilter::unrestricted_internal_consumer();
 
     void set_stores(InstructionStore* is, ResponseStore* rs) {
         routes.instruction_store_ = is;
@@ -89,7 +93,7 @@ struct DashboardResultsColumnsTestAccess {
     }
     std::string render(const std::string& command_id, const std::string& plugin,
                        const std::string& definition_id = {}) {
-        return routes.render_results(command_id, plugin, /*sort_col=*/"agent",
+        return routes.render_results(command_id, tier, plugin, /*sort_col=*/"agent",
                                      /*sort_dir=*/"asc", /*page=*/1, /*per_page=*/50,
                                      /*filters=*/{}, /*text_query=*/"", definition_id);
     }
@@ -98,27 +102,27 @@ struct DashboardResultsColumnsTestAccess {
     std::string render_reflected(const std::string& command_id, const std::string& plugin,
                                  const std::string& text_query,
                                  const std::string& definition_id) {
-        return routes.render_results(command_id, plugin, /*sort_col=*/"agent",
+        return routes.render_results(command_id, tier, plugin, /*sort_col=*/"agent",
                                      /*sort_dir=*/"asc", /*page=*/1, /*per_page=*/50,
                                      /*filters=*/{}, text_query, definition_id);
     }
     std::string render_filtered(const std::string& command_id, const std::string& plugin,
                                 const std::vector<FacetFilter>& filters,
                                 const std::string& definition_id = {}) {
-        return routes.render_results(command_id, plugin, /*sort_col=*/"agent",
+        return routes.render_results(command_id, tier, plugin, /*sort_col=*/"agent",
                                      /*sort_dir=*/"asc", /*page=*/1, /*per_page=*/50, filters,
                                      /*text_query=*/"", definition_id);
     }
     std::string render_filter_bar(const std::string& command_id, const std::string& plugin,
                                    const std::string& username = {}) {
-        return routes.render_filter_bar(command_id, plugin, /*definition_id=*/{},
+        return routes.render_filter_bar(command_id, tier, plugin, /*definition_id=*/{},
                                         /*template_id=*/{}, username);
     }
     // #1712 / #3290 Phase 2 — the fleet-read gate's composed
     // meet(management-group, service-scope) VisibleSet.
     std::string render_scoped(const std::string& command_id, const std::string& plugin,
                               const yuzu::server::authz::VisibleSet& scope) {
-        return routes.render_results(command_id, plugin, /*sort_col=*/"agent",
+        return routes.render_results(command_id, tier, plugin, /*sort_col=*/"agent",
                                      /*sort_dir=*/"asc", /*page=*/1, /*per_page=*/50,
                                      /*filters=*/{}, /*text_query=*/"", /*definition_id=*/"",
                                      /*template_id=*/"", /*visible_columns=*/{}, scope);
@@ -565,6 +569,7 @@ TEST_CASE("render_filter_bar route: dispatched through TestRouteSink, the "
         DashboardRoutes routes;
         yuzu::server::test::TestRouteSink sink;
     } h;
+    yuzu::server::test::wire_forensics_permissive(h.routes); // #4990: not a tier case
 
     h.routes.register_routes(h.sink, auth_fn, perm_fn, audit_fn,
                              &rs, /*mgmt_group_store=*/nullptr, /*registry=*/nullptr,
@@ -646,6 +651,7 @@ TEST_CASE("create-group-form route: dispatched through TestRouteSink, the "
         DashboardRoutes routes;
         yuzu::server::test::TestRouteSink sink;
     } h;
+    yuzu::server::test::wire_forensics_permissive(h.routes); // #4990: not a tier case
 
     h.routes.register_routes(h.sink, auth_fn, perm_fn, audit_fn,
                              &rs, /*mgmt_group_store=*/nullptr, /*registry=*/nullptr,
@@ -704,6 +710,7 @@ TEST_CASE("create-group-form route: a filter value over kMaxFacetValueBytes repl
         DashboardRoutes routes;
         yuzu::server::test::TestRouteSink sink;
     } h;
+    yuzu::server::test::wire_forensics_permissive(h.routes); // #4990: not a tier case
     h.routes.register_routes(h.sink, auth_fn, perm_fn, audit_fn, &rs, /*mgmt_group_store=*/nullptr,
                              /*registry=*/nullptr, /*tag_store=*/nullptr, /*event_bus=*/nullptr,
                              /*agents_json_fn=*/[] { return std::string{"[]"}; },
@@ -788,6 +795,7 @@ TEST_CASE("create-group-form route: an over-bound filter on a degraded store sho
         DashboardRoutes routes;
         yuzu::server::test::TestRouteSink sink;
     } h;
+    yuzu::server::test::wire_forensics_permissive(h.routes); // #4990: not a tier case
     h.routes.register_routes(h.sink, auth_fn, perm_fn, audit_fn, &bad_rs,
                              /*mgmt_group_store=*/nullptr, /*registry=*/nullptr,
                              /*tag_store=*/nullptr, /*event_bus=*/nullptr,
@@ -875,6 +883,7 @@ TEST_CASE("create-group-form route: a JIT-elevated session sees the "
         DashboardRoutes routes;
         yuzu::server::test::TestRouteSink sink;
     } h;
+    yuzu::server::test::wire_forensics_permissive(h.routes); // #4990: not a tier case
 
     h.routes.register_routes(h.sink, auth_fn, perm_fn, audit_fn,
                              &rs, /*mgmt_group_store=*/nullptr, /*registry=*/nullptr,
@@ -946,6 +955,7 @@ TEST_CASE("render_filter_bar route: a JIT-elevated session sees every agent's "
         DashboardRoutes routes;
         yuzu::server::test::TestRouteSink sink;
     } h;
+    yuzu::server::test::wire_forensics_permissive(h.routes); // #4990: not a tier case
 
     h.routes.register_routes(h.sink, auth_fn, perm_fn, audit_fn,
                              &rs, /*mgmt_group_store=*/nullptr, /*registry=*/nullptr,

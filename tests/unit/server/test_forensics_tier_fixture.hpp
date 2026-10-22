@@ -55,4 +55,25 @@ struct ForensicsCaller {
     }
 };
 
+/// A caller who never changes: a global Forensics:Read. For a harness whose cases are not about the
+/// tier but read stored responses through a surface that now needs the tier wired.
+inline ForensicsCaller& permissive_forensics_caller() {
+    static ForensicsCaller caller;
+    return caller;
+}
+
+/// Wire the real catalogue-derived plugin set and `caller` into any surface that has the
+/// `set_forensics_plugin_set` / `set_forensics_visibility_fn` setter pair (RestApiV1, McpServer,
+/// DashboardRoutes).
+template <class Surface>
+void wire_forensics(Surface& surface, ForensicsCaller& caller) {
+    surface.set_forensics_plugin_set(&forensics_plugin_set());
+    surface.set_forensics_visibility_fn(caller.fn());
+}
+
+template <class Surface>
+void wire_forensics_permissive(Surface& surface) {
+    wire_forensics(surface, permissive_forensics_caller());
+}
+
 } // namespace yuzu::server::test

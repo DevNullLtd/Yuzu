@@ -37,6 +37,7 @@
 #include "store_errors.hpp" // kDbErrorPrefix
 #include "product_pack_store.hpp"
 #include "response_store.hpp"
+#include "test_forensics_tier_fixture.hpp"
 #include "test_route_sink.hpp"
 #include "test_response_execution_authz_pg_helper.hpp"
 #include "workflow_api_local.hpp" // ADR-0031 WS-A4 (eighth family): make_local_workflow_api
@@ -190,6 +191,12 @@ struct ExecHarness {
     std::unique_ptr<ExecutionEventBus> event_bus;
 
     bool perm_grant{true};
+    /// #4990: the executions drawer serves its responses section only to a caller who also holds
+    /// Response:Read (`probe_response_read`, the render-time probe) and then only the rows the
+    /// Forensics filter permits (`forensics`). Both default permissive so every pre-existing case
+    /// keeps its meaning; the tier cases flip them. Every OTHER probe answers true.
+    bool probe_response_read{true};
+    yuzu::server::test::ForensicsCaller forensics;
     /// #1712 / #3290 Phase 2 — the executions-drawer detail route's fake
     /// twin of require_fleet_read. Defaults to admit-unfiltered (nullopt
     /// scope) so every pre-existing detail test keeps the full-fleet path;
@@ -518,6 +525,12 @@ struct ExecHarness {
             };
         }
         wf_deps.response_store = responses.get();
+        wf_deps.forensics_plugins = &yuzu::server::test::forensics_plugin_set();
+        wf_deps.forensics_visibility_fn = forensics.fn();
+        wf_deps.probe_perm_fn = [this](const httplib::Request&, const std::string& type,
+                                       const std::string& op) {
+            return (type == "Response" && op == "Read") ? probe_response_read : true;
+        };
         // CDX-FV-03: nullptr unless opted in, so /api/workflows/* keeps its 503
         // path for every pre-existing test.
         wf_deps.workflow_engine = workflows.get();
@@ -649,8 +662,9 @@ struct ExecHarness {
     /// empty exercises the legacy timestamp-window fallback path.
     void store_response(const std::string& command_id, const std::string& agent_id,
                         const std::string& output, const std::string& execution_id = "",
-                        int64_t timestamp = 1735689610) {
+                        int64_t timestamp = 1735689610, const std::string& plugin = "") {
         StoredResponse r;
+        r.plugin = plugin;
         r.instruction_id = command_id;
         r.agent_id = agent_id;
         r.status = 1;
@@ -1236,6 +1250,140 @@ TEST_CASE("executions page detail: the responses list is scope-filtered before t
     CHECK(scoped->body.find("Showing 50 of 52.") != std::string::npos);
     CHECK(scoped->body.find("HIDDEN-OUTPUT") == std::string::npos);
     CHECK(scoped->body.find("agent-hidden") == std::string::npos);
+}
+
+// ── #4990: the Forensics tier and the Response:Read probe on the executions drawer ─────────────────
+//
+// The drawer gates on Execution:Read, a lower tier than the Response:Read the stored output needs.
+// Real PG-backed store and the exact rendered HTML, with an ordinary-plugin control row throughout.
+namespace {
+using yuzu::server::test::kForensicsPlugin;
+using yuzu::server::test::kOrdinaryPlugin;
+
+std::string seed_tier_exec(ExecHarness& h) {
+    h.make_def("def-T", "T def");
+    const auto eid = h.make_exec("def-T", "completed", 3, 3, 0);
+    h.store_response("def-T", "agent-A", "TOKEN-FORENSICS-A", eid, 1735689610, kForensicsPlugin);
+    h.store_response("def-T", "agent-B", "TOKEN-FORENSICS-B", eid, 1735689611, kForensicsPlugin);
+    h.store_response("def-T", "agent-A", "TOKEN-ORDINARY-A", eid, 1735689612, kOrdinaryPlugin);
+    h.store_response("def-T", "agent-C", "TOKEN-ORDINARY-C", eid, 1735689613, kOrdinaryPlugin);
+    return eid;
+}
+bool has(const std::string& hay, const char* needle) { return hay.find(needle) != std::string::npos; }
+} // namespace
+
+TEST_CASE("executions drawer: Forensics rows follow the caller's Forensics visibility",
+          "[pg][workflow][executions][detail][drawer][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    const auto eid = seed_tier_exec(h);
+    const auto url = "/fragments/executions/" + eid + "/detail";
+
+    h.forensics.viewer();
+    auto viewer = h.sink.Get(url);
+    REQUIRE(viewer);
+    REQUIRE(viewer->status == 200);
+    CHECK(has(viewer->body, "TOKEN-ORDINARY-A"));
+    CHECK(has(viewer->body, "TOKEN-ORDINARY-C"));
+    CHECK_FALSE(has(viewer->body, "TOKEN-FORENSICS"));
+    CHECK(has(viewer->body, "Show responses (2)"));
+
+    h.forensics.admin();
+    auto admin = h.sink.Get(url);
+    REQUIRE(admin);
+    CHECK(has(admin->body, "TOKEN-FORENSICS-A"));
+    CHECK(has(admin->body, "TOKEN-FORENSICS-B"));
+    CHECK(has(admin->body, "Show responses (4)"));
+
+    h.forensics.scoped({"agent-B"});
+    auto scoped = h.sink.Get(url);
+    REQUIRE(scoped);
+    CHECK(has(scoped->body, "TOKEN-FORENSICS-B"));
+    CHECK_FALSE(has(scoped->body, "TOKEN-FORENSICS-A"));
+    CHECK(has(scoped->body, "Show responses (3)"));
+}
+
+TEST_CASE("executions page detail: Forensics rows follow the caller's Forensics visibility, and the "
+          "count is the permitted count",
+          "[pg][workflow][executions][detail][page][devices][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    const auto eid = seed_tier_exec(h);
+    const auto url = "/fragments/executions/" + eid + "/detail?view=page";
+
+    h.forensics.viewer();
+    auto viewer = h.sink.Get(url);
+    REQUIRE(viewer);
+    REQUIRE(viewer->status == 200);
+    CHECK(has(viewer->body, "TOKEN-ORDINARY-A"));
+    CHECK_FALSE(has(viewer->body, "TOKEN-FORENSICS"));
+    CHECK(has(viewer->body, "Show responses (2)"));
+
+    h.forensics.admin();
+    auto admin = h.sink.Get(url);
+    REQUIRE(admin);
+    CHECK(has(admin->body, "TOKEN-FORENSICS-A"));
+    CHECK(has(admin->body, "Show responses (4)"));
+}
+
+TEST_CASE("executions drawer: without Response:Read the responses section carries no rows and no "
+          "count, the grid still renders, and the store is not read",
+          "[pg][workflow][executions][detail][drawer][page][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    const auto eid = seed_tier_exec(h);
+    h.agent_status(eid, "agent-A", "success");
+    h.probe_response_read = false;
+    h.forensics.admin(); // even a global Forensics:Read does not lift the Response:Read requirement
+
+    for (const char* suffix : {"", "?view=page"}) {
+        INFO(suffix);
+        auto res = h.sink.Get("/fragments/executions/" + eid + "/detail" + suffix);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        CHECK(has(res->body, "Response:Read"));
+        CHECK_FALSE(has(res->body, "TOKEN-"));
+        CHECK_FALSE(has(res->body, "Show responses"));
+        CHECK_FALSE(has(res->body, "No responses recorded"));
+        // The rest of the drawer is the Execution:Read view and is unchanged.
+        CHECK(has(res->body, "agent-A"));
+    }
+
+    // No store read happened: with the response table unreadable the section still names the
+    // permission rather than reporting a degraded store.
+    exec_sql(db.dsn(), "ALTER TABLE response_store.responses RENAME TO responses_hidden_drawer");
+    auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
+    auto page = h.sink.Get("/fragments/executions/" + eid + "/detail?view=page");
+    exec_sql(db.dsn(), "ALTER TABLE response_store.responses_hidden_drawer RENAME TO responses");
+    REQUIRE(res);
+    REQUIRE(page);
+    for (const auto* r : {res.get(), page.get()}) {
+        CHECK(has(r->body, "Response:Read"));
+        CHECK_FALSE(has(r->body, "Responses unavailable"));
+    }
+}
+
+TEST_CASE("executions drawer: the confined-projection redaction is unchanged by the tier and the "
+          "probe",
+          "[pg][workflow][executions][detail][drawer][confinement][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    const auto eid = seed_tier_exec(h);
+    h.forensics.admin();
+    // An Execution:Read grant scoped to agent-C only: rows outside it stay hidden, and the
+    // redaction of the scope/parameters is the same as before this change.
+    h.fleet_read_scope = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-C"}};
+    auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    CHECK(has(res->body, "TOKEN-ORDINARY-C"));
+    CHECK_FALSE(has(res->body, "TOKEN-ORDINARY-A"));
+    CHECK_FALSE(has(res->body, "TOKEN-FORENSICS"));
+    CHECK(has(res->body, "Show responses (1)"));
 }
 
 TEST_CASE("executions page detail: gate denial stays 403 and a tracker degrade stays 503",

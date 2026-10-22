@@ -412,7 +412,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                     }
                 }
 
-                auto html = render_results(command_id, plugin, sort_col, sort_dir,
+                // #4990: derived after the Response:Read gate (never writes a response); the
+                // filter narrows the rows, facets and counts below to what the caller may read.
+                const auto tier = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                auto html = render_results(command_id, tier, plugin, sort_col, sort_dir,
                                            page, per_page, filters, text_query,
                                            definition_id, template_id,
                                            visible_columns, gate.scope);
@@ -455,7 +458,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                     if (std::regex_match(raw, kTplIdRegex)) template_id = raw;
                 }
 
-                auto html = render_filter_bar(command_id, plugin, definition_id, template_id,
+                // #4990: derived after the Response:Read gate; facet options come from the
+                // rows the caller may read, so a filtered value is not offered.
+                const auto tier = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                auto html = render_filter_bar(command_id, tier, plugin, definition_id, template_id,
                                               session->username, auth::is_elevated(*session));
                 // The body is now principal-specific (confined per caller's
                 // visible scope) rather than fleet-common, so an unpartitioned
@@ -565,8 +571,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 // no-store/no-filter cases need a NEW distinction from it.
                 std::optional<int64_t> agent_count;
                 if (response_store_ && !filters.empty()) {
-                    // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
-                    const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins_);
+                    // #4990: after the ManagementGroup:Write gate; the tier filter alone closes
+                    // the Forensics half (no Response:Read gate is added to this route).
+                    const auto tier = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
                     agent_count = response_store_->facet_agent_count(command_id, tier, filters,
                                                                       agent_scope);
                 }
@@ -645,8 +652,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // match" — that's a wrong-result-presented-as-correct claim on
                  // a write-adjacent action (it would tell the operator their
                  // filters are bad when the store just couldn't be read).
-                 // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
-                 const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins_);
+                 // #4990: after the ManagementGroup:Write gate and the same-site gate; the tier
+                 // filter alone closes the Forensics half, so the membership this materialises
+                 // never reflects rows the caller may not read.
+                 const auto tier = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
                  auto agent_ids_opt = response_store_->facet_agent_ids(command_id, tier, filters);
                  if (!agent_ids_opt.has_value()) {
                      res.status = 503;
@@ -2333,7 +2342,7 @@ std::vector<std::string> DashboardRoutes::resolve_render_columns(
 // ---------------------------------------------------------------------------
 
 std::string DashboardRoutes::render_results(
-    const std::string& command_id, const std::string& plugin,
+    const std::string& command_id, const ResponseTierFilter& tier, const std::string& plugin,
     const std::string& sort_col, const std::string& sort_dir,
     int page, int per_page,
     const std::vector<FacetFilter>& filters,
@@ -2347,8 +2356,6 @@ std::string DashboardRoutes::render_results(
         return "<tbody id=\"results-tbody\"><tr><td class=\"empty-state\">"
                "Response store not available.</td></tr></tbody>";
     }
-    // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
-    const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins_);
 
     auto col_names = resolve_render_columns(plugin, definition_id);
 
@@ -2784,6 +2791,7 @@ std::string DashboardRoutes::render_results(
 // ---------------------------------------------------------------------------
 
 std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
+                                                const ResponseTierFilter& tier,
                                                 const std::string& plugin,
                                                 const std::string& definition_id,
                                                 const std::string& template_id,
@@ -2870,8 +2878,6 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
         std::vector<FacetValue> facet_vals;
         bool facet_degraded = false;
         if (response_store_) {
-            // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
-            const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins_);
             auto facet_opt = response_store_->facet_values(command_id, tier, col_idx, agent_scope);
             facet_degraded = !facet_opt.has_value();
             facet_vals = std::move(facet_opt).value_or(std::vector<FacetValue>{});

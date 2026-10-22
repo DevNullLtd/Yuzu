@@ -183,8 +183,7 @@ public:
     /// #4990 - the Forensics plugin set the stored-response read tier excludes
     /// (`ServerImpl::forensics_plugin_set_`, borrowed: it outlives this object). Same setter idiom
     /// as `set_fleet_read_fn`: handlers read the member per request. Unset (nullptr, a test
-    /// harness) leaves the pre-tier behaviour for the results fragments until their
-    /// `ForensicsVisibilityFn` wiring lands.
+    /// harness) fails closed: the results fragments then refuse every row (`tier_filter_for`).
     void set_forensics_plugin_set(const ForensicsPluginSet* plugins) { forensics_plugins_ = plugins; }
 
     /// #4990 - the resolver behind the results fragments' Forensics tier (see
@@ -350,6 +349,9 @@ private:
     /// the listed plugin column names are rendered (the "Agent" pseudo-
     /// column is always shown). @p template_id is propagated through pager
     /// / sort URLs so that switching pages doesn't drop the chosen template.
+    /// @p tier — #4990: what the caller may read with respect to the Forensics tier
+    /// (`tier_filter_for`, derived by the route after its gate). Required, no default: every
+    /// store read below (rows, counts, byte-cap cuts, facets) is computed over the permitted set.
     /// @p scope — #1712 / #3290 Phase 2: the fleet-read gate's composed
     /// meet(management-group, service-scope) VisibleSet. nullopt (TOP) ⇒
     /// unfiltered — a global grant or RBAC-off, byte-identical to the
@@ -357,7 +359,8 @@ private:
     /// nullopt so the existing DashboardResultsColumnsTestAccess friend
     /// seam (test_dashboard_results_columns.cpp) keeps testing the
     /// unfiltered path unchanged.
-    std::string render_results(const std::string& command_id, const std::string& plugin,
+    std::string render_results(const std::string& command_id, const ResponseTierFilter& tier,
+                               const std::string& plugin,
                                const std::string& sort_col, const std::string& sort_dir,
                                int page, int per_page,
                                const std::vector<FacetFilter>& filters,
@@ -374,7 +377,8 @@ private:
     /// Issue #254 — also renders a response-template selector dropdown at
     /// the top of the bar listing the synthesised default plus any
     /// operator-defined templates on the definition.
-    std::string render_filter_bar(const std::string& command_id, const std::string& plugin,
+    std::string render_filter_bar(const std::string& command_id, const ResponseTierFilter& tier,
+                                   const std::string& plugin,
                                    const std::string& definition_id = {},
                                    const std::string& template_id = {},
                                    const std::string& username = {},
