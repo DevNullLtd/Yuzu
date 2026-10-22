@@ -405,6 +405,7 @@ agent_test_exe = executable(
     'unit/test_registry_local_dispatcher.cpp', # PR1.7 remediation fix #3: real registry.dll driven
                                                 # end to end via LocalDispatcher (Windows-only; a no-op
                                                 # TU elsewhere via the file's own #ifdef _WIN32 guard)
+    'unit/test_agent_command_frames.cpp',     # agents/core/src/command_frames.hpp -- the CommandResponse.action stamp on output + final frames (pure, every host)
     'unit/test_wmi_local_dispatcher.cpp',      # gate-1 remediation: real wmi.dll's query/get_instance
                                                 # actions driven end to end via LocalDispatcher, same
                                                 # pattern as test_registry_local_dispatcher.cpp above
@@ -1720,6 +1721,8 @@ if build_server
       'unit/server/test_store_worker_pool.cpp', # #3261: StoreWorkerPool submit/quiesce/backpressure/exception-firewall, no HTTP (avoids the unrelated TSan/glibc crash #2504)
       'unit/server/test_dispatch_confined_arms.cpp', # PR1.4: the production per-arm intersection, bound by exact-send-set assertions
       'unit/server/test_dispatch_destructive_gate.cpp', # #3685: Destructive targeting gate — pure verdict + confinement + refusal-string pins
+      'unit/server/test_plugin_result_audit.cpp', # registry.write audit extraction from mutating-action output frames (pure) + live ingest on both frame paths
+      'unit/server/test_rundown_gate.cpp', # the shutdown rundown behind the registry.write hook (pure): enter/close/drain, the wake-up, a latch race against one close
       'unit/server/test_printing_clear_queue_gate.cpp', # Wave 9 PR9.1b: printing.clear_queue against the same Destructive targeting gate + AdminOrApproval chokepoint
       'unit/server/test_dashboard_destructive_gate.cpp', # PR6.0b: the same gate wired into POST /api/dashboard/execute
       'unit/server/test_default_certs.cpp',
@@ -3764,6 +3767,21 @@ test('access reviews production wiring lexical gate',
 test('presence departure wiring lexical gate (#5678)',
   _python3_test,
   args: [files('test_presence_departure_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# registry.write audit wiring: static lexical gate pinning that agent.cpp stamps the dispatched action
+# on every output frame and its terminal frame (the command loop is not constructible from a test), and
+# that each of the four frame-storing sites in agent_service_impl.cpp writes the audit row BEFORE the
+# execution advances (the Subscribe arms and the gateway terminal arm have no runtime ordering test),
+# that the hook reads the store only through its weak reference, and that server.cpp wires it exactly
+# once.
+# Carries its own in-memory mutation self-test. No build required. Suite 'docs' for the same reason as
+# the presence gate above.
+test('audit action stamp wiring lexical gate',
+  _python3_test,
+  args: [files('test_audit_action_stamp_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )
