@@ -216,8 +216,9 @@ dispatches.
    after that (#6098), is never deleted, and, for an instruction-origin ticket, dispatches nothing. Record the
    ids of the approved test tickets in your change record so nobody mistakes them for a real decision later.
 
-**Rolling back, or running mixed versions.** This change adds no schema, so a rollback starts cleanly. What
-changes is which checks run.
+**Rolling back, or running mixed versions.** The approver-assurance change itself adds no schema; the separate
+scheduled-approval change (#6096, below) adds a data-only approvals step and a command-outbox index, both of which an
+older binary ignores, so a rollback starts cleanly. What changes is which checks run.
 
 - A replica or a rolled-back binary that predates this change still accepts bearer and MCP approvals, and does
   not check an approved ticket's age when it is consumed or when `ScheduleRunner` fires it. While any such
@@ -242,11 +243,56 @@ changes is which checks run.
   (step size minus 5 minutes) before the step) is expired permanently once an accepted submission has swept it
   (until then correcting the clock restores it), and older approved tickets stay live
   (observability tracked in #6098).
-- Submission time (`submitted_at`) and the schedule's own run stamps still come from the clock of the server that
-  wrote them, not from the database. Keep every server NTP-synchronised. When the server that submitted an approval
-  and the one that advances a recurring schedule disagree about the time (a leader change under clock skew, or a clock
-  step), an approved ticket can be used for an extra occurrence or be ignored and requested again, and a submitter
-  clock far from the database's lengthens or shortens how long its pending requests live. Tracked in #6096.
+- Submission time (`submitted_at`) now also comes from the database, like the review and use times, so a server
+  whose own clock is wrong can no longer lengthen or shorten how long its pending requests live. A recurring
+  schedule no longer decides that an approval is spent by comparing clocks: when the occurrence an approved ticket
+  belongs to has been queued, the ticket is marked used (a rejected ticket is marked used when it skips its
+  occurrence), so one approval runs at most one occurrence whatever the clocks say (#6096). A used ticket keeps its
+  status (`approved` or `rejected`); only its use time and user are filled in. The schedule's own run times are
+  still stamped by the server that advances it; they only decide when an occurrence is due.
+- **Scheduled approvals are retired once on upgrade (#6096).** Before this release a spent scheduled ticket was
+  never marked used; it was recognised as spent by comparing clocks. The approvals schema step (v2) therefore marks
+  every outstanding approved or rejected ticket that belongs to a schedule as used, once per database, with no clock
+  comparison. A schedule that was holding an occurrence for an approval you had already given (approved but not yet
+  fired when you upgraded) asks again for that held occurrence, and a rejection you had already given no longer skips
+  that occurrence: the schedule asks again. Pending requests, requests from the dashboard and MCP, and tickets
+  already used are untouched. Nothing to do. The step is data only (no table or column changes). It touches
+  every unsettled approved or rejected scheduled ticket, including old rejected ones (rejected tickets never expire
+  and are never swept); that is normally small. It runs inside the upgrade transaction under a 300 s statement
+  timeout and is skipped on every later start. If the 300 s timeout is hit the step fails, nothing is applied,
+  and the approvals store does not open (the server logs a schema migration failure for that store); investigate
+  the table size and restart. The command outbox also gains a small index on its approval id
+  (`outbox_approval_idx`) at the same upgrade; its build is bounded by the same 300 s timeout.
+- **Upgrade one replica first when the outbox table is large (#6096).** Building `outbox_approval_idx` takes a share
+  lock on the outbox table for up to 300 s, so enqueue and claim on other replicas wait meanwhile. A second replica
+  that boots at the same time waits on the migration advisory lock under the pool's default lock and statement
+  timeouts and may fail its boot closed; restarting it recovers, because the migration is then applied. The
+  recommendation is to start ONE replica, wait for it to finish migrating, then start the others. These are not
+  measured numbers.
+- **Where the legacy marker lives (#6096).** The retired tickets carry `consumed_by = 'schedule:legacy-6096'` in
+  `approval_manager.approvals`. It is readable only by SQL; no API returns it. Tickets the outbox showed had already
+  been used by an earlier occurrence carry the related marker `consumed_by = 'schedule:ledger-spent:<schedule id>:<n>'`;
+  tickets settled by a normal fire or skip carry `schedule:<schedule id>:<n>`. To list the legacy ones:
+
+  ```sql
+  SELECT id, status, schedule_id, consumed_at
+  FROM approval_manager.approvals
+  WHERE consumed_by = 'schedule:legacy-6096';
+  ```
+- **Mixed versions and rollback for scheduled approvals (#6096).** Recommended practice: drain or stop every replica
+  that predates this change before anyone approves scheduled work. The command outbox records which approval ticket
+  each scheduled run used, and the new binary refuses to fire a ticket the outbox shows was already used by an
+  earlier occurrence, so a ticket fired by an older leader is inert after the upgrade. A rolled-back binary does
+  not consult the outbox ledger or the used marker, so an older binary can re-fire a ticket the new binary marked
+  used (the old clock comparison); rolling back restores the old behaviour, including that exposure. After a rollback
+  followed by a second upgrade, run this once, because a rejected ticket spent under the older binary would
+  otherwise skip one occurrence. It also retires approved-but-unfired scheduled tickets, which then ask again:
+
+  ```sql
+  UPDATE approval_manager.approvals
+  SET consumed_at = EXTRACT(EPOCH FROM now())::bigint, consumed_by = 'schedule:legacy-6096'
+  WHERE schedule_id <> '' AND consumed_at = 0 AND status IN ('approved','rejected');
+  ```
 - Tickets already approved when you upgrade keep their original `reviewed_at`; the seven days are counted
   from it.
 

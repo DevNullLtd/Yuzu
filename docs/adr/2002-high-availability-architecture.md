@@ -234,7 +234,7 @@ outbox** with **durable monotonic event IDs** (replacing the per-process channel
   event spine**; presentation-terminated SSE/MCP consumers replay via `Last-Event-ID` / `?since=`
   against **core's spine API** (never the `yuzu` outbox directly) and **tolerate duplicates**
   (at-least-once). Cursor ownership: the client cursor is core's; presentation is a stateless relay.
-- The outbox inherits the **clock-guarded retention** rules (routed concern).
+- The outbox inherits the **clock-guarded retention** rules (routed concern). Its rows are also the schedule runner's spent-ticket ledger (#6096, `approval_id`), so any reaper must retain approval-bearing rows at least 7 days from creation.
 
 **Load-bearing prerequisite:** cross-instance correlation requires execution state in Postgres.
 `execution_tracker` (SQLite) and `cmd_execution_ids_` (in-process map, `agent_service_impl.hpp:330`)

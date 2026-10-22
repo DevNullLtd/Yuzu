@@ -415,12 +415,10 @@ endpoint, not only approval (verify `amr` before enabling; the way back is resta
 [recovery runbook](ops-runbooks/auth-db-recovery.md#locked-out-by-mfa-enforcement-misconfiguration)), and every local user must enrol at login. SAML users are refused at step-up
 gates in every mode, independent of `required`.
 
-*Second residual, CC8.1 (maker-checker on scheduled runs, tracked in #6096):* the time an approval was
-submitted comes from the submitting server's own clock and is compared with the schedule's own run
-stamps from the server that advances the schedule, not with database time. Keep every server
-NTP-synchronised; after a leader change or a clock step, an approved ticket on a recurring schedule
-may be used for extra occurrences until it ages out (at most 7 days), or be ignored and requested
-again. Further small residuals (database-clock steps expiring approved tickets, a stale `approved`
+*Second residual, CC8.1 (maker-checker on scheduled runs), closed by #6096:* every approval stamp,
+submission time included, is now database time, and a scheduled ticket is marked used when its
+occurrence is queued, so one approval runs at most one occurrence regardless of server clocks, once every replica runs the fixed binary. Further small
+residuals (database-clock steps expiring approved tickets, a stale `approved`
 status on lists until the next sweep, no approval or schedule alert rules) are tracked in #6097 and
 #6098. Operator-facing detail: `docs/user-manual/instructions.md`, "Who can
 approve". The MCP half is a recorded exception to the both-surfaces rule: ADR-1005's
