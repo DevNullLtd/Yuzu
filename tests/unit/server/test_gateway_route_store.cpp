@@ -3164,6 +3164,10 @@ TEST_CASE("GatewayRouteStore: migration v5 text pins the index name and its lock
     // The lock-wait bound, the lifted statement timeout and the up-front lock.
     CHECK(sql.find("lock_timeout") != std::string::npos);
     CHECK(sql.find("statement_timeout") != std::string::npos);
+    // The exact statements: the 30 s bound is what the operator docs promise, and
+    // `statement_timeout = 0` is what keeps a large build from being cut off.
+    CHECK(sql.find("SET LOCAL lock_timeout = '30s';") != std::string::npos);
+    CHECK(sql.find("SET LOCAL statement_timeout = 0;") != std::string::npos);
     CHECK(sql.find("ACCESS EXCLUSIVE") != std::string::npos);
     // IF EXISTS on the old-index drop, and NO IF NOT EXISTS on the create.
     CHECK(sql.find("DROP INDEX IF EXISTS agent_routes_session_id_idx") != std::string::npos);
@@ -3200,4 +3204,35 @@ TEST_CASE("GatewayRouteStore[pg]: a later start reports the durable v5 count onc
     CHECK(text.find("route_meta records 2 agent_routes row(s) tombstoned by the v5 migration on "
                     "an earlier start (not re-counted)") != std::string::npos);
     CHECK(text.find("migration v5 tombstoned") == std::string::npos);
+}
+
+TEST_CASE("GatewayRouteStore[pg]: an unreadable route_meta count on the migrating start warns and "
+          "still opens",
+          "[gateway_route][pg][store][unique_session][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    V4Schema schema(db.dsn());
+    {
+        // route_meta exists from v2. A BEFORE INSERT trigger rewrites whatever v5
+        // writes into a non-numeric value, so the constructor's read-back cannot
+        // parse it. The trigger must exist BEFORE the store opens (v5 runs then).
+        auto conn = raw_connect(db.dsn());
+        raw_run(conn.get(), "CREATE FUNCTION gateway_route_store.yuzu_test_garble() RETURNS "
+                            "trigger LANGUAGE plpgsql AS $$ BEGIN NEW.value := 'garbage'; "
+                            "RETURN NEW; END $$");
+        raw_run(conn.get(), "CREATE TRIGGER yuzu_test_garble_trg BEFORE INSERT ON "
+                            "gateway_route_store.route_meta FOR EACH ROW EXECUTE FUNCTION "
+                            "gateway_route_store.yuzu_test_garble()");
+    }
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    yuzu::test::LogCapture capture;
+    GatewayRouteStore store{pool};
+    capture.stop();
+    // The count is advisory evidence, never a gate on opening.
+    REQUIRE(store.is_open());
+    CHECK(store.boot_session_dedup_rows() == 0);
+    CHECK(capture.text().find("could not be read") != std::string::npos);
+    auto conn = raw_connect(db.dsn());
+    CHECK(raw_scalar(conn.get(), "SELECT value FROM gateway_route_store.route_meta WHERE key = "
+                                 "'v5_session_dedup_tombstoned_rows'") == "garbage");
 }

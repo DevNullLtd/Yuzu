@@ -3656,6 +3656,10 @@ TEST_CASE("#5683 NotifyStreamStatus CONNECTED: a fallback insert refused by the 
     CHECK(capture.text().find("stream CONNECTED") == std::string::npos);
     CHECK(capture.text().find("that another agent's route already holds (#5683)") !=
           std::string::npos);
+    // The call site logs the refusal itself; the generic "guard rejected the write"
+    // WARN (record_directory_desync's catch-all, which says the directory "may be
+    // out of sync") must NOT also fire for this expected outcome.
+    CHECK(capture.text().find("guard rejected the write") == std::string::npos);
 
     CHECK(metrics
               .counter("yuzu_server_gateway_route_desync_total",

@@ -2241,11 +2241,14 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         // reader's `routable` trust predicate, not this write, is the integrity
         // backstop. #4669: the exceptions are `cluster_affinity_violation` and
         // (#5683) `session_held_by_other_agent`, both fail-closed arms
-        // below — by this point the #4669 pre-check ABOVE has already refused
-        // the common case, so reaching a violation HERE is only the narrow
-        // race window that comment describes; still counted distinctly, but
-        // `set_gateway_route` has already run by then (that race's accepted
-        // cost — see the pre-check's own comment).
+        // below. They differ in how they are reached. For the AFFINITY arm the
+        // #4669 pre-check ABOVE has already refused the common case, so
+        // reaching it HERE is only the narrow race window that comment
+        // describes (that race's accepted cost: `set_gateway_route` has already
+        // run by then; see the pre-check's own comment). The pre-check does NOT
+        // look at session ownership, so for `session_held_by_other_agent` the
+        // refused no-row fallback insert is the ORDINARY outcome, not a race:
+        // that arm reverts the placement itself (`unpublish_gateway_route`).
         if (gateway_route_store_) {
             // 4.2a #8: a session recorded in lost_race_sessions_ lost its
             // register_fresh epoch race — the durable row already belongs to

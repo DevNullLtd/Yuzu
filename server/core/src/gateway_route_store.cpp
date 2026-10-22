@@ -254,8 +254,7 @@ ALTER TABLE agent_routes ADD COLUMN home_cluster_id TEXT;
         // migration by design - atomically, schema_meta stays 4 and boot is
         // refused. The operator clears it with
         // `DROP INDEX gateway_route_store.ux_agent_routes_session_id;` and
-        // restarts; the migration then runs afresh. v5 is unreleased, so it is
-        // edited in place rather than followed by a v6.
+        // restarts; the migration then runs afresh.
         {5, R"(
 SET LOCAL lock_timeout = '30s';
 SET LOCAL statement_timeout = 0;
