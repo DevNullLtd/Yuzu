@@ -129,14 +129,23 @@ template <class F> [[nodiscard]] F ntdll_proc(const char* symbol) {
     return out.empty() ? static_cast<long>(ERROR_INVALID_DATA) : static_cast<long>(ERROR_SUCCESS);
 }
 
-/// The kernel name of a predefined root, read once per process (a function-local static per root) from a real
-/// handle to it: `\REGISTRY\MACHINE` for HKLM, `\REGISTRY\USER` for HKU. Empty when it could not be read,
+/// The kernel name of a predefined root, read once per process (a function-local static per root):
+/// `\REGISTRY\MACHINE` for HKLM, `\REGISTRY\USER` for HKU. The root cannot be asked directly:
+/// RegOpenKeyExW(root, L"") hands back the predefined pseudo-handle, and NtQueryKey refuses it with
+/// STATUS_INVALID_HANDLE (kingsley, 2026-10-22). So a child that exists on every Windows install
+/// (HKLM\SOFTWARE, HKU\.DEFAULT) is opened as a real handle and the root name is its canonical name
+/// minus `\<child>`; a name that does not end that way is refused. Empty when it could not be read,
 /// which disables the fast open for that root for the life of the process (the walk is the fallback).
-[[nodiscard]] std::string read_root_name(HKEY root) {
+[[nodiscard]] std::string read_root_name(HKEY root, const wchar_t* child, std::string_view leaf) {
     yuzu::win::RegKey k;
     std::string name;
-    if (RegOpenKeyExW(root, L"", REG_OPTION_OPEN_LINK, KEY_QUERY_VALUE, k.put()) != ERROR_SUCCESS) return {};
+    if (RegOpenKeyExW(root, child, REG_OPTION_OPEN_LINK, KEY_QUERY_VALUE, k.put()) != ERROR_SUCCESS) return {};
     if (query_key_name(k.get(), name) != ERROR_SUCCESS) return {};
+    const std::string tail = "\\" + std::string{leaf};
+    if (name.size() <= tail.size() ||
+        !names_equal_ascii_ci(std::string_view{name}.substr(name.size() - tail.size()), tail))
+        return {};
+    name.resize(name.size() - tail.size());
     return name;
 }
 
@@ -174,8 +183,8 @@ public:
     long final_name(Handle key, std::string& out) override { return query_key_name(as_hkey(key), out); }
 
     long root_name(Handle root, std::string& out) override {
-        static const std::string hklm = read_root_name(HKEY_LOCAL_MACHINE);
-        static const std::string hku = read_root_name(HKEY_USERS);
+        static const std::string hklm = read_root_name(HKEY_LOCAL_MACHINE, L"SOFTWARE", "SOFTWARE");
+        static const std::string hku = read_root_name(HKEY_USERS, L".DEFAULT", ".DEFAULT");
         const std::string* cached = root == as_handle(HKEY_LOCAL_MACHINE) ? &hklm
                                     : root == as_handle(HKEY_USERS)       ? &hku
                                                                           : nullptr;
