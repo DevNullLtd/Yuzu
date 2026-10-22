@@ -479,7 +479,7 @@
       "completeness": "partial",
       "provenance": "`tar_db_unavailable`",
       "status": "`UNAVAILABLE`",
-      "when": "`tar.db` failed to open read-only (missing file, permission denied, lock contention; on Windows also a `tar.db`, `-wal`, `-shm` or `-journal` owned by an account other than SYSTEM, Administrators or the agent's, or with more than one hard link, which is refused before SQLite opens it, the detail naming the file and why) — every capture in this package hits this branch, since none of the capture hosts had a live `tar.db` with usage collection enabled at the default path."
+      "when": "`tar.db` failed to open read-only (missing file, permission denied, lock contention; on Windows also a `tar.db`, `-wal`, `-shm` or `-journal` owned by an account other than SYSTEM, Administrators or the agent's, or with more than one hard link, which is checked before SQLite opens it and again after its first read, the detail naming the file and why; where the owner cannot be read, as on FAT or exFAT, nothing is refused on that ground) — every capture in this package hits this branch, since none of the capture hosts had a live `tar.db` with usage collection enabled at the default path."
     },
     {
       "completeness": "partial",

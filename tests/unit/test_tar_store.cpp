@@ -1951,6 +1951,51 @@ TEST_CASE("TarDatabase: a hot rollback journal beside tar.db is replayed by open
     CHECK(reopened->get_config("retention_days", "") == "EVIL");
 }
 
+// The journal is one of the four files SQLite reads for a database, so quarantine moves it with
+// the rest: it is evidence that belongs beside the quarantine (an empty one is dropped, like
+// -wal and -shm), and the fresh database must not serve it. SQLite consumes a HOT journal at the
+// integrity probe, before quarantine runs, so the journal planted here has a zero first byte
+// (what journal_mode=PERSIST leaves behind): not hot, so the probe leaves it, byte-ful, for
+// quarantine to deal with.
+TEST_CASE("TarDatabase: a corrupt tar.db's rollback journal is quarantined with it (#559)",
+          "[tar][store][lifecycle][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_tar_qjournal_"};
+    fs::create_directories(dir.path);
+    const fs::path db = dir.path / "tar.db";
+    plant_evil_journal(db);
+    const fs::path journal{db.string() + "-journal"};
+    const auto journal_size = fs::file_size(journal);
+    REQUIRE(journal_size > 0);
+    {
+        std::fstream f(journal, std::ios::binary | std::ios::in | std::ios::out);
+        REQUIRE(f.is_open());
+        f.put('\0');
+    }
+    {
+        std::ofstream f(db, std::ios::binary | std::ios::trunc);
+        REQUIRE(f.is_open());
+        f << "this is not a valid sqlite database -- corrupt tar.db beside a journal";
+    }
+
+    auto reopened = TarDatabase::open(db);
+    REQUIRE(reopened.has_value());
+    REQUIRE(reopened->quarantined_this_open().has_value());
+    CHECK(reopened->get_config("retention_days", "") != "EVIL");
+
+    // The journal sits beside the quarantine, byte for byte, and not beside the fresh database.
+    const std::string prefix = db.filename().string() + ".corrupt-";
+    int moved = 0;
+    for (const auto& entry : fs::directory_iterator(dir.path)) {
+        const std::string name = entry.path().filename().string();
+        if (name.rfind(prefix, 0) == 0 && name.ends_with("-journal")) {
+            ++moved;
+            CHECK(fs::file_size(entry.path()) == journal_size);
+        }
+    }
+    CHECK(moved == 1);
+    CHECK_FALSE(fs::exists(journal));
+}
+
 #ifndef _WIN32
 TEST_CASE("TarDatabase: a corrupt-and-unmovable tar.db fails closed (#559 primary)",
           "[tar][store][lifecycle][corruption]") {

@@ -32,6 +32,7 @@
 
 #include <filesystem>
 #include <format>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -50,6 +51,7 @@ public:
             error_ = ::GetLastError();
             return;
         }
+        const HandlePtr token_guard{token, ::CloseHandle}; // closes on the resize throwing too
         DWORD len = 0;
         ::GetTokenInformation(token, TokenUser, nullptr, 0, &len); // size probe
         user_buf_.resize(len);
@@ -57,7 +59,6 @@ public:
             len != 0 && ::GetTokenInformation(token, TokenUser, user_buf_.data(), len, &len);
         if (!got)
             error_ = ::GetLastError();
-        ::CloseHandle(token);
         // The PSID points INTO user_buf_ (alive as long as *this, hence no copy or move). The
         // cast is aligned: vector<BYTE>::data() is a heap block aligned to the default new
         // alignment.
@@ -71,13 +72,6 @@ public:
     [[nodiscard]] DWORD error() const noexcept { return error_; } // set at the failing call
     [[nodiscard]] PSID user_sid() const noexcept { return user_sid_; }
 
-    // SYSTEM, BUILTIN\Administrators or the process token's user.
-    [[nodiscard]] bool owner_allowed(PSID owner) const noexcept {
-        return ok() && owner != nullptr &&
-               (::EqualSid(owner, user_sid_) || ::IsWellKnownSid(owner, WinLocalSystemSid) ||
-                ::IsWellKnownSid(owner, WinBuiltinAdministratorsSid));
-    }
-
     // Why `file` (an open handle with READ_CONTROL) is owned by a foreign account, else nullopt.
     // `read_error`, when given, receives the owner read's result (ERROR_SUCCESS on success) so the
     // caller can log a failed read: that case returns nullopt, because a filesystem without ACLs
@@ -88,7 +82,7 @@ public:
         PSECURITY_DESCRIPTOR sd = nullptr;
         const DWORD rc = ::GetSecurityInfo(file, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
                                            &owner, nullptr, nullptr, nullptr, &sd);
-        const LocalFreeOnExit sd_guard{sd}; // `owner` points into it
+        const LocalPtr sd_guard{sd, ::LocalFree}; // `owner` points into it
         if (read_error != nullptr)
             *read_error = rc;
         if (rc != ERROR_SUCCESS || owner == nullptr || !ok() || owner_allowed(owner))
@@ -121,7 +115,7 @@ public:
                                            nullptr);
             if (h == INVALID_HANDLE_VALUE)
                 continue;
-            const HandleOnExit guard{h};
+            const HandlePtr guard{h, ::CloseHandle};
             std::optional<std::string> why = foreign_owner(h);
             if (!why)
                 why = extra_links(h);
@@ -132,29 +126,21 @@ public:
     }
 
 private:
-    struct LocalFreeOnExit {
-        HLOCAL p;
-        explicit LocalFreeOnExit(HLOCAL x) noexcept : p(x) {}
-        ~LocalFreeOnExit() {
-            if (p)
-                ::LocalFree(p);
-        }
-        LocalFreeOnExit(const LocalFreeOnExit&) = delete;
-        LocalFreeOnExit& operator=(const LocalFreeOnExit&) = delete;
-    };
-    struct HandleOnExit {
-        HANDLE h;
-        explicit HandleOnExit(HANDLE x) noexcept : h(x) {}
-        ~HandleOnExit() { ::CloseHandle(h); }
-        HandleOnExit(const HandleOnExit&) = delete;
-        HandleOnExit& operator=(const HandleOnExit&) = delete;
-    };
+    using HandlePtr = std::unique_ptr<void, decltype(&::CloseHandle)>;
+    using LocalPtr = std::unique_ptr<void, decltype(&::LocalFree)>;
+
+    // SYSTEM, BUILTIN\Administrators or the process token's user.
+    [[nodiscard]] bool owner_allowed(PSID owner) const noexcept {
+        return ok() && owner != nullptr &&
+               (::EqualSid(owner, user_sid_) || ::IsWellKnownSid(owner, WinLocalSystemSid) ||
+                ::IsWellKnownSid(owner, WinBuiltinAdministratorsSid));
+    }
 
     static std::string sid_text(PSID sid) {
         LPWSTR raw = nullptr;
         if (!::ConvertSidToStringSidW(sid, &raw))
             return "an unreadable SID";
-        const LocalFreeOnExit guard{raw};
+        const LocalPtr guard{raw, ::LocalFree};
         return from_wide(raw);
     }
 

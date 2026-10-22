@@ -129,11 +129,11 @@ function, never in `applies_*` collectors.
 
 | Operation | tar.db behavior |
 |-----------|-----------------|
-| **In-place agent upgrade** | tar.db is preserved (lives in the agent data dir, not the install dir). Schema migration runs at first open of the new binary. Live-tier rows captured by the old binary remain queryable; rollups continue. On Windows, the first open also re-secures `tar.db` and its sidecars, and refuses the open when the files are owned by an account other than SYSTEM, Administrators or the agent's (for example after the agent's service account changed): see `docs/user-manual/tar.md` "Data storage". |
+| **In-place agent upgrade** | tar.db is preserved (lives in the agent data dir, not the install dir). Schema migration runs at first open of the new binary. Live-tier rows captured by the old binary remain queryable; rollups continue. On Windows, the first open also re-secures `tar.db` and its sidecars, and refuses the open when the files are owned by an account other than SYSTEM, Administrators or the agent's (for example after the agent's service account changed; the new account also needs access to the files): see `docs/user-manual/tar.md` "Data storage". |
 | **Uninstall** (`yuzu-agent --remove-service`, MSI uninstall) | tar.db is **left in place** by design. The data dir is operator-managed; uninstall removes the binary and service registration only. To wipe TAR data, delete `<data_dir>/tar.db` explicitly. |
 | **Reinstall over an existing data dir** | The new binary opens the existing tar.db, runs migration if the schema version differs, and resumes collection. State in `tar_state` may be stale (see §5). On Windows, files left by a different agent account are refused rather than adopted (`docs/user-manual/tar.md` "Data storage"). |
 | **`data_dir` change** (config update) | The new directory has no tar.db — the next collect_fast creates it from scratch. The old tar.db at the previous path is orphaned but not deleted. Operator concern, not TAR's. |
-| **Corruption detected at open** (#559) | `TarDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm` sidecars are renamed to `tar.db.corrupt-<epoch>` in the same directory (collision-safe if a second corruption lands in the same epoch-second) and a fresh database is initialised (a sidecar that can't be moved is removed so the new DB can't replay it). All `tar_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `tar.db.corruption_detected`; the sidecar is **not** auto-deleted (operator recovers it). If the corrupt file can't be moved aside (read-only/locked/perms), open **fails closed** — TAR refuses to load rather than trust the corrupt DB. **Fleet visibility:** the plugin publishes `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last`, bridged to the `yuzu.plugin.tar.*` heartbeat tags; the server exposes `yuzu_fleet_tar_db_corruption_agents` and writes a `tar.db.corruption_quarantined` audit row — see docs/user-manual/tar.md "Fleet visibility". |
+| **Corruption detected at open** (#559) | `TarDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm`/`-journal` sidecars are renamed to `tar.db.corrupt-<epoch>` in the same directory (collision-safe if a second corruption lands in the same epoch-second) and a fresh database is initialised (a sidecar that can't be moved is removed so the new DB can't replay it). All `tar_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `tar.db.corruption_detected`; the sidecar is **not** auto-deleted (operator recovers it). If the corrupt file can't be moved aside (read-only/locked/perms), open **fails closed** — TAR refuses to load rather than trust the corrupt DB. **Fleet visibility:** the plugin publishes `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last`, bridged to the `yuzu.plugin.tar.*` heartbeat tags; the server exposes `yuzu_fleet_tar_db_corruption_agents` and writes a `tar.db.corruption_quarantined` audit row — see docs/user-manual/tar.md "Fleet visibility". |
 
 The "leave data on uninstall" rule is identical to other Yuzu agent
 state stores. If a customer asks for "delete tar data on uninstall",
@@ -349,8 +349,10 @@ header):
    `crossplatform.tar.configure` (the MCP/REST + GUI toggle path) and any canned
    `tar.sql` drill-downs.
 9. **Server GUI** (optional) — the Capture-sources frame
-   (`render_tar_capture_sources`) auto-lists any source the agent reports in
-   `tar status`; presentation metadata (category, always-on, `$`-name, badges)
+   (`render_tar_capture_sources`) lists the ten core sources in a static array
+   (`kSources` in `tar_process_tree.cpp`, plus the Push allowlist in
+   `tar_tree_routes.cpp`); a new source is toggled through `tar.configure`
+   until it is added to both; presentation metadata (category, always-on, `$`-name, badges)
    lives in that render function. Device-level panels (no pid) go in the
    process-tree pane (`render_tar_*_panel` + a `tar_tree_routes` fragment).
 10. **Tests** — extend `test_tar_schema_registry.cpp` (every source has all three

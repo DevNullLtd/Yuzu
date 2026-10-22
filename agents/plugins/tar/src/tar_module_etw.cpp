@@ -339,8 +339,9 @@ std::int64_t image_mtime_unix(void* image) noexcept {
 // unrecognised status is kUnknown. Signer is best-effort, only when signed.
 ModuleSignVerdict verify_image_signature_win(void* image, const std::string& nt_path) {
     ModuleSignVerdict out; // {kUnknown, ""}
-    // The path field is required; it is the raw NT path (alive across both calls), which no
-    // Win32 reopen-by-name could resolve, so a fallback inside the provider fails, not follows.
+    // The path field is required. Authenticode on a PE reads the handle (the native parity case
+    // passes a bogus name with a real handle and still gets kSigned); the path is a label, the
+    // raw NT path kept alive across both calls.
     const std::wstring wpath = utf8_to_wide(nt_path);
     if (image == nullptr || wpath.empty()) {
         return out;

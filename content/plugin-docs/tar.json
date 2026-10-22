@@ -1817,7 +1817,7 @@
     {
       "columns": [
         {
-          "description": "Outcome token for the forced snapshot. The actual response line is `tar|snapshot|complete` when every enabled source collected cleanly, or `tar|snapshot|partial|<comma-joined source names>` when one or more sources threw an incomplete-capture error and retained their previous baseline instead of collecting. Values: complete, partial.",
+          "description": "Outcome token for the forced snapshot. The actual response line is `tar|snapshot|complete` when every enabled source collected cleanly, or `tar|snapshot|partial|<comma-joined source names>` when one or more sources threw an incomplete-capture error and retained their previous baseline instead of collecting, or whose `<source>_enabled` flag could not be read (that source's leg was skipped and its rows are kept). Values: complete, partial.",
           "example": "-",
           "name": "status",
           "platforms": [

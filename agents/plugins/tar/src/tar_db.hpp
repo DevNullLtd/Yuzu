@@ -443,8 +443,9 @@ public:
      * On failure the error text says WHY and, where there is one, the remedy: the directory
      * cannot be created, SQLite cannot open the file, a corrupt tar.db could not be moved aside
      * (#559, refused rather than trusted), a schema transaction wedged, or -- on Windows only --
-     * a planted tar.db, -wal, -shm or -journal (foreign owner or extra hard link) that could not
-     * be replaced. The plugin ABI carries only an error CODE, so the caller must log this text.
+     * a planted tar.db (refused) or a planted -wal, -shm or -journal that could not be replaced
+     * (foreign owner or extra hard link). The plugin ABI carries only an error CODE, so the
+     * caller must log this text.
      */
     static std::expected<TarDatabase, std::string> open(const std::filesystem::path& path);
 

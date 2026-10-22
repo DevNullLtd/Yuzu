@@ -143,8 +143,9 @@ DbHandle open_readonly(const fs::path& path, std::string& out_err, std::string_v
     // The daily sync ships these rows to the server, so a planted tar.db (or sidecar: -wal and
     // -shm are read as database content) must not be read. TAR refuses the same files before it
     // opens them, but a refused TAR init leaves the planted file in place, so this opener applies
-    // the same test itself, before SQLite touches anything.
-    if (const auto why = yuzu::win::TarDbOwnerProbe{}.distrust(path)) {
+    // the same test itself, before SQLite touches anything, and again after the first read.
+    const yuzu::win::TarDbOwnerProbe probe;
+    if (const auto why = probe.distrust(path)) {
         out_err = *why;
         return DbHandle{};
     }
@@ -171,6 +172,16 @@ DbHandle open_readonly(const fs::path& path, std::string& out_err, std::string_v
         out_token = "tar_db_corrupt";
         return DbHandle{};
     }
+#ifdef _WIN32
+    // The look above and sqlite3_open_v2 are two by-name operations, and an absent file passes
+    // the look, so a file moved in between would have been read. By now SQLite holds tar.db and
+    // the -wal/-shm it reads open without FILE_SHARE_DELETE, so those names are pinned to the
+    // files it read and anything planted is still there to be judged.
+    if (const auto why = probe.distrust(path)) {
+        out_err = *why;
+        return DbHandle{};
+    }
+#endif
     return db;
 }
 

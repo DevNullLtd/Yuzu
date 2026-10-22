@@ -325,7 +325,7 @@ their declared columns at all; see Caveats.
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `status` | string | - | Windows, Linux, macOS | `-` | Outcome token for the forced snapshot. The actual response line is `tar\|snapshot\|complete` when every enabled source collected cleanly, or `tar\|snapshot\|partial\|<comma-joined source names>` when one or more sources threw an incomplete-capture error and retained their previous baseline instead of collecting. Values: complete, partial. |
+| `status` | string | - | Windows, Linux, macOS | `-` | Outcome token for the forced snapshot. The actual response line is `tar\|snapshot\|complete` when every enabled source collected cleanly, or `tar\|snapshot\|partial\|<comma-joined source names>` when one or more sources threw an incomplete-capture error and retained their previous baseline instead of collecting, or whose `<source>_enabled` flag could not be read (that source's leg was skipped and its rows are kept). Values: complete, partial. |
 | `events_recorded` | int32 | - | all | `-` | Declared as a count of events the forced snapshot recorded; the current wire format (tar\|snapshot\|complete or \|partial\|<sources>) does not carry a numeric count, so this column is not populated — see Caveats and known gaps. Values: not emitted by the current wire format. |
 
 **`crossplatform.tar.sql` — `output`**

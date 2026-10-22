@@ -23,6 +23,7 @@
  * platform-guarded dispatcher TU hides a dead leg.
  */
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <yuzu/agent/plugin_loader.hpp>
 #include <yuzu/plugin.h>
@@ -325,10 +326,11 @@ TEST_CASE("app_usage plugin: StandalonePluginContext-seeded real tar.db — init
 }
 
 #ifdef _WIN32
-// ── Windows: a planted tar.db is refused, not read ───────────────────────────────────────────
-// The daily sync ships what this plugin reads, so it applies the same owner test TAR applies
-// before it opens the file (win_tar_db_owner_probe.hpp). The foreign owner needs
-// SeRestorePrivilege to set; the case SKIPs without it.
+// ── Windows: a planted tar.db or sidecar is refused, not read ────────────────────────────────
+// The daily sync ships what this plugin reads, so it applies the same owner and link tests TAR
+// applies before it opens the files (win_tar_db_owner_probe.hpp, distrust(): tar.db, -wal, -shm
+// and -journal; the same call runs again after the first read). The foreign owner needs
+// SeRestorePrivilege to set; those cases SKIP without it.
 namespace {
 
 bool enable_restore_privilege() {
@@ -355,15 +357,18 @@ void set_owner(const fs::path& p, PSID sid) {
 
 } // namespace
 
-TEST_CASE("app_usage plugin (Windows): a tar.db owned by a foreign account is refused, "
-          "not read",
+TEST_CASE("app_usage plugin (Windows): a planted tar.db or sidecar is refused, not read",
           "[app_usage][actions][hardening]") {
+    // "" is tar.db itself, then the three sidecars SQLite reads or replays; "hardlink" is a
+    // second name for tar.db.
+    const std::string kind = GENERATE(as<std::string>{}, "", "-wal", "-shm", "-journal", "hardlink");
+    const bool link = kind == "hardlink";
     auto plugin = load_app_usage_plugin();
     if (!plugin) {
         require_plugin_or_skip();
         return;
     }
-    if (!enable_restore_privilege())
+    if (!link && !enable_restore_privilege())
         SKIP("SeRestorePrivilege unavailable");
 
     yuzu::test::TempDir dir_guard{"yuzu_test_app_usage_owner_"};
@@ -409,16 +414,46 @@ TEST_CASE("app_usage plugin (Windows): a tar.db owned by a foreign account is re
     PSID users = nullptr;
     REQUIRE(::ConvertStringSidToSidW(L"S-1-5-32-545", &users)); // BUILTIN\Users
     const std::unique_ptr<void, decltype(&::LocalFree)> users_guard{users, ::LocalFree};
-    set_owner(db, users);
+
+    // Plant: a second hard link to tar.db, or a sidecar (or tar.db itself) owned by a foreign
+    // account. `planted` is the extra name (hardlink) or the file the owner is set on.
+    fs::path planted = db;
+    if (link) {
+        planted += ".link";
+        std::error_code link_ec;
+        fs::create_hard_link(db, planted, link_ec);
+        if (link_ec)
+            SKIP("hard links unavailable on this volume");
+    } else {
+        planted += kind;
+        if (!kind.empty())
+            REQUIRE(std::ofstream(planted, std::ios::binary).is_open());
+        set_owner(planted, users);
+    }
 
     const auto refused = dispatcher.run(plugin->descriptor, "summary");
     CHECK(refused.rc == 1);
     const auto refused_rows = captured_rows(refused.captured);
     REQUIRE_FALSE(refused_rows.empty());
     CHECK(refused_rows.front().rfind("constrained|tar_db_unavailable|", 0) == 0);
-    CHECK(refused_rows.front().find("owned by") != std::string::npos);
+    // The detail names the file and why: the planted sidecar, or tar.db with its second link.
+    CHECK(refused_rows.front().find(link ? "tar.db has 2 hard links"
+                                         : "tar.db" + kind + " is owned by") !=
+          std::string::npos);
 
-    set_owner(db, token_user); // reversible: back to ours, the next read works
+    // Reversible: undo the plant and the next read works, so the refusal was that file's.
+    if (link) {
+        std::error_code rm_ec;
+        fs::remove(planted, rm_ec);
+        REQUIRE_FALSE(rm_ec);
+    } else {
+        set_owner(planted, token_user);
+        if (!kind.empty()) {
+            std::error_code rm_ec;
+            fs::remove(planted, rm_ec);
+            REQUIRE_FALSE(rm_ec);
+        }
+    }
     const auto again = dispatcher.run(plugin->descriptor, "summary");
     CHECK(again.rc == 0);
 

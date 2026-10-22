@@ -195,14 +195,23 @@ bool integrity_ok(sqlite3* db) noexcept {
     return ok;
 }
 
-// Move a corrupt tar.db (and its -wal/-shm sidecars) aside to a timestamped
-// `.corrupt-<epoch>` path for forensic review, so open() can re-initialise a
-// fresh, trustworthy database rather than refusing to load TAR entirely.
+// The integer in a tar_config `schema_version` value; an unparseable one reads as 0.
+int parse_schema_version(const std::string& text) {
+    try {
+        return std::stoi(text);
+    } catch (...) {
+        return 0;
+    }
+}
+
+// Move a corrupt tar.db (and its -wal/-shm/-journal sidecars, the four files SQLite reads for
+// it) aside to a timestamped `.corrupt-<epoch>` path for forensic review, so open() can
+// re-initialise a fresh, trustworthy database rather than refusing to load TAR entirely.
 // Returns the quarantine path, or std::nullopt if the corrupt main file could
 // NOT be moved aside (read-only mount, locked file on Windows, permissions) —
 // in which case the caller MUST fail closed rather than re-open-and-trust the
 // still-corrupt file (#559 / UP-1). A sidecar that can't be moved is removed
-// instead, so the freshly-created DB can never adopt a stale -wal/-shm; the
+// instead, so the freshly-created DB can never adopt a stale -wal/-shm/-journal; the
 // caller's post-reopen integrity re-check is the backstop if even that fails.
 // An EMPTY sidecar is removed rather than kept: it holds no evidence.
 std::optional<std::filesystem::path>
@@ -228,7 +237,7 @@ quarantine_corrupt_db(const std::filesystem::path& path) {
     std::filesystem::rename(path, dest, ec);
     if (ec)
         return std::nullopt; // could not move the corrupt DB aside — fail closed
-    for (const char* suffix : {"-wal", "-shm"}) {
+    for (const char* suffix : {"-wal", "-shm", "-journal"}) {
         std::filesystem::path side = path;
         side += suffix;
         std::error_code ec2;
@@ -378,9 +387,12 @@ int exec_ddl_batch(sqlite3* db, const char* ddl, char** err_msg) {
 // that way SQLite cannot open either. FILE_FLAG_OPEN_REPARSE_POINT examines a planted symlink
 // as the link, never its target. Lock-out: a later run under a different non-admin account
 // cannot open tar.db. An account switch is not undone by `icacls /reset` (it rewrites the DACL,
-// never the owner): the old account still owns the files, so the open is refused until the new
-// account owns them AND holds an ACE for them (the open asks FILE_READ_ATTRIBUTES, which owning
-// a file does not grant).
+// never the owner): the open fails until the new account holds an ACE for the files (the open
+// asks FILE_READ_ATTRIBUTES, which owning a file does not grant) and, when the former owner is
+// neither SYSTEM nor Administrators, until it owns them too, since the owner test refuses them
+// first. A former owner of SYSTEM or Administrators passes the owner test, so no owner is named:
+// the log shows "could not open ... (error 5)", then "failed to open tar.db". Not yet verified
+// on a Windows host.
 
 using LocalPtr = std::unique_ptr<void, decltype(&::LocalFree)>;
 using HandlePtr = std::unique_ptr<void, decltype(&::CloseHandle)>;
@@ -500,9 +512,9 @@ std::optional<std::string> secure_tar_db_files(const std::filesystem::path& db,
         std::string remedy;
         if (auto owned_by = probe.foreign_owner(h.get(), &owner_rc)) {
             why = std::move(*owned_by);
-            remedy = "move it aside or remove it, then restart the agent; if it belongs to a "
-                     "former agent account, take ownership of the tar.db files and grant the "
-                     "agent account full access instead";
+            remedy = "move it aside or remove it, then restart the agent; if its owner SID is a "
+                     "former agent account's, take ownership of tar.db, tar.db-wal, tar.db-shm "
+                     "and tar.db-journal and grant the agent account full access instead";
         } else if (auto linked = yuzu::win::TarDbOwnerProbe::extra_links(h.get())) {
             why = std::move(*linked);
             remedy = std::format("remove the other links (fsutil hardlink list \"{}\" names "
@@ -755,11 +767,7 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
         // would rewrite the version to 2 and replay the whole ladder (v8 included, which flips an
         // operator's disable back on). Only a confirmed-absent or unparseable row migrates.
         if (const auto stored = db.try_get_config("schema_version")) {
-            int version = 0;
-            try {
-                version = stored->has_value() ? std::stoi(**stored) : 0;
-            } catch (...) {} // unparseable reads as 0, as schema_version() does
-            if (version < 2) {
+            if ((stored->has_value() ? parse_schema_version(**stored) : 0) < 2) {
                 db.set_config("schema_version", "2");
                 spdlog::info("TarDatabase: migrated to schema version 2 (typed warehouse tables)");
             }
@@ -1839,12 +1847,7 @@ bool TarDatabase::set_config_locked(const std::string& key, const std::string& v
 // ── Warehouse schema management ─────────────────────────────────────────────
 
 int TarDatabase::schema_version() {
-    auto v = get_config("schema_version", "0");
-    try {
-        return std::stoi(v);
-    } catch (...) {
-        return 0;
-    }
+    return parse_schema_version(get_config("schema_version", "0"));
 }
 
 bool TarDatabase::create_warehouse_tables() {
