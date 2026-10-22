@@ -62,9 +62,9 @@ TEST_CASE("step-up policy: kExempt and kOwnGate rows carry a reason, kRequired r
     }
 }
 
-TEST_CASE("step-up policy: the gated set is exactly the 33 routes with an in-handler call",
+TEST_CASE("step-up policy: the gated set is exactly the 36 routes with an in-handler call",
           "[stepup][policy]") {
-    CHECK(count_class(StepUpClass::kRequired) == 33);
+    CHECK(count_class(StepUpClass::kRequired) == 36);
     CHECK(count_class(StepUpClass::kOwnGate) == 3);
     CHECK(count_class(StepUpClass::kStrong) == 0);
 }
@@ -92,6 +92,21 @@ TEST_CASE("step-up policy: lookup is by exact key, never by prefix or verb-blind
         REQUIRE(e != nullptr);
         CHECK(e->cls == StepUpClass::kRequired);
         CHECK(e->action_label == "POST /api/v1/tokens");
+    }
+    SECTION("the approval decisions and the policy-generation raise carry their in-handler labels") {
+        const auto* approve = step_up_policy_for("POST", R"(/api/approvals/([^/]+)/approve)");
+        const auto* reject = step_up_policy_for("POST", R"(/api/approvals/([^/]+)/reject)");
+        const auto* raise =
+            step_up_policy_for("POST", "/api/v1/guaranteed-state/policy-generation/raise");
+        REQUIRE(approve != nullptr);
+        REQUIRE(reject != nullptr);
+        REQUIRE(raise != nullptr);
+        CHECK(approve->cls == StepUpClass::kRequired);
+        CHECK(reject->cls == StepUpClass::kRequired);
+        CHECK(raise->cls == StepUpClass::kRequired);
+        CHECK(approve->action_label == "POST /api/approvals/{id}/approve");
+        CHECK(reject->action_label == "POST /api/approvals/{id}/reject");
+        CHECK(raise->action_label == "POST /api/v1/guaranteed-state/policy-generation/raise");
     }
     SECTION("a raw-string pattern is the registered text, escapes included") {
         const auto* e =
@@ -150,8 +165,6 @@ struct PendingKey {
 // the same change. A NEW mutating route is never added here: classify it kExempt with a named
 // reason, or kRequired with an action label.
 constexpr PendingKey kGrandfatheredPending[] = {
-    {"POST", R"(/api/approvals/([^/]+)/approve)"},
-    {"POST", R"(/api/approvals/([^/]+)/reject)"},
     {"PUT", R"(/api/config/([a-z_]+))"},
     {"POST", R"(/api/dashboard/group-from-results)"},
     {"PUT", R"(/api/directory/group-mappings)"},

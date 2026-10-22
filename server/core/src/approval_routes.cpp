@@ -106,8 +106,13 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
                  "contact an administrator");
         return;
     }
-    if (!deps.step_up_fn(req, res, *session,
-                         std::string("POST /api/approvals/{id}/") + verb))
+    // Each label is spelled out as a literal (not a prefix plus the verb) because the label pin in
+    // test_step_up_route_inventory.cpp reads these call sites lexically and must see the text
+    // kStepUpPolicy carries for the two approval rows.
+    const bool stepped_up =
+        is_approve ? deps.step_up_fn(req, res, *session, "POST /api/approvals/{id}/approve")
+                   : deps.step_up_fn(req, res, *session, "POST /api/approvals/{id}/reject");
+    if (!stepped_up)
         return; // step-up wrote its own 401 envelope
 
     const auto id = req.matches[1].str();

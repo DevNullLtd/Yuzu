@@ -132,6 +132,8 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
     step_up_mcp_detail::pending("import_ca_chain",                      "POST",   R"(/api/v1/ca/import-chain)"),
     step_up_mcp_detail::pending("issue_code_signing_cert",              "POST",   R"(/api/v1/ca/issue-code-signing)"),
     step_up_mcp_detail::pending("mint_engine_credential",               "POST",   R"(/api/v1/engine-principals/([^/]+)/credentials)"),
+    // Added at the dev merge, ruling due in PR 2: the twin is kRequired, so the tool cannot be exempt.
+    step_up_mcp_detail::pending("raise_guardian_policy_generation",     "POST",   R"(/api/v1/guaranteed-state/policy-generation/raise)"),
     step_up_mcp_detail::pending("revoke_engine_principal",              "DELETE", R"(/api/v1/engine-principals/([^/]+))"),
     step_up_mcp_detail::pending("rewrap_secrets",                       "POST",   R"(/api/v1/secrets/kek/rewrap)"),
     step_up_mcp_detail::pending("rotate_engine_credential",             "POST",   R"(/api/v1/engine-principals/([^/]+)/credentials/rotate)"),
@@ -156,8 +158,10 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
 // clang-format on
 
 /// Ceiling on the number of kPendingRuling MCP rows. May only be LOWERED: a new tool cannot be
-/// parked as pending, it needs a real class.
-inline constexpr std::size_t kMcpPendingRulingMax = 44;
+/// parked as pending, it needs a real class. The one exception so far is
+/// `raise_guardian_policy_generation` (44 -> 45), added at the dev merge: its REST twin is
+/// kRequired, so the tool cannot be kExempt, and kRequired is not evaluated for MCP yet.
+inline constexpr std::size_t kMcpPendingRulingMax = 45;
 
 inline constexpr std::size_t kMcpStepUpPolicyCount = std::size(kMcpStepUpPolicy);
 

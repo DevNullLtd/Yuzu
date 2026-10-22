@@ -122,7 +122,9 @@ namespace {
 // The exact tool-name set of the kPendingRuling rows, sorted. kMcpPendingRulingMax alone only
 // bounds how MANY rows are pending, so swapping one pending tool for another would pass; this
 // list pins WHICH ones. Resolving a row (moving it to kExempt with a named reason) means deleting
-// its entry here AND lowering kMcpPendingRulingMax in the same change. A NEW tool is never added here: classify it kExempt with a named reason.
+// its entry here AND lowering kMcpPendingRulingMax in the same change. A NEW tool is never added
+// here: classify it kExempt with a named reason. The one exception so far is
+// raise_guardian_policy_generation, added at the dev merge (its REST twin is kRequired).
 constexpr std::string_view kGrandfatheredMcpPending[] = {
     "activate_platform_license",
     "add_management_group_member",
@@ -148,6 +150,7 @@ constexpr std::string_view kGrandfatheredMcpPending[] = {
     "mint_upload_grant",
     "push_guardian_rules",
     "quarantine_device",
+    "raise_guardian_policy_generation", // added at the dev merge, ruling due in PR 2
     "reject_request",
     "revoke_api_token",
     "revoke_certificate",

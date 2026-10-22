@@ -149,6 +149,10 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     {"PUT",    R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",          StepUpClass::kRequired, step_up_detail::kNoReason, "PUT /api/v1/guaranteed-state/rules/{id}"},
     {"DELETE", R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",          StepUpClass::kRequired, step_up_detail::kNoReason, "DELETE /api/v1/guaranteed-state/rules/{id}"},
     {"POST",   R"(/api/v1/guaranteed-state/push)",                              StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/guaranteed-state/push"},
+    {"POST",   R"(/api/v1/guaranteed-state/policy-generation/raise)",           StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/guaranteed-state/policy-generation/raise"},
+    // Approvals (approval_routes.cpp; the label is the handler's verb-based one)
+    {"POST",   R"(/api/approvals/([^/]+)/approve)",                             StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/approvals/{id}/approve"},
+    {"POST",   R"(/api/approvals/([^/]+)/reject)",                              StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/approvals/{id}/reject"},
     // Dashboard (guardian_routes.cpp)
     {"POST",   R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/update)",        StepUpClass::kRequired, step_up_detail::kNoReason, "POST /fragments/guardian/guard/{id}/update"},
     {"POST",   R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/delete)",        StepUpClass::kRequired, step_up_detail::kNoReason, "POST /fragments/guardian/guard/{id}/delete"},
@@ -171,9 +175,6 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     // literal "classification pending". The assert is `count <= kPendingRulingMax`; keep
     // `kPendingRulingMax` equal to the count (test_step_up_policy.cpp pins equality, so it may
     // only be lowered, never left above). Rows are grouped by owning file, in registration-scan order.
-    // approval_routes.cpp
-    step_up_detail::pending("POST",  R"(/api/approvals/([^/]+)/approve)"),
-    step_up_detail::pending("POST",  R"(/api/approvals/([^/]+)/reject)"),
     // auth_routes.cpp
     step_up_detail::exempt("POST",  R"(/login)",                                                                  step_up_detail::kPreSession),
     step_up_detail::exempt("POST",  R"(/login/mfa)",                                                              step_up_detail::kPreSession),
@@ -406,7 +407,7 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
 
 /// Ceiling on the number of kPendingRuling rows. May only be LOWERED: a new
 /// route cannot be parked as pending, it needs a real class.
-inline constexpr std::size_t kPendingRulingMax = 75;
+inline constexpr std::size_t kPendingRulingMax = 73;
 
 inline constexpr std::size_t kStepUpPolicyCount = std::size(kStepUpPolicy);
 

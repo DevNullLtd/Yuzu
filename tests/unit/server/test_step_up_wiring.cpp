@@ -14,6 +14,8 @@
  * `apply_step_up_chokepoint` turns the refusal test red.
  */
 
+#include "../../../server/core/src/approval_routes.hpp"
+#include "../../../server/core/src/http_route_sink.hpp"
 #include "../../../server/core/src/step_up_policy.hpp"
 #include "../../../server/core/src/step_up_wiring.hpp"
 
@@ -428,6 +430,194 @@ TEST_CASE("wiring: a bearer principal passes a kRequired route and an unresolved
         CHECK(r->status == 401);
         CHECK_FALSE(r->get_header_value("X-Correlation-Id").empty());
         CHECK(s.rotate_handler_calls.load() == 0);
+    }
+}
+
+namespace {
+
+// The REAL approval routes (approval_routes.cpp) behind the same pre-request stage as production,
+// with no ApprovalManager wired: a request that gets past the handler's class check answers 503
+// ("service unavailable") before the handler's own step-up call, so no store is needed to see
+// WHERE each caller class is stopped. The handler's step-up closure is a recording stub.
+struct ApprovalWiringServer {
+    httplib::Server svr;
+    int port{0};
+
+    std::mutex mu;
+    std::optional<auth::Session> session;
+    std::vector<AuditRow> chokepoint_audits;
+
+    std::atomic<int> perm_calls{0};
+    std::atomic<int> handler_step_up_calls{0};
+    std::atomic<int> handler_audit_rows{0};
+
+    yuzu::MetricsRegistry metrics;
+
+    MfaStatusFn mfa_status = [](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
+        AuthDB::MfaStatus st;
+        st.enrolled = true;
+        return st;
+    };
+    StepUpSessionFn resolver = [this](const httplib::Request&) -> std::optional<auth::Session> {
+        std::lock_guard lk(mu);
+        return session;
+    };
+    StepUpAuditFn audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
+                                 const std::string&, const std::string& ti,
+                                 const std::string& d) -> bool {
+        std::lock_guard lk(mu);
+        chokepoint_audits.push_back({a, r, ti, d});
+        return true;
+    };
+
+    ApprovalWiringServer() {
+        svr.set_pre_routing_handler([](const httplib::Request&, httplib::Response&) {
+            detail::clear_step_up_pass();
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
+        svr.set_pre_request_handler(
+            [this](const httplib::Request& req,
+                   httplib::Response& res) -> httplib::Server::HandlerResponse {
+                const StepUpChokepointDeps deps{.resolve_session = &resolver,
+                                                .auth_db = nullptr,
+                                                .mfa_status = &mfa_status,
+                                                .audit_fn = &audit,
+                                                .metrics = &metrics,
+                                                .window_secs = 300,
+                                                .mfa_enforcement = "optional"};
+                return detail::run_pre_request_stage(req, res, deps);
+            });
+        svr.set_post_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+            detail::finish_step_up_pass(req, res, &metrics);
+        });
+
+        approval::Deps deps;
+        deps.perm_fn = [this](const httplib::Request&, httplib::Response&, const std::string&,
+                              const std::string&) {
+            perm_calls.fetch_add(1);
+            return true;
+        };
+        deps.resolve_session_fn = [this](const httplib::Request&) -> std::optional<auth::Session> {
+            std::lock_guard lk(mu);
+            return session;
+        };
+        deps.audit_fn = [this](const httplib::Request&, const std::string&, const std::string&,
+                               const std::string&, const std::string&, const std::string&) {
+            handler_audit_rows.fetch_add(1);
+            return true;
+        };
+        deps.emit_event_fn = [](const std::string&, const httplib::Request&, const nlohmann::json&,
+                                const nlohmann::json&) {};
+        deps.step_up_fn = [this](const httplib::Request&, httplib::Response&, const auth::Session&,
+                                 const std::string&) {
+            handler_step_up_calls.fetch_add(1);
+            return true;
+        };
+        HttplibRouteSink sink(svr);
+        approval::register_approval_routes(sink, std::move(deps));
+
+        port = svr.bind_to_any_port("127.0.0.1");
+        REQUIRE(port > 0);
+        listener.start();
+        CHECK(listener.wait_running());
+    }
+
+    void set_session(std::optional<auth::Session> s) {
+        std::lock_guard lk(mu);
+        session = std::move(s);
+    }
+
+    double gate_count(std::string_view outcome, std::string_view source) {
+        return metrics
+            .counter("yuzu_auth_mfa_step_up_gate_total", {{"outcome", std::string(outcome)},
+                                                          {"source", std::string(source)},
+                                                          {"surface", "dashboard"}})
+            .value();
+    }
+
+    httplib::Result post(const std::string& path, bool same_site_origin) {
+        httplib::Client cli("127.0.0.1", port);
+        cli.set_connection_timeout(5, 0);
+        cli.set_read_timeout(5, 0);
+        cli.set_write_timeout(5, 0);
+        httplib::Headers h;
+        if (same_site_origin)
+            h.emplace("Origin", "http://127.0.0.1:" + std::to_string(port));
+        return cli.Post(path, h, "{}", "application/json");
+    }
+
+    // LAST member: destroyed first (see ListenerThread).
+    ListenerThread listener{svr};
+};
+
+} // namespace
+
+TEST_CASE("wiring: the approve and reject routes compose with the central step-up check",
+          "[stepup][wiring][approval_routes]") {
+    for (const char* verb : {"approve", "reject"}) {
+        const std::string path = std::string("/api/approvals/abc123/") + verb;
+        INFO(path);
+        const auto* row = step_up_policy_for("POST", std::string("/api/approvals/([^/]+)/") + verb);
+        REQUIRE(row != nullptr);
+        REQUIRE(row->cls == StepUpClass::kRequired);
+        CHECK(row->action_label == std::string("POST /api/approvals/{id}/") + verb);
+
+        SECTION(std::string(verb) + ": a stale cookie proof is a 401 before any handler check") {
+            ApprovalWiringServer s;
+            s.set_session(make_session("alice", "local", Role::admin, 1h));
+            auto r = s.post(path, /*same_site_origin=*/true);
+            REQUIRE(r);
+            CHECK(r->status == 401);
+            const auto body = nlohmann::json::parse(r->body, nullptr, /*allow_exceptions=*/false);
+            REQUIRE(body.is_object());
+            CHECK(body["meta"].value("mfa_step_up_required", false) == true);
+            CHECK(s.perm_calls.load() == 0); // the handler never ran
+            CHECK(s.handler_audit_rows.load() == 0);
+            CHECK(s.gate_count("refused", "local") == 1);
+        }
+        SECTION(std::string(verb) + ": an engine principal is a 403 engine_principal_denied from "
+                                    "the central check") {
+            ApprovalWiringServer s;
+            auto engine = make_session("engine:ci", "engine_token", Role::admin, 5s);
+            engine.principal_kind = "engine";
+            s.set_session(engine);
+            auto r = s.post(path, /*same_site_origin=*/false);
+            REQUIRE(r);
+            CHECK(r->status == 403);
+            CHECK(s.perm_calls.load() == 0);
+            CHECK(s.handler_audit_rows.load() == 0);
+            bool engine_row = false;
+            std::lock_guard lk(s.mu);
+            for (const auto& a : s.chokepoint_audits)
+                engine_row = engine_row || (a.action == "mfa.step_up.required" &&
+                                            a.detail.find("engine_principal_denied") !=
+                                                std::string::npos);
+            CHECK(engine_row);
+        }
+        SECTION(std::string(verb) + ": an API-token session passes the central check and the "
+                                    "handler still refuses it 403") {
+            ApprovalWiringServer s;
+            s.set_session(make_session("tok-owner", "api_token", Role::admin, 1h));
+            auto r = s.post(path, /*same_site_origin=*/false);
+            REQUIRE(r);
+            CHECK(r->status == 403);
+            CHECK(s.gate_count("pass", "api_token") == 1);
+            CHECK(s.perm_calls.load() == 1); // the handler ran and refused it
+            CHECK(r->body.find("approver_assurance_required:non_interactive_session") !=
+                  std::string::npos);
+            CHECK(s.handler_step_up_calls.load() == 0);
+        }
+        SECTION(std::string(verb) + ": a fresh cookie proof reaches the handler") {
+            ApprovalWiringServer s;
+            s.set_session(make_session("alice", "local", Role::admin, 5s));
+            auto r = s.post(path, /*same_site_origin=*/true);
+            REQUIRE(r);
+            // No ApprovalManager is wired, so the handler answers 503 after the class check.
+            CHECK(r->status == 503);
+            CHECK(s.perm_calls.load() == 1);
+            CHECK(s.gate_count("pass", "local") == 1);
+            CHECK(s.gate_count("refused", "local") == 0);
+        }
     }
 }
 
