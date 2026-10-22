@@ -59,6 +59,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <functional>
 #include <memory>
 #include <set>
 #include <stdexcept>
@@ -3045,7 +3047,10 @@ TEST_CASE("WS-5 BatchHeartbeat: a session id carried by TWO directory rows is re
     auto row_b = owner.store.lookup_route("yuzu_test_ws5_dup_b");
     REQUIRE(row_b.has_value());
     REQUIRE(row_b->has_value());
-    // Force the duplicate: agent b's row now carries agent a's session id.
+    // Force the duplicate: agent b's row now carries agent a's session id. The
+    // v5 unique index would refuse it, so model pre-v5 data by dropping it
+    // (defense-in-depth: the ambiguity refusal must keep working).
+    raw_exec(db.dsn(), "DROP INDEX gateway_route_store.ux_agent_routes_session_id");
     raw_bump_epoch(db.dsn(), "yuzu_test_ws5_dup_b", (*row_b)->connection_epoch + 1, sid1);
 
     auto resp = batch_hb(other.svc, {sid1});
@@ -3517,6 +3522,7 @@ TEST_CASE("WS-5 ProxyInventory: a degraded read with a local hint still ingests 
         auto row_b = owner.store.lookup_route("yuzu_test_ws5_inv_amb_b");
         REQUIRE(row_b.has_value());
         REQUIRE(row_b->has_value());
+        raw_exec(db.dsn(), "DROP INDEX gateway_route_store.ux_agent_routes_session_id");
         raw_bump_epoch(db.dsn(), "yuzu_test_ws5_inv_amb_b", (*row_b)->connection_epoch + 1, sid1);
 
         apb::InventoryReport rpt;
@@ -3526,6 +3532,128 @@ TEST_CASE("WS-5 ProxyInventory: a degraded read with a local hint still ingests 
         CHECK_FALSE(ack.received());
         CHECK(owner.desync("session_lookup", "ambiguous_session") == 1);
     }
+}
+
+TEST_CASE("#5683 ProxyRegister: racing replay adopts of one unheld id by two agents land "
+          "exactly once over gRPC",
+          "[pg][gateway_route_wiring][ws5][unique_session]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture owner(db.dsn());
+    LiveGatewayWiringHarness harness(owner.store);
+
+    constexpr int kPairs = 40;
+    int bad_pairs = 0;
+    int doubles = 0;
+    for (int i = 0; i < kPairs; ++i) {
+        char hex[40];
+        std::snprintf(hex, sizeof(hex), "%032x", 0x5683u + static_cast<unsigned>(i));
+        const std::string sid = std::string("gw-session-") + hex;
+        const std::string a = "yuzu_test_us_grpc_a" + std::to_string(i);
+        const std::string b = "yuzu_test_us_grpc_b" + std::to_string(i);
+        auto req_a = make_gw_register(harness.auth_mgr, a);
+        auto req_b = make_gw_register(harness.auth_mgr, b);
+
+        std::atomic<bool> go{false};
+        grpc::Status status_a;
+        grpc::Status status_b;
+        auto call = [&](const apb::RegisterRequest& req, grpc::Status& out) {
+            grpc::ClientContext ctx;
+            ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
+            ctx.AddMetadata(std::string(AgentServiceImpl::kSessionMetadataKey), sid);
+            apb::RegisterResponse resp;
+            while (!go.load(std::memory_order_acquire)) {}
+            out = harness.stub_->ProxyRegister(&ctx, req, &resp);
+        };
+        std::thread ta(call, std::cref(req_a), std::ref(status_a));
+        std::thread tb(call, std::cref(req_b), std::ref(status_b));
+        go.store(true, std::memory_order_release);
+        ta.join();
+        tb.join();
+
+        const int ok = status_a.ok() + status_b.ok();
+        const int refused = (status_a.error_code() == grpc::StatusCode::FAILED_PRECONDITION) +
+                            (status_b.error_code() == grpc::StatusCode::FAILED_PRECONDITION);
+        if (ok != 1 || refused != 1)
+            ++bad_pairs;
+
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult r{PQexec(conn.get(),
+                              ("SELECT count(*) FROM gateway_route_store.agent_routes "
+                               "WHERE session_id = '" + sid + "'").c_str())};
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        if (std::stoi(PQgetvalue(r.get(), 0, 0)) > 1)
+            ++doubles;
+    }
+    CHECK(doubles == 0);
+    CHECK(bad_pairs == 0);
+}
+
+TEST_CASE("#5683 NotifyStreamStatus CONNECTED: a fallback insert refused by the unique session "
+          "index unpublishes the placement and is counted and audited",
+          "[pg][gateway_route_wiring][ws5][unique_session]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    PgAuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    svc.set_gateway_route_store(&store);
+    svc.set_audit_store(&audit);
+
+    auto req_a = make_gw_register(auth_mgr, "yuzu_test_us_ntf_a");
+    auto req_b = make_gw_register(auth_mgr, "yuzu_test_us_ntf_b");
+    apb::RegisterResponse resp_a;
+    apb::RegisterResponse resp_b;
+    REQUIRE(svc.ProxyRegister(/*context=*/nullptr, &req_a, &resp_a).ok());
+    REQUIRE(svc.ProxyRegister(/*context=*/nullptr, &req_b, &resp_b).ok());
+    const std::string sid_b = resp_b.session_id();
+
+    // b's row is gone (purged) while its local session lives; a's row now
+    // carries b's session id, so b's fallback insert collides on the index.
+    raw_exec(db.dsn(), "DELETE FROM gateway_route_store.agent_routes "
+                       "WHERE agent_id = 'yuzu_test_us_ntf_b'");
+    raw_bump_epoch(db.dsn(), "yuzu_test_us_ntf_a", 7, sid_b);
+
+    gw::StreamStatusNotification notif;
+    notif.set_agent_id("yuzu_test_us_ntf_b");
+    notif.set_session_id(sid_b);
+    notif.set_event(gw::StreamStatusNotification::CONNECTED);
+    notif.set_cluster_id("cluster-us");
+    notif.set_gateway_node("node-us");
+    notif.add_wire_capabilities("cap-us");
+    gw::StreamStatusAck ack;
+    REQUIRE(svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack).ok());
+
+    CHECK(metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "announce_connected"}, {"outcome", "session_held_by_other_agent"}})
+              .value() == 1);
+    CHECK(metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "announce_connected"}, {"outcome", "session_mismatch"}})
+              .value() == 0);
+    CHECK_FALSE(registry.gateway_has_wire_capability("yuzu_test_us_ntf_b", "cap-us"));
+    auto row_b = store.lookup_route("yuzu_test_us_ntf_b");
+    REQUIRE(row_b.has_value());
+    CHECK_FALSE(row_b->has_value());
+
+    auto rows = audit.query({});
+    REQUIRE(rows.has_value());
+    auto it = std::ranges::find_if(*rows, [](const auto& r) {
+        return r.action == "gateway.session_held_by_other_agent";
+    });
+    REQUIRE(it != rows->end());
+    CHECK(it->target_id == "yuzu_test_us_ntf_b");
+    CHECK(it->result == "failure");
+    CHECK(it->detail.find(sid_b) == std::string::npos);
 }
 
 TEST_CASE("WS-5 ProxyRegister: an attacker presenting a victim's session id is refused and the "
