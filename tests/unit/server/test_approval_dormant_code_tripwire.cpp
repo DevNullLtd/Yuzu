@@ -11,8 +11,10 @@
  * WHAT IT SCANS. Source text only, under `server/core/src` (YUZU_SERVER_SRC_DIR) and nowhere
  * else. EVERY regular file there is lexed as C++ whatever its extension (.cpp .hpp .ipp .inl
  * .tpp .cxx .def, none at all ...), except those on kNonSourceExtensions: documentation, data,
- * images, fonts, certificates and archives, which cannot be compiled into the server. Not
- * scanned: `tests/`, `server/core/include`, `common/include`, `sdk/include`, `agents/`, files
+ * images, fonts, certificates and archives, skipped by repository convention (by what these
+ * extensions are used for here), NOT because the compiler could not read them: a C++
+ * `#include "fragment.txt"` can include source, so a fragment included under a skipped extension
+ * is an unscanned residual. Not scanned: `tests/`, `server/core/include`, `common/include`, `sdk/include`, `agents/`, files
  * reached through a directory symlink, generated files. A macro that pastes a name together, a
  * generated file and anything the lexer cannot see are invisible to it, and it proves nothing
  * about what a caller does.
@@ -43,9 +45,12 @@
  * repository has no CODEOWNERS entry for these paths. The failure message names the ADR
  * conditions; it cannot check that they were met.
  *
- * HOW IT LEXES. Line comments (a trailing backslash continues one onto the next line), block
- * comments, string, character and raw-string literals, including the encoding prefixes u8 u U L
- * on each. A `'` is a digit separator only inside a number (the run before it starts with a
+ * HOW IT LEXES. First translation phase 2: every backslash, optional horizontal whitespace and
+ * LF or CR-LF is removed (the compiler splices it, with a warning when whitespace sits between),
+ * and each byte of the spliced text remembers its place in the original, so a hit is reported on
+ * its original line. A raw string is the exception: splices are reverted inside it, so its body
+ * and closing delimiter are read from the original text. Then line comments, block comments,
+ * string, character and raw-string literals, including the encoding prefixes u8 u U L on each. A `'` is a digit separator only inside a number (the run before it starts with a
  * digit); anywhere else, `case'"':` included, it opens a character literal. `$` and a non-ASCII
  * byte count as identifier characters when deciding where a literal starts. An earlier version
  * tested each raw line for a block comment opener and so treated a route pattern ending in
@@ -54,11 +59,11 @@
  * metric pre-seed are each found exactly once) exist so that a scanner which goes blind fails
  * instead of passing.
  *
- * KNOWN UNHANDLED SHAPES, none present in `server/core/src` today: a line splice inside a
- * token (a comment opener split by backslash-newline, or `submit_\<newline>bound`), a
- * universal-character-name spelling of an identifier, a block comment or raw string that is
- * unterminated at end of file (it blanks to the end), and text in a skipped `#if 0` region
- * (read as code, so it can only add a hit, never hide one).
+ * KNOWN UNHANDLED SHAPES, none present in `server/core/src` today: a universal-character-name
+ * spelling of an identifier, a block comment or raw string that is unterminated at end of file
+ * (it blanks to the end), a lone CR used as a line end, and text in a skipped `#if 0` region
+ * (read as code, so it can only add a hit, never hide one). A splice inside a token (a comment
+ * opener split by backslash-newline, or `submit_\<newline>bound`) IS handled.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -142,74 +147,107 @@ bool is_digit_separator(const std::string& text, std::size_t at, std::size_t flo
     }
 }
 
-// End (the index of the newline, or the text size) of the `//` comment that starts at `from`. A
-// backslash directly before a newline (a CR may sit between) continues the comment onto the next
-// line, as the compiler's line splicing does, so a `/*` on the continuation is still comment.
-std::size_t line_comment_end(const std::string& text, std::size_t from) {
-    std::size_t end = text.find('\n', from);
-    while (end != std::string::npos) {
-        std::size_t b = end;
-        if (b > 0 && text[b - 1] == '\r')
-            --b;
-        if (b > from + 2 && text[b - 1] == '\\')
-            end = text.find('\n', end + 1);
-        else
-            break;
-    }
-    return end == std::string::npos ? text.size() : end;
+// The lexed form of a file: the text AFTER translation phase 2 (every backslash, optional
+// horizontal whitespace, CR-LF or LF removed, as the compiler splices lines), with the content of
+// comments and of string, character and raw-string literals replaced by spaces. `origin[k]` is the
+// offset in the ORIGINAL text of `code[k]` and `newlines` the offsets of its '\n' bytes, so a hit
+// is reported on the line it really sits on.
+struct Lexed {
+    std::string code;
+    std::vector<std::size_t> origin;
+    std::vector<std::size_t> newlines;
+};
+
+int original_line(const Lexed& lexed, std::size_t k) {
+    return 1 + static_cast<int>(std::lower_bound(lexed.newlines.begin(), lexed.newlines.end(),
+                                                 lexed.origin[k]) -
+                                lexed.newlines.begin());
 }
 
-// `text` with the CONTENT of every comment and every string, character and raw-string literal
-// replaced by spaces (newlines kept, so line numbers survive).
-std::string code_only(const std::string& text) {
-    std::string out = text;
-    const auto blank = [&](std::size_t from, std::size_t to) {
-        for (std::size_t k = from; k < to && k < out.size(); ++k)
-            if (out[k] != '\n')
-                out[k] = ' ';
-    };
+// Translation phase 2. A backslash followed by optional horizontal whitespace (the compiler
+// accepts it with a warning) and a line end (LF or CR-LF) is removed together with them. A
+// backslash with no line end after it, including one at the very end of the file, is kept.
+void splice_lines(const std::string& text, Lexed& out) {
     const std::size_t n = text.size();
+    out.code.reserve(n);
+    out.origin.reserve(n);
+    for (std::size_t i = 0; i < n;) {
+        if (text[i] == '\\') {
+            std::size_t k = i + 1;
+            while (k < n && (text[k] == ' ' || text[k] == '\t' || text[k] == '\f' || text[k] == '\v'))
+                ++k;
+            std::size_t end = 0;
+            if (k + 1 < n && text[k] == '\r' && text[k + 1] == '\n')
+                end = k + 2;
+            else if (k < n && text[k] == '\n')
+                end = k + 1;
+            if (end != 0) {
+                i = end;
+                continue;
+            }
+        }
+        out.code.push_back(text[i]);
+        out.origin.push_back(i);
+        ++i;
+    }
+}
+
+// `text` after phase 2 with the CONTENT of every comment and every string, character and
+// raw-string literal replaced by spaces (newlines kept). Splices are reverted inside a raw string,
+// so its body and closing delimiter are searched in the ORIGINAL text.
+Lexed lex(const std::string& text) {
+    Lexed out;
+    for (std::size_t k = 0; k < text.size(); ++k)
+        if (text[k] == '\n')
+            out.newlines.push_back(k);
+    splice_lines(text, out);
+    const std::string sp = out.code; // the spliced text, read-only; out.code gets the blanks
+    const auto blank = [&](std::size_t from, std::size_t to) {
+        for (std::size_t k = from; k < to && k < out.code.size(); ++k)
+            if (out.code[k] != '\n')
+                out.code[k] = ' ';
+    };
+    const auto at_origin = [&](std::size_t original_offset) {
+        return static_cast<std::size_t>(
+            std::lower_bound(out.origin.begin(), out.origin.end(), original_offset) -
+            out.origin.begin());
+    };
+    const std::size_t n = sp.size();
     std::size_t i = 0;
     std::size_t literal_end = 0; // just past the last string, character or raw-string literal
     while (i < n) {
-        const char c = text[i];
-        const char next = i + 1 < n ? text[i + 1] : '\0';
+        const char c = sp[i];
+        const char next = i + 1 < n ? sp[i + 1] : '\0';
         if (c == '/' && next == '/') {
-            const std::size_t end = line_comment_end(text, i);
+            std::size_t end = sp.find('\n', i);
+            if (end == std::string::npos)
+                end = n;
             blank(i, end);
             i = end;
         } else if (c == '/' && next == '*') {
-            std::size_t end = text.find("*/", i + 2);
+            std::size_t end = sp.find("*/", i + 2);
             end = end == std::string::npos ? n : end + 2;
             blank(i, end);
             i = end;
-        } else if (c == 'R' && next == '"' && starts_token_after_prefix(text, i, literal_end)) {
+        } else if (c == 'R' && next == '"' && starts_token_after_prefix(sp, i, literal_end)) {
             // Raw string: R"delim( ... )delim", with an optional u8 / u / U / L prefix.
-            const std::size_t open = text.find('(', i + 2);
+            const std::size_t open = sp.find('(', i + 2);
             if (open == std::string::npos || open - (i + 2) > 16) {
                 ++i;
                 continue;
             }
-            const std::string close = ")" + text.substr(i + 2, open - (i + 2)) + "\"";
-            std::size_t end = text.find(close, open + 1);
-            end = end == std::string::npos ? n : end + close.size();
+            const std::string close = ")" + sp.substr(i + 2, open - (i + 2)) + "\"";
+            const std::size_t found = text.find(close, out.origin[open] + 1);
+            const std::size_t end = found == std::string::npos ? n : at_origin(found + close.size());
             blank(open + 1, end - 1);
             i = end;
             literal_end = i;
-        } else if (c == '"' || (c == '\'' && !is_digit_separator(text, i, literal_end))) {
+        } else if (c == '"' || (c == '\'' && !is_digit_separator(sp, i, literal_end))) {
             // String or character literal. Ends at the matching unescaped quote, or at the
             // newline if it is unterminated, so one stray quote cannot blind the rest of the file.
-            // A backslash escapes the next byte, and a backslash before a CRLF line end escapes
-            // both bytes of it (a line splice), so a CRLF-continued literal does not end early.
             std::size_t j = i + 1;
-            while (j < n && text[j] != c && text[j] != '\n') {
-                if (text[j] != '\\')
-                    ++j;
-                else if (j + 2 < n && text[j + 1] == '\r' && text[j + 2] == '\n')
-                    j += 3;
-                else
-                    j += 2;
-            }
+            while (j < n && sp[j] != c && sp[j] != '\n')
+                j += sp[j] == '\\' ? 2 : 1;
             blank(i + 1, j);
             i = j < n ? j + 1 : n;
             literal_end = i;
@@ -242,8 +280,10 @@ struct Scan {
     std::vector<Call> calls;                      // every `consume_ticket` occurrence
 };
 
-// Extensions that cannot be compiled into the server: documentation, data, images, fonts,
-// certificates and archives. EVERY other regular file under the scan root is lexed as C++,
+// Extensions skipped by repository convention: documentation, data, images, fonts, certificates
+// and archives. This is NOT a compiler guarantee (`#include "fragment.txt"` can include source), so
+// a fragment included under one of these extensions is an unscanned residual. EVERY other regular
+// file under the scan root is lexed as C++,
 // whatever its extension (`.ipp`, `.inl`, `.tpp`, `.cxx`, `.hxx`, `.def`, no extension at all):
 // a caller moved into an included fragment must not escape by its file name. Today
 // `server/core/src` holds only `.cpp` and `.hpp`; this list is the whole of what may be skipped,
@@ -317,9 +357,14 @@ Scan scan_tree(const fs::path& root) {
         std::ostringstream ss;
         ss << in.rdbuf();
         const std::string rel = fs::relative(e.path(), root).generic_string();
-        const std::string code = code_only(ss.str());
+        const std::string original = ss.str();
+        const Lexed lexed = lex(original);
+        const std::string& code = lexed.code;
         ++scan.files;
         scan.scanned.insert(rel);
+        // Lines are counted on the original text, one per '\n' plus a final unterminated line.
+        scan.lines += lexed.newlines.size() +
+                      (!original.empty() && original.back() != '\n' ? 1 : 0);
         constexpr std::string_view kConsume = "consume_ticket";
         for (auto at = code.find(kConsume); at != std::string::npos; at = code.find(kConsume, at + 1)) {
             const bool left = at == 0 || !is_ident_char(code[at - 1]);
@@ -327,8 +372,7 @@ Scan scan_tree(const fs::path& root) {
                                !is_ident_char(code[at + kConsume.size()]);
             if (!left || !right)
                 continue;
-            Call call{rel, 1 + static_cast<int>(std::count(code.begin(), code.begin() + at, '\n')),
-                      false, {}};
+            Call call{rel, original_line(lexed, at), false, {}};
             std::size_t k = at + kConsume.size();
             while (k < code.size() && (code[k] == ' ' || code[k] == '\t' || code[k] == '\n' || code[k] == '\r'))
                 ++k;
@@ -336,17 +380,12 @@ Scan scan_tree(const fs::path& root) {
                 call.is_call = call_arguments(code, k, call.args);
             scan.calls.push_back(std::move(call));
         }
-        std::istringstream lines(code);
-        std::string line;
-        for (int n = 1; std::getline(lines, line); ++n) {
-            ++scan.lines;
-            for (const auto& id : kIdentifiers) {
-                for (auto at = line.find(id); at != std::string::npos; at = line.find(id, at + 1)) {
-                    const bool left = at == 0 || !is_ident_char(line[at - 1]);
-                    const bool right = at + id.size() >= line.size() || !is_ident_char(line[at + id.size()]);
-                    if (left && right)
-                        scan.hits[id].push_back({rel, n});
-                }
+        for (const auto& id : kIdentifiers) {
+            for (auto at = code.find(id); at != std::string::npos; at = code.find(id, at + 1)) {
+                const bool left = at == 0 || !is_ident_char(code[at - 1]);
+                const bool right = at + id.size() >= code.size() || !is_ident_char(code[at + id.size()]);
+                if (left && right)
+                    scan.hits[id].push_back({rel, original_line(lexed, at)});
             }
         }
     }
@@ -687,6 +726,40 @@ TEST_CASE("the tripwire lexer keeps literals, comments and digit separators apar
         {"a CRLF line comment continuation hides the continuation line itself",
          "// note \\\r\nvoid h() { m.submit_bound(a); }\r\nvoid k() { m.consume_ticket(x); }\r\n",
          "submit_bound", 1, 0},
+        // Translation phase 2, as the compiler does it: a backslash, optional horizontal
+        // whitespace and a line end is removed before anything is tokenised.
+        {"two backslashes before CRLF inside a character literal (the splice leaves '\\n')",
+         "char c = '\\\\\r\nn'; m.submit_bound(a);\r\n", "submit_bound", 2},
+        {"a Windows-path string split across a backslash pair and CRLF",
+         "const char* p = \"C:\\\\dir\\\\\r\nfile\"; m.submit_bound(a);\r\n", "submit_bound", 2},
+        {"a space after the continuation backslash of a line comment (CRLF)",
+         "// note \\ \r\n /* example\r\nm.submit_bound();\r\n/* close */\r\n", "submit_bound", 3},
+        {"a tab after the continuation backslash of a line comment (LF)",
+         "// note \\\t\n /* example\nm.submit_bound();\n/* close */\n", "submit_bound", 3},
+        {"a space after the continuation backslash of a string literal",
+         "log(\"Starting \\ \r\nrequest\", m.submit_bound());\r\n", "submit_bound", 2},
+        {"mixed LF and CRLF continuations",
+         "// a \\\n /* b\r\nm.submit_bound(a);\n/* c */\n", "submit_bound", 3},
+        {"a splice in the middle of an identifier", "m.submit_\\\nbound(a);\n", "submit_bound", 1},
+        {"a CRLF splice in the middle of an identifier", "m.submit_\\\r\nbound(a);\r\n",
+         "submit_bound", 1},
+        {"splices inside the delimiters of a block comment",
+         "/\\\n* c *\\\n/ m.submit_bound(a);\n", "submit_bound", 3},
+        {"a call inside a block comment whose delimiters are split by splices is not code",
+         "/\\\n* m.submit_bound(a); *\\\n/ m.consume_ticket(x);\n", "submit_bound", 1, 0},
+        {"a splice inside the opener of a line comment",
+         "/\\\n/ note /* x\nm.submit_bound(a);\n", "submit_bound", 3},
+        {"a raw string holding backslash-newline: its body is not code, the call after it is",
+         "auto s = R\"(a\\\nb m.submit_bound(a) )\"; m.consume_ticket(x);\n", "consume_ticket", 2},
+        {"the same raw string hides the call inside it",
+         "auto s = R\"(a\\\nb m.submit_bound(a) )\";\n", "submit_bound", 1, 0},
+        {"a closing delimiter split by a splice is NOT a close (splices are reverted in a raw string)",
+         "auto s = R\"(x )\\\n\" m.submit_bound(a) )\";\n", "submit_bound", 1, 0},
+        {"a trailing backslash at the end of the file is kept and harmless",
+         "m.submit_bound(a); \\", "submit_bound", 1},
+        {"a backslash-newline at the end of the file", "m.submit_bound(a);\\\n", "submit_bound", 1},
+        {"the reported line is the ORIGINAL one after several splices",
+         "int a;\\\nint b;\nint c;\\\n\\\nint d; m.submit_bound(a);\n", "submit_bound", 5},
         {"a continued line comment hides the continuation line itself",
          "// note \\\nvoid h() { m.submit_bound(a); }\nvoid k() { m.consume_ticket(x); }\n",
          "submit_bound", 1, 0},
@@ -719,6 +792,30 @@ TEST_CASE("the tripwire lexer keeps literals, comments and digit separators apar
             if (row.hits == 1)
                 CHECK(scan.hits[row.id][0].line == row.line);
         }
+    }
+    SECTION("phase 2 output: what is removed, what is kept, and where each kept byte came from") {
+        // Removed: backslash, optional horizontal whitespace, LF or CRLF.
+        CHECK(lex("a\\\nb").code == "ab");
+        CHECK(lex("a\\\r\nb").code == "ab");
+        CHECK(lex("a\\ \t\f\v\r\nb").code == "ab");
+        CHECK(lex("a\\\\\r\nb").code == "a\\b"); // the second backslash splices, the first stays
+        // Kept: a backslash with no line end after it, at the end of the file or anywhere else,
+        // a lone CR, and a backslash before spaces and then a non-line-end.
+        CHECK(lex("int a;\\").code == "int a;\\");
+        CHECK(lex("a\\ ").code == "a\\ ");
+        CHECK(lex("a\\\rb").code == "a\\\rb");
+        CHECK(lex("a\\ b").code == "a\\ b");
+        // The map: each kept byte points at its place in the original text.
+        const Lexed spliced = lex("ab\\\ncd");
+        REQUIRE(spliced.code == "abcd");
+        CHECK(spliced.origin == std::vector<std::size_t>{0, 1, 4, 5});
+        CHECK(original_line(spliced, 1) == 1);
+        CHECK(original_line(spliced, 2) == 2);
+        // A raw string keeps its splice: the body is read from the original text.
+        const Lexed raw = lex("R\"(a\\\nb)\" x");
+        CHECK(raw.code.find("x") != std::string::npos);
+        CHECK(raw.code.find('a') == std::string::npos);
+        CHECK(raw.code.find('b') == std::string::npos);
     }
     SECTION("the body of a prefixed raw string and the content of a prefixed char are not code") {
         write(tmp.path / "mentions.cpp",
