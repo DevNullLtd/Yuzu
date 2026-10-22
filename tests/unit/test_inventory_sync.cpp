@@ -2454,3 +2454,443 @@ TEST_CASE("collector: skip_reason names the cause of each skip and clears on suc
         CHECK(src.skip_reason() == "installed_software:blob_cap");
     }
 }
+
+// --- M.10c characterisation: today's adapter output, pinned BEFORE the status-row refactor ---
+//
+// Every cell asserts the whole observable result of an adapter: status, reason, entry count and
+// ALL fourteen fields of every entry. The cells reach the adapters only through the four binders
+// below, so the refactor that moves the constrained policy into the action table changes the
+// binders and nothing else; the expectations never move. Status rows are written as raw text
+// (not through a formatter) so they are independent of the producer being refactored.
+
+namespace {
+
+std::string show_entry(const SwEntry& e) {
+    std::string s;
+    for (const std::string* f :
+         {&e.name, &e.version, &e.publisher, &e.install_date, &e.kind, &e.ecosystem, &e.epoch,
+          &e.release, &e.arch, &e.signature_status, &e.distro_id, &e.distro_version, &e.package_id,
+          &e.source}) {
+        s += *f;
+        s += ',';
+    }
+    return s;
+}
+
+std::string show(const AdaptedRows& r) {
+    std::string s = r.status == Status::ok            ? "ok"
+                    : r.status == Status::unsupported ? "unsupported"
+                                                      : "failed";
+    s += "|reason=" + r.reason + "|n=" + std::to_string(r.entries.size());
+    for (const auto& e : r.entries)
+        s += "|" + show_entry(e);
+    return s;
+}
+
+// Expected-result builders (the entry text is built through show_entry, so a field the refactor
+// drops or reorders is a visible difference, not a silently shorter string).
+std::string res(std::string_view status, std::string_view reason, std::initializer_list<SwEntry> es = {}) {
+    std::string s = std::string(status) + "|reason=" + std::string(reason) +
+                    "|n=" + std::to_string(es.size());
+    for (const auto& e : es)
+        s += "|" + show_entry(e);
+    return s;
+}
+
+SwEntry entry_of(std::string name, std::string version, std::string publisher, std::string kind,
+                 std::string ecosystem, std::string package_id = {}, std::string release = {},
+                 std::string arch = {}) {
+    SwEntry e;
+    e.name = std::move(name);
+    e.version = std::move(version);
+    e.publisher = std::move(publisher);
+    e.kind = std::move(kind);
+    e.ecosystem = std::move(ecosystem);
+    e.package_id = std::move(package_id);
+    e.release = std::move(release);
+    e.arch = std::move(arch);
+    return e;
+}
+
+std::string st(std::string_view action, std::string_view level, std::string_view tokens) {
+    return "status|" + std::string(action) + "|" + std::string(level) + "|" + std::string(tokens);
+}
+
+std::string crlf(std::string s) {
+    std::string out;
+    for (char c : s) {
+        if (c == '\n')
+            out += '\r';
+        out += c;
+    }
+    return out;
+}
+
+// The four binders: the ONLY place the cells touch an adapter.
+AdaptedRows bind_managers(const std::string& s) { return parse_pkg_inventory_managers_output(s); }
+AdaptedRows bind_packages(const std::string& s) { return parse_pkg_inventory_packages_output(s); }
+AdaptedRows bind_store(const std::string& s) { return parse_pkg_inventory_store_packages_output(s); }
+AdaptedRows bind_msi(const std::string& s) { return parse_msi_packages_list_inventory_output(s); }
+
+struct Grammar {
+    std::string action;
+    std::function<AdaptedRows(const std::string&)> bind;
+    std::string mapped;    // one row the adapter maps to exactly `entry`
+    SwEntry entry;
+    std::string unmapped;  // a row that is SEEN but maps to nothing
+    std::string notseen;   // a row of the wrong shape: neither seen nor mapped
+    bool keeps_constrained_rows; // managers: a constrained answer keeps its rows iff one was seen
+};
+
+// Every status-grammar cell, shared by the four adapters that read `status|<action>|...`.
+void check_status_matrix(const Grammar& g) {
+    INFO("action=" << g.action);
+    const std::string other = g.action == "packages" ? "managers" : "packages";
+    const auto run = [&](std::initializer_list<std::string> lines) { return show(g.bind(nl(lines))); };
+    const auto ok1 = res("ok", "", {g.entry});
+
+    // supported: reason stays empty at 4 fields and at 5+ (field 4 is parsed, not surfaced)
+    CHECK(run({st(g.action, "supported", "-"), g.mapped}) == ok1);
+    CHECK(run({st(g.action, "supported", "tok"), g.mapped}) == ok1);
+    CHECK(run({st(g.action, "supported", "tok|extra"), g.mapped}) == ok1);
+    CHECK(run({st(g.action, "supported", "-|a|b|c"), g.mapped}) == ok1);
+    CHECK(run({st(g.action, "supported", "-")}) == res("ok", ""));
+    // order independence, blank lines, a trailing status row
+    CHECK(show(g.bind(g.mapped + "\n\n" + st(g.action, "supported", "-") + "\n")) == ok1);
+    // CRLF
+    CHECK(show(g.bind(crlf(nl({st(g.action, "supported", "-"), g.mapped})))) == ok1);
+
+    // unsupported clears entries, whatever followed; reason empty
+    CHECK(run({st(g.action, "unsupported", "linux:no_such")}) == res("unsupported", ""));
+    CHECK(run({st(g.action, "unsupported", "linux:no_such"), g.mapped}) == res("unsupported", ""));
+    CHECK(run({st(g.action, "unsupported", "t|extra"), g.mapped}) == res("unsupported", ""));
+
+    // constrained: field 4 is the reason
+    if (g.keeps_constrained_rows) {
+        CHECK(run({st(g.action, "constrained", "tok"), g.mapped}) == res("ok", "tok", {g.entry}));
+        CHECK(run({st(g.action, "constrained", "tok|extra"), g.mapped}) ==
+              res("ok", "tok", {g.entry}));
+        CHECK(show(g.bind(crlf(nl({st(g.action, "constrained", "tok"), g.mapped})))) ==
+              res("ok", "tok", {g.entry}));
+        // seen-but-unmapped counts as evidence the read worked
+        CHECK(run({st(g.action, "constrained", "tok"), g.unmapped}) == res("ok", "tok"));
+    } else {
+        CHECK(run({st(g.action, "constrained", "tok"), g.mapped}) == res("failed", "tok"));
+        CHECK(run({st(g.action, "constrained", "tok|extra"), g.mapped}) == res("failed", "tok"));
+        CHECK(show(g.bind(crlf(nl({st(g.action, "constrained", "tok"), g.mapped})))) ==
+              res("failed", "tok"));
+        CHECK(run({st(g.action, "constrained", "tok"), g.unmapped}) == res("failed", "tok"));
+    }
+    // zero rows, or only rows that are not even seen, fail on every adapter
+    CHECK(run({st(g.action, "constrained", "tok")}) == res("failed", "tok"));
+    CHECK(run({st(g.action, "constrained", "tok"), g.notseen}) == res("failed", "tok"));
+    // an escaped pipe in a status token is cut at the raw split (format escapes, parse does not)
+    CHECK(run({"status|" + g.action + "|constrained|a\\|b", g.mapped}) ==
+          (g.keeps_constrained_rows ? res("ok", "a\\", {g.entry}) : res("failed", "a\\")));
+
+    // bad status: zero or two counted status rows, a short row, an unknown level
+    const std::string bad = res("failed", "bad status");
+    CHECK(run({g.mapped}) == bad);
+    CHECK(run({}) == bad);
+    CHECK(run({"status|" + g.action + "|supported", g.mapped}) == bad);
+    CHECK(run({"status", g.mapped}) == bad);
+    CHECK(run({"status|", g.mapped}) == bad);
+    CHECK(run({"status|" + g.action, g.mapped}) == bad);
+    CHECK(run({st(g.action, "supported", "-"), st(g.action, "supported", "-"), g.mapped}) == bad);
+    CHECK(run({st(g.action, "supported", "-"), st(g.action, "constrained", "t"), g.mapped}) == bad);
+    CHECK(run({st(g.action, "supported", "-"), st(g.action, "unsupported", "t")}) == bad);
+    CHECK(run({st(other, "supported", "-"), g.mapped}) == bad);
+    for (const char* level : {"bogus", "", "Supported", "supported ", "SUPPORTED", "constrained2"})
+        CHECK(run({st(g.action, level, "-"), g.mapped}) == bad);
+    // a status row for another action, or a too-short one, is not counted: it neither fails the
+    // action nor stands in for its own status row
+    CHECK(run({st(other, "supported", "-"), st(g.action, "supported", "-"), g.mapped}) == ok1);
+    CHECK(run({"status|" + g.action + "|supported", st(g.action, "supported", "-"), g.mapped}) ==
+          ok1);
+
+    // data rows: a wrong-shaped row is dropped, status still decides
+    CHECK(run({st(g.action, "supported", "-"), g.notseen, g.mapped, g.notseen}) == ok1);
+    CHECK(run({st(g.action, "supported", "-"), g.unmapped}) == res("ok", ""));
+    CHECK(run({st(g.action, "supported", "-"), g.unmapped, g.mapped}) == ok1);
+    CHECK(run({st(g.action, "supported", "-"), "", "garbage", "|", "||||", g.mapped}) == ok1);
+    // a ten-token status row for this action still counts as a status row (a second one: bad)
+    CHECK(run({st(g.action, "supported", "-"), "status|" + g.action + "|supported|-|-|-|-|-|-|-"}) ==
+          bad);
+}
+
+} // namespace
+
+TEST_CASE("characterisation: packages", "[sync][characterisation][adapter]") {
+    Grammar g{"packages",
+              bind_packages,
+              "package|homebrew|wget|1.24|formula",
+              entry_of("wget", "1.24", "", "pkg", "brew"),
+              "package|homebrew|mystery|1.0|bogus",
+              "package|homebrew|onlythree",
+              false};
+    check_status_matrix(g);
+
+    const auto run = [](std::initializer_list<std::string> lines) {
+        return show(bind_packages(nl(lines)));
+    };
+    const std::string sup = st("packages", "supported", "-");
+    SECTION("row mapping") {
+        CHECK(run({sup, "package|homebrew|firefox|130.0|cask"}) ==
+              res("ok", "", {entry_of("firefox", "130.0", "", "app", "brew")}));
+        CHECK(run({sup, "package|homebrew|a|1|formula", "package|homebrew|a|1|formula"}) ==
+              res("ok", "",
+                  {entry_of("a", "1", "", "pkg", "brew"), entry_of("a", "1", "", "pkg", "brew")}));
+        // an empty version is carried, an empty name is seen and not mapped
+        CHECK(run({sup, "package|homebrew|a||formula"}) ==
+              res("ok", "", {entry_of("a", "", "", "pkg", "brew")}));
+        CHECK(run({sup, "package|homebrew||1|formula"}) == res("ok", ""));
+    }
+    SECTION("rows that are not mapped") {
+        CHECK(run({sup, "package|snap|x|1|formula"}) == res("ok", ""));
+        CHECK(run({sup, "package|homebrew|a|1|formula|extra"}) == res("ok", ""));
+        CHECK(run({sup, "package|homebrew|a|1"}) == res("ok", ""));
+        CHECK(run({sup, "manager|homebrew|present|-|/|-|-"}) == res("ok", ""));
+        CHECK(run({sup, "inv|homebrew|a|1|formula"}) == res("ok", ""));
+        CHECK(run({sup, "package|Homebrew|a|1|formula"}) == res("ok", ""));
+        CHECK(run({sup, "package|homebrew|a|1|Formula"}) == res("ok", ""));
+    }
+    SECTION("a long field is clamped to the wire cap") {
+        const auto r = bind_packages(nl({sup, "package|homebrew|" + std::string(2000, 'n') + "|" +
+                                                  std::string(2000, 'v') + "|formula"}));
+        REQUIRE(r.entries.size() == 1);
+        CHECK(r.entries[0].name == std::string(1024, 'n'));
+        CHECK(r.entries[0].version == std::string(1024, 'v'));
+    }
+}
+
+TEST_CASE("characterisation: store_packages", "[sync][characterisation][adapter]") {
+    Grammar g{"store_packages",
+              bind_store,
+              "package|snap|btop|1.4.7|app|1073|-|-|active",
+              entry_of("btop", "1.4.7", "", "app", "snap", "", "1073"),
+              "package|snap|btop|1|app|1|-|-|inactive",
+              "package|snap|btop|1|app|1|-|-",
+              false};
+    check_status_matrix(g);
+
+    const auto run = [](std::initializer_list<std::string> lines) {
+        return show(bind_store(nl(lines)));
+    };
+    const std::string sup = st("store_packages", "supported", "-");
+    SECTION("row mapping") {
+        CHECK(run({sup, "package|flatpak|org.x.App|-|app|abc|x86_64|stable|active"}) ==
+              res("ok", "", {entry_of("org.x.App", "", "", "app", "flatpak", "", "abc", "x86_64")}));
+        // flatpak never carries a version, even when the row has one
+        CHECK(run({sup, "package|flatpak|org.x.App|9.9|runtime|abc|-|stable|active"}) ==
+              res("ok", "", {entry_of("org.x.App", "", "", "pkg", "flatpak", "", "abc", "")}));
+        // snap: version `-` is honest-empty, kind other than `app` is pkg, release `-` is empty
+        CHECK(run({sup, "package|snap|core22|-|base|-|-|-|active"}) ==
+              res("ok", "", {entry_of("core22", "", "", "pkg", "snap")}));
+        // snap ignores arch (field 6)
+        CHECK(run({sup, "package|snap|x|2|app|7|amd64|-|active"}) ==
+              res("ok", "", {entry_of("x", "2", "", "app", "snap", "", "7", "")}));
+    }
+    SECTION("seen but not mapped") {
+        CHECK(run({sup, "package|homebrew|a|1|app|1|-|-|active"}) == res("ok", ""));
+        CHECK(run({sup, "package|snap|a|1|app|1|-|-|unknown"}) == res("ok", ""));
+        CHECK(run({sup, "package|snap||1|app|1|-|-|active"}) == res("ok", ""));
+        // a constrained answer still fails: the policy for this action is fail whatever was seen
+        CHECK(run({st("store_packages", "constrained", "tok"),
+                   "package|homebrew|a|1|app|1|-|-|active"}) == res("failed", "tok"));
+    }
+    SECTION("over-wide and short rows are dropped, not truncated") {
+        CHECK(run({sup, "package|snap|a|1|app|1|-|-|active|extra"}) == res("ok", ""));
+        CHECK(run({sup, "package|snap|a|1|app|1|-|active"}) == res("ok", ""));
+    }
+}
+
+TEST_CASE("characterisation: managers", "[sync][characterisation][adapter]") {
+    Grammar g{"managers",
+              bind_managers,
+              "manager|homebrew|present|-|/opt/homebrew|-|-",
+              entry_of("homebrew", "", "", "app", "brew"),
+              "manager|snap|present|2.60|/|-|-",
+              "manager|homebrew|present|-|/opt/homebrew|-",
+              true};
+    check_status_matrix(g);
+
+    const auto run = [](std::initializer_list<std::string> lines) {
+        return show(bind_managers(nl(lines)));
+    };
+    const std::string sup = st("managers", "supported", "-");
+    const std::string hb = "manager|homebrew|present|4.1|/opt/homebrew|-|-";
+    SECTION("presence row fields") {
+        CHECK(run({sup, hb}) ==
+              res("ok", "", {entry_of("homebrew", "4.1", "", "app", "brew")}));
+        CHECK(run({sup, hb, "manager|homebrew|present|-|/usr/local|-|-"}) ==
+              res("ok", "",
+                  {entry_of("homebrew", "4.1", "", "app", "brew"),
+                   entry_of("homebrew", "", "", "app", "brew")}));
+    }
+    SECTION("a present non-homebrew manager is seen and dropped") {
+        for (const char* m : {"dpkg", "apt", "rpm", "dnf", "pacman", "apk", "snap", "flatpak",
+                              "something_new"}) {
+            const std::string row = std::string("manager|") + m + "|present|1.0|/|-|-";
+            INFO(m);
+            CHECK(run({sup, row}) == res("ok", ""));
+            CHECK(run({st("managers", "constrained", "tok"), row}) == res("ok", "tok"));
+        }
+        // a dropped manager next to a mapped one: only the mapped one is an entry
+        CHECK(run({st("managers", "constrained", "tok"), "manager|snap|present|1|/|-|-", hb}) ==
+              res("ok", "tok", {entry_of("homebrew", "4.1", "", "app", "brew")}));
+    }
+    SECTION("an unavailable manager is neither seen nor mapped") {
+        const std::string un = "manager|homebrew|unavailable|-|/usr/local|-|macos:homebrew_cellar:permission_denied";
+        CHECK(run({sup, un}) == res("ok", ""));
+        CHECK(run({st("managers", "constrained", "tok"), un}) == res("failed", "tok"));
+        CHECK(run({st("managers", "constrained", "tok"), un, "manager|snap|present|1|/|-|-"}) ==
+              res("ok", "tok"));
+        CHECK(run({st("managers", "constrained", "tok"), "manager|homebrew|bogus|-|/|-|-"}) ==
+              res("failed", "tok"));
+    }
+    SECTION("over-wide rows are dropped, not truncated") {
+        CHECK(run({sup, hb + "|extra"}) == res("ok", ""));
+        CHECK(run({st("managers", "constrained", "tok"), hb + "|extra"}) == res("failed", "tok"));
+    }
+    SECTION("supported keeps no reason, whatever field 4 holds") {
+        CHECK(run({st("managers", "supported", "tok|more"), hb}) ==
+              res("ok", "", {entry_of("homebrew", "4.1", "", "app", "brew")}));
+    }
+    SECTION("unknown level fails even with a present row") {
+        CHECK(run({st("managers", "bogus", "tok"), hb}) == res("failed", "bad status"));
+    }
+}
+
+TEST_CASE("characterisation: msi list_inventory", "[sync][characterisation][adapter][msi_packages]") {
+    const std::string code = "{AAAAAAAA-0000-0000-0000-000000000001}";
+    Grammar g{"list_inventory",
+              bind_msi,
+              "inv|" + code + "|App|1.0|Pub",
+              entry_of("App", "1.0", "Pub", "pkg", "msi", code),
+              "inv|" + code + "||1.0|Pub",
+              "inv|" + code + "|App|1.0",
+              false};
+    check_status_matrix(g);
+
+    const auto run = [](std::initializer_list<std::string> lines) {
+        return show(bind_msi(nl(lines)));
+    };
+    const std::string sup = st("list_inventory", "supported", "-");
+    SECTION("row mapping") {
+        // an empty code is mapped with an empty package_id; case is carried verbatim
+        CHECK(run({sup, "inv||n|1|p"}) == res("ok", "", {entry_of("n", "1", "p", "pkg", "msi")}));
+        CHECK(run({sup, "inv|{aaaaaaaa-0000-0000-0000-000000000001}|n||"}) ==
+              res("ok", "",
+                  {entry_of("n", "", "", "pkg", "msi", "{aaaaaaaa-0000-0000-0000-000000000001}")}));
+    }
+    SECTION("rows that are not mapped") {
+        CHECK(run({sup, "inv|" + code + "|App|1.0|Pub|extra"}) == res("ok", ""));
+        CHECK(run({sup, "msi|" + code + "|App|1.0|-"}) == res("ok", ""));
+        CHECK(run({sup, "package|homebrew|a|1|formula"}) == res("ok", ""));
+        CHECK(run({sup, "INV|" + code + "|App|1.0|Pub"}) == res("ok", ""));
+    }
+    SECTION("a status row for the pkg_inventory `packages` action is not this action's") {
+        CHECK(run({st("packages", "supported", "-"), "inv|" + code + "|App|1.0|Pub"}) ==
+              res("failed", "bad status"));
+    }
+}
+
+// Collector level: the whole blob, pinned. The digests were MEASURED on the unrefactored tree
+// (merge-base 6468fc11d) and are the wire-contract proof of this refactor: the blob is hashed
+// byte-identically on agent and server (ADR-0016), so any movement here is a one-sided change.
+// Re-measure ONLY on a sample recapture, the same rule as the record counts above.
+TEST_CASE("characterisation: collector blob digests are byte-pinned", "[sync][characterisation][collector]") {
+    constexpr const char* kMac = "db0a9878010b71264fced3df9cb00e4703093e50cb59314d171a3227b929f2bf";
+    constexpr const char* kWindows =
+        "fe9619361232be03c99ea7e0dc4059c988344734d91d18cb24dc30ec0b1e61e5";
+    constexpr const char* kLinuxManagers =
+        "522b8d64c16e2f503bdff8f68d2ba21989e534234da2c7174b7f11b38b955561";
+    const auto digest = [](const char* what) {
+        const auto got = collect_with(all_plugins());
+        INFO(what);
+        REQUIRE(got.has_value());
+        CHECK(sha256_hex(got->first) == got->second);
+        return got->second;
+    };
+    SECTION("Mac-shaped run") {
+        fake_mac();
+        CHECK(digest("mac") == kMac);
+    }
+    SECTION("Windows-shaped run") {
+        fake_windows();
+        CHECK(digest("windows") == kWindows);
+    }
+    SECTION("Mac-shaped run with a constrained managers answer that keeps its present row") {
+        fake_mac();
+        g_fake[1].out["managers"] = constrained_managers_with_present_row();
+        // Same digest as the Mac run: the kept present row maps to the one homebrew record the
+        // capture already carries, so the constrained answer must not move a byte.
+        CHECK(digest("mac+constrained managers") == kMac);
+    }
+    SECTION("Linux-shaped managers answer: present dpkg/apt rows under a constrained status") {
+        fake_mac();
+        g_fake[1].out["managers"] =
+            nl({st("managers", "constrained", "linux:apt_sources_d:permission_denied"),
+                "manager|dpkg|present|1.22|/|-|-", "manager|apt|present|2.7|/|-|-"});
+        CHECK(digest("mac+linux managers") == kLinuxManagers);
+    }
+}
+
+TEST_CASE("characterisation: collector skip reasons per status mix", "[sync][characterisation][collector]") {
+    struct Case {
+        int fake;
+        const char* plugin;
+        const char* action;
+        bool windows; // which sample set the other actions come from
+    };
+    const Case cases[] = {{1, "pkg_inventory", "packages", false},
+                          {1, "pkg_inventory", "store_packages", false},
+                          {1, "pkg_inventory", "managers", false},
+                          {3, "msi_packages", "list_inventory", true}};
+    for (const auto& c : cases) {
+        INFO(c.plugin << "." << c.action);
+        const std::string source = std::string(c.plugin) + "." + c.action;
+        const auto setup = [&] { c.windows ? fake_windows() : fake_mac(); };
+        const auto skip_with = [&](const std::string& output) {
+            setup();
+            g_fake[c.fake].out[c.action] = output;
+            auto src = make_installed_software_source(all_plugins());
+            const bool collected = src.collect().has_value();
+            return std::make_pair(collected, src.skip_reason());
+        };
+        const std::string a = c.action;
+        // constrained with no data row: skipped, the status token is the reason
+        CHECK(skip_with(nl({st(a, "constrained", "tok")})) ==
+              std::make_pair(false, source + ":tok"));
+        // constrained with a row of the wrong shape: still skipped
+        CHECK(skip_with(nl({st(a, "constrained", "tok"), "garbage|row"})) ==
+              std::make_pair(false, source + ":tok"));
+        // zero, two, short and mis-levelled status rows
+        CHECK(skip_with("") == std::make_pair(false, source + ":bad status"));
+        CHECK(skip_with(nl({"status|" + a + "|supported"})) ==
+              std::make_pair(false, source + ":bad status"));
+        CHECK(skip_with(nl({st(a, "supported", "-"), st(a, "supported", "-")})) ==
+              std::make_pair(false, source + ":bad status"));
+        CHECK(skip_with(nl({st(a, "wrong", "-")})) == std::make_pair(false, source + ":bad status"));
+        // unsupported is silently skipped (the cycle succeeds, nothing recorded as a skip)
+        CHECK(skip_with(nl({st(a, "unsupported", "tok")})) == std::make_pair(true, std::string{}));
+        // supported with zero rows is a legitimate answer
+        CHECK(skip_with(nl({st(a, "supported", "-")})) == std::make_pair(true, std::string{}));
+    }
+    SECTION("managers: a constrained answer with only a present, unmapped row keeps the cycle") {
+        fake_mac();
+        g_fake[1].out["managers"] = nl({st("managers", "constrained", "tok"),
+                                        "manager|dpkg|present|1.0|/|-|-"});
+        auto src = make_installed_software_source(all_plugins());
+        CHECK(src.collect().has_value());
+        CHECK(src.skip_reason().empty());
+    }
+    SECTION("managers: a constrained answer with only an unavailable row skips") {
+        fake_mac();
+        g_fake[1].out["managers"] = nl({st("managers", "constrained", "tok"),
+                                        "manager|homebrew|unavailable|-|/|-|why"});
+        auto src = make_installed_software_source(all_plugins());
+        CHECK_FALSE(src.collect().has_value());
+        CHECK(src.skip_reason() == "pkg_inventory.managers:tok");
+    }
+}
