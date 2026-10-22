@@ -391,6 +391,8 @@ WalkOutcome walk_find_by_hash(const std::string& root, std::string_view target_l
                     // entry ahead, so exactly `max_results` matches in a fully walked tree is
                     // clean.
                     it.increment(ec);
+                    if (ec)
+                        ++c.skipped_unreadable; // the entry that could not be looked at
                     if (ec || it != end)
                         out.stop = StopReason::max_results;
                     break;
