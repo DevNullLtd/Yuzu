@@ -13,6 +13,7 @@
 #include "audit_store.hpp"
 #include "baseline_store.hpp"
 #include "ca_store.hpp"
+#include "crypto_dashboard_layout_store.hpp"
 #include "custom_properties_store.hpp"
 #include "default_certs.hpp"
 #include "deployment_store.hpp"
@@ -862,11 +863,20 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         // is always constructed, so a null pointer or a not-open handle is
         // genuinely "broken", not "feature off". Without this row a dead CVE
         // cache showed only as the yuzu_nvd_* gauges going absent.
+        // crypto_dashboard_layout_store is the third (ADR-0071, owner decision
+        // 2026-10-19): a layout is a loss-tolerant UI preference, so a store that
+        // did not open DEGRADES the boot (server.cpp resets the pointer; operators
+        // see the default layout and cannot save) instead of refusing it. Gating
+        // here would pull a node that serves everything else out of rotation for
+        // a dashboard preference; the notice keeps the boot failure visible. The
+        // store is always constructed when Postgres is up, so null = did not open.
         std::vector<StoreCheck> notices = {
             {"analytics_event_store",
              !deps.cfg->analytics_enabled ||
                  (deps.analytics_store && deps.analytics_store->is_open())},
             {"nvd_db", deps.nvd_db && deps.nvd_db->is_open()},
+            {"crypto_dashboard_layout_store",
+             deps.crypto_dashboard_layout_store && deps.crypto_dashboard_layout_store->is_open()},
         };
 
         std::string failed_list;

@@ -371,8 +371,9 @@ int main(int argc, char* argv[]) {
     app.add_option("--csrf-trusted-origin", cfg.csrf_trusted_origins,
                    "External origin the dashboard is served on, for the CSRF same-site check "
                    "(repeatable; a single value may be comma-separated). Set this when a reverse "
-                   "proxy rewrites Host, otherwise every CSRF-gated dashboard action is refused "
-                   "with 403 because the browser's Origin cannot match the proxied Host. Forms: "
+                   "proxy rewrites Host, otherwise every cookie-session write is refused with "
+                   "403 because the browser's Origin cannot match the proxied Host. Environment "
+                   "variable: YUZU_CSRF_TRUSTED_ORIGIN. Forms: "
                    "'https://yuzu.example' (matched on scheme AND host) or a bare 'yuzu.example' "
                    "(host only). Wildcards are NOT supported. No forwarded header is consulted.")
         // Comma-splitting is done ONCE, in normalise_trusted_origins (web_utils.hpp),
@@ -794,12 +795,20 @@ int main(int argc, char* argv[]) {
     int generate_tokens = 0;
     std::string gen_label;
     int gen_max_uses = 1;
-    int gen_ttl_hours = 0;
+    int gen_ttl_hours = yuzu::server::auth::kDefaultEnrollmentTokenTtlHours;
     app.add_option("--generate-tokens", generate_tokens,
                    "Generate N enrollment tokens and print to stdout (JSON), then exit");
     app.add_option("--token-label", gen_label, "Label prefix for generated tokens");
-    app.add_option("--token-max-uses", gen_max_uses, "Max uses per token (default: 1)");
-    app.add_option("--token-ttl-hours", gen_ttl_hours, "Token TTL in hours (0 = no expiry)");
+    // Non-negative only: a negative --token-ttl-hours used to fall through to "no
+    // expiry" below, the opposite of what a signed number reads as (the REST twin
+    // refuses a negative ttl_hours), and a negative --token-max-uses was refused by the
+    // store rather than by the option parser. 0 is the explicit way to ask for either.
+    app.add_option("--token-max-uses", gen_max_uses,
+                   "Max uses per token (default: 1; 0 = unlimited)")
+        ->check(CLI::NonNegativeNumber);
+    app.add_option("--token-ttl-hours", gen_ttl_hours,
+                   "Token TTL in hours (default 72; 0 = no expiry)")
+        ->check(CLI::NonNegativeNumber);
 
     // Break-glass MFA reset mode (runs and exits, no server startup). Clears a
     // user's MFA enrollment out-of-band so an operator locked out by MFA
@@ -1107,6 +1116,12 @@ int main(int argc, char* argv[]) {
         spdlog::info("CSRF same-site gate: accepting {} operator-declared external origin(s) "
                      "in addition to the request Host — {}",
                      accepted, joined);
+    } else {
+        spdlog::info("CSRF same-site gate: cookie-session writes require a same-site Origin or "
+                     "Referer matching the request Host; no --csrf-trusted-origin value "
+                     "accepted. Behind a reverse proxy that rewrites Host, declare the public "
+                     "origin with --csrf-trusted-origin or dashboard writes will be refused "
+                     "with 403.");
     }
     // A config whose entries were ALL rejected previously logged nothing — boot
     // output byte-identical to not passing the flag, followed by every proxied
@@ -2112,7 +2127,13 @@ int main(int argc, char* argv[]) {
         // regardless of which entry point minted it.
         {
             constexpr std::size_t kMaxListed = 20;
-            std::string detail = "by=" + created_by + " max_uses=" + std::to_string(gen_max_uses) +
+            // `by=` and `label=` carry operator text: audit_token() keeps either from
+            // adding a key or a line to the detail (space, `=`, `,` and control bytes
+            // become `_`). The principal column keeps the raw value.
+            std::string detail = "by=" + yuzu::server::audit_token(created_by) +
+                                 " max_uses=" + std::to_string(gen_max_uses) +
+                                 " ttl_s=" + std::to_string(ttl.count()) +
+                                 " label=" + yuzu::server::audit_token(gen_label) +
                                  " count=" + std::to_string(token_ids.size());
             if (!token_ids.empty()) {
                 detail += " ids=";
