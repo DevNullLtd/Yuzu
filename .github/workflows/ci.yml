@@ -2960,11 +2960,15 @@ jobs:
           CXX: ccache g++-13
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
         run: |
+          # No -Dbuild_tests: the canary runs no tests (see the note after the
+          # link-provenance step), and linking the debug yuzu_server_tests binary
+          # (~1.2 GB) needs ~8 GB of RAM, which the 7 GB hosted runner does not
+          # have: the Build step was OOM-killed there (SIGTERM 143). yuzu_pg_canary,
+          # which the provenance step inspects, does not depend on tests.
           meson setup build-linux \
             --native-file meson/native/linux-gcc13.ini \
             --buildtype=debug \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
-            -Dbuild_tests=true
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux
 
       - name: Build
         id: build-canary

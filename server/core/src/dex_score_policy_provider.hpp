@@ -29,6 +29,30 @@
  *     current(), an exception included, so no failure can leave the refresh
  *     wedged.
  *
+ * Writes (write(), the only way a policy is installed on the writing instance):
+ *   - a write is commit-then-install under ONE process-local writer lock, so on the
+ *     writing instance commit order equals install order and two overlapping writers
+ *     cannot leave the cache on the older document; other instances still converge
+ *     within kDexPolicyRefreshMs through the store;
+ *   - the writer lock is held across the caller's commit (database I/O) -- the ONLY lock
+ *     in this file held across I/O. ADMISSION is bounded: a waiting writer gives up after
+ *     kDexPolicyWriterWait with the typed WriterBusy. The HOLD is not hard-bounded: the commit
+ *     runs under the store's lease wait plus the pool's SERVER-SIDE statement_timeout, which a
+ *     frozen backend cannot enforce (server.cpp, the "CONCURRENCY BOUND on the containment
+ *     read" note: a paused backend returned after 101 s with neither statement_timeout nor
+ *     tcp_user_timeout firing). Even that server-side timeout is in force only when the pool
+ *     injects it: a DSN or PGOPTIONS carrying its own `options=` leaves the server's defaults
+ *     (pg_pool.cpp), so a transaction-scoped bound on the store compare-and-set is the writer
+ *     route's obligation, not this file's. So one stalled initiating request holds the writer
+ *     lock and its own request thread for the stall, every other writer fails fast with
+ *     WriterBusy, and readers are unaffected -- a stall delays writers, never wedges the
+ *     process;
+ *   - readers never take the writer lock: current() is unaffected by a parked writer, and the
+ *     install under mu_ touches state, the injected clock and log lines only: no I/O;
+ *   - an install serves at once and restarts the refresh window; a successful read that was in
+ *     flight across an install is discarded, a failed one is still capped as above. The
+ *     5 s / 60 s bounds are unchanged.
+ *
  * No clock or store is touched except through the injected functions, so the
  * behaviour is testable without sleeping.
  */
@@ -38,6 +62,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <expected>
@@ -53,6 +78,24 @@ namespace yuzu::server {
 inline constexpr std::int64_t kDexPolicyRefreshMs = 5000;
 /// How long the last good policy is served while the store cannot be read.
 inline constexpr std::int64_t kDexPolicyStaleCapMs = 60000;
+/// How long a second writer in this process waits for the writer lock before it is told to
+/// retry. Equals the store's own lease wait and the Apps read's retry_after_ms.
+inline constexpr std::chrono::milliseconds kDexPolicyWriterWait{2000};
+
+/// Why write() installed nothing.
+enum class DexPolicyWriteError {
+    WriterBusy,   ///< the writer-lock wait expired; the commit was NEVER invoked; retryable
+    Stale,        ///< the commit reported the stored text was not the one expected
+    CommitFailed, ///< the commit returned an error or threw; nothing is installed, and a store
+                  ///< failure leaves the store's own outcome unknown (see CommitFn)
+};
+
+struct DexPolicyWriteFailure {
+    DexPolicyWriteError kind;
+    /// WriterBusy: ours. CommitFailed: the commit's own error string, unchanged (so a caller
+    /// can still classify it by kRuntimeConfigDbErrorPrefix), or "commit threw: ...".
+    std::string detail;
+};
 
 class DexScorePolicyProvider {
 public:
@@ -61,8 +104,19 @@ public:
     /// Monotonic milliseconds.
     using ClockFn = std::function<std::int64_t()>;
 
-    DexScorePolicyProvider(ReadFn read, ClockFn clock)
-        : read_(std::move(read)), clock_(std::move(clock)) {}
+    /// The store commit of a write: true = committed, false = stale (nothing changed), error =
+    /// failed: nothing is installed, but a store error (prefixed kRuntimeConfigDbErrorPrefix)
+    /// returned after the statement was sent, such as a connection lost after the commit, leaves
+    /// the store's OUTCOME UNKNOWN, and the caller re-reads the store to learn it. Runs under the
+    /// writer lock for as long as it takes (the banner states what bounds it and what does
+    /// not), so keep it to the store compare-and-set. It must not call write() on this
+    /// provider: the writer lock is not recursive, so re-entry is undefined behaviour, not a
+    /// typed WriterBusy.
+    using CommitFn = std::function<std::expected<bool, std::string>()>;
+
+    DexScorePolicyProvider(ReadFn read, ClockFn clock,
+                           std::chrono::milliseconds writer_wait = kDexPolicyWriterWait)
+        : read_(std::move(read)), clock_(std::move(clock)), writer_wait_(writer_wait) {}
 
     DexScorePolicyProvider(const DexScorePolicyProvider&) = delete;
     DexScorePolicyProvider& operator=(const DexScorePolicyProvider&) = delete;
@@ -93,10 +147,73 @@ public:
                 flag = false;
             }
         } clear{lk, refreshing_};
+        const std::uint64_t gen = generation_;
         lk.unlock(); // the store read and the parse run unlocked: no caller queues behind them
         auto r = read_and_resolve();
         lk.lock();
+        // A SUCCESSFUL read that began before an install may predate it: serve the installed
+        // policy. A FAILED one is not discarded -- apply_locked still enforces the stale cap.
+        if (r && generation_ != gen)
+            return cached_;
         return apply_locked(std::move(r), clock_());
+    }
+
+    /// Commit a new stored text and install it, as one step the other writers in this process
+    /// are serialised behind. `text` is the EXACT text `commit` stores (nullopt = the key is
+    /// removed, i.e. the shipped defaults); `commit` is the store compare-and-set / -remove
+    /// and nothing slower (no audit write, no second store call): it runs under the writer
+    /// lock. Call this on the WRITING instance and never write this key to the store outside
+    /// it, or the install order can reverse. The text is resolved (parsed, validated, hashed)
+    /// before any lock; an invalid document installs the shipped defaults with `fault`, as a
+    /// read of it would. Canonical text is unchanged by the store's scrub, so no re-read is
+    /// needed before installing.
+    ///
+    /// This neither authorises nor audits: the caller does both. The provider must outlive the
+    /// call (server.cpp holds it by shared_ptr; the caller keeps its own copy across write()).
+    /// A frozen database backend is not bounded by any deadline named in the banner: it holds
+    /// the writer lock and this call for the stall, every other writer gets WriterBusy, and
+    /// readers are unaffected.
+    ///
+    /// Outcomes, for the caller to map to its own response: WriterBusy is retryable, the commit
+    /// never ran, and a retry is worth making after kDexPolicyWriterWait; Stale means the
+    /// stored text was not the one expected; CommitFailed means the commit failed or threw,
+    /// classified by the store's kRuntimeConfigDbErrorPrefix on `detail` (prefixed = a store
+    /// failure, whose outcome is unknown until the store is re-read; unprefixed = the caller's
+    /// input was refused). Nothing is installed on any error.
+    [[nodiscard]] std::expected<DexPolicyInForce, DexPolicyWriteFailure>
+    write(const std::optional<std::string>& text, const CommitFn& commit) {
+        auto r = dex_policy_in_force_from_stored(text);
+        std::unique_lock wl(writer_mu_, std::defer_lock);
+        if (!wl.try_lock_for(writer_wait_))
+            return std::unexpected(DexPolicyWriteFailure{
+                DexPolicyWriteError::WriterBusy,
+                "another score policy write in this process is still running after " +
+                    std::to_string(writer_wait_.count()) + " ms"});
+        std::expected<bool, std::string> c;
+        try {
+            c = commit();
+        } catch (const std::exception& e) {
+            return std::unexpected(DexPolicyWriteFailure{DexPolicyWriteError::CommitFailed,
+                                                         std::string("commit threw: ") + e.what()});
+        } catch (...) {
+            return std::unexpected(DexPolicyWriteFailure{DexPolicyWriteError::CommitFailed,
+                                                         "commit threw"});
+        }
+        if (!c)
+            return std::unexpected(
+                DexPolicyWriteFailure{DexPolicyWriteError::CommitFailed, std::move(c.error())});
+        if (!*c)
+            return std::unexpected(DexPolicyWriteFailure{
+                DexPolicyWriteError::Stale, "the stored policy is not the one expected"});
+        // The install completes BEFORE the writer lock is released: commit order == install
+        // order. A resolved value is always a good read, so apply_locked cannot fail here. The
+        // clock is read under mu_ and generation_ is bumped only after the install, so a bump
+        // always means an install.
+        std::lock_guard lk(mu_);
+        const std::int64_t now = clock_();
+        auto out = apply_locked(std::move(r), now);
+        ++generation_;
+        return *out;
     }
 
 private:
@@ -149,8 +266,13 @@ private:
 
     ReadFn read_;
     ClockFn clock_;
+    std::chrono::milliseconds writer_wait_;
 
+    // Serialises commit+install across writers. Held across the caller's commit I/O: the WAIT is
+    // bounded by writer_wait_, the HOLD is not (see the banner); never taken by current().
+    std::timed_mutex writer_mu_;
     std::mutex mu_; // guards the state below only; never held across the store read
+    std::uint64_t generation_{0}; // bumped by each install
     bool refreshing_{false};
     bool have_{false};
     bool outage_logged_{false};

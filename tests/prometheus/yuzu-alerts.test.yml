@@ -4094,6 +4094,134 @@ tests:
         eval_time: 29m
         exp_samples: []
 
+  # ── YuzuCryptoCaReadDegraded (/crypto widgets, Gate 7 SRE-4) ─────────────
+  #
+  # The /crypto Yuzu-issued reads refused or failed for 15 minutes. The rule
+  # sums every reason of source="ca_issued" into ONE series (no reason label),
+  # so a shed and a database fault that alternate still hold it firing.
+
+  # CASE: a sustained mix of admission_full and query_error fires after the 15m
+  # hold, with no reason/instance label (sum() drops them), and not before.
+  - interval: 1m
+    name: crypto CA read degraded - sustained degrades fire after 15 minutes
+    input_series:
+      - series: 'yuzu_inventory_read_degrade_total{job="yuzu",instance="s1",source="ca_issued",reason="admission_full"}'
+        values: "0+1x40"
+      - series: 'yuzu_inventory_read_degrade_total{job="yuzu",instance="s1",source="ca_issued",reason="query_error"}'
+        values: "0+2x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCryptoCaReadDegraded", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCryptoCaReadDegraded", alertstate="firing"}'
+        eval_time: 17m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCryptoCaReadDegraded", alertstate="firing", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuCryptoCaReadDegraded", alertstate="firing"}'
+        eval_time: 35m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCryptoCaReadDegraded", alertstate="firing", severity="warning"}'
+            value: 1
+
+  # CASE: a 5-minute burst leaves the 5m window long before the 15m hold, so it
+  # never fires; and a rising degrade of ANOTHER source (the library reads, the
+  # layout store) is not this alert's business.
+  - interval: 1m
+    name: crypto CA read degraded - a short burst and other sources stay quiet
+    input_series:
+      - series: 'yuzu_inventory_read_degrade_total{job="yuzu",instance="s1",source="ca_issued",reason="admission_full"}'
+        values: "0 1 2 3 4 5 5x40"
+      - series: 'yuzu_inventory_read_degrade_total{job="yuzu",instance="s1",source="installed_software",reason="query_error"}'
+        values: "0+1x40"
+      - series: 'yuzu_inventory_read_degrade_total{job="yuzu",instance="s1",source="crypto_layout",reason="store_not_open"}'
+        values: "0+1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCryptoCaReadDegraded"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCryptoCaReadDegraded"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE: the zero-seeded healthy shape (admission_full is pre-seeded at boot)
+  # stays silent.
+  - interval: 1m
+    name: crypto CA read degraded - a flat pre-seeded series stays quiet
+    input_series:
+      - series: 'yuzu_inventory_read_degrade_total{job="yuzu",instance="s1",source="ca_issued",reason="admission_full"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCryptoCaReadDegraded"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # ── YuzuCryptoLayoutEraseFailed (ADR-0071 deprovision erasure, Gate 8 M1) ──
+  #
+  # Any increase of the erasure-failure counter in the last hour fires at once
+  # (no hold), one series per reason; it clears once the hour has passed.
+
+  # CASE: one failure fires immediately with its reason and clears after the
+  # 1h window has rolled past it.
+  - interval: 1m
+    name: crypto layout erase failed - one failure fires with its reason, then clears
+    input_series:
+      - series: 'yuzu_server_crypto_layout_erase_failures_total{job="yuzu",instance="s1",reason="pool_acquire_timeout"}'
+        values: "0x10 1x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing", reason="pool_acquire_timeout", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed"}'
+        eval_time: 100m
+        exp_samples: []
+
+  # CASE (R2-1): link_read_failed - an already-inactive SCIM user's linked
+  # identities could not be read, so only the slug's row was erased - fires
+  # like any other reason (the rule is reason-agnostic).
+  - interval: 1m
+    name: crypto layout erase failed - link_read_failed fires with its reason
+    input_series:
+      - series: 'yuzu_server_crypto_layout_erase_failures_total{job="yuzu",instance="s1",reason="link_read_failed"}'
+        values: "0x10 1x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing", reason="link_read_failed", severity="warning"}'
+            value: 1
+
+  # CASE: the pre-seeded healthy shape (every reason at a flat zero) stays
+  # silent, and two reasons failing fire as two series.
+  - interval: 1m
+    name: crypto layout erase failed - flat zeros stay quiet; two reasons, two series
+    input_series:
+      - series: 'yuzu_server_crypto_layout_erase_failures_total{job="yuzu",instance="s1",reason="store_not_open"}'
+        values: "0x30 0 1x20"
+      - series: 'yuzu_server_crypto_layout_erase_failures_total{job="yuzu",instance="s1",reason="query_error"}'
+        values: "0x30 0 2x20"
+      - series: 'yuzu_server_crypto_layout_erase_failures_total{job="yuzu",instance="s1",reason="outcome_unknown"}'
+        values: "0x50"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed"}'
+        eval_time: 25m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing", reason="query_error", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing", reason="store_not_open", severity="warning"}'
+            value: 1
+
   # ── YuzuEnablementRegressed / YuzuEnablementRulesRejected / YuzuEnablementAnchorWriteFailing (ADR-3006) ──
   #
   # Cases for three of the enablement store's five alerts. YuzuEnablementUnresolvedUnits and

@@ -12,14 +12,18 @@
 
 #include "ca_routes.hpp"
 #include "ca_store.hpp"
+#include "crypto_api_local.hpp"
+#include "crypto_widget_catalogue.hpp"
 #include "pg/pg_pool.hpp"
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <memory>
@@ -66,6 +70,7 @@ struct Harness {
     test::TestRouteSink sink;
     std::vector<AuditRow> audits;
     bool perm_allow{true};
+    bool unauthenticated{false}; // perm_fn answers 401 as production's does with no session
     // Operation-aware denial: an operation named here ("Read", "Delete", "Write") is refused
     // while the others pass, so a role that holds Delete or Write without Read can be modelled.
     std::set<std::string> deny_ops;
@@ -98,6 +103,11 @@ struct Harness {
                            .serial_hex = "C5C1FEED",
                            .not_after = "2027-01-01T00:00:00Z"}};
     int issue_calls{0};
+    // ADR-0070 R2-2: the filtered /ca/issued. `wire_filtered` false = the deps are unset (503);
+    // `standing` is the confinement probe's answer.
+    bool wire_filtered{true};
+    yuzu::server::crypto_widgets::Access standing{yuzu::server::crypto_widgets::Access::kAvailable};
+    int standing_calls{0};
     std::string last_issue_csr;
     std::string last_issue_label;
     std::optional<int> last_issue_validity_days;
@@ -127,6 +137,12 @@ struct Harness {
                                        const std::string& type, const std::string& op) {
             last_perm_type = type;
             last_perm_op = op;
+            if (unauthenticated) {
+                res.status = 401;
+                res.set_content(R"({"error":{"code":401,"message":"authentication required"}})",
+                                "application/json");
+                return false;
+            }
             if (!perm_allow || deny_ops.count(op) != 0) {
                 res.status = 403;
                 res.set_content(R"({"error":{"code":403,"message":"denied"}})", "application/json");
@@ -165,6 +181,13 @@ struct Harness {
             last_issue_issued_by = issued_by;
             return issue_result;
         };
+        if (wire_filtered)
+            routes.set_filtered_issued(CaRoutes::FilteredIssuedDeps{
+                .api = make_local_crypto_api(LocalCryptoApiDeps{.ca = null_store ? nullptr : store.get()}),
+                .confinement_fn = [this](const httplib::Request&) {
+                    ++standing_calls;
+                    return standing;
+                }});
         if (probe_wired)
             routes.set_read_probe([this](const httplib::Request&) {
                 return perm_allow && deny_ops.count("Read") == 0;
@@ -1280,6 +1303,195 @@ TEST_CASE("ca_routes: POST /ca/issue-code-signing rejects an out-of-range validi
     }
 }
 
+
+// ── ADR-0070 R2-2: the filtered GET /api/v1/ca/issued (the /crypto Yuzu-issued drill) ─────────
+
+namespace {
+std::int64_t wall_now_s() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+} // namespace
+
+TEST_CASE("ca_routes: filtered /ca/issued lists the rows behind a count, audited, pinned paging",
+          "[ca_routes][pki][pg][crypto]") {
+    Harness h;
+    h.wire();
+    const auto now = wall_now_s();
+    for (int i = 0; i < 3; ++i) {
+        auto r = sample_issued("F" + std::to_string(i));
+        r.issued_at = now - 3600;
+        r.not_after = now + (i + 1) * 86400;
+        REQUIRE(h.store->record_issued(r));
+    }
+    auto r = sample_issued("AB1");
+    r.issued_at = now - 10 * 86400;
+    r.status = CertStatus::Revoked;
+    r.revoked_at = now - 3600;
+    r.revocation_reason = std::string(kRevokeReasonSuperseded);
+    REQUIRE(h.store->record_issued(r));
+
+    auto res = h.sink.Get("/api/v1/ca/issued?kind=expiring&days=3&limit=2");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["count"] == 2);
+    CHECK(j["meta"]["has_more"] == true);
+    CHECK_FALSE(j["meta"].contains("next_offset"));
+    REQUIRE(j["next_cursor"].is_string());
+    const std::string cursor = j["next_cursor"].get<std::string>();
+    CHECK(j["filter"]["total"] == 3);
+    CHECK(j["filter"]["kind"] == "expiring");
+    CHECK(j["filter"]["rule_id"] == "yuzu_ca_expiring");
+    const auto as_of = j["filter"]["as_of"].get<std::int64_t>();
+    CHECK(h.last_perm_type == "Security");
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "crypto.ca.certificates.view");
+    CHECK(h.audits[0].result == "success");
+
+    // Page two is the keyset cursor (H2): it carries the same snapshot; the last page's
+    // next_cursor is null.
+    res = h.sink.Get("/api/v1/ca/issued?kind=expiring&days=3&limit=2&cursor=" + cursor);
+    REQUIRE(res->status == 200);
+    j = nlohmann::json::parse(res->body);
+    CHECK(j["count"] == 1);
+    CHECK(j["items"][0]["serial_hex"] == "F2");
+    CHECK(j["filter"]["as_of"] == as_of);
+    CHECK(j["meta"]["has_more"] == false);
+    CHECK(j["next_cursor"].is_null());
+    CHECK_THAT(h.audits.back().detail, Catch::Matchers::ContainsSubstring("page=continuation"));
+    // The cursor bound to another filter, or tampered, is a 400 naming it.
+    for (const std::string& q : {"kind=expiring&days=7&cursor=" + cursor,
+                                "kind=expiring&days=3&cursor=" + cursor + "A",
+                                std::string("kind=expiring&days=3&cursor=c1:nope")}) {
+        INFO(q);
+        res = h.sink.Get("/api/v1/ca/issued?" + q);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK_THAT(nlohmann::json::parse(res->body)["error"]["message"].get<std::string>(),
+                   Catch::Matchers::ContainsSubstring("cursor"));
+    }
+
+    // Bucket filter: the superseded revocation, with its recorded reason on the row.
+    res = h.sink.Get("/api/v1/ca/issued?kind=revoked&days=7&bucket=superseded");
+    REQUIRE(res->status == 200);
+    j = nlohmann::json::parse(res->body);
+    REQUIRE(j["count"] == 1);
+    CHECK(j["items"][0]["serial_hex"] == "AB1");
+    CHECK(j["items"][0]["revocation_reason"] == "superseded");
+    // Expired/expiring cover active only: the revoked row is in no expiry window.
+    res = h.sink.Get("/api/v1/ca/issued?kind=expired&days=90");
+    CHECK(nlohmann::json::parse(res->body)["count"] == 0);
+}
+
+TEST_CASE("ca_routes: filtered /ca/issued refuses each malformed parameter by name (400)",
+          "[ca_routes][pki][pg][crypto]") {
+    Harness h;
+    h.wire();
+    const auto now = wall_now_s();
+    struct Bad {
+        std::string q;
+        const char* names;
+    };
+    const std::vector<Bad> bad{
+        {"kind=weak", "kind"},
+        {"days=7", "kind"},
+        {"kind=expiring&days=45", "days"},
+        {"kind=active&days=7", "days"},
+        {"kind=issued_week&week=2026-W54", "week"},
+        {"kind=active&bucket=other", "bucket"},
+        {"kind=active&limit=0", "limit"},
+        {"kind=active&limit=501", "limit"},
+        {"kind=active&offset=abc", "offset"},
+        {"kind=active&offset=2", "offset"}, // keyset paging only (H2)
+        {"kind=active&cursor=c1:bogus", "cursor"},
+        {"kind=active&as_of=abc", "as_of"},
+        {"kind=active&as_of=" + std::to_string(now + 3600), "as_of"},
+        {"kind=active&as_of=" + std::to_string(now - 8 * 86400), "as_of"},
+    };
+    for (const auto& b : bad) {
+        INFO(b.q);
+        auto res = h.sink.Get("/api/v1/ca/issued?" + b.q);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        // L6: the PARSED A4 error.message names the offending parameter (not just the body).
+        auto err = nlohmann::json::parse(res->body);
+        REQUIRE(err["error"]["message"].is_string());
+        CHECK_THAT(err["error"]["message"].get<std::string>(),
+                   Catch::Matchers::ContainsSubstring(b.names));
+        CHECK(err["error"]["retry_after_ms"].is_null());
+    }
+    CHECK(h.audits.empty());
+}
+
+TEST_CASE("ca_routes: /ca/issued without a session is 401, filtered or not, with no read",
+          "[ca_routes][pki][pg][crypto]") {
+    // L6 (qe-9): the auth answer comes first - no confinement probe, no audit row, no store read.
+    Harness h;
+    h.unauthenticated = true;
+    h.wire();
+    for (const char* path : {"/api/v1/ca/issued", "/api/v1/ca/issued?kind=active"}) {
+        INFO(path);
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->status == 401);
+    }
+    CHECK(h.standing_calls == 0);
+    CHECK(h.audits.empty());
+}
+
+TEST_CASE("ca_routes: a confined Security:Read holder is withheld the filtered list; the "
+          "unfiltered list is unchanged",
+          "[ca_routes][pki][pg][crypto][security]") {
+    Harness h;
+    h.standing = yuzu::server::crypto_widgets::Access::kConfined;
+    h.wire();
+    REQUIRE(h.store->record_issued(sample_issued("C1")));
+    auto filtered = h.sink.Get("/api/v1/ca/issued?kind=active");
+    REQUIRE(filtered);
+    CHECK(filtered->status == 403);
+    const auto j = nlohmann::json::parse(filtered->body);
+    CHECK_FALSE(j["error"].contains("permission"));
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "denied");
+    // The unfiltered inventory answers exactly as before: no probe, no audit (pre-existing).
+    const int probes = h.standing_calls;
+    auto plain = h.sink.Get("/api/v1/ca/issued");
+    REQUIRE(plain);
+    CHECK(plain->status == 200);
+    CHECK(nlohmann::json::parse(plain->body)["count"] == 1);
+    CHECK_FALSE(nlohmann::json::parse(plain->body).contains("filter"));
+    CHECK(h.standing_calls == probes);
+    CHECK(h.audits.size() == 1);
+}
+
+TEST_CASE("ca_routes: filtered /ca/issued fails closed when unwired or degraded",
+          "[ca_routes][pki][pg][crypto]") {
+    {
+        Harness h;
+        h.wire_filtered = false;
+        h.wire();
+        auto res = h.sink.Get("/api/v1/ca/issued?kind=active");
+        CHECK(res->status == 503);
+        // L3: a wiring fault lasts until a restart - no retry hint.
+        CHECK(nlohmann::json::parse(res->body)["error"]["retry_after_ms"].is_null());
+        CHECK(h.sink.Get("/api/v1/ca/issued")->status == 200); // unfiltered unaffected
+    }
+    {
+        Harness h;
+        h.standing = yuzu::server::crypto_widgets::Access::kDegraded;
+        h.wire();
+        CHECK(h.sink.Get("/api/v1/ca/issued?kind=active")->status == 503);
+    }
+    {
+        Harness h;
+        h.perm_allow = false;
+        h.wire();
+        CHECK(h.sink.Get("/api/v1/ca/issued?kind=active")->status == 403);
+        CHECK(h.standing_calls == 0); // Security:Read first
+    }
+}
 // ── System > Certificates and secrets: the `?view=pki` shape (SYS-3) ─────────
 //
 // The default shape (`render_ca_fragment`) is exercised by the cases above and is

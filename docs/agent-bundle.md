@@ -158,13 +158,24 @@ Persistent: run `installers\YuzuAgentSetup-<v>.exe` (enter gateway + token on th
 config page), or fully unattended —
 `installers\YuzuAgentSetup-<v>.exe /VERYSILENT /SUPPRESSMSGBOXES /SERVER=<GATEWAY_HOST>:50051 /TOKEN=<TOKEN> /LOG=<path>`
 (the installer takes the gateway address as `/SERVER=`, not only the GUI page).
+Give the token with `/TOKEN=` or `/TOKEN_FILE=<file>` (not both, nor `/TOKEN_FILE=`
+together with a token typed in the wizard). Either way, the installer writes it to
+`%ProgramData%\Yuzu\enrollment-token` (Administrators and
+SYSTEM only) and configures the service with `--enrollment-token-file` pointing at
+it — a service registered by this installer no longer carries the token on its
+command line, and the agent removes the file after its first accepted registration, or when the server refuses the token.
+A service registered by an earlier installer keeps its earlier command line until
+the installer is run again (with the original `/SERVER=` and `/NOTLS`;
+`sc.exe qc YuzuAgent` shows which form a service has). `/TOKEN_FILE=` keeps
+the token out of the Setup command line entirely; `/TOKEN=` does not — Setup still
+writes its own whole command line, including the `/TOKEN=` value, to the `/LOG=`
+file. The token must be exactly 64 lowercase hexadecimal characters; the installer
+exits with code 7 on anything else.
 Keep `/LOG=`: without it Setup writes no log, and the log is the only record of
-why an unattended install failed and what it did about the service. The log also
-records the enrollment token: Setup writes its whole command line, including the
-`/TOKEN=` value, and the service command line it registers. Tokens can be reused,
-so write the log where only Administrators and SYSTEM can read it, and restrict or
-delete it after the deployment; deployment tools (SCCM's AppEnforce.log, Intune)
-record the command line too.
+why an unattended install failed and what it did about the service. Tokens can be
+reused, so write the log where only Administrators and SYSTEM can read it, and
+restrict or delete it after the deployment; deployment tools (SCCM's
+AppEnforce.log, Intune) record the command line too.
 Service name `YuzuAgent`.
 If a silent install exits with code **7** and its `/LOG=` log says "The update
 trust-anchor directory is not secured", the installer refused to continue

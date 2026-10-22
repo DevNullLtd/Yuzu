@@ -2803,6 +2803,7 @@
     ],
     "changelog": [
       "changelog.d/2026-10-14-dex-tar-titles.changed.md",
+      "changelog.d/2026-10-21-tar-timeline-render.added.md",
       "changelog.d/20261014-tar-adhoc-sql-moved.changed.md"
     ],
     "definitions": [
@@ -2874,6 +2875,7 @@
     "privilege_row": true,
     "tests": [
       "tests/unit/server/test_tar_process_tree.cpp",
+      "tests/unit/server/test_tar_timeline_render.cpp",
       "tests/unit/server/test_tar_tree_routes.cpp",
       "tests/unit/test_tar_aggregator.cpp",
       "tests/unit/test_tar_arp.cpp",
