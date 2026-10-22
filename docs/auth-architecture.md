@@ -762,9 +762,12 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   change below, also a service-scoped token.
 - **Administrator-only runtime-config keys.** `PUT /api/config/{key}` for
   `plugin_signing_required`, `dex_alert_routing`, `dex_blast_min_devices`,
-  `dex_blast_window_seconds`, `dex_blast_cooldown_seconds` and `dex_cohort_export_key`
-  applies the same caller rule as the Settings routes that also write them, which are
-  behind `require_admin`: `authz::admin_gate_verdict` (`admin_gate.hpp`) refuses a
+  `dex_blast_window_seconds`, `dex_blast_cooldown_seconds`, `dex_cohort_export_key` and
+  `audit_retention_days` applies one caller rule. For the first six it is the rule of the
+  Settings routes that also write them; `audit_retention_days` has no Settings route
+  (the generic PUT is its only writer) and is in the class by maintainer ruling, because
+  it sets how long audit events are kept (the SOC 2 audit retention floor). The Settings
+  routes are behind `require_admin`; the generic route uses the same predicate: `authz::admin_gate_verdict` (`admin_gate.hpp`) refuses a
   service-scoped token and an MCP-tier token whatever the creator's role, and otherwise
   requires the EFFECTIVE role to be `admin`. Any administrator account session passes,
   including an administrator API token that is not MCP-tier. Unlike the `oidc_*` rule
@@ -776,8 +779,9 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   audit their denials as `auth.admin_required` instead. In production a service-scoped
   token and a `readonly` or `operator` MCP token are refused earlier by the permission
   gate, so the callers that reach this rule are a supervised-tier MCP token and, with RBAC
-  on, a non-administrator holding `Infrastructure:Write`. Every other key stays under
-  `Infrastructure:Write`.
+  on, a non-administrator holding `Infrastructure:Write`. Every other key
+  (`response_retention_days`, `guardian_event_retention_days`, `log_level`,
+  `heartbeat_timeout`, `auto_approve_enabled`) stays under `Infrastructure:Write`.
 - **OIDC-amr elevation — RESTORED by durable SSO identity (#1852).** As of the
   `oidc:<iss>#<sub>` principal re-key (#1837/#1857), an OIDC session's principal
   is not a local-charset `users` username (it contains `:`/`#`), and before #1852

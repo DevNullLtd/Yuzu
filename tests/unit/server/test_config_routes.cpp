@@ -961,7 +961,7 @@ TEST_CASE("config_routes: the administrator-only keys refuse a supervised MCP-ti
     h.wire();
 
     const auto keys = admin_route_keys();
-    REQUIRE(keys.size() == 6);
+    REQUIRE(keys.size() == 7);
     for (const auto& key : keys)
         check_refused(h, key, "administrator account is required",
                       "token_session_admin_setting_blocked");
@@ -1047,7 +1047,7 @@ TEST_CASE("config_routes: a supervised MCP-tier token is refused for every admin
     h.wire();
 
     const auto keys = admin_route_keys();
-    REQUIRE(keys.size() == 6);
+    REQUIRE(keys.size() == 7);
     for (const auto& key : keys) {
         check_refused(h, key, "administrator account is required",
                       "token_session_admin_setting_blocked");
@@ -1067,7 +1067,7 @@ TEST_CASE("config_routes: a non-administrator Infrastructure:Write holder is ref
     h.wire();
 
     const auto keys = admin_route_keys();
-    REQUIRE(keys.size() == 6);
+    REQUIRE(keys.size() == 7);
     for (const auto& key : keys) {
         check_refused(h, key, "own administrator role", "admin_role_required_setting_blocked");
         CHECK(w.store.get_value(key).empty());
@@ -1090,7 +1090,8 @@ TEST_CASE("config_routes: a non-administrator Infrastructure:Write holder is ref
                                                           {"dex_blast_min_devices", "5"},
                                                           {"dex_blast_window_seconds", "300"},
                                                           {"dex_blast_cooldown_seconds", "600"},
-                                                          {"dex_cohort_export_key", "team"}}) {
+                                                          {"dex_cohort_export_key", "team"},
+                                                          {"audit_retention_days", "400"}}) {
         INFO(key);
         h.audits.clear();
         res = h.sink.Put("/api/config/" + key, R"({"value":")" + value + R"("})");
@@ -1170,7 +1171,11 @@ TEST_CASE("config_routes: every key a Settings route writes is not classified Ge
 
     // Guard against the scan rotting into a vacuous pass: the six administrator keys and the
     // oidc keys are all written by settings_routes.cpp today.
-    for (const auto& key : admin_route_keys()) {
+    // (audit_retention_days is administrator-only too but has no Settings writer, so it is not
+    // here.)
+    for (const char* key :
+         {"plugin_signing_required", "dex_alert_routing", "dex_blast_min_devices",
+          "dex_blast_window_seconds", "dex_blast_cooldown_seconds", "dex_cohort_export_key"}) {
         INFO(key << ": settings_routes.cpp changed shape? update this scan or classify the key");
         CHECK(written.count(key) == 1);
     }

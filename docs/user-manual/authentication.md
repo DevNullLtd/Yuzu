@@ -336,7 +336,7 @@ Navigate to **Settings → Security and sign-in** in the dashboard and use the *
 
 Saving the OIDC settings in the dashboard, or writing an `oidc_*` key through `PUT /api/config/{key}`, needs the administrator role on your own account: a session that is administrator only through a temporary elevation is refused with `403`. A stored `oidc_admin_group` still applies after a restart.
 
-The same applies, with a temporary elevation admitted, to the administrator-only keys `plugin_signing_required`, `dex_alert_routing`, `dex_blast_min_devices`, `dex_blast_window_seconds`, `dex_blast_cooldown_seconds` and `dex_cohort_export_key`: `Infrastructure:Write` alone no longer suffices to write them through `PUT /api/config/{key}`; the caller needs the administrator role, as on the Settings pages, and an MCP-tier token is refused.
+The same applies, with a temporary elevation admitted, to the administrator-only keys `plugin_signing_required`, `dex_alert_routing`, `dex_blast_min_devices`, `dex_blast_window_seconds`, `dex_blast_cooldown_seconds`, `dex_cohort_export_key` and `audit_retention_days`: `Infrastructure:Write` alone no longer suffices to write them through `PUT /api/config/{key}`; the caller needs the administrator role, as on the Settings pages, and an MCP-tier token is refused. `audit_retention_days` has no Settings page; it is in this class by maintainer ruling because it sets how long audit events are kept.
 
 Example startup:
 

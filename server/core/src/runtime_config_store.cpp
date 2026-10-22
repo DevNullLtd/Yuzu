@@ -46,9 +46,11 @@ constexpr ConfigWriteClass kAdmin = ConfigWriteClass::AdminRoute;
 constexpr ConfigWriteClass kOidc = ConfigWriteClass::AdminRouteInteractiveOnly;
 
 constexpr KeySpec kKeySpecs[] = {
-    {"heartbeat_timeout", kGeneral},             // seconds before marking agent offline
-    {"response_retention_days", kGeneral},       // days to keep instruction responses
-    {"audit_retention_days", kGeneral},          // days to keep audit events
+    {"heartbeat_timeout", kGeneral},       // seconds before marking agent offline
+    {"response_retention_days", kGeneral}, // days to keep instruction responses
+    // days to keep audit events. Administrator-only by maintainer ruling: it sets the audit
+    // retention floor, and the generic PUT is its only writer (no Settings route).
+    {"audit_retention_days", kAdmin},
     {"guardian_event_retention_days", kGeneral}, // days to keep guaranteed-state events
     {"auto_approve_enabled", kGeneral},          // "true" or "false"
     {"log_level", kGeneral},                     // trace|debug|info|warn|error

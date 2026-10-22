@@ -125,7 +125,7 @@ TEST_CASE("every allowed key has a write class, and the classes are the reviewed
     const std::vector<std::pair<std::string, C>> expected = {
         {"heartbeat_timeout", C::General},
         {"response_retention_days", C::General},
-        {"audit_retention_days", C::General},
+        {"audit_retention_days", C::AdminRoute},
         {"guardian_event_retention_days", C::General},
         {"auto_approve_enabled", C::General},
         {"log_level", C::General},
