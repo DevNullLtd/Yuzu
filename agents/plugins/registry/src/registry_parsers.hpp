@@ -36,7 +36,7 @@ inline constexpr std::size_t kMaxKeyComponents = 32;
 inline constexpr std::size_t kMaxValueNameBytes = 16383;
 /// Largest value this plugin will write or read back for verification.
 inline constexpr std::size_t kMaxWriteBytes = 1024 * 1024;
-/// A previous value is captured up to this many bytes; the rest is flagged `truncated`.
+/// A previous value is captured up to this many bytes; `OldValue::total` keeps the full size.
 inline constexpr std::size_t kCaptureValueCap = 4096;
 /// delete_key: nodes (the key itself plus its values) counted by the bounded enumeration before `capped`;
 /// past it `counted_values` is a lower bound.
@@ -410,13 +410,12 @@ static_assert(kOldStateNames[static_cast<std::size_t>(OldState::unreadable)] == 
 }
 
 /// The state of one value BEFORE a mutation: `bytes` holds up to kCaptureValueCap of it, `total` the
-/// full size, `truncated` = total > bytes.size(). `error` is the token when unreadable.
+/// full size. `error` is the token when unreadable.
 struct OldValue {
     OldState state = OldState::absent;
     std::uint32_t type = 0;
     std::vector<std::uint8_t> bytes;
     std::size_t total = 0;
-    bool truncated = false;
     std::string error;
 };
 

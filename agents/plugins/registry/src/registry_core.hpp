@@ -204,12 +204,8 @@ struct Opened {
 /// Equal byte for byte except that A-Z fold to a-z: a strict subset of the kernel's case folding, so it never
 /// equates two names the kernel keeps distinct. A name that differs only in non-ASCII case compares unequal
 /// and the caller takes the walk.
-[[nodiscard]] inline bool names_equal_ascii_ci(std::string_view a, std::string_view b) noexcept {
-    if (a.size() != b.size()) return false;
-    const auto fold = [](char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c; };
-    for (std::size_t i = 0; i < a.size(); ++i)
-        if (fold(a[i]) != fold(b[i])) return false;
-    return true;
+[[nodiscard]] inline bool names_equal_ascii_ci(std::string_view a, std::string_view b) {
+    return detail::fold_ascii(a) == detail::fold_ascii(b);
 }
 
 /// The fast open (see the file banner). ACCEPT => `fast` is set and `leaf` is the checked handle; every
@@ -325,7 +321,6 @@ struct Opened {
         v.type = q.type;
         v.total = q.size;
         v.bytes = std::move(q.bytes);
-        v.truncated = q.size > v.bytes.size();
     } else if (rc != kErrorFileNotFound) {
         v.state = OldState::unreadable;
         v.error = rc_token(rc, Missing::value);
@@ -354,6 +349,17 @@ inline void fail_with(WriteOutcome& o, std::string reason, bool attempted) {
     o.reason = std::move(reason);
 }
 
+/// Stamps the read-back verdict of a mutation that was applied: ok, or a verify_mismatch failure.
+inline void confirm(WriteOutcome& o, bool verified) {
+    if (verified) {
+        o.verify = "ok";
+        o.result = "ok";
+        return;
+    }
+    o.verify = "mismatch";
+    fail_with(o, std::string{kTokVerifyMismatch}, true);
+}
+
 /// Writes `bytes` to `name` on the checked handle `h`, reads it back and compares (type + bytes).
 inline void write_value_on(RegistryWriter& reg, Handle h, std::string_view name, std::uint32_t type,
                            std::span<const std::uint8_t> bytes, WriteOutcome& o) {
@@ -364,14 +370,8 @@ inline void write_value_on(RegistryWriter& reg, Handle h, std::string_view name,
     o.mutated = true;
     QueryResult q;
     const long qrc = reg.query_value(h, name, kMaxWriteBytes, q);
-    if (qrc == kErrorSuccess && q.type == type && q.size == bytes.size() &&
-        std::equal(q.bytes.begin(), q.bytes.end(), bytes.begin(), bytes.end())) {
-        o.verify = "ok";
-        o.result = "ok";
-        return;
-    }
-    o.verify = "mismatch";
-    fail_with(o, std::string{kTokVerifyMismatch}, true);
+    confirm(o, qrc == kErrorSuccess && q.type == type && q.size == bytes.size() &&
+                   std::equal(q.bytes.begin(), q.bytes.end(), bytes.begin(), bytes.end()));
 }
 
 /// Deletes `name` on the checked handle `h` and confirms it is gone.
@@ -382,13 +382,7 @@ inline void delete_value_on(RegistryWriter& reg, Handle h, std::string_view name
     }
     o.mutated = true;
     QueryResult q;
-    if (reg.query_value(h, name, 0, q) == kErrorFileNotFound) {
-        o.verify = "ok";
-        o.result = "ok";
-        return;
-    }
-    o.verify = "mismatch";
-    fail_with(o, std::string{kTokVerifyMismatch}, true);
+    confirm(o, reg.query_value(h, name, 0, q) == kErrorFileNotFound);
 }
 
 [[nodiscard]] inline WriteOutcome set_value_verified(RegistryWriter& reg, Handle root, std::string_view key,
@@ -464,13 +458,7 @@ inline void delete_key_on(RegistryWriter& reg, Handle h, WriteOutcome& o) {
     }
     o.mutated = true;
     QueryResult q;
-    if (reg.query_value(h, "", 0, q) == kErrorKeyDeleted) {
-        o.verify = "ok";
-        o.result = "ok";
-        return;
-    }
-    o.verify = "mismatch";
-    fail_with(o, std::string{kTokVerifyMismatch}, true);
+    confirm(o, reg.query_value(h, "", 0, q) == kErrorKeyDeleted);
 }
 
 /// Non-recursive delete_key: a key with subkeys is refused `key_has_subkeys` and nothing is deleted. A leaf's
