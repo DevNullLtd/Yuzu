@@ -193,6 +193,7 @@
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
 #include "capability_fragments.hpp" // YUZU_ALL_CAPABILITY_FRAGMENTS: every capability fragment, spelled once
+#include "forensics_plugin_set.hpp"   // #4990: catalogue-derived Forensics plugin set (response read tier)
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -4789,6 +4790,17 @@ public:
 
         // Wire up cross-references for AgentServiceImpl
         // (done after stores are created below)
+
+        // #4990: the Forensics plugin set the stored-response read tier excludes, derived ONCE
+        // from the composed capability registry (never a hand-kept list). An empty derivation
+        // would silently exclude nothing, so boot REFUSES, same posture as the substrate checks.
+        forensics_plugin_set_ = yuzu::server::derive_forensics_plugin_set(capability_registry_);
+        if (!forensics_plugin_set_) {
+            spdlog::error("[Forensics] Refusing to start: the capability catalogue yields no "
+                          "plugin on the Forensics securable, so the stored-response read tier "
+                          "would exclude nothing (#4990) - fail-closed");
+            startup_failed_ = true;
+        }
 
         // PostgreSQL substrate (ADR-0006/0007): one shared pool, constructed
         // BEFORE any Postgres-backed store and validated by a probe checkout so
@@ -22544,6 +22556,10 @@ private:
     /// dependency on any other member, so declaration order carries no
     /// constraint.
     yuzu::server::CommandCapabilityRegistry capability_registry_{YUZU_ALL_CAPABILITY_FRAGMENTS};
+    /// #4990: plugins whose stored response rows are Forensics-tier, derived from
+    /// `capability_registry_` in the constructor (empty derivation = startup_failed_). Declared
+    /// after the registry it is derived from; route classes borrow `&*forensics_plugin_set_`.
+    std::optional<yuzu::server::ForensicsPluginSet> forensics_plugin_set_;
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail
     /// closed if the DSN is empty or unreachable), reset in stop() AFTER the

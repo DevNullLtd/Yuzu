@@ -5,8 +5,11 @@
 #include <expected>
 #include <initializer_list>
 #include <span>
+#include <algorithm>
 #include <stdexcept>
+#include <string>
 #include <string_view>
+#include <vector>
 
 #include "authz_model.hpp"
 
@@ -206,6 +209,28 @@ public:
             return std::unexpected(ClassificationError::Unclassified);
         }
         return *found;
+    }
+
+    /// Every distinct plugin name carrying at least one row whose `securable` equals `securable`,
+    /// lowercased and sorted. Derived from the composed sources on each call (a handful of
+    /// fragments, boot-time use), so a new fragment row is reflected with no second list to keep.
+    /// A plugin is reported if ANY of its rows is on the securable: a mixed-tier plugin is
+    /// therefore over-inclusive by design (the store records only the plugin, not the action).
+    [[nodiscard]] std::vector<std::string> plugins_on_securable(std::string_view securable) const {
+        std::vector<std::string> out;
+        for (std::size_t i = 0; i < source_count_; ++i) {
+            for (const auto& cap : sources_[i]) {
+                if (cap.securable != securable)
+                    continue;
+                std::string name(cap.plugin);
+                for (auto& c : name)
+                    c = to_lower_ascii(c);
+                out.push_back(std::move(name));
+            }
+        }
+        std::ranges::sort(out);
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        return out;
     }
 
 private:

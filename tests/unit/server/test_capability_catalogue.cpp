@@ -47,11 +47,13 @@
 #include "capability_decls/plugin_action_catalogue_shares.hpp"
 #include "capability_decls/plugin_action_catalogue_remote_access_audit.hpp"
 #include "command_capability.hpp"
+#include "forensics_plugin_set.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <span>
 #include <string>
 #include <string_view>
@@ -709,4 +711,38 @@ TEST_CASE("capability catalogue: privacy_permissions.permissions pins its exact 
     const auto classified = registry.classify("privacy_permissions", "permissions");
     REQUIRE(classified.has_value());
     check_row(*classified);
+}
+
+// #4990: the stored-response read tier excludes exactly the plugins this derivation returns, so a
+// Forensics row the derivation misses would leave that plugin's stored output readable at the
+// lower Response:Read tier. The derivation reads the composed registry; this case proves it
+// covers every catalogue row on the Forensics securable and pins the resulting set.
+TEST_CASE("capability catalogue: every Forensics-securable plugin is in the response-tier plugin "
+          "set",
+          "[server][dispatch][capability][responses][forensics]") {
+    const auto registry = build_registry(all_labeled_sources());
+    const auto set = derive_forensics_plugin_set(registry);
+    REQUIRE(set.has_value());
+
+    std::size_t forensics_rows = 0;
+    for (const auto& source : all_labeled_sources()) {
+        for (const auto& row : source.rows) {
+            if (row.securable != kForensicsSecurable)
+                continue;
+            ++forensics_rows;
+            INFO("source=" << source.label << " plugin=" << row.plugin << " action=" << row.action);
+            std::string lower(row.plugin);
+            for (auto& c : lower)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            CHECK(std::ranges::binary_search(set->names(), lower));
+        }
+    }
+    CHECK(forensics_rows > 0);
+
+    // A NEW Forensics plugin must be acknowledged HERE (and in test_response_tier_filter.cpp):
+    // its stored rows become Forensics-tier on every operator read, which is a user-visible
+    // change for anyone who holds Response:Read but not Forensics:Read.
+    CHECK(set->names() == std::vector<std::string>{"app_usage", "browser_inventory",
+                                                   "execution_artifacts", "privacy_permissions",
+                                                   "remote_access_audit"});
 }
