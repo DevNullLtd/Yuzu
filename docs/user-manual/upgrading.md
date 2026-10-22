@@ -58,7 +58,7 @@ now leaves two rows: do not sum the two when counting denials. The older
 unconsumed ticket (today only the MCP `confirm_engine_rotation` recall) now re-checks the stored
 row: a ticket whose reviewer is the submitter or an excluded root, that records no reviewer,
 whose excluded roots cannot be read, or whose stored request does not match its digest is
-refused. Through MCP it surfaces as the generic "approval not consumable (already used, not approved, or absent)" refusal, and the
+refused. Through MCP it surfaces as the same "approval already used (one-time ticket)" refusal a replay gets, and the
 audit row reads `refused: foreign_origin`; the cause is only in the server log. Approving a
 ticket always records a distinct reviewer, so ordinary operation never triggers this: it
 indicates a row edited by hand, restored from a backup or written by an older build, and such a
