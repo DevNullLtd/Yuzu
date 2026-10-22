@@ -3840,6 +3840,16 @@ test('OpenAPI literal segment size lexical gate',
   timeout: 30,
 )
 
+# Lexical gate: the OpenAPI x-yuzu-unavailable markers agree with the stores server.cpp passes to
+# register_routes (a store passed as nullptr <=> its group is marked). Carries its own in-memory
+# mutation self-test. No build required.
+test('OpenAPI unavailable markers match store wiring lexical gate',
+  _python3_test,
+  args: [files('test_unavailable_store_wiring.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # The /swagger page's renderer, run under node against a fake DOM and a queued fetch: panels and rows,
 # the typed / untyped / unavailable pills, guides built on demand, oneOf tables, hostile spec text kept as
 # text, a malformed URL fragment, the v2 curl path and the failure view with Retry. Skips (77) without node.

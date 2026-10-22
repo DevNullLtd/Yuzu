@@ -10,9 +10,12 @@ spec text shown as text and never as an element, a malformed URL fragment that m
 page down, deep links, the v2 route's curl path, and the failure view (status-aware message,
 correlation id, Retry that fetches again).
 
-Skips cleanly (exit 77) when `node` is not on PATH. Stdlib only.
+Skips cleanly (exit 77) when `node` is not on PATH, unless YUZU_REQUIRE_NODE=1 is set, in which
+case a missing node fails (exit 1). docs-lint.yml sets it on a hosted image that ships node, so
+the only check of the page's script cannot silently skip there. Stdlib only.
 """
 import json
+import os
 import pathlib
 import re
 import shutil
@@ -156,6 +159,11 @@ def extract_js():
 def main():
     node = shutil.which("node")
     if not node:
+        if os.environ.get("YUZU_REQUIRE_NODE") == "1":
+            # docs-lint.yml runs this on a hosted image that ships node: a missing node
+            # there must fail, not skip the only check of the page's script.
+            print("YUZU_REQUIRE_NODE=1 but node is not on PATH")
+            return 1
         print("node not on PATH: skipping")
         return 77
     js = extract_js()
