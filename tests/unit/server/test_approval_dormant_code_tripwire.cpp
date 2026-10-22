@@ -179,9 +179,17 @@ std::string code_only(const std::string& text) {
         } else if (c == '"' || (c == '\'' && !is_digit_separator(text, i, literal_end))) {
             // String or character literal. Ends at the matching unescaped quote, or at the
             // newline if it is unterminated, so one stray quote cannot blind the rest of the file.
+            // A backslash escapes the next byte, and a backslash before a CRLF line end escapes
+            // both bytes of it (a line splice), so a CRLF-continued literal does not end early.
             std::size_t j = i + 1;
-            while (j < n && text[j] != c && text[j] != '\n')
-                j += text[j] == '\\' ? 2 : 1;
+            while (j < n && text[j] != c && text[j] != '\n') {
+                if (text[j] != '\\')
+                    ++j;
+                else if (j + 2 < n && text[j + 1] == '\r' && text[j + 2] == '\n')
+                    j += 3;
+                else
+                    j += 2;
+            }
             blank(i + 1, j);
             i = j < n ? j + 1 : n;
             literal_end = i;
@@ -532,6 +540,19 @@ TEST_CASE("the tripwire lexer keeps literals, comments and digit separators apar
         {"the same with CRLF line ends",
          "// note \\\r\n /* ignore\r\nvoid h() { m.submit_bound(a); }\r\n/* close */\r\n",
          "submit_bound", 3},
+        // The same splice with CRLF line ends: the literal continues onto the next line, so its
+        // real closing quote is not a new opening quote and the call after it is code.
+        {"a CRLF-continued string literal, then a call",
+         "log(\"Starting bound \\\r\nrequest\", m.submit_bound());\r\n", "submit_bound", 2},
+        {"the same string literal with LF line ends (control)",
+         "log(\"Starting bound \\\nrequest\", m.submit_bound());\n", "submit_bound", 2},
+        {"a CRLF-continued character literal, then a call",
+         "char c = '\\\r\nx'; m.submit_bound(a);\r\n", "submit_bound", 2},
+        {"a CRLF-continued string literal holding a call name is not code",
+         "log(\"bound \\\r\nm.submit_bound()\");\r\n", "submit_bound", 1, 0},
+        {"a CRLF line comment continuation hides the continuation line itself",
+         "// note \\\r\nvoid h() { m.submit_bound(a); }\r\nvoid k() { m.consume_ticket(x); }\r\n",
+         "submit_bound", 1, 0},
         {"a continued line comment hides the continuation line itself",
          "// note \\\nvoid h() { m.submit_bound(a); }\nvoid k() { m.consume_ticket(x); }\n",
          "submit_bound", 1, 0},
