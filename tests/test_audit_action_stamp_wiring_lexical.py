@@ -15,9 +15,9 @@ Invariants:
 
   agent.cpp
     1. `command_frames.hpp` is included once.
-    2. Exactly one `stamp_output_frame(resp, command_id, action, std::move(combined));` (the
-       output flush) and exactly one `stamp_final_frame(final_resp, cmd.command_id(),
-       cmd.action(), rc);` (the terminal frame).
+    2. Exactly one `make_output_frame(command_id, action, std::move(combined))` (the output
+       flush) and exactly one `make_final_frame(cmd.command_id(), cmd.action(), rc)` (the
+       terminal frame).
     3. Exactly one `.action = cmd.action(),` (the CommandContextImpl initialiser that carries the
        dispatched action to the flush).
 
@@ -103,8 +103,8 @@ def normalise(src):
 
 AGENT_ONCE = (
     '#include "command_frames.hpp"',
-    "yuzu::agent::stamp_output_frame(resp, command_id, action, std::move(combined));",
-    "yuzu::agent::stamp_final_frame(final_resp, cmd.command_id(), cmd.action(), rc);",
+    "yuzu::agent::make_output_frame(command_id, action, std::move(combined))",
+    "yuzu::agent::make_final_frame(cmd.command_id(), cmd.action(), rc)",
     ".action = cmd.action(),",
 )
 
@@ -282,8 +282,8 @@ def server_problems(src):
 
 # (file, pattern, replacement); each must make that file's problems() non-empty.
 AGENT_MUTATIONS = [
-    (r"yuzu::agent::stamp_output_frame\(resp, command_id, action, std::move\(combined\)\);", "(void)0;"),
-    (r"yuzu::agent::stamp_final_frame\(final_resp, cmd\.command_id\(\), cmd\.action\(\), rc\);", "(void)0;"),
+    (r"yuzu::agent::make_output_frame\(command_id, action, std::move\(combined\)\)", "pb::CommandResponse{}"),
+    (r"yuzu::agent::make_final_frame\(cmd\.command_id\(\), cmd\.action\(\), rc\)", "pb::CommandResponse{}"),
     (r"\.action = cmd\.action\(\),", ""),
     (r'#include "command_frames\.hpp"', ""),
 ]

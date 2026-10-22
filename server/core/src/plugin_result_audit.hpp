@@ -10,7 +10,7 @@
  * what the server mints for a registry command (`registry-` plus 16 or 32 lowercase hex digits; the
  * plugin name keeps the operator's spelling, so it is compared ASCII-case-insensitively) AND the
  * frame's `CommandResponse.action` (stamped by the AGENT on every plugin-output RUNNING frame and on
- * the terminal frame: stamp_output_frame / stamp_final_frame in agents/core/src/command_frames.hpp,
+ * the terminal frame: make_output_frame / make_final_frame in agents/core/src/command_frames.hpp,
  * called from agent.cpp) is one of the three
  * MUTATING actions. A read action's output can never mint a row, and an agent that stamps no action
  * (every agent that predates the stamp) produces none: fail-closed, documented. A read action's

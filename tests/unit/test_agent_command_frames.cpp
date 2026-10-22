@@ -14,8 +14,8 @@ using Resp = ::yuzu::agent::v1::CommandResponse;
 
 TEST_CASE("agent command frames: an output frame carries the dispatched action",
           "[agent][command_frames]") {
-    Resp resp;
-    yuzu::agent::stamp_output_frame(resp, "cmd-1", "set_value", "audit|op=set_value\nstatus|ok");
+    const Resp resp =
+        yuzu::agent::make_output_frame("cmd-1", "set_value", "audit|op=set_value\nstatus|ok");
 
     CHECK(resp.command_id() == "cmd-1");
     CHECK(resp.status() == Resp::RUNNING);
@@ -27,24 +27,21 @@ TEST_CASE("agent command frames: an output frame carries the dispatched action",
 
 TEST_CASE("agent command frames: the final frame carries the action and the exit code",
           "[agent][command_frames]") {
-    Resp ok;
-    yuzu::agent::stamp_final_frame(ok, "cmd-3", "delete_key", 0);
+    const Resp ok = yuzu::agent::make_final_frame("cmd-3", "delete_key", 0);
     CHECK(ok.command_id() == "cmd-3");
     CHECK(ok.status() == Resp::SUCCESS);
     CHECK(ok.exit_code() == 0);
     CHECK(ok.action() == "delete_key");
     CHECK(ok.plugin().empty());
 
-    Resp bad;
-    yuzu::agent::stamp_final_frame(bad, "cmd-4", "delete_value", 1);
+    const Resp bad = yuzu::agent::make_final_frame("cmd-4", "delete_value", 1);
     CHECK(bad.status() == Resp::FAILURE);
     CHECK(bad.exit_code() == 1);
     CHECK(bad.action() == "delete_value");
 
     // An empty action is the proto3 default: nothing is stamped on either frame kind.
-    Resp none_out, none_fin;
-    yuzu::agent::stamp_output_frame(none_out, "cmd-5", "", "line");
-    yuzu::agent::stamp_final_frame(none_fin, "cmd-5", "", 0);
+    const Resp none_out = yuzu::agent::make_output_frame("cmd-5", "", "line");
+    const Resp none_fin = yuzu::agent::make_final_frame("cmd-5", "", 0);
     CHECK(none_out.action().empty());
     CHECK(none_fin.action().empty());
 }
