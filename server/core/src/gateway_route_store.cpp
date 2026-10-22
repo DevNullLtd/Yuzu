@@ -153,6 +153,17 @@ std::optional<std::string> col_opt(PGresult* r, int row, int col) {
 // Postgres boolean text output is 't'/'f'.
 bool to_bool(const char* s) { return s != nullptr && s[0] == 't'; }
 
+// True iff `res` failed on the v5 unique session index (#5683). Any other 23505
+// (the agent_id primary key) is NOT this, so it stays a db_error.
+bool is_session_unique_violation(const pg::PgResult& res) {
+    if (res.status() != PGRES_FATAL_ERROR)
+        return false;
+    const char* state = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
+    const char* constraint = PQresultErrorField(res.get(), PG_DIAG_CONSTRAINT_NAME);
+    return state != nullptr && constraint != nullptr && std::string_view(state) == "23505" &&
+           std::string_view(constraint) == "ux_agent_routes_session_id";
+}
+
 // parse_reap_i64 / parse_declined_marker moved to gateway_route_reap_rules.hpp
 // (PR #4299 round-3 split): they are now shared by decide_reap (pure) AND this
 // store's apply tail, and both are unit-tested without Postgres.
@@ -355,6 +366,13 @@ GatewayRouteStore::register_fresh(std::string_view agent_id, std::string_view se
         "RETURNING connection_epoch",
         std::vector<std::optional<std::string>>{std::string(agent_id), std::string(session_id)});
     if (res.status() != PGRES_TUPLES_OK) {
+        if (is_session_unique_violation(res)) {
+            // A server-minted id (128 random bits) cannot collide: this is an RNG
+            // fault or a planted row. Fail closed; the next attempt mints anew.
+            spdlog::error("GatewayRouteStore::register_fresh: minted session id is already "
+                          "held by another agent_routes row (#5683) — refusing");
+            return std::unexpected(GatewayRouteStoreError::db_error);
+        }
         spdlog::error("GatewayRouteStore::register_fresh: query failed: {}",
                       PQresultErrorMessage(res.get()));
         return std::unexpected(GatewayRouteStoreError::db_error);
@@ -487,6 +505,13 @@ GatewayRouteStore::announce_connected(std::string_view agent_id, std::string_vie
         std::vector<std::optional<std::string>>{
             std::string(agent_id), std::move(cluster_arg), std::string(gateway_node),
             std::string(session_id), std::to_string(lease_ttl_secs), std::move(home_id_arg)});
+    if (is_session_unique_violation(ins)) {
+        // #5683: another agent's row already holds this session id, so the
+        // fallback insert was refused by the unique index. The caller unpublishes.
+        return AnnounceResult{.matched = false,
+                              .cluster_affinity_violation = cluster_affinity_violation,
+                              .session_held_by_other_agent = true};
+    }
     if (ins.status() != PGRES_COMMAND_OK) {
         spdlog::error("GatewayRouteStore::announce_connected: fallback insert failed: {}",
                       PQresultErrorMessage(ins.get()));
@@ -543,6 +568,11 @@ GatewayRouteStore::reclaim_tombstoned_session(std::string_view agent_id,
         "SELECT EXISTS (SELECT 1 FROM ins), EXISTS (SELECT 1 FROM other)",
         std::vector<std::optional<std::string>>{std::string(agent_id), std::string(session_id),
                                                  std::to_string(lease_ttl_secs)});
+    if (is_session_unique_violation(res)) {
+        // #5683: lost the race to a concurrent adopt of the same id; the
+        // unique index, not the snapshot above, is what arbitrates it.
+        return ReclaimOutcome::held_by_other_agent;
+    }
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
         spdlog::error("GatewayRouteStore::reclaim_tombstoned_session: query failed: {}",
                       PQresultErrorMessage(res.get()));
@@ -550,8 +580,8 @@ GatewayRouteStore::reclaim_tombstoned_session(std::string_view agent_id,
     }
     if (std::string_view(PQgetvalue(res.get(), 0, 0)) == "t")
         return ReclaimOutcome::adopted;
-    // Not adopted: either another agent's row holds the id (best-effort: the
-    // index is non-unique) or the caller's own row holds a LIVE session
+    // Not adopted: either another agent's row holds the id or the caller's own
+    // row holds a LIVE session
     // (normally a different one; a concurrent identical reclaim also lands
     // here). Either way the caller must refuse it outright.
     return std::string_view(PQgetvalue(res.get(), 0, 1)) == "t"

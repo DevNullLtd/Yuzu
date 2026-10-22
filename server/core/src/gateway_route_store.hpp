@@ -439,6 +439,11 @@ struct AnnounceResult {
     /// the in-memory registry), never merely logged as a desync. Mutually
     /// exclusive with `matched` (a violation never also matches).
     bool cluster_affinity_violation{false};
+    /// #5683: true iff the fallback INSERT was refused because ANOTHER agent's
+    /// row already holds `session_id` (the unique index). Like
+    /// `cluster_affinity_violation` this is a fail-closed refusal the caller
+    /// must not publish anywhere, never a benign `matched == false` desync.
+    bool session_held_by_other_agent{false};
 };
 
 /// Outcome of `reclaim_tombstoned_session`; a degraded store is the error channel.
@@ -719,9 +724,11 @@ public:
     /// SAME id also lands here, because the guard needs `session_id IS NULL`);
     /// `held_by_other_agent` iff another agent's row already carries
     /// `session_id` (a forged or colliding id). For either refusal the caller
-    /// MUST NOT install anything. The cross-agent guard is a same-statement
-    /// NOT EXISTS and is best-effort: `session_id` has no UNIQUE index, so two
-    /// concurrent reclaims of one unheld id under READ COMMITTED can both win.
+    /// MUST NOT install anything. The same-statement NOT EXISTS is only the fast
+    /// path; two concurrent reclaims of one unheld id are arbitrated by the
+    /// UNIQUE partial index `ux_agent_routes_session_id` (migration v5, #5683):
+    /// the loser's write fails 23505 on that index and is reported as
+    /// `held_by_other_agent`.
     ///
     /// Deliberately does NOT mint a fresh `connection_epoch` (unlike
     /// `register_fresh`): this is not a new connection racing for the row,
@@ -778,19 +785,18 @@ public:
     /// bytes are dropped before the query (returned as absent; the caller
     /// counts them malformed) and duplicate ids are collapsed, so a repeat can
     /// never come back twice. The rest are read in ceil(n/1024) statements
-    /// (`session_id = ANY($1)`, served by `agent_routes_session_id_idx`, each
+    /// (`session_id = ANY($1)`, served by `ux_agent_routes_session_id`, each
     /// `ORDER BY agent_id`) on ONE lease: `kHotReadTimeout` (500 ms) bounds
     /// only the lease ACQUISITION, each statement is bounded by the pool's
     /// `statement_timeout`, and there is no aggregate deadline.
     /// `RoutableRoute::route.session_id` is the matched id and
     /// `route.agent_id` the owning agent; `routable` is computed IN-SQL on the
     /// DB clock exactly as in `lookup_routes`. A session with no row is simply
-    /// absent. **`session_id` is NOT unique** (`register_fresh` guards only
-    /// the caller's own row and `reclaim_tombstoned_session`'s cross-agent
-    /// guard is best-effort), so one id can legitimately come back on SEVERAL
-    /// rows — the CALLER must treat more than one row per id as ambiguous and
-    /// refuse to resolve it; this method deliberately returns every match
-    /// rather than picking one. Use `lookup_route(agent_id)` (PK, unambiguous)
+    /// absent. Since migration v5 (#5683) a non-NULL `session_id` is UNIQUE, so
+    /// at most one row per id comes back; the method still returns every match
+    /// rather than picking one, and the CALLER keeps its more-than-one-row
+    /// ambiguity refusal as defense in depth (a hand-dropped index, or data
+    /// from before v5). Use `lookup_route(agent_id)` (PK, unambiguous)
     /// whenever the agent_id is already known.
     [[nodiscard]] std::expected<std::vector<RoutableRoute>, GatewayRouteStoreError>
     lookup_by_sessions(std::span<const std::string> session_ids);

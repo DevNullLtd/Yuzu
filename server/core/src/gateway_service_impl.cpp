@@ -364,7 +364,10 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "\"malformed_session_id\" is a replayed id that is not the gw-session- plus 32 "
             "lowercase hex shape this server mints, and \"session_held_by_other_agent\" is a "
             "replayed id another agent's row already holds (a forged or colliding id); both are "
-            "refused and both expect zero, so any increase is actionable. "
+            "refused and both expect zero, so any increase is actionable. #5683: "
+            "op=\"announce_connected\" outcome \"session_held_by_other_agent\" is the same "
+            "condition caught on the CONNECTED path (the unique session index refused the "
+            "fallback insert); the placement is unpublished and the same alert covers it. "
             "op=\"notify_stream_status\" outcome \"connected_unverified\" is a CONNECTED refused "
             "because the directory read degraded and this replica holds no matching local "
             "session (the agent recovers by reconnecting). HA WS-5 lookups: "
@@ -419,6 +422,10 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
         // See gateway_route_store.hpp's "AGENT<->CLUSTER AFFINITY" note.
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "announce_connected"}, {"outcome", "cluster_affinity_violation"}});
+        // #5683: a CONNECTED whose session id another agent's row already holds
+        // (the unique index refused the fallback INSERT), refused fail-closed.
+        metrics_->counter("yuzu_server_gateway_route_desync_total",
+                          {{"op", "announce_connected"}, {"outcome", "session_held_by_other_agent"}});
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "notify_stream_status"}, {"outcome", "unknown_session"}});
         // HA WS-4 4.4 post-build adversarial review (PR #4636 FortitudeEtc,
@@ -2315,6 +2322,41 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                                     .append(" claimed_cluster_id=")
                                     .append(cluster_id)
                                     .append(" detected_at=announce_connected_write");
+                    ev.result = "failure";
+                    if (!audit_store_->log(ev))
+                        signal_grpc_audit_failed(context);
+                }
+            } else if (res->session_held_by_other_agent) {
+                // #5683: the unique session index refused the fallback INSERT:
+                // another agent's row holds this id. Same shape as the affinity
+                // branch above: set_gateway_route already published the
+                // placement in memory, so revert it, and leave a best-effort
+                // audit row.
+                spdlog::warn("[gateway] NotifyStreamStatus: CONNECTED for agent {} presents "
+                             "session {} that another agent's route already holds (#5683) — "
+                             "refusing, not publishing this placement",
+                             ::yuzu::log_id_token(agent_id), ::yuzu::log_key_token(session_id));
+                record_directory_desync(metrics_, "announce_connected",
+                                        "session_held_by_other_agent");
+                if (has_local_session && !registry_.unpublish_gateway_route(agent_id, session_id)) {
+                    spdlog::debug("[gateway] NotifyStreamStatus: session_held_by_other_agent "
+                                  "revert no-op for agent {} session {} — session already "
+                                  "superseded",
+                                  ::yuzu::log_id_token(agent_id), ::yuzu::log_key_token(session_id));
+                }
+                if (audit_store_ && audit_store_->is_open()) {
+                    AuditEvent ev;
+                    ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+                    ev.principal = "gateway_cluster:" + cluster_id;
+                    ev.principal_role = "gateway";
+                    ev.action = "gateway.session_held_by_other_agent";
+                    ev.target_type = "agent";
+                    ev.target_id = agent_id;
+                    // The presented id may be another agent's LIVE session: never
+                    // written into the audit row.
+                    ev.detail = "detected_at=announce_connected_write";
                     ev.result = "failure";
                     if (!audit_store_->log(ev))
                         signal_grpc_audit_failed(context);
