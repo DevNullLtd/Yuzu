@@ -144,7 +144,8 @@ enum class ConfigWriteClass : std::uint8_t {
     /// Infrastructure:Write is enough.
     General,
     /// The key's settings route is `require_admin`: refused for a service-scoped token, an
-    /// MCP-tier token, and a caller whose effective role is not admin (`authz::admin_gate_verdict`).
+    /// MCP-tier token, and a caller whose effective role is not admin
+    /// (`authz::admin_gate_verdict`).
     AdminRoute,
     /// Sign-in provider keys: the caller's OWN role must be admin from an interactive session,
     /// so a JIT elevation is refused as well as an MCP-tier token.

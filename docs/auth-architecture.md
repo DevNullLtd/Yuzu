@@ -766,8 +766,9 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   applies the same caller rule as the Settings routes that also write them, which are
   behind `require_admin`: `authz::admin_gate_verdict` (`admin_gate.hpp`) refuses a
   service-scoped token and an MCP-tier token whatever the creator's role, and otherwise
-  requires the EFFECTIVE role to be `admin`. Unlike the `oidc_*` rule above, an active JIT
-  elevation is admitted, as it is on those Settings routes. `Infrastructure:Write` alone
+  requires the EFFECTIVE role to be `admin`. Any administrator account session passes,
+  including an administrator API token that is not MCP-tier. Unlike the `oidc_*` rule
+  above, an active JIT elevation is admitted, as it is on those Settings routes. `Infrastructure:Write` alone
   does not suffice. The refusal precedes the store-open check and the body parse and is
   audited `config.update / denied` on `RuntimeConfig` with `target_id` = the key, no
   `attempted` row, and `detail` `token_session_admin_setting_blocked` (token) or

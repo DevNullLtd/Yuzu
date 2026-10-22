@@ -1,6 +1,6 @@
 #include "config_routes.hpp"
 
-#include "admin_gate.hpp"           // authz::admin_gate_verdict
+#include "admin_gate.hpp"            // authz::admin_gate_verdict
 #include "dex_score_policy_json.hpp" // kDexScorePolicyKey
 #include "http_route_sink.hpp"
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
@@ -129,18 +129,18 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
         if (write_class == ConfigWriteClass::RouteOwned) {
             res.status = 400;
             res.set_content(
-                detail::a4_error(res,
-                                 key == kDexScorePolicyKey
-                                     ? std::string("dex_score_policy is written only through "
-                                                   "PUT /api/v1/dex/score-policy")
-                                     : key + " is written only through its own route",
-                                 detail::A4ErrorOpts{
-                                     .remediation = key == kDexScorePolicyKey
-                                                        ? "send the whole policy document to "
-                                                          "PUT /api/v1/dex/score-policy with "
-                                                          "If-Match (not yet available in this "
-                                                          "release)"
-                                                        : "use the route that owns this key"}),
+                detail::a4_error(
+                    res,
+                    key == kDexScorePolicyKey
+                        ? std::string("dex_score_policy is written only through "
+                                      "PUT /api/v1/dex/score-policy")
+                        : key + " is written only through its own route",
+                    detail::A4ErrorOpts{.remediation = key == kDexScorePolicyKey
+                                                           ? "send the whole policy document to "
+                                                             "PUT /api/v1/dex/score-policy with "
+                                                             "If-Match (not yet available in this "
+                                                             "release)"
+                                                           : "use the route that owns this key"}),
                 "application/json");
             return;
         }
@@ -157,37 +157,50 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
         // `attempted` (outcome unknown).
         const char* refusal_detail = nullptr;
         const char* refusal_message = "changing this setting needs your own administrator role";
-        if (write_class == ConfigWriteClass::AdminRouteInteractiveOnly) {
-            refusal_message = "changing sign-in provider settings needs your own administrator role";
-            if (session->role != auth::Role::admin || !session->mcp_tier.empty() ||
-                !session->token_scope_service.empty())
-                refusal_detail = auth::is_elevated(*session)
-                                     ? "elevated_session_oidc_setting_blocked"
-                                     : "admin_role_required_oidc_setting_blocked";
-        } else if (write_class == ConfigWriteClass::AdminRoute) {
-            switch (authz::admin_gate_verdict(*session)) {
-            case authz::AdminGate::Admit:
+        // No `default`: a new ConfigWriteClass enumerator must be handled here (-Wswitch), not
+        // fall through as General. An unknown key has no class and is refused further down.
+        if (write_class) {
+            switch (*write_class) {
+            case ConfigWriteClass::AdminRouteInteractiveOnly:
+                refusal_message =
+                    "changing sign-in provider settings needs your own administrator role";
+                if (session->role != auth::Role::admin || !session->mcp_tier.empty() ||
+                    !session->token_scope_service.empty())
+                    refusal_detail = auth::is_elevated(*session)
+                                         ? "elevated_session_oidc_setting_blocked"
+                                         : "admin_role_required_oidc_setting_blocked";
                 break;
-            case authz::AdminGate::ServiceScoped:
-            case authz::AdminGate::McpTier:
-                refusal_detail = "token_session_admin_setting_blocked";
-                refusal_message = "an interactive administrator session is required; MCP-tier and "
-                                  "service-scoped tokens cannot change this setting";
+            case ConfigWriteClass::AdminRoute:
+                switch (authz::admin_gate_verdict(*session)) {
+                case authz::AdminGate::Admit:
+                    break;
+                case authz::AdminGate::ServiceScoped:
+                case authz::AdminGate::McpTier:
+                    refusal_detail = "token_session_admin_setting_blocked";
+                    refusal_message = "an administrator account is required; MCP-tier and "
+                                      "service-scoped tokens cannot change this setting";
+                    break;
+                case authz::AdminGate::NotAdmin:
+                    refusal_detail = "admin_role_required_setting_blocked";
+                    break;
+                }
                 break;
-            case authz::AdminGate::NotAdmin:
-                refusal_detail = "admin_role_required_setting_blocked";
+            case ConfigWriteClass::General:
+            case ConfigWriteClass::RouteOwned: // refused above
                 break;
             }
         }
         if (refusal_detail) {
-            (void)deps.audit_fn(req, "config.update", "denied", "RuntimeConfig", key,
-                                refusal_detail);
+            // try_persist_audit: a throwing or empty sink must not turn the refusal into a 500.
+            (void)detail::try_persist_audit(deps.audit_fn, req, "config.update", "denied",
+                                            "RuntimeConfig", key, refusal_detail);
             res.status = 403;
             res.set_content(
                 detail::a4_error(res, refusal_message,
                                  detail::A4ErrorOpts{
-                                     .remediation = "change this setting from an interactive "
-                                                    "administrator session (the Settings page)"}),
+                                     .remediation = "change this setting as an administrator, from "
+                                                    "the Settings page or with an administrator "
+                                                    "API token that is not MCP-tier"}),
                 "application/json");
             return;
         }

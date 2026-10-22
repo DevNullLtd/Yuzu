@@ -44,10 +44,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <optional>
 #include <regex>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -94,6 +97,8 @@ struct MockHarness {
     bool audit_succeeds{true};
     /// 0-based index of the one audit call that fails (-1: none); independent of audit_succeeds.
     int audit_fails_at{-1};
+    /// The audit sink throws instead of returning (a store fault surfacing as an exception).
+    bool audit_throws{false};
     std::vector<AuditRow> audits;
 
     yuzu::server::test::TestRouteSink sink;
@@ -132,9 +137,11 @@ struct MockHarness {
             }
             return true;
         };
-        deps.audit_fn = [this](const httplib::Request&, const std::string& a,
-                               const std::string& r, const std::string& tt,
-                               const std::string& ti, const std::string& d) -> bool {
+        deps.audit_fn = [this](const httplib::Request&, const std::string& a, const std::string& r,
+                               const std::string& tt, const std::string& ti,
+                               const std::string& d) -> bool {
+            if (audit_throws)
+                throw std::runtime_error("audit sink fault");
             const int idx = static_cast<int>(audits.size());
             audits.push_back({a, r, tt, ti, d});
             return audit_succeeds && idx != audit_fails_at;
@@ -956,14 +963,14 @@ TEST_CASE("config_routes: the administrator-only keys refuse a supervised MCP-ti
     const auto keys = admin_route_keys();
     REQUIRE(keys.size() == 6);
     for (const auto& key : keys)
-        check_refused(h, key, "interactive administrator session",
+        check_refused(h, key, "administrator account is required",
                       "token_session_admin_setting_blocked");
 
     // Defence in depth: a service-scoped session is refused by the same rule if it ever reaches it.
     h.session_mcp_tier.clear();
     h.session_token_scope_service = "svc-a";
     for (const auto& key : keys)
-        check_refused(h, key, "interactive administrator session",
+        check_refused(h, key, "administrator account is required",
                       "token_session_admin_setting_blocked");
 
     // A non-administrator role (an engine-principal-like session) holding Infrastructure:Write.
@@ -989,19 +996,43 @@ TEST_CASE("config_routes: the administrator-only keys refuse a supervised MCP-ti
     CHECK(res->status == 400);
 }
 
-TEST_CASE("config_routes: a failing audit sink never turns a refusal into a write or a 5xx",
+TEST_CASE("config_routes: a failing or throwing audit sink never turns a refusal into a 5xx",
+          "[server][routes][config_routes][elevation]") {
+    MockHarness h; // no store: the 403 holds without one, so this isolates the audit sink
+    h.session_role = auth::Role::admin;
+    h.session_mcp_tier = "supervised";
+    h.wire();
+
+    for (const bool throws : {false, true}) {
+        h.audit_succeeds = throws; // false: returns false; true: unused, the sink throws instead
+        h.audit_throws = throws;
+        for (const auto& key : admin_route_keys()) {
+            INFO(key << " throws=" << throws);
+            auto res = h.sink.Put("/api/config/" + key, R"({"value":"true"})");
+            REQUIRE(res);
+            CHECK(res->status == 403); // the refusal holds without its evidence row
+        }
+    }
+}
+
+TEST_CASE("config_routes: a denied caller gets 403 before the body is parsed",
           "[server][routes][config_routes][elevation]") {
     MockHarness h;
     h.session_role = auth::Role::admin;
     h.session_mcp_tier = "supervised";
-    h.audit_succeeds = false; // the denied row cannot be stored
     h.wire();
 
-    for (const auto& key : admin_route_keys()) {
-        INFO(key);
-        auto res = h.sink.Put("/api/config/" + key, R"({"value":"true"})");
+    // Malformed JSON, a missing value and a non-integer for an integer key would each be a 400
+    // for an admitted caller; the class refusal precedes all of them.
+    for (const auto& [key, payload] : std::vector<std::pair<std::string, std::string>>{
+             {"dex_blast_min_devices", "not json"},
+             {"dex_blast_min_devices", R"({"nope":1})"},
+             {"dex_blast_min_devices", R"({"value":"abc"})"},
+             {"oidc_issuer", "not json"}}) {
+        INFO(key << " " << payload);
+        auto res = h.sink.Put("/api/config/" + key, payload);
         REQUIRE(res);
-        CHECK(res->status == 403); // the refusal holds without its evidence row
+        CHECK(res->status == 403);
     }
 }
 
@@ -1019,14 +1050,14 @@ TEST_CASE("config_routes: a supervised MCP-tier token is refused for every admin
     const auto keys = admin_route_keys();
     REQUIRE(keys.size() == 6);
     for (const auto& key : keys) {
-        check_refused(h, key, "interactive administrator session",
+        check_refused(h, key, "administrator account is required",
                       "token_session_admin_setting_blocked");
         CHECK(w.store.get_value(key).empty());
     }
 }
 
 TEST_CASE("config_routes: a non-administrator Infrastructure:Write holder is refused for "
-          "every administrator-only key; an interactive administrator and an elevated "
+          "every administrator-only key; an administrator account and an elevated "
           "session are admitted, as on the settings routes",
           "[pg][server][routes][config_routes][elevation]") {
     YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
@@ -1050,17 +1081,17 @@ TEST_CASE("config_routes: a non-administrator Infrastructure:Write holder is ref
     CHECK(res->status == 200);
     CHECK(w.store.get_value("plugin_signing_required") == "true");
 
-    // An interactive administrator writes every one of them: attempted, then success, and the
+    // An administrator account writes every one of them: attempted, then success, and the
     // value is stored.
     h.session_elevated = false;
     h.session_role = auth::Role::admin;
-    for (const auto& [key, value] : std::vector<std::pair<std::string, std::string>>{
-             {"plugin_signing_required", "false"},
-             {"dex_alert_routing", "[]"},
-             {"dex_blast_min_devices", "5"},
-             {"dex_blast_window_seconds", "300"},
-             {"dex_blast_cooldown_seconds", "600"},
-             {"dex_cohort_export_key", "team"}}) {
+    for (const auto& [key, value] :
+         std::vector<std::pair<std::string, std::string>>{{"plugin_signing_required", "false"},
+                                                          {"dex_alert_routing", "[]"},
+                                                          {"dex_blast_min_devices", "5"},
+                                                          {"dex_blast_window_seconds", "300"},
+                                                          {"dex_blast_cooldown_seconds", "600"},
+                                                          {"dex_cohort_export_key", "team"}}) {
         INFO(key);
         h.audits.clear();
         res = h.sink.Put("/api/config/" + key, R"({"value":")" + value + R"("})");
@@ -1109,22 +1140,41 @@ TEST_CASE("config_routes: every key a Settings route writes is not classified Ge
 #ifndef YUZU_SERVER_SRC_DIR
 #error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
 #endif
-    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "settings_routes.cpp");
-    REQUIRE(in.is_open());
-    const std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-
     static const std::regex kSet(
         R"re(runtime_config_store_->set\(\s*(?:"([a-z_]+)"|plugin_signing::(kPluginSigningRequiredKey)))re");
+    static const std::regex kAnySet(R"re(runtime_config_store_?->set\()re");
+
     std::set<std::string> written;
-    for (auto it = std::sregex_iterator(src.begin(), src.end(), kSet);
-         it != std::sregex_iterator(); ++it) {
-        written.insert((*it)[1].matched ? (*it)[1].str() : std::string("plugin_signing_required"));
+    std::set<std::string> other_writers; // route files besides these two that write the store
+    for (const auto& entry : std::filesystem::directory_iterator(YUZU_SERVER_SRC_DIR)) {
+        const auto name = entry.path().filename().string();
+        if (!name.ends_with("_routes.cpp"))
+            continue;
+        std::ifstream in(entry.path());
+        REQUIRE(in.is_open());
+        const std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+        if (name == "settings_routes.cpp") {
+            for (auto it = std::sregex_iterator(src.begin(), src.end(), kSet);
+                 it != std::sregex_iterator(); ++it)
+                written.insert((*it)[1].matched ? (*it)[1].str()
+                                                : std::string("plugin_signing_required"));
+        } else if (name != "config_routes.cpp" && std::regex_search(src, kAnySet)) {
+            other_writers.insert(name);
+        }
     }
 
+    // A new route file that writes runtime config is outside this scan: classify its keys and
+    // extend the scan (and route the write through the shared class rule) before adding it.
+    for (const auto& name : other_writers)
+        FAIL_CHECK(name << " writes runtime_config_store_ but this scan only covers "
+                           "settings_routes.cpp; extend the scan and classify its keys");
+
     // Guard against the scan rotting into a vacuous pass: the six administrator keys and the
-    // oidc keys are all written by Settings routes today.
-    for (const auto& key : admin_route_keys())
+    // oidc keys are all written by settings_routes.cpp today.
+    for (const auto& key : admin_route_keys()) {
+        INFO(key << ": settings_routes.cpp changed shape? update this scan or classify the key");
         CHECK(written.count(key) == 1);
+    }
     CHECK(written.count("oidc_admin_group") == 1);
     CHECK(written.size() >= 12);
 
