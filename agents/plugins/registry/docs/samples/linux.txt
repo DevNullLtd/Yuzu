@@ -1,4 +1,4 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-10-17 · euid 0 · leg-hash 8e63a482f476
+captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-10-22 · euid 0 · leg-hash 8e63a482f476
 == action=get_value hive=HKLM key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" name=ProductName
 registry|unsupported|Windows registry is not available on this platform
 [result_status] UNDECLARED / UNKNOWN / 

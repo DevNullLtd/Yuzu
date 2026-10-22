@@ -244,7 +244,7 @@ The contract the server relies on (it cannot recover from a violation):
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-17 · interactive user (elevated; username, SID and profile path anonymised) · leg-hash 8e63a482f476
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-22 · interactive user (elevated; username, SID and profile path anonymised) · leg-hash 8e63a482f476
 
 ```
 == action=get_value hive=HKLM key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" name=ProductName
@@ -361,7 +361,7 @@ registry|unsupported|Windows registry has no macOS equivalent; use defaults/plis
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-10-17 · euid 0 · leg-hash 8e63a482f476
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-10-22 · euid 0 · leg-hash 8e63a482f476
 
 ```
 == action=get_value hive=HKLM key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" name=ProductName

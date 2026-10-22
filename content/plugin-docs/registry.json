@@ -1116,11 +1116,11 @@
         }
       ],
       "stamp": {
-        "date": "2026-10-17",
-        "host_class": "container",
+        "date": "2026-10-22",
+        "host_class": "vm",
         "leg_hash": "8e63a482f476",
         "os": "linux",
-        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "os_version": "Ubuntu 26.04.1 LTS x86_64",
         "privilege": "euid 0"
       }
     },
@@ -1445,7 +1445,7 @@
         }
       ],
       "stamp": {
-        "date": "2026-10-17",
+        "date": "2026-10-22",
         "host_class": "bare-metal",
         "leg_hash": "8e63a482f476",
         "os": "windows",
