@@ -6,7 +6,7 @@ contract on any C++ diff; recorded here rather than only in a run narrative so a
 can check it against the code. First written at HEAD `3db8d88b5` after Gate 4 of the round-4
 re-verify reported that no Resource Ledger covered the fix-round diff (`g8r4-cs-2`, a candidate
 policy floor); corrected and extended for Gate 8 round 5 (`g8r5-cs-3`, `g8r5-cs-4`) and the
-round-6 fixes at HEAD `cf89cdc62` (31 C++/JS files, 5201 insertions, 209 deletions by `git diff
+round-6 and round-7 fixes at HEAD `ec413e6a0` (31 C++/JS files, 5503 insertions, 209 deletions by `git diff
 16934bebe..HEAD --stat -- '*.cpp' '*.hpp' '*.js'`).
 
 **Provenance, stated plainly.** Authored by the fix agent from the diff and the code at the
