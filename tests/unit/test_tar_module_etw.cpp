@@ -526,7 +526,23 @@ TEST_CASE("Windows module drain: a WOF-compressed image is not refused and still
     CloseHandle(h);
     if (!compressed)
         SKIP("WOF unavailable on this volume");
-    REQUIRE((GetFileAttributesW(copy.c_str()) & FILE_ATTRIBUTE_REPARSE_POINT) != 0);
+    // The case proves nothing unless the copy is WOF-backed. A plain attribute query cannot say
+    // (the filter hides the reparse bit from a normal open), so ask the filter itself.
+    {
+        struct {
+            WOF_EXTERNAL_INFO wof;
+            FILE_PROVIDER_EXTERNAL_INFO_V1 file;
+        } backing{};
+        HANDLE q = CreateFileW(copy.c_str(), GENERIC_READ, kShareAll, nullptr, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+        REQUIRE(q != INVALID_HANDLE_VALUE);
+        DWORD got = 0;
+        const BOOL queried = DeviceIoControl(q, FSCTL_GET_EXTERNAL_BACKING, nullptr, 0, &backing,
+                                             sizeof(backing), &got, nullptr);
+        CloseHandle(q);
+        if (!queried || backing.wof.Provider != WOF_PROVIDER_FILE)
+            SKIP("the copy is not WOF-backed on this volume");
+    }
 
     const std::string nt = nt_path_of(copy);
     const auto image = open_local_image_no_reparse(nt);

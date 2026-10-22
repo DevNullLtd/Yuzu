@@ -203,6 +203,7 @@ bool integrity_ok(sqlite3* db) noexcept {
 // still-corrupt file (#559 / UP-1). A sidecar that can't be moved is removed
 // instead, so the freshly-created DB can never adopt a stale -wal/-shm; the
 // caller's post-reopen integrity re-check is the backstop if even that fails.
+// An EMPTY sidecar is removed rather than kept: it holds no evidence.
 std::optional<std::filesystem::path>
 quarantine_corrupt_db(const std::filesystem::path& path) {
     const auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
@@ -231,6 +232,13 @@ quarantine_corrupt_db(const std::filesystem::path& path) {
         side += suffix;
         std::error_code ec2;
         if (std::filesystem::exists(side, ec2)) {
+            // A zero-length sidecar holds nothing to preserve (the Windows open() pre-creates both,
+            // protected): drop it, so one corruption leaves one quarantine file, not three.
+            std::error_code size_ec;
+            if (std::filesystem::file_size(side, size_ec) == 0) {
+                std::filesystem::remove(side, ec2);
+                continue;
+            }
             std::filesystem::path side_dest = dest;
             side_dest += suffix;
             std::filesystem::rename(side, side_dest, ec2);

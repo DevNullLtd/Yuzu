@@ -1769,6 +1769,43 @@ TEST_CASE("TarDatabase: a corrupt tar.db is quarantined and re-initialised fresh
     }
 }
 
+TEST_CASE("TarDatabase: a quarantine leaves one file even when empty sidecars sit beside the corrupt db (#559)",
+          "[tar][store][lifecycle][corruption]") {
+    // The Windows open() pre-creates tar.db-wal / -shm as EMPTY protected files; an empty sidecar
+    // holds no evidence, so it must not become a forensic artifact of its own.
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_sidecar_");
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        REQUIRE(f.is_open());
+        f << "this is not a valid sqlite database -- corrupt tar.db sidecar test";
+    }
+    for (const char* suffix : {"-wal", "-shm"})
+        REQUIRE(std::ofstream(fs::path{tmp.string() + suffix}, std::ios::binary | std::ios::trunc)
+                    .is_open());
+
+    {
+        auto reopened = TarDatabase::open(tmp);
+        REQUIRE(reopened.has_value());
+    }
+
+    std::vector<std::string> kept;
+    const std::string prefix = tmp.filename().string() + ".corrupt-";
+    for (const auto& entry : fs::directory_iterator(tmp.parent_path())) {
+        const std::string name = entry.path().filename().string();
+        if (name.rfind(prefix, 0) == 0) {
+            kept.push_back(name);
+            std::error_code ec;
+            fs::remove(entry.path(), ec);
+        }
+    }
+    REQUIRE(kept.size() == 1);
+    CHECK_FALSE((kept[0].ends_with("-wal") || kept[0].ends_with("-shm")));
+
+    std::error_code ec;
+    for (const char* suffix : {"", "-wal", "-shm"})
+        fs::remove(fs::path{tmp.string() + suffix}, ec);
+}
+
 TEST_CASE("TarDatabase: a second corruption never overwrites the first quarantine (#559 collision-safe)",
           "[tar][store][lifecycle][corruption]") {
     // Quarantine names are 1-second granular; two corruptions in the same wall
