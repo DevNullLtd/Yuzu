@@ -1248,6 +1248,31 @@ std::string statement_from(const std::string& code, std::string_view anchor) {
 }
 } // namespace
 
+namespace {
+// The banned-clock needle lists and the ONE matcher both tripwires below use, shared so the
+// positive control can exercise exactly what the real checks run. The haystacks are
+// lower-cased, so every needle must be lower case or it can never match.
+bool tripwire_matches(const std::string& lowercased_haystack, std::string_view needle) {
+    return lowercased_haystack.find(needle) != std::string::npos;
+}
+const std::vector<std::string_view>& approval_manager_banned_needles() {
+    static const std::vector<std::string_view> v = {
+        "system_clock", "steady_clock", "high_resolution_clock", "utc_clock", "tai_clock",
+        "gps_clock", "file_clock", "clock_gettime", "gettimeofday", "time_t", "std::time(",
+        "time(nullptr)", "time(null)", "time(0)", "time(&", "localtime", "gmtime", ".now(",
+        "now (", "clock(", "clock_timestamp", "current_timestamp", "statement_timestamp",
+        "transaction_timestamp", "localtimestamp"};
+    return v;
+}
+const std::vector<std::string_view>& schedule_path_banned_needles() {
+    static const std::vector<std::string_view> v = {
+        "steady_clock", "high_resolution_clock", "utc_clock", "tai_clock", "gps_clock",
+        "file_clock", "clock_gettime", "gettimeofday", "std::time(", "time(nullptr)",
+        "time(null)", "time(0)", "localtime", "gmtime"};
+    return v;
+}
+} // namespace
+
 // G8-QE-1 / R3-QE-1 (UP-3/UP-4 closure evidence), tightened by #6096. The skew defect cannot
 // be simulated in-process (the database clock is not injectable, and the behavioural tests
 // above run both clocks on one host), so this pins the CAUSE at the source: EVERY stamp and
@@ -1272,17 +1297,11 @@ TEST_CASE("ApprovalManager: every stamp and expiry cutoff is authored in-SQL fro
     CHECK(count_occurrences(lc, "::now(") == 0);
     CHECK(count_occurrences(lc, "submit_stamp_epoch") == 0);
     // The haystack is lower-cased, so every needle must be lower case or it can never match.
-    const std::vector<std::string_view> banned_list = {
-        "system_clock", "steady_clock", "high_resolution_clock", "utc_clock", "tai_clock",
-        "gps_clock", "file_clock", "clock_gettime", "gettimeofday", "time_t", "std::time(",
-        "time(nullptr)", "time(null)", "time(0)", "time(&", "localtime", "gmtime", ".now(",
-        "now (", "clock(", "clock_timestamp", "current_timestamp", "statement_timestamp",
-        "transaction_timestamp", "localtimestamp"};
-    for (const std::string_view banned : banned_list) {
+    for (const std::string_view banned : approval_manager_banned_needles()) {
         INFO("banned clock API: " << banned);
         CHECK(std::none_of(banned.begin(), banned.end(),
                            [](unsigned char ch) { return std::isupper(ch) != 0; }));
-        CHECK(lc.find(banned) == std::string::npos);
+        CHECK_FALSE(tripwire_matches(lc, banned));
     }
     // The one database clock: SQL `now()` (any case) appears only in kDbNowEpochSql's own
     // definition.
@@ -1318,6 +1337,16 @@ TEST_CASE("ApprovalManager: every stamp and expiry cutoff is authored in-SQL fro
     CHECK(consume.find("kDbNowEpochSql") != std::string::npos);  // consumed_at
     CHECK(retire.find("kDbNowEpochSql") != std::string::npos);   // consumed_at, schedule retire
     CHECK(migration_v2.find("kDbNowEpochSql") != std::string::npos); // consumed_at, v2 migration
+    // Structural pin (not PG-gated): the v2 data step is bounded by a transaction-local 300 s
+    // statement timeout. migrations() is file-local, so pin the source text just before the
+    // UPDATE. (A behavioural check would need a table large enough to hit the timeout.)
+    {
+        const auto at = code.find("UPDATE approvals SET consumed_at = ");
+        REQUIRE(at != std::string::npos);
+        const auto from = at > 120 ? at - 120 : 0;
+        CHECK(code.substr(from, at - from).find("SET LOCAL statement_timeout = '300s';") !=
+              std::string::npos);
+    }
     CHECK(consume.find("ticket_live_sql()") != std::string::npos);
     CHECK(why.find("ticket_live_sql()") != std::string::npos);   // consume's expiry diagnostic
     CHECK(is_live.find("ticket_live_sql()") != std::string::npos); // ticket_is_live()
@@ -1330,6 +1359,28 @@ TEST_CASE("ApprovalManager: every stamp and expiry cutoff is authored in-SQL fro
     CHECK(live_now.find("kDbNowEpochSql") != std::string::npos); // the liveness predicate
     CHECK(live_stmt.find("ticket_live_sql()") != std::string::npos);
     CHECK(sweep_approved.find("live_sql") != std::string::npos); // approved sweep cutoff
+}
+
+// Positive control for both tripwires: a fixture holding EVERY needle must be matched by the
+// same matcher the real checks use, so a needle that can never match (a typo, an upper-case
+// letter against a lower-cased haystack) fails here instead of silently guarding nothing.
+TEST_CASE("Clock tripwires: every banned needle can actually match (positive control, #6096)",
+          "[approval_manager][approval][6096]") {
+    for (const auto* list : {&approval_manager_banned_needles(), &schedule_path_banned_needles()}) {
+        std::string fixture;
+        for (const std::string_view needle : *list) {
+            fixture += needle;
+            fixture += " ";
+        }
+        for (const std::string_view needle : *list) {
+            INFO("needle: " << needle);
+            CHECK(tripwire_matches(fixture, needle));
+            CHECK_FALSE(tripwire_matches(std::string("benign code"), needle));
+        }
+    }
+    // The matcher is case-sensitive over a lower-cased haystack, which is why the real tripwires
+    // lower-case first: an upper-case spelling in the source is only caught after lower-casing.
+    CHECK_FALSE(tripwire_matches("steady_clock", "STEADY_CLOCK"));
 }
 
 // #6096. The approval path's remaining process-clock reads are an allow-listed, documented
@@ -1362,17 +1413,13 @@ TEST_CASE("Schedule path: the process-clock reads are an allow-listed, documente
     };
     const std::string runner_lc = lower(runner);
     const std::string engine_lc = lower(engine);
-    const std::vector<std::string_view> banned_list = {
-        "steady_clock", "high_resolution_clock", "utc_clock", "tai_clock", "gps_clock",
-        "file_clock", "clock_gettime", "gettimeofday", "std::time(", "time(nullptr)",
-        "time(null)", "time(0)", "localtime", "gmtime"};
-    for (const std::string_view banned : banned_list)
+    for (const std::string_view banned : schedule_path_banned_needles())
         CHECK(std::none_of(banned.begin(), banned.end(),
                            [](unsigned char ch) { return std::isupper(ch) != 0; }));
     for (const auto* code : {&runner_lc, &engine_lc})
-        for (const std::string_view banned : banned_list) {
+        for (const std::string_view banned : schedule_path_banned_needles()) {
             INFO("banned clock API: " << banned);
-            CHECK(code->find(banned) == std::string::npos);
+            CHECK_FALSE(tripwire_matches(*code, banned));
         }
     // The runner no longer compares a ticket stamp with a schedule stamp at all.
     CHECK(runner.find("ticket_is_current") == std::string::npos);

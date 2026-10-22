@@ -165,6 +165,19 @@ TEST_CASE("CommandOutboxStore[pg]: opens and migrates", "[command_outbox][pg][st
     CHECK(fx.store().is_open());
 }
 
+// Structural pin (not PG-gated): the v2 index build is bounded by a transaction-local 300 s
+// statement timeout, because the plain CREATE INDEX scans a table nothing prunes and would
+// otherwise run under the pool's default timeout.
+TEST_CASE("CommandOutboxStore: the v2 migration carries the 300 s statement timeout (#6096)",
+          "[command_outbox][store][migration][6096]") {
+    const auto& migs = CommandOutboxStore::migrations();
+    REQUIRE(migs.size() == 2);
+    CHECK(migs.back().version == 2);
+    CHECK(migs.back().sql.rfind("SET LOCAL statement_timeout = '300s';", 0) == 0);
+    CHECK(migs.back().sql.find("outbox_approval_idx") != std::string::npos);
+    CHECK(migs.front().version == 1);
+}
+
 // #6096: the schedule runner's spent-ticket ledger reads.
 TEST_CASE("CommandOutboxStore[pg]: occurrences_for_approval and occurrence_exists (#6096)",
           "[command_outbox][pg][store][6096]") {
