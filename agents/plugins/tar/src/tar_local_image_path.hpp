@@ -11,15 +11,16 @@
  * signing verdict (module) or an empty version (procperf).
  *
  * Accepted (and nothing else):
- *   - `\Device\HarddiskVolume<digits>\...`, optionally behind `\\?\GLOBALROOT`
- *     (the shape the Kernel-Process IMAGE event delivers);
+ *   - `\Device\HarddiskVolume<digits>\...` (the shape the Kernel-Process IMAGE event
+ *     delivers);
  *   - `X:\...` or `\\?\X:\...` when the caller-supplied drive type of `X:\` is
  *     DRIVE_FIXED (3).
  * Refused: UNC (`\\server\...`, `\\?\UNC\...`), `\Device\Mup`, `\Device\LanmanRedirector`,
- *   `\Device\WebDavRedirector`, any other `\Device\*`, `\SystemRoot\...`, `\??\...`, a
- *   non-fixed drive letter, and the empty string. `\SystemRoot\` and `\??\` paths already
- *   yielded an unknown verdict (WinVerifyTrust rejects them), so refusing them changes
- *   nothing observable.
+ *   `\Device\WebDavRedirector`, any other `\Device\*`, `\SystemRoot\...`, `\??\...`, the
+ *   converted `\\?\GLOBALROOT\...` form (callers classify the path as delivered, BEFORE the
+ *   NT-to-Win32 conversion), a non-fixed drive letter, and the empty string. `\SystemRoot\`
+ *   and `\??\` paths already yielded an unknown verdict (WinVerifyTrust rejects them), so
+ *   refusing them changes nothing observable.
  *
  * The drive type is injected (the Windows shell calls GetDriveTypeW on drive_root_of()),
  * so this header needs no Windows API and runs in the unit suites on every host.
@@ -52,19 +53,13 @@ inline constexpr unsigned kDriveTypeFixed = 3;
 // the OS drive type of drive_root_of(path); it is consulted only for the drive-letter forms.
 [[nodiscard]] inline bool is_local_fixed_image_path(std::string_view path,
                                                     unsigned drive_type_of_root) noexcept {
-    constexpr std::string_view kGlobalRoot = "\\\\?\\GLOBALROOT";
     constexpr std::string_view kVolume = "\\Device\\HarddiskVolume";
 
-    std::string_view nt = path;
-    if (nt.starts_with(kGlobalRoot))
-        nt.remove_prefix(kGlobalRoot.size());
-    if (nt.starts_with(kVolume)) {
-        nt.remove_prefix(kVolume.size());
-        const auto end = nt.find_first_not_of("0123456789");
-        return end != 0 && end != std::string_view::npos && nt[end] == '\\';
+    if (path.starts_with(kVolume)) {
+        path.remove_prefix(kVolume.size());
+        const auto end = path.find_first_not_of("0123456789");
+        return end != 0 && end != std::string_view::npos && path[end] == '\\';
     }
-    // GLOBALROOT fronting anything but a HarddiskVolume path falls through to here and is
-    // refused: drive_root_of() finds no drive letter in it.
     return drive_type_of_root == kDriveTypeFixed && !drive_root_of(path).empty();
 }
 

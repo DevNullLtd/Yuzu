@@ -675,8 +675,6 @@ TEST_CASE("tar_local_image_path: only local fixed-volume images are classified o
     SECTION("NT device path on a local volume") {
         CHECK(is_local_fixed_image_path(R"(\Device\HarddiskVolume3\Windows\x.dll)", kUnknown));
         CHECK(is_local_fixed_image_path(R"(\Device\HarddiskVolume12\a\b.exe)", kUnknown));
-        CHECK(is_local_fixed_image_path(
-            R"(\\?\GLOBALROOT\Device\HarddiskVolume3\Windows\x.dll)", kUnknown));
     }
     SECTION("drive letter is accepted only when the injected type is DRIVE_FIXED") {
         CHECK(is_local_fixed_image_path(R"(C:\Windows\x.exe)", kDriveTypeFixed));
@@ -693,18 +691,19 @@ TEST_CASE("tar_local_image_path: only local fixed-volume images are classified o
             R"(\Device\LanmanRedirector\;Z:0\evil\s\x.dll)", kDriveTypeFixed));
         CHECK_FALSE(is_local_fixed_image_path(
             R"(\Device\WebDavRedirector\evil\x.dll)", kDriveTypeFixed));
-        CHECK_FALSE(is_local_fixed_image_path(
-            R"(\\?\GLOBALROOT\Device\Mup\evil\s\x.dll)", kDriveTypeFixed));
     }
     SECTION("other NT namespaces and malformed input are refused") {
         CHECK_FALSE(is_local_fixed_image_path(R"(\SystemRoot\System32\ntdll.dll)", kDriveTypeFixed));
         CHECK_FALSE(is_local_fixed_image_path(R"(\??\C:\Windows\x.exe)", kDriveTypeFixed));
+        // The converted Win32 form is never classified (callers classify the path as
+        // delivered); a caller that did present it must not be told it is local.
+        CHECK_FALSE(is_local_fixed_image_path(
+            R"(\\?\GLOBALROOT\Device\HarddiskVolume3\Windows\x.dll)", kUnknown));
         CHECK_FALSE(is_local_fixed_image_path(R"(\Device\CdRom0\x.exe)", kDriveTypeFixed));
         CHECK_FALSE(is_local_fixed_image_path(R"(\Device\HarddiskVolume\x.dll)", kUnknown));
         CHECK_FALSE(is_local_fixed_image_path(R"(\Device\HarddiskVolume3)", kUnknown));
         CHECK_FALSE(is_local_fixed_image_path(R"(\Device\HarddiskVolumeShadowCopy3\x.dll)",
                                               kUnknown));
-        CHECK_FALSE(is_local_fixed_image_path(R"(\\?\GLOBALROOT\C:\x.exe)", kDriveTypeFixed));
         CHECK_FALSE(is_local_fixed_image_path(R"(1:\x.exe)", kDriveTypeFixed));
         CHECK_FALSE(is_local_fixed_image_path(R"(C:x.exe)", kDriveTypeFixed));
         CHECK_FALSE(is_local_fixed_image_path("", kDriveTypeFixed));
