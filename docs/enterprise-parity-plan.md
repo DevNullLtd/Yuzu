@@ -104,7 +104,7 @@ These commercial-peer features have functional equivalents in Yuzu that are as g
 | AD/Entra sync | DirectorySync via Microsoft Graph |
 | API tokens | ApiTokenStore + MCP tiers |
 | Software deployment | SoftwareDeploymentStore (stage/deploy/rollback) |
-| Patch management | PatchManager (scan/download/install/verify/reboot) |
+| Patch management | PatchManager (records only: scan/download/install/verify/reboot orchestration removed, ADR-0062, #3669; inventory never populated, #3676) |
 | Vulnerability scanning | `vuln_scan` plugin + NVD sync |
 | Workflows | WorkflowEngine (if/foreach/retry/parallel) |
 

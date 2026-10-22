@@ -111,9 +111,12 @@
     "method": "POST",
     "path": "/fragments/guardian/guard/{param}/enabled",
     "capability_id": "post.fragments-guardian-guard-param-enabled",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "PUT",
+      "path": "/api/v1/guaranteed-state/rules/{param}"
+    },
+    "mcp_twin": "update_guardian_rule",
+    "status": "twinned"
   },
   {
     "method": "GET",
@@ -152,9 +155,12 @@
     "method": "POST",
     "path": "/fragments/guardian/guards",
     "capability_id": "post.fragments-guardian-guards",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "POST",
+      "path": "/api/v1/guaranteed-state/rules"
+    },
+    "mcp_twin": "create_guardian_rule",
+    "status": "twinned"
   },
   {
     "method": "GET",
