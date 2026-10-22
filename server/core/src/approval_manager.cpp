@@ -1256,9 +1256,17 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
         const auto fault = approval_integrity_fault(a);
         if (!fault)
             return std::nullopt;
-        spdlog::error("ApprovalManager: ticket {} failed its redemption integrity "
-                      "check ({}); refusing",
-                      redact_id(id), fault->cause);
+        // A caller retries a refused ticket, so the line is throttled per ticket (one error per
+        // id prefix per minute, repeats at debug) like the other repeated refusal lines. The
+        // refusal itself, and the caller's own audit row, are never throttled.
+        static RefusalLogThrottle integrity_throttle;
+        if (integrity_throttle.should_warn(redact_id(id)))
+            spdlog::error("ApprovalManager: ticket {} failed its redemption integrity "
+                          "check ({}); refusing",
+                          redact_id(id), fault->cause);
+        else
+            spdlog::debug("ApprovalManager: ticket {} still fails its redemption integrity check",
+                          redact_id(id));
         if (fault->unevaluated)
             return ConsumeError{ConsumeFailure::kStoreError,
                                 "approval integrity check could not run",
