@@ -9,22 +9,17 @@
  */
 #include <catch2/catch_test_macros.hpp>
 
-#include <yuzu/agent/plugin_loader.hpp>
 #include <yuzu/plugin.h>
-#include <yuzu/plugin.hpp>
 
+#include "filesystem_dispatcher_test_support.hpp"
 #include "local_dispatcher.hpp"
 #include "test_helpers.hpp"
 
 #include <sha256.hpp>
 
 #include <cctype>
-#include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <memory>
-#include <optional>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -35,82 +30,15 @@
 
 namespace fs = std::filesystem;
 
+using yuzu::test::filesystem_dispatcher_support::captured_rows;
+using yuzu::test::filesystem_dispatcher_support::load_or_fail;
+using yuzu::test::filesystem_dispatcher_support::LoadedPlugin;
+using yuzu::test::filesystem_dispatcher_support::Tree;
+#ifndef _WIN32
+using yuzu::test::filesystem_dispatcher_support::running_as_root;
+#endif
+
 namespace {
-
-#if defined(_WIN32)
-constexpr const char* kPluginExt = ".dll";
-#elif defined(__APPLE__)
-constexpr const char* kPluginExt = ".dylib";
-#else
-constexpr const char* kPluginExt = ".so";
-#endif
-
-std::vector<std::string> captured_rows(const std::string& captured) {
-    std::vector<std::string> out;
-    std::istringstream ss(captured);
-    std::string line;
-    while (std::getline(ss, line)) {
-        if (!line.empty() && line.back() == '\r')
-            line.pop_back();
-        if (!line.empty())
-            out.push_back(line);
-    }
-    return out;
-}
-
-fs::path find_plugin() {
-    const std::string lib_name = std::string{"filesystem"} + kPluginExt;
-    std::vector<fs::path> candidates;
-#if defined(_MSC_VER)
-#pragma warning(push)
-#pragma warning(disable : 4996)
-#endif
-    auto* build_root = std::getenv("MESON_BUILD_ROOT");
-#if defined(_MSC_VER)
-#pragma warning(pop)
-#endif
-    if (build_root)
-        candidates.emplace_back(fs::path{build_root} / "agents" / "plugins" / "filesystem" /
-                                lib_name);
-    candidates.emplace_back(fs::path{"agents"} / "plugins" / "filesystem" / lib_name);
-    candidates.emplace_back(fs::path{".."} / "agents" / "plugins" / "filesystem" / lib_name);
-    for (const char* b : {"build-macos", "build-linux", "build-windows"})
-        candidates.emplace_back(fs::path{b} / "agents" / "plugins" / "filesystem" / lib_name);
-    for (const auto& c : candidates)
-        if (std::error_code ec; fs::exists(c, ec))
-            return c;
-    return {};
-}
-
-struct LoadedPlugin {
-    yuzu::agent::PluginHandle handle;
-    const YuzuPluginDescriptor* descriptor{nullptr};
-};
-
-/// Under `meson test` (MESON_BUILD_ROOT always set) a missing plugin is a broken build and
-/// must not report "All tests passed".
-std::optional<LoadedPlugin> load_or_fail() {
-    auto path = find_plugin();
-    if (!path.empty()) {
-        if (auto loaded = yuzu::agent::PluginHandle::load(path)) {
-            if (const auto* d = loaded->descriptor())
-                return LoadedPlugin{std::move(*loaded), d};
-        }
-    }
-#if defined(_MSC_VER)
-#pragma warning(push)
-#pragma warning(disable : 4996)
-#endif
-    const bool under_meson = std::getenv("MESON_BUILD_ROOT") != nullptr;
-#if defined(_MSC_VER)
-#pragma warning(pop)
-#endif
-    if (under_meson)
-        FAIL("filesystem plugin library not found under meson test -- it did not build, or "
-             "link_depends is not forcing it to build before this test runs");
-    WARN("filesystem plugin library not found -- skipping the LocalDispatcher round-trip");
-    return std::nullopt;
-}
 
 yuzu::agent::LocalDispatcher::Result find_by_hash(const LoadedPlugin& p, const std::string& dir,
                                                   const std::string& sha256,
@@ -121,29 +49,6 @@ yuzu::agent::LocalDispatcher::Result find_by_hash(const LoadedPlugin& p, const s
     yuzu::agent::LocalDispatcher dispatcher;
     return dispatcher.run(p.descriptor, "find_by_hash", params);
 }
-
-/// A canonical temp directory (the plugin canonicalises its root, so match rows carry the
-/// canonical spelling: /private/var/... on macOS).
-struct Tree {
-    yuzu::test::TempDir tmp{"yuzu_test_fbh_"};
-    fs::path root;
-    Tree() {
-        fs::create_directories(tmp.path);
-        root = fs::canonical(tmp.path);
-    }
-    fs::path write(const std::string& rel, std::string_view content) const {
-        const fs::path p = root / fs::path(rel).make_preferred();
-        fs::create_directories(p.parent_path());
-        std::ofstream{p, std::ios::binary} << content;
-        return p;
-    }
-};
-
-#ifndef _WIN32
-bool running_as_root() {
-    return ::geteuid() == 0;
-}
-#endif
 
 } // namespace
 

@@ -154,12 +154,6 @@ class SeededDirectory(unittest.TestCase):
         self.assertEqual(ir._SEED, {})
         self.assertEqual(list(Path(self.base).iterdir()), [])
 
-    def test_clean_exit_removes_the_directory(self):
-        with ir.seeded_directory(self.base) as path:
-            self.assertTrue(Path(path).is_dir())
-        self.assertFalse(Path(path).exists())
-        self.assertEqual(ir._SEED, {})
-
     def test_unwritable_base_falls_back_to_the_user_temp_directory(self):
         bad = os.path.join(self.base, "missing", "parent")  # mkdir under a missing parent: OSError
         fallback = Path(self.base) / "fallback"
@@ -186,6 +180,15 @@ class SeededDirectory(unittest.TestCase):
         self.assertIn("seed directory unavailable", lines[0])
         self.assertEqual(ir._SEED, {})
 
+    @contextlib.contextmanager
+    def _patched_main(self, fake_run):
+        """main() runs `fake_run` instead of the real run, with the seed rooted in self.base."""
+        with mock.patch.object(ir, "parse_args", return_value=object()), \
+                mock.patch.object(ir, "run", fake_run), \
+                mock.patch.object(ir.tempfile, "gettempdir", return_value=self.base), \
+                mock.patch.dict(ir._HOST_PATHS, {ir.HOST: {**ir._HOST_PATHS[ir.HOST], "dir": self.base}}):
+            yield
+
     def test_main_runs_the_whole_run_inside_the_seed_and_cleans_up_after(self):
         seen = {}
 
@@ -194,10 +197,7 @@ class SeededDirectory(unittest.TestCase):
             seen["exists"] = bool(seen["dir"]) and Path(seen["dir"]).is_dir()
             return 7
 
-        with mock.patch.object(ir, "parse_args", return_value=object()), \
-                mock.patch.object(ir, "run", fake_run), \
-                mock.patch.object(ir.tempfile, "gettempdir", return_value=self.base), \
-                mock.patch.dict(ir._HOST_PATHS, {ir.HOST: {**ir._HOST_PATHS[ir.HOST], "dir": self.base}}):
+        with self._patched_main(fake_run):
             self.assertEqual(ir.main([]), 7)
         self.assertTrue(seen["exists"], "run() did not execute inside the seeded directory")
         self.assertEqual(Path(seen["dir"]).parent, Path(self.base))
@@ -211,11 +211,7 @@ class SeededDirectory(unittest.TestCase):
             seen["dir"] = ir._SEED["dir"]
             raise KeyboardInterrupt
 
-        with mock.patch.object(ir, "parse_args", return_value=object()), \
-                mock.patch.object(ir, "run", fake_run), \
-                mock.patch.object(ir.tempfile, "gettempdir", return_value=self.base), \
-                mock.patch.dict(ir._HOST_PATHS, {ir.HOST: {**ir._HOST_PATHS[ir.HOST], "dir": self.base}}), \
-                contextlib.redirect_stderr(io.StringIO()):
+        with self._patched_main(fake_run), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(ir.main([]), 130)
         self.assertFalse(Path(seen["dir"]).exists())
         self.assertEqual(ir._SEED, {})

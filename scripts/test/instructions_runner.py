@@ -339,14 +339,13 @@ _SEED_FILES: tuple[tuple[str, bytes], ...] = (
 
 
 def _provision_seed(base: str) -> tuple[str, str]:
-    """Create <base>/yuzu_test_instr_<pid>_<salt> holding the seed files; return (dir, sha256 of a.txt).
+    """Create <base>/yuzu_test_instr_<salt> holding the seed files; return (dir, sha256 of a.txt).
 
     Raises OSError (after removing any partial directory) so the caller can try another base.
     """
-    path = os.path.join(base, f"yuzu_test_instr_{os.getpid()}_{os.urandom(4).hex()}")
-    os.mkdir(path, 0o755)
+    path = tempfile.mkdtemp(prefix="yuzu_test_instr_", dir=base)
     try:
-        os.chmod(path, 0o755)  # mkdir's mode is masked by the umask
+        os.chmod(path, 0o755)  # mkdtemp creates the directory 0700
         for name, data in _SEED_FILES:
             file_path = os.path.join(path, name)
             with open(file_path, "wb") as fh:

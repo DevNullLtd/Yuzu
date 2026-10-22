@@ -217,7 +217,7 @@ public:
     [[nodiscard]] bool check() {
         if (stop_ != StopReason::none)
             return false;
-        if (cancelled_ && cancelled_()) {
+        if (cancelled_()) {
             stop_ = StopReason::cancelled;
             return false;
         }

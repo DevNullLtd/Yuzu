@@ -10,6 +10,7 @@
  */
 #include <catch2/catch_test_macros.hpp>
 
+#include "filesystem_dispatcher_test_support.hpp"
 #include "filesystem_find_by_hash.hpp"
 #include "test_helpers.hpp"
 
@@ -21,7 +22,6 @@
 #include <cerrno>
 #include <chrono>
 #include <filesystem>
-#include <fstream>
 #include <set>
 #include <string>
 #include <string_view>
@@ -35,6 +35,11 @@
 namespace fbh = yuzu::filesystem::find_by_hash;
 namespace fs = std::filesystem;
 
+using yuzu::test::filesystem_dispatcher_support::Tree;
+#ifndef _WIN32
+using yuzu::test::filesystem_dispatcher_support::running_as_root;
+#endif
+
 namespace {
 
 constexpr std::string_view kTarget =
@@ -43,24 +48,6 @@ constexpr std::string_view kMiss =
     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 constexpr std::string_view kEmptySha =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-
-/// A TempDir whose root is canonical, so the real no-follow hasher (O_NOFOLLOW_ANY refuses the
-/// /var -> /private/var link of a macOS temp path) sees a path with no symlink component.
-struct Tree {
-    yuzu::test::TempDir tmp{"yuzu_test_fbh_"};
-    fs::path root;
-    Tree() {
-        fs::create_directories(tmp.path);
-        root = fs::canonical(tmp.path);
-    }
-    fs::path write(const std::string& rel, std::string_view content = "x") const {
-        const fs::path p = root / fs::path(rel).make_preferred();
-        fs::create_directories(p.parent_path());
-        std::ofstream{p, std::ios::binary} << content;
-        return p;
-    }
-    [[nodiscard]] std::string str() const { return root.string(); }
-};
 
 /// What the fake hooks saw, in call order.
 struct Probe {
@@ -143,12 +130,6 @@ struct FakeClock {
         };
     }
 };
-
-#ifndef _WIN32
-bool running_as_root() {
-    return ::geteuid() == 0;
-}
-#endif
 
 } // namespace
 
