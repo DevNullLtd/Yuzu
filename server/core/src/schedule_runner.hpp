@@ -34,16 +34,24 @@
 ///     ticket for the same definition/creator/scope) and leaves the
 ///     schedule due — it re-checks each tick,
 ///   * fires within a tick of the ticket being APPROVED. One-approval ==
-///     one-run is enforced by the occurrence anchor: firing advances the
-///     schedule, and only tickets submitted strictly AFTER the last advance
-///     count for the next occurrence, so a spent ticket can never re-fire,
+///     at-most-one-run is enforced by state plus a clock-free ledger: after
+///     the occurrence is durably queued the tickets this tick observed are
+///     retired (a guarded `consumed_at` transition on database time,
+///     ApprovalManager::retire_schedule_tickets) before the schedule
+///     advances, only unretired tickets are eligible, and before firing the
+///     command outbox is asked which occurrences already used the ticket
+///     (Deps::outbox_occurrences_fn): a ticket with a row for a DIFFERENT
+///     occurrence was spent, whatever consumed_at says. No clock comparison
+///     is involved (#6096),
 ///   * skips the occurrence and advances when the ticket is REJECTED —
 ///     the next occurrence submits a fresh ticket.
 ///
 /// Advance discipline: every non-approval outcome advances the schedule
 /// (fire-and-advance — a missed/failed occurrence is recorded and skipped,
-/// never retried into a backlog). Only a pending approval holds a schedule
-/// at its due time.
+/// never retried into a backlog). Among others (a failed or fenced-out
+/// enqueue, a definition-store read failure), a pending approval, a ticket
+/// that could not be settled (retire failure or exception), or an
+/// unreadable outbox ledger holds a schedule at its due time (#6096).
 ///
 /// Arming re-check (D7, PLAN-003) — a schedule can sit dormant for months
 /// between occurrences, long enough for the authority it was armed under to
@@ -55,6 +63,7 @@
 /// not a second copy of it — a denial here means fire_with_approval never
 /// runs at all for that occurrence.
 
+#include <expected>
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -102,6 +111,17 @@ public:
                                              const std::string& plugin,
                                              const std::string& action)>;
 
+    /// #6096: the outbox as a SPENT-TICKET LEDGER (clock-free). Every occurrence key the
+    /// outbox holds for an approval ticket id; an approved scheduled ticket with a row for a
+    /// DIFFERENT occurrence than the one being fired has already been used. A store error is
+    /// an error, never an empty vector. REQUIRED for approval-gated schedules: an unwired
+    /// seam fails closed (the occurrence is held), exactly like the arming check.
+    using OutboxOccurrencesFn =
+        std::function<std::expected<std::vector<std::string>, std::string>(const std::string&)>;
+    /// #6096: does an outbox row exist for this occurrence key (an occurrence that already ran
+    /// but whose schedule did not advance)? Same error and fail-closed contract.
+    using OutboxExistsFn = std::function<std::expected<bool, std::string>(const std::string&)>;
+
     struct Deps {
         ScheduleEngine* schedule_engine{nullptr};       // required
         InstructionStore* instruction_store{nullptr};   // required
@@ -111,6 +131,8 @@ public:
         yuzu::MetricsRegistry* metrics{nullptr};        // optional observability sink
         EnqueueFn enqueue_fn;                            // required (WS-3 3.3) — see doc comment
         ArmingCheckFn arming_check;                      // fail-closed when unset — see above
+        OutboxOccurrencesFn outbox_occurrences_fn;       // #6096 ledger; fail-closed when unset
+        OutboxExistsFn outbox_exists_fn;                 // #6096 ledger; fail-closed when unset
         // #3495: lets a shutdown request stop tick() from firing further due
         // schedules once stop_requested_ flips — checked once per schedule,
         // before fire() runs, so a schedule already firing still completes
@@ -133,8 +155,10 @@ private:
     void fire(const InstructionSchedule& s);
 
     // The approval-gated arm of fire(). Returns true when the occurrence is
-    // settled (fired, skipped-rejected, or submit failed) and the schedule
-    // was advanced; false when it stays due waiting on a pending ticket.
+    // settled (fired, skipped-rejected, already in the outbox, or submit
+    // failed) and the caller should advance the schedule; false when it stays
+    // due: waiting on a pending ticket, a failed enqueue, a ticket that could
+    // not be retired (error or exception), or an unreadable outbox ledger.
     bool fire_with_approval(const InstructionSchedule& s, const std::string& plugin,
                             const std::string& action);
 
@@ -147,6 +171,16 @@ private:
     // agents — the delivery loop does that.
     bool enqueue_occurrence(const InstructionSchedule& s, const std::string& plugin,
                             const std::string& action, const std::string& approval_id);
+
+    // #6096: settle (retire) the tickets observed this tick after an occurrence is queued or
+    // skipped. false = hold the occurrence (store error or exception).
+    // `key` is the occurrence key stored as `consumed_by` ("ledger-spent:<key>" marks tickets
+    // the outbox ledger showed were used by an earlier occurrence).
+    bool settle_tickets(const InstructionSchedule& s, const std::vector<std::string>& observed,
+                        const std::string& decided_by, const std::string& key);
+    std::expected<std::vector<std::string>, std::string>
+    outbox_occurrences_for(const std::string& approval_id);
+    std::expected<bool, std::string> outbox_has_occurrence(const std::string& key);
 
     void audit(const InstructionSchedule& s, const std::string& action,
                const std::string& result, const std::string& detail);
