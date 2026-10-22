@@ -3533,7 +3533,7 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
             // PR-5c #4221 up-2, registers a receipt that is already terminal - the
             // Wedged head it observes - so ack_ledger_'s very next drain resolves it
             // immediately rather than waiting on anything new.)
-            ack_ledger_->add_pending(rule.rule_id(), std::move(res->receipt));
+            ack_ledger_->add_pending(rule.rule_id(), std::move(res->receipt), boot_app_open_);
             return ReconcileOutcome::Accepted;
         }
         if (placement == RulePlacement::Unrecognized) {

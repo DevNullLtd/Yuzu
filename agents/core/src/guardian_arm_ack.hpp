@@ -48,10 +48,12 @@
  * Suppressed) from a genuine failure (retry Reapplied) - see decide_retry().
  *
  * One current application, never a history (Astra opine review: "New
- * application: stale receipts cannot acknowledge it"). begin_application()
- * unconditionally replaces whatever was there. A receipt from a superseded
- * application resolving later touches nothing - it is simply no longer in
- * any ledger's pending set. This is safe by construction, not by explicit
+ * application: stale receipts cannot acknowledge it"). begin_application() and
+ * begin_full_application() replace whatever was there; begin_delta_application()
+ * (#5547) replaces it too but CARRIES every unresolved per-rule outcome of a rule the
+ * delta does not name (see its comment). A receipt from a superseded
+ * application resolving later touches nothing unless it was carried - it is simply no
+ * longer in any ledger's pending set. This is safe by construction, not by explicit
  * cancellation: an ArmReceipt is an OBSERVATION handle (its own doc comment)
  * and its KeyClaim is owned entirely by the runtime's own claims_ registry
  * either way - dropping the ledger's copy neither withdraws the rule nor
@@ -60,10 +62,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <yuzu/plugin.h>
@@ -97,8 +102,8 @@ inline constexpr std::size_t kAckDrainMaxPerTick = 1024;
 /// recapture; the flip gate's AC-10 lists the cases) but does NOT unstick the wedged
 /// claim - an identical re-observation returns the existing claim. It bounds the
 /// dependence on the suppress classification; it is NOT a recovery guarantee against
-/// a classifier that misidentifies a dead claim. Reset only by begin_application()
-/// and retire().
+/// a classifier that misidentifies a dead claim. Reset by begin_application(),
+/// begin_full_application(), begin_delta_application() and retire().
 inline constexpr std::size_t kWedgeSuppressMaxDecisions = 10;
 
 /// Content identity for a push: a rule_id, its enabled flag, enforcement_mode,
@@ -150,8 +155,49 @@ public:
     /// that omits an unresolved rule drops that rule's retry obligation, because this
     /// replaces the open application wholesale): design doc R5.3 known limits, flip-gate
     /// AC-11.
+    ///
+    /// #5547 (C1, ledger only): this overload deliberately KEEPS its pre-change
+    /// wholesale-replacement body and carries NOTHING - no obligation, no inherited_latch, no
+    /// boot_claims. The engine still calls it, because switching apply_rules() to the two entry
+    /// points below is C2, together with the full-sync discharge of the inherited latch (carrying
+    /// an inherited_latch that nothing discharges would hold every later generation).
+    /// Removed in C2.
     void begin_application(std::uint64_t generation, std::string content_id, bool full_sync,
                            std::size_t applied);
+
+    /// #5547: starts an application for an authoritative full_sync push (Application::full_sync
+    /// is true). The only OBLIGATION it carries is the unattributed legacy debt:
+    /// `inherited_latch = old.inherited_latch || old.latched_failure` (Ruling 22 (b); it is
+    /// discharged by discharge_inherited_latch() once a full sync completes cleanly, never
+    /// here). Every per-rule outcome is dropped: a full sync re-arms its named rules and
+    /// detaches the rest. It also copies boot_claims (claim IDENTITY only, never an
+    /// obligation), so a full sync that re-observes an unchanged boot-origin claim keeps its
+    /// boot tag. Built into a local and published last: if anything throws, the open
+    /// application is untouched. Not noexcept.
+    void begin_full_application(std::uint64_t generation, std::string content_id,
+                                std::size_t applied);
+
+    /// #5547: starts an application for a delta (additive, full_sync == false) push naming
+    /// exactly `named_rules`. Every unresolved per-rule outcome of the open application for a
+    /// rule ABSENT from `named_rules` is carried into the new one, so a delta that omits a
+    /// rule cannot drop that rule's retry obligation: pending receipts, retained wedges
+    /// (failed_receipts), drained failures (failed_ids) and synchronous failures
+    /// (sync_failed_ids), plus each carried rule's boot-origin tag. A rule that IS named
+    /// (enabled or disabled - the ledger cannot tell them apart and does not need to) is
+    /// covered by the new application and is not carried. Also carried: inherited_latch
+    /// (old.inherited_latch || old.latched_failure; the new application's own
+    /// latched_failure starts false) and boot_claims (identity only). NOT carried:
+    /// resolved_armed, applied, resolved_statuses_for_test, and wedge_suppress_count, which
+    /// restarts at 0 (Ruling 22 (c): alternating applications give no per-wedge elapsed-time
+    /// bound). If one id sits in more than one of the old application's sets (a drain that
+    /// threw between its insert and its erase leaves that shape), exactly one source is
+    /// carried, in the order sync_failed_ids, failed_ids, failed_receipts, pending.
+    /// The new application is built in full before current_ is assigned; any throw (including
+    /// the test hook) leaves the open application, its obligations and its suppress budget
+    /// exactly as they were. Not noexcept.
+    void begin_delta_application(std::uint64_t generation, std::string content_id,
+                                 std::size_t applied,
+                                 const std::set<std::string, std::less<>>& named_rules);
 
     /// Add one rule's accepted arm to the current application - USUALLY still
     /// unresolved, but a re-observed Wedged receipt (rung 9c PR-5c, #4221
@@ -163,7 +209,32 @@ public:
     /// boundary, and never with no current application). A no-op (logged, not
     /// asserted - this is bookkeeping, not a safety property) if called with
     /// no current application.
-    void add_pending(std::string rule_id, GuardianSparkRuntime::ArmReceipt receipt);
+    ///
+    /// #5547: `boot_origin` marks the entry as belonging to the boot application (the
+    /// engine passes boot_app_open_). The effective tag is `boot_origin` OR "boot_claims
+    /// already holds the SAME claim for this rule" - a re-observation of an unchanged boot
+    /// claim by a later application keeps its tag, while a genuinely new attempt (a
+    /// different claim) is not tagged merely because the rule id matches, and drops the
+    /// stale boot_claims entry. Defaulted so the existing two-argument callers keep their
+    /// meaning (not boot-origin). May throw (allocation); on a throw the entry is not
+    /// registered.
+    void add_pending(std::string rule_id, GuardianSparkRuntime::ArmReceipt receipt,
+                     bool boot_origin = false);
+
+    /// #5547 (Ruling 22 (a)): record that `rule_id` failed SYNCHRONOUSLY in the current
+    /// application (admission refusal, a put_rule failure or throw for that rule) so the
+    /// failure survives a replacing delta that omits the rule and holds can_advance()
+    /// false. `boot_origin` tags it as a boot-application failure (ruling (d)). Unlike
+    /// latch_failure() this MAY THROW (set insertion); a caller that must not throw wraps it
+    /// and falls back to latch_failure(). A no-op if there is no current application.
+    void note_sync_failure(const std::string& rule_id, bool boot_origin);
+
+    /// #5547 (Ruling 22 (b), Dave 2026-10-22): clears ONLY the inherited, unattributed
+    /// legacy debt (Application::inherited_latch). Called by apply_rules() at the tail of a
+    /// full_sync push whose synchronous phases all succeeded - NOT when a full sync merely
+    /// begins. It never touches latched_failure, sync_failed_ids or any per-rule outcome of
+    /// THIS application. noexcept: a bool store. A no-op if there is no current application.
+    void discharge_inherited_latch() noexcept;
 
     /// Mark the current application as having hit one of apply_rules()'s
     /// existing generation-hold failures (the kv sweep failure, a del_keys
@@ -206,11 +277,22 @@ public:
     /// tracked by #4062). The caller (GuardianEngine::journal_maintenance_tick()) folds
     /// this into `arm_failures_` itself - the ledger has no engine pointer of its
     /// own and must not gain one.
+    ///
+    /// #5547: the drain is TRANSACTIONAL and idempotent per receipt. For each resolved
+    /// non-Committed receipt the fallible set insertion happens first, and resolved_failed,
+    /// `*failed_out` and `*boot_origin_failed` move ONLY when that insertion added a new
+    /// element, so a receipt a throw left behind in `pending` is not counted a second time
+    /// on the next drain. The outputs are written at each receipt's commit, by reference,
+    /// so an exceptional return leaves everything committed so far visible to the caller.
+    /// `boot_origin_failed`, if non-null, is set true (never reset) when a newly counted
+    /// failure belongs to a rule tagged boot-origin.
     std::size_t drain_locked(GuardianSparkRuntime& runtime, std::size_t max_per_tick,
-                             std::size_t* failed_out = nullptr);
+                             std::size_t* failed_out = nullptr, bool* boot_origin_failed = nullptr);
 
     /// True iff there IS a current application, it has nothing left pending,
-    /// nothing latched, and nothing resolved to a (still-counted) failure. #5459
+    /// nothing latched (neither its own latched_failure nor the inherited_latch carried
+    /// from an earlier application, #5547), no synchronous per-rule failure, and nothing
+    /// resolved to a (still-counted) failure. #5459
     /// (option D): there is NO wedge escape any more - an outstanding wedge, a
     /// compensation-pending wedge, and every ordinary failure all hold the
     /// generation until a genuine recovery decrements resolved_failed (the runtime
@@ -271,6 +353,43 @@ public:
     /// accessor exists so a third never needs LogCapture at all). No production
     /// caller.
     std::vector<GuardianSparkRuntime::ReceiptStatus> resolved_statuses_for_test() const;
+
+    /// TEST-ONLY (#5547): which of the per-rule sets (an id is meant to be in at most one of
+    /// them) the current application holds `rule_id` in; if an id is in several, the first
+    /// match in the order SyncFailed, FailedId, FailedReceipt, Pending is reported. None when
+    /// there is no current application or the id is in none of them.
+    enum class ObligationForTest { None, Pending, FailedReceipt, FailedId, SyncFailed };
+    [[nodiscard]] ObligationForTest obligation_for_test(const std::string& rule_id) const;
+    /// TEST-ONLY (#5547): sizes of the new per-rule sets and maps (0 if no current application).
+    std::size_t failed_id_count_for_test() const;
+    std::size_t sync_failed_count_for_test() const;
+    std::size_t boot_origin_count_for_test() const;
+    std::size_t boot_claim_count_for_test() const;
+    /// TEST-ONLY (#5547): whether `rule_id` is tagged boot-origin in the current application.
+    [[nodiscard]] bool boot_origin_for_test(const std::string& rule_id) const;
+    /// TEST-ONLY (#5547): the application-wide flags and the suppress-budget counter.
+    [[nodiscard]] bool latched_failure_for_test() const;
+    [[nodiscard]] bool inherited_latch_for_test() const;
+    [[nodiscard]] std::size_t wedge_suppress_count_for_test() const;
+
+    /// TEST-ONLY (#5547): fault seam for begin_full_application()/begin_delta_application().
+    /// The hook is invoked while the new application is still a LOCAL (current_ untouched),
+    /// so a hook that throws proves the build-before-replace property: MidCarry fires inside a
+    /// delta's carry, after the pending, failed_receipts and failed_ids groups have been
+    /// copied and before the rest; BeforePublish fires after everything is built, immediately
+    /// before the assignment to current_. An empty function (the default) is a no-op. Persists
+    /// across applications (it is ledger state, not Application state). No production caller.
+    enum class BeginFaultSite { MidCarry, BeforePublish };
+    void set_begin_fault_hook_for_test(std::function<void(BeginFaultSite)> hook);
+
+    /// TEST-ONLY (#5547): fault seam for drain_locked(), invoked with the rule id in play.
+    /// BeforeBlockingInsert fires in the recovery scan before a Blocking entry's insertion into
+    /// failed_ids (nothing has changed yet). AfterAccounting fires in the pending loop after a
+    /// failed receipt's set insertion and counters are committed and before its erase from
+    /// `pending` - the exact window a mid-drain throw would leave a receipt in both. An empty
+    /// function (the default) is a no-op. No production caller.
+    enum class DrainFaultSite { BeforeBlockingInsert, AfterAccounting };
+    void set_drain_fault_hook_for_test(std::function<void(DrainFaultSite, std::string_view)> hook);
 
     /// rung 9c PR-3: a re-statable snapshot of the current application's pending
     /// and resolved-failed counts (see guardian_arm_heartbeat.hpp's
@@ -398,20 +517,49 @@ private:
         /// Failed/Stopped/AdmissionRejected outcome, or the claim was popped from its
         /// key's FIFO by a real completion nobody adopted) is dropped from this map
         /// WITHOUT decrementing resolved_failed: it is still a genuine, counted
-        /// failure, just no longer an outstanding wedge. So
-        /// `resolved_failed == failed_receipts.size()` means "every counted failure
-        /// has a retained retry-deferral candidate", a NECESSARY condition for
-        /// decide_retry()'s wedge Suppress - never sufficient (each entry is
+        /// failure, just no longer an outstanding wedge (#5547: it MOVES to failed_ids).
+        /// So `resolved_failed == failed_receipts.size() + failed_ids.size()` always, and
+        /// `failed_ids.empty()` with `resolved_failed == failed_receipts.size()` means
+        /// "every counted failure has a retained retry-deferral candidate", a NECESSARY
+        /// condition for decide_retry()'s wedge Suppress - never sufficient (each entry is
         /// re-read live) and never an acknowledgment gate.
         std::map<std::string, GuardianSparkRuntime::ArmReceipt> failed_receipts;
         /// #5459 (option D): how many times decide_retry() has returned Suppress on
         /// account of an outstanding wedge for THIS application. Bounded by
         /// kWedgeSuppressMaxDecisions (the safety valve); incremented only on that
-        /// branch; reset only by begin_application()/retire() (this struct is
-        /// replaced wholesale), never by a drain or a sibling's recovery.
+        /// branch; reset by every begin_*() overload and retire() (this struct is
+        /// replaced, and begin_delta_application() deliberately does NOT carry it - Ruling
+        /// 22 (c)), never by a drain or a sibling's recovery.
         std::size_t wedge_suppress_count{0};
+        /// #5547: rule ids whose arm resolved to a counted failure that is NOT a retained
+        /// outstanding wedge (Failed, CongestionExpired, Withdrawn, Stopped, a Wedged
+        /// receipt that was neither wedge-eligible nor compensation-pending when drained,
+        /// and a retained wedge the recovery scan later found Blocking). The receipt is
+        /// discarded; only the rule id is kept. Each entry is one unit of resolved_failed.
+        std::set<std::string> failed_ids;
+        /// #5547: rule ids that failed SYNCHRONOUSLY in this application (note_sync_failure()).
+        /// Not counted in resolved_failed, so they are outside arm_stats().failed.
+        std::set<std::string> sync_failed_ids;
+        /// #5547: the subset of the ids above (and `pending`) whose obligation originated in
+        /// the boot application: kept a subset of pending, failed_receipts, failed_ids and
+        /// sync_failed_ids (a tag is erased when the last of them holding the id releases it).
+        std::set<std::string> boot_origin_ids;
+        /// #5547: rule id -> the receipt of its boot-origin attempt. Claim IDENTITY only,
+        /// never an obligation: it lets add_pending() recognise a re-observation of the
+        /// same boot claim by a later application. Holding the receipt keeps the claim alive,
+        /// so its address cannot be reused by a different claim. An entry is dropped when
+        /// add_pending() sees a different claim for the rule, and otherwise lives until
+        /// retire().
+        std::map<std::string, GuardianSparkRuntime::ArmReceipt> boot_claims;
+        /// #5547: unattributed legacy debt inherited from earlier applications
+        /// (old.inherited_latch || old.latched_failure), distinct from latched_failure,
+        /// which is a failure raised by THIS application. Cleared only by
+        /// discharge_inherited_latch().
+        bool inherited_latch{false};
     };
     std::unique_ptr<Application> current_;
+    std::function<void(BeginFaultSite)> begin_fault_hook_;
+    std::function<void(DrainFaultSite, std::string_view)> drain_fault_hook_;
 };
 
 } // namespace yuzu::agent
