@@ -884,9 +884,67 @@ The following are planned and not yet available. No dates are committed.
   libraries (see "Exporting a CBOM"); certificates, keys, protocols and algorithms will join it
   as they are collected, still carrying inventory facts only, with no security-level fields.
 
-Yuzu does not label weak cryptography, expiry risk or post-quantum readiness, now or in these
-planned views. It reports facts (libraries, versions and, later, certificates and keys); operators
-can apply their own policy to those facts.
+This page reports facts (libraries and versions today; certificates and keys later). The library
+view labels nothing as weak, outdated or unsupported. A small, fixed set of built-in checks is
+planned, and no others:
+
+- four named weak-key rules: `sig_md5` (MD5 signature), `sig_sha1` (SHA-1 signature),
+  `rsa_lt_2048` (RSA key under 2048 bits) and `ec_lt_224` (EC key on a curve whose group order
+  is under 224 bits);
+- certificates active, expiring within, expired within and revoked within fixed numbers of
+  days, and issued within the last 7 days, plus issued and revoked per week;
+- counts of active, expiring, expired, issued and revoked certificates of Yuzu's own CA, with
+  revocations in three groups
+  (superseded, unpublished, and other as recorded). An account whose view is confined to some devices sees "not available to this
+  account" instead of these counts;
+- revocations of other certificates, read only from CRLs an administrator has registered.
+  OCSP is not consulted. A certificate reads "not listed on <CA>'s CRL of <thisUpdate>, next
+  update <nextUpdate>", never "valid" or "not revoked", only when all of these hold:
+  - the CRL verified against the registered CA's key;
+  - the CRL covers that certificate (a CRL that covers only some revocation reasons names
+    the reasons it covers);
+  - the CRL is not older than the newest CRL already held for it;
+  - the certificate is matched to that CA by its authority key identifier or by a verified
+    signature.
+
+  Unless the server verified the certificate's signature against the registered CA key, both
+  "revoked" and "not listed" read "matched by issuer and serial". Each revoked count also
+  reports how many certificates read "revocation not checked" and, beside that, how many were
+  checked against a CRL covering only some reasons.
+
+  Otherwise the certificate reads "revocation not checked", with the cause. For example, the
+  issuer is not registered, or the certificate had expired before the CRL was issued and the
+  CRL does not keep expired entries. ADR-0070 D5 lists every cause. Registered CRLs past their
+  next-update time are counted, with that criterion. That count is shown only to
+  administrators, who can see the registered-CRL list. A certificate's revocation status is
+  separate from any chain result, which is shown separately if it is built;
+- fleet-wide counts of SSH keys observed in use within fixed periods, only once the SSH slice's
+  collection is permitted by its own privacy decision. These are never shown per device or per
+  user.
+
+Each count names the rule or window it applies and the server time it used. Yuzu does not label
+any other weak cryptography, expiry risk or post-quantum readiness. Operators can filter the facts
+with their own thresholds and apply their own policy to them; policy over certificate facts is not
+available until the certificate view ships. The placement of each part is recorded in
+[ADR-0070](../adr/0070-cryptographic-asset-inventory-placement.md).
+
+**Known limits of the built-in counts.**
+
+- A certificate is active from its start time up to and including its expiry time.
+  Expiring counts only active certificates, so a certificate not yet valid is in
+  neither count. The Yuzu-CA expiring and expired counts cover certificates with
+  status active in Yuzu's CA; a revoked certificate is counted only as revoked. Each window is measured from
+  the response's `as_of` time, in whole seconds, and windows are cumulative: a certificate
+  expiring in 5 days is also in the 7-day and every longer window.
+- The weekly series covers 52 ISO weeks, including the current week, which is marked
+  partial.
+- Every count carries its `as_of` time.
+- Yuzu-CA issue and revocation times come from the server replicas' clocks, so those window
+  edges are accurate only to the replicas' clock synchronisation.
+- An account with `Inventory:Read` but not `Security:Read` sees the Yuzu-CA counts but cannot
+  recompute them. With `Security:Read`, recomputing from `GET /api/v1/ca/issued` is
+  approximate.
+- SSH counts can be recomputed only from the SSH slice's aggregate read, which is not built.
 
 ## Related documentation
 

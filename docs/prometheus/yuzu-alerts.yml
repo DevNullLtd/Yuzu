@@ -2999,14 +2999,17 @@ groups:
           description: >-
             yuzu_server_audit_emit_failed_total is rising. Every REST route that uses
             fail-closed audit-on-open (guardian.device.view, dex.device.view,
-            dex.signal.view, dex.perf.device.view, network.device.view, plus
+            dex.signal.view, dex.perf.device.view, network.device.view, inventory.devices,
+            inventory.device.ci, plus
             response.read on the v1 query, aggregate and export routes and on the
             legacy get, aggregate and export routes) is returning 503 and withholding PII or response
             data, so a ServiceNow / CMDB poll blackouts fleet-wide. Set-and-proceed reads, including
             crypto.libraries.*, keep serving data and do not 503: their REST routes and dashboard
-            fragments set the Sec-Audit-Failed header, their MCP tools set audit_persisted:false,
-            and only the /crypto (crypto.libraries.*) pages also show an on-page "Audit not
-            recorded" notice.
+            fragments set the Sec-Audit-Failed header, their MCP tools set audit_persisted:false
+            (the hardware CI tools list_hardware_ci and get_hardware_ci, which audit as
+            inventory.devices and inventory.device.ci, fail closed instead: they withhold the
+            data and answer a retryable -32603), and only the /crypto (crypto.libraries.*) pages
+            also show an on-page "Audit not recorded" notice.
             Check audit_store health (/healthz
             stores.audit) and free disk / connection saturation on the PostgreSQL
             server (ADR-0040 — audit is Postgres-backed, not a local file). Note: a bad_alloc-class

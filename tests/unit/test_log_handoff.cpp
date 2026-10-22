@@ -384,11 +384,13 @@ TEST_CASE("U5: teardown() on a wedged sink fires the deadline action within grac
 
     std::thread teardown_thread([&] {
         h.handoff->teardown_with_action_for_test(grace, [&] {
-            {
-                std::lock_guard<std::mutex> lk(fired_mu);
-                fired = true;
-                fired_at = std::chrono::steady_clock::now();
-            }
+            // notify_all() UNDER the lock (#6219): fired_mu/fired_cv live on the test's stack
+            // and the waiter returns as soon as it sees `fired`, so a notify after the unlock
+            // races the waiter's ~condition_variable (TSan: pthread_cond_destroy vs
+            // pthread_cond_broadcast). Held, the waiter cannot return until notify_all() has.
+            std::lock_guard<std::mutex> lk(fired_mu);
+            fired = true;
+            fired_at = std::chrono::steady_clock::now();
             fired_cv.notify_all();
         });
     });
@@ -500,11 +502,10 @@ TEST_CASE("BLOCKER-1 regression: teardown()'s deadline watchdog still fires whil
 
     std::thread teardown_thread([&] {
         h.handoff->teardown_with_action_for_test(grace, [&] {
-            {
-                std::lock_guard<std::mutex> lk(fired_mu);
-                fired = true;
-                fired_at = std::chrono::steady_clock::now();
-            }
+            // notify_all() under the lock, as in U5 (#6219).
+            std::lock_guard<std::mutex> lk(fired_mu);
+            fired = true;
+            fired_at = std::chrono::steady_clock::now();
             fired_cv.notify_all();
         });
     });
@@ -617,11 +618,10 @@ TEST_CASE("BLOCKER round-2 regression: teardown()'s deadline watchdog still fire
 
     std::thread teardown_thread([&] {
         h.handoff->teardown_with_action_for_test(grace, [&] {
-            {
-                std::lock_guard<std::mutex> lk(fired_mu);
-                fired = true;
-                fired_at = std::chrono::steady_clock::now();
-            }
+            // notify_all() under the lock, as in U5 (#6219).
+            std::lock_guard<std::mutex> lk(fired_mu);
+            fired = true;
+            fired_at = std::chrono::steady_clock::now();
             fired_cv.notify_all();
         });
     });

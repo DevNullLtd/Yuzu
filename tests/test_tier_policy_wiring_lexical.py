@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""#5047 static lexical gate over server/core/src/server.cpp's three TierPolicyFn wiring sites.
+"""#5047 static lexical gate over server/core/src/server.cpp's three TierPolicyFn wiring sites, plus
+(clause 5, #6065 PR-Q) the one-definition-two-uses wiring of the dispatch authorizer closure.
 
 AuthRoutes::gateless_tier_policy_fn() (auth_routes.hpp) is the SOLE production factory for a
 gate-less-route TierPolicyFn -- the result-set sites' own comments say so explicitly: "never
@@ -17,9 +18,12 @@ call site would pass every existing test. This gate closes that:
      -- exactly once, as an ACTIVE line (anchored start-of-line, not merely a substring -- a
      commented-out copy of this exact text does not count; #5047 governance re-review finding,
      independently converged by two reviewers).
-  2. `rest_api_v1_->register_routes(...)`'s final positional argument (the REST
-     /api/v1/result-sets JSON wiring) is `auth_routes_->gateless_tier_policy_fn());` -- exactly
-     once, same anchored-active-line requirement.
+  2. `rest_api_v1_->register_routes(...)`'s positional tier-policy argument (the REST
+     /api/v1/result-sets JSON wiring) is `auth_routes_->gateless_tier_policy_fn(),` -- exactly
+     once, same anchored-active-line requirement. It is no longer the FINAL argument: #6065 PR-Q
+     appends `authorize_dispatch` after it, so the line ends in a comma, not `);`. The only other
+     active line of this shape is clause 1's, which carries the `.tier_policy_fn = ` prefix and
+     so cannot satisfy this anchored pattern.
   3. `CryptoRoutes::Deps`'s LAST designated-init field (the /crypto dashboard layout routes,
      GET/PUT /api/v1/crypto/dashboard/layout -- the caller's OWN layout, keyed by the session
      username, so there is no securable grant to admit against: a gate-less route like the
@@ -31,6 +35,27 @@ call site would pass every existing test. This gate closes that:
      sum of clauses 1-3): it exists to catch a brand-new fourth call site written in some OTHER
      shape none of clauses 1-3 would recognise. The trade-off: an unrelated comment that happens to
      quote the literal string would also trip this clause -- a false RED, never a false GREEN.
+
+  5. (#6065 PR-Q) The dispatch-chokepoint pre-check closure is defined ONCE in server.cpp
+     (`const mcp::McpServer::AuthorizeDispatchFn authorize_dispatch =`) and used EXACTLY twice,
+     both as ACTIVE lines: as REST's trailing `register_routes` argument (`authorize_dispatch);`)
+     and in `set_authorize_dispatch_fn(authorize_dispatch)`. The REST parameter is defaulted so
+     that unrelated callers still compile, which means dropping the trailing argument compiles
+     cleanly and every POST and DELETE /api/v1/quarantine then answers 500 -- and no unit test, whose rig
+     wires its own closure, can see it. A second definition (a route-local copy) is the drift the
+     closure exists to prevent. Same anchored-active-line requirement as clauses 1 and 2.
+
+  6. (#6065 PR-Q, rest-audit-principal-reresolution)
+     `rest_api_v1_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());` is called
+     EXACTLY ONCE in server.cpp as an ACTIVE line: the production writer is the AuthRoutes
+     factory (whose closure a test drives through a real AuditStore), never a hand-rolled lambda
+     whose eight same-typed parameters could be transposed unseen. The setter's parameter is optional by
+     construction (every other `RestApiV1` rig leaves it unwired), so dropping the call compiles
+     cleanly and every POST and DELETE /api/v1/quarantine then answers 500 -- and no unit test,
+     whose rig wires its own writer, can see it. Same anchored-active-line requirement as above.
+     The call must also PRECEDE `rest_api_v1_->register_routes(`: the writer is captured by value
+     there, so a call placed after it keeps the count at one and every unit rig green while
+     production answers 500 on both routes.
 
 Static/text-only, no build required -- a lexical gate, not a semantic one: it cannot see a
 relocation that keeps the same tokens but changes the surrounding control flow, nor a `#if 0` /
@@ -58,25 +83,36 @@ SERVER_CPP = ROOT / "server" / "core" / "src" / "server.cpp"
 TAG = "test_tier_policy_wiring_lexical"
 CALL = "auth_routes_->gateless_tier_policy_fn()"
 DESIGNATED = r"[ \t\r\f\v]*\.tier_policy_fn = auth_routes_->gateless_tier_policy_fn\(\),"
-POSITIONAL = r"[ \t\r\f\v]*auth_routes_->gateless_tier_policy_fn\(\)\);"
+POSITIONAL = r"[ \t\r\f\v]*auth_routes_->gateless_tier_policy_fn\(\),"
 CRYPTO = r"[ \t\r\f\v]*\.tier_policy_fn = auth_routes_->gateless_tier_policy_fn\(\)\}\);"
 EXPECTED_TOTAL = 3
+CLOSURE_DEF = r"[ \t\r\f\v]*const mcp::McpServer::AuthorizeDispatchFn authorize_dispatch =.*"
+CLOSURE_REST = r"[ \t\r\f\v]*authorize_dispatch\);"
+CLOSURE_MCP = r"[ \t\r\f\v]*mcp_server_->set_authorize_dispatch_fn\(authorize_dispatch\);"
+AUDIT_SESSION = r"[ \t\r\f\v]*rest_api_v1_->set_audit_as_session_fn\(auth_routes_->audit_as_session_fn\(\)\);"
+REGISTER_ROUTES = r"[ \t\r\f\v]*rest_api_v1_->register_routes\("
 
 
 def problems(src):
-    """One message per violated clause, in clause order (1, 2, 3, 4); [] when clean."""
+    """One message per violated clause, in clause order (1 to 6); [] when clean."""
     lines = src.split("\n")
     total = sum(1 for ln in lines if CALL in ln)
     designated = sum(1 for ln in lines if re.fullmatch(DESIGNATED, ln))
     positional = sum(1 for ln in lines if re.fullmatch(POSITIONAL, ln))
     crypto = sum(1 for ln in lines if re.fullmatch(CRYPTO, ln))
+    closure_def = sum(1 for ln in lines if re.fullmatch(CLOSURE_DEF, ln))
+    closure_rest = sum(1 for ln in lines if re.fullmatch(CLOSURE_REST, ln))
+    closure_mcp = sum(1 for ln in lines if re.fullmatch(CLOSURE_MCP, ln))
+    audit_session = sum(1 for ln in lines if re.fullmatch(AUDIT_SESSION, ln))
+    setter_at = [i for i, ln in enumerate(lines) if re.fullmatch(AUDIT_SESSION, ln)]
+    register_at = [i for i, ln in enumerate(lines) if re.match(REGISTER_ROUTES, ln)]
     out = []
     if designated != 1:
         out.append("expected exactly 1 designated-init site ('.tier_policy_fn = auth_routes_->gateless_tier_policy_fn(),' "
                    f"-- the dashboard-fragment result_set::Deps wiring), found {designated}. A reversion to a "
                    "hand-rolled lambda here reopens the #5047 clause-5 gap on /fragments/result-sets/*.")
     if positional != 1:
-        out.append("expected exactly 1 positional-arg site ('auth_routes_->gateless_tier_policy_fn());' -- the REST "
+        out.append("expected exactly 1 positional-arg site ('auth_routes_->gateless_tier_policy_fn(),' -- the REST "
                    f"rest_api_v1_->register_routes(...) wiring), found {positional}. A reversion to a hand-rolled "
                    "lambda here reopens the #5047 clause-5 gap on /api/v1/result-sets.")
     if crypto != 1:
@@ -89,12 +125,36 @@ def problems(src):
                    "new call site was added outside this gate's knowledge -- extend this script in the same change, "
                    "per gateless_tier_policy_fn()'s own doc comment (auth_routes.hpp: 'every server.cpp wiring "
                    "site calls this SAME function').")
+    if (closure_def, closure_rest, closure_mcp) != (1, 1, 1):
+        out.append("expected the dispatch authorizer closure to be defined exactly once "
+                   "('const mcp::McpServer::AuthorizeDispatchFn authorize_dispatch =') and used exactly once as "
+                   "REST's trailing register_routes argument ('authorize_dispatch);') and once as "
+                   "'mcp_server_->set_authorize_dispatch_fn(authorize_dispatch);'; found "
+                   f"definition={closure_def}, rest-arg={closure_rest}, mcp-wiring={closure_mcp}. A dropped "
+                   "REST argument compiles (the parameter is defaulted) and makes POST and DELETE /api/v1/quarantine "
+                   "answer 500; a second definition is a route-local copy that can drift from MCP's.")
+    if audit_session != 1:
+        out.append("expected 'rest_api_v1_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());' exactly once "
+                   "in server.cpp as an active line (the AuthRoutes factory, not a lambda); "
+                   f"found {audit_session}. A dropped call compiles (the setter is optional) and makes "
+                   "POST and DELETE /api/v1/quarantine answer 500; a second call is a second writer that can drift.")
+    if len(register_at) != 1:
+        out.append("expected exactly 1 active 'rest_api_v1_->register_routes(' line in server.cpp, found "
+                   f"{len(register_at)}; the setter-order check below cannot run without it, so a reformatted "
+                   "or renamed call must update this gate in the same change.")
+    if audit_session == 1 and len(register_at) == 1 and setter_at[0] > register_at[0]:
+        out.append("'rest_api_v1_->set_audit_as_session_fn(' must be called BEFORE 'rest_api_v1_->register_routes(': "
+                   "the writer is captured by value at registration, so a later call leaves it empty and POST and "
+                   "DELETE /api/v1/quarantine answer 500.")
     return out
 
 
 DESIGNATED_LINE = "                            .tier_policy_fn = auth_routes_->gateless_tier_policy_fn(),\n"
-POSITIONAL_LINE = "            auth_routes_->gateless_tier_policy_fn());\n"
+POSITIONAL_LINE = "            auth_routes_->gateless_tier_policy_fn(),\n"
 CRYPTO_LINE = "                               .tier_policy_fn = auth_routes_->gateless_tier_policy_fn()});\n"
+CLOSURE_REST_LINE = "            authorize_dispatch);\n"
+CLOSURE_MCP_LINE = "            mcp_server_->set_authorize_dispatch_fn(authorize_dispatch);\n"
+AUDIT_SESSION_LINE = "        rest_api_v1_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());\n"
 LAMBDA = "[](const auto&) { return TierPolicy{}; }"
 
 
@@ -110,7 +170,7 @@ class TierPolicyWiringLexical(unittest.TestCase):
 
     def test_mutations_are_caught(self):
         src = self.src
-        for a in (DESIGNATED_LINE, POSITIONAL_LINE, CRYPTO_LINE):
+        for a in (DESIGNATED_LINE, POSITIONAL_LINE, CRYPTO_LINE, CLOSURE_REST_LINE, CLOSURE_MCP_LINE, AUDIT_SESSION_LINE):
             n = src.count(a)
             self.assertEqual(n, 1, f"mutation anchor must match exactly once, found {n}; update the constant: {a!r}")
         # (name, mutated source, the clause fragments that must appear; len(p) pins that no other clause fires)
@@ -127,12 +187,39 @@ class TierPolicyWiringLexical(unittest.TestCase):
             ("T4 fourth call appended (clause 4 only)",
              src + "    auth_routes_->gateless_tier_policy_fn();\n",
              ["EXACTLY THREE"]),
-            ("T5 crypto layout site reverted to a lambda",
+            ("T14 crypto layout site reverted to a lambda",
              src.replace(CRYPTO_LINE, CRYPTO_LINE.replace(CALL, LAMBDA), 1),
              ["crypto-layout", "EXACTLY THREE"]),
-            ("T6 crypto layout site commented out (anchoring proof: clause 3 only)",
+            ("T15 crypto layout site commented out (anchoring proof: clause 3 only)",
              src.replace(CRYPTO_LINE, "// " + CRYPTO_LINE, 1),
              ["crypto-layout"]),
+            ("T5 REST trailing authorize_dispatch argument dropped (compiles: the param is defaulted)",
+             src.replace(CLOSURE_REST_LINE, "            );\n", 1),
+             ["authorizer closure"]),
+            ("T6 MCP wiring dropped",
+             src.replace(CLOSURE_MCP_LINE, "", 1),
+             ["authorizer closure"]),
+            ("T7 a route-local second definition appended",
+             src + "    const mcp::McpServer::AuthorizeDispatchFn authorize_dispatch = {};\n",
+             ["authorizer closure"]),
+            ("T8 session audit writer wiring dropped (compiles: the setter is optional)",
+             src.replace(AUDIT_SESSION_LINE, "        rest_api_v1_->unrelated(\n", 1),
+             ["set_audit_as_session_fn"]),
+            ("T9 session audit writer wiring commented out (anchoring proof)",
+             src.replace(AUDIT_SESSION_LINE, "// " + AUDIT_SESSION_LINE, 1),
+             ["set_audit_as_session_fn"]),
+            ("T10 a second session audit writer appended",
+             src + AUDIT_SESSION_LINE,
+             ["set_audit_as_session_fn"]),
+            ("T12 register_routes call reformatted so the order check cannot find it",
+             src.replace("        rest_api_v1_->register_routes(", "        rest_api_v1_\n            ->register_routes(", 1),
+             ["register_routes"]),
+            ("T13 the writer wired with a hand-rolled lambda instead of the AuthRoutes factory",
+             src.replace(AUDIT_SESSION_LINE, "        rest_api_v1_->set_audit_as_session_fn([](const auto&...) { return true; });\n", 1),
+             ["set_audit_as_session_fn"]),
+            ("T11 the writer wired after register_routes (count stays one)",
+             src.replace(AUDIT_SESSION_LINE, "        rest_api_v1_->unrelated(\n", 1) + AUDIT_SESSION_LINE,
+             ["BEFORE"]),
         ]
         for name, mutated, present in cases:
             with self.subTest(mutation=name):

@@ -4,6 +4,7 @@
 #include "mcp_server_testonly.hpp" // decls for the tool_*_for_test() defs below
 #include "approver_assurance.hpp" // #6061: approve/reject are human-session acts (typed refusal)
 #include "approval_model.hpp" // #2146 A2-R4: shared approval-row JSON builder (REST v1 + MCP)
+#include "dispatch_denial_text.hpp" // shared describe_dispatch_denial (#6065 PR-Q; was an anonymous-namespace local here)
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
 #include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
 #include "mcp_approval_error.hpp" // shared approval-store failure body (#2786)
@@ -12,6 +13,7 @@
 #include "discovered_devices_model.hpp" // list_discovered_devices shared builders
 #include "mcp_orientation.hpp" // shared initialize.instructions / yuzu://about source (2g PR 1)
 #include "mcp_policy.hpp"
+#include "hardware_routes.hpp"   // HardwareRoutes::*Fn: the static_asserts pinning ToolDeps
 #include "mcp_tool_registry.hpp" // ToolRecord/ToolCallContext: the registry seam (merged by catalogue())
 #include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
 #include "mcp_transport.hpp"     // Streamable HTTP transport pre-checks (2f)
@@ -45,6 +47,7 @@
 #include "guardian_generation_raise.hpp"   // raise_guardian_policy_generation: shared REST+MCP parse/audit-detail/result builders
 #include "store_errors.hpp"              // #2146 Batch B1: is_conflict_error/strip_conflict_prefix (create/update)
 #include "software_catalogue_model.hpp" // M.9: shared REST+MCP software catalogue model
+#include "software_catalog_rules.hpp"   // M.10b: kEcosystemFamilies + expand_ecosystem_tokens (ecosystem enums/pipe list)
 #include "crypto_cbom.hpp"          // export_crypto_cbom (CycloneDX 1.7 shaper)
 #include "crypto_library_model.hpp" // get_crypto_libraries / list_crypto_library_devices (shared model)
 #include "crypto_widget_catalogue.hpp" // the /crypto widget, layout and Yuzu-issued twins (shared model)
@@ -124,6 +127,7 @@
 #include <chrono>
 #include <cstdio>
 #include <ctime>
+#include <deque>
 #include <iterator>
 #include <limits> // numeric_limits (query_responses status range, #4644)
 #include <map>
@@ -816,7 +820,7 @@ static const ToolDef kTools[] = {
      "(ADR-0016) — machine-wide installed packages per device, fleet-wide. Each row carries name, "
      "version (upstream, release stripped), publisher (rpm PACKAGER / deb Maintainer / Windows "
      "Publisher), install_date, kind (package|app|pkg|feat), "
-     "ecosystem (rpm|deb|apk|pacman|snap|flatpak|windows|macos|macos_pkgutil|brew|optional_feature|msi), "
+     "ecosystem (@@ECOSYSTEM_LIST@@), "
      "epoch, release, arch, signature_status (rpm only, from stored header tags), "
      "distro_id and distro_version (/etc/os-release, rpm/deb/apk/pacman rows); fields an ecosystem does not "
      "store are empty strings, never synthesised. Snaps are kind app or pkg (ecosystem snap), flatpak "
@@ -3936,7 +3940,7 @@ static const ToolDef kTools[] = {
      "get_software_versions, or to query_installed_software for the devices carrying it. A "
      "degraded store read is a retryable error, never an empty result. Every call that reaches "
      "the store is audited (mcp.query_software_catalogue).",
-     R"j({"type":"object","properties":{"q":{"type":"string","maxLength":128,"description":"Case-insensitive literal substring over title name, publisher, ecosystems and sources"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature","msi"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's titles"},"versions_min":{"type":"integer","minimum":0,"maximum":100000,"description":"Only titles with at least this many distinct versions"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum titles returned"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"}}})j",
+     R"j({"type":"object","properties":{"q":{"type":"string","maxLength":128,"description":"Case-insensitive literal substring over title name, publisher, ecosystems and sources"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["@@ECOSYSTEM_ENUM@@"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's titles"},"versions_min":{"type":"integer","minimum":0,"maximum":100000,"description":"Only titles with at least this many distinct versions"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum titles returned"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"}}})j",
      R"j({"type":"object","properties":{"titles":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"publisher":{"type":"string"},"installs":{"type":"integer"},"versions":{"type":"integer"},"ecosystems":{"type":"array","items":{"type":"string"}},"kinds":{"type":"array","items":{"type":"string"}},"newest_version":{"type":"string"}},"required":["name","publisher","installs","versions","ecosystems","kinds","newest_version"]}},"count":{"type":"integer"},"next_cursor":{"type":["string","null"]},"totals":{"type":"object","properties":{"titles":{"type":"integer"},"installs":{"type":"integer"}},"required":["titles","installs"]},"kpis":{"type":["object","null"]},"devices_omitted":{"type":"integer"},"newest_omitted":{"type":"boolean"},"audit_persisted":{"type":"boolean"}},"required":["titles","count","next_cursor","totals","kpis","devices_omitted"]})j"},
 
     {"get_software_versions",
@@ -3953,7 +3957,7 @@ static const ToolDef kTools[] = {
      "ecosystem is refused: omit the key. Take the title name from query_software_catalogue; "
      "query_installed_software lists the devices carrying a version. Audited as "
      "mcp.get_software_versions.",
-     R"j({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact title name"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature","msi"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's versions"},"limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Maximum versions returned"}},"required":["name"]})j",
+     R"j({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact title name"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["@@ECOSYSTEM_ENUM@@"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's versions"},"limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Maximum versions returned"}},"required":["name"]})j",
      R"j({"type":"object","properties":{"name":{"type":"string"},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},"installs":{"type":"integer"},"newest":{"type":"boolean"}},"required":["version","installs","newest"]}},"count":{"type":"integer"},"truncated":{"type":"boolean"},"devices_omitted":{"type":"integer"},"newest_omitted":{"type":"boolean"},"audit_persisted":{"type":"boolean"}},"required":["name","versions","count","truncated","devices_omitted"]})j"},
 
     // ── Software "Sync now": MCP twin of POST /api/v1/hardware/sync. Both call the SAME
@@ -4026,7 +4030,7 @@ static const ToolDef kTools[] = {
      "omit for any). Audited as mcp.get_crypto_libraries. Mirrors GET /api/v1/crypto/libraries.",
      R"j({"type":"object","properties":{)j"
      R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Restrict to one library family id; omit for every family"},)j"
-     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature","msi"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"})j"
+     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["@@ECOSYSTEM_ENUM_OR_EMPTY@@"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"})j"
      R"j(}})j",
      R"j({"type":"object","properties":{)j"
      R"j("table_version":{"type":"integer","description":"Version of the curated package-name table that produced this answer"},)j"
@@ -4068,7 +4072,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Library family id (from get_crypto_libraries)"},)j"
      R"j("version":{"type":"string","maxLength":1024,"description":"Exact version bucket; empty string selects rows with no version; omit for every version"},)j"
-     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature","msi"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"},)j"
+     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["@@ECOSYSTEM_ENUM_OR_EMPTY@@"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"},)j"
      R"j("cursor":{"type":"string","maxLength":2048,"description":"Opaque next_cursor from the previous page; bound to the family/version/ecosystem filter and the table_version; refused if the previous page was read on live names and the catalogue is now in use; restart without a cursor"},)j"
      R"j("limit":{"type":"integer","minimum":1,"maximum":1000,"default":100,"description":"Page size"})j"
      R"j(},"required":["family"]})j",
@@ -4114,7 +4118,7 @@ static const ToolDef kTools[] = {
      "BOM. Audited as mcp.export_crypto_cbom. Mirrors GET /api/v1/crypto/cbom.",
      R"j({"type":"object","additionalProperties":false,"properties":{)j"
      R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Restrict the BOM to one library family id; omit for every family"},)j"
-     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature","msi"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"})j"
+     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["@@ECOSYSTEM_ENUM_OR_EMPTY@@"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"})j"
      R"j(}})j",
      R"j({"type":"object","properties":{)j"
      R"j("bom":{"type":"string","description":"The CycloneDX 1.7 JSON document, serialised (media type application/vnd.cyclonedx+json; version=1.7)"},)j"
@@ -5618,6 +5622,24 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
 static_assert(std::is_same_v<ToolCallContext::PermFn, McpServer::PermFn>,
               "ToolCallContext::PermFn drifted from McpServer::PermFn (mcp_server.hpp)");
 
+// ToolDeps spells its provider signatures out (mcp_tool_deps.hpp); these pin each
+// to the twin it must share an instance with, so a signature change on either side
+// is a build failure and not a silent copy.
+static_assert(std::is_same_v<ToolDeps::FleetReadFn, McpServer::FleetReadFn>,
+              "ToolDeps::FleetReadFn drifted from McpServer::FleetReadFn (mcp_server.hpp)");
+static_assert(std::is_same_v<ToolDeps::FleetReadFn, HardwareRoutes::FleetReadFn>,
+              "ToolDeps::FleetReadFn drifted from HardwareRoutes::FleetReadFn");
+static_assert(std::is_same_v<ToolDeps::AuditFn, McpServer::AuditFn>,
+              "ToolDeps::AuditFn drifted from McpServer::AuditFn (mcp_server.hpp)");
+static_assert(std::is_same_v<ToolDeps::AuditFn, HardwareRoutes::AuditFn>,
+              "ToolDeps::AuditFn drifted from HardwareRoutes::AuditFn");
+static_assert(std::is_same_v<ToolDeps::RosterFn, HardwareRoutes::RosterFn>,
+              "ToolDeps::RosterFn drifted from HardwareRoutes::RosterFn");
+static_assert(std::is_same_v<ToolDeps::CiDetailFn, HardwareRoutes::CiDetailFn>,
+              "ToolDeps::CiDetailFn drifted from HardwareRoutes::CiDetailFn");
+static_assert(std::is_same_v<ToolDeps::DexScoreFn, HardwareRoutes::DexScoreFn>,
+              "ToolDeps::DexScoreFn drifted from HardwareRoutes::DexScoreFn");
+
 // ── Merged tool catalogue (registry seam) ────────────────────────────────
 //
 // The registry-resident tools (mcp_tools_<domain>.cpp, see mcp_tool_registry.hpp),
@@ -5628,14 +5650,15 @@ static_assert(std::is_same_v<ToolCallContext::PermFn, McpServer::PermFn>,
 std::span<const ToolRecord> registered_tool_records() {
     static const std::vector<ToolRecord> records = [] {
         std::vector<ToolRecord> all;
-        for (const auto span : {discovery_tool_records()})
+        for (const auto span : {discovery_tool_records(), hardware_tool_records(), containment_tool_records()})
             all.insert(all.end(), span.begin(), span.end());
         return all;
     }();
     return records;
 }
 
-// Every consumer of the tool tables reads THIS, never the raw tables, so the
+// Every consumer of the tool tables reads THIS, never the raw tables (except the test hook that
+// returns the unexpanded templates), so the
 // legacy rows and the registry records cannot disagree about what is served,
 // gated, classified or dispatched.
 //
@@ -5645,10 +5668,11 @@ std::span<const ToolRecord> registered_tool_records() {
 //     first-wins collapse (#2423 review F1);
 //   * the DERIVED lookups collapse duplicates, which is safe only because the
 //     validator rejects them before the server serves.
-// Served order is the legacy kTools[] order, then the registry records in
-// registered_tool_records() order. Write-set membership for a registry record
-// is derived (`operation != "Read"`), the validator's own parity rule.
-// All string_views and const char* point at static-storage literals.
+// Served order is tool-name order (build_catalogue() sorts `served` after merging the
+// legacy kTools[] rows with the registry records). Write-set membership for a
+// registry record is derived (`operation != "Read"`), the validator's own parity rule.
+// All string_views and const char* point at static-storage literals, or at `expanded_text` for an
+// expanded description/schema.
 struct Catalogue {
     // Raw sequences, duplicates preserved (validator input).
     std::vector<ToolDef> served;
@@ -5663,6 +5687,18 @@ struct Catalogue {
     std::unordered_map<std::string, ToolAnnotation> annotations;
     std::unordered_map<std::string_view, ToolHandler> handlers;
 
+    // Owns every served text build_catalogue() expanded from a token template; `served` points
+    // into it. A deque's push_back never relocates and a container move keeps element addresses
+    // (C++17 [container.reqmts]), so the pointers survive the return from build_catalogue().
+    // Copying is deleted: a copy's `served` would point at the original's storage.
+    std::deque<std::string> expanded_text;
+
+    Catalogue() = default;
+    Catalogue(const Catalogue&) = delete;
+    Catalogue& operator=(const Catalogue&) = delete;
+    Catalogue(Catalogue&&) = default;
+    Catalogue& operator=(Catalogue&&) = default;
+
     // The registry handler for `tool_name`, or nullptr when the tool is not
     // registry-resident (every legacy tool).
     ToolHandler handler(const std::string& tool_name) const {
@@ -5674,7 +5710,8 @@ struct Catalogue {
 // `records` is a parameter so a test can hand in a malformed set (the testonly
 // build_catalogue_for_test); production passes registered_tool_records().
 //
-// Refuses a malformed record by THROWING. The catalogue is first built in the
+// Refuses a malformed record, or served text that still carries an ecosystem marker or is
+// not valid JSON after expansion, by THROWING. The catalogue is first built in the
 // ServerImpl constructor (server.cpp calls approval_gated_tool_names()
 // unconditionally, even under --mcp-disable), before and independently of the boot
 // validator, so this check must be self-contained: a null field would otherwise be
@@ -5694,6 +5731,45 @@ Catalogue build_catalogue(std::span<const ToolRecord> records) {
         c.served.push_back(t);
     for (const auto& r : records)
         c.served.push_back({r.name, r.description, r.input_schema_json, r.output_schema_json});
+
+    // M.10b: the ecosystem enums and the pipe list are generated from kEcosystemFamilies. kTools
+    // and the registry records keep token templates; each served copy whose text carries a marker
+    // is expanded ONCE here into Catalogue-owned storage and re-pointed, so every consumer of
+    // `served` (the #2383 boot validator, compiled_input_schemas, tools/list, the test hooks)
+    // sees the expanded text. A marker that survives would be served as a literal enum value, so
+    // it refuses to boot naming the tool - this runs in the ServerImpl constructor, before and
+    // independently of the McpServer validator, like the record_defect check above.
+    // No other served tool text carries `@@`.
+    constexpr auto residual = [](std::string_view s) {
+        return s.find("@@") != std::string_view::npos ||
+               s.find("@ECOSYSTEM_") != std::string_view::npos;
+    };
+    for (auto& t : c.served) {
+        const auto expand = [&](const char* label, const char*& field, bool is_json_schema) {
+            if (field == nullptr)
+                return;
+            const std::string_view text{field};
+            if (!residual(text))
+                return;
+            std::string expanded = software_catalog::expand_ecosystem_tokens(text);
+            if (residual(expanded))
+                throw std::logic_error(
+                    std::string("MCP tool '") + t.name + "' " + label +
+                    " still carries an `@@` or `@ECOSYSTEM_` marker after expansion (a misspelt, "
+                    "single-@ or unquoted @@ECOSYSTEM_ token; see software_catalog_rules.hpp "
+                    "expand_ecosystem_tokens)");
+            // Output schemas are spliced raw into tools/list and parsed nowhere at boot (input
+            // schemas are parsed later by compile_input_schema), so an expansion that yields
+            // malformed JSON is caught here. Never the description: it is prose.
+            if (is_json_schema && !nlohmann::json::accept(expanded))
+                throw std::logic_error(std::string("MCP tool '") + t.name + "' " + label +
+                                       " is not valid JSON after ecosystem token expansion");
+            field = c.expanded_text.emplace_back(std::move(expanded)).c_str();
+        };
+        expand("description", t.description, false);
+        expand("input schema", t.input_schema_json, true);
+        expand("output schema", t.output_schema_json, true);
+    }
 
     c.raw_security.reserve(std::size(kToolSecurityRows) + records.size());
     for (const auto& r : kToolSecurityRows)
@@ -5734,6 +5810,14 @@ Catalogue build_catalogue(std::span<const ToolRecord> records) {
     c.handlers.reserve(records.size());
     for (const auto& r : records)
         c.handlers.emplace(r.name, r.handler);
+
+    // tools/list is served in tool-name order, a property of the catalogue so every
+    // consumer (tools/list, tool_names_for_test) agrees and a future migration
+    // from kTools[] to the registry does not move a tool in the list. Only `served`
+    // is sorted: the raw_* sequences stay in insertion order (validator input).
+    std::sort(c.served.begin(), c.served.end(), [](const ToolDef& a, const ToolDef& b) {
+        return std::string_view{a.name} < std::string_view{b.name};
+    });
     return c;
 }
 
@@ -6327,84 +6411,6 @@ bool reject_unsupported_protocol_version(const httplib::Request& req, httplib::R
                                "header to accept the 2025-03-26 default)"),
         "application/json");
     return true;
-}
-
-/// #3687: the (code, message, remediation) execute_instruction's pre-dispatch
-/// authorization dry run answers with for each
-/// `yuzu::server::detail::DispatchDenialReason` the shared chokepoint can
-/// produce. `kApprovalRequired` (-32006) is deliberately NOT used for
-/// `ApprovalRequired` here — that code's established contract (this file's
-/// `approval_required_error` closure) MUST carry `approval_id`/`status_url`
-/// for a caller to poll, and this dry run mints no ticket (Decision 7: "no
-/// new ticket-mint surface"); `kPermissionDenied` plus the machine-readable
-/// `error.data.reason` (added by the caller of this function) carries the
-/// discrimination instead. Every interpolated value below is either a
-/// server literal, an already-classified `securable`/`operation` (bounded,
-/// closed vocabularies — never caller text), or the caller's OWN `plugin`/
-/// `action` arguments already bounds-checked and lower-cased above this
-/// call site — none of it needs escaping for a JSON-RPC `message` string.
-struct DispatchDenialText {
-    int code;
-    std::string message;
-    std::string remediation;
-};
-
-[[nodiscard]] DispatchDenialText
-describe_dispatch_denial(yuzu::server::detail::DispatchDenialReason reason,
-                         const std::string& plugin, const std::string& action,
-                         const yuzu::server::detail::DispatchDenial& denial) {
-    using Reason = yuzu::server::detail::DispatchDenialReason;
-    switch (reason) {
-    case Reason::Unclassified:
-    case Reason::Ambiguous:
-        // Byte-identical message to the C8 pre-mint site's own ClassifyMiss
-        // arm and to REST's `/api/command` classification-error arm
-        // (server.cpp) — one literal, three call sites.
-        return {kInvalidParams, "unknown or ambiguous plugin.action",
-                "confirm the plugin/action name via discover_plugins or "
-                "discover_instructions and re-call"};
-    case Reason::AnonymousOperator:
-        // `denial.securable`/`.operation` ARE populated for this reason
-        // (DispatchDenial's own doc comment, agent_registry.hpp) but an
-        // empty principal reaching here means caller_fn/derive_dispatch_caller
-        // failed to resolve an identity for an authenticated MCP session —
-        // a wiring fault, not a caller mistake, so the remediation says so.
-        return {kPermissionDenied,
-                "dispatch denied: the caller has no resolved identity for " +
-                    denial.securable + ":" +
-                    std::string(yuzu::server::authz::to_string(denial.operation)),
-                "this indicates a server-side identity-derivation fault, not a caller "
-                "mistake; contact an administrator"};
-    case Reason::Forbidden:
-        // Same "permission denied: securable:operation" wording REST's
-        // generic bucket already uses for this reason (server.cpp) — kept
-        // identical so an operator who has seen the REST message recognizes
-        // this one.
-        return {kPermissionDenied,
-                "permission denied: " + denial.securable + ":" +
-                    std::string(yuzu::server::authz::to_string(denial.operation)),
-                "the dispatching caller lacks this grant; request it, or dispatch as "
-                "a caller who holds it"};
-    case Reason::ApprovalRequired:
-        return {kPermissionDenied,
-                "approval required for " + plugin + "." + action +
-                    " — this action requires either an admin caller or a redeemed "
-                    "approval ticket that this dispatch does not carry",
-                "re-call using a supervised-tier MCP token, which mints and polls an "
-                "approval ticket for this class of call, or dispatch as an admin caller"};
-    case Reason::KillSwitched:
-        return {kPermissionDenied,
-                "dispatch denied: the per-action kill switch is OFF for " + plugin + "." +
-                    action,
-                "an operator has thrown an emergency stop for this plugin.action "
-                "(set_plugin_kill_switch / PUT .../kill-switch); it must be re-enabled "
-                "before this call can dispatch"};
-    }
-    // No default: arm — matches this file's own doctrine
-    // (evaluate_destructive_targeting's switch, to_string(DispatchDenialReason)'s
-    // own no-default doctrine) so a future 7th reason is a -Werror=switch
-    // build failure here, not a silent generic fallback.
-    return {kInternalError, "dispatch denied", {}};
 }
 
 // #3893 fix round (Doomgoose review, blocking findings 1+2): the ONE place
@@ -7689,8 +7695,20 @@ McpServer::HandlerFn McpServer::build_handler(
                                       yuzu::server::detail::sanitize_detail_value(plugin) + ":" +
                                       yuzu::server::detail::sanitize_detail_value(action) +
                                       " correlation_id=" + cid);
-                    const auto text =
-                        describe_dispatch_denial(denial.reason, plugin, action, denial);
+                    const auto text = describe_dispatch_denial(denial.reason, plugin, action,
+                                                               denial, DenialSurface::kMcp);
+                    int text_code = kInternalError;
+                    switch (text.cls) {
+                    case DispatchDenialClass::kInvalidParams:
+                        text_code = kInvalidParams;
+                        break;
+                    case DispatchDenialClass::kPermissionDenied:
+                        text_code = kPermissionDenied;
+                        break;
+                    case DispatchDenialClass::kInternal:
+                        text_code = kInternalError;
+                        break;
+                    }
                     std::string data = R"({"correlation_id":")" + cid +
                                        R"(","retry_after_ms":null,"remediation":)";
                     data += text.remediation.empty() ? std::string("null")
@@ -7699,7 +7717,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!audit_ok)
                         data += R"(,"audit_persisted":false)";
                     data += "}";
-                    res.set_content(error_response(id, text.code, text.message, data),
+                    res.set_content(error_response(id, text_code, text.message, data),
                                     "application/json");
                 };
 
@@ -8975,12 +8993,34 @@ McpServer::HandlerFn McpServer::build_handler(
             // Placed AFTER the C8 block on purpose: knownness, C7, service-scope,
             // tier and approval above have already run, so tier-before-RBAC holds for
             // a registry tool exactly as for a legacy one; the handler's own
-            // tier_allows/perm_fn pair runs after them. The #2405 input-schema check
-            // above runs ONLY inside the approval-gated branch: a non-gated registry
-            // handler receives UNVALIDATED args (any JSON value) and must validate
-            // them itself. A legacy tool has no handler here and falls through to the
-            // chain below.
+            // tier_allows/perm_fn pair runs after them (a confined read gated by
+            // ToolDeps::fleet_read_fn runs neither). The #2405 input-schema check
+            // above runs ONLY inside the approval-gated branch; the central check
+            // below guarantees `args` is a JSON object, but a non-gated registry
+            // handler must still validate the keys and values itself. A legacy tool
+            // has no handler here and falls through to the chain below.
             if (const ToolHandler registry_handler = catalogue().handler(tool_name)) {
+                // ONE central shape check for every registry tool: `arguments` must be a
+                // JSON object. Placed after knownness, C7, C8, tier and approval (a
+                // tier-denied caller still gets its tier error first, the #2405 ordering)
+                // and before the context is built, so no handler ever sees a scalar,
+                // array or null `arguments`. This proves is_object() ONLY: it is not the
+                // #2405 schema check, so enum/minimum/maximum in the advertised schema are
+                // still the handler's own job for a non-approval-gated tool. Deliberately
+                // no metric: yuzu_mcp_tool_args_invalid_total bounds `tool` to the
+                // approval-gated set (docs/user-manual/metrics.md).
+                if (!args.is_object()) {
+                    const std::string cid = yuzu::server::detail::make_correlation_id();
+                    const bool audit_ok =
+                        mcp_audit("denied", "arguments must be a JSON object correlation_id=" + cid);
+                    res.set_content(
+                        a4_error(kInvalidParams, "arguments must be a JSON object",
+                                 "pass `arguments` as a JSON object matching this tool's tools/list "
+                                 "inputSchema and re-call",
+                                 -1, cid, audit_ok),
+                        "application/json");
+                    return;
+                }
                 // The two per-request lambdas are bound into std::functions; default
                 // arguments do not survive that, so a handler passes every argument.
                 const ToolCallContext::AuditFn ctx_audit = [&](const std::string& result_status,
@@ -8993,8 +9033,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         return a4_error(code, message, remediation, retry_after_ms, cid_override,
                                         audit_ok);
                     };
-                const ToolCallContext ctx{req,     res,       id,           args,        tier,
-                                          perm_fn, ctx_audit, ctx_a4_error, &tool_result};
+                const ToolCallContext ctx{req,     res,       id,           args,
+                                          tier,    perm_fn,   ctx_audit,    ctx_a4_error,
+                                          &tool_result, &tool_deps_};
                 dispatch_registry_handler(registry_handler, tool_name, ctx);
                 return;
             }
@@ -29207,6 +29248,10 @@ void dispatch_registry_handler_for_test(ToolHandler handler, const ToolCallConte
     dispatch_registry_handler(handler, "dispatch_registry_handler_for_test", ctx);
 }
 
+std::span<const ToolRecord> registry_records_for_test() {
+    return registered_tool_records();
+}
+
 std::vector<std::string> registry_tool_names_for_test() {
     std::vector<std::string> names;
     for (const auto& r : registered_tool_records())
@@ -29276,6 +29321,20 @@ std::vector<ToolSchemaRowOwned> input_schemas_for_test() {
     out.reserve(catalogue().served.size());
     for (const auto& t : catalogue().served)
         out.push_back({t.name, t.input_schema_json});
+    return out;
+}
+
+std::vector<ToolTextRowOwned> tool_templates_for_test() {
+    std::vector<ToolTextRowOwned> out;
+    const auto text = [](const char* p) {
+        return p != nullptr ? std::string(p) : std::string();
+    };
+    for (const auto& t : kTools)
+        out.push_back(
+            {t.name, text(t.description), text(t.input_schema_json), text(t.output_schema_json)});
+    for (const auto& r : registered_tool_records())
+        out.push_back(
+            {r.name, text(r.description), text(r.input_schema_json), text(r.output_schema_json)});
     return out;
 }
 
