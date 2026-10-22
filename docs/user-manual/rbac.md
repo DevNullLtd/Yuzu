@@ -825,6 +825,8 @@ An Administrator can grant or revoke one of the 6 non-`ITServiceOwner` built-in 
 
 Changing the sign-in provider settings (`POST /api/settings/oidc`, and `PUT /api/config/{key}` for the `oidc_*` keys) needs the caller's own administrator role: a session that is administrator only through a temporary elevation is refused, because the provider decides who becomes an administrator at the next SSO login.
 
+Likewise, `Infrastructure:Write` alone no longer suffices to write the administrator-only runtime-config keys through `PUT /api/config/{key}` (`plugin_signing_required`, `dex_alert_routing`, `dex_blast_min_devices`, `dex_blast_window_seconds`, `dex_blast_cooldown_seconds`, `dex_cohort_export_key`): the caller needs the administrator role (a temporary elevation counts), as on the Settings pages, and an MCP-tier token is refused. See [REST API](rest-api.md#put-apiconfigkey).
+
 ```bash
 # Grant the Operator role to a user, fleet-wide
 curl -s -b cookies.txt -X POST \

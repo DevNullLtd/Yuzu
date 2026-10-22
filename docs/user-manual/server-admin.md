@@ -393,11 +393,19 @@ Check your own unit, env file, compose file or installer arguments before upgrad
 
 ### vNEXT - changing sign-in provider settings needs your own administrator role (breaking for elevation-only operators)
 
-**What changed.** `POST /api/settings/oidc` (Settings > OIDC) and `PUT /api/config/{key}` for the `oidc_*` keys refuse, with `403`, any session whose own role is not `admin`: a session that is administrator only through a temporary elevation, and (for the config route) a non-administrator account that holds `Infrastructure:Write` through a custom or service role, or whose authority is an RBAC Administrator grant only, and any MCP-tier token. The attempt is audited (`elevated_session_oidc_change_blocked`, `elevated_session_oidc_setting_blocked`). Other runtime-config keys are unaffected.
+**What changed.** `POST /api/settings/oidc` (Settings > OIDC) and `PUT /api/config/{key}` for the `oidc_*` keys refuse, with `403`, any session whose own role is not `admin`: a session that is administrator only through a temporary elevation, and (for the config route) a non-administrator account that holds `Infrastructure:Write` through a custom or service role, or whose authority is an RBAC Administrator grant only, and any MCP-tier token. The attempt is audited (`elevated_session_oidc_change_blocked`, `elevated_session_oidc_setting_blocked`). Six other keys, `plugin_signing_required` and the `dex_*` alerting keys, are administrator-only on the same route: see the next note. Every remaining runtime-config key is unaffected.
 
 **Who this affects.** Operators who rely on an elevated session to change the OIDC issuer, client, secret, redirect URI or administrator group, in particular deployments where every administrator is an elevation-eligible `user` account; and automation that writes `oidc_*` through `PUT /api/config/{key}` with a token whose creator is not an `admin` account.
 
 **What to do.** Make the change from an account whose own role is `admin` (a local administrator, or a member of the identity provider's administrator group). If no such account can sign in, use the break-glass account (`--break-glass-user`, `--break-glass-arm`) or the direct-SQL fallback in [`auth-db-recovery.md`](../ops-runbooks/auth-db-recovery.md). A stored `oidc_*` value overrides the matching `--oidc-*` flag after a restart, so correct the stored value rather than only the flag.
+
+### vNEXT - six runtime-config keys are administrator-only on `PUT /api/config/{key}` (breaking for MCP-tier tokens and non-administrator roles)
+
+**What changed.** `PUT /api/config/{key}` for `plugin_signing_required`, `dex_alert_routing`, `dex_blast_min_devices`, `dex_blast_window_seconds`, `dex_blast_cooldown_seconds` and `dex_cohort_export_key` now applies the same caller rule as the Settings routes that also write them: an MCP-tier token, a service-scoped token, or a session whose effective role is not `admin` (a temporary elevation counts) is refused with `403`. The attempt is audited as `config.update / denied` (`token_session_admin_setting_blocked` or `admin_role_required_setting_blocked`) and nothing is stored. `oidc_*` keys, which already needed your own administrator role, also refuse a service-scoped token. Every other key (the retention keys, `log_level`, `heartbeat_timeout`) is unchanged and stays writable under `Infrastructure:Write`.
+
+**Who this affects.** Automation that writes these keys with a supervised-tier MCP token, even one minted by an administrator, and, with RBAC on, a non-administrator role that holds `Infrastructure:Write`.
+
+**What to do.** Change these settings from an interactive administrator session through the Settings pages (DEX alerts, Plugin Code Signing). To find earlier writes and for the replay caveat, rolling-upgrade behaviour and the audit query, read the full note in [Upgrading](upgrading.md) ("Breaking: six runtime-config keys are administrator-only on `PUT /api/config/{key}`").
 
 ### vNEXT — the shipped Docker Compose files keep `/etc/yuzu/certs` on a volume (#5370; action needed before you recreate a 0.14.0 container)
 
@@ -2750,7 +2758,7 @@ Plugin signature verification ships in two parts: an agent-side CMS verifier and
 
 **Cert-dir collision check.** The server now treats this filename as authoritative. If a prior deployment placed an unrelated PEM at this exact path for a different purpose, it will be interpreted as the plugin trust bundle on first read. This is unlikely (the filename was unused before this release) but worth confirming before upgrade. Run `ls <cert-dir>/plugin-trust-bundle.pem` and rename the file if it pre-exists for any other purpose.
 
-**New `runtime_config` key.** `plugin_signing_required` (string `"true"` or `"false"`). Set via the Settings card; reading and writing the key directly via the runtime-config REST surface is supported but not recommended — the Settings UI guarantees the disk-and-DB invariants (two-phase clear, file-presence-equals-enabled).
+**New `runtime_config` key.** `plugin_signing_required` (string `"true"` or `"false"`). Set via the Settings card; reading the key directly via the runtime-config REST surface is supported, and writing it there needs an interactive administrator session (an MCP-tier or service-scoped token is refused) but is not recommended — the Settings UI guarantees the disk-and-DB invariants (two-phase clear, file-presence-equals-enabled).
 
 **New audit actions.** `plugin_signing.bundle.uploaded`, `plugin_signing.bundle.cleared`, `plugin_signing.require.changed` — see `audit-log.md` for the result and detail conventions. SIEM rules already filtering on `success`/`failure`/`denied` will pick these up unchanged; no new vocabulary tokens.
 

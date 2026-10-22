@@ -76,9 +76,13 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
         for (const auto& k : RuntimeConfigStore::allowed_keys())
             allowed.push_back(k);
 
-        // Allowed keys that this route lists but does not write: the generic PUT
-        // refuses them (they have their own route).
-        const nlohmann::json read_only = nlohmann::json::array({std::string(kDexScorePolicyKey)});
+        // Allowed keys that this route lists but does not write: the generic PUT refuses them
+        // (they have their own route). Derived from the write class, so a second route-owned key
+        // is listed here without a second edit.
+        nlohmann::json read_only = nlohmann::json::array();
+        for (const auto& k : RuntimeConfigStore::allowed_keys())
+            if (RuntimeConfigStore::write_class(k) == ConfigWriteClass::RouteOwned)
+                read_only.push_back(k);
 
         res.set_content(nlohmann::json({{"config", config_obj},
                                         {"overrides", overrides},
@@ -112,22 +116,82 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        // The score policy is one document that will have its own writer (a later change),
-        // which validates it whole; a generic single-value write could leave it half-edited. Refused
-        // before the store gate (the answer does not depend on the store) and with
-        // no audit row, like the unknown-key refusal below.
-        if (req.matches[1].str() == kDexScorePolicyKey) {
+        // One lookup decides both refusals below. Both run before the store gate: the answer
+        // depends on the key and the caller, not on the store, and a denied caller must get the
+        // same 403 whether or not the store is up. An unknown key has no class and is refused
+        // further down, as before.
+        auto key = req.matches[1].str();
+        const auto write_class = RuntimeConfigStore::write_class(key);
+
+        // A route-owned key (today only dex_score_policy: one document that will have its own
+        // writer, which validates it whole; a generic single-value write could leave it
+        // half-edited). Refused with no audit row, like the unknown-key refusal below.
+        if (write_class == ConfigWriteClass::RouteOwned) {
             res.status = 400;
             res.set_content(
-                detail::a4_error(res, "dex_score_policy is written only through "
-                                      "PUT /api/v1/dex/score-policy",
+                detail::a4_error(res,
+                                 key == kDexScorePolicyKey
+                                     ? std::string("dex_score_policy is written only through "
+                                                   "PUT /api/v1/dex/score-policy")
+                                     : key + " is written only through its own route",
                                  detail::A4ErrorOpts{
-                                     .remediation = "send the whole policy document to "
-                                                    "PUT /api/v1/dex/score-policy with If-Match "
-                                                    "(not yet available in this release)"}),
+                                     .remediation = key == kDexScorePolicyKey
+                                                        ? "send the whole policy document to "
+                                                          "PUT /api/v1/dex/score-policy with "
+                                                          "If-Match (not yet available in this "
+                                                          "release)"
+                                                        : "use the route that owns this key"}),
                 "application/json");
             return;
         }
+
+        // A key whose own settings route is administrator-only is not writable here by a weaker
+        // caller (RuntimeConfigStore::write_class). perm_fn admits a JIT-elevated session and an
+        // MCP-tier token; the settings routes refuse an MCP-tier or service-scoped token through
+        // require_admin, so this route must too. The oidc_* keys decide who becomes an
+        // administrator at an SSO login (oidc_admin_group is read from the stored value at the
+        // next start), so they additionally refuse an elevation: the caller's OWN role must be
+        // admin. That is the one rule here that is not authz::admin_gate_verdict, on purpose.
+        // Every other key stays writable under Infrastructure:Write. Refused before the
+        // audit-first `attempted` row so a denial leaves one `denied` row, not a dangling
+        // `attempted` (outcome unknown).
+        const char* refusal_detail = nullptr;
+        const char* refusal_message = "changing this setting needs your own administrator role";
+        if (write_class == ConfigWriteClass::AdminRouteInteractiveOnly) {
+            refusal_message = "changing sign-in provider settings needs your own administrator role";
+            if (session->role != auth::Role::admin || !session->mcp_tier.empty() ||
+                !session->token_scope_service.empty())
+                refusal_detail = auth::is_elevated(*session)
+                                     ? "elevated_session_oidc_setting_blocked"
+                                     : "admin_role_required_oidc_setting_blocked";
+        } else if (write_class == ConfigWriteClass::AdminRoute) {
+            switch (authz::admin_gate_verdict(*session)) {
+            case authz::AdminGate::Admit:
+                break;
+            case authz::AdminGate::ServiceScoped:
+            case authz::AdminGate::McpTier:
+                refusal_detail = "token_session_admin_setting_blocked";
+                refusal_message = "an interactive administrator session is required; MCP-tier and "
+                                  "service-scoped tokens cannot change this setting";
+                break;
+            case authz::AdminGate::NotAdmin:
+                refusal_detail = "admin_role_required_setting_blocked";
+                break;
+            }
+        }
+        if (refusal_detail) {
+            (void)deps.audit_fn(req, "config.update", "denied", "RuntimeConfig", key,
+                                refusal_detail);
+            res.status = 403;
+            res.set_content(
+                detail::a4_error(res, refusal_message,
+                                 detail::A4ErrorOpts{
+                                     .remediation = "change this setting from an interactive "
+                                                    "administrator session (the Settings page)"}),
+                "application/json");
+            return;
+        }
+
         if (!deps.runtime_config_store || !deps.runtime_config_store->is_open()) {
             res.status = 503;
             res.set_content(
@@ -136,7 +200,6 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        auto key = req.matches[1].str();
         std::string value;
         try {
             // #2437-class guard: raw-text depth check before parse - "value"
@@ -200,53 +263,6 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
                 nlohmann::json({{"error", "key '" + key + "' is not a configurable runtime setting"}})
                     .dump(),
                 "application/json");
-            return;
-        }
-
-        // A key whose own settings route is administrator-only is not writable here by a weaker
-        // caller (RuntimeConfigStore::write_class). perm_fn admits a JIT-elevated session and an
-        // MCP-tier token; the settings routes refuse an MCP-tier or service-scoped token through
-        // require_admin, so this route must too. The oidc_* keys decide who becomes an
-        // administrator at an SSO login (oidc_admin_group is read from the stored value at the
-        // next start), so they additionally refuse an elevation: the caller's OWN role must be
-        // admin. Every other key stays writable under Infrastructure:Write. Refused before the
-        // audit-first `attempted` row so a denial leaves one `denied` row, not a dangling
-        // `attempted` (outcome unknown).
-        const char* refusal_detail = nullptr;
-        switch (RuntimeConfigStore::write_class(key).value_or(ConfigWriteClass::General)) {
-        case ConfigWriteClass::AdminRouteInteractiveOnly:
-            if (session->role != auth::Role::admin || !session->mcp_tier.empty())
-                refusal_detail = auth::is_elevated(*session)
-                                     ? "elevated_session_oidc_setting_blocked"
-                                     : "admin_role_required_oidc_setting_blocked";
-            break;
-        case ConfigWriteClass::AdminRoute:
-            switch (authz::admin_gate_verdict(*session)) {
-            case authz::AdminGate::Admit:
-                break;
-            case authz::AdminGate::ServiceScoped:
-            case authz::AdminGate::McpTier:
-                refusal_detail = "token_session_admin_setting_blocked";
-                break;
-            case authz::AdminGate::NotAdmin:
-                refusal_detail = "admin_role_required_setting_blocked";
-                break;
-            }
-            break;
-        case ConfigWriteClass::General:
-        case ConfigWriteClass::RouteOwned:
-            break;
-        }
-        if (refusal_detail) {
-            (void)deps.audit_fn(req, "config.update", "denied", "RuntimeConfig", key,
-                                refusal_detail);
-            res.status = 403;
-            res.set_content(detail::a4_error(res, key.starts_with("oidc_")
-                                                       ? "changing sign-in provider settings needs "
-                                                         "your own administrator role"
-                                                       : "changing this setting needs your own "
-                                                         "administrator role"),
-                            "application/json");
             return;
         }
 

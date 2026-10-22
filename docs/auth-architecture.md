@@ -757,7 +757,26 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   administrator at SSO login, so it is a standing grant. Audit
   `oidc.configure / denied / elevated_session_oidc_change_blocked` and
   `config.update / denied / elevated_session_oidc_setting_blocked` (or
-  `admin_role_required_oidc_setting_blocked` when the caller was not elevated).
+  `admin_role_required_oidc_setting_blocked` when the caller was not elevated). The
+  `oidc_*` config rule refuses an MCP-tier token and, since the administrator-only-key
+  change below, also a service-scoped token.
+- **Administrator-only runtime-config keys.** `PUT /api/config/{key}` for
+  `plugin_signing_required`, `dex_alert_routing`, `dex_blast_min_devices`,
+  `dex_blast_window_seconds`, `dex_blast_cooldown_seconds` and `dex_cohort_export_key`
+  applies the same caller rule as the Settings routes that also write them, which are
+  behind `require_admin`: `authz::admin_gate_verdict` (`admin_gate.hpp`) refuses a
+  service-scoped token and an MCP-tier token whatever the creator's role, and otherwise
+  requires the EFFECTIVE role to be `admin`. Unlike the `oidc_*` rule above, an active JIT
+  elevation is admitted, as it is on those Settings routes. `Infrastructure:Write` alone
+  does not suffice. The refusal precedes the store-open check and the body parse and is
+  audited `config.update / denied` on `RuntimeConfig` with `target_id` = the key, no
+  `attempted` row, and `detail` `token_session_admin_setting_blocked` (token) or
+  `admin_role_required_setting_blocked` (effective role not `admin`); the Settings routes
+  audit their denials as `auth.admin_required` instead. In production a service-scoped
+  token and a `readonly` or `operator` MCP token are refused earlier by the permission
+  gate, so the callers that reach this rule are a supervised-tier MCP token and, with RBAC
+  on, a non-administrator holding `Infrastructure:Write`. Every other key stays under
+  `Infrastructure:Write`.
 - **OIDC-amr elevation — RESTORED by durable SSO identity (#1852).** As of the
   `oidc:<iss>#<sub>` principal re-key (#1837/#1857), an OIDC session's principal
   is not a local-charset `users` username (it contains `:`/`#`), and before #1852

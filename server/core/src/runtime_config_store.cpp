@@ -37,14 +37,15 @@ struct KeySpec {
     ConfigWriteClass write_class;
 };
 
-// One row per allowed key, and every row names its write class: a key cannot be added without
-// deciding who may write it through the generic PUT /api/config/{key} (config_routes.cpp).
-// A key whose own settings route is administrator-only must not be weaker here.
+// One row per allowed key, and every row names its write class explicitly: the generic
+// PUT /api/config/{key} (config_routes.cpp) applies the class, and a key whose own settings route
+// is administrator-only must not be weaker here. test_runtime_config_secret_redaction.cpp pins
+// every key's class, so a new row without a deliberate class fails there.
 constexpr ConfigWriteClass kGeneral = ConfigWriteClass::General;
 constexpr ConfigWriteClass kAdmin = ConfigWriteClass::AdminRoute;
 constexpr ConfigWriteClass kOidc = ConfigWriteClass::AdminRouteInteractiveOnly;
 
-const KeySpec kKeySpecs[] = {
+constexpr KeySpec kKeySpecs[] = {
     {"heartbeat_timeout", kGeneral},             // seconds before marking agent offline
     {"response_retention_days", kGeneral},       // days to keep instruction responses
     {"audit_retention_days", kGeneral},          // days to keep audit events

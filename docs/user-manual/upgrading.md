@@ -2,6 +2,33 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## ⚠️ Breaking: six runtime-config keys are administrator-only on `PUT /api/config/{key}`
+
+**What changed.** `PUT /api/config/{key}` for `plugin_signing_required`, `dex_alert_routing`, `dex_blast_min_devices`, `dex_blast_window_seconds`, `dex_blast_cooldown_seconds` and `dex_cohort_export_key` now applies the same caller rule as the Settings routes that also write them, which are administrator-only. A session with an MCP-tier token or a service-scoped token, or whose effective role is not `admin` (an active temporary elevation counts as `admin`), gets `403`. The refusal happens before the runtime-config store is opened and before the request body is parsed, nothing is stored, and the audit log records `config.update` with result `denied`, `target_type` `RuntimeConfig`, `target_id` the key and no preceding `attempted` row. `detail` is `token_session_admin_setting_blocked` (MCP-tier or service-scoped token) or `admin_role_required_setting_blocked` (effective role not `admin`). The `403` body carries a `remediation` ("change this setting from an interactive administrator session (the Settings page)") and no `permission` field. Before this change the route admitted these keys under `Infrastructure:Write` alone.
+
+The `oidc_*` rule is unchanged (your own role must be `admin`; an elevation, an MCP-tier token and now also a service-scoped token are refused). Only the caller rule is shared with the Settings routes: the generic route still validates less than they do (they validate and clamp DEX values and tag keys and apply them live), so a value this route accepts may still be rejected or clamped when saved through Settings. `GET /api/config` is unchanged. Every other key stays writable under `Infrastructure:Write`, including the retention keys, `log_level`, `heartbeat_timeout` and `auto_approve_enabled`, and that includes a supervised-tier MCP-tier token whose creator is an administrator. That is deliberate for now, pending a maintainer ruling.
+
+**Who is affected.**
+
+- Automation that writes these keys with a supervised-tier MCP-tier token, even when an administrator minted the token.
+- With RBAC on, a non-administrator role that holds `Infrastructure:Write`.
+- Service-scoped, `readonly` and `operator` tier tokens were already refused earlier by the permission gate (audit `auth.permission_required`), so they see no change and produce no `config.update / denied` row.
+
+**How to detect.** After the upgrade, search the audit log for action `config.update` with result `denied`: `GET /api/v1/audit?action=config.update&target_type=RuntimeConfig&target_id=<key>` for one key (`target_id` requires `target_type`), or drop `target_id` and keep rows whose `result` is `denied`. The `detail` values above say which rule fired. The Settings routes audit their denials as `auth.admin_required`, so a SIEM rule keyed on `auth.admin_required` will not see a refusal on this route: add `config.update` with result `denied`.
+
+**Review stored values.** Before this change a supervised-tier MCP-tier token could write these six keys. Stored values persist across the upgrade, and the `dex_*` ones are re-applied when the server starts; `plugin_signing_required` only records intent (see [REST API](rest-api.md#put-apiconfigkey), "records intent only"). To check what is stored now:
+
+1. `GET /api/config` and read `updated_by` and `updated_at` for each of the six keys under `overrides`.
+2. Query the audit log for each key as above and read the `success` rows (`detail` is `value=<new value>`).
+
+Two limits. Audit rows carry `principal`, `principal_role`, `principal_class` (`agent` for bearer tokens), `session_id` and `source_ip`, but not the MCP tier, and `mcp_tool` is empty for REST calls, so a past MCP-tier write cannot be told apart from an administrator API-token write. And rows older than your `audit_retention_days` window may have been pruned. If a value is suspect, re-save it from an interactive administrator session through the Settings pages (DEX alerts, Plugin Code Signing): the save re-validates the value, applies it to the running server and writes its own audit row.
+
+**What to do.** Change these six settings from an interactive administrator session through the Settings pages, or with an administrator API token that is not an MCP-tier token. The retention keys, `log_level` and `heartbeat_timeout` stay on `Infrastructure:Write` for now, so automation that writes only those needs no change.
+
+**Rolling upgrades and rollback.** The check is enforced per server replica. During a mixed-version roll the same call can return `200` on a replica that has not been upgraded and `403` on one that has, so finish the roll before relying on the restriction. Rolling a replica back reopens it. No data changes in either direction.
+
+**Config-as-code replay.** Replaying the whole `GET /api/config` `overrides` map with a token that is not an interactive administrator applies the general keys and then stops at the first administrator-only key with `403`, leaving the configuration half-applied. `GET /api/config` does not yet list which keys are administrator-only. Replay as an interactive administrator, or write the six keys separately through the Settings pages.
+
 ## Behaviour change: the Windows agent installer passes the enrollment token by file
 
 **What changed.** The Windows agent installer no longer puts the enrollment token on the

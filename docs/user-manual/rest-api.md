@@ -4981,7 +4981,16 @@ keys with a stored override, so a key can appear in `config` without appearing i
 
 Update a single runtime configuration value. The key must be one of the allowed runtime-configurable keys.
 
-**Permission:** `Infrastructure:Write`. Writing an `oidc_*` key also needs the caller's own administrator role (the local account role, or the role mapped from the identity provider) from an interactive session: any session whose own role is not `admin` (an administrator only through a temporary elevation, or a non-administrator holding `Infrastructure:Write`) and any MCP-tier token gets `403` and the audit row `config.update / denied`, detail `elevated_session_oidc_setting_blocked` (elevation) or `admin_role_required_oidc_setting_blocked`. The keys `plugin_signing_required`, `dex_alert_routing`, `dex_blast_min_devices`, `dex_blast_window_seconds`, `dex_blast_cooldown_seconds` and `dex_cohort_export_key` follow their Settings routes, which are administrator-only: an MCP-tier token, a service-scoped token and a session whose effective role is not `admin` (an active temporary elevation counts) get `403` with the audit row `config.update / denied`, detail `token_session_admin_setting_blocked` (token) or `admin_role_required_setting_blocked`. Every other key stays writable under `Infrastructure:Write`.
+**Permission:** `Infrastructure:Write`, plus a caller rule for two groups of keys. A caller the rule refuses gets `403` (A4 error envelope, with a `remediation` field and no `permission` field) and the audit row `config.update / denied`, with nothing stored and no preceding `attempted` row. The refusal happens before the runtime-config store is opened and before the request body is parsed, so a refused caller gets `403` even when the store is unavailable or the body is malformed.
+
+- **`oidc_*` keys:** the caller's OWN role must be `admin` (the local account role, or the role mapped from the identity provider), from an interactive session. A session that is an administrator only through a temporary elevation, a non-administrator holding `Infrastructure:Write`, an MCP-tier token and a service-scoped token are all refused. The `403` message is "changing sign-in provider settings needs your own administrator role"; `detail` is `elevated_session_oidc_setting_blocked` (elevation) or `admin_role_required_oidc_setting_blocked` (any other refused caller).
+- **Administrator-only keys:** `plugin_signing_required`, `dex_alert_routing`, `dex_blast_min_devices`, `dex_blast_window_seconds`, `dex_blast_cooldown_seconds` and `dex_cohort_export_key`. These apply the same caller rule as their Settings routes, which are administrator-only: a session with an MCP-tier token or a service-scoped token, or whose EFFECTIVE role is not `admin`, is refused (an active temporary elevation counts as `admin`, exactly as on the Settings routes; this differs from `oidc_*`). `detail` is `token_session_admin_setting_blocked` (MCP-tier or service-scoped token) or `admin_role_required_setting_blocked` (effective role not `admin`). The `403` message is "an interactive administrator session is required; MCP-tier and service-scoped tokens cannot change this setting" for a token, and "changing this setting needs your own administrator role" for a non-administrator role. The `remediation` field is "change this setting from an interactive administrator session (the Settings page)". Only the caller rule is shared with the Settings routes: the Settings routes also validate and clamp DEX values and tag keys and apply them live, which this generic route does not (see [When a change takes effect](#when-a-change-takes-effect)).
+
+Every other key stays writable under `Infrastructure:Write` alone, including the retention keys, `log_level`, `heartbeat_timeout` and `auto_approve_enabled`, and that includes a supervised-tier MCP-tier token whose creator is an administrator. That is deliberate for now, pending a maintainer ruling.
+
+In production the permission gate runs first. A service-scoped token, and a `readonly` or `operator` tier MCP token, are refused by that gate with the audit row `auth.permission_required` and never reach this rule, so they do not produce a `config.update / denied` row. The callers that do reach it are a supervised-tier MCP token (even one minted by an administrator) and, with RBAC on, a non-administrator role that holds `Infrastructure:Write`.
+
+**Replaying `GET /api/config`.** Writing the whole `overrides` map back with a token that is not an interactive administrator applies the general keys and then stops at the first administrator-only key with `403`, leaving the configuration half-applied. `GET /api/config` does not yet list which keys are administrator-only, so a config-as-code client should replay as an interactive administrator or write the six keys through the Settings pages.
 
 **Audit:** audit-first (ADR-0033 section 9, no audit row, no mutation). An `attempted` `config.update` row is written before anything changes; if it cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and the key is neither stored nor applied. A `success` row follows a change, or a `failure` row a store refusal. If only that outcome row is lost the change stays applied and the `200` carries `Sec-Audit-Failed: true` (see [`Sec-Audit-Failed`](#sec-audit-failed-and-the-behavioural-pii-audit-posture)). Each accepted call therefore leaves two rows.
 
@@ -4989,8 +4998,9 @@ Update a single runtime configuration value. The key must be one of the allowed 
 
 **Cross-site writes.** A session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API, MCP and engine token callers are exempt.
 
-**Allowed keys** (the full set; source of truth is `kAllowedKeys` in
-`server/core/src/runtime_config_store.cpp`):
+**Allowed keys** (the full set; source of truth is the `kKeySpecs` table in
+`server/core/src/runtime_config_store.cpp`, which pairs every key with its write class, that is, who
+may write it through this route; see **Permission** above):
 
 | Key | Type | Takes effect | Description |
 |---|---|---|---|
@@ -5113,19 +5123,18 @@ another OIDC field, restart first so the process is not holding the old value.
 > **Two different error sources, two different shapes.** The shared authorization gate in front of
 > this route **does** emit the A4 envelope: a `401`, a `403` permission denial, or a `503`
 > authorization-store failure carries `correlation_id` (echoed on `X-Correlation-Id`) like any other
-> gated route. Most bodies **the handler itself** emits do not (the three A4 refusals named at the end of this note are the exception) — `/api/config` is a legacy
+> gated route. Most bodies **the handler itself** emits do not (the A4 refusals named at the end of this note are the exception) — `/api/config` is a legacy
 > non-`/api/v1` route, and its own errors are either a bare `error` string or a nested
 > `{"error":{"code","message"},"meta":{"api_version"}}` object with no `correlation_id` and no
 > `retry_after_ms`. Besides those shown below, the handler emits nested bodies for `400` "missing
 > 'value' in request body", `400` "invalid JSON body", `400` "request body nests too deeply"
-> (over 32 levels, `kMcpMaxJsonDepth`), a `403` "changing sign-in provider settings needs your own
-> administrator role" (an `oidc_*` key written by a session whose own role is not `admin`; other administrator-only keys answer "changing this setting needs your own administrator role"), and a `503` "runtime config store unavailable"
+> (over 32 levels, `kMcpMaxJsonDepth`), and a `503` "runtime config store unavailable"
 > when the runtime-config store is unavailable (`GET` and `PUT` now share the identical message; an
 > earlier `GET`-side wording of "runtime configuration store unavailable" was a drift, not a
 > deliberate distinction, and has been unified). Note `503` and `403` are emitted by **both** sources, so status
 > alone does not tell you which shape you have: test for `error.correlation_id` rather than assuming
-> it, on every status. Three refusals use the A4 envelope (`correlation_id` present): `403`
-> `cross-site request refused`, `503` `audit log unavailable; the change was not made`
+> it, on every status. These refusals use the A4 envelope (`correlation_id` present): `403`
+> `cross-site request refused`, the `403` for a refused administrator-class write (see **Permission**; it carries a `remediation` and no `permission` field), `503` `audit log unavailable; the change was not made`
 > (`retry_after_ms: 5000`, a `remediation` hint, header `Sec-Audit-Failed: true`) and the `400` for
 > `dex_score_policy` (written only through its own route, which ships in a later change; no audit
 > row). An unknown key is a bare `400` and writes no audit row.
@@ -5174,7 +5183,7 @@ client secret contains `<redacted>`, rotate it at the IdP to a value that does n
 { "error": "value is the redaction placeholder, not a credential; send the real secret, or omit the key to leave it unchanged" }
 ```
 
-**Audit:** a write emits `config.update` / `RuntimeConfig` with `target_id` = the key: `attempted` (empty `detail`) before the change, then `success` (`detail` is `value=<new value>`, redacted for a secret key) or `failure` (`detail` is the store's refusal text, or `store error; outcome unknown` for a database error). A refused write of an administrator-only key (see **Permission**) emits `config.update` / `denied` (detail `elevated_session_oidc_setting_blocked` or `admin_role_required_oidc_setting_blocked` for an `oidc_*` key; `token_session_admin_setting_blocked` or `admin_role_required_setting_blocked` for the other administrator-only keys), stores nothing and is not preceded by an `attempted` row.
+**Audit:** a write emits `config.update` / `RuntimeConfig` with `target_id` = the key: `attempted` (empty `detail`) before the change, then `success` (`detail` is `value=<new value>`, redacted for a secret key) or `failure` (`detail` is the store's refusal text, or `store error; outcome unknown` for a database error). A write refused by the caller rule (see **Permission**) emits `config.update` / `denied` on `RuntimeConfig` with `target_id` = the key, and `detail` of `elevated_session_oidc_setting_blocked` or `admin_role_required_oidc_setting_blocked` for an `oidc_*` key, `token_session_admin_setting_blocked` or `admin_role_required_setting_blocked` for the other administrator-only keys. It stores nothing and is not preceded by an `attempted` row. The Settings routes audit the equivalent denial as `auth.admin_required`, so a SIEM rule keyed on `auth.admin_required` does not see a refusal on this route.
 See [Audit log](audit-log.md) for the `detail` contract, which differs for secret-valued keys.
 
 ---

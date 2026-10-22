@@ -46,6 +46,8 @@
 #include <chrono>
 #include <fstream>
 #include <optional>
+#include <regex>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -905,6 +907,12 @@ TEST_CASE("config_routes: an elevated-only session can still write non-oidc keys
 // The settings routes for these keys are `require_admin`: they refuse a service-scoped token, an
 // MCP-tier token and a non-admin effective role. The generic PUT admits the same callers on
 // Infrastructure:Write alone, so it applies the same verdict (RuntimeConfigStore::write_class).
+//
+// Reachability, so these cases are not read as more than they are: these tests give the route
+// whatever session `auth_fn` returns and a `perm_fn` that admits, which isolates the route's own
+// rule. In production `perm_fn` refuses a service-scoped token and a readonly or operator MCP
+// tier first (`auth.permission_required`); the sessions that reach this rule are a
+// supervised-tier MCP token and, with RBAC on, a non-admin role holding Infrastructure:Write.
 
 namespace {
 std::vector<std::string> admin_route_keys() {
@@ -914,50 +922,111 @@ std::vector<std::string> admin_route_keys() {
             keys.push_back(k);
     return keys;
 }
+
+// One refused PUT: 403, the A4 envelope without a `permission` field, exactly one denied row
+// carrying `detail`, and nothing stored.
+void check_refused(MockHarness& h, const std::string& key, const std::string& message_part,
+                   const std::string& detail) {
+    INFO(key);
+    h.audits.clear();
+    auto res = h.sink.Put("/api/config/" + key, R"({"value":"true"})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find(message_part) != std::string::npos);
+    const auto err = body(res->body)["error"];
+    CHECK(err.contains("correlation_id"));
+    CHECK(err.contains("remediation"));
+    CHECK_FALSE(err.contains("permission"));
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "config.update");
+    CHECK(h.audits[0].result == "denied");
+    CHECK(h.audits[0].target_id == key);
+    CHECK(h.audits[0].detail == detail);
+}
 } // namespace
 
-TEST_CASE("config_routes: an MCP-tier or service-scoped token is refused for every "
-          "administrator-route key, with one denied row and nothing stored",
+TEST_CASE("config_routes: the administrator-only keys refuse a supervised MCP-tier token and a "
+          "non-administrator before the store is consulted (no store, no PostgreSQL)",
+          "[server][routes][config_routes][elevation]") {
+    MockHarness h; // runtime_config_store left null: the refusal must not need it
+    h.session_role = auth::Role::admin; // an admin-minted token carries its creator's role
+    h.session_mcp_tier = "supervised";
+    h.wire();
+
+    const auto keys = admin_route_keys();
+    REQUIRE(keys.size() == 6);
+    for (const auto& key : keys)
+        check_refused(h, key, "interactive administrator session",
+                      "token_session_admin_setting_blocked");
+
+    // Defence in depth: a service-scoped session is refused by the same rule if it ever reaches it.
+    h.session_mcp_tier.clear();
+    h.session_token_scope_service = "svc-a";
+    for (const auto& key : keys)
+        check_refused(h, key, "interactive administrator session",
+                      "token_session_admin_setting_blocked");
+
+    // A non-administrator role (an engine-principal-like session) holding Infrastructure:Write.
+    h.session_token_scope_service.clear();
+    h.session_role = auth::Role::user;
+    for (const auto& key : keys)
+        check_refused(h, key, "own administrator role", "admin_role_required_setting_blocked");
+
+    // The oidc_* keys refuse a service-scoped session too, with the oidc wording and detail.
+    h.session_role = auth::Role::admin;
+    h.session_token_scope_service = "svc-a";
+    check_refused(h, "oidc_admin_group", "sign-in provider settings",
+                  "admin_role_required_oidc_setting_blocked");
+
+    // An admin with a null store is still answered 503 for a key the class lets through, and the
+    // route-owned key keeps its 400: the class lookup did not change either answer.
+    h.session_token_scope_service.clear();
+    auto res = h.sink.Put("/api/config/plugin_signing_required", R"({"value":"true"})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    res = h.sink.Put("/api/config/dex_score_policy", R"({"value":"{}"})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+}
+
+TEST_CASE("config_routes: a failing audit sink never turns a refusal into a write or a 5xx",
+          "[server][routes][config_routes][elevation]") {
+    MockHarness h;
+    h.session_role = auth::Role::admin;
+    h.session_mcp_tier = "supervised";
+    h.audit_succeeds = false; // the denied row cannot be stored
+    h.wire();
+
+    for (const auto& key : admin_route_keys()) {
+        INFO(key);
+        auto res = h.sink.Put("/api/config/" + key, R"({"value":"true"})");
+        REQUIRE(res);
+        CHECK(res->status == 403); // the refusal holds without its evidence row
+    }
+}
+
+TEST_CASE("config_routes: a supervised MCP-tier token is refused for every administrator-only "
+          "key with one denied row and nothing stored",
           "[pg][server][routes][config_routes][elevation]") {
     YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
     PgWired w{db.dsn()};
     MockHarness h;
     h.runtime_config_store = &w.store;
-    h.session_role = auth::Role::admin; // an admin-minted token carries its creator's role
+    h.session_role = auth::Role::admin;
+    h.session_mcp_tier = "supervised";
+    h.wire();
 
     const auto keys = admin_route_keys();
     REQUIRE(keys.size() == 6);
-
-    for (const bool service_scoped : {false, true}) {
-        for (const std::string tier : {"readonly", "supervised", "autonomous"}) {
-            if (service_scoped && tier != "supervised")
-                continue;
-            h.session_mcp_tier = service_scoped ? "" : tier;
-            h.session_token_scope_service = service_scoped ? "svc-a" : "";
-            h.wire();
-            for (const auto& key : keys) {
-                INFO(key << " tier=" << tier << " service_scoped=" << service_scoped);
-                h.audits.clear();
-                auto res = h.sink.Put("/api/config/" + key, R"({"value":"true"})");
-                REQUIRE(res);
-                CHECK(res->status == 403);
-                CHECK(res->body.find("own administrator role") != std::string::npos);
-                CHECK(body(res->body)["error"].contains("correlation_id"));
-                CHECK(body(res->body)["error"].dump().find("Infrastructure") ==
-                      std::string::npos); // no self-remediation grant named
-                REQUIRE(h.audits.size() == 1);
-                CHECK(h.audits[0].action == "config.update");
-                CHECK(h.audits[0].result == "denied");
-                CHECK(h.audits[0].target_id == key);
-                CHECK(h.audits[0].detail == "token_session_admin_setting_blocked");
-                CHECK(w.store.get_value(key).empty());
-            }
-        }
+    for (const auto& key : keys) {
+        check_refused(h, key, "interactive administrator session",
+                      "token_session_admin_setting_blocked");
+        CHECK(w.store.get_value(key).empty());
     }
 }
 
 TEST_CASE("config_routes: a non-administrator Infrastructure:Write holder is refused for "
-          "every administrator-route key; an interactive administrator and an elevated "
+          "every administrator-only key; an interactive administrator and an elevated "
           "session are admitted, as on the settings routes",
           "[pg][server][routes][config_routes][elevation]") {
     YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
@@ -970,14 +1039,7 @@ TEST_CASE("config_routes: a non-administrator Infrastructure:Write holder is ref
     const auto keys = admin_route_keys();
     REQUIRE(keys.size() == 6);
     for (const auto& key : keys) {
-        INFO(key);
-        h.audits.clear();
-        auto res = h.sink.Put("/api/config/" + key, R"({"value":"true"})");
-        REQUIRE(res);
-        CHECK(res->status == 403);
-        REQUIRE(h.audits.size() == 1);
-        CHECK(h.audits[0].result == "denied");
-        CHECK(h.audits[0].detail == "admin_role_required_setting_blocked");
+        check_refused(h, key, "own administrator role", "admin_role_required_setting_blocked");
         CHECK(w.store.get_value(key).empty());
     }
 
@@ -988,7 +1050,8 @@ TEST_CASE("config_routes: a non-administrator Infrastructure:Write holder is ref
     CHECK(res->status == 200);
     CHECK(w.store.get_value("plugin_signing_required") == "true");
 
-    // An interactive administrator writes every one of them: attempted, then success.
+    // An interactive administrator writes every one of them: attempted, then success, and the
+    // value is stored.
     h.session_elevated = false;
     h.session_role = auth::Role::admin;
     for (const auto& [key, value] : std::vector<std::pair<std::string, std::string>>{
@@ -1006,6 +1069,7 @@ TEST_CASE("config_routes: a non-administrator Infrastructure:Write holder is ref
         REQUIRE(h.audits.size() == 2);
         CHECK(h.audits[0].result == "attempted");
         CHECK(h.audits[1].result == "success");
+        CHECK(w.store.get_value(key) == value);
     }
 }
 
@@ -1025,6 +1089,51 @@ TEST_CASE("config_routes: an MCP-tier token can still write the general keys",
     res = h.sink.Put("/api/config/log_level", R"({"value":"info"})");
     REQUIRE(res);
     CHECK(res->status == 200);
+
+    // A plain (unelevated) non-administrator is not refused by the class for a general key either.
+    h.session_mcp_tier.clear();
+    h.session_role = auth::Role::user;
+    res = h.sink.Put("/api/config/log_level", R"({"value":"warn"})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+}
+
+// Drift tripwire (source scan; no PostgreSQL). The class table is only as good as its fit to the
+// writers: a Settings route that writes a runtime-config key through
+// `runtime_config_store_->set("key", ...)` is an administrator route by construction, so the
+// generic PUT must not let a weaker caller write the same key. This fails when a settings writer
+// names a key classified General. It sees literal keys and `plugin_signing::
+// kPluginSigningRequiredKey` only; a key built at runtime is invisible to it.
+TEST_CASE("config_routes: every key a Settings route writes is not classified General",
+          "[server][routes][config_routes]") {
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "settings_routes.cpp");
+    REQUIRE(in.is_open());
+    const std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+
+    static const std::regex kSet(
+        R"re(runtime_config_store_->set\(\s*(?:"([a-z_]+)"|plugin_signing::(kPluginSigningRequiredKey)))re");
+    std::set<std::string> written;
+    for (auto it = std::sregex_iterator(src.begin(), src.end(), kSet);
+         it != std::sregex_iterator(); ++it) {
+        written.insert((*it)[1].matched ? (*it)[1].str() : std::string("plugin_signing_required"));
+    }
+
+    // Guard against the scan rotting into a vacuous pass: the six administrator keys and the
+    // oidc keys are all written by Settings routes today.
+    for (const auto& key : admin_route_keys())
+        CHECK(written.count(key) == 1);
+    CHECK(written.count("oidc_admin_group") == 1);
+    CHECK(written.size() >= 12);
+
+    for (const auto& key : written) {
+        INFO(key << " is written by a Settings route but classified General");
+        const auto cls = RuntimeConfigStore::write_class(key);
+        REQUIRE(cls.has_value());
+        CHECK(*cls != ConfigWriteClass::General);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
