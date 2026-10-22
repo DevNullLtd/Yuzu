@@ -609,8 +609,9 @@ public:
     /// in step_up_policy.hpp; for those, the central check in server.cpp's
     /// pre-request handler (step_up_gate.hpp) evaluates the same decision
     /// BEFORE the handler runs, ahead of the handler's own permission and
-    /// cross-site checks, and this functor repeats it from that same verdict
-    /// within the request. The canonical enumerated list lives in
+    /// own cross-site copy (a cookie write has already met the server-wide
+    /// same-site gate in pre-routing), and this functor repeats it from that
+    /// same verdict within the request. The canonical enumerated list lives in
     /// docs/user-manual/rest-api.md "Step-up envelope on high-risk endpoints".
     /// An empty functor disables only this in-handler repeat; it does not
     /// affect the central check.

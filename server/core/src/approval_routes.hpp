@@ -30,8 +30,9 @@
 ///
 /// APPROVER ASSURANCE (#6061, four-eyes MVP PR1) -- approve/reject. Both routes
 /// are kRequired rows in the central step-up table, so the central check runs
-/// FIRST, in the pre-request stage, before the handler: a stale or absent proof
-/// is a 401, a SAML session a 403, and an engine principal a 403
+/// in the pre-request stage, before the handler (and after the server-wide
+/// same-site gate, which answers a cross-site cookie write first): a stale or
+/// absent proof is a 401, a SAML session a 403, and an engine principal a 403
 /// (`engine_principal_denied`, audited as `mfa.step_up.required`); the handler
 /// never runs for any of them. API-token and MCP-token sessions pass that check
 /// and are refused by step 3. The handler's own steps below then run in this
@@ -42,8 +43,9 @@
 ///      real `submitted_by` and so defeated the separation-of-duties check.
 ///   2b. SAME-SITE GATE (`WriteGate`, #6061 SG-1): a cookie-authorised POST
 ///      must name this site in Origin/Referer (403, `csrf.denied` row, before
-///      anything else in the handler is touched; a cross-site request with a
-///      stale proof is stopped by the central check first). Token callers are
+///      anything else in the handler is touched). This is defence in depth: in
+///      production the server-wide pre-routing gate answers a cross-site cookie
+///      write first, before the central step-up check. Token callers are
 ///      exempt from it and are refused by the class check instead.
 ///   3. Class check (`approver_assurance.hpp`): interactive local/OIDC/SAML
 ///      cookie session, `principal_kind == "human"`, not an engine principal.

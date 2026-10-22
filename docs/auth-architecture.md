@@ -699,9 +699,13 @@ by each handler.
   body of the pre-request handler `server.cpp` installs: after the route
   is matched and the body is read (and after the post-read body cap, which
   lives in the same function), before any handler. The order for a `kRequired` route is therefore: session
-  resolution (`401` when there is none), step-up, then the handler's own
-  checks (permission or durable-administrator check, same-site `Origin`/CSRF
-  check, self-target and break-glass-target checks, body policy). A caller
+  resolution (`401` when there is none), for a cookie session the server-wide
+  same-site gate (`403` `cross-site request refused`; pre-routing, see
+  [Same-site gate for cookie-session writes](#same-site-gate-for-cookie-session-writes);
+  a token caller skips it), step-up (which reads neither `Origin` nor
+  `Referer`), then the handler's own checks (permission or durable-administrator
+  check, the route's own same-site copy as defence in depth, self-target and
+  break-glass-target checks, body policy). A caller
   with a stale or absent proof is answered with the step-up envelope before
   the handler's `403` would have fired; an MFA-enrolled non-administrator who
   calls an administrator route directly is asked to step up first and then

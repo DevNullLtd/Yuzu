@@ -378,7 +378,9 @@ exact `(method, registered pattern)`, and the pre-request stage
 (`run_pre_request_stage` in `step_up_wiring.hpp`, installed by `server.cpp`)
 evaluates it before any handler runs. The gate's decision tree is unchanged;
 only where it is invoked, the order relative to the handler's authorization
-and CSRF checks (step-up first), the `403` for an engine principal, and the
+and its own CSRF copy (step-up first; for a cookie session the server-wide
+same-site gate in pre-routing answers a cross-site write before the step-up
+check), the `403` for an engine principal, and the
 fail-closed `503` for an unwired authentication store (any caller) or an
 unreadable one (local sessions) are new. The full description is in
 `docs/auth-architecture.md` "MFA step-up chokepoint".
