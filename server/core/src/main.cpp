@@ -542,7 +542,7 @@ int main(int argc, char* argv[]) {
     app.add_option("--mfa-step-up-window-secs", cfg.mfa_step_up_window_secs,
                    "Seconds after a TOTP proof that high-risk endpoints accept the session as "
                    "stepped-up (default: 300). A value <= 0 disables the stale-proof "
-                   "requirement on the 33 central step-up routes: a stale or absent proof is "
+                   "requirement on the 36 central step-up routes: a stale or absent proof is "
                    "neither refused nor recorded, SAML sessions pass, and the auth store is not "
                    "read; engine denials and unwired-store refusals still apply and are recorded")
         ->default_val(300)
@@ -1216,9 +1216,9 @@ int main(int argc, char* argv[]) {
     // so they keep prompting and keep emitting their audit rows.
     if (cfg.mfa_step_up_window_secs <= 0) {
         spdlog::warn(
-            "--mfa-step-up-window-secs={} disables the stale-proof requirement on the 33 central "
+            "--mfa-step-up-window-secs={} disables the stale-proof requirement on the 36 central "
             "step-up routes (REST, dashboard and Settings routes; the three JIT-elevation routes "
-            "keep their own 300 s window). On the 33 routes a stale or absent proof is neither refused nor "
+            "keep their own 300 s window). On the 36 routes a stale or absent proof is neither refused nor "
             "recorded (no SOC 2 CC6.6 `mfa.step_up.required` evidence row), they will NOT "
             "re-prompt for MFA proof, SAML sessions pass, and the auth store is not read. "
             "Engine-principal denials and unwired-auth-store refusals still apply on those "
