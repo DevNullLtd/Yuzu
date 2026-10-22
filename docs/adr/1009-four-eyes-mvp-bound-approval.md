@@ -243,7 +243,11 @@ conditions (security-guardian `sec-1`, with the architect's five conditions):
    `test_approval_dormant_code_tripwire.cpp`. It lexes every regular file under `server/core/src`
    and nowhere else, whatever its extension (so a caller moved into an `.ipp`, `.inl` or `.tpp`
    fragment is still seen), except an explicit list of documentation, data, image, font,
-   certificate and archive extensions that cannot be compiled into the server (comments, and string, character and
+   certificate and archive extensions, skipped by repository convention and not because a compiler
+   could not read them (an `#include` of a fragment under a skipped extension is an unscanned
+   residual). It first applies translation phase 2, so a line splice, with or without whitespace
+   after the backslash and with LF or CRLF line ends, cannot hide or split a name, and reports
+   each hit on its original line (comments, and string, character and
    raw-string literals including their `u8`, `u`, `U` and `L` prefixes, are excluded), counts
    `submit_bound`, `consume_ticket`, `kGuardianDeploy`, the interleaving seam and the three
    names a store member needs to reach them without spelling those (`submit_impl`,
@@ -257,8 +261,8 @@ conditions (security-guardian `sec-1`, with the architect's five conditions):
    wrapper, not the primitive), the overload a changed declaration binds a call to, anything
    outside `server/core/src` (`server/core/include`, `common/include`, `sdk/include`, `tests/`),
    a generated file, a macro that pastes a name together, a few lexer shapes
-   with no instance in the tree (a token split by a line splice, a universal-character-name
-   spelling, an unterminated block comment at end of file; the test header lists them), and any
+   with no instance in the tree (a universal-character-name spelling, an unterminated block
+   comment at end of file, a lone CR used as a line end; the test header lists them), and any
    behaviour. The one production `consume_ticket` call is also pinned by the text of its argument
    list, so replacing the pooled call in `mcp_server.cpp` with the caller-held overload (a
    connection first, same identifier count) fails with a message naming both lists; that check

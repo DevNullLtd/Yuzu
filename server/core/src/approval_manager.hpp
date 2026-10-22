@@ -617,10 +617,13 @@ public:
     /// check has passed, immediately before the consuming CAS. Never set in production. It is
     /// read without a lock, so it is installed (and cleared) only while no consume runs on
     /// another thread: tests install it per case or section on the test thread. A hook must not
-    /// call back into this manager's consume path. On the held overload the hook runs under the
-    /// row lock: SQL on a SECOND lease that touches the row waits on it until the pool's
-    /// lock_timeout (10 s by default, with a 30 s statement_timeout) ends it with an error, so
-    /// a hook there writes through the caller's own connection instead.
+    /// call back into this manager's consume path. On the held overload, kBetweenReads and
+    /// kBeforeCas run under the row lock the first read took: SQL on a SECOND lease that touches
+    /// the row waits on it until the pool's lock_timeout (10 s by default, with a 30 s
+    /// statement_timeout) ends it with an error, so a hook there writes through the caller's own
+    /// connection instead. kBeforeFirstRead runs BEFORE that locking read, so it holds the row
+    /// lock only if the caller's transaction had already locked or written the row; otherwise a
+    /// second lease can update the row freely.
     enum class ConsumeTestStage { kBetweenReads, kBeforeCas, kBeforeFirstRead };
     void set_consume_test_hook_for_test(std::function<void(ConsumeTestStage)> hook) {
         consume_test_hook_ = std::move(hook);
