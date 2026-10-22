@@ -851,6 +851,27 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `get.api-inventory-param-param`, `get.api-agents`,
        `get.fragments-network-overview`, `get.api-tags`).
 
+   - **2026-10-23 - MCP twin completeness gates, and `list_agents` as a dated
+     exception.** Two parts. First, `scripts/ci/check-api-parity.py` gains a
+     gate-parity check (for a ledger row with both a REST v1 twin and an MCP
+     tool, the securable, operation and gate kind must agree) and a
+     test-existence tripwire (each registry tool's test file must name the tool
+     and assert a schema and an audit row), and a Catch2 case checks that every
+     registry tool is both a ledger `mcp_twin` and a `kExpectedTwins` row. Each
+     check carries a size-pinned, shrink-only allowlist seeded from the tree as
+     it stood; the seeded gate-parity entries are rows whose REST and MCP gates
+     differ and are unadjudicated at seed, with a one-line reason each in the
+     script. These are tripwires, not proofs: a row whose `rest_v1_twin` or
+     `mcp_twin` is null compares nothing, and the checks read source text.
+     `MIN_REGISTRY_FILES` rises from 1 to 3, the number of `mcp_tools_*.cpp`
+     registry files. Second, `get.api-agents` becomes
+     `exception:#4041 revisit:2027-01-31`: MCP `list_agents` is unconfined by
+     design (the World A gap tracked by #4041) while `GET /api/v1/devices` is
+     confined through `require_fleet_read`, so it is not a twin until
+     `list_agents` is confined. The pin is `(4041, "2027-01-31")` in
+     `STRICT_EXCEPTION_PINS`; like the 2026-10-22 entry this is a session
+     statement by the ADR owner, not a signed decision.
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.

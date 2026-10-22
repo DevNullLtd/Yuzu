@@ -71,9 +71,13 @@ def synthetic_tree(root, routes=130, tools=100, flags=70, documented=True):
     write(root, src + "mcp_server.cpp", "static const ToolDef kTools[] = {\n" +
           "".join(f'    {{"tool_{i}", "d"}},\n' for i in range(tools)) + "};\n")
     # A tool served from the registry seam (mcp_tools_*.cpp) is not in kTools[]; the gate's tool
-    # set includes it, and the parity script's registry-file floor needs one file under --root.
-    write(root, src + "mcp_tools_fixture.cpp", "constexpr ToolRecord kToolRecords[] = {\n"
-          '    {"tool_registry", "d"},\n' "};\n")
+    # set includes it, and the parity script's registry-file floor (MIN_REGISTRY_FILES, read live so
+    # this fixture self-adjusts when the floor rises) needs that many files under --root, each with
+    # a unique file name and tool name.
+    registry_files = max(1, d.load_parity().MIN_REGISTRY_FILES)
+    for k in range(registry_files):
+        write(root, src + f"mcp_tools_fixture{k}.cpp", "constexpr ToolRecord kToolRecords[] = {\n"
+              f'    {{"tool_registry{k}", "d"}},\n' "};\n")
     write(root, src + "main.cpp", "".join(f'app.add_option("--flag-{i}", x);\n' for i in range(flags)))
     for j, rel in enumerate(d.FLAG_SOURCES[1:]):
         write(root, rel, f'app.add_flag("--src{j}-flag", y);\n')
@@ -81,7 +85,7 @@ def synthetic_tree(root, routes=130, tools=100, flags=70, documented=True):
     n = 1 if documented else 0
     write(root, "docs/user-manual/rest-api.md", "".join(f"#### `GET /api/v1/r{i}`\n" for i in range(routes * n)))
     write(root, "docs/user-manual/mcp.md", "".join(f"`tool_{i}`\n" for i in range(tools * n)) +
-          "`tool_registry`\n" * n)
+          "".join(f"`tool_registry{k}`\n" for k in range(registry_files * n)))
     write(root, "docs/user-manual/server-admin.md", "".join(f"`--flag-{i}`\n" for i in range(flags * n)) +
           "".join(f"`--src{j}-flag`\n" for j in range(len(d.FLAG_SOURCES) - 1)))
     write(root, "docs/user-manual/coupled.md", "coupled\n")

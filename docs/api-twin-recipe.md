@@ -322,6 +322,12 @@ so the record is not a single point of truth: keep the two in step. (A confined 
 7. **Decide `requires_approval()`.** It lives in `mcp_policy.hpp`, is NOT a `ToolRecord` field and is
    not boot-enforced, so a destructive twin needs it decided here exactly as on the legacy path
    (see "A fifth registration point" below).
+8. **Complete the twin set.** A registry tool also needs a `kExpectedTwins[]` row (the
+   twin-completeness test, `tests/unit/server/test_twin_completeness.cpp`, fails a registry record with
+   no row or no ledger `mcp_twin`), and a domain test file `tests/unit/server/test_mcp_tools_<domain>.cpp`
+   that names the tool, calls `schema_violation(` on a served body and asserts the audit row
+   (`check-api-parity.py` check 7 reads it; a tripwire, not a proof). A brand-new `mcp_tools_<domain>.cpp`
+   also raises `MIN_REGISTRY_FILES` in `scripts/ci/check-api-parity.py` in the same change.
 
 What rejects a mistake: building the catalogue (first done in the `ServerImpl` constructor, so it
 applies under `--mcp-disable` too) throws `std::logic_error` naming the record for a null handler, a
@@ -643,8 +649,8 @@ TU can assert against them without duplicating the maps: `tool_security_rows_for
 `tool_annotation_names_for_test()`, `write_tool_names_for_test()`, `tool_names_for_test()`, plus
 wrappers running the real C8 dispatch classifier/validator over synthetic tables.
 
-`tests/unit/server/test_operator_surface_twins.cpp`'s `kExpectedTwins[]` array (line 417) is the
-pattern to extend:
+The `kExpectedTwins[]` array in `tests/unit/server/test_expected_twins.hpp` (shared by
+`test_operator_surface_twins.cpp` and `test_twin_completeness.cpp`) is the pattern to extend:
 
 ```cpp
 constexpr TwinRow kExpectedTwins[] = {
@@ -697,9 +703,14 @@ see §5 for which chokepoints apply.
 6. **MCP registration.** `kTools[]`, `kToolSecurityRows[]`, `kWriteToolsRaw[]` (if non-Read),
    `kToolAnnotation`, plus the `if (tool_name == "...")` dispatch branch (§3), all boot-enforced; or
    one `ToolRecord` (§3, "The registry route", which also lists the header declaration, the
-   `registered_tool_records()` entry, the orientation family and the ledger block). Two lexical CI
+   `registered_tool_records()` entry, the orientation family, the ledger block and the completeness
+   inputs). Two lexical CI
    gates read the result: `scripts/ci/check-api-parity.py` (the tool name set, from `kTools[]` and
-   every `kToolRecords[]` slice) and `scripts/ci/check-mcp-retry-hints.py` (a new tool's handler
+   every `kToolRecords[]` slice; its check 6, gate parity, also compares the REST route's first gate
+   call with the tool's `"Securable", "Operation"` pair and confinement class for every ledger row that
+   names both twins, so a twin whose gate differs from its REST route fails unless the pair is
+   listed with a reason in `GATE_PARITY_KNOWN_MISMATCHES`; a route whose gate the script cannot read
+   fails closed unless it is in `GATE_PARITY_NO_GATE_ALLOWED`; both tables are shrink-only) and `scripts/ci/check-mcp-retry-hints.py` (a new tool's handler
    block: a store/query-fault branch needs a retry hint or a `// retry-hint-exempt:` comment).
    For a destructive action-twin, also decide `requires_approval()` (§3's "fifth registration
    point") explicitly — it is **not** boot-enforced, so a missed decision here fails silently, not
@@ -711,8 +722,9 @@ see §5 for which chokepoints apply.
    string per `docs/observability-conventions.md`'s audit envelope shape. Apply the correct posture
    per surface (§4) — fail-closed REST, set-and-proceed fragment, `audit_persisted:false` MCP, with
    the read-vs-mutate distinction from §4's closing note.
-8. **`kExpectedTwins[]` test row.** Add one row per new tool to
-   `tests/unit/server/test_operator_surface_twins.cpp:417` (§6).
+8. **`kExpectedTwins[]` test row.** Add one row per new tool (legacy or registry) to the shared table in
+   `tests/unit/server/test_expected_twins.hpp` (§6); the twin-completeness test fails a registry tool
+   that has no row or no ledger `mcp_twin`.
 9. **Tests.** A `TestRouteSink` fixture for the REST handler (mind the two gotchas, §6) and an MCP
    round-trip test dispatching the new tool through the JSON-RPC surface.
 10. **Docs.** `docs/user-manual/rest-api.md` entry (§2) + `docs/mcp-server.md` entry (following its

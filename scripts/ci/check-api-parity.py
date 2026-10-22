@@ -103,6 +103,33 @@ WHAT IT CHECKS
      change, or a later regression back up to the old baseline would pass
      silently. The count of rows carrying exactly the generic `planned:#2146`
      status has its own bidirectional baseline, BASELINE_GENERIC_PLANNED.
+  5. docs/api-parity-ledger.md's generated block matches a fresh render.
+  6. GATE PARITY. For every ledger row whose `mcp_twin` is a tool name and whose
+     `rest_v1_twin` is a {method, path} object (any status), the REST route's gate
+     and the MCP tool's gate must agree on (confinement, securable, operation).
+     REST side: the registration call's whole argument list is brace-bounded and
+     comment-stripped, and the FIRST gate call in it is read (`perm_fn(`,
+     `scoped_perm_fn(`, `fleet_read_fn(`, `list_read_fn(`, `require_permission(`,
+     `require_scoped_permission(`, with any `deps.`/`deps_.` receiver and an optional
+     trailing `_`), taking its `"Securable", "Operation"` literals; plain perm vs
+     scoped vs fleet-read is the gate kind. MCP side: the tool's pair in
+     mcp_server.cpp's kToolSecurityRows[], or for a registry tool the positional
+     `"Securable", "Operation", ServiceScopeClass::x` triple of its ToolRecord.
+     The confinement comparison is REST scoped/fleet == MCP `confined`. A route
+     with no recognisable gate (auth_fn only, a helper closure, a member-function
+     gate) fails CLOSED unless named in the size-pinned, shrink-only
+     GATE_PARITY_NO_GATE_ALLOWED; a mismatch is an error unless named, with its
+     exact two gates and a reason, in GATE_PARITY_KNOWN_MISMATCHES (same pin and
+     shrink-only rules; a stale or reshaped entry fails). LIMITS: first gate call
+     in the text, not the strictest on any path; an inline refusal before the gate
+     (deny_fleet_wide_service_scoped) and an in-handler second gate are not read;
+     a row with a null twin on either side compares nothing.
+  7. REGISTRY TEST EXISTENCE. Every registry tool's domain test file
+     tests/unit/server/test_mcp_tools_<domain>.cpp must exist, name the tool in a
+     string literal, call `schema_violation(` and hold a CHECK/REQUIRE that mentions
+     an audit row; a tool that cannot yet is named in the size-pinned, shrink-only
+     TEST_EXISTENCE_ALLOWED. A TRIPWIRE, not a proof: it shows the file was written,
+     not that it exercises this tool's audit contract.
 
 USAGE
   check-api-parity.py                    # run the full gate (CI mode)
@@ -143,7 +170,11 @@ MCP_SERVER_CPP = SERVER_SRC / "mcp_server.cpp"
 MCP_REGISTRY_DIR = None
 # The floor on registry files read: deleting every registry file would silently drop its tools
 # from the catalogue this script reads, so it fails loudly instead. Raise it as domains land.
-MIN_REGISTRY_FILES = 1
+# History: 1 while discovery was the only domain; the hardware and containment domains then landed
+# without raising it, so deleting either file passed silently. It is now the real count (discovery,
+# hardware, containment = 3). A new mcp_tools_<domain>.cpp raises it in the same change.
+# tests/test_docs_drift_selftest.py builds its --root fixture from this value, so it self-adjusts.
+MIN_REGISTRY_FILES = 3
 LEDGER_DOC = ROOT / "docs" / "api-parity-ledger.md"
 
 DOC_BEGIN = ("<!-- BEGIN GENERATED: check-api-parity.py - do not hand-edit; "
@@ -404,9 +435,10 @@ BASELINE_UNTWINNED = 214
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
 # issue. Bidirectional like BASELINE_UNTWINNED: lower it in the same change that removes rows.
 # 174 -> 87 (ledger reconcile, ADR-1005 2026-10-22 entry): 87 rows moved to twinned, exception, retire or composed-of.
+# 87 -> 86 (MCP twin completeness tooling, ADR-1005 2026-10-23 entry): get.api-agents became a dated exception.
 GENERIC_PLANNED_STATUS = "planned:#2146"
 GENERIC_PLANNED_ISSUE = 2146
-BASELINE_GENERIC_PLANNED = 87
+BASELINE_GENERIC_PLANNED = 86
 
 # A revisit date outside this window is a typo (9999-12-31), a shape error. A date at or before
 # today + REVISIT_WARN_DAYS only produces ONE aggregated warning, never a failure.
@@ -452,6 +484,8 @@ STRICT_EXCEPTION_PINS = {
     "get.fragments-hardware-ci-stored-data": (2102, "2027-01-13"),
     # #5357: admin password reset has no MCP twin (ADR-1005 2026-10-04 passwords entry).
     "post.api-v1-users-param-password": (5357, "2027-01-04"),
+    # #4041: MCP list_agents is unconfined by design while GET /api/v1/devices is confined; ADR-1005 2026-10-23 entry.
+    "get.api-agents": (4041, "2027-01-31"),
     # #6061: approve/reject is a human-session act, MCP approve_request/reject_request permanently refuse (ADR-1005 exception entry).
     "post.api-approvals-param-approve": (6061, "2027-01-18"),
     "post.api-approvals-param-reject": (6061, "2027-01-18"),
@@ -779,20 +813,23 @@ def _skip_blank_and_line_comments(text, i):
 _KNOWN_CLIENT_RECEIVERS = {"cli", "client"}
 
 
-def extract_verb_calls(text, path):
-    """Yields (method, raw_path_literal) for every `<receiver>.<Verb>(` call
-    whose first argument is a string/raw-string literal starting with '/'.
-    A call whose first argument is not a literal is reported via stderr WARN
-    (never silently dropped) UNLESS the receiver is a known httplib::Client
-    variable name (see `_KNOWN_CLIENT_RECEIVERS`) - route-registration sinks
-    (`sink`, `svr`, and any future receiver name) always warn loudly on a
-    non-literal first argument, since that would be a real extraction gap."""
+def iter_verb_calls(text, path, warn=True):
+    """Yields (method, raw_path_literal, open_paren_index) for every
+    `<receiver>.<Verb>(` call whose first argument is a string/raw-string
+    literal starting with '/'; the index is the offset of the call's `(` in
+    `text` (check 6 brace-bounds the handler from it). A call whose first
+    argument is not a literal is reported via stderr WARN (never silently
+    dropped; `warn=False` for a second pass over text already scanned once)
+    UNLESS the receiver is a known httplib::Client variable name (see
+    `_KNOWN_CLIENT_RECEIVERS`) - route-registration sinks (`sink`, `svr`, and
+    any future receiver name) always warn loudly on a non-literal first
+    argument, since that would be a real extraction gap."""
     for m in _VERB_CALL.finditer(text):
         receiver = m.group(1)
         method = m.group(2).upper()
         literal, _end = parse_adjacent_literals(text, m.end())
         if literal is None:
-            if receiver in _KNOWN_CLIENT_RECEIVERS:
+            if receiver in _KNOWN_CLIENT_RECEIVERS or not warn:
                 continue
             line = text.count("\n", 0, m.start()) + 1
             gh("warning",
@@ -801,6 +838,13 @@ def extract_verb_calls(text, path):
             continue
         if not literal.startswith("/"):
             continue
+        yield method, literal, m.end() - 1
+
+
+def extract_verb_calls(text, path):
+    """Yields (method, raw_path_literal) for every route-registration verb call
+    `iter_verb_calls` finds (same extraction, without the offset)."""
+    for method, literal, _open_paren in iter_verb_calls(text, path):
         yield method, literal
 
 
@@ -1709,6 +1753,503 @@ def ratchet_errors(untwinned, generic_planned):
     return errors
 
 
+# ── Gate parity (check 6) and registry test-existence (check 7) ───────────
+#
+# Both are LEXICAL TRIPWIRES, NOT PROOFS (see the module docstring). They read C++ text, do not
+# parse it, and cannot see a gate reached through indirection.
+
+# Where the per-domain MCP twin tests live (check 7).
+MCP_TOOL_TESTS_DIR = ROOT / "tests" / "unit" / "server"
+
+_CPP_SCAN = re.compile(r"""[/"'R]""")
+
+
+def _cpp_literal_end(text, i):
+    """End index (exclusive) of the string, raw-string or character literal that starts at
+    text[i], or None when nothing literal starts there. An unterminated plain string or
+    character literal ends at its line (it cannot run away), an unterminated raw string at the
+    end of the text. A `'` after a number token is a digit separator (`1'000`), not a literal."""
+    n = len(text)
+    c = text[i]
+    if c == "R":
+        if not text.startswith('R"', i):
+            return None
+        j = i
+        while j > 0 and (text[j - 1].isalnum() or text[j - 1] == "_"):
+            j -= 1
+        if text[j:i] not in ("", "u8", "u", "U", "L"):
+            return None
+        paren = text.find("(", i + 2)
+        if paren < 0:
+            return n
+        close = text.find(")" + text[i + 2:paren] + '"', paren + 1)
+        return n if close < 0 else close + (paren - i - 2) + 2
+    if c == '"' or c == "'":
+        if c == "'":
+            j = i
+            while j > 0 and (text[j - 1].isalnum() or text[j - 1] in "_."):
+                j -= 1
+            if text[j:i][:1].isdigit():
+                return None
+        k = i + 1
+        while k < n and text[k] not in (c, "\n"):
+            k += 2 if text[k] == "\\" else 1
+        return min(k + 1, n)
+    return None
+
+
+def blank_cpp_comments(text):
+    """`text` with every `//` and `/* */` comment replaced by spaces (newlines kept, so offsets
+    and line numbers survive). Unlike strip_cpp_comments, string, raw-string and character
+    literals are skipped properly, so a `//` inside `"https://..."` or a raw schema is not a
+    comment and a quote inside a comment opens nothing. A line-continued `//` comment is not
+    modelled (none occurs in the scanned sources)."""
+    parts = []
+    last = i = 0
+    n = len(text)
+    while True:
+        m = _CPP_SCAN.search(text, i)
+        if not m:
+            break
+        i = m.start()
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            end = n if end < 0 else end
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            end = n if end < 0 else end + 2
+        else:
+            lit = _cpp_literal_end(text, i)
+            i = i + 1 if lit is None else lit
+            continue
+        parts.append(text[last:i])
+        parts.append(re.sub(r"[^\n]", " ", text[i:end]))
+        last = i = end
+    parts.append(text[last:])
+    return "".join(parts)
+
+
+_BRACKET_SCAN = re.compile(r"""[()\[\]{}"'R]""")
+
+
+def _balanced_end(text, open_i):
+    """Index just past the bracket that closes text[open_i] ('(', '[' or '{'), skipping
+    literals; len(text) when it never closes. `text` must already be comment-blanked."""
+    depth = 0
+    i = open_i
+    while True:
+        m = _BRACKET_SCAN.search(text, i)
+        if not m:
+            return len(text)
+        i = m.start()
+        c = text[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        else:
+            lit = _cpp_literal_end(text, i)
+            if lit is not None:
+                i = lit
+                continue
+        i += 1
+
+
+# The REST gate calls check 6 recognises, and the gate kind each stands for. `list_read_fn` is the
+# admit-then-filter alias of the fleet read (authorize_list_read), so it is a fleet-read kind too.
+# The optional receiver chain (`deps.`, `deps_.`, `this->`) is accepted; a name with a longer
+# identifier prefix (`probe_perm_fn`) is a different function and does not match.
+_GATE_CALL = re.compile(r"(?<![\w])(?:\w+(?:\.|->))*(perm_fn_?|scoped_perm_fn_?|fleet_read_fn_?|list_read_fn_?"
+                        r"|require_permission|require_scoped_permission)\s*\(")
+_GATE_KIND = {"perm_fn": "plain", "require_permission": "plain",
+              "scoped_perm_fn": "scoped", "require_scoped_permission": "scoped",
+              "fleet_read_fn": "fleet", "list_read_fn": "fleet"}
+_GATE_ARGS = re.compile(r'\s*[\w.>-]+\s*,\s*[\w.>-]+\s*,\s*"(\w+)"\s*,\s*"(\w+)"')
+
+
+def first_gate(span_text):
+    """The FIRST gate call in a handler's source span: (kind, securable, operation), or
+    (None, why) when there is none or its arguments are not `req, res, "Securable", "Operation"`
+    literals. First means first in the text, not the strictest on any path: a handler that gates
+    a branch before its main gate reports the branch gate. `span_text` is comment-blanked."""
+    m = _GATE_CALL.search(span_text)
+    if not m:
+        return None, "no recognised gate call in the handler"
+    open_i = m.end() - 1
+    args = span_text[open_i + 1:_balanced_end(span_text, open_i) - 1]
+    a = _GATE_ARGS.match(args)
+    if not a:
+        return None, f"{m.group(1)}( arguments are not `req, res, \"Securable\", \"Operation\"` literals"
+    return _GATE_KIND[m.group(1).rstrip("_")], a.group(1), a.group(2)
+
+
+def extract_rest_gates(owners):
+    """{(METHOD, canonical_path): [(owner_file, gate)]} for every /api/vN/ registration in the
+    named server/core/src files; `gate` is first_gate()'s result over the registration call's
+    whole argument list (path literal, then the handler lambda)."""
+    gates = {}
+    versioned = re.compile(r"^/api/v\d+/")
+    for fname in sorted(owners):
+        text = blank_cpp_comments((SERVER_SRC / fname).read_text(encoding="utf-8"))
+        for method, raw, open_i in iter_verb_calls(text, fname, warn=False):
+            if versioned.match(raw):
+                span = text[open_i:_balanced_end(text, open_i)]
+                gates.setdefault((method, canonicalize(raw)), []).append((fname, first_gate(span)))
+    return gates
+
+
+_SEC_ROW = re.compile(r'\{\s*"(\w+)"\s*,\s*\{\s*"(\w+)"\s*,\s*"(\w+)"(?:\s*,\s*ServiceScopeClass::(\w+))?\s*\}\s*\}')
+_SEC_ROW_OPENER = re.compile(r'\{\s*"\w+"\s*,\s*\{')
+_RECORD_SEC = re.compile(r'"(\w+)"\s*,\s*"(\w+)"\s*,\s*ServiceScopeClass::(\w+)')
+
+
+def extract_mcp_security():
+    """(by_tool, registry): by_tool is {tool: (securable, operation, scope_class)} from the legacy
+    kToolSecurityRows[] in mcp_server.cpp and from each registry ToolRecord's positional
+    `"Securable", "Operation", ServiceScopeClass::x` triple; registry is {tool: source_file} for
+    the registry records alone (check 7). A row the patterns do not read in full, a missing
+    anchor and a tool described twice are named AnchorErrors."""
+    text = blank_cpp_comments(_read_mcp_server_cpp())
+    start = _find_unique(text, "static const ToolSecurityEntry kToolSecurityRows[] = {",
+                         "the kToolSecurityRows[] declaration")
+    end = text.find("\n};", start) if start >= 0 else -1
+    if end < 0:
+        raise AnchorError("kToolSecurityRows[] was not found (or is unterminated) in mcp_server.cpp - "
+                          "the lexical anchor `static const ToolSecurityEntry kToolSecurityRows[] = {` "
+                          "or its closing `};` at column 0 changed")
+    body = refuse_preprocessor_lines(text[start:end], "kToolSecurityRows[]")
+    rows = _SEC_ROW.findall(body)
+    openers = len(_SEC_ROW_OPENER.findall(body))
+    if not rows or len(rows) != openers:
+        raise AnchorError(f"kToolSecurityRows[] has {openers} `{{\"tool\", {{` row opener(s) but {len(rows)} "
+                          f"read in full as `{{\"tool\", {{\"Securable\", \"Operation\"[, "
+                          f"ServiceScopeClass::x]}}}}` - a row layout this script does not read would "
+                          f"drop its gate from check 6: teach the pattern or reshape the row")
+    by_tool = {}
+    for name, securable, operation, scope in rows:
+        if name in by_tool:
+            raise AnchorError(f"kToolSecurityRows[] describes tool {name!r} twice")
+        by_tool[name] = (securable, operation, scope or "denied")
+    registry = {}
+    registry_dir = _registry_dir()
+    for path in sorted(registry_dir.glob("mcp_tools_*.cpp")):
+        rtext = blank_cpp_comments(path.read_text(encoding="utf-8"))
+        rstart = _find_unique(rtext, _REGISTRY_ANCHOR, f"the kToolRecords[] declaration in {path.name}")
+        rend = rtext.find("\n};", rstart) if rstart >= 0 else -1
+        if rend < 0:
+            raise AnchorError(f"kToolRecords[] was not found (or is unterminated) in {path.name}")
+        chunks, name = {}, None
+        for line in rtext[rstart:rend].split("\n"):
+            m = _REGISTRY_ENTRY.match(line)
+            if m:
+                name = m.group(1)
+                chunks[name] = []
+            if name is not None:
+                chunks[name].append(line)
+        for name, lines in chunks.items():
+            triples = _RECORD_SEC.findall("\n".join(lines))
+            if len(triples) != 1:
+                raise AnchorError(f"{path.name}: record {name!r} has {len(triples)} `\"Securable\", "
+                                  f"\"Operation\", ServiceScopeClass::x` triples, expected exactly one - "
+                                  f"the positional layout this script reads changed")
+            if name in by_tool:
+                raise AnchorError(f"MCP tool {name!r} has a security pair in kToolSecurityRows[] and in "
+                                  f"{path.name} - a tool is described in exactly one place")
+            by_tool[name] = triples[0]
+            registry[name] = path.name
+    return by_tool, registry
+
+
+# Check 6 allowlists. Both are SHRINK-ONLY and SIZE-PINNED (pattern: GRANDFATHERED_MAX): each entry
+# must still be a live finding, the table's size must equal its MAX, and an entry whose finding
+# changes shape (a different gate on either side) is stale. A fix removes its entry AND lowers the
+# MAX in the same change; adding an entry needs a reviewed reason, never to unblock a new twin.
+#
+# KNOWN_MISMATCHES: (METHOD, canonical REST path, tool) -> (REST gate, MCP gate, reason), where a
+# gate reads `<kind>:<Securable>:<Operation>`. REST kind is plain (perm_fn / require_permission),
+# scoped (scoped_perm_fn) or fleet (fleet_read_fn / list_read_fn, the admit-then-filter reads); MCP
+# kind is the tool's ServiceScopeClass (denied / confined / global_safe). The comparison is the
+# securable, the operation, and whether the surface is confined (REST scoped or fleet == MCP
+# confined); denied and global_safe both count as unconfined.
+GATE_PARITY_KNOWN_MISMATCHES_MAX = 19
+GATE_PARITY_KNOWN_MISMATCHES = {
+    ("GET", "/api/v1/devices", "list_agents"): (
+        "fleet:Infrastructure:Read", "denied:Infrastructure:Read",
+        "REST is the confined fleet read; the MCP row stays `denied` on purpose "
+        "(kToolSecurityRows #4027 comment: service-scoped tokens are structurally denied, parity "
+        "with the device-picker REST guard)"),
+    ("GET", "/api/v1/dex/app", "get_dex_app"): (
+        "plain:GuaranteedState:Read", "confined:GuaranteedState:Read",
+        "REST gates on plain perm_fn behind an inline deny_fleet_wide_service_scoped refusal (a "
+        "service-scoped token is refused outright); the MCP row is `confined`, so the two differ "
+        "in confinement kind"),
+    ("GET", "/api/v1/dex/overview", "get_dex_overview"): (
+        "plain:GuaranteedState:Read", "confined:GuaranteedState:Read",
+        "REST gates on plain perm_fn behind an inline deny_fleet_wide_service_scoped refusal (a "
+        "service-scoped token is refused outright); the MCP row is `confined`, so the two differ "
+        "in confinement kind"),
+    ("GET", "/api/v1/dex/perf/compare", "compare_app_perf_versions"): (
+        "plain:GuaranteedState:Read", "confined:GuaranteedState:Read",
+        "REST gates on plain perm_fn behind an inline deny_fleet_wide_service_scoped refusal (a "
+        "service-scoped token is refused outright); the MCP row is `confined`, so the two differ "
+        "in confinement kind"),
+    ("GET", "/api/v1/dex/perf/devices", "list_dex_perf_devices"): (
+        "plain:GuaranteedState:Read", "confined:GuaranteedState:Read",
+        "REST gates on plain perm_fn behind an inline deny_fleet_wide_service_scoped refusal (a "
+        "service-scoped token is refused outright); the MCP row is `confined`, so the two differ "
+        "in confinement kind"),
+    ("GET", "/api/v1/dex/signals/{param}", "get_dex_signal_detail"): (
+        "plain:GuaranteedState:Read", "confined:GuaranteedState:Read",
+        "REST gates on plain perm_fn behind an inline deny_fleet_wide_service_scoped refusal (a "
+        "service-scoped token is refused outright); the MCP row is `confined`, so the two differ "
+        "in confinement kind"),
+    ("GET", "/api/v1/guaranteed-state/rules/{param}/status", "get_guardian_rule_status"): (
+        "fleet:GuaranteedState:Read", "denied:GuaranteedState:Read",
+        "REST serves through the admit-then-filter list read and handles gate.scope itself; the "
+        "MCP row is the default `denied`. Unadjudicated at seed"),
+    ("GET", "/api/v1/guaranteed-state/status", "get_guardian_status"): (
+        "fleet:GuaranteedState:Read", "denied:GuaranteedState:Read",
+        "REST serves through the admit-then-filter list read and handles gate.scope itself; the "
+        "MCP row is the default `denied`. Unadjudicated at seed"),
+    ("GET", "/api/v1/inventory/tables", "list_inventory_tables"): (
+        "plain:Inventory:Read", "denied:Infrastructure:Read",
+        "REST requires Inventory:Read, the MCP tool Infrastructure:Read: a caller holding only "
+        "one of the two reads the table list on one surface and not the other. Unadjudicated at "
+        "seed (noted in the twin-completeness design review)"),
+    ("GET", "/api/v1/network/devices", "list_network_devices"): (
+        "plain:GuaranteedState:Read", "confined:GuaranteedState:Read",
+        "REST gates on plain perm_fn behind an inline deny_fleet_wide_service_scoped refusal (a "
+        "service-scoped token is refused outright); the MCP row is `confined`, so the two differ "
+        "in confinement kind"),
+    ("GET", "/api/v1/plugin-config", "list_plugin_config"): (
+        "fleet:PluginConfig:Read", "denied:PluginConfig:Read",
+        "REST admits through the list read, then answers 403 to any confined caller (gate.scope), "
+        "so it is global-only in effect; the MCP row is `denied`, which agrees in effect but not "
+        "in label"),
+    ("GET", "/api/v1/rbac/roles", "discover_permissions"): (
+        "plain:UserManagement:Read", "denied:Infrastructure:Read",
+        "the tool serves the taxonomy at Infrastructure:Read and gates the role-to-permission "
+        "grid in-handler on UserManagement:Read (declared via roles_omitted); this route is the "
+        "grid half, so the tier row and the REST gate name different securables by design"),
+    ("GET", "/api/v1/rbac/roles/{param}/permissions", "discover_permissions"): (
+        "plain:UserManagement:Read", "denied:Infrastructure:Read",
+        "the tool serves the taxonomy at Infrastructure:Read and gates the role-to-permission "
+        "grid in-handler on UserManagement:Read (declared via roles_omitted); this route is the "
+        "grid half, so the tier row and the REST gate name different securables by design"),
+    ("GET", "/api/v1/result-sets/{param}/members", "get_result_set_members"): (
+        "fleet:Infrastructure:Read", "denied:Infrastructure:Read",
+        "REST runs the fleet read after a deny_fleet_wide_service_scoped refusal; the MCP row is "
+        "the default `denied`. Unadjudicated at seed"),
+    ("GET", "/api/v1/schedules", "list_schedules"): (
+        "plain:Schedule:Read", "confined:Schedule:Read",
+        "REST gates on plain perm_fn behind an inline deny_fleet_wide_service_scoped refusal (a "
+        "service-scoped token is refused outright); the MCP row is `confined`, so the two differ "
+        "in confinement kind"),
+    ("GET", "/api/v1/tar/capture-sources", "list_tar_capture_sources_devices"): (
+        "fleet:Infrastructure:Read", "denied:Infrastructure:Read",
+        "REST is the confined fleet read for management-group callers; the MCP row stays `denied` "
+        "on purpose (kToolSecurityRows #4027 comment, parity with the REST service-scope 403)"),
+    ("GET", "/api/v1/tar/process-tree", "list_tar_process_tree_devices"): (
+        "fleet:Infrastructure:Read", "denied:Infrastructure:Read",
+        "REST is the confined fleet read for management-group callers; the MCP row stays `denied` "
+        "on purpose (kToolSecurityRows #4027 comment, parity with the REST service-scope 403)"),
+    ("GET", "/api/v1/tar/retention-paused", "list_tar_retention_paused"): (
+        "fleet:Infrastructure:Read", "denied:Infrastructure:Read",
+        "REST is the confined fleet read for management-group callers; the MCP row stays `denied` "
+        "on purpose (kToolSecurityRows #4027 comment, parity with the REST service-scope 403)"),
+    ("POST", "/api/v1/result-sets", "create_result_set"): (
+        "fleet:Infrastructure:Read", "denied:Infrastructure:Write",
+        "OPERATION differs: REST create is gated on the fleet read of Infrastructure:Read (after "
+        "a service-scope refusal), the MCP tool on Infrastructure:Write. Unadjudicated at seed"),
+}
+# NO_GATE_ALLOWED: (METHOD, canonical REST path, tool) -> reason. A twinned route whose handler
+# holds no gate call this script recognises (owner-only reads that call auth_fn alone, helper
+# gates such as sw_admit, member-function gates) cannot be compared, so it fails closed unless it
+# is named here.
+GATE_PARITY_NO_GATE_MAX = 12
+GATE_PARITY_NO_GATE_ALLOWED = {
+    ("DELETE", "/api/v1/result-sets/{param}", "delete_result_set"): (
+        "owner-scoped on the session via auth_fn behind a service-scope refusal; no RBAC gate "
+        "call (result-set precedent, kToolSecurityRows comment)"),
+    ("GET", "/api/v1/crypto/ca/stats", "get_crypto_ca_stats"): (
+        "gated by the file-local ca_counts_gate helper, not a recognised gate call"),
+    ("GET", "/api/v1/crypto/dashboard/layout", "get_crypto_dashboard_layout"): (
+        "owner-scoped on the session via auth_fn, tier_ok and a service-scope refusal; no RBAC "
+        "gate call"),
+    ("GET", "/api/v1/inventory/software/catalogue", "query_software_catalogue"): (
+        "gated by the sw_admit helper closure (Inventory:Read confined read), not a recognised "
+        "gate call"),
+    ("GET", "/api/v1/inventory/software/catalogue/versions", "get_software_versions"): (
+        "gated by the sw_admit helper closure (Inventory:Read confined read), not a recognised "
+        "gate call"),
+    ("GET", "/api/v1/result-sets", "list_result_sets"): (
+        "owner-scoped on the session via auth_fn behind a service-scope refusal; no RBAC gate "
+        "call (result-set precedent)"),
+    ("GET", "/api/v1/result-sets/{param}", "get_result_set"): (
+        "owner-scoped on the session via auth_fn; no RBAC gate call (result-set precedent)"),
+    ("GET", "/api/v1/viz/fleet/topology", "get_fleet_topology"): (
+        "the gate lives in the member function handle_topology, not in the registration lambda"),
+    ("GET", "/api/v1/viz/host/{param}/topology", "get_host_topology"): (
+        "the gate lives in the member function handle_topology, not in the registration lambda"),
+    ("POST", "/api/v1/result-sets/{param}/pin", "pin_result_set"): (
+        "owner-scoped on the session via auth_fn; no RBAC gate call (result-set precedent)"),
+    ("POST", "/api/v1/result-sets/{param}/unpin", "unpin_result_set"): (
+        "owner-scoped on the session via auth_fn; no RBAC gate call (result-set precedent)"),
+    ("POST", "/api/v1/scope/validate", "validate_scope"): (
+        "auth_fn only: validates an expression the caller supplied and reads no fleet data"),
+}
+
+# Check 7 allowlist: registry tool -> reason, for a tool whose domain test file lacks the
+# required content below. Same shrink-only, size-pinned rules.
+TEST_EXISTENCE_ALLOWED_MAX = 1
+TEST_EXISTENCE_ALLOWED = {
+    "discover_routes": (
+        "the discovery domain has no tests/unit/server/test_mcp_tools_discovery.cpp yet (only "
+        "incidental references in test_mcp_dispatch_coverage.cpp and test_mcp_tools_hardware.cpp)"),
+}
+
+_AUDIT_ASSERT = re.compile(r"\b(?:CHECK|REQUIRE)\w*\s*\([^;]*audit", re.IGNORECASE)
+
+
+def _gate_desc(kind, securable, operation):
+    return f"{kind}:{securable}:{operation}"
+
+
+def gate_parity_findings(ledger_rows, mcp_tools, rest_gates, mcp_security):
+    """Check 6 core (pure, selftested): (mismatches, no_gates, errors). Every ledger row whose
+    mcp_twin is a tool name (not `resource:`) AND whose rest_v1_twin is an object is compared;
+    a row with a null twin on either side compares nothing (a REST-only or MCP-only capability
+    has no pair to hold against its other half), and a twin check 2 already reports as missing
+    is skipped here. mismatches is {key: (rest_gate, mcp_gate)}, no_gates {key: why}, where key
+    is (METHOD, canonical REST path, tool)."""
+    mismatches, no_gates, errors = {}, {}, []
+    for row in ledger_rows.values():
+        tool, rest = row["mcp_twin"], row["rest_v1_twin"]
+        if not tool or tool.startswith(RESOURCE_TWIN_PREFIX) or not isinstance(rest, dict):
+            continue
+        route = (rest["method"], canonicalize(rest["path"]))
+        if tool not in mcp_tools or route not in rest_gates:
+            continue
+        key = (route[0], route[1], tool)
+        mcp = mcp_security.get(tool)
+        if mcp is None:
+            errors.append(f"{row['_file']}: MCP tool {tool!r} (twin of {route[0]} {route[1]}) has no "
+                          f"securable/operation pair this script can read")
+            continue
+        mcp_desc = _gate_desc(mcp[2], mcp[0], mcp[1])
+        for owner, gate in rest_gates[route]:
+            if gate[0] is None:
+                no_gates[key] = f"{owner}: {gate[1]}"
+                continue
+            kind, securable, operation = gate
+            rest_desc = _gate_desc(kind, securable, operation)
+            if (securable, operation) != (mcp[0], mcp[1]) or (kind != "plain") != (mcp[2] == "confined"):
+                mismatches[key] = (rest_desc, mcp_desc)
+    return mismatches, no_gates, errors
+
+
+def _pinned_table_errors(label, const, table, limit, live):
+    """Shrink-only, size-pinned allowlist errors shared by checks 6 and 7: the table's size must
+    equal its MAX and every entry must still match a live finding (`live` = the set of keys, or
+    for the mismatch table a {key: value} dict checked by the caller)."""
+    errors = []
+    n = len(table)
+    stale = sorted(k for k in table if k not in live)
+    if n > limit:
+        errors.append(f"{label} grew ({n} entries, {const} is {limit}): remove the added entr(ies); "
+                      f"the pin is never raised to admit a new finding")
+    elif n < limit:
+        errors.append(f"{label} has {n} entries, fewer than {const} {limit}: lower {const} to "
+                      f"{n - len(stale) if stale else n} in THIS change")
+    for k in stale:
+        errors.append(f"{label} entry {k} is stale - the finding it excuses is gone (or changed shape): "
+                      f"remove it and lower {const} in THIS change")
+    return errors
+
+
+def gate_parity_errors(mismatches, no_gates, errors=()):
+    """Check 6's verdict (pure, selftested): findings the allowlists do not excuse, plus stale and
+    mis-sized allowlists."""
+    out = list(errors)
+    for key, (rest_desc, mcp_desc) in sorted(mismatches.items()):
+        pinned = GATE_PARITY_KNOWN_MISMATCHES.get(key)
+        if pinned is not None and pinned[:2] == (rest_desc, mcp_desc):
+            continue
+        out.append(f"gate parity: {key[0]} {key[1]} gates on {rest_desc} but its MCP twin {key[2]!r} "
+                   f"gates on {mcp_desc} - align the two gates, or add the row to "
+                   f"GATE_PARITY_KNOWN_MISMATCHES with a reason (and raise its MAX) in this change"
+                   + (f" (the pinned entry reads {pinned[0]} / {pinned[1]} - it went stale)" if pinned else ""))
+    for key, why in sorted(no_gates.items()):
+        if key in GATE_PARITY_NO_GATE_ALLOWED:
+            continue
+        out.append(f"gate parity: {key[0]} {key[1]} (MCP twin {key[2]!r}) has no gate this script can read "
+                   f"({why}) - a route that cannot be compared fails closed: gate it with perm_fn / "
+                   f"scoped_perm_fn / fleet_read_fn / require_permission, or name it in "
+                   f"GATE_PARITY_NO_GATE_ALLOWED with a reason")
+    live_mismatch = {k for k, v in mismatches.items()
+                     if (GATE_PARITY_KNOWN_MISMATCHES.get(k) or (None, None))[:2] == v}
+    out += _pinned_table_errors("GATE_PARITY_KNOWN_MISMATCHES", "GATE_PARITY_KNOWN_MISMATCHES_MAX",
+                                GATE_PARITY_KNOWN_MISMATCHES, GATE_PARITY_KNOWN_MISMATCHES_MAX, live_mismatch)
+    out += _pinned_table_errors("GATE_PARITY_NO_GATE_ALLOWED", "GATE_PARITY_NO_GATE_MAX",
+                                GATE_PARITY_NO_GATE_ALLOWED, GATE_PARITY_NO_GATE_MAX, set(no_gates))
+    return out
+
+
+def registry_tests_findings(registry, tests_dir):
+    """Check 7 core (selftested): {tool: [defect, ...]} for every registry tool whose domain test
+    file (`tests/unit/server/test_mcp_tools_<domain>.cpp`, the domain being the `mcp_tools_<domain>.cpp`
+    record file's) is missing, does not name the tool in a string literal, has no `schema_violation(`
+    call (the served output schema is checked against a real body) or has no CHECK/REQUIRE that
+    mentions an audit row. A TRIPWIRE: a name, a call and an assertion that mentions audit
+    prove the file was written, not that it tests this tool's audit contract."""
+    found = {}
+    for tool, fname in sorted(registry.items()):
+        domain = fname[len("mcp_tools_"):-len(".cpp")]
+        path = Path(tests_dir) / f"test_mcp_tools_{domain}.cpp"
+        try:
+            text = blank_cpp_comments(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError):
+            found[tool] = [f"{path.name} is missing or unreadable"]
+            continue
+        defects = []
+        if f'"{tool}"' not in text:
+            defects.append(f"{path.name} never names \"{tool}\"")
+        if "schema_violation(" not in text:
+            defects.append(f"{path.name} never calls schema_violation(")
+        if not _AUDIT_ASSERT.search(text):
+            defects.append(f"{path.name} has no CHECK/REQUIRE that mentions an audit row")
+        if defects:
+            found[tool] = defects
+    return found
+
+
+def registry_tests_errors(findings):
+    """Check 7's verdict (pure, selftested)."""
+    out = []
+    for tool, defects in sorted(findings.items()):
+        if tool in TEST_EXISTENCE_ALLOWED:
+            continue
+        out.append(f"test existence: registry tool {tool!r}: {'; '.join(defects)} - a registry tool ships "
+                   f"with a tests/unit/server/test_mcp_tools_<domain>.cpp that names it, validates its "
+                   f"output with schema_violation( and asserts its audit row (docs/api-twin-recipe.md); "
+                   f"or name it in TEST_EXISTENCE_ALLOWED with a reason")
+    out += _pinned_table_errors("TEST_EXISTENCE_ALLOWED", "TEST_EXISTENCE_ALLOWED_MAX",
+                                TEST_EXISTENCE_ALLOWED, TEST_EXISTENCE_ALLOWED_MAX, set(findings))
+    return out
+
+
+def gate_checks(ledger_rows, mcp_tools, bucket_b):
+    """Checks 6 and 7 over the real tree: the error strings, in order."""
+    by_tool, registry = extract_mcp_security()
+    owners = {fname for key, regs in bucket_b.items() for fname, _raw in regs}
+    rest_gates = extract_rest_gates(owners)
+    mismatches, no_gates, errors = gate_parity_findings(ledger_rows, mcp_tools, rest_gates, by_tool)
+    return (gate_parity_errors(mismatches, no_gates, errors)
+            + registry_tests_errors(registry_tests_findings(registry, MCP_TOOL_TESTS_DIR)))
+
+
 def run_check(ledger_dir=None, doc_path=None, extracted=None, today=None):
     """The CI gate. The keyword arguments let the selftest drive the real
     wiring over a temporary ledger with synthetic extraction; CI passes none.
@@ -1737,6 +2278,18 @@ def run_check(ledger_dir=None, doc_path=None, extracted=None, today=None):
         bucket_a, bucket_b, openapi_paths, mcp_tools, mcp_resources = extracted
 
     ok = True
+    # 6 + 7. gate parity between each twinned REST route and its MCP tool, and the registry-tool
+    #     test-existence tripwire. Real extraction only: a synthetic `extracted` has no source
+    #     tree to read the gates from.
+    if extracted is None:
+        try:
+            gate_errors = gate_checks(ledger_rows, mcp_tools, bucket_b)
+        except AnchorError as e:
+            gate_errors = [str(e)]
+        for err in gate_errors:
+            gh("error", f"check-api-parity: {err}")
+            ok = False
+
     # 0. the grandfather set is size-pinned to GRANDFATHERED_MAX (growth and
     #    shrinkage both fail); extend+bump, swap and rebind are review-only.
     for err in stale_grandfather_errors(ledger_rows, GRANDFATHERED_LEGACY_EXCEPTIONS):
@@ -2672,6 +3225,184 @@ def _selftest_body():
         _rows, errs = load_ledger(dd)
         check(any("devices.json" in e and "invalid JSON" in e for e in errs),
               f"load_ledger: a directory named *.json is a clean error, got {errs}")
+
+    # -- check 6 / 7 lexical helpers: comment blanking, literal skipping, gate reading ---------
+    src_text = ('int a = 1\'000; // note "q\n'
+                'const char* u = "https://x//y"; /* blk \' */ int b;\n'
+                'auto r = R"j(// not a comment " )j"; // tail\n')
+    blanked = blank_cpp_comments(src_text)
+    check(len(blanked) == len(src_text) and blanked.count("\n") == src_text.count("\n"),
+          "blank_cpp_comments: offsets and line breaks must survive")
+    check("note" not in blanked and "blk" not in blanked and "tail" not in blanked,
+          f"blank_cpp_comments: comments must be blanked, got {blanked!r}")
+    check('"https://x//y"' in blanked and "R\"j(// not a comment \" )j\"" in blanked and "1'000" in blanked,
+          f"blank_cpp_comments: string, raw-string and digit-separator text must survive, got {blanked!r}")
+    check(_balanced_end('f(a, "x)", R"j()j", g(1)) tail', 1) == len('f(a, "x)", R"j()j", g(1))'),
+          "_balanced_end: a bracket inside a string or raw string must not close the group")
+    for label, code, want in (
+            ("plain", 'if (!perm_fn(req, res, "Sec", "Read")) return;', ("plain", "Sec", "Read")),
+            ("receiver", 'deps_.perm_fn(req, res, "Sec", "Write");', ("plain", "Sec", "Write")),
+            ("member-underscore", 'if (!perm_fn_(req, res, "Sec", "Read")) return;', ("plain", "Sec", "Read")),
+            ("scoped", 'scoped_perm_fn(req, res, "Sec", "Read", agent_id)', ("scoped", "Sec", "Read")),
+            ("fleet", 'auto g = deps.fleet_read_fn(req, res, "Sec", "Read");', ("fleet", "Sec", "Read")),
+            ("list-read", 'auto g = list_read_fn(req, res, "Sec", "Read");', ("fleet", "Sec", "Read")),
+            ("require", 'require_permission(req, res, "Sec", "Delete")', ("plain", "Sec", "Delete")),
+            ("require-scoped", 'auth.require_scoped_permission(req, res, "Sec", "Read", id)', ("scoped", "Sec", "Read")),
+            ("first-wins", 'scoped_perm_fn(req, res, "A", "Read", id); perm_fn(req, res, "B", "Read");',
+             ("scoped", "A", "Read"))):
+        check(first_gate(code) == want, f"first_gate({label}): want {want}, got {first_gate(code)}")
+    for label, code in (("none", "auth_fn(req, res);"), ("other-name", 'probe_perm_fn(req, res, "S", "Read");'),
+                        ("variable-args", "perm_fn(req, res, securable, op);"),
+                        ("declaration", "bool perm_fn;")):
+        got = first_gate(code)
+        check(got[0] is None and isinstance(got[1], str), f"first_gate({label}): must report no gate, got {got}")
+
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as td:
+        tsrc = Path(td) / "src"
+        tsrc.mkdir()
+        (tsrc / "routes.cpp").write_text(
+            'void r(S& sink) {\n'
+            '    sink.Get("/api/v1/a", [&](const R& q, P& p) {\n'
+            '        // if (!perm_fn(q, p, "Commented", "Read")) return;\n'
+            '        /* perm_fn(q, p, "Block", "Read") */\n'
+            '        if (!perm_fn(q, p, "Real", "Read")) return;\n'
+            '    });\n'
+            '    sink.Post("/api/v1" "/b", [&](const R& q, P& p) { auth_fn(q, p); });\n'
+            '    sink.Get("/fragments/f", [&](const R& q, P& p) { perm_fn(q, p, "Frag", "Read"); });\n'
+            '    sink.Put(R"(/api/v1/c/(\\d+))", [&](const R& q, P& p) {\n'
+            '        auto g = fleet_read_fn(q, p, "Fleet", "Read"); }); }\n', encoding="utf-8")
+        with _patched(SERVER_SRC=tsrc):
+            gates = extract_rest_gates({"routes.cpp"})
+        check(gates.get(("GET", "/api/v1/a")) == [("routes.cpp", ("plain", "Real", "Read"))],
+              f"extract_rest_gates: a gate call inside a comment is ignored, got {gates.get(('GET', '/api/v1/a'))}")
+        check(gates.get(("POST", "/api/v1/b", ), [("", (1,))])[0][1][0] is None,
+              "extract_rest_gates: an adjacent-literal route with no gate call reports no gate")
+        check(gates.get(("PUT", "/api/v1/c/{param}")) == [("routes.cpp", ("fleet", "Fleet", "Read"))],
+              f"extract_rest_gates: raw-string route path, got {gates.get(('PUT', '/api/v1/c/{param}'))}")
+        check(all(not k[1].startswith("/fragments") for k in gates), "extract_rest_gates: only /api/vN/ routes")
+
+        sec_cpp = Path(td) / "mcp_server.cpp"
+        reg_dir = Path(td) / "reg"
+        reg_dir.mkdir()
+        sec_body = ('static const ToolSecurityEntry kToolSecurityRows[] = {\n'
+                    '    // {"commented", {"Nope", "Read"}},\n'
+                    '    {"tool_a", {"Sec", "Read"}},\n'
+                    '    {"tool_b",\n     {"Sec", "Write", ServiceScopeClass::confined}},\n'
+                    '};\n')
+        rec_body = ('constexpr ToolRecord kToolRecords[] = {\n'
+                    '    {"reg_x", "desc", "schema",\n     // note\n'
+                    '     "schema2", "Reg", "Read", ServiceScopeClass::confined, ToolEffect::ReadOnly, true,\n'
+                    '     "Title", &handler},\n};\n')
+        sec_cpp.write_text(sec_body, encoding="utf-8")
+        (reg_dir / "mcp_tools_one.cpp").write_text(rec_body, encoding="utf-8")
+        with _patched(MCP_SERVER_CPP=sec_cpp, MCP_REGISTRY_DIR=reg_dir):
+            by_tool, registry = extract_mcp_security()
+        check(by_tool == {"tool_a": ("Sec", "Read", "denied"), "tool_b": ("Sec", "Write", "confined"),
+                          "reg_x": ("Reg", "Read", "confined")} and registry == {"reg_x": "mcp_tools_one.cpp"},
+              f"extract_mcp_security: legacy rows, multi-line rows and registry triples, got {by_tool} {registry}")
+        for label, sbody, rbody, needle in (
+                ("row-layout", sec_body.replace('{"Sec", "Read"}}', '{kSec, "Read"}}'), rec_body, "read in full"),
+                ("duplicate", sec_body.replace("tool_b", "tool_a"), rec_body, "twice"),
+                ("no-anchor", "int x;\n", rec_body, "kToolSecurityRows[] was not found"),
+                ("record-layout", sec_body, rec_body.replace('"Reg", "Read", ServiceScopeClass', 'kReg, ServiceScopeClass'),
+                 "expected exactly one"),
+                ("cross-source-duplicate", sec_body, rec_body.replace("reg_x", "tool_a"), "exactly one place")):
+            sec_cpp.write_text(sbody, encoding="utf-8")
+            (reg_dir / "mcp_tools_one.cpp").write_text(rbody, encoding="utf-8")
+            try:
+                with _patched(MCP_SERVER_CPP=sec_cpp, MCP_REGISTRY_DIR=reg_dir):
+                    extract_mcp_security()
+                check(False, f"extract_mcp_security({label}): must raise AnchorError")
+            except AnchorError as e:
+                check(needle in str(e), f"extract_mcp_security({label}): want {needle!r}, got {e}")
+
+    # -- check 6 core: mismatch, confinement, no-gate, null twin, stale and mis-sized allowlists ---
+    def _gp_row(tool, method="GET", path="/api/v1/x", rest=True):
+        return {"method": method, "path": "/fragments/g", "capability_id": "g", "status": "twinned",
+                "_file": "g.json", "mcp_twin": tool,
+                "rest_v1_twin": {"method": method, "path": path} if rest else None}
+
+    gp_rows = {("GET", "/fragments/a"): _gp_row("t_ok"), ("GET", "/fragments/b"): _gp_row("t_sec", path="/api/v1/y"),
+               ("GET", "/fragments/c"): _gp_row("t_op", path="/api/v1/z"),
+               ("GET", "/fragments/d"): _gp_row("t_conf", path="/api/v1/w"),
+               ("GET", "/fragments/e"): _gp_row("t_none", path="/api/v1/v"),
+               ("GET", "/fragments/f"): _gp_row("t_null", rest=False),
+               ("GET", "/fragments/g"): _gp_row("resource:yuzu://r", path="/api/v1/u"),
+               ("GET", "/fragments/h"): _gp_row("t_gone", path="/api/v1/gone")}
+    gp_tools = {"t_ok", "t_sec", "t_op", "t_conf", "t_none", "t_null", "t_gone"}
+    gp_rest = {("GET", "/api/v1/x"): [("a.cpp", ("plain", "Sec", "Read"))],
+               ("GET", "/api/v1/y"): [("a.cpp", ("plain", "Other", "Read"))],
+               ("GET", "/api/v1/z"): [("a.cpp", ("plain", "Sec", "Write"))],
+               ("GET", "/api/v1/w"): [("a.cpp", ("fleet", "Sec", "Read"))],
+               ("GET", "/api/v1/v"): [("a.cpp", (None, "no recognised gate call in the handler"))],
+               ("GET", "/api/v1/u"): [("a.cpp", ("plain", "Bad", "Bad"))]}
+    gp_mcp = {"t_ok": ("Sec", "Read", "denied"), "t_sec": ("Sec", "Read", "denied"),
+              "t_op": ("Sec", "Read", "denied"), "t_conf": ("Sec", "Read", "denied"),
+              "t_none": ("Sec", "Read", "denied"), "t_null": ("Bad", "Bad", "denied")}
+    mism, nog, errs = gate_parity_findings(gp_rows, gp_tools, gp_rest, gp_mcp)
+    check(set(mism) == {("GET", "/api/v1/y", "t_sec"), ("GET", "/api/v1/z", "t_op"), ("GET", "/api/v1/w", "t_conf")}
+          and mism[("GET", "/api/v1/w", "t_conf")] == ("fleet:Sec:Read", "denied:Sec:Read") and errs == [],
+          f"gate parity: securable, operation and confinement mismatches are found (and only those), got {mism} {errs}")
+    check(set(nog) == {("GET", "/api/v1/v", "t_none")},
+          f"gate parity: a route with no gate fails closed; null-twin, resource and unknown-tool rows compare nothing, got {nog}")
+    _m, _n, e2 = gate_parity_findings(gp_rows, gp_tools | {"t_missing_sec"}, gp_rest,
+                                      {k: v for k, v in gp_mcp.items() if k != "t_ok"})
+    check(any("t_ok" in e for e in e2), f"gate parity: a catalogue tool with no readable security pair is an error, got {e2}")
+    conf = ("fleet:Sec:Read", "denied:Sec:Read")
+    with _patched(GATE_PARITY_KNOWN_MISMATCHES={}, GATE_PARITY_KNOWN_MISMATCHES_MAX=0,
+                  GATE_PARITY_NO_GATE_ALLOWED={}, GATE_PARITY_NO_GATE_MAX=0):
+        e = gate_parity_errors(mism, nog)
+        check(len(e) == 4 and sum("gates on" in x for x in e) == 3 and sum("no gate this script" in x for x in e) == 1,
+              f"gate parity errors: three mismatches and one no-gate, all unexcused, got {e}")
+    pins = {k: (v[0], v[1], "r") for k, v in mism.items()}
+    with _patched(GATE_PARITY_KNOWN_MISMATCHES=pins, GATE_PARITY_KNOWN_MISMATCHES_MAX=3,
+                  GATE_PARITY_NO_GATE_ALLOWED={("GET", "/api/v1/v", "t_none"): "r"}, GATE_PARITY_NO_GATE_MAX=1):
+        check(gate_parity_errors(mism, nog) == [], "gate parity: pinned findings are excused when both tables are exact")
+        e = gate_parity_errors({k: v for k, v in mism.items() if k[2] != "t_op"}, nog)
+        check(len(e) == 1 and "stale" in e[0] and "t_op" in e[0],
+              f"gate parity: an allowlist entry whose finding is gone is stale, got {e}")
+        with _patched(GATE_PARITY_KNOWN_MISMATCHES={k: v for k, v in pins.items() if k[2] != "t_op"}):
+            e = gate_parity_errors({k: v for k, v in mism.items() if k[2] != "t_op"}, nog)
+            check(len(e) == 1 and "fewer than" in e[0] and "lower GATE_PARITY_KNOWN_MISMATCHES_MAX to 2" in e[0],
+                  f"gate parity: a table smaller than its MAX says to lower the MAX, got {e}")
+        e = gate_parity_errors(mism, {})
+        check(any("stale" in x and "t_none" in x for x in e), f"gate parity: a stale no-gate entry is reported, got {e}")
+        reshaped = dict(mism)
+        reshaped[("GET", "/api/v1/w", "t_conf")] = ("plain:Sec:Read", "denied:Sec:Read")
+        e = gate_parity_errors(reshaped, nog)
+        check(any("went stale" in x for x in e) and any("stale" in x and "/api/v1/w" in x for x in e),
+              f"gate parity: an entry whose gates changed shape is both unexcused and stale, got {e}")
+    with _patched(GATE_PARITY_KNOWN_MISMATCHES={**pins, ("GET", "/api/v1/extra", "t_extra"): ("a", "b", "r")},
+                  GATE_PARITY_KNOWN_MISMATCHES_MAX=3, GATE_PARITY_NO_GATE_ALLOWED={("GET", "/api/v1/v", "t_none"): "r"},
+                  GATE_PARITY_NO_GATE_MAX=1):
+        e = gate_parity_errors(mism, nog)
+        check(any("grew" in x for x in e), f"gate parity: an allowlist larger than its MAX is reported, got {e}")
+
+    # -- check 7 core: the registry tool's domain test file ----------------------------------------
+    good_test = ('#include "x"\nTEST_CASE("t") {\n  CHECK(schema_violation(s, v) == "");\n'
+                 '  call("tool_x");\n  CHECK(audit_log.size() == 1);\n}\n')
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as td:
+        tdir = Path(td)
+        (tdir / "test_mcp_tools_alpha.cpp").write_text(good_test, encoding="utf-8")
+        (tdir / "test_mcp_tools_beta.cpp").write_text(
+            '// "tool_y" schema_violation( CHECK(audit)\nTEST_CASE("t") { CHECK(1 == 1); }\n', encoding="utf-8")
+        (tdir / "test_mcp_tools_gamma.cpp").write_text(good_test.replace("schema_violation(", "other("), encoding="utf-8")
+        reg = {"tool_x": "mcp_tools_alpha.cpp", "tool_y": "mcp_tools_beta.cpp", "tool_z": "mcp_tools_delta.cpp",
+               "tool_g": "mcp_tools_gamma.cpp"}
+        found = registry_tests_findings(reg, tdir)
+        check(set(found) == {"tool_y", "tool_z", "tool_g"} and len(found["tool_y"]) == 3
+              and "missing" in found["tool_z"][0] and len(found["tool_g"]) == 2,
+              f"registry tests: comments do not count, a missing file and a missing call are found, got {found}")
+        with _patched(TEST_EXISTENCE_ALLOWED={}, TEST_EXISTENCE_ALLOWED_MAX=0):
+            check(len(registry_tests_errors(found)) == 3 and registry_tests_errors({}) == [],
+                  "registry tests: unexcused findings are errors, a clean tree passes")
+        with _patched(TEST_EXISTENCE_ALLOWED={k: "r" for k in found}, TEST_EXISTENCE_ALLOWED_MAX=3):
+            check(registry_tests_errors(found) == [], "registry tests: pinned findings are excused")
+            e = registry_tests_errors({k: v for k, v in found.items() if k != "tool_g"})
+            check(any("stale" in x and "tool_g" in x for x in e),
+                  f"registry tests: an entry whose finding is gone is stale, got {e}")
+        with _patched(TEST_EXISTENCE_ALLOWED={"tool_y": "r"}, TEST_EXISTENCE_ALLOWED_MAX=0):
+            check(any("grew" in x for x in registry_tests_errors(found)), "registry tests: an oversized allowlist is reported")
 
     if failures:
         print("SELFTEST FAILURES:", *failures, sep="\n  ")
