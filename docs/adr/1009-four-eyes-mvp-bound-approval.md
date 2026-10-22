@@ -181,7 +181,9 @@ conditions (security-guardian `sec-1`, with the architect's five conditions):
    copy is exact and claims no second person`, in `test_operate_pages_ui.cpp`, whose pins forbid
    "cannot change after your decision", "frozen under the digest" and "exactly the effect shown"
    (exists today).
-3. The first caller of `submit_bound` or the caller-held `consume_ticket` MUST get
+3. The first change that mints a bound ticket or consumes on a caller-held connection, under
+   whatever name (a call to `submit_bound` or the caller-held `consume_ticket`, or a new store
+   member that reaches the private bodies `submit_impl` or `consume_core`), MUST get
    security-guardian and cpp-safety review, and MUST roll the REAL effect and the ticket back
    together: the effect (the deploy) and the spend of the ticket commit or roll back in ONE
    transaction on the connection the ticket was consumed on, and a lost commit acknowledgement is
@@ -191,7 +193,9 @@ conditions (security-guardian `sec-1`, with the architect's five conditions):
    one transaction` and `deploy: a retry after a lost commit acknowledgement does not execute
    twice`. These MUST be EXECUTED against Postgres, not skipped: the PG tests skip silently
    (exit 0) when `YUZU_TEST_POSTGRES_DSN` is unset, so the PR MUST show the shard that runs them
-   with zero PG skips.
+   with zero PG skips. The held redeemer MUST NOT run DDL (CLUSTER, a rewriting ALTER TABLE,
+   TRUNCATE) on the redeeming connection inside the redeeming transaction: the version pin below
+   cannot see a table rewrite issued by the holding transaction itself.
 4. No bound ticket is minted until every replica runs a build that includes this change (an older
    replica's `approve()` ignores `excluded_roots`); the Upgrading guide states it. This is prose
    only today, and NO replica-enumeration mechanism exists to make it more: `submit_bound` checks
@@ -214,7 +218,11 @@ conditions (security-guardian `sec-1`, with the architect's five conditions):
    producer therefore MUST either make a bound ticket structurally unusable to an older build
    (it fails closed instead of reading the row as unbound), or adopt the operator rule as the
    control and prove its detection query (Rollback below). It MUST NOT cite a boot-time check in
-   the new build as the control for this.
+   the new build as the control for this. Proof for the structural option, which no mechanism in
+   the tree provides today and which is therefore unproven until the producer builds it:
+   `upgrade: a reader that knows only migration v1 fails closed on a bound row`, in
+   `test_approval_manager_bound.cpp`, loading the row through the base build's own select list.
+   Proof for the operator-rule option: the Rollback bullet's detection-query test.
 5. PR3 lands in the same release window as PR2, or the dormant half is cut back out. Made
    checkable: let TAG be any git tag, a release candidate (`-rcN`) included, for which `git tag
    --contains <the commit that merges PR2>` is non-empty. PR3 (#6063) MUST merge before the first
@@ -235,18 +243,22 @@ conditions (security-guardian `sec-1`, with the architect's five conditions):
    `test_approval_dormant_code_tripwire.cpp`. It lexes the `.cpp`, `.hpp`, `.inc`, `.cc` and `.h`
    files under `server/core/src` and nowhere else (comments, and string, character and
    raw-string literals including their `u8`, `u`, `U` and `L` prefixes, are excluded), counts
-   `submit_bound`, `consume_ticket`, `kGuardianDeploy` and the interleaving seam in code, per
-   file, and fails unless each count equals its allow-list entry exactly. Nothing is exempt: the
-   store files are pinned like every other file (a wrapper added there that calls a primitive
-   raises a count and fails), a file with no entry is allowed none, and it also fails when the
+   `submit_bound`, `consume_ticket`, `kGuardianDeploy`, the interleaving seam and the three
+   names a store member needs to reach them without spelling those (`submit_impl`,
+   `consume_core`, `BoundRequest`) in code, per file, and fails unless each count equals its
+   allow-list entry exactly. Nothing is exempt: the store files are pinned like every other file
+   (a member added there that mints or consumes through any of the seven raises a count and
+   fails), a file with no entry is allowed none, and it also fails when the
    store, `mcp_server.cpp` or `server.cpp` is not scanned. Its own tests plant a producer, a
    store wrapper and prefixed literals in temp trees to show it is not blind. What it does NOT
    see: a wrapper that is only CALLED from elsewhere under its own name (the caller names the
    wrapper, not the primitive), the difference between the pooled `consume_ticket` overload and
    the held one (swapping the one MCP call from one to the other stays green), anything outside
    `server/core/src` (`server/core/include`, `common/include`, `sdk/include`, `tests/`),
-   a generated file, another extension, a macro that pastes a name together, and any behaviour.
-   It is a tripwire for a careless first producer, not a control against a deliberate one.
+   a generated file, another extension, a macro that pastes a name together, a few lexer shapes
+   with no instance in the tree (a token split by a line splice, a universal-character-name
+   spelling, an unterminated block comment at end of file; the test header lists them), and any
+   behaviour. It is a tripwire for a careless first producer, not a control against a deliberate one.
 
 ### PR3 entry conditions
 
@@ -259,18 +271,28 @@ consumed row keeps reading as the ordinary refusal it is. The consuming statemen
 row VERSION of the last row examined, which is two values: `xmin` (the transaction that wrote the
 version) and `ctid` (its tuple position). An update of the row by ANOTHER transaction between the
 checks and the statement, in any column (`consumed_at`, `reviewed_at`, `definition_id` and the
-rest included), moves `xmin`; a second write by a transaction that already wrote the row (the
-held overload, when the caller's own transaction wrote it first) keeps `xmin`, because every
-version one transaction writes carries its xid, and moves `ctid`. Either makes the statement
-match nothing and read as the uniform not-consumable; the explicit status, reviewer, request,
-digest, excluded-roots, origin and submitter pins are kept as defence in depth. What that is NOT:
-the check and the statement remain two statements, and a writer who can replace the row
-wholesale or work below SQL is outside what it can tell. It also fails closed, with a false
-refusal that a retry (a fresh read of the new version) clears: a no-op rewrite of the row is a
-new version, and VACUUM FULL or CLUSTER move `ctid` of an unchanged row; VACUUM FREEZE changes
-neither value and refuses nothing. It detects a row that moved by accident or by an old build; it
-is not a boundary against a principal with database write access. On an autocommit connection
-(the `cs-3` item below) the held overload gets only the pin.
+rest included), moves `xmin`; a second write at the same (sub)transaction level (the held
+overload, when the caller's own transaction wrote the row first) keeps `xmin`, because every
+version written at one level carries that level's xid, and moves `ctid` (a write after a
+SAVEPOINT carries the subtransaction's xid and moves `xmin` too, which only refuses more).
+Neither value alone is a version: a plain VACUUM between two other transactions' writes can put
+the new tuple back in the examined slot, and only `xmin` then tells them apart. For DML, either
+mismatch makes the statement match nothing and read as the uniform not-consumable; the explicit
+status, reviewer, request, digest, excluded-roots, origin and submitter pins are kept as defence
+in depth. What that is NOT: the check and the statement remain two statements; a writer who can
+replace the row wholesale or work below SQL is outside what it can tell; `xmin` is the raw
+32-bit xid with no epoch, so a different writer that received the same xid after a wraparound
+and reused the same slot would match; and, for the HELD overload only, a table-rewriting
+statement issued by the holding transaction itself (CLUSTER, a rewriting ALTER TABLE, TRUNCATE
+followed by a re-insert) can leave a changed row at the examined pair, which is why entry
+condition 3 forbids DDL on the redeeming connection (the only production caller today is
+pooled and cannot reach this). It also fails closed, with a false refusal: a no-op rewrite of
+the row is a new version, and VACUUM FULL or CLUSTER can move `ctid` of an unchanged row. After
+either, a retry (a fresh read of the new version) succeeds; when the other writer was a
+concurrent consume or a real edit, the refusal is correct and the retry is refused again.
+VACUUM FREEZE changes neither value and refuses nothing. It detects a row that moved by accident
+or by an old build; it is not a boundary against a principal with database write access. On an
+autocommit connection (the `cs-3` item below) the held overload gets only the pin.
 
 Each bullet below is a MUST. Its Proof names the case title and file that demonstrates it,
 except three that are descriptions rather than titles: the Classification proof's file (the
