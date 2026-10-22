@@ -1993,7 +1993,9 @@ TEST_CASE("TarDatabase: a corrupt tar.db's rollback journal is quarantined with 
         }
     }
     CHECK(moved == 1);
-    CHECK_FALSE(fs::exists(journal));
+    // Nothing byte-ful stays beside the fresh database (the Windows open() pre-creates an EMPTY
+    // protected journal there, so absence is not the portable statement).
+    CHECK((!fs::exists(journal) || fs::file_size(journal) == 0));
 }
 
 #ifndef _WIN32
