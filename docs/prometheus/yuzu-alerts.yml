@@ -374,10 +374,14 @@ groups:
             migration v5, which also removes existing duplicates) a NEW
             duplicate cannot be created: this fires only after the index
             `ux_agent_routes_session_id` was dropped by hand. Check first:
-            SELECT 1 FROM pg_indexes WHERE schemaname =
-            'gateway_route_store' AND indexname = 'ux_agent_routes_session_id';
-            If the index exists the duplicate is already gone and this alert
-            clears within the hour. If the index is missing, follow the
+            SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname =
+            'gateway_route_store' AND c.relname = 'ux_agent_routes_session_id'
+            AND i.indisunique AND i.indisvalid AND i.indpred IS NOT NULL;
+            (a row means the index exists, is unique, is valid and is partial;
+            a same-named index of another shape or an invalid one returns no
+            row). If it returns a row the duplicate is already gone and this
+            alert clears within the hour. If it returns no row, follow the
             recovery procedure in
             docs/user-manual/gateway.md "Recovering a missing unique session
             index" (tombstone the duplicates, then recreate the index under
@@ -431,12 +435,22 @@ groups:
             residual, ADR-2002 7f). The expected rate
             is zero: this means a forged or colliding presented id from a
             pinned gateway peer, a CC6.6 signal.
-            FIRST REMEDIATION: first rule out the migration artifact. If
-            yuzu_server_gateway_route_session_dedup_total is above 0 on this
-            start, or the server logged "migration v5 tombstoned N" shortly
-            before the first refusal, the refusals are the one-time v5 dedup
-            (the affected agents lost the replay race and re-register); they
-            stop on their own. Otherwise treat the alert as a forged or
+            FIRST REMEDIATION: first rule out the migration artifact. The
+            refusals are the one-time v5 dedup artifact ONLY IF BOTH hold: (a)
+            the number of session_held_by_other_agent refusals since that
+            start is at most N, the number of rows migration v5 tombstoned on
+            that start (yuzu_server_gateway_route_session_dedup_total on the
+            migrating start; the "migration v5 tombstoned N" WARN, or the
+            route_meta value after a restart), because a tombstoned group of
+            k rows can produce at most k-1 refusals; and (b) they all occur
+            within a few minutes of that start (about 1-2 heartbeat cycles).
+            Refusals that continue past that window, or exceed N, are NOT the
+            artifact: treat them as a forged or colliding id. The counter
+            keeps its migrating-start value for the whole process lifetime, so
+            it proves nothing about timing; after any restart it reads 0 and
+            the route_meta value has no timestamp, so use the earlier start's
+            WARN time (or the deploy time) and the route_meta count.
+            Otherwise treat the alert as a forged or
             colliding id. Find the server WARN, one of two texts:
             "ProxyRegister: presented session <id> for agent <agent> is
             already held by a different agent's directory row" (op

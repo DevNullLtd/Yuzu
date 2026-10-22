@@ -1707,8 +1707,10 @@ failures now count toward the shared breaker (see below).
   `yuzu_server_gateway_route_desync_total{op="notify_stream_status"}` with
   outcome `connected_unverified` (the directory read failed and this replica
   holds no matching local session) or `stale_connected_session` (the directory
-  row or the local registry names a different session). Recovery is the same:
-  the agent's next reconnect.
+  row or the local registry names a different session). The same holds for the
+  `op="announce_connected"` refusals `session_held_by_other_agent` and
+  `cluster_affinity_violation`. Recovery is the same: the agent's next
+  reconnect.
 - Correctness on several core replicas (see below).
 - Any order beyond first-in, first-out in sorted session-id order. The gateway
   sorts the ids it keeps from one response, so each verdict's agents are queued
@@ -2199,12 +2201,21 @@ reads 0 on any later restart. The durable record is the `route_meta` row
 (`SELECT value FROM gateway_route_store.route_meta WHERE key = 'v5_session_dedup_tombstoned_rows';`),
 and a later start logs it once at INFO. A tombstoned agent's replay can lose the
 race to another tombstoned agent that presented the same id first; the loser is
-refused (`session_held_by_other_agent`) and re-registers with a fresh session. So
-when `YuzuGatewaySessionHeldByOtherAgent` fires: if
-`yuzu_server_gateway_route_session_dedup_total` is above 0 on this start, or the
-`migration v5 tombstoned N` WARN appeared shortly before the first refusal, the
-refusals are the migration artifact (the affected agents lost the replay race)
-and stop by themselves; otherwise treat the alert as a forged or colliding id.
+refused (`session_held_by_other_agent`) and re-registers with a fresh session.
+So when `YuzuGatewaySessionHeldByOtherAgent` fires, the refusals are the
+one-time migration artifact ONLY IF BOTH hold: (a) the number of
+`session_held_by_other_agent` refusals since that start is at most N, the number
+of rows migration v5 tombstoned on that start
+(`yuzu_server_gateway_route_session_dedup_total` on the migrating start; the
+`migration v5 tombstoned N` WARN, or the `route_meta` value after a restart),
+because a tombstoned group of k rows can produce at most k-1 refusals; and (b)
+they all occur within a few minutes of that start (about 1-2 heartbeat cycles).
+Refusals that continue past that window, or exceed N, are NOT the artifact:
+treat them as a forged or colliding id and escalate. The counter keeps its
+migrating-start value for the whole process lifetime, so it proves nothing about
+timing; after any restart it reads 0 and the `route_meta` value has no
+timestamp, so use the earlier start's WARN time (or the deploy time) and the
+`route_meta` count.
 See
 [upgrading](upgrading.md#behaviour-change-gateway-sessions-are-unique-per-agent-a-one-time-migration-gateway_route_store-v5-5683).
 
@@ -2216,29 +2227,41 @@ other name is not recognised, so a racing adopt fails as a generic route-write
 error, `ProxyRegister` answers `UNAVAILABLE` and the gateway counts that against
 its circuit breaker.
 
-1. Find the duplicates:
+1. Find the duplicates (optional; the block below tombstones none if there are
+   none):
    `SELECT session_id, array_agg(agent_id) FROM gateway_route_store.agent_routes WHERE session_id IS NOT NULL GROUP BY session_id HAVING count(*) > 1;`
-2. Tombstone them with the same statement migration v5 uses (every row of each
-   duplicate group; the affected agents re-register through the replay):
+2. Tombstone the duplicates and recreate the index in ONE transaction. The lock
+   stops any writer creating a new duplicate in between, and the tombstone is
+   the statement migration v5 uses (every row of each duplicate group; the
+   affected agents re-register through the replay). Run it as one block:
    ```sql
+   BEGIN;
+   SET LOCAL lock_timeout = '30s';
+   LOCK TABLE gateway_route_store.agent_routes IN ACCESS EXCLUSIVE MODE;
    UPDATE gateway_route_store.agent_routes
    SET session_id = NULL, lease_until = NULL, cluster_id = NULL,
        gateway_node = NULL, stream_home_id = NULL, updated_at = now()
    WHERE session_id IN (
        SELECT session_id FROM gateway_route_store.agent_routes
        WHERE session_id IS NOT NULL GROUP BY session_id HAVING count(*) > 1);
+   CREATE UNIQUE INDEX ux_agent_routes_session_id
+       ON gateway_route_store.agent_routes (session_id) WHERE session_id IS NOT NULL;
+   COMMIT;
    ```
-3. Recreate the index with the exact name:
-   `CREATE UNIQUE INDEX ux_agent_routes_session_id ON gateway_route_store.agent_routes (session_id) WHERE session_id IS NOT NULL;`
-   Run steps 2 and 3 in one transaction that first takes
-   `LOCK TABLE gateway_route_store.agent_routes IN ACCESS EXCLUSIVE MODE`, so no
-   writer can create a new duplicate between them.
-4. Drop the old non-unique index only if it still exists:
+   You do not need to stop the server. While the block runs, the live server's
+   statements on `agent_routes` stall (about 2.4 s per million rows for the
+   build); if the lock is not granted within 30 s the block rolls back and
+   nothing changed, so it is safe to retry.
+3. Drop the old non-unique index only if it still exists (a no-op when
+   migration v5 already ran):
    `DROP INDEX IF EXISTS gateway_route_store.agent_routes_session_id_idx;`
 
 If the server will not start after an upgrade because an object named
 `ux_agent_routes_session_id` already exists with another shape, migration v5
-failed on purpose and rolled back: drop that object
+failed on purpose and rolled back. The server log shows
+`PgMigrationRunner: migration v5 failed for gateway_route_store:` carrying the
+Postgres error `relation "ux_agent_routes_session_id" already exists`, followed
+by `GatewayRouteStore: schema migration failed`. Drop that object
 (`DROP INDEX gateway_route_store.ux_agent_routes_session_id;`) and restart.
 
 **Agent dependency.** The ordinary restart path above does not need the agent
