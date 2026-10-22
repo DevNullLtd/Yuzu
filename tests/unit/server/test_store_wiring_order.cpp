@@ -768,5 +768,5 @@ TEST_CASE("server.cpp: every username-keyed legacy-open resolver keeps its engin
     // reads could disagree across a concurrent toggle and let an engine through both branches).
     CHECK(count("!enforced && yuzu::server::authz::is_engine_principal_name(username)") == 2);
     // response_visible_set_fn returns no agents for an engine under legacy-open.
-    CHECK(count("if (yuzu::server::authz::is_engine_principal_name(username))") >= 1);
+    CHECK(count("if (yuzu::server::authz::is_engine_principal_name(username))") == 1);
 }

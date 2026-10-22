@@ -33,7 +33,8 @@
 ///   * a missing or unopened `RbacStore`.
 ///
 /// RBAC legacy-open (`rbac_enforcement_in_effect()` false) ADMITS, matching
-/// every other authz call site's posture.
+/// every other authz call site's posture, except for an engine principal (`engine:<slug>`),
+/// whose only authority is an explicit RBAC grant (#6204).
 
 #include "command_capability.hpp"
 #include "rbac_store.hpp"
