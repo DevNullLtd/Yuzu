@@ -230,7 +230,7 @@ conditions (security-guardian `sec-1`, with the architect's five conditions):
    four things: the `excluded_roots` refusal in `approve()`, `submit_bound` (with
    `BoundRequest`, `SubmitError` and their validation), the `kGuardianDeploy` origin, and the
    caller-held-transaction `consume_ticket(PGconn*, ...)` overload with its
-   `ConsumeTestStage` seam; migration v2's columns stay (they are forward-only and harmless
+   `ConsumeTestStage` seam; migration v3's columns stay (they are forward-only and harmless
    empty). Removing them also touches their compile and test dependents: the `kGuardianDeploy`
    entry in the `yuzu_approval_precondition_denied_total` pre-seed loop in `server.cpp` (and the
    series' documentation in `metrics.md`), and the allow-list in
@@ -440,8 +440,9 @@ keep them green and extend them to the new surface. Test names are the case titl
   `reject: the submitter is refused and the page does not offer it`, in
   `test_approval_manager_bound.cpp`.
 - **Rollback** (`g8-up-4`): the operator-rule option of condition 4's rollback leg. A build older
-  than migration v2 starts against a v2 schema (the runner skips versions it does not know and
-  has no schema-ahead guard, so the new build's boot check cannot stop the old one), reads a
+  than migration v3 starts against a v3 schema (a pre-#6096 build knows migration v1 only and a
+  #6096 build without this change knows v1 and v2; the runner skips versions it does not know
+  and has no schema-ahead guard, so the new build's boot check cannot stop the old one), reads a
   bound row as unbound and ignores `excluded_roots`. Rolling back while any bound ticket is
   pending or approved-and-unconsumed MUST be refused by the operator runbook, or those tickets
   MUST be rejected first. `upgrading.md` states the rule in prose today; the PR MUST add the

@@ -298,7 +298,7 @@ bool requires_bound_request(ApprovalOrigin origin) {
 namespace {
 
 // `excluded_roots` is stored as a JSON array of strings; '' (the column default, and
-// every row minted before migration v2) means "none". nullopt == the column holds
+// every row minted before migration v3) means "none". nullopt == the column holds
 // something else: callers that ENFORCE the list refuse on it, they never read it as
 // empty.
 std::optional<std::vector<std::string>> decode_excluded_roots(const std::string& text) {
@@ -411,7 +411,7 @@ bool same_human_root(const std::string& a, const std::string& b) { return a == b
 // as a store error, see integrity_refusal).
 //
 // A legacy row (no request_json, no digest, no excluded roots) passes the digest and
-// roots checks by construction, so every pre-v2 and unbound ticket redeems as before.
+// roots checks by construction, so every pre-v3 and unbound ticket redeems as before.
 struct IntegrityFault {
     std::string cause;
     bool unevaluated{false}; ///< the digest could not be computed: nothing was decided

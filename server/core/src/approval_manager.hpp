@@ -223,7 +223,7 @@ struct Approval {
     /// The exact effect a reviewer is shown, frozen at mint (#6062, four-eyes MVP
     /// PR2). EMPTY for every ticket minted through the unbound `submit()` (all MCP,
     /// interactive-instruction and scheduled-fire tickets today, and every row that
-    /// predates migration v2): an empty value means "this ticket binds no request",
+    /// predates migration v3): an empty value means "this ticket binds no request",
     /// never "an empty request was reviewed". Only `submit_bound()` writes it, and
     /// nothing updates it afterwards. The store treats it as an opaque UTF-8 JSON
     /// document; the Approvals page renders a bounded summary of it (see
