@@ -158,6 +158,8 @@ constexpr std::int64_t kDegradeEpisodeGapSecs = 60;
 
 constexpr std::array<std::string_view, 3> kRecognizedIdpSources = {"entra", "saml", "ad"};
 constexpr std::string_view kLocalPrefix = "local:";
+// Keep in step with `authz::is_engine_principal_name` (authz_model.hpp), the engine-namespace test the
+// username-keyed server resolvers use; rbac_store.cpp does not depend on that header.
 constexpr std::string_view kEnginePrefix = "engine:";
 
 bool has_reserved_idp_prefix(std::string_view name) {

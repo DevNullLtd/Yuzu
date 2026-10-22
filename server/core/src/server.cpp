@@ -12522,6 +12522,8 @@ private:
 
         yuzu::server::authz::ExecVisibleFacts facts;
         facts.legacy_open = !rbac_enforcement_in_effect(rbac_store_.get());
+        // Tripwire: an engine is not an AuthDB user, so the principal_resolves check above already
+        // denied an `engine:` creator; this keeps the composer correct if that ever changes.
         facts.principal_is_engine = yuzu::server::authz::is_engine_principal_name(username);
         facts.global_grant =
             rbac_store_ && rbac_store_->check_permission(username, "Execution", "Execute");
@@ -12789,9 +12791,11 @@ private:
     /// Mirrors every other dispatch-adjacent RBAC read in this file (e.g.
     /// derive_exec_visible's own `legacy_open` composition): a
     /// loaded-and-explicitly-disabled store is legacy-open, and legacy-open
-    /// means "RBAC off, everyone may do everything" — the SAME bypass every
-    /// other securable already grants here, not a new one minted for this
-    /// chokepoint.
+    /// means "RBAC off, every HUMAN principal may do everything" — the SAME
+    /// bypass every other securable already grants here, not a new one minted
+    /// for this chokepoint. An ENGINE principal (`engine:<slug>`) is the one
+    /// exclusion: its only authority is an explicit RBAC grant, so under
+    /// legacy-open it is refused, never admitted (#6204).
     [[nodiscard]] bool dispatch_has_permission(std::string_view principal,
                                                std::string_view securable,
                                                yuzu::server::authz::Operation op) const {
@@ -13346,15 +13350,17 @@ private:
         auto agents = registry_.to_json_obj();
         // An engine principal's only authority is an explicit RBAC grant: with RBAC off it
         // sees no agents rather than the legacy-open fleet.
-        if (yuzu::server::authz::is_engine_principal_name(username) &&
-            !rbac_enforcement_in_effect(rbac_store_.get()))
+        // ONE enforcement snapshot per decision: two separate reads could disagree across a
+        // concurrent toggle and let an engine fall through both branches to the full fleet.
+        const bool enforced = rbac_enforcement_in_effect(rbac_store_.get());
+        if (!enforced && yuzu::server::authz::is_engine_principal_name(username))
             return nlohmann::json::array();
         // #1498 — restrict whenever RBAC enforcement is in effect, which includes
         // a missing/load-failed store (fail closed); only a loaded-and-explicitly-
         // disabled store skips filtering and returns the full fleet. Shares the
         // rbac_enforcement_in_effect predicate with the get_visible_agents probe
         // so /api/agents and the TAR fleet scan can never disagree.
-        if (mgmt_group_store_ && rbac_enforcement_in_effect(rbac_store_.get())) {
+        if (mgmt_group_store_ && enforced) {
             // A global Infrastructure:Read grant sees the whole fleet even under
             // RBAC-on. On a load-failed store check_permission is unavailable
             // (is_open()==false), so this is false and visibility falls to the
@@ -15827,10 +15833,11 @@ private:
         auto visible_set_fn =
             [this](const std::string& username) -> std::optional<std::set<std::string>> {
             // Engine principal, RBAC off: legacy-open does not apply to it, so it sees nothing.
-            if (yuzu::server::authz::is_engine_principal_name(username) &&
-                !rbac_enforcement_in_effect(rbac_store_.get()))
+            // ONE enforcement snapshot: two reads could disagree across a concurrent toggle.
+            const bool enforced = rbac_enforcement_in_effect(rbac_store_.get());
+            if (!enforced && yuzu::server::authz::is_engine_principal_name(username))
                 return std::set<std::string>{};
-            if (mgmt_group_store_ && rbac_enforcement_in_effect(rbac_store_.get())) {
+            if (mgmt_group_store_ && enforced) {
                 bool global_read = rbac_store_ && rbac_store_->is_open() &&
                                    rbac_store_->check_permission(username, "Infrastructure", "Read");
                 if (!global_read) {

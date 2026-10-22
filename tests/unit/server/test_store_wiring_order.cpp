@@ -740,3 +740,33 @@ TEST_CASE("find_confined_dispatch_sink_sites recognises the documented construct
         CHECK(find_confined_dispatch_sink_sites(std::string_view(d).substr(0, 27)).empty());
     }
 }
+
+// #6204: the username-keyed visibility and dispatch-permission resolvers in server.cpp must keep
+// their engine arm (an engine principal's only authority is an explicit RBAC grant, so the
+// legacy-open fallback must never apply to it). ServerImpl is not unit-constructible, so these
+// resolvers cannot be driven behaviourally; the pure composer and RbacStore halves are covered in
+// test_authz_model.cpp. This is a STRING-PRESENCE pin: it catches a dropped engine arm, not a
+// wrong one, the same limit the other cases in this file document.
+TEST_CASE("server.cpp: every username-keyed legacy-open resolver keeps its engine arm (#6204)",
+          "[wiring_order][6204]") {
+    const std::string& text = cached_server_cpp_text();
+    const auto count = [&text](std::string_view needle) {
+        std::size_t n = 0;
+        for (auto pos = text.find(needle); pos != std::string::npos;
+             pos = text.find(needle, pos + needle.size()))
+            ++n;
+        return n;
+    };
+    // The session-keyed and username-keyed exec-visible derivations both feed the composer.
+    CHECK(count("facts.principal_is_engine = sess.is_engine();") == 1);
+    CHECK(count("facts.principal_is_engine = yuzu::server::authz::is_engine_principal_name(username);") == 1);
+    // dispatch_has_permission: legacy-open admits everyone EXCEPT an engine principal.
+    CHECK(count("return !yuzu::server::authz::is_engine_principal_name(principal);") == 1);
+    // response_agent_in_scope shares the same shape with `username`.
+    CHECK(count("return !yuzu::server::authz::is_engine_principal_name(username);") == 1);
+    // get_visible_agents_json and visible_set_fn take ONE enforcement snapshot per decision (two
+    // reads could disagree across a concurrent toggle and let an engine through both branches).
+    CHECK(count("!enforced && yuzu::server::authz::is_engine_principal_name(username)") == 2);
+    // response_visible_set_fn returns no agents for an engine under legacy-open.
+    CHECK(count("if (yuzu::server::authz::is_engine_principal_name(username))") >= 1);
+}

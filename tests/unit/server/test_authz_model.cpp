@@ -423,6 +423,15 @@ TEST_CASE("authz_model #6204: an engine principal is never handed the legacy-ope
         REQUIRE(broken.has_value());
         CHECK(broken->empty());
     }
+    SECTION("JIT elevation does not apply to an engine: RBAC on, no grant, elevated => its scoped set") {
+        f.legacy_open = false;
+        f.elevated = true;
+        f.scoped_visible = std::unordered_set<std::string>{"a_one"};
+        auto visible = yuzu::server::authz::compose_exec_visible(f);
+        REQUIRE(visible.has_value()); // NOT nullopt
+        CHECK(visible->size() == 1);
+        CHECK(visible->contains("a_one"));
+    }
     SECTION("the SAME legacy-open facts for a human stay unfiltered") {
         f.principal_is_engine = false;
         CHECK_FALSE(yuzu::server::authz::compose_exec_visible(f).has_value());

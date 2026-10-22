@@ -447,7 +447,7 @@ struct ExecVisibleFacts {
     /// The ADR-0017 per-agent visible set. `nullopt` == store error, fail closed.
     std::optional<std::unordered_set<std::string>> scoped_visible;
     /// The caller is an engine principal (`engine:<slug>`). Its only authority is an explicit
-    /// RBAC grant (design §4.2 default-deny): no legacy-open fallback and no JIT elevation.
+    /// RBAC grant (docs/auth-engine-principals-design.md §4.2 default-deny): no legacy-open fallback and no JIT elevation.
     bool principal_is_engine = false;
 };
 
@@ -467,6 +467,10 @@ struct ExecVisibleFacts {
 /// minting a service-A token still matched the global grant, came out
 /// unfiltered, and reached the whole fleet. Checking the global grant first —
 /// or composing the two branches independently — reintroduces exactly that.
+///
+/// An ENGINE principal (`principal_is_engine`) is resolved next, RBAC-only: legacy-open yields
+/// present-EMPTY (never `nullopt`), a global grant yields `nullopt`, otherwise its scoped set; JIT
+/// elevation never applies to it (design §4.2 default-deny).
 ///
 /// This is a free function rather than a method for one reason: the previous
 /// arrangement, where the decision lived only inside `ServerImpl`, could not be

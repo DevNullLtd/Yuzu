@@ -59,7 +59,9 @@ namespace yuzu::server {
     if (rbac == nullptr || !rbac->is_open())
         return false;
     if (!rbac_enforcement_in_effect(rbac))
-        return true;
+        // Legacy-open arms for everyone EXCEPT an engine principal, whose only authority is an
+        // explicit RBAC grant (and RBAC is off here).
+        return !yuzu::server::authz::is_engine_principal_name(principal);
     return rbac->check_permission(principal, std::string(classified->securable),
                                   std::string(yuzu::server::authz::to_string(classified->operation)));
 }
