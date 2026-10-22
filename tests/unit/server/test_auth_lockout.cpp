@@ -161,12 +161,17 @@ TEST_CASE_METHOD(LockoutFixture, "expired window unlocks and grants a fresh budg
     {
         auto lease = db.pool().acquire();
         REQUIRE(lease);
-        REQUIRE(yuzu::server::pg::exec_params(
-                    lease.get(),
-                    "UPDATE auth.users SET locked_until = now() - interval '1 second' "
-                    "WHERE username = 'alice'",
-                    std::vector<std::string>{})
-                    .ok());
+        // The WHERE clause is the authored-width check the old 3.5 s sleep gave for free:
+        // the 1 s window must still be open (> now()) and no wider than 3 s, so a window
+        // authored in the wrong unit (minutes, hours) matches no row and fails here.
+        auto res = yuzu::server::pg::exec_params(
+            lease.get(),
+            "UPDATE auth.users SET locked_until = now() - interval '1 second' "
+            "WHERE username = 'alice' AND locked_until > now() "
+            "AND locked_until <= now() + interval '3 seconds' RETURNING 1",
+            std::vector<std::string>{});
+        REQUIRE(res.ok());
+        REQUIRE(PQntuples(res.get()) == 1);
     }
 
     // The lock auto-expires — no background job needed.

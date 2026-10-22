@@ -128,12 +128,17 @@ TEST_CASE_METHOD(BreakGlassFixture, "expired window auto-disarms", "[pg][auth][b
     {
         auto lease = db.pool().acquire();
         REQUIRE(lease);
-        REQUIRE(yuzu::server::pg::exec_params(
-                    lease.get(),
-                    "UPDATE auth.users SET break_glass_armed_until = now() - interval '1 second' "
-                    "WHERE username = 'alice'",
-                    std::vector<std::string>{})
-                    .ok());
+        // The WHERE clause is the authored-width check the old sleep gave for free: the
+        // 1 s arm must still be open (> now()) and no wider than 3 s, so a window authored
+        // in the wrong unit matches no row and fails here.
+        auto res = yuzu::server::pg::exec_params(
+            lease.get(),
+            "UPDATE auth.users SET break_glass_armed_until = now() - interval '1 second' "
+            "WHERE username = 'alice' AND break_glass_armed_until > now() "
+            "AND break_glass_armed_until <= now() + interval '3 seconds' RETURNING 1",
+            std::vector<std::string>{});
+        REQUIRE(res.ok());
+        REQUIRE(PQntuples(res.get()) == 1);
     }
 
     // The arm auto-expires with no background job — the login gate would now
