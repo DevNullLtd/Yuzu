@@ -626,7 +626,8 @@ disagree: the `consume_ticket` CAS, its diagnostic read, `submit()`'s approved-t
   retire, advance). After the occurrence is durably enqueued (`Enqueued` or `AlreadyEnqueued`) and BEFORE the
   schedule advances, the runner calls `ApprovalManager::retire_schedule_tickets(schedule_id, occurrence_key,
   ids)`: one UPDATE (`WHERE schedule_id AND consumed_at = 0 AND status IN ('approved','rejected') AND id =
-  ANY(ids)`, `consumed_at` on database time, `consumed_by = 'schedule:<occurrence key>'`, never empty). `ids`
+  ANY(ids)`, `consumed_at` on database time, `consumed_by = 'schedule:<occurrence key>'`, or `schedule:ledger-spent:<occurrence key>` for the
+  ledger-spent site below; never empty). `ids`
   are the unsettled tickets of that schedule the runner OBSERVED in its own snapshot this tick (matched,
   mismatch-skipped, expired-unswept, outbox-spent; on a rejected skip, the rejected ones too), so an approved
   mismatch-skipped ticket is retired with the one that fired (otherwise it could fire a LATER occurrence after
@@ -634,7 +635,10 @@ disagree: the `consume_ticket` CAS, its diagnostic read, `submit()`'s approved-t
   is never touched. Pending tickets are never touched. A retire store failure or exception HOLDS the
   occurrence; the next tick re-enqueues the same occurrence key (idempotent) and retries the retire, so a
   failure between the enqueue and the retire can neither lose the fire nor run it twice. A rejected ticket is
-  retired the same way after it skips its occurrence. When no ticket is eligible but the occurrence key is
+  retired the same way after it skips its occurrence. Every retire site settles only observed ids, by a CAS
+  from unsettled: the enqueue site and the already-ran site run after the outbox row exists; the ledger-spent
+  site settles tickets whose outbox row belongs to an EARLIER occurrence; the rejected-skip site has no outbox
+  row. When no ticket is eligible but the occurrence key is
   already in the outbox (retire ok, advance failed), the runner advances without raising a fresh ask. The
   retire is deliberately NOT epoch-fenced: the only fenced write is the outbox INSERT (`ScheduleRunner::tick`
   is FencedLeaderOnly); on the enqueue paths the retire only runs after the outbox row exists (whoever
@@ -668,8 +672,9 @@ disagree: the `consume_ticket` CAS, its diagnostic read, `submit()`'s approved-t
   `consumed_at`, so they would all look unspent. Approvals schema migration v2 retires every unsettled
   approved/rejected ticket that has a `schedule_id` (`consumed_by = 'schedule:legacy-6096'`), once per
   database, with no comparison between `submitted_at` and `last_executed_at`, under a 300 s statement
-  timeout (a verified bound: `SET LOCAL` was observed to take effect when sent as one message inside the
-  step's transaction, also over a shorter session-level timeout). It touches every unsettled approved or
+  timeout (`SET LOCAL` was observed to take effect when sent as one libpq `PQexec` message inside the
+  step's transaction, also over a shorter session-level timeout, in a one-off check on a throwaway PG16 by the
+  implementer; it is not a repo test, and the repo tests pin only that the statement carries the prefix). It touches every unsettled approved or
   rejected scheduled ticket, including old rejected ones (rejected tickets never expire and are never swept).
   The deny direction: a legitimate approved-but-unfired ticket at upgrade time just gets a fresh ask. See the upgrade note in `docs/user-manual/upgrading.md`.
 - **Parts 1, 2 and 4 DECLINED for the approved-ticket and the pending path; part 3 is not declined

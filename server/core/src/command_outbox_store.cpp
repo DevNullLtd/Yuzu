@@ -280,7 +280,7 @@ CommandOutboxStore::occurrences_for_approval(const std::string& approval_id) con
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT occurrence_id FROM command_outbox_store.outbox WHERE approval_id = $1 "
-        "AND approval_id <> ''", // literal predicate: always matches outbox_approval_idx
+        "AND approval_id <> ''", // lets the planner prove the partial index applies
         std::vector<std::string>{approval_id});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("CommandOutboxStore::occurrences_for_approval: query failed: {}",

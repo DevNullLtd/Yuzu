@@ -129,8 +129,10 @@ struct Approval {
     // principal whose recall executed the gated tool. Empty while unconsumed.
     // SQLite-era additive column (v3). Completes the ticket's evidence chain:
     // submitted_by → reviewed_by → consumed_by. For a schedule ticket (#6096) it is
-    // `schedule:<schedule_id>:<next_execution_at>` (the occurrence it settled), or
-    // `schedule:legacy-6096` for a ticket the v2 migration retired.
+    // `schedule:<schedule_id>:<next_execution_at>` (the occurrence it settled),
+    // `schedule:ledger-spent:<schedule_id>:<next_execution_at>` (a ticket the outbox ledger
+    // showed an EARLIER occurrence had used), or `schedule:legacy-6096` for a ticket the v2
+    // migration retired.
     std::string consumed_by;
     /// Empty for an interactively-submitted ticket (workflow_routes.cpp) or an
     /// MCP-minted one (mcp_server.cpp); set to the owning schedule's id for a
@@ -573,8 +575,9 @@ public:
     /// ticket needs `consumed_at == 0` to be eligible (necessary but not sufficient: the outbox
     /// ledger also decides). One guarded UPDATE keyed on
     /// `consumed_at = 0` (not a read followed by a write) and on `id = ANY(ids)`, stamped from
-    /// DATABASE time, with `consumed_by = 'schedule:' + occurrence_id`
-    /// (`schedule_id:next_execution_at`, the outbox key) so the evidence chain is never empty.
+    /// DATABASE time, with `consumed_by = 'schedule:' + occurrence_id`, where `occurrence_id` is
+    /// the outbox key (`schedule_id:next_execution_at`) or `ledger-spent:<that key>`, so the
+    /// evidence chain is never empty.
     /// Returns the number of rows THIS call retired; 0 is not an error (empty `ids`, nothing
     /// unsettled, or another caller got there first). Pending tickets are never touched.
     ///
@@ -591,6 +594,11 @@ public:
     /// The next tick finds the occurrence already in the outbox and advances without a fresh
     /// ask (the outbox guard); the burnt ticket is simply spent. There is deliberately no
     /// replay eligibility keyed on `consumed_by` equalling the occurrence key.
+    ///
+    /// Every retire site settles only observed ids, by a CAS from unsettled. The enqueue site
+    /// and the already-ran site run after the outbox row exists; the ledger-spent site settles
+    /// tickets whose outbox row belongs to an EARLIER occurrence; the rejected-skip site has no
+    /// outbox row.
     ///
     /// Deliberately NOT epoch-fenced. The only fenced write is the outbox INSERT
     /// (`ScheduleRunner::tick` is FencedLeaderOnly). On the enqueue paths the retire only runs

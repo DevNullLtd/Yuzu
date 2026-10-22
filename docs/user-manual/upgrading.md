@@ -259,10 +259,20 @@ older binary ignores, so a rollback starts cleanly. What changes is which checks
   already used are untouched. Nothing to do. The step is data only (no table or column changes). It touches
   every unsettled approved or rejected scheduled ticket, including old rejected ones (rejected tickets never expire
   and are never swept); that is normally small. It runs inside the upgrade transaction under a 300 s statement
-  timeout and is skipped on every later start. The command outbox also gains a small index on its approval id
+  timeout and is skipped on every later start. If the 300 s timeout is hit the step fails, nothing is applied,
+  and the approvals store does not open (the server logs a schema migration failure for that store); investigate
+  the table size and restart. The command outbox also gains a small index on its approval id
   (`outbox_approval_idx`) at the same upgrade; its build is bounded by the same 300 s timeout.
+- **Upgrade one replica first when the outbox table is large (#6096).** Building `outbox_approval_idx` takes a share
+  lock on the outbox table for up to 300 s, so enqueue and claim on other replicas wait meanwhile. A second replica
+  that boots at the same time waits on the migration advisory lock under the pool's default lock and statement
+  timeouts and may fail its boot closed; restarting it recovers, because the migration is then applied. The
+  recommendation is to start ONE replica, wait for it to finish migrating, then start the others. These are not
+  measured numbers.
 - **Where the legacy marker lives (#6096).** The retired tickets carry `consumed_by = 'schedule:legacy-6096'` in
-  `approval_manager.approvals`. It is readable only by SQL; no API returns it. To list them:
+  `approval_manager.approvals`. It is readable only by SQL; no API returns it. Tickets the outbox showed had already
+  been used by an earlier occurrence carry the related marker `consumed_by = 'schedule:ledger-spent:<schedule id>:<n>'`;
+  tickets settled by a normal fire or skip carry `schedule:<schedule id>:<n>`. To list the legacy ones:
 
   ```sql
   SELECT id, status, schedule_id, consumed_at

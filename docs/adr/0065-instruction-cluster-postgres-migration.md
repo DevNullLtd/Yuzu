@@ -261,7 +261,8 @@ process-clock `last_executed_at`, is removed rather than worked around: one appr
 scheduled run is now a guarded state transition plus a clock-free ledger. `ApprovalManager::
 retire_schedule_tickets(schedule_id, occurrence_key, ids)` is one UPDATE keyed on `consumed_at = 0`
 and scoped to the ticket ids the runner observed in its own snapshot (database-time `consumed_at`,
-`consumed_by = 'schedule:<occurrence key>'`); the runner calls it after the occurrence is durably
+`consumed_by = 'schedule:<occurrence key>'`, or `schedule:ledger-spent:<occurrence key>` for tickets
+the outbox ledger shows an earlier occurrence used); the runner calls it after the occurrence is durably
 enqueued and before the schedule advances, and a ticket is eligible only while `consumed_at = 0`. A
 retire failure or exception holds the occurrence; the idempotent occurrence key makes the retry safe.
 The command outbox is the spent-ticket ledger: before firing, the runner reads which occurrences
@@ -272,7 +273,9 @@ schedule advances without a fresh ask. Any future outbox reaper must retain rows
 ticket life. The retire is deliberately not epoch-fenced (the only fenced write is the outbox INSERT) and
 is safe because, on the enqueue paths, it runs only after the outbox row exists, and on the
 rejected-skip path it is an observed-ids-only CAS from unsettled, so a stale leader can only settle
-tickets it saw (the deny direction); retire-ok
+tickets it saw (the deny direction). Every retire site settles only observed ids by a CAS from
+unsettled: the enqueue and already-ran sites run after the outbox row exists, the ledger-spent site settles
+tickets whose row belongs to an earlier occurrence, and the rejected-skip site has no outbox row. Retire-ok
 with a failed advance burns one approval, accepted. `consume_ticket` still refuses `kSchedule` origins.
 `ScheduleEngine`'s own stamps stay process clock (due-ness bookkeeping, informational for approvals).
 The approvals ladder gains **v2**, a clock-free data migration that retires every pre-upgrade
