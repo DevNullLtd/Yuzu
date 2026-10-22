@@ -240,8 +240,10 @@ conditions (security-guardian `sec-1`, with the architect's five conditions):
    in a comment on #6060 before the first such TAG is cut; the deadline is that TAG. There is no
    release gate that checks this today. A tripwire keeps the question honest in between: `bound-
    approval primitives still have no production use (ADR-1009 tripwire, not proof)`, in
-   `test_approval_dormant_code_tripwire.cpp`. It lexes the `.cpp`, `.hpp`, `.inc`, `.cc` and `.h`
-   files under `server/core/src` and nowhere else (comments, and string, character and
+   `test_approval_dormant_code_tripwire.cpp`. It lexes every regular file under `server/core/src`
+   and nowhere else, whatever its extension (so a caller moved into an `.ipp`, `.inl` or `.tpp`
+   fragment is still seen), except an explicit list of documentation, data, image, font,
+   certificate and archive extensions that cannot be compiled into the server (comments, and string, character and
    raw-string literals including their `u8`, `u`, `U` and `L` prefixes, are excluded), counts
    `submit_bound`, `consume_ticket`, `kGuardianDeploy`, the interleaving seam and the three
    names a store member needs to reach them without spelling those (`submit_impl`,
@@ -252,13 +254,25 @@ conditions (security-guardian `sec-1`, with the architect's five conditions):
    store, `mcp_server.cpp` or `server.cpp` is not scanned. Its own tests plant a producer, a
    store wrapper and prefixed literals in temp trees to show it is not blind. What it does NOT
    see: a wrapper that is only CALLED from elsewhere under its own name (the caller names the
-   wrapper, not the primitive), the difference between the pooled `consume_ticket` overload and
-   the held one (swapping the one MCP call from one to the other stays green), anything outside
-   `server/core/src` (`server/core/include`, `common/include`, `sdk/include`, `tests/`),
-   a generated file, another extension, a macro that pastes a name together, a few lexer shapes
+   wrapper, not the primitive), the overload a changed declaration binds a call to, anything
+   outside `server/core/src` (`server/core/include`, `common/include`, `sdk/include`, `tests/`),
+   a generated file, a macro that pastes a name together, a few lexer shapes
    with no instance in the tree (a token split by a line splice, a universal-character-name
    spelling, an unterminated block comment at end of file; the test header lists them), and any
-   behaviour. It is a tripwire for a careless first producer, not a control against a deliberate one.
+   behaviour. The one production `consume_ticket` call is also pinned by the text of its argument
+   list, so replacing the pooled call in `mcp_server.cpp` with the caller-held overload (a
+   connection first, same identifier count) fails with a message naming both lists; that check
+   is lexical too. It is a tripwire for a careless first producer, not a control against a
+   deliberate one.
+
+   Any change to the tripwire's allow-list, its expected-count table, its pinned call shape or its
+   skip list is the act that activates the dormant code, and a PR that makes one MUST carry a
+   recorded review by a maintainer who is not its author (a PR-review obligation: the author
+   and the proving-test evidence are named in the PR). NOTHING enforces this today. The test
+   cannot see who reviewed, an author can edit the rules and their baseline together, the
+   repository has no CODEOWNERS entry for the test, `approval_manager.*` or this ADR, and no
+   branch-protection setting is claimed here; the failure message only names the conditions. The
+   obligation stands until an enforced review owner exists.
 
 ### PR3 entry conditions
 
