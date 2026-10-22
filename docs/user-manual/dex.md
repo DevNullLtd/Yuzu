@@ -446,6 +446,41 @@ does (agentic-first parity):
   value.
 - **`GET /api/v1/dex/devices/{id}/app-perf?app=`** — one device's retained per-app
   history (behavioral PII; scoped + audited fail-closed, `dex.device.app_perf.view`).
+- **`GET /api/v1/dex/perf/compare?group=&app=&baseline=&candidate=&window=`**, the
+  before/after comparison for an upgrade: the shift is computed per machine for
+  the machines in one management group that ran both versions, then aggregated
+  (`window` is days each side, default 7). Evidential only, with no verdict and no
+  device floor; audited as `dex.app_perf.compare` and denied to a service-scoped
+  API token.
+- **`GET /api/v1/dex/app?name=&window=`**, one application's blast radius (crash
+  and hang summary, faulting modules, exceptions, affected devices). Audited
+  fail-closed (`dex.app.view`) and denied to a service-scoped API token, because it
+  names devices fleet-wide.
+- **`GET /api/v1/dex/apps?window=`**, the application stability list (a distinct
+  device count per application, no `agent_id`; not audited).
+- **`GET /api/v1/dex/catalogue?os=&window=`**, the Catalogue family cards, fleet
+  coverage and the uncatalogued list, and **`GET /api/v1/dex/catalogue/group?name=&os=&window=`**,
+  one signal family's member signals (404 for an unknown family). Aggregates, not
+  audited.
+- **`GET /api/v1/dex/health?weighting=&window=`**, the derived composite health
+  score, and **`GET /api/v1/dex/trends?window=`**, the cross-OS comparison and
+  per-family trend source data. Aggregates, not audited.
+- **`GET /api/v1/dex/overview?window=`**, the landing-page fleet summary including
+  the top-devices list. Audited fail-closed (`dex.overview.view`) and denied to a
+  service-scoped API token.
+- **`GET /api/v1/dex/devices/{id}`**, one device's score and signal summary
+  (`window`; scoped to the device, audited fail-closed as `dex.device.view`), and
+  **`GET /api/v1/dex/devices/{id}/history?window=`**, that device's raw signal
+  history (same scope and audit verb).
+- **`GET /api/v1/dex/devices/{id}/observations/{event_id}`**, one observation's
+  detail (scoped, audited fail-closed as `dex.observation.view`; an unknown or
+  foreign event id is a 404).
+- **`POST /api/v1/dex/devices/{id}/live?kind=uptime|processes`**, the "Get live
+  info" read: it dispatches a read-only instruction to the device and waits up to
+  about 20 seconds for the result (hence POST, not GET). Needs scoped `Read` and
+  `Execute`, audited before dispatch (`device.live.uptime` or
+  `device.live.processes`), and answers 429, 502, 503 or 504 when the device
+  cannot answer in time.
 
 The signal endpoints take a `window` of `24h`/`7d`/`30d`/`all` (and the
 catalogue rollup + per-signal drill-down additionally take the optional `os`
@@ -481,10 +516,10 @@ MCP tools (`list_dex_signals`,
 `get_dex_tag_app_perf`); the
 version-row devices drill has its own MCP twin `list_dex_app_perf_devices`
 (same `dex.app_perf.devices.view` audit, set-and-proceed on MCP); the
-per-device app-perf drill is exposed via REST **and** the dashboard device drill
-(the "Application performance over time" panel, same `dex.device.app_perf.view`
-audit) but has **no MCP twin** (MCP's set-and-proceed posture can't express the
-REST fail-closed contract). Full request/response
+per-device app-perf drill is exposed via REST, the dashboard device drill
+(the "Application performance over time" panel) and the MCP tool
+`get_dex_device_app_perf` (all three write the same `dex.device.app_perf.view`
+audit). Full request/response
 shapes are in [`rest-api.md`](rest-api.md#dex-digital-employee-experience) and
 `GET /api/v1/openapi.json`.
 

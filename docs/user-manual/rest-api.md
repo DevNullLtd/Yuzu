@@ -1074,7 +1074,7 @@ The `expires_at` above is a placeholder epoch: with `mcp_tier` set it must be in
 | `expires_at` | integer | No | Unix epoch seconds, in the future. `0` or omitted = never expires. **Required** for MCP tokens (max 90 days). Must be one JSON integer: a string, float, boolean, `null`, a negative or past value, or one above 9223372036854775807 is `400` and mints nothing. |
 | `mcp_tier` | string | No | MCP authorization tier: `"readonly"`, `"operator"`, or `"supervised"`. Omit for standard API tokens. When set, `expires_at` is mandatory. |
 
-`mcp_tier` is honored at mint time (a value outside `readonly`/`operator`/`supervised` is rejected). A tiered (`mcp_tier` set) or service-scoped token also requires a valid `expires_at` within the 90-day cap. Setting `scope_service` requires RBAC to be enabled and either a global `ManagementGroup:Write` grant or `ITServiceOwner` on the `"Service: <scope_service>"` management group — see [Service-Scoped Tokens](authentication.md#service-scoped-tokens).
+`mcp_tier` is honored at mint time (a value outside `readonly`/`operator`/`supervised` is rejected). A tiered (`mcp_tier` set) or service-scoped token also requires a valid `expires_at`; the 90-day cap applies to tiered (`mcp_tier` set) tokens only, so a service-scoped token without a tier may expire later than that. Setting `scope_service` requires RBAC to be enabled and either a global `ManagementGroup:Write` grant or `ITServiceOwner` on the `"Service: <scope_service>"` management group — see [Service-Scoped Tokens](authentication.md#service-scoped-tokens).
 
 **Validation errors (`400`):**
 
@@ -1626,7 +1626,7 @@ curl -s -X DELETE \
 
 Self-revoke "Sign out everywhere". Wipes every cookie session belonging to the authenticated caller AND revokes every API token they own. This is intended as the lost-device recovery flow: every credential bearing the caller's identity is killed in one call.
 
-**Permission:** Any interactive authenticated session (cookie). MCP-tier tokens and service-scoped automation tokens are explicitly rejected with 403 — those credential classes have no other write privilege and accepting them here would create a novel DoS surface against the human owner. Use the dashboard or a fresh password-authenticated session.
+**Permission:** Any authenticated caller: a cookie session or a plain API token (one with no `mcp_tier` and no service scope) is accepted. MCP-tier tokens and service-scoped automation tokens are explicitly rejected with 403 — those credential classes have no other write privilege and accepting them here would create a novel DoS surface against the human owner. Use the dashboard, a fresh password-authenticated session or a plain API token.
 
 **Example:**
 
@@ -5799,7 +5799,7 @@ validation failures (invalid key, unrecognized type, an invalid/oversized valida
 
 ### Webhooks
 
-Webhooks deliver real-time HTTP POST notifications to external systems when events occur in Yuzu (e.g., agent registration, command completion, policy compliance changes).
+Webhooks deliver real-time HTTP POST notifications to external systems when events occur in Yuzu (e.g., agent registration, a command response arriving, a DEX signal).
 
 #### `GET /api/webhooks`
 
@@ -5813,7 +5813,7 @@ List all configured webhooks.
     {
       "id": 1,
       "url": "https://example.com/hooks/yuzu",
-      "event_types": ["agent.registered", "command.completed"],
+      "event_types": ["agent.registered", "execution.completed"],
       "has_secret": true,
       "enabled": true,
       "created_at": 1710849600
@@ -5833,7 +5833,7 @@ Create a new webhook subscription.
 ```json
 {
   "url": "https://example.com/hooks/yuzu",
-  "event_types": ["agent.registered", "command.completed", "policy.violation"],
+  "event_types": ["agent.registered", "execution.completed", "dex.signal"],
   "secret": "optional-hmac-secret"
 }
 ```
@@ -5849,10 +5849,11 @@ Create a new webhook subscription.
 | Event type | Fired when | Notable payload fields |
 |---|---|---|
 | `agent.registered` | An agent enrolls or re-enrolls | `agent_id`, `hostname`, `os`, `arch`, `agent_version` |
-| `command.completed` / `execution.completed` | An instruction finishes across its targets | command/execution identifiers |
-| `policy.violation` | A policy evaluation finds a non-compliant device | policy + device identifiers |
+| `execution.completed` | Once per agent response to a command, not once per instruction: each target agent that answers produces its own event | `command_id`, `agent_id`, `status`, `exit_code` (and `error` when the response carries one) |
 | `dex.blast_radius` | N distinct devices report the same DEX signal `(obs_type, subject)` within the window — thresholds are operator-tunable on the DEX → Alerts tab (defaults 5 devices / 15 min; see [DEX fleet incident alerts](dex.md#fleet-incident-alerts-blast-radius)) | `obs_type`, `subject`, `device_count`, `window_seconds` |
 | `dex.signal` | A device reports a DEX signal type the operator routed to alerts (DEX → Alerts tab; once per device per hour — see [Routing signals to alerts](dex.md#routing-signals-to-alerts)) | `obs_type`, `subject`, `agent_id` |
+
+These four (`agent.registered`, `execution.completed`, `dex.blast_radius`, `dex.signal`) are the only event types the server fires; no other event is ever sent.
 
 `agent.registered` fires on *every* gRPC reconnect, not only first enrollment — a server restart, a network blip, or a gateway bounce that strands and reconnects a fleet produces one delivery per reconnecting agent, not one per genuinely new device. A target wired to a low-tolerance channel (e.g. a Slack alert intended for "new device joined the fleet") should filter or debounce on the receiving end if reconnect noise matters; the dashboard's own "Agent Enrolled" notification does not have this problem (it fires once, on first enrollment only).
 
@@ -5959,7 +5960,7 @@ Create a new offload target. Returns 201 + `{id, status}` on success, 400 when v
 | `auth_type` | string | No (`none`) | One of `none`, `bearer`, `basic`, `hmac`. |
 | `auth_credential` | string | No | Bearer token (Bearer), `user:pass` (Basic), shared secret (Hmac). Never returned by any endpoint. |
 | `event_types` | string | No (`*`) | Comma-separated list of event types or `*` for all. Same semantics as webhooks. |
-| `batch_size` | int | No (1) | Accumulate up to N events into a single POST body. `1` = no batching. Must be `1`..`10000` (read as a 64-bit value, so an oversized number is rejected rather than wrapped; a float such as `5.5`, a string, a boolean or `null` is `400` `invalid_field_type`, where a float used to be truncated); the per-target buffer flushes only at this size and has no other cap, so the store refuses a larger value (the same range MCP `create_offload_target` enforces). |
+| `batch_size` | int | No (1) | Accumulate up to N events into a single POST body. `1` = no batching. Must be `1`..`10000` (read as a 64-bit value, so an oversized number is rejected rather than wrapped; a float such as `5.5`, a string, a boolean or `null` is `400` `invalid_field_type`, where a float used to be truncated); the per-target buffer flushes only when it reaches this size and at graceful server shutdown (there is no timer flush, so a partly filled buffer waits for more events and is dropped on a crash or when the target is deleted) and has no other cap, so the store refuses a larger value (the same range MCP `create_offload_target` enforces). |
 | `enabled` | bool | No (true) | When false, no events are dispatched until re-enabled. |
 
 **Auth headers (set per `auth_type`):**
@@ -9303,6 +9304,8 @@ To suppress process-level visibility for specific agents (privacy-sensitive host
 
 These overlays are in addition to the standard browser console entry. Previous releases (PR 5 and earlier) left the scene blank on every error condition.
 
+The `413` overlay text names a `--viz-machines-max` flag and a management group, but neither is a remedy: no such flag exists, and `machines_max` is a query parameter on the REST route (default `5000`, ceiling `100000`, see below) that the page does not send. The topology call is gated by a global `Response:Read` check and is not narrowed by management group, so scoping the request that way does not shrink the snapshot. To read a fleet above the default cap, call the REST route directly with a larger `machines_max`.
+
 #### `GET /api/v1/viz/fleet/topology`
 
 Returns the full topology as JSON.
@@ -9503,6 +9506,8 @@ Get an aggregated view of fleet execution statistics.
   "meta": { "api_version": "v1" }
 }
 ```
+
+A failed read of the execution store answers `503` with `retry_after_ms: 2000`, never a zeroed summary (see [Execution Statistics](#execution-statistics)).
 
 ---
 
@@ -9732,7 +9737,7 @@ read (`service-scoped tokens may not list upload grants`, no `permission` field,
 
 Revoke a grant before it is redeemed. **Permission:** `UploadGrant:Delete`.
 Returns `204` on success, `404` if the grant does not exist or is no longer
-revocable (already redeemed, expired, or already revoked).
+revocable (already redeemed or already revoked). An expired grant that was never redeemed is still revocable, so it can be revoked to clear it.
 
 The agent then redeems the grant and streams the file over the agent-facing
 upload session routes (`/api/v1/uploads*`), documented under [Uploads](#uploads).

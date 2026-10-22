@@ -99,9 +99,10 @@ Recommended order for a fresh install:
 > appearing in the dashboard list, `/api/agents`, and TAR fleet scans rather than
 > the whole fleet being exposed. **The same fail-closed posture covers MOST
 > response/execution readers (#1634):** `query_responses`, `aggregate_responses`,
-> `GET /api/v1/executions/{id}/visualization`, and the legacy `GET /api/responses/{id}`
+> and the legacy `GET /api/responses/{id}`
 > / `/aggregate` / `/export` surfaces return **zero rows** (the legacy aggregate
-> returns `503`) on a corrupt store rather than reopening the cross-operator
+> returns `503`), and `GET /api/v1/executions/{id}/visualization` answers `503`,
+> on a corrupt store rather than reopening the cross-operator
 > fleet-wide read.
 >
 > **The dashboard's facet/scope surfaces are covered too, on a narrower anchor

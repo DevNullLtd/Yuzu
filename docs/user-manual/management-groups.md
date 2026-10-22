@@ -1,6 +1,6 @@
 # Management Groups
 
-Management groups organize devices into a hierarchy for scoped access control and targeted operations. They support both static membership (manually assigned) and dynamic membership (auto-populated by a scope expression).
+Management groups organize devices into a hierarchy for scoped access control and targeted operations. They support both static membership (manually assigned) and dynamic membership (a group that stores a scope expression; Yuzu fills only some dynamic groups from it, see the concepts table below).
 
 ## Concepts
 
@@ -9,7 +9,7 @@ Management groups organize devices into a hierarchy for scoped access control an
 | **Management group** | A named container for devices, with optional parent/child relationships. |
 | **Root group** | The built-in "All Devices" group (ID `000000000000`) is auto-created on server startup. It cannot be deleted or re-parented. Every newly enrolled agent is automatically added to this group. |
 | **Static membership** | Agents are explicitly added to or removed from the group by an operator. |
-| **Dynamic membership** | A scope expression (e.g., `ostype == "Windows" AND tag:department == "Finance"`) determines membership. Matching agents are included automatically. |
+| **Dynamic membership** | A scope expression (e.g., `ostype == "Windows" AND tag:department == "Finance"`) is stored with the group. Yuzu computes members from it only for the auto-created `Service: {name}` groups (refreshed when a `service` tag is written); the root group is filled at enrollment. For any other dynamic group created through the API the expression is stored but members are not computed, so add them with `POST /api/v1/management-groups/{id}/members`. |
 | **Hierarchy** | Groups form a tree with a maximum depth of 5 levels below the root (root + 5 child levels). Role assignments on a parent group cascade to all children. |
 | **Service groups** | When a `service` tag is set on an agent, Yuzu auto-creates a `Service: {name}` management group containing all agents with that tag. |
 | **Visibility filtering** | Non-admin users only see agents that belong to management groups where they hold a role assignment. Global administrators see all agents regardless of group membership. |
@@ -301,7 +301,7 @@ Returns `201 Created`:
 }
 ```
 
-This endpoint is intended for static membership groups. For dynamic groups, membership is controlled by the scope expression and refreshed via `refresh_dynamic_membership`.
+This endpoint is intended for static membership groups. For a dynamic group the server computes members only for the root group (filled at enrollment) and for the groups it creates itself when a `service` tag is written; for any other dynamic group created through the API, members are not computed from the scope expression.
 
 ### Remove a Member
 

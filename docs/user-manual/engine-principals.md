@@ -37,8 +37,12 @@ Every mutating operation on this surface requires:
 
 **A structural rule with no exception:** a caller whose *own* session is
 itself engine-classed can never touch this surface at all, on either
-transport — not even to read. REST and all 9 MCP tools carry the same
-denial belt.
+transport — not even to read. On REST, the engine-principal lifecycle and
+credential routes refuse an engine session explicitly, while the three
+`/api/v1/engine-principals/{id}/roles` routes carry no separate engine-session
+check and rely on their permission gate alone (an engine principal can never be
+given the Administrator role). For the MCP tools, see the
+[MCP tool list](mcp.md#available-tools).
 
 ## Walkthrough: create, mint, rotate, confirm, transfer, revoke
 

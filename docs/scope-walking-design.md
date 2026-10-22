@@ -191,6 +191,8 @@ Base path: `/api/v1/result-sets`. All routes require an authenticated session an
 | `POST` | `/api/v1/result-sets/{id}/re-eval` | — | `{new_id, device_count_delta}` | Re-runs `source_payload` and creates a new set with `parent_id = original.parent_id` (sibling, not child). |
 | `DELETE` | `/api/v1/result-sets/{id}` | — | `204` | Pinned sets must be unpinned first. |
 
+**Shipped behaviour differs from the table above in two places:** `DELETE /api/v1/result-sets/{id}` answers `200` with `{"data":{"deleted":true}}` (not `204`; an unknown id is `404`, a pinned set `409`), and `GET /api/v1/result-sets/{id}` does not return `source_payload` (it returns the set's metadata, `status`, `source_execution_id` and `device_count`).
+
 **`parent_id` is a targeting argument, and omitted is not the same as empty (#2500).** Omit
 `parent_id` to run against `__all__` deliberately. A **supplied** `parent_id` that is an empty
 string, a non-string value, or an explicit `null` returns `400 RESULT_SET_BAD_PARENT` rather
