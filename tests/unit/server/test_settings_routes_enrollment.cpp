@@ -190,6 +190,12 @@ std::string raw_token_in(const std::string& html) {
     return {};
 }
 
+/// True when `tp` is `h` hours from now, give or take two minutes of test runtime.
+bool near_hours(std::chrono::system_clock::time_point tp, int h) {
+    const auto want = std::chrono::system_clock::now() + std::chrono::hours(h);
+    return tp > want - std::chrono::minutes(2) && tp < want + std::chrono::minutes(2);
+}
+
 } // namespace
 
 TEST_CASE("settings enrollment: token create audits token_id + principal, never the raw token",
@@ -210,6 +216,10 @@ TEST_CASE("settings enrollment: token create audits token_id + principal, never 
     CHECK(row.target_id == tokens[0].token_id);
     CHECK(row.detail.find("by=admin") != std::string::npos);
     CHECK(row.detail.find("max_uses=2") != std::string::npos);
+    // Operator text in the detail is neutralised (audit_token): the space in the label
+    // cannot start a key of its own.
+    CHECK(row.detail.find("label=NYC_rollout") != std::string::npos);
+    CHECK(row.detail.find("label=NYC rollout") == std::string::npos);
     CHECK_FALSE(h.audit_mentions(raw)); // the shown-once secret never reaches the audit store
 }
 
@@ -270,7 +280,7 @@ TEST_CASE("settings enrollment: batch create returns N tokens and audits ids onl
           "[pg][settings_routes][enrollment]") {
     EnrollRoutesHarness h;
     auto res = h.sink.Post("/api/settings/enrollment-tokens/batch",
-                           R"({"label":"rollout","count":"3","max_uses":"1","ttl_hours":"1"})");
+                           R"({"label":"roll out=1","count":"3","max_uses":"1","ttl_hours":"1"})");
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
@@ -280,6 +290,9 @@ TEST_CASE("settings enrollment: batch create returns N tokens and audits ids onl
     const auto row = h.only("enrollment.bulk_token_create");
     CHECK(row.result == "success");
     CHECK(row.detail.find("count=3") != std::string::npos);
+    // The label is operator text: audit_token keeps its space and '=' from forming keys.
+    CHECK(row.detail.find("label=roll_out_1 ") != std::string::npos);
+    CHECK(row.detail.find("label=roll out") == std::string::npos);
     CHECK(row.detail.find("by=admin") != std::string::npos);
     for (const auto& t : j["tokens"])
         CHECK_FALSE(h.audit_mentions(t.get<std::string>()));
@@ -660,30 +673,52 @@ TEST_CASE("settings enrollment: a malformed max_uses or ttl_hours mints nothing"
     }
 }
 
-TEST_CASE("settings enrollment: an empty or literal-zero limit still means unlimited",
+TEST_CASE("settings enrollment: a literal-zero limit still means unlimited",
           "[pg][settings_routes][enrollment][numeric_params]") {
-    // `-0` and `00` parse to a literal 0, so they keep the documented meaning; only an empty
-    // field or a value that parses to 0 is "unlimited" / "no expiry".
-    for (const char* body : {"label=x&max_uses=0&ttl_hours=0", "label=x&max_uses=&ttl_hours=",
-                             "label=x", "label=x&max_uses=00&ttl_hours=-0"}) {
+    // `-0` and `00` parse to a literal 0, so they keep the documented meaning: a value that
+    // parses to 0 is "unlimited" / "no expiry", regardless of the bounded default.
+    using std::chrono::system_clock;
+    for (const char* body :
+         {"label=x&max_uses=0&ttl_hours=0", "label=x&max_uses=00&ttl_hours=-0"}) {
         EnrollRoutesHarness h;
         INFO(body);
         auto res = h.sink.Post("/api/settings/enrollment-tokens", body, kForm);
         REQUIRE(res);
         CHECK(res->status == 200);
-        CHECK(h.auth_mgr.list_enrollment_tokens().value().size() == 1);
+        const auto tokens = h.auth_mgr.list_enrollment_tokens().value();
+        REQUIRE(tokens.size() == 1);
+        CHECK(tokens[0].max_uses == 0);
+        CHECK(tokens[0].expires_at == system_clock::time_point::max());
+    }
+}
+
+TEST_CASE("settings enrollment: a limit left blank takes the bounded default",
+          "[pg][settings_routes][enrollment][numeric_params]") {
+    // A field left BLANK (or the whole body, i.e. only `label`) takes the bounded default
+    // (100 uses / 72 hours) — it does NOT mean unlimited. Only a literal 0 means that, so a
+    // blank field next to an explicit 0 keeps its own default (the last row).
+    struct Row {
+        const char* body;
+        int max_uses;
+    };
+    for (const Row& row : {Row{"label=x", 100}, Row{"label=x&max_uses=&ttl_hours=", 100},
+                           Row{"label=x&max_uses=0&ttl_hours=", 0}}) {
+        EnrollRoutesHarness h;
+        INFO(row.body);
+        auto res = h.sink.Post("/api/settings/enrollment-tokens", row.body, kForm);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto tokens = h.auth_mgr.list_enrollment_tokens().value();
+        REQUIRE(tokens.size() == 1);
+        CHECK(tokens[0].max_uses == row.max_uses);
+        CHECK(near_hours(tokens[0].expires_at, 72));
     }
 }
 
 TEST_CASE("settings enrollment: the batch route honours JSON numbers AND numeric strings "
           "(the documented curl example mints what it says, #4644)",
           "[pg][settings_routes][enrollment][numeric_params]") {
-    using std::chrono::hours;
     using std::chrono::system_clock;
-    const auto near_hours = [](system_clock::time_point tp, int h) {
-        const auto want = system_clock::now() + hours(h);
-        return tp > want - std::chrono::minutes(2) && tp < want + std::chrono::minutes(2);
-    };
 
     SECTION("JSON numbers (the documented example shape)") {
         EnrollRoutesHarness h;
@@ -711,7 +746,7 @@ TEST_CASE("settings enrollment: the batch route honours JSON numbers AND numeric
             CHECK(near_hours(t.expires_at, 2));
         }
     }
-    SECTION("an empty string or an absent key keeps the documented default") {
+    SECTION("an empty string or an absent key keeps the documented default (72h)") {
         EnrollRoutesHarness h;
         auto res = h.sink.Post("/api/settings/enrollment-tokens/batch",
                                R"({"count":2,"max_uses":"","ttl_hours":""})");
@@ -721,15 +756,30 @@ TEST_CASE("settings enrollment: the batch route honours JSON numbers AND numeric
         REQUIRE(tokens.size() == 2);
         for (const auto& t : tokens) {
             CHECK(t.max_uses == 1);
-            CHECK(t.expires_at == system_clock::time_point::max());
+            CHECK(near_hours(t.expires_at, 72));
         }
     }
-    SECTION("a blank body keeps every default (10 single-use tokens)") {
+    SECTION("an explicit ttl_hours of 0 still means no expiry") {
+        EnrollRoutesHarness h;
+        auto res = h.sink.Post("/api/settings/enrollment-tokens/batch",
+                               R"({"count":1,"ttl_hours":0})");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto tokens = h.auth_mgr.list_enrollment_tokens().value();
+        REQUIRE(tokens.size() == 1);
+        CHECK(tokens[0].expires_at == system_clock::time_point::max());
+    }
+    SECTION("a blank body keeps every default (10 single-use tokens, each expiring in 72h)") {
         EnrollRoutesHarness h;
         auto res = h.sink.Post("/api/settings/enrollment-tokens/batch", "");
         REQUIRE(res);
         CHECK(res->status == 200);
-        CHECK(h.auth_mgr.list_enrollment_tokens().value().size() == 10);
+        const auto tokens = h.auth_mgr.list_enrollment_tokens().value();
+        REQUIRE(tokens.size() == 10);
+        for (const auto& t : tokens) {
+            CHECK(t.max_uses == 1);
+            CHECK(near_hours(t.expires_at, 72));
+        }
     }
 }
 

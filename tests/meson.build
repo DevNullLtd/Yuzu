@@ -245,6 +245,7 @@ agent_test_exe = executable(
     'unit/test_detached_signature.cpp', # shared detached-CMS verifier (#416/#3807)
     'unit/test_updater_signature.cpp', # OTA signature gate, end to end (#416/#3807)
     'unit/test_agent_ota_disabled_lifecycle.cpp', # registration → command → reconnect, OTA disabled
+    'unit/test_agent_enrollment_token_file_lifecycle.cpp', # --enrollment-token-file: removed after an accepted Register or a refusal of the token (kept while pending, retried after a failed removal), kept after an administrator's denial (POSIX only)
     'unit/test_update_signature_mode.cpp', # OTA update-signature mode report + env typo check (#5249)
     'unit/test_plugin_loader.cpp',
     'unit/test_capability_registry_tables.cpp',
@@ -334,6 +335,7 @@ agent_test_exe = executable(
     'unit/test_firewall_local_dispatcher.cpp',
     'unit/test_agent_csr.cpp',
     'unit/test_tls_policy.cpp', # #4722: shared TLS cipher policy (common/include/yuzu/tls_policy.hpp), pure
+    'unit/test_enrollment_token_file.cpp', # --enrollment-token-file: shared token shape + text parser (common/include/yuzu/enrollment_token_shape.hpp), the no-follow reader and source precedence (agents/core/include/yuzu/agent/enrollment_token_file.hpp)
     'unit/test_protective_actions.cpp', # shared protective-action predicate (common/include/yuzu/protective_actions.hpp), pure
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
@@ -3139,6 +3141,16 @@ test('release artifact gate',
 test('agent installer trust-anchor ACL lint',
   _python3_test,
   args: [files('test_agent_installer_acl_lint.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# The Windows agent installer writes the enrollment token to a file instead
+# of the service command line. Lints the .iss source text the same way as the
+# sibling ACL lint above (no compile).
+test('agent installer enrollment-token lint',
+  _python3_test,
+  args: [files('test_agent_installer_token_lint.py')],
   suite: 'docs',
   timeout: 30,
 )
