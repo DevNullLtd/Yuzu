@@ -404,7 +404,8 @@ private:
             error_ = ::GetLastError();
             return;
         }
-        // The PSID points INTO user_buf_; alive as long as *this.
+        // The PSID points INTO user_buf_; alive as long as *this. The cast is aligned:
+        // vector<BYTE>::data() is a heap block aligned to the default new alignment (16).
         user_sid_ = reinterpret_cast<TOKEN_USER*>(user_buf_.data())->User.Sid;
 
         // "D:P" = SE_DACL_PROTECTED (a file created with it merges none of the parent's
@@ -462,19 +463,17 @@ std::string sid_to_string(PSID sid) {
 // Returns a refusal message when a foreign-owned file must stop the open, else nullopt.
 std::optional<std::string> secure_tar_db_files(const std::filesystem::path& db,
                                                TarDbDacl& dacl) {
-    if (!dacl.ok()) {
-        spdlog::warn("TarDatabase: owner-only DACL not built (error {}); tar.db keeps the "
-                     "directory's inherited ACL",
-                     dacl.build_error());
-        return std::nullopt;
-    }
+    if (!dacl.ok())
+        return std::nullopt; // open() warned once, when it built the DACL
     constexpr DWORD kAccess = READ_CONTROL | WRITE_DAC;
     constexpr DWORD kShareAll = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
     constexpr DWORD kFlags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT;
     for (const char* suffix : {"", "-wal", "-shm"}) {
         std::filesystem::path file = db;
         file += suffix;
-        const std::string name = file.string();
+        // from_wide, not path::string(): that narrows through the ANSI code page and would
+        // mangle a non-ASCII state directory in the log text and the icacls remedy.
+        const std::string name = yuzu::win::from_wide(file.c_str());
 
         HANDLE raw = ::CreateFileW(file.c_str(), kAccess, kShareAll, dacl.sa(), OPEN_ALWAYS,
                                    kFlags, nullptr);
@@ -495,6 +494,11 @@ std::optional<std::string> secure_tar_db_files(const std::filesystem::path& db,
                                                  OWNER_SECURITY_INFORMATION, &owner, nullptr,
                                                  nullptr, nullptr, &owner_sd);
         const LocalPtr owner_sd_guard{owner_sd, ::LocalFree}; // `owner` points into it
+        if (owner_rc != ERROR_SUCCESS) {
+            spdlog::warn("TarDatabase: could not read the owner of {} (error {}); re-securing it "
+                         "in place",
+                         name, owner_rc);
+        }
         if (owner_rc == ERROR_SUCCESS && owner != nullptr && !dacl.owner_allowed(owner)) {
             const std::string who = sid_to_string(owner);
             const std::string remedy =
@@ -600,6 +604,11 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
     // Create or re-secure tar.db, -wal and -shm BEFORE SQLite touches them, and refuse a
     // foreign-owned (planted) file; see the DACL block above.
     TarDbDacl dacl;
+    if (!dacl.ok()) {
+        spdlog::warn("TarDatabase: owner-only DACL not built (error {}); tar.db keeps the "
+                     "directory's inherited ACL",
+                     dacl.build_error());
+    }
     if (auto refusal = secure_tar_db_files(path, dacl))
         return std::unexpected(*refusal);
 #endif

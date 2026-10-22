@@ -1970,6 +1970,7 @@ std::string token_user_sid() {
     const BOOL got = ::GetTokenInformation(token, TokenUser, buf.data(), len, &len);
     ::CloseHandle(token);
     REQUIRE(got);
+    // Aligned cast: vector<BYTE>::data() is a heap block aligned to the default new alignment.
     return sid_string(reinterpret_cast<TOKEN_USER*>(buf.data())->User.Sid);
 }
 
