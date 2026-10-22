@@ -758,9 +758,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      rows.** The ADR owner (Dave Rae) ruled on the disposition of rows that were
      still `planned` in `scripts/ci/api-parity/*.json`. One row of the 87,
      `get.api-procfetch-status`, was added by the author during governance
-     review (it has the same shape as `get.api-chargen-status`) and awaits the
-     owner's confirmation; treat it as proposed until this sentence is
-     amended. Where the rulings are recorded: the admin-plane rulings in
+     review (it has the same shape as `get.api-chargen-status`) and was
+     confirmed by the owner on 2026-10-22. Where the rulings are recorded: the admin-plane rulings in
      #6325, the retire ruling in #6326, and the NVD and UI-only rulings in
      this entry only (#4099 and #5955 are not amended). Like the earlier
      entries they are session statements, not signed decisions. Where #6325's
