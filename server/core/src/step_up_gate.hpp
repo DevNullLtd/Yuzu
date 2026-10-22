@@ -208,8 +208,8 @@ namespace detail {
 /// (`Session::is_engine()`), stored and compared as a bool, never folded into the hashes. `h1` and
 /// `h2` are the first and second 64 bits of one SHA-256 over a length-prefixed concatenation of
 /// (principal_kind, auth_source, username), so no two distinct triples share an encoding and a
-/// collision needs a 128-bit match against a cryptographic hash (a pair of seeded non-cryptographic
-/// 64-bit hashes would be forgeable by a caller who chooses the username).
+/// collision needs a 128-bit match against a cryptographic hash. The username is caller-chosen
+/// text, so a pair of seeded non-cryptographic 64-bit hashes would not give that margin.
 struct StepUpPassIdentity {
     bool engine{false};
     std::uint64_t h1{0};

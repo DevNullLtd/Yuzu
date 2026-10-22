@@ -1708,13 +1708,13 @@ TEST_CASE("pass identity: the engine class is an exact compare, never hash-only"
     REQUIRE(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
             StepUpChokepointResult::kPassed);
 
-    // Forge the stashed fingerprint so every hash word equals the engine session's, leaving only
+    // Set the stashed fingerprint so every hash word equals the engine session's, leaving only
     // the exact class flag to tell them apart.
     const auto engine = engine_session("alice");
-    detail::StepUpPassIdentity forged;
-    REQUIRE(detail::step_up_identity_of(engine, forged));
-    forged.engine = false;
-    detail::tls_step_up_pass().identity = forged;
+    detail::StepUpPassIdentity stashed;
+    REQUIRE(detail::step_up_identity_of(engine, stashed));
+    stashed.engine = false;
+    detail::tls_step_up_pass().identity = stashed;
     CHECK_FALSE(detail::consume_step_up_pass(req, engine, std::string(kTokensLabel)));
 }
 
