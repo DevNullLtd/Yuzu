@@ -775,7 +775,7 @@ TEST_CASE("registry core: delete_key non-recursive refuses a key with subkeys an
     }
 }
 
-// ── the guarded two-call value read ──────────────────────────────────────
+// ── the guarded value read ───────────────────────────────────────────────
 
 namespace {
 
@@ -813,143 +813,239 @@ struct QueryModel {
         if (after) after(n);
         return rc;
     }
+    /// Every call carried real storage of at least one byte (never a null lpData, #2771 P2-N5).
+    [[nodiscard]] bool every_call_had_storage() const {
+        return std::all_of(calls.begin(), calls.end(), [](const auto& c) { return c.first && c.second >= 1; });
+    }
 };
+
+/// n bytes, 1, 2, 3 ... (wrapping), so a short copy or a stale buffer shows.
+[[nodiscard]] Bytes ramp(std::size_t n) {
+    Bytes b(n);
+    for (std::size_t i = 0; i < n; ++i) b[i] = static_cast<std::uint8_t>(i + 1);
+    return b;
+}
 
 } // namespace
 
-TEST_CASE("registry core: query_value_bounded reads a value that grows from nothing between the two calls",
+TEST_CASE("registry core: query_value_bounded reads a value that fits the first buffer in one data call",
           "[registry][core][query]") {
-    QueryModel m;
-    m.type = kRegDword;
-    m.after = [&](std::size_t n) {
-        if (n == 0) m.value = B({1, 2, 3, 4}); // empty at the size query, 4 bytes by the data call
-    };
-    QueryResult q;
-    CHECK(query_value_bounded(4096, std::ref(m), q) == 0);
-    CHECK(q.type == kRegDword);
-    CHECK(q.size == 4);
-    CHECK(q.bytes == B({1, 2, 3, 4}));
-    REQUIRE(m.calls.size() == 3); // size query, data call (MORE_DATA), data call
-    CHECK(m.calls[1].first); // the data call gets real storage, never a null lpData ...
-    CHECK(m.calls[1].second >= 1); // ... of at least one byte
-    CHECK(m.calls[2].second == 4);
-}
-
-TEST_CASE("registry core: query_value_bounded grows its buffer once and honours the cap and the size bound",
-          "[registry][core][query]") {
-    SECTION("N bytes growing to more: one MORE_DATA retry") {
+    // The first data call has 256 bytes of stack storage: the usual value costs ONE Win32 call, not a size
+    // query and a read. A value over 256 bytes answers ERROR_MORE_DATA with its size and is read once more.
+    SECTION("a small value: one call, with storage") {
         QueryModel m;
+        m.type = kRegDword;
         m.value = B({1, 2, 3, 4});
-        m.after = [&](std::size_t n) {
-            if (n == 0) m.value = B({1, 2, 3, 4, 5, 6, 7, 8});
-        };
         QueryResult q;
         CHECK(query_value_bounded(4096, std::ref(m), q) == 0);
-        CHECK(q.size == 8);
-        CHECK(q.bytes == B({1, 2, 3, 4, 5, 6, 7, 8}));
-        CHECK(m.calls.size() == 3);
+        CHECK(q.type == kRegDword);
+        CHECK(q.size == 4);
+        CHECK(q.bytes == B({1, 2, 3, 4}));
+        REQUIRE(m.calls.size() == 1);
+        CHECK(m.every_call_had_storage());
+        CHECK(m.calls[0].second == 256);
     }
-    SECTION("a cap cuts the bytes, the size stays full") {
+    SECTION("exactly 256 bytes still fits: one call") {
+        QueryModel m;
+        m.value = ramp(256);
+        QueryResult q;
+        CHECK(query_value_bounded(4096, std::ref(m), q) == 0);
+        CHECK(q.size == 256);
+        CHECK(q.bytes == ramp(256));
+        CHECK(m.calls.size() == 1);
+    }
+    SECTION("257 bytes does not: MORE_DATA, then one read with exactly the room it reported") {
+        QueryModel m;
+        m.value = ramp(257);
+        QueryResult q;
+        CHECK(query_value_bounded(4096, std::ref(m), q) == 0);
+        CHECK(q.type == kRegBinary);
+        CHECK(q.size == 257);
+        CHECK(q.bytes == ramp(257));
+        REQUIRE(m.calls.size() == 2);
+        CHECK(m.every_call_had_storage());
+        CHECK(m.calls[1].second == 257); // no separate size query in between
+    }
+    SECTION("a zero-length value: one call, the type and size survive, no bytes, no loop") {
+        QueryModel m;
+        m.type = kRegSz;
+        QueryResult q;
+        CHECK(query_value_bounded(4096, std::ref(m), q) == 0);
+        CHECK(q.type == kRegSz);
+        CHECK(q.size == 0);
+        CHECK(q.bytes.empty());
+        CHECK(m.calls.size() == 1);
+        CHECK(m.every_call_had_storage());
+    }
+}
+
+TEST_CASE("registry core: query_value_bounded honours the cap and the size bound", "[registry][core][query]") {
+    SECTION("a cap smaller than a value that fits the first buffer cuts the bytes, the size stays full") {
         QueryModel m;
         m.value = B({1, 2, 3, 4, 5, 6});
         QueryResult q;
         CHECK(query_value_bounded(4, std::ref(m), q) == 0);
         CHECK(q.size == 6);
         CHECK(q.bytes == B({1, 2, 3, 4}));
-    }
-    SECTION("cap 0 asks for the size only: one call, no bytes") {
-        QueryModel m;
-        m.value = B({1, 2, 3});
-        QueryResult q;
-        CHECK(query_value_bounded(0, std::ref(m), q) == 0);
-        CHECK(q.size == 3);
-        CHECK(q.bytes.empty());
         CHECK(m.calls.size() == 1);
     }
-    SECTION("a value above kMaxWriteBytes is answered size-only without reading it") {
+    SECTION("a cap smaller than a value past the first buffer does the same") {
         QueryModel m;
-        m.script = [](std::size_t, std::uint32_t* t, std::uint8_t* data, std::uint32_t* size) -> std::optional<long> {
-            if (data != nullptr) return std::nullopt;
-            *t = kRegBinary;
-            *size = static_cast<std::uint32_t>(kMaxWriteBytes + 1);
-            return 0;
-        };
+        m.value = ramp(300);
         QueryResult q;
-        CHECK(query_value_bounded(4096, std::ref(m), q) == 0);
-        CHECK(q.size == kMaxWriteBytes + 1);
-        CHECK(q.bytes.empty());
-        CHECK(m.calls.size() == 1);
+        CHECK(query_value_bounded(4, std::ref(m), q) == 0);
+        CHECK(q.size == 300);
+        CHECK(q.bytes == B({1, 2, 3, 4}));
+        CHECK(m.calls.size() == 2);
     }
-    SECTION("a value that grows past the bound mid-read is answered size-only") {
+    SECTION("cap 0 asks for the size only: one null-data call, no bytes") {
+        for (const std::size_t n : {std::size_t{3}, std::size_t{300}}) {
+            QueryModel m;
+            m.value = ramp(n);
+            QueryResult q;
+            CHECK(query_value_bounded(0, std::ref(m), q) == 0);
+            CHECK(q.size == n);
+            CHECK(q.bytes.empty());
+            REQUIRE(m.calls.size() == 1);
+            CHECK_FALSE(m.calls[0].first);
+        }
+    }
+    SECTION("max_read below a value that fits the first buffer: size only, no bytes") {
         QueryModel m;
-        m.value = B({1, 2});
-        m.after = [&](std::size_t n) {
-            if (n == 0) m.value = B({1, 2, 3, 4, 5, 6, 7, 8});
-        };
+        m.value = ramp(8);
         QueryResult q;
         CHECK(query_value_bounded(4096, std::ref(m), q, /*max_read=*/4) == 0);
         CHECK(q.size == 8);
         CHECK(q.bytes.empty());
+        CHECK(m.calls.size() == 1);
+    }
+    SECTION("a value above kMaxWriteBytes is answered size-only without ever reading it") {
+        QueryModel m;
+        m.script = [](std::size_t, std::uint32_t* t, std::uint8_t* data, std::uint32_t* size) -> std::optional<long> {
+            *t = kRegBinary;
+            *size = static_cast<std::uint32_t>(kMaxWriteBytes + 1);
+            return data != nullptr ? 234 : 0; // too big for any buffer it was given; the null-data call says the size
+        };
+        QueryResult q;
+        CHECK(query_value_bounded(4096, std::ref(m), q) == 0);
+        CHECK(q.type == kRegBinary);
+        CHECK(q.size == kMaxWriteBytes + 1);
+        CHECK(q.bytes.empty());
+        REQUIRE(m.calls.size() == 2); // the data call, then the size-only question that also yields the type
+        CHECK(m.calls[0].second == 256);
+        CHECK_FALSE(m.calls[1].first);
     }
 }
 
-TEST_CASE("registry core: query_value_bounded gives up on a value that keeps growing and passes failures through",
+TEST_CASE("registry core: query_value_bounded reads a value that grows between its calls",
           "[registry][core][query]") {
-    SECTION("three retries, then ERROR_MORE_DATA") {
+    SECTION("past the first buffer, then bigger again: one MORE_DATA retry") {
         QueryModel m;
-        m.value = B({1, 2, 3, 4});
+        m.value = ramp(300);
+        m.after = [&](std::size_t n) {
+            if (n == 0) m.value = ramp(500);
+        };
+        QueryResult q;
+        CHECK(query_value_bounded(4096, std::ref(m), q) == 0);
+        CHECK(q.size == 500);
+        CHECK(q.bytes == ramp(500));
+        CHECK(m.calls.size() == 3); // 256 -> MORE_DATA(300); 300 -> MORE_DATA(500); 500 -> ok
+        CHECK(m.every_call_had_storage());
+    }
+    SECTION("past the bound mid-read is answered size-only") {
+        QueryModel m;
+        m.value = ramp(300);
+        m.after = [&](std::size_t n) {
+            if (n == 0) m.value = ramp(400);
+        };
+        QueryResult q;
+        CHECK(query_value_bounded(4096, std::ref(m), q, /*max_read=*/350) == 0);
+        CHECK(q.size == 400);
+        CHECK(q.bytes.empty());
+        CHECK(m.calls.size() == 2);
+    }
+    SECTION("a value that keeps growing: three retries, then ERROR_MORE_DATA") {
+        QueryModel m;
+        m.value = ramp(300);
         m.after = [&](std::size_t) { m.value.push_back(0); }; // grows after every call
         QueryResult q;
         CHECK(query_value_bounded(4096, std::ref(m), q) == 234);
-        CHECK(m.calls.size() == 4); // the size query and three data calls
+        CHECK(m.calls.size() == 4); // the first data call and three sized reads
     }
-    SECTION("an absent value, and a failing data call, return their code") {
+}
+
+TEST_CASE("registry core: query_value_bounded passes failures through", "[registry][core][query]") {
+    QueryResult q;
+    SECTION("an absent value") {
         QueryModel absent;
         absent.absent = true;
-        QueryResult q;
         CHECK(query_value_bounded(4096, std::ref(absent), q) == 2);
         CHECK(absent.calls.size() == 1);
-
+    }
+    SECTION("a failing first data call") {
         QueryModel denied;
         denied.value = B({1});
+        denied.script = [](std::size_t, std::uint32_t*, std::uint8_t*, std::uint32_t*) -> std::optional<long> { return 5; };
+        CHECK(query_value_bounded(4096, std::ref(denied), q) == 5);
+        CHECK(denied.calls.size() == 1);
+    }
+    SECTION("a failing sized read") {
+        QueryModel denied;
+        denied.value = ramp(300);
         denied.script = [](std::size_t n, std::uint32_t*, std::uint8_t*, std::uint32_t*) -> std::optional<long> {
             return n == 1 ? std::optional<long>{5} : std::nullopt;
         };
         CHECK(query_value_bounded(4096, std::ref(denied), q) == 5);
+        CHECK(denied.calls.size() == 2);
     }
-}
-
-TEST_CASE("registry core: query_value_bounded answers a value that stays zero-length without looping",
-          "[registry][core][query]") {
-    QueryModel m;
-    m.type = kRegSz;
-    QueryResult q;
-    CHECK(query_value_bounded(4096, std::ref(m), q) == 0);
-    CHECK(q.type == kRegSz);
-    CHECK(q.size == 0);
-    CHECK(q.bytes.empty());
-    CHECK(m.calls.size() == 2); // the size query and one data call
+    SECTION("a failing size-only question") {
+        QueryModel gone;
+        gone.script = [](std::size_t n, std::uint32_t* t, std::uint8_t*, std::uint32_t* size) -> std::optional<long> {
+            *t = kRegBinary;
+            *size = static_cast<std::uint32_t>(kMaxWriteBytes + 1);
+            return n == 0 ? 234 : 2; // too big, then gone before the size could be read
+        };
+        CHECK(query_value_bounded(4096, std::ref(gone), q) == 2);
+        CHECK(gone.calls.size() == 2);
+    }
 }
 
 TEST_CASE("registry core: query_value_bounded never forms a copy range from a count the buffer cannot hold",
           "[registry][core][query]") {
-    SECTION("a SUCCESS that reports more bytes than the buffer holds is retried with room") {
+    SECTION("a SUCCESS on the first call that reports more bytes than the 256-byte buffer is read again with room") {
         QueryModel m;
-        m.value = B({1, 2, 3, 4});
+        m.value = ramp(300);
+        m.script = [&](std::size_t n, std::uint32_t* t, std::uint8_t* data, std::uint32_t* size) -> std::optional<long> {
+            if (n != 0) return std::nullopt;
+            *t = kRegBinary;
+            *size = 300; // claims 300 although it was given room for 256
+            data[0] = 0xEE;
+            return 0;
+        };
+        QueryResult q;
+        CHECK(query_value_bounded(4096, std::ref(m), q) == 0);
+        CHECK(q.size == 300);
+        CHECK(q.bytes == ramp(300)); // none of it is the 0xEE the lying call left behind
+        CHECK(m.calls.size() == 2);
+        CHECK(m.calls[1].second == 300);
+    }
+    SECTION("a SUCCESS on a sized read that reports more bytes than it was given room for is retried with room") {
+        QueryModel m;
+        m.value = ramp(300);
         m.script = [&](std::size_t n, std::uint32_t* t, std::uint8_t* data, std::uint32_t* size) -> std::optional<long> {
             if (n != 1) return std::nullopt;
             *t = kRegBinary;
-            *size = 8; // the first data call claims 8 bytes although it was given room for 4
+            *size = 400; // the sized read was given room for 300
             data[0] = 0xEE;
             return 0;
         };
         m.after = [&](std::size_t n) {
-            if (n == 1) m.value = B({1, 2, 3, 4, 5, 6, 7, 8});
+            if (n == 1) m.value = ramp(400);
         };
         QueryResult q;
         CHECK(query_value_bounded(4096, std::ref(m), q) == 0);
-        CHECK(q.size == 8);
-        CHECK(q.bytes == B({1, 2, 3, 4, 5, 6, 7, 8}));
+        CHECK(q.size == 400);
+        CHECK(q.bytes == ramp(400));
         CHECK(m.calls.size() == 3);
     }
 }
@@ -1317,10 +1413,10 @@ TEST_CASE("registry core: fast open and the two documented ancestor divergences"
 }
 
 TEST_CASE("registry core: fast set_value issues a fixed number of seam calls at every depth", "[registry][core]") {
-    // Seam calls, not Win32 calls: capture and read-back are each a size call and a data call underneath
-    // (query_value_bounded), so a fast set_value is about nine Win32 calls. Counted across the whole seam, the
-    // fast path is root_name + open_path + final_name + probe + capture + set + read-back + close, whatever
-    // the depth; the walk it replaces grows with every component.
+    // Seam calls, not Win32 calls: the probe, the capture and the read-back are each ONE RegQueryValueExW for a
+    // value that fits query_value_bounded's first buffer, so a fast set_value is about seven Win32 calls. Counted
+    // across the whole seam, the fast path is root_name + open_path + final_name + probe + capture + set +
+    // read-back + close, whatever the depth; the walk it replaces grows with every component.
     constexpr std::size_t kBudget = 8;
     std::vector<std::size_t> fast_counts, walk_counts;
     for (const std::size_t depth : {3u, 6u, 10u}) {

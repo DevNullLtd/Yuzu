@@ -126,7 +126,14 @@ template <class F> [[nodiscard]] F ntdll_proc(const char* symbol) {
     std::memcpy(&name_bytes, buf, sizeof name_bytes);
     if (name_bytes % sizeof(wchar_t) != 0 || sizeof name_bytes + name_bytes > sizeof buf)
         return ERROR_INSUFFICIENT_BUFFER;
-    out = from_wide(reinterpret_cast<const wchar_t*>(buf + sizeof name_bytes), static_cast<int>(name_bytes / sizeof(wchar_t)));
+    const auto* name = reinterpret_cast<const wchar_t*>(buf + sizeof name_bytes);
+    const std::size_t n = name_bytes / sizeof(wchar_t);
+    if (std::all_of(name, name + n, [](wchar_t c) { return c > 0 && c < 0x80; })) { // the usual name: no NLS call
+        out.resize(n);
+        std::transform(name, name + n, out.begin(), [](wchar_t c) { return static_cast<char>(c); });
+    } else {
+        out = from_wide(name, static_cast<int>(n));
+    }
     return out.empty() ? static_cast<long>(ERROR_INVALID_DATA) : static_cast<long>(ERROR_SUCCESS);
 }
 
@@ -152,13 +159,39 @@ template <class F> [[nodiscard]] F ntdll_proc(const char* symbol) {
 
 // ── the Win32 binding ────────────────────────────────────────────────────
 
+/// A key path or value name as a NUL-terminated UTF-16 string. Pure ASCII that fits (every key path, nearly every
+/// name) widens into the stack buffer: no heap string and no NLS calls on the hot path. Anything else takes
+/// yuzu::win::to_wide, as before.
+class Wide {
+public:
+    explicit Wide(std::string_view s) {
+        const auto ascii = [](char c) { return static_cast<unsigned char>(c) - 1u < 0x7Fu; }; // 0x01..0x7F
+        if (s.size() < std::size(buf_) && std::all_of(s.begin(), s.end(), ascii)) {
+            std::copy(s.begin(), s.end(), buf_);
+            buf_[s.size()] = L'\0';
+            p_ = buf_;
+        } else {
+            heap_ = to_wide(s);
+            p_ = heap_.c_str();
+        }
+    }
+    Wide(const Wide&) = delete;
+    Wide& operator=(const Wide&) = delete;
+    [[nodiscard]] const wchar_t* c_str() const noexcept { return p_; }
+
+private:
+    wchar_t buf_[256];
+    std::wstring heap_;
+    const wchar_t* p_ = nullptr;
+};
+
 /// RegQueryValueExW as the `raw` callable query_value_bounded (registry_core.hpp) drives. `wname` must
 /// outlive the returned callable.
-[[nodiscard]] auto raw_query(HKEY key, const std::wstring& wname) {
-    return [key, &wname](std::uint32_t* type, std::uint8_t* data, std::uint32_t* size) -> long {
+[[nodiscard]] auto raw_query(HKEY key, const wchar_t* wname) {
+    return [key, wname](std::uint32_t* type, std::uint8_t* data, std::uint32_t* size) -> long {
         DWORD t = *type;
         DWORD n = *size;
-        const LSTATUS rc = RegQueryValueExW(key, wname.c_str(), nullptr, &t, data, &n);
+        const LSTATUS rc = RegQueryValueExW(key, wname, nullptr, &t, data, &n);
         *type = t;
         *size = n;
         return rc;
@@ -175,7 +208,8 @@ public:
 
     long open_path(Handle root, std::string_view key_path, std::uint32_t access, Handle& out) override {
         HKEY k = nullptr;
-        const LSTATUS rc = RegOpenKeyExW(as_hkey(root), to_wide(key_path).c_str(), REG_OPTION_OPEN_LINK, access, &k);
+        const Wide wide{key_path};
+        const LSTATUS rc = RegOpenKeyExW(as_hkey(root), wide.c_str(), REG_OPTION_OPEN_LINK, access, &k);
         if (rc == ERROR_SUCCESS) out = as_handle(k);
         return rc;
     }
@@ -215,19 +249,21 @@ public:
     void close(Handle key) override { RegCloseKey(as_hkey(key)); }
 
     long query_value(Handle key, std::string_view name, std::size_t cap, QueryResult& out) override {
-        const std::wstring wname = to_wide(name);
-        return query_value_bounded(cap, raw_query(as_hkey(key), wname), out);
+        const Wide wname{name};
+        return query_value_bounded(cap, raw_query(as_hkey(key), wname.c_str()), out);
     }
 
     long set_value(Handle key, std::string_view name, std::uint32_t type,
                    std::span<const std::uint8_t> data) override {
-        return RegSetValueExW(as_hkey(key), to_wide(name).c_str(), 0, type,
+        const Wide wname{name};
+        return RegSetValueExW(as_hkey(key), wname.c_str(), 0, type,
                               data.empty() ? nullptr : reinterpret_cast<const BYTE*>(data.data()),
                               static_cast<DWORD>(data.size()));
     }
 
     long delete_value(Handle key, std::string_view name) override {
-        return RegDeleteValueW(as_hkey(key), to_wide(name).c_str());
+        const Wide wname{name};
+        return RegDeleteValueW(as_hkey(key), wname.c_str());
     }
 
     long enum_value(Handle key, std::uint32_t index, std::string& name) override {
@@ -263,21 +299,21 @@ int emit(yuzu::CommandContext& ctx, const ActionOutput& out) {
 
 // L7: log access to sensitive registry paths for the agent log (unchanged behaviour).
 void audit_sensitive_path(std::string_view hive, std::string_view key_path) {
-    std::string upper_key;
-    upper_key.reserve(key_path.size());
-    for (char c : key_path) upper_key += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    if (hive == "HKLM") {
-        if (upper_key.starts_with("SOFTWARE\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\RUN") ||
-            upper_key.starts_with("SYSTEM\\CURRENTCONTROLSET\\SERVICES")) {
-            spdlog::info("Registry: accessing sensitive path HKLM\\{}", key_path);
-        }
-    }
+    if (hive != "HKLM") return;
+    const auto starts_ci = [&](std::string_view upper_prefix) { // ASCII upper-cased prefix match, no copy of the key
+        return key_path.size() >= upper_prefix.size() &&
+               std::equal(upper_prefix.begin(), upper_prefix.end(), key_path.begin(), [](char p, char c) {
+                   return p == static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+               });
+    };
+    if (starts_ci("SOFTWARE\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\RUN") || starts_ci("SYSTEM\\CURRENTCONTROLSET\\SERVICES"))
+        spdlog::info("Registry: accessing sensitive path HKLM\\{}", key_path);
 }
 
 struct Target {
     Hive hive = Hive::hklm;
-    std::string key;
-    bool fast = false; ///< the fast open may be tried (fast_open_hive)
+    std::string_view key; ///< a view into the command's parameters, which outlive the action
+    bool fast = false;    ///< the fast open may be tried (fast_open_hive)
 };
 
 /// The hive and key every action names. Writes its own `error|...` line and returns nullopt on a miss.
@@ -294,7 +330,7 @@ std::optional<Target> parse_target(yuzu::CommandContext& ctx, yuzu::Params param
         return std::nullopt;
     }
     audit_sensitive_path(hive, key);
-    return Target{*h, std::string{key}, fast_open_hive(*h)};
+    return Target{*h, key, fast_open_hive(*h)};
 }
 
 /// A refused single action: the audit line and `error|<token>` with rc 1.
@@ -308,13 +344,13 @@ AuditRecord base_record(std::string_view op, const Target& t, std::string_view n
     AuditRecord r;
     r.op = std::string{op};
     r.hive = std::string{hive_name(t.hive)};
-    r.key = t.key;
+    r.key = std::string{t.key};
     r.name = std::string{name};
     return r;
 }
 
 // ── read actions (moved from 1.0.0 with two changes: registry-controlled text is sanitised, and get_value
-//    reads through the guarded two-call query_value_bounded) ───────────
+//    reads through the guarded query_value_bounded) ───────────
 
 int do_get_value(yuzu::CommandContext& ctx, yuzu::Params params) {
     const auto target = parse_target(ctx, params);
@@ -329,11 +365,11 @@ int do_get_value(yuzu::CommandContext& ctx, yuzu::Params params) {
     }
 
     // The whole value, as before (no size bound: get_value's output for existing callers is unchanged);
-    // only the acquisition is the shared guarded two-call read.
+    // only the acquisition is the shared guarded read.
     constexpr std::size_t kWhole = (std::numeric_limits<std::uint32_t>::max)();
-    const auto wname = to_wide(val_name);
+    const Wide wname{val_name};
     QueryResult q;
-    if (query_value_bounded(kWhole, raw_query(opened.get(), wname), q, kWhole) != ERROR_SUCCESS) {
+    if (query_value_bounded(kWhole, raw_query(opened.get(), wname.c_str()), q, kWhole) != ERROR_SUCCESS) {
         ctx.write_output("error|value not found");
         return 1;
     }
@@ -604,7 +640,7 @@ int do_set_value(yuzu::CommandContext& ctx, yuzu::Params params) {
 
     Win32Registry reg;
     const auto o = set_value_verified(reg, as_handle(hive_root(t.hive)), t.key, name, *prep.type, prep.enc.bytes, t.fast);
-    return emit(ctx, render_single_action(au, o, false));
+    return emit(ctx, render_single_action(std::move(au), o, false));
 }
 
 int do_delete_value(yuzu::CommandContext& ctx, yuzu::Params params) {

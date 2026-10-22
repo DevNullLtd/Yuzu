@@ -257,6 +257,7 @@ inline void put_le(std::vector<std::uint8_t>& out, std::uint64_t v, int bytes) {
     case kRegDword:
     case kRegQword: {
         const bool wide = type == kRegQword;
+        r.bytes.reserve(wide ? 8 : 4);
         std::uint64_t v = 0;
         const char* end = value.data() + value.size();
         const auto [p, ec] = std::from_chars(value.data(), end, v);
@@ -273,7 +274,10 @@ inline void put_le(std::vector<std::uint8_t>& out, std::uint64_t v, int bytes) {
     case kRegExpandSz:
         if (value.size() > kMaxWriteBytes) {
             r.error = kTokValueOverflow;
-        } else if (!utf8_to_utf16le(value, r.bytes)) {
+            return r;
+        }
+        r.bytes.reserve(value.size() * 2 + 2); // UTF-16 never needs more than two bytes per UTF-8 byte, plus the NUL
+        if (!utf8_to_utf16le(value, r.bytes)) {
             r.bytes.clear();
             r.error = kTokInvalidData;
         } else {
@@ -342,6 +346,7 @@ inline void put_le(std::vector<std::uint8_t>& out, std::uint64_t v, int bytes) {
 
 [[nodiscard]] inline std::vector<std::string_view> split_key(std::string_view key) {
     std::vector<std::string_view> parts;
+    parts.reserve(1 + static_cast<std::size_t>(std::count(key.begin(), key.end(), '\\'))); // one allocation, whatever the depth
     std::size_t pos = 0;
     while (pos <= key.size()) {
         const std::size_t bs = std::min(key.find('\\', pos), key.size());
@@ -425,9 +430,14 @@ struct OldValue {
 /// space, '=' and ',' (yuzu::log_token) -> '_', and '|' -> '_' (log_token does not map the field
 /// separator). Over `cap` bytes it is cut on a character boundary and gets `~<total length>`.
 [[nodiscard]] inline std::string audit_token(std::string_view s, std::size_t cap = kAuditTokenCap) {
-    std::string scrubbed{s};
-    yuzu::shared::scrub_wire_bytes(scrubbed);
-    std::string t = yuzu::log_token(scrubbed);
+    std::string t;
+    if (yuzu::shared::count_invalid_wire_bytes(s) == 0) { // well-formed (the usual case): no scrubbed copy
+        t = yuzu::log_token(s);
+    } else {
+        std::string scrubbed{s};
+        yuzu::shared::scrub_wire_bytes(scrubbed);
+        t = yuzu::log_token(scrubbed);
+    }
     std::replace(t.begin(), t.end(), '|', '_');
     if (t.size() <= cap) return t.empty() ? std::string{"-"} : t;
     std::size_t cut = cap;
@@ -474,13 +484,17 @@ namespace detail {
 [[nodiscard]] inline std::string render_audit_line(const AuditRecord& r) {
     using detail::dash;
     using detail::num;
-    std::string o = "audit|op=" + audit_token(r.op, 64);
+    std::string o;
+    o.reserve(512); // a typical line is under 400 bytes: one allocation instead of a dozen regrowths
+    o += "audit|op=" + audit_token(r.op, 64);
     o += "|hive=" + audit_token(r.hive, 64);
     o += "|result=" + dash(r.result);
     o += "|reason=" + audit_token(r.reason, 64);
     o += "|verify=" + dash(r.verify);
-    o += "|key=" + audit_token(r.key);
-    o += "|name=" + audit_token(r.name);
+    o += "|key=";
+    o += audit_token(r.key);
+    o += "|name=";
+    o += audit_token(r.name);
     o += "|type=" + audit_token(r.type_name, 32);
     o += "|len=" + num(r.len);
     o += "|dry_run=" + num(r.dry_run);
@@ -490,8 +504,10 @@ namespace detail {
     o += "|sid=" + audit_token(r.sid, 64);
     o += "|old_state=" + dash(r.old_state);
     o += "|old_type=" + dash(r.old_type);
-    o += "|old=" + (r.has_old ? render_hex(r.old_bytes, kAuditHexCapBytes, r.old_total) : "-");
-    o += "|new=" + (r.has_new ? render_hex(r.new_bytes, kAuditHexCapBytes, r.new_total) : "-");
+    o += "|old=";
+    o += r.has_old ? render_hex(r.old_bytes, kAuditHexCapBytes, r.old_total) : "-";
+    o += "|new=";
+    o += r.has_new ? render_hex(r.new_bytes, kAuditHexCapBytes, r.new_total) : "-";
     return o;
 }
 

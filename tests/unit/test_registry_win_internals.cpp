@@ -327,4 +327,34 @@ TEST_CASE("execute_guarded turns a throwing action into rc 1 and one error|excep
     }
 }
 
+TEST_CASE("Win32Registry::query_value returns a REG_SZ stored without its terminator exactly as stored",
+          "[registry][windows][internals]") {
+    // The capture of a pre-existing value feeds the audit row's old= field: it must be the stored bytes. A
+    // RegQueryValueExW into a roomy buffer may append a terminator the stored value never had; this pins that
+    // the plugin's read does not report one.
+    const std::string root =
+        "SOFTWARE\\YuzuTest-" + std::to_string(yuzu::test::process_random_salt()) + "-unterminated";
+    ScratchTree cleanup{root};
+    HKEY raw = nullptr;
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, widen(root).c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE,
+                        KEY_SET_VALUE | KEY_QUERY_VALUE, nullptr, &raw, nullptr) != ERROR_SUCCESS) {
+        skip_or_fail("not elevated -- HKLM scratch not writable");
+        return;
+    }
+    const wchar_t stored[2] = {L'a', L'b'}; // four bytes, no terminator
+    REQUIRE(RegSetValueExW(raw, L"V", 0, REG_SZ, reinterpret_cast<const BYTE*>(stored), sizeof stored) ==
+            ERROR_SUCCESS);
+    Win32Registry reg;
+    yuzu::registry::QueryResult q;
+    REQUIRE(reg.query_value(as_handle(raw), "V", 4096, q) == ERROR_SUCCESS);
+    CHECK(q.type == REG_SZ);
+    CHECK(q.size == 4);
+    REQUIRE(q.bytes.size() == 4);
+    CHECK(q.bytes[0] == 'a');
+    CHECK(q.bytes[1] == 0);
+    CHECK(q.bytes[2] == 'b');
+    CHECK(q.bytes[3] == 0);
+    RegCloseKey(raw);
+}
+
 #endif // defined(_WIN32)

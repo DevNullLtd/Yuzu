@@ -71,19 +71,36 @@ struct QueryResult {
     std::vector<std::uint8_t> bytes;  ///< its first min(size, cap) bytes; empty when size > the reader's own bound
 };
 
-/// The Win32 two-call value read over an injected `raw(type*, data*, size*) -> long` that mirrors
-/// RegQueryValueExW (`data == nullptr` asks for the size only, whatever `*size` holds). Fills `out` like
+/// The Win32 value read over an injected `raw(type*, data*, size*) -> long` that mirrors RegQueryValueExW
+/// (`data == nullptr` asks for the size only, whatever `*size` holds). Fills `out` like
 /// RegistryWriter::query_value: the full size, and the first min(size, cap) bytes (none when `cap` is
-/// 0 or the value is larger than `max_read`). The data call ALWAYS gets non-null storage of at least
-/// one byte: a null lpData would turn a value that grew 0 -> N between the calls into a size answer
-/// over an empty buffer (win_profiles.hpp, #2771 P2-N5). A value that keeps growing is retried three
-/// times, then answered kErrorMoreData; a count the buffer cannot hold never forms a copy range.
+/// 0 or the value is larger than `max_read`). A read that needs bytes (`cap` > 0) makes ONE data call into a
+/// small stack buffer first: a value that fits (the common case) costs one call; a bigger one answers
+/// ERROR_MORE_DATA with its size and is read into a buffer of that size. The size-only question (`cap` 0, or a
+/// value past `max_read`) is the null-data call. EVERY data call gets non-null storage of at least one byte: a
+/// null lpData would turn a value that grew 0 -> N between calls into a size answer over an empty buffer
+/// (win_profiles.hpp, #2771 P2-N5). A value that keeps growing is retried three times, then answered
+/// kErrorMoreData; a count the buffer cannot hold never forms a copy range.
 template <class Raw>
 [[nodiscard]] long query_value_bounded(std::size_t cap, Raw&& raw, QueryResult& out,
                                        std::size_t max_read = kMaxWriteBytes) {
     std::uint32_t type = 0;
     std::uint32_t size = 0;
-    if (const long rc = raw(&type, nullptr, &size); rc != kErrorSuccess) return rc;
+    if (cap != 0) {
+        std::uint8_t first[256];
+        std::uint32_t got = sizeof first;
+        const long rc = raw(&type, first, &got);
+        if (rc == kErrorSuccess && got <= sizeof first) {
+            out.type = type;
+            out.size = got;
+            out.bytes.assign(first, first + (got <= max_read ? std::min<std::size_t>(got, cap) : 0));
+            return kErrorSuccess;
+        }
+        if (rc != kErrorSuccess && rc != kErrorMoreData) return rc;
+        size = got; // larger than the first buffer: the size the call reported
+    }
+    if (size == 0 || size > max_read) // size unknown, or the answer is size-only: ask for it (it also yields the type)
+        if (const long rc = raw(&type, nullptr, &size); rc != kErrorSuccess) return rc;
     out.type = type;
     out.size = size;
     out.bytes.clear();
@@ -92,7 +109,7 @@ template <class Raw>
     for (int attempt = 0; attempt < 3; ++attempt) {
         std::uint32_t got = static_cast<std::uint32_t>(buf.size());
         const long rc = raw(&type, buf.data(), &got);
-        if (rc == kErrorMoreData) { // the value grew between the size query and the read
+        if (rc == kErrorMoreData) { // the value grew between the two reads
             if (got > max_read) {
                 out.type = type;
                 out.size = got;
@@ -209,7 +226,8 @@ struct Opened {
 /// equates two names the kernel keeps distinct. A name that differs only in non-ASCII case compares unequal
 /// and the caller takes the walk.
 [[nodiscard]] inline bool names_equal_ascii_ci(std::string_view a, std::string_view b) {
-    return detail::fold_ascii(a) == detail::fold_ascii(b);
+    const auto fold = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c; };
+    return std::equal(a.begin(), a.end(), b.begin(), b.end(), [&](char x, char y) { return fold(x) == fold(y); });
 }
 
 /// The fast open (see the file banner). ACCEPT => `fast` is set and `leaf` is the checked handle; every
@@ -219,8 +237,10 @@ struct Opened {
 [[nodiscard]] inline Opened open_fast(RegistryWriter& reg, Handle root, std::string_view key_path,
                                       std::uint32_t leaf_access, bool leaf_may_be_link) {
     Opened out{reg};
-    for (const auto p : split_key(key_path))
-        if (p.empty()) return out; // the walk reports invalid_key_path
+    // An empty component (a leading, trailing or doubled backslash): the walk reports invalid_key_path.
+    if (key_path.empty() || key_path.front() == '\\' || key_path.back() == '\\' ||
+        key_path.find("\\\\") != std::string_view::npos)
+        return out;
     std::string expected;
     if (reg.root_name(root, expected) != kErrorSuccess || expected.empty()) return out;
     Handle h = 0;
@@ -549,6 +569,7 @@ inline void fill_old(AuditRecord& au, const OldValue& old) {
         base.capped = o.capped ? 1 : 0;
     }
     ActionOutput out;
+    out.lines.reserve(is_delete_key ? 6 : 2);
     out.lines.push_back(render_audit_line(base));
     if (!o.ok()) {
         out.lines.push_back("error|" + o.reason);
