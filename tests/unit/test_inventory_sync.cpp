@@ -2860,10 +2860,9 @@ TEST_CASE("characterisation: msi list_inventory",
     }
 }
 
-// Collector level: the whole blob, pinned. The digests were MEASURED on the unrefactored tree
-// (merge-base 6468fc11d) and are the wire-contract proof of this refactor: the blob is hashed
-// byte-identically on agent and server (ADR-0016), so any movement here is a one-sided change.
-// Re-measure ONLY on a sample recapture, the same rule as the record counts above.
+// Collector level: the whole blob, pinned. The blob is hashed byte-identically on agent and
+// server (ADR-0016), so any movement here is a one-sided change. Re-measure ONLY on a sample
+// recapture, the same rule as the record counts above.
 TEST_CASE("characterisation: collector blob digests are byte-pinned",
           "[sync][characterisation][collector]") {
     constexpr const char* kMac = "db0a9878010b71264fced3df9cb00e4703093e50cb59314d171a3227b929f2bf";

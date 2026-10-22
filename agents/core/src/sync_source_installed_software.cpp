@@ -215,8 +215,9 @@ AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action,
 // The table maps names only: a new manager also needs its own row-shape arm in the adapter
 // (store_packages branches on snap vs flatpak for the field layout). A row the table does not
 // cover is counted differently per action: an unlisted manager's `packages` row is NOT seen,
-// while its `store_packages` and present `managers` rows are seen but not mapped -- the
-// `package_action` column is what pins that difference.
+// while its `store_packages` and present `managers` rows are seen but not mapped -- each
+// adapter's row filter decides that; the `package_action` column only says where a listed
+// manager maps.
 constexpr std::string_view kActionManagers = "managers";
 constexpr std::string_view kActionPackages = "packages";
 constexpr std::string_view kActionStorePackages = "store_packages";
