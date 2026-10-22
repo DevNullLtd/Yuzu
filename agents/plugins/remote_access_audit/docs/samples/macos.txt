@@ -1,0 +1,25 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-18 · euid 501 (account redacted to jsmith) · leg-hash 58c6c41593ed
+== action=list
+status|list|constrained|macos:remote_access_audit:homes:permission_denied
+source|sshd_config|read|3
+source|homes|read|2|1
+source|service|read|1
+config|permitrootlogin|-|-
+config|passwordauthentication|-|-
+config|pubkeyauthentication|-|-
+config|kbdinteractiveauthentication|-|-
+config|gssapiauthentication|-|-
+config|permitemptypasswords|-|-
+config|usepam|yes|include:100-macos.conf
+config|port|-|-
+config|authorizedkeysfile|custom:1|sshd_config
+config|allowusers_count|0|-
+config|allowgroups_count|0|-
+config|denyusers_count|0|-
+config|denygroups_count|0|-
+config|match_blocks|0|-
+service|com.openssh.sshd|enabled|launchctl_print_disabled
+file|jsmith|authorized_keys|read|1|0|0
+key|jsmith|authorized_keys|ssh-ed25519|SHA256:KvyMqQNTYcqLvYhJttCE6h3/AYnkXfjEcQOmEx/Vvsc|256|-|-
+file|root|authorized_keys|refused|-|-|-
+[result_status] CONSTRAINED / PARTIAL / macos:remote_access_audit:homes:permission_denied

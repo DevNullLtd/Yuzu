@@ -1,13 +1,13 @@
 # Cryptographic asset inventory: design and phasing
 
-**Status:** design reference, mostly proposed. Only slice 1, the crypto-library view, is built, in
-PR #6056, which is open and not yet merged to `dev`. Everything from
-[Slice 2](#slice-2-certificate-inventory) on is a proposal that each slice must confirm before it
-builds. Claims about existing code are checked against `dev` at the date below, and claims about
-slice 1 against #6056's branch; each cites the file it comes from. A claim marked **Proposed** is a design intent that has not
-been built or tested.
+**Status:** design reference, mostly proposed. Only slice 1, the crypto-library view, is built:
+PR #6056, merged to `dev` on 2026-10-18 (`be635620c`). A CycloneDX 1.7 CBOM export of that
+slice-1 inventory (PR #6123) is also on `dev`, landed by #6143 on 2026-10-19. Everything from [Slice 2](#slice-2-certificate-inventory) on is a proposal that
+each slice must confirm before it builds. Claims about existing code, slice 1 included, are
+checked against `dev` at the date below; each cites the file it comes from. A claim marked
+**Proposed** is a design intent that has not been built or tested.
 
-Last checked against code: 2026-10-18.
+Last checked against code: 2026-10-19.
 
 ## What this is for
 
@@ -23,7 +23,7 @@ design decision.
 
 This document records the phasing, the constraints every slice inherits, the decisions still open
 and the ways this could ship wrong. The operator manual for what is built is
-`docs/user-manual/crypto.md` (it lands with #6056).
+`docs/user-manual/crypto.md` (it landed with #6056).
 
 ## Principles every slice inherits
 
@@ -31,7 +31,11 @@ and the ways this could ship wrong. The operator manual for what is built is
    (`docs/adr/1005-headless-platform-use-case-engines.md`) puts interpretation (labels such as weak,
    deprecated or quantum-safe) in a use-case engine, not the server. Slice 1 follows this: it never
    labels a library or version good, bad, current or out of date (`crypto_library_model.hpp`).
-   Where classification lives for later slices is open decision 1 (#6051).
+   Where classification lives for later slices is decided by ADR-0070
+   (`docs/adr/0070-cryptographic-asset-inventory-placement.md`): facts in core, verdicts in an
+   engine, except two maintainer exceptions it rules into core: the closed set of built-in
+   weak-key rules and dashboard windows (D13), and revocation status read only from
+   operator-registered CRLs (D5 as amended, R1).
 2. **A failed or partial read never looks like a clean answer.** "Supported, zero rows" must not
    read as "none installed", and a collector that could not read a source reports that, never an
    empty success. This is the most likely way the feature misleads (see
@@ -117,7 +121,8 @@ Known follow-ups are #6044 to #6050, #6052 and #6109.
 
 ## Slice 2: certificate inventory
 
-**Proposed.** It starts after #6056 merges and after the placement ADR (#6051).
+**Proposed.** #6056 has merged; slice 2 starts after the placement ADR (ADR-0070, #6051) is
+accepted, and its design must satisfy that ADR's D4, D5, D6, D7 and D12.
 
 The slice-2 design is `docs/crypto-slice2-certificate-design.md`; where it and this section
 differ, it governs.
@@ -140,10 +145,12 @@ differ, it governs.
   - macOS: a machine-store allowlist, `System.keychain` and `SystemRootCertificates.keychain`
     only, read in-process as the existing leg reads them. The machine-scope sync never reads the
     console user's login keychain, which the existing `list` reaches with `store=all`.
-- **Server-side expiry (superseded).** This bullet once proposed a days-to-expiry field computed on
-  the server. ADR-0070 D4 and D13 rule that out: no stored `days_remaining`, and expiry is answered
-  only by caller-supplied thresholds and D13's read-time windows. The agent still syncs absolute
-  dates only, so the daily sync's hash-skip is unaffected.
+- **No stored or synced days-to-expiry.** The agent syncs full UTC validity timestamps
+  (`not_before`, `not_after`) and nothing relative to "now": a relative value would change every
+  day and defeat the daily sync's hash-skip. The server does not compute or serve a
+  `days_remaining` field either (ADR-0070 D4 and its placement table). Expiry is read only
+  through caller-supplied filters over the raw timestamps (D4) and D13's named, fixed read-time
+  windows, each computed against Postgres `now()` and returned with its `as_of`.
 
 ## Slice 3: SSH host keys and usage
 
@@ -197,7 +204,8 @@ differ, it governs.
   fail-closed construction) and ADR-0012 (a declared runtime failure posture, bounded acquires, one
   lease per operation). It stamps freshness with server receipt time, as ADR-0016 requires (#1685).
 - **Access and projection.**
-  - Decide the securable: `Inventory`, `Security`, or a new `Crypto` securable (open decision 2).
+  - Decide the securable (open decision 2). For certificates ADR-0070 D12 has decided it: a
+    dedicated certificate securable, not `Inventory` or `Security`.
   - Decide, per action and per field, what each tier sees, including with RBAC off. Paths stay out
     of the daily blob and are served on demand, as ADR-0016 does for install locations. Whether an
     on-demand read needs a stricter tier is decided per field (open decision 3).
@@ -251,7 +259,7 @@ change.
   is a known gap that needs that field collected first.
 - The export shows facts only. CycloneDX also has strength fields such as
   `nistQuantumSecurityLevel` and `classicalSecurityLevel`. Filling those in is interpretation, so
-  they stay empty in core until open decision 1 is settled.
+  they stay empty in core (ADR-0070 D7).
 
 ## Phase 2: opt-in active and file discovery
 
@@ -311,9 +319,10 @@ change.
 
 - **Linkage.** Connect a listener to its owning executable, its leaf SPKI, the file path and its
   libraries, stored as timestamped edges because each input refreshes at a different rate.
-- **PQC readiness.** This comes after open decision 1, and reports classes, not a score. Key
-  exchange on live TLS listeners ranks highest, because traffic recorded today can be decrypted
-  later; signatures rank lower, except long-lived roots.
+- **PQC readiness.** This is use-case-engine territory, behind the ADR-0032 interlock (ADR-0070
+  D9), and reports classes, not a score. Key exchange on live TLS listeners ranks highest,
+  because traffic recorded today can be decrypted later; signatures rank lower, except
+  long-lived roots.
 - **Result sets.** No result-set producer reads a typed store: `from-inventory-query` reads the
   generic store with a 5,000-row limit and refuses a truncated result. So `from_result_set` cannot
   build on crypto data until an authorised typed producer exists (open decision 6).
@@ -339,8 +348,8 @@ change.
 
 | # | Decision | Tracking |
 |---|---|---|
-| 1 | Where classification lives: a use-case engine, or a minimal carve-out in core recorded in an ADR | #6051 |
-| 2 | The securable (`Inventory`, `Security` or a new `Crypto`) and the per-action, per-field projection matrix, including RBAC-off behaviour | not filed |
+| 1 | Where classification lives: a use-case engine, or a minimal carve-out in core recorded in an ADR | decided: ADR-0070 (#6051); D13 and D5 as amended (R1) are its maintainer exceptions |
+| 2 | The per-action, per-field projection matrix, including RBAC-off behaviour. For certificates the securable is decided: D12's dedicated certificate securable (ADR-0070), not `Inventory` or `Security` | not filed |
 | 3 | Which fields and paths go in the daily sync, and which are on-demand at an operator tier | not filed |
 | 4 | The `tls_listeners` allowlist model: static config, per-fleet policy, or supplied per run | not filed |
 | 5 | Whether any private-key content sniffing is allowed at all, and under what approval | not filed |

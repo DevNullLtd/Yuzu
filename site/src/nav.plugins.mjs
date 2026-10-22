@@ -52,6 +52,7 @@ export const PLUGIN_ENTRIES = [
   { file: 'agents/plugins/quarantine/README', slug: 'plugins/quarantine', title: 'quarantine' },
   { file: 'agents/plugins/rdp_control/README', slug: 'plugins/rdp_control', title: 'rdp_control' },
   { file: 'agents/plugins/registry/README', slug: 'plugins/registry', title: 'registry' },
+  { file: 'agents/plugins/remote_access_audit/README', slug: 'plugins/remote_access_audit', title: 'remote_access_audit' },
   { file: 'agents/plugins/runtimes/README', slug: 'plugins/runtimes', title: 'runtimes' },
   { file: 'agents/plugins/sccm/README', slug: 'plugins/sccm', title: 'sccm' },
   { file: 'agents/plugins/script_exec/README', slug: 'plugins/script_exec', title: 'script_exec' },

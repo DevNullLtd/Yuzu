@@ -234,9 +234,11 @@ One deliberate exclusion: the BACKGROUND engines (scheduler, Guardian push, poli
 dispatch as system with `nullopt`, deferred to the #1714/#1715 core chokepoint.
 
 `quarantine_device` is NOT an unfiltered exclusion — both the MCP tool and the REST twin
-(`POST`/`DELETE /api/v1/quarantine`) gate on the SOLE per-target `scoped_perm_fn("Security","Execute",
-agent_id)` (CDX-P1-02 brought REST to parity with MCP, which already threads a `{agent_id}` confined
-`VisibleSet`), and both fail CLOSED — a 500/`kInternalError` — when the scope gate is unwired, never
+(`POST`/`DELETE /api/v1/quarantine`) gate on the per-target `scoped_perm_fn("Security","Execute",
+agent_id)` FIRST (CDX-P1-02 brought REST to parity with MCP, which already threads a `{agent_id}` confined
+`VisibleSet`); since #6065 PR-Q `POST` then also runs the shared dispatch chokepoint
+(`classify_and_authorize_dispatch`), so the scoped gate is no longer the sole gate on creation and a
+global grant alone no longer admits a non-administrator (`DELETE` runs the same check for the `unquarantine` pair; `GET` remains scoped-gate only), and both fail CLOSED — a 500/`kInternalError` — when the scope gate is unwired, never
 widening to a global grant. `GET /api/v1/quarantine` is scoped the same way (gov-fix, admit-then-filter
 per record via the same `scoped_perm_fn`): a device outside the caller's visible set is dropped from
 the list entirely, not merely blocked from write access — closing the asymmetry where a confined
@@ -332,7 +334,7 @@ mirror (`kRbacSecurables`):
 
 | Securable | Purpose | Consumed operations | Roles |
 |---|---|---|---|
-| `Forensics` | Read-only forensic artefact reads (ShimCache/AmCache/Prefetch, application usage, per-app privacy-permission grants). Every catalogue row on it is `ExecuteGate::AdminOrApproval` AND single-target (below) — Administrator by default; the stored rows of a dispatched read follow `Response:Read`. | `Read`, plus the unused CRUD-loop ops (harmless, keeps the loop uniform) | Administrator (CRUD via the loop); deliberately ABSENT from the Viewer read-list — dispatching a forensic read is never a Viewer-tier operation (the stored results, though, follow `Response:Read`, which Viewer holds) |
+| `Forensics` | Read-only forensic artefact reads (ShimCache/AmCache/Prefetch, application usage, per-app privacy-permission grants, per-account SSH authorized-key fingerprints and sshd settings). Every catalogue row on it is `ExecuteGate::AdminOrApproval` AND single-target (below) — Administrator by default; the stored rows of a dispatched read follow `Response:Read`. | `Read`, plus the unused CRUD-loop ops (harmless, keeps the loop uniform) | Administrator (CRUD via the loop); deliberately ABSENT from the Viewer read-list — dispatching a forensic read is never a Viewer-tier operation (the stored results, though, follow `Response:Read`, which Viewer holds) |
 | `Decommission` | The whole-device erasure cascade (`DELETE /api/v1/sle/agents/{id}`). Replaces the three-way `SoftwareLicensing`∧`Inventory`∧`GuaranteedState:Delete` conjunction ADR-0024 Decision 9 originally rejected promoting a dedicated securable for. | `Delete` is the ONLY consumed operation — `Read`/`Write`/`Execute`/`Approve` are meaningless on this securable and are never widened onto it | Administrator (CRUD via the loop, PowerManagement/PluginConfig precedent); ITServiceOwner gets a TARGETED `Decommission:Delete` grant only (preserves the population that could decommission under the old conjunction — ITServiceOwner held CRUD on all three of its members) |
 
 `Decommission` has **no MCP consumer by design** — the erasure verb is REST-only (ADR-1005

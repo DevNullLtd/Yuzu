@@ -13,6 +13,8 @@ there is nothing to repair on the host.
 ```
 [error] Fatal exception: MCP tool security registration invalid (C8 fail-closed, #2383): <sorted list of offenders>
 [error] Fatal exception: MCP registry record '<name>' is malformed: <defect>
+[error] Fatal exception: MCP tool '<name>' <description|input schema|output schema> still carries an `@@` or `@ECOSYSTEM_` marker after expansion (...)
+[error] Fatal exception: MCP tool '<name>' <input schema|output schema> is not valid JSON after ecosystem token expansion
 ```
 
 The first line is the cross-table validator (skipped by `--mcp-disable`). The
@@ -51,7 +53,11 @@ first built in the server constructor: a registry record with a null handler or
 string field, a name outside `^[a-z][a-z0-9_]*$`, or an effect / operation
 mismatch (`ToolEffect::ReadOnly` with a non-`Read` operation, or the reverse)
 throws a `std::logic_error` naming the record, and that also stops boot with
-`--mcp-disable`. If the shipped systemd unit
+`--mcp-disable`. The third and fourth lines are the same constructor-time build
+expanding the ecosystem tokens in any `kTools[]` or registry text: a misspelt,
+single-`@` or unquoted token, or an expansion that leaves a schema as invalid
+JSON, throws a `std::logic_error` naming the tool and the field, and also stops
+boot with `--mcp-disable`. If the shipped systemd unit
 (`deploy/systemd/yuzu-server.service`) is in use, the unit retries up to
 `StartLimitBurst=3` times within `StartLimitIntervalSec=60` and then enters
 the `failed` state. Note: the gRPC agent listener opens briefly each attempt

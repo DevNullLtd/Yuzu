@@ -98,6 +98,7 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers.hpp>        // REQUIRE_THROWS_WITH (#2383)
+#include <catch2/matchers/catch_matchers_exception.hpp> // MessageMatches (M.10b)
 #include <catch2/matchers/catch_matchers_string.hpp> // ContainsSubstring (#2383)
 
 #include "agent.pb.h" // yuzu::agent::v1::AgentInfo (discover_plugins test)
@@ -1235,6 +1236,12 @@ struct McpTestServer {
         return {true, std::nullopt};
     };
 
+    /// Registry-tool provider closures (mcp_tool_deps.hpp), set beside
+    /// set_fleet_read_fn. Empty by default except for `fleet_read_fn`, which falls
+    /// back to the fixture's permissive fleet_read_fn_for_test at start(); a test
+    /// that exercises a deps-backed registry tool fills in the closures it needs.
+    yuzu::server::mcp::ToolDeps tool_deps_for_test{};
+
     /// #4037 — the fake twin of require_list_read (fixture-side, not
     /// production's fail-closed-when-unwired default): admits unfiltered
     /// unless a test overrides it, matching fleet_read_fn_for_test's
@@ -1566,6 +1573,15 @@ private:
         // predicate's "legacy-open" posture, so this is a no-op change of
         // shape for every pre-existing test that never touches it.
         mcp.set_fleet_read_fn(fleet_read_fn_for_test);
+
+        // The registry tools' ToolDeps rides a setter beside it. The fleet gate is the
+        // same permissive fake, so a deps-backed tool reaches its provider closures.
+        {
+            auto deps = tool_deps_for_test;
+            if (!deps.fleet_read_fn)
+                deps.fleet_read_fn = fleet_read_fn_for_test;
+            mcp.set_tool_deps(std::move(deps));
+        }
 
         // #4981 PR-2: scope_evaluate_fn rides a setter too — wire before the
         // handlers are built. Default (empty) leaves preview_scope_targets on
@@ -2764,6 +2780,93 @@ TEST_CASE("MCP registry seam: a handler that forgets to respond gets an internal
         dispatch_registry_handler_for_test([](const ToolCallContext&) {}, ctx);
         REQUIRE(a4_calls.size() == 1);
         CHECK(a4_calls[0].ends_with("|dropped"));
+    }
+}
+
+// tools/list is served in tool-name order. The order is a property of the catalogue
+// (build_catalogue sorts the merged legacy + registry set once), so a tool moving
+// from a legacy table to the registry does not move. The set is unchanged.
+TEST_CASE("MCP registry seam: tools/list is served sorted by tool name", "[mcp][registry_seam]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    std::vector<std::string> listed;
+    for (const auto& t : tools)
+        listed.push_back(t["name"].get<std::string>());
+    REQUIRE_FALSE(listed.empty());
+
+    CHECK(std::is_sorted(listed.begin(), listed.end()));
+
+    // Same set as the legacy-plus-registry union the catalogue exposes, no repeats.
+    auto expected = tool_names_for_test();
+    std::sort(expected.begin(), expected.end());
+    auto listed_sorted = listed;
+    std::sort(listed_sorted.begin(), listed_sorted.end());
+    CHECK(listed_sorted == expected);
+    CHECK(std::adjacent_find(listed.begin(), listed.end()) == listed.end());
+
+    // tool_names_for_test reads the same served sequence, so it agrees on order too.
+    CHECK(tool_names_for_test() == listed);
+
+    // Every registry tool is in the list.
+    for (const auto& r : registry_tool_names_for_test())
+        CHECK(std::find(listed.begin(), listed.end(), r) != listed.end());
+}
+
+// Registry seam: ToolCallContext::deps is the LAST field, so a context built from the
+// original nine values still compiles and carries deps == nullptr; a ToolDeps built by
+// hand and passed as the tenth value is what a handler reads its provider closures from.
+TEST_CASE("MCP registry seam: ToolCallContext::deps defaults to null and carries a hand-built ToolDeps",
+          "[mcp][registry_seam]") {
+    using namespace yuzu::server::mcp;
+
+    httplib::Request req;
+    httplib::Response res;
+    const nlohmann::json id = 1;
+    const nlohmann::json args = nlohmann::json::object();
+    const std::string tier = "readonly";
+    const ToolCallContext::PermFn perm = [](const httplib::Request&, httplib::Response&,
+                                            const std::string&, const std::string&) {
+        return true;
+    };
+    const ToolCallContext::AuditFn audit = [](const std::string&, const std::string&) {
+        return true;
+    };
+    const ToolCallContext::A4ErrorFn a4 = [](int, std::string_view, std::string_view, long,
+                                             std::string_view, bool) { return std::string{}; };
+
+    SECTION("the nine-value aggregate leaves deps null") {
+        const ToolCallContext ctx{req, res, id, args, tier, perm, audit, a4, nullptr};
+        CHECK(ctx.deps == nullptr);
+    }
+    SECTION("a hand-built ToolDeps is reachable through ctx.deps") {
+        ToolDeps d;
+        d.dex_score_fn = [](const std::string& agent) { return agent == "a1" ? 77 : -1; };
+        d.roster_fn = [] {
+            yuzu::server::InventoryDevicesResult r;
+            r.roster_degraded = true;
+            return r;
+        };
+        const ToolCallContext ctx{req, res, id, args, tier, perm, audit, a4, nullptr, &d};
+        REQUIRE(ctx.deps == &d);
+
+        dispatch_registry_handler_for_test(
+            [](const ToolCallContext& c) {
+                const bool degraded = c.deps->roster_fn().roster_degraded;
+                c.res.set_content(std::to_string(c.deps->dex_score_fn("a1")) +
+                                      (degraded ? "|degraded" : "|ok"),
+                                  "text/plain");
+            },
+            ctx);
+        CHECK(res.body == "77|degraded");
+        // Closures nobody wired stay empty: a handler must null-check before calling.
+        CHECK_FALSE(static_cast<bool>(ctx.deps->ci_detail_fn));
+        CHECK_FALSE(static_cast<bool>(ctx.deps->quarantine_list_fn));
+        CHECK_FALSE(static_cast<bool>(ctx.deps->fleet_read_fn));
+        CHECK_FALSE(static_cast<bool>(ctx.deps->audit_fn));
     }
 }
 
@@ -7260,6 +7363,84 @@ TEST_CASE("MCP registry seam: discover_routes under a read-only tier and --mcp-r
     const auto body = nlohmann::json::parse(res->body);
     CHECK_FALSE(body.contains("error"));
     CHECK(ts.audit_log.back() == "mcp.discover_routes|success");
+}
+
+// Registry seam: ONE central check refuses a non-object `arguments` for every registry
+// tool before its handler runs. Tier, C7, C8 and approval are earlier, so an
+// unauthorised caller still gets its own denial first.
+TEST_CASE("MCP registry seam: a non-object arguments value is refused before the handler",
+          "[mcp][registry_seam][dispatch_coverage]") {
+    McpTestServer ts;
+    bool handler_perm_fn_reached = false;
+    ts.perm_override_for_test = [&](const std::string&, const std::string&) {
+        handler_perm_fn_reached = true;
+        return true;
+    };
+    ts.start("readonly");
+
+    for (const char* bad : {"5", "[]", "\"x\"", "null"}) {
+        INFO("arguments: " << bad);
+        ts.audit_log.clear();
+        ts.audit_details.clear();
+        auto res = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":61,)") +
+                           R"("params":{"name":"discover_routes","arguments":)" + bad + "}}");
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"] == "arguments must be a JSON object");
+        const auto& data = body["error"]["data"];
+        CHECK_FALSE(data["remediation"].is_null());
+        CHECK_FALSE(data["correlation_id"].get<std::string>().empty());
+        CHECK(data["retry_after_ms"].is_null());
+        // The handler (and its perm_fn) never ran; the failure is audited as a denial
+        // under the tool's own verb, and the row's detail names the envelope's
+        // correlation id.
+        CHECK_FALSE(handler_perm_fn_reached);
+        REQUIRE(ts.audit_log.size() == 1);
+        CHECK(ts.audit_log[0] == "mcp.discover_routes|denied");
+        REQUIRE(ts.audit_details.size() == 1);
+        CHECK(ts.audit_details[0].find("correlation_id=" +
+                                       data["correlation_id"].get<std::string>()) !=
+              std::string::npos);
+    }
+
+    SECTION("an object (including an empty one) and an omitted arguments still run the handler") {
+        ts.audit_log.clear();
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":62,"params":{"name":"discover_routes","arguments":{}}})");
+        REQUIRE(res);
+        CHECK_FALSE(nlohmann::json::parse(res->body).contains("error"));
+        CHECK(ts.audit_log.back() == "mcp.discover_routes|success");
+        ts.audit_log.clear();
+        res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":63,"params":{"name":"discover_routes"}})");
+        REQUIRE(res);
+        CHECK_FALSE(nlohmann::json::parse(res->body).contains("error"));
+        CHECK(ts.audit_log.back() == "mcp.discover_routes|success");
+    }
+}
+
+TEST_CASE("MCP registry seam: the generic gates answer before the non-object arguments check",
+          "[mcp][registry_seam][dispatch_coverage][security]") {
+    McpTestServer ts;
+    int expected_code = 0;
+    SECTION("a service-scoped token is refused at the C8 chokepoint") {
+        ts.mock_token_scope_service = "printers";
+        ts.start("readonly");
+        expected_code = yuzu::server::mcp::kPermissionDenied;
+    }
+    SECTION("a tier that does not permit the tool gets its tier error") {
+        ts.start("bogus-tier"); // an unknown tier is denied for every operation
+        expected_code = yuzu::server::mcp::kTierDenied;
+    }
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":64,"params":{"name":"discover_routes","arguments":5}})");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == expected_code);
+    CHECK(body["error"]["message"] != "arguments must be a JSON object");
 }
 
 TEST_CASE("MCP Integration: discover_permissions wired vs unwired",
@@ -39197,5 +39378,197 @@ TEST_CASE("MCP sync_hardware_software: every Runner refusal maps to the intended
         const bool has_hint = body["error"].contains("data") && body["error"]["data"].contains("retry_after_ms") &&
                               !body["error"]["data"]["retry_after_ms"].is_null();
         CHECK(has_hint == c.hint);
+    }
+}
+
+// ── M.10b: ecosystem enums and pipe list are generated from kEcosystemFamilies ──────────────
+namespace {
+constexpr std::array<std::string_view, 5> kEcosystemEnumTools{
+    "query_software_catalogue", "get_software_versions", "get_crypto_libraries",
+    "list_crypto_library_devices", "export_crypto_cbom"};
+constexpr std::array<std::string_view, 3> kEcosystemWithEmptyTools{
+    "get_crypto_libraries", "list_crypto_library_devices", "export_crypto_cbom"};
+
+// Every `ecosystem` property carrying an `enum`, anywhere in a parsed schema.
+void collect_ecosystem_enums(const nlohmann::json& j, std::vector<nlohmann::json>& out) {
+    if (j.is_object()) {
+        for (const auto& [k, v] : j.items()) {
+            if (k == "ecosystem" && v.is_object() && v.contains("enum"))
+                out.push_back(v["enum"]);
+            collect_ecosystem_enums(v, out);
+        }
+    } else if (j.is_array()) {
+        for (const auto& v : j)
+            collect_ecosystem_enums(v, out);
+    }
+}
+} // namespace
+
+TEST_CASE("MCP ecosystem enums: every served ecosystem property and the pipe list are generated "
+          "from kEcosystemFamilies",
+          "[mcp][software][ecosystem]") {
+    std::vector<std::string> table;
+    std::string pipes;
+    for (const auto& e : yuzu::server::software_catalog::kEcosystemFamilies) {
+        table.emplace_back(e.ecosystem);
+        if (!pipes.empty())
+            pipes += '|';
+        pipes += e.ecosystem;
+    }
+    auto with_empty = table;
+    with_empty.insert(with_empty.begin(), "");
+
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    CHECK(res->body.find("@@") == std::string::npos);
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+
+    std::set<std::string> seen;
+    bool pipe_tool_seen = false;
+    for (const auto& t : tools) {
+        const auto name = t["name"].get<std::string>();
+        const auto props = t["inputSchema"].value("properties", nlohmann::json::object());
+        const bool empty_form =
+            std::ranges::find(kEcosystemWithEmptyTools, name) != kEcosystemWithEmptyTools.end();
+        INFO(name);
+        if (props.is_object() && props.contains("ecosystem") &&
+            props["ecosystem"].contains("enum")) {
+            seen.insert(name);
+            const auto got = props["ecosystem"]["enum"].get<std::vector<std::string>>();
+            // Exact vector equality: order is pinned to the table.
+            CHECK(got == (empty_form ? with_empty : table));
+        }
+        // An output schema is expanded and served too: any ecosystem enum it carries follows
+        // the same rule (none does today; this keeps one from drifting from the table).
+        if (t.contains("outputSchema")) {
+            std::vector<nlohmann::json> out_enums;
+            collect_ecosystem_enums(t["outputSchema"], out_enums);
+            for (const auto& e : out_enums)
+                CHECK(e.get<std::vector<std::string>>() == (empty_form ? with_empty : table));
+        }
+        if (name == "query_installed_software") {
+            pipe_tool_seen = true;
+            CHECK(t["description"].get<std::string>().find("ecosystem (" + pipes + ")") !=
+                  std::string::npos);
+        }
+    }
+    CHECK(pipe_tool_seen);
+    // Other prose naming ecosystems (the snap/flatpak sentences) stays hand-written by
+    // decision and is not scanned; only the pipe list above is generated.
+    const std::set<std::string> expected(kEcosystemEnumTools.begin(), kEcosystemEnumTools.end());
+    CHECK(seen == expected);
+}
+
+TEST_CASE("MCP ecosystem provenance: the unexpanded templates carry only the generator tokens",
+          "[mcp][software][ecosystem]") {
+    const auto rows = tool_templates_for_test();
+    REQUIRE_FALSE(rows.empty());
+
+    const auto count = [](const std::string& hay, const std::string& needle) {
+        std::size_t n = 0;
+        for (auto p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + 1))
+            ++n;
+        return n;
+    };
+
+    std::set<std::string> names;
+    std::size_t sites = 0;
+    std::size_t token_mentions = 0;
+    bool pipe_tool_seen = false;
+    for (const auto& r : rows) {
+        INFO(r.name);
+        const bool empty_form =
+            std::ranges::find(kEcosystemWithEmptyTools, r.name) != kEcosystemWithEmptyTools.end();
+        // Input and (when present) output schema: an ecosystem enum is a generator token in both.
+        for (const auto* schema : {&r.input_schema_json, &r.output_schema_json}) {
+            if (schema->empty())
+                continue;
+            const auto doc = nlohmann::json::parse(*schema, nullptr, false);
+            REQUIRE_FALSE(doc.is_discarded());
+            std::vector<nlohmann::json> enums;
+            collect_ecosystem_enums(doc, enums);
+            for (const auto& e : enums) {
+                ++sites;
+                names.insert(r.name);
+                CHECK(e == nlohmann::json::array({empty_form ? "@@ECOSYSTEM_ENUM_OR_EMPTY@@"
+                                                             : "@@ECOSYSTEM_ENUM@@"}));
+            }
+        }
+        if (r.name == "query_installed_software") {
+            pipe_tool_seen = true;
+            CHECK(r.description.find("ecosystem (@@ECOSYSTEM_LIST@@)") != std::string::npos);
+        }
+        for (const auto* text : {&r.description, &r.input_schema_json, &r.output_schema_json})
+            token_mentions += count(*text, "@@ECOSYSTEM_");
+    }
+    CHECK(pipe_tool_seen);
+    CHECK(sites == kEcosystemEnumTools.size());
+    const std::set<std::string> expected(kEcosystemEnumTools.begin(), kEcosystemEnumTools.end());
+    CHECK(names == expected);
+    // Each enum site plus the one pipe-list sentence: a token pasted on a `kind` enum, into
+    // another description or into an output schema is an extra mention and fails here.
+    CHECK(token_mentions == sites + 1);
+}
+
+TEST_CASE("MCP build_catalogue refuses a served text that still carries an ecosystem token",
+          "[mcp][software][ecosystem][registry_seam]") {
+    using namespace yuzu::server::mcp;
+
+    SECTION("a well-formed token is expanded, not refused") {
+        auto r = good_registry_record();
+        r.input_schema_json =
+            R"({"type":"object","properties":{"ecosystem":{"type":"string","enum":["@@ECOSYSTEM_ENUM@@"]}}})";
+        CHECK_NOTHROW(build_catalogue_for_test(std::span<const ToolRecord>(&r, 1)));
+    }
+    SECTION("a misspelt token in the input schema names the tool and the field") {
+        auto r = good_registry_record();
+        r.input_schema_json =
+            R"({"type":"object","properties":{"e":{"enum":["@@ECOSYSTEM_ENM@@"]}}})";
+        CHECK_THROWS_MATCHES(build_catalogue_for_test(std::span<const ToolRecord>(&r, 1)),
+                             std::logic_error,
+                             Catch::Matchers::MessageMatches(
+                                 Catch::Matchers::ContainsSubstring("MCP tool 'synthetic_tool'") &&
+                                 Catch::Matchers::ContainsSubstring("input schema")));
+    }
+    SECTION("a single-@ token is refused") {
+        auto r = good_registry_record();
+        r.input_schema_json =
+            R"({"type":"object","properties":{"e":{"enum":["@ECOSYSTEM_ENUM@"]}}})";
+        CHECK_THROWS_WITH(build_catalogue_for_test(std::span<const ToolRecord>(&r, 1)),
+                          Catch::Matchers::ContainsSubstring("input schema"));
+    }
+    SECTION("an unquoted enum token in a description is refused") {
+        auto r = good_registry_record();
+        r.description = "see @@ECOSYSTEM_ENUM@@";
+        CHECK_THROWS_WITH(build_catalogue_for_test(std::span<const ToolRecord>(&r, 1)),
+                          Catch::Matchers::ContainsSubstring("MCP tool 'synthetic_tool'") &&
+                              Catch::Matchers::ContainsSubstring("description"));
+    }
+    SECTION("the output schema is expanded and guarded too") {
+        auto r = good_registry_record();
+        r.output_schema_json =
+            R"({"type":"object","properties":{"e":{"enum":["@@ECOSYSTEM_ENUM_OR_EMPTY@@"]}}})";
+        CHECK_NOTHROW(build_catalogue_for_test(std::span<const ToolRecord>(&r, 1)));
+        r.output_schema_json =
+            R"({"type":"object","properties":{"e":{"enum":["@@ECOSYSTEM_X@@"]}}})";
+        CHECK_THROWS_WITH(build_catalogue_for_test(std::span<const ToolRecord>(&r, 1)),
+                          Catch::Matchers::ContainsSubstring("output schema"));
+    }
+    SECTION("a description with a misspelt token that has no @ECOSYSTEM_ substring is refused") {
+        auto r = good_registry_record();
+        r.description = "x @@ECOSYTEM_ENUM@@";
+        CHECK_THROWS_WITH(build_catalogue_for_test(std::span<const ToolRecord>(&r, 1)),
+                          Catch::Matchers::ContainsSubstring("description"));
+    }
+    SECTION("an expansion that yields malformed JSON in the output schema is refused") {
+        auto r = good_registry_record();
+        // Adjacent tokens expand to `"a", "b""a", "b"`: no residue, but not valid JSON.
+        r.output_schema_json =
+            R"({"type":"object","properties":{"e":{"enum":["@@ECOSYSTEM_ENUM@@""@@ECOSYSTEM_ENUM@@"]}}})";
+        CHECK_THROWS_WITH(build_catalogue_for_test(std::span<const ToolRecord>(&r, 1)),
+                          Catch::Matchers::ContainsSubstring("output schema") &&
+                              Catch::Matchers::ContainsSubstring("not valid JSON"));
     }
 }

@@ -11,6 +11,7 @@
 #include "audit_store.hpp"
 #include "auth_routes.hpp" // #4037: ListReadGate — get_guardian_status's require_list_read confinement seam
 #include "authz_gates.hpp" // #3290 Phase 2: authz::FleetReadGate — query_installed_software's real confinement seam
+#include "mcp_tool_deps.hpp" // ToolDeps: provider closures a registry handler may reach
 #include "authz_model.hpp" // #1788: VisibleSet — MCP dispatch confinement (in_scope/filter_to_scope)
 #include "ca_routes.hpp" // IssueCodeSigningFn/CodeSigningIssuance (free at yuzu::server scope, unlike
                          // CaRoutes::PublishCrlFn below) — reused verbatim by issue_code_signing_cert
@@ -602,6 +603,15 @@ public:
                                            const std::string& securable_type,
                                            const std::string& operation)>;
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
+
+    /// The provider closures a registry tool handler may reach (mcp_tool_deps.hpp),
+    /// passed to every registry handler as `ctx.deps`. The SAME closure instances
+    /// `HardwareRoutes::Deps` receives, wired beside `set_fleet_read_fn` in the
+    /// ServerImpl constructor, so a twin cannot observe a different composition
+    /// than the REST route. Set once before `build_handler`; the value lives as long
+    /// as this McpServer, which outlives every request. Unset leaves every closure
+    /// empty and the handlers answer an internal error.
+    void set_tool_deps(ToolDeps deps) { tool_deps_ = std::move(deps); }
 
     /// #4037 — the injected-callback twin of `AuthRoutes::require_list_read`
     /// (ADR-0017), backing `get_guardian_status`'s real confinement and
@@ -1238,6 +1248,8 @@ private:
     UploadGrantListReadFn upload_grant_list_read_fn_;
     // #3290 Phase 2 — see set_fleet_read_fn above.
     FleetReadFn fleet_read_fn_;
+    // See set_tool_deps above; `&tool_deps_` is ToolCallContext::deps.
+    ToolDeps tool_deps_;
     // #4037 — see set_list_read_fn above.
     ListReadFn list_read_fn_;
     // #4036 (api-parity Batch A) — see set_preflight_run_store above.

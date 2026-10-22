@@ -191,7 +191,7 @@
 #include "mcp_disabled_routes.hpp" // #2542 PR-12: the 3-route MCP-disabled stub triple, extracted onto the HttpRouteSink seam
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
-#include "capability_fragments.hpp" // YUZU_ALL_CAPABILITY_FRAGMENTS: the 28 fragments, spelled once
+#include "capability_fragments.hpp" // YUZU_ALL_CAPABILITY_FRAGMENTS: every capability fragment, spelled once
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -365,6 +365,7 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <utility>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1716,7 +1717,9 @@ public:
                           "for tiers that never reach C8) denying locally before the real "
                           "chokepoint would otherwise be reached. `kill_switched` is an "
                           "operator-thrown emergency stop, deliberately distinct from the "
-                          "`forbidden` authorization verdict.",
+                          "`forbidden` authorization verdict. `POST` and `DELETE "
+                          "/api/v1/quarantine` (#6065) are a third emitter: each runs the "
+                          "same pre-dispatch check before writing or releasing a record.",
                           "counter");
         for (auto reason : {"unclassified", "ambiguous", "anonymous_operator", "forbidden",
                             "approval_required", "kill_switched"}) {
@@ -5312,6 +5315,20 @@ public:
                     "/api/v1/plugin-config/privacy_permissions/kill-switch")) {
                 spdlog::error(
                     "[PG] Refusing to start: privacy_permissions default-off kill-switch "
+                    "seed failed");
+                startup_failed_ = true;
+            }
+        }
+
+        // remote_access_audit ships default-off (Forensics class, like privacy_permissions);
+        // enable via PUT /api/v1/plugin-config/remote_access_audit/kill-switch.
+        if (plugin_config_store_ && !startup_failed_) {
+            if (!plugin_config_store_->seed_kill_switch_default_off(
+                    "remote_access_audit",
+                    "default-off: forensics class; enable per PUT "
+                    "/api/v1/plugin-config/remote_access_audit/kill-switch")) {
+                spdlog::error(
+                    "[PG] Refusing to start: remote_access_audit default-off kill-switch "
                     "seed failed");
                 startup_failed_ = true;
             }
@@ -18796,10 +18813,9 @@ private:
             return offline_identity_row(eps, agent_id, now_ms, inv_human_age);
         };
         // The full per-device CI record composition — ONE closure shared verbatim
-        // by the dashboard fragment and the REST twin, so the two can never drift
-        // on what "the CI record" means. No MCP twin exists yet (tracked as a
-        // follow-up, governance Gate 3 finding — this comment previously claimed
-        // one was already wired).
+        // by the dashboard fragment, the REST twin and the MCP get_hardware_ci
+        // twin (via ToolDeps::ci_detail_fn), so the three can never drift on what
+        // "the CI record" means.
         auto hw_ci_detail_fn = [this, hw_identity_fn](const std::string& agent_id) -> HardwareCiDetail {
             HardwareCiDetail detail;
             apply_identity_read(detail, hw_identity_fn(agent_id));
@@ -18929,6 +18945,25 @@ private:
         // `fleet_read_fn` is the SOLE gate on the list + REST twin (admit-then-filter,
         // ADR-0017) — `build_hw_roster` is deliberately UNFILTERED, matching
         // `FleetReadFn`'s own contract (never stack a second scope predicate).
+        // Devices-page merge (round 3): the same 7-day DEX score used by the standalone
+        // Devices/DEX drills. Deliberately NOT baked into RosterFn/build_hw_roster: this
+        // must only ever be called on the rows actually rendered on the current page
+        // (post filter/sort/paginate), never the whole roster (dex_device_score is one
+        // GROUP-BY query per call). Named so the MCP ToolDeps (set_tool_deps) receives the
+        // SAME closure the REST routes do.
+        auto hw_dex_score_fn = [this](const std::string& id) -> int {
+            return dex_device_score(guaranteed_state_store_.get(), id, dex_iso_since(7));
+        };
+        // List pill: the authoritative active-quarantine read (one per list render; the
+        // snapshot the dispatch gate keeps is a 20 s cache and is deliberately not reused
+        // for an operator display). Named for the same reason as hw_dex_score_fn.
+        auto hw_quarantine_list_fn =
+            [this](const std::vector<std::string>* ids,
+                   std::size_t limit) -> std::optional<std::vector<QuarantineRecord>> {
+            if (!quarantine_store_ || !quarantine_store_->is_open())
+                return std::nullopt;
+            return quarantine_store_->list_quarantined_in(ids, limit);
+        };
         hardware_routes_ = std::make_unique<HardwareRoutes>();
         hardware_routes_->register_routes(
             *web_server_, HardwareRoutes::Deps{
@@ -19033,27 +19068,10 @@ private:
                                          return std::nullopt;
                                      return sess->agent_version;
                                  },
-                             // Devices-page merge (round 3): the same 7-day DEX score
-                             // used by the standalone Devices/DEX drills. Deliberately
-                             // NOT baked into RosterFn/build_hw_roster — this must only
-                             // ever be called on the rows actually rendered on the
-                             // current page (post filter/sort/paginate), never the whole
-                             // roster (dex_device_score is one GROUP-BY query per call).
-                             .dex_score_fn =
-                                 [this](const std::string& id) -> int {
-                                     return dex_device_score(guaranteed_state_store_.get(), id,
-                                                             dex_iso_since(7));
-                                 },
-                             // List pill: the authoritative active-quarantine read (one per
-                             // list render; the snapshot the dispatch gate keeps is a 20 s
-                             // cache and is deliberately not reused for an operator display).
-                             .quarantine_list_fn =
-                                 [this](const std::vector<std::string>* ids, std::size_t limit)
-                                     -> std::optional<std::vector<QuarantineRecord>> {
-                                     if (!quarantine_store_ || !quarantine_store_->is_open())
-                                         return std::nullopt;
-                                     return quarantine_store_->list_quarantined_in(ids, limit);
-                                 },
+                             // Devices-page merge (round 3): see hw_dex_score_fn above.
+                             .dex_score_fn = hw_dex_score_fn,
+                             // List pill: see hw_quarantine_list_fn above.
+                             .quarantine_list_fn = hw_quarantine_list_fn,
                              // POST /api/v1/hardware/sync (Software "Sync now" for a scope).
                              // Type-level Execution:Execute; the targets are then resolved
                              // against the caller's OWN Execution:Execute visible set.
@@ -20834,6 +20852,82 @@ private:
                                                           target_type, target_id);
             }});
         rest_api_v1_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
+        // #6065 PR-Q (rest-audit-principal-reresolution): POST and DELETE
+        // /api/v1/quarantine stamp every audit row from the session they resolved, not from
+        // a second resolution of the request that could name a different actor.
+        // AuthRoutes::audit_as_session_fn() is the one factory (a test drives that closure):
+        // it stamps the principal, the effective role the route captured per binding, the
+        // engine class and the session correlator. MUST run BEFORE register_routes().
+        rest_api_v1_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());
+        // #6065 PR-Q: the dispatch-chokepoint pre-check closure, defined ONCE and
+        // handed to BOTH REST (POST and DELETE /api/v1/quarantine, the trailing register_routes
+        // param) and MCP (set_authorize_dispatch_fn, wired further below), so the two
+        // surfaces cannot observe a different admit decision for the same caller
+        // (never bind a route-local copy). Each consumer holds its own COPY of this
+        // one lambda; the copies cannot diverge because it captures only `this` and
+        // everything it reads is live -- a stateful capture added here would break
+        // that, and tests/test_tier_policy_wiring_lexical.py pins "one definition,
+        // two uses". Formerly an inline lambda at the MCP wiring site; its
+        // rationale follows.
+        // Composes the SAME two DECISIONS build_classified_command
+        // makes, in the SAME order, and NEITHER is a re-implemented slice:
+        // the classify+authorize half calls classify_and_authorize_dispatch
+        // via the SAME has_permission binder (dispatch_has_permission
+        // above); the kill-switch half calls the SAME kill_switch_denial
+        // (agent_registry.hpp) finalize_classified_command itself calls —
+        // Gate 6 governance fix: an earlier round of this PR re-expressed
+        // that boolean inline instead of sharing code with
+        // finalize_classified_command, reintroducing the exact
+        // "from-scratch copy drifts from what production enforces" shape
+        // that function's own M6/wave1 extraction closed once already;
+        // this wiring now shares the extracted function instead.
+        // `action_allowed`'s construction (nullptr-guarded
+        // plugin_config_store_ wrap) is the SAME literal composition
+        // build_classified_command uses ahead of its own
+        // finalize_classified_command call, above. `plugin_config_store_`
+        // is read live through `this` (not captured by value), so this
+        // wiring is safe regardless of construction order relative to
+        // that store; an unset store means legacy-open for the
+        // kill-switch gate ONLY, mirroring build_classified_command's own
+        // unwired contract. Per McpServer::AuthorizeDispatchFn's
+        // fail-closed contract (mcp_server.hpp), omitting this whole call
+        // refuses every execute_instruction call outright, not merely a
+        // degraded tool.
+        const mcp::McpServer::AuthorizeDispatchFn authorize_dispatch =
+            [this](const yuzu::server::DispatchCaller& caller, std::string_view plugin,
+                   std::string_view action)
+                -> std::expected<yuzu::server::CommandCapability,
+                                 yuzu::server::detail::DispatchDenial> {
+                auto decision = yuzu::server::detail::classify_and_authorize_dispatch(
+                    capability_registry_, caller, plugin, action,
+                    [this](std::string_view principal, std::string_view securable,
+                           yuzu::server::authz::Operation op) {
+                        return dispatch_has_permission(principal, securable, op);
+                    });
+                if (!decision)
+                    return decision;
+                const yuzu::server::detail::KillSwitchFn action_allowed =
+                    plugin_config_store_ != nullptr
+                        ? yuzu::server::detail::KillSwitchFn(
+                              [this](std::string_view p, std::string_view a) {
+                                  return plugin_config_store_->kill_switch_decision(p, a);
+                              })
+                        : yuzu::server::detail::KillSwitchFn{};
+                // The dry run has no target, so it cannot see the per-OS
+                // layer (only the all-OS denial); a per-OS withhold shows
+                // up at dispatch as kill_switched_os_count > 0.
+                if (auto os_set =
+                        yuzu::server::detail::kill_switch_denial(*decision, action_allowed);
+                    !os_set) {
+                    return std::unexpected(os_set.error());
+                }
+                return decision;
+            };
+        // REST and MCP name this type separately; they must stay the SAME type, or the
+        // copies handed to each could silently drift behind a std::function conversion.
+        static_assert(std::is_same_v<RestApiV1::AuthorizeDispatchFn,
+                                     mcp::McpServer::AuthorizeDispatchFn>,
+                      "REST and MCP must take the identical authorize-dispatch callable type");
         rest_api_v1_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res)
@@ -21300,7 +21394,11 @@ private:
             // lambda; a second copy is exactly how the original clause-5
             // violation this belt exists to prevent could recur unreviewed
             // at a 9th call site.
-            auth_routes_->gateless_tier_policy_fn());
+            auth_routes_->gateless_tier_policy_fn(),
+            // #6065 PR-Q: POST and DELETE /api/v1/quarantine's dispatch-chokepoint pre-check --
+            // a copy of the SAME closure MCP's set_authorize_dispatch_fn receives
+            // below, never a route-local one. Unwired would make those routes answer 500.
+            authorize_dispatch);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -21396,66 +21494,25 @@ private:
             // #3687 — wired UNCONDITIONALLY, same reasoning as
             // set_capability_classify_fn immediately above (capability_registry_
             // is a plain ServerImpl member, never conditional on another store's
-            // presence). Composes the SAME two DECISIONS build_classified_command
-            // makes, in the SAME order, and NEITHER is a re-implemented slice:
-            // the classify+authorize half calls classify_and_authorize_dispatch
-            // via the SAME has_permission binder (dispatch_has_permission
-            // above); the kill-switch half calls the SAME kill_switch_denial
-            // (agent_registry.hpp) finalize_classified_command itself calls —
-            // Gate 6 governance fix: an earlier round of this PR re-expressed
-            // that boolean inline instead of sharing code with
-            // finalize_classified_command, reintroducing the exact
-            // "from-scratch copy drifts from what production enforces" shape
-            // that function's own M6/wave1 extraction closed once already;
-            // this wiring now shares the extracted function instead.
-            // `action_allowed`'s construction (nullptr-guarded
-            // plugin_config_store_ wrap) is the SAME literal composition
-            // build_classified_command uses ahead of its own
-            // finalize_classified_command call, above. `plugin_config_store_`
-            // is read live through `this` (not captured by value), so this
-            // wiring is safe regardless of construction order relative to
-            // that store; an unset store means legacy-open for the
-            // kill-switch gate ONLY, mirroring build_classified_command's own
-            // unwired contract. Per McpServer::AuthorizeDispatchFn's
-            // fail-closed contract (mcp_server.hpp), omitting this whole call
-            // refuses every execute_instruction call outright, not merely a
-            // degraded tool.
-            mcp_server_->set_authorize_dispatch_fn(
-                [this](const yuzu::server::DispatchCaller& caller, std::string_view plugin,
-                       std::string_view action)
-                    -> std::expected<yuzu::server::CommandCapability,
-                                     yuzu::server::detail::DispatchDenial> {
-                    auto decision = yuzu::server::detail::classify_and_authorize_dispatch(
-                        capability_registry_, caller, plugin, action,
-                        [this](std::string_view principal, std::string_view securable,
-                               yuzu::server::authz::Operation op) {
-                            return dispatch_has_permission(principal, securable, op);
-                        });
-                    if (!decision)
-                        return decision;
-                    const yuzu::server::detail::KillSwitchFn action_allowed =
-                        plugin_config_store_ != nullptr
-                            ? yuzu::server::detail::KillSwitchFn(
-                                  [this](std::string_view p, std::string_view a) {
-                                      return plugin_config_store_->kill_switch_decision(p, a);
-                                  })
-                            : yuzu::server::detail::KillSwitchFn{};
-                    // The dry run has no target, so it cannot see the per-OS
-                    // layer (only the all-OS denial); a per-OS withhold shows
-                    // up at dispatch as kill_switched_os_count > 0.
-                    if (auto os_set =
-                            yuzu::server::detail::kill_switch_denial(*decision, action_allowed);
-                        !os_set) {
-                        return std::unexpected(os_set.error());
-                    }
-                    return decision;
-                });
+            // presence). The closure itself is `authorize_dispatch`, defined before the REST
+            // registration above (#6065 PR-Q): one definition, two consumers.
+            mcp_server_->set_authorize_dispatch_fn(authorize_dispatch);
             // #3290 Phase 2 — the SAME fleet_read_fn lambda wired into the REST
             // registration's trailing fleet_read_fn param below, so the REST and MCP
             // query_installed_software twins cannot observe a different admit
             // decision for the same caller (same conversion, same underlying
             // require_fleet_read call).
             mcp_server_->set_fleet_read_fn(fleet_read_fn);
+            // Registry tools reach the REST provider closures through ToolDeps: the SAME
+            // closure instances HardwareRoutes::Deps received above (roster, CI detail,
+            // DEX score, quarantine list, fleet_read_fn gate, audit_fn), never a store
+            // pointer, so an MCP twin cannot observe a different composition than REST.
+            mcp_server_->set_tool_deps(mcp::ToolDeps{.fleet_read_fn = fleet_read_fn,
+                                                     .audit_fn = audit_fn,
+                                                     .roster_fn = build_hw_roster,
+                                                     .ci_detail_fn = hw_ci_detail_fn,
+                                                     .dex_score_fn = hw_dex_score_fn,
+                                                     .quarantine_list_fn = hw_quarantine_list_fn});
             // /crypto slice 1: the SAME CryptoApi instance CryptoRoutes serves, so
             // get_crypto_libraries / list_crypto_library_devices cannot disagree with the
             // page or the REST twins. Null (no inventory store) -> the tools answer an
