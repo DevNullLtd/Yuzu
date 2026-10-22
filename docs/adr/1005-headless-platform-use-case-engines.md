@@ -860,10 +860,13 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      which leaves the guides out, and no MCP tool or resource takes a
      `guides` argument.
      - **Reason.** The guides are prose written for people reading the
-       reference page. An agentic worker gets the same operations, schemas and
-       permissions from the default document, which carries every operation
-       description, and the guide text would make the document larger for
-       every reader of the MCP resource.
+       reference page, and the guide text would make the document larger for
+       every reader of the MCP resource. The default document does not carry
+       everything the guides carry. Counted by parsing the document, 40 of
+       its 259 operations have no description, and 73 operations in all have
+       descriptions that name no securable permission. The permission and
+       audit prose in each guide's access block is present only in the
+       `guides=true` form.
      - **Scope.** The exception covers the guide text only. The operations,
        parameters, schemas and `operationId` values are identical on both
        surfaces, and the `/swagger` page adds no capability beyond what the
@@ -873,8 +876,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        reads routes and tool names, so it cannot see a query-parameter variant
        or the `/swagger` page. This entry is the record that the gap is
        deliberate.
-     - **Acceptance.** No maintainer ruling is recorded yet; the ADR owner
-       confirms or rejects this entry.
+     - **Acceptance.** No maintainer ruling is recorded yet. Until one is
+       recorded, this entry is a proposal and not an accepted exception.
 
 ## Interim rules (until the named follow-ups ship)
 
