@@ -166,9 +166,15 @@ struct WiringServer {
     // Per-request inputs, mutated between requests by the test thread and read by worker threads.
     std::mutex mu;
     std::optional<auth::Session> session;
+    // When set, every resolution after the first in one request returns this instead of `session`.
+    // The first resolution is the central check's; later ones are the handler's own, so a test can
+    // make the handler resolve a different principal than the one the central check decided on.
+    std::optional<auth::Session> later_session;
+    std::atomic<int> resolutions{0};
     std::vector<AuditRow> audits;
 
     // Observations written by the route handlers (worker threads).
+    std::atomic<int> raise_mutations{0};
     std::atomic<int> rotate_handler_calls{0};
     std::atomic<int> unclassified_handler_calls{0};
     std::atomic<int> raise_handler_calls{0};
@@ -189,8 +195,9 @@ struct WiringServer {
         return st;
     };
     StepUpSessionFn resolver = [this](const httplib::Request&) -> std::optional<auth::Session> {
+        const int n = resolutions.fetch_add(1);
         std::lock_guard lk(mu);
-        return session;
+        return (n >= 1 && later_session) ? later_session : session;
     };
     StepUpAuditFn audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
                                  const std::string&, const std::string& ti,
@@ -203,7 +210,8 @@ struct WiringServer {
     WiringServer() {
         // Mirrors server.cpp's pre-routing top: a stash left by a prior request on this worker
         // thread must not be seen by this one.
-        svr.set_pre_routing_handler([](const httplib::Request&, httplib::Response&) {
+        svr.set_pre_routing_handler([this](const httplib::Request&, httplib::Response&) {
+            resolutions.store(0);
             detail::clear_step_up_pass();
             return httplib::Server::HandlerResponse::Unhandled;
         });
@@ -231,17 +239,43 @@ struct WiringServer {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      rotate_handler_calls.fetch_add(1);
                      rotate_req_addr.store(&req);
-                     // What the in-handler StepUpFn does first in production.
-                     if (consume_in_handler.load())
+                     // What the in-handler StepUpFn does first in production, with the session
+                     // the handler resolves itself.
+                     if (consume_in_handler.load()) {
+                         const auto handler_session = resolver(req);
                          handler_consumed_pass.store(
-                             detail::consume_step_up_pass(req, std::string(kRotateLabel)));
+                             handler_session &&
+                             detail::consume_step_up_pass(req, *handler_session,
+                                                          std::string(kRotateLabel)));
+                     }
                      res.status = 200;
                      res.set_content("{\"ok\":true}", "application/json");
                  });
         svr.Post(std::string(kRaisePath), [this](const httplib::Request& req,
                                                  httplib::Response& res) {
             raise_handler_calls.fetch_add(1);
-            raise_consumed_pass.store(detail::consume_step_up_pass(req, std::string(kRaiseLabel)));
+            // The production shape of a kRequired handler with no class guard of its own: resolve
+            // the session, consume the central pass for it, otherwise evaluate that session afresh
+            // (`require_mfa_step_up` is decide + effects + render over a real store; this stub
+            // injects the status function the same way the chokepoint's deps do).
+            const auto handler_session = resolver(req);
+            if (!handler_session) {
+                res.status = 401;
+                return;
+            }
+            const bool consumed =
+                detail::consume_step_up_pass(req, *handler_session, std::string(kRaiseLabel));
+            raise_consumed_pass.store(consumed);
+            if (!consumed) {
+                const auto verdict = decide_step_up(*handler_session, mfa_status, 300, "optional");
+                if (!verdict.passed()) {
+                    emit_step_up_refusal_effects(req, verdict, audit, std::string(kRaiseLabel), {},
+                                                 &metrics);
+                    render_step_up_refusal(req, res, verdict, StepUpSurface::kRest);
+                    return;
+                }
+            }
+            raise_mutations.fetch_add(1);
             res.status = 200;
             res.set_content("{\"ok\":true}", "application/json");
         });
@@ -249,8 +283,11 @@ struct WiringServer {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      unclassified_handler_calls.fetch_add(1);
                      unclassified_req_addr.store(&req);
+                     const auto handler_session = resolver(req);
                      unclassified_consumed_rotate_pass.store(
-                         detail::consume_step_up_pass(req, std::string(kRotateLabel)));
+                         handler_session &&
+                         detail::consume_step_up_pass(req, *handler_session,
+                                                      std::string(kRotateLabel)));
                      res.status = 200;
                      res.set_content("{\"ok\":true}", "application/json");
                  });
@@ -267,6 +304,10 @@ struct WiringServer {
     void set_session(std::optional<auth::Session> s) {
         std::lock_guard lk(mu);
         session = std::move(s);
+    }
+    void set_later_session(std::optional<auth::Session> s) {
+        std::lock_guard lk(mu);
+        later_session = std::move(s);
     }
 
     std::vector<AuditRow> audit_rows() {
@@ -468,6 +509,9 @@ struct ApprovalWiringServer {
 
     std::mutex mu;
     std::optional<auth::Session> session;
+    // See WiringServer: every resolution after the first in one request returns this instead.
+    std::optional<auth::Session> later_session;
+    std::atomic<int> resolutions{0};
     std::vector<AuditRow> chokepoint_audits;
     std::vector<std::string> handler_step_up_labels;
     std::vector<AuditRow> handler_audits;
@@ -483,9 +527,13 @@ struct ApprovalWiringServer {
         st.enrolled = true;
         return st;
     };
-    StepUpSessionFn resolver = [this](const httplib::Request&) -> std::optional<auth::Session> {
+    std::optional<auth::Session> resolve_next() {
+        const int n = resolutions.fetch_add(1);
         std::lock_guard lk(mu);
-        return session;
+        return (n >= 1 && later_session) ? later_session : session;
+    }
+    StepUpSessionFn resolver = [this](const httplib::Request&) -> std::optional<auth::Session> {
+        return resolve_next();
     };
     StepUpAuditFn audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
                                  const std::string&, const std::string& ti,
@@ -497,7 +545,8 @@ struct ApprovalWiringServer {
 
     explicit ApprovalWiringServer(ApprovalManager* mgr = nullptr, int window = 300)
         : approval_manager(mgr), window_secs(window) {
-        svr.set_pre_routing_handler([](const httplib::Request&, httplib::Response&) {
+        svr.set_pre_routing_handler([this](const httplib::Request&, httplib::Response&) {
+            resolutions.store(0);
             detail::clear_step_up_pass();
             return httplib::Server::HandlerResponse::Unhandled;
         });
@@ -525,8 +574,7 @@ struct ApprovalWiringServer {
             return true;
         };
         deps.resolve_session_fn = [this](const httplib::Request&) -> std::optional<auth::Session> {
-            std::lock_guard lk(mu);
-            return session;
+            return resolve_next();
         };
         deps.audit_fn = [this](const httplib::Request&, const std::string& a, const std::string& r,
                                const std::string&, const std::string& ti, const std::string& d) {
@@ -560,6 +608,10 @@ struct ApprovalWiringServer {
         std::lock_guard lk(mu);
         session = std::move(s);
     }
+    void set_later_session(std::optional<auth::Session> s) {
+        std::lock_guard lk(mu);
+        later_session = std::move(s);
+    }
 
     double gate_count(std::string_view outcome, std::string_view source) {
         return metrics
@@ -569,13 +621,16 @@ struct ApprovalWiringServer {
             .value();
     }
 
-    httplib::Result post(const std::string& path, bool same_site_origin) {
+    httplib::Result post(const std::string& path, bool same_site_origin,
+                         const std::string& foreign_origin = {}) {
         httplib::Client cli("127.0.0.1", port);
         cli.set_connection_timeout(5, 0);
         cli.set_read_timeout(5, 0);
         cli.set_write_timeout(5, 0);
         httplib::Headers h;
-        if (same_site_origin)
+        if (!foreign_origin.empty())
+            h.emplace("Origin", foreign_origin);
+        else if (same_site_origin)
             h.emplace("Origin", "http://127.0.0.1:" + std::to_string(port));
         return cli.Post(path, h, "{}", "application/json");
     }
@@ -793,6 +848,35 @@ TEST_CASE("wiring: the approve and reject handlers consume the central pass with
     }
 }
 
+// The approve handler resolves its own session after the central check. When that session is a
+// different principal than the one the central check passed, the pass is not consumed: the shared
+// in-handler decision evaluates the handler's session afresh (this harness has no auth store, so
+// that evaluation fails closed 503) and the ticket is not decided. The control is the same case
+// with one principal at both sites above ("consume the central pass with their own label").
+TEST_CASE("wiring: the approve handler does not consume a pass earned by another principal",
+          "[stepup][wiring][approval_routes][pg]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    auto id = mgr->submit("def-wiring-identity", "submitter1", "ostype = 'windows'", "",
+                          ApprovalOrigin::kInstruction);
+    REQUIRE(id.has_value());
+
+    ApprovalWiringServer s(mgr.get(), 300);
+    s.set_session(make_session("alice", "local", Role::admin, 5s));
+    s.set_later_session(make_session("bob", "local", Role::admin, 5s));
+    auto r = s.post("/api/approvals/" + *id + "/approve", /*same_site_origin=*/true);
+    REQUIRE(r);
+    CHECK(r->status == 503);
+    CHECK(s.gate_count("pass", "local") == 1);
+    CHECK(s.handler_step_up_calls.load() == 1);
+    // The refused pass was cleared, so no skipped gate is reported for this request.
+    CHECK(s.gate_count("handler_skipped", "local") == 0);
+    // Nothing was decided: no `attempted` audit row and the ticket is still pending.
+    CHECK(s.handler_audit_rows.load() == 0);
+    auto row = mgr->get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->status == "pending");
+}
+
 // COVERAGE NOTE (policy-generation raise). The real route's handler (rest_api_v1.cpp) is driven
 // by test_guardian_generation_raise.cpp through RbacRoleHarness, whose `TestRouteSink` does not run
 // the pre-request stage, so a test of the REAL handler behind the REAL central check would need the
@@ -844,6 +928,106 @@ TEST_CASE("wiring: the policy-generation raise row is decided by the central che
         CHECK(s.raise_handler_calls.load() == 1);
         CHECK(s.raise_consumed_pass.load());
     }
+}
+
+// A step-up pass is honoured only for the principal that earned it. The handler resolves its own
+// session, and that resolution can land on a different principal than the one the central check
+// decided on; the resolver here returns session A on its first call per request (the central
+// check's) and session B afterwards (the handler's), as the real flow can. The raise stub is a
+// kRequired route with no class guard of its own, so only the pass decides whether it mutates.
+TEST_CASE("wiring: the in-request pass is honoured only for the principal that earned it",
+          "[stepup][wiring]") {
+    const auto* row = step_up_policy_for("POST", kRaisePath);
+    REQUIRE(row != nullptr);
+    REQUIRE(row->cls == StepUpClass::kRequired);
+
+    SECTION("control: the same principal at both sites consumes the pass and mutates once") {
+        WiringServer s;
+        s.set_session(make_session("alice", "local", Role::admin, 5s));
+        auto r = s.post(std::string(kRaisePath));
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(s.raise_consumed_pass.load());
+        CHECK(s.raise_mutations.load() == 1);
+        CHECK(s.audit_rows().empty());
+        CHECK(s.gate_count("handler_skipped", "local", "rest") == 0);
+    }
+    SECTION("an engine principal at the handler is refused 403 and nothing mutates") {
+        WiringServer s;
+        s.set_session(make_session("alice", "local", Role::admin, 5s));
+        auto engine = make_session("engine:ci", "engine_token", Role::admin, 5s);
+        engine.principal_kind = "engine";
+        s.set_later_session(engine);
+        auto r = s.post(std::string(kRaisePath));
+        REQUIRE(r);
+        CHECK(r->status == 403);
+        CHECK(s.raise_handler_calls.load() == 1);
+        CHECK_FALSE(s.raise_consumed_pass.load());
+        CHECK(s.raise_mutations.load() == 0);
+        bool engine_row = false;
+        for (const auto& a : s.audit_rows())
+            engine_row =
+                engine_row || (a.action == "mfa.step_up.required" && a.target_id == kRaiseLabel &&
+                               a.detail.find("engine_principal_denied") != std::string::npos);
+        CHECK(engine_row);
+        // The central check passed A once; the refused pass was cleared, so no skipped gate is
+        // reported for a request the handler answered itself.
+        CHECK(s.gate_count("pass", "local", "rest") == 1);
+        CHECK(s.gate_count("handler_skipped", "local", "rest") == 0);
+        CHECK(s.gate_count("handler_skipped", "engine_token", "rest") == 0);
+    }
+    SECTION("a different human with a fresh proof is evaluated afresh, allowed, and not reported "
+            "as a skipped gate") {
+        WiringServer s;
+        s.set_session(make_session("alice", "local", Role::admin, 5s));
+        s.set_later_session(make_session("bob", "local", Role::admin, 5s));
+        auto r = s.post(std::string(kRaisePath));
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK_FALSE(s.raise_consumed_pass.load()); // alice's pass was not bob's to consume
+        CHECK(s.raise_mutations.load() == 1);      // bob's own fresh proof allowed it
+        CHECK(s.gate_count("handler_skipped", "local", "rest") == 0);
+    }
+    SECTION("a different human with a stale proof is evaluated afresh and refused 401") {
+        WiringServer s;
+        s.set_session(make_session("alice", "local", Role::admin, 5s));
+        s.set_later_session(make_session("bob", "local", Role::admin, 1h));
+        auto r = s.post(std::string(kRaisePath));
+        REQUIRE(r);
+        CHECK(r->status == 401);
+        CHECK_FALSE(s.raise_consumed_pass.load());
+        CHECK(s.raise_mutations.load() == 0);
+        bool row_seen = false;
+        for (const auto& a : s.audit_rows())
+            row_seen = row_seen || (a.action == "mfa.step_up.required" && a.target_id == kRaiseLabel);
+        CHECK(row_seen);
+    }
+}
+
+// Order check: the central step-up refusal precedes the handler's cross-site check. A stale cookie
+// proof with a foreign Origin is answered by the central check (401, step-up envelope) and the
+// handler's same-site gate, which would audit a `csrf.denied` row, never runs.
+TEST_CASE("wiring: a stale cookie proof with a foreign Origin is a step-up 401 before the "
+          "handler's cross-site check",
+          "[stepup][wiring][approval_routes]") {
+    ApprovalWiringServer s;
+    s.set_session(make_session("alice", "local", Role::admin, 1h));
+    auto r = s.post("/api/approvals/abc123/approve", /*same_site_origin=*/false,
+                    "http://evil.example");
+    REQUIRE(r);
+    CHECK(r->status == 401);
+    const auto body = nlohmann::json::parse(r->body, nullptr, /*allow_exceptions=*/false);
+    REQUIRE(body.is_object());
+    CHECK(body["meta"].value("mfa_step_up_required", false) == true);
+    CHECK(s.perm_calls.load() == 0);
+    CHECK(s.handler_audit_rows.load() == 0);
+    std::lock_guard lk(s.mu);
+    for (const auto& a : s.handler_audits)
+        CHECK(a.action != "csrf.denied");
+    bool step_up_row = false;
+    for (const auto& a : s.chokepoint_audits)
+        step_up_row = step_up_row || a.action == "mfa.step_up.required";
+    CHECK(step_up_row);
 }
 
 TEST_CASE("wiring: an over-cap body is refused 413 by the body cap, before the chokepoint",

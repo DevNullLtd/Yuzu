@@ -103,9 +103,12 @@ run_pre_request_stage(const httplib::Request& req, httplib::Response& res,
 }
 
 /// The in-handler step-up decision, behind the `StepUpFn` `server.cpp` hands to the route owners.
-///   1. The chokepoint already passed this request for this action: consume the pass and allow
-///      (skips a second MFA store read). The address is not a key; the stash clears and the label
-///      match are what protect against a stale pass (see `StepUpPassStash`).
+///   1. The chokepoint already passed this request for this action AND for the principal `session`
+///      (the one the handler resolved): consume the pass and allow (skips a second MFA store
+///      read). The address is not a key; the stash clears, the label match and the identity match
+///      are what protect against a stale pass or one earned by another principal (see
+///      `StepUpPassStash`). A pass for a different principal is refused and cleared, and step 2/3
+///      evaluate `session` afresh.
 ///   2. No auth store: fail closed with the 503 (`refuse_step_up_store_unwired`) for EVERY caller
 ///      class, before any decision is made.
 ///   3. Otherwise evaluate and render exactly as `require_mfa_step_up` does.
@@ -115,7 +118,7 @@ run_in_handler_step_up(const httplib::Request& req, httplib::Response& res,
                        const auth::Session& session, const std::string& action_label,
                        AuthDB* auth_db, int window_secs, const StepUpAuditFn& audit,
                        std::string_view mfa_enforcement, yuzu::MetricsRegistry* metrics) {
-    if (consume_step_up_pass(req, action_label))
+    if (consume_step_up_pass(req, session, action_label))
         return true;
     if (auth_db == nullptr) {
         // Fail closed: no auth store means the gate cannot evaluate, so it refuses.

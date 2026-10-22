@@ -7,6 +7,7 @@
 #include "rest_a4_envelope_http.hpp"
 
 #include <httplib.h>
+#include <openssl/evp.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <yuzu/metrics.hpp>
@@ -16,6 +17,7 @@
 #include <chrono>
 #include <cstdint>
 #include <exception>
+#include <memory>
 #include <string>
 
 namespace yuzu::server {
@@ -115,6 +117,21 @@ void note_chokepoint_exception(const std::string& label, const char* what) noexc
             spdlog::error("step-up gate: evaluating {} threw ({}); failing closed (1 log per {} "
                           "exceptions; the counter records all)",
                           label, onbehalf::sanitize_for_log(what ? what : ""), kStepUpLogSample);
+    } catch (...) { // NOLINT(bugprone-empty-catch)
+    }
+}
+
+// A pass that the handler's session could not claim. One sampled warning naming only the route
+// (never a username); the continuous signal is the handler's own evaluation, which renders and
+// audits its verdict. Must not throw: a logger failure is swallowed.
+void note_pass_identity_mismatch(const std::string& label) noexcept {
+    try {
+        static std::atomic<std::uint64_t> mismatch_hits{0};
+        if (should_log_sampled(mismatch_hits))
+            spdlog::warn("step-up gate: the pass for {} was not honoured because the handler's "
+                         "session is not the principal that earned it; evaluating afresh (1 log "
+                         "per {} occurrences)",
+                         onbehalf::sanitize_for_log(label), kStepUpLogSample);
     } catch (...) { // NOLINT(bugprone-empty-catch)
     }
 }
@@ -575,11 +592,18 @@ StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req, htt
             return refuse(v, session->auth_source);
 
         count_gate(deps.metrics, "pass", session->auth_source, surface);
+        // Bind the pass to the principal decided on. If the identity cannot be fingerprinted no
+        // pass is armed and the handler's own gate evaluates (fail closed, one extra store read).
         auto& stash = tls_step_up_pass();
-        stash.req = &req;
-        stash.row = row;
-        stash.surface = surface;
-        stash.source = step_up_source_label(session->auth_source);
+        stash = StepUpPassStash{};
+        StepUpPassIdentity identity;
+        if (step_up_identity_of(*session, identity)) {
+            stash.req = &req;
+            stash.row = row;
+            stash.surface = surface;
+            stash.source = step_up_source_label(session->auth_source);
+            stash.identity = identity;
+        }
         return StepUpChokepointResult::kPassed;
     } catch (const std::exception& e) {
         // Fail closed: a gated row never passes because evaluating it threw.
@@ -591,10 +615,57 @@ StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req, htt
     }
 }
 
-bool consume_step_up_pass(const httplib::Request& req, const std::string& action_label) noexcept {
+bool step_up_identity_of(const auth::Session& session, StepUpPassIdentity& out) noexcept {
+    // One SHA-256 over (len, bytes) for each of principal_kind, auth_source, username: the length
+    // prefix makes the encoding injective, so no two distinct triples hash the same input.
+    struct CtxDeleter {
+        void operator()(EVP_MD_CTX* c) const noexcept { EVP_MD_CTX_free(c); }
+    };
+    std::unique_ptr<EVP_MD_CTX, CtxDeleter> ctx(EVP_MD_CTX_new());
+    if (!ctx || EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) != 1)
+        return false;
+    const auto feed = [&](const std::string& field) noexcept {
+        const std::uint64_t len = field.size();
+        unsigned char prefix[sizeof(len)];
+        for (std::size_t i = 0; i < sizeof(len); ++i)
+            prefix[i] = static_cast<unsigned char>(len >> (8 * i));
+        return EVP_DigestUpdate(ctx.get(), prefix, sizeof(prefix)) == 1 &&
+               (field.empty() || EVP_DigestUpdate(ctx.get(), field.data(), field.size()) == 1);
+    };
+    if (!feed(session.principal_kind) || !feed(session.auth_source) || !feed(session.username))
+        return false;
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int md_len = 0;
+    if (EVP_DigestFinal_ex(ctx.get(), md, &md_len) != 1 || md_len < 16)
+        return false;
+    const auto word = [&](std::size_t off) noexcept {
+        std::uint64_t w = 0;
+        for (std::size_t i = 0; i < 8; ++i)
+            w |= static_cast<std::uint64_t>(md[off + i]) << (8 * i);
+        return w;
+    };
+    out.engine = session.is_engine();
+    out.h1 = word(0);
+    out.h2 = word(8);
+    return true;
+}
+
+bool consume_step_up_pass(const httplib::Request& req, const auth::Session& handler_session,
+                          const std::string& action_label) noexcept {
     auto& stash = tls_step_up_pass();
     if (stash.req != &req || stash.row == nullptr || stash.row->action_label != action_label)
         return false;
+    // A pass is honoured only for the principal that earned it. The engine class is an exact
+    // compare, and the hashes cover kind, source and username. On any mismatch (or if the
+    // handler's identity cannot be fingerprinted) the pass is cleared so the post-routing report
+    // does not count a skipped gate, and the caller evaluates the handler's session afresh.
+    StepUpPassIdentity handler_identity;
+    if (!step_up_identity_of(handler_session, handler_identity) ||
+        handler_identity.engine != stash.identity.engine || handler_identity != stash.identity) {
+        note_pass_identity_mismatch(action_label);
+        clear_step_up_pass();
+        return false;
+    }
     clear_step_up_pass();
     return true;
 }

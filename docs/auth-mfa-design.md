@@ -757,3 +757,9 @@ regress:
    gates, a null auth store answers `503` for every caller class first, then an engine is `403` with no
    store read, ahead of the window-disabled hatch, which in turn precedes the
    SAML denial and the store read (so a window of 0 or less lets SAML through).
+   The in-handler `step_up_fn` reuses the central verdict only through a per-request pass
+   that is bound to the principal that earned it (the principal class exactly, plus a
+   fingerprint of principal kind, auth source and username): the handler resolves its own
+   session, and a pass is honoured only when that session is the same principal. A handler
+   session that differs refuses the pass, clears it, and is evaluated afresh, which is the
+   path that answers an engine principal `403`.

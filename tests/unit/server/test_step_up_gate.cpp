@@ -710,7 +710,7 @@ TEST_CASE("chokepoint: stale proof on a kRequired row is refused before the hand
         CHECK(rig.gate_count("pass", "local", "rest") == 0);
     }
     SECTION("a refusal arms no pass stash") {
-        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
     }
 }
 
@@ -914,7 +914,7 @@ TEST_CASE("chokepoint: the MFA recovery-codes and disable routes are gated",
               StepUpChokepointResult::kPassed);
         CHECK(res.status == -1);
         CHECK(rig.gate_count("pass", "local", "dashboard") == 1);
-        CHECK(detail::consume_step_up_pass(req, route.label));
+        CHECK(detail::consume_step_up_pass(req, *rig.session, route.label));
     }
     SECTION("an un-enrolled caller passes whatever the proof age") {
         Rig rig;
@@ -987,7 +987,7 @@ TEST_CASE("chokepoint: an engine session is refused 403 before the handler and a
                   "engine principals cannot perform this operation");
         }
         // The handler is never reached: no pass stash is armed for it.
-        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
         REQUIRE(rig.audits.size() == 1);
         CHECK(rig.audits[0].action == "mfa.step_up.required");
         CHECK(rig.audits[0].result == "error");
@@ -1136,7 +1136,7 @@ TEST_CASE("chokepoint: no session, an unwired resolver and a throwing resolver a
         CHECK(body_of(res)["meta"]["mfa_step_up_required"] == true);
         // No session resolved, so there is no source to report.
         CHECK(rig.gate_count("unavailable", "other", "rest") == 1);
-        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
         // No session had resolved, so the row has no user; the reason token is still recorded.
         REQUIRE(rig.audits.size() == 1);
         CHECK(rig.audits[0].action == "mfa.step_up.required");
@@ -1164,7 +1164,7 @@ TEST_CASE("chokepoint: no session, an unwired resolver and a throwing resolver a
         CHECK(rig.gate_count("unavailable", "other", "rest") == 0);
         CHECK(rig.gate_count("pass", "local", "rest") == 0);
         // The pass stash is not armed: a handler-side consume finds nothing.
-        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
         REQUIRE(rig.audits.size() == 1);
         CHECK(rig.audits[0].action == "mfa.step_up.required");
         CHECK(rig.audits[0].result == "error");
@@ -1253,7 +1253,7 @@ TEST_CASE("chokepoint: no session, an unwired resolver and a throwing resolver a
         CHECK_NOTHROW(detail::apply_step_up_chokepoint(req, res, rig.deps()));
         CHECK(res.status == 503);
         CHECK(rig.gate_count("unavailable", "local", "rest") == 1);
-        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
     }
 }
 
@@ -1300,7 +1300,7 @@ TEST_CASE("chokepoint: an evaluation that throws after the session resolves keep
     CHECK(rig.gate_count("unavailable", source, "rest") == 1);
     CHECK(rig.gate_count("unavailable", "other", "rest") == 0);
     CHECK(rig.gate_count("pass", source, "rest") == 0);
-    CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+    CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
     REQUIRE(rig.audits.size() == 1);
     CHECK(rig.audits[0].action == "mfa.step_up.required");
     CHECK(rig.audits[0].result == "error");
@@ -1335,7 +1335,7 @@ TEST_CASE("chokepoint: a refusal renderer that throws still ends in a 503", "[st
         CHECK(result == StepUpChokepointResult::kRefused);
         CHECK(res.status == 503);
         CHECK(rig.gate_count("unavailable", "local", "rest") == 1);
-        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
         REQUIRE(rig.audits.size() == 1);
         CHECK(without_cid(rig.audits[0].detail) ==
               "user=alice reason=chokepoint_exception stage=pre_authz");
@@ -1359,7 +1359,7 @@ TEST_CASE("chokepoint: a refusal renderer that throws still ends in a 503", "[st
         CHECK(result == StepUpChokepointResult::kRefused);
         CHECK(res.status == 503);
         CHECK(rig.gate_count("unavailable", "local", "rest") == 1);
-        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
     }
 }
 
@@ -1607,23 +1607,138 @@ TEST_CASE("pass stash: consumed once, for this request and this label only", "[s
             StepUpChokepointResult::kPassed);
 
     SECTION("a different action label does not consume it") {
-        CHECK_FALSE(detail::consume_step_up_pass(req, "DELETE /api/v1/tokens/{id}"));
-        CHECK(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, "DELETE /api/v1/tokens/{id}"));
+        CHECK(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
     }
     SECTION("a different request object does not consume it") {
         auto other = make_request("POST", kTokensPattern, "/api/v1/tokens");
-        CHECK_FALSE(detail::consume_step_up_pass(other, std::string(kTokensLabel)));
-        CHECK(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        CHECK_FALSE(detail::consume_step_up_pass(other, *rig.session, std::string(kTokensLabel)));
+        CHECK(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
     }
     SECTION("it is single-use: the second call re-evaluates") {
-        CHECK(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
-        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        CHECK(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
+        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
     }
     SECTION("a cleared stash (pre-routing / post-routing) is gone") {
         detail::clear_step_up_pass();
-        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
     }
     detail::clear_step_up_pass();
+}
+
+namespace {
+auth::Session engine_session(const std::string& user) {
+    auto e = make_session(user, "engine_token", Role::admin, ago(5s));
+    e.principal_kind = "engine";
+    return e;
+}
+} // namespace
+
+// A step-up pass is honoured only for the principal that earned it: the handler resolves its own
+// session, and the identity of that session (exact principal class, plus a fingerprint of
+// principal kind, auth source and username) must equal the one the chokepoint decided on.
+TEST_CASE("pass identity: consumed only by the principal that earned it", "[stepup][gate][identity]") {
+    Rig rig;
+    rig.session = make_session("alice", "local", Role::admin, ago(10s));
+    const auto earned = *rig.session;
+    auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
+    httplib::Response res;
+    REQUIRE(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+            StepUpChokepointResult::kPassed);
+
+    // A mismatch refuses AND clears: the earning principal cannot consume it afterwards either, and
+    // the post-routing report does not count a skipped gate for a pass the handler refused.
+    const auto refused_and_cleared = [&](const auth::Session& handler_session) {
+        CHECK_FALSE(detail::consume_step_up_pass(req, handler_session, std::string(kTokensLabel)));
+        CHECK_FALSE(detail::consume_step_up_pass(req, earned, std::string(kTokensLabel)));
+        httplib::Response done;
+        done.status = 200;
+        detail::finish_step_up_pass(req, done, &rig.metrics);
+        CHECK(rig.gate_count("handler_skipped", "local", "rest") == 0);
+    };
+
+    SECTION("the same identity consumes it, once") {
+        CHECK(detail::consume_step_up_pass(req, earned, std::string(kTokensLabel)));
+        CHECK_FALSE(detail::consume_step_up_pass(req, earned, std::string(kTokensLabel)));
+    }
+    SECTION("an equal-but-distinct session object (same fields) consumes it") {
+        auto copy = make_session("alice", "local", Role::user, ago(1h));
+        CHECK(detail::consume_step_up_pass(req, copy, std::string(kTokensLabel)));
+    }
+    SECTION("a different username is refused and the pass is cleared") {
+        refused_and_cleared(make_session("bob", "local", Role::admin, ago(10s)));
+    }
+    SECTION("a different auth source is refused and the pass is cleared") {
+        refused_and_cleared(make_session("alice", "oidc", Role::admin, ago(10s)));
+    }
+    SECTION("an API-token session of the same username is refused and the pass is cleared") {
+        refused_and_cleared(make_session("alice", "api_token", Role::admin, ago(10s)));
+    }
+    SECTION("a different principal kind is refused and the pass is cleared") {
+        auto other = make_session("alice", "local", Role::admin, ago(10s));
+        other.principal_kind = "engine";
+        refused_and_cleared(other);
+    }
+    SECTION("a different non-engine principal kind is refused on the fingerprint alone") {
+        auto other = make_session("alice", "local", Role::admin, ago(10s));
+        other.principal_kind = "service";
+        refused_and_cleared(other);
+    }
+    SECTION("an engine session behind a local pass is refused and the pass is cleared") {
+        refused_and_cleared(engine_session("alice"));
+    }
+    SECTION("an engine session with a different name is refused too") {
+        refused_and_cleared(engine_session("engine:ci"));
+    }
+    SECTION("a refusal on identity leaves a later request's pass unaffected") {
+        refused_and_cleared(make_session("bob", "local", Role::admin, ago(10s)));
+        httplib::Response res2;
+        REQUIRE(detail::apply_step_up_chokepoint(req, res2, rig.deps()) ==
+                StepUpChokepointResult::kPassed);
+        CHECK(detail::consume_step_up_pass(req, earned, std::string(kTokensLabel)));
+    }
+}
+
+TEST_CASE("pass identity: the engine class is an exact compare, never hash-only",
+          "[stepup][gate][identity]") {
+    Rig rig;
+    rig.session = make_session("alice", "local", Role::admin, ago(10s));
+    auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
+    httplib::Response res;
+    REQUIRE(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+            StepUpChokepointResult::kPassed);
+
+    // Forge the stashed fingerprint so every hash word equals the engine session's, leaving only
+    // the exact class flag to tell them apart.
+    const auto engine = engine_session("alice");
+    detail::StepUpPassIdentity forged;
+    REQUIRE(detail::step_up_identity_of(engine, forged));
+    forged.engine = false;
+    detail::tls_step_up_pass().identity = forged;
+    CHECK_FALSE(detail::consume_step_up_pass(req, engine, std::string(kTokensLabel)));
+}
+
+TEST_CASE("pass identity: the fingerprint separates fields and is deterministic",
+          "[stepup][gate][identity]") {
+    const auto fp = [](const std::string& kind, const std::string& source, const std::string& user) {
+        auth::Session s;
+        s.principal_kind = kind;
+        s.auth_source = source;
+        s.username = user;
+        detail::StepUpPassIdentity id;
+        REQUIRE(detail::step_up_identity_of(s, id));
+        return id;
+    };
+    CHECK(fp("human", "local", "alice") == fp("human", "local", "alice"));
+    CHECK_FALSE(fp("human", "local", "alice") == fp("human", "local", "alicf"));
+    CHECK_FALSE(fp("human", "local", "alice") == fp("human", "oidc", "alice"));
+    CHECK_FALSE(fp("human", "local", "alice") == fp("engine", "local", "alice"));
+    CHECK_FALSE(fp("human", "local", "alice") == fp("service", "local", "alice"));
+    // The length prefix keeps a boundary shift between fields from producing the same encoding.
+    CHECK_FALSE(fp("human", "local", "x") == fp("human", "loca", "lx"));
+    CHECK_FALSE(fp("human", "", "local") == fp("human", "local", ""));
+    CHECK(fp("engine", "local", "a").engine);
+    CHECK(fp("human", "engine_token", "a").engine); // the engine auth source is an engine class
 }
 
 TEST_CASE("pass stash: an unconsumed pass on a 2xx response is counted handler_skipped",
@@ -1640,10 +1755,10 @@ TEST_CASE("pass stash: an unconsumed pass on a 2xx response is counted handler_s
         out.status = 200;
         detail::finish_step_up_pass(req, out, &rig.metrics);
         CHECK(rig.gate_count("handler_skipped", "local", "rest") == 1);
-        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
     }
     SECTION("a consumed pass is not counted") {
-        REQUIRE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        REQUIRE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
         httplib::Response out;
         out.status = 200;
         detail::finish_step_up_pass(req, out, &rig.metrics);
@@ -1654,7 +1769,7 @@ TEST_CASE("pass stash: an unconsumed pass on a 2xx response is counted handler_s
         out.status = 403;
         detail::finish_step_up_pass(req, out, &rig.metrics);
         CHECK(rig.gate_count("handler_skipped", "local", "rest") == 0);
-        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
     }
 }
 
@@ -1686,7 +1801,7 @@ TEST_CASE("pass stash lifecycle: a pass armed by request A is not consumable by 
     SECTION("control: with NO clear between them the address and label alone admit B") {
         // This is why the clears exist: nothing in the stash distinguishes A from B.
         become_request_b();
-        CHECK(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        CHECK(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
     }
     SECTION("the post-routing handler of A clears it (and reports it once if A skipped its gate)") {
         httplib::Response a_done;
@@ -1694,7 +1809,7 @@ TEST_CASE("pass stash lifecycle: a pass armed by request A is not consumable by 
         detail::finish_step_up_pass(req, a_done, &rig.metrics);
         CHECK(rig.gate_count("handler_skipped", "local", "rest") == 1);
         become_request_b();
-        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
     }
     SECTION("post-routing clears on a non-2xx response too, without reporting it") {
         httplib::Response a_failed;
@@ -1702,14 +1817,14 @@ TEST_CASE("pass stash lifecycle: a pass armed by request A is not consumable by 
         detail::finish_step_up_pass(req, a_failed, &rig.metrics);
         CHECK(rig.gate_count("handler_skipped", "local", "rest") == 0);
         become_request_b();
-        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
     }
     SECTION("the pre-routing top of B clears a pass A left (A's post-routing never ran)") {
         // What the first statements of server.cpp's pre-routing handler do for a request that
         // follows one which bypassed post-routing.
         detail::clear_step_up_pass();
         become_request_b();
-        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
     }
     SECTION("a refused request B does not inherit A's pass, and its post-routing clears it") {
         rig.session = make_session("alice", "local", Role::admin, ago(1h));
@@ -1719,13 +1834,13 @@ TEST_CASE("pass stash lifecycle: a pass armed by request A is not consumable by 
                 StepUpChokepointResult::kRefused);
         // A refused B is Handled, so no handler runs; post-routing must still leave nothing armed.
         detail::finish_step_up_pass(req, res_b, &rig.metrics);
-        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
         CHECK(rig.gate_count("handler_skipped", "local", "rest") == 0);
     }
     SECTION("a different action label at the same address never consumes it, and keeps it") {
-        CHECK_FALSE(detail::consume_step_up_pass(req, "DELETE /api/v1/tokens/{id}"));
+        CHECK_FALSE(detail::consume_step_up_pass(req, *rig.session, "DELETE /api/v1/tokens/{id}"));
         // The refused attempt did not burn A's pass: only a matching consume or a clear does.
-        CHECK(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        CHECK(detail::consume_step_up_pass(req, *rig.session, std::string(kTokensLabel)));
     }
 }
 
@@ -1740,7 +1855,8 @@ TEST_CASE("pass stash lifecycle: a Rig leaves no stash behind for the next test"
                 StepUpChokepointResult::kPassed);
         // Deliberately neither consumed nor cleared: a failing REQUIRE would leave exactly this.
     }
-    CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+    const auto alice = make_session("alice", "local", Role::admin, ago(10s));
+    CHECK_FALSE(detail::consume_step_up_pass(req, alice, std::string(kTokensLabel)));
 }
 
 TEST_CASE("pass stash lifecycle: a Rig starts with an empty stash", "[stepup][gate][lifecycle]") {
@@ -1751,7 +1867,8 @@ TEST_CASE("pass stash lifecycle: a Rig starts with an empty stash", "[stepup][ga
     stash.row = step_up_policy_for("POST", kTokensPattern);
     REQUIRE(stash.row != nullptr);
     Rig next;
-    CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+    const auto alice = make_session("alice", "local", Role::admin, ago(10s));
+    CHECK_FALSE(detail::consume_step_up_pass(req, alice, std::string(kTokensLabel)));
 }
 
 // ── in-handler fail-closed helper ────────────────────────────────────────────

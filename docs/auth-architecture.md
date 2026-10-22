@@ -720,7 +720,12 @@ by each handler.
   `rotate`/`confirm` routes re-evaluate on every call, including an
   idempotent re-serve. A per-request stash lets the handler's own
   `step_up_fn` call (kept as a second, identical check) reuse the verdict
-  instead of reading enrollment state a second time. That stash, its
+  instead of reading enrollment state a second time. The stash is bound to
+  the principal the central check decided on (principal class exactly, plus a
+  fingerprint of principal kind, auth source and username) as well as to the
+  request and the action label: a handler whose own resolved session is a
+  different principal does not consume it, the stash is cleared, and that
+  session is evaluated afresh. That stash, its
   consumer (`consume_step_up_pass`), the `handler_skipped` outcome (a
   report-only tripwire raised when a 2xx follows an unconsumed pass) and the
   in-handler calls themselves are transitional: PR 2 deletes them once the
