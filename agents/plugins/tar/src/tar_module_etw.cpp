@@ -107,8 +107,6 @@ namespace yuzu::tar {
 
 static_assert(kDriveTypeFixed == DRIVE_FIXED);
 static_assert(kFileAttributeReparsePoint == FILE_ATTRIBUTE_REPARSE_POINT);
-static_assert(kReparseTagSymlink == IO_REPARSE_TAG_SYMLINK);
-static_assert(kReparseTagMountPoint == IO_REPARSE_TAG_MOUNT_POINT);
 static_assert(kReparseTagNameSurrogateBit == IsReparseTagNameSurrogate(0xFFFFFFFFU));
 
 namespace {
@@ -596,30 +594,22 @@ std::vector<ModuleEvent> ModuleEtwCollector::drain() {
             full.push_back('\\');
         }
         full += e.module_name;
-        if (!image_path_is_local(full)) {
-            // Not a local path (UNC / \Device\Mup / a network drive): the agent runs as
-            // LocalSystem, so opening it would authenticate the machine account to that host
-            // and could stall this drain (it runs under collect_mu_). Open NOTHING.
-            e.signed_state = ModuleSignedState::kUnknown;
-            e.signer.clear();
-        } else {
-            // ONE open, following no reparse point, by the NT path as delivered; mtime (cache
-            // key), verdict and signer all come from this handle. A failed open (vanished file,
-            // planted link, unsupported flag) keeps the row with an unknown verdict, which
-            // module_is_risky does not count.
-            ImageHandle img = open_local_image_no_reparse(full);
-            if (!img) {
-                e.signed_state = ModuleSignedState::kUnknown;
-                e.signer.clear();
-            } else {
-                const std::int64_t mtime = image_mtime_unix(img.get());
-                const ModuleSignVerdict v =
-                    sign_cache_.get(full, mtime, [&](const std::string&) {
-                        return verify_image_signature_win(img.get(), full);
-                    });
-                e.signed_state = v.state;
-                e.signer = v.signer;
-            }
+        // Not a local path (UNC / \Device\Mup / a network drive): the agent runs as LocalSystem,
+        // so opening it would authenticate the machine account to that host and could stall this
+        // drain (it runs under collect_mu_). Open NOTHING. For a local path: ONE open, following
+        // no reparse point, by the NT path as delivered; mtime (cache key), verdict and signer
+        // all come from this handle. No open (network path, vanished file, planted link,
+        // unsupported flag) keeps the row with the unknown verdict the mapped event already
+        // carries, which module_is_risky does not count.
+        const ImageHandle img =
+            image_path_is_local(full) ? open_local_image_no_reparse(full) : ImageHandle{};
+        if (img) {
+            const std::int64_t mtime = image_mtime_unix(img.get());
+            const ModuleSignVerdict v = sign_cache_.get(full, mtime, [&](const std::string&) {
+                return verify_image_signature_win(img.get(), full);
+            });
+            e.signed_state = v.state;
+            e.signer = v.signer;
         }
         // Privacy edge-drop AFTER signing (governance BLOCKING): the stored dir
         // must never carry a username.

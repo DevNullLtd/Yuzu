@@ -1214,8 +1214,9 @@ if host_machine.system() == 'windows'
   tar_test_deps += cxx.find_library('tdh') # tar_proc_etw.cpp / tar_module_etw.cpp ETW decode
   tar_test_deps += cxx.find_library('wintrust') # tar_module_etw.cpp WinVerifyTrust
   tar_test_deps += cxx.find_library('crypt32')  # tar_module_etw.cpp CertGetNameStringW (signer from the WinVerifyTrust chain)
-  # advapi32, declared deliberately: tar_db.cpp's owner-only DACL (SetEntriesInAclW,
-  # SetSecurityInfo, GetSecurityInfo) and the test_tar_store.cpp DACL readback/owner calls.
+  # advapi32, declared deliberately: tar_db.cpp's owner-only DACL
+  # (ConvertStringSecurityDescriptorToSecurityDescriptorW, SetSecurityInfo, GetSecurityInfo) and
+  # the test_tar_store.cpp DACL readback/owner calls.
   tar_test_deps += cxx.find_library('advapi32')
   tar_test_deps += cxx.find_library('version')  # tar_proc_perf.cpp GetFileVersionInfoW
   tar_test_deps += cxx.find_library('wevtapi')  # tar_netconn_win.cpp EvtQuery/EvtRender

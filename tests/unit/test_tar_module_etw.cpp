@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -285,14 +286,15 @@ TEST_CASE("reparse_leaf_refused refuses name surrogates only", "[tar][module][et
     constexpr std::uint32_t kWof = 0x80000017;        // IO_REPARSE_TAG_WOF (CompactOS)
     constexpr std::uint32_t kDedup = 0x80000013;      // IO_REPARSE_TAG_DEDUP
     constexpr std::uint32_t kCloudFiles = 0x9000001A; // IO_REPARSE_TAG_CLOUD (placeholder)
-    CHECK(reparse_leaf_refused(kReparse, kReparseTagSymlink));
-    CHECK(reparse_leaf_refused(kReparse, kReparseTagMountPoint));
+    constexpr std::uint32_t kSymlink = 0xA000000C;    // IO_REPARSE_TAG_SYMLINK
+    CHECK(reparse_leaf_refused(kReparse, kSymlink));
+    CHECK(reparse_leaf_refused(kReparse, 0xA0000003)); // IO_REPARSE_TAG_MOUNT_POINT
     CHECK(reparse_leaf_refused(kReparse, 0x20000000)); // any other name-surrogate tag
     CHECK_FALSE(reparse_leaf_refused(kReparse, kWof));
     CHECK_FALSE(reparse_leaf_refused(kReparse, kDedup));
     CHECK_FALSE(reparse_leaf_refused(kReparse, kCloudFiles));
     // No reparse attribute: the tag field is not meaningful and never refuses.
-    CHECK_FALSE(reparse_leaf_refused(0x80, kReparseTagSymlink));
+    CHECK_FALSE(reparse_leaf_refused(0x80, kSymlink));
     CHECK_FALSE(reparse_leaf_refused(0, 0));
 }
 
@@ -314,9 +316,6 @@ TEST_CASE("ModuleEtwCollector is a clean no-op off-Windows", "[tar][module][etw]
 // Needs a Windows host (system binaries, WinVerifyTrust, NTFS); compiled out elsewhere. A case
 // SKIPs, naming why, where the account cannot create symbolic links or the volume refuses WOF.
 #ifdef _WIN32
-#ifndef SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
-#define SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE 0x2
-#endif
 
 namespace {
 
@@ -393,27 +392,6 @@ bool make_link(const std::wstring& link, const std::wstring& target, bool direct
     return false;
 }
 
-// The discriminating oracle: by name the link resolves.
-bool opens_by_name(const std::wstring& win32) {
-    HANDLE h = CreateFileW(win32.c_str(), GENERIC_READ, kShareAll, nullptr, OPEN_EXISTING,
-                           FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE)
-        return false;
-    CloseHandle(h);
-    return true;
-}
-
-// An empty file: the link cases aim every link at a DECOY like this one inside the temp root, never
-// at a real system path, so no cleanup bug, however it recurses, can reach outside the temp root.
-bool make_sentinel(const std::wstring& path) {
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
-                           FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE)
-        return false;
-    CloseHandle(h);
-    return true;
-}
-
 // First boot-critical system binary with an embedded Authenticode signature (kernel32.dll is
 // catalog-signed and verifies as unsigned by this path), as {Win32 path, NT path}.
 std::optional<std::pair<std::wstring, std::string>> first_signed_candidate() {
@@ -439,13 +417,15 @@ TEST_CASE("Windows module drain: a FILE symlink is refused while the name still 
           "[tar][module][etw][windows]") {
     yuzu::test::TempDir dir{"yuzu_test_tar_nolink_"};
     std::filesystem::create_directories(dir.path);
-    const std::wstring target = (dir.path / L"decoy.dll").wstring();
-    REQUIRE(make_sentinel(target));
-    const std::wstring link = (dir.path / L"decoy_link.dll").wstring();
-    if (!make_link(link, target, false))
+    // Every link below is aimed at an empty DECOY inside the temp root, never at a real system
+    // path, so no cleanup bug, however it recurses, can reach outside the temp root.
+    const std::filesystem::path target = dir.path / L"decoy.dll";
+    REQUIRE(std::ofstream{target}.is_open());
+    const std::filesystem::path link = dir.path / L"decoy_link.dll";
+    if (!make_link(link.wstring(), target.wstring(), false))
         SKIP("account cannot create symbolic links");
-    REQUIRE(opens_by_name(link));
-    CHECK_FALSE(open_local_image_no_reparse(nt_path_of(link)));
+    REQUIRE(std::ifstream{link}.is_open()); // by name the link resolves
+    CHECK_FALSE(open_local_image_no_reparse(nt_path_of(link.wstring())));
 }
 
 TEST_CASE("Windows module drain: an ancestor DIRECTORY symlink is refused",
@@ -453,17 +433,13 @@ TEST_CASE("Windows module drain: an ancestor DIRECTORY symlink is refused",
     yuzu::test::TempDir dir{"yuzu_test_tar_nolink_"};
     const std::filesystem::path decoy_dir = dir.path / L"decoy_dir";
     std::filesystem::create_directories(decoy_dir);
-    REQUIRE(make_sentinel((decoy_dir / L"kernel32.dll").wstring()));
-    const std::wstring link_dir = (dir.path / L"decoy_dir_link").wstring();
-    if (!make_link(link_dir, decoy_dir.wstring(), true))
+    REQUIRE(std::ofstream{decoy_dir / L"kernel32.dll"}.is_open());
+    const std::filesystem::path link_dir = dir.path / L"decoy_dir_link";
+    if (!make_link(link_dir.wstring(), decoy_dir.wstring(), true))
         SKIP("account cannot create symbolic links");
-    struct LinkGuard { // removes the link itself, whatever the standard library does with it
-        const std::wstring& dir;
-        ~LinkGuard() { RemoveDirectoryW(dir.c_str()); }
-    } guard{link_dir};
-    REQUIRE(opens_by_name(link_dir + L"\\kernel32.dll"));
+    REQUIRE(std::ifstream{link_dir / L"kernel32.dll"}.is_open()); // by name the link resolves
     // The LINK's own NT path plus the leaf, not the decoy's resolved path.
-    CHECK_FALSE(open_local_image_no_reparse(nt_path_of(link_dir) + "\\kernel32.dll"));
+    CHECK_FALSE(open_local_image_no_reparse(nt_path_of(link_dir.wstring()) + "\\kernel32.dll"));
 }
 
 TEST_CASE("Windows module drain: the by-handle verdict equals the by-name verdict",
@@ -509,10 +485,11 @@ TEST_CASE("Windows module drain: a WOF-compressed image is not refused and still
     REQUIRE(CopyFileW(candidate->first.c_str(), copy.c_str(), FALSE));
     SetFileAttributesW(copy.c_str(), FILE_ATTRIBUTE_NORMAL);
 
-    struct {
+    struct WofBacking {
         WOF_EXTERNAL_INFO wof;
         FILE_PROVIDER_EXTERNAL_INFO_V1 file;
-    } in{};
+    };
+    WofBacking in{};
     in.wof.Version = WOF_CURRENT_VERSION;
     in.wof.Provider = WOF_PROVIDER_FILE;
     in.file.Version = FILE_PROVIDER_CURRENT_VERSION;
@@ -523,26 +500,18 @@ TEST_CASE("Windows module drain: a WOF-compressed image is not refused and still
     DWORD returned = 0;
     const BOOL compressed = DeviceIoControl(h, FSCTL_SET_EXTERNAL_BACKING, &in, sizeof(in),
                                             nullptr, 0, &returned, nullptr);
+    // The case proves nothing unless the copy is WOF-backed. A plain attribute query cannot say
+    // (the filter hides the reparse bit from a normal open), so ask the filter itself, on the
+    // same handle.
+    WofBacking backing{};
+    const BOOL queried = compressed && DeviceIoControl(h, FSCTL_GET_EXTERNAL_BACKING, nullptr, 0,
+                                                       &backing, sizeof(backing), &returned,
+                                                       nullptr);
     CloseHandle(h);
     if (!compressed)
         SKIP("WOF unavailable on this volume");
-    // The case proves nothing unless the copy is WOF-backed. A plain attribute query cannot say
-    // (the filter hides the reparse bit from a normal open), so ask the filter itself.
-    {
-        struct {
-            WOF_EXTERNAL_INFO wof;
-            FILE_PROVIDER_EXTERNAL_INFO_V1 file;
-        } backing{};
-        HANDLE q = CreateFileW(copy.c_str(), GENERIC_READ, kShareAll, nullptr, OPEN_EXISTING,
-                               FILE_ATTRIBUTE_NORMAL, nullptr);
-        REQUIRE(q != INVALID_HANDLE_VALUE);
-        DWORD got = 0;
-        const BOOL queried = DeviceIoControl(q, FSCTL_GET_EXTERNAL_BACKING, nullptr, 0, &backing,
-                                             sizeof(backing), &got, nullptr);
-        CloseHandle(q);
-        if (!queried || backing.wof.Provider != WOF_PROVIDER_FILE)
-            SKIP("the copy is not WOF-backed on this volume");
-    }
+    if (!queried || backing.wof.Provider != WOF_PROVIDER_FILE)
+        SKIP("the copy is not WOF-backed on this volume");
 
     const std::string nt = nt_path_of(copy);
     const auto image = open_local_image_no_reparse(nt);

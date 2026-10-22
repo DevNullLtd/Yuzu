@@ -86,14 +86,11 @@ inline constexpr unsigned kDriveTypeFixed = 3;
 // them) so this stays pure.
 inline constexpr std::uint32_t kFileAttributeReparsePoint = 0x400;
 inline constexpr std::uint32_t kReparseTagNameSurrogateBit = 0x20000000;
-inline constexpr std::uint32_t kReparseTagSymlink = 0xA000000C;
-inline constexpr std::uint32_t kReparseTagMountPoint = 0xA0000003;
 
 [[nodiscard]] constexpr bool reparse_leaf_refused(std::uint32_t file_attributes,
                                                   std::uint32_t reparse_tag) noexcept {
     return (file_attributes & kFileAttributeReparsePoint) != 0 &&
-           ((reparse_tag & kReparseTagNameSurrogateBit) != 0 || reparse_tag == kReparseTagSymlink ||
-            reparse_tag == kReparseTagMountPoint);
+           (reparse_tag & kReparseTagNameSurrogateBit) != 0;
 }
 
 } // namespace yuzu::tar

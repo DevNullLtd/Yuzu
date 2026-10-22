@@ -1702,12 +1702,12 @@ TEST_CASE("TarDatabase: a corrupt tar.db is quarantined and re-initialised fresh
         CHECK(db.get_config("process_enabled", "true") == "false");
     } // connection closed; WAL checkpointed into the main file on close
 
-    // 2. Corrupt it: drop any WAL/SHM sidecars and clobber the whole file with
-    //    non-SQLite bytes so PRAGMA integrity_check fails deterministically.
-    for (const char* suffix : {"-wal", "-shm"}) {
-        std::error_code ec;
-        fs::remove(fs::path{tmp.string() + suffix}, ec);
-    }
+    // 2. Corrupt it: leave EMPTY WAL/SHM sidecars beside it (the Windows open() pre-creates
+    //    them that way) and clobber the whole file with non-SQLite bytes so PRAGMA
+    //    integrity_check fails deterministically.
+    for (const char* suffix : {"-wal", "-shm"})
+        REQUIRE(std::ofstream(fs::path{tmp.string() + suffix}, std::ios::binary | std::ios::trunc)
+                    .is_open());
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
         REQUIRE(f.is_open());
@@ -1725,17 +1725,19 @@ TEST_CASE("TarDatabase: a corrupt tar.db is quarantined and re-initialised fresh
     // CLEAN database, not a silent read-failure default over corrupt bytes.
     CHECK(db2.get_config("process_enabled", "true") == "true");
 
-    // A timestamped quarantine sidecar exists next to the original path.
-    bool found_quarantine = false;
+    // Exactly one timestamped quarantine file exists next to the original path: the sidecars
+    // were seeded empty (as the Windows open() pre-creates them) and an empty sidecar holds no
+    // evidence, so it is dropped, not kept as a forensic artifact of its own.
+    int quarantine_files = 0;
     const std::string prefix = tmp.filename().string() + ".corrupt-";
     for (const auto& entry : fs::directory_iterator(tmp.parent_path())) {
         if (entry.path().filename().string().rfind(prefix, 0) == 0) {
-            found_quarantine = true;
+            ++quarantine_files;
             std::error_code ec;
             fs::remove(entry.path(), ec); // tidy up the quarantine artifact
         }
     }
-    CHECK(found_quarantine);
+    CHECK(quarantine_files == 1);
 
     // #1567: this open knows it quarantined, and the fact is persisted (epoch +
     // basename only) so it survives a restart and can be published fleet-wide.
@@ -1763,47 +1765,10 @@ TEST_CASE("TarDatabase: a corrupt tar.db is quarantined and re-initialised fresh
             fs::remove(entry.path(), ec);
         }
     }
-    {
+    for (const char* suffix : {"", "-wal", "-shm"}) {
         std::error_code ec;
-        fs::remove(tmp, ec);
-    }
-}
-
-TEST_CASE("TarDatabase: a quarantine leaves one file even when empty sidecars sit beside the corrupt db (#559)",
-          "[tar][store][lifecycle][corruption]") {
-    // The Windows open() pre-creates tar.db-wal / -shm as EMPTY protected files; an empty sidecar
-    // holds no evidence, so it must not become a forensic artifact of its own.
-    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_sidecar_");
-    {
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        REQUIRE(f.is_open());
-        f << "this is not a valid sqlite database -- corrupt tar.db sidecar test";
-    }
-    for (const char* suffix : {"-wal", "-shm"})
-        REQUIRE(std::ofstream(fs::path{tmp.string() + suffix}, std::ios::binary | std::ios::trunc)
-                    .is_open());
-
-    {
-        auto reopened = TarDatabase::open(tmp);
-        REQUIRE(reopened.has_value());
-    }
-
-    std::vector<std::string> kept;
-    const std::string prefix = tmp.filename().string() + ".corrupt-";
-    for (const auto& entry : fs::directory_iterator(tmp.parent_path())) {
-        const std::string name = entry.path().filename().string();
-        if (name.rfind(prefix, 0) == 0) {
-            kept.push_back(name);
-            std::error_code ec;
-            fs::remove(entry.path(), ec);
-        }
-    }
-    REQUIRE(kept.size() == 1);
-    CHECK_FALSE((kept[0].ends_with("-wal") || kept[0].ends_with("-shm")));
-
-    std::error_code ec;
-    for (const char* suffix : {"", "-wal", "-shm"})
         fs::remove(fs::path{tmp.string() + suffix}, ec);
+    }
 }
 
 TEST_CASE("TarDatabase: a second corruption never overwrites the first quarantine (#559 collision-safe)",
@@ -1983,13 +1948,7 @@ TEST_CASE("TarDatabase: open() sets tar.db and its WAL sidecars owner-only (0600
 // re-secures the file before SQLite does.
 namespace {
 
-struct LocalFreeDeleter {
-    void operator()(void* p) const noexcept {
-        if (p != nullptr)
-            ::LocalFree(p);
-    }
-};
-using LocalPtr = std::unique_ptr<void, LocalFreeDeleter>;
+using LocalPtr = std::unique_ptr<void, decltype(&::LocalFree)>;
 
 constexpr const char* kUsers = "S-1-5-32-545";
 constexpr const char* kSystem = "S-1-5-18";
@@ -1998,7 +1957,7 @@ constexpr const char* kAdministrators = "S-1-5-32-544";
 std::string sid_string(PSID sid) {
     LPWSTR raw = nullptr;
     REQUIRE(::ConvertSidToStringSidW(sid, &raw));
-    const LocalPtr guard{raw};
+    const LocalPtr guard{raw, ::LocalFree};
     return yuzu::win::from_wide(raw);
 }
 
@@ -2029,7 +1988,7 @@ DaclFacts dacl_facts(const fs::path& p) {
     PSECURITY_DESCRIPTOR sd = nullptr;
     REQUIRE(::GetNamedSecurityInfoW(p.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
                                     nullptr, &dacl, nullptr, &sd) == ERROR_SUCCESS);
-    const LocalPtr sd_guard{sd};
+    const LocalPtr sd_guard{sd, ::LocalFree};
     SECURITY_DESCRIPTOR_CONTROL control = 0;
     DWORD revision = 0;
     REQUIRE(::GetSecurityDescriptorControl(sd, &control, &revision));
@@ -2050,7 +2009,7 @@ std::string owner_sid(const fs::path& p) {
     PSECURITY_DESCRIPTOR sd = nullptr;
     REQUIRE(::GetNamedSecurityInfoW(p.c_str(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
                                     &owner, nullptr, nullptr, nullptr, &sd) == ERROR_SUCCESS);
-    const LocalPtr sd_guard{sd};
+    const LocalPtr sd_guard{sd, ::LocalFree};
     return sid_string(owner);
 }
 
@@ -2071,12 +2030,12 @@ void assert_owner_only(const fs::path& p) {
 void seed_users_ace(const fs::path& p, bool inheritable) {
     PSID users = nullptr;
     REQUIRE(::ConvertStringSidToSidW(L"S-1-5-32-545", &users));
-    const LocalPtr users_guard{users};
+    const LocalPtr users_guard{users, ::LocalFree};
     PACL old_dacl = nullptr;
     PSECURITY_DESCRIPTOR sd = nullptr;
     REQUIRE(::GetNamedSecurityInfoW(p.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
                                     nullptr, &old_dacl, nullptr, &sd) == ERROR_SUCCESS);
-    const LocalPtr sd_guard{sd};
+    const LocalPtr sd_guard{sd, ::LocalFree};
     EXPLICIT_ACCESS_W ea{};
     ea.grfAccessPermissions = FILE_GENERIC_READ;
     ea.grfAccessMode = GRANT_ACCESS;
@@ -2086,7 +2045,7 @@ void seed_users_ace(const fs::path& p, bool inheritable) {
     ea.Trustee.ptstrName = reinterpret_cast<LPWSTR>(users);
     PACL new_dacl = nullptr;
     REQUIRE(::SetEntriesInAclW(1, &ea, old_dacl, &new_dacl) == ERROR_SUCCESS);
-    const LocalPtr acl_guard{new_dacl};
+    const LocalPtr acl_guard{new_dacl, ::LocalFree};
     std::wstring name = p.wstring(); // SetNamedSecurityInfoW takes a mutable LPWSTR
     REQUIRE(::SetNamedSecurityInfoW(
                 name.data(), SE_FILE_OBJECT,
@@ -2114,7 +2073,7 @@ bool enable_restore_privilege() {
 void set_owner(const fs::path& p, const std::string& sid_text) {
     PSID sid = nullptr;
     REQUIRE(::ConvertStringSidToSidW(yuzu::win::to_wide(sid_text).c_str(), &sid));
-    const LocalPtr sid_guard{sid};
+    const LocalPtr sid_guard{sid, ::LocalFree};
     std::wstring name = p.wstring();
     REQUIRE(::SetNamedSecurityInfoW(name.data(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, sid,
                                     nullptr, nullptr, nullptr) == ERROR_SUCCESS);

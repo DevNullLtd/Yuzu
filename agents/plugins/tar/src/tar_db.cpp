@@ -40,8 +40,8 @@
 #endif
 #include <windows.h>
 
-#include <aclapi.h> // SetEntriesInAclW, SetSecurityInfo, GetSecurityInfo
-#include <sddl.h>   // ConvertSidToStringSidW (refusal message only)
+#include <aclapi.h> // SetSecurityInfo, GetSecurityInfo
+#include <sddl.h>   // the SDDL -> security descriptor conversion, ConvertSidToStringSidW
 #include <win_str.hpp>
 #endif
 
@@ -351,8 +351,9 @@ int exec_ddl_batch(sqlite3* db, const char* ddl, char** err_msg) {
 // The state directory inherits C:\ProgramData's ACL (Users: read), and tar.db now holds every
 // capture source. These three files get a PROTECTED DACL (SYSTEM, Administrators and the
 // agent's account, FILE_ALL_ACCESS, no inheritance) -- the counterpart of the 0600 pass in
-// open(), in the shape of key_provider.cpp's WinOwnerOnlyDacl (a server class, not linkable
-// from a plugin). It runs before each sqlite3_open_v2 and once at the end of open():
+// open(), built from one SDDL string as agents/core temp_file.cpp and updater.cpp do (explicit
+// SIDs, not the Owner Rights alias "OW": execution_artifacts_win.cpp stores that one literally).
+// It runs before each sqlite3_open_v2 and once at the end of open():
 //  - a missing file is CREATED here with the protected DACL (no inheritance window; SQLite
 //    then creates nothing, and a 0-byte tar.db is a valid empty database);
 //  - an existing file is re-secured in place (an upgraded tar.db on its first open);
@@ -366,31 +367,12 @@ int exec_ddl_batch(sqlite3* db, const char* ddl, char** err_msg) {
 // its target. Lock-out: a later run under a different non-admin account cannot open tar.db;
 // Administrators keep access (`icacls <file> /reset`).
 
-struct LocalFreeDeleter {
-    void operator()(void* p) const noexcept {
-        if (p != nullptr)
-            ::LocalFree(p);
-    }
-};
-using LocalPtr = std::unique_ptr<void, LocalFreeDeleter>;
-
-struct HandleCloser {
-    void operator()(void* h) const noexcept {
-        if (h != nullptr && h != INVALID_HANDLE_VALUE)
-            ::CloseHandle(h);
-    }
-};
-using HandlePtr = std::unique_ptr<void, HandleCloser>;
+using LocalPtr = std::unique_ptr<void, decltype(&::LocalFree)>;
+using HandlePtr = std::unique_ptr<void, decltype(&::CloseHandle)>;
 
 class TarDbDacl {
 public:
     TarDbDacl() { build(); }
-    ~TarDbDacl() {
-        if (admins_ != nullptr)
-            ::FreeSid(admins_);
-        if (system_ != nullptr)
-            ::FreeSid(system_);
-    }
     TarDbDacl(const TarDbDacl&) = delete;
     TarDbDacl& operator=(const TarDbDacl&) = delete;
 
@@ -398,12 +380,12 @@ public:
     [[nodiscard]] DWORD build_error() const noexcept { return error_; } // set at the failing call
     // For CreateFileW: a file created with this SD has the protected DACL from creation.
     [[nodiscard]] SECURITY_ATTRIBUTES* sa() noexcept { return ok_ ? &sa_ : nullptr; }
-    [[nodiscard]] PACL acl() const noexcept { return static_cast<PACL>(acl_.get()); }
+    [[nodiscard]] PACL acl() const noexcept { return acl_; } // points into the SD; valid when ok()
     // SYSTEM, BUILTIN\Administrators or the process token's user.
     [[nodiscard]] bool owner_allowed(PSID owner) const noexcept {
         return ok_ && owner != nullptr &&
-               (::EqualSid(owner, user_sid_) || ::EqualSid(owner, system_) ||
-                ::EqualSid(owner, admins_));
+               (::EqualSid(owner, user_sid_) || ::IsWellKnownSid(owner, WinLocalSystemSid) ||
+                ::IsWellKnownSid(owner, WinBuiltinAdministratorsSid));
     }
 
 private:
@@ -413,7 +395,7 @@ private:
             error_ = ::GetLastError();
             return;
         }
-        const HandlePtr token{raw_token};
+        const HandlePtr token{raw_token, ::CloseHandle};
         DWORD len = 0;
         ::GetTokenInformation(token.get(), TokenUser, nullptr, 0, &len); // size probe
         user_buf_.resize(len);
@@ -422,52 +404,47 @@ private:
             error_ = ::GetLastError();
             return;
         }
-        // The PSID points INTO user_buf_ (no string round trip); alive as long as *this.
+        // The PSID points INTO user_buf_; alive as long as *this.
         user_sid_ = reinterpret_cast<TOKEN_USER*>(user_buf_.data())->User.Sid;
 
-        SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
-        if (!::AllocateAndInitializeSid(&nt, 1, SECURITY_LOCAL_SYSTEM_RID, 0, 0, 0, 0, 0, 0, 0,
-                                        &system_) ||
-            !::AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID,
-                                        DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &admins_)) {
+        // "D:P" = SE_DACL_PROTECTED (a file created with it merges none of the parent's
+        // inheritable ACEs); "FA" = FILE_ALL_ACCESS; an ACE with no flags is NO_INHERITANCE.
+        LPWSTR raw_sid = nullptr;
+        if (!::ConvertSidToStringSidW(user_sid_, &raw_sid)) {
             error_ = ::GetLastError();
             return;
         }
-        EXPLICIT_ACCESS_W ea[3] = {};
-        PSID sids[3] = {user_sid_, system_, admins_};
-        for (int i = 0; i < 3; ++i) {
-            ea[i].grfAccessPermissions = FILE_ALL_ACCESS;
-            ea[i].grfAccessMode = SET_ACCESS;
-            ea[i].grfInheritance = NO_INHERITANCE;
-            ea[i].Trustee.TrusteeForm = TRUSTEE_IS_SID;
-            ea[i].Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN;
-            ea[i].Trustee.ptstrName = reinterpret_cast<LPWSTR>(sids[i]);
-        }
-        PACL raw_acl = nullptr;
-        if (const DWORD rc = ::SetEntriesInAclW(3, ea, nullptr, &raw_acl); rc != ERROR_SUCCESS) {
-            error_ = rc;
+        const LocalPtr sid_text{raw_sid, ::LocalFree};
+        std::wstring sddl = L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;";
+        sddl += raw_sid;
+        sddl += L')';
+        PSECURITY_DESCRIPTOR raw_sd = nullptr;
+        if (!::ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1,
+                                                                    &raw_sd, nullptr)) {
+            error_ = ::GetLastError();
             return;
         }
-        acl_.reset(raw_acl);
-        // PROTECTED: a file created with this SD does not merge the parent's inheritable ACEs.
-        if (!::InitializeSecurityDescriptor(&sd_, SECURITY_DESCRIPTOR_REVISION) ||
-            !::SetSecurityDescriptorDacl(&sd_, TRUE, raw_acl, FALSE) ||
-            !::SetSecurityDescriptorControl(&sd_, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
+        sd_.reset(raw_sd);
+        BOOL present = FALSE;
+        BOOL defaulted = FALSE;
+        if (!::GetSecurityDescriptorDacl(sd_.get(), &present, &acl_, &defaulted)) {
             error_ = ::GetLastError();
+            return;
+        }
+        if (!present || acl_ == nullptr) { // never hand SetSecurityInfo a NULL DACL (= everyone)
+            error_ = ERROR_INVALID_ACL;
             return;
         }
         sa_.nLength = sizeof(sa_);
-        sa_.lpSecurityDescriptor = &sd_;
+        sa_.lpSecurityDescriptor = sd_.get();
         sa_.bInheritHandle = FALSE;
         ok_ = true;
     }
 
     std::vector<BYTE> user_buf_;
     PSID user_sid_ = nullptr;
-    PSID system_ = nullptr;
-    PSID admins_ = nullptr;
-    LocalPtr acl_;
-    SECURITY_DESCRIPTOR sd_ = {};
+    LocalPtr sd_{nullptr, ::LocalFree}; // the self-relative protected SD; acl_ points into it
+    PACL acl_ = nullptr;
     SECURITY_ATTRIBUTES sa_ = {};
     DWORD error_ = ERROR_SUCCESS;
     bool ok_ = false;
@@ -477,7 +454,7 @@ std::string sid_to_string(PSID sid) {
     LPWSTR raw = nullptr;
     if (!::ConvertSidToStringSidW(sid, &raw))
         return "an unreadable SID";
-    const LocalPtr guard{raw};
+    const LocalPtr guard{raw, ::LocalFree};
     return yuzu::win::from_wide(raw);
 }
 
@@ -508,7 +485,7 @@ std::optional<std::string> secure_tar_db_files(const std::filesystem::path& db,
                          name, open_err);
             continue;
         }
-        HandlePtr h{raw};
+        HandlePtr h{raw, ::CloseHandle};
         if (open_err != ERROR_ALREADY_EXISTS)
             continue; // created just now WITH the protected DACL
 
@@ -517,7 +494,7 @@ std::optional<std::string> secure_tar_db_files(const std::filesystem::path& db,
         const DWORD owner_rc = ::GetSecurityInfo(h.get(), SE_FILE_OBJECT,
                                                  OWNER_SECURITY_INFORMATION, &owner, nullptr,
                                                  nullptr, nullptr, &owner_sd);
-        const LocalPtr owner_sd_guard{owner_sd}; // `owner` points into it
+        const LocalPtr owner_sd_guard{owner_sd, ::LocalFree}; // `owner` points into it
         if (owner_rc == ERROR_SUCCESS && owner != nullptr && !dacl.owner_allowed(owner)) {
             const std::string who = sid_to_string(owner);
             const std::string remedy =
