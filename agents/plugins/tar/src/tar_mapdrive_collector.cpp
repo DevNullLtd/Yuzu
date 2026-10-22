@@ -1082,6 +1082,19 @@ OutboundRead read_user_outbound_history(HKEY user_root, const std::string& profi
     return result;
 }
 
+// Pins this plugin's module so FreeLibrary can never unmap it (the pin is for the life of the
+// process). Called on the dispatching thread when a mount times out; pinning again is harmless.
+void pin_plugin_module() noexcept {
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                            reinterpret_cast<LPCWSTR>(&pin_plugin_module), &module)) {
+        spdlog::error("TAR mapdrive: could not pin the plugin module after a hive-mount timeout "
+                      "(GetLastError {}); an unload while the abandoned mount thread runs is "
+                      "unsafe",
+                      GetLastError());
+    }
+}
+
 // Walk every profile in ProfileList; read the outbound artifacts from the live
 // HKU\<SID> hive, or load NTUSER.DAT for offline users (RAII-unloaded).
 //
@@ -1120,19 +1133,6 @@ OutboundRead read_user_outbound_history(HKEY user_root, const std::string& profi
 // returns), and it occupies one of the shared primitive's 64 outstanding-call slots. The walk
 // therefore stops mounting after the first timeout (decide_mount_call): later profiles would only
 // queue behind the stuck mount, time out, and burn attempts they never made.
-// Pins this plugin's module so FreeLibrary can never unmap it (the pin is for the life of the
-// process). Called on the dispatching thread when a mount times out; pinning again is harmless.
-void pin_plugin_module() noexcept {
-    HMODULE module = nullptr;
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
-                            reinterpret_cast<LPCWSTR>(&pin_plugin_module), &module)) {
-        spdlog::error("TAR mapdrive: could not pin the plugin module after a hive-mount timeout "
-                      "(GetLastError {}); an unload while the abandoned mount thread runs is "
-                      "unsafe",
-                      GetLastError());
-    }
-}
-
 constexpr std::chrono::milliseconds kHiveMountBoundMs{30000}; // generous for a legitimately slow
                                                               // network-share read; see dism's 17s
                                                               // for a comparable Windows API bound

@@ -12,8 +12,9 @@
  * pending" -- a second key for the timestamp would open exactly that window.
  *
  * Domain: a SID is `S-1-` followed by one or more of `[0-9-]`; an attempt count is a decimal
- * integer in [1, kMapDriveBackfillMaxAttempts]; a malformed segment (bad SID shape,
- * non-numeric/zero/negative count, empty segment) is DROPPED, never thrown on -- a hand-edited or
+ * integer in [0, kMapDriveBackfillMaxAttempts] (0 = listed but not yet tried: the first pass
+ * could not reach it); a malformed segment (bad SID shape, non-numeric/negative count, empty
+ * segment) is DROPPED, never thrown on -- a hand-edited or
  * corrupt value degrades to "nothing pending", not a crash; a count above the max is clamped;
  * duplicate SIDs collapse to the highest count.
  *
@@ -193,7 +194,7 @@ namespace detail {
 
 /// Parses the persisted `<last_ts>;sid:attempts;sid:attempts...` value. A missing or unparsable
 /// leading timestamp parses as 0 (due). Every later segment is validated independently: a
-/// malformed SID, a non-numeric/zero/negative/unparsable count, or an empty segment is dropped,
+/// malformed SID, a non-numeric/negative/unparsable count, or an empty segment is dropped,
 /// never thrown on; a count above `max_attempts` is clamped to it; duplicate SIDs collapse to the
 /// highest count seen.
 [[nodiscard]] inline PendingState parse_pending_state(std::string_view text, int max_attempts) {
@@ -221,7 +222,7 @@ namespace detail {
         if (!detail::is_valid_sid_shape(sid))
             continue;
         const auto parsed_count = detail::parse_whole_i64(count_sv);
-        if (!parsed_count || *parsed_count <= 0)
+        if (!parsed_count || *parsed_count < 0)
             continue;
         int count = static_cast<int>(std::min<std::int64_t>(*parsed_count, max_attempts));
         bool merged = false;
@@ -267,8 +268,8 @@ retry_sids(const PendingState& st, int max_attempts = kMapDriveBackfillMaxAttemp
 /// timestamp to build the first PendingState): every outcome this run could not fully resolve
 /// (any non-ok status, an ok mount with a failed inner read, or an ok-and-read-ok walk the cap
 /// cut short) starts at attempt 1 -- the first pass itself is attempt 1, not attempt 0.
-/// A profile the first pass did not try (`attempted` false) is seeded at 1 as well: the persisted
-/// grammar has no zero count, and later retry runs never charge an attempt that was not made.
+/// A profile the first pass did not try (`attempted` false) is seeded at 0: it is listed so it is
+/// retried, but no attempt is charged for a mount that was never made.
 [[nodiscard]] inline std::vector<PendingProfile>
 initial_pending(const std::vector<ProfileHiveOutcome>& outcomes) {
     std::vector<PendingProfile> out;
@@ -276,7 +277,7 @@ initial_pending(const std::vector<ProfileHiveOutcome>& outcomes) {
         const bool resolved = (o.status == yuzu::profiles::HiveAccessStatus::ok) && o.read_ok &&
                               o.complete;
         if (!resolved)
-            out.push_back(PendingProfile{o.sid, 1});
+            out.push_back(PendingProfile{o.sid, o.attempted ? 1 : 0});
     }
     return out;
 }

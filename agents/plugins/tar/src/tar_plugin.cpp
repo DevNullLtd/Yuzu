@@ -961,8 +961,8 @@ public:
                     // 1/kMapDriveBackfillMaxAttempts -- the first pass itself is attempt 1.
                     PendingState pending{now_epoch_seconds(), initial_pending(hist.profiles)};
                     for (const auto& p : pending.profiles) {
-                        spdlog::info("TAR mapdrive backfill: profile {} attempt 1/{} pending",
-                                     p.sid, kMapDriveBackfillMaxAttempts);
+                        spdlog::info("TAR mapdrive backfill: profile {} attempt {}/{} pending",
+                                     p.sid, p.attempts, kMapDriveBackfillMaxAttempts);
                     }
                     if (!commit_first_pass(
                             [&](std::string_view k, std::string_view v) {

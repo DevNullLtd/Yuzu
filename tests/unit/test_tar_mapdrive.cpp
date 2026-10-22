@@ -902,14 +902,18 @@ TEST_CASE("mapdrive backfill parse_pending_state: a missing or unparsable leadin
 TEST_CASE("mapdrive backfill parse_pending_state: malformed segments are dropped, never thrown on",
           "[tar][mapdrive][backfill]") {
     // Bad SID shape (no S-1- prefix, letters in the suffix, the bare prefix with no suffix at
-    // all), non-numeric/zero/negative count, and an empty segment are all dropped silently.
+    // all), non-numeric/negative count, and an empty segment are all dropped silently. A zero
+    // count is VALID (listed, not yet tried) and survives a round trip.
     const PendingState st = parse_pending_state(
         "0;not-a-sid:1;S-1-5-abc:1;S-1-:1;S-1-5-21-1:0;S-1-5-21-2:-3;S-1-5-21-3:notanumber;;"
         "S-1-5-21-4:2",
         7);
-    REQUIRE(st.profiles.size() == 1);
-    CHECK(st.profiles[0].sid == "S-1-5-21-4");
-    CHECK(st.profiles[0].attempts == 2);
+    REQUIRE(st.profiles.size() == 2);
+    CHECK(st.profiles[0].sid == "S-1-5-21-1");
+    CHECK(st.profiles[0].attempts == 0);
+    CHECK(st.profiles[1].sid == "S-1-5-21-4");
+    CHECK(st.profiles[1].attempts == 2);
+    CHECK(format_pending_state(st) == "0;S-1-5-21-1:0;S-1-5-21-4:2");
 }
 
 TEST_CASE("mapdrive backfill parse_pending_state: a count above max is clamped; duplicate SIDs "
@@ -1021,8 +1025,8 @@ TEST_CASE("mapdrive backfill apply_outcomes: an outcome that was never attempted
     CHECK(r.retained[1].cause == "skipped_after_timeout");
 }
 
-TEST_CASE("mapdrive backfill initial_pending: a profile the first pass did not try is still "
-          "seeded so it is retried, not lost",
+TEST_CASE("mapdrive backfill initial_pending: a profile the first pass did not try is seeded at "
+          "zero attempts so it is retried, not lost",
           "[tar][mapdrive][backfill]") {
     ProfileHiveOutcome skipped{"S-1-5-21-2", HiveAccessStatus::mount_failed,
                                "skipped_after_timeout"};
@@ -1030,7 +1034,7 @@ TEST_CASE("mapdrive backfill initial_pending: a profile the first pass did not t
     const auto pending = initial_pending({skipped});
     REQUIRE(pending.size() == 1);
     CHECK(pending[0].sid == "S-1-5-21-2");
-    CHECK(pending[0].attempts == 1);
+    CHECK(pending[0].attempts == 0); // listed so it is retried; no attempt was made, none charged
 }
 
 TEST_CASE("mapdrive backfill decide_mount_call: a timeout counts, halts the walk and pins the "

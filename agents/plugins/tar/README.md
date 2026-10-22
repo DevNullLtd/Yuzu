@@ -673,11 +673,13 @@ three broken legs; it is one chokepoint. See Caveats item 1.
    often than once per 24 h per profile, checked at service start and again before each slow-tick
    collection but never inside the shared collection lock (the retry's own enumeration runs
    unlocked; only its claim and its commit take `collect_mu_`, each briefly), until it resolves or
-   is abandoned without a further mount. A walk that reads a profile only up to the row cap counts
-   that read as an attempt like any other. A hive mount that exceeds its 30 s bound counts as one
-   attempt and ends that run's mounting: the profiles after it are not tried and not charged
-   an attempt, and the plugin module is pinned in memory for the life of the process so an unload
-   cannot unmap the code the abandoned mount thread is still running. The retry's insert is duplicate-free against what is
+   is abandoned without a further mount. A walk that reads a profile only up to the row cap
+   counts that read as an attempt like any other. A hive mount that exceeds its 30 s bound counts
+   as one attempt and ends that run's mounting: the profiles after it are listed but not tried
+   and not charged an attempt. The abandoned mount thread is not stopped: it keeps the
+   process-wide hive lock and the backup/restore privileges until the mount returns, and the
+   plugin module is pinned in memory for the life of the process so an unload cannot unmap the
+   code it is still running. The retry's insert is duplicate-free against what is
    already recorded (`mapdrive_live`'s `origin='historical'` rows): a mapping already recorded
    keeps its first-recorded timestamp, never overwritten by a later retry that re-observes it. A
    ProfileList walk that is itself permanently incomplete (a terminating registry error on every
