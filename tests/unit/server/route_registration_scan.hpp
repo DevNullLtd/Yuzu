@@ -69,18 +69,27 @@ inline std::size_t receiver_start(std::string_view text, std::size_t at, bool wi
 }
 
 // Parses the first argument starting at `j` (after the opening parenthesis):
-// optional whitespace, then `R"(...)"` or `"..."`. Returns false if neither shape.
-inline bool first_argument(std::string_view text, std::size_t j, std::string& out) {
+// optional whitespace, then `R"(...)"` or `"..."`. Returns false if neither shape. On
+// success `end` is one past the literal. `no_raw_close_from` remembers the first raw
+// literal body that had no `)"` after it: no later body can have one either, so a source
+// with many unterminated `R"(` candidates scans its suffix once, not once per candidate.
+inline bool first_argument(std::string_view text, std::size_t j, std::string& out,
+                           std::size_t& end, std::size_t& no_raw_close_from) {
     while (j < text.size() && is_space(text[j]))
         ++j;
     if (j >= text.size())
         return false;
     if (text.compare(j, 3, "R\"(") == 0) {
         const std::size_t body = j + 3;
-        const std::size_t close = text.find(")\"", body);
-        if (close == std::string_view::npos)
+        if (body >= no_raw_close_from)
             return false;
+        const std::size_t close = text.find(")\"", body);
+        if (close == std::string_view::npos) {
+            no_raw_close_from = body;
+            return false;
+        }
         out.assign(text.substr(body, close - body));
+        end = close + 2;
         return true;
     }
     if (text[j] != '"')
@@ -95,6 +104,7 @@ inline bool first_argument(std::string_view text, std::size_t j, std::string& ou
             k += 2;
         } else if (c == '"') {
             out.assign(text.substr(j + 1, k - (j + 1)));
+            end = k + 1;
             return true;
         } else {
             ++k;
@@ -108,26 +118,45 @@ inline bool first_argument(std::string_view text, std::size_t j, std::string& ou
 // Every `<receiver>.<Method>(<literal>` for `Method` in `methods`, where the receiver
 // is `sink.` / `svr.` / `web_server_->` and starts at a word boundary (`mysink.Post(`,
 // `cli.Post(` and `client.Post(` are not registrations), in ascending position.
+// Matches do not overlap: text inside a matched first-argument literal is not searched
+// again, as the former single pass over the text did not.
 inline std::vector<RouteRegistration>
 find_route_registrations(std::string_view text, std::initializer_list<std::string_view> methods) {
-    std::vector<RouteRegistration> out;
+    struct Hit {
+        RouteRegistration reg;
+        std::size_t end; // one past the first-argument literal
+    };
+    std::vector<Hit> hits;
     for (const std::string_view method : methods) {
         const std::string needle = std::string(method) + "(";
+        std::size_t consumed = 0;                           // end of this method's last match
+        std::size_t no_raw_close_from = std::string::npos;  // see first_argument
         for (std::size_t at = text.find(needle); at != std::string_view::npos;
              at = text.find(needle, at + 1)) {
             const std::size_t recv = detail::receiver_start(text, at, true);
-            if (recv == std::string::npos)
+            if (recv == std::string::npos || recv < consumed)
                 continue;
             std::string path;
-            if (!detail::first_argument(text, at + needle.size(), path))
+            std::size_t end = 0;
+            if (!detail::first_argument(text, at + needle.size(), path, end, no_raw_close_from))
                 continue;
-            out.push_back({recv, std::string(method), std::move(path)});
+            consumed = end;
+            hits.push_back({{recv, std::string(method), std::move(path)}, end});
         }
     }
-    // One list in source order: the methods were searched one at a time.
-    std::stable_sort(
-        out.begin(), out.end(),
-        [](const RouteRegistration& a, const RouteRegistration& b) { return a.pos < b.pos; });
+    // One list in source order: the methods were searched one at a time. A hit that
+    // starts inside an earlier hit's literal belongs to that literal's text, not to a
+    // registration of its own.
+    std::stable_sort(hits.begin(), hits.end(),
+                     [](const Hit& a, const Hit& b) { return a.reg.pos < b.reg.pos; });
+    std::vector<RouteRegistration> out;
+    std::size_t covered = 0;
+    for (auto& h : hits) {
+        if (h.reg.pos < covered)
+            continue;
+        covered = h.end;
+        out.push_back(std::move(h.reg));
+    }
     return out;
 }
 

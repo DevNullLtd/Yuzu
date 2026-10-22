@@ -738,6 +738,28 @@ TEST_CASE("route_registration_scan: rejects client receivers, a non-boundary rec
     CHECK(gets[0].raw_path == "/x");
 }
 
+TEST_CASE("route_registration_scan: a registration inside a matched literal is not a "
+          "second registration, and unterminated raw literals match nothing",
+          "[body_cap][inventory]") {
+    // The former single pass consumed the outer match, so the route-looking text in its
+    // raw argument was not a registration. Across methods too: the Put sits inside the Post's
+    // literal.
+    const std::string nested =
+        "sink.Post(R\"(/outer/sink.Post(\"/inner\", h))\", h);\n"
+        "sink.Post(R\"(/q/sink.Put(\"/inner2\", h))\", h);\n";
+    const auto regs = route_scan::find_route_registrations(nested, route_scan::kMutatingMethods);
+    REQUIRE(regs.size() == 2);
+    CHECK(regs[0].raw_path == "/outer/sink.Post(\"/inner\", h)");
+    CHECK(regs[1].raw_path == "/q/sink.Put(\"/inner2\", h)");
+
+    // Many candidates, none with a closing `)"`: no match, and the scan remembers the
+    // first failure instead of searching the remaining suffix once per candidate.
+    std::string unterminated;
+    for (int i = 0; i < 2000; ++i)
+        unterminated += "sink.Post(R\"(/x" + std::to_string(i) + "\n";
+    CHECK(route_scan::find_route_registrations(unterminated, route_scan::kMutatingMethods).empty());
+}
+
 TEST_CASE("route_registration_scan: find_receiver_calls returns one position-sorted list "
           "across verbs, so Post / Get / Get(req.body) / Post flags exactly the second Get",
           "[body_cap][inventory]") {
