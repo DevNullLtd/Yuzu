@@ -9711,7 +9711,7 @@ List upload grants. **Permission:** `UploadGrant:Read`, routed through
 permission check for a human caller). A service-scoped API token is refused `403` before any grant is
 read (`service-scoped tokens may not list upload grants`, no `permission` field, audit
 `upload_grant.list.access_denied`), whoever minted it; list with a non-service token.
-An engine principal is admitted only by an explicit `UploadGrant:Read` RBAC grant: with RBAC off, or
+An engine principal is admitted only when RBAC is enabled and it holds an explicit `UploadGrant:Read` grant: with RBAC off, or
 with RBAC on and no grant, it gets `403` (`503` when the RBAC store is unavailable), the same answer as
 the MCP `list_upload_grants` tool. The engine denial is audited as `auth.permission_required`.
 
