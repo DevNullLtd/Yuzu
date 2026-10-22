@@ -144,8 +144,8 @@ struct DexScorePolicyWriteDeps {
     DexScorePolicyProvider::ReadFn read_stored;
     DexScorePolicyCasFn compare_and_set;
     DexScorePolicyCarFn compare_and_remove;
-    /// Serialises writers and installs the policy on this instance. Copied for the whole call:
-    /// the caller's copy keeps it alive across a write that may outlast the request.
+    /// Serialises writers and installs the policy on this instance. The caller's Deps outlives
+    /// the call.
     std::shared_ptr<DexScorePolicyProvider> provider;
     /// Audit hook: true = the row persisted (or audit is off). Empty = audit off.
     std::function<bool(std::string_view verb, std::string_view result,
@@ -155,7 +155,6 @@ struct DexScorePolicyWriteDeps {
 
 enum class DexScorePolicyWriteStatus {
     Ok,
-    NoChange,
     IfMatchMissing,
     IfMatchMalformed,
     Stale,
@@ -169,7 +168,6 @@ enum class DexScorePolicyWriteStatus {
 [[nodiscard]] constexpr int dex_score_policy_http_status(DexScorePolicyWriteStatus s) noexcept {
     switch (s) {
     case DexScorePolicyWriteStatus::Ok:
-    case DexScorePolicyWriteStatus::NoChange:
         return 200;
     case DexScorePolicyWriteStatus::IfMatchMissing:
         return 428;
@@ -189,11 +187,10 @@ enum class DexScorePolicyWriteStatus {
 
 struct DexScorePolicyWriteResult {
     DexScorePolicyWriteStatus status{DexScorePolicyWriteStatus::StoreUnavailable};
-    std::string message;     ///< empty on Ok / NoChange
-    std::string field;       ///< Invalid: the offending path ("dry_run", "tiers.edges", ...)
+    std::string message;     ///< empty on Ok
     std::string remediation; ///< a recovery hint, or empty
     std::optional<std::int64_t> retry_after_ms;
-    /// Ok / NoChange: the policy now in force (a dry run: the policy that WOULD be).
+    /// Ok: the policy now in force (a dry run: the policy that WOULD be).
     DexPolicyInForce in_force;
     /// The revision the store held when the write was checked ("default" when none).
     std::string previous_revision;
@@ -287,13 +284,23 @@ apply_dex_score_policy(const DexScorePolicyWriteRequest& rq, const DexScorePolic
     auto refuse = [&](Status st, std::string msg, std::string_view reason, AuditDetail det,
                       std::string field = {}, std::string remediation = {}) -> Result {
         det.reason = std::string(reason);
-        det.field = field;
+        det.field = std::move(field);
         (void)emit(verb, "denied", det); // the refusal does not depend on this row
         out.status = st;
         out.message = std::move(msg);
-        out.field = std::move(field);
         out.remediation = std::move(remediation);
         return out;
+    };
+    using Rd = std::expected<std::optional<std::string>, std::string>;
+    // The injected reader is untrusted: an exception from it is an unreadable store.
+    auto safe_read = [&]() -> Rd {
+        try {
+            return d.read_stored();
+        } catch (const std::exception& e) {
+            return std::unexpected(std::string("read threw: ") + e.what());
+        } catch (...) {
+            return std::unexpected(std::string("read threw"));
+        }
     };
     auto audit_unavailable = [&]() -> Result {
         out.status = Status::AuditUnavailable;
@@ -361,20 +368,13 @@ apply_dex_score_policy(const DexScorePolicyWriteRequest& rq, const DexScorePolic
                           std::string(dex_score_policy_projection_remediation(v.error().field)));
         canonical = dex_score_policy_canonical(*v);
         base.revision = dex_score_policy_revision(canonical);
-        base.document = nlohmann::json::parse(canonical);
+        base.document = dex_score_policy_to_json(*v);
     } else {
         base.revision = std::string(kDexScorePolicyDefaultRevision);
     }
 
     // 4. The observed store text, and the precondition against it.
-    std::expected<std::optional<std::string>, std::string> rd;
-    try {
-        rd = d.read_stored();
-    } catch (const std::exception& e) {
-        rd = std::unexpected(std::string("read threw: ") + e.what());
-    } catch (...) {
-        rd = std::unexpected(std::string("read threw"));
-    }
+    auto rd = safe_read();
     if (!rd) {
         spdlog::warn("DEX score policy write: store read failed: {}",
                      ::yuzu::log_key_token(rd.error()));
@@ -406,7 +406,7 @@ apply_dex_score_policy(const DexScorePolicyWriteRequest& rq, const DexScorePolic
         if (!emit(verb, "attempted", base))
             return audit_unavailable();
         (void)emit(verb, "no_change", base);
-        out.status = Status::NoChange;
+        out.status = Status::Ok;
         out.in_force = dex_policy_in_force_from_stored(std::nullopt);
         return out;
     }
@@ -415,9 +415,7 @@ apply_dex_score_policy(const DexScorePolicyWriteRequest& rq, const DexScorePolic
     if (!emit(verb, "attempted", base))
         return audit_unavailable();
 
-    // 7. Commit then install, under the provider's writer lock. The caller's copy of the
-    // provider outlives the call.
-    const auto provider = d.provider;
+    // 7. Commit then install, under the provider's writer lock.
     const std::optional<std::string> text = put ? std::optional<std::string>(canonical)
                                                 : std::nullopt;
     const DexScorePolicyProvider::CommitFn commit = [&]() -> std::expected<bool, std::string> {
@@ -427,7 +425,7 @@ apply_dex_score_policy(const DexScorePolicyWriteRequest& rq, const DexScorePolic
     std::optional<std::expected<DexPolicyInForce, DexPolicyWriteFailure>> w;
     std::string ambiguous; // non-empty: the commit's outcome is unknown, for this reason
     try {
-        w = provider->write(text, commit);
+        w = d.provider->write(text, commit);
     } catch (const std::exception& e) {
         // write() catches a throwing commit itself, so an exception that reaches here is a
         // parse before the lock or the install AFTER the commit: the store may hold the text.
@@ -475,14 +473,7 @@ apply_dex_score_policy(const DexScorePolicyWriteRequest& rq, const DexScorePolic
     }
 
     // Ambiguous outcome: re-read the store to learn what is there now.
-    std::expected<std::optional<std::string>, std::string> re;
-    try {
-        re = d.read_stored();
-    } catch (const std::exception& e) {
-        re = std::unexpected(std::string("read threw: ") + e.what());
-    } catch (...) {
-        re = std::unexpected(std::string("read threw"));
-    }
+    const auto re = safe_read();
     out.status = Status::OutcomeUnknown;
     out.retry_after_ms = kDexScorePolicyRetryMs;
     out.remediation = "GET /api/v1/dex/score-policy and compare its revision";

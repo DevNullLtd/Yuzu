@@ -194,7 +194,6 @@ TEST_CASE("parse_dry_run: absent is false, true and false only", "[dex][score_po
 
 TEST_CASE("dex_score_policy_http_status: the status mapping", "[dex][score_policy_writer]") {
     CHECK(dex_score_policy_http_status(St::Ok) == 200);
-    CHECK(dex_score_policy_http_status(St::NoChange) == 200);
     CHECK(dex_score_policy_http_status(St::IfMatchMissing) == 428);
     CHECK(dex_score_policy_http_status(St::IfMatchMalformed) == 400);
     CHECK(dex_score_policy_http_status(St::Invalid) == 400);
@@ -213,7 +212,6 @@ TEST_CASE("writer: a bad dry_run is refused with a denied row and no store call"
     SECTION("PUT with dry_run=yes") {
         const auto r = w.put("default", doc_with_excellent(95.0), std::string("ye s=1\n"));
         CHECK(r.status == St::Invalid);
-        CHECK(r.field == "dry_run");
         REQUIRE(w.rows.size() == 1);
         CHECK(w.rows[0].verb == "dex.score_policy.update");
         CHECK(w.rows[0].result == "denied");
@@ -224,7 +222,6 @@ TEST_CASE("writer: a bad dry_run is refused with a denied row and no store call"
     SECTION("DELETE with dry_run=true") {
         const auto r = w.del("default", std::string("true"));
         CHECK(r.status == St::Invalid);
-        CHECK(r.field == "dry_run");
         CHECK(r.message == "DELETE does not support dry_run");
         REQUIRE(w.rows.size() == 1);
         CHECK(w.rows[0].verb == "dex.score_policy.reset");
@@ -281,7 +278,6 @@ TEST_CASE("writer: the Apps projection is refused with a remediation naming tier
     World w;
     const auto r = w.put("default", R"({"tiers":{"excellent":{"edge":90,"name":"Excellent"}}})");
     CHECK(r.status == St::Invalid);
-    CHECK(r.field == "tiers.excellent");
     CHECK(r.message == "unparseable at tiers.excellent: unknown key");
     CHECK(r.remediation.find("tiers.edges") != std::string::npos);
     REQUIRE(w.rows.size() == 1);
@@ -294,7 +290,6 @@ TEST_CASE("writer: version 2 is refused with the reader's own wording",
     World w;
     const auto r = w.put("default", R"({"version":2})");
     CHECK(r.status == St::Invalid);
-    CHECK(r.field == "version");
     CHECK(r.message == "unsupported_version at version: 2 above the supported 1");
 }
 
@@ -303,7 +298,6 @@ TEST_CASE("writer: an oversized body is refused at document before it is parsed"
     World w;
     const auto r = w.put("default", std::string(kDexScorePolicyMaxBytes + 1, ' ') + "{}");
     CHECK(r.status == St::Invalid);
-    CHECK(r.field == "document");
     CHECK(r.message.rfind("oversized at document", 0) == 0);
     CHECK(w.cas_calls == 0);
 }
@@ -312,7 +306,6 @@ TEST_CASE("writer: a too-deep body is refused at document", "[dex][score_policy_
     World w;
     const auto r = w.put("default", std::string(200, '[') + std::string(200, ']'));
     CHECK(r.status == St::Invalid);
-    CHECK(r.field == "document");
     CHECK(r.message == "request body nests too deeply");
 }
 
@@ -320,7 +313,6 @@ TEST_CASE("writer: a validator refusal names its token and group", "[dex][score_
     World w;
     const auto r = w.put("default", R"({"tiers":{"edges":{"excellent":50,"good":60,"fair":40}}})");
     CHECK(r.status == St::Invalid);
-    CHECK(r.field == "tiers.edges");
     CHECK(r.message == "edges_not_descending at tiers.edges");
 }
 
@@ -509,12 +501,13 @@ TEST_CASE("writer: a second writer in this process gets WriterBusy", "[dex][scor
 
 // ── DELETE ──────────────────────────────────────────────────────────────────
 
-TEST_CASE("writer: DELETE of a never-written policy is NoChange: attempted then no_change",
+TEST_CASE("writer: DELETE of a never-written policy is Ok: attempted then no_change",
           "[dex][score_policy_writer]") {
     World w;
     const auto r = w.del("default");
-    REQUIRE(r.status == St::NoChange);
+    REQUIRE(r.status == St::Ok);
     CHECK(r.in_force.revision == "default");
+    CHECK(r.previous_revision == "default");
     CHECK(r.in_force.source == "default");
     REQUIRE(w.rows.size() == 2);
     CHECK(w.rows[0].verb == "dex.score_policy.reset");
