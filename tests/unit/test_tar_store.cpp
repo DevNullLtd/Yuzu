@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -2081,6 +2082,41 @@ void set_owner(const fs::path& p, const std::string& sid_text) {
     REQUIRE(owner_sid(p) == sid_text); // the owner change took
 }
 
+// Gives ONLY the token user and SYSTEM read/write on `p` (protected, no WRITE_DAC, no DELETE):
+// what a planting user would set so the service can use the file but not re-secure it. Call it
+// while the test still owns `p`.
+void set_read_write_only_dacl(const fs::path& p) {
+    PSID system_sid = nullptr;
+    REQUIRE(::ConvertStringSidToSidW(L"S-1-5-18", &system_sid));
+    const LocalPtr system_guard{system_sid, ::LocalFree};
+    PSID user_sid = nullptr;
+    REQUIRE(::ConvertStringSidToSidW(yuzu::win::to_wide(token_user_sid()).c_str(), &user_sid));
+    const LocalPtr user_guard{user_sid, ::LocalFree};
+    PSID sids[] = {system_sid, user_sid};
+    EXPLICIT_ACCESS_W ea[2]{};
+    for (int i = 0; i < 2; ++i) {
+        ea[i].grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+        ea[i].grfAccessMode = GRANT_ACCESS;
+        ea[i].grfInheritance = NO_INHERITANCE;
+        ea[i].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        ea[i].Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN;
+        ea[i].Trustee.ptstrName = reinterpret_cast<LPWSTR>(sids[i]);
+    }
+    PACL acl = nullptr;
+    REQUIRE(::SetEntriesInAclW(2, ea, nullptr, &acl) == ERROR_SUCCESS);
+    const LocalPtr acl_guard{acl, ::LocalFree};
+    std::wstring name = p.wstring();
+    REQUIRE(::SetNamedSecurityInfoW(
+                name.data(), SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, nullptr,
+                nullptr, acl, nullptr) == ERROR_SUCCESS);
+}
+
+std::string read_file(const fs::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
 // A directory carrying the inheritable Users ACE, and the tar.db path inside it.
 struct AclDir {
     yuzu::test::TempDir dir{"yuzu_test_tar_acl_"};
@@ -2154,6 +2190,88 @@ TEST_CASE("TarDatabase (Windows): a foreign-owned tar.db refuses the open",
 
     set_owner(d.db, token_user_sid()); // reversible: back to ours, the next open works
     CHECK(TarDatabase::open(d.db).has_value());
+}
+
+// A hard link shares its target's owner and security descriptor, so the owner test passes it:
+// only the link count tells it from a file of ours.
+TEST_CASE("TarDatabase (Windows): a hard-linked sidecar is replaced and its target left alone",
+          "[tar][store][lifecycle][hardening]") {
+    AclDir d;
+    { REQUIRE(TarDatabase::open(d.db).has_value()); } // created, then closed
+    const fs::path decoy = d.dir.path / "decoy.bin"; // ours, inherits the directory's Users ACE
+    { std::ofstream(decoy, std::ios::binary) << "not a wal"; }
+    REQUIRE(dacl_facts(decoy).allows(kUsers));
+    REQUIRE_FALSE(dacl_facts(decoy).dacl_protected);
+
+    const fs::path wal = d.file("-wal");
+    std::error_code ec;
+    fs::remove(wal, ec); // SQLite normally removes it on close; a plant needs the name free
+    fs::create_hard_link(decoy, wal, ec);
+    REQUIRE_FALSE(ec);
+    REQUIRE(fs::hard_link_count(wal) == 2);
+
+    auto reopened = TarDatabase::open(d.db);
+    REQUIRE(reopened.has_value());
+    REQUIRE(reopened->set_config("acl_probe", "1"));
+    CHECK(fs::hard_link_count(wal) == 1); // our name was replaced, not rewritten in place
+    assert_owner_only(wal);
+    // The target kept its bytes and its descriptor: nothing re-secured or initialised it.
+    CHECK(fs::hard_link_count(decoy) == 1);
+    CHECK(read_file(decoy) == "not a wal");
+    CHECK_FALSE(dacl_facts(decoy).dacl_protected);
+    CHECK(dacl_facts(decoy).allows(kUsers));
+}
+
+TEST_CASE("TarDatabase (Windows): a hard-linked tar.db refuses the open",
+          "[tar][store][lifecycle][hardening]") {
+    AclDir d;
+    { REQUIRE(TarDatabase::open(d.db).has_value()); } // created, then closed
+    const fs::path alias = d.dir.path / "alias.db";
+    std::error_code ec;
+    fs::create_hard_link(d.db, alias, ec);
+    REQUIRE_FALSE(ec);
+
+    auto refused = TarDatabase::open(d.db);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("hard link") != std::string::npos);
+    CHECK(refused.error().find("fsutil") != std::string::npos);
+
+    REQUIRE(fs::remove(alias)); // reversible: one name again, the next open works
+    CHECK(TarDatabase::open(d.db).has_value());
+}
+
+// The planting user owns the file, so it can deny the service WRITE_DAC: the re-secure open then
+// fails ACCESS_DENIED, and without a fallback look the owner test would never run on it. The
+// owner is a SID outside this token (a group such as BUILTIN\Users in the token would hand the
+// service implicit WRITE_DAC and hide the case).
+TEST_CASE("TarDatabase (Windows): a foreign sidecar that denies WRITE_DAC is still replaced",
+          "[tar][store][lifecycle][hardening]") {
+    if (!enable_restore_privilege())
+        SKIP("SeRestorePrivilege unavailable");
+    AclDir d;
+    { REQUIRE(TarDatabase::open(d.db).has_value()); } // created, then closed
+    const fs::path wal = d.file("-wal");
+    { std::ofstream plant(wal, std::ios::binary | std::ios::trunc); }
+    set_read_write_only_dacl(wal);
+    set_owner(wal, "S-1-5-21-1111111111-2222222222-3333333333-1001");
+
+    // The premise: the open secure_tar_db_files makes first is refused for this file.
+    HANDLE probe = ::CreateFileW(wal.c_str(), READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                 OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    const DWORD probe_err = ::GetLastError();
+    if (probe != INVALID_HANDLE_VALUE)
+        ::CloseHandle(probe);
+    REQUIRE(probe == INVALID_HANDLE_VALUE);
+    REQUIRE(probe_err == ERROR_ACCESS_DENIED);
+
+    auto reopened = TarDatabase::open(d.db);
+    REQUIRE(reopened.has_value());
+    REQUIRE(reopened->set_config("acl_probe", "1"));
+    const std::string owner = owner_sid(wal);
+    CHECK((owner == token_user_sid() || owner == kSystem || owner == kAdministrators));
+    assert_owner_only(wal);
 }
 #endif // _WIN32
 

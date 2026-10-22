@@ -359,13 +359,19 @@ int exec_ddl_batch(sqlite3* db, const char* ddl, char** err_msg) {
 //  - an existing file is re-secured in place (an upgraded tar.db on its first open);
 //  - the end pass exists because, on a FRESH (0-page) database, SQLite deletes the pre-created
 //    -wal and recreates it with the inherited ACL on the first write.
-// A file owned by anyone but SYSTEM, Administrators or the agent account is PLANTED: a foreign
-// WAL is replayed into tar.db and a foreign tar.db is attacker-controlled config (#559 class),
-// so a sidecar is deleted and re-created and a foreign tar.db refuses the open. Only POSITIVE
-// evidence refuses; a failed owner read (FAT/exFAT: no ACL) or DACL apply is logged and never
-// fails the open. FILE_FLAG_OPEN_REPARSE_POINT examines a planted symlink as the link, never
-// its target. Lock-out: a later run under a different non-admin account cannot open tar.db;
-// Administrators keep access (`icacls <file> /reset`).
+// A file owned by anyone but SYSTEM, Administrators or the agent account, or carrying more than
+// one hard link, is PLANTED: a foreign WAL is replayed into tar.db, a foreign tar.db is
+// attacker-controlled config (#559 class), and a hard link shares its target's owner and
+// security descriptor, so re-securing or WAL-initialising it would rewrite the OTHER name's
+// target (the owner test cannot see that). A sidecar is therefore deleted and re-created and
+// such a tar.db refuses the open. Only POSITIVE evidence refuses; a failed owner read
+// (FAT/exFAT: no ACL), link-count query or DACL apply is logged and never fails the open.
+// A file that denies us WRITE_DAC (its owner can do that to dodge the checks) is looked at
+// through a READ_CONTROL-only handle and gets the same two tests; if it passes it keeps its
+// ACL, logged. SQLite's own GENERIC_READ includes READ_CONTROL, so a file we cannot look at
+// that way SQLite cannot open either. FILE_FLAG_OPEN_REPARSE_POINT examines a planted symlink
+// as the link, never its target. Lock-out: a later run under a different non-admin account
+// cannot open tar.db; Administrators keep access (`icacls <file> /reset`).
 
 using LocalPtr = std::unique_ptr<void, decltype(&::LocalFree)>;
 using HandlePtr = std::unique_ptr<void, decltype(&::CloseHandle)>;
@@ -460,12 +466,15 @@ std::string sid_to_string(PSID sid) {
 }
 
 // Creates or re-secures tar.db, tar.db-wal and tar.db-shm (see the block comment above).
-// Returns a refusal message when a foreign-owned file must stop the open, else nullopt.
+// Returns a refusal message when a planted file must stop the open, else nullopt.
 std::optional<std::string> secure_tar_db_files(const std::filesystem::path& db,
                                                TarDbDacl& dacl) {
     if (!dacl.ok())
         return std::nullopt; // open() warned once, when it built the DACL
-    constexpr DWORD kAccess = READ_CONTROL | WRITE_DAC;
+    // FILE_READ_ATTRIBUTES is for the link count below. None of these asks for data or DELETE
+    // access, so share arbitration never weighs the open: no holder's share mode can refuse it.
+    constexpr DWORD kAccess = READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES;
+    constexpr DWORD kLookOnly = READ_CONTROL | FILE_READ_ATTRIBUTES; // no WRITE_DAC
     constexpr DWORD kShareAll = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
     constexpr DWORD kFlags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT;
     for (const char* suffix : {"", "-wal", "-shm"}) {
@@ -478,6 +487,19 @@ std::optional<std::string> secure_tar_db_files(const std::filesystem::path& db,
         HANDLE raw = ::CreateFileW(file.c_str(), kAccess, kShareAll, dacl.sa(), OPEN_ALWAYS,
                                    kFlags, nullptr);
         const DWORD open_err = ::GetLastError(); // ERROR_ALREADY_EXISTS when it pre-existed
+        bool existed = open_err == ERROR_ALREADY_EXISTS;
+        bool can_secure = true; // the handle carries WRITE_DAC
+        if (raw == INVALID_HANDLE_VALUE && open_err == ERROR_ACCESS_DENIED) {
+            // Either the file cannot be created, or it exists and its DACL withholds WRITE_DAC
+            // from us. The second is how a planted file would dodge the checks below, so look
+            // at it without WRITE_DAC; a file that is not there fails this open too.
+            raw = ::CreateFileW(file.c_str(), kLookOnly, kShareAll, nullptr, OPEN_EXISTING,
+                                kFlags, nullptr);
+            if (raw != INVALID_HANDLE_VALUE) {
+                existed = true;
+                can_secure = false;
+            }
+        }
         if (raw == INVALID_HANDLE_VALUE) {
             spdlog::warn("TarDatabase: could not open {} to secure it (error {}); it keeps its "
                          "current ACL",
@@ -485,7 +507,7 @@ std::optional<std::string> secure_tar_db_files(const std::filesystem::path& db,
             continue;
         }
         HandlePtr h{raw, ::CloseHandle};
-        if (open_err != ERROR_ALREADY_EXISTS)
+        if (!existed)
             continue; // created just now WITH the protected DACL
 
         PSID owner = nullptr;
@@ -495,37 +517,52 @@ std::optional<std::string> secure_tar_db_files(const std::filesystem::path& db,
                                                  nullptr, nullptr, &owner_sd);
         const LocalPtr owner_sd_guard{owner_sd, ::LocalFree}; // `owner` points into it
         if (owner_rc != ERROR_SUCCESS) {
-            spdlog::warn("TarDatabase: could not read the owner of {} (error {}); re-securing it "
-                         "in place",
+            spdlog::warn("TarDatabase: could not read the owner of {} (error {}); the owner test "
+                         "is skipped for it",
                          name, owner_rc);
         }
+        // Positive evidence only: a foreign owner, or a second hard link (which shares the
+        // target's owner and so passes the owner test). A failed link-count query is no evidence.
+        std::string why;
+        std::string remedy;
         if (owner_rc == ERROR_SUCCESS && owner != nullptr && !dacl.owner_allowed(owner)) {
-            const std::string who = sid_to_string(owner);
-            const std::string remedy =
-                std::format("make Administrators its owner (icacls \"{}\" /setowner "
-                            "*S-1-5-32-544 /L) or remove it, then restart the agent",
-                            name);
-            if (suffix[0] == '\0') {
-                return std::format("tar.db at {} is owned by {}, not SYSTEM, Administrators or "
-                                   "the agent account, and was not opened: {}",
-                                   name, who, remedy);
-            }
-            h.reset(); // release our handle before deleting
+            why = std::format("is owned by {}, not SYSTEM, Administrators or the agent account",
+                              sid_to_string(owner));
+            remedy = std::format("make Administrators its owner (icacls \"{}\" /setowner "
+                                 "*S-1-5-32-544 /L) or remove it, then restart the agent",
+                                 name);
+        } else if (BY_HANDLE_FILE_INFORMATION info{};
+                   ::GetFileInformationByHandle(h.get(), &info) && info.nNumberOfLinks > 1) {
+            why = std::format("has {} hard links", info.nNumberOfLinks);
+            remedy = std::format("remove the other links (fsutil hardlink list \"{}\" names "
+                                 "them) or remove it, then restart the agent",
+                                 name);
+        }
+        if (!why.empty()) {
+            if (suffix[0] == '\0')
+                return std::format("tar.db at {} {}, and was not opened: {}", name, why, remedy);
+            h.reset(); // release our handle before deleting; a link loses only OUR name
             if (!::DeleteFileW(file.c_str())) {
-                return std::format("{} is owned by {}, not SYSTEM, Administrators or the agent "
-                                   "account, and could not be removed (error {}): {}",
-                                   name, who, ::GetLastError(), remedy);
+                return std::format("{} {}, and could not be removed (error {}): {}", name, why,
+                                   ::GetLastError(), remedy);
             }
             raw = ::CreateFileW(file.c_str(), kAccess, kShareAll, dacl.sa(), CREATE_NEW, kFlags,
                                 nullptr);
             if (raw == INVALID_HANDLE_VALUE) {
-                return std::format("{} was foreign-owned (owner {}), removed, and could not be "
-                                   "re-created (error {}); tar.db was not opened",
-                                   name, who, ::GetLastError());
+                return std::format("{} {}; it was removed but could not be re-created (error "
+                                   "{}), so tar.db was not opened",
+                                   name, why, ::GetLastError());
             }
             h.reset(raw);
-            spdlog::warn("TarDatabase: replaced foreign-owned {} (owner {})", name, who);
+            spdlog::warn("TarDatabase: replaced {}, which {}", name, why);
             continue; // re-created WITH the protected DACL
+        }
+        if (!can_secure) {
+            // Ours by owner and link count, but its DACL withholds WRITE_DAC: nothing to apply.
+            spdlog::warn("TarDatabase: could not open {} to secure it (error {}); it keeps its "
+                         "current ACL",
+                         name, open_err);
+            continue;
         }
         // Owner read failed (no ACL on this filesystem) or the owner is ours: re-secure in
         // place. Best-effort -- availability of a diagnostics DB over confidentiality.
@@ -602,7 +639,7 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
 
 #ifdef _WIN32
     // Create or re-secure tar.db, -wal and -shm BEFORE SQLite touches them, and refuse a
-    // foreign-owned (planted) file; see the DACL block above.
+    // planted file (foreign owner or extra hard link); see the DACL block above.
     TarDbDacl dacl;
     if (!dacl.ok()) {
         spdlog::warn("TarDatabase: owner-only DACL not built (error {}); tar.db keeps the "
