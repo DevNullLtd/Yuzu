@@ -5448,3 +5448,61 @@ groups:
             boot log line says which. Make the data directory writable
             (one persistent data directory per replica; an ephemeral one makes
             the mechanism inert).
+
+  - name: yuzu-web-writes
+    # Cookie-session requests refused by the pre-routing same-site gate
+    # (yuzu_server_csrf_denied_total{path_class,reason}). Every path_class x
+    # reason series is zero-seeded at boot, so increase() sees the first
+    # refusal and an absent() would stay a real signal.
+    #
+    # Deliberately NOT alerted: reason="no_origin_no_referer". A header-less
+    # cookie write is what a curl script reusing a cookie jar sends, and the
+    # reason is common and benign at low volume; the two mismatch reasons are
+    # the ones that mean a browser sent a request from another site (or a proxy
+    # rewrote Host without --csrf-trusted-origin). A refused Sec-Fetch-Site
+    # value also counts as origin_mismatch.
+    #
+    # The rule name YuzuCookieWritesRefusedSameSite is kept from when only
+    # writes were refused; renaming it would break existing consumers.
+    rules:
+      - alert: YuzuCookieWritesRefusedSameSite
+        expr: |
+          sum(
+            increase(yuzu_server_csrf_denied_total{reason=~"origin_mismatch|referer_mismatch"}[15m])
+          ) >= 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cookie-session requests are being refused for a cross-site Origin, Referer or fetch metadata"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#vnext--behind-a-reverse-proxy-declare-your-external-origin-or-csrf-gated-dashboard-actions-keep-failing-2537"
+          description: >-
+            Three or more cookie-session requests were refused in 15 minutes because
+            the Origin or Referer did not name this site (or a --csrf-trusted-origin
+            entry), or because the request's fetch metadata (Sec-Fetch-Site) was not
+            same-origin or none. Three causes: a browser sent a request from another
+            site, a reverse proxy rewrites the Host header and the server was started
+            without --csrf-trusted-origin (or YUZU_CSRF_TRUSTED_ORIGIN), in which case
+            every dashboard write fails, or a client sent a Sec-Fetch-Site value other
+            than same-origin or none. Each refusal is audited as csrf.denied with the
+            closed reason; this alert sums over path_class, so query
+            yuzu_server_csrf_denied_total by path_class to see which kind of route was
+            targeted. Check the Host and Origin the proxy forwards first.
+
+      - alert: YuzuSameSiteGateInternalError
+        expr: |
+          sum(
+            increase(yuzu_server_csrf_denied_total{reason="gate_error"}[15m])
+          ) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "The same-site gate failed internally and refused requests"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#vnext--behind-a-reverse-proxy-declare-your-external-origin-or-csrf-gated-dashboard-actions-keep-failing-2537"
+          description: >-
+            The same-site check for cookie-session requests hit an internal
+            error and refused the request (it fails closed). A refusal that
+            fails inside the gate may have no audit row, so the metric and the
+            server log (at most one warning per minute) may be the only
+            evidence. Look for
+            the gate warning in the server log; a persistent error means
+            cookie-session requests are failing for every operator.

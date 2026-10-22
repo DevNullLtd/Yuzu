@@ -101,6 +101,7 @@
 #include "on_behalf_guard.hpp"
 #include "principal_class.hpp"
 #include "principal_quota_gate.hpp"
+#include "same_site_write_gate.hpp" // cookie-session writes require a same-site Origin or Referer
 #include "rest_a4_envelope_http.hpp"
 #include "inventory_store.hpp"
 #include "app_perf_daily_store.hpp"
@@ -1889,6 +1890,23 @@ public:
                 metrics_.counter("yuzu_body_cap_rejected_total",
                                  {{"path_class", std::string(entry.path_class)},
                                   {"reason", "unmeasurable"}});
+            }
+        }
+        // Cookie-session writes refused by the pre-routing same-site gate.
+        // Bounded labels only: path_class from kBodyCapTable (never the raw
+        // path) x the closed reason set; pre-seeded so absent() alerts stay
+        // meaningful (docs/observability-conventions.md). Re-seeding a
+        // path_class shared by several table rows is idempotent.
+        metrics_.describe("yuzu_server_csrf_denied_total",
+                          "Cookie-session writes refused by the pre-routing same-site gate, by "
+                          "route class and reason (no_origin_no_referer, origin_mismatch, "
+                          "referer_mismatch, gate_error)",
+                          "counter");
+        for (const auto& entry : yuzu::server::kBodyCapTable) {
+            for (const auto reason : yuzu::server::kSameSiteDenyReasons) {
+                metrics_.counter("yuzu_server_csrf_denied_total",
+                                 {{"path_class", std::string(entry.path_class)},
+                                  {"reason", std::string(reason)}});
             }
         }
         for (auto reason : {"client_disconnect", "superseded", "session_terminated",
@@ -15435,6 +15453,24 @@ private:
                 return httplib::Server::HandlerResponse::Handled;
             }
 
+            // Cookie-session writes require a same-site Origin or Referer. ONE
+            // chokepoint: the decision keys on the RESOLVED session's
+            // auth_source (token sources are exempt), never on header presence.
+            // The audit row is stamped from the session held here (never a
+            // second resolve_session), and the counter and the A4 body live in
+            // same_site_write_gate.hpp. A refusal happens after authentication
+            // and before step-up evaluation and any route handler. Exemptions
+            // are by placement: is_login_exempt_path, the probes and the metrics
+            // endpoint return above, before resolve_session. Never add another
+            // early Unhandled beyond the pinned exempt returns. The web listener's
+            // TLS state (cfg_.https_enabled) selects the scheme-aware same-host
+            // comparison. Invariants: the header banner of same_site_write_policy.hpp.
+            if (detail::apply_same_site_write_gate(req, res, *session, cfg_.csrf_trusted_origins,
+                                                   cfg_.https_enabled, metrics_,
+                                                   same_site_audit_fn_)) {
+                return httplib::Server::HandlerResponse::Handled;
+            }
+
             // principal_class metric (PR 4.5) — stash whether this RESOLVED
             // session is an engine principal, for the post-routing metric
             // emission (principal_class.hpp's principal_class_resolved).
@@ -22785,6 +22821,19 @@ private:
     std::mutex peer_serial_cache_mu_;
     std::unordered_map<std::string, std::string> peer_serial_cache_;
     std::unique_ptr<AuthRoutes> auth_routes_;
+    // The csrf.denied sink for the pre-routing same-site gate: stamps the principal the
+    // gate already holds (never a second resolve_session). Initialised here, not in a
+    // constructor body, so it can never be empty (an empty function reads as audit-off
+    // to try_persist_audit_for_principal); it reads auth_routes_ at call time.
+    // Capturing `this` is safe: the only caller is the web server's pre-routing handler, and
+    // stop() joins web_thread_ before any member is destroyed (as for mcp_sessions_).
+    detail::SameSitePrincipalAuditFn same_site_audit_fn_ =
+        [this](const httplib::Request& r, const std::string& action, const std::string& result,
+               const detail::SameSiteAuditPrincipal& p, const std::string& tt,
+               const std::string& tid, const std::string& d) {
+            return auth_routes_->audit_log_for_principal(r, action, result, p.id, p.role, tt, tid,
+                                                         d, p.cls);
+        };
     std::unique_ptr<RestApiV1> rest_api_v1_;
     std::unique_ptr<SettingsRoutes> settings_routes_;
     std::unique_ptr<mcp::McpServer> mcp_server_;

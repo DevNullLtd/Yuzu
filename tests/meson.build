@@ -1713,6 +1713,10 @@ if build_server
       'unit/server/test_authz_topology_floor.cpp', # #2376: the RBAC-off legacy-fallback topology floor (AccessReview/UserManagement/EnginePrincipal Read)
       'unit/server/test_body_cap_policy.cpp', # #2407: pre-auth request-body cap policy table (method+segment-boundary path -> cap/requires_measurable/metric label)
       'unit/server/test_body_cap_route_inventory.cpp', # #2407: architect-mandated route-inventory coverage — every ACTUALLY REGISTERED POST/PUT/PATCH route resolves to a deliberate class, mechanically scanned from server/core/src at test run time
+      'unit/server/test_same_site_write_policy.cpp', # cookie-session writes require a same-site Origin or Referer: pure decision truth table and gate exception-path contract
+      'unit/server/test_same_site_write_gate.cpp', # same-site gate behaviour through the real pre-routing pipeline
+      'unit/server/test_same_site_write_gate_pg.cpp', # same-site gate over the real session resolver (Postgres-gated)
+      'unit/server/test_same_site_exempt_inventory.cpp', # same-site gate exemption inventory, scanned from server/core/src at test run time
       'unit/server/test_mcp_dispatch_coverage.cpp', # Seam PR1: every served MCP tool has a handler; no orphan or dead tool_name branch in mcp_server.cpp (scanned from server/core/src at run time)
       'unit/server/test_mcp_tools_containment.cpp', # Seam PR2: list_quarantined_devices registry tool (gate, scope, degrade, audit, byte identity with the REST body)
       'unit/server/test_store_wiring_order.cpp', # #3261: every agent_service_/gateway_service_ store setter runs after its member's construction, mechanically scanned from server.cpp at test run time
@@ -3745,6 +3749,30 @@ test('access users production wiring lexical gate',
 test('access audit production wiring lexical gate',
   _python3_test,
   args: [files('test_access_audit_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# Cookie-session writes require a same-site Origin or Referer: pins the one gate call site in the
+# pre-routing lambda in server.cpp (source-text only, so Python; suite 'docs' like the gates above).
+test('same-site gate production wiring lexical gate',
+  _python3_test,
+  args: [files('test_same_site_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('same-site gate production wiring lexical selftest',
+  _python3_test,
+  args: [files('test_same_site_wiring_lexical_selftest.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
+# Every repository-markdown runbook_url in the shipped alert rules that carries a #fragment names a
+# heading that exists in that file (source-text only, stdlib Python).
+test('alert runbook anchors resolve',
+  _python3_test,
+  args: [files('test_alert_runbook_anchors.py')],
   suite: 'docs',
   timeout: 30,
 )
