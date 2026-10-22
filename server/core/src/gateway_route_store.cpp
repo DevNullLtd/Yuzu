@@ -154,14 +154,18 @@ std::optional<std::string> col_opt(PGresult* r, int row, int col) {
 bool to_bool(const char* s) { return s != nullptr && s[0] == 't'; }
 
 // True iff `res` failed on the v5 unique session index (#5683). Any other 23505
-// (the agent_id primary key) is NOT this, so it stays a db_error.
+// (the agent_id primary key) is NOT this, so it stays a db_error. The index name
+// is `GatewayRouteStore::kSessionUniqueIndexName`; keep it in sync with migration
+// v5's CREATE UNIQUE INDEX (a unit test pins the two together). An index
+// recreated under any other name is NOT remapped and would turn racing adopts
+// into db_error (see docs/user-manual/gateway.md recovery procedure).
 bool is_session_unique_violation(const pg::PgResult& res) {
     if (res.status() != PGRES_FATAL_ERROR)
         return false;
     const char* state = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
     const char* constraint = PQresultErrorField(res.get(), PG_DIAG_CONSTRAINT_NAME);
     return state != nullptr && constraint != nullptr && std::string_view(state) == "23505" &&
-           std::string_view(constraint) == "ux_agent_routes_session_id";
+           std::string_view(constraint) == GatewayRouteStore::kSessionUniqueIndexName;
 }
 
 // parse_reap_i64 / parse_declined_marker moved to gateway_route_reap_rules.hpp
@@ -242,6 +246,16 @@ ALTER TABLE agent_routes ADD COLUMN home_cluster_id TEXT;
         // recorded in ADR-0053 "Update (2026-10-20)" (no rolling upgrade yet).
         // statement_timeout is lifted for the build; lock_timeout bounds the wait,
         // on expiry the migration rolls back, boot is refused and a restart retries.
+        //
+        // The old index is dropped with IF EXISTS (a hand-dropped one must not
+        // abort the migration), but the CREATE UNIQUE INDEX deliberately has NO
+        // IF NOT EXISTS: a pre-existing object named ux_agent_routes_session_id
+        // (a wrong-shape index must fail loudly, not be adopted) aborts this
+        // migration by design - atomically, schema_meta stays 4 and boot is
+        // refused. The operator clears it with
+        // `DROP INDEX gateway_route_store.ux_agent_routes_session_id;` and
+        // restarts; the migration then runs afresh. v5 is unreleased, so it is
+        // edited in place rather than followed by a v6.
         {5, R"(
 SET LOCAL lock_timeout = '30s';
 SET LOCAL statement_timeout = 0;
@@ -262,7 +276,7 @@ SELECT 'v5_session_dedup_tombstoned_rows', count(*)::text FROM tomb
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 CREATE UNIQUE INDEX ux_agent_routes_session_id
     ON agent_routes (session_id) WHERE session_id IS NOT NULL;
-DROP INDEX agent_routes_session_id_idx;
+DROP INDEX IF EXISTS agent_routes_session_id_idx;
 )"},
     };
     return kMigrations;
@@ -284,23 +298,50 @@ GatewayRouteStore::GatewayRouteStore(pg::PgPool& pool) : pool_(pool) {
                       "disabled");
         return;
     }
-    if (version_before >= 0 && version_before < 5) {
-        // v5 (#5683) left its tombstone count in route_meta. Counts only: a
-        // session id is gateway-asserted identity and is never logged here.
+    if (version_before >= 0) {
+        // v5 (#5683) left its tombstone count in route_meta (written on every
+        // run of v5, 0 included, so the key is always present after it).
+        // Counts only: a session id is gateway-asserted identity and is never
+        // logged here. The read is advisory evidence, never a gate on opening.
         pg::PgResult meta = pg::exec_params(
             lease.get(),
             "SELECT value FROM gateway_route_store.route_meta "
             "WHERE key = 'v5_session_dedup_tombstoned_rows'",
             std::vector<std::optional<std::string>>{});
-        if (meta.status() == PGRES_TUPLES_OK && PQntuples(meta.get()) == 1) {
+        std::int64_t recorded = 0;
+        bool parsed = false;
+        if (meta.status() == PGRES_TUPLES_OK && PQntuples(meta.get()) == 1 &&
+            PQgetisnull(meta.get(), 0, 0) == 0) {
             const char* v = PQgetvalue(meta.get(), 0, 0);
-            std::from_chars(v, v + std::char_traits<char>::length(v), boot_session_dedup_rows_);
-            if (boot_session_dedup_rows_ > 0) {
-                spdlog::warn("GatewayRouteStore: migration v5 tombstoned {} agent_routes row(s) "
-                             "that shared a session id (each affected agent re-establishes its "
-                             "route through the normal renew/reclaim replay)",
-                             boot_session_dedup_rows_);
+            const char* end = v + std::char_traits<char>::length(v);
+            const auto [ptr, ec] = std::from_chars(v, end, recorded);
+            parsed = (ec == std::errc{} && ptr == end && recorded >= 0);
+            if (!parsed)
+                recorded = 0;
+        }
+        if (version_before < 5) {
+            // THIS construction ran v5.
+            if (!parsed) {
+                spdlog::warn("GatewayRouteStore: migration v5 ran but its route_meta tombstone "
+                             "count could not be read; yuzu_server_gateway_route_session_dedup_"
+                             "total will read 0 even if rows were tombstoned (the durable record "
+                             "is route_meta key v5_session_dedup_tombstoned_rows)");
+            } else {
+                boot_session_dedup_rows_ = recorded;
+                if (recorded > 0) {
+                    spdlog::warn("GatewayRouteStore: migration v5 tombstoned {} agent_routes "
+                                 "row(s) that shared a session id (each affected agent "
+                                 "re-establishes its route through the normal renew/reclaim "
+                                 "replay)",
+                                 recorded);
+                }
             }
+        } else if (parsed && recorded > 0) {
+            // A later start: boot_session_dedup_rows() stays 0 (it counts only
+            // THIS construction), so surface the durable record once.
+            spdlog::info("GatewayRouteStore: route_meta records {} agent_routes row(s) "
+                         "tombstoned by the v5 migration on an earlier start (not re-counted)",
+                         recorded);
         }
     }
     open_ = true;
@@ -581,9 +622,9 @@ GatewayRouteStore::reclaim_tombstoned_session(std::string_view agent_id,
     if (std::string_view(PQgetvalue(res.get(), 0, 0)) == "t")
         return ReclaimOutcome::adopted;
     // Not adopted: either another agent's row holds the id or the caller's own
-    // row holds a LIVE session
-    // (normally a different one; a concurrent identical reclaim also lands
-    // here). Either way the caller must refuse it outright.
+    // row holds a LIVE session (normally a different one; a concurrent
+    // identical reclaim also lands here). Either way the caller must refuse it
+    // outright.
     return std::string_view(PQgetvalue(res.get(), 0, 1)) == "t"
                ? ReclaimOutcome::held_by_other_agent
                : ReclaimOutcome::superseded;
@@ -988,8 +1029,8 @@ GatewayRouteStore::lookup_by_sessions(std::span<const std::string> session_ids) 
         return std::unexpected(GatewayRouteStoreError::store_unavailable);
     }
     // Array-param idiom and in-SQL DB-clock `routable` as lookup_routes, one
-    // statement per chunk on this lease; session_id is not unique so EVERY
-    // match is returned.
+    // statement per chunk on this lease; session_id has been unique since v5
+    // (#5683) but EVERY match is still returned (defence in depth).
     std::vector<RoutableRoute> out;
     for (std::size_t off = 0; off < views.size(); off += kSessionLookupChunk) {
         const std::size_t n_ids = std::min(kSessionLookupChunk, views.size() - off);

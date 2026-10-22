@@ -443,6 +443,9 @@ struct AnnounceResult {
     /// row already holds `session_id` (the unique index). Like
     /// `cluster_affinity_violation` this is a fail-closed refusal the caller
     /// must not publish anywhere, never a benign `matched == false` desync.
+    /// Both flags can be true only in a delete race (the affinity read saw a
+    /// row that the fallback insert then found gone); callers act on
+    /// `cluster_affinity_violation` FIRST, and both arms unpublish.
     bool session_held_by_other_agent{false};
 };
 
@@ -795,8 +798,8 @@ public:
     /// absent. Since migration v5 (#5683) a non-NULL `session_id` is UNIQUE, so
     /// at most one row per id comes back; the method still returns every match
     /// rather than picking one, and the CALLER keeps its more-than-one-row
-    /// ambiguity refusal as defense in depth (a hand-dropped index, or data
-    /// from before v5). Use `lookup_route(agent_id)` (PK, unambiguous)
+    /// ambiguity refusal as defense in depth (only a hand-dropped index can let
+    /// a duplicate exist after v5). Use `lookup_route(agent_id)` (PK, unambiguous)
     /// whenever the agent_id is already known.
     [[nodiscard]] std::expected<std::vector<RoutableRoute>, GatewayRouteStoreError>
     lookup_by_sessions(std::span<const std::string> session_ids);
@@ -880,6 +883,12 @@ public:
     /// `session_id` with a one-time dedup — #5683). Exposed for tests and the
     /// migration ladder.
     static const std::vector<pg::PgMigration>& migrations();
+
+    /// Name of the UNIQUE partial index migration v5 (#5683) creates; the 23505
+    /// remap in the three writers matches this constraint name EXACTLY. Keep in
+    /// sync with the CREATE UNIQUE INDEX in migration v5 (a unit test pins the
+    /// two). An index recreated under another name silently breaks the remap.
+    static constexpr std::string_view kSessionUniqueIndexName = "ux_agent_routes_session_id";
 
     /// Rows migration v5 tombstoned in THIS construction because they shared a
     /// session id (#5683); 0 when v5 did not run here or found no duplicate.
