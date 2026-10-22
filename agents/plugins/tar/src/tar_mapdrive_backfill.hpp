@@ -87,25 +87,26 @@ enum class MountCallResult { completed, timed_out, rejected };
 /// What the per-profile walk does with a bounded call's result. A timed-out mount is abandoned,
 /// not cancelled: its thread keeps running, still holding the process-wide offline-hive mutex,
 /// so every later offline mount would queue behind it and time out too -- the walk stops mounting
-/// (`halt_walk`) and the remaining profiles are recorded as not attempted. The thread also runs
-/// plugin code, so the plugin module is pinned (`pin_module`) to keep an unload from unmapping it.
-/// A rejected call never ran the mount at all (the ceiling was full), so it is not an attempt.
+/// (`halt_walk`) and the remaining profiles are recorded as not attempted. A rejected call never
+/// ran the mount at all (the ceiling was full): it is not an attempt, and the next call would be
+/// refused the same way, so it halts too. (The plugin module is pinned before the FIRST mount, in
+/// the collector, not here: even a call that completes leaves its worker thread destroying plugin
+/// code after the result is published.)
 struct MountCallDecision {
     bool attempted = true;
     bool halt_walk = false;
-    bool pin_module = false;
 };
 
 [[nodiscard]] constexpr MountCallDecision decide_mount_call(MountCallResult r) noexcept {
     switch (r) {
     case MountCallResult::completed:
-        return {true, false, false};
+        return {true, false};
     case MountCallResult::timed_out:
-        return {true, true, true};
+        return {true, true};
     case MountCallResult::rejected:
-        return {false, true, false};
+        return {false, true};
     }
-    return {true, true, false}; // unreachable; a corrupt value is treated as a stop
+    return {true, true}; // unreachable; a corrupt value is treated as a stop
 }
 
 /// sid abandoned this run without a further acquisition attempt, with the token that explains

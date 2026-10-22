@@ -677,9 +677,10 @@ three broken legs; it is one chokepoint. See Caveats item 1.
    counts that read as an attempt like any other. A hive mount that exceeds its 30 s bound counts
    as one attempt and ends that run's mounting: the profiles after it are listed but not tried
    and not charged an attempt. The abandoned mount thread is not stopped: it keeps the
-   process-wide hive lock and the backup/restore privileges until the mount returns, and the
-   plugin module is pinned in memory for the life of the process so an unload cannot unmap the
-   code it is still running. The retry's insert is duplicate-free against what is
+   process-wide hive lock and the backup/restore privileges until the mount returns. Because any
+   mount thread, abandoned or not, can still be running plugin code when the agent shuts down, the
+   plugin module is pinned in memory before the first mount and stays loaded for the life of the
+   process; if the pin cannot be taken no mount is attempted and every profile is retried later. The retry's insert is duplicate-free against what is
    already recorded (`mapdrive_live`'s `origin='historical'` rows): a mapping already recorded
    keeps its first-recorded timestamp, never overwritten by a later retry that re-observes it. A
    ProfileList walk that is itself permanently incomplete (a terminating registry error on every

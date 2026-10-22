@@ -1083,16 +1083,24 @@ OutboundRead read_user_outbound_history(HKEY user_root, const std::string& profi
 }
 
 // Pins this plugin's module so FreeLibrary can never unmap it (the pin is for the life of the
-// process). Called on the dispatching thread when a mount times out; pinning again is harmless.
-void pin_plugin_module() noexcept {
-    HMODULE module = nullptr;
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
-                            reinterpret_cast<LPCWSTR>(&pin_plugin_module), &module)) {
-        spdlog::error("TAR mapdrive: could not pin the plugin module after a hive-mount timeout "
-                      "(GetLastError {}); an unload while the abandoned mount thread runs is "
-                      "unsafe",
+// process), once, and answers whether it holds. Called on the dispatching thread BEFORE the first
+// bounded mount spawns a worker: a worker that completes is detached too, and destroys its
+// plugin-resident closure after publishing the result, so a pin taken only on a timeout would
+// leave that tail exposed to an unload.
+bool pin_plugin_module() noexcept {
+    static const bool pinned = [] {
+        HMODULE module = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_PIN,
+                               reinterpret_cast<LPCWSTR>(&pin_plugin_module), &module))
+            return true;
+        spdlog::error("TAR mapdrive: could not pin the plugin module (GetLastError {}); hive "
+                      "mounts are not attempted, because a detached mount thread must not outlive "
+                      "an unload",
                       GetLastError());
-    }
+        return false;
+    }();
+    return pinned;
 }
 
 // Walk every profile in ProfileList; read the outbound artifacts from the live
@@ -1124,9 +1132,11 @@ void pin_plugin_module() noexcept {
 // lives in agent-core, which is never unloaded): the abandoned thread keeps executing THIS
 // plugin's code. The agent's teardown can FreeLibrary the plugin while it runs, and the SDK's
 // Plugin::shutdown contract says such a thread must never touch the plugin's code after the
-// bounded wait. This call site cannot join it (a hung RegLoadKeyW has no cancel), so on the first
-// timeout the plugin module is PINNED (pin_plugin_module, below): unload can then never unmap code
-// the thread is running, at the price of the DLL staying loaded until process exit. Three more
+// bounded wait. This call site cannot join it (a hung RegLoadKeyW has no cancel; and even a call
+// that completes leaves its worker destroying a plugin-resident closure after the result is
+// published), so the plugin module is PINNED before the first mount (pin_plugin_module, above):
+// unload can then never unmap code any such thread is running, at the price of the DLL staying
+// loaded until process exit (it is loaded for the agent's lifetime anyway). Three more
 // costs of a stuck mount are accepted and recorded in the governance ledger: it holds the
 // process-wide offline-hive mutex (every other with_user_hive caller queues behind it), it keeps
 // SeBackup/SeRestore enabled on the process token (PrivilegeScope restores only when the call
@@ -1163,8 +1173,11 @@ void enum_registry_outbound_history(MapDriveHistory& h, const std::vector<std::s
             key_open_rc[f.sid] = f.rc;
     }
 
-    // Set after a bounded mount timed out or was refused: no further mount is tried this run.
-    bool mounts_halted = false;
+    // Pinned before any worker thread exists. If the pin fails no mount is tried at all: every
+    // profile is recorded as not attempted ("pin_failed") and retried later. After that, set once
+    // a bounded mount times out or is refused: no further mount is tried this run.
+    bool mounts_halted = !pin_plugin_module();
+    const char* halted_token = mounts_halted ? "pin_failed" : "skipped_after_timeout";
     for (const auto& profile : profiles) {
         if (only_sids) {
             bool wanted = false;
@@ -1183,7 +1196,7 @@ void enum_registry_outbound_history(MapDriveHistory& h, const std::vector<std::s
             ProfileHiveOutcome skipped;
             skipped.sid = profile.sid;
             skipped.status = yuzu::win::HiveAccessStatus::mount_failed;
-            skipped.token = "skipped_after_timeout";
+            skipped.token = halted_token;
             skipped.attempted = false;
             h.profiles.push_back(std::move(skipped));
             continue;
@@ -1219,8 +1232,6 @@ void enum_registry_outbound_history(MapDriveHistory& h, const std::vector<std::s
                 bounded.status == yuzu::shared::BoundedCallStatus::TimedOut
                     ? yuzu::tar::MountCallResult::timed_out
                     : yuzu::tar::MountCallResult::rejected);
-            if (decision.pin_module)
-                pin_plugin_module();
             ProfileHiveOutcome outcome;
             outcome.sid = profile.sid;
             outcome.status = yuzu::win::HiveAccessStatus::mount_failed;
@@ -1229,6 +1240,7 @@ void enum_registry_outbound_history(MapDriveHistory& h, const std::vector<std::s
             outcome.complete = true; // nothing about this profile's cap/completeness changed
             h.profiles.push_back(std::move(outcome));
             mounts_halted = decision.halt_walk;
+            halted_token = decision.attempted ? "skipped_after_timeout" : "skipped_after_rejection";
             continue;
         }
         BoundedProfileRead& result = *bounded.value;

@@ -9,8 +9,11 @@ test_tar_mapdrive.cpp), so this pins the wiring lexically. Invariants:
 
   1. pin_plugin_module pins by address: GET_MODULE_HANDLE_EX_FLAG_PIN | ..._FROM_ADDRESS, with
      its own address as the module hint.
-  2. The non-Completed branch asks decide_mount_call, calls pin_plugin_module() when told to
-     (`decision.pin_module`), and stops the walk (`mounts_halted = decision.halt_walk`).
+  2. The walk pins the module BEFORE the first bounded mount (`mounts_halted = !pin_plugin_module()`:
+     a failed pin means no mount is tried), and the non-Completed branch asks decide_mount_call
+     and stops the walk (`mounts_halted = decision.halt_walk`). The pin is taken up front, not on a
+     timeout, because a worker that COMPLETES is detached too and destroys its plugin-resident
+     closure after publishing the result.
   3. A halted walk records the remaining profiles as not attempted (`attempted = false`) and
      `continue`s, BEFORE the next bounded_call_ex.
   4. A MountPoints2 child-open failure reaches note_failure(sk_rc); a clean cap-cut read is
@@ -66,7 +69,7 @@ def problems(collector_src, plugin_src):
     c = normalise(collector_src)
     p = normalise(plugin_src)
 
-    pin = body_of(c, "void pin_plugin_module() noexcept")
+    pin = body_of(c, "bool pin_plugin_module() noexcept")
     if pin is None:
         out.append("pin_plugin_module() is missing")
     else:
@@ -81,8 +84,10 @@ def problems(collector_src, plugin_src):
     else:
         if "decide_mount_call(" not in walk:
             out.append("the walk no longer asks decide_mount_call")
-        if not re.search(r"if \(decision\.pin_module\) pin_plugin_module\(\);", walk):
-            out.append("the timeout branch no longer pins the module on decision.pin_module")
+        pin_at = walk.find("mounts_halted = !pin_plugin_module();")
+        if pin_at < 0 or pin_at > walk.find("bounded_call_ex("):
+            out.append("the walk must pin the module (and halt if it cannot) before its first "
+                       "bounded_call_ex")
         if not re.search(r"mounts_halted = decision\.halt_walk;", walk):
             out.append("the timeout branch no longer halts the walk")
         halted = re.search(r"if \(mounts_halted\) \{(.*?)\bcontinue;", walk)
@@ -134,13 +139,15 @@ class TarMapdrivePinLexical(unittest.TestCase):
     def test_mutations_are_caught(self):
         c, p = self.collector, self.plugin
         cases = {
-            "pin call deleted": (mutate(c, "pin_plugin_module();\n", "\n"), p),
+            "pin call deleted": (mutate(c, "bool mounts_halted = !pin_plugin_module();",
+                                        "bool mounts_halted = false;"), p),
             "pin call commented out": (
-                mutate(c, "if (decision.pin_module)\n                pin_plugin_module();",
-                       "// if (decision.pin_module) pin_plugin_module();"), p),
-            "pin flag dropped": (mutate(c, "GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | "
-                                           "GET_MODULE_HANDLE_EX_FLAG_PIN",
-                                        "GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS"), p),
+                mutate(c, "bool mounts_halted = !pin_plugin_module();",
+                       "bool mounts_halted = false; // !pin_plugin_module();"), p),
+            "pin failure ignored": (mutate(c, "bool mounts_halted = !pin_plugin_module();",
+                                           "(void)pin_plugin_module(); bool mounts_halted = "
+                                           "false;"), p),
+            "pin flag dropped": (mutate(c, "GET_MODULE_HANDLE_EX_FLAG_PIN", "0"), p),
             "halt assignment dropped": (mutate(c, "mounts_halted = decision.halt_walk;",
                                                "(void)decision;"), p),
             "halted block loses attempted=false": (

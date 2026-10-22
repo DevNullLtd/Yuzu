@@ -1037,23 +1037,20 @@ TEST_CASE("mapdrive backfill initial_pending: a profile the first pass did not t
     CHECK(pending[0].attempts == 0); // listed so it is retried; no attempt was made, none charged
 }
 
-TEST_CASE("mapdrive backfill decide_mount_call: a timeout counts, halts the walk and pins the "
-          "module; a refusal halts without counting; a completed call is untouched",
+TEST_CASE("mapdrive backfill decide_mount_call: a timeout counts and halts the walk; a refusal "
+          "halts without counting; a completed call is untouched",
           "[tar][mapdrive][backfill]") {
     const auto done = decide_mount_call(MountCallResult::completed);
     CHECK(done.attempted);
     CHECK_FALSE(done.halt_walk);
-    CHECK_FALSE(done.pin_module);
 
     const auto timed_out = decide_mount_call(MountCallResult::timed_out);
     CHECK(timed_out.attempted);
     CHECK(timed_out.halt_walk);
-    CHECK(timed_out.pin_module);
 
     const auto rejected = decide_mount_call(MountCallResult::rejected);
     CHECK_FALSE(rejected.attempted);
     CHECK(rejected.halt_walk);
-    CHECK_FALSE(rejected.pin_module); // no thread was spawned, so nothing runs plugin code
 }
 
 TEST_CASE("mapdrive backfill apply_outcomes (complete=true): ok+read_failed bumps attempts and "
