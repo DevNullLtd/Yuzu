@@ -1,0 +1,341 @@
+/**
+ * test_registry_parsers.cpp -- the registry plugin's pure layer (registry_parsers.hpp): value
+ * encoders, validators, token mapping and the audit-line renderer. OS-free: no registry, file,
+ * process or clock, so it runs on every host in the agent suite. The expected bytes are written out literally (UTF-16LE
+ * little-endian), never recomputed with the code under test.
+ *
+ * Win32 sources behind the non-obvious rules: RegSetValueExW's cbData includes the terminating NUL
+ * of a string type; registry element size limits are 255 characters per key name and 16,383 per
+ * value name (learn.microsoft.com/windows/win32/sysinfo/registry-element-size-limits).
+ */
+#include <catch2/catch_test_macros.hpp>
+
+#include <algorithm>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "registry_parsers.hpp"
+
+using namespace yuzu::registry;
+using yuzu::profiles::kRegBinary;
+using yuzu::profiles::kRegDword;
+using yuzu::profiles::kRegExpandSz;
+using yuzu::profiles::kRegMultiSz;
+using yuzu::profiles::kRegQword;
+using yuzu::profiles::kRegSz;
+using Bytes = std::vector<std::uint8_t>;
+
+namespace {
+
+Bytes B(std::initializer_list<int> v) {
+    Bytes out;
+    for (const int x : v) out.push_back(static_cast<std::uint8_t>(x));
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("registry parse_reg_type: the six writable names, case-sensitive; nothing else",
+          "[registry][parsers]") {
+    CHECK(parse_reg_type("REG_SZ") == kRegSz);
+    CHECK(parse_reg_type("REG_EXPAND_SZ") == kRegExpandSz);
+    CHECK(parse_reg_type("REG_BINARY") == kRegBinary);
+    CHECK(parse_reg_type("REG_DWORD") == kRegDword);
+    CHECK(parse_reg_type("REG_MULTI_SZ") == kRegMultiSz);
+    CHECK(parse_reg_type("REG_QWORD") == kRegQword);
+    for (const char* bad : {"reg_sz", "Reg_Sz", "REG_LINK", "REG_NONE", "REG_DWORD_BIG_ENDIAN",
+                            "REG_UNKNOWN", "", "garbage", "REG_SZ ", " REG_SZ"})
+        CHECK_FALSE(parse_reg_type(bad).has_value());
+    CHECK(is_writable_type(kRegSz));
+    CHECK_FALSE(is_writable_type(0));  // REG_NONE
+    CHECK_FALSE(is_writable_type(6));  // REG_LINK
+    CHECK_FALSE(is_writable_type(5));  // REG_DWORD_BIG_ENDIAN
+}
+
+TEST_CASE("registry encode REG_DWORD / REG_QWORD: decimal digits only, range-checked",
+          "[registry][parsers]") {
+    SECTION("accepted values, little-endian") {
+        CHECK(encode_value(kRegDword, "0", {}, false).bytes == B({0, 0, 0, 0}));
+        CHECK(encode_value(kRegDword, "4294967295", {}, false).bytes == B({0xff, 0xff, 0xff, 0xff}));
+        CHECK(encode_value(kRegDword, "16909060", {}, false).bytes == B({0x04, 0x03, 0x02, 0x01}));
+        CHECK(encode_value(kRegQword, "18446744073709551615", {}, false).bytes ==
+              B({0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}));
+        CHECK(encode_value(kRegQword, "4294967296", {}, false).bytes == B({0, 0, 0, 0, 1, 0, 0, 0}));
+    }
+    SECTION("out of range is value_overflow") {
+        CHECK(encode_value(kRegDword, "4294967296", {}, false).error == kTokValueOverflow);
+        CHECK(encode_value(kRegQword, "18446744073709551616", {}, false).error == kTokValueOverflow);
+        CHECK(encode_value(kRegDword, "99999999999999999999999999", {}, false).error == kTokValueOverflow);
+    }
+    SECTION("any other shape is invalid_data") {
+        for (const char* bad : {"", "-1", "+1", "1 ", " 1", "0x10", "1.5", "12abc", "abc", "1e3", "\t7"})
+            CHECK(encode_value(kRegDword, bad, {}, false).error == kTokInvalidData);
+        CHECK(encode_value(kRegQword, "-1", {}, false).error == kTokInvalidData);
+        CHECK(encode_value(kRegQword, "", {}, false).error == kTokInvalidData);
+    }
+    SECTION("data_hex must be exactly 4 / 8 bytes") {
+        CHECK(encode_value(kRegDword, {}, "01000000", true).bytes == B({1, 0, 0, 0}));
+        CHECK(encode_value(kRegDword, {}, "010000", true).error == kTokInvalidData);
+        CHECK(encode_value(kRegDword, {}, "0100000000", true).error == kTokInvalidData);
+        CHECK(encode_value(kRegQword, {}, "0100000000000000", true).bytes == B({1, 0, 0, 0, 0, 0, 0, 0}));
+        CHECK(encode_value(kRegQword, {}, "01000000", true).error == kTokInvalidData);
+    }
+}
+
+TEST_CASE("registry encode REG_SZ / REG_EXPAND_SZ: strict UTF-8 to UTF-16LE plus the terminating NUL",
+          "[registry][parsers]") {
+    for (const auto type : {kRegSz, kRegExpandSz}) {
+        CHECK(encode_value(type, "", {}, false).bytes == B({0, 0})); // empty: one NUL wchar, cbData 2
+        CHECK(encode_value(type, "a", {}, false).bytes == B({0x61, 0, 0, 0}));
+        CHECK(encode_value(type, "\xC3\xA9", {}, false).bytes == B({0xE9, 0, 0, 0}));       // U+00E9
+        CHECK(encode_value(type, "\xE2\x82\xAC", {}, false).bytes == B({0xAC, 0x20, 0, 0})); // U+20AC
+        // U+1F600 -> the surrogate pair D83D DE00
+        CHECK(encode_value(type, "\xF0\x9F\x98\x80", {}, false).bytes == B({0x3D, 0xD8, 0x00, 0xDE, 0, 0}));
+        CHECK(encode_value(type, "\xC3", {}, false).error == kTokInvalidData);          // truncated
+        CHECK(encode_value(type, "\xC0\x80", {}, false).error == kTokInvalidData);      // overlong NUL
+        CHECK(encode_value(type, "\xED\xA0\x80", {}, false).error == kTokInvalidData);  // surrogate
+        CHECK(encode_value(type, std::string_view{"a\0b", 3}, {}, false).error == kTokInvalidData);
+    }
+    SECTION("the 1 MiB write cap is on the encoded bytes") {
+        const std::string fits(kMaxWriteBytes / 2 - 1, 'x'); // + NUL = exactly kMaxWriteBytes bytes
+        CHECK(encode_value(kRegSz, fits, {}, false).bytes.size() == kMaxWriteBytes);
+        const std::string over(kMaxWriteBytes / 2, 'x');
+        CHECK(encode_value(kRegSz, over, {}, false).error == kTokValueOverflow);
+    }
+    SECTION("data_hex needs an even count ending in a NUL code unit") {
+        CHECK(encode_value(kRegSz, {}, "61000000", true).bytes == B({0x61, 0, 0, 0}));
+        CHECK(encode_value(kRegSz, {}, "0000", true).bytes == B({0, 0}));
+        CHECK(encode_value(kRegSz, {}, "6100", true).error == kTokInvalidData);  // no terminator
+        CHECK(encode_value(kRegSz, {}, "610000", true).error == kTokInvalidData); // odd byte count
+        CHECK(encode_value(kRegSz, {}, "", true).error == kTokInvalidData);       // present but empty
+    }
+}
+
+TEST_CASE("registry encode REG_MULTI_SZ: LF-separated records, empty text is the lone double NUL",
+          "[registry][parsers]") {
+    CHECK(encode_value(kRegMultiSz, "", {}, false).bytes == B({0, 0, 0, 0}));
+    CHECK(encode_value(kRegMultiSz, "a", {}, false).bytes == B({0x61, 0, 0, 0, 0, 0}));
+    CHECK(encode_value(kRegMultiSz, "a\nb", {}, false).bytes == B({0x61, 0, 0, 0, 0x62, 0, 0, 0, 0, 0}));
+    for (const char* bad : {"a\n\nb", "a\n", "\n", "\na"})
+        CHECK(encode_value(kRegMultiSz, bad, {}, false).error == kTokInvalidData);
+    CHECK(encode_value(kRegMultiSz, std::string_view{"a\0b", 3}, {}, false).error == kTokInvalidData);
+    SECTION("data_hex") {
+        CHECK(encode_value(kRegMultiSz, {}, "610000000000", true).bytes == B({0x61, 0, 0, 0, 0, 0}));
+        CHECK(encode_value(kRegMultiSz, {}, "00000000", true).bytes == B({0, 0, 0, 0}));
+        CHECK(encode_value(kRegMultiSz, {}, "61000000", true).error == kTokInvalidData); // single NUL only
+        CHECK(encode_value(kRegMultiSz, {}, "6100000000", true).error == kTokInvalidData); // odd count
+        CHECK(encode_value(kRegMultiSz, {}, "0000", true).error == kTokInvalidData);       // too short
+    }
+}
+
+TEST_CASE("registry encode REG_BINARY: value is hex, empty is zero bytes", "[registry][parsers]") {
+    CHECK(encode_value(kRegBinary, "", {}, false).bytes.empty());
+    CHECK(encode_value(kRegBinary, "", {}, false).error.empty());
+    CHECK(encode_value(kRegBinary, "0102ff", {}, false).bytes == B({1, 2, 0xff}));
+    CHECK(encode_value(kRegBinary, "ABcd", {}, false).bytes == B({0xab, 0xcd}));
+    CHECK(encode_value(kRegBinary, "abc", {}, false).error == kTokInvalidData);
+    CHECK(encode_value(kRegBinary, "zz", {}, false).error == kTokInvalidData);
+    CHECK(encode_value(kRegBinary, "0x", {}, false).error == kTokInvalidData);
+    SECTION("the 1 MiB boundary") {
+        const std::string fits(kMaxWriteBytes * 2, 'a');
+        CHECK(encode_value(kRegBinary, fits, {}, false).bytes.size() == kMaxWriteBytes);
+        const std::string over(kMaxWriteBytes * 2 + 2, 'a');
+        CHECK(encode_value(kRegBinary, over, {}, false).error == kTokValueOverflow);
+        CHECK(encode_value(kRegBinary, {}, over, true).error == kTokValueOverflow);
+    }
+}
+
+TEST_CASE("registry data_hex precedence: present wins and value must then be empty",
+          "[registry][parsers]") {
+    CHECK(encode_value(kRegBinary, {}, "0a0b", true).bytes == B({0x0a, 0x0b}));
+    CHECK(encode_value(kRegBinary, "0102", "0a0b", true).error == kTokInvalidData); // both provided
+    // A present-but-empty data_hex (a JSON "data_hex": "") is the zero-byte form: a BINARY restore.
+    const auto zero = encode_value(kRegBinary, {}, "", true);
+    CHECK(zero.error.empty());
+    CHECK(zero.bytes.empty());
+    CHECK(encode_value(kRegBinary, "0102", "", true).error == kTokInvalidData);
+    CHECK(encode_value(kRegDword, {}, "", true).error == kTokInvalidData);
+    CHECK(encode_value(6, "x", {}, false).error == kTokInvalidType); // a non-writable type
+}
+
+TEST_CASE("registry render_hex: cap and the ~<total> marker are byte-exact", "[registry][parsers]") {
+    const Bytes b = B({0, 1, 2, 3, 4, 5, 6, 7, 8, 9});
+    CHECK(render_hex(b, 4, b.size()) == "00010203~10");
+    CHECK(render_hex(b, 10, b.size()) == "00010203040506070809");
+    CHECK(render_hex({}, 4, 0).empty());
+    // The caller's own capture cap counts too: 4 bytes kept of a 5000-byte value.
+    CHECK(render_hex(B({0xde, 0xad, 0xbe, 0xef}), 256, 5000) == "deadbeef~5000");
+}
+
+TEST_CASE("registry validate_key_path: boundaries and refusals", "[registry][parsers]") {
+    CHECK(validate_key_path("Software").empty());
+    CHECK(validate_key_path("Software\\Vendor\\App").empty());
+    CHECK(validate_key_path(std::string(255, 'a')).empty());
+    CHECK(validate_key_path(std::string(256, 'a')) == kTokInvalidKeyPath);
+    SECTION("component count") {
+        std::string k32, k33;
+        for (int i = 0; i < 32; ++i) k32 += (i ? "\\k" : "k");
+        for (int i = 0; i < 33; ++i) k33 += (i ? "\\k" : "k");
+        CHECK(validate_key_path(k32).empty());
+        CHECK(validate_key_path(k33) == kTokInvalidKeyPath);
+    }
+    SECTION("empty, dot and separators") {
+        for (const char* bad : {"", "\\A", "A\\", "A\\\\B", "\\", ".", "..", "A\\.\\B", "A\\..\\B", "A\\.", "..\\A"})
+            CHECK(validate_key_path(bad) == kTokInvalidKeyPath);
+    }
+    SECTION("a hive alias as the first component") {
+        for (const char* bad : {"HKLM", "hklm\\Software", "HKCU\\X", "HKCR\\X", "HKU\\X", "HKCC\\X",
+                                "HKEY_LOCAL_MACHINE\\SOFTWARE", "hkey_users\\S-1", "HKEY_CURRENT_USER\\X",
+                                "HKEY_CLASSES_ROOT\\X", "HKEY_CURRENT_CONFIG\\X"})
+            CHECK(validate_key_path(bad) == kTokInvalidKeyPath);
+        CHECK(validate_key_path("Software\\HKLM").empty()); // only the FIRST component is an alias
+        CHECK(validate_key_path("HKLMX\\a").empty());
+    }
+    SECTION("control bytes and invalid UTF-8") {
+        CHECK(validate_key_path(std::string_view{"A\0B", 3}) == kTokInvalidKeyPath);
+        for (const char* bad : {"A\rB", "A\nB", "A\tB", "A\x01" "B", "A\x7F" "B"})
+            CHECK(validate_key_path(bad) == kTokInvalidKeyPath);
+        CHECK(validate_key_path("A\xC3") == kTokInvalidKeyPath);
+        CHECK(validate_key_path("A\xC0\x80") == kTokInvalidKeyPath);
+        CHECK(validate_key_path("A\xFF") == kTokInvalidKeyPath);
+        CHECK(validate_key_path("Caf\xC3\xA9\\\xE2\x82\xAC").empty());
+    }
+    SECTION("a forward slash is ordinary key-name text") {
+        CHECK(validate_key_path("MIME\\Database\\Content Type\\application/pdf").empty());
+    }
+}
+
+TEST_CASE("registry validate_value_name: boundaries and refusals", "[registry][parsers]") {
+    CHECK(validate_value_name("").empty()); // the key's default value
+    CHECK(validate_value_name("Version").empty());
+    CHECK(validate_value_name(std::string(16383, 'n')).empty());
+    CHECK(validate_value_name(std::string(16384, 'n')) == kTokInvalidValueName);
+    CHECK(validate_value_name(std::string_view{"a\0b", 3}) == kTokInvalidValueName);
+    for (const char* bad : {"a\rb", "a\nb", "a\tb", "a\x1F" "b", "a\x7F" "b", "a\xC3", "a\xFF"})
+        CHECK(validate_value_name(bad) == kTokInvalidValueName);
+    CHECK(validate_value_name("a\\b").empty()); // a value name may contain a backslash
+    CHECK(validate_value_name("\xC3\xA9").empty());
+}
+
+
+TEST_CASE("registry rc_token: write-error vocabulary", "[registry][parsers]") {
+    CHECK(rc_token(0, Missing::key).empty());
+    CHECK(rc_token(5, Missing::key) == "access_denied");
+    CHECK(rc_token(2, Missing::key) == "key_not_found");
+    CHECK(rc_token(3, Missing::key) == "key_not_found");
+    CHECK(rc_token(2, Missing::value) == "value_not_found");
+    CHECK(rc_token(3, Missing::value) == "value_not_found");
+    CHECK(rc_token(1018, Missing::key) == "concurrent_change");
+    CHECK(rc_token(32, Missing::value) == "win32:32");
+}
+
+TEST_CASE("registry audit_token: neutralises everything that could forge a field or a line",
+          "[registry][parsers]") {
+    CHECK(audit_token("a|result=ok|b") == "a_result_ok_b");
+    CHECK(audit_token("line1\nline2\rx") == "line1_line2_x");
+    CHECK(audit_token("a b,c=d") == "a_b_c_d");
+    CHECK(audit_token("") == "-");
+    CHECK(audit_token(std::string_view{"a\0b", 3}) == "a?b");                 // NUL cannot cross the C-string ABI
+    CHECK(audit_token("ok\xFF" "bad") == "ok?bad");                       // invalid UTF-8 never reaches the wire
+    CHECK(audit_token("SOFTWARE\\Acme") == "SOFTWARE\\Acme");             // backslash is kept
+    CHECK(audit_token("Caf\xC3\xA9") == "Caf\xC3\xA9");                   // valid UTF-8 survives
+    SECTION("over the cap: cut on a character boundary, with ~<length>") {
+        CHECK(audit_token(std::string(300, 'k')) == std::string(256, 'k') + "~300");
+        CHECK(audit_token(std::string(256, 'k')) == std::string(256, 'k')); // exactly the cap: whole
+        // 255 ASCII bytes then a 2-byte character: the cut at 256 would split it, so it backs up.
+        std::string s(255, 'k');
+        s += "\xC3\xA9";
+        s += "tail";
+        const auto t = audit_token(s);
+        CHECK(t == std::string(255, 'k') + "~" + std::to_string(s.size()));
+    }
+}
+
+TEST_CASE("registry render_audit_line: byte-exact grammar", "[registry][parsers]") {
+    AuditRecord r;
+    r.op = "set_value";
+    r.hive = "HKLM";
+    r.key = "SOFTWARE\\Acme";
+    r.name = "Ver";
+    r.type_name = "REG_DWORD";
+    r.len = 4;
+    r.result = "ok";
+    r.verify = "ok";
+    r.old_state = "present";
+    r.old_type = "REG_DWORD";
+    r.old_bytes = B({1, 0, 0, 0});
+    r.old_total = 4;
+    r.has_old = true;
+    r.new_bytes = B({2, 0, 0, 0});
+    r.new_total = 4;
+    r.has_new = true;
+    CHECK(render_audit_line(r) ==
+          "audit|op=set_value|hive=HKLM|key=SOFTWARE\\Acme|name=Ver|type=REG_DWORD|len=4|result=ok|"
+          "reason=-|verify=ok|dry_run=-|counted_keys=-|counted_values=-|capped=-|sid=-|"
+          "old_state=present|old_type=REG_DWORD|old=01000000|new=02000000");
+
+    SECTION("a refusal carries its reason and nothing it did not do") {
+        AuditRecord x;
+        x.op = "delete_value";
+        x.hive = "HKCU";
+        x.key = "Software\\X";
+        x.result = "refused";
+        x.reason = "value_not_found";
+        x.old_state = "absent";
+        CHECK(render_audit_line(x) ==
+              "audit|op=delete_value|hive=HKCU|key=Software\\X|name=-|type=-|len=-|result=refused|"
+              "reason=value_not_found|verify=-|dry_run=-|counted_keys=-|counted_values=-|capped=-|sid=-|"
+              "old_state=absent|old_type=-|old=-|new=-");
+    }
+    SECTION("delete_key counts, dry_run and the per-user sid") {
+        AuditRecord x;
+        x.op = "delete_key";
+        x.hive = "HKU";
+        x.key = "k";
+        x.result = "ok";
+        x.verify = "ok";
+        x.dry_run = 1;
+        x.counted_keys = 3;
+        x.counted_values = 7;
+        x.capped = 0;
+        x.sid = "S-1-5-21-1-2-3-1001";
+        CHECK(render_audit_line(x) ==
+              "audit|op=delete_key|hive=HKU|key=k|name=-|type=-|len=-|result=ok|reason=-|verify=ok|"
+              "dry_run=1|counted_keys=3|counted_values=7|capped=0|sid=S-1-5-21-1-2-3-1001|"
+              "old_state=-|old_type=-|old=-|new=-");
+    }
+    SECTION("old and new are capped at 256 raw bytes with ~<total>") {
+        AuditRecord x = r;
+        x.old_bytes.assign(300, 0xaa);
+        x.old_total = 5000;
+        x.new_bytes.assign(257, 0xcd);
+        x.new_total = 257;
+        const auto line = render_audit_line(x);
+        CHECK(line.find("|old=" + std::string(512, 'a') + "~5000|new=") != std::string::npos);
+        CHECK(line.ends_with("~257"));
+    }
+    SECTION("a 16,383-character name cannot push the mandatory fields past the 4 KiB extractor cap") {
+        AuditRecord x = r;
+        x.name = std::string(16383, 'n');
+        x.key = std::string(255, 'k');
+        x.old_bytes.assign(256, 0xff);
+        x.old_total = 4096;
+        x.new_bytes.assign(256, 0xee);
+        x.new_total = 4096;
+        const auto line = render_audit_line(x);
+        CHECK(line.size() < 2048);
+        CHECK(line.find("|name=" + std::string(256, 'n') + "~16383|type=REG_DWORD|len=4|result=ok|reason=-|verify=ok|") !=
+              std::string::npos);
+        CHECK(line.find("|old_state=present|old_type=REG_DWORD|old=") != std::string::npos);
+    }
+    SECTION("hostile key and name cannot forge a field or a line") {
+        AuditRecord x = r;
+        x.key = "a|result=ok\naudit|op=x";
+        x.name = "n|verify=ok";
+        const auto line = render_audit_line(x);
+        CHECK(line.find('\n') == std::string::npos);
+        CHECK(line.find("|key=a_result_ok_audit_op_x|name=n_verify_ok|") != std::string::npos);
+        CHECK(std::count(line.begin(), line.end(), '|') == 18); // the grammar's 19 fields, nothing extra
+    }
+}

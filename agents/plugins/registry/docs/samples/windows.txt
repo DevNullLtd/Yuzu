@@ -1,19 +1,26 @@
-captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM (account name redacted to jsmith; account SID replaced with a placeholder) · leg-hash 6255117edeb8
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-17 · interactive user (elevated; username, SID and profile path anonymised) · leg-hash 2db0b6e73233
 == action=get_value hive=HKLM key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" name=ProductName
 value|Windows 10 Pro
 type|REG_SZ
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=set_value hive=HKCU key=Software\YuzuCaptureTmp name=probe value=1
+audit|op=set_value|hive=HKCU|key=Software\YuzuCaptureTmp|name=probe|type=REG_SZ|len=4|result=ok|reason=-|verify=ok|dry_run=-|counted_keys=-|counted_values=-|capped=-|sid=-|old_state=absent|old_type=-|old=-|new=31000000
 status|ok
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=delete_value hive=HKCU key=Software\YuzuCaptureTmp name=probe
+audit|op=delete_value|hive=HKCU|key=Software\YuzuCaptureTmp|name=probe|type=-|len=-|result=ok|reason=-|verify=ok|dry_run=-|counted_keys=-|counted_values=-|capped=-|sid=-|old_state=present|old_type=REG_SZ|old=31000000|new=-
 status|ok
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=delete_key hive=HKCU key=Software\YuzuCaptureTmp
+audit|op=delete_key|hive=HKCU|key=Software\YuzuCaptureTmp|name=-|type=-|len=-|result=ok|reason=-|verify=ok|dry_run=0|counted_keys=1|counted_values=0|capped=0|sid=-|old_state=-|old_type=-|old=-|new=-
 status|ok
+counted_keys|1
+counted_values|0
+dry_run|0
+capped|0
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=key_exists hive=HKLM key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
@@ -40,6 +47,7 @@ subkey|DiskDiagnostics
 subkey|drivers.desc
 subkey|Drivers32
 subkey|EFS
+subkey|EMDMgmt
 subkey|Event Viewer
 subkey|Font Drivers
 subkey|Font Management
@@ -91,6 +99,7 @@ subkey|SBI
 subkey|Schedule
 subkey|SecEdit
 subkey|Sensor
+subkey|setup
 subkey|SoftwareProtectionPlatform
 subkey|SPP
 subkey|SRUM
@@ -153,17 +162,33 @@ value|PendingInstall|REG_DWORD
 value|ProductId|REG_SZ
 value|DigitalProductId|REG_BINARY
 value|DigitalProductId4|REG_BINARY
-value|RegisteredOwner|REG_SZ
 value|InstallTime|REG_QWORD
+value|RegisteredOwner|REG_SZ
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=get_user_value username=jsmith key=Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced name=Hidden
 username|jsmith
-value|1
+value|2
 type|REG_DWORD
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=list_profiles
 S-1-5-21-1111111111-2222222222-3333333333-1001|jsmith|C:\Users\jsmith|loaded
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=set_user_value username=jsmith key=Software\YuzuCaptureTmp name=probe value=1
+audit|op=set_user_value|hive=HKU|key=Software\YuzuCaptureTmp|name=probe|type=REG_SZ|len=4|result=ok|reason=-|verify=ok|dry_run=-|counted_keys=-|counted_values=-|capped=-|sid=S-1-5-21-1111111111-2222222222-3333333333-1001|old_state=absent|old_type=-|old=-|new=31000000
+status|ok
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=delete_user_value username=jsmith key=Software\YuzuCaptureTmp name=probe
+audit|op=delete_user_value|hive=HKU|key=Software\YuzuCaptureTmp|name=probe|type=-|len=-|result=ok|reason=-|verify=ok|dry_run=-|counted_keys=-|counted_values=-|capped=-|sid=S-1-5-21-1111111111-2222222222-3333333333-1001|old_state=present|old_type=REG_SZ|old=31000000|new=-
+status|ok
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=apply plan=[{"op":"create_key","key":"SOFTWARE\\YuzuCaptureTmp"}]
+item|0|create_key|HKLM|SOFTWARE\YuzuCaptureTmp|-|would_apply|-|-|1|-|-|-|-
+audit|op=apply.create_key|hive=HKLM|key=SOFTWARE\YuzuCaptureTmp|name=-|type=-|len=-|result=ok|reason=-|verify=-|dry_run=1|counted_keys=-|counted_values=-|capped=-|sid=-|old_state=-|old_type=-|old=-|new=-
+summary|1|1|0|0|0|1|1
 [result_status] UNDECLARED / UNKNOWN / 
 
