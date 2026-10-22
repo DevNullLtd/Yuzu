@@ -48,9 +48,10 @@ constexpr ToolRecord kToolRecords[] = {
      "(the response carries a caveat field). Read-only catalog.",
      R"({"type":"object","properties":{}})",
      // #2986: build_routes_catalog's per-route projection is fixed
-     // (method/path/summary/tags/description) regardless of which OpenAPI
+     // (method/path/summary/tags/description, plus `unavailable` on an operation the
+     // build documents but does not register) regardless of which OpenAPI
      // operations exist — the route COUNT varies, the shape does not.
-     R"j({"type":"object","properties":{"version":{"type":"integer"},"source":{"type":"string"},"description":{"type":"string"},"caveat":{"type":"string"},"count":{"type":"integer"},"routes":{"type":"array","items":{"type":"object","properties":{"method":{"type":"string"},"path":{"type":"string"},"summary":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}},"description":{"type":"string"}},"required":["method","path","summary","tags","description"]}}},"required":["version","source","description","caveat","count","routes"]})j",
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"source":{"type":"string"},"description":{"type":"string"},"caveat":{"type":"string"},"count":{"type":"integer"},"routes":{"type":"array","items":{"type":"object","properties":{"method":{"type":"string"},"path":{"type":"string"},"summary":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}},"description":{"type":"string"},"unavailable":{"type":"string"}},"required":["method","path","summary","tags","description"]}}},"required":["version","source","description","caveat","count","routes"]})j",
      "Infrastructure", "Read", ServiceScopeClass::denied, ToolEffect::ReadOnly, true,
      "Discover REST routes", &handle_discover_routes},
 };

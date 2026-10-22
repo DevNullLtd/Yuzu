@@ -28,6 +28,7 @@
 #include "instruction_param_schema.hpp"
 #include "instruction_store.hpp"
 #include "mcp_input_schema.hpp"
+#include "openapi_spec_access.hpp"
 #include "pg/pg_pool.hpp"
 #include "rbac_store.hpp"
 #include "scope_engine.hpp"
@@ -47,8 +48,11 @@
 #include "agent.pb.h"
 
 #include <algorithm>
+#include <cctype>
 #include <functional>
+#include <map>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -1029,6 +1033,57 @@ TEST_CASE("discover.routes: subsets the OpenAPI document, honesty fields present
     CHECK(saw_self);
 
     CHECK(h.last_securable_type == "Infrastructure");
+}
+
+TEST_CASE("discover.routes: an operation marked unavailable carries the marker into the catalog",
+          "[discovery][routes][unavailable]") {
+    const std::string spec = R"({"paths":{"/served":{"get":{"summary":"s","tags":["T"],
+        "description":"d"}},"/shelved":{"post":{"summary":"p","tags":["U"],"description":"e",
+        "x-yuzu-unavailable":"Not served by this build."},"get":{"summary":"g","tags":["U"],
+        "description":"f","x-yuzu-unavailable":42}}}})";
+    const auto doc = nlohmann::json::parse(yuzu::server::build_routes_catalog(spec).json);
+    REQUIRE(doc.at("count") == 3);
+    std::map<std::string, nlohmann::json> by_key;
+    for (const auto& r : doc.at("routes"))
+        by_key[r.at("method").get<std::string>() + " " + r.at("path").get<std::string>()] = r;
+
+    REQUIRE(by_key.contains("GET /api/v1/served"));
+    CHECK_FALSE(by_key["GET /api/v1/served"].contains("unavailable"));
+
+    REQUIRE(by_key.contains("POST /api/v1/shelved"));
+    REQUIRE(by_key["POST /api/v1/shelved"].contains("unavailable"));
+    CHECK(by_key["POST /api/v1/shelved"]["unavailable"] == "Not served by this build.");
+
+    // A marker that is not a string is not carried, so the field's type never varies.
+    REQUIRE(by_key.contains("GET /api/v1/shelved"));
+    CHECK_FALSE(by_key["GET /api/v1/shelved"].contains("unavailable"));
+}
+
+TEST_CASE("discover.routes: the real catalog marks the same operations as the document",
+          "[discovery][routes][unavailable]") {
+    const auto spec = nlohmann::json::parse(yuzu::server::openapi_spec_json());
+    std::set<std::string> in_document;
+    for (const auto& [path, item] : spec.at("paths").items()) {
+        for (const auto& [method, op] : item.items()) {
+            if (op.is_object() && op.contains("x-yuzu-unavailable"))
+                in_document.insert("/api/v1" + path + " " + method);
+        }
+    }
+    REQUIRE(in_document.size() == 14);
+
+    const auto doc = nlohmann::json::parse(
+        yuzu::server::build_routes_catalog(yuzu::server::openapi_spec_json()).json);
+    std::set<std::string> in_catalog;
+    for (const auto& r : doc.at("routes")) {
+        if (!r.contains("unavailable"))
+            continue;
+        CHECK(r["unavailable"].is_string());
+        auto method = r.at("method").get<std::string>();
+        std::transform(method.begin(), method.end(), method.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        in_catalog.insert(r.at("path").get<std::string>() + " " + method);
+    }
+    CHECK(in_catalog == in_document);
 }
 
 // ── /discover/scope-kinds ────────────────────────────────────────────────────

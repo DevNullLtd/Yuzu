@@ -7068,7 +7068,7 @@ How a client should read `input_schema`:
 
 #### `GET /api/v1/discover/routes`
 
-REST route catalog — a subset of the SAME OpenAPI document `GET /api/v1/openapi.json` serves (they read the identical compiled-in spec, so they cannot disagree), reshaped to `{method, path, summary, tags, description}` rows.
+REST route catalog — a subset of the SAME OpenAPI document `GET /api/v1/openapi.json` serves (they read the identical compiled-in spec, so they cannot disagree), reshaped to `{method, path, summary, tags, description}` rows. An operation that is documented but not registered on a running server (see the `x-yuzu-unavailable` extension under `GET /api/v1/openapi.json`) also carries an `unavailable` string with the same text; the field is absent on every other row. Do not call a row that has it.
 
 **Permission:** `Infrastructure:Read`
 

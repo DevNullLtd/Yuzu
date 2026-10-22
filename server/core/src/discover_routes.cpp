@@ -406,7 +406,7 @@ DiscoveryDoc build_routes_catalog(const std::string& openapi_json) {
                     continue;
                 const auto& op = ops[method];
                 json tags = op.value("tags", json::array());
-                routes_arr.push_back({
+                json entry = {
                     {"method", std::string(method) == "get" ? "GET"
                               : std::string(method) == "post" ? "POST"
                               : std::string(method) == "put" ? "PUT"
@@ -417,7 +417,14 @@ DiscoveryDoc build_routes_catalog(const std::string& openapi_json) {
                     {"summary", op.value("summary", "")},
                     {"tags", std::move(tags)},
                     {"description", op.value("description", "")},
-                });
+                };
+                // An operation documented but not registered carries a marker string. Pass
+                // it through so the catalog does not list an unserved route as callable.
+                // The field is present only on those entries.
+                if (const auto it = op.find("x-yuzu-unavailable");
+                    it != op.end() && it->is_string())
+                    entry["unavailable"] = *it;
+                routes_arr.push_back(std::move(entry));
             }
         }
     }

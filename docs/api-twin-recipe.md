@@ -219,8 +219,11 @@ and by the `/swagger` page as well as by people:
   only the form without them.
 - **Unserved routes.** An operation that is documented but not registered on a running server,
   because the store behind it is not started, carries an `x-yuzu-unavailable` string on the
-  operation saying so. The `/swagger` page labels such operations unavailable. A route that is
-  registered must not carry it.
+  operation saying so. The `/swagger` page labels such operations unavailable, and the route
+  catalog (`GET /api/v1/discover/routes`, MCP `discover_routes`) repeats the string as an
+  `unavailable` field on that row. A route that is registered must not carry it. When a store
+  becomes wired in `server.cpp`, remove its markers in the same change:
+  `tests/test_unavailable_store_wiring.py` fails if they disagree.
 
 **The `ecosystem` tokens.** Three placeholders in the literal are expanded once, on first use, by
 `expand_ecosystem_tokens()`: `"@@ECOSYSTEM_ENUM@@"` (the software routes),
