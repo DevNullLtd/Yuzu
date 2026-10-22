@@ -1480,8 +1480,10 @@ TEST_CASE("tar timeline window: one outside 1970..9999 says so and draws nothing
     struct Win {
         std::int64_t from, to;
     };
-    // the top of int64 (both ends are one double), past year 9999, before 1970, and the epoch
-    for (const Win w : {Win{kMax - 1000, kMax}, Win{W0, kYear9999 + 1}, Win{kMin, W1}, Win{0, W1}}) {
+    // the top of int64 (both ends are one double), past year 9999, before 1970, the epoch, and a
+    // window that ends before it starts
+    for (const Win w : {Win{kMax - 1000, kMax}, Win{W0, kYear9999 + 1}, Win{kMin, W1}, Win{0, W1},
+                        Win{W1, W0}}) {
         INFO("window " << w.from << " .. " << w.to);
         const std::vector<TarTimelineItem> items{bar("a", w.from + 1, w.from + 2), tick("t", w.from + 1)};
         auto m = with_lane(lane("l", "process", "p", items, {}), "G");
@@ -1495,16 +1497,22 @@ TEST_CASE("tar timeline window: one outside 1970..9999 says so and draws nothing
             "outside the years 1970 to 9999, so nothing can be drawn.</div>";
         contains(html, warn);
         CHECK(html.find(warn) < html.find("<div class=\"tl\">"));
-        // the banner is true: no item and no region stretch is drawn
+        // the banner is true: no item, no region stretch and no playhead or future shade is drawn
         CHECK(count_of(html, "<button type=\"button\" class=\"tl-") == 0);
         lacks(html, "tl-rg");
+        lacks(html, "tl-ph");
+        lacks(html, "tl-fut");
     }
     // a valid window, up to the last representable second, carries no banner
     auto edge = base();
     edge.window_from_ts = kYear9999 - 1000;
     edge.window_to_ts = kYear9999;
-    for (const auto& m : {base(), edge})
-        lacks(render_timeline_lanes(m), "The time window is not valid");
+    for (const auto& m : {base(), edge}) {
+        const auto html = render_timeline_lanes(m);
+        lacks(html, "The time window is not valid");
+        contains(html, "tl-ph"); // a valid window keeps its playhead and future shade
+        contains(html, "tl-fut");
+    }
 }
 
 TEST_CASE("tar timeline ruler: a window outside 1970..9999 draws no ruler and always ends",
@@ -1560,7 +1568,8 @@ TEST_CASE("tar timeline times: one past year 9999 is said in words, never as 190
     contains(html, "oldest observed a time outside the recordable range");
     contains(html, "exact records reach back to a time outside the recordable range on this device");
     lacks(html, "1900-");
-    // the playhead chip, the device bar chip and a limits bullet say the same
+    // the device bar chip and a limits bullet say the same; the playhead chip cannot, because a
+    // window outside 1970..9999 draws no playhead at all
     auto top = base();
     top.window_from_ts = kMax - 1000;
     top.window_to_ts = kMax;
@@ -1569,7 +1578,7 @@ TEST_CASE("tar timeline times: one past year 9999 is said in words, never as 190
     std::string all;
     for (const auto& s : all_outputs(top, links_full()))
         all += s;
-    contains(render_timeline_lanes(top), "a time outside the recordable range</b>");
+    lacks(render_timeline_lanes(top), "tl-ph");
     contains(all, "Services <span class=\"pill warn\">Paused since a time outside the recordable range</span>");
     lacks(all, "1900-");
 }

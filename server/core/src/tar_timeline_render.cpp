@@ -1008,12 +1008,17 @@ std::string render_timeline_lanes(const TarTimelineModel& m) {
     }
     h += "</div>";
 
-    const std::int64_t moment = tar_timeline_resolve_moment(m);
-    const double f = tar_timeline_pct(m, moment) / 100.0;
-    h += "<div class=\"tl-fut\" style=\"" + plot_left(f, " + 1px") + "\"></div>";
-    h += "<div class=\"tl-ph\" style=\"" + plot_left(f) + "\"><b" +
-         (f > 0.9 ? " class=\"e\"" : (f < 0.05 ? " class=\"s\"" : "")) + ">" + esc(iso(moment)) +
-         "</b></div></div>";
+    // The future shade and the playhead are positions on the window's axis. A window that is
+    // not valid has no axis (its banner says nothing is drawn), so it gets neither.
+    if (window_in_range(m)) {
+        const std::int64_t moment = tar_timeline_resolve_moment(m);
+        const double f = tar_timeline_pct(m, moment) / 100.0;
+        h += "<div class=\"tl-fut\" style=\"" + plot_left(f, " + 1px") + "\"></div>";
+        h += "<div class=\"tl-ph\" style=\"" + plot_left(f) + "\"><b" +
+             (f > 0.9 ? " class=\"e\"" : (f < 0.05 ? " class=\"s\"" : "")) + ">" + esc(iso(moment)) +
+             "</b></div>";
+    }
+    h += "</div>";
     return h;
 }
 

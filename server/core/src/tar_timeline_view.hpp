@@ -20,7 +20,10 @@
 ///  - Item ids are unique across the model. An empty id is not selectable, and of two items
 ///    with one id the renderer shows the first.
 ///  - Within a lane, the region drawn on top where regions overlap is the one that starts
-///    later (a tie goes to the later in vector order); tar_timeline_region_at agrees.
+///    later (a tie goes to the later in vector order); tar_timeline_region_at agrees. An
+///    exact region draws nothing, so where one overlaps a non-exact region the non-exact one
+///    must be the one on top: an exact region on top would leave the lane showing the
+///    non-exact state while the moment panel says nothing is lost.
 ///  - TarKeptBand::oldest_ts is MEASURED coverage: the oldest row or bucket the engine
 ///    observed for that tier on this device (0 = none observed). It is an absolute
 ///    boundary, never a duration, and never a projected reach.
