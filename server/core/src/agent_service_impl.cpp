@@ -1991,7 +1991,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         }
 
         // A terminal frame that carries output owes its audit rows too (see the Subscribe twin;
-        // the hook has logged any failure and counted the rows it knows itself).
+        // the hook has logged any failure (and counted the rows it knows) itself).
         (void)audit_registry_frame(agent_id, resp);
 
         // UAT 2026-05-06 #8: gateway-streamed terminal — notify tracker.

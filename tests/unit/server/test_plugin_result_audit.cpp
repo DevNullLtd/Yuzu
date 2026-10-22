@@ -1039,8 +1039,8 @@ TEST_CASE("registry audit live ingest: rows refused before a shutdown close stay
     // One row per 1 s window. Row 0 is written (call 1), row 1 is refused (call 2), and the clock
     // closes the hook on call 3 while moving into a new window, so row 2 is admitted and then
     // finds the gate closed. The closed branch must book what it has not attempted (rows 2 and 3)
-    // as lost to the shutdown and keep the earlier refusal as `suppressed`: the three counters
-    // plus the written row add up to the four rows the frame owed.
+    // as lost to the shutdown and keep the earlier refusal as `suppressed`: the written row, the
+    // one `suppressed` row and the two `persist_failed` rows add up to the four the frame owed.
     h.svc.set_registry_audit_budget(std::make_unique<DenialAuditBudget>(
         /*max_rows=*/1, /*window_ms=*/1'000,
         [&] {

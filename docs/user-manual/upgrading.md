@@ -3776,7 +3776,7 @@ a rollback is genuinely needed.
   hardening) up to 60 s waiting for WebhookStore and OffloadTargetStore to
   drain their delivery queues — that stage runs the two stores
   CONCURRENTLY, not sequentially, so it adds 60 s to the total rather than
-  120 s), and, as a separate stage right before the audit store is released,
+  120 s, and, as a separate stage right before the audit store is released,
   up to 15 s waiting for a `registry.write` audit write that a gateway
   forwarder thread has in flight (milliseconds unless the database is stuck
   or slow: a connect or a lock wait can use the whole bound). Stacked, this can reach

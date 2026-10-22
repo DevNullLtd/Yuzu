@@ -10984,9 +10984,9 @@ public:
         // forwarder threads) takes the analytics_store_ treatment below for the OBJECT:
         // shared_ptr here, a weak_ptr in agent_service_ locked per frame and only for a
         // frame that owes audit rows, set once at wiring and never cleared. That is NOT
-        // enough for the pg::PgPool& the store borrows. analytics_store_'s emit() enqueues
-        // and returns, so a latch that refuses new entrants leaves only a short gap;
-        // the registry hook holds its strong reference across up to 300 synchronous
+        // enough for the pg::PgPool& the store borrows. analytics_store_'s emit() does one
+        // lease and one INSERT, so a latch that refuses new entrants leaves a gap of one
+        // write; the registry hook holds its strong reference across up to 300 synchronous
         // writes, each of which leases the pool, so a forwarder BETWEEN two rows is
         // invisible to ~PgPool and would lease a pool being destroyed. The hook therefore
         // runs inside a rundown gate (rundown_gate.hpp): it enters before it locks the
