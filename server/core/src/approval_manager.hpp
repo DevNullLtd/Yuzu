@@ -610,9 +610,12 @@ public:
     /// `consume_ticket` at the two points where a concurrent writer could change the row and
     /// where an interleaving test cannot otherwise stand - between the first read and the
     /// precondition's fresher read (only when a precondition is supplied), and after every
-    /// check has passed, immediately before the consuming CAS. Never set in production; set
-    /// once before any consume, so it is read without a lock. A hook must not call back into
-    /// this manager's consume path.
+    /// check has passed, immediately before the consuming CAS. Never set in production. It is
+    /// read without a lock, so it is installed (and cleared) only while no consume runs on
+    /// another thread: tests install it per case or section on the test thread. A hook must not
+    /// call back into this manager's consume path. On the held overload the hook runs under the
+    /// row lock: SQL on a SECOND lease that touches the row would wait on it forever, so a hook
+    /// there writes through the caller's own connection instead.
     enum class ConsumeTestStage { kBetweenReads, kBeforeCas };
     void set_consume_test_hook_for_test(std::function<void(ConsumeTestStage)> hook) {
         consume_test_hook_ = std::move(hook);
@@ -856,9 +859,13 @@ public:
     /// `conn`'s lock: keep it cheap and never have it touch `conn` or take another
     /// store's lease it could wait on while the caller's pool is exhausted.
     ///
-    /// Postgres aborts a transaction on any failed statement, so a kStoreError from
-    /// this overload leaves the caller's transaction unusable until it rolls back;
-    /// the caller must roll back on ANY error. A refusal that is not a store error
+    /// Postgres aborts a transaction on any failed statement, so a kStoreError caused
+    /// by a failed SQL statement leaves the caller's transaction unusable until it
+    /// rolls back. A kStoreError that never reached Postgres (null `conn`, database
+    /// not open, an empty id or `consumed_by`, a precondition that threw, a digest
+    /// that could not be computed) leaves it usable; the caller must still roll
+    /// back on ANY error, which is the rule that needs no such distinction. A
+    /// refusal that is not a store error
     /// (kForeignOrigin, kNotConsumable, kPrecondition, ...) leaves the transaction
     /// healthy and the row untouched. `conn` must be non-null; null is a
     /// kStoreError. The caller keeps `conn` and its lease alive for the call.
