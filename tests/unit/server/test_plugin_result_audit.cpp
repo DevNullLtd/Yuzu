@@ -278,25 +278,39 @@ TEST_CASE("registry audit: the AuditEvent shape", "[server][registry_audit]") {
     CHECK(ev.target_id == rid(77));
     // The trusted token comes FIRST and the endpoint's line after it, so a reader that takes the
     // first `agent=` match (the role.elevation.granted convention) finds the server's.
-    CHECK(ev.detail == "agent=agent-1 " + std::string{kOkLine});
+    CHECK(ev.detail == "agent=agent-1 cut=0 " + std::string{kOkLine});
     CHECK(ev.result == "success");
     SECTION("an agent id with spaces or '=' cannot forge a detail token") {
         const auto e2 = make_registry_audit_event("a b=c", rid(1), only_line(kOkLine), 1);
-        CHECK(e2.detail.starts_with("agent=a_b_c audit|"));
+        CHECK(e2.detail.starts_with("agent=a_b_c cut=0 audit|"));
     }
     SECTION("the id token is log_token's, which keeps the bytes log_id_token would replace") {
         REQUIRE(yuzu::log_token(kOddAgent) != yuzu::log_id_token(kOddAgent));
         const auto e5 = make_registry_audit_event(kOddAgent, rid(1), only_line(kOkLine), 1);
-        CHECK(e5.detail.starts_with("agent=" + yuzu::log_token(kOddAgent) + " audit|"));
+        CHECK(e5.detail.starts_with("agent=" + yuzu::log_token(kOddAgent) + " cut=0 audit|"));
     }
     SECTION("an agent= token inside the endpoint's own line is never the first one") {
         const auto e3 = make_registry_audit_event(
             "agent-1", rid(77),
             only_line("audit|op=set_value|result=ok|reason=x agent=evil|new=1"), 1);
-        CHECK(e3.detail.starts_with("agent=agent-1 audit|"));
+        CHECK(e3.detail.starts_with("agent=agent-1 cut=0 audit|"));
         CHECK(e3.detail.find("agent=") == 0U);
         CHECK(e3.detail.find("agent=evil") == e3.detail.rfind("agent="));
         CHECK(e3.detail.find("agent=evil") > 0U);
+    }
+    SECTION("a cut= token inside the endpoint's own line is never the first one") {
+        // Uncut: the server states cut=0, so the endpoint's ` cut=1` is not the first match.
+        const auto uncut = make_registry_audit_event(
+            "agent-1", rid(77), only_line("audit|op=set_value|result=ok|reason=x cut=1|new=1"), 1);
+        CHECK(uncut.detail.starts_with("agent=agent-1 cut=0 audit|"));
+        CHECK(uncut.detail.find("cut=") == std::string{"agent=agent-1 "}.size());
+        CHECK(uncut.detail.find("cut=1") > uncut.detail.find("cut=0"));
+        // Cut: the endpoint's ` cut=0` inside the kept prefix is not the first match either.
+        const auto cut = make_registry_audit_event(
+            "agent-1", rid(77),
+            only_line("audit|op=x|reason=cut=0 " + std::string(5000, 'k')), 1);
+        CHECK(cut.detail.starts_with("agent=agent-1 cut=1 audit|"));
+        CHECK(cut.detail.find("cut=") == std::string{"agent=agent-1 "}.size());
     }
     SECTION("a cut line says so, right after the server's own token") {
         const auto e4 = make_registry_audit_event(
@@ -636,7 +650,8 @@ TEST_CASE("registry audit live ingest: a RUNNING frame with output then the empt
     CHECK(rows[0].result == "success");
     CHECK(rows[0].timestamp >= before);
     CHECK(rows[0].timestamp <= after);
-    CHECK(rows[0].detail.starts_with("agent=agent-1 audit|op=set_value|hive=HKLM|key=K|name=V|"));
+    CHECK(rows[0].detail.starts_with(
+        "agent=agent-1 cut=0 audit|op=set_value|hive=HKLM|key=K|name=V|"));
     CHECK(rows[0].detail.find("status|ok") ==
           std::string::npos); // only the audit line, not the output
     CHECK(h.dropped("suppressed") == 0.0);

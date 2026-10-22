@@ -21,15 +21,15 @@
  * BOUNDS. At most kMaxRegistryAuditLinesPerFrame lines per frame, each cut to
  * kMaxRegistryAuditLineBytes on a UTF-8 character boundary (bytes that are not UTF-8 are cut at the
  * bound), every control byte neutralised. A frame over a bound is reported (`truncated`) and the
- * excess is not recorded; a cut line's row carries the server token `cut=1`. Across frames the
- * caller applies a per-agent budget (kRegistryAuditBudget*), because a bound per frame is not a
- * bound on frames.
+ * excess is not recorded; every row carries the server token `cut=0` or, for a cut line, `cut=1`.
+ * Across frames the caller applies a per-agent budget (kRegistryAuditBudget*), because a bound per
+ * frame is not a bound on frames.
  *
  * ROW SHAPE. docs/user-manual/audit-log.md. `result` is the FIRST `|result=` token of the WHOLE
  * line (read before any cut), never `dry_run=`. `detail` is the trusted `agent=<id>` token FIRST,
- * then `cut=1` when the line was cut, then the line: a crafted line cannot forge a server token for
- * a reader that takes the first match. `target_type` is `command`, the spelling of the dispatch
- * rows the `command_id` joins to.
+ * then `cut=0` or `cut=1` (1 when the line was cut), then the line: a crafted line cannot forge a
+ * server token for a reader that takes the first `agent=` or the first `cut=` match. `target_type`
+ * is `command`, the spelling of the dispatch rows the `command_id` joins to.
  *
  * FIELD CONTRACT (a requirement on the plugin that produces the lines; this header cannot recover
  * from a violation). One record per line, LF-terminated. No `|`, LF or CR inside a field: a registry
@@ -226,9 +226,11 @@ struct RegistryAuditLines {
     ev.action = "registry.write";
     ev.target_type = "command";
     ev.target_id = std::string{command_id};
-    // The trusted tokens go FIRST: the line is endpoint text, and a ` agent=<other>` or ` cut=1`
-    // inside it must not be what a first-match reader finds (the role.elevation.granted convention).
-    ev.detail = "agent=" + yuzu::log_token(agent_id) + (line.cut ? " cut=1 " : " ") + line.text;
+    // The trusted tokens go FIRST, and `cut` is always stated: the line is endpoint text, and a
+    // ` agent=<other>` or ` cut=1` inside it must not be what a first-match reader finds (the
+    // role.elevation.granted convention). With `cut` only on a cut row, a forged ` cut=1` in an
+    // uncut line would have been the first match.
+    ev.detail = "agent=" + yuzu::log_token(agent_id) + (line.cut ? " cut=1 " : " cut=0 ") + line.text;
     ev.result = line.ok ? "success" : "failure";
     return ev;
 }
