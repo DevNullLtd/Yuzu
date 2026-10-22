@@ -61,6 +61,10 @@
 
 #include "app_usage_parsers.hpp"
 
+#ifdef _WIN32
+#include <win_tar_db_owner_probe.hpp> // the owner / hard-link test TAR applies before it opens
+#endif
+
 namespace {
 
 namespace fs = std::filesystem;
@@ -128,13 +132,23 @@ private:
 // this still costs a scan, same as any integrity check.
 //
 // `out_token` is set to the distinct wire token the caller should emit --
-// "tar_db_unavailable" (missing file, permission denied, lock contention) or
-// "tar_db_corrupt" (opened fine, failed the integrity gate) -- governance
+// "tar_db_unavailable" (missing file, permission denied, lock contention, or on Windows a
+// planted file) or "tar_db_corrupt" (opened fine, failed the integrity gate) -- governance
 // Gate 6 sre finding: both used to collapse into the same token, leaving an
 // operator unable to distinguish "benign, often transient" from "possible
 // disk corruption, worth investigating" without parsing free-text detail.
 DbHandle open_readonly(const fs::path& path, std::string& out_err, std::string_view& out_token) {
     out_token = "tar_db_unavailable";
+#ifdef _WIN32
+    // The daily sync ships these rows to the server, so a planted tar.db (or sidecar: -wal and
+    // -shm are read as database content) must not be read. TAR refuses the same files before it
+    // opens them, but a refused TAR init leaves the planted file in place, so this opener applies
+    // the same test itself, before SQLite touches anything.
+    if (const auto why = yuzu::win::TarDbOwnerProbe{}.distrust(path)) {
+        out_err = *why;
+        return DbHandle{};
+    }
+#endif
     sqlite3* raw = nullptr;
     const int rc = sqlite3_open_v2(path.string().c_str(), &raw,
                                    SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nullptr);

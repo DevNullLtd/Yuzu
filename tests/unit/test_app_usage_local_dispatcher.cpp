@@ -45,6 +45,19 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+#include <aclapi.h> // SetNamedSecurityInfoW
+#include <sddl.h>   // ConvertStringSidToSidW
+#endif
+
 namespace fs = std::filesystem;
 namespace seed = yuzu::test::app_usage;
 
@@ -310,6 +323,108 @@ TEST_CASE("app_usage plugin: StandalonePluginContext-seeded real tar.db — init
 
     plugin->descriptor->shutdown(ctx.get());
 }
+
+#ifdef _WIN32
+// ── Windows: a planted tar.db is refused, not read ───────────────────────────────────────────
+// The daily sync ships what this plugin reads, so it applies the same owner test TAR applies
+// before it opens the file (win_tar_db_owner_probe.hpp). The foreign owner needs
+// SeRestorePrivilege to set; the case SKIPs without it.
+namespace {
+
+bool enable_restore_privilege() {
+    HANDLE token = nullptr;
+    if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+        return false;
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    const bool ok =
+        ::LookupPrivilegeValueW(nullptr, L"SeRestorePrivilege", &tp.Privileges[0].Luid) &&
+        ::AdjustTokenPrivileges(token, FALSE, &tp, 0, nullptr, nullptr) &&
+        ::GetLastError() != ERROR_NOT_ALL_ASSIGNED;
+    ::CloseHandle(token);
+    return ok;
+}
+
+// Sets `p`'s owner to `sid` (a PSID that outlives the call).
+void set_owner(const fs::path& p, PSID sid) {
+    std::wstring name = p.wstring(); // SetNamedSecurityInfoW takes a mutable LPWSTR
+    REQUIRE(::SetNamedSecurityInfoW(name.data(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, sid,
+                                    nullptr, nullptr, nullptr) == ERROR_SUCCESS);
+}
+
+} // namespace
+
+TEST_CASE("app_usage plugin (Windows): a tar.db owned by a foreign account is refused, "
+          "not read",
+          "[app_usage][actions][hardening]") {
+    auto plugin = load_app_usage_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    if (!enable_restore_privilege())
+        SKIP("SeRestorePrivilege unavailable");
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_app_usage_owner_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    REQUIRE_FALSE(ec);
+    const fs::path db = dir_guard.path / "tar.db";
+
+    constexpr int64_t kSecondsPerDay = 86400;
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    sqlite3* writer = nullptr;
+    REQUIRE(sqlite3_open(db.string().c_str(), &writer) == SQLITE_OK);
+    seed::exec_or_fail(writer, "PRAGMA journal_mode=WAL");
+    seed::create_schema(writer);
+    seed::insert_usage_daily(writer, now - (now % kSecondsPerDay), "owner_probe.exe",
+                             /*run_count=*/1, /*total_seconds=*/60, /*first_seen=*/now,
+                             /*last_seen=*/now, /*superseded_runs=*/0, /*expired_runs=*/0);
+    seed::insert_tar_config(writer, "usage_enabled", "true");
+    seed::insert_tar_config(writer, "usage_feeder_enabled", "true");
+    sqlite3_close(writer);
+
+    yuzu::agent::StandalonePluginContext ctx("app_usage",
+                                             {{"agent.data_dir", dir_guard.path.string()}});
+    REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
+    yuzu::agent::LocalDispatcher dispatcher;
+
+    // Control: the same file, owned by us, is read -- so the refusal below is the owner test.
+    const auto control = dispatcher.run(plugin->descriptor, "summary");
+    REQUIRE(control.rc == 0);
+    const auto control_rows = captured_rows(control.captured);
+    REQUIRE_FALSE(control_rows.empty());
+    REQUIRE(control_rows.front().rfind("meta|", 0) == 0);
+
+    HANDLE token = nullptr;
+    REQUIRE(::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token));
+    DWORD len = 0;
+    ::GetTokenInformation(token, TokenUser, nullptr, 0, &len);
+    std::vector<BYTE> user_buf(len);
+    const BOOL got = ::GetTokenInformation(token, TokenUser, user_buf.data(), len, &len);
+    ::CloseHandle(token);
+    REQUIRE(got);
+    PSID token_user = reinterpret_cast<TOKEN_USER*>(user_buf.data())->User.Sid;
+    PSID users = nullptr;
+    REQUIRE(::ConvertStringSidToSidW(L"S-1-5-32-545", &users)); // BUILTIN\Users
+    const std::unique_ptr<void, decltype(&::LocalFree)> users_guard{users, ::LocalFree};
+    set_owner(db, users);
+
+    const auto refused = dispatcher.run(plugin->descriptor, "summary");
+    CHECK(refused.rc == 1);
+    const auto refused_rows = captured_rows(refused.captured);
+    REQUIRE_FALSE(refused_rows.empty());
+    CHECK(refused_rows.front().rfind("constrained|tar_db_unavailable|", 0) == 0);
+    CHECK(refused_rows.front().find("owned by") != std::string::npos);
+
+    set_owner(db, token_user); // reversible: back to ours, the next read works
+    const auto again = dispatcher.run(plugin->descriptor, "summary");
+    CHECK(again.rc == 0);
+
+    plugin->descriptor->shutdown(ctx.get());
+}
+#endif // _WIN32
 
 // ── regression: tar_config PREPARE failure must map to Errored, never ──────
 // silently to Enabled (governance Gate 7 finding — b88c3b690's fix had zero

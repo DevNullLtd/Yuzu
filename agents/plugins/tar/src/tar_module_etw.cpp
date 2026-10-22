@@ -364,6 +364,19 @@ ModuleSignVerdict verify_image_signature_win(void* image, const std::string& nt_
     wd.pFile = &fi;
     wd.dwStateAction = WTD_STATEACTION_VERIFY;
     const LONG st = WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action, &wd);
+    // WinVerifyTrust allocates the trust state even when the verdict is bad; free it on every
+    // exit, including a throw from the signer read below (an allocation can throw).
+    struct TrustStateCloser {
+        TrustStateCloser(GUID& a, WINTRUST_DATA& d) noexcept : action_(a), data_(d) {}
+        TrustStateCloser(const TrustStateCloser&) = delete;
+        TrustStateCloser& operator=(const TrustStateCloser&) = delete;
+        ~TrustStateCloser() {
+            data_.dwStateAction = WTD_STATEACTION_CLOSE;
+            WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action_, &data_);
+        }
+        GUID& action_;
+        WINTRUST_DATA& data_;
+    } closer{action, wd};
     switch (st) {
     case ERROR_SUCCESS:
         out.state = ModuleSignedState::kSigned;
@@ -398,8 +411,6 @@ ModuleSignVerdict verify_image_signature_win(void* image, const std::string& nt_
             }
         }
     }
-    wd.dwStateAction = WTD_STATEACTION_CLOSE; // free the trust state
-    WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action, &wd);
     return out;
 }
 
@@ -601,15 +612,21 @@ std::vector<ModuleEvent> ModuleEtwCollector::drain() {
         // all come from this handle. No open (network path, vanished file, planted link,
         // unsupported flag) keeps the row with the unknown verdict the mapped event already
         // carries, which module_is_risky does not count.
-        const ImageHandle img =
-            image_path_is_local(full) ? open_local_image_no_reparse(full) : ImageHandle{};
-        if (img) {
-            const std::int64_t mtime = image_mtime_unix(img.get());
-            const ModuleSignVerdict v = sign_cache_.get(full, mtime, [&](const std::string&) {
-                return verify_image_signature_win(img.get(), full);
-            });
-            e.signed_state = v.state;
-            e.signer = v.signer;
+        try {
+            const ImageHandle img =
+                image_path_is_local(full) ? open_local_image_no_reparse(full) : ImageHandle{};
+            if (img) {
+                const std::int64_t mtime = image_mtime_unix(img.get());
+                const ModuleSignVerdict v = sign_cache_.get(full, mtime, [&](const std::string&) {
+                    return verify_image_signature_win(img.get(), full);
+                });
+                e.signed_state = v.state;
+                e.signer = v.signer;
+            }
+        } catch (...) {
+            // An allocation failure while signing must not unwind drain() after ring_.drain()
+            // emptied the ring, which would lose the whole batch: the verdict stays unknown and
+            // the row is kept (the ETW callback drops the same way).
         }
         // Privacy edge-drop AFTER signing (governance BLOCKING): the stored dir
         // must never carry a username.

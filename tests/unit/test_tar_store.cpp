@@ -17,7 +17,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -63,6 +66,7 @@ struct TestTarDb {
         fs::remove(path, ec);
         fs::remove(fs::path{path.string() + "-wal"}, ec);
         fs::remove(fs::path{path.string() + "-shm"}, ec);
+        fs::remove(fs::path{path.string() + "-journal"}, ec); // pre-created empty on Windows
     }
 };
 
@@ -1365,6 +1369,7 @@ TEST_CASE("TarDatabase: missing warehouse tables are re-created on reopen (upgra
     fs::remove(tmp, ec);
     fs::remove(fs::path{tmp.string() + "-wal"}, ec);
     fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+    fs::remove(fs::path{tmp.string() + "-journal"}, ec);
 }
 
 TEST_CASE("TarDatabase: a fresh open creates no tar_events table (#760 UP-8)",
@@ -1437,6 +1442,7 @@ TEST_CASE("TarDatabase: a pre-v3 database still has tar_events dropped on open",
     fs::remove(tmp, ec);
     fs::remove(fs::path{tmp.string() + "-wal"}, ec);
     fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+    fs::remove(fs::path{tmp.string() + "-journal"}, ec);
 }
 
 TEST_CASE("TarDatabase: schema v5 drops tar_events from an ALREADY-MIGRATED database",
@@ -1476,6 +1482,7 @@ TEST_CASE("TarDatabase: schema v5 drops tar_events from an ALREADY-MIGRATED data
     fs::remove(tmp, ec);
     fs::remove(fs::path{tmp.string() + "-wal"}, ec);
     fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+    fs::remove(fs::path{tmp.string() + "-journal"}, ec);
 }
 
 TEST_CASE("TarDatabase: create_warehouse_tables joins a transaction the caller already holds",
@@ -1573,6 +1580,7 @@ TEST_CASE("TarDatabase: schema v4 ALTERs version onto a pre-existing procperf ti
     fs::remove(tmp, ec);
     fs::remove(fs::path{tmp.string() + "-wal"}, ec);
     fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+    fs::remove(fs::path{tmp.string() + "-journal"}, ec);
 }
 
 TEST_CASE("TarDatabase: schema v7 ALTERs is_kthread onto a pre-existing procperf tier "
@@ -1637,6 +1645,7 @@ TEST_CASE("TarDatabase: schema v7 ALTERs is_kthread onto a pre-existing procperf
     fs::remove(tmp, ec);
     fs::remove(fs::path{tmp.string() + "-wal"}, ec);
     fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+    fs::remove(fs::path{tmp.string() + "-journal"}, ec);
 }
 
 TEST_CASE("TarDatabase: insert and query arp events (ADR-0015)", "[tar][store][crud][arp]") {
@@ -1766,7 +1775,7 @@ TEST_CASE("TarDatabase: a corrupt tar.db is quarantined and re-initialised fresh
             fs::remove(entry.path(), ec);
         }
     }
-    for (const char* suffix : {"", "-wal", "-shm"}) {
+    for (const char* suffix : {"", "-wal", "-shm", "-journal"}) {
         std::error_code ec;
         fs::remove(fs::path{tmp.string() + suffix}, ec);
     }
@@ -1812,6 +1821,7 @@ TEST_CASE("TarDatabase: a second corruption never overwrites the first quarantin
     fs::remove(tmp, ec);
     fs::remove(fs::path{tmp.string() + "-wal"}, ec);
     fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+    fs::remove(fs::path{tmp.string() + "-journal"}, ec);
 }
 
 TEST_CASE("TarDatabase: a valid DB opens cleanly with no quarantine and preserves data (#559)",
@@ -1839,6 +1849,106 @@ TEST_CASE("TarDatabase: a valid DB opens cleanly with no quarantine and preserve
     fs::remove(tmp, ec);
     fs::remove(fs::path{tmp.string() + "-wal"}, ec);
     fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+    fs::remove(fs::path{tmp.string() + "-journal"}, ec);
+}
+
+namespace {
+
+std::vector<unsigned char> read_bytes(const fs::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    return std::vector<unsigned char>(std::istreambuf_iterator<char>(in),
+                                      std::istreambuf_iterator<char>());
+}
+
+void put_be32(std::vector<unsigned char>& out, std::uint32_t x) {
+    for (int shift = 24; shift >= 0; shift -= 8)
+        out.push_back(static_cast<unsigned char>(x >> shift));
+}
+
+// Writes the rollback journal that, replayed onto `victim`, restores `evil`'s version of every
+// page that differs (sqlite.org/fileformat.html, "The Rollback Journal"). It is HOT: a valid
+// header with a non-zero first byte, and no lock held on the database it sits beside.
+void write_hot_journal(const fs::path& victim, const fs::path& evil, const fs::path& journal) {
+    const auto v = read_bytes(victim);
+    const auto e = read_bytes(evil);
+    REQUIRE(v.size() > 100);
+    std::size_t page = (std::size_t{v[16]} << 8) | v[17]; // big-endian page size at offset 16
+    if (page == 1)
+        page = 65536;
+    REQUIRE(e.size() >= page);
+    REQUIRE(e.size() % page == 0);
+    constexpr std::uint32_t kNonce = 0x12345678;
+    constexpr std::size_t kSector = 512;
+    const std::size_t evil_pages = e.size() / page;
+
+    std::vector<unsigned char> records;
+    std::uint32_t changed = 0;
+    for (std::size_t pg = 1; pg <= evil_pages; ++pg) {
+        const unsigned char* ep = e.data() + (pg - 1) * page;
+        if (pg * page <= v.size() && std::equal(ep, ep + page, v.data() + (pg - 1) * page))
+            continue; // identical on both sides: nothing to restore
+        ++changed;
+        put_be32(records, static_cast<std::uint32_t>(pg));
+        records.insert(records.end(), ep, ep + page);
+        std::uint32_t checksum = kNonce; // the journal's sparse checksum: every 200th byte from the end
+        for (auto j = static_cast<std::ptrdiff_t>(page) - 200; j > 0; j -= 200)
+            checksum += ep[j];
+        put_be32(records, checksum);
+    }
+    REQUIRE(changed > 0);
+
+    std::vector<unsigned char> header = {0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7};
+    put_be32(header, changed);
+    put_be32(header, kNonce);
+    put_be32(header, static_cast<std::uint32_t>(evil_pages));
+    put_be32(header, static_cast<std::uint32_t>(kSector));
+    put_be32(header, static_cast<std::uint32_t>(page));
+    header.resize(kSector, 0);
+    std::ofstream out(journal, std::ios::binary | std::ios::trunc);
+    REQUIRE(out.is_open());
+    out.write(reinterpret_cast<const char*>(header.data()),
+              static_cast<std::streamsize>(header.size()));
+    out.write(reinterpret_cast<const char*>(records.data()),
+              static_cast<std::streamsize>(records.size()));
+}
+
+// Leaves a CLOSED tar.db at `db` (retention_days = "7") with a hot rollback journal beside it
+// that would rewrite retention_days to "EVIL". `db`'s directory must exist.
+void plant_evil_journal(const fs::path& db) {
+    {
+        auto created = TarDatabase::open(db);
+        REQUIRE(created.has_value());
+        REQUIRE(created->set_config("retention_days", "7"));
+    } // closed: the WAL is empty, so the main file holds everything
+    const fs::path evil = db.parent_path() / "evil.db";
+    fs::copy_file(db, evil, fs::copy_options::overwrite_existing);
+    {
+        yuzu::test::SqliteHandleOwner<sqlite3> owner;
+        REQUIRE(sqlite3_open(evil.string().c_str(), &owner.db) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(owner.db,
+                             "UPDATE tar_config SET value = 'EVIL' WHERE key = 'retention_days';"
+                             "PRAGMA wal_checkpoint(TRUNCATE);",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+    write_hot_journal(db, evil, fs::path{db.string() + "-journal"});
+}
+
+} // namespace
+
+// The premise of the Windows planted-journal case below, runnable everywhere: a hot journal is
+// replayed by open() when nothing says it is foreign. That is crash recovery working, and it is
+// why the Windows pass looks at the journal's OWNER before SQLite does.
+TEST_CASE("TarDatabase: a hot rollback journal beside tar.db is replayed by open()",
+          "[tar][store][lifecycle][hardening]") {
+    yuzu::test::TempDir dir{"yuzu_test_tar_journal_"};
+    fs::create_directories(dir.path);
+    const fs::path db = dir.path / "tar.db";
+    plant_evil_journal(db);
+    REQUIRE(fs::file_size(fs::path{db.string() + "-journal"}) > 0);
+
+    auto reopened = TarDatabase::open(db);
+    REQUIRE(reopened.has_value());
+    CHECK(reopened->get_config("retention_days", "") == "EVIL");
 }
 
 #ifndef _WIN32
@@ -1918,6 +2028,7 @@ TEST_CASE("TarDatabase: open() sets tar.db and its WAL sidecars owner-only (0600
             fs::remove(db, ec);
             fs::remove(fs::path{db.string() + "-wal"}, ec);
             fs::remove(fs::path{db.string() + "-shm"}, ec);
+            fs::remove(fs::path{db.string() + "-journal"}, ec);
         }
     } cleanup{tmp};
     {
@@ -2129,7 +2240,7 @@ struct AclDir {
     [[nodiscard]] fs::path file(const char* suffix) const { return fs::path{db.string() + suffix}; }
 };
 
-constexpr const char* kFiles[] = {"", "-wal", "-shm"};
+constexpr const char* kFiles[] = {"", "-wal", "-shm", "-journal"};
 
 } // namespace
 
@@ -2175,6 +2286,28 @@ TEST_CASE("TarDatabase (Windows): a foreign-owned sidecar is replaced, not adopt
     assert_owner_only(wal);
 }
 
+// SQLite replays a hot rollback journal beside the database before it reads the WAL. The journal
+// planted here is the one the portable premise test above shows being replayed; only its owner
+// differs, so what keeps "EVIL" out is the owner test.
+TEST_CASE("TarDatabase (Windows): a foreign-owned hot journal is replaced, not replayed",
+          "[tar][store][lifecycle][hardening]") {
+    if (!enable_restore_privilege())
+        SKIP("SeRestorePrivilege unavailable");
+    AclDir d;
+    plant_evil_journal(d.db);
+    const fs::path journal = d.file("-journal");
+    REQUIRE(fs::file_size(journal) > 0); // the attack is armed
+    set_owner(journal, kUsers);
+
+    auto reopened = TarDatabase::open(d.db);
+    REQUIRE(reopened.has_value());
+    CHECK(reopened->get_config("retention_days", "") == "7"); // not "EVIL"
+    CHECK(fs::file_size(journal) == 0); // swapped for the protected empty one, which is inert
+    const std::string owner = owner_sid(journal);
+    CHECK((owner == token_user_sid() || owner == kSystem || owner == kAdministrators));
+    assert_owner_only(journal);
+}
+
 TEST_CASE("TarDatabase (Windows): a foreign-owned tar.db refuses the open",
           "[tar][store][lifecycle][hardening]") {
     if (!enable_restore_privilege())
@@ -2186,7 +2319,8 @@ TEST_CASE("TarDatabase (Windows): a foreign-owned tar.db refuses the open",
     auto refused = TarDatabase::open(d.db);
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().find("owner") != std::string::npos);
-    CHECK(refused.error().find("icacls") != std::string::npos);
+    CHECK(refused.error().find("move it aside or remove it") != std::string::npos);
+    CHECK(refused.error().find("grant the agent account full access") != std::string::npos);
 
     set_owner(d.db, token_user_sid()); // reversible: back to ours, the next open works
     CHECK(TarDatabase::open(d.db).has_value());
@@ -2712,6 +2846,7 @@ void remove_db_files(const fs::path& tmp) {
     fs::remove(tmp, ec);
     fs::remove(fs::path{tmp.string() + "-wal"}, ec);
     fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+    fs::remove(fs::path{tmp.string() + "-journal"}, ec); // pre-created empty by the Windows open()
 }
 
 } // namespace
@@ -2838,6 +2973,115 @@ TEST_CASE("TarDatabase v7->v8: a failed flip rolls the whole migration back and 
         CHECK(db->get_config("procperf_paused_at", "") == "0");
         CHECK(db->get_config("netqual_enabled", "") == "true");
         CHECK(db->get_config("netqual_paused_at", "") == "0");
+    }
+    remove_db_files(tmp);
+}
+
+TEST_CASE("TarDatabase v7->v8: a disable written while a failed migration is pending is reset by "
+          "the retry",
+          "[tar][store][migration][v8][atomic]") {
+    // Pins the documented limit (upgrading.md, tar.md): the opt-out guarantee holds once the v8
+    // migration has SUCCEEDED. One failed v8 step leaves the agent running at schema 7, and the
+    // retry on the next start reads a "false" an operator wrote in that window as a pre-upgrade
+    // opt-out of one of the eight formerly-off sources.
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_v8_");
+    seed_v7_config(tmp, {{"procperf_enabled", "false"}},
+                   "CREATE TRIGGER yuzu_test_v8_abort BEFORE UPDATE ON tar_config "
+                   "WHEN NEW.key = 'procperf_enabled' "
+                   "BEGIN SELECT RAISE(ABORT, 'injected'); END;");
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        REQUIRE(db->schema_version() == 7); // the v8 step failed; the agent runs on
+        REQUIRE(db->set_config("arp_enabled", "false")); // tar.configure arp enabled=false
+        REQUIRE(db->set_config("arp_paused_at", "1761000000"));
+    }
+    {
+        yuzu::test::SqliteHandleOwner<sqlite3> owner;
+        REQUIRE(sqlite3_open(tmp.string().c_str(), &owner.db) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(owner.db, "DROP TRIGGER yuzu_test_v8_abort", nullptr, nullptr,
+                             nullptr) == SQLITE_OK);
+    }
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        CHECK(db->schema_version() == 8);
+        CHECK(db->get_config("arp_enabled", "") == "true");
+        CHECK(db->get_config("arp_paused_at", "") == "0");
+    }
+    remove_db_files(tmp);
+}
+
+namespace {
+
+// Denies the Nth read of tar_config.value on the FIRST connection a later TarDatabase::open()
+// creates. Inside open() that connection's reads of the column are, in order: the retention_days
+// probe (1), then the schema_version read (2) that decides whether the version needs writing.
+// A SQLITE_DENY at prepare time makes get_config fall to its default, which is a failed read.
+std::atomic<int> g_value_reads{0};
+std::atomic<int> g_deny_value_read{-1};
+std::atomic<bool> g_denied{false};
+std::atomic<bool> g_instrument_next{false};
+
+int deny_nth_value_read(void*, int action, const char* table, const char* column, const char*,
+                        const char*) {
+    if (action == SQLITE_READ && table != nullptr && column != nullptr &&
+        std::strcmp(table, "tar_config") == 0 && std::strcmp(column, "value") == 0 &&
+        ++g_value_reads == g_deny_value_read.load()) {
+        g_denied = true;
+        return SQLITE_DENY;
+    }
+    return SQLITE_OK;
+}
+
+int instrument_first_connection(sqlite3* db, char**, const sqlite3_api_routines*) {
+    if (g_instrument_next.exchange(false))
+        sqlite3_set_authorizer(db, deny_nth_value_read, nullptr);
+    return SQLITE_OK;
+}
+
+// Unregisters the process-wide hook on every exit path, so no later test's connection sees it.
+struct AutoExtensionGuard {
+    AutoExtensionGuard() {
+        sqlite3_auto_extension(reinterpret_cast<void (*)()>(instrument_first_connection));
+    }
+    ~AutoExtensionGuard() {
+        sqlite3_cancel_auto_extension(reinterpret_cast<void (*)()>(instrument_first_connection));
+        g_instrument_next = false;
+        g_deny_value_read = -1;
+    }
+    AutoExtensionGuard(const AutoExtensionGuard&) = delete;
+    AutoExtensionGuard& operator=(const AutoExtensionGuard&) = delete;
+};
+
+} // namespace
+
+TEST_CASE("TarDatabase: one failed schema_version read at open does not replay the migrations",
+          "[tar][store][migration][v8]") {
+    // A post-upgrade operator state that must survive: module disabled and paused. A schema_version
+    // read that FAILS used to read as 0, rewrite the version to 2 and walk the whole ladder again,
+    // v8 included, which flips every formerly-off source's "false" back to "true".
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_v8_");
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        REQUIRE(db->schema_version() == 8);
+        REQUIRE(db->set_config("module_enabled", "false"));
+        REQUIRE(db->set_config("module_paused_at", "1761000000"));
+    }
+    {
+        const AutoExtensionGuard hook;
+        g_value_reads = 0;
+        g_denied = false;
+        g_deny_value_read = 2;
+        g_instrument_next = true;
+        auto db = TarDatabase::open(tmp);
+        g_deny_value_read = -1;
+        REQUIRE(db.has_value());
+        REQUIRE(g_denied.load()); // the fault reached the schema_version read
+        CHECK(db->schema_version() == 8);
+        CHECK(db->get_config("module_enabled", "") == "false");
+        CHECK(db->get_config("module_paused_at", "") == "1761000000");
     }
     remove_db_files(tmp);
 }

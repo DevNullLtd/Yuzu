@@ -701,13 +701,17 @@ condition clears.
 > `true` or `false`), and the stored values of the eight sources that were already on
 > (`process`, `tcp`, `service`, `user`, `perf`, `power`, `removable`, `usage`), are
 > left untouched. The reset runs only once: an opt-out you write **after** the
-> upgrade (`<source>_enabled=false` via `configure`) sticks across restarts.
+> migration has succeeded (`<source>_enabled=false` via `configure`) sticks across
+> restarts. A failed migration is retried on the next start, and a disable written
+> before it succeeds is reset by the retry.
 >
-> **If the migration fails.** Search the agent log for `TarDatabase: v8`: the success
-> line is `TarDatabase: migrated to schema version 8`, and a failure logs
+> **If the migration fails.** The success line in the agent log is
+> `TarDatabase: migrated to schema version 8`; a failure logs
 > `TarDatabase: v8 migration failed at` followed by the failing step, rolls the whole
-> migration back, and retries it on the next start; until a start succeeds the old
-> stored values stay in force.
+> migration back, and retries it on the next start. Until a start succeeds the old
+> stored values stay in force, and a `<source>_enabled=false` written for one of the
+> eight in that window is reset by the retry: look for the success line before relying
+> on a disable.
 >
 > **What to expect.** `tar.status` reads `<source>_enabled|true` for all eight. New
 > collection starts without operator action, on each OS where the source has a collector
@@ -974,5 +978,5 @@ TAR events are stored in `{data_dir}/tar.db` (SQLite), where `data_dir` is the a
 - WAL journal mode for concurrent performance
 - `busy_timeout=5000` for thread safety
 - `secure_delete=ON` to zero deleted data
-- On Linux and macOS, `tar.db` and its `-wal`/`-shm` files are set to owner-only (0600) each time the database is opened. On Windows the agent creates or re-secures the same three files with a protected DACL before SQLite opens them (SYSTEM, Administrators and the agent service account only, no inheritance from `C:\ProgramData\Yuzu`), so local standard users cannot read them; an upgraded database is re-secured on its first open. A file in that set owned by any other account, or carrying more than one hard link, is treated as planted: a sidecar is removed and re-created (only its own name in the state directory is removed), and a foreign-owned or hard-linked `tar.db` stops the open with the remedy in the log (`icacls <file> /setowner *S-1-5-32-544 /L`, or removing the other link, which `fsutil hardlink list <file>` names). A file whose permissions deny the agent the right to change them gets the same two checks and keeps its permissions if it passes. A handle opened before the upgrade keeps its access until it is closed. Every other file in the state directory keeps the directory's inherited ACL (see `docs/agent-privilege-model.md`)
+- On Linux and macOS, `tar.db` and its `-wal`/`-shm`/`-journal` files are set to owner-only (0600) each time the database is opened. On Windows the agent creates or re-secures the same four files with a protected DACL before SQLite opens them (SYSTEM, Administrators and the agent service account only, no inheritance from `C:\ProgramData\Yuzu`), so local standard users cannot read them; an upgraded database is re-secured on its first open. A file in that set owned by any other account, or carrying more than one hard link, is treated as planted: a sidecar is removed and re-created (only its own name in the state directory is removed), and a foreign-owned or hard-linked `tar.db` stops the open, with the file, its owner and the remedy in the agent log. For a foreign-owned `tar.db`, do not adopt it: move `tar.db` and its `-wal`, `-shm` and `-journal` files aside or remove them, then restart the agent (the history in them is lost). The same applies when the agent now runs as a different account from the one that created the files, since they stay owned by the former account and `icacls <file> /reset` does not change an owner; an administrator can instead take ownership of the four files and grant the new account full access (this sequence has not yet been verified on a Windows host). For a hard-linked file, remove the other link, which `fsutil hardlink list <file>` names. A file whose permissions deny the agent the right to change them gets the same two checks and keeps its permissions if it passes. A handle opened before the upgrade keeps its access until it is closed. Every other file in the state directory keeps the directory's inherited ACL (see `docs/agent-privilege-model.md`)
 - Indexes on `timestamp`, `(event_type, timestamp)`, and `snapshot_id`

@@ -36,6 +36,7 @@ struct TestTarDb {
         fs::remove(path, ec);
         fs::remove(fs::path{path.string() + "-wal"}, ec);
         fs::remove(fs::path{path.string() + "-shm"}, ec);
+        fs::remove(fs::path{path.string() + "-journal"}, ec); // pre-created empty on Windows
     }
 };
 

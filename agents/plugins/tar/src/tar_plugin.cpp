@@ -593,6 +593,9 @@ public:
         auto db_path = std::filesystem::path{db_dir} / "tar.db";
         auto result = yuzu::tar::TarDatabase::open(db_path);
         if (!result) {
+            // The ABI carries only the code, so this line is where the cause (a refused planted
+            // file, its owner and the remedy; a corrupt-and-unmovable db) reaches the log.
+            spdlog::error("TAR: failed to open db: {}", result.error());
             return std::unexpected(
                 yuzu::PluginError{1, std::format("TAR: failed to open db: {}", result.error())});
         }
@@ -946,6 +949,17 @@ public:
         // hazard for the same reason.
         for (auto& src : cursor_sources_) {
             try {
+                // An UNREADABLE flag is not a disable: nothing later re-routes
+                // on_enabled_changed(true) (do_configure routes only a canonical
+                // edge, the collect loop only skips), so latching the source off
+                // would leave it reporting Advanced/0 forever while `status`
+                // says enabled. Throw instead -- the catch below drops the source
+                // loudly, the same outcome as any other start failure. Read BEFORE
+                // start() so this path arms nothing that a drop would have to unarm.
+                const auto enabled_state = yuzu::tar::source_enabled_state(*db_, src->name());
+                if (!enabled_state)
+                    throw std::runtime_error(
+                        std::format("{}_enabled unreadable at init", src->name()));
                 src->start(*db_);
                 // A source is constructed CAPTURING. start() arms the OS
                 // subscription regardless of the configured enable state --
@@ -960,17 +974,6 @@ public:
                 // is absolute -- NOTHING from a paused window is ever stored --
                 // and the disabled-collect path only skips the tick, it does
                 // not discard what the OS already handed the source.
-                //
-                // An UNREADABLE flag is not a disable: nothing later re-routes
-                // on_enabled_changed(true) (do_configure routes only a canonical
-                // edge, the collect loop only skips), so latching the source off
-                // here would leave it reporting Advanced/0 forever while `status`
-                // says enabled. Throw instead -- the catch below drops the source
-                // loudly, the same outcome as any other start failure.
-                const auto enabled_state = yuzu::tar::source_enabled_state(*db_, src->name());
-                if (!enabled_state)
-                    throw std::runtime_error(
-                        std::format("{}_enabled unreadable at init", src->name()));
                 if (!*enabled_state)
                     src->on_enabled_changed(false);
             } catch (const std::exception& e) {
@@ -991,8 +994,9 @@ public:
         // on_enabled_changed(false) that the block above argues must land
         // before the first callback can arrive, because that call is inside the
         // same try. Found by both the architect and cpp-safety. A source dropped
-        // AFTER a successful start() (the unreadable-flag throw above) is unarmed by
-        // its destructor (R-007 / RAII session and fd members), so the reset is safe.
+        // AFTER a successful start() (a throwing on_enabled_changed) is unarmed by its
+        // destructor: R-007 (`~...CursorSource() { stop(); }`) on the power and removable
+        // legs, RAII session and fd members elsewhere, so the reset is safe.
         std::erase_if(cursor_sources_, [](const auto& s) { return s == nullptr; });
 
         spdlog::info("TAR plugin initialized (fast={}s, slow={}s, db={})", fast_interval,
@@ -3265,6 +3269,11 @@ private:
         // that silently retained a source's stale baseline returns nonzero
         // at the action level, not just in the "tar|snapshot|partial|..."
         // text line a generic/MCP/automation consumer may not parse.
+        // An unreadable enable flag skips its source's leg through skip_token() and never raises
+        // IncompleteCaptureError, so no leg above names it: a snapshot that skipped it is partial.
+        for (const auto& src : yuzu::tar::capture_sources())
+            if (!yuzu::tar::source_enabled_state(*db_, src.name))
+                skipped_sources.emplace_back(src.name);
         const bool had_earlier_skips = !skipped_sources.empty();
         const auto phase_outcome =
             yuzu::tar::snapshot_phase_outcome(fast_rc, slow_rc, software_rc, had_earlier_skips);

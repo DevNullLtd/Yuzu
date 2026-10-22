@@ -9,8 +9,8 @@
  * (idempotent replay) -> the #1846 status keys. Unguarded on every OS.
  *
  * Also pins the default-on contract at the plugin seam the unit-test exe cannot
- * reach (tar_plugin.cpp is not linked there): no `<src>_enabled` seed at init, and
- * the destructive purge refusing an unreadable enable flag.
+ * reach (tar_plugin.cpp is not linked there): no `<src>_enabled` seed at init, the
+ * destructive purge refusing an unreadable enable flag, and `snapshot` reporting partial.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -373,7 +373,7 @@ TEST_CASE("tar plugin: corrupt boot quarantines, publishes the fleet signal, sta
 }
 
 TEST_CASE("tar plugin: every source is enabled by default with no stored flag; an unreadable flag "
-          "refuses a purge",
+          "refuses a purge and makes a snapshot partial",
           "[tar][local_dispatcher][default-on]") {
     const auto plugin_path = find_tar_plugin();
     if (plugin_path.empty()) {
@@ -435,6 +435,19 @@ TEST_CASE("tar plugin: every source is enabled by default with no stored flag; a
         const auto control = d.run(desc, "purge_source", process_params);
         CHECK(control.rc == 1);
         CHECK(control.captured.find("error|source_not_paused") != std::string::npos);
+    }
+
+    SECTION("snapshot reports partial, not complete, when an enable flag cannot be read") {
+        // An unreadable flag skips its source through skip_token() and never raises
+        // IncompleteCaptureError, so only the flag read in do_snapshot can name it.
+        make_config_key_unreadable(db_path, "module_enabled");
+
+        const auto snap = d.run(desc, "snapshot");
+        CHECK(snap.rc != 0);
+        const auto line = row_with_prefix(rows_of(snap.captured), "tar|snapshot|");
+        REQUIRE(line.has_value());
+        CHECK(line->starts_with("tar|snapshot|partial|"));
+        CHECK(line->find("module") != std::string::npos);
     }
 
     desc->shutdown(ctx.get());

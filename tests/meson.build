@@ -118,6 +118,9 @@ elif host_machine.system() == 'windows'
   agent_test_native_deps += cxx.find_library('oleaut32')
   # test_msi_packages_actions.cpp's live per-user cross-check calls MsiEnumProductsExW directly.
   agent_test_native_deps += cxx.find_library('msi')
+  # test_app_usage_local_dispatcher.cpp's foreign-owner case calls SetNamedSecurityInfoW and
+  # AdjustTokenPrivileges directly, as tar_test_deps' Windows block does for its DACL cases.
+  agent_test_native_deps += cxx.find_library('advapi32')
 endif
 
 # ── Test fixture: FROZEN ABI3-layout plugin (PLAN-03 — real backward-compat) ──
