@@ -1559,7 +1559,9 @@ integrity failure writes today: the stored reviewer is the submitter or an exclu
 records no reviewer, the excluded roots cannot be read, or the stored request no longer matches its digest
 (or is a digest with no request). The cause is in the server log only (a digest that could not be computed at
 all is reported to the caller as a store error instead); a distinct kind is an
-ADR-1009 entry condition for the first producer.) The
+ADR-1009 entry condition for the first producer. A ticket whose row was rewritten by another
+transaction between those checks and the consuming statement is refused the same way and audited as
+`refused: not_consumable`; that is a false refusal, and a retry succeeds.) The
 `yuzu_mcp_approval_refused_total` counter does **not** break the refusals down
 by reason: a store failure is already exposed via the response code (`-32603`
 vs `-32003`), and what stays withheld is the split *within* a `-32003` denial —

@@ -7,7 +7,8 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 This release lands the storage and redemption half of the four-eyes bound approval primitive
 ([ADR-1009](../adr/1009-four-eyes-mvp-bound-approval.md), epic #6060). **Nothing in this release
 creates a bound approval ticket and there is no Guardian deploy gate yet**; those arrive in later
-changes (#6063 onwards). What an operator can see today is the three items below.
+changes (#6063 onwards). What an operator can see today is the three items below, plus a fourth
+refusal that normal operation never triggers.
 
 **1. The `guardian.` definition-id prefix is reserved (breaking for operator-authored ids).** A
 new instruction definition whose id starts `guardian.` is refused on create, import and the
@@ -52,6 +53,21 @@ the MCP `confirm_engine_rotation` recall, so for now the new series moves only w
 An MCP recall refused this way still writes its own `mcp.*` denied row as before, so one MCP event
 now leaves two rows: do not sum the two when counting denials. The older
 `yuzu_mcp_approval_precondition_denied_total{tool}` series is unchanged.
+
+**4. A redemption integrity re-check, and a row-moved refusal.** Redeeming an approved,
+unconsumed ticket (today only the MCP `confirm_engine_rotation` recall) now re-checks the stored
+row: a ticket whose reviewer is the submitter or an excluded root, that records no reviewer,
+whose excluded roots cannot be read, or whose stored request does not match its digest is
+refused. Through MCP it surfaces as the generic "approval not consumable (already used, not approved, or absent)" refusal, and the
+audit row reads `refused: foreign_origin`; the cause is only in the server log. Approving a
+ticket always records a distinct reviewer, so ordinary operation never triggers this: it
+indicates a row edited by hand, restored from a backup or written by an older build, and such a
+ticket stays unredeemable until its seven-day lifetime ends. Separately, a ticket whose row was
+rewritten by another transaction between the check and the consuming statement (and, rarely,
+VACUUM FULL or CLUSTER running at that moment, which move the row) is also refused, audited as
+`refused: not_consumable`. Both read like a replay in the counter and the audit trail; the second
+is a false refusal and a retry clears it. See [MCP approvals](mcp.md) and
+[metrics](metrics.md).
 
 ## Behaviour change: four privileged REST routes refuse cross-site cookie writes
 
