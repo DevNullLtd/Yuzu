@@ -22,8 +22,8 @@
  *   `\Device\WebDavRedirector`, any other `\Device\*`, `\SystemRoot\...`, `\??\...`, the
  *   converted `\\?\GLOBALROOT\...` form (callers classify the path as delivered, BEFORE the
  *   NT-to-Win32 conversion), a non-fixed drive letter, and the empty string. `\SystemRoot\`
- *   and `\??\` paths are refused conservatively: the Kernel-Process IMAGE event does not
- *   deliver these forms.
+ *   and `\??\` paths are refused because they match neither accepted shape; the module
+ *   source has only ever converted `\Device\...` names for the file APIs (nt_path_to_win32).
  *
  * Residual: the check is lexical and the open happens by name afterwards (a tick later
  * for module, immediately for procperf), so a local-looking path swapped for a symbolic
