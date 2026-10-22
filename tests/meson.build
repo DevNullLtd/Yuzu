@@ -554,11 +554,12 @@ agent_test_exe = executable(
     'unit/test_privacy_permissions_local_dispatcher.cpp', # Wave 8 PR8.5: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_privacy_permissions_macos_internals.cpp',  # TU-inclusion seam over privacy_permissions_macos.cpp, Apple-only body, unguarded TU
     'unit/test_privacy_permissions_win_internals.cpp',    # TU-inclusion seam over privacy_permissions_win.cpp (Windows-only body, empty TU elsewhere)
-    'unit/test_privacy_permissions_win_walk.cpp',  # fake-registry/fake-probe locks over privacy_permissions_win_walk.hpp + privacy_permissions_hive_guard.hpp, pure, every host
+    'unit/test_privacy_permissions_win_walk.cpp',  # fake-registry/fake-probe locks over privacy_permissions_win_walk.hpp + agents/shared/win_hive_file_guard.hpp, pure, every host
     'unit/test_posix_dir_walk.cpp',     # PR #4154 round-8 remediation: shared capped
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
     'unit/test_posix_secure_read.cpp',  # shared O_NOFOLLOW dir-open + bounded no-follow file read (agents/shared/posix_secure_read.hpp), POSIX-only bodies
     'unit/test_sha256.cpp',             # shared in-memory SHA-256 (agents/shared/sha256.hpp), portable
+    'unit/test_base64.cpp',             # shared strict RFC 4648 base64 (agents/shared/base64.hpp), portable
     'unit/test_email_redaction.cpp',    # shared [redacted-email] helper (agents/shared/email_redaction.hpp), portable
     'unit/test_wire_utf8.cpp',          # shared strict-UTF-8 scrubber (agents/shared/wire_utf8.hpp), portable
     'unit/test_row_byte_budget.cpp',    # shared row/byte budget (agents/shared/row_byte_budget.hpp), portable
@@ -577,6 +578,11 @@ agent_test_exe = executable(
     'unit/test_shares_legs.cpp',                    # shares: OS-free list_linux decision seam over injected fakes; portable
     'unit/test_shares_posix_fs.cpp',                # shares: the real POSIX fs binding under a TempDir (symlink/FIFO/cap/dirfd); body #if !defined(_WIN32)
     'unit/test_shares_local_dispatcher.cpp',        # shares: real plugin via LocalDispatcher + execute seam, unguarded on every OS
+    'unit/test_remote_access_audit_config_parsers.cpp',  # remote_access_audit: pure sshd_config/Include/service parsers over REAL CAPTURE + labelled fixtures; portable
+    'unit/test_remote_access_audit_keys_parsers.cpp',    # remote_access_audit: pure authorized_keys/options/blob decoder/fingerprint over REAL ssh-keygen captures; portable
+    'unit/test_remote_access_audit_legs.cpp',            # remote_access_audit: OS-free list_posix decision seam over injected fakes; portable
+    'unit/test_remote_access_audit_posix_fs.cpp',        # remote_access_audit: the real POSIX fs binding under a TempDir (symlink/FIFO/cap/dirfd/mountinfo); body #if !defined(_WIN32)
+    'unit/test_remote_access_audit_local_dispatcher.cpp',  # remote_access_audit: real plugin via LocalDispatcher + execute seam, unguarded on every OS
     'unit/test_firmware_posture_parsers.cpp',           # Wave 8 PR8.4: pure SMBIOS/DMI/fwupd/IODeviceTree decoders over REAL CAPTURE fixtures
     'unit/test_firmware_posture_local_dispatcher.cpp',  # Wave 8 PR8.4: real firmware_posture plugin via LocalDispatcher, unguarded on every OS
     'unit/test_platform_security_parsers.cpp',            # Wave 8 PR8.1-a1: pure decoders/classifiers/status over REAL CAPTURE fixtures
@@ -623,6 +629,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/update_source_trust/src'),  # update_source_trust_*.hpp (Wave 10 PR10.1-d)
     include_directories('../agents/plugins/mgmt_posture/src'),  # mgmt_posture_parsers.hpp / _legs.hpp
     include_directories('../agents/plugins/shares/src'),  # shares_parsers.hpp / _legs.hpp / _posix_fs.hpp
+    include_directories('../agents/plugins/remote_access_audit/src'),  # remote_access_audit_*_parsers.hpp / _legs.hpp / _posix_fs.hpp
     include_directories('../agents/plugins/firmware_posture/src'),  # firmware_posture_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/platform_security/src'),  # platform_security_*parsers.hpp / _legs.hpp (pure helpers), Wave 8 PR8.1-a1
     include_directories('../agents/plugins/system_hardening/src'),  # system_hardening_*parsers.hpp (pure helpers), Wave 8 PR8.1-b
@@ -810,6 +817,7 @@ agent_test_exe = executable(
                 update_source_trust_plugin_lib,  # Wave 10 PR10.1-d
                 mgmt_posture_plugin_lib,  # management-plane posture
                 shares_plugin_lib,  # shares
+                remote_access_audit_plugin_lib,  # remote_access_audit
                 firmware_posture_plugin_lib,  # Wave 8 PR8.4
                 browser_inventory_plugin_lib,  # Wave 10 P2a
                 local_security_policy_plugin_lib,  # Wave 8 PR8.3
@@ -901,6 +909,7 @@ if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
     include_directories: [include_directories('../agents/plugins/browser_policy/src'),
                           include_directories('../agents/plugins/mgmt_posture/src'),
                           include_directories('../agents/plugins/shares/src'),
+                          include_directories('../agents/plugins/remote_access_audit/src'),
                           include_directories('../agents/plugins/update_source_trust/src'),
                           include_directories('../agents/core/include'),  # yuzu/agent/runner_status.hpp, subprocess_runner.hpp (mgmt_posture_legs.hpp; header-only use)
                           include_directories('../agents/shared')],
@@ -1416,7 +1425,8 @@ if build_server
       'unit/server/test_access_render.cpp', # Access pages (Phase 2): Users list + Account panel renderers
       'unit/server/test_access_routes.cpp', # Access pages: /access/users + fragments + static glue (gate order, degraded states)
       'unit/server/test_access_js.cpp', # Access pages: string pins on the template and yuzu-access.js
-      'unit/server/test_access_golden.cpp', # Access pages: four rendered-fragment goldens
+      'unit/server/test_access_golden.cpp', # Access pages: rendered-fragment goldens
+      'unit/server/test_access_authz.cpp', # Users and roles page: [pg] persona matrix through the real gates
       'unit/server/test_access_tokens_render.cpp', # Tokens and principals page: pure renderers
       'unit/server/test_access_tokens_routes.cpp', # Tokens and principals page: routes, gates, audit, degraded states
       'unit/server/test_access_tokens_js.cpp', # Tokens and principals page: string pins on template and glue
@@ -1428,6 +1438,10 @@ if build_server
       'unit/server/test_access_audit_routes.cpp', # Audit and reviews page: routes, gates, bounds, degraded states
       'unit/server/test_access_audit_js.cpp', # Audit and reviews page: string pins on template and glue
       'unit/server/test_access_audit_authz.cpp', # Audit and reviews page: [pg] persona matrix through the real gates
+      'unit/server/test_access_reviews_render.cpp', # Audit and reviews page: Access reviews renderers (campaigns, campaign, grants)
+      'unit/server/test_access_reviews_routes.cpp', # Audit and reviews page: Access reviews fragments, gates, audit tuples
+      'unit/server/test_access_reviews_js.cpp', # Audit and reviews page: Access reviews string pins on template and glue
+      'unit/server/test_access_reviews_authz.cpp', # Audit and reviews page: Access reviews [pg] persona matrix through the real gates
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
       'unit/server/test_approval_routes.cpp', # #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
@@ -1579,8 +1593,10 @@ if build_server
       'unit/server/test_device_routes.cpp',
       'unit/server/test_device_lens_routes.cpp', # ADR-0031 WS-A4 wave 2: DEX/Guardian device lenses (no public twin — outside the seam)
       'unit/server/test_hardware_list_model.cpp', # round-3: Hardware CI list/record pure model
+      'unit/server/test_quarantine_read_model.cpp', # Seam PR2: shared quarantine list JSON builder (key order, escaping)
       'unit/server/test_hardware_ui.cpp',         # round-3: Hardware CI list/record HTML fragment
       'unit/server/test_hardware_routes.cpp',     # round-3: Hardware CI list/record routes + REST twin
+      'unit/server/test_mcp_tools_hardware.cpp',  # Seam PR2: list_hardware_ci / get_hardware_ci MCP twins (REST byte identity, fail-closed audit, confinement)
       'unit/server/test_software_sync_decision.cpp', # Software "Sync now": pure request grammar, partition, fleet-wide rule, 500 cap, cooldown, audit wording
       'unit/server/test_software_sync_runner.cpp',   # Software sync: the shared Runner (REST + MCP) - cooldown, lease, bounded partition, audit-before-send
       'unit/server/test_hardware_sync_routes.cpp', # Software "Sync now": POST /api/v1/hardware/sync route matrix (HwHarness pattern)
@@ -1671,6 +1687,12 @@ if build_server
       'unit/server/test_crl_publisher.cpp', # HA WS-6 CRL follow-ups (#4828/#4831)
       'unit/server/test_kek_routes.cpp', # #2395 track D — KEK rotation REST surface
       'unit/server/test_developer_writes.cpp', # System > Developer and API: Load generator Start/Stop script pins
+      'unit/server/test_plugin_page_model.cpp', # System > Plugins and updates: pure panel goldens
+      'unit/server/test_settings_plugins_page.cpp', # System > Plugins and updates: page pins and fragment gates
+      'unit/server/test_settings_plugins_authz.cpp', # System > Plugins and updates: [pg] the fragments through the REAL probe gates (denial rows: token yes, cookie no)
+      'unit/server/test_ca_panel_render.cpp', # System > Certificates and secrets: pure CA panel goldens
+      'unit/server/test_kek_panel_render.cpp', # System > Certificates and secrets: pure KEK status panel goldens
+      'unit/server/test_settings_pki_page.cpp', # System > Certificates and secrets: page pins, page gate, KEK fragment
       'unit/server/test_kek_op_lock_holder.cpp', # #2530 B6 — advisory-lock holder query
       'unit/server/test_pg_session_advisory_lock.cpp', # #2964 round 3 — PgAdvisoryLockKey + aborted-txn unlock recovery
       'unit/server/test_kek_rotate_control.cpp', # #2530 B3/B4 — rotate control-flow ordering + half-commit classification
@@ -1687,6 +1709,8 @@ if build_server
       'unit/server/test_authz_topology_floor.cpp', # #2376: the RBAC-off legacy-fallback topology floor (AccessReview/UserManagement/EnginePrincipal Read)
       'unit/server/test_body_cap_policy.cpp', # #2407: pre-auth request-body cap policy table (method+segment-boundary path -> cap/requires_measurable/metric label)
       'unit/server/test_body_cap_route_inventory.cpp', # #2407: architect-mandated route-inventory coverage — every ACTUALLY REGISTERED POST/PUT/PATCH route resolves to a deliberate class, mechanically scanned from server/core/src at test run time
+      'unit/server/test_mcp_dispatch_coverage.cpp', # Seam PR1: every served MCP tool has a handler; no orphan or dead tool_name branch in mcp_server.cpp (scanned from server/core/src at run time)
+      'unit/server/test_mcp_tools_containment.cpp', # Seam PR2: list_quarantined_devices registry tool (gate, scope, degrade, audit, byte identity with the REST body)
       'unit/server/test_store_wiring_order.cpp', # #3261: every agent_service_/gateway_service_ store setter runs after its member's construction, mechanically scanned from server.cpp at test run time
       'unit/server/test_presence_departure.cpp', # #5678: the one departure->presence mirror both disconnect paths share (pure helper cases)
       'unit/server/test_shutdown_join_order.cpp', # #3495: agent_server_->Shutdown(deadline) runs before the policy-eval/pre-flight/quarantine/schedule joins + the heartbeat fn-null wait, mechanically scanned from server.cpp at test run time
@@ -1719,6 +1743,7 @@ if build_server
       'unit/server/test_token_rotation_lookup.cpp',   # P2 #11: derive_rotation_successor, DB-free unit coverage
       'unit/server/test_rest_tag_routes.cpp',   # K-05: REST tag-route authz wiring (CDX-03/CDX-R4-02/B4)
       'unit/server/test_rest_quarantine_routes.cpp',   # CDX-P1-02: REST quarantine-route authz wiring
+      'unit/server/test_rest_quarantine_create_gate.cpp', # #6065 PR-Q: REST create gate composed with the real chokepoint + reconciler
       'unit/server/test_rest_api_events.cpp',
       'unit/server/test_openapi_spec_completeness.cpp',   # #3991 F1: ADR-0031 INV-31-4 / #842 unit-test half
       'unit/server/test_rest_software_packages.cpp',
@@ -3348,6 +3373,16 @@ test('shares definition columns',
   timeout: 30,
 )
 
+# remote_access_audit's definition-column contract (content/definitions/remote_access_audit.yaml):
+# row_kind first, then the generic field_1..field_7 sequence pinned to the wire rows
+# remote_access_audit_*_parsers.hpp emit (the test holds the expected literals).
+test('remote_access_audit definition columns',
+  _python3_test,
+  args: [files('test_remote_access_audit_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # update_source_trust's failure-token contract (#4874): every `note_failure` literal and every
 # errno_detail token in the plugin headers is named in the README's Result status row and gloss
 # table, and nothing in those tables is undefined in the source.
@@ -3639,6 +3674,15 @@ test('access users production wiring lexical gate',
 test('access audit production wiring lexical gate',
   _python3_test,
   args: [files('test_access_audit_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# Access reviews: pins the production wiring in server.cpp (the loud perm_fn gate, the scratch-response
+# Attest probe, the fail-closed store reads, the grant-table read). Source-text only, so Python.
+test('access reviews production wiring lexical gate',
+  _python3_test,
+  args: [files('test_access_reviews_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )

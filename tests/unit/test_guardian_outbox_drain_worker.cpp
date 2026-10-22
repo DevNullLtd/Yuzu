@@ -1837,6 +1837,19 @@ TEST_CASE("#3980: an orphan stalled on an emptied compliance lane is counted and
     // (notify() enqueues NOTHING): the probe reaps the finished slot on the emptied lane.
     CHECK(f.compliance().in_flight_snapshot().running);
     f.sink.open();
+    // Let the released send actually FINISH before waking the loop. notify() wakes the loop at
+    // once, and its tail probe can only reclaim a slot whose send is already done: if the
+    // detached send thread has not run yet (a starved box), the probe reclaims nothing, a
+    // counted stall contributes no clamp, and the next cycle is the 1 h periodic bound - so the
+    // 5 s wait below would time out (#6041: 40 of 240 runs on two pinned cores). `running` is
+    // `in_flight && !done`, so !running with in_flight still true is exactly "finished, not yet
+    // reaped": the state the probe is documented to reclaim.
+    REQUIRE(spin_until(
+        [&] {
+            const auto snap = f.compliance().in_flight_snapshot();
+            return snap.in_flight && !snap.running;
+        },
+        5s));
     f.worker.notify();
     REQUIRE(spin_until([&] { return !f.compliance().in_flight_snapshot().in_flight; }, 5s));
     CHECK(f.compliance().offer_calls_for_test() == 1); // reaped by the probe, not by an offer()

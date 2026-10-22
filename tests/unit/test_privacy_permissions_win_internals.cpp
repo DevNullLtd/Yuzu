@@ -1,11 +1,12 @@
 /**
  * test_privacy_permissions_win_internals.cpp -- TU-inclusion seam over privacy_permissions_win.cpp:
- * its production Win32Registry and Win32HiveFileProbe shells (and the internal-linkage
- * StabilityWatch and with_user_hive wiring) driven through the pure walk and guard headers
- * (privacy_permissions_win_walk.hpp, privacy_permissions_hive_guard.hpp). The pure classifiers
- * (classify_stability, classify_hive_file, ...) are covered in
- * test_privacy_permissions_parsers.cpp, and the walk and guard logic (the deadline-first order
- * among it) over fakes in test_privacy_permissions_win_walk.cpp; these cases prove the production
+ * its production Win32Registry and (via agents/shared/win_hive_file_probe.hpp) Win32HiveFileProbe
+ * shells (and the internal-linkage StabilityWatch and with_user_hive wiring) driven through the
+ * pure walk and guard headers (privacy_permissions_win_walk.hpp,
+ * agents/shared/win_hive_file_guard.hpp). The pure classifiers (classify_stability,
+ * classify_hive_file, ...) are covered in test_privacy_permissions_parsers.cpp, and the walk and
+ * guard logic (the deadline-first order among it) over fakes in
+ * test_privacy_permissions_win_walk.cpp; these cases prove the production
  * WIRING around them: that the watch is armed and polled, that the walk decodes a ConsentStore
  * subtree, that the guard verifies the file identity, that with_user_hive reads a loaded hive
  * before ever entering the offline arm, and that the final-path comparison is Windows' own
@@ -53,6 +54,19 @@ namespace fs = std::filesystem;
 #include <winioctl.h> // FSCTL_SET_SPARSE (the sparse-file oversize fixture)
 
 using namespace yuzu::privacy_permissions;
+
+// The guard lives in yuzu::win; this file spells its names win::X.
+namespace yuzu::privacy_permissions::win {
+using namespace ::yuzu::win;
+}
+
+// The shared hive-file probe, its owners and its helpers (agents/shared/win_hive_file_probe.hpp,
+// pulled in by the plugin TU above), spelled unqualified below.
+using yuzu::win::FindHandle;
+using yuzu::win::LocalFreeGuard;
+using yuzu::win::UniqueHandle;
+using yuzu::win::Win32HiveFileProbe;
+using yuzu::win::final_path_matches;
 
 static_assert(!std::is_copy_constructible_v<UniqueHandle>);
 static_assert(!std::is_copy_constructible_v<FindHandle>);

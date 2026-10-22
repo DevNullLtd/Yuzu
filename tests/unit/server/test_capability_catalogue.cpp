@@ -45,6 +45,7 @@
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
 #include "capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_shares.hpp"
+#include "capability_decls/plugin_action_catalogue_remote_access_audit.hpp"
 #include "command_capability.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -166,6 +167,7 @@ struct LabeledSpan {
         {"pkg_inventory", capdecls::plugin_action_catalogue_pkg_inventory(), false},
         {"mgmt_posture", capdecls::plugin_action_catalogue_mgmt_posture(), false},
         {"shares", capdecls::plugin_action_catalogue_shares(), false},
+        {"remote_access_audit", capdecls::plugin_action_catalogue_remote_access_audit(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
     };
 }
@@ -174,7 +176,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, twenty-eight sources exactly as a live composition site would use.
+    // literally, twenty-nine sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -203,6 +205,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_pkg_inventory(),
         capdecls::plugin_action_catalogue_mgmt_posture(),
         capdecls::plugin_action_catalogue_shares(),
+        capdecls::plugin_action_catalogue_remote_access_audit(),
         capdecls::core_dispatch_capabilities(),
     };
 }
@@ -413,6 +416,32 @@ TEST_CASE("capability catalogue: shares.list pins its exact classification",
     CHECK(row.risk_tier == authz::RiskTier::Low);
     CHECK(row.system_reserved == false);
     CHECK(row.execute_gate == ExecuteGate::None);
+}
+
+/// Exact-row pin for `remote_access_audit.list` (Wave 11, Forensics-class): per-account SSH key
+/// fingerprints on one named machine, the same Forensics/AdminOrApproval boundary as
+/// privacy_permissions, checked on the fragment AND as the composed registry classifies it, so
+/// neither a fragment edit nor a composition change can drift it silently.
+TEST_CASE("capability catalogue: remote_access_audit.list pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_remote_access_audit();
+    REQUIRE(rows.size() == 1);
+    const auto check_row = [](const CommandCapability& r) {
+        CHECK(r.plugin == "remote_access_audit");
+        CHECK(r.action == "list");
+        CHECK(r.dispatch_class == DispatchClass::ReadOnly);
+        CHECK(r.mutability == Mutability::None);
+        CHECK(r.securable == "Forensics");
+        CHECK(r.operation == authz::Operation::Read);
+        CHECK(r.risk_tier == authz::RiskTier::High);
+        CHECK(r.execute_gate == ExecuteGate::AdminOrApproval);
+        CHECK_FALSE(r.system_reserved);
+    };
+    check_row(rows.front());
+    auto registry = build_registry(all_labeled_sources());
+    const auto classified = registry.classify("remote_access_audit", "list");
+    REQUIRE(classified.has_value());
+    check_row(*classified);
 }
 
 TEST_CASE("capability catalogue: classify() resolves every declared plugin.action across every "

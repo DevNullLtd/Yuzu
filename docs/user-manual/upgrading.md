@@ -2,6 +2,25 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## ⚠️ Breaking: `POST` and `DELETE /api/v1/quarantine` now apply the dispatch approval check (#6065)
+
+**What changed.** `POST /api/v1/quarantine` (and the dashboard's Quarantine device button, which calls it) now runs the same dispatch approval check as the quarantine plugin's `quarantine` action, after the scoped `Security:Execute` gate and the `whitelist` validation and before any record is written. `DELETE /api/v1/quarantine/{agent_id}` (the Release from quarantine button) now runs the same check for the plugin's `unquarantine` action, after the scoped gate and before the `attempt` audit row and the release. Neither depends on any approval-workflow setting.
+
+"Administrator" here means an account whose **account role** is `admin` (a live temporary JIT elevation counts as that role). The RBAC `Administrator` role, or a global `Security:Execute` grant, on an account whose role is `user` does not make it one.
+
+- **RBAC on, a non-administrator who holds `Security:Execute` globally:** admitted before (`201`, and the reconciler then isolated the device), now `403` `approval_required`. This includes an account that holds the RBAC `Administrator` role but whose account role is `user`. REST has no approval-ticket path, so such a caller cannot create a quarantine record through REST or the dashboard.
+- **RBAC on, a caller who holds `Security:Execute` only through a management group:** now `403` `forbidden`, the same answer MCP `quarantine_device` gives at its pre-check. So is an account that is an administrator only through a JIT elevation and has no global `Security:Execute` grant of its own: the check reads the account's own grants, not the elevated role.
+- **RBAC off (the default):** nothing changes for non-administrators, because the legacy gate already refuses `Security:Execute` without the `admin` account role, so this check adds no new refusal there. A JIT-elevated administrator is admitted as before.
+- A session that expires between the route's first authorisation check and its second look-up now ends the request at the `401`. Before, the record was written and attributed to `system`. A request whose two look-ups name different principals (a session cookie that lapsed with a bearer token for another account on the same request) also ends at `401` and writes no record, and the audit rows of both routes now name the session the route resolved, so they agree with the record's `quarantined_by`. When searching the audit log for callers relying on the old behaviour, ignore `denied` rows whose `detail` is `authenticated principal changed during the request now=<account>`: they are that `401`, not an approval refusal.
+
+A refused request writes no quarantine record and releases none. The `403` bodies carry `message` and `remediation` and no `permission` field.
+
+**Release.** The same answers apply to `DELETE`: a non-administrator who could end a record before now gets `403` `approval_required` (RBAC on, global grant) or `403` `forbidden` (group-only, or an unreadable RBAC store), the record stays active, and the refusal is audited as `quarantine.disable` with `result=denied` and no `attempt` row. Only an administrator (with RBAC on, one who also holds `Security:Execute` globally) can release a record through REST or the dashboard. A JIT elevation counts as the administrator role only if the account also holds `Security:Execute` globally; otherwise the release is refused `forbidden`. The `remediation` text names the MCP supervised flow, which can create a record but has no release tool, so for a release the only path is an administrator. Release still ends the server record only; it does not remove the endpoint firewall rules.
+
+**Rolling upgrades and rollback.** The check is enforced per server replica. During a rolling upgrade, or after rolling a replica back, a replica that has not been upgraded still accepts `POST /api/v1/quarantine` from a non-administrator who holds `Security:Execute` on the device (`201`, and the leader then isolates the device) and accepts the same caller's `DELETE` release (`200`). The check applies across the cluster only once every replica runs this version, so do not treat a `201` from a non-administrator during the rollout as a failure of the new check. Rolling back restores the old behaviour; no data changes in either direction.
+
+**What to check.** Automation that creates or releases quarantine records with a non-administrator API token or cookie session must move to a durable administrator account (not a JIT elevation; with RBAC on, one that also holds `Security:Execute` globally in its own right). For creation only, MCP `quarantine_device` on the supervised tier is the alternative, where an administrator approves the ticket in an interactive session with MFA step-up (see the #6061 note below); release has no such path and needs an administrator. To find callers that were relying on the old behaviour, search the audit log for action `quarantine.enable` (create) or `quarantine.disable` (release) with result `denied`: the principal and the device are on the row. `yuzu_server_dispatch_denied_total{reason}` shows only the fleet-wide trend; it is shared with MCP and `/api/command` and cannot name this route. For a least-privilege containment operator (`Security:Execute`, not an administrator) there is no REST or dashboard approval path yet; adding one is planned follow-up work, and until then creation can go through the MCP supervised flow or the quarantine plugin's `quarantine` action on the Instructions page (role-gated approval). Releasing through the plugin's `unquarantine` action alone clears the endpoint firewall rules but leaves the active record, so while the record is active the reconciler re-applies the stored isolation when the device next reconnects; an administrator must end the record. No configuration or data migration is required.
+
 ## Behaviour change: four privileged REST routes refuse cross-site cookie writes
 
 **What changed.** A call to `PUT /api/v1/rbac/enforcement`, `POST /api/v1/rbac/roles/{name}/assignments`, `DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id}` or `POST /api/v1/guaranteed-state/push` authorised by a **session cookie** must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`). Otherwise it answers `403` `cross-site request refused` and is audited as `csrf.denied`. The check runs after the authorization gates and MFA step-up, so a caller who is not authorized learns nothing from it, and before the request body is read. The password routes, the response-template routes and `POST /api/v1/guaranteed-state/policy-generation/raise` already apply the same rule. API, MCP and engine token callers are not affected.
@@ -496,9 +515,9 @@ API-token Create and Revoke buttons) now apply the same step-up check as the RES
   probes that fetch `/home` still receive `200`.
 - **The Hardware pages no longer show quarantine controls.** The Quarantine link, the
   Quarantined pill, the Quarantined devices panel, the containment banner and tab, and the
-  quarantine plugin's rows in the Actions lens are hidden until an approval workflow for containment actions is added. Quarantine itself is unchanged: the REST API, the MCP tools, the quarantine
-  plugin and the role-gated quarantine instructions on the Instructions page all work as
-  before, and server-side enforcement does not depend on the UI. While the controls are
+  quarantine plugin's rows in the Actions lens are hidden until an approval workflow for containment actions is added. Quarantine itself is unchanged apart from the Breaking entry at the top of this page: the MCP tools, the quarantine
+  plugin and the role-gated quarantine instructions on the Instructions page work as
+  before, the REST create and release routes now run the dispatch approval check, and server-side enforcement does not depend on the UI. While the controls are
   hidden, use `GET /api/v1/quarantine` to list records. `DELETE /api/v1/quarantine/{agent_id}`
   ends the server record only; to remove the device's firewall rules, run the quarantine
   plugin's release instruction (`security.quarantine.release`, "Release Device from Quarantine")
@@ -602,6 +621,16 @@ store is degraded (previously an empty `200`) and `404` for an unknown role
 
 **What to check.** A script that signs in with a cookie and calls the per-device sync route without `Origin` or `Referer` now gets `403`: use an API token, or send the header. The Hardware and Software pages already send it. Behind a reverse proxy that rewrites `Host`, declare the public address with `--csrf-trusted-origin`.
 
+## Behaviour change: adding, removing and re-roling a local account refuse cross-site cookie writes and are audit-first
+
+**What changed.**
+
+- `POST /api/settings/users`, `DELETE /api/settings/users/{username}` and `POST /api/settings/users/{username}/role` called with a **session cookie** must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`), otherwise they answer `403 cross-site request refused` and write a `csrf.denied` audit row. Calls authorised by an API token are not affected.
+- `POST /api/settings/users/{username}/role` accepts only `application/json` and answers `415` otherwise.
+- Each of the three writes a `result=attempted` audit row before it changes anything. If that row cannot be written the call answers `503` with `Sec-Audit-Failed: true` and changes nothing; if only the outcome row is lost the `2xx` stands and the header is set.
+
+**What to check.** A script that signs in with a cookie and calls these routes without `Origin` or `Referer`, or posts the role body as a form, now gets `403` or `415`: use an API token, send the header, or post JSON. A SIEM or alert rule that counts `csrf.denied` rows will now see the three user-management routes as targets, and a rule on `user.create`, `user.delete` or `user.role_change` rows will now also see `attempted` rows.
+
 ## Behaviour change: MCP `revoke_upload_grant` is audit-first and refuses during an audit-store outage (#6169)
 
 **What changed.** The MCP tool `revoke_upload_grant` now writes an `upload_grant.revoke` audit row with result `attempted` before it revokes anything, then a `success` or `failure` row, the same rows its REST twin `DELETE /api/v1/upload-grants/{grant_id}` writes. If the `attempted` row cannot be stored, the tool answers a retryable `-32603` error carrying `retry_after_ms` and the grant is **not** revoked. It stays redeemable until it expires at its TTL. The REST route already refused the same way, with `503`, so no transport can revoke a grant while the audit store is down. The success result no longer includes `audit_persisted`. `mint_upload_grant` is unchanged.
@@ -693,6 +722,37 @@ header rather than a redirect, so a panel never swaps the sign-in page into itse
 **What to check.** Any monitor, load-balancer health check or script that expects `GET /login` to answer `200`
 must probe `/livez`, `/readyz`, `/health` or `/home` instead (`/home` answers `200` without a session). Scripts
 that sign in with `POST /login` need no change. Bookmarks to `/login` keep working through the redirect.
+
+## Behaviour change: kill-switch audit rows carry the operator's reason
+
+The `detail` of the `plugin_config.kill_switch.set` audit rows (both the `attempted` row and the
+`success` or `failure` row, over REST and MCP) now carries `, reason="<text>"` when the caller gave a
+reason. A reason over 512 bytes is refused before anything is written; if one ever reached the audit
+writer it would be cut at a character boundary and `, reason_truncated=true` would follow the closing
+quote. Before, `detail` was exactly `enabled=true|false`, with `, protective_exempt=true` appended
+for a protective pair. A SIEM rule that matches the whole string (`detail == "enabled=false"`) stops
+matching a call that carries a reason: match `enabled=true|false` as a prefix instead. The reason is
+free text entered by an operator (at most 512 bytes before escaping; `\` and `"` are backslash-escaped),
+so do not parse it as structured data. A call without a reason is unchanged. See
+[Audit Log](audit-log.md).
+
+## Behaviour change: the plugin-config list is authorized by one list-read gate
+
+`GET /api/v1/plugin-config`, the MCP `list_plugin_config` tool and the Plugins and updates panel now
+decide from the one ADR-0017 list-read gate instead of a permission check stacked on a list check.
+What you may notice:
+
+- A session with an active just-in-time elevation is now admitted on the REST route and the MCP tool
+  (before, an elevated session with no underlying grant was refused there while other permission
+  checks admitted it).
+- A management-group-confined grant is still refused. On the REST route the refusal is still an
+  `auth.permission_required` denial row, now with the detail text `management-group-scoped grant
+  cannot read the unscoped list PluginConfig:Read`. On MCP it is now recorded as
+  `mcp.list_plugin_config` with result `denied` (it was `auth.permission_required`). Update a SIEM rule
+  that matched the old MCP verb.
+- For a non-engine caller, a closed or degraded authorization store answers 403 (it fails closed),
+  where the REST route's explicit store check could answer 503. Boot already fails closed on that
+  store, so this is rare in practice.
 
 ## Behaviour change: Guardian heartbeat reconcile is admission-controlled and fails closed on a degraded tag or property store (#5513)
 

@@ -35,6 +35,8 @@
 
 #include <row_byte_budget.hpp>
 
+#include <win_hive_file_guard.hpp>
+
 #include "privacy_permissions_parsers.hpp"
 #include "user_profile_model.hpp"
 
@@ -414,92 +416,10 @@ struct RawGrant {
     return out;
 }
 
-// ── offline hive-file guard (pure decisions; the Win32 facts are gathered in the shell) ──
+// ── change-notification stability ───────────────────────────────────────
 
-inline constexpr std::uint32_t kDriveFixed = 3; // DRIVE_FIXED
-inline constexpr std::size_t kMaxHivePathDepth = 32;
-inline constexpr std::uint64_t kMaxHiveBytes = 512ull * 1024ull * 1024ull;
-/// A stock profile directory holds a handful of `<hive>*` transaction-log sidecars (.LOG1/.LOG2,
-/// .TM.blf, .TMContainer*.regtrans-ms); more than this is refused rather than walked.
-inline constexpr std::size_t kMaxHiveSidecars = 64;
 inline constexpr std::uint32_t kWaitObject0 = 0;  // WAIT_OBJECT_0
 inline constexpr std::uint32_t kWaitTimeout = 258; // WAIT_TIMEOUT
-
-/// What the shell learned about one NTUSER.DAT, every handle-derived fact taken from an opened
-/// HANDLE (the drive type and the sidecar listing are the two handle-less sources; the path facts
-/// come from the requested path before any syscall). `final_path_matches` is the shell's verdict
-/// that GetFinalPathNameByHandleW(VOLUME_NAME_DOS) equals `\\?\` + the requested path under
-/// Windows' own ordinal case-insensitive comparison (CompareStringOrdinal on the wide
-/// strings: a non-ASCII case-only difference is the same path, which byte-wise ASCII folding on
-/// UTF-8 would misjudge). The default is the neutral `true`, so only the facts gathered so far can
-/// trip a classification.
-struct HiveFileFacts {
-    bool path_is_unc = false;
-    std::uint32_t drive_type = kDriveFixed;
-    std::size_t depth = 0;
-    bool ancestor_reparse = false;
-    bool is_reparse = false;
-    bool is_directory = false;
-    bool is_disk_file = true;
-    /// FILE_ATTRIBUTE_OFFLINE / RECALL_ON_OPEN / RECALL_ON_DATA_ACCESS: a cloud or tiered
-    /// placeholder, which RegLoadKeyW would recall while the process-wide hive lock is held.
-    /// Never FILE_ATTRIBUTE_SPARSE_FILE (a resident file can be sparse).
-    bool not_resident = false;
-    std::string owner_sid;
-    std::string profile_sid;
-    bool final_path_matches = true;
-    std::uint64_t size = 0;
-    /// Facts about the `<hive file name>*` sidecars beside the leaf (see read_sidecars).
-    bool sidecar_reparse = false;
-    bool sidecar_hardlinked = false;
-    std::size_t sidecar_count = 0;
-};
-
-/// Hive-refusal token literals (the cause after `<profile>:`).
-inline constexpr std::string_view kHivePathUnc = "hive_path_unc";
-inline constexpr std::string_view kHivePathNotFixed = "hive_path_not_fixed";
-inline constexpr std::string_view kHivePathTooDeep = "hive_path_too_deep";
-inline constexpr std::string_view kHivePathReparseAncestor = "hive_path_reparse_ancestor";
-inline constexpr std::string_view kHiveReparsePoint = "hive_reparse_point";
-inline constexpr std::string_view kHiveNotRegular = "hive_not_regular";
-inline constexpr std::string_view kHiveNotResident = "hive_not_resident";
-inline constexpr std::string_view kHiveOwnerUnexpected = "hive_owner_unexpected";
-inline constexpr std::string_view kHivePathRedirected = "hive_path_redirected";
-inline constexpr std::string_view kHiveOversized = "hive_oversized";
-inline constexpr std::string_view kHiveSidecarReparse = "hive_sidecar_reparse";
-inline constexpr std::string_view kHiveSidecarHardlinked = "hive_sidecar_hardlinked";
-inline constexpr std::string_view kHiveSidecarCount = "hive_sidecar_count";
-inline constexpr std::string_view kHiveIdentityChanged = "hive_identity_changed";
-inline constexpr std::string_view kHiveTimeout = "timeout";
-
-/// A stock profile hive is owned by the profile's own user, LocalSystem or BUILTIN\Administrators;
-/// any other owner is refused (widen only to an owner measured on a real host, never to "any").
-[[nodiscard]] inline bool hive_owner_allowed(std::string_view owner_sid,
-                                             std::string_view profile_sid) noexcept {
-    return !owner_sid.empty() &&
-           (owner_sid == profile_sid || owner_sid == "S-1-5-18" || owner_sid == "S-1-5-32-544");
-}
-
-/// The first refusal token for a hive file's facts, in this fixed order, or nullopt to proceed.
-/// Path facts come first so a UNC/redirected target is refused before any leaf fact is trusted.
-[[nodiscard]] inline std::optional<std::string> classify_hive_file(const HiveFileFacts& f) {
-    if (f.path_is_unc) return std::string{kHivePathUnc};
-    if (f.drive_type != kDriveFixed) return std::string{kHivePathNotFixed};
-    if (f.depth > kMaxHivePathDepth) return std::string{kHivePathTooDeep};
-    if (f.ancestor_reparse) return std::string{kHivePathReparseAncestor};
-    if (f.is_reparse) return std::string{kHiveReparsePoint};
-    if (f.is_directory || !f.is_disk_file) return std::string{kHiveNotRegular};
-    if (f.not_resident) return std::string{kHiveNotResident};
-    if (!hive_owner_allowed(f.owner_sid, f.profile_sid)) return std::string{kHiveOwnerUnexpected};
-    if (!f.final_path_matches) return std::string{kHivePathRedirected};
-    if (f.size > kMaxHiveBytes) return std::string{kHiveOversized};
-    if (f.sidecar_reparse) return std::string{kHiveSidecarReparse};
-    if (f.sidecar_hardlinked) return std::string{kHiveSidecarHardlinked};
-    if (f.sidecar_count > kMaxHiveSidecars) return std::string{kHiveSidecarCount};
-    return std::nullopt;
-}
-
-// ── change-notification stability ───────────────────────────────────────
 
 /// The Win32 outcomes of arming and polling one RegNotifyChangeKeyValue watch. The ConsentStore
 /// was read stable ONLY when the event was created, the watch armed and the zero-timeout wait
@@ -721,7 +641,7 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
             // refusal); a refused live root beneath it is the denial. `timeout` also ends the
             // run: this branch marks the budget itself, so the run-level row never depends on the
             // injected deadline callback's side effect.
-            if (rd.refusal == kHiveTimeout) budget.timed_out = true;
+            if (rd.refusal == ::yuzu::win::kHiveTimeout) budget.timed_out = true;
             profile_failed(rd.refusal);
             break;
         }
