@@ -49,19 +49,23 @@ Invariants:
        `if (!in_flight) return true;`, after the pure verdict and BEFORE the weak lock (the
        entry must die last, so the count falls after the strong reference is released); exactly
        one `registry_audit_gate_.closed()`, after the charge and before the only `store->log(`
-       (what the closed branch then does is pinned by the unit cases, not here); the hook never
-       closes or waits itself; and the weak lock is the only `registry_audit_store_.lock(` in the
-       file (a second reader would also need the gate).
+       (what the closed branch then does is pinned by the unit cases, not here); the owed count
+       (`owed = frame.events.size();`) is taken before the entry, so a throw out of the entry or
+       the store lock books every row the frame owes; the hook never closes or waits itself,
+       through the gate or through the service; and the weak lock is the only
+       `registry_audit_store_.lock(` in the file (a second reader would also need the gate).
 
   server.cpp
    12. `agent_service_.set_registry_audit_store(audit_store_);` appears exactly once and the setter
        is called nowhere else: deleting the line turns every row off silently, and clearing a weak
        pointer that a forwarder may be locking is a data race (the #3350 precedent).
    13. In stop(), `agent_service_.close_registry_audit();` then `if (!agent_service_.
-       wait_registry_audit_idle(` ... `std::_Exit(1);` appear exactly once each, in that order,
-       and both BEFORE the one `audit_store_.reset();`: reset the store or the pool while a
-       forwarder is between two rows and the next row leases a pool that is going (the wait is
-       what makes that impossible; on its timeout the process exits rather than go on).
+       wait_registry_audit_idle(` appear exactly once each, in that order, and both BEFORE the one
+       `audit_store_.reset();`; the `std::_Exit(1);` sits inside the block the wait guards (on its
+       timeout the process exits rather than go on); and the bound is the declared
+       `std::chrono::seconds(15)` that the documents quote. Reset the store or the pool while a
+       forwarder is between two rows and the next row leases a pool that is going: the wait is
+       what makes that impossible.
 
 `//` comments are stripped and whitespace runs collapsed before matching, so line wrapping and
 comment text cannot satisfy or break a check. The self-test applies in-memory mutations (a
@@ -69,12 +73,13 @@ deleted stamp call, a deleted initialiser, a hook moved after the notification, 
 signal, a flag that is never set or is re-armed per frame, a raw store read beside the weak lock or
 in the forwarder entry, a verdict outside the try, a charge without the overflow key, a missing
 factory call, a deleted or cleared weak-store wiring, the rundown gate's entry deleted or moved
-after the lock, its per-row check deleted or moved before the charge, a second weak lock, the close or the wait deleted, swapped or moved after the
-reset, the wait's result ignored or its force-exit removed) and requires problems() to be
+after the lock, its per-row check deleted or moved before the charge, the owed count moved after
+the entry, a second weak lock, the hook closing or waiting through the gate or the service, the
+close or the wait deleted, swapped or moved after the reset, the wait's result ignored, its
+force-exit removed or made unconditional, the bound changed) and requires problems() to be
 non-empty on each; a mutation whose pattern no longer matches fails loudly rather than passing
-vacuously. A
-second set of BENIGN edits (a comment or a string naming the raw store, a re-wrapped call) must
-leave problems() empty.
+vacuously. A second set of BENIGN edits (a comment or a string naming the raw store, a re-wrapped
+call) must leave problems() empty.
 
 Usage: python3 tests/test_audit_action_stamp_wiring_lexical.py
 """
@@ -122,6 +127,8 @@ CLOSE_CALL = "agent_service_.close_registry_audit();"
 WAIT_COND = "if (!agent_service_.wait_registry_audit_idle("
 EXIT_CALL = "std::_Exit(1);"
 STORE_RESET = "audit_store_.reset();"
+BOUND_DECL = "static constexpr auto kRegistryAuditRundownBound = std::chrono::seconds(15);"
+OWED = "owed = frame.events.size();"
 VERDICT = "registry_audit_events_for_frame("
 LITERAL = re.compile(r'"(?:[^"\\]|\\.)*"')
 OVERFLOW_KEY = "const std::string overflow = registry_audit_overflow_key(agent_id);"
@@ -164,6 +171,17 @@ def raw_store_read(body):
     return re.search(r"(?<![A-Za-z0-9_])audit_store_", LITERAL.sub('""', body))
 
 
+def brace_block(t, start):
+    """The normalised text of the first `{...}` block at or after `start` (braces balanced)."""
+    open_at = t.find("{", start)
+    depth = 0
+    for i in range(open_at, len(t)) if open_at >= 0 else ():
+        depth += (t[i] == "{") - (t[i] == "}")
+        if depth == 0:
+            return t[open_at : i + 1]
+    return ""
+
+
 def main_problems(src):
     t = normalise(src)
     out = []
@@ -178,13 +196,19 @@ def main_problems(src):
     close, wait, reset = normalise(CLOSE_CALL), normalise(WAIT_COND), normalise(STORE_RESET)
     n_close, n_wait, n_reset = t.count(close), t.count(wait), t.count(reset)
     c, w, r = t.find(close), t.find(wait), t.find(reset)
-    if (n_close, n_wait, n_reset) != (1, 1, 1) or not 0 <= c < w < r or EXIT_CALL not in t[w:r]:
+    block = brace_block(t, w) if w >= 0 else ""
+    if (
+        (n_close, n_wait, n_reset) != (1, 1, 1)
+        or not 0 <= c < w < r
+        or EXIT_CALL not in block
+        or t.count(normalise(BOUND_DECL)) != 1
+    ):
         out.append(
-            f"server.cpp: stop() must call `{CLOSE_CALL}`, then wait with `{WAIT_COND}...` and"
-            f" `{EXIT_CALL}` on its timeout, each exactly once, all BEFORE the one `{STORE_RESET}`"
-            f" (found {n_close} close, {n_wait} wait and {n_reset} reset statement(s)): reset the"
-            " store or the pool while a forwarder thread is between two rows and its next row"
-            " leases a pool that is going"
+            f"server.cpp: stop() must call `{CLOSE_CALL}`, then wait with `{WAIT_COND}...` whose"
+            f" block holds `{EXIT_CALL}`, each exactly once, all BEFORE the one `{STORE_RESET}`,"
+            f" with the bound `{BOUND_DECL}` the documents quote (found {n_close} close, {n_wait}"
+            f" wait and {n_reset} reset statement(s)): reset the store or the pool while a"
+            " forwarder thread is between two rows and its next row leases a pool that is going"
         )
     return out
 
@@ -210,24 +234,32 @@ def server_problems(src):
         enter = normalise(f"{ENTER} {ENTER_GUARD}")
         at_enter, at_verdict, at_lock = body.find(enter), body.find(VERDICT), body.find(WEAK_LOCK)
         at_charge, at_closed = body.find(normalise(CHARGE)), body.find(CLOSED_CHECK)
-        at_log = body.find(STORE_LOG)
+        at_log, at_owed = body.find(STORE_LOG), body.find(OWED)
         if (
             body.count(enter) != 1
-            or not 0 <= at_verdict < at_enter < at_lock
+            or not 0 <= at_verdict < at_owed < at_enter < at_lock
+            or body.count(OWED) != 1
             or body.count(CLOSED_CHECK) != 1
             or body.count(STORE_LOG) != 1
             or not 0 <= at_charge < at_closed < at_log
-            or "registry_audit_gate_.close()" in body
-            or "wait_idle" in body
+            or any(
+                call in body
+                for call in (
+                    "registry_audit_gate_.close()",
+                    "close_registry_audit(",
+                    "wait_idle(",
+                    "wait_registry_audit_idle(",
+                )
+            )
             or t.count("registry_audit_store_.lock(") != 1
         ):
             out.append(
                 f"agent_service_impl.cpp: audit_registry_frame must enter the rundown gate with"
-                f" `{ENTER} {ENTER_GUARD}` once, after the verdict and BEFORE `{WEAK_LOCK}` (it"
-                f" must die last), check `{CLOSED_CHECK}` once, after the charge and before the"
-                f" only `{STORE_LOG}`, never close or wait itself, and hold the only"
-                f" `registry_audit_store_.lock(` in the file: otherwise a forwarder between two rows"
-                f" leases a pool that stop() is destroying"
+                f" `{ENTER} {ENTER_GUARD}` once, after the verdict and `{OWED}` and BEFORE"
+                f" `{WEAK_LOCK}` (it must die last), check `{CLOSED_CHECK}` once, after the charge"
+                f" and before the only `{STORE_LOG}`, never close or wait itself (through the gate"
+                f" or the service), and hold the only `registry_audit_store_.lock(` in the file:"
+                f" otherwise a forwarder between two rows leases a pool that stop() is destroying"
             )
     if body is None or not 0 <= body.find("try {") < body.find(VERDICT):
         out.append(
@@ -276,8 +308,14 @@ def server_problems(src):
 
 # (file, pattern, replacement); each must make that file's problems() non-empty.
 AGENT_MUTATIONS = [
-    (r"yuzu::agent::make_output_frame\(command_id, action, std::move\(combined\)\)", "pb::CommandResponse{}"),
-    (r"yuzu::agent::make_final_frame\(cmd\.command_id\(\), cmd\.action\(\), rc\)", "pb::CommandResponse{}"),
+    (
+        r"yuzu::agent::make_output_frame\(command_id, action, std::move\(combined\)\)",
+        "pb::CommandResponse{}",
+    ),
+    (
+        r"yuzu::agent::make_final_frame\(cmd\.command_id\(\), cmd\.action\(\), rc\)",
+        "pb::CommandResponse{}",
+    ),
     (r"\.action = cmd\.action\(\),", ""),
     (r'#include "command_frames\.hpp"', ""),
 ]
@@ -371,6 +409,27 @@ SERVER_MUTATIONS = [
         r"(const auto store = registry_audit_store_\.lock\(\);)",
         r"\1 (void)registry_audit_store_.lock();",
     ),
+    # the owed count taken after the entry: a throw out of the entry books nothing
+    (
+        r"\n        owed = frame\.events\.size\(\);[^\n]*",
+        "",
+    ),
+    (
+        r"(const auto store = registry_audit_store_\.lock\(\);\s*"
+        r"if \(!store \|\| !store->is_open\(\)\)\s*return true;[^\n]*\n)",
+        "\\1        owed = frame.events.size();\n",
+    ),
+    # the hook waits through the service
+    (
+        r"if \(registry_audit_gate_\.closed\(\)\) \{",
+        "(void)wait_registry_audit_idle(std::chrono::milliseconds{0});\n"
+        "            if (registry_audit_gate_.closed()) {",
+    ),
+    # the hook closes through the service
+    (
+        r"if \(registry_audit_gate_\.closed\(\)\) \{",
+        "close_registry_audit();\n            if (registry_audit_gate_.closed()) {",
+    ),
     # the verdict outside the try
     (r"(?s)    try \{\n(        const auto frame = .*?return true;\n)", r"\1    try {\n"),
 ]
@@ -427,8 +486,9 @@ MAIN_MUTATIONS = [
     ),
     # the close moved after the wait
     (
-        r"(?s)(agent_service_\.close_registry_audit\(\);)(\s*)(if \(!agent_service_\."
-        r"wait_registry_audit_idle\(kRegistryAuditRundownBound\)\) \{.*?std::_Exit\(1\);\s*\})",
+        r"(?s)(agent_service_\.close_registry_audit\(\);)(\s*spdlog::info\(.*?\);\s*)"
+        r"(if \(!agent_service_\.wait_registry_audit_idle\(kRegistryAuditRundownBound\)\) \{"
+        r".*?std::_Exit\(1\);\s*\})",
         r"\3\2\1",
     ),
     # the wait moved after the reset it must precede
@@ -442,6 +502,14 @@ MAIN_MUTATIONS = [
         r"(?s)(wait_registry_audit_idle\(kRegistryAuditRundownBound\)\) \{.*?)std::_Exit\(1\);",
         r"\1(void)0;",
     ),
+    # the force-exit made unconditional: the process would always exit
+    (
+        r"(?s)(wait_registry_audit_idle\(kRegistryAuditRundownBound\)\) \{.*?)"
+        r"std::_Exit\(1\);(\s*\})",
+        r"\1\2\n        std::_Exit(1);",
+    ),
+    # the documented bound changed without the documents
+    (r"std::chrono::seconds\(15\);", "std::chrono::seconds(150);"),
     # the wait's result ignored
     (
         r"if \(!agent_service_\.wait_registry_audit_idle\(kRegistryAuditRundownBound\)\)",

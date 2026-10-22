@@ -226,11 +226,11 @@ struct RegistryAuditLines {
     ev.action = "registry.write";
     ev.target_type = "command";
     ev.target_id = std::string{command_id};
-    // The trusted tokens go FIRST, and `cut` is always stated: the line is endpoint text, and a
-    // ` agent=<other>` or ` cut=1` inside it must not be what a first-match reader finds (the
-    // role.elevation.granted convention). With `cut` only on a cut row, a forged ` cut=1` in an
-    // uncut line would have been the first match.
-    ev.detail = "agent=" + yuzu::log_token(agent_id) + (line.cut ? " cut=1 " : " cut=0 ") + line.text;
+    // The trusted tokens go FIRST and `cut` is always stated, so the first `agent=` and the first
+    // `cut=` in the detail are the server's whatever the endpoint's line contains (the
+    // role.elevation.granted convention).
+    ev.detail = "agent=" + yuzu::log_token(agent_id) + (line.cut ? " cut=1 " : " cut=0 ") +
+                line.text;
     ev.result = line.ok ? "success" : "failure";
     return ev;
 }

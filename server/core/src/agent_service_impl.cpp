@@ -94,9 +94,11 @@ static_assert(kRegistryAuditBudgetKeyBytes >= auth::kMaxAgentIdLength,
 // ends the frame. The hook must not throw into a stream handler or a detached thread: everything
 // below, the verdict and the store lock included, runs inside one try, and an exception is
 // reported as a failed write: logged, returned as false, and counted as `persist_failed` for the
-// rows already known to be owed (an allocation failure inside the verdict leaves none known, so
-// only the error line says so). An allocation failure while REPORTING one is not caught; no other
-// code around the hook guards that either.
+// rows already known to be owed. That is every row of the frame once the verdict is taken, so a
+// throw out of the gate entry or the store lock books them all; an exception out of the verdict
+// itself (an allocation failure) leaves none known, and only the error line says so. An
+// allocation failure while REPORTING one is not caught; no other code around the hook guards
+// that either.
 bool AgentServiceImpl::audit_registry_frame(const std::string& agent_id,
                                             const pb::CommandResponse& resp) {
     if (resp.output().empty() || resp.action().empty())
@@ -130,6 +132,7 @@ bool AgentServiceImpl::audit_registry_frame(const std::string& agent_id,
             resp.output(), yuzu::server::now_epoch_seconds());
         if (frame.events.empty() && !frame.truncated && !frame.unmintable_id)
             return true;
+        owed = frame.events.size(); // known before anything below can throw (see the catch arms)
         // Declared BEFORE `store`: locals die in reverse order, so the strong reference is
         // released first and the count falls after it, on every exit including a throw.
         const auto in_flight = registry_audit_gate_.try_enter();
@@ -138,7 +141,6 @@ bool AgentServiceImpl::audit_registry_frame(const std::string& agent_id,
         const auto store = registry_audit_store_.lock();
         if (!store || !store->is_open())
             return true; // no store (released at shutdown): silent, like the other audit sites
-        owed = frame.events.size();
         if (frame.unmintable_id) {
             dropped("unmintable_id", 1);
             spdlog::warn("[audit] registry.write frame ignored: command_id is not a server-minted "
@@ -169,7 +171,9 @@ bool AgentServiceImpl::audit_registry_frame(const std::string& agent_id,
             }
             // Immediately before the only call that leases the pool: once stop() has closed the
             // gate no row starts a lease, so the pool can go as soon as the hooks inside leave.
-            // The rows from this one on are lost, and counted as such.
+            // The rows from this one on are lost, and counted as such. A row the budget refused
+            // above never gets here: it never leases, so the close changes nothing for it (it
+            // stays `suppressed`).
             if (registry_audit_gate_.closed()) {
                 const std::size_t not_attempted = owed - done;
                 book_rows();

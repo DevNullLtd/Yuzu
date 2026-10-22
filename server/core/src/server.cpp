@@ -11227,16 +11227,24 @@ public:
         // already inside stops before its next row), then wait for the hooks that are inside
         // to leave: only then is it safe to reset the store and, below, the pool. Late on
         // purpose, so the frames that arrive during the delivery drain above are still
-        // audited. 15s is a 4s lease wait (AuditStore::kWriteTimeout) plus the 10s connect
-        // that a lease started just inside that deadline may still run
-        // (PgPool::Options::connect_timeout_s). On timeout: force-exit, the same choice as
-        // the web_thread_ and delivery-queue stages and for the same reason. Continuing past
-        // a hook that is still inside reopens exactly the use-after-free this gate closes
-        // (see the leak-and-continue discussion above), and nothing durable is lost: state
-        // is in Postgres, and this is strictly no worse than the supervisor's SIGKILL.
-        // Update upgrading.md's stacked-bound section if this constant changes.
+        // audited. 15s is the 4s lease wait (`kWriteTimeout`, audit_store.cpp) plus the 10s
+        // connect that a lease started just inside that deadline may still run
+        // (PgPool::Options::connect_timeout_s, the default when the DSN sets none): a DSN
+        // with a longer connect_timeout, or a host list, can keep a started connect past
+        // this bound, and the force-exit below then ends a healthy-but-slow shutdown the way
+        // it ends a wedged database. On timeout: force-exit, the same choice as the
+        // web_thread_ and delivery-queue stages and for the same reason. Continuing past a
+        // hook that is still inside reopens exactly the use-after-free this gate closes (see
+        // the leak-and-continue discussion above), and nothing durable is lost: state is in
+        // Postgres, and this is strictly no worse than the supervisor's SIGKILL.
+        // If this constant changes, change the "within 15s" message below and the 15 s and
+        // ~130 s / ~190 s figures in upgrading.md, server-admin.md, audit-log.md, the
+        // changelog fragment and the resource ledger; the static gate pins the value.
         static constexpr auto kRegistryAuditRundownBound = std::chrono::seconds(15);
         agent_service_.close_registry_audit();
+        spdlog::info("Shutting down server: waiting up to {}s for a registry.write audit write "
+                     "in flight...",
+                     kRegistryAuditRundownBound.count());
         if (!agent_service_.wait_registry_audit_idle(kRegistryAuditRundownBound)) {
             // Same idiom as the stages above: spdlog would be legal here, the raw write()
             // stays because _Exit() skips any buffered sink flush.

@@ -790,7 +790,7 @@ TEST_CASE("registry audit live ingest: a store that fails ends the frame at the 
     yuzu::test::LogCapture cap;
     h.svc.process_gateway_response(
         agent, IngestHarness::frame(rid(0xf1), apb::CommandResponse::RUNNING, "set_value", three));
-    // The terminal gateway site shares the helper and has its own error line.
+    // The terminal gateway site runs the same hook.
     h.svc.process_gateway_response(
         agent, IngestHarness::frame(rid(0xf2), apb::CommandResponse::FAILURE, "set_value", three));
     cap.stop();
@@ -802,12 +802,14 @@ TEST_CASE("registry audit live ingest: a store that fails ends the frame at the 
 
     const std::string text = cap.text();
     const auto count = [&](const std::string& needle) { return count_of(text, needle); };
-    // The early-out error line: once per frame, naming the agent, the command and the two rows
-    // that were not attempted.
+    // The hook's failure line: once per frame, at error level, naming the agent, the command and
+    // the two rows that were not attempted. (The store logs a diagnostic of its own for the failed
+    // INSERT; that line is the store's, not the hook's.)
     for (const auto& id : {rid(0xf1), rid(0xf2)})
-        CHECK(count("[audit] registry.write row failed to persist (agent=" + who + ", command=" +
-                    id + "); 2 further row(s) of this frame not attempted") == 1);
-    // The gateway path has no trailer and the hook's line is its only signal: no second line.
+        CHECK(count("[error] [audit] registry.write row failed to persist (agent=" + who +
+                    ", command=" + id + "); 2 further row(s) of this frame not attempted") == 1);
+    // The gateway path has no trailer and the hook's line is its signal: the gateway sites add no
+    // second line of their own.
     CHECK(count("[gateway] registry.write audit row failed to persist") == 0);
     // a failed write leaves its gate too
     CHECK(h.svc.wait_registry_audit_idle(std::chrono::milliseconds{0}));
@@ -960,13 +962,16 @@ void check_a_close_mid_frame(const std::string& dsn, int close_at, std::size_t k
             return std::int64_t{1'000};
         },
         /*max_keys=*/8));
-    const std::string one{kOkLine};
+    constexpr std::size_t kRows = 4;
+    std::string rows_text{kOkLine};
+    for (std::size_t i = 1; i < kRows; ++i)
+        rows_text += "\n" + std::string{kOkLine};
     yuzu::test::LogCapture cap;
     h.svc.process_gateway_response(
         "agent-1", IngestHarness::frame(rid(0xc3), apb::CommandResponse::RUNNING, "set_value",
-                                        one + "\n" + one + "\n" + one + "\n" + one));
+                                        rows_text));
     cap.stop();
-    const std::size_t lost = 4 - kept;
+    const std::size_t lost = kRows - kept;
     CHECK(inside_seen);
     CHECK(h.rows().size() == kept);
     CHECK(h.dropped("persist_failed") == static_cast<double>(lost));
@@ -992,6 +997,37 @@ TEST_CASE("registry audit live ingest: shutdown closing the hook mid-frame keeps
     SECTION("closed during the first row's charge: none is written") {
         check_a_close_mid_frame(db.dsn(), /*close_at=*/1, /*kept=*/0);
     }
+}
+
+TEST_CASE("registry audit live ingest: a row the budget refuses stays suppressed when shutdown "
+          "closes the hook",
+          "[pg][server][registry_audit][rundown]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
+    int clock_calls = 0; // outlives the harness: the budget's clock reads it
+    IngestHarness h(db.dsn());
+    // One row per window: row 0 is written and rows 1-3 are refused. The clock closes the hook
+    // during row 1's charge, so the close lands while every remaining row is already a budget
+    // refusal. A refused row never reaches the pool, so the close changes nothing for it: it
+    // stays `suppressed`, nothing is booked as lost to the shutdown, and the hook reports success.
+    h.svc.set_registry_audit_budget(std::make_unique<DenialAuditBudget>(
+        /*max_rows=*/1, /*window_ms=*/60'000,
+        [&] {
+            if (++clock_calls == 2)
+                h.svc.close_registry_audit();
+            return std::int64_t{1'000};
+        },
+        /*max_keys=*/8));
+    const std::string one{kOkLine};
+    yuzu::test::LogCapture cap;
+    h.svc.process_gateway_response(
+        "agent-1", IngestHarness::frame(rid(0xc4), apb::CommandResponse::RUNNING, "set_value",
+                                        one + "\n" + one + "\n" + one + "\n" + one));
+    cap.stop();
+    CHECK(h.rows().size() == 1);
+    CHECK(h.dropped("suppressed") == 3.0);
+    CHECK(h.dropped("persist_failed") == 0.0);
+    CHECK(count_of(cap.text(), "cut short by shutdown") == 0);
+    CHECK(h.svc.wait_registry_audit_idle(std::chrono::milliseconds{0}));
 }
 
 TEST_CASE("registry audit live ingest: a frame after the shutdown close records and counts nothing",
@@ -1398,7 +1434,8 @@ TEST_CASE("registry audit live ingest: a close mid-frame sets the audit-failed t
     CHECK(subscribe_with(h, "agent-c",
                          {IngestHarness::frame(rid(0xe2), apb::CommandResponse::RUNNING,
                                                "set_value", one + "\n" + one + "\n" + one)}) == 1U);
-    CHECK(h.metrics.counter("yuzu_server_registry_audit_dropped_total", {{"reason", "persist_failed"}})
+    CHECK(h.metrics
+              .counter("yuzu_server_registry_audit_dropped_total", {{"reason", "persist_failed"}})
               .value() == 2.0);
     // A frame that arrives after the close is silent, like one after the store is released: no
     // row, no count, no trailer.
