@@ -12,6 +12,8 @@
 #include "sync_source_installed_software.hpp"
 #include "windows_optional_features_parsers.hpp"
 
+#include <inventory_status_row.hpp>
+
 #include <yuzu/plugin.h>
 
 #include <algorithm>
@@ -32,6 +34,7 @@
 #include <vector>
 
 using yuzu::agent::AdaptedRows;
+using yuzu::agent::ConstrainedPolicy;
 using yuzu::agent::installed_software_canonical_blob;
 using yuzu::agent::make_installed_software_source;
 using yuzu::agent::parse_msi_packages_list_inventory_output;
@@ -1182,6 +1185,11 @@ namespace fs = std::filesystem;
 namespace pkg = yuzu::pkg_inventory;
 namespace msi = yuzu::msi_packages::inventory;
 using Status = AdaptedRows::Status;
+// The ConstrainedPolicy each action's table row carries in the collector
+// (sync_source_installed_software.cpp kInventoryActions): managers keeps a constrained answer's
+// rows when a present row was seen, every other status-row action fails the cycle.
+constexpr ConstrainedPolicy kKeepPolicy = ConstrainedPolicy::keep_rows_if_present_seen;
+constexpr ConstrainedPolicy kFailPolicy = ConstrainedPolicy::fail;
 
 // Server-side fixtures, copied verbatim from
 // tests/unit/server/test_software_inventory_store.cpp: the agent builder and the
@@ -1349,7 +1357,7 @@ void fake_windows() {
 // name), counted from the sample itself so a recapture does not break the pinned totals.
 std::size_t msi_sample_mapped_rows() {
     return parse_msi_packages_list_inventory_output(
-               capture_section("msi_packages", "windows.txt", "list_inventory"))
+               capture_section("msi_packages", "windows.txt", "list_inventory"), kFailPolicy)
         .entries.size();
 }
 
@@ -1358,7 +1366,7 @@ std::optional<std::pair<std::string, std::string>> collect_with(SyncPluginMap pl
 }
 
 std::string supported_status(std::string_view action) {
-    return pkg::format_status_row(action, pkg::StatusLevel::supported, "");
+    return yuzu::shared::format_status_row(action, yuzu::shared::StatusLevel::supported, "");
 }
 
 // `n` machine-scope `inv|name|version|` rows; names are padded with 'x' to `name_width`.
@@ -1465,7 +1473,7 @@ TEST_CASE("extended tail order: package_id sorts before source, even when they d
 
 TEST_CASE("pkg_inventory packages adapter: real macOS capture", "[sync][parse][adapter]") {
     const auto r = parse_pkg_inventory_packages_output(
-        capture_section("pkg_inventory", "macos.txt", "packages"));
+        capture_section("pkg_inventory", "macos.txt", "packages"), kFailPolicy);
     REQUIRE(r.status == Status::ok);
     REQUIRE(r.entries.size() == 70);
     CHECK(r.entries[0].name == "actionlint");
@@ -1483,7 +1491,8 @@ TEST_CASE("pkg_inventory packages adapter maps casks to kind app", "[sync][parse
     const auto r = parse_pkg_inventory_packages_output(
         nl({supported_status("packages"),
             pkg::format_package_row("wget", "1.24", pkg::PackageKind::formula),
-            pkg::format_package_row("firefox", "130.0", pkg::PackageKind::cask)}));
+            pkg::format_package_row("firefox", "130.0", pkg::PackageKind::cask)}),
+        kFailPolicy);
     REQUIRE(r.status == Status::ok);
     REQUIRE(r.entries.size() == 2);
     CHECK(r.entries[0].kind == "pkg");
@@ -1492,7 +1501,7 @@ TEST_CASE("pkg_inventory packages adapter maps casks to kind app", "[sync][parse
 
 TEST_CASE("pkg_inventory managers adapter: one Homebrew presence row", "[sync][parse][adapter]") {
     const auto r = parse_pkg_inventory_managers_output(
-        capture_section("pkg_inventory", "macos.txt", "managers"));
+        capture_section("pkg_inventory", "macos.txt", "managers"), kKeepPolicy);
     REQUIRE(r.status == Status::ok);
     REQUIRE(r.entries.size() == 1);
     CHECK(r.entries[0].name == "homebrew");
@@ -1509,7 +1518,7 @@ TEST_CASE("pkg_inventory managers adapter: presence semantics and Homebrew-only"
     SECTION("two prefixes parse to two identical entries; the collector yields ONE record") {
         const std::string managers = nl({supported_status("managers"), hb_row("/opt/homebrew"),
                                          hb_row("/usr/local")});
-        const auto r = parse_pkg_inventory_managers_output(managers);
+        const auto r = parse_pkg_inventory_managers_output(managers, kKeepPolicy);
         REQUIRE(r.status == Status::ok);
         REQUIRE(r.entries.size() == 2);
         CHECK(r.entries[0].name == r.entries[1].name);
@@ -1529,15 +1538,18 @@ TEST_CASE("pkg_inventory managers adapter: presence semantics and Homebrew-only"
         const auto r = parse_pkg_inventory_managers_output(
             nl({supported_status("managers"),
                 pkg::format_manager_row(pkg::Manager::dpkg, pkg::Presence::present, "1.22", "/",
-                                        "-", "")}));
+                                        "-", "")}),
+            kKeepPolicy);
         CHECK(r.status == Status::ok);
         CHECK(r.entries.empty());
     }
     SECTION("an unavailable manager emits nothing") {
-        const auto r = parse_pkg_inventory_managers_output(nl(
-            {supported_status("managers"),
-             pkg::format_manager_row(pkg::Manager::homebrew, pkg::Presence::unavailable, "",
-                                     "/usr/local", "-", "macos:homebrew_cellar:permission_denied")}));
+        const auto r = parse_pkg_inventory_managers_output(
+            nl({supported_status("managers"),
+                pkg::format_manager_row(pkg::Manager::homebrew, pkg::Presence::unavailable, "",
+                                        "/usr/local", "-",
+                                        "macos:homebrew_cellar:permission_denied")}),
+            kKeepPolicy);
         CHECK(r.status == Status::ok);
         CHECK(r.entries.empty());
     }
@@ -1547,39 +1559,47 @@ TEST_CASE("pkg_inventory adapters: status grammar", "[sync][parse][adapter]") {
     const std::string good_row = pkg::format_package_row("wget", "1.24", pkg::PackageKind::formula);
 
     SECTION("no status row") {
-        CHECK(parse_pkg_inventory_packages_output(nl({good_row})).status == Status::failed);
+        CHECK(parse_pkg_inventory_packages_output(nl({good_row}), kFailPolicy).status ==
+              Status::failed);
     }
     SECTION("constrained carries the reason") {
         const auto r = parse_pkg_inventory_packages_output(
-            nl({pkg::format_status_row("packages", pkg::StatusLevel::constrained, "x"), good_row}));
+            nl({yuzu::shared::format_status_row("packages", yuzu::shared::StatusLevel::constrained,
+                                                "x"),
+                good_row}),
+            kFailPolicy);
         CHECK(r.status == Status::failed);
         CHECK(r.reason == "x");
     }
     SECTION("two status rows") {
         CHECK(parse_pkg_inventory_packages_output(
-                  nl({supported_status("packages"), supported_status("packages"), good_row}))
+                  nl({supported_status("packages"), supported_status("packages"), good_row}),
+                  kFailPolicy)
                   .status == Status::failed);
     }
     SECTION("an unknown level") {
         CHECK(parse_pkg_inventory_packages_output(
-                  nl({std::string("status|packages|") + "bogus" + "|-", good_row}))
+                  nl({std::string("status|packages|") + "bogus" + "|-", good_row}), kFailPolicy)
                   .status == Status::failed);
     }
     SECTION("a malformed data row is dropped; status decides") {
         const auto r = parse_pkg_inventory_packages_output(
-            nl({supported_status("packages"), good_row, "package|homebrew|onlythree"}));
+            nl({supported_status("packages"), good_row, "package|homebrew|onlythree"}),
+            kFailPolicy);
         REQUIRE(r.status == Status::ok);
         CHECK(r.entries.size() == 1);
     }
     SECTION("a status row for the other action is not accepted") {
-        CHECK(parse_pkg_inventory_packages_output(nl({supported_status("managers"), good_row}))
+        CHECK(parse_pkg_inventory_packages_output(nl({supported_status("managers"), good_row}),
+                                                  kFailPolicy)
                   .status == Status::failed);
-        CHECK(parse_pkg_inventory_managers_output(nl({supported_status("packages"), good_row}))
+        CHECK(parse_pkg_inventory_managers_output(nl({supported_status("packages"), good_row}),
+                                                  kKeepPolicy)
                   .status == Status::failed);
     }
     SECTION("empty input") {
-        CHECK(parse_pkg_inventory_packages_output("").status == Status::failed);
-        CHECK(parse_pkg_inventory_managers_output("").status == Status::failed);
+        CHECK(parse_pkg_inventory_packages_output("", kFailPolicy).status == Status::failed);
+        CHECK(parse_pkg_inventory_managers_output("", kKeepPolicy).status == Status::failed);
     }
 }
 
@@ -1587,17 +1607,17 @@ TEST_CASE("pkg_inventory adapters: the Linux sample (a toolchain container with 
           "[sync][parse][adapter]") {
     // managers: supported, with present dpkg/apt rows that map to nothing.
     const auto m = parse_pkg_inventory_managers_output(
-        capture_section("pkg_inventory", "linux.txt", "managers"));
+        capture_section("pkg_inventory", "linux.txt", "managers"), kKeepPolicy);
     CHECK(m.status == Status::ok);
     CHECK(m.entries.empty());
     // packages: unsupported by design (installed_apps owns the Linux roster).
     const auto p = parse_pkg_inventory_packages_output(
-        capture_section("pkg_inventory", "linux.txt", "packages"));
+        capture_section("pkg_inventory", "linux.txt", "packages"), kFailPolicy);
     CHECK(p.status == Status::unsupported);
     CHECK(p.entries.empty());
     // store_packages: supported, zero rows (the container has neither snapd nor flatpak).
     const auto s = parse_pkg_inventory_store_packages_output(
-        capture_section("pkg_inventory", "linux.txt", "store_packages"));
+        capture_section("pkg_inventory", "linux.txt", "store_packages"), kFailPolicy);
     CHECK(s.status == Status::ok);
     CHECK(s.entries.empty());
 }
@@ -1620,8 +1640,7 @@ std::string flatpak_store_row(std::string_view id, std::string_view kind, std::s
 TEST_CASE("pkg_inventory store_packages adapter: active rows map, the rest are seen but unmapped",
           "[sync][parse][adapter]") {
     const auto r = parse_pkg_inventory_store_packages_output(
-        nl({supported_status("store_packages"),
-            snap_store_row("btop", "1.4.7", "app", "1073"),
+        nl({supported_status("store_packages"), snap_store_row("btop", "1.4.7", "app", "1073"),
             snap_store_row("core24", "20260824", "base", "2124"),
             flatpak_store_row("org.gnome.Calculator", "app", kCalcCommit),
             flatpak_store_row("org.gnome.Platform", "runtime", kCalcCommit),
@@ -1631,8 +1650,8 @@ TEST_CASE("pkg_inventory store_packages adapter: active rows map, the rest are s
             snap_store_row("oldsnap", "1.0", "app", "1", pkg::StoreState::inactive),
             snap_store_row("mystery", "1.0", "app", "1", pkg::StoreState::unknown),
             // Not nine tokens, and an unknown store token: dropped.
-            "package|snap|short|1.0|app|1|-|active",
-            "package|apt|x|1.0|app|1|-|-|active"}));
+            "package|snap|short|1.0|app|1|-|active", "package|apt|x|1.0|app|1|-|-|active"}),
+        kFailPolicy);
     REQUIRE(r.status == Status::ok);
     REQUIRE(r.entries.size() == 5);
     CHECK(r.reason.empty());
@@ -1668,12 +1687,12 @@ TEST_CASE("pkg_inventory store_packages adapter: an over-wide row is dropped, ne
     const std::string good = snap_store_row("btop", "1.4.7", "app", "1073");
     for (const std::string extra : {"|x", "|x|y"}) {
         const auto r = parse_pkg_inventory_store_packages_output(
-            nl({supported_status("store_packages"), good + extra}));
+            nl({supported_status("store_packages"), good + extra}), kFailPolicy);
         CHECK(r.status == Status::ok);
         CHECK(r.entries.empty());
     }
     const auto ok = parse_pkg_inventory_store_packages_output(
-        nl({supported_status("store_packages"), good}));
+        nl({supported_status("store_packages"), good}), kFailPolicy);
     CHECK(ok.entries.size() == 1);
 }
 
@@ -1681,26 +1700,32 @@ TEST_CASE("pkg_inventory store_packages adapter: status grammar", "[sync][parse]
     const std::string row = snap_store_row("btop", "1.4.7", "app", "1073");
     SECTION("constrained fails (a partial roster would delete stored rows)") {
         const auto r = parse_pkg_inventory_store_packages_output(
-            nl({pkg::format_status_row("store_packages", pkg::StatusLevel::constrained,
-                                       "linux:flatpak_app:permission_denied"),
-                row}));
+            nl({yuzu::shared::format_status_row("store_packages",
+                                                yuzu::shared::StatusLevel::constrained,
+                                                "linux:flatpak_app:permission_denied"),
+                row}),
+            kFailPolicy);
         CHECK(r.status == Status::failed);
         CHECK(r.reason == "linux:flatpak_app:permission_denied");
     }
     SECTION("unsupported") {
         const auto r = parse_pkg_inventory_store_packages_output(
-            nl({pkg::unsupported_status_row("store_packages", "macos:owned_by_installed_apps")}));
+            nl({pkg::unsupported_status_row("store_packages", "macos:owned_by_installed_apps")}),
+            kFailPolicy);
         CHECK(r.status == Status::unsupported);
         CHECK(r.entries.empty());
     }
     SECTION("a status row for another action, no status row, empty input") {
-        CHECK(parse_pkg_inventory_store_packages_output(nl({supported_status("packages"), row}))
+        CHECK(parse_pkg_inventory_store_packages_output(nl({supported_status("packages"), row}),
+                                                        kFailPolicy)
                   .status == Status::failed);
-        CHECK(parse_pkg_inventory_store_packages_output(nl({row})).status == Status::failed);
-        CHECK(parse_pkg_inventory_store_packages_output("").status == Status::failed);
+        CHECK(parse_pkg_inventory_store_packages_output(nl({row}), kFailPolicy).status ==
+              Status::failed);
+        CHECK(parse_pkg_inventory_store_packages_output("", kFailPolicy).status == Status::failed);
     }
     SECTION("supported with zero rows is a legitimate answer") {
-        const auto r = parse_pkg_inventory_store_packages_output(nl({supported_status("store_packages")}));
+        const auto r = parse_pkg_inventory_store_packages_output(
+            nl({supported_status("store_packages")}), kFailPolicy);
         CHECK(r.status == Status::ok);
         CHECK(r.entries.empty());
     }
@@ -1713,23 +1738,27 @@ TEST_CASE("pkg_inventory managers adapter: a constrained answer that names a pre
     // installed_software entry. MUTATION: counting MAPPED entries (the old `entries.empty()`
     // rule) instead of present rows fails the first section and skips every Linux cycle.
     const std::string token = "linux:apt_sources_d:permission_denied";
-    const auto constrained = pkg::format_status_row("managers", pkg::StatusLevel::constrained, token);
+    const auto constrained =
+        yuzu::shared::format_status_row("managers", yuzu::shared::StatusLevel::constrained, token);
     SECTION("an unmapped present row: ok, zero entries, reason = the token") {
         const auto r = parse_pkg_inventory_managers_output(
             nl({constrained, pkg::format_manager_row(pkg::Manager::dpkg, pkg::Presence::present, "",
-                                                     "", "-", "")}));
+                                                     "", "-", "")}),
+            kKeepPolicy);
         CHECK(r.status == Status::ok);
         CHECK(r.entries.empty());
         CHECK(r.reason == token);
     }
     SECTION("zero data rows still fails") {
-        CHECK(parse_pkg_inventory_managers_output(nl({constrained})).status == Status::failed);
+        CHECK(parse_pkg_inventory_managers_output(nl({constrained}), kKeepPolicy).status ==
+              Status::failed);
     }
     SECTION("only an unavailable row still fails") {
         CHECK(parse_pkg_inventory_managers_output(
-                  nl({constrained, pkg::format_manager_row(pkg::Manager::homebrew,
-                                                           pkg::Presence::unavailable, "",
-                                                           "/usr/local", "-", token)}))
+                  nl({constrained,
+                      pkg::format_manager_row(pkg::Manager::homebrew, pkg::Presence::unavailable,
+                                              "", "/usr/local", "-", token)}),
+                  kKeepPolicy)
                   .status == Status::failed);
     }
 }
@@ -1765,8 +1794,8 @@ TEST_CASE("collector: Linux store_packages rows are collected, and a degraded ro
 
     // A constrained store_packages answer (an incomplete LIST) skips the cycle: nothing is deleted.
     g_fake[1].out["store_packages"] = nl(
-        {pkg::format_status_row("store_packages", pkg::StatusLevel::constrained,
-                                "linux:snapd_snaps:permission_denied"),
+        {yuzu::shared::format_status_row("store_packages", yuzu::shared::StatusLevel::constrained,
+                                         "linux:snapd_snaps:permission_denied"),
          snap_store_row("btop", "1.4.7", "app", "1073")});
     CHECK_FALSE(collect_with(all_plugins()).has_value());
 }
@@ -1834,7 +1863,8 @@ TEST_CASE("new adapters clamp every field like parse_installed_apps_output",
     SECTION("packages: 0x1F stripped from the name, version truncated") {
         const auto r = parse_pkg_inventory_packages_output(
             nl({supported_status("packages"),
-                std::string("package|homebrew|wg\037et|") + too_long + "|formula"}));
+                std::string("package|homebrew|wg\037et|") + too_long + "|formula"}),
+            kFailPolicy);
         REQUIRE(r.status == Status::ok);
         REQUIRE(r.entries.size() == 1);
         CHECK(r.entries[0].name == "wget");
@@ -1843,7 +1873,8 @@ TEST_CASE("new adapters clamp every field like parse_installed_apps_output",
     SECTION("managers: over-length version truncated") {
         const auto r = parse_pkg_inventory_managers_output(
             nl({supported_status("managers"),
-                "manager|homebrew|present|" + too_long + "|/opt/homebrew|-|-"}));
+                "manager|homebrew|present|" + too_long + "|/opt/homebrew|-|-"}),
+            kKeepPolicy);
         REQUIRE(r.status == Status::ok);
         REQUIRE(r.entries.size() == 1);
         CHECK(r.entries[0].version.size() == 1024);
@@ -1851,7 +1882,8 @@ TEST_CASE("new adapters clamp every field like parse_installed_apps_output",
     SECTION("msi: every field truncated, invalid UTF-8 in the name becomes U+FFFD") {
         const auto r = parse_msi_packages_list_inventory_output(
             nl({"status|list_inventory|supported|-",
-                "inv|" + too_long + "|Caf\xe9|" + too_long + "|" + too_long}));
+                "inv|" + too_long + "|Caf\xe9|" + too_long + "|" + too_long}),
+            kFailPolicy);
         REQUIRE(r.status == Status::ok);
         REQUIRE(r.entries.size() == 1);
         CHECK(r.entries[0].package_id.size() == 1024);
@@ -1912,7 +1944,7 @@ std::string msi_rendered_fixture(std::size_t* machine_rows = nullptr) {
 TEST_CASE("msi_packages adapter: maps the builder-rendered Kingsley capture",
           "[sync][parse][adapter][msi_packages]") {
     std::size_t n = 0;
-    const auto r = parse_msi_packages_list_inventory_output(msi_rendered_fixture(&n));
+    const auto r = parse_msi_packages_list_inventory_output(msi_rendered_fixture(&n), kFailPolicy);
     REQUIRE(r.status == Status::ok);
     REQUIRE(n == 118);
     REQUIRE(r.entries.size() == 118);
@@ -1953,7 +1985,7 @@ TEST_CASE("msi_packages adapter: a pipe-bearing product survives the producer/co
     std::string out;
     for (const auto& row : msi::render(inv))
         out += row + '\n';
-    const auto r = parse_msi_packages_list_inventory_output(out);
+    const auto r = parse_msi_packages_list_inventory_output(out, kFailPolicy);
     REQUIRE(r.status == Status::ok);
     REQUIRE(r.entries.size() == 1);
     CHECK(r.entries[0].name == "Foo  Bar Agent");
@@ -1963,7 +1995,7 @@ TEST_CASE("msi_packages adapter: a pipe-bearing product survives the producer/co
 
 TEST_CASE("msi_packages adapter: the real Windows sample", "[sync][parse][adapter][msi_packages]") {
     const auto r = parse_msi_packages_list_inventory_output(
-        capture_section("msi_packages", "windows.txt", "list_inventory"));
+        capture_section("msi_packages", "windows.txt", "list_inventory"), kFailPolicy);
     REQUIRE(r.status == Status::ok);
     REQUIRE_FALSE(r.entries.empty());
     for (const auto& e : r.entries) {
@@ -1983,32 +2015,35 @@ TEST_CASE("msi_packages adapter: status grammar", "[sync][parse][adapter][msi_pa
     };
     SECTION("constrained fails (a partial roster would delete stored msi rows)") {
         const auto r = parse_msi_packages_list_inventory_output(
-            nl({status("constrained", "windows:msi_enum:1610"), row}));
+            nl({status("constrained", "windows:msi_enum:1610"), row}), kFailPolicy);
         CHECK(r.status == Status::failed);
         CHECK(r.reason == "windows:msi_enum:1610");
     }
     SECTION("unsupported on macOS and Linux") {
         for (const char* token : {"macos:owned_by_installed_apps", "linux:no_msi"}) {
             const auto r = parse_msi_packages_list_inventory_output(
-                nl({status("unsupported", token)}));
+                nl({status("unsupported", token)}), kFailPolicy);
             CHECK(r.status == Status::unsupported);
             CHECK(r.entries.empty());
         }
     }
     SECTION("no status row, another action's status row, empty input") {
-        CHECK(parse_msi_packages_list_inventory_output(nl({row})).status == Status::failed);
-        CHECK(parse_msi_packages_list_inventory_output(nl({"status|packages|supported|-", row}))
+        CHECK(parse_msi_packages_list_inventory_output(nl({row}), kFailPolicy).status ==
+              Status::failed);
+        CHECK(parse_msi_packages_list_inventory_output(nl({"status|packages|supported|-", row}),
+                                                       kFailPolicy)
                   .status == Status::failed);
-        CHECK(parse_msi_packages_list_inventory_output("").status == Status::failed);
+        CHECK(parse_msi_packages_list_inventory_output("", kFailPolicy).status == Status::failed);
     }
     SECTION("supported with zero rows is a legitimate answer") {
-        const auto r = parse_msi_packages_list_inventory_output(nl({status("supported", "-")}));
+        const auto r =
+            parse_msi_packages_list_inventory_output(nl({status("supported", "-")}), kFailPolicy);
         CHECK(r.status == Status::ok);
         CHECK(r.entries.empty());
     }
     SECTION("two status rows fail") {
         CHECK(parse_msi_packages_list_inventory_output(
-                  nl({status("supported", "-"), status("supported", "-")}))
+                  nl({status("supported", "-"), status("supported", "-")}), kFailPolicy)
                   .status == Status::failed);
     }
 }
@@ -2019,26 +2054,29 @@ TEST_CASE("msi_packages adapter: row shape", "[sync][parse][adapter][msi_package
     SECTION("a 4-token and a 6-token inv row are dropped, never truncated or padded") {
         // MUTATION: split_tokens truncation to 5 would map the 6-token row.
         const auto r = parse_msi_packages_list_inventory_output(
-            nl({ok_status, "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0",
-                good + "|extra", good + "|extra|more"}));
+            nl({ok_status, "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0", good + "|extra",
+                good + "|extra|more"}),
+            kFailPolicy);
         CHECK(r.status == Status::ok);
         CHECK(r.entries.empty());
     }
     SECTION("an empty code is mapped with an empty package_id (the adapter invents no key)") {
-        const auto r = parse_msi_packages_list_inventory_output(nl({ok_status, "inv||name|1|pub"}));
+        const auto r = parse_msi_packages_list_inventory_output(nl({ok_status, "inv||name|1|pub"}),
+                                                                kFailPolicy);
         REQUIRE(r.entries.size() == 1);
         CHECK(r.entries[0].package_id.empty());
     }
     SECTION("an empty name is seen but not mapped") {
         const auto r = parse_msi_packages_list_inventory_output(
-            nl({ok_status, "inv|{AAAAAAAA-0000-0000-0000-000000000001}||1|pub"}));
+            nl({ok_status, "inv|{AAAAAAAA-0000-0000-0000-000000000001}||1|pub"}), kFailPolicy);
         CHECK(r.status == Status::ok);
         CHECK(r.entries.empty());
     }
     SECTION("legacy list rows and product_codes rows are ignored") {
         const auto r = parse_msi_packages_list_inventory_output(
             nl({ok_status, "msi|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0|-",
-                "product_code|{AAAAAAAA-0000-0000-0000-000000000001}|App", good}));
+                "product_code|{AAAAAAAA-0000-0000-0000-000000000001}|App", good}),
+            kFailPolicy);
         REQUIRE(r.entries.size() == 1);
         CHECK(r.entries[0].name == "App");
     }
@@ -2177,7 +2215,9 @@ TEST_CASE("collector: one failing action skips the whole cycle", "[sync][collect
     SECTION("pkg_inventory constrained") {
         fake_mac();
         g_fake[1].out["packages"] =
-            pkg::format_status_row("packages", pkg::StatusLevel::constrained, "macos:x") + "\n";
+            yuzu::shared::format_status_row("packages", yuzu::shared::StatusLevel::constrained,
+                                            "macos:x") +
+            "\n";
         CHECK_FALSE(collect_with(all_plugins()).has_value());
     }
     SECTION("windows_optional_features unavailable") {
@@ -2305,8 +2345,8 @@ TEST_CASE("entry cap: the splitter reads one past kMaxEntries and the collector 
 namespace {
 // Real emitters: a constrained managers status row carrying one present Homebrew row.
 std::string constrained_managers_with_present_row() {
-    return nl({pkg::format_status_row("managers", pkg::StatusLevel::constrained,
-                                      "macos:homebrew_taps:permission_denied"),
+    return nl({yuzu::shared::format_status_row("managers", yuzu::shared::StatusLevel::constrained,
+                                               "macos:homebrew_taps:permission_denied"),
                pkg::format_manager_row(pkg::Manager::homebrew, pkg::Presence::present, "",
                                        "/opt/homebrew", "-", "")});
 }
@@ -2328,12 +2368,12 @@ TEST_CASE("collector: constrained managers keeps a present row", "[sync][collect
     }
     SECTION("only an unavailable row: skipped") {
         fake_mac();
-        g_fake[1].out["managers"] = nl(
-            {pkg::format_status_row("managers", pkg::StatusLevel::constrained,
-                                    "macos:homebrew_taps:permission_denied"),
-             pkg::format_manager_row(pkg::Manager::homebrew, pkg::Presence::unavailable, "",
-                                     "/usr/local", "-",
-                                     "macos:homebrew_cellar:permission_denied")});
+        g_fake[1].out["managers"] =
+            nl({yuzu::shared::format_status_row("managers", yuzu::shared::StatusLevel::constrained,
+                                                "macos:homebrew_taps:permission_denied"),
+                pkg::format_manager_row(pkg::Manager::homebrew, pkg::Presence::unavailable, "",
+                                        "/usr/local", "-",
+                                        "macos:homebrew_cellar:permission_denied")});
         CHECK_FALSE(collect_with(all_plugins()).has_value());
     }
 }
@@ -2342,7 +2382,8 @@ TEST_CASE("pkg_inventory adapters: constrained managers with a present row is ok
           "its reason",
           "[sync][parse][adapter]") {
     const std::string token = "macos:homebrew_taps:permission_denied";
-    const auto m = parse_pkg_inventory_managers_output(constrained_managers_with_present_row());
+    const auto m =
+        parse_pkg_inventory_managers_output(constrained_managers_with_present_row(), kKeepPolicy);
     CHECK(m.status == AdaptedRows::Status::ok);
     CHECK(m.entries.size() == 1);
     CHECK(m.reason == token);
@@ -2467,10 +2508,9 @@ namespace {
 
 std::string show_entry(const SwEntry& e) {
     std::string s;
-    for (const std::string* f :
-         {&e.name, &e.version, &e.publisher, &e.install_date, &e.kind, &e.ecosystem, &e.epoch,
-          &e.release, &e.arch, &e.signature_status, &e.distro_id, &e.distro_version, &e.package_id,
-          &e.source}) {
+    for (const std::string* f : {&e.name, &e.version, &e.publisher, &e.install_date, &e.kind,
+                                 &e.ecosystem, &e.epoch, &e.release, &e.arch, &e.signature_status,
+                                 &e.distro_id, &e.distro_version, &e.package_id, &e.source}) {
         s += *f;
         s += ',';
     }
@@ -2489,9 +2529,10 @@ std::string show(const AdaptedRows& r) {
 
 // Expected-result builders (the entry text is built through show_entry, so a field the refactor
 // drops or reorders is a visible difference, not a silently shorter string).
-std::string res(std::string_view status, std::string_view reason, std::initializer_list<SwEntry> es = {}) {
-    std::string s = std::string(status) + "|reason=" + std::string(reason) +
-                    "|n=" + std::to_string(es.size());
+std::string res(std::string_view status, std::string_view reason,
+                std::initializer_list<SwEntry> es = {}) {
+    std::string s =
+        std::string(status) + "|reason=" + std::string(reason) + "|n=" + std::to_string(es.size());
     for (const auto& e : es)
         s += "|" + show_entry(e);
     return s;
@@ -2527,18 +2568,26 @@ std::string crlf(std::string s) {
 }
 
 // The four binders: the ONLY place the cells touch an adapter.
-AdaptedRows bind_managers(const std::string& s) { return parse_pkg_inventory_managers_output(s); }
-AdaptedRows bind_packages(const std::string& s) { return parse_pkg_inventory_packages_output(s); }
-AdaptedRows bind_store(const std::string& s) { return parse_pkg_inventory_store_packages_output(s); }
-AdaptedRows bind_msi(const std::string& s) { return parse_msi_packages_list_inventory_output(s); }
+AdaptedRows bind_managers(const std::string& s) {
+    return parse_pkg_inventory_managers_output(s, kKeepPolicy);
+}
+AdaptedRows bind_packages(const std::string& s) {
+    return parse_pkg_inventory_packages_output(s, kFailPolicy);
+}
+AdaptedRows bind_store(const std::string& s) {
+    return parse_pkg_inventory_store_packages_output(s, kFailPolicy);
+}
+AdaptedRows bind_msi(const std::string& s) {
+    return parse_msi_packages_list_inventory_output(s, kFailPolicy);
+}
 
 struct Grammar {
     std::string action;
     std::function<AdaptedRows(const std::string&)> bind;
-    std::string mapped;    // one row the adapter maps to exactly `entry`
+    std::string mapped; // one row the adapter maps to exactly `entry`
     SwEntry entry;
-    std::string unmapped;  // a row that is SEEN but maps to nothing
-    std::string notseen;   // a row of the wrong shape: neither seen nor mapped
+    std::string unmapped;        // a row that is SEEN but maps to nothing
+    std::string notseen;         // a row of the wrong shape: neither seen nor mapped
     bool keeps_constrained_rows; // managers: a constrained answer keeps its rows iff one was seen
 };
 
@@ -2546,7 +2595,9 @@ struct Grammar {
 void check_status_matrix(const Grammar& g) {
     INFO("action=" << g.action);
     const std::string other = g.action == "packages" ? "managers" : "packages";
-    const auto run = [&](std::initializer_list<std::string> lines) { return show(g.bind(nl(lines))); };
+    const auto run = [&](std::initializer_list<std::string> lines) {
+        return show(g.bind(nl(lines)));
+    };
     const auto ok1 = res("ok", "", {g.entry});
 
     // supported: reason stays empty at 4 fields and at 5+ (field 4 is parsed, not surfaced)
@@ -2614,8 +2665,8 @@ void check_status_matrix(const Grammar& g) {
     CHECK(run({st(g.action, "supported", "-"), g.unmapped, g.mapped}) == ok1);
     CHECK(run({st(g.action, "supported", "-"), "", "garbage", "|", "||||", g.mapped}) == ok1);
     // a ten-token status row for this action still counts as a status row (a second one: bad)
-    CHECK(run({st(g.action, "supported", "-"), "status|" + g.action + "|supported|-|-|-|-|-|-|-"}) ==
-          bad);
+    CHECK(run({st(g.action, "supported", "-"),
+               "status|" + g.action + "|supported|-|-|-|-|-|-|-"}) == bad);
 }
 
 } // namespace
@@ -2678,8 +2729,9 @@ TEST_CASE("characterisation: store_packages", "[sync][characterisation][adapter]
     };
     const std::string sup = st("store_packages", "supported", "-");
     SECTION("row mapping") {
-        CHECK(run({sup, "package|flatpak|org.x.App|-|app|abc|x86_64|stable|active"}) ==
-              res("ok", "", {entry_of("org.x.App", "", "", "app", "flatpak", "", "abc", "x86_64")}));
+        CHECK(
+            run({sup, "package|flatpak|org.x.App|-|app|abc|x86_64|stable|active"}) ==
+            res("ok", "", {entry_of("org.x.App", "", "", "app", "flatpak", "", "abc", "x86_64")}));
         // flatpak never carries a version, even when the row has one
         CHECK(run({sup, "package|flatpak|org.x.App|9.9|runtime|abc|-|stable|active"}) ==
               res("ok", "", {entry_of("org.x.App", "", "", "pkg", "flatpak", "", "abc", "")}));
@@ -2720,16 +2772,15 @@ TEST_CASE("characterisation: managers", "[sync][characterisation][adapter]") {
     const std::string sup = st("managers", "supported", "-");
     const std::string hb = "manager|homebrew|present|4.1|/opt/homebrew|-|-";
     SECTION("presence row fields") {
-        CHECK(run({sup, hb}) ==
-              res("ok", "", {entry_of("homebrew", "4.1", "", "app", "brew")}));
+        CHECK(run({sup, hb}) == res("ok", "", {entry_of("homebrew", "4.1", "", "app", "brew")}));
         CHECK(run({sup, hb, "manager|homebrew|present|-|/usr/local|-|-"}) ==
               res("ok", "",
                   {entry_of("homebrew", "4.1", "", "app", "brew"),
                    entry_of("homebrew", "", "", "app", "brew")}));
     }
     SECTION("a present non-homebrew manager is seen and dropped") {
-        for (const char* m : {"dpkg", "apt", "rpm", "dnf", "pacman", "apk", "snap", "flatpak",
-                              "something_new"}) {
+        for (const char* m :
+             {"dpkg", "apt", "rpm", "dnf", "pacman", "apk", "snap", "flatpak", "something_new"}) {
             const std::string row = std::string("manager|") + m + "|present|1.0|/|-|-";
             INFO(m);
             CHECK(run({sup, row}) == res("ok", ""));
@@ -2740,7 +2791,8 @@ TEST_CASE("characterisation: managers", "[sync][characterisation][adapter]") {
               res("ok", "tok", {entry_of("homebrew", "4.1", "", "app", "brew")}));
     }
     SECTION("an unavailable manager is neither seen nor mapped") {
-        const std::string un = "manager|homebrew|unavailable|-|/usr/local|-|macos:homebrew_cellar:permission_denied";
+        const std::string un =
+            "manager|homebrew|unavailable|-|/usr/local|-|macos:homebrew_cellar:permission_denied";
         CHECK(run({sup, un}) == res("ok", ""));
         CHECK(run({st("managers", "constrained", "tok"), un}) == res("failed", "tok"));
         CHECK(run({st("managers", "constrained", "tok"), un, "manager|snap|present|1|/|-|-"}) ==
@@ -2761,7 +2813,8 @@ TEST_CASE("characterisation: managers", "[sync][characterisation][adapter]") {
     }
 }
 
-TEST_CASE("characterisation: msi list_inventory", "[sync][characterisation][adapter][msi_packages]") {
+TEST_CASE("characterisation: msi list_inventory",
+          "[sync][characterisation][adapter][msi_packages]") {
     const std::string code = "{AAAAAAAA-0000-0000-0000-000000000001}";
     Grammar g{"list_inventory",
               bind_msi,
@@ -2799,7 +2852,8 @@ TEST_CASE("characterisation: msi list_inventory", "[sync][characterisation][adap
 // (merge-base 6468fc11d) and are the wire-contract proof of this refactor: the blob is hashed
 // byte-identically on agent and server (ADR-0016), so any movement here is a one-sided change.
 // Re-measure ONLY on a sample recapture, the same rule as the record counts above.
-TEST_CASE("characterisation: collector blob digests are byte-pinned", "[sync][characterisation][collector]") {
+TEST_CASE("characterisation: collector blob digests are byte-pinned",
+          "[sync][characterisation][collector]") {
     constexpr const char* kMac = "db0a9878010b71264fced3df9cb00e4703093e50cb59314d171a3227b929f2bf";
     constexpr const char* kWindows =
         "fe9619361232be03c99ea7e0dc4059c988344734d91d18cb24dc30ec0b1e61e5";
@@ -2836,7 +2890,8 @@ TEST_CASE("characterisation: collector blob digests are byte-pinned", "[sync][ch
     }
 }
 
-TEST_CASE("characterisation: collector skip reasons per status mix", "[sync][characterisation][collector]") {
+TEST_CASE("characterisation: collector skip reasons per status mix",
+          "[sync][characterisation][collector]") {
     struct Case {
         int fake;
         const char* plugin;
@@ -2850,7 +2905,9 @@ TEST_CASE("characterisation: collector skip reasons per status mix", "[sync][cha
     for (const auto& c : cases) {
         INFO(c.plugin << "." << c.action);
         const std::string source = std::string(c.plugin) + "." + c.action;
-        const auto setup = [&] { c.windows ? fake_windows() : fake_mac(); };
+        const auto setup = [&] {
+            c.windows ? fake_windows() : fake_mac();
+        };
         const auto skip_with = [&](const std::string& output) {
             setup();
             g_fake[c.fake].out[c.action] = output;
@@ -2871,7 +2928,8 @@ TEST_CASE("characterisation: collector skip reasons per status mix", "[sync][cha
               std::make_pair(false, source + ":bad status"));
         CHECK(skip_with(nl({st(a, "supported", "-"), st(a, "supported", "-")})) ==
               std::make_pair(false, source + ":bad status"));
-        CHECK(skip_with(nl({st(a, "wrong", "-")})) == std::make_pair(false, source + ":bad status"));
+        CHECK(skip_with(nl({st(a, "wrong", "-")})) ==
+              std::make_pair(false, source + ":bad status"));
         // unsupported is silently skipped (the cycle succeeds, nothing recorded as a skip)
         CHECK(skip_with(nl({st(a, "unsupported", "tok")})) == std::make_pair(true, std::string{}));
         // supported with zero rows is a legitimate answer
@@ -2879,18 +2937,63 @@ TEST_CASE("characterisation: collector skip reasons per status mix", "[sync][cha
     }
     SECTION("managers: a constrained answer with only a present, unmapped row keeps the cycle") {
         fake_mac();
-        g_fake[1].out["managers"] = nl({st("managers", "constrained", "tok"),
-                                        "manager|dpkg|present|1.0|/|-|-"});
+        g_fake[1].out["managers"] =
+            nl({st("managers", "constrained", "tok"), "manager|dpkg|present|1.0|/|-|-"});
         auto src = make_installed_software_source(all_plugins());
         CHECK(src.collect().has_value());
         CHECK(src.skip_reason().empty());
     }
     SECTION("managers: a constrained answer with only an unavailable row skips") {
         fake_mac();
-        g_fake[1].out["managers"] = nl({st("managers", "constrained", "tok"),
-                                        "manager|homebrew|unavailable|-|/|-|why"});
+        g_fake[1].out["managers"] =
+            nl({st("managers", "constrained", "tok"), "manager|homebrew|unavailable|-|/|-|why"});
         auto src = make_installed_software_source(all_plugins());
         CHECK_FALSE(src.collect().has_value());
         CHECK(src.skip_reason() == "pkg_inventory.managers:tok");
+    }
+}
+
+// The collector's manager -> ecosystem table (kManagerEcosystems), pinned through the adapters it
+// serves: every row reaches the wire with its ecosystem, and the three rows that must NOT map stay
+// unmapped. The published-value half (every emitted ecosystem is in the vocabulary) is
+// tests/test_software_vocabulary_consistency.py, which reads the table's `.ecosystem = "..."`.
+TEST_CASE("manager-ecosystem table: each row maps through its own action only",
+          "[sync][characterisation][adapter]") {
+    SECTION("homebrew -> brew, through packages and the managers presence row") {
+        CHECK(show(bind_packages(
+                  nl({st("packages", "supported", "-"), "package|homebrew|wget|1.24|formula"}))) ==
+              res("ok", "", {entry_of("wget", "1.24", "", "pkg", "brew")}));
+        CHECK(show(bind_managers(nl({st("managers", "supported", "-"),
+                                     "manager|homebrew|present|4.1|/opt/homebrew|-|-"}))) ==
+              res("ok", "", {entry_of("homebrew", "4.1", "", "app", "brew")}));
+    }
+    SECTION("snap -> snap and flatpak -> flatpak, through store_packages") {
+        CHECK(show(bind_store(nl({st("store_packages", "supported", "-"),
+                                  "package|snap|btop|1.4.7|app|1073|-|-|active"}))) ==
+              res("ok", "", {entry_of("btop", "1.4.7", "", "app", "snap", "", "1073")}));
+        CHECK(
+            show(bind_store(nl({st("store_packages", "supported", "-"),
+                                "package|flatpak|org.x.App|-|app|abc|x86_64|stable|active"}))) ==
+            res("ok", "", {entry_of("org.x.App", "", "", "app", "flatpak", "", "abc", "x86_64")}));
+    }
+    SECTION("a manager is never mapped through another manager's action") {
+        // snap inside `packages`: not even seen. homebrew inside `store_packages`: seen, unmapped.
+        CHECK(show(bind_packages(nl({st("packages", "supported", "-"),
+                                     "package|snap|x|1|formula"}))) == res("ok", ""));
+        CHECK(show(bind_store(nl({st("store_packages", "supported", "-"),
+                                  "package|homebrew|x|1|app|1|-|-|active"}))) == res("ok", ""));
+        // snap and flatpak have no presence row: dropped from `managers`
+        for (const char* m : {"snap", "flatpak"}) {
+            CHECK(show(bind_managers(nl({st("managers", "supported", "-"),
+                                         std::string("manager|") + m + "|present|1|/|-|-"}))) ==
+                  res("ok", ""));
+        }
+    }
+    SECTION("a dropped manager still counts as seen under a constrained managers answer") {
+        for (const char* m : {"snap", "flatpak", "dpkg"}) {
+            CHECK(show(bind_managers(nl({st("managers", "constrained", "tok"),
+                                         std::string("manager|") + m + "|present|1|/|-|-"}))) ==
+                  res("ok", "tok"));
+        }
     }
 }
