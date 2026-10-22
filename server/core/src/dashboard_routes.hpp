@@ -27,12 +27,12 @@
 #include "authz_gates.hpp" // yuzu::server::authz::FleetReadGate (#1712 / #3290 Phase 2)
 #include "authz_model.hpp" // yuzu::server::authz::VisibleSet (#1788 / CDX-R7-02)
 #include "command_capability.hpp" // PR6.0b: CommandCapability / ClassificationError — ClassifyFn's return type
+#include "forensics_visibility.hpp" // ForensicsVisibilityFn (#4990)
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
 
 namespace yuzu::server {
 
 // Forward declarations
-class ForensicsPluginSet;
 class ResponseStore;
 class ManagementGroupStore;
 class TagStore;
@@ -187,6 +187,13 @@ public:
     /// `ForensicsVisibilityFn` wiring lands.
     void set_forensics_plugin_set(const ForensicsPluginSet* plugins) { forensics_plugins_ = plugins; }
 
+    /// #4990 - the resolver behind the results fragments' Forensics tier (see
+    /// `forensics_visibility.hpp`); read live per request like `fleet_read_fn_`. Unset resolves to
+    /// present-empty at the use site.
+    void set_forensics_visibility_fn(ForensicsVisibilityFn fn) {
+        forensics_visibility_fn_ = std::move(fn);
+    }
+
     /// PR6.0b — classifies a `plugin.action` pair for the Destructive
     /// TARGETING gate on `POST /api/dashboard/execute`
     /// (`dispatch_destructive_gate.hpp`). Deliberately the SAME shape and the
@@ -282,6 +289,7 @@ private:
     AuditFn audit_fn_;
     ResponseStore* response_store_{nullptr};
     const ForensicsPluginSet* forensics_plugins_{nullptr}; // #4990 - see set_forensics_plugin_set
+    ForensicsVisibilityFn forensics_visibility_fn_;         // #4990 - see set_forensics_visibility_fn
     ManagementGroupStore* mgmt_group_store_{nullptr};
     detail::AgentRegistry* registry_{nullptr};
     TagStore* tag_store_{nullptr};

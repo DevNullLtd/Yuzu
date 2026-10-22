@@ -32,6 +32,7 @@
 #include "product_pack_store.hpp"
 #include "quarantine_store.hpp"
 #include "rbac_store.hpp"
+#include "forensics_visibility.hpp" // ForensicsVisibilityFn (#4990)
 #include "response_store.hpp"
 #include "result_set_store.hpp"
 #include "schedule_engine.hpp"
@@ -717,6 +718,13 @@ public:
     /// until their `ForensicsVisibilityFn` wiring lands.
     void set_forensics_plugin_set(const ForensicsPluginSet* plugins) { forensics_plugins_ = plugins; }
 
+    /// #4990 - the resolver behind the response routes' Forensics tier (see
+    /// `forensics_visibility.hpp`). Same timing contract as `set_forensics_plugin_set`: BEFORE
+    /// `register_routes()`. Unset resolves to present-empty at the use site.
+    void set_forensics_visibility_fn(ForensicsVisibilityFn fn) {
+        forensics_visibility_fn_ = std::move(fn);
+    }
+
     /// #4981 PR-2 — see `ScopeEvaluateFn`'s doc comment above. MUST be called
     /// BEFORE `register_routes()`, same timing contract as
     /// `set_engine_principal_store`. Unset (`{}`, the default) makes
@@ -827,6 +835,7 @@ private:
     EnginePrincipalStore* engine_principal_store_{nullptr};
     UserExistsFn user_exists_fn_;
     const ForensicsPluginSet* forensics_plugins_{nullptr}; // #4990 - see set_forensics_plugin_set
+    ForensicsVisibilityFn forensics_visibility_fn_;         // #4990 - see set_forensics_visibility_fn
     PasswordChangeDeps password_deps_;
     std::vector<std::string> csrf_trusted_origins_;
     ScopeEvaluateFn scope_evaluate_fn_;

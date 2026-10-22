@@ -4,6 +4,7 @@
 // and the derivation (what counts as a Forensics plugin).
 #include "capability_fragments.hpp"
 #include "forensics_plugin_set.hpp"
+#include "forensics_visibility.hpp"
 #include "response_store.hpp"
 #include "response_tier_filter.hpp"
 
@@ -261,4 +262,60 @@ TEST_CASE("ResponseStore reads require a tier filter (compile-time, see the stat
     // The assertions are static_asserts; this case exists so the file shows up in a test listing and
     // a build that compiled this translation unit has, by definition, passed them.
     SUCCEED("static_asserts hold");
+}
+
+// -- tier_filter_for: an unwired input resolves to the fail-closed answer ---------------------------
+
+TEST_CASE("tier_filter_for fails closed on unwired inputs",
+          "[server][responses][security][forensics]") {
+    httplib::Request req;
+    const auto set = make_set({"app_usage", "execution_artifacts"});
+
+    SECTION("no resolver wired: present-empty (every Forensics plugin excluded for every agent)") {
+        const auto f = tier_filter_for(req, ForensicsVisibilityFn{}, &set);
+        CHECK(f.restricts());
+        CHECK_FALSE(f.refuses_every_row());
+        CHECK(f.excluded_plugins() == set.names());
+        CHECK(f.exempt_agents().empty());
+    }
+    SECTION("no plugin set wired: every row is refused, never admitted") {
+        const auto f = tier_filter_for(
+            req, [](const httplib::Request&) { return authz::VisibleSet{}; }, nullptr);
+        CHECK(f.restricts());
+        CHECK(f.refuses_every_row());
+        // Even a resolver that would admit everything cannot make an unwired set permissive.
+        const auto g = tier_filter_for(req, ForensicsVisibilityFn{}, nullptr);
+        CHECK(g.refuses_every_row());
+    }
+    SECTION("the resolver's answer is applied, and consulted once per request") {
+        int calls = 0;
+        const ForensicsVisibilityFn global = [&](const httplib::Request&) {
+            ++calls;
+            return authz::VisibleSet{};
+        };
+        CHECK_FALSE(tier_filter_for(req, global, &set).restricts());
+        const ForensicsVisibilityFn subset = [&](const httplib::Request&) {
+            ++calls;
+            return authz::VisibleSet{std::unordered_set<std::string>{"agent-a"}};
+        };
+        const auto f = tier_filter_for(req, subset, &set);
+        CHECK(f.restricts());
+        CHECK(f.exempt_agents() == std::vector<std::string>{"agent-a"});
+        CHECK(calls == 2);
+    }
+}
+
+TEST_CASE("ResponseTierFilter::refuse_unwired and for_fixed_plugin_poll",
+          "[server][responses][security][forensics]") {
+    const auto set = make_set({"app_usage"});
+    CHECK(ResponseTierFilter::refuse_unwired().refuses_every_row());
+    CHECK(ResponseTierFilter::refuse_unwired().restricts());
+
+    // A poll of a fixed non-Forensics plugin excludes the Forensics plugins outright...
+    const auto poll = ResponseTierFilter::for_fixed_plugin_poll(&set);
+    CHECK(poll.restricts());
+    CHECK(poll.excluded_plugins() == set.names());
+    CHECK(poll.exempt_agents().empty());
+    // ...and an unwired harness (no set) simply has no clause: the plugin is fixed either way.
+    CHECK_FALSE(ResponseTierFilter::for_fixed_plugin_poll(nullptr).restricts());
 }

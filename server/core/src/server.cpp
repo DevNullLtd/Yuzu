@@ -15997,6 +15997,20 @@ private:
             if (!v) return std::set<std::string>{}; // degrade → fail-closed, never nullopt
             return std::set<std::string>(v->begin(), v->end());
         };
+        // #4990: who may read Forensics-plugin rows out of the response store. ONE production
+        // resolver, wired into every surface that reads stored responses (REST, MCP, dashboard,
+        // executions drawer, hardware poll). Deliberately NOT built like response_visible_set_fn
+        // above: that returns nullopt whenever RBAC is off, which is right for Response:Read and
+        // wrong here (a global Forensics:Read is the only thing that admits; with RBAC off it is
+        // floored to administrators). See forensics_visibility.hpp.
+        yuzu::server::ForensicsVisibilityFn forensics_visibility_fn =
+            [this](const httplib::Request& req) -> yuzu::server::authz::VisibleSet {
+            return yuzu::server::resolve_forensics_visible(
+                {.auth_routes = auth_routes_.get(),
+                 .rbac_store = rbac_store_.get(),
+                 .mgmt_store = mgmt_group_store_.get()},
+                req);
+        };
         // #4035 review fix's bespoke `dex_visible_fn` resolver (a global-Read
         // bypass + `RbacStore::visible_agents_for_permission` join) is
         // RETIRED (WS-A4 PR-1 fix round, sec-1/sec-2): this resolver's bare
@@ -16584,6 +16598,7 @@ private:
                              .audit_fn = audit_fn,
                              .store = response_store_.get(),
                              .forensics_plugins = forensics_plugins(),
+                             .forensics_visibility_fn = forensics_visibility_fn,
                              .metrics = &metrics_,
                          });
 
@@ -19380,6 +19395,7 @@ private:
                              .sync_perm_fn = perm_fn,
                              .sync_runner = software_sync_runner(),
                              .write_gate = WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins},
+                             .forensics_visibility_fn = forensics_visibility_fn,
                          });
 
         // DashboardSummaryRoutes — /fragments/dashboard/summary (readout, needs
@@ -19975,6 +19991,7 @@ private:
         // require_fleet_read as its sole gate.
         dashboard_routes_->set_fleet_read_fn(fleet_read_fn);
         dashboard_routes_->set_forensics_plugin_set(forensics_plugins()); // #4990
+        dashboard_routes_->set_forensics_visibility_fn(forensics_visibility_fn);
         // PR6.0b — the SAME capability_registry_ classifier /api/command and MCP
         // execute_instruction consult, so the three operator-facing dispatch
         // surfaces cannot disagree about whether a plugin.action is Destructive.
@@ -20161,6 +20178,7 @@ private:
         wf_deps.approval_manager = approval_manager_.get();
         wf_deps.response_store = response_store_.get();
         wf_deps.forensics_plugins = forensics_plugins(); // #4990
+        wf_deps.forensics_visibility_fn = forensics_visibility_fn;
         // PR 3 — SSE event bus for live execution updates. Server owns
         // the bus; ExecutionTracker publishes onto it; SSE handler
         // subscribes per-connection.
@@ -21134,6 +21152,7 @@ private:
         // #4990 - the Forensics plugin set feeding the response read tier; MUST run BEFORE
         // register_routes() (captured by value at registration), same timing as the setters above.
         rest_api_v1_->set_forensics_plugin_set(forensics_plugins());
+        rest_api_v1_->set_forensics_visibility_fn(forensics_visibility_fn);
         // #4983 — `POST /api/v1/result-sets`'s device_ids[] existence check.
         // registry_.all_ids() is presence-merged (HA WS-5), the SAME domain
         // scope_evaluate_fn's ScopePopulation::Fleet path above uses — NOT
@@ -21833,6 +21852,7 @@ private:
             // require_fleet_read call).
             mcp_server_->set_fleet_read_fn(fleet_read_fn);
             mcp_server_->set_forensics_plugin_set(forensics_plugins()); // #4990
+            mcp_server_->set_forensics_visibility_fn(forensics_visibility_fn);
             // Registry tools reach the REST provider closures through ToolDeps: the SAME
             // closure instances HardwareRoutes::Deps received above (roster, CI detail,
             // DEX score, quarantine list, fleet_read_fn gate, audit_fn), never a store

@@ -104,10 +104,21 @@ public:
         return plugins ? exclude(*plugins, authz::deny_all()) : ResponseTierFilter{Key{}};
     }
 
+    /// Fail-closed sink for a surface whose plugin set was never wired (impossible in production:
+    /// boot refuses without one). Without the set the Forensics rows cannot be told apart from the
+    /// rest, so EVERY row is refused rather than any being admitted.
+    [[nodiscard]] static ResponseTierFilter refuse_unwired() {
+        ResponseTierFilter f{Key{}};
+        f.refuse_all_ = true;
+        return f;
+    }
+
     // -- Accessors for response_store.cpp (the SQL builder); not a policy surface. -----------------
 
     /// True when a SQL clause is needed: the filter excludes plugins for at least some agents.
-    [[nodiscard]] bool restricts() const noexcept { return !excluded_.empty(); }
+    [[nodiscard]] bool restricts() const noexcept { return refuse_all_ || !excluded_.empty(); }
+    /// True for `refuse_unwired()`: the read matches no row at all (`AND 1=0`).
+    [[nodiscard]] bool refuses_every_row() const noexcept { return refuse_all_; }
     /// Lowercase plugin names to exclude (empty iff `!restricts()`).
     [[nodiscard]] const std::vector<std::string>& excluded_plugins() const noexcept { return excluded_; }
     /// Sorted agent ids whose Forensics rows are still readable; empty = none.
@@ -119,6 +130,7 @@ private:
 
     std::vector<std::string> excluded_;
     std::vector<std::string> exempt_agents_;
+    bool refuse_all_{false};
 };
 
 } // namespace yuzu::server

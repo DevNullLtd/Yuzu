@@ -817,6 +817,7 @@ void append_scope_clause(std::string& sql, std::vector<std::string>& binds, int&
 // rows the caller may not see). Bind parameters only. `col_prefix` qualifies the columns when the
 // predicate is evaluated against an aliased `responses` row (the facet EXISTS); "" otherwise.
 //   * unrestricted / global Forensics:Read -> nothing appended
+//   * refuse_unwired (no plugin set wired) -> AND 1=0
 //   * no per-agent exemption               -> AND lower(plugin) <> ALL($n::text[])
 //   * per-agent exemption                  -> AND (lower(plugin) <> ALL($n) OR agent_id = ANY($m))
 // `plugin` is stored as the agent sent it, so it is compared lowercased against the lowercase
@@ -825,6 +826,10 @@ void append_tier_clause(std::string& sql, std::vector<std::string>& binds, int& 
                         const ResponseTierFilter& tier, std::string_view col_prefix = {}) {
     if (!tier.restricts())
         return;
+    if (tier.refuses_every_row()) {
+        sql += " AND 1=0"; // unwired plugin set: no row is provably non-Forensics
+        return;
+    }
     const std::string plugin_col = std::string(col_prefix) + "plugin";
     const std::string agent_col = std::string(col_prefix) + "agent_id";
     const auto to_views = [](const std::vector<std::string>& v) {
@@ -848,6 +853,10 @@ void append_facet_tier_clause(std::string& sql, std::vector<std::string>& binds,
                               const ResponseTierFilter& tier) {
     if (!tier.restricts())
         return;
+    if (tier.refuses_every_row()) {
+        sql += " AND 1=0";
+        return;
+    }
     sql += " AND EXISTS (SELECT 1 FROM response_store.responses r WHERE r.id = f.response_id";
     append_tier_clause(sql, binds, idx, tier, "r.");
     sql += ")";

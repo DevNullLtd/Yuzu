@@ -24,6 +24,7 @@
 #include "command_capability.hpp"    // CommandCapability, ClassificationError
 #include "device_containment_render.hpp" // kContainmentUi
 #include "dex_routes.hpp"            // DexAgentResponse (ResponsesFn return type)
+#include "forensics_visibility.hpp"  // ForensicsVisibilityFn (#4990)
 #include "hardware_action_form.hpp"  // ActionFormSpec
 #include "hardware_list_model.hpp"
 #include "inventory_routes.hpp"      // InventoryDeviceRow / InventoryDevicesResult reuse
@@ -330,6 +331,9 @@ public:
         /// Same-site gate for the cookie-authorised sync POSTs (both the fleet and the
         /// per-device route). Unwired fails closed: a header-less request is refused.
         WriteGate write_gate;
+        /// #4990: who may read Forensics-plugin rows out of the response store (see
+        /// `forensics_visibility.hpp`). Unwired (empty) resolves to present-empty at the use site.
+        ForensicsVisibilityFn forensics_visibility_fn;
     };
 
     void register_routes(httplib::Server& svr, Deps deps);

@@ -13,6 +13,7 @@
 #include "custom_properties_store.hpp"
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
 #include "execution_tracker.hpp"
+#include "forensics_visibility.hpp" // ForensicsVisibilityFn (#4990)
 #include "instruction_param_schema.hpp" // ParamValidatorCache (Deps::param_validators)
 #include "instruction_store.hpp"
 #include "policy_store.hpp"
@@ -230,6 +231,9 @@ public:
         /// #4990: `ServerImpl::forensics_plugin_set_` (null in tests that predate the tier). Feeds
         /// the `ResponseTierFilter` the drawer's response reads take.
         const ForensicsPluginSet* forensics_plugins{nullptr};
+        /// #4990: who may read Forensics-plugin rows (see `forensics_visibility.hpp`). Unwired
+        /// (empty) resolves to present-empty at the use site.
+        ForensicsVisibilityFn forensics_visibility_fn;
         /// PR 3 — per-execution SSE event bus for `/sse/executions/{id}`.
         /// When non-null, `ExecutionTracker` publishers (update_agent_status,
         /// refresh_counts, mark_cancelled) emit transitions onto this bus

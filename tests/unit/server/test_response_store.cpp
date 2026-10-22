@@ -3618,3 +3618,59 @@ TEST_CASE("ResponseStore tier: plugin names and agent ids are bound, never inter
     CHECK(rows->size() == 6);
     CHECK(store.total_count(f) == 6);
 }
+
+TEST_CASE("ResponseStore tier: a filter with no plugin set wired refuses every row on every read",
+          "[pg][response_store][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    seed_tier_matrix(store);
+    const auto f = ResponseTierFilter::refuse_unwired();
+    const std::vector<FacetFilter> ctl{{.col_idx = 0, .value = "ctl"}};
+
+    // Control: the same store is not simply empty.
+    REQUIRE(store.total_count(kAllRows) == 6);
+
+    auto rows = store.query(kTierInstr, f);
+    REQUIRE(rows.has_value());
+    CHECK(rows->empty());
+    auto by_exec = store.query_by_execution(kTierExec, f);
+    REQUIRE(by_exec.has_value());
+    CHECK(by_exec->empty());
+    ResponseQuery q;
+    q.limit = 100;
+    auto bounded = store.query_bounded(kTierInstr, f, q, std::nullopt, 1u << 20);
+    REQUIRE(bounded.has_value());
+    CHECK(bounded->rows.empty());
+    CHECK_FALSE(bounded->row_cap_hit);
+    AggregationQuery aq;
+    aq.group_by = "agent_id";
+    auto agg = store.aggregate(kTierInstr, f, aq);
+    REQUIRE(agg.has_value());
+    CHECK(agg->empty());
+    auto agents = store.distinct_agent_ids(kTierInstr, f);
+    REQUIRE(agents.has_value());
+    CHECK(agents->empty());
+    CHECK(store.total_count(f) == 0);
+    auto fv = store.facet_values(kTierInstr, f, 0);
+    REQUIRE(fv.has_value());
+    CHECK(fv->empty());
+    auto fa = store.facet_agent_ids(kTierInstr, f, ctl);
+    REQUIRE(fa.has_value());
+    CHECK(fa->empty());
+    auto fc = store.facet_agent_count(kTierInstr, f, ctl);
+    REQUIRE(fc.has_value());
+    CHECK(*fc == 0);
+    auto fr = store.facet_response_ids(kTierInstr, f, ctl);
+    REQUIRE(fr.has_value());
+    CHECK(fr->empty());
+    auto all = store.query(kTierInstr, kAllRows);
+    REQUIRE(all.has_value());
+    std::vector<int64_t> ids;
+    for (const auto& r : *all)
+        ids.push_back(r.id);
+    auto by_ids = store.query_by_ids(ids, f);
+    REQUIRE(by_ids.has_value());
+    CHECK(by_ids->empty());
+}

@@ -60,6 +60,7 @@
 #include "policy_store.hpp"
 #include "quarantine_store.hpp"
 #include "rbac_store.hpp"
+#include "forensics_visibility.hpp" // ForensicsVisibilityFn (#4990)
 #include "response_store.hpp"
 #include "result_set_model.hpp" // #2146 Batch B2: ResultSetStore (fwd-declared only otherwise) + shared JSON builder
 #include "schedule_api.hpp" // ADR-0031 WS-A4 (seventh family): the public in-process schedule-read API seam
@@ -611,6 +612,13 @@ public:
     /// test harness) leaves the pre-tier behaviour for the response tools until their
     /// `ForensicsVisibilityFn` wiring lands.
     void set_forensics_plugin_set(const ForensicsPluginSet* plugins) { forensics_plugins_ = plugins; }
+
+    /// #4990 - the resolver behind the response tools' Forensics tier (see
+    /// `forensics_visibility.hpp`); read live per request like `fleet_read_fn_`. Unset resolves to
+    /// present-empty at the use site.
+    void set_forensics_visibility_fn(ForensicsVisibilityFn fn) {
+        forensics_visibility_fn_ = std::move(fn);
+    }
 
     /// The provider closures a registry tool handler may reach (mcp_tool_deps.hpp),
     /// passed to every registry handler as `ctx.deps`. The SAME closure instances
@@ -1267,6 +1275,7 @@ private:
     // #3290 Phase 2 — see set_fleet_read_fn above.
     FleetReadFn fleet_read_fn_;
     const ForensicsPluginSet* forensics_plugins_{nullptr}; // #4990 - see set_forensics_plugin_set
+    ForensicsVisibilityFn forensics_visibility_fn_;         // #4990 - see set_forensics_visibility_fn
     // See set_tool_deps above; `&tool_deps_` is ToolCallContext::deps.
     ToolDeps tool_deps_;
     // #4037 — see set_list_read_fn above.

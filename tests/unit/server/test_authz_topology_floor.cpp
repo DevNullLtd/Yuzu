@@ -23,9 +23,13 @@
 #include "audit_store.hpp"
 #include "dashboard_api_routes.hpp"
 #include "engine_principal_store.hpp"
+#include "forensics_visibility.hpp"
+#include "management_group_store.hpp"
 #include "oidc_provider.hpp"
 #include "rbac_store.hpp"
 #include "rest_api_v1.hpp"
+#include "test_api_token_pg_helper.hpp" // ApiTokenStorePg
+#include "test_mgmt_group_pg_helper.hpp" // ManagementGroupStorePg
 #include "test_rbac_store_pg_helper.hpp" // PG-backed RbacStore (ADR-0041)
 #include "test_route_sink.hpp"
 
@@ -51,6 +55,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -1040,4 +1045,243 @@ TEST_CASE("AuditLog:Read floor: a non-admin is refused 403 on filtered and malfo
         CHECK(res->status == 403);
     }
     CHECK(floored.value() == static_cast<double>(queries.size()));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #4990: the production Forensics-visibility resolver (forensics_visibility.hpp).
+//
+// These drive the REAL `resolve_forensics_visible` over a real AuthRoutes, a real PG RbacStore, a real
+// ManagementGroupStore and real API-token / engine-principal sessions, so a regression in which
+// gate family decides the global proof (the floored `has_permission`, never an fleet-read gate that
+// admits everyone while RBAC is off) fails here. A stub function that records calls proves nothing.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+yuzu::test::PgTestTemplate forensics_vis_engine_tpl{
+    "epforensicsvis", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        EnginePrincipalStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("forensicsvis template: engine principal store failed to migrate");
+    }};
+
+std::int64_t forensics_vis_now() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+bool is_present_empty(const authz::VisibleSet& v) { return v.has_value() && v->empty(); }
+
+struct ForensicsVisRig {
+    yuzu::test::RbacStorePg rbac_bundle;
+    RbacStore& rbac = *rbac_bundle;
+    yuzu::test::ManagementGroupStorePg mgmt_bundle;
+    ManagementGroupStore& mgmt = *mgmt_bundle;
+    yuzu::test::ApiTokenStorePg api_tokens;
+    yuzu::test::PostgresTestDb engine_db{forensics_vis_engine_tpl};
+    std::optional<yuzu::server::pg::PgPool> engine_pool;
+    std::unique_ptr<EnginePrincipalStore> engines;
+    Config cfg{};
+    yuzu::MetricsRegistry metrics;
+    auth::AuthManager auth_mgr{};
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
+    std::unique_ptr<AuthRoutes> ar;
+    std::string group_id; // management group G = {agent-1, agent-2}
+
+    ForensicsVisRig() {
+        REQUIRE(rbac.is_open());
+        INFO("[ForensicsVisRig] engine db status (blank == ok): " << engine_db.error());
+        REQUIRE(engine_db.available());
+        engine_pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = engine_db.dsn(), .size = 2});
+        engines = std::make_unique<EnginePrincipalStore>(*engine_pool);
+        REQUIRE(engines->is_open());
+        auth_mgr.set_metrics_registry(&metrics);
+        ar = std::make_unique<AuthRoutes>(cfg, auth_mgr, &rbac, api_tokens.get(),
+                                          /*audit_store=*/nullptr, &mgmt, /*tag_store=*/nullptr,
+                                          /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
+        ar->set_engine_principal_store(engines.get());
+        api_tokens->set_engine_referent_check(
+            [this](const std::string& id) { return engines->get_for_auth(id).status; });
+
+        // A custom role holding Forensics:Read, granted on one management group below.
+        REQUIRE(rbac.create_role({"ForensicsScoped", "", false, 0}).has_value());
+        REQUIRE(rbac.set_permission({"ForensicsScoped", "Forensics", "Read", "allow"}).has_value());
+        ManagementGroup g;
+        g.name = "G";
+        g.membership_type = "static";
+        auto id = mgmt.create_group(g);
+        REQUIRE(id.has_value());
+        group_id = *id;
+        REQUIRE(mgmt.add_member(group_id, "agent-1").has_value());
+        REQUIRE(mgmt.add_member(group_id, "agent-2").has_value());
+    }
+
+    ForensicsVisibilityDeps deps() {
+        return {.auth_routes = ar.get(), .rbac_store = &rbac, .mgmt_store = &mgmt};
+    }
+
+    httplib::Request cookie_request(const std::string& username, auth::Role role) {
+        REQUIRE(auth_mgr.upsert_user(username, "password1234", role));
+        auto token = auth_mgr.create_local_session_for_test(username, role, /*mfa_verified=*/true);
+        httplib::Request req;
+        req.headers.emplace("Cookie", "yuzu_session=" + token);
+        return req;
+    }
+
+    httplib::Request bearer_request(const std::string& raw) {
+        httplib::Request req;
+        req.headers.emplace("Authorization", "Bearer " + raw);
+        return req;
+    }
+};
+
+} // namespace
+
+TEST_CASE("forensics visibility: RBAC off - an ordinary user sees no Forensics row, an admin sees all",
+          "[pg][auth_routes][authz_topology_floor][forensics]") {
+    ForensicsVisRig rig;
+    rig.rbac.set_rbac_enabled(false);
+
+    // The legacy fallback admits every Read to any authenticated session; the topology floor is what
+    // keeps Forensics:Read admin-only. A resolver built on a fleet-read gate would return nullopt here.
+    auto viewer = rig.cookie_request("viewer1", auth::Role::user);
+    CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), viewer)));
+
+    auto admin = rig.cookie_request("admin1", auth::Role::admin);
+    CHECK_FALSE(resolve_forensics_visible(rig.deps(), admin).has_value()); // nullopt = global
+}
+
+TEST_CASE("forensics visibility: RBAC on - Viewer none, Administrator and JIT elevation global",
+          "[pg][auth_routes][authz_topology_floor][forensics]") {
+    ForensicsVisRig rig;
+    rig.rbac.set_rbac_enabled(true);
+
+    auto viewer = rig.cookie_request("viewer2", auth::Role::user);
+    REQUIRE(rig.rbac.assign_role({"user", "viewer2", "Viewer"}).has_value());
+    // Viewer holds Response:Read (the point of the bug) but no Forensics grant.
+    CHECK(rig.rbac.check_permission("viewer2", "Response", "Read"));
+    CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), viewer)));
+
+    auto admin = rig.cookie_request("admin2", auth::Role::admin);
+    REQUIRE(rig.rbac.assign_role({"user", "admin2", "Administrator"}).has_value());
+    CHECK_FALSE(resolve_forensics_visible(rig.deps(), admin).has_value());
+
+    // JIT elevation is a full-admin window (require_permission short-circuits on it).
+    REQUIRE(rig.auth_mgr.upsert_user("elev1", "password1234", auth::Role::user));
+    auto token = rig.auth_mgr.create_local_session_for_test("elev1", auth::Role::user, true);
+    REQUIRE(rig.auth_mgr.elevate_session(token, std::chrono::seconds(300)).has_value());
+    httplib::Request elevated;
+    elevated.headers.emplace("Cookie", "yuzu_session=" + token);
+    CHECK_FALSE(resolve_forensics_visible(rig.deps(), elevated).has_value());
+}
+
+TEST_CASE("forensics visibility: RBAC on - a group-scoped Forensics:Read grant resolves to that group's agents",
+          "[pg][auth_routes][authz_topology_floor][forensics]") {
+    ForensicsVisRig rig;
+    rig.rbac.set_rbac_enabled(true);
+
+    auto scoped = rig.cookie_request("scoped1", auth::Role::user);
+    REQUIRE(rig.mgmt.assign_role({rig.group_id, "user", "scoped1", "ForensicsScoped"}).has_value());
+    // Not a global grant, so the global probe says no and the resolver composes the scoped set.
+    CHECK_FALSE(rig.rbac.check_permission("scoped1", "Forensics", "Read"));
+    auto v = resolve_forensics_visible(rig.deps(), scoped);
+    REQUIRE(v.has_value());
+    CHECK(*v == std::unordered_set<std::string>{"agent-1", "agent-2"});
+
+    // A user with no grant on the group gets nothing (present-empty), not the group's agents.
+    auto other = rig.cookie_request("scoped2", auth::Role::user);
+    CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), other)));
+
+    // The same grant with enforcement OFF is not honoured (no scoped grants exist in that world).
+    rig.rbac.set_rbac_enabled(false);
+    CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), scoped)));
+}
+
+TEST_CASE("forensics visibility: a service-scoped token never inherits its minter's Forensics authority",
+          "[pg][auth_routes][authz_topology_floor][forensics][service_scope]") {
+    ForensicsVisRig rig;
+    rig.rbac.set_rbac_enabled(true);
+    REQUIRE(rig.auth_mgr.upsert_user("minter", "password1234", auth::Role::admin));
+    // The minter holds BOTH a global Administrator grant and a scoped Forensics grant...
+    REQUIRE(rig.rbac.assign_role({"user", "minter", "Administrator"}).has_value());
+    REQUIRE(rig.mgmt.assign_role({rig.group_id, "user", "minter", "ForensicsScoped"}).has_value());
+    auto minter_cookie = rig.cookie_request("minter", auth::Role::admin);
+    CHECK_FALSE(resolve_forensics_visible(rig.deps(), minter_cookie).has_value()); // sanity: global
+
+    // ...yet a token it mints scoped to a service carries neither.
+    auto raw = rig.api_tokens->create_token("svc", "minter", forensics_vis_now() + 3600, "billing");
+    REQUIRE(raw.has_value());
+    auto svc = rig.bearer_request(*raw);
+    CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), svc)));
+
+    // A plain (non-service) token of the same user keeps the user's global authority.
+    auto plain = rig.api_tokens->create_token("plain", "minter", forensics_vis_now() + 3600);
+    REQUIRE(plain.has_value());
+    auto plain_req = rig.bearer_request(*plain);
+    CHECK_FALSE(resolve_forensics_visible(rig.deps(), plain_req).has_value());
+}
+
+TEST_CASE("forensics visibility: an engine principal without a grant sees nothing",
+          "[pg][auth_routes][authz_topology_floor][forensics][engine_principal]") {
+    ForensicsVisRig rig;
+    rig.rbac.set_rbac_enabled(true);
+    REQUIRE(rig.auth_mgr.upsert_user("owner1", "password1234", auth::Role::admin));
+    REQUIRE(rig.engines->create("Vuln Sync", "owner1", "forensics visibility test", "internal",
+                                "admin", "engine:vuln")
+                .has_value());
+    auto raw = rig.api_tokens->create_token("engine-token", "engine:vuln",
+                                            forensics_vis_now() + 3600, "", "readonly", "engine");
+    REQUIRE(raw.has_value());
+    auto req = rig.bearer_request(*raw);
+    // Prove this really is an engine session, so the assertion below is not a "no session" pass.
+    auto session = rig.ar->resolve_session(req);
+    REQUIRE(session.has_value());
+    REQUIRE(session->is_engine());
+    CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), req)));
+
+    // RBAC off: an engine principal has no legacy authority either.
+    rig.rbac.set_rbac_enabled(false);
+    CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), req)));
+}
+
+TEST_CASE("forensics visibility: every degraded or unwired input resolves to present-empty, never nullopt",
+          "[pg][auth_routes][authz_topology_floor][forensics]") {
+    ForensicsVisRig rig;
+    rig.rbac.set_rbac_enabled(true);
+    auto scoped = rig.cookie_request("scoped3", auth::Role::user);
+    REQUIRE(rig.mgmt.assign_role({rig.group_id, "user", "scoped3", "ForensicsScoped"}).has_value());
+    REQUIRE(resolve_forensics_visible(rig.deps(), scoped).has_value()); // healthy baseline: a subset
+
+    SECTION("management-group store unreachable") {
+        yuzu::server::pg::PgPool bad_pool{
+            {.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+        ManagementGroupStore bad_mgmt(bad_pool);
+        REQUIRE_FALSE(bad_mgmt.is_open());
+        ForensicsVisibilityDeps d = rig.deps();
+        d.mgmt_store = &bad_mgmt;
+        CHECK(is_present_empty(resolve_forensics_visible(d, scoped)));
+    }
+    SECTION("management-group store not wired") {
+        ForensicsVisibilityDeps d = rig.deps();
+        d.mgmt_store = nullptr;
+        CHECK(is_present_empty(resolve_forensics_visible(d, scoped)));
+    }
+    SECTION("rbac store not wired") {
+        ForensicsVisibilityDeps d = rig.deps();
+        d.rbac_store = nullptr;
+        CHECK(is_present_empty(resolve_forensics_visible(d, scoped)));
+    }
+    SECTION("auth routes not wired") {
+        ForensicsVisibilityDeps d = rig.deps();
+        d.auth_routes = nullptr;
+        auto admin = rig.cookie_request("admin3", auth::Role::admin);
+        CHECK(is_present_empty(resolve_forensics_visible(d, admin)));
+    }
+    SECTION("an unauthenticated request") {
+        httplib::Request anonymous;
+        CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), anonymous)));
+    }
 }

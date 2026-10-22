@@ -642,6 +642,7 @@ yuzu_server_core_lib = static_library(
     'src/ota_signature_sidecar.cpp',
     'src/update_registry.cpp',
     'src/response_store.cpp',
+    'src/forensics_visibility.cpp', # #4990: ForensicsVisibilityFn + the production resolver
     'src/response_routes.cpp',
     'src/response_query_model.cpp', # #2146 A2-R2: shared REST v1 + MCP builder for the
                                      # instruction/command-ID-keyed response query/aggregate/export surface
