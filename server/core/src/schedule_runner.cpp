@@ -14,6 +14,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <chrono>
 #include <tuple>
 
@@ -21,23 +22,20 @@ namespace yuzu::server {
 
 namespace {
 
+// The outbox occurrence key and the `consumed_by` evidence of the tickets that settle it:
+// ONE definition so the two can never drift.
+std::string occurrence_key(const InstructionSchedule& s) {
+    return s.id + ":" + std::to_string(s.next_execution_at);
+}
+
+// The audit row's timestamp is the ONE process-clock read in this file. No approval
+// decision depends on a clock any more (#6096): a ticket is eligible while its
+// `consumed_at` is 0 and is retired by a guarded database transition after it settles an
+// occurrence (ApprovalManager::retire_schedule_tickets).
 int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
-}
-
-// Tickets submitted before this occurrence became the current one are stale:
-// a rejected ticket from a PREVIOUS occurrence must not skip this one, and a
-// long-spent approved ticket must not fire it. Once a schedule has advanced,
-// only tickets submitted STRICTLY after the advance count — that strictness
-// is the one-approval == one-run guarantee (advance stamps
-// last_executed_at, retiring the ticket that settled the occurrence, even
-// within the same second). A never-advanced schedule accepts any ticket
-// since its creation (`>=` — create and submit can share a second).
-bool ticket_is_current(const Approval& a, const InstructionSchedule& s) {
-    return s.last_executed_at > 0 ? a.submitted_at > s.last_executed_at
-                                  : a.submitted_at >= s.created_at;
 }
 
 } // namespace
@@ -189,9 +187,9 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
     // classify`'s own independent-field shape eliminates that class.
 
     // 1) An APPROVED ticket for THIS schedule's occurrence, for THIS exact
-    //    target → fire. The caller advances the schedule on our true return,
-    //    which retires the ticket via the occurrence anchor (see
-    //    ticket_is_current) — approve == at most one scheduled run. Single
+    //    target → fire, then retire the observed tickets (consumed_at, database time)
+    //    before returning true so the caller advances; approve == at most one scheduled
+    //    run, by state and not by comparing clocks (#6096). Single
     //    tick thread, so no concurrent-fire race. Matching on
     //    a.schedule_id == s.id (M-02, #1806) is required, not just
     //    belt-and-suspenders: without it, two schedules sharing (creator,
@@ -213,15 +211,59 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
     // is not new information (step 2 below already suppresses the
     // resubmission that would otherwise duplicate-ask).
     std::string mismatch_audit_detail;
+
+    // The approved tickets of THIS schedule this tick OBSERVED unsettled, whatever happens to
+    // them below (matched, mismatch-skipped, expired-unswept, outbox-spent). The retire is
+    // scoped to exactly these ids (#6096), so a ticket approved after this snapshot, or a
+    // successor occurrence's ticket, is never settled by this occurrence.
+    std::vector<std::string> observed;
+    // The subset of `observed` the outbox ledger shows was already used by an earlier
+    // occurrence. They are settled directly (below) rather than left to linger.
+    std::vector<std::string> spent_ids;
+
     auto approved = d_.approval_manager->query({.status = "approved", .submitted_by = s.created_by});
+    // Collected over the WHOLE snapshot before any ticket is acted on: the loop below fires
+    // (and settles) the first eligible ticket it meets, which may come before an older
+    // mismatch-skipped or outbox-spent one in list order.
+    for (const auto& a : approved)
+        if (a.schedule_id == s.id && a.consumed_at == 0)
+            observed.push_back(a.id);
     for (const auto& a : approved) {
+        // Eligible = THIS schedule's, unspent (consumed_at == 0), for the same definition
+        // and scope. A retired ticket is skipped silently: that is the normal state of
+        // every earlier occurrence's ticket.
         if (a.definition_id != s.definition_id || a.scope_expression != s.scope_expression ||
-            a.schedule_id != s.id || !ticket_is_current(a, s))
+            a.schedule_id != s.id || a.consumed_at != 0)
             continue;
+        // SPENT-TICKET LEDGER (#6096): `consumed_at` is a state this runner writes AFTER the
+        // enqueue, so it can lag the truth (an old-binary leader fired the ticket without
+        // settling it, or a skip-advance passed over a failed retire). The outbox row carries
+        // the approval id and is written with the occurrence, so it cannot lag: a ticket that
+        // already has a row for a DIFFERENT occurrence was used, whatever consumed_at says.
+        // Only a row for THIS occurrence is the legitimate retry (enqueue -> AlreadyEnqueued,
+        // retire, advance). A store error HOLDS: an unreadable ledger is not an empty one.
+        const auto spent = outbox_occurrences_for(a.id);
+        if (!spent) {
+            count("yuzu_schedule_fire_failures_total");
+            spdlog::warn("schedule_runner: schedule '{}' (id={}) approval {} outbox ledger could "
+                         "not be read ({}); holding the occurrence",
+                         s.name, s.id, a.id, spent.error());
+            return false;
+        }
+        const std::string key = occurrence_key(s);
+        const bool spent_earlier = std::any_of(spent->begin(), spent->end(),
+                                               [&](const std::string& o) { return o != key; });
+        if (spent_earlier) {
+            spdlog::info("schedule_runner: schedule '{}' (id={}) approval {} was already used by "
+                         "an earlier occurrence; settling it, not firing it",
+                         s.name, s.id, a.id);
+            spent_ids.push_back(a.id);
+            continue;
+        }
         // LIFETIME (#6061, governance SG-2): an approved ticket is a live one-time
         // capability and dies at the same moment consume_ticket() would refuse it. This
-        // path never calls consume_ticket (it retires the ticket by advancing the
-        // schedule), so without this check an approved ticket older than the TTL still
+        // path never calls consume_ticket (it settles the ticket itself, below), so
+        // without this check an approved ticket older than the TTL still
         // fired unattended as the schedule's creator, fleet-wide. Same predicate, same
         // (database) clock: ApprovalManager::ticket_is_live. An expired ticket falls
         // through to step 4 and a fresh ask is raised. A store failure INSIDE this call
@@ -234,20 +276,20 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
         const auto live = d_.approval_manager->ticket_is_live(a.id);
         if (!live) {
             spdlog::warn("schedule_runner: schedule '{}' (id={}) approval {} liveness could not "
-                         "be read ({}) — holding the occurrence",
+                         "be read ({}); holding the occurrence",
                          s.name, s.id, a.id, live.error());
             return false;
         }
         if (!*live) {
             spdlog::info("schedule_runner: schedule '{}' (id={}) approval {} is past its "
-                         "lifetime — not firing; a fresh ticket will be requested",
+                         "lifetime; not firing, a fresh ticket will be requested",
                          s.name, s.id, a.id);
             continue;
         }
         if (a.target_plugin != plugin || a.target_action != action) {
             spdlog::warn("schedule_runner: schedule '{}' (id={}) approval {} no longer matches "
-                         "the definition's CURRENT target ({}.{} != approved {}.{}) — refusing "
-                         "to redeem stale review; a fresh ticket will be requested",
+                         "the definition's CURRENT target ({}.{} != approved {}.{}); refusing "
+                         "to redeem stale review, a fresh ticket will be requested",
                          s.name, s.id, a.id, plugin, action, a.target_plugin, a.target_action);
             if (mismatch_audit_detail.empty()) {
                 mismatch_audit_detail =
@@ -260,10 +302,47 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
             continue;
         }
         // WS-3 3.3: enqueue instead of inline dispatch. Propagate the enqueue
-        // outcome as the settle signal — a degraded enqueue returns false so the
+        // outcome as the settle signal; a degraded enqueue returns false so the
         // caller does NOT advance; the approved ticket stays valid and the next
         // tick re-enqueues the same (idempotent) occurrence.
-        return enqueue_occurrence(s, plugin, action, a.id);
+        if (!enqueue_occurrence(s, plugin, action, a.id))
+            return false;
+        // The occurrence is durably queued (Enqueued or AlreadyEnqueued): spend the
+        // tickets BEFORE the caller advances (#6096). Never earlier: a retire that
+        // preceded a failed enqueue would lose the fire. A retire failure (or throw) holds
+        // the occurrence; the next tick re-enqueues the same key (AlreadyEnqueued, no second
+        // run) and retries the retire. It settles every ticket observed above, not just
+        // `a`, so a mismatch-skipped ticket cannot fire a later occurrence.
+        return settle_tickets(s, observed, a.id, occurrence_key(s));
+    }
+
+    // Ledger-spent tickets: settle them now (before the A4 check and before any fresh ask), so
+    // a spent ticket does not linger and cost a ledger read and a log line on every tick. A
+    // failure or exception HOLDS, like any other settle.
+    if (!spent_ids.empty() &&
+        !settle_tickets(s, spent_ids, "ledger", "ledger-spent:" + occurrence_key(s)))
+        return false;
+
+    // A4 (#6096): no eligible ticket. If this occurrence is ALREADY in the outbox, it ran and
+    // its ticket was settled, but the schedule did not advance (the advance is a separate
+    // write). Settle whatever this tick observed, then advance; raising a fresh ask here would
+    // hold the schedule on an approval for an occurrence that already ran. A store error, or
+    // a settle failure or exception, HOLDS.
+    {
+        const auto ran = outbox_has_occurrence(occurrence_key(s));
+        if (!ran) {
+            count("yuzu_schedule_fire_failures_total");
+            spdlog::warn("schedule_runner: schedule '{}' (id={}) outbox could not be read ({}); "
+                         "holding the occurrence",
+                         s.name, s.id, ran.error());
+            return false;
+        }
+        if (*ran) {
+            spdlog::info("schedule_runner: schedule '{}' (id={}) occurrence {} is already in the "
+                         "outbox; advancing without a new approval request",
+                         s.name, s.id, occurrence_key(s));
+            return settle_tickets(s, observed, "outbox", occurrence_key(s));
+        }
     }
 
     // 2) A PENDING ticket for THIS schedule → the occurrence waits (no
@@ -281,17 +360,25 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
     // 3) A REJECTED ticket for this occurrence → skip it. The next occurrence
     //    submits a fresh ticket (each occurrence is one ask).
     auto rejected = d_.approval_manager->query({.status = "rejected", .submitted_by = s.created_by});
+    // This schedule's unsettled rejected tickets seen in THIS snapshot join the observed
+    // approved ones; the retire below is scoped to exactly these ids (#6096).
+    for (const auto& a : rejected)
+        if (a.schedule_id == s.id && a.consumed_at == 0)
+            observed.push_back(a.id);
     for (const auto& a : rejected) {
         if (a.definition_id != s.definition_id || a.scope_expression != s.scope_expression ||
             a.schedule_id != s.id || a.target_plugin != plugin || a.target_action != action ||
-            !ticket_is_current(a, s))
+            a.consumed_at != 0)
             continue;
-        spdlog::info("schedule_runner: schedule '{}' (id={}) occurrence skipped — approval {} "
+        spdlog::info("schedule_runner: schedule '{}' (id={}) occurrence skipped; approval {} "
                      "rejected by {}",
                      s.name, s.id, a.id, a.reviewed_by);
         audit(s, "instruction.schedule_fired", "denied",
               "approval_rejected approval_id=" + a.id + " schedule_id=" + s.id);
-        return true;
+        // Spend the rejected ticket so it skips exactly this one occurrence (#6096). A
+        // retire failure holds the occurrence (re-audited next tick, the lesser harm than
+        // a rejection that could skip a second occurrence).
+        return settle_tickets(s, observed, a.id, occurrence_key(s));
     }
 
     // 4) No ticket yet → submit one (tagged with this schedule's id, M-02,
@@ -323,6 +410,64 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
     audit(s, "instruction.approval_required", "pending",
           "approval_id=" + *submitted + " mode=scheduled schedule_id=" + s.id);
     return false;
+}
+
+// Retire the observed tickets after an occurrence is settled. Returns true when the caller
+// may advance. An error OR an exception holds the occurrence (false): tick()'s catch advances
+// the schedule, so a throw escaping from here would pass over an unsettled ticket (#6096).
+bool ScheduleRunner::settle_tickets(const InstructionSchedule& s,
+                                    const std::vector<std::string>& observed,
+                                    const std::string& decided_by,
+                                    const std::string& key) {
+    std::string failure;
+    try {
+        const auto retired = d_.approval_manager->retire_schedule_tickets(s.id, key, observed);
+        if (retired) {
+            // Skipped, mismatched and ledger-spent tickets legitimately settle together with
+            // the one that decided the occurrence, so a count above 1 is not an anomaly.
+            spdlog::info("schedule_runner: schedule '{}' (id={}) settled {} ticket(s) as {} "
+                         "(decided by {})",
+                         s.name, s.id, *retired, key, decided_by);
+            return true;
+        }
+        failure = retired.error();
+    } catch (const std::exception& e) {
+        failure = std::string("threw: ") + e.what();
+    } catch (...) {
+        failure = "threw a non-std exception";
+    }
+    count("yuzu_schedule_fire_failures_total");
+    spdlog::warn("schedule_runner: schedule '{}' (id={}) could not settle tickets as {} (decided "
+                 "by {}): {}; holding the occurrence",
+                 s.name, s.id, key, decided_by, failure);
+    return false;
+}
+
+// The outbox ledger reads. An unwired seam or a throw is an ERROR (hold), never an empty
+// answer: an empty answer reads as "unspent" / "never ran" and would let a spent ticket fire.
+std::expected<std::vector<std::string>, std::string>
+ScheduleRunner::outbox_occurrences_for(const std::string& approval_id) {
+    if (!d_.outbox_occurrences_fn)
+        return std::unexpected("outbox ledger not wired");
+    try {
+        return d_.outbox_occurrences_fn(approval_id);
+    } catch (const std::exception& e) {
+        return std::unexpected(std::string("threw: ") + e.what());
+    } catch (...) {
+        return std::unexpected("threw a non-std exception");
+    }
+}
+
+std::expected<bool, std::string> ScheduleRunner::outbox_has_occurrence(const std::string& key) {
+    if (!d_.outbox_exists_fn)
+        return std::unexpected("outbox ledger not wired");
+    try {
+        return d_.outbox_exists_fn(key);
+    } catch (const std::exception& e) {
+        return std::unexpected(std::string("threw: ") + e.what());
+    } catch (...) {
+        return std::unexpected("threw a non-std exception");
+    }
 }
 
 bool ScheduleRunner::enqueue_occurrence(const InstructionSchedule& s, const std::string& plugin,
@@ -365,7 +510,7 @@ bool ScheduleRunner::enqueue_occurrence(const InstructionSchedule& s, const std:
     // after a crash-before-advance recomputes the identical key, so the store
     // returns AlreadyEnqueued (one occurrence, never two). The delivery loop
     // dispatches by scope, so schedules carry no agent_ids.
-    req.occurrence_id = s.id + ":" + std::to_string(s.next_execution_at);
+    req.occurrence_id = occurrence_key(s);
     req.source = "schedule_runner";
     req.plugin = plugin;
     req.action = action;
