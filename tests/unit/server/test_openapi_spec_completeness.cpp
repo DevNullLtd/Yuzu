@@ -873,7 +873,9 @@ TEST_CASE("openapi_spec_json(): x-yuzu-unavailable marks exactly the operations 
     const auto ops = all_operations(spec);
 
     // The groups whose routes exist only when their store is wired, and which production does not
-    // wire. A group joining or leaving this set is a decision to make here, on purpose.
+    // wire. A group joining or leaving this set is a decision to make here, on purpose. That
+    // production passes a null for each of these stores is not observable from this file;
+    // tests/test_unavailable_store_wiring.py reads the call in server.cpp and ties it to the markers.
     const std::set<std::string> kUnavailableGroups = {"License Management", "Device Tokens",
                                                       "Software Deployment"};
 
@@ -1010,25 +1012,357 @@ TEST_CASE("openapi_strip_guides(): input it cannot use is returned unchanged and
     }
 }
 
+namespace {
+
+/// Starts spinning threads behind one flag. The destructor opens the flag and joins every thread,
+/// so an exception while the threads are being created cannot leave the earlier ones spinning or
+/// reach std::terminate on a joinable thread. std::jthread would do the same, but Apple Clang's
+/// libc++ does not provide it.
+struct SpinGate {
+    std::atomic<bool> go{false};
+    std::vector<std::thread> threads;
+    SpinGate() = default;
+    SpinGate(const SpinGate&) = delete;
+    SpinGate& operator=(const SpinGate&) = delete;
+    ~SpinGate() {
+        go.store(true, std::memory_order_release);
+        for (auto& t : threads) {
+            if (t.joinable())
+                t.join();
+        }
+    }
+    void wait_for_go() const {
+        while (!go.load(std::memory_order_acquire))
+            std::this_thread::yield();
+    }
+};
+
+} // namespace
+
 TEST_CASE("openapi_spec_json(): concurrent callers all get the same string",
           "[openapi][guides][concurrency]") {
     constexpr int kThreads = 8;
     std::vector<const std::string*> seen(kThreads, nullptr);
-    std::atomic<bool> go{false};
-    std::vector<std::thread> threads;
-    threads.reserve(kThreads);
-    for (int i = 0; i < kThreads; ++i) {
-        threads.emplace_back([&, i] {
-            while (!go.load(std::memory_order_acquire))
-                std::this_thread::yield();
-            seen[static_cast<std::size_t>(i)] = &yuzu::server::openapi_spec_json();
-        });
+    {
+        SpinGate gate;
+        gate.threads.reserve(kThreads);
+        for (int i = 0; i < kThreads; ++i) {
+            gate.threads.emplace_back([&gate, &seen, i] {
+                gate.wait_for_go();
+                seen[static_cast<std::size_t>(i)] = &yuzu::server::openapi_spec_json();
+            });
+        }
+        // Every thread exists; open the flag, then the gate's destructor joins them.
+        gate.go.store(true, std::memory_order_release);
     }
-    go.store(true, std::memory_order_release);
-    for (auto& t : threads)
-        t.join();
     for (const auto* p : seen) {
         REQUIRE(p != nullptr);
         CHECK(p == &yuzu::server::openapi_spec_json());
+    }
+}
+
+// ── Both forms of the document, table-driven ────────────────────────────────────────────────────
+
+namespace {
+
+const std::string& document_text(bool with_guides) {
+    return with_guides ? yuzu::server::openapi_spec_with_guides_json()
+                       : yuzu::server::openapi_spec_json();
+}
+
+const char* form_name(bool with_guides) { return with_guides ? "with guides" : "default"; }
+
+/// The node a `$ref` names, or the node itself when it is not a reference.
+json resolve_ref(const json& spec, const json& node) {
+    if (!node.is_object() || !node.contains("$ref"))
+        return node;
+    static const std::string kPrefix = "#/components/schemas/";
+    const auto ref = node["$ref"].get<std::string>();
+    REQUIRE(ref.starts_with(kPrefix));
+    return spec.at("components").at("schemas").at(ref.substr(kPrefix.size()));
+}
+
+/// True when a 2xx response declares a schema under any media type: the test the /swagger page's
+/// "Typed response" filter applies.
+bool has_typed_success(const json& op) {
+    if (!op.contains("responses"))
+        return false;
+    for (const auto& [code, resp] : op["responses"].items()) {
+        if (code.empty() || code[0] != '2' || !resp.contains("content"))
+            continue;
+        for (const auto& [media, body] : resp["content"].items()) {
+            if (body.contains("schema"))
+                return true;
+        }
+    }
+    return false;
+}
+
+std::set<std::string> key_set(const json& obj) {
+    std::set<std::string> out;
+    for (const auto& [k, v] : obj.items())
+        out.insert(k);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("openapi documents: every operation has a unique operationId in both forms",
+          "[openapi][structure]") {
+    for (const bool with_guides : {false, true}) {
+        INFO("form: " << form_name(with_guides));
+        const json spec = json::parse(document_text(with_guides));
+        const auto ops = all_operations(spec);
+        // Adding or removing an operation changes this count on purpose.
+        CHECK(ops.size() == 259);
+        std::set<std::string> ids;
+        for (const auto& o : ops) {
+            INFO(o.where());
+            REQUIRE(o.op.contains("operationId"));
+            REQUIRE(o.op["operationId"].is_string());
+            CHECK_FALSE(o.op["operationId"].get<std::string>().empty());
+            ids.insert(o.op["operationId"].get<std::string>());
+        }
+        CHECK(ids.size() == ops.size());
+    }
+}
+
+TEST_CASE("openapi documents: x-yuzu-unavailable marks exactly the pinned operations",
+          "[openapi][structure][unavailable]") {
+    // method and path as they appear in the document, without the /api/v1 base.
+    const std::set<std::string> kExpected = {
+        "get /license",
+        "post /license",
+        "delete /license/{id}",
+        "get /license/alerts",
+        "get /device-tokens",
+        "post /device-tokens",
+        "delete /device-tokens/{token_id}",
+        "get /software-packages",
+        "post /software-packages",
+        "get /software-deployments",
+        "post /software-deployments",
+        "post /software-deployments/{id}/start",
+        "post /software-deployments/{id}/rollback",
+        "post /software-deployments/{id}/cancel",
+    };
+    REQUIRE(kExpected.size() == 14);
+    for (const bool with_guides : {false, true}) {
+        INFO("form: " << form_name(with_guides));
+        const json spec = json::parse(document_text(with_guides));
+        std::set<std::string> marked;
+        for (const auto& o : all_operations(spec)) {
+            if (o.op.contains("x-yuzu-unavailable"))
+                marked.insert(o.where());
+        }
+        CHECK(marked == kExpected);
+    }
+}
+
+TEST_CASE("openapi documents: x-yuzu-guide is on every tag in the guides form only",
+          "[openapi][structure][guides]") {
+    const json lean = json::parse(document_text(false));
+    const json full = json::parse(document_text(true));
+    REQUIRE(lean["tags"].is_array());
+    REQUIRE(full["tags"].is_array());
+    CHECK(lean["tags"].size() == full["tags"].size());
+    CHECK(full["tags"].size() > 0);
+    for (const auto& tag : lean["tags"]) {
+        INFO("default form tag: " << tag.value("name", ""));
+        CHECK_FALSE(tag.contains("x-yuzu-guide"));
+    }
+    for (const auto& tag : full["tags"]) {
+        INFO("guides form tag: " << tag.value("name", ""));
+        REQUIRE(tag.contains("x-yuzu-guide"));
+        CHECK(tag["x-yuzu-guide"].is_object());
+        CHECK_FALSE(tag["x-yuzu-guide"].empty());
+    }
+}
+
+TEST_CASE("openapi documents: all but two operations declare a typed success response",
+          "[openapi][structure][typed]") {
+    // These two answer 204 with no body, so there is nothing to type. A third name here is a
+    // regression to a prose-only response, not a quiet addition.
+    const std::set<std::string> kUntyped = {"delete /upload-grants/{grant_id}",
+                                            "delete /uploads/{upload_id}"};
+    for (const bool with_guides : {false, true}) {
+        INFO("form: " << form_name(with_guides));
+        const json spec = json::parse(document_text(with_guides));
+        std::set<std::string> untyped;
+        std::size_t typed = 0;
+        for (const auto& o : all_operations(spec)) {
+            if (has_typed_success(o.op))
+                ++typed;
+            else
+                untyped.insert(o.where());
+        }
+        CHECK(untyped == kUntyped);
+        CHECK(typed == 257);
+    }
+}
+
+namespace {
+
+/// What one handler emits, read from the handler in rest_api_v1.cpp, for a route whose response
+/// schema was corrected to the handler's real envelope.
+struct ResponsePin {
+    const char* path;
+    /// Top-level keys of the response body: ok_json gives data and meta, list_json adds pagination.
+    std::set<std::string> envelope;
+    bool data_is_array;
+    /// Keys the handler writes for each element (an array route) or for data (an object route).
+    std::set<std::string> data_keys;
+    /// true: the schema's readable properties are exactly data_keys. false: the schema may carry
+    /// more (a field only some callers get), but must carry all of data_keys.
+    bool exact;
+    /// Set when data holds a nested array of objects that the handler writes with these keys.
+    const char* nested_array;
+    std::set<std::string> nested_keys;
+};
+
+} // namespace
+
+TEST_CASE("openapi documents: the corrected success schemas match their handlers",
+          "[openapi][structure][envelope]") {
+    const std::set<std::string> kList = {"data", "pagination", "meta"};
+    const std::set<std::string> kOne = {"data", "meta"};
+    // Each key list was read from the named handler, not from the schema:
+    //  inventory/tables: JObj of plugin, agent_count, last_collected, through list_json.
+    //  rules list: rule_to_jobj (14 fields) through list_json.
+    //  rule get: rule_to_jobj through ok_json.
+    //  rule status: agent_id, state, updated_at per row, through list_json.
+    //  events: 15 fields per row, through list_json.
+    //  agents/{id}/rules: agent_id, guards[rule_id, name, state, updated_at], total_guards, ok_json.
+    //  status: total_rules, compliant_rules, drifted_rules, errored_rules, note, through ok_json;
+    //          the per-agent route adds agent_id.
+    //  device-compliance: baseline, deployed, assessable, agent_id, total_guards, snapshot_total,
+    //          compliant, drifted, errored, pending, last_updated, guards[], through ok_json.
+    const std::vector<ResponsePin> pins = {
+        {"/inventory/tables", kList, true, {"plugin", "agent_count", "last_collected"}, true, "", {}},
+        {"/guaranteed-state/rules",
+         kList,
+         true,
+         {"rule_id", "name", "yaml_source", "spec_json", "version", "enabled", "enforcement_mode",
+          "severity", "os_target", "scope_expr", "created_at", "updated_at", "created_by",
+          "updated_by"},
+         true,
+         "",
+         {}},
+        {"/guaranteed-state/rules/{rule_id}",
+         kOne,
+         false,
+         {"rule_id", "name", "yaml_source", "spec_json", "version", "enabled", "enforcement_mode",
+          "severity", "os_target", "scope_expr", "created_at", "updated_at", "created_by",
+          "updated_by"},
+         true,
+         "",
+         {}},
+        {"/guaranteed-state/rules/{rule_id}/status",
+         kList,
+         true,
+         {"agent_id", "state", "updated_at"},
+         true,
+         "",
+         {}},
+        {"/guaranteed-state/events",
+         kList,
+         true,
+         {"event_id", "rule_id", "agent_id", "event_type", "severity", "guard_type",
+          "guard_category", "detected_value", "expected_value", "detail_json",
+          "remediation_action", "remediation_success", "detection_latency_us",
+          "remediation_latency_us", "timestamp"},
+         true,
+         "",
+         {}},
+        {"/guaranteed-state/agents/{agent_id}/rules",
+         kOne,
+         false,
+         {"agent_id", "guards", "total_guards"},
+         true,
+         "guards",
+         {"rule_id", "name", "state", "updated_at"}},
+        {"/guaranteed-state/status",
+         kOne,
+         false,
+         {"total_rules", "compliant_rules", "drifted_rules", "errored_rules", "note"},
+         false,
+         "",
+         {}},
+        {"/guaranteed-state/status/{agent_id}",
+         kOne,
+         false,
+         {"agent_id", "total_rules", "compliant_rules", "drifted_rules", "errored_rules", "note"},
+         false,
+         "",
+         {}},
+        {"/guaranteed-state/device-compliance",
+         kOne,
+         false,
+         {"baseline", "deployed", "assessable", "agent_id", "total_guards", "snapshot_total",
+          "compliant", "drifted", "errored", "pending", "last_updated", "guards"},
+         true,
+         "guards",
+         {"rule_id", "name", "status", "updated_at"}},
+    };
+
+    // The properties a response can carry: writeOnly ones are input-only and never in a response.
+    const auto readable = [](const json& schema) {
+        std::set<std::string> out;
+        if (!schema.contains("properties"))
+            return out;
+        for (const auto& [k, v] : schema["properties"].items()) {
+            if (!v.value("writeOnly", false))
+                out.insert(k);
+        }
+        return out;
+    };
+
+    for (const bool with_guides : {false, true}) {
+        const json spec = json::parse(document_text(with_guides));
+        for (const auto& pin : pins) {
+            INFO("form: " << form_name(with_guides) << ", route: GET " << pin.path);
+            REQUIRE(spec["paths"].contains(pin.path));
+            const json& get = spec["paths"][pin.path].at("get");
+            const json& schema = get.at("responses")
+                                     .at("200")
+                                     .at("content")
+                                     .at("application/json")
+                                     .at("schema");
+
+            // The envelope is the response body itself, with exactly these keys, all required.
+            REQUIRE(schema.contains("properties"));
+            CHECK(key_set(schema["properties"]) == pin.envelope);
+            REQUIRE(schema.contains("required"));
+            CHECK(std::set<std::string>(schema["required"].begin(), schema["required"].end()) ==
+                  pin.envelope);
+
+            const json data = resolve_ref(spec, schema["properties"].at("data"));
+            std::set<std::string> have;
+            json element = data;
+            if (pin.data_is_array) {
+                CHECK(data.value("type", "") == "array");
+                REQUIRE(data.contains("items"));
+                element = resolve_ref(spec, data["items"]);
+            } else {
+                CHECK(data.value("type", "") == "object");
+            }
+            have = readable(element);
+            if (pin.exact) {
+                CHECK(have == pin.data_keys);
+            } else {
+                for (const auto& k : pin.data_keys) {
+                    INFO("data key: " << k);
+                    CHECK(have.contains(k));
+                }
+            }
+
+            if (std::string(pin.nested_array) != "") {
+                REQUIRE(element["properties"].contains(pin.nested_array));
+                const json nested = resolve_ref(spec, element["properties"][pin.nested_array]);
+                CHECK(nested.value("type", "") == "array");
+                REQUIRE(nested.contains("items"));
+                CHECK(readable(resolve_ref(spec, nested["items"])) == pin.nested_keys);
+            }
+        }
     }
 }
