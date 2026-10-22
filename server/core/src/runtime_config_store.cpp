@@ -30,41 +30,74 @@ namespace yuzu::server {
 
 // ── Allowed keys (safe for runtime modification) ─────────────────────────────
 
-static const std::vector<std::string> kAllowedKeys = {
-    "heartbeat_timeout",             // seconds before marking agent offline
-    "response_retention_days",       // days to keep instruction responses
-    "audit_retention_days",          // days to keep audit events
-    "guardian_event_retention_days", // days to keep guaranteed-state events
-    "auto_approve_enabled",          // "true" or "false"
-    "log_level",                     // trace|debug|info|warn|error
-    "oidc_issuer",                   // OIDC issuer URL
-    "oidc_client_id",                // OIDC client ID
-    "oidc_client_secret",            // OIDC client secret — SecretCodec-envelope
-                                     // encrypted; see runtime_config_secrets (ADR-0060)
-    "oidc_redirect_uri",             // OIDC redirect URI
-    "oidc_admin_group",              // OIDC admin group ID
-    "oidc_skip_tls_verify",          // "true" or "false"
-    "plugin_signing_required",       // see plugin_signing::kPluginSigningRequiredKey — must match
-    // F1 DEX alerting (Settings → DEX alerts; applied live, no restart)
-    "dex_alert_routing",             // JSON array of routed obs_types
-    "dex_blast_min_devices",         // blast-radius alert shape (clamped on apply)
-    "dex_blast_window_seconds",      //
-    "dex_blast_cooldown_seconds",    //
-    // F2a PR3 cohort metrics export (Settings → DEX alerts; next gauge sweep)
-    "dex_cohort_export_key",         // tag key; "" = export disabled (validated on apply)
-    // Customer score policy (tiers, names, weights, per-app overrides).
-    "dex_score_policy",              // JSON document; route-owned - to be written only through
-                                     // the policy route's writer (a later change), which
-                                     // validates it whole; the generic PUT refuses it. Spelled
-                                     // as kDexScorePolicyKey in dex_score_policy_json.hpp.
+namespace {
+
+struct KeySpec {
+    const char* key;
+    ConfigWriteClass write_class;
 };
 
+// One row per allowed key, and every row names its write class: a key cannot be added without
+// deciding who may write it through the generic PUT /api/config/{key} (config_routes.cpp).
+// A key whose own settings route is administrator-only must not be weaker here.
+constexpr ConfigWriteClass kGeneral = ConfigWriteClass::General;
+constexpr ConfigWriteClass kAdmin = ConfigWriteClass::AdminRoute;
+constexpr ConfigWriteClass kOidc = ConfigWriteClass::AdminRouteInteractiveOnly;
+
+const KeySpec kKeySpecs[] = {
+    {"heartbeat_timeout", kGeneral},             // seconds before marking agent offline
+    {"response_retention_days", kGeneral},       // days to keep instruction responses
+    {"audit_retention_days", kGeneral},          // days to keep audit events
+    {"guardian_event_retention_days", kGeneral}, // days to keep guaranteed-state events
+    {"auto_approve_enabled", kGeneral},          // "true" or "false"
+    {"log_level", kGeneral},                     // trace|debug|info|warn|error
+    {"oidc_issuer", kOidc},                      // OIDC issuer URL
+    {"oidc_client_id", kOidc},                   // OIDC client ID
+    {"oidc_client_secret", kOidc},               // OIDC client secret: SecretCodec-envelope
+                                                 // encrypted; see runtime_config_secrets (ADR-0060)
+    {"oidc_redirect_uri", kOidc},                // OIDC redirect URI
+    {"oidc_admin_group", kOidc},                 // OIDC admin group ID
+    {"oidc_skip_tls_verify", kOidc},             // "true" or "false"
+    // see plugin_signing::kPluginSigningRequiredKey - must match
+    {"plugin_signing_required", kAdmin},
+    // F1 DEX alerting (Settings -> DEX alerts; applied live, no restart)
+    {"dex_alert_routing", kAdmin},          // JSON array of routed obs_types
+    {"dex_blast_min_devices", kAdmin},      // blast-radius alert shape (clamped on apply)
+    {"dex_blast_window_seconds", kAdmin},   //
+    {"dex_blast_cooldown_seconds", kAdmin}, //
+    // F2a PR3 cohort metrics export (Settings -> DEX alerts; next gauge sweep)
+    {"dex_cohort_export_key", kAdmin}, // tag key; "" = export disabled (validated on apply)
+    // Customer score policy (tiers, names, weights, per-app overrides). JSON document;
+    // route-owned - to be written only through the policy route's writer (a later change),
+    // which validates it whole; the generic PUT refuses it. Spelled as kDexScorePolicyKey in
+    // dex_score_policy_json.hpp.
+    {"dex_score_policy", ConfigWriteClass::RouteOwned},
+};
+
+} // namespace
+
 const std::vector<std::string>& RuntimeConfigStore::allowed_keys() {
-    return kAllowedKeys;
+    static const std::vector<std::string> keys = [] {
+        std::vector<std::string> v;
+        for (const auto& spec : kKeySpecs)
+            v.emplace_back(spec.key);
+        return v;
+    }();
+    return keys;
 }
 
 bool RuntimeConfigStore::is_allowed_key(const std::string& key) {
-    return std::find(kAllowedKeys.begin(), kAllowedKeys.end(), key) != kAllowedKeys.end();
+    for (const auto& spec : kKeySpecs)
+        if (key == spec.key)
+            return true;
+    return false;
+}
+
+std::optional<ConfigWriteClass> RuntimeConfigStore::write_class(const std::string& key) {
+    for (const auto& spec : kKeySpecs)
+        if (key == spec.key)
+            return spec.write_class;
+    return std::nullopt;
 }
 
 bool RuntimeConfigStore::is_secret_key(const std::string& key) {

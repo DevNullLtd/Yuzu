@@ -137,6 +137,22 @@ class SecretCodec;
 
 namespace yuzu::server {
 
+/// Who may write an allowed key through the generic PUT /api/config/{key}. The route already
+/// requires Infrastructure:Write; a class other than General adds the caller-identity rule of
+/// the key's own settings route, so the generic route is never the weaker way to the same key.
+enum class ConfigWriteClass : std::uint8_t {
+    /// Infrastructure:Write is enough.
+    General,
+    /// The key's settings route is `require_admin`: refused for a service-scoped token, an
+    /// MCP-tier token, and a caller whose effective role is not admin (`authz::admin_gate_verdict`).
+    AdminRoute,
+    /// Sign-in provider keys: the caller's OWN role must be admin from an interactive session,
+    /// so a JIT elevation is refused as well as an MCP-tier token.
+    AdminRouteInteractiveOnly,
+    /// Written only through its own route; the generic PUT refuses it.
+    RouteOwned,
+};
+
 struct RuntimeConfigEntry {
     std::string key;
     std::string value;
@@ -361,6 +377,10 @@ public:
 
     /// Check if a key is in the allow-list of safe runtime-configurable keys.
     static bool is_allowed_key(const std::string& key);
+
+    /// Who may write `key` through the generic PUT /api/config/{key}; nullopt for a key
+    /// that is not allowed. Every allowed key has exactly one class.
+    static std::optional<ConfigWriteClass> write_class(const std::string& key);
 
     /// True if this key's VALUE is a credential and must never be emitted in
     /// plaintext - not to a log, not to an API response, not to an audit detail, not

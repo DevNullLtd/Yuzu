@@ -1,5 +1,6 @@
 #include "config_routes.hpp"
 
+#include "admin_gate.hpp"           // authz::admin_gate_verdict
 #include "dex_score_policy_json.hpp" // kDexScorePolicyKey
 #include "http_route_sink.hpp"
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
@@ -202,21 +203,49 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        // The oidc_* keys decide who becomes an administrator at an SSO login (oidc_admin_group
-        // is read from the stored value at the next start). perm_fn admits a JIT-elevated
-        // session and an MCP-tier token, so require the caller's own administrator role from an
-        // interactive session, as POST /api/settings/oidc does (require_admin). Every other key
-        // stays writable under Infrastructure:Write. Refused before the audit-first `attempted`
-        // row so a denial leaves one `denied` row, not a dangling `attempted` (outcome unknown).
-        if (key.starts_with("oidc_") &&
-            (session->role != auth::Role::admin || !session->mcp_tier.empty())) {
+        // A key whose own settings route is administrator-only is not writable here by a weaker
+        // caller (RuntimeConfigStore::write_class). perm_fn admits a JIT-elevated session and an
+        // MCP-tier token; the settings routes refuse an MCP-tier or service-scoped token through
+        // require_admin, so this route must too. The oidc_* keys decide who becomes an
+        // administrator at an SSO login (oidc_admin_group is read from the stored value at the
+        // next start), so they additionally refuse an elevation: the caller's OWN role must be
+        // admin. Every other key stays writable under Infrastructure:Write. Refused before the
+        // audit-first `attempted` row so a denial leaves one `denied` row, not a dangling
+        // `attempted` (outcome unknown).
+        const char* refusal_detail = nullptr;
+        switch (RuntimeConfigStore::write_class(key).value_or(ConfigWriteClass::General)) {
+        case ConfigWriteClass::AdminRouteInteractiveOnly:
+            if (session->role != auth::Role::admin || !session->mcp_tier.empty())
+                refusal_detail = auth::is_elevated(*session)
+                                     ? "elevated_session_oidc_setting_blocked"
+                                     : "admin_role_required_oidc_setting_blocked";
+            break;
+        case ConfigWriteClass::AdminRoute:
+            switch (authz::admin_gate_verdict(*session)) {
+            case authz::AdminGate::Admit:
+                break;
+            case authz::AdminGate::ServiceScoped:
+            case authz::AdminGate::McpTier:
+                refusal_detail = "token_session_admin_setting_blocked";
+                break;
+            case authz::AdminGate::NotAdmin:
+                refusal_detail = "admin_role_required_setting_blocked";
+                break;
+            }
+            break;
+        case ConfigWriteClass::General:
+        case ConfigWriteClass::RouteOwned:
+            break;
+        }
+        if (refusal_detail) {
             (void)deps.audit_fn(req, "config.update", "denied", "RuntimeConfig", key,
-                                auth::is_elevated(*session)
-                                    ? "elevated_session_oidc_setting_blocked"
-                                    : "admin_role_required_oidc_setting_blocked");
+                                refusal_detail);
             res.status = 403;
-            res.set_content(detail::a4_error(res, "changing sign-in provider settings needs your own "
-                                                  "administrator role"),
+            res.set_content(detail::a4_error(res, key.starts_with("oidc_")
+                                                       ? "changing sign-in provider settings needs "
+                                                         "your own administrator role"
+                                                       : "changing this setting needs your own "
+                                                         "administrator role"),
                             "application/json");
             return;
         }
