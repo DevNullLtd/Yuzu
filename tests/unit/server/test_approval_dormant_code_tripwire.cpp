@@ -5,7 +5,8 @@
  * primitives (`submit_bound`, the caller-held-connection `consume_ticket`, the `kGuardianDeploy`
  * origin) on the condition that nothing in production uses them yet. This test fails the day a
  * production use appears, so the first producer cannot land without someone consciously
- * extending the allow-list below AND the ADR's entry conditions.
+ * extending the allow-list below; the ADR's entry conditions are named in the failure message,
+ * and this test cannot check that they were met.
  *
  * WHAT IT SCANS. Source text only, under `server/core/src` (YUZU_SERVER_SRC_DIR) and nowhere
  * else: files with the extensions .cpp .hpp .inc .cc .h. Not scanned: `tests/`, `server/core/
@@ -13,21 +14,33 @@
  * A macro that pastes a name together, a generated file and anything the lexer cannot see are
  * invisible to it, and it proves nothing about what a caller does.
  *
- * WHAT IT COUNTS. Each identifier of kIdentifiers, in code only, per file. kRules gives the
- * EXACT count allowed in each file (min == max); a file with no entry for an identifier is
- * allowed none. Nothing is exempt: the store files (`approval_manager.hpp/.cpp`) are pinned like
- * every other, so a wrapper added there that calls a primitive raises the count and fails. What
- * it still cannot see: a wrapper that is merely CALLED from elsewhere under its own name (the
- * caller names the wrapper, not the primitive; only the wrapper's own use of the primitive is
- * counted), and the difference between the pooled `consume_ticket` overload and the held one
- * (it counts the identifier, so swapping the one MCP call for the held overload stays green).
+ * WHAT IT COUNTS. Each identifier of kIdentifiers, in code only, per file: the four public
+ * primitives and the three names a store member needs to reach them without spelling any of the
+ * four (`submit_impl`, `consume_core`, `BoundRequest`). kRules gives the EXACT count allowed in
+ * each file (min == max); a file with no entry for an identifier is allowed none. Nothing is
+ * exempt: the store files (`approval_manager.hpp/.cpp`) are pinned like every other, so a member
+ * added there that mints or consumes through any of the seven raises a count and fails. What it
+ * still cannot see: a wrapper that is merely CALLED from elsewhere under its own name (the caller
+ * names the wrapper, not the primitive; only the wrapper's own use is counted), and the
+ * difference between the pooled `consume_ticket` overload and the held one (it counts the
+ * identifier, so swapping the one MCP call for the held overload stays green).
  *
- * HOW IT LEXES. Line and block comments, string, character and raw-string literals, including
- * the encoding prefixes u8 u U L on each. An earlier version tested each raw line for a block
- * comment opener and so treated a route pattern ending in slash-star inside a string as the
- * start of a comment that swallowed the following thousands of lines; the NON-VACUITY floors
- * below (the store is scanned, the known MCP call and the known metric pre-seed are each found
- * exactly once) exist so that a scanner which goes blind fails instead of passing.
+ * HOW IT LEXES. Line comments (a trailing backslash continues one onto the next line), block
+ * comments, string, character and raw-string literals, including the encoding prefixes u8 u U L
+ * on each. A `'` is a digit separator only inside a number (the run before it starts with a
+ * digit); anywhere else, `case'"':` included, it opens a character literal. `$` and a non-ASCII
+ * byte count as identifier characters when deciding where a literal starts. An earlier version
+ * tested each raw line for a block comment opener and so treated a route pattern ending in
+ * slash-star inside a string as the start of a comment that swallowed the following thousands of
+ * lines; the NON-VACUITY floors below (the store is scanned, the known MCP call and the known
+ * metric pre-seed are each found exactly once) exist so that a scanner which goes blind fails
+ * instead of passing.
+ *
+ * KNOWN UNHANDLED SHAPES, none present in `server/core/src` today: a line splice inside a
+ * token (a comment opener split by backslash-newline, or `submit_\<newline>bound`), a
+ * universal-character-name spelling of an identifier, a block comment or raw string that is
+ * unterminated at end of file (it blanks to the end), and text in a skipped `#if 0` region
+ * (read as code, so it can only add a hit, never hide one).
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -53,17 +66,77 @@ bool is_ident_char(char c) {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
 }
 
+// An identifier character for the lexer's own token decisions (where a literal starts): ASCII,
+// `$` (accepted in identifiers by every toolchain the project builds with) or a non-ASCII byte
+// (UTF-8 inside an identifier). A leading UTF-8 byte-order mark is not one. The identifier
+// SCAN below deliberately keeps the ASCII-only is_ident_char: it must still see a name that
+// follows a byte-order mark.
+bool is_ident_at(const std::string& text, std::size_t k) {
+    const char c = text[k];
+    if (is_ident_char(c) || c == '$')
+        return true;
+    if (static_cast<unsigned char>(c) < 0x80)
+        return false;
+    return !(k < 3 && text.compare(0, 3, "\xEF\xBB\xBF") == 0);
+}
+
 // True when the encoding prefix (u8, u, U or L, possibly empty) that ends at `at` is a whole
-// token: nothing identifier-like precedes it. `at` indexes the `R` of a raw string or the `'`
-// of a character literal. An empty prefix means the character before `at` is not an identifier
-// character. `1'000` and `FooL'x'` are not prefixes: the token is not exactly one.
-bool starts_token_after_prefix(const std::string& text, std::size_t at) {
+// token: nothing identifier-like precedes it. `at` indexes the `R` of a raw string. An empty
+// prefix means the character before `at` is not an identifier character. `FOOR"(x)"` and
+// `fooL"x"` are not prefixed: the token is not exactly one. A token that starts exactly where
+// the previous literal ended (`literal_end`) is that literal's user-defined suffix, not a prefix.
+bool starts_token_after_prefix(const std::string& text, std::size_t at, std::size_t literal_end) {
     std::size_t p = at;
     if (p >= 2 && text[p - 2] == 'u' && text[p - 1] == '8')
         p -= 2;
     else if (p >= 1 && (text[p - 1] == 'u' || text[p - 1] == 'U' || text[p - 1] == 'L'))
         p -= 1;
-    return p == 0 || !is_ident_char(text[p - 1]);
+    if (p != 0 && p == literal_end)
+        return false;
+    return p == 0 || !is_ident_at(text, p - 1);
+}
+
+// True when the `'` at `at` is a digit separator (1'000, 0x1'F, 1.5'2). It is one only inside a
+// pp-number: the maximal identifier-character run right before it starts with a digit (a `.`
+// ends the run, so `u8R1.5'2` is the number `.5'2` after the identifier `u8R1`), or it is a
+// further separator in a chain (`0x1'F'F`), and the next character continues the number.
+// Anywhere else it opens a character literal, so `case'"':`, `return'"'`, `L'"'` and `u8'x'`
+// are literals, not separators. `floor` is the end of the previous literal: the `'` that closed
+// it is not a separator in a chain, and what follows it is a user-defined-literal suffix.
+bool is_digit_separator(const std::string& text, std::size_t at, std::size_t floor) {
+    if (at == 0 || !is_ident_at(text, at - 1))
+        return false;
+    if (at + 1 >= text.size() || !is_ident_at(text, at + 1))
+        return false;
+    std::size_t p = at;
+    for (;;) {
+        std::size_t s = p;
+        while (s > 0 && is_ident_at(text, s - 1))
+            --s;
+        if (text[s] >= '0' && text[s] <= '9')
+            return true;
+        if (s >= floor + 2 && text[s - 1] == '\'' && is_ident_at(text, s - 2))
+            p = s - 1;
+        else
+            return false;
+    }
+}
+
+// End (the index of the newline, or the text size) of the `//` comment that starts at `from`. A
+// backslash directly before a newline (a CR may sit between) continues the comment onto the next
+// line, as the compiler's line splicing does, so a `/*` on the continuation is still comment.
+std::size_t line_comment_end(const std::string& text, std::size_t from) {
+    std::size_t end = text.find('\n', from);
+    while (end != std::string::npos) {
+        std::size_t b = end;
+        if (b > 0 && text[b - 1] == '\r')
+            --b;
+        if (b > from + 2 && text[b - 1] == '\\')
+            end = text.find('\n', end + 1);
+        else
+            break;
+    }
+    return end == std::string::npos ? text.size() : end;
 }
 
 // `text` with the CONTENT of every comment and every string, character and raw-string literal
@@ -77,13 +150,12 @@ std::string code_only(const std::string& text) {
     };
     const std::size_t n = text.size();
     std::size_t i = 0;
+    std::size_t literal_end = 0; // just past the last string, character or raw-string literal
     while (i < n) {
         const char c = text[i];
         const char next = i + 1 < n ? text[i + 1] : '\0';
         if (c == '/' && next == '/') {
-            std::size_t end = text.find('\n', i);
-            if (end == std::string::npos)
-                end = n;
+            const std::size_t end = line_comment_end(text, i);
             blank(i, end);
             i = end;
         } else if (c == '/' && next == '*') {
@@ -91,7 +163,7 @@ std::string code_only(const std::string& text) {
             end = end == std::string::npos ? n : end + 2;
             blank(i, end);
             i = end;
-        } else if (c == 'R' && next == '"' && starts_token_after_prefix(text, i)) {
+        } else if (c == 'R' && next == '"' && starts_token_after_prefix(text, i, literal_end)) {
             // Raw string: R"delim( ... )delim", with an optional u8 / u / U / L prefix.
             const std::size_t open = text.find('(', i + 2);
             if (open == std::string::npos || open - (i + 2) > 16) {
@@ -103,17 +175,16 @@ std::string code_only(const std::string& text) {
             end = end == std::string::npos ? n : end + close.size();
             blank(open + 1, end - 1);
             i = end;
-        } else if (c == '"' || (c == '\'' && (i == 0 || !is_ident_char(text[i - 1]) ||
-                                              starts_token_after_prefix(text, i)))) {
-            // String or character literal (a `'` after an identifier character is a digit
-            // separator, as in 1'000, unless that token is exactly an encoding prefix: L'x',
-            // u8'x', u'x', U'x'). Ends at the matching unescaped quote, or at the newline
-            // if it is unterminated, so one stray quote cannot blind the rest of the file.
+            literal_end = i;
+        } else if (c == '"' || (c == '\'' && !is_digit_separator(text, i, literal_end))) {
+            // String or character literal. Ends at the matching unescaped quote, or at the
+            // newline if it is unterminated, so one stray quote cannot blind the rest of the file.
             std::size_t j = i + 1;
             while (j < n && text[j] != c && text[j] != '\n')
                 j += text[j] == '\\' ? 2 : 1;
             blank(i + 1, j);
             i = j < n ? j + 1 : n;
+            literal_end = i;
         } else {
             ++i;
         }
@@ -133,8 +204,14 @@ struct Scan {
     std::map<std::string, std::vector<Hit>> hits; // identifier -> where it appears as code
 };
 
-const std::vector<std::string> kIdentifiers = {"submit_bound", "consume_ticket", "kGuardianDeploy",
-                                               "set_consume_test_hook_for_test"};
+// The four public primitives, and the three names a store member needs to reach them without
+// spelling any of the four: `submit_impl` (the one mint body behind submit and submit_bound),
+// `consume_core` (the one consume body behind both overloads) and `BoundRequest` (the type that
+// makes a ticket bound).
+const std::vector<std::string> kIdentifiers = {"submit_bound",    "consume_ticket",
+                                               "kGuardianDeploy", "set_consume_test_hook_for_test",
+                                               "submit_impl",     "consume_core",
+                                               "BoundRequest"};
 
 Scan scan_tree(const fs::path& root) {
     REQUIRE(fs::is_directory(root));
@@ -193,6 +270,12 @@ const Rules kRules = {
      {{"approval_manager.hpp", {1, 1}}, {"approval_manager.cpp", {4, 4}}, {"server.cpp", {1, 1}}}},
     // The interleaving seam is declared by the store and used by tests only.
     {"set_consume_test_hook_for_test", {{"approval_manager.hpp", {1, 1}}}},
+    // The private bodies: declared once, defined once, called by the two public entry points
+    // each (submit and submit_bound; the pooled and the held consume_ticket). A store member
+    // that reaches them under its own name is a producer or a held redeemer under another name.
+    {"submit_impl", {{"approval_manager.hpp", {1, 1}}, {"approval_manager.cpp", {3, 3}}}},
+    {"consume_core", {{"approval_manager.hpp", {1, 1}}, {"approval_manager.cpp", {3, 3}}}},
+    {"BoundRequest", {{"approval_manager.hpp", {3, 3}}, {"approval_manager.cpp", {2, 2}}}},
 };
 
 // The same table, written out independently of kRules so a test can pin kRules to it: a rule
@@ -212,6 +295,12 @@ const Expected kExpected[] = {
     {"kGuardianDeploy", "approval_manager.cpp", 4},
     {"kGuardianDeploy", "server.cpp", 1},
     {"set_consume_test_hook_for_test", "approval_manager.hpp", 1},
+    {"submit_impl", "approval_manager.hpp", 1},
+    {"submit_impl", "approval_manager.cpp", 3},
+    {"consume_core", "approval_manager.hpp", 1},
+    {"consume_core", "approval_manager.cpp", 3},
+    {"BoundRequest", "approval_manager.hpp", 3},
+    {"BoundRequest", "approval_manager.cpp", 2},
 };
 
 // One entry per violation, in a stable order, each naming the identifier and the place.
@@ -285,6 +374,8 @@ TEST_CASE("bound-approval primitives still have no production use (ADR-1009 trip
     CHECK(v.empty());
 }
 
+namespace {
+
 bool has(const std::vector<std::string>& v, const std::string& message) {
     return std::find(v.begin(), v.end(), message) != v.end();
 }
@@ -320,6 +411,14 @@ void write_expected_tree(const fs::path& root, const Expected* skip = nullptr,
     for (const auto& [file, body] : files)
         write(root / file, body);
 }
+
+int line_count(const fs::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    return static_cast<int>(std::count(std::istreambuf_iterator<char>(in),
+                                       std::istreambuf_iterator<char>(), '\n'));
+}
+
+} // namespace
 
 TEST_CASE("the tripwire lexer sees code that a naive line scan loses to a phantom comment",
           "[approval_manager][bound][tripwire]") {
@@ -383,15 +482,17 @@ TEST_CASE("the tripwire lexer sees code that a naive line scan loses to a phanto
     }
 }
 
-TEST_CASE("the tripwire lexer handles encoding-prefixed raw strings and character literals",
+TEST_CASE("the tripwire lexer keeps literals, comments and digit separators apart from code",
           "[approval_manager][bound][tripwire]") {
     yuzu::test::TempDir tmp("yuzu_test_tripwire_");
-    // Each row: a literal whose body holds a quote (and, for raw strings, a block-comment
-    // opener), then a REAL call on the same line. The call must be seen, once.
+    // Each row: a literal or comment whose body holds a quote (and, for raw strings, a
+    // block-comment opener), then a REAL call. The call must be seen on `line`, `hits` times.
     struct Row {
         const char* name;
         const char* source;
         const char* id;
+        int line = 1;
+        int hits = 1;
     };
     const Row rows[] = {
         {"LR", "auto s = LR\"(\")\"; m.submit_bound(a);\n", "submit_bound"},
@@ -410,13 +511,58 @@ TEST_CASE("the tripwire lexer handles encoding-prefixed raw strings and characte
          "auto n = 1'000'000u + 0x1'0L + 0xFF'FFu; m.submit_bound(a);\n", "submit_bound"},
         {"prefixed literal, then a block comment, then a call",
          "auto s = LR\"(x)\"; /* c */ m.kGuardianDeploy;\n", "kGuardianDeploy"},
+        {"a decimal pp-number with a separator", "double d = 1.5'25; m.submit_bound(a);\n",
+         "submit_bound"},
+        // A `'` is a digit separator only inside a number. Glued to a keyword or an identifier it
+        // opens a character literal whose quote must not be read as a string.
+        {"case glued to a character literal", "switch (c) { case'\"': m.submit_bound(a); }\n",
+         "submit_bound"},
+        {"case glued to an escaped backslash literal", "switch (c) { case'\\\\': m.submit_bound(a); }\n",
+         "submit_bound"},
+        {"return glued to a character literal", "char f() { return'\"'; } void g() { m.consume_ticket(x); }\n",
+         "consume_ticket"},
+        {"a chain of hex separators, then a call", "auto h = 0x1'F'F; m.submit_bound(a);\n",
+         "submit_bound"},
+        {"a hex number with separators, then a glued literal",
+         "auto h = 0x1'F; auto c = h ? 'a' : '\"'; m.submit_bound(a);\n", "submit_bound"},
+        // A line comment continued by a trailing backslash swallows the next line, including a
+        // block-comment opener on it; the code after it is code.
+        {"a continued line comment holding a block-comment opener",
+         "// note \\\n /* ignore\nvoid h() { m.submit_bound(a); }\n/* close */\n", "submit_bound", 3},
+        {"the same with CRLF line ends",
+         "// note \\\r\n /* ignore\r\nvoid h() { m.submit_bound(a); }\r\n/* close */\r\n",
+         "submit_bound", 3},
+        {"a continued line comment hides the continuation line itself",
+         "// note \\\nvoid h() { m.submit_bound(a); }\nvoid k() { m.consume_ticket(x); }\n",
+         "submit_bound", 1, 0},
+        // `$` and a non-ASCII byte are identifier characters, so `R"(` after one is a string
+        // literal followed by text, not a raw string.
+        {"a dollar identifier before R and a quote", "int v = $R\"(x\" + 0; m.submit_bound(a); auto t = \")\";\n",
+         "submit_bound"},
+        {"a UTF-8 identifier before R and a quote",
+         "int v = \xC3\xA9R\"(x\" + 0; m.submit_bound(a); auto t = \")\";\n", "submit_bound"},
+        // A literal's user-defined suffix is not a prefix of what follows it.
+        {"a literal suffix named R before a quote", "auto v = 'x'R\"(y\" + 0; m.submit_bound(a); auto t = \")\";\n",
+         "submit_bound"},
+        {"two glued character literals", "auto c = L'\\0'u8'x'; m.submit_bound(a);\n", "submit_bound"},
+        // A leading byte-order mark is neither an identifier character for the raw-string
+        // decision nor a reason to miss the name that follows it.
+        {"a byte-order mark, then a call", "\xEF\xBB\xBFvoid f() { m.submit_bound(a); }\n",
+         "submit_bound"},
+        {"a name directly after a non-ASCII byte is still counted (the scan stays conservative)",
+         "int \xC3\xA9submit_bound(a);\n", "submit_bound"},
+        {"a byte-order mark directly before the name", "\xEF\xBB\xBF" "submit_bound(a);\n",
+         "submit_bound"},
+        {"a byte-order mark, then a raw string holding a quote, then a call",
+         "\xEF\xBB\xBF" "R\"(\")\"; m.submit_bound(a);\n", "submit_bound"},
     };
     for (const auto& row : rows) {
         DYNAMIC_SECTION(row.name) {
             write(tmp.path / "row.cpp", row.source);
             Scan scan = scan_tree(tmp.path);
-            REQUIRE(scan.hits[row.id].size() == 1);
-            CHECK(scan.hits[row.id][0].line == 1);
+            REQUIRE(scan.hits[row.id].size() == static_cast<std::size_t>(row.hits));
+            if (row.hits == 1)
+                CHECK(scan.hits[row.id][0].line == row.line);
         }
     }
     SECTION("the body of a prefixed raw string and the content of a prefixed char are not code") {
@@ -430,7 +576,7 @@ TEST_CASE("the tripwire lexer handles encoding-prefixed raw strings and characte
     }
 }
 
-TEST_CASE("the allow-list pins exact counts and is the table the ADR describes",
+TEST_CASE("the allow-list pins exact counts and equals the independent expected table",
           "[approval_manager][bound][tripwire]") {
     // kRules must say exactly what kExpected says: no rule loosened (max != count), zeroed
     // (min != count), dropped or added.
@@ -486,10 +632,9 @@ TEST_CASE("the tripwire names the specific violation for every way the allow-lis
     }
     SECTION("a WRAPPER added to the store that calls a primitive is flagged (g8r5-sg2-1)") {
         // A future `submit_guardian_deploy` in the store calls `submit_bound`; the caller of the
-        // wrapper names none of the four identifiers, so the store's own count is what sees it.
-        // The expected tree's approval_manager.cpp is 7 lines (1 + 2 + 4 uses), so the wrapper's
-        // body line is line 9.
+        // wrapper names none of the identifiers, so the store's own count is what sees it.
         write_expected_tree(tmp.path);
+        const int before = line_count(tmp.path / "approval_manager.cpp");
         {
             std::ofstream out(tmp.path / "approval_manager.cpp", std::ios::binary | std::ios::app);
             REQUIRE(out.is_open());
@@ -499,9 +644,50 @@ TEST_CASE("the tripwire names the specific violation for every way the allow-lis
         }
         write(tmp.path / "guardian_routes.cpp", "void g() { mgr.submit_guardian_deploy(r); }\n");
         const auto v = violations(scan_tree(tmp.path), kRules);
-        CHECK(has(v, "unexpected use of `submit_bound` at approval_manager.cpp:9"));
-        CHECK(has(v, "unexpected use of `kGuardianDeploy` at approval_manager.cpp:9"));
+        const std::string at = "approval_manager.cpp:" + std::to_string(before + 2);
+        CHECK(has(v, "unexpected use of `submit_bound` at " + at));
+        CHECK(has(v, "unexpected use of `kGuardianDeploy` at " + at));
         CHECK(v.size() == 2); // the wrapper's caller is, as documented, invisible
+    }
+    SECTION("a store member that mints through the private body is flagged (g8r6-sg2-1)") {
+        // `submit_impl` is private and is the one mint body behind submit and submit_bound; a
+        // member may call it with a bound request and any origin without spelling `submit_bound`
+        // or `kGuardianDeploy`.
+        write_expected_tree(tmp.path);
+        const int before = line_count(tmp.path / "approval_manager.cpp");
+        {
+            std::ofstream out(tmp.path / "approval_manager.cpp", std::ios::binary | std::ios::app);
+            REQUIRE(out.is_open());
+            out << "auto ApprovalManager::mint_for(Req r, Origin o) {\n"
+                   "    return submit_impl(r.def, r.who, o, &bound);\n"
+                   "}\n";
+        }
+        const auto v = violations(scan_tree(tmp.path), kRules);
+        REQUIRE(v.size() == 1);
+        CHECK(v[0] == "unexpected use of `submit_impl` at approval_manager.cpp:" +
+                          std::to_string(before + 2));
+    }
+    SECTION("a store member that consumes through the private body is flagged (g8r6-sg2-1)") {
+        write_expected_tree(tmp.path);
+        const int before = line_count(tmp.path / "approval_manager.cpp");
+        {
+            std::ofstream out(tmp.path / "approval_manager.cpp", std::ios::binary | std::ios::app);
+            REQUIRE(out.is_open());
+            out << "auto ApprovalManager::redeem_in(PGconn* held_conn, Id id) {\n"
+                   "    return consume_core(held_conn, id, who, ApprovalOrigin::kMcp, {});\n"
+                   "}\n";
+        }
+        const auto v = violations(scan_tree(tmp.path), kRules);
+        REQUIRE(v.size() == 1);
+        CHECK(v[0] == "unexpected use of `consume_core` at approval_manager.cpp:" +
+                          std::to_string(before + 2));
+    }
+    SECTION("a bound request built outside the store is flagged (g8r6-sg2-1)") {
+        write_expected_tree(tmp.path);
+        write(tmp.path / "guardian_routes.cpp", "void g() { BoundRequest r; (void)r; }\n");
+        const auto v = violations(scan_tree(tmp.path), kRules);
+        REQUIRE(v.size() == 1);
+        CHECK(v[0] == "unexpected use of `BoundRequest` at guardian_routes.cpp:1");
     }
     SECTION("the interleaving seam named in a production file is flagged") {
         write_expected_tree(tmp.path);
