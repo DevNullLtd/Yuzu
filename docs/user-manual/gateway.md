@@ -2139,7 +2139,9 @@ The session id on the gateway-to-server hop is asserted by the gateway.
   neither acknowledged nor listed, and counts under
   `yuzu_server_gateway_route_desync_total{op="session_lookup",outcome="ambiguous_session"}`
   (alert `YuzuGatewaySessionAmbiguous`). It means duplicate placement, two
-  concurrent adopts of one id (below), or a forged presented id.
+  concurrent adopts of one id (below), or a forged presented id. Since the
+  unique index (#5683) a duplicate can exist only after that index was dropped
+  by hand (see "Recovering a missing unique session index" below).
 - An unreadable directory is never treated as "unknown" (which would trigger a
   re-register). A session this replica itself registered (a local hint) is
   still acknowledged, lease-renewed and ingested during the degrade, which
@@ -2156,14 +2158,18 @@ The session id on the gateway-to-server hop is asserted by the gateway.
   index on `session_id` (migration v5, #5683) serialises two concurrent adopts
   of one id for different agents: the second is refused with the same
   `FAILED_PRECONDITION` and the same counter, so no duplicate row is created
-  (the ambiguity refusal above remains as defense in depth for data from before
-  the index). The same refusal applies when a stream notification (CONNECTED)
-  presents an id another agent holds: the placement is not published, it is
-  counted under
+  (the ambiguity refusal above remains as defense in depth for a hand-dropped
+  index only). A stream notification (CONNECTED) that presents an id another
+  agent holds is refused the same way when the presenting agent has no directory
+  row (the fallback insert is what the unique index refuses): the placement is
+  not published, the notification is not acknowledged, it is counted under
   `yuzu_server_gateway_route_desync_total{op="announce_connected",outcome="session_held_by_other_agent"}`
   (same alert) and a `gateway.session_held_by_other_agent` audit row is written
-  (without the session id). The index cannot see another agent's row that was
-  already tombstoned
+  (without the session id). An agent that still has a row, including a
+  tombstone, is not covered: its CONNECTED lands as `session_mismatch` and does
+  not unpublish (the tombstoned-victim residual recorded in ADR-2002 7f "Still
+  open", #5685 area, unchanged by this change). The index cannot see another
+  agent's row that was already tombstoned
   (after a Postgres outage longer than 270 s): the presented id is then
   reclaimed and resolves to the presenting agent until the original agent's
   stream reconnects. If the original agent was already listed for replay, its
@@ -2177,16 +2183,63 @@ The session id on the gateway-to-server hop is asserted by the gateway.
   refusals apart.
 
 The evidence for these decisions is the metrics above and the server log (ids
-are sanitized and truncated to 64 bytes); there is no per-event audit row,
-except the `announce_connected` refusal above.
+are sanitized and truncated); there is no per-event audit row, except the
+`announce_connected` refusal above (the `ProxyRegister` replay refusal writes
+none). Paste a session id from a log line into SQL only if it matches
+`^gw-session-[0-9a-f]{32}$`.
 
 **One-time dedup at upgrade.** Migration v5 tombstones every row of a group of
 rows that already shared a session id (expected: none) and logs
 `migration v5 tombstoned N agent_routes row(s)` once; the count is exported as
 `yuzu_server_gateway_route_session_dedup_total`. A non-zero value means those
 agents re-registered through the normal heartbeat replay (one or two heartbeat
-cycles); find how the duplicate arose. See
+cycles); find how the duplicate arose. The counter is present when the server
+runs with `--gateway-upstream` and reads the migration of THIS start only: it
+reads 0 on any later restart. The durable record is the `route_meta` row
+(`SELECT value FROM gateway_route_store.route_meta WHERE key = 'v5_session_dedup_tombstoned_rows';`),
+and a later start logs it once at INFO. A tombstoned agent's replay can lose the
+race to another tombstoned agent that presented the same id first; the loser is
+refused (`session_held_by_other_agent`) and re-registers with a fresh session. So
+when `YuzuGatewaySessionHeldByOtherAgent` fires: if
+`yuzu_server_gateway_route_session_dedup_total` is above 0 on this start, or the
+`migration v5 tombstoned N` WARN appeared shortly before the first refusal, the
+refusals are the migration artifact (the affected agents lost the replay race)
+and stop by themselves; otherwise treat the alert as a forged or colliding id.
+See
 [upgrading](upgrading.md#behaviour-change-gateway-sessions-are-unique-per-agent-a-one-time-migration-gateway_route_store-v5-5683).
+
+**Recovering a missing unique session index.** The unique index is named
+`ux_agent_routes_session_id` and the server recognises a lost race only by that
+exact name. If an operator dropped it (the `YuzuGatewaySessionAmbiguous` alert is
+the symptom), restore it in this order. Use the exact name: an index under any
+other name is not recognised, so a racing adopt fails as a generic route-write
+error, `ProxyRegister` answers `UNAVAILABLE` and the gateway counts that against
+its circuit breaker.
+
+1. Find the duplicates:
+   `SELECT session_id, array_agg(agent_id) FROM gateway_route_store.agent_routes WHERE session_id IS NOT NULL GROUP BY session_id HAVING count(*) > 1;`
+2. Tombstone them with the same statement migration v5 uses (every row of each
+   duplicate group; the affected agents re-register through the replay):
+   ```sql
+   UPDATE gateway_route_store.agent_routes
+   SET session_id = NULL, lease_until = NULL, cluster_id = NULL,
+       gateway_node = NULL, stream_home_id = NULL, updated_at = now()
+   WHERE session_id IN (
+       SELECT session_id FROM gateway_route_store.agent_routes
+       WHERE session_id IS NOT NULL GROUP BY session_id HAVING count(*) > 1);
+   ```
+3. Recreate the index with the exact name:
+   `CREATE UNIQUE INDEX ux_agent_routes_session_id ON gateway_route_store.agent_routes (session_id) WHERE session_id IS NOT NULL;`
+   Run steps 2 and 3 in one transaction that first takes
+   `LOCK TABLE gateway_route_store.agent_routes IN ACCESS EXCLUSIVE MODE`, so no
+   writer can create a new duplicate between them.
+4. Drop the old non-unique index only if it still exists:
+   `DROP INDEX IF EXISTS gateway_route_store.agent_routes_session_id_idx;`
+
+If the server will not start after an upgrade because an object named
+`ux_agent_routes_session_id` already exists with another shape, migration v5
+failed on purpose and rolled back: drop that object
+(`DROP INDEX gateway_route_store.ux_agent_routes_session_id;`) and restart.
 
 **Agent dependency.** The ordinary restart path above does not need the agent
 to do anything. When the gateway does disconnect an agent process (an

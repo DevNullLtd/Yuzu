@@ -310,10 +310,10 @@ groups:
       # counter is expected at a low background rate (see its own doc
       # comment) and alerting on it needs real fleet data to set a threshold
       # that doesn't page on a routine post-restart/failover baseline rise;
-      # it remains unalerted EXCEPT two expected-zero pairs:
+      # it remains unalerted EXCEPT three expected-zero pairs:
       # (op="session_lookup", outcome="ambiguous_session") and
-      # (op="proxy_register"|"announce_connected",
-      # outcome="session_held_by_other_agent"), see
+      # (op="proxy_register", outcome="session_held_by_other_agent") and
+      # (op="announce_connected", outcome="session_held_by_other_agent"), see
       # YuzuGatewaySessionAmbiguous and YuzuGatewaySessionHeldByOtherAgent
       # below. `route_unreadable` fires the
       # command outbox's retry-with-backoff path (the SAME reschedule
@@ -370,10 +370,18 @@ groups:
             it (never acked, never listed, never ingested). Causes: a
             duplicate placement, two concurrent ProxyRegister adopts of one id
             for different agents (before the unique index), or a forged /
-            colliding presented id. Since the unique session
-            index (#5683) a NEW duplicate cannot be created: this fires only
-            for data from before that migration, or after the index was
-            dropped by hand.
+            colliding presented id. Since the unique session index (#5683,
+            migration v5, which also removes existing duplicates) a NEW
+            duplicate cannot be created: this fires only after the index
+            `ux_agent_routes_session_id` was dropped by hand. Check first:
+            SELECT 1 FROM pg_indexes WHERE schemaname =
+            'gateway_route_store' AND indexname = 'ux_agent_routes_session_id';
+            If the index exists the duplicate is already gone and this alert
+            clears within the hour. If the index is missing, follow the
+            recovery procedure in
+            docs/user-manual/gateway.md "Recovering a missing unique session
+            index" (tombstone the duplicates, then recreate the index under
+            that exact name).
             FIRST REMEDIATION: the id is not a metric label, so list every
             shared id from the directory: SELECT session_id,
             array_agg(agent_id) FROM gateway_route_store.agent_routes WHERE
@@ -391,7 +399,11 @@ groups:
       # committed directory row already holds it (the reclaim statement's
       # NOT EXISTS guard, or the unique session index for a concurrent adopt,
       # #5683). Also covers op="announce_connected": a CONNECTED whose session
-      # id another agent's row holds, refused by the same index (#5683).
+      # id another agent's row holds, refused by the same index (#5683) - but
+      # ONLY when the presenting agent has NO directory row (the fallback
+      # insert is what the index refuses). A presenter that still has a row,
+      # including a tombstone, lands as session_mismatch and is not alerted
+      # (the tombstoned-victim residual, ADR-2002 7f "Still open", #5685 area).
       # Kept separate from YuzuGatewaySessionAmbiguous:
       # nothing became ambiguous (the write was refused), so that alert's
       # duplicate-row query finds nothing and the remediation differs. No
@@ -405,20 +417,36 @@ groups:
         annotations:
           summary: "A gateway presented a session_id another agent holds"
           description: >-
-            A gateway presented one agent a session_id that a different
+            Possible forged or colliding gateway session id; see the steps
+            below. A gateway presented one agent a session_id that a different
             agent's directory row already holds, and the server refused it:
             either a ProxyRegister replay adopt (FAILED_PRECONDITION; the
             gateway disconnects that agent so it registers fresh; op label
             proxy_register) or a NotifyStreamStatus CONNECTED (placement
             unpublished, op label announce_connected; also audit action
-            gateway.session_held_by_other_agent). The expected rate
+            gateway.session_held_by_other_agent). The CONNECTED refusal covers
+            a presenting agent that has NO directory row; an agent that still
+            has a row, including a tombstone, is not covered (its CONNECTED is
+            a session_mismatch and does not unpublish: the tombstoned-victim
+            residual, ADR-2002 7f). The expected rate
             is zero: this means a forged or colliding presented id from a
             pinned gateway peer, a CC6.6 signal.
-            FIRST REMEDIATION: find the server WARN "ProxyRegister: presented
-            session <id> for agent <agent> is already held by a different
-            agent's directory row" (the id is sanitized and truncated to 64
-            bytes), look up the holder with SELECT agent_id, gateway_node FROM
-            gateway_route_store.agent_routes WHERE session_id = '<id>', identify the
+            FIRST REMEDIATION: first rule out the migration artifact. If
+            yuzu_server_gateway_route_session_dedup_total is above 0 on this
+            start, or the server logged "migration v5 tombstoned N" shortly
+            before the first refusal, the refusals are the one-time v5 dedup
+            (the affected agents lost the replay race and re-register); they
+            stop on their own. Otherwise treat the alert as a forged or
+            colliding id. Find the server WARN, one of two texts:
+            "ProxyRegister: presented session <id> for agent <agent> is
+            already held by a different agent's directory row" (op
+            proxy_register) or "NotifyStreamStatus: CONNECTED for agent
+            <agent> presents session <id> that another agent's route already
+            holds (#5683)" (op announce_connected); ids are sanitized and
+            truncated. Paste an id into SQL only if it matches
+            ^gw-session-[0-9a-f]{32}$. Look up the holder with SELECT
+            agent_id, gateway_node FROM gateway_route_store.agent_routes
+            WHERE session_id = '<id>', identify the
             presenting gateway from its peer certificate, and escalate to
             security. Concurrent adopts of one id are serialised by the
             unique session index; the loser is counted here. Evidence is

@@ -3048,8 +3048,8 @@ TEST_CASE("WS-5 BatchHeartbeat: a session id carried by TWO directory rows is re
     REQUIRE(row_b.has_value());
     REQUIRE(row_b->has_value());
     // Force the duplicate: agent b's row now carries agent a's session id. The
-    // v5 unique index would refuse it, so model pre-v5 data by dropping it
-    // (defense-in-depth: the ambiguity refusal must keep working).
+    // v5 unique index would refuse it, so model a hand-dropped index by dropping
+    // it (defense-in-depth: the ambiguity refusal must keep working).
     raw_exec(db.dsn(), "DROP INDEX gateway_route_store.ux_agent_routes_session_id");
     raw_bump_epoch(db.dsn(), "yuzu_test_ws5_dup_b", (*row_b)->connection_epoch + 1, sid1);
 
