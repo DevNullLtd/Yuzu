@@ -676,6 +676,14 @@ ApprovalManager::submit_impl(const std::string& definition_id, const std::string
         if (!names_concrete_surface(origin))
             return fail(SubmitFailure::kInvalidRequest,
                         "a bound approval must declare a concrete origin");
+        // A bound ticket is never a scheduled one. ScheduleRunner matches approved tickets
+        // on (schedule_id, definition, scope) with no origin check and fires the schedule's
+        // own definition, so a bound ticket carrying a schedule id could be fired without
+        // its frozen request, digest or excluded roots ever being compared. Unbound
+        // scheduled tickets (the #6096 path) are unaffected.
+        if (!schedule_id.empty())
+            return fail(SubmitFailure::kInvalidRequest,
+                        "a bound approval cannot carry a schedule id");
         if (bound->request_json.empty() || bound->request_json.size() > kMaxRequestJsonBytes)
             return fail(SubmitFailure::kInvalidRequest,
                         "request_json is required and at most " +

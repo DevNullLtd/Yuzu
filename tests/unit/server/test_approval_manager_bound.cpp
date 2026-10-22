@@ -747,6 +747,48 @@ std::string request_of_size(std::size_t total) {
 
 } // namespace
 
+// A bound ticket is never a scheduled ticket. ScheduleRunner matches approved tickets on
+// (schedule_id, definition, scope) with no origin check and fires the schedule's OWN
+// definition, so a bound ticket carrying a schedule id could be fired without the frozen
+// request, digest or excluded roots ever being compared. The mint refuses the combination.
+TEST_CASE("submit_bound: a bound mint with a schedule id is refused and writes nothing",
+          "[pg][approval_manager][bound][6096]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    REQUIRE(mgr.pending_count() == 0);
+
+    SECTION("refused with the validation kind, no row, no pending-count change") {
+        for (const auto origin : {ApprovalOrigin::kGuardianDeploy, ApprovalOrigin::kSchedule}) {
+            auto r = mgr.submit_bound("guardian.d", "alice", "scope", "sched-a", origin,
+                                      bound_request({"carol"}));
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error().kind == SubmitFailure::kInvalidRequest);
+            CHECK(r.error().message.find("schedule") != std::string::npos);
+            CHECK(mgr.pending_count() == 0);
+            CHECK(mgr.query({}).empty()); // no row of any status
+        }
+    }
+    SECTION("an unbound mint with a schedule id (the #6096 path) is unchanged") {
+        auto id = mgr.submit("d", "alice", "scope", "sched-a", ApprovalOrigin::kSchedule, "p", "a");
+        REQUIRE(id.has_value());
+        CHECK(mgr.pending_count() == 1);
+        const auto row = mgr.get(*id);
+        REQUIRE(row.has_value());
+        CHECK(row->schedule_id == "sched-a");
+        CHECK(row->request_json.empty());
+    }
+    SECTION("a bound mint with an empty schedule id still works") {
+        auto id = mgr.submit_bound("guardian.d", "alice", "scope", "",
+                                   ApprovalOrigin::kGuardianDeploy, bound_request({"carol"}));
+        REQUIRE(id.has_value());
+        CHECK(mgr.pending_count() == 1);
+        const auto row = mgr.get(*id);
+        REQUIRE(row.has_value());
+        CHECK(row->schedule_id.empty());
+        CHECK(row->request_json == kRequest);
+    }
+}
+
 // One boundary per SECTION (Catch2 re-runs the case for each), each asserting the typed kind AND
 // that the refusal is for the stated reason: a refusal for the wrong reason must not pass, and
 // the first failure must not hide the others.
