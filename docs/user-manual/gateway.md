@@ -2215,7 +2215,9 @@ migrating start; the
 because a tombstoned group of k rows can produce at most k-1 refusals (N is a
 safe upper bound; the recovery block's own tombstones produce the same refusals
 but `route_meta` does not count them, so record that `UPDATE`'s row count and
-time and apply the same rule); any `op="announce_connected"` refusal is NOT the
+time and apply the same rule); count the refusal WARN lines rather than the
+counter if any replica restarted since the migrating start (the counter resets
+on restart); any `op="announce_connected"` refusal is NOT the
 artifact; and (b) they all occur within that start's window: one or two agent
 heartbeat cycles (30 s by default, `--heartbeat` changes it), plus up to 300 s
 of breaker backoff (cap `circuit_breaker_max_reset_timeout_ms` in
@@ -2280,8 +2282,20 @@ its circuit breaker.
    ```
    You do not need to stop the server. While the block runs, the live server's
    statements on `agent_routes` stall (about 2.4 s per million rows for the
-   build); if the lock is not granted within 30 s the block rolls back and
-   nothing changed, so it is safe to retry.
+   build). A pending `ACCESS EXCLUSIVE` request already queues new statements
+   during its up-to-30 s lock wait, not only during the build. A stalled
+   statement waits at most the pool's 10 s `lock_timeout` (set on every pooled
+   connection, `pg_pool.hpp`) and then fails as a degrade (`ProxyRegister`
+   `UNAVAILABLE`, counted in `yuzu_server_gateway_route_write_failed_total`);
+   that is only reachable above roughly 4M rows. If the lock is not granted
+   within 30 s the block rolls back and nothing changed, so it is safe to retry.
+   To get a SQL session: on the single-node composes run
+   `docker compose exec postgres psql -U yuzu -d yuzu` (or
+   `psql "$YUZU_POSTGRES_DSN"`); in `docker-compose.ha-postgres.yml`
+   `postgres` is only a network alias on HAProxy (port 5432 forwards to the
+   current Patroni primary), so connect through that alias or exec into the
+   current Patroni leader (a replica rejects the block with a read-only
+   transaction error, which is safe).
 3. Drop the old non-unique index only if it still exists (a no-op when
    migration v5 already ran):
    `DROP INDEX IF EXISTS gateway_route_store.agent_routes_session_id_idx;`

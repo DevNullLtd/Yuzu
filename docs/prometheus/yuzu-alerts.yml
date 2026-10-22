@@ -446,8 +446,10 @@ groups:
             at most N, the number of rows migration v5 tombstoned on that start
             (yuzu_server_gateway_route_session_dedup_total on the migrating
             start; the "migration v5 tombstoned N" WARN, or the route_meta
-            value after a restart); any op="announce_connected" refusal is NOT
-            the artifact; and (b) they all occur within that start's window:
+            value after a restart); count the refusal WARN lines rather than
+            the counter if any replica restarted since the migrating start
+            (the counter resets on restart); any op="announce_connected"
+            refusal is NOT the artifact; and (b) they all occur within that start's window:
             one or two agent heartbeat cycles (30 s by default, --heartbeat
             changes it), plus up to 300 s of breaker backoff (cap
             circuit_breaker_max_reset_timeout_ms in gateway/config/sys.config),

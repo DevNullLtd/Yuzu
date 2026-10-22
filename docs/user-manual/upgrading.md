@@ -599,7 +599,8 @@ unheld session id used to both succeed; now the second is refused (`FAILED_PRECO
   to the `Type=simple` `yuzu-server.service`. A Kubernetes `startupProbe` or `livenessProbe` that gives up first
   WOULD restart the server mid-build (the build rolls back and the next start begins again); no
   Kubernetes manifest ships with Yuzu, so allow the same total there.
-- **Seeing whether it is building or waiting.** In `psql`, `SELECT phase, blocks_done, blocks_total FROM
+- **Seeing whether it is building or waiting.** In `psql` (opening a SQL session in each shipped topology:
+  [gateway.md](gateway.md#forged-or-colliding-session-ids)), `SELECT phase, blocks_done, blocks_total FROM
   pg_stat_progress_create_index;` shows a build in progress. A row in `pg_stat_activity` for the server's
   connection with `wait_event_type = 'Lock'` means it is still waiting for its lock.
 - **If the 30 s lock wait expires.** The migration waits at most 30 s for its lock. If another session
@@ -627,7 +628,8 @@ unheld session id used to both succeed; now the second is refused (`FAILED_PRECO
   N, the number of rows migration v5 tombstoned on that start
   (`yuzu_server_gateway_route_session_dedup_total` on the migrating start; the `migration v5 tombstoned N`
   WARN, or the `route_meta` value after a restart), because a tombstoned group of k rows can produce at
-  most k-1 refusals (N is a safe upper bound); any
+  most k-1 refusals (N is a safe upper bound); count the refusal WARN lines rather than the counter if
+  any replica restarted since the migrating start (the counter resets on restart); any
   `op="announce_connected"` refusal is NOT the artifact; and (b) they all occur within that start's
   window: one or two agent heartbeat cycles (30 s by default, `--heartbeat` changes it), plus up to 300 s
   of breaker backoff (cap `circuit_breaker_max_reset_timeout_ms` in `gateway/config/sys.config`), plus the
