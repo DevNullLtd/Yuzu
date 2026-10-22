@@ -1655,7 +1655,7 @@ TEST_CASE("pass identity: consumed only by the principal that earned it", "[step
     // A mismatch refuses AND spends the pass: the earning principal cannot consume it afterwards
     // either. (That the spent pass is not reported as a skipped gate is pinned separately below,
     // where nothing consumes it before the post-routing report.)
-    const auto refused_and_cleared = [&](const auth::Session& handler_session) {
+    const auto refused_and_spent = [&](const auth::Session& handler_session) {
         CHECK_FALSE(detail::consume_step_up_pass(req, handler_session, std::string(kTokensLabel)));
         CHECK_FALSE(detail::consume_step_up_pass(req, earned, std::string(kTokensLabel)));
     };
@@ -1668,30 +1668,30 @@ TEST_CASE("pass identity: consumed only by the principal that earned it", "[step
         auto copy = make_session("alice", "local", Role::user, ago(1h));
         CHECK(detail::consume_step_up_pass(req, copy, std::string(kTokensLabel)));
     }
-    SECTION("a different username is refused and the pass is cleared") {
-        refused_and_cleared(make_session("bob", "local", Role::admin, ago(10s)));
+    SECTION("a different username is refused and the pass is spent") {
+        refused_and_spent(make_session("bob", "local", Role::admin, ago(10s)));
     }
-    SECTION("a different auth source is refused and the pass is cleared") {
-        refused_and_cleared(make_session("alice", "oidc", Role::admin, ago(10s)));
+    SECTION("a different auth source is refused and the pass is spent") {
+        refused_and_spent(make_session("alice", "oidc", Role::admin, ago(10s)));
     }
-    SECTION("an API-token session of the same username is refused and the pass is cleared") {
-        refused_and_cleared(make_session("alice", "api_token", Role::admin, ago(10s)));
+    SECTION("an API-token session of the same username is refused and the pass is spent") {
+        refused_and_spent(make_session("alice", "api_token", Role::admin, ago(10s)));
     }
-    SECTION("a different principal kind is refused and the pass is cleared") {
+    SECTION("a different principal kind is refused and the pass is spent") {
         auto other = make_session("alice", "local", Role::admin, ago(10s));
         other.principal_kind = "engine";
-        refused_and_cleared(other);
+        refused_and_spent(other);
     }
     SECTION("a different non-engine principal kind is refused on the fingerprint alone") {
         auto other = make_session("alice", "local", Role::admin, ago(10s));
         other.principal_kind = "service";
-        refused_and_cleared(other);
+        refused_and_spent(other);
     }
-    SECTION("an engine session behind a local pass is refused and the pass is cleared") {
-        refused_and_cleared(engine_session("alice"));
+    SECTION("an engine session behind a local pass is refused and the pass is spent") {
+        refused_and_spent(engine_session("alice"));
     }
     SECTION("an engine session with a different name is refused too") {
-        refused_and_cleared(engine_session("engine:ci"));
+        refused_and_spent(engine_session("engine:ci"));
     }
     SECTION("a refused pass is not reported as a skipped gate") {
         // Nothing consumes the pass after the mismatch, so the count below is decided by the
@@ -1704,7 +1704,7 @@ TEST_CASE("pass identity: consumed only by the principal that earned it", "[step
         CHECK(rig.gate_count("handler_skipped", "local", "rest") == 0);
     }
     SECTION("a refusal on identity leaves a later request's pass unaffected") {
-        refused_and_cleared(make_session("bob", "local", Role::admin, ago(10s)));
+        refused_and_spent(make_session("bob", "local", Role::admin, ago(10s)));
         httplib::Response res2;
         REQUIRE(detail::apply_step_up_chokepoint(req, res2, rig.deps()) ==
                 StepUpChokepointResult::kPassed);
@@ -2120,8 +2120,9 @@ TEST_CASE("pass stash: an unconsumed pass on a 2xx response is counted handler_s
 
 // The stash is a thread_local, and successive requests on one httplib worker thread can share a
 // `httplib::Request` address, so the address is not a key. These cases run the sequences the
-// three clear sites in server.cpp (pre-routing top, post-routing, and the consume/catch sites in
-// step_up_gate.cpp) exist for, through the same `detail::` entry points those sites call.
+// clear sites in server.cpp (pre-routing top, post-routing) and the chokepoint's fail-closed
+// path exist for, through the same `detail::` entry points those sites call. Consume is not a
+// clear site: it spends the pass and leaves the binding armed.
 // server.cpp's own calls are pinned by test_step_up_wiring.cpp.
 TEST_CASE("pass stash lifecycle: a pass armed by request A is not consumable by request B at the "
           "same address",

@@ -105,7 +105,7 @@ run_pre_request_stage(const httplib::Request& req, httplib::Response& res,
 /// The in-handler step-up decision, behind the `StepUpFn` `server.cpp` hands to the route owners.
 ///   1. The chokepoint already passed this request for this action AND for the principal `session`
 ///      (the one the handler resolved): consume the pass and allow (skips a second MFA store
-///      read). The address is not a key; the stash clears, the label match and the identity match
+///      read). The address is not a key; the end-of-request clears, the label match and the identity match
 ///      are what protect against a stale pass or one earned by another principal (see
 ///      `StepUpPassStash`). A pass for a different principal is refused and spent, and step 2/3
 ///      evaluate `session` afresh. The request's principal binding outlives the pass.

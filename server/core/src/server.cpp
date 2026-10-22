@@ -15540,15 +15540,17 @@ private:
                 ~EngineClassStashClear() { detail::tls_engine_principal() = false; }
             } engine_class_stash_clear;
 
+            // Step-up chokepoint: a pass that the in-handler gate never spent, on a 2xx
+            // response, is counted as handler_skipped (report-only); always clears the stash,
+            // the per-request principal binding included. It is noexcept and runs BEFORE the
+            // quota-slot release below, so the stash and the binding are cleared even if that
+            // release throws.
+            detail::finish_step_up_pass(req, res, &metrics_);
+
             // Per-principal quota (PR 4.4) — release the concurrency slot
             // (if any) admitted for this request at pre-routing. A no-op for
             // denied/streaming/non-engine requests, which never stash one.
             detail::tls_quota_slot().reset();
-
-            // Step-up chokepoint: a pass that the in-handler gate never spent, on a 2xx
-            // response, is counted as handler_skipped (report-only); always clears the stash,
-            // the per-request principal binding included.
-            detail::finish_step_up_pass(req, res, &metrics_);
 
             // -- Security response headers (SOC2-C1) ---------------------
             // Applied to ALL responses (dashboard, API, metrics, health,

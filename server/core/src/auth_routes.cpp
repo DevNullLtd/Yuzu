@@ -472,7 +472,7 @@ std::optional<auth::Session> AuthRoutes::resolve_session_unbound(const httplib::
         // lapses is where the `role.elevation.expired` audit row is minted.
         // Uses audit_log_for_principal (not audit_log) because audit_log's
         // make_audit_event() itself calls resolve_session(req) — calling that
-        // from inside resolve_session would re-enter this function. `session`
+        // from inside resolve_session would re-enter the resolution. `session`
         // already carries the base role (Session::role is never the elevated
         // view), matching the `role.elevation.revoked` audit's principal_role.
         if (auto expired_user = auth_mgr_.reap_expired_elevation(token)) {

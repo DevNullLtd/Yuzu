@@ -214,9 +214,12 @@ namespace detail {
 /// collision needs a 128-bit match against a cryptographic hash. The username is caller-chosen
 /// text, so a pair of seeded non-cryptographic 64-bit hashes would not give that margin.
 ///
-/// Coupling note: the identity omits role, mcp_tier and token_scope_service. That is safe only
-/// while `decide_step_up` ignores them for every principal it can pass; if it ever consults one,
-/// extend this identity in the same change.
+/// Coupling note: the identity omits the role, the MFA proof timestamps, mcp_tier and
+/// token_scope_service, although `decide_step_up` does read the role (the OIDC no-proof branch,
+/// through `mfa_enforcement_protects`) and the proof timestamps. It is sufficient because one
+/// request resolves ONE cookie session or ONE token class, so those inputs come from a single
+/// session record per credential. If a credential kind can carry a differing role or proof for
+/// the same (principal kind, auth source, username), extend this identity in the same change.
 struct StepUpPassIdentity {
     bool engine{false};
     std::uint64_t h1{0};
@@ -256,11 +259,16 @@ struct StepUpPassIdentity {
 ///     the principal the chokepoint decided on, so the binding keeps the principal that
 ///     authorises the request the principal the step-up check was made for.
 ///
-/// PR 2 deletes this stash, `consume_step_up_pass`, `finish_step_up_pass`, the binding and the
-/// `handler_skipped` outcome together with the in-handler `StepUpFn` calls. Precondition for that
-/// deletion: handlers consume the centrally resolved session, or the repeated resolutions are
-/// removed (resolve once, issue #6200). Deleting the binding while handlers still resolve more
-/// than once re-opens the multi-resolution gap.
+/// Thread affinity: the stash and the binding are thread-local. A session resolution made on a
+/// thread other than the one that ran the pre-request stage is unbound (admitted, as for any
+/// non-gated request). No kRequired route resolves off the worker thread today.
+///
+/// Chokepoint PR 2 deletes the pass, `consume_step_up_pass`, `finish_step_up_pass` and the
+/// `handler_skipped` outcome together with the in-handler `StepUpFn` calls, but KEEPS the binding
+/// until handlers consume the centrally resolved session or the repeated resolutions are removed
+/// (resolve once, issue #6200); ideally the binding then carries the resolved session itself.
+/// Deleting the binding while handlers still resolve more than once re-opens the
+/// multi-resolution gap.
 struct StepUpPassStash {
     const httplib::Request* req{nullptr};
     const StepUpPolicyEntry* row{nullptr}; // non-null only while the pass is unspent
@@ -293,7 +301,8 @@ static_assert(std::is_trivially_destructible_v<StepUpPassStash>,
 /// if `session` has exactly the bound identity (an identity that cannot be fingerprinted is not
 /// admitted). On false one sampled warning with a fixed message is logged (no username, no
 /// credential). Called by `AuthRoutes::resolve_session` on every path it returns a session on, so
-/// every later resolution for a gated request yields the bound principal or none.
+/// every later resolution for a gated request yields the bound principal or none. The binding is
+/// thread-local: a resolution made on another thread is unbound (admitted).
 [[nodiscard]] bool step_up_binding_admits(const httplib::Request& req,
                                           const auth::Session& session) noexcept;
 

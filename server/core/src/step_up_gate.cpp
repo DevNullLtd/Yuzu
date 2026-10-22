@@ -121,6 +121,20 @@ void note_chokepoint_exception(const std::string& label, const char* what) noexc
     }
 }
 
+// The session could not be fingerprinted, so the request cannot be bound to a principal and is
+// refused. Nothing threw, so this is not `note_chokepoint_exception`'s line. Sampled like it, with
+// a fixed message (no username). Must not throw.
+void note_chokepoint_unfingerprintable(const std::string& label) noexcept {
+    try {
+        static std::atomic<std::uint64_t> unfingerprintable_hits{0};
+        if (should_log_sampled(unfingerprintable_hits))
+            spdlog::error("step-up gate: could not fingerprint the session for {}; failing closed "
+                          "(1 log per {} occurrences; the counter records all)",
+                          label, kStepUpLogSample);
+    } catch (...) { // NOLINT(bugprone-empty-catch)
+    }
+}
+
 // A pass that the handler's session could not claim. One sampled warning naming only the route
 // (never a username); the continuous signal is the handler's own evaluation, which renders and
 // audits its verdict. Must not throw: a logger failure is swallowed.
@@ -612,7 +626,7 @@ StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req, htt
         // evaluation that would leave later session resolutions unbound.
         StepUpPassIdentity identity;
         if (!step_up_identity_of(*session, identity)) {
-            note_chokepoint_exception(label, "identity digest failed");
+            note_chokepoint_unfingerprintable(label);
             return fail_closed();
         }
         count_gate(deps.metrics, "pass", session->auth_source, surface);

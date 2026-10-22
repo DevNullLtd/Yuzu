@@ -903,7 +903,7 @@ TEST_CASE("wiring: the approve handler does not consume a pass earned by another
     CHECK(r->status == 503);
     CHECK(s.gate_count("pass", "local") == 1);
     CHECK(s.handler_step_up_calls.load() == 1);
-    // The refused pass was cleared, so no skipped gate is reported for this request.
+    // The refused pass was spent, so no skipped gate is reported for this request.
     CHECK(s.gate_count("handler_skipped", "local") == 0);
     // Nothing was decided: no `attempted` audit row and the ticket is still pending.
     CHECK(s.handler_audit_rows.load() == 0);
@@ -1006,7 +1006,7 @@ TEST_CASE("wiring: the in-request pass is honoured only for the principal that e
                 engine_row || (a.action == "mfa.step_up.required" && a.target_id == kRaiseLabel &&
                                a.detail.find("engine_principal_denied") != std::string::npos);
         CHECK(engine_row);
-        // The central check passed A once; the refused pass was cleared, so no skipped gate is
+        // The central check passed A once; the refused pass was spent, so no skipped gate is
         // reported for a request the handler answered itself.
         CHECK(s.gate_count("pass", "local", "rest") == 1);
         CHECK(s.gate_count("handler_skipped", "local", "rest") == 0);
@@ -1311,7 +1311,7 @@ TEST_CASE("wiring: a fresh cookie proof with a foreign Origin reaches the handle
     ApprovalWiringServer s;
     s.set_session(make_session("alice", "local", Role::admin, 5s));
     auto r = s.post("/api/approvals/abc123/approve", /*same_site_origin=*/false,
-                    "http://evil.example");
+                    "https://other-site.example");
     REQUIRE(r);
     CHECK(s.gate_count("pass", "local") == 1);
     bool csrf_row = false;
@@ -1332,7 +1332,7 @@ TEST_CASE("wiring: a stale cookie proof with a foreign Origin is a step-up 401 b
     ApprovalWiringServer s;
     s.set_session(make_session("alice", "local", Role::admin, 1h));
     auto r = s.post("/api/approvals/abc123/approve", /*same_site_origin=*/false,
-                    "http://evil.example");
+                    "https://other-site.example");
     REQUIRE(r);
     CHECK(r->status == 401);
     const auto body = nlohmann::json::parse(r->body, nullptr, /*allow_exceptions=*/false);
