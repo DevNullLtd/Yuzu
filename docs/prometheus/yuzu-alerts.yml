@@ -380,10 +380,12 @@ groups:
             AND i.indrelid = 'gateway_route_store.agent_routes'::regclass AND
             i.indnatts = 1 AND i.indkey[0] = (SELECT attnum FROM pg_attribute
             WHERE attrelid = i.indrelid AND attname = 'session_id') AND
-            i.indisunique AND i.indisvalid AND i.indpred IS NOT NULL;
-            (a row means the index is unique, valid, partial and on
-            agent_routes(session_id); a same-named index of another shape,
-            column or table, or an invalid one, returns no row). If it returns
+            i.indisunique AND i.indisvalid AND pg_get_expr(i.indpred,
+            i.indrelid) = '(session_id IS NOT NULL)';
+            (a row means the index is unique, valid, on
+            agent_routes(session_id) and partial with exactly that predicate;
+            a same-named index of another shape, column, table or predicate,
+            or an invalid one, returns no row). If it returns
             a row the duplicate is already gone and this alert clears within
             the hour. If it returns no row, follow the
             recovery procedure in
@@ -425,8 +427,12 @@ groups:
         annotations:
           summary: "A gateway presented a session_id another agent holds"
           description: >-
-            Possible forged or colliding gateway session id; see the steps
-            below. A gateway presented one agent a session_id that a different
+            Possible forged or colliding gateway session id, a CC6.6 signal;
+            expected rate zero. Likely benign only if a server upgrade to this
+            version started within about the last 6 minutes and the count is
+            at most the tombstoned-row count; otherwise treat it as a security
+            event and escalate to security.
+            A gateway presented one agent a session_id that a different
             agent's directory row already holds, and the server refused it:
             either a ProxyRegister replay adopt (FAILED_PRECONDITION; the
             gateway disconnects that agent so it registers fresh; op label
@@ -436,40 +442,37 @@ groups:
             a presenting agent that has NO directory row; an agent that still
             has a row, including a tombstone, is not covered (its CONNECTED is
             a session_mismatch and does not unpublish: the tombstoned-victim
-            residual, ADR-2002 7f). The expected rate
-            is zero: this means a forged or colliding presented id from a
-            pinned gateway peer, a CC6.6 signal.
-            FIRST REMEDIATION: first rule out the migration artifact. The
-            refusals can be the one-time v5 dedup artifact ONLY IF BOTH hold:
-            (a) the number of op="proxy_register" session_held_by_other_agent
-            refusals since that start, summed over every server replica, is
-            at most N, the number of rows migration v5 tombstoned on that start
+            residual, ADR-2002 7f).
+            FIRST REMEDIATION: rule out the migration artifact. The refusals
+            can be the one-time v5 dedup artifact ONLY IF BOTH hold: (a) the
+            number of op="proxy_register" refusals since that start, summed
+            over every server replica, is at most N, the number of rows
+            migration v5 tombstoned on that start
             (yuzu_server_gateway_route_session_dedup_total on the migrating
             start; the "migration v5 tombstoned N" WARN, or the route_meta
             value after a restart); count the refusal WARN lines rather than
-            the counter if any replica restarted since the migrating start
-            (the counter resets on restart); any op="announce_connected"
-            refusal is NOT the artifact; and (b) they all occur within that start's window:
-            one or two agent heartbeat cycles (30 s by default, --heartbeat
+            the counter if any replica restarted since (the counter resets on
+            restart); any op="announce_connected" refusal is NOT the
+            artifact; and (b) they all occur within that start's window: one
+            or two agent heartbeat cycles (30 s by default, --heartbeat
             changes it), plus up to 300 s of breaker backoff (cap
             circuit_breaker_max_reset_timeout_ms in gateway/config/sys.config),
             plus the replay drip (about 20 ms per agent on that gateway):
-            allow roughly 6 minutes plus 20 ms per agent at the defaults.
-            Refusals past that window, or more than N, are NOT the artifact
-            (this errs on the safe side): treat them as a
-            forged or colliding id. Refusals inside the bound and window are
-            NOT proof of benignness (a forged presenter acting at the same
-            time could hide inside them): the rule only lets you stop
+            roughly 6 minutes plus 20 ms per agent at the defaults. Refusals
+            past that window, or more than N, are NOT the artifact. Refusals
+            inside the bound and window are NOT proof of benignness (a forged
+            presenter could hide inside them): the rule only lets you stop
             escalating once refusals have stopped inside the window, so
-            re-check the count after the window has passed and do not silence
-            this alert beyond it (it has no for: and uses increase()[1h], so a
-            silence would hide later refusals). The counter keeps its
-            migrating-start value for the process lifetime, so it proves
-            nothing about timing: establish timing from the WARN timestamps,
-            and if the migrating start's time or log cannot be found,
-            escalate (details: docs/user-manual/gateway.md "One-time dedup at
-            upgrade"). Find the server WARN, one of two texts:
-            "ProxyRegister: presented session <id> for agent <agent> is
+            re-check the count after the window and do not silence this alert
+            beyond it (it has no for: and uses increase()[1h]). The counter
+            keeps its migrating-start value for the process lifetime, so
+            establish timing from the WARN timestamps, or, while the store is
+            still at version 5, SELECT version, to_timestamp(upgraded_at) FROM
+            public.schema_meta WHERE store = 'gateway_route_store' (a later
+            store migration overwrites it); if the migrating start's time
+            cannot be found, escalate (details: docs/user-manual/gateway.md
+            "One-time dedup at upgrade"). Find the server WARN, one of two
+            texts: "ProxyRegister: presented session <id> for agent <agent> is
             already held by a different agent's directory row" (op
             proxy_register) or "NotifyStreamStatus: CONNECTED for agent
             <agent> presents session <id> that another agent's route already
@@ -477,13 +480,10 @@ groups:
             truncated. Paste an id into SQL only if it matches
             ^gw-session-[0-9a-f]{32}$. Look up the holder with SELECT
             agent_id, gateway_node FROM gateway_route_store.agent_routes
-            WHERE session_id = '<id>', identify the
-            presenting gateway from its peer certificate, and escalate to
-            security. Concurrent adopts of one id are serialised by the
-            unique session index; the loser is counted here. Evidence is
-            metrics and logs (plus the audit row for op announce_connected). See
-            ADR-2002 §7f and docs/user-manual/gateway.md "Forged or colliding
-            session ids".
+            WHERE session_id = '<id>' and identify the presenting gateway from
+            its peer certificate. Evidence is metrics and logs (plus the audit
+            row for op announce_connected). See ADR-2002 §7f and docs/user-manual/gateway.md "Forged or
+            colliding session ids".
 
       # HA WS-4 rest-of-4.3 (ADR-2002 §7d) — cross-cluster gateway fan-out.
       # No `for:`, matching YuzuGatewayMgmtAuthRejected's own reasoning

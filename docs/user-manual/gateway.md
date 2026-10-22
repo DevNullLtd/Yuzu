@@ -1708,9 +1708,11 @@ failures now count toward the shared breaker (see below).
   outcome `connected_unverified` (the directory read failed and this replica
   holds no matching local session) or `stale_connected_session` (the directory
   row or the local registry names a different session). The same holds for the
-  `op="announce_connected"` refusals `session_held_by_other_agent` and
-  `cluster_affinity_violation`. Recovery is the same: the agent's next
-  reconnect.
+  `op="announce_connected"` refusals `session_held_by_other_agent` and the
+  affinity pre-check `cluster_affinity_violation`, which answer
+  `acknowledged=false`; the post-write `cluster_affinity_violation` arm answers
+  `acknowledged=true` today (#5977), so the gateway sees no refusal there.
+  Recovery is the same: the agent's next reconnect.
 - Correctness on several core replicas (see below).
 - Any order beyond first-in, first-out in sorted session-id order. The gateway
   sorts the ids it keeps from one response, so each verdict's agents are queued
@@ -2236,7 +2238,10 @@ silence would hide later refusals). The counter keeps its migrating-start value
 for the whole process lifetime, so it proves nothing about timing; establish
 timing from the WARN timestamps (after any restart the counter reads 0 and the
 `route_meta` value has no timestamp, so use the earlier start's WARN time or the
-deploy time, with the `route_meta` count). If the migrating start's time or log
+deploy time, with the `route_meta` count; while the store is still at version 5,
+`SELECT version, to_timestamp(upgraded_at) FROM public.schema_meta WHERE store = 'gateway_route_store';`
+gives the time v5 was applied, but a later store migration overwrites it, then
+use the logs). If the migrating start's time or log
 cannot be found, escalate.
 See
 [upgrading](upgrading.md#behaviour-change-gateway-sessions-are-unique-per-agent-a-one-time-migration-gateway_route_store-v5-5683).
@@ -2250,8 +2255,9 @@ error, `ProxyRegister` answers `UNAVAILABLE` and the gateway counts that against
 its circuit breaker.
 
 0. Check first whether the correct index exists:
-   `SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'gateway_route_store' AND c.relname = 'ux_agent_routes_session_id' AND i.indrelid = 'gateway_route_store.agent_routes'::regclass AND i.indnatts = 1 AND i.indkey[0] = (SELECT attnum FROM pg_attribute WHERE attrelid = i.indrelid AND attname = 'session_id') AND i.indisunique AND i.indisvalid AND i.indpred IS NOT NULL;`
-   A row means the index is unique, valid, partial and on `agent_routes(session_id)`: do not run
+   `SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'gateway_route_store' AND c.relname = 'ux_agent_routes_session_id' AND i.indrelid = 'gateway_route_store.agent_routes'::regclass AND i.indnatts = 1 AND i.indkey[0] = (SELECT attnum FROM pg_attribute WHERE attrelid = i.indrelid AND attname = 'session_id') AND i.indisunique AND i.indisvalid AND pg_get_expr(i.indpred, i.indrelid) = '(session_id IS NOT NULL)';`
+   A row means the index is unique, valid, on `agent_routes(session_id)` and partial
+   with exactly the predicate `session_id IS NOT NULL`: do not run
    the block below (the duplicate is already gone and the alert clears within
    the hour; running it anyway is harmless but rebuilds the index under the
    lock). No row means it is missing, invalid or of another shape: continue.
@@ -2261,10 +2267,17 @@ its circuit breaker.
 2. Tombstone the duplicates and recreate the index in ONE transaction. The lock
    stops any writer creating a new duplicate in between, and the tombstone is
    the statement migration v5 uses (every row of each duplicate group; the
-   affected agents re-register through the replay). Run it as one block:
+   affected agents re-register through the replay). Run it as one block: save
+   it to a file and run `psql -v ON_ERROR_STOP=1 -f block.sql`; do not paste it
+   into a session with `ON_ERROR_ROLLBACK` enabled or a client that wraps
+   statements in savepoints (a failed `LOCK` would then leave the `UPDATE`
+   applied and the index unbuilt). Before running it, list who holds or waits
+   for a lock on the table, and avoid `pg_dump` windows (an empty result means
+   nothing is in the way):
+   `SELECT l.pid, a.state, a.application_name, a.xact_start FROM pg_locks l JOIN pg_stat_activity a USING (pid) WHERE l.relation = 'gateway_route_store.agent_routes'::regclass AND l.pid <> pg_backend_pid();`
    ```sql
    BEGIN;
-   SET LOCAL lock_timeout = '30s';
+   SET LOCAL lock_timeout = '5s';
    SET LOCAL statement_timeout = 0;
    LOCK TABLE gateway_route_store.agent_routes IN ACCESS EXCLUSIVE MODE;
    UPDATE gateway_route_store.agent_routes
@@ -2281,14 +2294,21 @@ its circuit breaker.
    COMMIT;
    ```
    You do not need to stop the server. While the block runs, the live server's
-   statements on `agent_routes` stall (about 2.4 s per million rows for the
-   build). A pending `ACCESS EXCLUSIVE` request already queues new statements
-   during its up-to-30 s lock wait, not only during the build. A stalled
-   statement waits at most the pool's 10 s `lock_timeout` (set on every pooled
-   connection, `pg_pool.hpp`) and then fails as a degrade (`ProxyRegister`
-   `UNAVAILABLE`, counted in `yuzu_server_gateway_route_write_failed_total`);
-   that is only reachable above roughly 4M rows. If the lock is not granted
-   within 30 s the block rolls back and nothing changed, so it is safe to retry.
+   statements on `agent_routes` stall: during the lock wait (a pending
+   `ACCESS EXCLUSIVE` request queues new statements) and during the build (about
+   2.4 s per million rows). A stalled statement waits at most the pool's 10 s
+   `lock_timeout` (set on every pooled connection, `pg_pool.hpp`) and then fails
+   as a degrade: fail-closed operations (`ProxyRegister`) return `UNAVAILABLE`
+   and feed the gateway circuit breaker; fail-open writers only count under
+   `yuzu_server_gateway_route_write_failed_total`. The build phase stalls
+   statements that long only above about 4M rows, but a lock wait behind a long
+   holder degrades queued statements at ANY table size. That is why the block
+   waits only 5 s, below the pool's 10 s (the migration's own 30 s wait runs at
+   start-up, before the gateway listener is up). If the lock is not granted
+   within 5 s the block gives up and nothing changed, so it is safe to retry.
+   Record the `UPDATE n` row count, the time and the operator in the change
+   ticket: Yuzu does not audit this manual change (rely on database statement
+   logging or pgaudit if enabled).
    To get a SQL session: on the single-node composes run
    `docker compose exec postgres psql -U yuzu -d yuzu` (or
    `psql "$YUZU_POSTGRES_DSN"`); in `docker-compose.ha-postgres.yml`

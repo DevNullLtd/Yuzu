@@ -570,12 +570,19 @@ from it. Rolling back removes the page, routes and tools; nothing is migrated.
 
 ## Behaviour change: gateway sessions are unique per agent; a one-time migration (`gateway_route_store` v5, #5683)
 
-**What changed.** A gateway session id can now be held by only one agent. Migration v5 of the
-gateway route directory adds a unique index on `gateway_route_store.agent_routes(session_id)`
-(tombstoned rows are not indexed) and drops the old non-unique one. Two agents racing to adopt one
-unheld session id used to both succeed; now the second is refused (`FAILED_PRECONDITION`, counted as
+**Short answer.** A normal upgrade needs no action. The first start takes an exclusive lock on
+`agent_routes` (about 2.4 s per million rows) and the health probes are silent meanwhile. If a
+blocking session holds the lock past 30 s the server exits and a supervisor retries about every 35 s
+until it is cleared. Details follow.
+
+**What changed.** In a gateway-fronted deployment the route directory enforces at most one non-NULL
+route row per session id by a database unique index; the tombstoned-victim window is not closed; run
+one replica. Migration v5 of the gateway route directory adds a unique index on
+`gateway_route_store.agent_routes(session_id)` (tombstoned rows are not indexed) and drops the old
+non-unique one. Two agents racing to adopt one unheld session id used to both succeed; now the second
+is refused (`FAILED_PRECONDITION`, counted as
 `yuzu_server_gateway_route_desync_total{outcome="session_held_by_other_agent"}`, alert
-`YuzuGatewaySessionHeldByOtherAgent`). It only matters for gateway-fronted deployments.
+`YuzuGatewaySessionHeldByOtherAgent`).
 
 - **One-time lock at the first start.** The migration takes an exclusive lock on `agent_routes`,
   removes any duplicates and builds the index. The lock blocks every other statement on that table
@@ -640,8 +647,10 @@ unheld session id used to both succeed; now the second is refused (`FAILED_PRECO
   same time could hide inside them): re-check the count after the window has passed and do not silence
   the alert beyond it (it uses `increase()[1h]`, so a silence would hide later refusals). The counter
   keeps its migrating-start value for the whole process lifetime, so it proves nothing about timing:
-  establish timing from the WARN timestamps, and if the migrating start's time or log cannot be found,
-  escalate (full rule: [gateway.md](gateway.md#forged-or-colliding-session-ids)).
+  establish timing from the WARN timestamps (or, while the store is still at version 5,
+  `SELECT version, to_timestamp(upgraded_at) FROM public.schema_meta WHERE store =
+  'gateway_route_store';`; a later store migration overwrites it), and if the migrating start's time
+  or log cannot be found, escalate (full rule: [gateway.md](gateway.md#forged-or-colliding-session-ids)).
 - **A CONNECTED notification is covered only when the presenting agent has no directory row.** An agent
   that still has a row, including a tombstone, is not covered: its CONNECTED lands as `session_mismatch`
   and does not unpublish (the tombstoned-victim residual recorded in ADR-2002 7f "Still open", #5685 area;
@@ -658,7 +667,10 @@ unheld session id used to both succeed; now the second is refused (`FAILED_PRECO
   is not unpublished. The tombstones the migration wrote are not undone.
 
 **Action.** None for a normal upgrade. On a very large directory, schedule the first start for a quiet
-period and raise any startup probe timeout.
+period and raise any startup probe timeout. To learn WHICH agents share a session id (the migration
+erases the association), run the duplicate query from step 1 of
+[gateway.md](gateway.md#forged-or-colliding-session-ids) "Recovering a missing unique session index"
+before the first start and keep the output with the change record.
 
 ## Behaviour change: new `ca_store` indexes, built during the upgrade
 
