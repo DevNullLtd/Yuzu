@@ -609,8 +609,7 @@ public:
     /// #4990 - the Forensics plugin set the stored-response read tier excludes
     /// (`ServerImpl::forensics_plugin_set_`, borrowed: it outlives this object). Same live-read
     /// timing as `set_fleet_read_fn`: the handlers read the member per request. Unset (nullptr, a
-    /// test harness) leaves the pre-tier behaviour for the response tools until their
-    /// `ForensicsVisibilityFn` wiring lands.
+    /// test harness) fails closed: the response tools refuse every row (`tier_filter_for`).
     void set_forensics_plugin_set(const ForensicsPluginSet* plugins) { forensics_plugins_ = plugins; }
 
     /// #4990 - the resolver behind the response tools' Forensics tier (see

@@ -1044,6 +1044,12 @@ struct McpTestServer {
     /// keeps existing tests on the "Response store unavailable" path.
     yuzu::server::ResponseStore* response_store_for_test{nullptr};
 
+    /// #4990: the caller's Forensics visibility for the response tools (admin by default, so a
+    /// test that is not about the tier keeps its meaning; the tier cases flip it before calling).
+    /// `forensics_unwired_for_test` leaves the resolver AND plugin set unwired (fail closed).
+    yuzu::server::test::ForensicsCaller forensics_for_test;
+    bool forensics_unwired_for_test{false};
+
     /// Optionally wire a real AuditStore so query_audit_log can be exercised
     /// end-to-end through the actual MCP dispatch path. Default nullptr keeps
     /// every pre-existing test on the "Audit store unavailable" path.
@@ -1585,6 +1591,12 @@ private:
         // predicate's "legacy-open" posture, so this is a no-op change of
         // shape for every pre-existing test that never touches it.
         mcp.set_fleet_read_fn(fleet_read_fn_for_test);
+
+        // #4990: the Forensics tier for the response tools, wired like the fleet gate above.
+        if (!forensics_unwired_for_test) {
+            mcp.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
+            mcp.set_forensics_visibility_fn(forensics_for_test.fn());
+        }
 
         // The registry tools' ToolDeps rides a setter beside it. The fleet gate is the
         // same permissive fake, so a deps-backed tool reaches its provider closures.
@@ -27353,6 +27365,196 @@ TEST_CASE("MCP aggregate_responses: unrestricted fleet gate preserves legacy-ope
     for (const auto& a : ts.audit_log)
         CHECK(a != "mcp.aggregate_responses|denied");
     CHECK_FALSE(result.contains("audit_persisted"));
+}
+
+// ── #4990: the Forensics tier on the response tools ─────────────────────────────────────────────
+//
+// Real PG-backed store, exact rendered rows, and a non-Forensics control row in every case: a stub
+// that only recorded the filter it was handed would stay green with the SQL clause deleted.
+namespace {
+using yuzu::server::test::kForensicsPlugin;
+using yuzu::server::test::kOrdinaryPlugin;
+using TierOutputs = std::set<std::string>;
+
+void store_tier_row(yuzu::server::ResponseStore& store, const std::string& exec_id,
+                    const std::string& instr_id, const std::string& agent,
+                    const std::string& plugin, const std::string& output, int64_t ts) {
+    auto r = mk_resp(exec_id, instr_id, agent, 0, output, ts);
+    r.plugin = plugin;
+    store.store(r);
+}
+
+// agent-A and agent-B each answered with a Forensics row; agent-A and agent-C with an ordinary one.
+void seed_mcp_tier(yuzu::server::ResponseStore& store, const std::string& exec_id,
+                   const std::string& instr_id) {
+    store_tier_row(store, exec_id, instr_id, "agent-A", kForensicsPlugin, "forensics-A", 600);
+    store_tier_row(store, exec_id, instr_id, "agent-B", kForensicsPlugin, "forensics-B", 601);
+    store_tier_row(store, exec_id, instr_id, "agent-A", kOrdinaryPlugin, "ordinary-A", 602);
+    store_tier_row(store, exec_id, instr_id, "agent-C", kOrdinaryPlugin, "ordinary-C", 603);
+}
+
+nlohmann::json query_responses_result(McpTestServer& ts, const std::string& args) {
+    auto body = mcp_tool_call(ts, "query_responses", args);
+    REQUIRE(body.contains("result"));
+    return body["result"];
+}
+
+TierOutputs response_outputs(const nlohmann::json& result) {
+    const auto rows = nlohmann::json::parse(result["content"][0]["text"].get<std::string>());
+    TierOutputs out;
+    for (const auto& r : rows)
+        out.insert(r["output"].get<std::string>());
+    return out;
+}
+} // namespace
+
+TEST_CASE("MCP query_responses: Forensics rows follow the caller's Forensics visibility, on both "
+          "id paths",
+          "[pg][mcp][integration][response][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    seed_mcp_tier(store, "exec-tier", "instr-tier");
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    for (const char* args : {R"({"execution_id":"exec-tier"})", R"({"instruction_id":"instr-tier"})"}) {
+        INFO(args);
+        ts.forensics_for_test.viewer();
+        CHECK(response_outputs(query_responses_result(ts, args)) ==
+              TierOutputs{"ordinary-A", "ordinary-C"});
+        ts.forensics_for_test.admin();
+        CHECK(response_outputs(query_responses_result(ts, args)) ==
+              TierOutputs{"forensics-A", "forensics-B", "ordinary-A", "ordinary-C"});
+        ts.forensics_for_test.scoped({"agent-B"});
+        CHECK(response_outputs(query_responses_result(ts, args)) ==
+              TierOutputs{"forensics-B", "ordinary-A", "ordinary-C"});
+    }
+}
+
+TEST_CASE("MCP query_responses: a filtered row looks absent and the cap flag follows the permitted set",
+          "[pg][mcp][integration][response][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    // Three Forensics rows and one ordinary row; limit=2 caps the full set but not the ordinary one.
+    store_tier_row(store, "exec-cap", "instr-cap", "agent-A", kForensicsPlugin, "forensics-1", 600);
+    store_tier_row(store, "exec-cap", "instr-cap", "agent-B", kForensicsPlugin, "forensics-2", 601);
+    store_tier_row(store, "exec-cap", "instr-cap", "agent-C", kForensicsPlugin, "forensics-3", 602);
+    store_tier_row(store, "exec-cap", "instr-cap", "agent-A", kOrdinaryPlugin, "ordinary-1", 603);
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    ts.forensics_for_test.viewer();
+    {
+        const auto result = query_responses_result(ts, R"({"execution_id":"exec-cap","limit":2})");
+        CHECK(response_outputs(result) == TierOutputs{"ordinary-1"});
+        CHECK_FALSE(result.contains("result_truncated_by_cap"));
+        CHECK_FALSE(result.contains("audit_persisted"));
+    }
+    ts.forensics_for_test.admin();
+    {
+        const auto result = query_responses_result(ts, R"({"execution_id":"exec-cap","limit":2})");
+        CHECK(response_outputs(result).size() == 2);
+        CHECK(result.contains("result_truncated_by_cap"));
+    }
+}
+
+TEST_CASE("MCP query_responses: an unwired Forensics resolver or plugin set fails closed",
+          "[pg][mcp][integration][response][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    seed_mcp_tier(store, "exec-unw", "instr-unw");
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.forensics_unwired_for_test = true;
+    ts.start("operator");
+    // No plugin set: the Forensics rows cannot be told apart from the rest, so none is served.
+    CHECK(response_outputs(query_responses_result(ts, R"({"execution_id":"exec-unw"})")).empty());
+}
+
+TEST_CASE("MCP aggregate_responses: totals are computed from the permitted rows only",
+          "[pg][mcp][integration][response][aggregate][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    seed_mcp_tier(store, "exec-agg", "instr-agg");
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    auto counts = [&] {
+        auto body = mcp_tool_call(
+            ts, "aggregate_responses",
+            R"({"instruction_id":"instr-agg","group_by":"agent_id","aggregate":"count"})");
+        const auto groups = nlohmann::json::parse(
+            body["result"]["content"][0]["text"].get<std::string>());
+        std::map<std::string, std::int64_t> m;
+        for (const auto& g : groups)
+            m[g["group_value"].get<std::string>()] = g["count"].get<std::int64_t>();
+        return m;
+    };
+    using M = std::map<std::string, std::int64_t>;
+
+    ts.forensics_for_test.viewer();
+    CHECK(counts() == M{{"agent-A", 1}, {"agent-C", 1}});
+    ts.forensics_for_test.admin();
+    CHECK(counts() == M{{"agent-A", 2}, {"agent-B", 1}, {"agent-C", 1}});
+    ts.forensics_for_test.scoped({"agent-B"});
+    CHECK(counts() == M{{"agent-A", 1}, {"agent-B", 1}, {"agent-C", 1}});
+}
+
+TEST_CASE("MCP preview_management_group_agent_count: only readable rows make an agent count",
+          "[pg][mcp][integration][response][devices][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    const std::string command_id = "cmd-mcp-preview-tier";
+    auto put = [&](const std::string& agent, const std::string& plugin) {
+        yuzu::server::StoredResponse r;
+        r.instruction_id = command_id;
+        r.agent_id = agent;
+        r.received_at_ms = 1000;
+        r.status = 0;
+        r.output = "same-value";
+        r.plugin = plugin;
+        store.store(r);
+    };
+    put("agent-a", kForensicsPlugin);
+    put("agent-b", kForensicsPlugin);
+    put("agent-c", kOrdinaryPlugin);
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start();
+
+    auto count = [&] {
+        const nlohmann::json args = {{"command_id", command_id},
+                                     {"plugin", "registry"},
+                                     {"filters", {{"output", "same-value"}}}};
+        auto body = mcp_tool_call(ts, "preview_management_group_agent_count", args.dump());
+        INFO(body.dump());
+        return preview_structured(body)["agent_count"].get<std::int64_t>();
+    };
+
+    ts.forensics_for_test.viewer();
+    CHECK(count() == 1); // agent-c only
+    ts.forensics_for_test.admin();
+    CHECK(count() == 3);
+    ts.forensics_for_test.scoped({"agent-a"});
+    CHECK(count() == 2); // agent-a (Forensics, in scope) + agent-c
 }
 
 TEST_CASE("MCP aggregate_responses: aggregate wrong JSON type is rejected -- not silently "

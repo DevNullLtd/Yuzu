@@ -775,6 +775,11 @@ static const ToolDef kTools[] = {
      "grant sees only their in-scope agents' rows, pushed into the underlying query "
      "before the row-limit cap so a confined caller's page is never truncated by "
      "hidden rows; a global Response:Read holder sees every agent's rows unchanged. "
+     "Rows written by Forensics-tier plugins (those with an action on the Forensics securable) "
+     "are served only to a caller who also holds Forensics:Read, globally or, while RBAC is "
+     "enforced, on that agent's management group; for any other caller they are absent from "
+     "the rows and from the row cap, with no marker (with RBAC off, Forensics:Read is "
+     "administrator-only). "
      "Fails closed (zero rows) when the RBAC store is corrupt. Each row also carries "
      "the response's own row id, its instruction_id, error_detail (populated on a "
      "failed/errored response), the originating plugin name, and received_at_ms "
@@ -793,7 +798,11 @@ static const ToolDef kTools[] = {
      "regardless of what a caller asked for). Confined by management group: "
      "the caller's visible-agent set is resolved and applied to the aggregation source rows BEFORE "
      "grouping (filter-before-aggregate), so a confined caller's totals cover only their in-scope "
-     "agents; a global Response:Read holder's totals are unchanged. Fails closed (a JSON-RPC error, "
+     "agents; a global Response:Read holder's totals are unchanged. Rows written by Forensics-tier "
+     "plugins (those with an action on the Forensics securable) are counted only for a caller "
+     "who also holds Forensics:Read, globally or, while RBAC is enforced, on that agent's "
+     "management group; for any other caller they add to no group or total, with no marker "
+     "(with RBAC off, Forensics:Read is administrator-only). Fails closed (a JSON-RPC error, "
      "never empty totals) when the RBAC store is corrupt or the response read errors. A denied-scope "
      "audit row is emitted on a drop.",
      R"({"type":"object","properties":{"instruction_id":{"type":"string"},"group_by":{"type":"string"},"aggregate":{"type":"string","enum":["count","sum","avg","min","max"]},"op_column":{"type":"string","enum":["timestamp","status","id"],"description":"Column for sum/avg/min/max; ignored for count. Defaults to \"id\" when omitted."}},"required":["instruction_id","group_by"]})",
@@ -941,7 +950,11 @@ static const ToolDef kTools[] = {
      "an empty filters map returns a genuine 0 (no scoped count to report), never a "
      "store read. Requires ManagementGroup:Write — approval-gated (supervised MCP "
      "tier maker-checker), matching every other ManagementGroup:Write surface, even "
-     "though this tool itself performs no mutation. When unindexed_filter_keys is "
+     "though this tool itself performs no mutation. An agent is counted only through response "
+     "rows the caller may read: rows written by Forensics-tier plugins (those with an action "
+     "on the Forensics securable) count only for a caller who also holds Forensics:Read, "
+     "globally or, while RBAC is enforced, on that agent's management group (with RBAC off, "
+     "Forensics:Read is administrator-only). When unindexed_filter_keys is "
      "non-empty, agent_count can be 0 or an undercount because filter values over "
      "2048 bytes (measured as ingest stores it: a NUL or invalid UTF-8 byte counts as 3) "
      "are not indexed in newly stored responses; its keys are in a stable "
@@ -9881,8 +9894,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // hidden ones the LIMIT already truncated. Mirrors aggregate_responses'
                 // resolve-then-scope pattern; `distinct_agent_ids`/`_by_execution` picks
                 // the twin matching whichever id this call used.
-                // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
-                const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins_);
+                // #4990: derived after the Response:Read gate (never writes a response), before the store read.
+                const auto tier = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
                 AggregateScope scope_arg; // nullopt = unrestricted
                 bool scope_filtered = false;
                 std::size_t dropped_agents = 0;
@@ -10839,8 +10852,8 @@ McpServer::HandlerFn McpServer::build_handler(
 
                 // #1634: resolve the gate's VisibleSet before aggregation. An engaged,
                 // empty AggregateScope is deliberate and produces zero rows.
-                // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
-                const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins_);
+                // #4990: derived after the Response:Read gate (never writes a response), before the store read.
+                const auto tier = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
                 AggregateScope agg_scope; // nullopt = unrestricted
                 std::size_t dropped_agents = 0;
                 if (gate.scope) {
@@ -11759,8 +11772,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         agent_scope = std::vector<std::string>(scope->begin(), scope->end());
                 }
 
-                // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
-                const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins_);
+                // #4990: derived after the Response:Read gate (never writes a response), before the store read.
+                const auto tier = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
                 auto count = group_agent_count_preview(response_store, tier, command_id, filters,
                                                        agent_scope);
                 if (!count) {
