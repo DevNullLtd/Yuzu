@@ -178,6 +178,55 @@ std::string sanitize_pg_text(std::string_view s) {
     return out;
 }
 
+// True when `expected` is a text a write could ever have stored: every stored text passed
+// through sanitize_pg_text, so one it would change (NUL, invalid UTF-8) can never equal a
+// stored value. compare_and_set/compare_and_remove compare EXACTLY and refuse such an
+// `expected` as caller input -- scrubbing it would alias distinct inputs onto one form, and
+// binding it raw would C-string-truncate at a NUL (pg_exec.hpp).
+bool representable_expected(const std::string& expected) {
+    return sanitize_pg_text(expected) == expected;
+}
+
+// Per-key value validation shared by set() and compare_and_set(). The secret placeholder
+// guard is set()'s alone: conditional writes refuse secret keys outright.
+std::expected<void, std::string> validate_value(const std::string& key, const std::string& value) {
+    if (key == "heartbeat_timeout" || key == "response_retention_days" ||
+        key == "audit_retention_days") {
+        try {
+            int val = std::stoi(value);
+            if (val <= 0)
+                return std::unexpected("value must be a positive integer");
+            if (key == "heartbeat_timeout" && val < kMinHeartbeatTimeoutSeconds)
+                return std::unexpected("heartbeat_timeout must be at least " +
+                                       std::to_string(kMinHeartbeatTimeoutSeconds) +
+                                       " seconds (the default agent heartbeat interval)");
+        } catch (...) {
+            return std::unexpected("value must be a valid integer");
+        }
+    }
+
+    if (key == "auto_approve_enabled" || key == "plugin_signing_required") {
+        if (value != "true" && value != "false")
+            return std::unexpected("value must be 'true' or 'false'");
+    }
+
+    if (key == "log_level") {
+        static const std::vector<std::string> valid_levels = {"trace", "debug", "info", "warn",
+                                                              "error"};
+        if (std::find(valid_levels.begin(), valid_levels.end(), value) == valid_levels.end())
+            return std::unexpected("value must be one of: trace, debug, info, warn, error");
+    }
+    return {};
+}
+
+// The in-process effect of a committed write (set() and compare_and_set()).
+void apply_live_change(const std::string& key, const std::string& value) {
+    if (key == "log_level") {
+        spdlog::set_level(spdlog::level::from_str(value));
+        spdlog::info("Runtime config: log_level changed to '{}'", value);
+    }
+}
+
 RuntimeConfigEntry plain_row(PGresult* r, int i) {
     RuntimeConfigEntry e;
     e.key = col_str(r, i, 0);
@@ -546,33 +595,8 @@ std::expected<void, std::string> RuntimeConfigStore::set(const std::string& key,
         return std::unexpected("value is the redaction placeholder, not a credential; send the "
                                "real secret, or omit the key to leave it unchanged");
 
-    // Basic validation per key
-    if (key == "heartbeat_timeout" || key == "response_retention_days" ||
-        key == "audit_retention_days") {
-        try {
-            int val = std::stoi(value);
-            if (val <= 0)
-                return std::unexpected("value must be a positive integer");
-            if (key == "heartbeat_timeout" && val < kMinHeartbeatTimeoutSeconds)
-                return std::unexpected("heartbeat_timeout must be at least " +
-                                       std::to_string(kMinHeartbeatTimeoutSeconds) +
-                                       " seconds (the default agent heartbeat interval)");
-        } catch (...) {
-            return std::unexpected("value must be a valid integer");
-        }
-    }
-
-    if (key == "auto_approve_enabled" || key == "plugin_signing_required") {
-        if (value != "true" && value != "false")
-            return std::unexpected("value must be 'true' or 'false'");
-    }
-
-    if (key == "log_level") {
-        static const std::vector<std::string> valid_levels = {"trace", "debug", "info", "warn",
-                                                              "error"};
-        if (std::find(valid_levels.begin(), valid_levels.end(), value) == valid_levels.end())
-            return std::unexpected("value must be one of: trace, debug, info, warn, error");
-    }
+    if (auto v = validate_value(key, value); !v)
+        return std::unexpected(std::move(v.error()));
 
     const std::string sanitized_by = sanitize_pg_text(updated_by);
     const auto now = now_secs();
@@ -679,12 +703,88 @@ std::expected<void, std::string> RuntimeConfigStore::set(const std::string& key,
     }
 
     // Apply the change immediately
-    if (key == "log_level") {
-        spdlog::set_level(spdlog::level::from_str(value));
-        spdlog::info("Runtime config: log_level changed to '{}'", value);
-    }
+    apply_live_change(key, value);
 
     return {};
+}
+
+std::expected<bool, std::string>
+RuntimeConfigStore::compare_and_set(const std::string& key,
+                                    const std::optional<std::string>& expected,
+                                    const std::string& value, const std::string& updated_by) {
+    if (!open_)
+        return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) + "store not open");
+    if (!is_allowed_key(key))
+        return std::unexpected("key '" + key + "' is not a configurable runtime setting");
+    if (is_secret_key(key))
+        return std::unexpected("conditional writes are for non-secret keys only");
+    if (auto v = validate_value(key, value); !v)
+        return std::unexpected(std::move(v.error()));
+    if (expected && !representable_expected(*expected))
+        return std::unexpected("expected text contains NUL or invalid UTF-8, which no stored "
+                               "text can");
+
+    // `expected` is bound as given, never sanitized (exact comparison).
+    const std::string sanitized_value = sanitize_pg_text(value);
+    const std::string sanitized_by = sanitize_pg_text(updated_by);
+    const std::string now = std::to_string(now_secs());
+
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) +
+                               "no database connection in time");
+    // ONE statement either way, so no advisory lock (see the file header on a non-secret
+    // write). Under READ COMMITTED a concurrent commit makes PostgreSQL re-evaluate the
+    // UPDATE's WHERE against the new row version, so two replicas cannot both pass.
+    pg::PgResult res =
+        expected ? pg::exec_params(lease.get(),
+                                   "UPDATE runtime_config_store.runtime_config SET value = $2, "
+                                   "updated_by = $3, updated_at = $4::bigint "
+                                   "WHERE key = $1 AND value = $5 RETURNING key",
+                                   std::vector<std::string>{key, sanitized_value, sanitized_by,
+                                                            now, *expected})
+                 : pg::exec_params(lease.get(),
+                                   "INSERT INTO runtime_config_store.runtime_config (key, value, "
+                                   "updated_by, updated_at) VALUES ($1, $2, $3, $4::bigint) "
+                                   "ON CONFLICT (key) DO NOTHING RETURNING key",
+                                   std::vector<std::string>{key, sanitized_value, sanitized_by,
+                                                            now});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) +
+                               "database write failed");
+    if (PQntuples(res.get()) != 1)
+        return false;
+    lease.reset(); // the pool slot is not held across the live effect (set() scopes its lease)
+    apply_live_change(key, value);
+    return true;
+}
+
+std::expected<bool, std::string>
+RuntimeConfigStore::compare_and_remove(const std::string& key, const std::string& expected) {
+    if (!open_)
+        return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) + "store not open");
+    if (!is_allowed_key(key))
+        return std::unexpected("key '" + key + "' is not a configurable runtime setting");
+    if (is_secret_key(key))
+        return std::unexpected("conditional writes are for non-secret keys only");
+    if (!representable_expected(expected))
+        return std::unexpected("expected text contains NUL or invalid UTF-8, which no stored "
+                               "text can");
+
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) +
+                               "no database connection in time");
+    // The secrets table is never touched: a non-secret key has no row there.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "DELETE FROM runtime_config_store.runtime_config WHERE key = $1 AND value = $2 "
+        "RETURNING key",
+        std::vector<std::string>{key, expected});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) +
+                               "database write failed");
+    return PQntuples(res.get()) == 1;
 }
 
 bool RuntimeConfigStore::remove(const std::string& key) {
