@@ -17,9 +17,12 @@
  *
  * WHAT IT IS NOT. It reads SOURCE TEXT, never the strings the compiler produced. It cannot see
  * a pattern built from a variable or a helper, an owner that registers through a differently
- * named receiver, or an escape sequence in a non-raw literal (it reports the escape's source
- * bytes, not the compiled character). A raw-string pattern is reported byte for byte, which is
- * what httplib stores. Tests that need the compiled pattern text register the owner against a
+ * named receiver, a registration call wrapped in a macro (the expansion is not in the text it
+ * scans), or an escape sequence in a non-raw literal (it reports the escape's source bytes, not
+ * the compiled character). The production route inventory (the sink `HttplibRouteSink` records),
+ * the boot sweep over it and the seal cover macro-wrapped registrations, because they see the
+ * call at run time. A raw-string pattern is reported byte for byte, which is what httplib
+ * stores. Tests that need the compiled pattern text register the owner against a
  * `TestRouteSink` instead (test_step_up_route_inventory.cpp's L1 layer); this scan is the lowest,
  * lexical layer that still sees registrations no in-process harness can construct.
  *

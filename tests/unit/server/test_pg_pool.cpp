@@ -34,6 +34,14 @@ struct PgPoolTestAccess {
     static std::unique_lock<std::mutex> lock(const PgPool& pool) {
         return std::unique_lock<std::mutex>{pool.mu_};
     }
+    // Runs the pool's single breaker-deadline write (the helper both the arm and the clear sites
+    // go through) under the lock it requires, so a test can drive the clear without a live
+    // database.
+    static void set_connect_blocked_until(PgPool& pool,
+                                          std::chrono::steady_clock::time_point t) {
+        std::lock_guard lk{pool.mu_};
+        pool.set_connect_blocked_until_locked(t);
+    }
 };
 
 } // namespace yuzu::server::pg
@@ -304,6 +312,31 @@ TEST_CASE("PgPool connect_breaker_open follows the breaker: closed, open, expire
 
     // A new failed connect after expiry arms it again.
     check_open_after_failed_acquire();
+}
+
+TEST_CASE("PgPool connect_breaker_open closes at once when the breaker is cleared",
+          "[pool][breaker]") {
+    // The clear site (a connection that succeeds) writes through the same helper as the arm site,
+    // which pairs the stored deadline with the lock-free mirror `connect_breaker_open()` reads. A
+    // clear that updated only the deadline would leave the breaker reading open until it expired.
+    PgPool pool{{.conninfo = unconnectable_conninfo(),
+                 .size = 2,
+                 .connect_backoff_base = 30000ms,
+                 .connect_backoff_cap = 30000ms}};
+    REQUIRE(pool.valid());
+
+    CHECK_FALSE(static_cast<bool>(pool.acquire())); // a failed connect arms a 22-30 s window
+    REQUIRE(pool.connect_breaker_open());
+
+    PgPoolTestAccess::set_connect_blocked_until(pool, {}); // what a successful connect does
+    CHECK_FALSE(pool.connect_breaker_open());
+
+    // The same helper re-arms it: a future deadline reads open, the cleared value reads closed.
+    PgPoolTestAccess::set_connect_blocked_until(pool,
+                                                std::chrono::steady_clock::now() + 30s);
+    CHECK(pool.connect_breaker_open());
+    PgPoolTestAccess::set_connect_blocked_until(pool, {});
+    CHECK_FALSE(pool.connect_breaker_open());
 }
 
 TEST_CASE("PgPool connect_breaker_open does not wait on the pool lock", "[pool][breaker]") {
