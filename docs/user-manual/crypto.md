@@ -413,6 +413,50 @@ Prometheus clock, while `/crypto` compares the shared catalogue stamp with the d
 database clock step back of more than five minutes, or forward far enough to push the stamp past
 two hours, can send `/crypto` to live reads with neither alert firing; compare `names_as_of` with
 the database `now()`.
+
+### Deprovision erasure
+
+Each operator's `/crypto` dashboard layout is stored in the `crypto_dashboard_layout_store` schema
+(ADR-0071), keyed by the operator's username (personal data). When an operator
+is deprovisioned (SCIM `active:false`, SCIM `DELETE`, a SCIM create with `active:false`, or a
+local user deleted from the dashboard), the server erases the layout row of the username and of
+every linked `oidc:` / `saml:` identity, after the deprovision itself has committed. A SCIM
+`DELETE` of an already-inactive user, and an `active:false` replay that finds the user already
+inactive, run the same erasure again (it is idempotent), resolving the linked identities even
+though the user is inactive; no credential is revoked again on that path. If those linked
+identities cannot be read, that erasure removes the username's row alone and counts the case as
+`link_read_failed` (below): a linked identity's row may remain, and the check below removes it.
+
+The erasure is **best-effort**: it never changes the deprovision's answer. A failure is a `warn`
+log line naming only the reason (never the username, a hash or a token) and an increment of
+`yuzu_server_crypto_layout_erase_failures_total{reason}` (`store_not_open`,
+`pool_acquire_timeout`, `outcome_unknown`, `query_error`, `link_read_failed`; pre-seeded at zero
+at boot).
+`YuzuCryptoLayoutEraseFailed` fires on any increase in the last hour. It runs synchronously
+before the deprovision answers: on a saturated database each principal's erase can wait up to
+2 s.
+
+**Remedy, and a periodic check.** List the stored keys, compare them with your active operators
+(local users from **Settings → Users**, SCIM users from your identity provider) and delete the
+rows of principals who are no longer active. Product code never joins the layout table to the
+user tables; you supply the list:
+
+```sql
+-- every stored layout key
+SELECT username FROM crypto_dashboard_layout_store.layouts ORDER BY username;
+
+-- replace the example keys with yours; run the SELECT above first and delete only keys
+-- you have confirmed are no longer active
+DELETE FROM crypto_dashboard_layout_store.layouts
+ WHERE username = ANY (ARRAY['alice', 'oidc:https://idp.example.com/#sub-123']);
+```
+
+Two cases can leave a row behind even when nothing failed, and the same check removes them: a
+layout **save already in flight** when the erasure ran can re-insert the row after it (the
+operator's sessions are being revoked by the same deprovision, but that request may already be
+past authentication), and **restoring a database backup** taken before the deprovision brings
+erased rows back. Run the check after any restore.
+
 On the dashboard page and its **Load more** row the capacity shed reads "Temporarily busy: two
 reads are already running on this server; retry shortly" and a store fault reads "The inventory
 store could not be read" (a degraded access gate reads "The access check could not be completed:
