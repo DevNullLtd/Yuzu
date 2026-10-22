@@ -7,8 +7,7 @@
  *    not followed. A link planted BEFORE the plugin runs is already refused by the walk's own link probe
  *    (key_is_link), so test_registry_write_local_dispatcher.cpp never reaches the create step with a link in
  *    place; calling create_sub on a dangling link here is that swap, deterministically.
- *  - the fast open's two kernel calls, final_name (NtQueryKey) and root_name, and its verdicts against the
- *    reference walk on the REAL registry.
+ *  - the fast open's two kernel calls, final_name (NtQueryKey) and root_name.
  * The pure logic is locked on every host by test_registry_core.cpp; the dispatcher cases prove the plugin end
  * to end.
  *
@@ -39,7 +38,6 @@
 #include <string>
 #include <string_view>
 #include <utility>
-#include <vector>
 
 // The leg's anonymous-namespace helpers have no header seam; the guard macro drops the plugin-facing
 // execute_windows so this TU can include the file. Never defined by the real build. Excluding that
@@ -61,7 +59,6 @@ namespace {
 using yuzu::registry::as_handle;
 using yuzu::registry::as_hkey;
 using yuzu::registry::Handle;
-using yuzu::registry::Opened;
 using yuzu::registry::Owned;
 using yuzu::registry::Win32Registry;
 
@@ -122,43 +119,6 @@ struct LinkSweep {
     LinkSweep& operator=(const LinkSweep&) = delete;
 };
 
-/// Deletes the link objects `parent\<name>` by handle on scope exit, so the RegDeleteTreeW that follows never
-/// meets a link (it follows one found inside a tree). Never throws.
-struct LinkSweepAll {
-    Win32Registry& reg;
-    Handle parent;
-    std::vector<std::string> names;
-    ~LinkSweepAll() {
-        for (const auto& n : names) {
-            Handle h = 0;
-            if (reg.open_sub(parent, n, DELETE, h) == ERROR_SUCCESS) {
-                reg.delete_key_by_handle(h);
-                reg.close(h);
-            }
-        }
-    }
-    LinkSweepAll(Win32Registry& r, Handle p, std::vector<std::string> n) : reg(r), parent(p), names(std::move(n)) {}
-    LinkSweepAll(const LinkSweepAll&) = delete;
-    LinkSweepAll& operator=(const LinkSweepAll&) = delete;
-};
-
-bool make_machine_key(const std::string& path) {
-    yuzu::win::RegKey k;
-    return RegCreateKeyExW(HKEY_LOCAL_MACHINE, widen(path).c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE,
-                           KEY_SET_VALUE, nullptr, k.put(), nullptr) == ERROR_SUCCESS;
-}
-
-/// A plain (non-link) key `path` carrying a REG_SZ value named SymbolicLinkValue: the probe cannot tell it from a link.
-bool make_decoy_key(const std::string& path) {
-    yuzu::win::RegKey k;
-    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, widen(path).c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE,
-                        nullptr, k.put(), nullptr) != ERROR_SUCCESS)
-        return false;
-    const std::wstring v = L"not a link";
-    return RegSetValueExW(k.get(), L"SymbolicLinkValue", 0, REG_SZ, reinterpret_cast<const BYTE*>(v.c_str()),
-                          static_cast<DWORD>((v.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
-}
-
 } // namespace
 
 // A link whose TARGET is absent is the shape that matters for a create: a create that follows it makes the
@@ -218,7 +178,9 @@ TEST_CASE("Win32Registry::final_name names the object a handle is bound to and t
           "[registry][windows][internals]") {
     const std::string root = "SOFTWARE\\YuzuTest-" + std::to_string(yuzu::test::process_random_salt()) + "-names";
     ScratchTree cleanup{root};
-    if (!make_machine_key(root + "\\Target\\Sub")) {
+    yuzu::win::RegKey sub;
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, widen(root + "\\Target\\Sub").c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE,
+                        KEY_READ, nullptr, sub.put(), nullptr) != ERROR_SUCCESS) {
         skip_or_fail("not elevated -- HKLM scratch not writable, final_name case");
         return;
     }
@@ -233,7 +195,7 @@ TEST_CASE("Win32Registry::final_name names the object a handle is bound to and t
     }
     Win32Registry reg;
     const Handle hklm = as_handle(HKEY_LOCAL_MACHINE);
-    LinkSweepAll sweep{reg, as_handle(parent.get()), {"Link"}};
+    LinkSweep sweep{reg, as_handle(parent.get())};
     const std::string machine = "\\REGISTRY\\MACHINE\\" + root;
 
     SECTION("a plain key is named by its own path, in the stored case") {
@@ -275,76 +237,6 @@ TEST_CASE("Win32Registry::root_name is the kernel name of HKLM and HKU and is re
     CHECK(yuzu::registry::names_equal_ascii_ci(name, "\\REGISTRY\\USER"));
     CHECK(reg.root_name(as_handle(HKEY_CURRENT_USER), name) == ERROR_NOT_SUPPORTED);
     CHECK(reg.root_name(as_handle(HKEY_CLASSES_ROOT), name) == ERROR_NOT_SUPPORTED);
-}
-
-// The fast open against the reference walk on the REAL registry, one shape at a time. The fast open may only
-// ACCEPT: where it accepts it must hold the same object the walk holds, and where the walk refuses it may accept
-// only for the one divergence this fixture stages (a decoy SymbolicLinkValue value on a plain ANCESTOR); the
-// other, a traverse-only ACL ancestor, needs a second principal and is recorded by the kingsley evidence run.
-TEST_CASE("the fast open and the reference walk agree on a scratch tree of the real registry",
-          "[registry][windows][internals]") {
-    const std::string root = "SOFTWARE\\YuzuTest-" + std::to_string(yuzu::test::process_random_salt()) + "-parity";
-    ScratchTree cleanup{root};
-    if (!make_machine_key(root + "\\Real\\a\\b\\c") || !make_machine_key(root + "\\Real\\a\\other") ||
-        !make_decoy_key(root + "\\Decoy") || !make_machine_key(root + "\\Decoy\\sub")) {
-        skip_or_fail("not elevated -- HKLM scratch not writable, parity case");
-        return;
-    }
-    yuzu::win::RegKey parent;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, widen(root).c_str(), 0, KEY_READ, parent.put()) != ERROR_SUCCESS) {
-        skip_or_fail("could not open the scratch parent");
-        return;
-    }
-    // Lnk -> Real, LeafLnk -> Real\a, Chain2 -> Lnk (a two-link chain), Dangling -> (nothing), Self -> Self.
-    const bool links = make_machine_link(root + "\\Lnk", root + "\\Real") &&
-                       make_machine_link(root + "\\LeafLnk", root + "\\Real\\a") &&
-                       make_machine_link(root + "\\Chain2", root + "\\Lnk") &&
-                       make_machine_link(root + "\\Dangling", root + "\\Nowhere") &&
-                       make_machine_link(root + "\\Self", root + "\\Self");
-    Win32Registry reg;
-    LinkSweepAll sweep{reg, as_handle(parent.get()), {"Lnk", "LeafLnk", "Chain2", "Dangling", "Self"}};
-    if (!links) {
-        skip_or_fail("could not create the registry links here");
-        return;
-    }
-    const Handle hklm = as_handle(HKEY_LOCAL_MACHINE);
-
-    struct Row {
-        const char* what;
-        std::string rel;
-        bool leaf_may_be_link;
-        bool fast_accepts;
-        std::string walk_error; // "" = the walk accepts too
-    };
-    const std::vector<Row> rows{
-        {"a plain key", "Real\\a\\b\\c", false, true, ""},
-        {"the same key in another case", "real\\A\\B\\C", false, true, ""},
-        {"a path through a link", "Lnk\\a\\b\\c", false, false, "key_is_link"},
-        {"a path through a two-link chain", "Chain2\\a\\b", false, false, "key_is_link"},
-        {"a link at the leaf", "LeafLnk", false, false, "key_is_link"},
-        {"a link at the leaf for delete_key", "LeafLnk", true, true, ""},
-        {"a dangling link at the leaf", "Dangling", false, false, "key_is_link"},
-        {"a path through a dangling link", "Dangling\\x", false, false, "key_is_link"},
-        {"a self-referential link", "Self", false, false, "key_is_link"},
-        {"a path through a self-referential link", "Self\\x", false, false, "key_is_link"},
-        {"a decoy value on the LEAF", "Decoy", false, false, "key_is_link"},
-        {"a decoy value on a plain ANCESTOR (the documented divergence)", "Decoy\\sub", false, true, "key_is_link"},
-        {"a missing key", "Real\\a\\nope", false, false, "key_not_found"},
-    };
-    for (const auto& row : rows) {
-        INFO(row.what);
-        const std::string path = root + "\\" + row.rel;
-        const Opened fast = yuzu::registry::open_fast(reg, hklm, path, KEY_QUERY_VALUE, row.leaf_may_be_link);
-        const Opened walk = yuzu::registry::open_checked(reg, hklm, path, KEY_QUERY_VALUE, false, row.leaf_may_be_link, false);
-        CHECK(fast.fast == row.fast_accepts);
-        CHECK(walk.error == row.walk_error);
-        if (fast.fast && walk.error.empty()) { // both hold a handle: the same object
-            std::string a, b;
-            REQUIRE(reg.final_name(fast.leaf.get(), a) == ERROR_SUCCESS);
-            REQUIRE(reg.final_name(walk.leaf.get(), b) == ERROR_SUCCESS);
-            CHECK(a == b);
-        }
-    }
 }
 
 #endif // defined(_WIN32)

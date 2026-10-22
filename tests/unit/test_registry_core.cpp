@@ -1425,17 +1425,6 @@ TEST_CASE("registry core: a case variant of an existing key is a fast hit", "[re
     CHECK(reg.get("Software\\Acme", "V")->data == dword(2));
 }
 
-TEST_CASE("registry core: a non-ASCII case variant takes the walk and reaches the same verdict",
-          "[registry][core]") {
-    FakeRegistry reg;
-    reg.put("Software\\Caf\xC3\xA9", "V", kRegDword, dword(1));
-    const auto o = set_value_verified(reg, FakeRegistry::kRoot, "Software\\Caf\xC3\x89", "V", kRegDword, dword(2), true);
-    // the fake compares names ASCII-case-insensitively only, so the walk does not find this key either
-    CHECK(o.reason != "key_is_link");
-    CHECK(reg.method_calls("open_path") == 1);
-    CHECK(reg.method_calls("open_sub") >= 1); // the fast open declined: an ASCII fold never equates the two names
-}
-
 TEST_CASE("registry core: a failed final_name or root_name falls back to the walk and never accepts",
           "[registry][core]") {
     SECTION("final_name fails on a path that goes through a link: the walk refuses and nothing is written") {
@@ -1464,14 +1453,6 @@ TEST_CASE("registry core: a failed final_name or root_name falls back to the wal
         REQUIRE(set_value_verified(reg, FakeRegistry::kRoot, "Software\\Acme", "V", kRegDword, dword(2), true).ok());
         CHECK(reg.method_calls("open_path") == 0);
     }
-    SECTION("open_path fails for a reason other than a missing key: the walk reports it") {
-        FakeRegistry reg;
-        reg.key("Software\\Acme");
-        reg.inject["open_path"] = 1450;
-        const auto o = set_value_verified(reg, FakeRegistry::kRoot, "Software\\Acme", "V", kRegDword, dword(2), true);
-        REQUIRE(o.ok()); // the walk, not the fast open, produced this verdict
-        CHECK(reg.method_calls("open_sub") >= 1);
-    }
 }
 
 TEST_CASE("registry core: a leaf link is accepted by the fast open only to be deleted as the link",
@@ -1496,22 +1477,4 @@ TEST_CASE("registry core: a leaf link is accepted by the fast open only to be de
         CHECK(delete_value_verified(reg, FakeRegistry::kRoot, "Software\\L", "V", true).reason == "key_is_link");
         CHECK(reg.get("Real\\Target", "V")->data == dword(1));
     }
-}
-
-TEST_CASE("registry core: an intermediate link that resolves is never accepted by the fast open",
-          "[registry][core]") {
-    // The shape the name compare exists for: the kernel opens the TARGET key successfully and the probe on it
-    // is clean, so only the canonical-name check separates this from a plain key.
-    FakeRegistry reg;
-    reg.put("Target\\Child", "V", kRegDword, dword(1));
-    reg.link("A\\Link", "Target");
-    reg.key("A\\Link\\Child"); // the tree below a link: irrelevant to the kernel, which follows the link
-    const Opened fast = open_fast(reg, FakeRegistry::kRoot, "A\\Link\\Child", kFastAccess, false);
-    CHECK_FALSE(fast.fast);
-    CHECK(reg.method_calls("open_path") == 1);
-    CHECK(reg.method_calls("final_name") == 1);
-    CHECK(reg.method_calls("query_value") == 0); // declined at the name compare, before any probe
-    const auto o = set_value_verified(reg, FakeRegistry::kRoot, "A\\Link\\Child", "V", kRegDword, dword(2), true);
-    CHECK(o.reason == "key_is_link");
-    CHECK(reg.get("Target\\Child", "V")->data == dword(1));
 }

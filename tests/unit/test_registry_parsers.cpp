@@ -271,8 +271,8 @@ TEST_CASE("registry render_audit_line: byte-exact grammar", "[registry][parsers]
     r.new_total = 4;
     r.has_new = true;
     CHECK(render_audit_line(r) ==
-          "audit|op=set_value|hive=HKLM|key=SOFTWARE\\Acme|name=Ver|type=REG_DWORD|len=4|result=ok|"
-          "reason=-|verify=ok|dry_run=-|counted_keys=-|counted_values=-|capped=-|sid=-|"
+          "audit|op=set_value|hive=HKLM|result=ok|reason=-|verify=ok|key=SOFTWARE\\Acme|name=Ver|"
+          "type=REG_DWORD|len=4|dry_run=-|counted_keys=-|counted_values=-|capped=-|sid=-|"
           "old_state=present|old_type=REG_DWORD|old=01000000|new=02000000");
 
     SECTION("a refusal carries its reason and nothing it did not do") {
@@ -284,11 +284,11 @@ TEST_CASE("registry render_audit_line: byte-exact grammar", "[registry][parsers]
         x.reason = "value_not_found";
         x.old_state = "absent";
         CHECK(render_audit_line(x) ==
-              "audit|op=delete_value|hive=HKCU|key=Software\\X|name=-|type=-|len=-|result=refused|"
-              "reason=value_not_found|verify=-|dry_run=-|counted_keys=-|counted_values=-|capped=-|sid=-|"
+              "audit|op=delete_value|hive=HKCU|result=refused|reason=value_not_found|verify=-|"
+              "key=Software\\X|name=-|type=-|len=-|dry_run=-|counted_keys=-|counted_values=-|capped=-|sid=-|"
               "old_state=absent|old_type=-|old=-|new=-");
     }
-    SECTION("delete_key counts, dry_run and the per-user sid") {
+    SECTION("delete_key counts, dry_run and the sid column") {
         AuditRecord x;
         x.op = "delete_key";
         x.hive = "HKU";
@@ -301,7 +301,7 @@ TEST_CASE("registry render_audit_line: byte-exact grammar", "[registry][parsers]
         x.capped = 0;
         x.sid = "S-1-5-21-1-2-3-1001";
         CHECK(render_audit_line(x) ==
-              "audit|op=delete_key|hive=HKU|key=k|name=-|type=-|len=-|result=ok|reason=-|verify=ok|"
+              "audit|op=delete_key|hive=HKU|result=ok|reason=-|verify=ok|key=k|name=-|type=-|len=-|"
               "dry_run=1|counted_keys=3|counted_values=7|capped=0|sid=S-1-5-21-1-2-3-1001|"
               "old_state=-|old_type=-|old=-|new=-");
     }
@@ -325,8 +325,8 @@ TEST_CASE("registry render_audit_line: byte-exact grammar", "[registry][parsers]
         x.new_total = 4096;
         const auto line = render_audit_line(x);
         CHECK(line.size() < 2048);
-        CHECK(line.find("|name=" + std::string(256, 'n') + "~16383|type=REG_DWORD|len=4|result=ok|reason=-|verify=ok|") !=
-              std::string::npos);
+        CHECK(line.starts_with("audit|op=set_value|hive=HKLM|result=ok|reason=-|verify=ok|key="));
+        CHECK(line.find("|name=" + std::string(256, 'n') + "~16383|type=REG_DWORD|len=4|dry_run=-|") != std::string::npos);
         CHECK(line.find("|old_state=present|old_type=REG_DWORD|old=") != std::string::npos);
     }
     SECTION("hostile key and name cannot forge a field or a line") {
@@ -337,5 +337,78 @@ TEST_CASE("registry render_audit_line: byte-exact grammar", "[registry][parsers]
         CHECK(line.find('\n') == std::string::npos);
         CHECK(line.find("|key=a_result_ok_audit_op_x|name=n_verify_ok|") != std::string::npos);
         CHECK(std::count(line.begin(), line.end(), '|') == 18); // the grammar's 19 fields, nothing extra
+    }
+}
+
+TEST_CASE("registry audit producer contract: no pipe LF or CR survives and the field grammar holds",
+          "[registry][parsers]") {
+    const std::string hostile = std::string{"a|b\nc\rd=e,f g\t\x1b"} + "\xC3\x28" + std::string{"\0z", 2};
+    AuditRecord r;
+    r.op = hostile;
+    r.hive = hostile;
+    r.key = hostile;
+    r.name = hostile;
+    r.type_name = hostile;
+    r.reason = hostile;
+    r.sid = hostile;
+    r.result = "failed";
+    r.verify = "mismatch";
+    r.len = 12;
+    r.dry_run = 0;
+    r.counted_keys = 1;
+    r.counted_values = 2;
+    r.capped = 0;
+    r.old_state = "present";
+    r.old_type = "REG_SZ";
+    r.old_bytes = B({0x7c, 0x0a, 0x0d});
+    r.old_total = 3;
+    r.has_old = true;
+    r.new_bytes = B({0x3d, 0x2c});
+    r.new_total = 2;
+    r.has_new = true;
+    const std::string line = render_audit_line(r);
+
+    CHECK(line.find('\n') == std::string::npos);
+    CHECK(line.find('\r') == std::string::npos);
+    for (const char c : line) CHECK(static_cast<unsigned char>(c) >= 0x20); // no control byte at all
+    // 19 pipe-separated parts: the tag, then the 18 fields in the published order, each `name=value`.
+    std::vector<std::string> parts;
+    for (std::size_t pos = 0; pos <= line.size();) {
+        const std::size_t bar = std::min(line.find('|', pos), line.size());
+        parts.push_back(line.substr(pos, bar - pos));
+        pos = bar + 1;
+    }
+    constexpr std::string_view kOrder[] = {"op",   "hive",     "result",         "reason",         "verify",
+                                           "key",  "name",     "type",           "len",            "dry_run",
+                                           "counted_keys", "counted_values", "capped", "sid",
+                                           "old_state", "old_type", "old",       "new"};
+    REQUIRE(parts.size() == 1 + std::size(kOrder));
+    CHECK(parts[0] == "audit");
+    for (std::size_t i = 0; i < std::size(kOrder); ++i) {
+        INFO(kOrder[i]);
+        const std::string& part = parts[i + 1];
+        CHECK(part.starts_with(std::string{kOrder[i]} + "="));
+        CHECK(std::count(part.begin(), part.end(), '=') == 1); // '=' inside a value would read as a second field
+    }
+    // The server reads `result=` anywhere in the line, but a line over its byte bound loses its tail.
+    CHECK(line.find("|result=") < line.find("|key="));
+    CHECK(line.find("|reason=") < line.find("|key="));
+    CHECK(line.find("|verify=") < line.find("|key="));
+    SECTION("maximum-size caller input stays under 2 KiB and the result stays near the front") {
+        AuditRecord x = r;
+        x.key = std::string(255, 'k');
+        x.name = std::string(16383, 'n');
+        x.op = "delete_value";
+        x.hive = "HKLM";
+        x.reason = std::string(300, 'r');
+        x.type_name = "REG_MULTI_SZ";
+        x.sid = "-";
+        x.old_bytes.assign(256, 0xff);
+        x.old_total = 1 << 20;
+        x.new_bytes.assign(256, 0xee);
+        x.new_total = 1 << 20;
+        const std::string big = render_audit_line(x);
+        CHECK(big.size() < 2048);
+        CHECK(big.find("|key=") < 200);
     }
 }

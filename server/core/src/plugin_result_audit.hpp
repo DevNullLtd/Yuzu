@@ -32,7 +32,8 @@
  * is `command`, the spelling of the dispatch rows the `command_id` joins to.
  *
  * FIELD CONTRACT (a requirement on the plugin that produces the lines; this header cannot recover
- * from a violation). One record per line, LF-terminated. No `|`, LF or CR inside a field: a registry
+ * from a violation). One record per line, LF-terminated (one trailing CR is tolerated and stripped).
+ * No `|`, LF or CR inside a field: a registry
  * key or value name can hold them, so the producer REPLACES or percent-encodes them (a
  * backslash-escaped `|` is still a `|` to this parser, so text after it could pick the row's
  * result or forge a second row). Put `result=` before any caller-sized field: it is read from the
@@ -40,11 +41,11 @@
  * lines and kMaxRegistryAuditLineBytes bytes per line. A recursive delete is ONE record per
  * operation (the counts ride in fields): the frame and budget bounds assume it.
  *
- * BEFORE A PLUGIN EMITS (the emitting change owes these; none is code in this header): publish the
- * `audit|` grammar and the contract above in the plugin README; decide how `old=` and `new=` render
- * secret-class values (the rows are readable by every role holding AuditLog:Read or
- * Response:Read); state the minimum agent version in upgrading.md (an agent without the action
- * stamp produces no rows); then drop the "dormant" wording from the documents.
+ * PRODUCER: agents/plugins/registry/README.md ("Audit line grammar and producer contract"), pinned
+ * against this parser by the render-pin cases in tests/unit/server/test_plugin_result_audit.cpp.
+ * The rows are readable by every role holding AuditLog:Read or Response:Read; the README states what
+ * `old=` and `new=` carry. An agent without the action stamp produces no rows: the minimum agent
+ * version is in docs/user-manual/upgrading.md.
  */
 
 #include <algorithm>
@@ -181,6 +182,8 @@ struct RegistryAuditLines {
         const std::size_t nl = std::min(output.find('\n', pos), output.size());
         std::string_view line = output.substr(pos, nl - pos);
         pos = nl + 1;
+        if (line.ends_with('\r'))
+            line.remove_suffix(1); // CRLF line ending: the CR is not part of the last field
         if (!line.starts_with("audit|"))
             continue;
         if (out.lines.size() == kMaxRegistryAuditLinesPerFrame) {

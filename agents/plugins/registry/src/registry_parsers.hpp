@@ -466,21 +466,24 @@ namespace detail {
 
 } // namespace detail
 
-/// One `audit|op=...` line (grammar: docs/user-manual/audit-log.md `registry.write`). Every field is
-/// a token without '|', space, '=' or ',' except where noted; the whole line stays < 2 KiB by
-/// construction (key and name cap at 256 bytes + marker, old / new at 256 raw bytes each).
+/// One `audit|op=...` line. Grammar and producer contract: README "Audit line grammar and producer contract".
+/// Order: `result=`, `reason=` and `verify=` come BEFORE the caller-sized `key=` and `name=`, so a line cut at
+/// the server's byte bound loses only the tail and the server still reads the result. Every field is a token
+/// without '|', space, '=' or ',' except where noted; no byte of LF, CR or '|' survives in any field; the
+/// whole line stays < 2 KiB by construction (key and name cap at 256 bytes + marker, old / new at 256 raw
+/// bytes each).
 [[nodiscard]] inline std::string render_audit_line(const AuditRecord& r) {
     using detail::dash;
     using detail::num;
     std::string o = "audit|op=" + audit_token(r.op, 64);
     o += "|hive=" + audit_token(r.hive, 64);
+    o += "|result=" + dash(r.result);
+    o += "|reason=" + audit_token(r.reason, 64);
+    o += "|verify=" + dash(r.verify);
     o += "|key=" + audit_token(r.key);
     o += "|name=" + audit_token(r.name);
     o += "|type=" + audit_token(r.type_name, 32);
     o += "|len=" + num(r.len);
-    o += "|result=" + dash(r.result);
-    o += "|reason=" + audit_token(r.reason, 64);
-    o += "|verify=" + dash(r.verify);
     o += "|dry_run=" + num(r.dry_run);
     o += "|counted_keys=" + num(r.counted_keys);
     o += "|counted_values=" + num(r.counted_values);

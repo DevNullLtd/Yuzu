@@ -36,6 +36,7 @@
 #include "grpc_audit_signal.hpp"
 #include "pg/pg_pool.hpp"
 #include "plugin_result_audit.hpp"
+#include "../../../agents/plugins/registry/src/registry_parsers.hpp"
 #include "test_auth_db_pg_helper.hpp"
 #include "test_principal_lock_gate.hpp"
 #include "test_tracker_scope.hpp"
@@ -320,6 +321,79 @@ TEST_CASE("registry audit: the AuditEvent shape", "[server][registry_audit]") {
 }
 
 // ── the binding ──────────────────────────────────────────────────────────
+
+// ── the plugin's own renderer ────────────────────────────────────────────
+
+namespace {
+
+/// A line from the registry plugin's real renderer, never a hand-written one: the producer and this parser share
+/// only the text of the README grammar, so these cases are what keeps the two agreeing.
+std::string rendered(std::string_view result, std::string_view reason, std::string_view key) {
+    yuzu::registry::AuditRecord r;
+    r.op = "set_value";
+    r.hive = "HKLM";
+    r.key = std::string{key};
+    r.name = "Ver";
+    r.type_name = "REG_DWORD";
+    r.len = 4;
+    r.result = std::string{result};
+    r.reason = std::string{reason};
+    r.verify = result == "ok" ? "ok" : "";
+    r.old_state = "present";
+    r.old_type = "REG_DWORD";
+    r.old_bytes = {1, 0, 0, 0};
+    r.old_total = 4;
+    r.has_old = true;
+    r.new_bytes = {2, 0, 0, 0};
+    r.new_total = 4;
+    r.has_new = true;
+    return yuzu::registry::render_audit_line(r);
+}
+
+} // namespace
+
+TEST_CASE("registry audit: the plugin's own renderer puts result= where the extractor reads it",
+          "[server][registry_audit]") {
+    struct Case {
+        std::string_view result;
+        std::string_view reason;
+        const char* row_result;
+    };
+    for (const Case c : {Case{"ok", "", "success"}, Case{"refused", "access_denied", "failure"},
+                         Case{"failed", "verify_mismatch", "failure"}}) {
+        INFO(c.result);
+        const std::string line = rendered(c.result, c.reason, "SOFTWARE\\Acme");
+        REQUIRE(line.starts_with("audit|op=set_value|hive=HKLM|result=" + std::string{c.result} + "|"));
+        CHECK(registry_audit_result(line) == c.result);
+        const auto frame = registry_audit_events_for_frame("agent-1", rid(1), "registry", "set_value", line + "\n", 100);
+        REQUIRE(frame.events.size() == 1);
+        CHECK(frame.events[0].result == c.row_result);
+        CHECK(frame.events[0].action == "registry.write");
+        CHECK(frame.events[0].detail == "agent=agent-1 cut=0 " + line);
+    }
+}
+
+TEST_CASE("registry audit: a real rendered line with a 300-byte key is one row, cut by the renderer",
+          "[server][registry_audit]") {
+    const std::string line = rendered("ok", "", std::string(300, 'k'));
+    CHECK(line.find("|key=" + std::string(256, 'k') + "~300|") != std::string::npos);
+    const auto frame = registry_audit_events_for_frame("a1", rid(2), "registry", "set_value", line + "\n", 5);
+    REQUIRE(frame.events.size() == 1);
+    CHECK_FALSE(frame.truncated);
+    CHECK(frame.events[0].detail.starts_with("agent=a1 cut=0 audit|op=set_value|hive=HKLM|result=ok|"));
+    CHECK(frame.events[0].detail.ends_with("|old=01000000|new=02000000"));
+}
+
+TEST_CASE("registry audit: a real rendered line with one trailing CR yields the same row",
+          "[server][registry_audit]") {
+    const std::string line = rendered("ok", "", "SOFTWARE\\Acme");
+    const auto lf = registry_audit_events_for_frame("a1", rid(3), "registry", "set_value", line + "\n", 5);
+    const auto crlf = registry_audit_events_for_frame("a1", rid(3), "registry", "set_value", line + "\r\n", 5);
+    REQUIRE(lf.events.size() == 1);
+    REQUIRE(crlf.events.size() == 1);
+    CHECK(crlf.events[0].detail == lf.events[0].detail); // the CR is not neutralised into the last field's hex
+    CHECK(crlf.events[0].detail.ends_with("|new=02000000"));
+}
 
 TEST_CASE("registry audit: only the three mutating actions of the registry plugin mint rows",
           "[server][registry_audit]") {
