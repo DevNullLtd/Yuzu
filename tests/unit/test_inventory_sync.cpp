@@ -2496,13 +2496,13 @@ TEST_CASE("collector: skip_reason names the cause of each skip and clears on suc
     }
 }
 
-// --- M.10c characterisation: today's adapter output, pinned BEFORE the status-row refactor ---
+// --- Adapter characterisation: the whole observable result of each status-row adapter ---
 //
 // Every cell asserts the whole observable result of an adapter: status, reason, entry count and
 // ALL fourteen fields of every entry. The cells reach the adapters only through the four binders
-// below, so the refactor that moves the constrained policy into the action table changes the
-// binders and nothing else; the expectations never move. Status rows are written as raw text
-// (not through a formatter) so they are independent of the producer being refactored.
+// below, so the way the constrained policy reaches an adapter is the binders' concern alone and
+// the expectations stay put. Status rows are written as raw text (not through a formatter) so
+// they are independent of the producer.
 
 namespace {
 
@@ -2527,8 +2527,8 @@ std::string show(const AdaptedRows& r) {
     return s;
 }
 
-// Expected-result builders (the entry text is built through show_entry, so a field the refactor
-// drops or reorders is a visible difference, not a silently shorter string).
+// Expected-result builders (the entry text is built through show_entry, so a dropped or
+// reordered field is a visible difference, not a silently shorter string).
 std::string res(std::string_view status, std::string_view reason,
                 std::initializer_list<SwEntry> es = {}) {
     std::string s =
@@ -2714,6 +2714,16 @@ TEST_CASE("characterisation: packages", "[sync][characterisation][adapter]") {
         CHECK(r.entries[0].name == std::string(1024, 'n'));
         CHECK(r.entries[0].version == std::string(1024, 'v'));
     }
+    SECTION("only keep_rows_if_present_seen keeps a constrained answer's rows") {
+        // A scoped enum admits values that are neither enumerator; keeping rows is the opt-in,
+        // so an out-of-range policy fails closed even though a mapped row was seen.
+        const auto out =
+            nl({st("packages", "constrained", "tok"), "package|homebrew|wget|1.24|formula"});
+        CHECK(show(parse_pkg_inventory_packages_output(out, kKeepPolicy)) ==
+              res("ok", "tok", {entry_of("wget", "1.24", "", "pkg", "brew")}));
+        CHECK(show(parse_pkg_inventory_packages_output(out, static_cast<ConstrainedPolicy>(9))) ==
+              res("failed", "tok"));
+    }
 }
 
 TEST_CASE("characterisation: store_packages", "[sync][characterisation][adapter]") {
@@ -2879,8 +2889,8 @@ TEST_CASE("characterisation: collector blob digests are byte-pinned",
     SECTION("Mac-shaped run with a constrained managers answer that keeps its present row") {
         fake_mac();
         g_fake[1].out["managers"] = constrained_managers_with_present_row();
-        // Same digest as the Mac run: the kept present row maps to the one homebrew record the
-        // capture already carries, so the constrained answer must not move a byte.
+        // Same digest as the Mac-shaped run: the kept present row maps to the one homebrew
+        // record the capture already carries, so the constrained answer must not move a byte.
         CHECK(digest("mac+constrained managers") == kMac);
     }
     SECTION("Linux-shaped managers answer: present dpkg/apt rows under a constrained status") {
@@ -2931,7 +2941,7 @@ TEST_CASE("characterisation: collector skip reasons per status mix",
         // constrained with a row the adapter MAPS: still skipped, so the action table's
         // `constrained` column (fail) is what is pinned, not just the zero-row fallback.
         // Managers is the one action that keeps such a cycle (cases below).
-        if (*c.mapped != '\0') {
+        if (c.mapped[0] != '\0') {
             CHECK(skip_with(nl({st(a, "constrained", "tok"), c.mapped})) ==
                   std::make_pair(false, source + ":tok"));
         }

@@ -1,4 +1,4 @@
-// inventory_status_row.hpp -- the one definition of the inventory `status` row.
+// inventory_status_row.hpp -- the collector-fed inventory `status` row.
 //
 // Every inventory action that feeds the installed-software collector
 // (pkg_inventory.managers / packages / store_packages and
@@ -6,8 +6,11 @@
 //
 //   status|<action>|<supported|constrained|unsupported>|<tokens or ->
 //
-// row followed by its data rows. This header owns that grammar in both
-// directions so the producers and the consumer cannot drift:
+// row followed by its data rows. Other plugins keep their own status rows
+// (runtimes' StatusLevel in runtimes_parsers.hpp migrates here when it joins the
+// collector table; the StatusState family and browser_policy are not
+// collector-fed). This header owns the collector's grammar in both directions
+// so the producers and the consumer cannot drift:
 //
 //   - PRODUCER: format_status_row (pkg_inventory and msi_packages call it).
 //   - CONSUMER: is_status_line / parse_status_row (the collector,

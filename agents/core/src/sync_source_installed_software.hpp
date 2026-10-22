@@ -72,14 +72,13 @@ enum class ConstrainedPolicy {
 /// answer ("brew present, no formulae"); `unsupported` = the action answered
 /// "not on this OS" (skipped silently); `failed` = skip the whole cycle.
 /// `ok` with a non-empty `reason` = constrained answer whose rows are kept
-/// (ConstrainedPolicy::keep_rows_if_present_seen). Collector rules, per the table's `constrained`
-/// column: a constrained managers answer is ok iff at
-/// least one PRESENT manager row was seen, whether or not it maps to an entry
-/// (Linux dpkg/apt rows map to nothing but are still evidence the read worked;
-/// zero present rows still fails); a constrained store_packages, packages or
-/// msi list_inventory answer always fails (a partial roster would delete stored rows); typed
-/// PARTIAL completeness skips the cycle unless the action opts in (an in-band `unsupported` answer
-/// wins first); an absent plugin is warned.
+/// (ConstrainedPolicy::keep_rows_if_present_seen). Collector rules, per the table's
+/// `constrained` column: a constrained managers answer is ok iff at least one PRESENT manager
+/// row was seen, whether or not it maps to an entry (Linux dpkg/apt rows map to nothing but are
+/// still evidence the read worked; zero present rows still fails); a constrained
+/// store_packages, packages or msi list_inventory answer always fails (a partial roster would
+/// delete stored rows); typed PARTIAL completeness skips the cycle unless the action opts in
+/// (an in-band `unsupported` answer wins first); an absent plugin is warned.
 struct AdaptedRows {
     enum class Status { ok, unsupported, failed };
     Status status{Status::ok};

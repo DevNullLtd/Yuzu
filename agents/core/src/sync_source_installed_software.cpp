@@ -192,7 +192,8 @@ AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action,
     if (status_rows != 1 || !level)
         return failed("bad status");
     if (*level == yuzu::shared::StatusLevel::constrained) {
-        if (policy == ConstrainedPolicy::fail || seen == 0)
+        // Keeping rows is the opt-in: any other value (an out-of-range cast too) fails closed.
+        if (policy != ConstrainedPolicy::keep_rows_if_present_seen || seen == 0)
             return failed(reason);
         res.reason = reason; // ok + non-empty reason = constrained, rows kept
     }
@@ -205,11 +206,17 @@ AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action,
 
 // Manager token (a `manager|<token>|...` row or a `package|<token>|...` row) -> ecosystem, as
 // data. `package_action` names the ONE action whose package rows this manager's token maps in
-// (so a snap row inside `packages`, or a homebrew row inside `store_packages`, stays unmapped
-// exactly as before); `presence_row` is whether a present `managers` row for it becomes an
-// installed_software entry. A manager absent from this table maps to nothing. The ecosystem
-// values are written as `.ecosystem = "..."` so tests/test_software_vocabulary_consistency.py
-// still reads every ecosystem this file emits.
+// (so a snap row inside `packages`, or a homebrew row inside `store_packages`, stays unmapped);
+// `presence_row` is whether a present `managers` row for it becomes an installed_software
+// entry. A manager absent from this table maps to nothing. The ecosystem values are written as
+// `.ecosystem = "..."` so tests/test_software_vocabulary_consistency.py still reads every
+// ecosystem this file emits.
+//
+// The table maps names only: a new manager also needs its own row-shape arm in the adapter
+// (store_packages branches on snap vs flatpak for the field layout). A row the table does not
+// cover is counted differently per action: an unlisted manager's `packages` row is NOT seen,
+// while its `store_packages` and present `managers` rows are seen but not mapped -- the
+// `package_action` column is what pins that difference.
 constexpr std::string_view kActionManagers = "managers";
 constexpr std::string_view kActionPackages = "packages";
 constexpr std::string_view kActionStorePackages = "store_packages";
