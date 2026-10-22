@@ -5,11 +5,8 @@
 `matches_found|<count>`), so a reordered, renamed or reverted result column fails here rather than
 only in a dashboard.
 
-The server's declared-column matcher (result_set_matcher.cpp) binds a column matcher to this
-declared list and skips any row whose field count differs, so the version, the three column names
-and the row_kind values are load-bearing. tests/unit/server/test_result_set_matcher.cpp keeps its
-own copy of the schema (the server test binary has no YAML loader); this file is the pin that ties
-that copy to the definition that actually ships.
+tests/unit/server/test_result_set_matcher.cpp keeps its own copy of the schema (the server test
+binary has no YAML loader); this file ties that copy to the definition that actually ships.
 
 Runnable standalone: `python3 tests/test_filesystem_definition.py` (how meson runs it; a bare
 pytest-style file with no runner would execute zero assertions and always exit 0).
