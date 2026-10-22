@@ -991,7 +991,7 @@ TEST_CASE("mapdrive backfill apply_outcomes (complete=true): ok+incomplete count
 }
 
 TEST_CASE("mapdrive backfill apply_outcomes: a cap-cut profile is abandoned when the bump reaches "
-          "the maximum, never retried forever",
+          "the maximum and is never retried forever",
           "[tar][mapdrive][backfill]") {
     PendingState st;
     st.profiles = {{"S-1-5-21-1", 6}};
@@ -1026,7 +1026,7 @@ TEST_CASE("mapdrive backfill apply_outcomes: an outcome that was never attempted
 }
 
 TEST_CASE("mapdrive backfill initial_pending: a profile the first pass did not try is seeded at "
-          "zero attempts so it is retried, not lost",
+          "zero attempts so it is retried and not lost",
           "[tar][mapdrive][backfill]") {
     ProfileHiveOutcome skipped{"S-1-5-21-2", HiveAccessStatus::mount_failed,
                                "skipped_after_timeout"};
@@ -1303,4 +1303,58 @@ TEST_CASE("mapdrive insert: skip_known_historical adds no duplicate on an identi
     };
     REQUIRE(db.insert_mapdrive_events(retry_again, std::nullopt, true));
     CHECK(count_historical() == "3"); // the live row never counted; one more historical added
+}
+
+TEST_CASE("mapdrive backfill decide_walk_gate: a failed pin or a still-running abandoned worker "
+          "stops all mounting",
+          "[tar][mapdrive][backfill]") {
+    CHECK(decide_walk_gate(true, 0) == WalkGate::open);
+    CHECK(decide_walk_gate(false, 0) == WalkGate::pin_failed);
+    CHECK(decide_walk_gate(true, 1) == WalkGate::prior_mount_running);
+    CHECK(decide_walk_gate(true, 3) == WalkGate::prior_mount_running);
+    CHECK(decide_walk_gate(false, 2) == WalkGate::pin_failed); // the pin comes first
+    CHECK(std::string(walk_gate_token(WalkGate::pin_failed)) == "pin_failed");
+    CHECK(std::string(walk_gate_token(WalkGate::prior_mount_running)) ==
+          "prior_mount_still_running");
+}
+
+TEST_CASE("mapdrive backfill zero count: a not yet tried entry is selected for retry and costs "
+          "its first attempt only when a mount is really made",
+          "[tar][mapdrive][backfill]") {
+    PendingState st;
+    st.profiles = {{"S-1-5-21-1", 0}, {"S-1-5-21-2", 7}};
+    CHECK(retry_sids(st, 7) == std::vector<std::string>{"S-1-5-21-1"});
+
+    // Tried and failed: 0 -> 1.
+    const auto failed = apply_outcomes(
+        st, {{"S-1-5-21-1", HiveAccessStatus::mount_failed, "timeout", true, true}}, true, 7);
+    REQUIRE(failed.next.profiles.size() == 1);
+    CHECK(failed.next.profiles[0].attempts == 1);
+
+    // Not tried again: stays 0.
+    ProfileHiveOutcome skipped{"S-1-5-21-1", HiveAccessStatus::mount_failed,
+                               "prior_mount_still_running"};
+    skipped.attempted = false;
+    const auto kept = apply_outcomes(st, {skipped}, true, 7);
+    REQUIRE(kept.next.profiles.size() == 1);
+    CHECK(kept.next.profiles[0].attempts == 0);
+}
+
+TEST_CASE("mapdrive backfill parse_pending_state: a zero and a positive count for one sid keep "
+          "the positive one",
+          "[tar][mapdrive][backfill]") {
+    const PendingState st = parse_pending_state("0;S-1-5-21-1:0;S-1-5-21-1:3;S-1-5-21-2:0", 7);
+    REQUIRE(st.profiles.size() == 2);
+    CHECK(st.profiles[0].attempts == 3);
+    CHECK(st.profiles[1].attempts == 0);
+}
+
+TEST_CASE("mapdrive backfill initial_pending: an outcome that was not attempted is never "
+          "resolved even when its other fields read as clean",
+          "[tar][mapdrive][backfill]") {
+    ProfileHiveOutcome o{"S-1-5-21-9", HiveAccessStatus::ok, "ok", true, true};
+    o.attempted = false;
+    const auto pending = initial_pending({o});
+    REQUIRE(pending.size() == 1);
+    CHECK(pending[0].attempts == 0);
 }

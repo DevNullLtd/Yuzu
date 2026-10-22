@@ -9,15 +9,16 @@ test_tar_mapdrive.cpp), so this pins the wiring lexically. Invariants:
 
   1. pin_plugin_module pins by address: GET_MODULE_HANDLE_EX_FLAG_PIN | ..._FROM_ADDRESS, with
      its own address as the module hint.
-  2. The walk pins the module BEFORE the first bounded mount (`mounts_halted = !pin_plugin_module()`:
-     a failed pin means no mount is tried), and the non-Completed branch asks decide_mount_call
-     and stops the walk (`mounts_halted = decision.halt_walk`). The pin is taken up front, not on a
-     timeout, because a worker that COMPLETES is detached too and destroys its plugin-resident
-     closure after publishing the result.
-  3. A halted walk records the remaining profiles as not attempted (`attempted = false`) and
-     `continue`s, BEFORE the next bounded_call_ex.
-  4. A MountPoints2 child-open failure reaches note_failure(sk_rc); a clean cap-cut read is
-     labelled "row_cap".
+  2. The walk pins the module and asks decide_walk_gate (pin + abandoned workers still running,
+     counted by MountWorkerGuard) BEFORE the first bounded mount; a closed gate means no mount is
+     tried. The non-Completed branch asks decide_mount_call, records `outcome.attempted =
+     decision.attempted` and stops the walk (`mounts_halted = decision.halt_walk`). The pin is taken
+     up front, not on a timeout, because a worker that COMPLETES is detached too and destroys its
+     plugin-resident closure after publishing the result.
+  3. A halted walk records each remaining profile as not attempted (`attempted = false`, the cause
+     token, appended) and `continue`s, BEFORE the next bounded_call_ex.
+  4. A MountPoints2 child-open failure reaches note_failure(sk_rc) and skips the row; a clean
+     cap-cut read is labelled "row_cap".
   5. tar_plugin.cpp's first-pass insert passes skip_known_historical=true, and a vanished
      pending SID is logged.
   6. The banner no longer cites dism_bounded_call.hpp as the pattern it follows (that header
@@ -78,31 +79,49 @@ def problems(collector_src, plugin_src):
             if tok not in pin:
                 out.append(f"pin_plugin_module() no longer contains {tok}")
 
+    if not re.search(r"MountWorkerGuard\(\) noexcept \{ g_mount_workers_in_flight\.fetch_add\(1\);"
+                     r" \} ~MountWorkerGuard\(\) \{ g_mount_workers_in_flight\.fetch_sub\(1\); \}",
+                     c):
+        out.append("MountWorkerGuard no longer counts the worker in and out")
+
     walk = body_of(c, "void enum_registry_outbound_history(")
     if walk is None:
         out.append("enum_registry_outbound_history() is missing")
     else:
+        mount = walk.find("bounded_call_ex(")
+        gate_at = walk.find("decide_walk_gate(pin_plugin_module(), g_mount_workers_in_flight.load())")
+        if gate_at < 0 or mount < 0 or gate_at > mount:
+            out.append("the walk must pin the module and ask decide_walk_gate (pin + in-flight "
+                       "workers) before its first bounded_call_ex")
+        if not re.search(r"mounts_halted = gate != yuzu::tar::WalkGate::open;", walk):
+            out.append("a closed walk gate no longer halts the walk")
         if "decide_mount_call(" not in walk:
             out.append("the walk no longer asks decide_mount_call")
-        pin_at = walk.find("mounts_halted = !pin_plugin_module();")
-        if pin_at < 0 or pin_at > walk.find("bounded_call_ex("):
-            out.append("the walk must pin the module (and halt if it cannot) before its first "
-                       "bounded_call_ex")
         if not re.search(r"mounts_halted = decision\.halt_walk;", walk):
             out.append("the timeout branch no longer halts the walk")
-        halted = re.search(r"if \(mounts_halted\) \{(.*?)\bcontinue;", walk)
-        mount = walk.find("bounded_call_ex(")
+        if not re.search(r"outcome\.attempted = decision\.attempted;", walk):
+            out.append("the timeout/rejection outcome no longer carries decision.attempted")
+        if not re.search(r"const MountWorkerGuard \w+;[^}]*?with_user_hive\(", walk):
+            out.append("the mount worker closure no longer counts itself in flight")
+        halted = re.search(r"if \(mounts_halted\) \{ ProfileHiveOutcome skipped;([^{}]*?)"
+                           r"h\.profiles\.push_back\(std::move\(skipped\)\); continue; \}", walk)
         if not halted or mount < 0 or halted.start() > mount:
-            out.append("the halted-walk block must come, and continue, before the next "
-                       "bounded_call_ex")
-        elif "attempted = false" not in halted.group(1):
-            out.append("the halted-walk block must record the profile as attempted = false")
+            out.append("the halted-walk block must append its skipped outcome and continue, "
+                       "before the next bounded_call_ex")
+        else:
+            blk = halted.group(1)
+            if "attempted = false" not in blk:
+                out.append("the halted-walk block must record the profile as attempted = false")
+            if "skipped.token = halted_token;" not in blk:
+                out.append("the halted-walk block must carry the cause token")
         if '"row_cap"' not in walk:
             out.append('a clean cap-cut read is no longer labelled "row_cap"')
 
-    if not re.search(r"const LONG sk_rc = RegOpenKeyExW\(mp\.h, sub, 0, KEY_READ, &sk\.h\);"
-                     r".*?else note_failure\(sk_rc\);", c):
-        out.append("a MountPoints2 child-open failure no longer reaches note_failure")
+    if not re.search(r"const LONG sk_rc = RegOpenKeyExW\(mp\.h, sub, 0, KEY_READ, &sk\.h\); "
+                     r"if \(sk_rc != ERROR_SUCCESS\) \{.*?note_failure\(sk_rc\); idx\+\+; "
+                     r"len = 256; continue; \}", c):
+        out.append("a MountPoints2 child-open failure no longer skips the row and reaches "
+                   "note_failure")
 
     if not re.search(r"typed\.empty\(\) \|\| db_->insert_mapdrive_events\( ?typed, std::nullopt, "
                      r"/\*skip_known_historical=\*/true\)", p):
@@ -110,8 +129,7 @@ def problems(collector_src, plugin_src):
     if "dropped from the pending set" not in p:
         out.append("a vanished pending SID is no longer logged")
 
-    raw_banner = collector_src
-    if re.search(r"see dism_bounded_call\.hpp/power_health_plugin\.cpp", raw_banner):
+    if re.search(r"see dism_bounded_call\.hpp/power_health_plugin\.cpp", collector_src):
         out.append("the banner again cites dism_bounded_call.hpp as the pattern followed")
     return out
 
@@ -139,26 +157,44 @@ class TarMapdrivePinLexical(unittest.TestCase):
     def test_mutations_are_caught(self):
         c, p = self.collector, self.plugin
         cases = {
-            "pin call deleted": (mutate(c, "bool mounts_halted = !pin_plugin_module();",
-                                        "bool mounts_halted = false;"), p),
-            "pin call commented out": (
-                mutate(c, "bool mounts_halted = !pin_plugin_module();",
-                       "bool mounts_halted = false; // !pin_plugin_module();"), p),
-            "pin failure ignored": (mutate(c, "bool mounts_halted = !pin_plugin_module();",
-                                           "(void)pin_plugin_module(); bool mounts_halted = "
-                                           "false;"), p),
+            "gate decision deleted": (mutate(
+                c, "decide_walk_gate(pin_plugin_module(),\n"
+                   "                                                   g_mount_workers_in_flight.load())",
+                   "decide_walk_gate(true, 0)"), p),
+            "gate decision commented out": (mutate(
+                c, "const auto gate = yuzu::tar::decide_walk_gate(pin_plugin_module(),",
+                   "const auto gate = yuzu::tar::WalkGate::open; // decide_walk_gate(pin_plugin_module(),"), p),
             "pin flag dropped": (mutate(c, "GET_MODULE_HANDLE_EX_FLAG_PIN", "0"), p),
+            "closed gate no longer halts": (mutate(
+                c, "bool mounts_halted = gate != yuzu::tar::WalkGate::open;",
+                   "bool mounts_halted = false;"), p),
             "halt assignment dropped": (mutate(c, "mounts_halted = decision.halt_walk;",
                                                "(void)decision;"), p),
+            "outcome attempted flag dropped": (mutate(
+                c, "outcome.attempted = decision.attempted;", "(void)decision;"), p),
+            "worker no longer counted in flight": (mutate(
+                c, "const MountWorkerGuard in_flight;", "(void)0;"), p),
+            "in-flight guard stops counting": (mutate(
+                c, "g_mount_workers_in_flight.fetch_sub(1);", "(void)0;"), p),
             "halted block loses attempted=false": (
                 mutate(c, "skipped.attempted = false;", "skipped.attempted = true;"), p),
-            "halted block moved after the mount": (
-                mutate(mutate(c, "if (mounts_halted) {", "if (false) {"),
-                       "auto bounded = yuzu::shared::bounded_call_ex(",
-                       "if (mounts_halted) { continue; }\n        auto bounded = "
-                       "yuzu::shared::bounded_call_ex("), p),
+            "halted block loses its append": (mutate(
+                c, "h.profiles.push_back(std::move(skipped));", "(void)skipped;"), p),
+            "halted block loses its cause token": (mutate(
+                c, "skipped.token = halted_token;", 'skipped.token = "x";'), p),
+            "halted block loses its continue": (mutate(
+                mutate(c, "skipped.token = halted_token;", "skipped.token = halted_token;"),
+                "h.profiles.push_back(std::move(skipped));\n            continue;",
+                "h.profiles.push_back(std::move(skipped));"), p),
+            "halted check moved past the mount": (mutate(
+                mutate(c, "if (mounts_halted) {\n            // Not tried",
+                          "if (false) {\n            // Not tried"),
+                "auto bounded = yuzu::shared::bounded_call_ex(",
+                "if (mounts_halted) { h.profiles.push_back(ProfileHiveOutcome{}); continue; }\n"
+                "        auto bounded = yuzu::shared::bounded_call_ex("), p),
             "row_cap label dropped": (mutate(c, '"row_cap"', '"ok"'), p),
-            "MountPoints2 note_failure dropped": (mutate(c, "note_failure(sk_rc);", ";"), p),
+            "MountPoints2 failure no longer skips": (mutate(
+                c, "note_failure(sk_rc);\n                        idx++;", "idx++;"), p),
             "dism reference restored": (
                 c + "\n// plugin's first consumer; see dism_bounded_call.hpp/power_health_plugin.cpp\n",
                 p),

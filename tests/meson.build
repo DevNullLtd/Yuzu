@@ -3644,8 +3644,9 @@ test('log handoff wiring lexical gate (#4666 PR-2 W3a)',
 )
 
 # #5291 / PR #6311: static lexical gate over TAR's Windows-only bounded hive-mount call site --
-# the first timeout must pin the plugin module and stop the walk (an abandoned mount thread keeps
-# running plugin code with nothing joining it). Source text only, so Python, no build needed.
+# the module must be pinned before the first mount and the walk must stop mounting after a timeout
+# (a detached mount thread, abandoned or not, keeps running plugin code with nothing joining it).
+# Source text only, so Python, no build needed.
 test('TAR mapdrive hive-mount pin wiring lexical gate (#5291)',
   _python3_test,
   args: [files('test_tar_mapdrive_pin_lexical.py')],

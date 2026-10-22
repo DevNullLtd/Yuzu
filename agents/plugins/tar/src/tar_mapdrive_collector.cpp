@@ -1059,10 +1059,17 @@ OutboundRead read_user_outbound_history(HKEY user_root, const std::string& profi
                     RegKeyGuard sk;
                     int64_t ts = 0;
                     const LONG sk_rc = RegOpenKeyExW(mp.h, sub, 0, KEY_READ, &sk.h);
-                    if (sk_rc == ERROR_SUCCESS)
-                        ts = key_last_write_epoch(sk.h);
-                    else
-                        note_failure(sk_rc); // the row's timestamp is lost: not a clean read
+                    if (sk_rc != ERROR_SUCCESS) {
+                        // Same accounting as leg (a)'s failed child open: no row (a row with a
+                        // lost timestamp could never be repaired by the retry, whose insert
+                        // keeps the first-recorded row), and the read is not clean, so the
+                        // profile is retried.
+                        note_failure(sk_rc);
+                        idx++;
+                        len = 256;
+                        continue;
+                    }
+                    ts = key_last_write_epoch(sk.h);
                     MapDriveHistoryRow r;
                     r.ts = ts;
                     r.entry.direction = "outbound";
@@ -1082,6 +1089,19 @@ OutboundRead read_user_outbound_history(HKEY user_root, const std::string& profi
     return result;
 }
 
+// Mount workers currently running (spawned by bounded_call_ex, not yet returned from their
+// closure). A plugin static, safe because the module is pinned before any worker exists. A
+// worker the caller abandoned on a timeout stays counted until it really returns, which is how a
+// LATER walk learns that mounting would only queue behind it (decide_walk_gate).
+std::atomic<int> g_mount_workers_in_flight{0};
+
+struct MountWorkerGuard {
+    MountWorkerGuard() noexcept { g_mount_workers_in_flight.fetch_add(1); }
+    ~MountWorkerGuard() { g_mount_workers_in_flight.fetch_sub(1); }
+    MountWorkerGuard(const MountWorkerGuard&) = delete;
+    MountWorkerGuard& operator=(const MountWorkerGuard&) = delete;
+};
+
 // Pins this plugin's module so FreeLibrary can never unmap it (the pin is for the life of the
 // process), once, and answers whether it holds. Called on the dispatching thread BEFORE the first
 // bounded mount spawns a worker: a worker that completes is detached too, and destroys its
@@ -1090,6 +1110,8 @@ OutboundRead read_user_outbound_history(HKEY user_root, const std::string& profi
 bool pin_plugin_module() noexcept {
     static const bool pinned = [] {
         HMODULE module = nullptr;
+        // With FROM_ADDRESS the "name" argument is an address inside the module, not a string; the
+        // pointer is never read as wchar_t.
         if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                    GET_MODULE_HANDLE_EX_FLAG_PIN,
                                reinterpret_cast<LPCWSTR>(&pin_plugin_module), &module))
@@ -1136,13 +1158,16 @@ bool pin_plugin_module() noexcept {
 // that completes leaves its worker destroying a plugin-resident closure after the result is
 // published), so the plugin module is PINNED before the first mount (pin_plugin_module, above):
 // unload can then never unmap code any such thread is running, at the price of the DLL staying
-// loaded until process exit (it is loaded for the agent's lifetime anyway). Three more
-// costs of a stuck mount are accepted and recorded in the governance ledger: it holds the
-// process-wide offline-hive mutex (every other with_user_hive caller queues behind it), it keeps
-// SeBackup/SeRestore enabled on the process token (PrivilegeScope restores only when the call
-// returns), and it occupies one of the shared primitive's 64 outstanding-call slots. The walk
-// therefore stops mounting after the first timeout (decide_mount_call): later profiles would only
-// queue behind the stuck mount, time out, and burn attempts they never made.
+// loaded until process exit (it is loaded for the agent's lifetime anyway). Four more
+// costs of a stuck mount are accepted and recorded in governance.d/5291-hive-file-guard-default
+// .gTuSZf.resource-ledger.md: it holds the process-wide offline-hive mutex (every other
+// with_user_hive caller queues behind it), it keeps SeBackup/SeRestore enabled on the process
+// token (PrivilegeScope restores only when the call returns), a worker stuck after a successful
+// load keeps that hive mounted and its NTUSER.DAT locked, and it occupies one of this module's 64
+// outstanding-call slots (the counter is per DLL). The walk therefore stops mounting after the
+// first timeout (decide_mount_call), and a LATER walk does not mount while that worker is still
+// running (decide_walk_gate, g_mount_workers_in_flight): either would only queue behind the stuck
+// mount, time out, and burn attempts it never made.
 constexpr std::chrono::milliseconds kHiveMountBoundMs{30000}; // generous for a legitimately slow
                                                               // network-share read; see dism's 17s
                                                               // for a comparable Windows API bound
@@ -1173,11 +1198,19 @@ void enum_registry_outbound_history(MapDriveHistory& h, const std::vector<std::s
             key_open_rc[f.sid] = f.rc;
     }
 
-    // Pinned before any worker thread exists. If the pin fails no mount is tried at all: every
-    // profile is recorded as not attempted ("pin_failed") and retried later. After that, set once
-    // a bounded mount times out or is refused: no further mount is tried this run.
-    bool mounts_halted = !pin_plugin_module();
-    const char* halted_token = mounts_halted ? "pin_failed" : "skipped_after_timeout";
+    // Pinned before any worker thread exists. No mount is tried at all if the pin failed, or if an
+    // earlier walk's abandoned worker is still running: every requested profile is then recorded
+    // as not attempted and retried later. After that, set once a bounded mount times out or is
+    // refused: no further mount is tried this run.
+    const auto gate = yuzu::tar::decide_walk_gate(pin_plugin_module(),
+                                                   g_mount_workers_in_flight.load());
+    bool mounts_halted = gate != yuzu::tar::WalkGate::open;
+    const char* halted_token = mounts_halted ? yuzu::tar::walk_gate_token(gate)
+                                             : "skipped_after_timeout";
+    if (mounts_halted) {
+        spdlog::warn("TAR mapdrive: no hive mounts this run ({}); the profiles are retried later",
+                     halted_token);
+    }
     for (const auto& profile : profiles) {
         if (only_sids) {
             bool wanted = false;
@@ -1212,6 +1245,7 @@ void enum_registry_outbound_history(MapDriveHistory& h, const std::vector<std::s
         const std::size_t cap_baseline = h.rows.size();
         auto bounded = yuzu::shared::bounded_call_ex(
             kHiveMountBoundMs, [sid, path, pname, cap_baseline]() -> BoundedProfileRead {
+                const MountWorkerGuard in_flight; // counted until this closure really returns
                 BoundedProfileRead r;
                 r.status = yuzu::win::with_user_hive(
                     sid, path,
@@ -1232,15 +1266,19 @@ void enum_registry_outbound_history(MapDriveHistory& h, const std::vector<std::s
                 bounded.status == yuzu::shared::BoundedCallStatus::TimedOut
                     ? yuzu::tar::MountCallResult::timed_out
                     : yuzu::tar::MountCallResult::rejected);
+            const char* const cause = decision.attempted ? "timeout" : "mount_rejected";
             ProfileHiveOutcome outcome;
             outcome.sid = profile.sid;
             outcome.status = yuzu::win::HiveAccessStatus::mount_failed;
-            outcome.token = decision.attempted ? "timeout" : "mount_rejected";
+            outcome.token = cause;
             outcome.attempted = decision.attempted;
             outcome.complete = true; // nothing about this profile's cap/completeness changed
             h.profiles.push_back(std::move(outcome));
             mounts_halted = decision.halt_walk;
             halted_token = decision.attempted ? "skipped_after_timeout" : "skipped_after_rejection";
+            spdlog::warn("TAR mapdrive: hive mount for {} ({}); no further mounts this run, the "
+                         "remaining profiles are retried later",
+                         profile.sid, cause);
             continue;
         }
         BoundedProfileRead& result = *bounded.value;

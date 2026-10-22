@@ -97,6 +97,32 @@ struct MountCallDecision {
     bool halt_walk = false;
 };
 
+/// Whether a walk may start mounting at all. A walk that cannot pin the plugin module must not
+/// spawn a worker; a walk that starts while an earlier walk's ABANDONED worker is still running
+/// would only queue behind that worker's offline-hive mutex, time out, and charge its first
+/// profile an attempt it never made -- every run, for as long as the worker stays stuck. Either
+/// way no mount is tried and every requested profile is recorded as not attempted.
+enum class WalkGate { open, pin_failed, prior_mount_running };
+
+[[nodiscard]] constexpr WalkGate decide_walk_gate(bool pinned, int mount_workers_in_flight) noexcept {
+    if (!pinned)
+        return WalkGate::pin_failed;
+    return mount_workers_in_flight > 0 ? WalkGate::prior_mount_running : WalkGate::open;
+}
+
+/// The token an unattempted profile carries for the cause that stopped the walk.
+[[nodiscard]] constexpr const char* walk_gate_token(WalkGate g) noexcept {
+    switch (g) {
+    case WalkGate::open:
+        return "";
+    case WalkGate::pin_failed:
+        return "pin_failed";
+    case WalkGate::prior_mount_running:
+        return "prior_mount_still_running";
+    }
+    return "";
+}
+
 [[nodiscard]] constexpr MountCallDecision decide_mount_call(MountCallResult r) noexcept {
     switch (r) {
     case MountCallResult::completed:
@@ -275,7 +301,8 @@ retry_sids(const PendingState& st, int max_attempts = kMapDriveBackfillMaxAttemp
 initial_pending(const std::vector<ProfileHiveOutcome>& outcomes) {
     std::vector<PendingProfile> out;
     for (const auto& o : outcomes) {
-        const bool resolved = (o.status == yuzu::profiles::HiveAccessStatus::ok) && o.read_ok &&
+        const bool resolved = o.attempted &&
+                              (o.status == yuzu::profiles::HiveAccessStatus::ok) && o.read_ok &&
                               o.complete;
         if (!resolved)
             out.push_back(PendingProfile{o.sid, o.attempted ? 1 : 0});
@@ -295,9 +322,12 @@ initial_pending(const std::vector<ProfileHiveOutcome>& outcomes) {
 ///  2. No matching outcome: `complete` true means the walk covered every profile and this one is
 ///     simply gone (vanished, dropped); `complete` false means the walk never reached it, so its
 ///     absence proves nothing (retained unchanged, cause "profile_list_incomplete").
-///  3. ok + read_ok + complete: fully resolved, dropped silently (no longer pending).
-///  3a. An outcome with attempted == false (the mount was never tried this run): retained
-///     unchanged, no bump, cause = the outcome's token. It was not a failed attempt.
+///  3. An outcome with attempted == false (the mount was never tried this run: the shared ceiling
+///     refused it, an earlier profile's mount timed out, the plugin could not be pinned, or an
+///     earlier walk's abandoned worker is still running -- tokens mount_rejected,
+///     skipped_after_timeout, skipped_after_rejection, pin_failed, prior_mount_still_running):
+///     retained unchanged, no bump, cause = the outcome's token. It was not a failed attempt.
+///  3a. ok + read_ok + complete: fully resolved, dropped silently (no longer pending).
 ///  4. ok + read_ok + !complete: the hive read fine, just not completely (cap-cut). That is a
 ///     real acquisition, so it counts like any other attempt -- bump, then abandon if the bump
 ///     reaches max_attempts, else retain at the bumped count. (Retaining it unchanged retried a

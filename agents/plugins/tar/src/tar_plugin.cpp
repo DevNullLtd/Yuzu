@@ -951,18 +951,33 @@ public:
                            // must not be written a second time (the retry path's own insert).
                            db_->insert_mapdrive_events(typed, std::nullopt,
                                                        /*skip_known_historical=*/true)) {
-                    if (typed.empty())
-                        spdlog::info("TAR: no historical mapped drives found to backfill");
-                    else
-                        spdlog::info("TAR: backfilled {} historical mapped-drive rows", typed.size());
                     // §3.8 bounded per-profile retry (related issue #5291): every profile this
                     // pass could not fully resolve (not_found, privilege_missing, mount_failed, a
                     // refused hive file, a failed inner read, or a cap-cut walk) starts at attempt
-                    // 1/kMapDriveBackfillMaxAttempts -- the first pass itself is attempt 1.
+                    // 1/kMapDriveBackfillMaxAttempts -- the first pass itself is attempt 1 -- and
+                    // a profile it did not try at all (a mount before it timed out, or no mount
+                    // was possible) starts at 0.
                     PendingState pending{now_epoch_seconds(), initial_pending(hist.profiles)};
+                    if (typed.empty() && pending.profiles.empty()) {
+                        spdlog::info("TAR: no historical mapped drives found to backfill");
+                    } else if (typed.empty()) {
+                        spdlog::info("TAR: no historical mapped drives recovered this pass; {} "
+                                     "profile(s) are pending a retry",
+                                     pending.profiles.size());
+                    } else {
+                        spdlog::info("TAR: backfilled up to {} historical mapped-drive rows "
+                                     "(rows already recorded are skipped)",
+                                     typed.size());
+                    }
                     for (const auto& p : pending.profiles) {
-                        spdlog::info("TAR mapdrive backfill: profile {} attempt {}/{} pending",
-                                     p.sid, p.attempts, kMapDriveBackfillMaxAttempts);
+                        if (p.attempts == 0) {
+                            spdlog::info("TAR mapdrive backfill: profile {} not yet tried, pending "
+                                         "(0/{} attempts)",
+                                         p.sid, kMapDriveBackfillMaxAttempts);
+                        } else {
+                            spdlog::info("TAR mapdrive backfill: profile {} attempt {}/{} pending",
+                                         p.sid, p.attempts, kMapDriveBackfillMaxAttempts);
+                        }
                     }
                     if (!commit_first_pass(
                             [&](std::string_view k, std::string_view v) {
