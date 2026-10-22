@@ -422,7 +422,7 @@ The default-mode Phase 5 fan-out:
 
 ```bash
 gate_run "C++ unit (Catch2)" "unit-cpp.log" \
-    "meson test -C \"$BUILDDIR\" --suite agent --suite server --suite tar --suite proto --suite docs --print-errorlogs"
+    "meson test -C \"$BUILDDIR\" --suite agent --suite server --suite tar --suite proto --suite docs --suite platform --print-errorlogs"
 
 gate_run "EUnit" "eunit.log" \
     "bash scripts/test/eunit-gate.sh"
