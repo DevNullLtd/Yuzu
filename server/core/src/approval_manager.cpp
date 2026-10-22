@@ -411,8 +411,10 @@ bool same_human_root(const std::string& a, const std::string& b) { return a == b
 // excluded_roots, a hand edit, a restored backup) can say "approved" without any of
 // that having held. Redemption therefore re-derives the facts from the stored row
 // instead of trusting the status word. nullopt == the row is sound; otherwise a short
-// cause for the SERVER log only (never sent to a client: the refusal message is the
-// uniform one, so the redeemer is no oracle for which check fired).
+// cause for the SERVER log only (never sent to a client: for a fault the refusal message is
+// the uniform one, so the redeemer is no oracle for which check fired; the one exception is
+// the digest that could not be COMPUTED, which decided nothing and is reported to the caller
+// as a store error, see integrity_refusal).
 //
 // A legacy row (no request_json, no digest, no excluded roots) passes the digest and
 // roots checks by construction, so every pre-v2 and unbound ticket redeems as before.
@@ -476,6 +478,7 @@ Approval row_to_approval(PGresult* r, int i) {
     a.target_action = col_str(r, i, 14);
     a.request_json = col_str(r, i, 15);
     a.request_digest = col_str(r, i, 16);
+    a.row_version = col_str(r, i, 18);
     if (auto roots = decode_excluded_roots(col_str(r, i, 17)))
         a.excluded_roots = std::move(*roots);
     else
@@ -489,7 +492,7 @@ constexpr const char* kSelectAllCols =
     "id, definition_id, status, submitted_by, submitted_at, "
     "reviewed_by, reviewed_at, review_comment, scope_expression, "
     "consumed_at, consumed_by, schedule_id, origin, target_plugin, target_action, "
-    "request_json, request_digest, excluded_roots";
+    "request_json, request_digest, excluded_roots, xmin::text";
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets search_path to the store schema for
@@ -1282,7 +1285,8 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
     //
     // Refused as kForeignOrigin (integrity) with the uniform message: the closest EXISTING
     // kind, so it is counted and audited by every caller like the others, adds no new label
-    // value and is indistinguishable from a replay to the redeemer. The cause goes to the
+    // value and is indistinguishable from a replay to the redeemer (a digest that could not be
+    // computed is the exception: a store error, see integrity_refusal). The cause goes to the
     // server log. A digest that could not be COMPUTED decided nothing, so it is a store
     // error flagged `binding_check_unevaluated`, like a failed read.
     const auto check_examined = [&](const Approval& a) -> std::optional<ConsumeError> {
@@ -1293,7 +1297,7 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
         return integrity_refusal(a);
     };
     // The row the checks (and, if supplied, the precondition) LAST examined. The consuming CAS
-    // below is pinned to its status and to every column the checks read, so a decision made on
+    // below is pinned to the row's version (and to the columns the checks read), so a decision made on
     // one state of the row can only be spent against that same state (Gate 8 g8-sg-1).
     std::optional<Approval> examined;
     {
@@ -1427,17 +1431,43 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
     // an UNPINNED consuming statement out of this function altogether.)
     if (!examined)
         return std::unexpected(ConsumeError{ConsumeFailure::kNotConsumable, kNotConsumableMessage});
-    // The consuming CAS is PINNED to the state the checks above examined - reviewer, frozen
-    // request, digest, excluded roots, origin and submitter - as bound parameters. The
-    // pooled overload reads on one lease and updates on another, and a precondition runs
-    // arbitrary caller code between the two, so without the pin a row rewritten after the
-    // check (an old-build replica, a hand edit, a precondition that writes) would be consumed
-    // on the strength of a state it no longer has. A pin mismatch matches no row and reads as
-    // the uniform kNotConsumable below, never as a store error. Under the held overload's
-    // FOR UPDATE inside a real transaction the pin is redundant (the row cannot move); on an
-    // AUTOCOMMIT connection the lock drops after each statement and the pin is what holds
-    // (cs-3: refusing an autocommit connection outright, via PQTRANS_INTRANS, is deferred
-    // to PR3 - see the ADR-1009 entry conditions).
+    // The consuming CAS is PINNED to the row it examined. Two layers:
+    //
+    //  1. The ROW VERSION (`xmin::text`, taken from the last read): every UPDATE of the row,
+    //     whichever column and whatever the values, gives it a new version, so a statement
+    //     pinned to the examined version can only consume the very tuple the checks saw. This
+    //     is what closes the classes the per-column pins below cannot enumerate (consumed_at,
+    //     reviewed_at, definition_id, scope_expression, target_*, schedule_id, and any column
+    //     added later).
+    //  2. The explicit columns the checks read - status, reviewer, frozen request, digest,
+    //     excluded roots, origin, submitter - as bound parameters. Provably implied by (1) (an
+    //     unchanged version cannot have a changed column) and kept as defence in depth, so a
+    //     regression in the version pin does not silently reopen the classes they cover.
+    //
+    // The pooled overload reads on one lease and updates on another, and a precondition runs
+    // arbitrary caller code between the two, so without a pin a row rewritten after the check
+    // (an old-build replica, a hand edit, a precondition that writes) would be consumed on the
+    // strength of a state it no longer has. The status pin matters as much as the rest: a row
+    // examined as pending, rejected or expired never had its integrity checked, and must not
+    // become spendable by a status-only flip. A pin mismatch matches no row and reads as the
+    // uniform kNotConsumable below, never as a store error.
+    //
+    // WHAT THIS IS NOT. The check and the CAS are still two statements; the pin makes the CAS
+    // refuse a row that moved, it does not make them atomic. It is accident and skew detection
+    // for a row that changed between statements - an old-build replica, a stray UPDATE, a
+    // restore - not a boundary against a principal with database write access: a plain UPDATE
+    // cannot choose the version it writes, but a writer who can replace the row wholesale
+    // (a restore) or work below SQL is outside what it can tell. It fails CLOSED in one more direction: a
+    // no-op rewrite (`SET reviewed_by = reviewed_by`) is a new version, so it refuses a ticket
+    // whose content did not change; a retry reads the new version and succeeds. A row frozen
+    // by VACUUM FREEZE reads a stable version before and after the freeze; a freeze that lands
+    // BETWEEN the read and the CAS also refuses once, for the same reason, and a retry
+    // succeeds.
+    //
+    // Under the held overload's FOR UPDATE inside a real transaction the pin is redundant (the
+    // row cannot move); on an AUTOCOMMIT connection the lock drops after each statement and the
+    // pin is what holds (cs-3: refusing an autocommit connection outright, via PQTRANS_INTRANS,
+    // is deferred to PR3 - see the ADR-1009 entry conditions).
     const auto pinned_roots = encode_excluded_roots(examined->excluded_roots);
     if (!pinned_roots) // cannot happen for a list decoded from JSON; fail closed regardless
         return std::unexpected(ConsumeError{ConsumeFailure::kNotConsumable, kNotConsumableMessage});
@@ -1470,13 +1500,14 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
         "WHERE id = $2 AND status = 'approved' AND consumed_at = 0 AND " + ticket_live_sql() +
         " AND reviewed_by = $3 AND request_json = $4 AND request_digest = $5"
         " AND excluded_roots = $6 AND origin = $7 AND submitted_by = $8 AND status = $9"
+        " AND xmin::text = $10"
         " RETURNING 1";
     pg::PgResult res = pg::exec_params(
         conn, consume_sql.c_str(),
         std::vector<std::string>{consumed_by, id, examined->reviewed_by, examined->request_json,
                                  examined->request_digest, *pinned_roots,
                                  to_string(examined->origin), examined->submitted_by,
-                                 examined->status});
+                                 examined->status, examined->row_version});
 
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(ConsumeError{
@@ -1504,7 +1535,7 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
     // only, never values) at no extra round trip.
     const std::string why_sql =
         "SELECT status, consumed_at, NOT " + ticket_live_sql() +
-        ", reviewed_by, request_json, request_digest, excluded_roots, origin, submitted_by"
+        ", reviewed_by, request_json, request_digest, excluded_roots, origin, submitted_by, xmin::text"
         " FROM approval_manager.approvals WHERE id = $1";
     pg::PgResult why =
         pg::exec_params(conn, why_sql.c_str(), std::vector<std::string>{id});
@@ -1537,6 +1568,10 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
             note("excluded_roots", col_str(why.get(), 0, 6) != *pinned_roots);
             note("origin", col_str(why.get(), 0, 7) != to_string(examined->origin));
             note("submitted_by", col_str(why.get(), 0, 8) != examined->submitted_by);
+            // The row version also moves for a change in a column none of the checks read
+            // (consumed_at, reviewed_at, definition_id, scope, target, schedule), which is the
+            // point of pinning it.
+            note("row version", col_str(why.get(), 0, 9) != examined->row_version);
             static RefusalLogThrottle throttle;
             const std::string key = redact_id(id);
             if (throttle.should_warn(key))

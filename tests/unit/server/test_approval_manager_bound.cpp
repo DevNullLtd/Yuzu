@@ -1180,13 +1180,20 @@ namespace {
 
 using Stage = ApprovalManager::ConsumeTestStage;
 
-// Run `change` (autocommit SQL on a second lease) when `stage` is reached, once.
+// How many times the interleaving hook of the CURRENT test reached its stage. A test that
+// expects a refusal checks this is 1: a refusal that happens because the hook was moved or
+// removed is not evidence about the race.
+int g_fired = 0;
+
+// Run `change` (autocommit SQL on a second lease) each time `stage` is reached (once per consume).
 void interleave(ApprovalManager& mgr, yuzu::test::ApprovalManagerPg& bundle, Stage at,
                 const std::string& sql, const std::string& id,
                 const std::vector<std::string>& extra = {}) {
+    g_fired = 0;
     mgr.set_consume_test_hook_for_test([&bundle, at, sql, id, extra](Stage got) {
         if (got != at)
             return;
+        ++g_fired;
         std::vector<std::string> params{id};
         params.insert(params.end(), extra.begin(), extra.end());
         auto lease = bundle.pool().acquire();
@@ -1211,12 +1218,14 @@ std::string pending_bound(ApprovalManager& mgr, yuzu::test::ApprovalManagerPg& b
 }
 
 void require_refused(ApprovalManager& mgr, const std::string& id, ConsumeFailure kind,
-                     const ConsumePrecondition& pre = {}) {
+                     const ConsumePrecondition& pre = {}, bool hooked = false) {
     auto r = mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, pre);
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().kind == kind);
     CHECK(r.error().message == kNotConsumableMessage);
     CHECK(mgr.get(id)->consumed_at == 0);
+    if (hooked) // only a test that installed an interleaving hook has a count to check
+        CHECK(g_fired == 1);
 }
 
 const ConsumePrecondition kPass = [](const Approval&) -> std::expected<void, std::string> {
@@ -1234,24 +1243,24 @@ TEST_CASE("consume: a row examined as not-approved cannot be spent after a statu
         const auto id = pending_bound(mgr, bundle,
             "UPDATE approval_manager.approvals SET reviewed_by = 'alice' WHERE id = $1");
         interleave(mgr, bundle, Stage::kBeforeCas, kFlipToApproved, id);
-        require_refused(mgr, id, ConsumeFailure::kNotConsumable);
+        require_refused(mgr, id, ConsumeFailure::kNotConsumable, {}, /*hooked=*/true);
     }
     SECTION("A2: pending, reviewer is an excluded root") {
         const auto id = pending_bound(mgr, bundle,
             "UPDATE approval_manager.approvals SET reviewed_by = 'carol' WHERE id = $1");
         interleave(mgr, bundle, Stage::kBeforeCas, kFlipToApproved, id);
-        require_refused(mgr, id, ConsumeFailure::kNotConsumable);
+        require_refused(mgr, id, ConsumeFailure::kNotConsumable, {}, /*hooked=*/true);
     }
     SECTION("A4: pending, no reviewer recorded") {
         const auto id = pending_bound(mgr, bundle);
         interleave(mgr, bundle, Stage::kBeforeCas, kFlipToApproved, id);
-        require_refused(mgr, id, ConsumeFailure::kNotConsumable);
+        require_refused(mgr, id, ConsumeFailure::kNotConsumable, {}, /*hooked=*/true);
     }
     SECTION("C: rejected by an excluded root, then flipped to approved") {
         const auto id = pending_bound(mgr, bundle);
         REQUIRE(mgr.reject(id, "carol", "withdrawn").has_value());
         interleave(mgr, bundle, Stage::kBeforeCas, kFlipToApproved, id);
-        require_refused(mgr, id, ConsumeFailure::kNotConsumable);
+        require_refused(mgr, id, ConsumeFailure::kNotConsumable, {}, /*hooked=*/true);
     }
     SECTION("an expired row flipped to approved is refused too") {
         const auto id = pending_bound(mgr, bundle,
@@ -1260,6 +1269,7 @@ TEST_CASE("consume: a row examined as not-approved cannot be spent after a statu
         auto r = mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, {});
         REQUIRE_FALSE(r.has_value());
         CHECK(mgr.get(id)->consumed_at == 0);
+        CHECK(g_fired == 1);
     }
 }
 
@@ -1300,6 +1310,7 @@ TEST_CASE("consume: origin, submitter and integrity are re-checked on the precon
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error().kind == ConsumeFailure::kForeignOrigin);
         CHECK(mgr.get(id)->consumed_at == 0);
+        CHECK(g_fired == 1);
     }
     SECTION("B2: submitter rewritten between the reads") {
         const auto id = approved_bound(mgr);
@@ -1309,6 +1320,7 @@ TEST_CASE("consume: origin, submitter and integrity are re-checked on the precon
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error().kind == ConsumeFailure::kForeignSubmitter);
         CHECK(mgr.get(id)->consumed_at == 0);
+        CHECK(g_fired == 1);
     }
     SECTION("integrity: reviewer becomes an excluded root between the reads") {
         const auto id = approved_bound(mgr);
@@ -1318,6 +1330,7 @@ TEST_CASE("consume: origin, submitter and integrity are re-checked on the precon
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error().kind == ConsumeFailure::kForeignOrigin);
         CHECK(mgr.get(id)->consumed_at == 0);
+        CHECK(g_fired == 1);
     }
 }
 
@@ -1329,13 +1342,13 @@ TEST_CASE("consume: the CAS pins origin and submitter themselves (a change AFTER
         const auto id = approved_bound(mgr);
         interleave(mgr, bundle, Stage::kBeforeCas,
                    "UPDATE approval_manager.approvals SET origin = 'mcp' WHERE id = $1", id);
-        require_refused(mgr, id, ConsumeFailure::kNotConsumable);
+        require_refused(mgr, id, ConsumeFailure::kNotConsumable, {}, /*hooked=*/true);
     }
     SECTION("submitted_by") {
         const auto id = approved_bound(mgr);
         interleave(mgr, bundle, Stage::kBeforeCas,
                    "UPDATE approval_manager.approvals SET submitted_by = 'mallory' WHERE id = $1", id);
-        require_refused(mgr, id, ConsumeFailure::kNotConsumable);
+        require_refused(mgr, id, ConsumeFailure::kNotConsumable, {}, /*hooked=*/true);
     }
     SECTION("the same holds on the held overload, in a real transaction") {
         const auto id = approved_bound(mgr);
@@ -1344,6 +1357,139 @@ TEST_CASE("consume: the CAS pins origin and submitter themselves (a change AFTER
         // that the pinned statement is still correct for an untouched row on this overload.
         in_txn(bundle.pool(), /*commit=*/true, [&](PGconn* conn) {
             CHECK(mgr.consume_ticket(conn, id, "alice", ApprovalOrigin::kGuardianDeploy, {})
+                      .has_value());
+        });
+    }
+}
+
+TEST_CASE("consume: the CAS pins the WHOLE row version, so any change after the checks is refused "
+          "(g8r4-sg-1, g8r4-up-1, g8r4-up-3)",
+          "[pg][approval_manager][bound][race]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    const std::string consume_now =
+        "extract(epoch from now())::bigint";
+
+    SECTION("QE-d: a consumed, integrity-faulted row un-consumed before the CAS is not spent") {
+        const auto id = approved_bound(mgr);
+        REQUIRE(run_sql(bundle.pool(),
+                        "UPDATE approval_manager.approvals SET reviewed_by = submitted_by, "
+                        "consumed_at = " + consume_now + ", consumed_by = 'earlier' WHERE id = $1",
+                        {id})
+                    .status() == PGRES_COMMAND_OK);
+        interleave(mgr, bundle, Stage::kBeforeCas,
+                   "UPDATE approval_manager.approvals SET consumed_at = 0, consumed_by = '' "
+                   "WHERE id = $1",
+                   id);
+        auto r = mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, {});
+        REQUIRE_FALSE(r.has_value());
+        CHECK(g_fired == 1);
+        CHECK(mgr.get(id)->consumed_by.empty()); // the CAS would have stamped "alice"
+    }
+    SECTION("QE-d2: the same with no recorded reviewer") {
+        const auto id = approved_bound(mgr);
+        REQUIRE(run_sql(bundle.pool(),
+                        "UPDATE approval_manager.approvals SET reviewed_by = '', consumed_at = " +
+                            consume_now + ", consumed_by = 'earlier' WHERE id = $1",
+                        {id})
+                    .status() == PGRES_COMMAND_OK);
+        interleave(mgr, bundle, Stage::kBeforeCas,
+                   "UPDATE approval_manager.approvals SET consumed_at = 0, consumed_by = '' "
+                   "WHERE id = $1",
+                   id);
+        auto r = mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, {});
+        REQUIRE_FALSE(r.has_value());
+        CHECK(g_fired == 1);
+        CHECK(mgr.get(id)->consumed_by.empty());
+    }
+    SECTION("the same un-consume on the held overload over an AUTOCOMMIT connection") {
+        const auto id = approved_bound(mgr);
+        REQUIRE(run_sql(bundle.pool(),
+                        "UPDATE approval_manager.approvals SET reviewed_by = submitted_by, "
+                        "consumed_at = " + consume_now + ", consumed_by = 'earlier' WHERE id = $1",
+                        {id})
+                    .status() == PGRES_COMMAND_OK);
+        interleave(mgr, bundle, Stage::kBeforeCas,
+                   "UPDATE approval_manager.approvals SET consumed_at = 0, consumed_by = '' "
+                   "WHERE id = $1",
+                   id);
+        auto lease = bundle.pool().acquire(); // no BEGIN: the lock does not outlive the SELECT
+        REQUIRE(lease);
+        auto r = mgr.consume_ticket(lease.get(), id, "alice", ApprovalOrigin::kGuardianDeploy, {});
+        REQUIRE_FALSE(r.has_value());
+        CHECK(g_fired == 1);
+        CHECK(mgr.get(id)->consumed_by.empty());
+    }
+    SECTION("reviewed_at rewritten on an expired ticket makes it live again: refused") {
+        const auto id = approved_bound(mgr);
+        REQUIRE(run_sql(bundle.pool(),
+                        "UPDATE approval_manager.approvals SET reviewed_at = " + consume_now +
+                            " - 8*24*3600 WHERE id = $1",
+                        {id})
+                    .status() == PGRES_COMMAND_OK);
+        // Unchanged, the ticket is expired.
+        {
+            auto control = mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, {});
+            REQUIRE_FALSE(control.has_value());
+            CHECK(control.error().kind == ConsumeFailure::kExpired);
+        }
+        interleave(mgr, bundle, Stage::kBeforeCas,
+                   "UPDATE approval_manager.approvals SET reviewed_at = " + consume_now +
+                       " WHERE id = $1",
+                   id);
+        auto r = mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, {});
+        REQUIRE_FALSE(r.has_value());
+        CHECK(g_fired == 1);
+        CHECK(mgr.get(id)->consumed_by.empty());
+    }
+    SECTION("a column the checks never read (definition, scope, target, schedule)") {
+        for (const char* change : {"definition_id = 'guardian.other'", "scope_expression = 'all'",
+                                   "target_plugin = 'other'", "target_action = 'other'",
+                                   "schedule_id = 'sched-1'"}) {
+            DYNAMIC_SECTION(change) {
+                const auto id = approved_bound(mgr, std::string("guardian.") + change[0] + change[1]);
+                interleave(mgr, bundle, Stage::kBeforeCas,
+                           std::string("UPDATE approval_manager.approvals SET ") + change +
+                               " WHERE id = $1",
+                           id);
+                auto r = mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, {});
+                REQUIRE_FALSE(r.has_value());
+                CHECK(r.error().kind == ConsumeFailure::kNotConsumable);
+                CHECK(g_fired == 1);
+                CHECK(mgr.get(id)->consumed_by.empty());
+            }
+        }
+    }
+    SECTION("a no-op rewrite changes the row version and is refused, fail closed") {
+        // `SET reviewed_by = reviewed_by` writes a new tuple with the same values. The pin cannot
+        // tell that from a real change, so it refuses; the ticket is intact and a retry (a fresh
+        // read of the new version) succeeds. The cost of a whole-row pin is this false refusal.
+        const auto id = approved_bound(mgr);
+        interleave(mgr, bundle, Stage::kBeforeCas,
+                   "UPDATE approval_manager.approvals SET reviewed_by = reviewed_by WHERE id = $1",
+                   id);
+        auto r = mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, {});
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == ConsumeFailure::kNotConsumable);
+        CHECK(g_fired == 1);
+        mgr.set_consume_test_hook_for_test({});
+        CHECK(mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, {}).has_value());
+    }
+    SECTION("a row frozen by VACUUM FREEZE reads the same version at the check and at the CAS") {
+        const auto id = approved_bound(mgr);
+        // Not inside a transaction block, as VACUUM requires; autocommit on a leased connection.
+        REQUIRE(run_sql(bundle.pool(), "VACUUM (FREEZE) approval_manager.approvals").status() ==
+                PGRES_COMMAND_OK);
+        CHECK(mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, {}).has_value());
+    }
+    SECTION("an untouched row is consumed by every overload that can run it") {
+        const auto pooled = approved_bound(mgr, "guardian.pooled");
+        CHECK(mgr.consume_ticket(pooled, "alice", ApprovalOrigin::kGuardianDeploy, {}).has_value());
+        const auto pre = approved_bound(mgr, "guardian.pre");
+        CHECK(mgr.consume_ticket(pre, "alice", ApprovalOrigin::kGuardianDeploy, kPass).has_value());
+        const auto held = approved_bound(mgr, "guardian.held");
+        in_txn(bundle.pool(), /*commit=*/true, [&](PGconn* conn) {
+            CHECK(mgr.consume_ticket(conn, held, "alice", ApprovalOrigin::kGuardianDeploy, kPass)
                       .has_value());
         });
     }
