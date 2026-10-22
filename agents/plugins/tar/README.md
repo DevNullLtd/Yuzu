@@ -108,7 +108,8 @@ flowchart LR
 Binaries/subprocesses/network: `systemctl list-units --type=service --all --plain --no-pager --no-legend` and
 `launchctl list` (both via the shared bounded-argv runner `yuzu::agent::run_bounded_subprocess`,
 never a shell string — `tar_service_collector.cpp:244-247,277,305-306,329`; the same runner
-executes `smbstatus` for the mapdrive collector, `tar_mapdrive_collector.cpp:1110,1165,1233`); a
+executes `smbstatus` and `wevtutil` for the mapdrive collector, in `enumerate_mapdrive` and
+`enumerate_mapdrive_history`); a
 Windows ETW session on provider `Microsoft-Windows-Kernel-Process`
 (`tar_proc_etw.cpp:48-49,337,349,370,383,397`) and a second ETW session for module-load capture
 (`ModuleEtwCollector::start()` in `tar_module_etw.cpp`); an in-process macOS Endpoint Security client
@@ -366,7 +367,8 @@ same convention. A failed perf/procperf counter read reports `counters_unavailab
 (ETW); on Linux and macOS it ships its schema and config key with no collector registered yet —
 the `$Module_*` tables stay queryable and empty there, which means "not yet collecting," never
 "nothing happened" (`tar.yaml` `module_enabled` description). `power` and `removable` were in this state until PRs #4017/#4023 landed real
-collectors for all three OSes on both (`tar_schema_registry.cpp:969-1094`); see How it works.
+collectors for all three OSes on both (the `power` and `removable` entries of `build_sources()` in
+`tar_schema_registry.cpp`); see How it works.
 
 ### Result status
 
@@ -673,5 +675,5 @@ three broken legs; it is one chokepoint. See Caveats item 1.
 - Capability rows: `server/core/src/capability_decls/core_dispatch_capabilities.hpp` · `server/core/src/capability_decls/plugin_action_catalogue_a.hpp`
 - Tests: `tests/unit/server/test_tar_process_tree.cpp` · `tests/unit/server/test_tar_tree_routes.cpp` · `tests/unit/test_tar_aggregator.cpp` · `tests/unit/test_tar_arp.cpp` · `tests/unit/test_tar_capability_table.cpp` · `tests/unit/test_tar_capture_status.cpp` · `tests/unit/test_tar_cursor.cpp` · `tests/unit/test_tar_diff.cpp` · `tests/unit/test_tar_local_dispatcher.cpp` · `tests/unit/test_tar_mapdrive.cpp` · `tests/unit/test_tar_module_etw.cpp` · `tests/unit/test_tar_module_stream.cpp` · `tests/unit/test_tar_netconn.cpp` · `tests/unit/test_tar_netqual_nstat.cpp` · `tests/unit/test_tar_perf.cpp` · `tests/unit/test_tar_power.cpp` · `tests/unit/test_tar_proc_es.cpp` · `tests/unit/test_tar_proc_etw.cpp` · `tests/unit/test_tar_proc_perf.cpp` · `tests/unit/test_tar_removable.cpp` · `tests/unit/test_tar_schema_registry.cpp` · `tests/unit/test_tar_service.cpp` · `tests/unit/test_tar_software.cpp` · `tests/unit/test_tar_source_health.cpp` · `tests/unit/test_tar_store.cpp` · `tests/unit/test_tar_usage.cpp` · `tests/unit/test_tar_warehouse.cpp` · `tests/unit/test_tar_win_raii_guards.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-10-14-dex-tar-titles.changed.md` · `changelog.d/2026-10-21-tar-all-sources-default-on-hardening.security.md` · `changelog.d/2026-10-21-tar-all-sources-default-on.changed.md` · `changelog.d/20261014-tar-adhoc-sql-moved.changed.md`
+- Changelog: `changelog.d/2026-10-14-dex-tar-titles.changed.md` · `changelog.d/2026-10-21-tar-all-sources-default-on.changed.md` · `changelog.d/2026-10-21-tar-mapdrive-history-backfill.fixed.md` · `changelog.d/2026-10-21-tar-windows-image-db-hardening.security.md` · `changelog.d/20261014-tar-adhoc-sql-moved.changed.md`
 <!-- END GENERATED -->

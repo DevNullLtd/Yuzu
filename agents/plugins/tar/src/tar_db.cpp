@@ -28,6 +28,22 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
+
+#ifdef _WIN32
+// windows.h first; aclapi.h/sddl.h follow it. Confined to this TU (the owner-only DACL block).
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+#include <aclapi.h> // SetEntriesInAclW, SetSecurityInfo, GetSecurityInfo
+#include <sddl.h>   // ConvertSidToStringSidW (refusal message only)
+#include <win_str.hpp>
+#endif
 
 namespace yuzu::tar {
 
@@ -321,6 +337,223 @@ int exec_ddl_batch(sqlite3* db, const char* ddl, char** err_msg) {
     return rc;
 }
 
+#ifdef _WIN32
+// ── Windows: protected owner-only DACL on tar.db, tar.db-wal and tar.db-shm ─────────────
+//
+// The state directory inherits C:\ProgramData's ACL (Users: read), and tar.db now holds every
+// capture source. These three files get a PROTECTED DACL (SYSTEM, Administrators and the
+// agent's account, FILE_ALL_ACCESS, no inheritance) -- the counterpart of the 0600 pass in
+// open(), in the shape of key_provider.cpp's WinOwnerOnlyDacl (a server class, not linkable
+// from a plugin). It runs before each sqlite3_open_v2 and once at the end of open():
+//  - a missing file is CREATED here with the protected DACL (no inheritance window; SQLite
+//    then creates nothing, and a 0-byte tar.db is a valid empty database);
+//  - an existing file is re-secured in place (an upgraded tar.db on its first open);
+//  - the end pass exists because, on a FRESH (0-page) database, SQLite deletes the pre-created
+//    -wal and recreates it with the inherited ACL on the first write.
+// A file owned by anyone but SYSTEM, Administrators or the agent account is PLANTED: a foreign
+// WAL is replayed into tar.db and a foreign tar.db is attacker-controlled config (#559 class),
+// so a sidecar is deleted and re-created and a foreign tar.db refuses the open. Only POSITIVE
+// evidence refuses; a failed owner read (FAT/exFAT: no ACL) or DACL apply is logged and never
+// fails the open. FILE_FLAG_OPEN_REPARSE_POINT examines a planted symlink as the link, never
+// its target. Lock-out: a later run under a different non-admin account cannot open tar.db;
+// Administrators keep access (`icacls <file> /reset`).
+
+struct LocalFreeDeleter {
+    void operator()(void* p) const noexcept {
+        if (p != nullptr)
+            ::LocalFree(p);
+    }
+};
+using LocalPtr = std::unique_ptr<void, LocalFreeDeleter>;
+
+struct HandleCloser {
+    void operator()(void* h) const noexcept {
+        if (h != nullptr && h != INVALID_HANDLE_VALUE)
+            ::CloseHandle(h);
+    }
+};
+using HandlePtr = std::unique_ptr<void, HandleCloser>;
+
+class TarDbDacl {
+public:
+    TarDbDacl() { build(); }
+    ~TarDbDacl() {
+        if (admins_ != nullptr)
+            ::FreeSid(admins_);
+        if (system_ != nullptr)
+            ::FreeSid(system_);
+    }
+    TarDbDacl(const TarDbDacl&) = delete;
+    TarDbDacl& operator=(const TarDbDacl&) = delete;
+
+    [[nodiscard]] bool ok() const noexcept { return ok_; }
+    [[nodiscard]] DWORD build_error() const noexcept { return error_; } // set at the failing call
+    // For CreateFileW: a file created with this SD has the protected DACL from creation.
+    [[nodiscard]] SECURITY_ATTRIBUTES* sa() noexcept { return ok_ ? &sa_ : nullptr; }
+    [[nodiscard]] PACL acl() const noexcept { return static_cast<PACL>(acl_.get()); }
+    // SYSTEM, BUILTIN\Administrators or the process token's user.
+    [[nodiscard]] bool owner_allowed(PSID owner) const noexcept {
+        return ok_ && owner != nullptr &&
+               (::EqualSid(owner, user_sid_) || ::EqualSid(owner, system_) ||
+                ::EqualSid(owner, admins_));
+    }
+
+private:
+    void build() {
+        HANDLE raw_token = nullptr;
+        if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &raw_token)) {
+            error_ = ::GetLastError();
+            return;
+        }
+        const HandlePtr token{raw_token};
+        DWORD len = 0;
+        ::GetTokenInformation(token.get(), TokenUser, nullptr, 0, &len); // size probe
+        user_buf_.resize(len);
+        if (len == 0 ||
+            !::GetTokenInformation(token.get(), TokenUser, user_buf_.data(), len, &len)) {
+            error_ = ::GetLastError();
+            return;
+        }
+        // The PSID points INTO user_buf_ (no string round trip); alive as long as *this.
+        user_sid_ = reinterpret_cast<TOKEN_USER*>(user_buf_.data())->User.Sid;
+
+        SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
+        if (!::AllocateAndInitializeSid(&nt, 1, SECURITY_LOCAL_SYSTEM_RID, 0, 0, 0, 0, 0, 0, 0,
+                                        &system_) ||
+            !::AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID,
+                                        DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &admins_)) {
+            error_ = ::GetLastError();
+            return;
+        }
+        EXPLICIT_ACCESS_W ea[3] = {};
+        PSID sids[3] = {user_sid_, system_, admins_};
+        for (int i = 0; i < 3; ++i) {
+            ea[i].grfAccessPermissions = FILE_ALL_ACCESS;
+            ea[i].grfAccessMode = SET_ACCESS;
+            ea[i].grfInheritance = NO_INHERITANCE;
+            ea[i].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+            ea[i].Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN;
+            ea[i].Trustee.ptstrName = reinterpret_cast<LPWSTR>(sids[i]);
+        }
+        PACL raw_acl = nullptr;
+        if (const DWORD rc = ::SetEntriesInAclW(3, ea, nullptr, &raw_acl); rc != ERROR_SUCCESS) {
+            error_ = rc;
+            return;
+        }
+        acl_.reset(raw_acl);
+        // PROTECTED: a file created with this SD does not merge the parent's inheritable ACEs.
+        if (!::InitializeSecurityDescriptor(&sd_, SECURITY_DESCRIPTOR_REVISION) ||
+            !::SetSecurityDescriptorDacl(&sd_, TRUE, raw_acl, FALSE) ||
+            !::SetSecurityDescriptorControl(&sd_, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
+            error_ = ::GetLastError();
+            return;
+        }
+        sa_.nLength = sizeof(sa_);
+        sa_.lpSecurityDescriptor = &sd_;
+        sa_.bInheritHandle = FALSE;
+        ok_ = true;
+    }
+
+    std::vector<BYTE> user_buf_;
+    PSID user_sid_ = nullptr;
+    PSID system_ = nullptr;
+    PSID admins_ = nullptr;
+    LocalPtr acl_;
+    SECURITY_DESCRIPTOR sd_ = {};
+    SECURITY_ATTRIBUTES sa_ = {};
+    DWORD error_ = ERROR_SUCCESS;
+    bool ok_ = false;
+};
+
+std::string sid_to_string(PSID sid) {
+    LPWSTR raw = nullptr;
+    if (!::ConvertSidToStringSidW(sid, &raw))
+        return "an unreadable SID";
+    const LocalPtr guard{raw};
+    return yuzu::win::from_wide(raw);
+}
+
+// Creates or re-secures tar.db, tar.db-wal and tar.db-shm (see the block comment above).
+// Returns a refusal message when a foreign-owned file must stop the open, else nullopt.
+std::optional<std::string> secure_tar_db_files(const std::filesystem::path& db,
+                                               TarDbDacl& dacl) {
+    if (!dacl.ok()) {
+        spdlog::warn("TarDatabase: owner-only DACL not built (error {}); tar.db keeps the "
+                     "directory's inherited ACL",
+                     dacl.build_error());
+        return std::nullopt;
+    }
+    constexpr DWORD kAccess = READ_CONTROL | WRITE_DAC;
+    constexpr DWORD kShareAll = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    constexpr DWORD kFlags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT;
+    for (const char* suffix : {"", "-wal", "-shm"}) {
+        std::filesystem::path file = db;
+        file += suffix;
+        const std::string name = file.string();
+
+        HANDLE raw = ::CreateFileW(file.c_str(), kAccess, kShareAll, dacl.sa(), OPEN_ALWAYS,
+                                   kFlags, nullptr);
+        const DWORD open_err = ::GetLastError(); // ERROR_ALREADY_EXISTS when it pre-existed
+        if (raw == INVALID_HANDLE_VALUE) {
+            spdlog::warn("TarDatabase: could not open {} to secure it (error {}); it keeps its "
+                         "current ACL",
+                         name, open_err);
+            continue;
+        }
+        HandlePtr h{raw};
+        if (open_err != ERROR_ALREADY_EXISTS)
+            continue; // created just now WITH the protected DACL
+
+        PSID owner = nullptr;
+        PSECURITY_DESCRIPTOR owner_sd = nullptr;
+        const DWORD owner_rc = ::GetSecurityInfo(h.get(), SE_FILE_OBJECT,
+                                                 OWNER_SECURITY_INFORMATION, &owner, nullptr,
+                                                 nullptr, nullptr, &owner_sd);
+        const LocalPtr owner_sd_guard{owner_sd}; // `owner` points into it
+        if (owner_rc == ERROR_SUCCESS && owner != nullptr && !dacl.owner_allowed(owner)) {
+            const std::string who = sid_to_string(owner);
+            const std::string remedy =
+                std::format("make Administrators its owner (icacls \"{}\" /setowner "
+                            "*S-1-5-32-544 /L) or remove it, then restart the agent",
+                            name);
+            if (suffix[0] == '\0') {
+                return std::format("tar.db at {} is owned by {}, not SYSTEM, Administrators or "
+                                   "the agent account, and was not opened: {}",
+                                   name, who, remedy);
+            }
+            h.reset(); // release our handle before deleting
+            if (!::DeleteFileW(file.c_str())) {
+                return std::format("{} is owned by {}, not SYSTEM, Administrators or the agent "
+                                   "account, and could not be removed (error {}): {}",
+                                   name, who, ::GetLastError(), remedy);
+            }
+            raw = ::CreateFileW(file.c_str(), kAccess, kShareAll, dacl.sa(), CREATE_NEW, kFlags,
+                                nullptr);
+            if (raw == INVALID_HANDLE_VALUE) {
+                return std::format("{} was foreign-owned (owner {}), removed, and could not be "
+                                   "re-created (error {}); tar.db was not opened",
+                                   name, who, ::GetLastError());
+            }
+            h.reset(raw);
+            spdlog::warn("TarDatabase: replaced foreign-owned {} (owner {})", name, who);
+            continue; // re-created WITH the protected DACL
+        }
+        // Owner read failed (no ACL on this filesystem) or the owner is ours: re-secure in
+        // place. Best-effort -- availability of a diagnostics DB over confidentiality.
+        constexpr SECURITY_INFORMATION kDaclInfo =
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+        if (const DWORD rc = ::SetSecurityInfo(h.get(), SE_FILE_OBJECT, kDaclInfo, nullptr,
+                                               nullptr, dacl.acl(), nullptr);
+            rc != ERROR_SUCCESS) {
+            spdlog::warn("TarDatabase: could not apply the owner-only DACL to {} (error {}); it "
+                         "keeps its current ACL",
+                         name, rc);
+        }
+    }
+    return std::nullopt;
+}
+#endif // _WIN32
+
 } // namespace
 
 // ── Construction / destruction ───────────────────────────────────────────────
@@ -378,6 +611,14 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
     std::optional<int64_t> quarantined_at;
     std::string quarantined_file;
 
+#ifdef _WIN32
+    // Create or re-secure tar.db, -wal and -shm BEFORE SQLite touches them, and refuse a
+    // foreign-owned (planted) file; see the DACL block above.
+    TarDbDacl dacl;
+    if (auto refusal = secure_tar_db_files(path, dacl))
+        return std::unexpected(*refusal);
+#endif
+
     sqlite3* raw_db = nullptr;
     int rc = sqlite3_open_v2(path.string().c_str(), &raw_db,
                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
@@ -415,6 +656,11 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
         spdlog::error("TAR: tar.db failed PRAGMA integrity_check (tar.db.corruption_detected) — "
                       "quarantined to {} and re-initialising a fresh database",
                       quarantined->string());
+#ifdef _WIN32
+        // The quarantine rename left no tar.db: pre-create it (and any sidecar) protected again.
+        if (auto refusal = secure_tar_db_files(path, dacl))
+            return std::unexpected(*refusal);
+#endif
         rc = sqlite3_open_v2(path.string().c_str(), &raw_db,
                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
                              nullptr);
@@ -854,7 +1100,7 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
     // confidentiality boundary (agent-privilege-model.md), and tar.db now holds every
     // capture source. Best-effort per file (-wal/-shm may not exist yet); a chmod failure
     // never fails an otherwise-healthy open. SQLite derives later -wal/-shm modes from the
-    // db file. POSIX mode bits only: the Windows state-directory ACL is a packaging item.
+    // db file. POSIX mode bits only; Windows applies a protected DACL in the #else arm.
     for (const char* suffix : {"", "-wal", "-shm"}) {
         std::error_code pec;
         std::filesystem::permissions(path.string() + suffix,
@@ -862,6 +1108,13 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
                                          std::filesystem::perms::owner_write,
                                      std::filesystem::perm_options::replace, pec);
     }
+#else
+    // The pre-open pass created or re-secured the three files, but on a FRESH (0-page)
+    // database SQLite deletes the pre-created -wal and recreates it with the inherited ACL on
+    // the first write. This end-of-open pass closes that one-time window and refuses a foreign
+    // file raced in meanwhile. `db` owns raw_db, so returning here closes it.
+    if (auto refusal = secure_tar_db_files(path, dacl))
+        return std::unexpected(*refusal);
 #endif
 
     // Open a dedicated read-only, authorizer-sandboxed connection for untrusted

@@ -15,11 +15,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -28,6 +30,19 @@
 
 #ifndef _WIN32
 #include <unistd.h> // geteuid — the unmovable-quarantine test is POSIX-only
+#else
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+#include <aclapi.h> // GetNamedSecurityInfoW, SetNamedSecurityInfoW, SetEntriesInAclW
+#include <sddl.h>   // ConvertSidToStringSidW, ConvertStringSidToSidW
+
+#include <win_str.hpp>
 #endif
 
 namespace fs = std::filesystem;
@@ -1923,6 +1938,225 @@ TEST_CASE("TarDatabase: open() sets tar.db and its WAL sidecars owner-only (0600
         REQUIRE(fs::exists(p));
         CHECK((fs::status(p).permissions() & fs::perms::mask) == kOwnerOnly);
     }
+}
+#else // _WIN32
+// ── Windows: protected owner-only DACL on tar.db and its sidecars ─────────────────────
+// The directory carries an INHERITABLE BUILTIN\Users read ACE (as C:\ProgramData does), so a
+// sidecar SQLite creates itself WOULD inherit it: every case fails unless open() pre-creates or
+// re-secures the file before SQLite does.
+namespace {
+
+struct LocalFreeDeleter {
+    void operator()(void* p) const noexcept {
+        if (p != nullptr)
+            ::LocalFree(p);
+    }
+};
+using LocalPtr = std::unique_ptr<void, LocalFreeDeleter>;
+
+constexpr const char* kUsers = "S-1-5-32-545";
+constexpr const char* kSystem = "S-1-5-18";
+constexpr const char* kAdministrators = "S-1-5-32-544";
+
+std::string sid_string(PSID sid) {
+    LPWSTR raw = nullptr;
+    REQUIRE(::ConvertSidToStringSidW(sid, &raw));
+    const LocalPtr guard{raw};
+    return yuzu::win::from_wide(raw);
+}
+
+std::string token_user_sid() {
+    HANDLE token = nullptr;
+    REQUIRE(::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token));
+    DWORD len = 0;
+    ::GetTokenInformation(token, TokenUser, nullptr, 0, &len);
+    std::vector<BYTE> buf(len);
+    const BOOL got = ::GetTokenInformation(token, TokenUser, buf.data(), len, &len);
+    ::CloseHandle(token);
+    REQUIRE(got);
+    return sid_string(reinterpret_cast<TOKEN_USER*>(buf.data())->User.Sid);
+}
+
+// What a file's DACL says: whether it is protected, and the SIDs of its ALLOW aces.
+struct DaclFacts {
+    bool dacl_protected{false};
+    std::vector<std::string> allowed;
+    [[nodiscard]] bool allows(const std::string& sid) const {
+        return std::find(allowed.begin(), allowed.end(), sid) != allowed.end();
+    }
+};
+
+DaclFacts dacl_facts(const fs::path& p) {
+    DaclFacts out;
+    PACL dacl = nullptr;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    REQUIRE(::GetNamedSecurityInfoW(p.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
+                                    nullptr, &dacl, nullptr, &sd) == ERROR_SUCCESS);
+    const LocalPtr sd_guard{sd};
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    REQUIRE(::GetSecurityDescriptorControl(sd, &control, &revision));
+    out.dacl_protected = (control & SE_DACL_PROTECTED) != 0;
+    for (WORD i = 0; dacl != nullptr && i < dacl->AceCount; ++i) { // a NULL DACL lists nothing
+        void* ace = nullptr;
+        if (::GetAce(dacl, i, &ace) &&
+            static_cast<const ACE_HEADER*>(ace)->AceType == ACCESS_ALLOWED_ACE_TYPE) {
+            auto* allow = static_cast<ACCESS_ALLOWED_ACE*>(ace);
+            out.allowed.push_back(sid_string(reinterpret_cast<PSID>(&allow->SidStart)));
+        }
+    }
+    return out;
+}
+
+std::string owner_sid(const fs::path& p) {
+    PSID owner = nullptr;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    REQUIRE(::GetNamedSecurityInfoW(p.c_str(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                                    &owner, nullptr, nullptr, nullptr, &sd) == ERROR_SUCCESS);
+    const LocalPtr sd_guard{sd};
+    return sid_string(owner);
+}
+
+void assert_owner_only(const fs::path& p) {
+    INFO("file=" << p.filename().string());
+    REQUIRE(fs::exists(p));
+    const DaclFacts f = dacl_facts(p);
+    CHECK(f.dacl_protected);
+    for (const char* wide_group : {kUsers, "S-1-1-0" /*Everyone*/, "S-1-5-11" /*Authenticated*/})
+        CHECK_FALSE(f.allows(wide_group));
+    CHECK(f.allows(kSystem));
+    CHECK(f.allows(kAdministrators));
+    CHECK(f.allows(token_user_sid()));
+}
+
+// Adds an allow-read ACE for BUILTIN\Users and leaves the DACL UNPROTECTED -- which also strips
+// a protected file back to the pre-upgrade shape. `inheritable` is for a directory.
+void seed_users_ace(const fs::path& p, bool inheritable) {
+    PSID users = nullptr;
+    REQUIRE(::ConvertStringSidToSidW(L"S-1-5-32-545", &users));
+    const LocalPtr users_guard{users};
+    PACL old_dacl = nullptr;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    REQUIRE(::GetNamedSecurityInfoW(p.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
+                                    nullptr, &old_dacl, nullptr, &sd) == ERROR_SUCCESS);
+    const LocalPtr sd_guard{sd};
+    EXPLICIT_ACCESS_W ea{};
+    ea.grfAccessPermissions = FILE_GENERIC_READ;
+    ea.grfAccessMode = GRANT_ACCESS;
+    ea.grfInheritance = inheritable ? (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) : NO_INHERITANCE;
+    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    ea.Trustee.ptstrName = reinterpret_cast<LPWSTR>(users);
+    PACL new_dacl = nullptr;
+    REQUIRE(::SetEntriesInAclW(1, &ea, old_dacl, &new_dacl) == ERROR_SUCCESS);
+    const LocalPtr acl_guard{new_dacl};
+    std::wstring name = p.wstring(); // SetNamedSecurityInfoW takes a mutable LPWSTR
+    REQUIRE(::SetNamedSecurityInfoW(
+                name.data(), SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION, nullptr,
+                nullptr, new_dacl, nullptr) == ERROR_SUCCESS);
+    REQUIRE(dacl_facts(p).allows(kUsers)); // the seed took
+}
+
+// Lets this process hand a file to another owner; false when the privilege is not held.
+bool enable_restore_privilege() {
+    HANDLE token = nullptr;
+    if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+        return false;
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    const bool ok =
+        ::LookupPrivilegeValueW(nullptr, L"SeRestorePrivilege", &tp.Privileges[0].Luid) &&
+        ::AdjustTokenPrivileges(token, FALSE, &tp, 0, nullptr, nullptr) &&
+        ::GetLastError() != ERROR_NOT_ALL_ASSIGNED;
+    ::CloseHandle(token);
+    return ok;
+}
+
+void set_owner(const fs::path& p, const std::string& sid_text) {
+    PSID sid = nullptr;
+    REQUIRE(::ConvertStringSidToSidW(yuzu::win::to_wide(sid_text).c_str(), &sid));
+    const LocalPtr sid_guard{sid};
+    std::wstring name = p.wstring();
+    REQUIRE(::SetNamedSecurityInfoW(name.data(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, sid,
+                                    nullptr, nullptr, nullptr) == ERROR_SUCCESS);
+    REQUIRE(owner_sid(p) == sid_text); // the owner change took
+}
+
+// A directory carrying the inheritable Users ACE, and the tar.db path inside it.
+struct AclDir {
+    yuzu::test::TempDir dir{"yuzu_test_tar_acl_"};
+    fs::path db;
+    AclDir() {
+        fs::create_directories(dir.path);
+        seed_users_ace(dir.path, true);
+        db = dir.path / "tar.db";
+    }
+    [[nodiscard]] fs::path file(const char* suffix) const { return fs::path{db.string() + suffix}; }
+};
+
+constexpr const char* kFiles[] = {"", "-wal", "-shm"};
+
+} // namespace
+
+TEST_CASE("TarDatabase (Windows): a fresh db and its sidecars are created owner-only",
+          "[tar][store][lifecycle][hardening]") {
+    AclDir d;
+    auto opened = TarDatabase::open(d.db);
+    REQUIRE(opened.has_value());
+    REQUIRE(opened->set_config("acl_probe", "1")); // the WAL is live
+    for (const char* sfx : kFiles)
+        assert_owner_only(d.file(sfx)); // exists (REQUIRE) so the sidecar half is not vacuous
+}
+
+TEST_CASE("TarDatabase (Windows): an upgraded world-readable db is re-secured on open",
+          "[tar][store][lifecycle][hardening]") {
+    AclDir d;
+    { REQUIRE(TarDatabase::open(d.db).has_value()); } // created, then closed
+    seed_users_ace(d.db, false); // the pre-upgrade shape: unprotected, Users can read
+    REQUIRE_FALSE(dacl_facts(d.db).dacl_protected);
+
+    auto reopened = TarDatabase::open(d.db);
+    REQUIRE(reopened.has_value());
+    REQUIRE(reopened->set_config("acl_probe", "1"));
+    for (const char* sfx : kFiles)
+        assert_owner_only(d.file(sfx));
+}
+
+TEST_CASE("TarDatabase (Windows): a foreign-owned sidecar is replaced, not adopted",
+          "[tar][store][lifecycle][hardening]") {
+    if (!enable_restore_privilege())
+        SKIP("SeRestorePrivilege unavailable");
+    AclDir d;
+    { REQUIRE(TarDatabase::open(d.db).has_value()); } // created, then closed
+    const fs::path wal = d.file("-wal");
+    { std::ofstream plant(wal, std::ios::binary | std::ios::trunc); }
+    set_owner(wal, kUsers);
+
+    auto reopened = TarDatabase::open(d.db);
+    REQUIRE(reopened.has_value());
+    REQUIRE(reopened->set_config("acl_probe", "1"));
+    const std::string owner = owner_sid(wal);
+    CHECK((owner == token_user_sid() || owner == kSystem || owner == kAdministrators));
+    assert_owner_only(wal);
+}
+
+TEST_CASE("TarDatabase (Windows): a foreign-owned tar.db refuses the open",
+          "[tar][store][lifecycle][hardening]") {
+    if (!enable_restore_privilege())
+        SKIP("SeRestorePrivilege unavailable");
+    AclDir d;
+    { REQUIRE(TarDatabase::open(d.db).has_value()); } // created, then closed
+    set_owner(d.db, kUsers);
+
+    auto refused = TarDatabase::open(d.db);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("owner") != std::string::npos);
+    CHECK(refused.error().find("icacls") != std::string::npos);
+
+    set_owner(d.db, token_user_sid()); // reversible: back to ours, the next open works
+    CHECK(TarDatabase::open(d.db).has_value());
 }
 #endif // _WIN32
 

@@ -3,8 +3,8 @@
  * for the Windows module (image-load) and procperf (file-version) paths. Only local paths
  * pass; network paths are never opened.
  *
- * Both sources hand an image path to an API that OPENS it (GetFileAttributesExW,
- * CryptQueryObject, WinVerifyTrust, GetFileVersionInfoW). The agent runs as LocalSystem,
+ * Both sources hand an image path to an API that OPENS it (NtCreateFile/WinVerifyTrust for
+ * the module source, GetFileVersionInfoW for procperf). The agent runs as LocalSystem,
  * so a path on a network share would make the machine account authenticate to the
  * share's host and could stall the caller on the SMB round trip. The path is taken from
  * an image any standard user can load, so it is attacker-influenced. Callers classify the
@@ -20,18 +20,23 @@
  *     DRIVE_FIXED (3).
  * Refused: UNC (`\\server\...`, `\\?\UNC\...`), `\Device\Mup`, `\Device\LanmanRedirector`,
  *   `\Device\WebDavRedirector`, any other `\Device\*`, `\SystemRoot\...`, `\??\...`, the
- *   converted `\\?\GLOBALROOT\...` form (callers classify the path as delivered, BEFORE the
- *   NT-to-Win32 conversion), a non-fixed drive letter, and the empty string. `\SystemRoot\`
- *   and `\??\` paths are refused because they match neither accepted shape; the module
- *   source has only ever converted `\Device\...` names for the file APIs (nt_path_to_win32).
+ *   `\\?\GLOBALROOT\...` form (the module source opens the delivered NT path itself, so it
+ *   never builds that form, and the classifier still refuses it), a non-fixed drive letter,
+ *   and the empty string. `\SystemRoot\` and `\??\` paths are refused because they match
+ *   neither accepted shape.
  *
- * Residual: the check is lexical and the open happens by name afterwards (a tick later
- * for module, immediately for procperf), so a local-looking path swapped for a symbolic
- * link to a network target in that window is not caught. Creating such a link needs
- * SeCreateSymbolicLinkPrivilege (administrators, or any user when Windows Developer Mode
- * is on) and winning a race against the drain; a directory junction cannot point at a
- * remote share. Closing it fully needs a handle-relative, hop-by-hop open like
- * win_hive_file_guard.hpp, which is a separate change.
+ * Reparse points. module: after this check the drain opens the image ONCE with
+ * NtCreateFile and OBJ_DONT_REPARSE (tar_module_etw.cpp open_local_image_no_reparse), so a
+ * symbolic link or junction anywhere in the path, including one planted after the ETW
+ * event, fails the open and the row keeps an unknown verdict; nothing is opened by name.
+ * procperf: GetFileVersionInfoW still opens by name after this check; the image is
+ * RUNNING, its ancestors cannot be renamed while it is mapped and a renamed image reports
+ * its new name, so a swap cannot redirect it. Measured 2026-10-22 on Windows 11 Pro
+ * 26200.9711: a directory junction whose substitute name is `\??\UNC\localhost\C$\Windows\`
+ * is accepted by NTFS (FSCTL_SET_REPARSE_POINT returns 0) but traversing it fails with
+ * "The data present in the reparse point buffer is invalid"; other mount-point targets
+ * were not measured. A symbolic link to a share needs SeCreateSymbolicLinkPrivilege
+ * (administrators, Windows Developer Mode, or the "Create symbolic links" policy).
  *
  * The drive type is injected (the Windows shell calls GetDriveTypeW on drive_root_of()),
  * so this header needs no Windows API and runs in the unit suites on every host.
@@ -39,6 +44,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -72,6 +78,22 @@ inline constexpr unsigned kDriveTypeFixed = 3;
         return end != 0 && end != std::string_view::npos && path[end] == '\\';
     }
     return drive_type_of_root == kDriveTypeFixed && !drive_root_of(path).empty();
+}
+
+// The leaf decision for an image already opened with OBJ_DONT_REPARSE: refuse a NAME SURROGATE
+// reparse point (symbolic link, junction); a filter-handled tag (WOF/CompactOS, dedup, cloud
+// files) is an ordinary image. Values restated from winnt.h (tar_module_etw.cpp static_asserts
+// them) so this stays pure.
+inline constexpr std::uint32_t kFileAttributeReparsePoint = 0x400;
+inline constexpr std::uint32_t kReparseTagNameSurrogateBit = 0x20000000;
+inline constexpr std::uint32_t kReparseTagSymlink = 0xA000000C;
+inline constexpr std::uint32_t kReparseTagMountPoint = 0xA0000003;
+
+[[nodiscard]] constexpr bool reparse_leaf_refused(std::uint32_t file_attributes,
+                                                  std::uint32_t reparse_tag) noexcept {
+    return (file_attributes & kFileAttributeReparsePoint) != 0 &&
+           ((reparse_tag & kReparseTagNameSurrogateBit) != 0 || reparse_tag == kReparseTagSymlink ||
+            reparse_tag == kReparseTagMountPoint);
 }
 
 } // namespace yuzu::tar

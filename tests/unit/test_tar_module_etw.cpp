@@ -4,9 +4,11 @@
 // test_tar_proc_etw.cpp. What IS testable, and is pinned below: the ETW-sample →
 // ModuleEvent mapping, the module_dir redaction (the M1 governance BLOCKING
 // privacy edge-drop), the §5 risk-filter, the signing-verdict cache (with a fake
-// verifier), and the off-Windows no-op contract.
+// verifier), and the off-Windows no-op contract. The Windows-only cases at the end drive
+// the REAL no-reparse image open + by-handle WinVerifyTrust against files on the host.
 
 #include "tar_db.hpp"
+#include "tar_local_image_path.hpp"
 #include "tar_module_etw.hpp"
 #include "tar_module_stream.hpp"
 #include "test_helpers.hpp"
@@ -14,10 +16,29 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
+#include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+#include <softpub.h>
+#include <winioctl.h> // FSCTL_SET_EXTERNAL_BACKING, WOF_EXTERNAL_INFO, FILE_PROVIDER_*
+#include <wintrust.h>
+
+#include <win_str.hpp>
+#endif
 
 using namespace yuzu::tar;
 
@@ -257,6 +278,24 @@ TEST_CASE("SigningCache re-verifies an entry evicted by the bounded flush", "[ta
     CHECK(calls == 3);
 }
 
+// ── leaf reparse decision (pure; the Windows shell feeds it the handle's tag) ─
+
+TEST_CASE("reparse_leaf_refused refuses name surrogates only", "[tar][module][etw]") {
+    constexpr std::uint32_t kReparse = kFileAttributeReparsePoint;
+    constexpr std::uint32_t kWof = 0x80000017;        // IO_REPARSE_TAG_WOF (CompactOS)
+    constexpr std::uint32_t kDedup = 0x80000013;      // IO_REPARSE_TAG_DEDUP
+    constexpr std::uint32_t kCloudFiles = 0x9000001A; // IO_REPARSE_TAG_CLOUD (placeholder)
+    CHECK(reparse_leaf_refused(kReparse, kReparseTagSymlink));
+    CHECK(reparse_leaf_refused(kReparse, kReparseTagMountPoint));
+    CHECK(reparse_leaf_refused(kReparse, 0x20000000)); // any other name-surrogate tag
+    CHECK_FALSE(reparse_leaf_refused(kReparse, kWof));
+    CHECK_FALSE(reparse_leaf_refused(kReparse, kDedup));
+    CHECK_FALSE(reparse_leaf_refused(kReparse, kCloudFiles));
+    // No reparse attribute: the tag field is not meaningful and never refuses.
+    CHECK_FALSE(reparse_leaf_refused(0x80, kReparseTagSymlink));
+    CHECK_FALSE(reparse_leaf_refused(0, 0));
+}
+
 // ── no-op off-Windows contract ──────────────────────────────────────────────
 
 #ifndef _WIN32
@@ -270,6 +309,217 @@ TEST_CASE("ModuleEtwCollector is a clean no-op off-Windows", "[tar][module][etw]
     c.stop(); // safe without start
 }
 #endif
+
+// ── Windows: no-reparse image open + by-handle verification (real files) ─────
+// Needs a Windows host (system binaries, WinVerifyTrust, NTFS); compiled out elsewhere. A case
+// SKIPs, naming why, where the account cannot create symbolic links or the volume refuses WOF.
+#ifdef _WIN32
+#ifndef SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
+#define SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE 0x2
+#endif
+
+namespace {
+
+constexpr DWORD kShareAll = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+
+std::wstring system_dir() {
+    wchar_t buf[MAX_PATH];
+    const UINT n = GetSystemDirectoryW(buf, MAX_PATH);
+    REQUIRE(n > 0);
+    return std::wstring(buf, n);
+}
+
+// The NT path (`\Device\HarddiskVolumeN\...`) the IMAGE event would deliver for `win32`.
+// FILE_FLAG_OPEN_REPARSE_POINT makes a link report ITS OWN path, not its target's.
+std::string nt_path_of(const std::wstring& win32) {
+    HANDLE h = CreateFileW(win32.c_str(), 0, kShareAll, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    REQUIRE(h != INVALID_HANDLE_VALUE);
+    std::wstring buf(1024, L'\0');
+    const DWORD n =
+        GetFinalPathNameByHandleW(h, buf.data(), static_cast<DWORD>(buf.size()), VOLUME_NAME_NT);
+    CloseHandle(h);
+    REQUIRE((n > 0 && n < buf.size()));
+    buf.resize(n);
+    return yuzu::win::from_wide(buf.c_str());
+}
+
+// The OLD by-name verdict (WinVerifyTrust on the Win32 path, the production status mapping):
+// the oracle the by-handle verdict is compared against.
+ModuleSignedState oracle_state(const std::wstring& win32) {
+    GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    WINTRUST_FILE_INFO fi{};
+    fi.cbStruct = sizeof(fi);
+    fi.pcwszFilePath = win32.c_str();
+    WINTRUST_DATA wd{};
+    wd.cbStruct = sizeof(wd);
+    wd.dwUIChoice = WTD_UI_NONE;
+    wd.fdwRevocationChecks = WTD_REVOKE_NONE;
+    wd.dwUnionChoice = WTD_CHOICE_FILE;
+    wd.pFile = &fi;
+    wd.dwStateAction = WTD_STATEACTION_VERIFY;
+    const LONG st = WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action, &wd);
+    wd.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action, &wd);
+    switch (st) {
+    case ERROR_SUCCESS:
+        return ModuleSignedState::kSigned;
+    case TRUST_E_NOSIGNATURE:
+        return ModuleSignedState::kUnsigned;
+    case static_cast<LONG>(CERT_E_REVOKED):
+        return ModuleSignedState::kRevoked;
+    case static_cast<LONG>(TRUST_E_BAD_DIGEST):
+    case static_cast<LONG>(CERT_E_EXPIRED):
+    case static_cast<LONG>(CERT_E_UNTRUSTEDROOT):
+    case static_cast<LONG>(CERT_E_CHAINING):
+    case static_cast<LONG>(TRUST_E_EXPLICIT_DISTRUST):
+    case static_cast<LONG>(TRUST_E_SUBJECT_NOT_TRUSTED):
+        return ModuleSignedState::kInvalid;
+    default:
+        return ModuleSignedState::kUnknown;
+    }
+}
+
+// false: this account cannot create symbolic links (the caller SKIPs).
+bool make_link(const std::wstring& link, const std::wstring& target, bool directory) {
+    const DWORD flags = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE |
+                        (directory ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0);
+    if (CreateSymbolicLinkW(link.c_str(), target.c_str(), flags))
+        return true;
+    const DWORD err = GetLastError();
+    if (err == ERROR_PRIVILEGE_NOT_HELD || err == ERROR_INVALID_PARAMETER)
+        return false;
+    FAIL("CreateSymbolicLinkW failed, error " << err);
+    return false;
+}
+
+// The discriminating oracle: by name the link resolves.
+bool opens_by_name(const std::wstring& win32) {
+    HANDLE h = CreateFileW(win32.c_str(), GENERIC_READ, kShareAll, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+    CloseHandle(h);
+    return true;
+}
+
+// First boot-critical system binary with an embedded Authenticode signature (kernel32.dll is
+// catalog-signed and verifies as unsigned by this path), as {Win32 path, NT path}.
+std::optional<std::pair<std::wstring, std::string>> first_signed_candidate() {
+    for (const wchar_t* rel : {L"\\ntoskrnl.exe", L"\\ci.dll", L"\\drivers\\ntfs.sys"}) {
+        const std::wstring w = system_dir() + rel;
+        if (GetFileAttributesW(w.c_str()) != INVALID_FILE_ATTRIBUTES &&
+            oracle_state(w) == ModuleSignedState::kSigned)
+            return std::make_pair(w, nt_path_of(w));
+    }
+    return std::nullopt;
+}
+
+} // namespace
+
+TEST_CASE("Windows module drain: a system image opens through the no-reparse handle",
+          "[tar][module][etw][windows]") {
+    const auto image = open_local_image_no_reparse(nt_path_of(system_dir() + L"\\kernel32.dll"));
+    REQUIRE(image);
+    CHECK(image_mtime_unix(image.get()) > 0);
+}
+
+TEST_CASE("Windows module drain: a FILE symlink is refused while the name still opens",
+          "[tar][module][etw][windows]") {
+    yuzu::test::TempDir dir{"yuzu_test_tar_nolink_"};
+    std::filesystem::create_directories(dir.path);
+    const std::wstring link = (dir.path / L"k32_link.dll").wstring();
+    if (!make_link(link, system_dir() + L"\\kernel32.dll", false))
+        SKIP("account cannot create symbolic links");
+    REQUIRE(opens_by_name(link));
+    CHECK_FALSE(open_local_image_no_reparse(nt_path_of(link)));
+}
+
+TEST_CASE("Windows module drain: an ancestor DIRECTORY symlink is refused",
+          "[tar][module][etw][windows]") {
+    yuzu::test::TempDir dir{"yuzu_test_tar_nolink_"};
+    std::filesystem::create_directories(dir.path);
+    const std::wstring link_dir = (dir.path / L"sys32_link").wstring();
+    if (!make_link(link_dir, system_dir(), true))
+        SKIP("account cannot create symbolic links");
+    struct LinkGuard { // removes the link itself, whatever the standard library does with it
+        const std::wstring& dir;
+        ~LinkGuard() { RemoveDirectoryW(dir.c_str()); }
+    } guard{link_dir};
+    REQUIRE(opens_by_name(link_dir + L"\\kernel32.dll"));
+    // The LINK's own NT path plus the leaf, not the resolved System32 path.
+    CHECK_FALSE(open_local_image_no_reparse(nt_path_of(link_dir) + "\\kernel32.dll"));
+}
+
+TEST_CASE("Windows module drain: the by-handle verdict equals the by-name verdict",
+          "[tar][module][etw][windows]") {
+    for (const wchar_t* rel :
+         {L"\\ntoskrnl.exe", L"\\ci.dll", L"\\drivers\\ntfs.sys", L"\\kernel32.dll"}) {
+        const std::wstring w = system_dir() + rel;
+        if (GetFileAttributesW(w.c_str()) == INVALID_FILE_ATTRIBUTES)
+            continue;
+        const std::string nt = nt_path_of(w);
+        const auto image = open_local_image_no_reparse(nt);
+        REQUIRE(image);
+        INFO("file=" << nt);
+        CHECK(verify_image_signature_win(image.get(), nt).state == oracle_state(w));
+    }
+    const auto candidate = first_signed_candidate();
+    REQUIRE(candidate.has_value()); // not vacuous: one embedded-signed binary exists
+    const auto image = open_local_image_no_reparse(candidate->second);
+    REQUIRE(image);
+    const ModuleSignVerdict v = verify_image_signature_win(image.get(), candidate->second);
+    CHECK(v.state == ModuleSignedState::kSigned);
+    CHECK(v.signer == "Microsoft Windows"); // the production signing certificate's display name
+}
+
+TEST_CASE("Windows module drain: the verdict comes from the handle, not the name",
+          "[tar][module][etw][windows]") {
+    const auto candidate = first_signed_candidate();
+    REQUIRE(candidate.has_value());
+    const auto image = open_local_image_no_reparse(candidate->second);
+    REQUIRE(image);
+    CHECK(verify_image_signature_win(image.get(),
+                                     R"(\Device\HarddiskVolume0\yuzu_test_does_not_exist.dll)")
+              .state == ModuleSignedState::kSigned);
+}
+
+TEST_CASE("Windows module drain: a WOF-compressed image is not refused and still verifies",
+          "[tar][module][etw][windows]") {
+    const auto candidate = first_signed_candidate();
+    REQUIRE(candidate.has_value());
+    yuzu::test::TempDir dir{"yuzu_test_tar_wof_"};
+    std::filesystem::create_directories(dir.path);
+    const std::wstring copy = (dir.path / L"wof_copy.dll").wstring();
+    REQUIRE(CopyFileW(candidate->first.c_str(), copy.c_str(), FALSE));
+    SetFileAttributesW(copy.c_str(), FILE_ATTRIBUTE_NORMAL);
+
+    struct {
+        WOF_EXTERNAL_INFO wof;
+        FILE_PROVIDER_EXTERNAL_INFO_V1 file;
+    } in{};
+    in.wof.Version = WOF_CURRENT_VERSION;
+    in.wof.Provider = WOF_PROVIDER_FILE;
+    in.file.Version = FILE_PROVIDER_CURRENT_VERSION;
+    in.file.Algorithm = FILE_PROVIDER_COMPRESSION_XPRESS4K;
+    HANDLE h = CreateFileW(copy.c_str(), GENERIC_READ | GENERIC_WRITE, kShareAll, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    REQUIRE(h != INVALID_HANDLE_VALUE);
+    DWORD returned = 0;
+    const BOOL compressed = DeviceIoControl(h, FSCTL_SET_EXTERNAL_BACKING, &in, sizeof(in),
+                                            nullptr, 0, &returned, nullptr);
+    CloseHandle(h);
+    if (!compressed)
+        SKIP("WOF unavailable on this volume");
+    REQUIRE((GetFileAttributesW(copy.c_str()) & FILE_ATTRIBUTE_REPARSE_POINT) != 0);
+
+    const std::string nt = nt_path_of(copy);
+    const auto image = open_local_image_no_reparse(nt);
+    REQUIRE(image); // a filter-handled tag is an ordinary image, not a name surrogate
+    CHECK(verify_image_signature_win(image.get(), nt).state == ModuleSignedState::kSigned);
+    CHECK(oracle_state(copy) == ModuleSignedState::kSigned);
+}
+#endif // _WIN32
 
 // ── insert_module_events round-trip (the typed DB write path) ───────────────
 

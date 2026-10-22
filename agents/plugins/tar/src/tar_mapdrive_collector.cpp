@@ -392,7 +392,7 @@ std::string word_after(const std::string& line, const std::string& marker) {
 // Defined here, outside the _WIN32 leg, so the pin below compiles on every host.
 // Measured live on kingsley 2026-10-22 (31,362-record Security log): one /f:text
 // 4624 rendering averages 2.62 KB, so 500 events = 1.3 MB. The 8 KiB per-event
-// figure is a documented worst case (~3x the measured average), not a measurement.
+// figure is an assumed worst case (~3x the measured average), not a measurement.
 constexpr unsigned kWinInboundLogonEventCount = 500;
 constexpr std::size_t kWinRenderedLogonEventMaxBytes = 8u * 1024;
 constexpr std::size_t kWinInboundLogonOutputCap = 8u * 1024 * 1024;
@@ -1127,8 +1127,9 @@ std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
                                              .output_cap_bytes = kWinInboundLogonOutputCap});
     // Count/cap relation, measured live on kingsley 2026-10-22 (31,362-record
     // Security log): /c:5000 rendered 13.1 MB, over the 8 MiB cap, so the former
-    // call always tripped output_truncated and never recorded a row; /c:500
-    // renders ~1.3 MB; wevtutil alone ~0.3 s to a file, the runner's capture adds
+    // call tripped output_truncated and recorded no row on the measured host;
+    // /c:500 stays inside the cap (rendered size at the constants above);
+    // wevtutil alone ~0.3 s to a file, the runner's capture adds
     // build-dependent time (~4 s per fresh data dir in a Debug build on one host,
     // Release not measured). kWinInboundLogonEventCount is pinned against the
     // cap by the static_assert beside the constants.

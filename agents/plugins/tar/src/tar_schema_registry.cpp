@@ -538,8 +538,10 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "Microsoft-Windows-Kernel-Process image-load events (IMAGE "
                  "keyword 0x40, events 5/6) on a dedicated ETW session; driver "
                  "loads surface as kernel image-loads (System pid). Signing is "
-                 "verified out-of-band at drain (WinVerifyTrust + CryptQueryObject "
-                 "signer, cached); module_dir is scrubbed of user-profile prefixes "
+                 "verified out-of-band at drain on a no-reparse handle (WinVerifyTrust "
+                 "+ the verification-chain signer, cached); an image on a network path "
+                 "or behind a symlink/junction is never verified and reads unknown. "
+                 "module_dir is scrubbed of user-profile prefixes "
                  "before storage. CodeIntegrity/Operational (3033/3034) blocked-load "
                  "overlay is M3."},
                 {"linux", OsSupportStatus::kPlanned, "auditd",

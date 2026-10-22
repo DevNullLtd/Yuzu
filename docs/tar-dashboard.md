@@ -304,8 +304,8 @@ in-panel error and caches nothing rather than minting a weak token.
   dashboard-only `/run` route, itself excluded as dispatch-shaped (batched with
   #3994). Revisit once a `/run` (and `/result`) twin lands — see
   `scripts/ci/api-parity/tar.json`'s `exception:` rows on those two paths.
-- **Loaded modules / libraries** — out of scope: TAR records no module-load data; it
-  would need a new collector (ETW `Image`/`Load`) or a live modules probe.
+- **Loaded modules / libraries** — not shown by the viewer: the `module` source records
+  image loads on Windows (ETW) into the `$Module_*` tables, which `tar.sql` reads.
 - **Seed snapshot** (the original §5.1 below) — intentionally not built; revisit only
   if the no-seed completeness limit proves insufficient in the field.
 
