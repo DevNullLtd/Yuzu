@@ -118,7 +118,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 7.4 | [#191](https://github.com/Tr3kkR/Yuzu/issues/191) | System Notifications | Done |
 | | 7.5 | [#194](https://github.com/Tr3kkR/Yuzu/issues/194) | Active Directory / Entra Integration | Done |
 | | 7.6 | [#195](https://github.com/Tr3kkR/Yuzu/issues/195) | Custom Properties on Devices | Done |
-| | 7.7 | [#196](https://github.com/Tr3kkR/Yuzu/issues/196) | Agent Deployment Jobs | Done |
+| | 7.7 | [#196](https://github.com/Tr3kkR/Yuzu/issues/196) | Agent Deployment Jobs | **Not implemented**, record-only (nothing executes a job); routes scheduled for removal, #6326 |
 | | 7.8 | [#197](https://github.com/Tr3kkR/Yuzu/issues/197) | Patch Deployment Workflow | **Partial** — records + audits only; dispatch (#4138) and ingestion (#3676) are unwired, see body note |
 | | 7.9 | [#198](https://github.com/Tr3kkR/Yuzu/issues/198) | Product Packs (Bundled Definitions) | Done |
 | | 7.10 | [#199](https://github.com/Tr3kkR/Yuzu/issues/199) | User Sessions and Group Membership Plugins | Done |
@@ -912,7 +912,9 @@ Extensible typed metadata on devices:
 **Files:** `server/core/src/server.cpp`, `proto/yuzu/server/v1/management.proto`
 
 ### Issue 7.7: Agent Deployment Jobs
-**Capability:** 19.7 | **Scope:** Server
+**Capability:** 19.7 | **Scope:** Server | **Status:** **Not implemented**, record-only; scheduled for removal (#6326)
+
+**Correction (2026-10-22):** only the job record is implemented (`DeploymentStore`; unversioned `/api/deployment-jobs` create/list/get/cancel). Nothing executes a job and none advances past `pending`; the `ssh` and `group_policy` methods are not implemented, and create returns a placeholder install command. The capabilities listed below were never delivered. See `docs/capability-map.md` §19.7.
 
 Server-initiated agent installation on discovered endpoints:
 - Store installer binaries per OS/arch

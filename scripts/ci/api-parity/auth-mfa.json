@@ -5,7 +5,7 @@
     "capability_id": "post.api-settings-mfa-disable",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred (ADR-1005 legacy admin-plane inventory); MCP excluded by #520"
+    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred to the 2027-Q1 re-home (ADR-1005 2026-10-22 entry, #6325); no MCP twin is built (admin-only route, #520)"
   },
   {
     "method": "POST",
@@ -13,7 +13,7 @@
     "capability_id": "post.api-settings-mfa-init",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred (ADR-1005 legacy admin-plane inventory); MCP excluded by #520"
+    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred to the 2027-Q1 re-home (ADR-1005 2026-10-22 entry, #6325); no MCP twin is built (admin-only route, #520)"
   },
   {
     "method": "POST",
@@ -21,7 +21,7 @@
     "capability_id": "post.api-settings-mfa-recovery-codes",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred (ADR-1005 legacy admin-plane inventory); MCP excluded by #520"
+    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred to the 2027-Q1 re-home (ADR-1005 2026-10-22 entry, #6325); no MCP twin is built (admin-only route, #520)"
   },
   {
     "method": "POST",
@@ -29,7 +29,7 @@
     "capability_id": "post.api-settings-mfa-verify",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred (ADR-1005 legacy admin-plane inventory); MCP excluded by #520"
+    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred to the 2027-Q1 re-home (ADR-1005 2026-10-22 entry, #6325); no MCP twin is built (admin-only route, #520)"
   },
   {
     "method": "POST",
@@ -37,7 +37,7 @@
     "capability_id": "post.api-settings-oidc",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred (ADR-1005 legacy admin-plane inventory); MCP excluded by #520"
+    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred to the 2027-Q1 re-home (ADR-1005 2026-10-22 entry, #6325); no MCP twin is built (admin-only route, #520)"
   },
   {
     "method": "POST",
@@ -45,7 +45,7 @@
     "capability_id": "post.api-settings-oidc-test",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred (ADR-1005 legacy admin-plane inventory); MCP excluded by #520"
+    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred to the 2027-Q1 re-home (ADR-1005 2026-10-22 entry, #6325); no MCP twin is built (admin-only route, #520)"
   },
   {
     "method": "GET",
@@ -53,6 +53,6 @@
     "capability_id": "get.fragments-settings-mfa",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred (ADR-1005 legacy admin-plane inventory); MCP excluded by #520"
+    "status": "exception:#6325 revisit:2027-03-31 admin-plane REST v1 twin deferred to the 2027-Q1 re-home (ADR-1005 2026-10-22 entry, #6325); no MCP twin is built (admin-only route, #520)"
   }
 ]

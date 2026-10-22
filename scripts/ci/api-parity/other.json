@@ -131,7 +131,7 @@
     "capability_id": "get.api-chargen-status",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "exception:#5955 revisit:2026-11-30 One boolean (registry has_any) for the chargen test page; derivable from GET /api/v1/devices count. Chargen is on the #5955 accepted list."
+    "status": "exception:#5955 revisit:2026-11-30 One boolean (registry has_any) for the chargen test page; derivable from GET /api/v1/devices count. UI-only exception recorded by the ADR-1005 2026-10-22 entry (extends #5955)."
   },
   {
     "method": "POST",
@@ -239,7 +239,7 @@
     "capability_id": "post.api-export-json-to-csv",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "exception:#5955 revisit:2026-11-30 Stateless transform of caller-supplied JSON; reads no server data. On the #5955 accepted list."
+    "status": "exception:#5955 revisit:2026-11-30 Stateless transform of caller-supplied JSON; reads no server data. UI-only exception recorded by the ADR-1005 2026-10-22 entry (extends #5955)."
   },
   {
     "method": "GET",
@@ -266,7 +266,7 @@
     "capability_id": "get.api-help-autocomplete",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "exception:#5955 revisit:2026-11-30 Pure HTMX HTML fragment over the same help data as get.api-help; autocomplete is on the #5955 accepted list."
+    "status": "exception:#5955 revisit:2026-11-30 Pure HTMX HTML fragment over the same help data as get.api-help. UI-only exception recorded by the ADR-1005 2026-10-22 entry (extends #5955)."
   },
   {
     "method": "GET",
@@ -282,7 +282,7 @@
     "capability_id": "get.api-help-palette",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "exception:#5955 revisit:2026-11-30 Pure HTMX search fragment over the same registry data; palette is on the #5955 accepted list."
+    "status": "exception:#5955 revisit:2026-11-30 Pure HTMX search fragment over the same registry data as get.api-help. UI-only exception recorded by the ADR-1005 2026-10-22 entry (extends #5955)."
   },
   {
     "method": "GET",
@@ -370,7 +370,7 @@
     "capability_id": "post.api-nvd-match",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "exception:#4099 revisit:2027-03-31 ADR-1005 grandfathered surface 2 (NVD re-home strangler); routes slated for deprecation"
+    "status": "exception:#4099 revisit:2027-03-31 ADR-1005 grandfathered surface 2: the re-home to a use-case engine is tracked by #4099 (Phase 7, not started); no twin is built for the legacy route (ADR-1005 2026-10-22 entry)."
   },
   {
     "method": "GET",
@@ -378,7 +378,7 @@
     "capability_id": "get.api-nvd-status",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "exception:#4099 revisit:2027-03-31 ADR-1005 grandfathered surface 2 (NVD re-home strangler); routes slated for deprecation"
+    "status": "exception:#4099 revisit:2027-03-31 ADR-1005 grandfathered surface 2: the re-home to a use-case engine is tracked by #4099 (Phase 7, not started); no twin is built for the legacy route (ADR-1005 2026-10-22 entry)."
   },
   {
     "method": "POST",
@@ -386,7 +386,7 @@
     "capability_id": "post.api-nvd-sync",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "exception:#4099 revisit:2027-03-31 ADR-1005 grandfathered surface 2 (NVD re-home strangler); routes slated for deprecation"
+    "status": "exception:#4099 revisit:2027-03-31 ADR-1005 grandfathered surface 2: the re-home to a use-case engine is tracked by #4099 (Phase 7, not started); no twin is built for the legacy route (ADR-1005 2026-10-22 entry)."
   },
   {
     "method": "POST",
@@ -402,7 +402,7 @@
     "capability_id": "get.api-procfetch-status",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "composed-of:get.fragments-devices-list"
+    "status": "exception:#5955 revisit:2026-11-30 One boolean (registry has_any) for the procfetch test page, the same shape as get.api-chargen-status; derivable from GET /api/v1/devices count. UI-only exception recorded by the ADR-1005 2026-10-22 entry (extends #5955)."
   },
   {
     "method": "GET",
@@ -634,7 +634,7 @@
     "capability_id": "post.fragments-instructions-yaml-preview",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "exception:#5955 revisit:2026-11-30 Pure presentation: highlight_yaml output is HTML only; the validation half is validate_yaml_source, whose JSON capability is the planned post.api-instructions-validate-yaml row. Listed UI-only exception (#5955)."
+    "status": "exception:#5955 revisit:2026-11-30 Pure presentation: highlight_yaml output is HTML only; the validation half is validate_yaml_source, whose JSON capability is the planned post.api-instructions-validate-yaml row. UI-only exception recorded by the ADR-1005 2026-10-22 entry (extends #5955)."
   },
   {
     "method": "POST",

@@ -49,7 +49,7 @@
     "capability_id": "get.fragments-device-live",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "exception:#5955 revisit:2026-11-30 renders a static panel menu; every data/action behind it is device/live/run"
+    "status": "exception:#5955 revisit:2026-11-30 Renders a static panel menu; every data/action behind it is device/live/run. UI-only exception recorded by the ADR-1005 2026-10-22 entry (extends #5955)."
   },
   {
     "method": "GET",

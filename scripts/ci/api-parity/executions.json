@@ -48,6 +48,6 @@
     "capability_id": "get.fragments-results-filter-bar",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "exception:#5955 revisit:2026-11-30 Filter-bar chrome, an accepted UI-only exception class (#5955); the underlying data is the results table, which composes get.api-responses-param."
+    "status": "exception:#5955 revisit:2026-11-30 Filter-bar chrome; the underlying data is the results table, which composes get.api-responses-param. UI-only exception recorded by the ADR-1005 2026-10-22 entry (extends #5955)."
   }
 ]

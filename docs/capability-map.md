@@ -947,9 +947,9 @@ Shipped (SOC 2 CC6.6 privileged-access MFA ladder). RFC 6238 TOTP + RFC 4648 bas
 
 `CustomPropertiesStore` (462 LOC). Typed key-value properties per device: string, int, bool, datetime. Schema CRUD with validation regex. Usable in scope expressions via `props.<key>`. Property validation against schemas. REST API for property and schema CRUD. Key validation (1-64 chars, `[a-zA-Z0-9_.-:]`), value limit 1024 bytes.
 
-### 19.7 Agent Deployment Jobs :white_check_mark: `T2`
+### 19.7 Agent Deployment Jobs :x: `T2`
 
-`DeploymentStore` with job management. Create deployment jobs targeting discovered hosts by IP, OS, and method (ssh, group_policy, manual). Job lifecycle: pending → running → completed/failed/cancelled. REST API for job CRUD, status updates, and cancellation.
+**Not implemented: record-only, scheduled for removal (#6326).** `DeploymentStore` (PostgreSQL) stores job rows and the unversioned `/api/deployment-jobs` routes (`discovery_routes.cpp`) create, list, get and cancel them. Nothing executes a job and no caller advances one past `pending`; the `ssh` and `group_policy` methods are accepted by validation but have no implementation, and `manual` returns a placeholder install command. There is no `/api/v1/deployment-jobs` route. This is distinct from the live `/auto` Deploy workflow (§36.2). *(Regraded 2026-10-22 on the owner's ruling; previously mis-graded Done.)*
 
 ---
 

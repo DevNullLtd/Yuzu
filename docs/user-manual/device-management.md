@@ -658,46 +658,52 @@ curl -s -X POST http://localhost:8080/api/v1/discovery/{device_id}/mark-managed 
 
 ## Deployment Jobs
 
-Deploy the Yuzu agent to discovered or known endpoints without manual installation. Deployment jobs target hosts by IP address and support multiple deployment methods.
+> **Not functional; scheduled for removal (#6326).** Deployment jobs are **record-only**. The server stores a row and lets you list, read and cancel it, but nothing executes a job and nothing advances it past `pending`: no agent is installed on any host. The `ssh` and `group_policy` methods are accepted by validation but not implemented, and for `manual` the server only returns a placeholder install command (it points at the literal host `yuzu-server`, not your server). The route is the unversioned `/api/deployment-jobs`; there is no `/api/v1/deployment-jobs`. To get the agent onto a host, install it on that host directly; to install software on devices that are already enrolled, use the [`/auto` Deploy workflow](preflight.md).
 
-### Creating a Deployment Job
+The record-only API below still answers today. It needs `Infrastructure:Read` (list, get) or `Infrastructure:Write` (create, cancel).
+
+### Creating a Deployment Job Record
+
+Each job records exactly one host (`target_host`). `os` is `windows`, `linux` (default) or `darwin`; `method` is `ssh`, `group_policy` or `manual` (default). `target_host` must be a hostname or IP of at most 253 characters using only `[a-zA-Z0-9._-]`, and must not start or end with `-`.
 
 ```bash
-curl -s -X POST http://localhost:8080/api/v1/deployment-jobs \
+curl -s -X POST http://localhost:8080/api/deployment-jobs \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "name": "Deploy to office subnet",
-    "targets": ["192.168.1.10", "192.168.1.11", "192.168.1.12"],
-    "method": "ssh",
-    "os": "linux"
+    "target_host": "192.168.1.10",
+    "os": "linux",
+    "method": "manual"
   }'
 ```
 
-Supported deployment methods: `ssh`, `group_policy`, `manual`.
+The response is `201` with `{"id": "...", "status": "pending"}`, plus a placeholder `install_command` when `method` is `manual`.
 
-### Job Lifecycle
+### Job States
 
-Jobs progress through the following states:
+The store defines the states below, but only `pending` and `cancelled` are ever reached through the product. No caller moves a job to `running`, `completed` or `failed`.
 
-| State | Description |
-|---|---|
-| `pending` | Job created, not yet started |
-| `running` | Deployment in progress |
-| `completed` | All targets successfully deployed |
-| `failed` | One or more targets failed |
-| `cancelled` | Job was cancelled by an administrator |
+| State | Reachable today | Description |
+|---|---|---|
+| `pending` | Yes | Job record created; nothing will start it |
+| `running` | No | Defined, never set |
+| `completed` | No | Defined, never set |
+| `failed` | No | Defined, never set |
+| `cancelled` | Yes | Job was cancelled through the API |
 
-### Monitoring Job Status
+### Reading Job Records
 
 ```bash
-curl -s http://localhost:8080/api/v1/deployment-jobs/{job_id} \
+curl -s http://localhost:8080/api/deployment-jobs \
+  -H "Authorization: Bearer $TOKEN"
+
+curl -s http://localhost:8080/api/deployment-jobs/{job_id} \
   -H "Authorization: Bearer $TOKEN"
 ```
 
 ### Cancelling a Job
 
 ```bash
-curl -s -X POST http://localhost:8080/api/v1/deployment-jobs/{job_id}/cancel \
+curl -s -X DELETE http://localhost:8080/api/deployment-jobs/{job_id} \
   -H "Authorization: Bearer $TOKEN"
 ```

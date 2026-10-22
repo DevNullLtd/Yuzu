@@ -10,7 +10,7 @@ All `curl` examples assume a running Yuzu server at `https://localhost:8080` (HT
 
 | Section | Description |
 |---|---|
-| [Device Management](device-management.md) | Agent enrollment (3-tier), heartbeat, identity, OTA updates, custom properties, device discovery, and deployment jobs |
+| [Device Management](device-management.md) | Agent enrollment (3-tier), heartbeat, identity, OTA updates, custom properties, device discovery, and deployment jobs (record-only, not functional) |
 | [Authentication](authentication.md) | Login, session management, mTLS, and Windows certificate store integration |
 | [SCIM v2 Provisioning](scim-provisioning.md) | Auto-provision and auto-deprovision operators from an enterprise IdP (Okta/Entra/OneLogin) via SCIM 2.0 (SOC 2 CC6.2/CC6.8); Users-only, Groups→role mapping deferred |
 | [RBAC](rbac.md) | Role-based access control -- principals, roles, securable types, per-operation permissions |
@@ -51,12 +51,12 @@ The following features are documented within the files listed above:
 |---|---|---|
 | Custom Device Properties | [Device Management](device-management.md#custom-device-properties) | Typed key-value properties on devices with schema validation and scope integration |
 | Device Discovery | [Device Management](device-management.md#device-discovery) | Subnet scanning to find unmanaged devices |
-| Deployment Jobs | [Device Management](device-management.md#deployment-jobs) | Push agent installation to discovered endpoints |
+| Deployment Jobs | [Device Management](device-management.md#deployment-jobs) | Not functional: record-only, nothing installs an agent; scheduled for removal (#6326) |
 | Device Quarantine | [Security Hardening](security-hardening.md#device-quarantine) | Network isolation for compromised devices |
 | IOC Checking | [Security Hardening](security-hardening.md#ioc-checking) | Indicator of Compromise scanning for threat hunting |
 | Certificate Inventory | [Security Hardening](security-hardening.md#certificate-inventory) | System certificate enumeration, inspection, and deletion |
 | WiFi & WoL | [Agent Plugins](agent-plugins.md) · `agents/plugins/wifi/README.md`, `agents/plugins/wol/README.md` | WiFi network scanning and Wake-on-LAN magic packets |
-| Patch Management | [REST API](rest-api.md) | Patch deployment, status tracking, and fleet compliance (via `PatchManager`) |
+| Patch Management | [REST API](rest-api.md) | Patch records only: deployments are recorded but not dispatched and patch inventory is never populated, so lists are empty (#3669, #3676, #4138); `/api/patches*` removal tracked by #6326 |
 | Webhooks | [REST API](rest-api.md) | Event-driven HTTP notifications to external systems |
 | Product Packs | [REST API](rest-api.md) | Signed YAML bundles containing definitions, policies, and templates |
 
