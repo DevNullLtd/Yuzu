@@ -243,8 +243,15 @@ TEST_CASE("enrolment tokens: empty list says so and keeps the generate form",
         CHECK_THAT(html, ContainsSubstring(n));
     CHECK_THAT(html, ContainsSubstring("name=\"label\" maxlength=\"" +
                                        std::to_string(auth::kMaxEnrollmentTextLength) + "\""));
-    // Both limits empty: the unlimited warning is on screen by default.
-    CHECK_THAT(html, ContainsSubstring("data-token-unlimited"));
+    // Placeholders show the bounded defaults; the unlimited warning is hidden by default (a
+    // blank field takes the default, not unlimited).
+    CHECK_THAT(html, ContainsSubstring("placeholder=\"" +
+                                       std::to_string(auth::kDefaultEnrollmentTokenMaxUses) +
+                                       " (0 = unlimited)\""));
+    CHECK_THAT(html, ContainsSubstring("placeholder=\"" +
+                                       std::to_string(auth::kDefaultEnrollmentTokenTtlHours) +
+                                       " (0 = never)\""));
+    CHECK_THAT(html, ContainsSubstring("data-token-unlimited hidden"));
     CHECK_THAT(html, ContainsSubstring("Anyone holding this token can enrol agents indefinitely"));
 }
 

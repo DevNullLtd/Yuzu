@@ -11,11 +11,16 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "software_inventory_store.hpp"
+#include "ca_store.hpp"
+#include "crypto_dashboard_layout_store.hpp"
+#include "crypto_shared_read.hpp"
+#include "crypto_widget_catalogue.hpp"
 
 #include "../test_helpers.hpp"
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <yuzu/metrics.hpp>
 
@@ -40,6 +45,8 @@ using namespace yuzu::server;
 namespace pg = yuzu::server::pg;
 namespace cl = yuzu::server::crypto_library;
 using yuzu::server::pg::PgPool;
+using yuzu::server::pg::PgConn;
+using yuzu::server::pg::PgResult;
 
 namespace {
 
@@ -935,6 +942,46 @@ TEST_CASE("CryptoRoutes: a read over the admission bound is a REST 503 with retr
     }
 }
 
+TEST_CASE("CryptoRoutes: a pool too small for the library reads is a REST 503 with NO retry hint",
+          "[pg][crypto][routes][cbom]") {
+    // R2-2: a one-connection pool refuses the library reads and the CBOM export until a restart
+    // with a larger pool: not a shed, so no retry_after_ms, and the message names the flag.
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn()};
+    std::shared_ptr<CryptoApi> api =
+        make_local_crypto_api(LocalCryptoApiDeps{.software = &fx.store, .pool_size = 1});
+
+    CryptoRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    CryptoRoutes::Deps d;
+    d.auth_fn = [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "u";
+        s.role = auth::Role::user;
+        return s;
+    };
+    d.fleet_read_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                         const std::string&) -> authz::FleetReadGate { return {true, std::nullopt}; };
+    d.api = api;
+    d.audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) { return true; };
+    routes.register_routes(sink, std::move(d));
+
+    for (const char* path : {"/api/v1/crypto/libraries",
+                             "/api/v1/crypto/libraries/devices?family=openssl",
+                             "/api/v1/crypto/cbom"}) {
+        auto r = sink.dispatch("GET", path);
+        REQUIRE(r);
+        INFO(path << " " << r->body);
+        CHECK(r->status == 503);
+        const auto body = nlohmann::json::parse(r->body);
+        // A4: the field is always present, null when there is no retry hint.
+        CHECK(body["error"]["retry_after_ms"].is_null());
+        CHECK_THAT(body["error"]["message"].get<std::string>(),
+                   Catch::Matchers::ContainsSubstring("--postgres-pool-size"));
+    }
+}
+
 // ── Step 1: catalogue when fresh, else live ─────────────────────────────────────────────────
 
 
@@ -1238,4 +1285,498 @@ TEST_CASE("CryptoApi summary: a bucket past the 8-name store cap says package_na
     CHECK(v.package_names.size() == 8);
     CHECK(v.package_names_truncated);
     CHECK(cl::summary_json(*r)["families"][0]["versions"][0]["package_names_truncated"] == true);
+}
+
+// ── Dashboard widgets through the seam (ADR-0070 D13): the Yuzu-issued reads and the layout ──
+
+namespace {
+
+// CaStore + the layout store, pre-migrated (the library store is not needed here).
+yuzu::test::PgTestTemplate widgets_tpl{"cryptowidgets", [](const std::string& dsn) {
+                                           PgPool pool{{.conninfo = dsn, .size = 1}};
+                                           CaStore ca{pool};
+                                           CryptoDashboardLayoutStore layouts{pool};
+                                           if (!ca.is_open() || !layouts.is_open())
+                                               throw std::runtime_error(
+                                                   "cryptowidgets template: a store failed to migrate");
+                                       }};
+
+constexpr std::int64_t kWAsOf = 1792368000 + 9 * 3600; // 2026-10-19 09:00 UTC, a Monday
+constexpr std::int64_t kWDay = 86400;
+
+IssuedCertRecord widget_cert(const std::string& serial, std::int64_t issued_at,
+                             std::int64_t not_after, std::int64_t revoked_at = 0) {
+    IssuedCertRecord r;
+    r.serial_hex = serial;
+    r.subject = "CN=" + serial;
+    r.purpose = "agent";
+    r.issued_at = issued_at;
+    r.not_after = not_after;
+    r.revoked_at = revoked_at;
+    r.status = revoked_at > 0 ? CertStatus::Revoked : CertStatus::Active;
+    return r;
+}
+
+} // namespace
+
+TEST_CASE("CryptoApi: Yuzu-issued stats - closed windows, buckets, 52 labelled weeks, as_of",
+          "[pg][crypto][widgets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, widgets_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    CaStore ca{pool};
+    REQUIRE(ca.is_open());
+    REQUIRE(ca.record_issued(widget_cert("A1", kWAsOf - 2 * kWDay, kWAsOf + 10 * kWDay)));
+    REQUIRE(ca.record_issued(widget_cert("A2", kWAsOf - 200 * kWDay, kWAsOf - 5 * kWDay)));
+    REQUIRE(ca.record_issued(
+        widget_cert("A3", kWAsOf - 200 * kWDay, kWAsOf + 90 * kWDay, kWAsOf - 3 * kWDay)));
+    auto api = make_local_crypto_api(LocalCryptoApiDeps{.ca = &ca, .bound_pinned_as_of = false});
+
+    const auto st = api->ca_stats(kWAsOf);
+    REQUIRE(st.has_value());
+    CHECK(st->as_of == kWAsOf);
+    CHECK(st->active == 1);
+    REQUIRE(st->expiring.size() == 6);
+    CHECK(st->expiring[0].days == 3);
+    CHECK(st->expiring[0].count == 0);
+    CHECK(st->expiring[3].days == 21);
+    CHECK(st->expiring[3].count == 1); // A1 expires in 10 days
+    REQUIRE(st->expired.size() == 4);
+    CHECK(st->expired[0].count == 1); // A2, 5 days ago
+    REQUIRE(st->revoked.size() == 4);
+    CHECK(st->revoked[0].days == 7);
+    CHECK(st->revoked[0].other == 1); // A3, 3 days ago, reason not a system marker
+    CHECK(st->revoked[0].superseded == 0);
+    CHECK(st->issued.days == 7);
+    CHECK(st->issued.count == 1); // A1
+    REQUIRE(st->weeks.size() == 52);
+    CHECK(st->weeks.back().label == "2026-W43");
+    CHECK(st->weeks.back().week_start == 1792368000);
+    CHECK(st->weeks.back().partial);
+    CHECK_FALSE(st->weeks.front().partial);
+    CHECK(st->weeks.front().label == "2025-W44");
+    // A1 issued Saturday of W42; A3 revoked Friday of W42.
+    CHECK(st->weeks[50].label == "2026-W42");
+    CHECK(st->weeks[50].issued == 1);
+    CHECK(st->weeks[50].revoked_other == 1);
+    std::int64_t issued_total = 0;
+    for (const auto& w : st->weeks)
+        issued_total += w.issued;
+    CHECK(issued_total == 3); // A2/A3 (200 days ago) fall inside the 52-week series too
+
+    // Unpinned: the database's now() is the as_of, echoed.
+    const auto live = api->ca_stats(std::nullopt);
+    REQUIRE(live.has_value());
+    CHECK(live->as_of > 1700000000);
+}
+
+TEST_CASE("CryptoApi: Yuzu-issued stats - never shared, read at request time even with a TTL",
+          "[pg][crypto][widgets]") {
+    // ADR-0070 "The CaStore count method": polling is bounded by admission limits, not a cached
+    // or stored count. shared_read_ttl covers the slice-1 library summary only.
+    YUZU_REQUIRE_PG_DB_TPL(db, widgets_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    CaStore ca{pool};
+    REQUIRE(ca.is_open());
+    std::vector<std::pair<std::string, std::string>> notes;
+    auto api = make_local_crypto_api(LocalCryptoApiDeps{
+        .ca = &ca,
+        .shared_read_ttl = std::chrono::seconds(60),
+        .note_degrade = [&](std::string_view s, std::string_view r) {
+            notes.emplace_back(std::string(s), std::string(r));
+        }});
+    const auto first = api->ca_stats(std::nullopt);
+    REQUIRE(first.has_value());
+    REQUIRE(ca.record_issued(widget_cert("5A1", first->as_of - 60, first->as_of + 10 * kWDay)));
+    // Inside what would have been the TTL, the next unpinned read already counts the new row.
+    const auto second = api->ca_stats(std::nullopt);
+    REQUIRE(second.has_value());
+    CHECK(second->active == first->active + 1);
+    CHECK(second->as_of >= first->as_of);
+    // With no admission slot the read is refused (busy), never answered from an earlier read.
+    auto shut = make_local_crypto_api(LocalCryptoApiDeps{
+        .ca = &ca, .max_concurrent_reads = 0, .shared_read_ttl = std::chrono::seconds(60)});
+    const auto refused = shut->ca_stats(std::nullopt);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().kind == CryptoReadError::Kind::kDegraded);
+    CHECK(notes.empty());
+}
+
+TEST_CASE("CryptoApi: Yuzu-issued list - drill rows, buckets, pinned paging, refusals",
+          "[pg][crypto][widgets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, widgets_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    CaStore ca{pool};
+    REQUIRE(ca.is_open());
+    for (int i = 1; i <= 3; ++i)
+        REQUIRE(ca.record_issued(widget_cert("B" + std::to_string(i), kWAsOf - kWDay,
+                                             kWAsOf + i * kWDay)));
+    auto api = make_local_crypto_api(LocalCryptoApiDeps{.ca = &ca, .bound_pinned_as_of = false});
+
+    CaCertQuery q{.kind = CaCertKind::kExpiring, .days = 3, .as_of = kWAsOf, .limit = 2};
+    auto page = api->ca_certificates(q);
+    REQUIRE(page.has_value());
+    CHECK(page->as_of == kWAsOf);
+    CHECK(page->total == 3);
+    CHECK(page->truncated);
+    REQUIRE(page->rows.size() == 2);
+    CHECK(page->rows[0].serial_hex == "B1");
+    CHECK(page->rows[0].status == "active");
+    CHECK(page->rows[0].revoked_at == 0);
+    // H2: page 2 is the cursor alone; it carries the as_of, and the last page has no cursor.
+    REQUIRE_FALSE(page->next_cursor.empty());
+    q.as_of.reset();
+    q.cursor = page->next_cursor;
+    page = api->ca_certificates(q);
+    REQUIRE(page.has_value());
+    CHECK(page->as_of == kWAsOf);
+    CHECK_FALSE(page->truncated);
+    CHECK(page->next_cursor.empty());
+    REQUIRE(page->rows.size() == 1);
+    CHECK(page->rows[0].serial_hex == "B3");
+    // The same cursor with a different pinned as_of, or for another filter, is refused (400).
+    CaCertQuery clash = q;
+    clash.as_of = kWAsOf + 1;
+    auto refused = api->ca_certificates(clash);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().kind == CryptoReadError::Kind::kInvalid);
+    CHECK_THAT(refused.error().message, Catch::Matchers::ContainsSubstring("cursor"));
+    CaCertQuery other = q;
+    other.days = 7;
+    refused = api->ca_certificates(other);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().kind == CryptoReadError::Kind::kInvalid);
+    CHECK_THAT(refused.error().message, Catch::Matchers::ContainsSubstring("cursor"));
+    CaCertQuery tampered = q;
+    tampered.cursor.back() = tampered.cursor.back() == 'A' ? 'B' : 'A';
+    refused = api->ca_certificates(tampered);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().message == "invalid cursor");
+
+    // Unpinned: the store's as_of is echoed so the next page can pin it.
+    page = api->ca_certificates({.kind = CaCertKind::kActive});
+    REQUIRE(page.has_value());
+    CHECK(page->as_of > 1700000000);
+
+    // Out-of-range input is refused, never clamped; a bucket on a non-revoked kind is refused.
+    for (const CaCertQuery& b :
+         {CaCertQuery{.kind = CaCertKind::kExpiring, .days = 45},
+          CaCertQuery{.kind = CaCertKind::kIssuedWeek, .week_start = 1792368000 + 3600},
+          CaCertQuery{.kind = CaCertKind::kActive, .limit = 100000},
+          CaCertQuery{.kind = CaCertKind::kActive, .limit = 0},
+          CaCertQuery{.kind = CaCertKind::kActive, .bucket = RevokedBucket::kOther}}) {
+        auto bad = api->ca_certificates(b);
+        REQUIRE_FALSE(bad.has_value());
+        CHECK(bad.error().kind == CryptoReadError::Kind::kInvalid);
+    }
+}
+
+TEST_CASE("CryptoApi: layout - default, validation, per-user, versioned, unknown ids preserved",
+          "[pg][crypto][widgets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, widgets_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    CryptoDashboardLayoutStore layouts{pool};
+    REQUIRE(layouts.is_open());
+    auto api = make_local_crypto_api(LocalCryptoApiDeps{.layouts = &layouts});
+
+    auto got = api->dashboard_layout("alice");
+    REQUIRE(got.has_value());
+    CHECK(got->is_default);
+    CHECK(got->version == 0);
+    CHECK(got->widgets == crypto_widgets::default_layout_ids());
+
+    // A refused layout stores nothing.
+    auto refused = api->set_dashboard_layout("alice", {"ca.active", "nope"}, std::nullopt);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().kind == CryptoReadError::Kind::kInvalid);
+    CHECK(refused.error().message == "widgets[1] is not a catalogue widget id");
+    CHECK(api->dashboard_layout("alice")->is_default);
+
+    // First write against "nothing stored" (0).
+    auto saved = api->set_dashboard_layout("alice", {"ca.revoked_7d", "lib.families_table"}, 0);
+    REQUIRE(saved.has_value());
+    CHECK_FALSE(saved->is_default);
+    const auto v1 = saved->version;
+    CHECK(v1 > 0);
+    got = api->dashboard_layout("alice");
+    REQUIRE(got.has_value());
+    CHECK(got->version == v1);
+    CHECK(got->widgets == std::vector<std::string>{"ca.revoked_7d", "lib.families_table"});
+    CHECK(api->dashboard_layout("bob")->is_default); // per user
+
+    // A stale expected_version is a conflict naming the stored version; nothing is written.
+    auto stale = api->set_dashboard_layout("alice", {"ca.active"}, v1 - 1);
+    REQUIRE_FALSE(stale.has_value());
+    CHECK(stale.error().kind == CryptoReadError::Kind::kConflict);
+    CHECK(stale.error().version == v1);
+    CHECK(api->dashboard_layout("alice")->widgets.size() == 2);
+    // H1 (owner decision 2026-10-19): a save that omits expected_version is a FIRST save only;
+    // over a stored row it conflicts, naming the stored version, and writes nothing.
+    auto omitted = api->set_dashboard_layout("alice", {"ca.active"}, std::nullopt);
+    REQUIRE_FALSE(omitted.has_value());
+    CHECK(omitted.error().kind == CryptoReadError::Kind::kConflict);
+    CHECK(omitted.error().version == v1);
+    CHECK(api->dashboard_layout("alice")->widgets.size() == 2);
+    auto first_bob = api->set_dashboard_layout("bob", {"ca.active"}, std::nullopt);
+    REQUIRE(first_bob.has_value());
+    CHECK(first_bob->version == 1);
+    // Two tabs both reading v1: the first save wins, the second conflicts.
+    REQUIRE(api->set_dashboard_layout("alice", {"ca.active"}, v1).has_value());
+    auto second_tab = api->set_dashboard_layout("alice", {"ca.issued_7d"}, v1);
+    REQUIRE_FALSE(second_tab.has_value());
+    CHECK(second_tab.error().kind == CryptoReadError::Kind::kConflict);
+
+    // Saving the default list is the default (Reset), with nothing preserved.
+    const auto cur = api->dashboard_layout("alice")->version;
+    auto reset = api->set_dashboard_layout("alice", crypto_widgets::default_layout_ids(), cur);
+    REQUIRE(reset.has_value());
+    CHECK(reset->is_default);
+
+    // Ids a newer build stored are kept on save, after the caller's, and never drawn.
+    REQUIRE(layouts.put("carol", {"future.widget", "ca.active", "other.future"}, std::nullopt));
+    got = api->dashboard_layout("carol");
+    REQUIRE(got.has_value());
+    CHECK(got->widgets == std::vector<std::string>{"ca.active"});
+    CHECK(got->preserved_unknown == 2);
+    CHECK_FALSE(got->is_default);
+    auto kept = api->set_dashboard_layout("carol", {"ca.issued_7d"}, got->version);
+    REQUIRE(kept.has_value());
+    CHECK(kept->preserved_unknown == 2);
+    auto raw = layouts.get("carol");
+    REQUIRE(raw.has_value());
+    REQUIRE(raw->has_value());
+    CHECK((**raw).widget_ids ==
+          std::vector<std::string>{"ca.issued_7d", "future.widget", "other.future"});
+
+    // An over-long username is a refusal, not a degrade.
+    auto big = api->dashboard_layout(std::string(CryptoDashboardLayoutStore::kMaxUsernameBytes + 1, 'u'));
+    REQUIRE_FALSE(big.has_value());
+    CHECK(big.error().kind == CryptoReadError::Kind::kInvalid);
+}
+
+TEST_CASE("CryptoApi: layout - a write that loses an in-store race names the STORED version",
+          "[pg][crypto][widgets]") {
+    // The API reads the row, then writes conditionally on that version. When another writer
+    // lands in between, the store's conditional write matches no row (kConflict); the 409 /
+    // X-Crypto-Layout-Version must then carry the version now stored, never 0.
+    YUZU_REQUIRE_PG_DB_TPL(db, widgets_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    CryptoDashboardLayoutStore layouts{pool};
+    REQUIRE(layouts.is_open());
+    auto api = make_local_crypto_api(LocalCryptoApiDeps{.layouts = &layouts});
+    REQUIRE(api->set_dashboard_layout("alice", {"ca.active"}, std::nullopt).has_value());
+
+    PgConn admin{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(admin.get()) == CONNECTION_OK);
+    // Stand the stored row at version 5, then make every UPDATE of it match nothing: exactly
+    // what the conditional write sees when another save bumped the version after the read.
+    REQUIRE(PgResult{PQexec(admin.get(), "UPDATE crypto_dashboard_layout_store.layouts SET "
+                                         "version = 5 WHERE username = 'alice'")}
+                .ok());
+    REQUIRE(PgResult{PQexec(admin.get(),
+                            "CREATE FUNCTION crypto_dashboard_layout_store.yuzu_test_lose() "
+                            "RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$; "
+                            "CREATE TRIGGER yuzu_test_lose BEFORE UPDATE ON "
+                            "crypto_dashboard_layout_store.layouts FOR EACH ROW EXECUTE FUNCTION "
+                            "crypto_dashboard_layout_store.yuzu_test_lose()")}
+                .ok());
+    for (const std::optional<std::int64_t> expected : {std::optional<std::int64_t>{},
+                                                       std::optional<std::int64_t>{5}}) {
+        auto lost = api->set_dashboard_layout("alice", {"ca.issued_7d"}, expected);
+        REQUIRE_FALSE(lost.has_value());
+        CHECK(lost.error().kind == CryptoReadError::Kind::kConflict);
+        CHECK(lost.error().version == 5);
+    }
+
+    // With the race gone, a save against the version the 409 named lands.
+    REQUIRE(PgResult{PQexec(admin.get(), "DROP TRIGGER yuzu_test_lose ON "
+                                         "crypto_dashboard_layout_store.layouts")}
+                .ok());
+    auto saved = api->set_dashboard_layout("alice", {"ca.issued_7d"}, 5);
+    REQUIRE(saved.has_value());
+    CHECK(saved->version == 6);
+}
+
+TEST_CASE("CryptoApi: null stores and zero capacity degrade every widget method, never empty",
+          "[pg][crypto][widgets]") {
+    std::vector<std::pair<std::string, std::string>> notes;
+    auto note = [&](std::string_view s, std::string_view r) {
+        notes.emplace_back(std::string(s), std::string(r));
+    };
+    auto none = make_local_crypto_api(LocalCryptoApiDeps{.note_degrade = note});
+    auto stats = none->ca_stats(kWAsOf);
+    REQUIRE_FALSE(stats.has_value());
+    CHECK(stats.error().kind == CryptoReadError::Kind::kDegraded);
+    CHECK(stats.error().message == "Yuzu CA read degraded");
+    CHECK_FALSE(stats.error().unavailable_until_restart); // the layout store's posture only
+    auto certs = none->ca_certificates({.kind = CaCertKind::kActive});
+    REQUIRE_FALSE(certs.has_value());
+    CHECK(certs.error().kind == CryptoReadError::Kind::kDegraded);
+    auto layout = none->dashboard_layout("alice");
+    REQUIRE_FALSE(layout.has_value());
+    CHECK(layout.error().kind == CryptoReadError::Kind::kDegraded);
+    // A layout store that did not open at boot (server.cpp resets it to null, ADR-0071) lasts
+    // until a restart: flagged so no transport offers a retry, and the dashboard draws the
+    // default instead.
+    CHECK(layout.error().unavailable_until_restart);
+    CHECK(layout.error().message.find("did not open at server start") != std::string::npos);
+    auto set = none->set_dashboard_layout("alice", {"ca.active"}, std::nullopt);
+    REQUIRE_FALSE(set.has_value());
+    CHECK(set.error().kind == CryptoReadError::Kind::kDegraded);
+    CHECK(set.error().unavailable_until_restart);
+    auto lib = none->library_summary({}, std::nullopt);
+    REQUIRE_FALSE(lib.has_value());
+    CHECK(lib.error().kind == CryptoReadError::Kind::kDegraded);
+    auto bad = none->set_dashboard_layout("alice", {"nope"}, std::nullopt);
+    REQUIRE_FALSE(bad.has_value());
+    CHECK(bad.error().kind == CryptoReadError::Kind::kInvalid);
+    // Closed metric labels only.
+    for (const auto& [src, reason] : notes) {
+        CHECK((src == "ca_issued" || src == "crypto_layout"));
+        CHECK(reason == "store_not_open");
+    }
+    CHECK(notes.size() == 4);
+
+    YUZU_REQUIRE_PG_DB_TPL(db, widgets_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    CaStore ca{pool};
+    CryptoDashboardLayoutStore layouts{pool};
+    REQUIRE(ca.is_open());
+    REQUIRE(layouts.is_open());
+    notes.clear();
+    auto shut = make_local_crypto_api(LocalCryptoApiDeps{
+        .ca = &ca, .layouts = &layouts, .max_concurrent_reads = 0, .note_degrade = note});
+    for (const auto& err :
+         {shut->ca_stats(kWAsOf).error(), shut->ca_certificates({.kind = CaCertKind::kActive}).error()}) {
+        CHECK(err.kind == CryptoReadError::Kind::kDegraded);
+        CHECK(err.cause == CryptoReadCause::kCapacity);
+    }
+    CHECK(notes == std::vector<std::pair<std::string, std::string>>{
+                       {"ca_issued", "admission_full"}, {"ca_issued", "admission_full"}});
+    // B9: the layout read and save are NOT admission-bounded.
+    CHECK(shut->dashboard_layout("alice").has_value());
+    CHECK(shut->set_dashboard_layout("alice", {"ca.active"}, std::nullopt).has_value());
+
+    // B9: a pool of 1..3 refuses the Yuzu-issued reads outright; the bound is a quarter of it.
+    auto tiny = make_local_crypto_api(
+        LocalCryptoApiDeps{.ca = &ca, .pool_size = 3, .bound_pinned_as_of = false});
+    // R2-2: a pool too small is not a shed - it lasts until a restart, so it is not retryable
+    // and names the flag; the transient admission refusal above stays kCapacity (retryable).
+    const auto tiny_stats = tiny->ca_stats(kWAsOf);
+    REQUIRE_FALSE(tiny_stats.has_value());
+    CHECK(tiny_stats.error().kind == CryptoReadError::Kind::kDegraded);
+    CHECK(tiny_stats.error().unavailable_until_restart);
+    CHECK_THAT(tiny_stats.error().message,
+               Catch::Matchers::ContainsSubstring("--postgres-pool-size"));
+    const auto tiny_page = tiny->ca_certificates({.kind = CaCertKind::kActive});
+    REQUIRE_FALSE(tiny_page.has_value());
+    CHECK(tiny_page.error().unavailable_until_restart);
+    CHECK(make_local_crypto_api(
+              LocalCryptoApiDeps{.ca = &ca, .pool_size = 4, .bound_pinned_as_of = false})
+              ->ca_stats(kWAsOf));
+    STATIC_CHECK(crypto_admission_bound(2, 16) == 2);
+    STATIC_CHECK(crypto_admission_bound(2, 4) == 1);
+    STATIC_CHECK(crypto_admission_bound(2, 0) == 2);
+}
+
+
+TEST_CASE("CryptoApi: a pool of one connection refuses the library reads too (until restart)",
+          "[pg][crypto]") {
+    // M3: the mTLS-accept is_revoked check must keep the only connection, so a pool of 1
+    // refuses every library read, with no store call; a pool of 2 reads. R2-2: the refusal
+    // lasts until a restart with a larger pool, so it is not retryable and names the flag
+    // (the CBOM export reads through library_summary, so it inherits this answer).
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn()};
+    auto one = make_local_crypto_api(LocalCryptoApiDeps{.software = &fx.store, .pool_size = 1});
+    const auto s = one->library_summary({}, std::nullopt);
+    REQUIRE_FALSE(s.has_value());
+    CHECK(s.error().kind == CryptoReadError::Kind::kDegraded);
+    CHECK(s.error().unavailable_until_restart);
+    CHECK_THAT(s.error().message, Catch::Matchers::ContainsSubstring("--postgres-pool-size") &&
+                                      Catch::Matchers::ContainsSubstring("CBOM"));
+    CryptoDevicesQuery q;
+    q.family = "openssl";
+    const auto d = one->library_devices(q, std::nullopt);
+    REQUIRE_FALSE(d.has_value());
+    CHECK(d.error().unavailable_until_restart);
+    auto two = make_local_crypto_api(LocalCryptoApiDeps{.software = &fx.store, .pool_size = 2});
+    CHECK(two->library_summary({}, std::nullopt).has_value());
+    STATIC_CHECK(kCryptoLibraryMinPoolSize == 2);
+}
+
+TEST_CASE("CryptoApi: a pinned as_of outside its window is refused on the database clock",
+          "[pg][crypto][widgets]") {
+    // M2: production bounds (the default) are measured on the database clock in the read's own
+    // transaction; the refusal is a 400-class kInvalid naming as_of, never a degrade.
+    YUZU_REQUIRE_PG_DB_TPL(db, widgets_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    CaStore ca{pool};
+    REQUIRE(ca.is_open());
+    auto api = make_local_crypto_api(LocalCryptoApiDeps{.ca = &ca});
+    const auto live = api->ca_stats(std::nullopt);
+    REQUIRE(live.has_value());
+    for (const std::int64_t bad : {live->as_of - 8 * kWDay, live->as_of + 3600}) {
+        const auto st = api->ca_stats(bad);
+        REQUIRE_FALSE(st.has_value());
+        CHECK(st.error().kind == CryptoReadError::Kind::kInvalid);
+        CHECK_THAT(st.error().message, Catch::Matchers::ContainsSubstring("as_of"));
+        const auto page = api->ca_certificates({.kind = CaCertKind::kActive, .as_of = bad});
+        REQUIRE_FALSE(page.has_value());
+        CHECK(page.error().kind == CryptoReadError::Kind::kInvalid);
+        CHECK_THAT(page.error().message, Catch::Matchers::ContainsSubstring("database clock") ||
+                                             Catch::Matchers::ContainsSubstring("days old"));
+    }
+    // Inside the window (a minute ago, on the DB clock) it reads.
+    CHECK(api->ca_stats(live->as_of - 60).has_value());
+    CHECK(api->ca_certificates({.kind = CaCertKind::kActive, .as_of = live->as_of - 60}).has_value());
+}
+
+TEST_CASE("SharedRead: a compute that throws degrades its waiters and the next call re-reads",
+          "[crypto]") {
+    // L5: the computing caller settles the shared state with the exception, so a waiter on it
+    // answers `failed` (never hangs), and the failed read is never reused.
+    using R = SharedRead<int, std::string>;
+    R shared{"busy", "failed", std::chrono::seconds(5)};
+    std::atomic<bool> entered{false};
+    std::atomic<bool> release{false};
+    std::atomic<bool> computer_saw_throw{false}; // Catch2 assertions stay on the test thread
+    std::thread computer([&] {
+        try {
+            (void)shared.get(std::chrono::seconds(60), [&]() -> R::Result {
+                entered = true;
+                while (!release)
+                    std::this_thread::yield();
+                throw std::runtime_error("store blew up");
+            });
+        } catch (const std::runtime_error&) {
+            computer_saw_throw = true;
+        }
+    });
+    while (!entered)
+        std::this_thread::yield();
+    std::optional<R::Result> waited;
+    std::thread waiter([&] {
+        waited = shared.get(std::chrono::seconds(60), []() -> R::Result { return 7; });
+    });
+    // Deterministic latch (no sleep): the waiter has joined THIS in-flight compute - counted
+    // under the lock before it waits - and only then is the compute allowed to throw.
+    while (shared.joined_in_flight_for_test() < 1)
+        std::this_thread::yield();
+    release = true;
+    computer.join();
+    waiter.join();
+    CHECK(computer_saw_throw); // the computing caller sees its own exception
+    REQUIRE(waited.has_value());
+    // It joined the throwing read, so it answers `failed` - never a hang, never a re-read.
+    REQUIRE_FALSE(waited->has_value());
+    CHECK(waited->error() == "failed");
+    // The next call does not reuse the failed read: it computes again.
+    int calls = 0;
+    const auto next = shared.get(std::chrono::seconds(60), [&]() -> R::Result {
+        ++calls;
+        return 42;
+    });
+    REQUIRE(next.has_value());
+    CHECK(*next == 42);
+    CHECK(calls == 1);
 }
