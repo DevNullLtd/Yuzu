@@ -2896,12 +2896,16 @@ TEST_CASE("characterisation: collector skip reasons per status mix",
         int fake;
         const char* plugin;
         const char* action;
-        bool windows; // which sample set the other actions come from
+        bool windows;       // which sample set the other actions come from
+        const char* mapped; // a valid row the action maps; empty for managers (they keep it)
     };
-    const Case cases[] = {{1, "pkg_inventory", "packages", false},
-                          {1, "pkg_inventory", "store_packages", false},
-                          {1, "pkg_inventory", "managers", false},
-                          {3, "msi_packages", "list_inventory", true}};
+    const Case cases[] = {
+        {1, "pkg_inventory", "packages", false, "package|homebrew|wget|1.24|formula"},
+        {1, "pkg_inventory", "store_packages", false,
+         "package|snap|btop|1.4.7|app|1073|-|-|active"},
+        {1, "pkg_inventory", "managers", false, ""},
+        {3, "msi_packages", "list_inventory", true,
+         "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0|Pub"}};
     for (const auto& c : cases) {
         INFO(c.plugin << "." << c.action);
         const std::string source = std::string(c.plugin) + "." + c.action;
@@ -2922,6 +2926,13 @@ TEST_CASE("characterisation: collector skip reasons per status mix",
         // constrained with a row of the wrong shape: still skipped
         CHECK(skip_with(nl({st(a, "constrained", "tok"), "garbage|row"})) ==
               std::make_pair(false, source + ":tok"));
+        // constrained with a row the adapter MAPS: still skipped, so the action table's
+        // `constrained` column (fail) is what is pinned, not just the zero-row fallback.
+        // Managers is the one action that keeps such a cycle (cases below).
+        if (*c.mapped != '\0') {
+            CHECK(skip_with(nl({st(a, "constrained", "tok"), c.mapped})) ==
+                  std::make_pair(false, source + ":tok"));
+        }
         // zero, two, short and mis-levelled status rows
         CHECK(skip_with("") == std::make_pair(false, source + ":bad status"));
         CHECK(skip_with(nl({"status|" + a + "|supported"})) ==
