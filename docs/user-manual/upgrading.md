@@ -425,6 +425,45 @@ customer-distribution lane. Before switching lanes, read the
 **Action.** None required. To keep a custom role out of the new surface, remove `Inventory:Read`
 from it. Rolling back removes the page, routes and tools; nothing is migrated.
 
+## Behaviour change: new `ca_store` indexes, built during the upgrade
+
+**What changed.** The CA store's migration v5 adds three indexes on `ca_issued` (one row per
+certificate Yuzu ever issued). They back the Yuzu-issued certificate counts and the certificate
+list behind them on the `/crypto` dashboard (ADR-0070 D13).
+
+- **The build blocks CA writes while it runs.** It runs at the first start of the new version
+  inside the migration and blocks writes to `ca_issued` (certificate issuance and revocation, so
+  new enrolments too) while it runs. The build time grows with the number of rows: about 1.3 s
+  per 250,000 rows and 9 s per million in local measurement (PostgreSQL 18, a 12-core machine).
+  The build itself has no time limit, so a large table is not cut off part-way. Check the row
+  count beforehand with `SELECT count(*) FROM ca_store.ca_issued;`.
+- **Health probes do not answer until the migration finishes.** The server opens its HTTP
+  listener only after the CA store has opened, so `/livez`, `/readyz` and `/healthz` refuse
+  connections during the build and during any wait for its lock. A liveness or startup check
+  that gives up first (a container `start_period`, a Kubernetes `startupProbe`, systemd
+  `TimeoutStartSec`) restarts the server mid-build, the build rolls back, and the next start
+  begins it again. On a CA store above about a million rows, or wherever the build may wait
+  behind a long transaction, allow at least two minutes for the first start of this version.
+- **Seeing whether it is building or waiting.** In `psql`, `SELECT phase, blocks_done,
+  blocks_total FROM pg_stat_progress_create_index;` shows a build in progress. A row in
+  `pg_stat_activity` for the server's connection with `wait_event_type = 'Lock'` means it is
+  still waiting for its lock; while it waits, every other write to `ca_issued` (issuance,
+  revocation) queues behind it too, for up to the 30 s below.
+- **Start one replica first.** A second replica that starts while the first is building waits up
+  to the connection pool's 10 s lock timeout for it, then logs the same two lines as below and
+  **does not start**. Start it again once the first replica is up: it finds the migration done.
+- **If the 30 s lock wait expires.** The build waits at most 30 s for its lock on `ca_issued`. If
+  another session holds a conflicting lock for longer, such as a long transaction, the migration
+  fails and rolls back, nothing is left half-built, and the
+  server logs `CaStore: schema migration failed — CA persistence disabled` followed by
+  `[PG] Refusing to start: ca store migration/open failed` and **does not start** (the CA store is
+  required). Find and end the blocking session (`pg_locks` / `pg_stat_activity`), then start the
+  server again: the migration is retried from the start.
+
+**Action.** On a large CA store, schedule the upgrade for a quiet period, and raise any startup or
+liveness probe timeout first (see "Health probes do not answer" above). Rolling back leaves the
+v5 indexes in the database; they are harmless to the older binary.
+
 ## Behaviour change: the built-in server certificate is re-issued once with a server identity URI (#6016)
 
 On first boot after the upgrade, an install that uses the built-in default certificates has `default-server.pem` re-issued once, under the **same root and the same key**, with one added Subject Alternative Name: the server identity `yuzu://<ca-fingerprint>/server`. The previous certificate then appears **revoked with reason `superseded`** in the CA inventory (`GET /api/v1/ca/issued`, the CA page) and in the next CRL. That is bookkeeping, not a key compromise: the new certificate certifies the same key. Existing `mgmt_peer_pins` entries stay valid because the key is unchanged, so the gateway needs no action. The one-time event is audited as `server.default_certs_server_identity_upgraded` and logged as a WARN line. The CRL carries no revocation reason code, so the `superseded` reason is visible in the CA inventory only; a CRL consumer sees an ordinary revoked serial.
