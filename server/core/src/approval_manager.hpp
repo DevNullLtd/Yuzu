@@ -260,9 +260,10 @@ inline constexpr std::size_t kMaxExcludedRootBytes = 256;
 /// request that is readable and bounded and hashes to its digest (or no request and no digest
 /// at all, an unbound ticket), and an excluded-roots list that could be read. The request half is
 /// the very function `approve()` calls (`request_binding_fault`); `approve()` checks the
-/// excluded-roots half itself in `set_review_status`, so the two halves agree because tests pin
-/// them together (see `approval_state_is_approvable` in test_approval_manager_bound.cpp), not by
-/// construction. The dashboard uses this to offer Approve only when the store would not refuse it
+/// excluded-roots half itself in `set_review_status`, so the roots half agrees with it by test, not
+/// by construction: test_approvals_fragment_routes.cpp ("Approve is withheld exactly when the
+/// store would refuse the stored state") drives the page and the real `approve()` from the same
+/// rows, and test_approval_manager_bound.cpp pins the predicate on its own states. The dashboard uses this to offer Approve only when the store would not refuse it
 /// for these reasons. A reviewer who is themselves excluded or the submitter is a separate,
 /// per-viewer question (`reviewer_is_excluded`).
 [[nodiscard]] bool approval_state_is_approvable(const Approval& a);
@@ -387,9 +388,11 @@ enum class ConsumeFailure {
                     ///< see ConsumeError::sqlstate/binding_check_unevaluated
     kForeignOrigin, ///< minted on a surface other than the MCP recall (#2442); ALSO the kind for a
                     ///< ticket that fails the redemption integrity re-check (#6062): its stored
-                    ///< reviewer is the submitter or an excluded root, or its stored
-                    ///< request_json no longer hashes to request_digest. Same forgery class,
-                    ///< same uniform message, no new audit/metric label value.
+                    ///< reviewer is the submitter or an excluded root, an approved ticket records
+                    ///< no reviewer, its excluded roots cannot be read, or its stored request_json
+                    ///< no longer hashes to request_digest (or is a digest with no request).
+                    ///< Same forgery class, same uniform message, no new audit/metric label value.
+                    ///< (A digest that cannot be COMPUTED is a kStoreError instead.)
     kForeignSubmitter, ///< recalled by a principal other than the ticket's submitter (#2442)
     kExpired,       ///< approved but unconsumed past kApprovalTicketTtlSeconds since its review
                     ///< (#6061) — refused at consume by DATABASE time, no submit() sweep needed
@@ -801,8 +804,8 @@ public:
     ///
     /// Order: argument guards → `expected` is a concrete surface → #2442
     /// origin+submitter binding check → redemption integrity re-check (#6062: an
-    /// approved, unconsumed row whose stored reviewer is the submitter or an excluded
-    /// root, whose excluded_roots cannot be read, or whose non-empty request_json no
+    /// approved, unconsumed row whose stored reviewer is the submitter, an excluded
+    /// root or EMPTY, whose excluded_roots cannot be read, or whose non-empty request_json no
     /// longer hashes to request_digest is refused as kForeignOrigin with the uniform
     /// message; a legacy row with no request and no roots is unaffected) → match the
     /// row → reject a non-consumable one → evaluate `precondition` → CAS.

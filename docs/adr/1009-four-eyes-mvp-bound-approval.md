@@ -162,51 +162,87 @@ PR2 lands authorisation code with no production caller: the `excluded_roots` ref
 It all fails closed, but code that nothing exercises can rot unseen, so it is accepted on these
 conditions (security-guardian `sec-1`, with the architect's five conditions):
 
-1. The bound fields are not dashboard-only: every approval read (the legacy `GET /api/approvals`,
-   `GET /api/v1/approvals`, `GET /api/v1/approvals/{id}` and MCP `list_pending_approvals`) carries
-   `request` (the frozen request as a JSON object), `request_digest` and `excluded_roots`
-   (closes `arch-1`), so an agentic worker sees what a human sees.
-2. The Approvals dialog does not claim more than the store can back (`arch-3`): it says the
+1. The bound fields are not dashboard-only. Every approval read MUST carry `request` (the frozen
+   request as a JSON object), `request_digest` and `excluded_roots` for a bound ticket and
+   nothing extra for an unbound one: the legacy `GET /api/approvals`, `GET /api/v1/approvals`,
+   `GET /api/v1/approvals/{id}`, MCP `list_pending_approvals`, and the Approvals page and
+   Instructions tab (closes `arch-1`), so an agentic worker sees what a human sees. Proof:
+   `approval_routes: GET /api/approvals shows a bound ticket's frozen request as an object; an
+   unbound row is unchanged`, `GET /api/v1/approvals/{id} and the list: a bound ticket carries
+   request/digest/roots; an unbound row is unchanged; same Approval:Read gate` and `MCP
+   list_pending_approvals: a bound ticket carries request/digest/roots; an unbound row is the
+   legacy field set; tools/list declares the optional fields`, in `test_approval_routes.cpp`,
+   `test_rest_api_events.cpp` and `test_mcp_server.cpp` (all exist today).
+2. The Approvals dialog MUST NOT claim more than the store can back (`arch-3`): it says the
    summary is for orientation and that what is approved is the whole request as stored under the
    digest shown. It makes no promise that the request cannot change after the decision: the
    Approve request carries only a comment and matches the ticket id and pending status, so
-   that promise waits for the digest-pinned Approve below.
-3. The first caller of `submit_bound` or the caller-held `consume_ticket` gets security-guardian
-   and cpp-safety review on rollback and spent-ticket semantics, and a test that a rolled-back
-   caller transaction leaves the ticket redeemable.
+   that promise waits for the digest-pinned Approve below. Proof: `operate pages: Approvals
+   copy is exact and claims no second person`, in `test_operate_pages_ui.cpp`, whose pins forbid
+   "cannot change after your decision", "frozen under the digest" and "exactly the effect shown"
+   (exists today).
+3. The first caller of `submit_bound` or the caller-held `consume_ticket` MUST get
+   security-guardian and cpp-safety review, and MUST roll the REAL effect and the ticket back
+   together: the effect (the deploy) and the spend of the ticket commit or roll back in ONE
+   transaction on the connection the ticket was consumed on, and a lost commit acknowledgement is
+   reconciled from the redeemer's own record (see "Lost commit acknowledgement" below). Proof,
+   in the producer's test file: `deploy: a rolled-back deploy leaves the ticket redeemable and
+   the effect absent`, `deploy: a committed deploy spends the ticket and applies the effect in
+   one transaction` and `deploy: a retry after a lost commit acknowledgement does not execute
+   twice`. These MUST be EXECUTED against Postgres, not skipped: the PG tests skip silently
+   (exit 0) when `YUZU_TEST_POSTGRES_DSN` is unset, so the PR MUST show the shard that runs them
+   with zero PG skips.
 4. No bound ticket is minted until every replica runs a build that includes this change (an older
    replica's `approve()` ignores `excluded_roots`); the Upgrading guide states it. This is prose
-   only today: `submit_bound` checks no deployment capability and the store has no replica
-   registry. The first producer MUST establish it mechanically, not by an operator's say-so: it
-   refuses to mint unless every replica it can enumerate (the ADR-2002 coordination seam)
-   reports a build with migration v2 and this enforcement, treats a replica that is unknown,
-   unreachable or silent as NOT upgraded, and refuses below that build while a bound ticket
-   exists (see Rollback below). Proof: `submit_bound: a fleet that contains an unknown or
-   older replica refuses to mint`, in `test_approval_manager_bound.cpp`.
+   only today, and NO replica-enumeration mechanism exists to make it more: `submit_bound` checks
+   no deployment capability, the store has no replica registry, and ADR-2002 supports exactly
+   one replica until its safe-to-scale gate lifts (section 7c); it has no enumeration of
+   replicas and no report of their builds (a search of `server/core/src` finds a `replica_id`
+   only in `ExecutionTracker`'s own bookkeeping). So the first producer MUST either build such a
+   mechanism or cite an existing one, and it MUST establish three things, not by an operator's
+   say-so: the expected replica set comes from a named source (not from whatever happens to
+   answer), a replica that is unknown, unreachable or silent counts as NOT upgraded, and a
+   build older than this change cannot be started against a database holding a bound ticket
+   (the refusal is the NEW build's boot-time check; an older binary cannot refuse itself, see
+   Rollback below). Proof: `submit_bound: a fleet that contains an unknown or older replica
+   refuses to mint`, in `test_approval_manager_bound.cpp`.
 5. PR3 lands in the same release window as PR2, or the dormant half is cut back out. Made
-   checkable: PR3 (#6063) MUST merge before the first release tag that contains PR2, or a change
-   that removes the dormant half MUST merge before that tag. The accountable owner is the epic
-   owner (#6060), who records which of the two applies in #6060 before the tag is cut; the
-   deadline is that tag. A tripwire keeps the question honest between now and then:
-   `bound-approval primitives still have no production caller (ADR-1009 tripwire, not proof)`, in
-   `test_approval_dormant_code_tripwire.cpp`, fails the day a production call to `submit_bound`, a
-   second production `consume_ticket` call or a new `kGuardianDeploy` use appears, so the first
-   producer cannot land without someone updating its allow-list and this section. It reads source
-   text only and proves nothing about behaviour.
+   checkable: let TAG be any git tag, a release candidate (`-rcN`) included, for which `git tag
+   --contains <the commit that merges PR2>` is non-empty. PR3 (#6063) MUST merge before the first
+   such TAG, or a change that REMOVES the dormant half MUST merge before it. "The dormant half" is
+   exactly four things: the `excluded_roots` refusal in `approve()`, `submit_bound` (with
+   `BoundRequest`, `SubmitError` and their validation), the `kGuardianDeploy` origin, and the
+   caller-held-transaction `consume_ticket(PGconn*, ...)` overload with its
+   `ConsumeTestStage` seam; migration v2's columns stay (they are forward-only and harmless
+   empty). The accountable owner is the epic owner of #6060, who records which of the two applies
+   in a comment on #6060 before the first such TAG is cut; the deadline is that TAG. There is no
+   release gate that checks this today. A tripwire keeps the question honest in between: `bound-
+   approval primitives still have no production use (ADR-1009 tripwire, not proof)`, in
+   `test_approval_dormant_code_tripwire.cpp`, lexes every file under `server/core/src` (comments
+   and string, character and raw-string literals excluded) and fails when `submit_bound`, a
+   second `consume_ticket`, a new `kGuardianDeploy` or the interleaving seam appears in
+   production code, when the store, `mcp_server.cpp` or `server.cpp` is not scanned, or when the
+   known single uses are not found exactly once; its own tests plant a producer in a temp copy to
+   show it is not blind. It reads source text only: it cannot see a macro, a generated file or
+   another directory, and it proves nothing about behaviour.
 
 ### PR3 entry conditions
 
 Open findings that become conditions on the PR that first wires a producer or redeemer (#6063).
 The consume-time recheck is in PR2 (`up-2`, `g8-sg-1`). Every read a consume makes runs the
-origin, submitter and integrity checks (reviewer is not the submitter or an excluded root, an
-approved ticket names a reviewer, excluded roots readable, request matches its digest), and the
-consuming statement is pinned to the status, reviewer, request, digest, excluded roots, origin
-and submitter of the last row examined, so a row examined as pending, rejected or expired cannot be
-spent by a status-only flip. What that is NOT: the check and the statement remain two statements,
-so a change to a column outside the pin is not noticed, and a writer with database access who
-rewrites every pinned column consistently passes. It detects a row that moved by accident or by an
-old build; it is not a boundary against a database writer, and on an autocommit connection (the
-`cs-3` item below) the held overload gets only the pin.
+origin and submitter checks, and, for a row that is approved and not yet consumed, the integrity
+checks (reviewer is not the submitter or an excluded root, an approved ticket names a reviewer,
+excluded roots readable, request matches its digest); a pending, rejected, expired or already
+consumed row keeps reading as the ordinary refusal it is. The consuming statement is pinned to the
+row VERSION (`xmin`) of the last row examined, so ANY update of the row between the checks and the
+statement, in any column (`consumed_at`, `reviewed_at`, `definition_id` and the rest included),
+makes it match nothing and read as the uniform not-consumable; the explicit status, reviewer,
+request, digest, excluded-roots, origin and submitter pins are kept as defence in depth. What
+that is NOT: the check and the statement remain two statements, a no-op rewrite of the row also
+changes its version and refuses (fail closed; a retry succeeds), and a writer who can replace the
+row wholesale or work below SQL is outside what it can tell. It detects a row that moved by
+accident or by an old build; it is not a boundary against a principal with database write
+access. On an autocommit connection (the `cs-3` item below) the held overload gets only the pin.
 
 Each condition below is a MUST, and each names the test that proves it. A named test is written
 first and is red at the base of the PR that satisfies the condition; a test that cannot be made
@@ -258,10 +294,10 @@ adds.
   executed (a number such as 123456789012345678901234567890 displays rounded in the summary and in
   the API `request`, and a duplicate key displays last-wins). Proof: `submit_bound: a request with
   a duplicate key or an inexact number is refused`, in `test_approval_manager_bound.cpp`.
-- **Classification** (`co-4`): no secret-typed parameter MAY be frozen into `request_json` (clear
-  text, never pruned; see the Server Administration retention note). Proof: `the producer's
-  request builder refuses a parameter marked secret before submit_bound is reached`, in the PR's
-  producer test file.
+- **Classification** (`co-4`): no secret-typed parameter MUST NOT be frozen into `request_json` (clear
+  text, never pruned; see the Server Administration retention note), so the producer's request
+  builder MUST refuse one. Proof: `the producer's request builder refuses a parameter marked
+  secret before submit_bound is reached`, in the PR's producer test file.
 - **The decision is pinned to the digest the reviewer saw** (`g8-up-1`, `g8-up-2`, `g8-er-1`): the
   Approve request MUST carry the `request_digest` the reviewer displayed, and `approve()`'s update
   MUST add `AND request_digest = $N` (and pin `reviewed_by` and `excluded_roots` too), so a
@@ -278,7 +314,7 @@ adds.
 - **Display fidelity** (`g8-sg-3`, `g8-up-2`): any surface that shows a frozen request to a
   reviewer MUST show it ASCII-escaped (no raw bidirectional, line-separator or control character)
   with one field per line, as `summarize_bound_request` does. It MUST also be free of starvation:
-  no section may push another out of the summary. Definition and Hash are always shown, and
+  no section may push another out of the summary. The Definition line (and the Hash line when `definition` is an object) is never budgeted away, and
   Targets, Parameters, Definition fields and Other fields each have their own byte budget and say
   on their own line when they show fewer entries than the request holds; the sections a reviewer
   most needs (Targets, Parameters) precede the optional ones. Reordering alone is not enough
@@ -289,7 +325,7 @@ adds.
   `summarize_bound_request: no section can starve another; each says when it is cut` and
   `summarize_bound_request: a section whose first entry alone exceeds its budget still keeps its
   heading and says nothing was shown`, in `test_approvals_page_render.cpp`.
-- **Read tier** (`g8-sg-5`): BEFORE the first producer, a maintainer decides who may read the
+- **Read tier** (`g8-sg-5`): BEFORE the first producer, a maintainer MUST decide who may read the
   frozen request, which can name target devices. Option A: every `Approval:Read` holder, as today.
   Option B: only `Approval:Approve` holders and the submitter, the others getting the digest, the
   definition name and a target count. Today it is unconfined: with RBAC off, every authenticated
@@ -298,7 +334,9 @@ adds.
   the legacy `GET /api/approvals`, the v1 list, the v1 get, MCP `list_pending_approvals`, the
   Approvals page and the Instructions tab. Proof: for each of the six, a test through the real
   handler with a POPULATED request that a principal outside the chosen tier, and one whose
-  management-group policy would not reach the named targets, receives no `request`, in
+  management-group policy would not reach the named targets, receives no `request`, titled
+  `read tier: <surface> withholds a populated request from a principal outside the tier` (one
+  per surface) in
   `test_approval_routes.cpp`, `test_rest_api_events.cpp`, `test_mcp_server.cpp` and
   `test_approvals_fragment_routes.cpp`. The audit side of the same decision (the legacy list and
   the page write no `approval.read` row where the v1 routes and MCP do) is decided with it.
@@ -307,8 +345,11 @@ adds.
   foreign_origin`, a token the documentation defines as a cross-surface attempt, and the cause is
   only in the server log. The PR MUST add a server-side-only kind (`kIntegrityFault`) with its own
   counter and an audit row carrying a closed cause token (reviewer is the submitter, reviewer is
-  an excluded root, excluded roots unreadable, digest mismatch, digest without a request, digest
-  not computable), and MUST decide the client text in the same change (today a caller is told
+  an excluded root, approved with no recorded reviewer, excluded roots unreadable, digest
+  mismatch, digest without a request: SIX tokens, plus the seventh cause the code also treats as
+  a refusal, a digest that could not be computed, which today is a store error flagged
+  `binding_check_unevaluated` and not a `kForeignOrigin` at all), and MUST decide the client text
+  in the same change (today a caller is told
   "already used" for an intact approved ticket). Proof: `consume: an integrity failure is counted
   and audited under its own kind and cause`, in `test_approval_manager_bound.cpp`.
 - **Narrow list projection** (`sre-4`): a list read that elides `request_json` MUST return a
