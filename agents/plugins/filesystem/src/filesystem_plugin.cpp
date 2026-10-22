@@ -357,13 +357,18 @@ std::string compute_hash_unix(const std::string& path, std::string_view algorith
 std::vector<std::string> find_by_hash_network_mounts(const std::string& directory) {
     const fs::path raw = fs::path(directory).lexically_normal();
     const std::string spelled = raw.string();
+    // A relative root lands on the drive of the agent's working directory; fs::absolute resolves
+    // that lexically (GetFullPathNameW) and never touches the target. If it cannot, refuse.
+    std::error_code ec;
+    const fs::path judged = raw.has_root_name() ? raw : fs::absolute(raw, ec);
+    const std::string where = judged.string();
     // A UNC root IS the mount. A drive letter is judged by its drive type: anything but a fixed
     // disk (a mapped network drive, removable, optical, RAM disk, unknown) is refused; a
     // nonexistent drive falls through to the normal "directory is not accessible" error.
-    if (spelled.starts_with("\\\\") || spelled.starts_with("//"))
+    if (ec || where.starts_with("\\\\") || where.starts_with("//"))
         return {spelled};
-    if (raw.has_root_name()) {
-        const std::wstring root = raw.root_name().wstring() + L"\\";
+    if (judged.has_root_name()) {
+        const std::wstring root = judged.root_name().wstring() + L"\\";
         if (yuzu::filesystem::find_by_hash::win_root_drive_refused(GetDriveTypeW(root.c_str())))
             return {spelled};
     }

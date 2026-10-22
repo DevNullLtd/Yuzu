@@ -9,6 +9,7 @@
  */
 #include <catch2/catch_test_macros.hpp>
 
+#include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/plugin.h>
 
 #include "filesystem_dispatcher_test_support.hpp"
@@ -173,6 +174,33 @@ TEST_CASE("filesystem find_by_hash: missing parameters and a bad root keep their
         CHECK(captured_rows(result.captured) ==
               std::vector<std::string>{"error|directory is not accessible"});
     }
+}
+
+TEST_CASE("filesystem find_by_hash: the shutdown latch stops the walk before it visits anything",
+          "[filesystem][find_by_hash][dispatcher]") {
+    auto plugin = load_or_fail();
+    if (!plugin)
+        return;
+    // The latch is one process-wide flag in the agent core that the loaded plugin reads, so put
+    // back whatever was there rather than clearing it.
+    struct LatchRestore {
+        const bool previous = yuzu::agent::subprocess_cancel_requested();
+        ~LatchRestore() { yuzu::agent::request_subprocess_cancel(previous); }
+    } latch_restore;
+    // One entry is needed: an empty tree never reaches the budget check and would end clean.
+    Tree t;
+    t.write("a.txt", "a");
+    yuzu::agent::request_subprocess_cancel(true);
+    const auto result = find_by_hash(*plugin, t.root.string(), std::string(64, '0'));
+    CHECK(result.rc == 0);
+    CHECK(captured_rows(result.captured) ==
+          std::vector<std::string>{
+              "truncated|cancelled|visited=0|hashed=0|skipped_unreadable=0|skipped_symlink=0|"
+              "skipped_not_regular=0|skipped_oversize=0|skipped_network_mount=0",
+              "matches_found|0"});
+    CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(result.result_provenance == "filesystem:cancelled");
 }
 
 #ifdef _WIN32
