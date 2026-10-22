@@ -338,7 +338,8 @@ struct EngineListRig {
 
 } // namespace
 
-TEST_CASE("upload-grants list: an engine principal is default-deny, in step with the MCP gate",
+TEST_CASE("upload-grants list: an engine principal is default-deny, through the same gate as the "
+          "MCP list tool",
           "[pg][authz][engine_principal][upload]") {
     YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
     UploadGrantScopeRig r{db.dsn()};
@@ -354,6 +355,7 @@ TEST_CASE("upload-grants list: an engine principal is default-deny, in step with
 
     SECTION("RBAC off (the default posture), zero grants: 403 and no rows") {
         r.rig.rbac.set_rbac_enabled(false);
+        REQUIRE_FALSE(r.rig.rbac.is_rbac_enabled());
         expect_denied(e.sink_dispatch("GET", {}, e.engine_token), 403);
         CHECK(e.mcp_gate_status(e.engine_token) == 403);
         // The human minter is unchanged: RBAC off admits the whole list.
@@ -366,7 +368,11 @@ TEST_CASE("upload-grants list: an engine principal is default-deny, in step with
 
     SECTION("RBAC on, no grant: 403 and no rows") {
         REQUIRE(r.rig.rbac.is_rbac_enabled());
-        expect_denied(e.sink_dispatch("GET", {}, e.engine_token), 403);
+        auto res = e.sink_dispatch("GET", {}, e.engine_token);
+        expect_denied(res, 403);
+        // The engine gate names the missing permission; the list-admit deny does not, so this
+        // shows the denial came from the engine gate rather than only from the resolver.
+        CHECK(res->body.find("UploadGrant:Read") != std::string::npos);
         CHECK(e.mcp_gate_status(e.engine_token) == 403);
     }
 
@@ -405,23 +411,24 @@ TEST_CASE("upload-grants list: an engine principal is default-deny, in step with
         register_file_retrieval_routes(sink, std::move(deps));
         auto res = sink.dispatch("GET", "/api/v1/upload-grants", {}, "application/json",
                                  {{"Authorization", "Bearer " + e.engine_token}});
-        expect_denied(std::move(res), 503);
+        expect_denied(res, 503);
     }
 
     SECTION("an unwired perm_fn refuses an engine (fail closed), never lists") {
         auto deps = r.make_deps(/*wire_deny=*/true);
         deps.perm_fn = nullptr;
         r.rig.rbac.set_rbac_enabled(false);
+        REQUIRE_FALSE(r.rig.rbac.is_rbac_enabled());
         yuzu::server::test::TestRouteSink sink;
         register_file_retrieval_routes(sink, std::move(deps));
         auto res = sink.dispatch("GET", "/api/v1/upload-grants", {}, "application/json",
                                  {{"Authorization", "Bearer " + e.engine_token}});
-        expect_denied(std::move(res), 403);
+        expect_denied(res, 403);
     }
 }
 
 TEST_CASE("upload-grants list: a human session with no grant is still refused, one with a global "
-          "grant still sees every row",
+          "grant still sees every row, and RBAC off still admits a human",
           "[pg][authz][upload]") {
     YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
     UploadGrantScopeRig r{db.dsn()};
@@ -458,5 +465,16 @@ TEST_CASE("upload-grants list: a human session with no grant is still refused, o
     REQUIRE(ok);
     CHECK(ok->status == 200);
     CHECK(agent_ids(nlohmann::json::parse(ok->body)) ==
+          std::set<std::string>{"agent-A", "agent-B"});
+
+    // RBAC off is the state in which the engine gate differs from the human path: a human with
+    // no grant is still admitted by the unchanged list-admit resolver.
+    r.rig.rbac.set_rbac_enabled(false);
+    REQUIRE_FALSE(r.rig.rbac.is_rbac_enabled());
+    auto legacy = sink.dispatch("GET", "/api/v1/upload-grants", {}, "application/json",
+                                {{"Authorization", "Bearer " + *nogrant}});
+    REQUIRE(legacy);
+    CHECK(legacy->status == 200);
+    CHECK(agent_ids(nlohmann::json::parse(legacy->body)) ==
           std::set<std::string>{"agent-A", "agent-B"});
 }
