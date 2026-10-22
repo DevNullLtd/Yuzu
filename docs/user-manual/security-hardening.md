@@ -225,9 +225,18 @@ For additional protection, deploy a reverse proxy with rate limiting:
 limit_req_zone $binary_remote_addr zone=yuzu_api:10m rate=50r/s;
 location /api/ {
     limit_req zone=yuzu_api burst=20 nodelay;
+    proxy_set_header Host $http_host;   # repeat in every location that proxies to Yuzu
     proxy_pass http://127.0.0.1:8080;
 }
 ```
+
+Forward the client's `Host` unchanged (`proxy_set_header Host $http_host;`), as above, in every `location` that proxies to Yuzu or at `server` level: nginx otherwise sends `$proxy_host`, and every dashboard write is then refused until the public origin is declared with `--csrf-trusted-origin` (see [CSRF protection](#csrf-protection)). `$host` drops the port, so use `$http_host` unless the public port is 80 or 443.
+
+## CSRF protection
+
+Cookie-session writes require a same-site `Origin` or `Referer`. The server applies one check to every request that is authorised by a session cookie (local, OIDC or SAML) and uses any method other than `GET`, `HEAD` or `OPTIONS`: the request must carry an `Origin` or `Referer` that names the same host as the request's `Host` header or one of the origins declared with `--csrf-trusted-origin` (environment variable `YUZU_CSRF_TRUSTED_ORIGIN`). A request without a usable header, or with one naming another site, is refused `403` `cross-site request refused` after authentication and before step-up evaluation, challenge emission and route-handler effects, and before the body is read. Requests authenticated only by an API, MCP or engine token are exempt, because they do not ride a browser cookie; a request that presents a valid session cookie is treated as a cookie request even if it also carries a token. Evidence: each refusal writes a `csrf.denied` audit row (see [Audit Log](audit-log.md)) and increments `yuzu_server_csrf_denied_total{path_class,reason}` (see [Metrics](metrics.md)). The check fails closed: if it cannot complete, the request is refused and counted with `reason` `gate_error`, and a refusal whose audit row could not be written carries the `Sec-Audit-Failed` response header. The same-host comparison is scheme-aware where the server can know the public scheme. On a server that terminates TLS itself (HTTPS enabled), the `Origin` or `Referer` must be `https://`, and default ports are scheme-aware (`:443` is the default, `:80` is not), so `Host: yuzu.example.com` is matched only by `https://yuzu.example.com` or `https://yuzu.example.com:443`. Behind a TLS-terminating reverse proxy the server listens in plain HTTP and the `Host` header carries no scheme, so the server cannot see the public scheme: declare the public origin WITH its scheme (`--csrf-trusted-origin https://yuzu.example.com`) and a plain-`http://` `Origin` for that host and port is then refused, while a bare-host entry matches either scheme. Stated limits: on a plain-HTTP listener where no `https://` origin is declared for the host, an `http://` `Origin` naming the same host and port as `Host` is still treated as same-site, so a proxied deployment should declare its public `https://` origin; the endpoints that answer before a session exists (sign-in and similar) are outside the check; any origin you declare, including a sibling subdomain, is trusted completely; and the control relies on the browser sending `Origin` or `Referer`, so a proxy that injects or strips either header turns it off or locks every write out. It narrows, and does not eliminate, cross-site request risk, and it complements the other layers rather than replacing them.
+
+Cookie-session requests that dispatch work, persist state or force a refresh of server state (the guarded reads) are held to the same rule, whichever method they use. For those requests the browser's fetch metadata decides, and a `Sec-Fetch-Site` header that is present decides alone: `Origin` and `Referer` are not consulted. A request whose `Sec-Fetch-Site` header is `same-origin`, or `none` (a navigation the user started, such as a typed address or a bookmark), is admitted; any other value (`cross-site`, `same-site` or anything unrecognised) is refused `403` with reason `origin_mismatch`. Only a request without `Sec-Fetch-Site`, such as one from a script, `curl` or an old client, falls back to the `Origin` or `Referer` rule above, with the same trusted origins and the same scheme handling, and is refused with the same three reasons. A repeated `Sec-Fetch-Site` header is treated as a non-matching value and refused with `origin_mismatch`, even when a good `Origin` is also sent; to cure such a refusal send `Sec-Fetch-Site` once with value `same-origin` or `none`, or remove the header and send a same-site `Origin` or `Referer`. Page script cannot set `Sec-Fetch-Site`, and the dashboard's own requests send `same-origin`, so on HTTPS or loopback the dashboard needs no change. Browsers send `Sec-Fetch-*` headers only to potentially trustworthy origins (HTTPS and loopback), and Safari before 16.4 does not send them at all, so on a plain-HTTP listener at a non-loopback address these requests fall back to the `Origin` or `Referer` rule: a same-origin `GET` carries no `Origin`, so the dashboard then depends on the `Referer` the browser sends, which the server's default `Referrer-Policy` (`strict-origin-when-cross-origin`) supplies; a proxy or page policy of `no-referrer` would break those panels on such a deployment. A TLS-terminating proxy is unaffected, because the browser talks to the proxy over HTTPS. Requests authenticated only by a token are exempt, as above. The set of covered requests is an explicit, reviewed list kept as data next to the decision (`kFetchMetadataGuardedPaths` in `same_site_write_policy.hpp`), matched on the exact request path (the path, never a query flag, selects the gate); a best-effort source-text test is meant to fail when a handler that dispatches work or changes state is added without an entry (it is lexical and has stated blind spots), and the live-stack security test exercises one covered request. Refusals use the same `403` body, `csrf.denied` audit row (its `target_id` is `GET <path>` or `HEAD <path>`), counter and alerts as writes. Additional stated limits for these requests: fetch metadata does not tell a browser's own prefetch, prerender or link-preview of an address apart from a user action, so a request the same user's browser issues on its own initiative is admitted; a client that sends neither `Sec-Fetch-Site` nor `Origin`/`Referer` is refused; a request whose path is not on the list is not checked, and cookie-reachable `GET` requests outside the list remain there by decision. The audit `detail` text for a refusal of one of these requests still reads "browser write refused".
 
 ## HTTP Security Response Headers
 
@@ -307,6 +316,8 @@ If you deploy Yuzu behind a reverse proxy (nginx, HAProxy, Caddy, Cloudflare) th
 - Match both policies so the intersection allows what you need.
 
 The same applies to all other security headers — if both layers set them, browsers honor the strictest.
+
+Cookie-session writes require a same-site `Origin` or `Referer`. Forward the client's `Host` unchanged, port included (nginx: `proxy_set_header Host $http_host;` in every `location` that proxies to Yuzu, or at `server` level; `$host` drops the port) or, if the proxy rewrites `Host`, declare the public origin with `--csrf-trusted-origin` (see [CSRF protection](#csrf-protection) and [Server Administration](server-admin.md)). Declare it with its `https://` scheme (for example `https://yuzu.example.com`) even when `Host` is forwarded: the server behind a TLS-terminating proxy cannot see the public scheme, and the scheme-qualified entry is what makes it refuse a plain-`http://` `Origin` for that host. Do not configure the proxy to inject or rewrite `Origin` or `Referer`, which would turn the control off.
 
 ### Verifying headers
 
@@ -567,30 +578,58 @@ address. `whitelist` is the repair path for a device whose exceptions are wrong.
 
 ### Containment from the Hardware page
 
-> **Hidden in this release.** The Hardware page controls described below (pill, panel, banner and Containment tab) are not shown until an approval workflow for containment actions is added (the buttons here act directly, without the approval step the quarantine plugin carries). The quarantine REST API and MCP tools, and the quarantine plugin's actions on the Instructions page (role-gated approval), are unchanged.
+> **Hidden in this release.** The Hardware page controls described below (pill, panel, banner and Containment tab) are not shown until an approval workflow for containment actions is added to the dashboard. Creating a quarantine record through `POST /api/v1/quarantine` (which the **Quarantine device** button calls) now runs the same dispatch approval check as the quarantine plugin's `quarantine` action, so with RBAC on only an administrator (account role `admin`) who also holds `Security:Execute` globally in their own right can create one through REST or the dashboard today (a JIT elevation supplies the administrator role but not the grant; with RBAC off the legacy gate already requires the `admin` role); there is no approval-request path on those surfaces yet, which is planned follow-up work. Releasing a record (`DELETE /api/v1/quarantine/{agent_id}`, the **Release from quarantine** button) is likewise administrator-only under the same conditions. The MCP tools and the quarantine plugin's actions on the Instructions page (role-gated approval) are unchanged.
 
 The dashboard shows and drives quarantine records without a separate page:
 
 - **Quarantined devices** panel on `/hardware` lists the active records you may read
   (newest first, at most 200), with who quarantined the device, when, why, the whitelist and
   how far containment has been shown to reach it: *Recorded* (the server holds the record),
-  *Applied, not confirmed* (a re-dispatch was accepted) or *Confirmed on device* (a status
-  read reported the quarantine active). A read that cannot be completed is a banner, never
+  *Applied, not confirmed* (a re-dispatch was accepted) or *Confirmed on device at the last status read* (a status
+  read reported the quarantine active; it is a point-in-time reading, not a live one). A read that cannot be completed is a banner, never
   "no device is quarantined".
 - A **Quarantined** pill marks rows on the Hardware list, and the record header carries a
   banner while the device has an active record. Instructions to a quarantined device are
   withheld until it is released; Sync now still works.
 - The record's **Containment** tab shows the same state and offers **Quarantine device**
   (a reason is required in the dialog) and **Release from quarantine**. Both call
-  `POST /api/v1/quarantine` and `DELETE /api/v1/quarantine/{agent_id}`: they need
-  `Security:Execute` on the device and, like those routes, do **not** apply the approval step
-  the quarantine plugin's own actions require.
+  `POST /api/v1/quarantine` and `DELETE /api/v1/quarantine/{agent_id}` and need
+  `Security:Execute` on the device. **Quarantine device** then also runs the dispatch
+  approval check for the `quarantine.quarantine` pair, before any record is written: the
+  caller must be an administrator or carry an approved request. REST has no ticket path today,
+  so with RBAC on a non-administrator who holds `Security:Execute` on the device is refused with
+  `403` (`approval_required`), and a caller who holds it only through a management group is
+  refused with `403` (`forbidden`), exactly as at the MCP `quarantine_device` pre-check; an
+  MCP supervised token remains the approved path for a non-administrator. A refused request
+  writes no record. **Release from quarantine** runs the same check for the `quarantine.unquarantine`
+  pair, so a caller who cannot create a record cannot end one: the same `403` answers apply, the
+  record stays active, and the refusal is audited as `quarantine.disable` with `result=denied`.
+  There is no REST or MCP path for a non-administrator to end a record; an administrator
+  releases it (a JIT elevation counts only if the account also holds `Security:Execute`
+  globally, otherwise the release is refused `forbidden`).
 - **Release ends the server record only.** It does not remove the device's firewall rules;
-  run the plugin's `unquarantine` action from the Actions tab for that. Once the record is
+  run the plugin's `unquarantine` action from the Actions tab for that. The reverse also
+  holds: the plugin's `unquarantine` alone does not end the record, and only an administrator
+  can (release through REST needs one), so while the record stays active the device is still
+  withheld from other instructions and the reconciler re-applies the stored isolation when it
+  next reconnects. Once the record is
   released the lens reads "No active quarantine record" and cannot say whether the rules
   were removed, so check the plugin's `status` action.
 - An offline device can be quarantined: the record is stored now and applied when the device
   next connects.
+
+**Diagnosing an unexpected `403` on quarantine creation or release.** Search the audit log for action
+`quarantine.enable` (create) or `quarantine.disable` (release), result `denied`, target type `Security`, target id the device's agent id;
+`detail` holds `reason=<label> securable=<name>`. A `denied` row whose `detail` is `authenticated principal changed during the request now=<account>` is the `401` for a request whose two session look-ups named different principals, not an approval refusal. A refusal by the scoped permission gate itself
+(the caller has no `Security:Execute` on the device) is audited by that gate, not under
+`quarantine.enable`. `yuzu_server_dispatch_denied_total{reason}` shows the fleet-wide trend only.
+
+| Reason label | What it means | What to do |
+|---|---|---|
+| `approval_required` | RBAC is on and the account role is not `admin` (the RBAC `Administrator` role alone does not count) | Use an administrator account, or MCP `quarantine_device` on the supervised tier. A JIT elevation that lapsed between the route's two checks reads the same way |
+| `forbidden` | The caller's own `Security:Execute` grant is not global (group-only, or administrator only through a JIT elevation), or the RBAC store could not be read | Grant it globally; if the grant exists, check `yuzu_server_rbac_read_degrade_total` first, because a transient RBAC failure reads as a denial and retrying later can succeed |
+| `unclassified`, `ambiguous` | The quarantine action could not be matched to one catalogue entry | Report it: this is a defect, not a permission problem |
+| (a `500`, no label) | The dispatch check is not wired on this server | Report it; the route fails closed and writes no record |
 
 ### Quarantine now blocks instruction dispatch (#881)
 

@@ -253,6 +253,18 @@ yuzu_tokens_js_embed = custom_target(
     'YuzuTokensJs',
   ],
 )
+yuzu_tokens_actions_js_embed = custom_target(
+  'yuzu_tokens_actions_js_bundle',
+  input: 'static/yuzu-tokens-actions.js',
+  output: 'yuzu_tokens_actions_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuTokensActionsJs',
+  ],
+)
 
 # Audit and reviews page (Phase 2): client glue. Symbol: kYuzuAuditJs (std::string).
 yuzu_audit_js_embed = custom_target(
@@ -563,7 +575,8 @@ yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
    yuzu_viz_host_js_embed, yuzu_access_js_embed, yuzu_tokens_js_embed,
-   yuzu_audit_js_embed, cytoscape_js_embed, yuzu_operate_js_embed,
+   yuzu_tokens_actions_js_embed, yuzu_audit_js_embed,
+   cytoscape_js_embed, yuzu_operate_js_embed,
    yuzu_dialog_js_embed, yuzu_integrations_js_embed,
    yuzu_integrations_sync_js_embed, yuzu_operate_extras_js_embed,
    yuzu_estate_js_embed, yuzu_device_data_js_embed,
@@ -610,6 +623,8 @@ yuzu_server_core_lib = static_library(
     'src/access_audit_render.cpp', # Audit and reviews page: pure renderers (log, sample, retention)
     'src/access_audit_ui.cpp', # Audit and reviews page: template
     'src/access_audit_routes.cpp', # Audit and reviews page: /access/audit + fragments + glue
+    'src/access_reviews_render.cpp', # Audit and reviews page: Access reviews renderers
+    'src/access_reviews_routes.cpp', # Audit and reviews page: Access reviews fragments
     'src/login_ui.cpp',
     'src/settings_ui.cpp',
     'src/settings_security_ui.cpp',  # Security and sign-in page (System group)
@@ -701,6 +716,7 @@ yuzu_server_core_lib = static_library(
     'src/access_review_store.cpp',
     'src/session_store.cpp',
     'src/plugin_config_store.cpp',
+    'src/enablement_store.cpp', # ADR-3006: durable enablement store + continuity anchor
     'src/plugin_config_routes.cpp',
     'src/upload_grant_store.cpp',
     'src/file_retrieval_routes.cpp',
@@ -742,6 +758,9 @@ yuzu_server_core_lib = static_library(
     'src/mcp_session.cpp',
     'src/mcp_stream.cpp',
     'src/mcp_stream_bridge.cpp',
+    'src/mcp_tools_discovery.cpp',
+    'src/mcp_tools_hardware.cpp',
+    'src/mcp_tools_containment.cpp',
     'src/mcp_transport.cpp',
     'src/rest_api_v1.cpp',
     'src/compliance_model.cpp',
@@ -788,6 +807,13 @@ yuzu_server_core_lib = static_library(
     'src/sle_routes.cpp',
     'src/software_catalog_rollup.cpp',
     'src/software_catalogue_model.cpp',
+    'src/crypto_cbom.cpp',    # /crypto CBOM export: pure CycloneDX 1.7 shaper
+    'src/crypto_library_model.cpp', # /crypto slice 1: pure curated table + shared REST/MCP model
+    'src/crypto_api.cpp',     # /crypto slice 1: store-backed CryptoApi seam impl
+    'src/crypto_routes.cpp',  # /crypto slice 1: page + fragments + REST v1 route owner
+    'src/crypto_ui.cpp',      # /crypto slice 1: pure HTML renderers
+    'src/crypto_widget_catalogue.cpp', # /crypto widgets: pure catalogue + D13 windows + JSON shapers
+    'src/crypto_dashboard_layout_store.cpp', # /crypto widgets: per-operator layout (born-on-PG)
     'src/preflight_routes.cpp',
     'src/preflight_ui.cpp',
     'src/preflight_eval.cpp',
@@ -804,6 +830,7 @@ yuzu_server_core_lib = static_library(
     'src/deployment_run_store.cpp',
     'src/deployment_engine.cpp',
     'src/tar_process_tree.cpp',
+    'src/tar_timeline_render.cpp',
     'src/tar_tree_routes.cpp',
     'src/dashboard_routes.cpp',
     'src/workflow_routes.cpp',
@@ -915,7 +942,14 @@ yuzu_server_core_lib = static_library(
     'src/crl_publisher.cpp',
     'src/default_certs.cpp',
     'src/ca_routes.cpp',
+    'src/ca_panel_render.cpp',
     'src/kek_routes.cpp',
+    'src/settings_plugins_routes.cpp',
+    'src/settings_plugins_ui.cpp',
+    'src/plugin_page_model.cpp',
+    'src/kek_panel_render.cpp',
+    'src/pki_routes.cpp',
+    'src/settings_pki_ui.cpp',
     'src/security_headers.cpp',
   )],
   include_directories: ['include', '../../common/include'],

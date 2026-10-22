@@ -313,7 +313,8 @@ TEST_CASE("dialog module: bundle shape, CSP-clean, bounded request",
                              "document.write", "javascript:", "setTimeout(\"", "setInterval(\""})
         CHECK_FALSE(has(js, sink));
     // Bounded fetch, built inside try/catch so an old browser degrades to no timeout.
-    CHECK(has(js, "try { init.signal = AbortSignal.timeout(15000); } catch (e)"));
+    CHECK(has(js, "try { init.signal = AbortSignal.timeout(prep.timeoutMs); } catch (e)"));
+    CHECK(has(js, "? ms : 15000;"));  // the default stays 15 s
     CHECK(has(js, "credentials: 'same-origin', cache: 'no-store'"));
     // One dialog at a time.
     CHECK(has(js, "Promise.reject(new Error('dialog busy'))"));

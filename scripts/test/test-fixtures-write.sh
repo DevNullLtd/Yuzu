@@ -112,6 +112,11 @@ fl()   { printf "  ${R}\u2717${N} %s\n" "$*"; FAILED=$((FAILED + 1)); }
 warn() { printf "  ${Y}\u26a0${N} %s\n" "$*"; }
 info() { printf "  ${C}\u2192${N} %s\n" "$*"; }
 
+# Cookie-session writes send a same-site Origin (scheme://host:port of the
+# dashboard URL, which is re-resolved after the container restart below, so it
+# is computed per call). A server that does not check it ignores the header.
+site_origin() { sed -E 's,^([A-Za-z][A-Za-z0-9+.-]*://)([^/?#@]*@)?([^/?#]*).*,\1\3,' <<< "$DASHBOARD_URL"; }
+
 FAILED=0
 WROTE=0
 
@@ -183,9 +188,9 @@ fi
 # --- enrollment token -----------------------------------------------------
 
 info "creating enrollment token"
-ENROLL_BODY=$(curl -s -b "$COOKIES" --max-time "$TIMEOUT_S" \
+ENROLL_BODY=$(curl -s -b "$COOKIES" -H "Origin: $(site_origin)" --max-time "$TIMEOUT_S" \
     -X POST "$DASHBOARD_URL/api/settings/enrollment-tokens" \
-    -d "label=fixture-${RANDOM}&max_uses=1&ttl=3600" 2>/dev/null || echo "")
+    -d "label=fixture-${RANDOM}&max_uses=1&ttl_hours=1" 2>/dev/null || echo "")
 ENROLL_TOKEN=$(echo "$ENROLL_BODY" | grep -oE '[a-f0-9]{64}' | head -1)
 if [[ -n "$ENROLL_TOKEN" ]]; then
     ok "enrollment token created (sha256 prefix ${ENROLL_TOKEN:0:8}...)"
@@ -198,10 +203,11 @@ fi
 
 info "creating API token"
 # Field names match settings_routes.cpp POST /api/settings/api-tokens:
-# name=<label>, ttl_hours=<hours> — NOT label/ttl (those field names are
-# for enrollment tokens). Getting these wrong silently produces a 200
-# with an HTML error fragment, which looks like success until verify.
-API_TOKEN_BODY=$(curl -s -w "\n__HTTP__%{http_code}" -b "$COOKIES" --max-time "$TIMEOUT_S" \
+# name=<label>, ttl_hours=<hours> — NOT label/ttl. The enrollment-token
+# route above takes label/max_uses/ttl_hours. Getting these wrong silently
+# produces a 200 with an HTML error fragment, which looks like success
+# until verify.
+API_TOKEN_BODY=$(curl -s -w "\n__HTTP__%{http_code}" -b "$COOKIES" -H "Origin: $(site_origin)" --max-time "$TIMEOUT_S" \
     -X POST "$DASHBOARD_URL/api/settings/api-tokens" \
     -d "name=fixture-api-${RANDOM}&ttl_hours=1" 2>/dev/null || echo "__HTTP__000")
 API_TOKEN_HTTP=$(echo "$API_TOKEN_BODY" | sed -n 's/.*__HTTP__\([0-9][0-9]*\).*/\1/p' | tail -1)
@@ -254,6 +260,24 @@ if [[ -n "$CONTAINER" ]]; then
         dexec cat "$TOKENS_CFG" | awk -F: -v l="$1" '$3==l {print $1; exit}'
     }
 
+    # One cookie-session write to the OLD binary. A status that is not 2xx (or
+    # no answer at all: 000, with curl's exit status) is reported with the
+    # method, path and code, so a refused or dropped write is named here and
+    # not left for the read-back below to notice as a vague "could not read
+    # back". A 2xx that curl then failed to finish reading still counts: the
+    # server answered.
+    pre62_write() {  # METHOD PATH [form body]
+        local method="$1" path="$2" data="${3:-}" code rc
+        code=$(curl -s -o /dev/null -w '%{http_code}' -b "$COOKIES" \
+            -H "Origin: $(site_origin)" --max-time "$TIMEOUT_S" \
+            -X "$method" "$DASHBOARD_URL$path" ${data:+-d "$data"} 2>/dev/null)
+        rc=$?
+        [[ -n "$code" ]] || code=000
+        case "$code" in 2??) return 0 ;; esac
+        warn "enrollment_pre62: $method $path returned HTTP $code (curl exit $rc)"
+        return 1
+    }
+
     PRE62_STEP_OK=1
 
     if ! dexec test -d "$DATA_DIR"; then
@@ -264,12 +288,13 @@ if [[ -n "$CONTAINER" ]]; then
     if [[ $PRE62_STEP_OK -eq 1 ]]; then
         # Two rows driven through the OLD binary's OWN write path (proves it
         # writes THIS format, not an assumption about it).
-        curl -s -b "$COOKIES" --max-time "$TIMEOUT_S" \
-            -X POST "$DASHBOARD_URL/api/settings/enrollment-tokens" \
-            -d "label=${TOK_LABEL_PLAIN}&max_uses=1&ttl=3600" >/dev/null 2>&1 || true
-        curl -s -b "$COOKIES" --max-time "$TIMEOUT_S" \
-            -X POST "$DASHBOARD_URL/api/settings/enrollment-tokens" \
-            -d "label=${TOK_LABEL_REVOKED}&max_uses=1&ttl=3600" >/dev/null 2>&1 || true
+        # The plain row asks for no expiry (ttl_hours=0), so the old binary
+        # writes expires_epoch=0, the encoding the upgrade import must read
+        # as "never expires"; the other rows carry a real expiry.
+        pre62_write POST /api/settings/enrollment-tokens \
+            "label=${TOK_LABEL_PLAIN}&max_uses=1&ttl_hours=0" || true
+        pre62_write POST /api/settings/enrollment-tokens \
+            "label=${TOK_LABEL_REVOKED}&max_uses=1&ttl_hours=1" || true
         REVOKE_ID=$(token_id_for_label "$TOK_LABEL_REVOKED")
         PLAIN_ID=$(token_id_for_label "$TOK_LABEL_PLAIN")
         if [[ -z "$REVOKE_ID" || -z "$PLAIN_ID" ]]; then
@@ -277,8 +302,7 @@ if [[ -n "$CONTAINER" ]]; then
             PRE62_STEP_OK=0
         else
             # Revoke via the OLD binary's own DELETE route (real write, not injected).
-            curl -s -b "$COOKIES" --max-time "$TIMEOUT_S" \
-                -X DELETE "$DASHBOARD_URL/api/settings/enrollment-tokens/${REVOKE_ID}" >/dev/null 2>&1 || true
+            pre62_write DELETE "/api/settings/enrollment-tokens/${REVOKE_ID}" || true
             REVOKED_FLAG=$(dexec cat "$TOKENS_CFG" | awk -F: -v id="$REVOKE_ID" '$1==id {print $NF}')
             if [[ "$REVOKED_FLAG" != "1" ]]; then
                 warn "enrollment_pre62: revoke via the OLD binary's own route did not persist — skipping"
@@ -328,7 +352,14 @@ EOF
         # the OLD release's real code parsed this exact format, not just that
         # this script's transcription of it is self-consistent.
         info "enrollment_pre62: restarting $CONTAINER to force a cold reload of the injected rows"
-        docker restart "$CONTAINER" >/dev/null 2>&1 || true
+        # A restart that did not happen would let the round trip below pass
+        # without the cold reload it exists to prove, so it ends the step.
+        RESTART_FAILED=0
+        if ! docker restart "$CONTAINER" >/dev/null 2>&1; then
+            warn "enrollment_pre62: docker restart $CONTAINER failed — round-trip unproven"
+            RESTART_FAILED=1
+            PRE62_STEP_OK=0
+        fi
         # A container published with an UNPINNED host port (this compose file's
         # "8080", no host-side number) gets a FRESH random host port on every
         # start, not just at creation — measured empirically writing this
@@ -348,24 +379,24 @@ print(urlunsplit((u.scheme, f'{u.hostname}:{sys.argv[2]}', u.path, u.query, u.fr
         fi
         RESTART_WAITED=0
         RESTART_READY=0
-        while (( RESTART_WAITED < TIMEOUT_S * 2 )); do
+        while (( RESTART_FAILED == 0 && RESTART_WAITED < TIMEOUT_S * 2 )); do
             RB=$(curl -sf --max-time 3 "$DASHBOARD_URL/readyz" 2>/dev/null || echo "")
             [[ "$RB" == *'"ready"'* ]] && { RESTART_READY=1; break; }
             sleep 1
             RESTART_WAITED=$((RESTART_WAITED + 1))
         done
-        if [[ $RESTART_READY -eq 0 ]]; then
+        if [[ $RESTART_FAILED -eq 1 ]]; then
+            :  # already reported above
+        elif [[ $RESTART_READY -eq 0 ]]; then
             warn "enrollment_pre62: $CONTAINER never became ready again after restart — round-trip unproven"
             PRE62_STEP_OK=0
         else
             # Re-authenticate: the restart drops any in-memory session state.
             curl -s -o /dev/null -c "$COOKIES" --max-time "$TIMEOUT_S" \
                 "$DASHBOARD_URL/login" -d "username=${USERNAME}&password=${PASSWORD}" 2>/dev/null || true
-            curl -s -b "$COOKIES" --max-time "$TIMEOUT_S" \
-                -X POST "$DASHBOARD_URL/api/settings/enrollment-tokens" \
-                -d "label=preha-roundtrip-${RANDOM}&max_uses=1&ttl=3600" >/dev/null 2>&1 || true
-            curl -s -b "$COOKIES" --max-time "$TIMEOUT_S" \
-                -X POST "$DASHBOARD_URL/api/settings/pending-agents/${AGENT_ROUNDTRIP}/approve" >/dev/null 2>&1 || true
+            pre62_write POST /api/settings/enrollment-tokens \
+                "label=preha-roundtrip-${RANDOM}&max_uses=1&ttl_hours=1" || true
+            pre62_write POST "/api/settings/pending-agents/${AGENT_ROUNDTRIP}/approve" || true
 
             PARTIAL_SURVIVED=$(dexec cat "$TOKENS_CFG" | awk -F: -v l="$TOK_LABEL_PARTIAL" '$3==l')
             PENDING_SURVIVED=$(dexec cat "$PENDING_CFG" | awk -F: -v a="$AGENT_APPROVED" '$1==a && $7=="approved"')

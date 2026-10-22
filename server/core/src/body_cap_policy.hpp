@@ -168,7 +168,8 @@ struct BodyCapEntry {
     /// Stable short label for a metric dimension. MUST be a fixed string
     /// literal from this table — NEVER derived from the raw, attacker-
     /// controlled request path (unbounded cardinality on a pre-auth metric
-    /// is its own DoS surface).
+    /// is its own DoS surface). Also the label source of
+    /// `yuzu_server_csrf_denied_total` (same_site_write_gate.hpp).
     std::string_view path_class;
 };
 
@@ -519,6 +520,16 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // the 4 MiB catch-all, which a toggle this small does not need.
     {kBodyCapAnyMethod, "/api/v1/rbac/enforcement", 1u * 1024, false, "rbac_enforcement"},
 
+    // /api/v1/guaranteed-state/policy-generation: the Guardian policy-generation raise
+    // (rest_api_v1.cpp): POST .../raise carries {"target_generation": <integer up to 16
+    // digits>, "acknowledge_rule_set_replaced": true, "acknowledge_empty_rule_set": true}, under
+    // 192 bytes pretty-printed; 1 KiB is over 5x headroom. Its gates (administrator check, MFA step-up) run in the handler, after
+    // httplib buffers the body, so without its own entry the path would fall to the 4 MiB
+    // catch-all. Segment-boundary matching means it does NOT inherit the
+    // guardian_rule_authoring rows above (a different literal prefix).
+    {kBodyCapAnyMethod, "/api/v1/guaranteed-state/policy-generation", 1u * 1024, false,
+     "guardian_policy_generation"},
+
     // /api/v1/users — the local-account user-management REST v1 subtree
     // (#5342): POST /api/v1/users/me/password {current_password,
     // new_password}, POST /api/v1/users/{name}/password {new_password}
@@ -535,6 +546,14 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // bodyless siblings share the prefix (rule 4 in the routed-concern row).
     // requires_measurable stays OFF per the file-header default.
     {kBodyCapAnyMethod, "/api/v1/users", 16u * 1024, false, "users"},
+
+    // /api/v1/crypto — the /crypto REST v1 subtree. The only body-bearing route is
+    // PUT /api/v1/crypto/dashboard/layout {"widgets":[ids]}: at most 64 catalogue ids of at most
+    // 64 bytes (crypto_widget_catalogue.hpp kMaxLayoutWidgets / kWidgetIdMaxBytes), about 4.4 KiB
+    // even fully escaped. Mirrors the handler's own kLayoutBodyMaxBytes (16 KiB) exactly - the
+    // ca_revoke two-authority-split precedent. ANY method: every sibling is a bodyless GET and
+    // shares the prefix (rule 4 in the routed-concern row).
+    {kBodyCapAnyMethod, "/api/v1/crypto", 16u * 1024, false, "crypto"},
 
     // The catch-all default. ANY method, empty prefix — always matches, and
     // always loses a longest-match comparison against every entry above.

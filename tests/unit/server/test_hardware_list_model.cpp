@@ -17,6 +17,8 @@
 ///  - hardware_row_json / hardware_list_json: JSON-null normalisation for
 ///    blank/sentinel fields, never an empty string/array/-1.
 ///  - agent_supports_sync_now: the >= 0.13.1 semver-3 floor, exact boundary.
+///  - hardware_query_from_args / scoped_roster / id_is_audit_safe / classify_hardware_ci_read:
+///    the shared read core the REST handlers and the MCP twin both call.
 ///  - hardware_ci_json: ci_state discrimination (found/absent/degraded) and
 ///    the independent nullopt-vs-present-empty signal for software/tags.
 
@@ -31,6 +33,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -765,4 +768,201 @@ TEST_CASE("apply_identity_read: error degrades; nullopt is absent; row is identi
     CHECK_FALSE(found.identity_degraded);
     REQUIRE(found.identity.has_value());
     CHECK(found.identity->agent_id == "a1");
+}
+
+// ── hardware_query_from_args (the MCP argument parser, strict-typed per #4644) ──
+
+TEST_CASE("hardware_query_from_args: an empty object yields the REST defaults", "[hardware][model][args]") {
+    const auto q = hardware_query_from_args(nlohmann::json::object());
+    REQUIRE(q.has_value());
+    CHECK(q->q.empty());
+    CHECK(q->os == "all");
+    CHECK(q->status == "all");
+    CHECK(q->sort == "name");
+    CHECK_FALSE(q->desc);
+    CHECK(q->offset == 0);
+    CHECK(q->limit == 50);
+    CHECK(q->tag.empty());
+}
+
+TEST_CASE("hardware_query_from_args: every documented argument is carried through",
+          "[hardware][model][args]") {
+    const auto q = hardware_query_from_args(nlohmann::json{
+        {"q", "lap top"}, {"os", "windows"}, {"status", "offline"}, {"sort", "ram"},
+        {"dir", "desc"}, {"tag", "site=emea"}, {"offset", 10}, {"limit", 200}});
+    REQUIRE(q.has_value());
+    CHECK(q->q == "lap top");
+    CHECK(q->os == "windows");
+    CHECK(q->status == "offline");
+    CHECK(q->sort == "ram");
+    CHECK(q->desc);
+    CHECK(q->tag == "site=emea");
+    CHECK(q->offset == 10);
+    CHECK(q->limit == 200);
+}
+
+TEST_CASE("hardware_query_from_args: boundary limits are accepted, outside them refused",
+          "[hardware][model][args]") {
+    CHECK(hardware_query_from_args(nlohmann::json{{"limit", 1}}).has_value());
+    CHECK(hardware_query_from_args(nlohmann::json{{"limit", 200}}).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"limit", 0}}).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"limit", 201}}).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"limit", -1}}).has_value());
+    CHECK(hardware_query_from_args(nlohmann::json{{"offset", 0}}).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"offset", -1}}).has_value());
+    // Beyond int64: still an integer, still refused, never wrapped into a small value.
+    CHECK(hardware_query_from_args(nlohmann::json{{"offset", 9223372036854775807ULL}}).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"offset", 18446744073709551615ULL}}).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"limit", 18446744073709551615ULL}}).has_value());
+}
+
+TEST_CASE("hardware_query_from_args: a mistyped argument is refused, never coerced",
+          "[hardware][model][args]") {
+    // The REST query string coerces "50"; a typed JSON argument must not.
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"limit", "50"}}).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"offset", "0"}}).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"limit", 50.0}}).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"limit", true}}).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"limit", nullptr}}).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"q", 5}}).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"tag", nlohmann::json::array()}}).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"os", 1}}).has_value());
+}
+
+TEST_CASE("hardware_query_from_args: enums are exact documented tokens", "[hardware][model][args]") {
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"os", "bsd"}}).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"os", "Windows"}}).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"os", ""}}).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"status", "stale"}}).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"sort", "dex"}}).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"sort", "dex_score"}}).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"dir", "up"}}).has_value());
+    for (const char* os : {"all", "windows", "linux", "macos"})
+        CHECK(hardware_query_from_args(nlohmann::json{{"os", os}}).has_value());
+    for (const char* st : {"all", "online", "offline"})
+        CHECK(hardware_query_from_args(nlohmann::json{{"status", st}}).has_value());
+    for (const char* sort : {"name", "os", "status", "last_seen", "manufacturer", "model", "serial",
+                             "cpu", "ram", "os_version", "version", "ip"}) {
+        CAPTURE(sort);
+        const auto q = hardware_query_from_args(nlohmann::json{{"sort", sort}});
+        REQUIRE(q.has_value());
+        // The parser's tokens and the model's whitelist must stay in step.
+        CHECK(parse_hw_sort_key(q->sort).has_value());
+    }
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"dir", "asc"}})->desc);
+    CHECK(hardware_query_from_args(nlohmann::json{{"dir", "desc"}})->desc);
+}
+
+TEST_CASE("hardware_query_from_args: text arguments are capped at 256 bytes", "[hardware][model][args]") {
+    CHECK(hardware_query_from_args(nlohmann::json{{"q", std::string(256, 'a')}}).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"q", std::string(257, 'a')}}).has_value());
+    CHECK(hardware_query_from_args(nlohmann::json{{"tag", std::string(256, 'a')}}).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"tag", std::string(257, 'a')}}).has_value());
+}
+
+TEST_CASE("hardware_query_from_args: unknown keys are ignored, a non-object is refused",
+          "[hardware][model][args]") {
+    CHECK(hardware_query_from_args(nlohmann::json{{"bogus", 1}, {"limit", 5}}).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json::array()).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json("x")).has_value());
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json(nullptr)).has_value());
+}
+
+TEST_CASE("hardware_query_from_args: the reason names the argument and the query still normalises",
+          "[hardware][model][args]") {
+    std::string why;
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"limit", "50"}}, &why).has_value());
+    CHECK(why.find("limit") != std::string::npos);
+    why.clear();
+    CHECK_FALSE(hardware_query_from_args(nlohmann::json{{"os", "bsd"}}, &why).has_value());
+    CHECK(why.find("os") != std::string::npos);
+
+    // The parser output is RAW: tag-key validation stays in normalise_hardware_query.
+    const auto q = hardware_query_from_args(nlohmann::json{{"tag", "bad key!=x"}});
+    REQUIRE(q.has_value());
+    CHECK_FALSE(normalise_hardware_query(*q).has_value());
+}
+
+// ── scoped_roster / id_is_audit_safe (lifted out of hardware_routes.cpp) ──
+
+TEST_CASE("scoped_roster: TOP keeps every row, a set keeps members, empty drops all",
+          "[hardware][model][scope]") {
+    InventoryDevicesResult all;
+    all.rows = {make_row("a"), make_row("b"), make_row("c")};
+
+    auto [top_rows, top_dropped] = scoped_roster(all, authz::VisibleSet{});
+    CHECK(top_rows.size() == 3);
+    CHECK(top_dropped == 0);
+
+    auto [some_rows, some_dropped] =
+        scoped_roster(all, authz::VisibleSet{std::unordered_set<std::string>{"a", "c"}});
+    REQUIRE(some_rows.size() == 2);
+    CHECK(some_rows[0].agent_id == "a");
+    CHECK(some_rows[1].agent_id == "c");
+    CHECK(some_dropped == 1);
+
+    auto [none_rows, none_dropped] = scoped_roster(all, authz::deny_all());
+    CHECK(none_rows.empty());
+    CHECK(none_dropped == 3);
+}
+
+TEST_CASE("id_is_audit_safe: bounded length and no control bytes", "[hardware][model][scope]") {
+    CHECK(id_is_audit_safe("agent-1"));
+    CHECK(id_is_audit_safe(std::string(256, 'a')));
+    CHECK_FALSE(id_is_audit_safe(std::string(257, 'a')));
+    CHECK_FALSE(id_is_audit_safe("agent\n1"));
+    CHECK_FALSE(id_is_audit_safe("agent\r1"));
+    CHECK_FALSE(id_is_audit_safe(std::string("a\0b", 3)));
+    CHECK_FALSE(id_is_audit_safe(std::string("\x1f", 1)));
+    CHECK(id_is_audit_safe("agent 1")); // 0x20 itself is not a control byte
+}
+
+// ── classify_hardware_ci_read (the single-record decision, shared by every transport) ──
+
+TEST_CASE("classify_hardware_ci_read: found, not found, roster unreadable", "[hardware][model][classify]") {
+    HardwareCiDetail empty;
+    empty.ci = std::optional<DeviceCiRecord>{}; // the CI read answered: no record
+
+    SECTION("nothing known and nothing failed is NotFound") {
+        CHECK(classify_hardware_ci_read(empty) == HardwareCiRead::NotFound);
+    }
+    SECTION("empty software and tag lists are still nothing") {
+        empty.software = std::vector<SoftwareEntry>{};
+        empty.tags = std::vector<DeviceTag>{};
+        CHECK(classify_hardware_ci_read(empty) == HardwareCiRead::NotFound);
+    }
+    SECTION("an unanswered software or tag read counts as empty, as REST always did") {
+        empty.software = std::nullopt;
+        empty.tags = std::nullopt;
+        CHECK(classify_hardware_ci_read(empty) == HardwareCiRead::NotFound);
+    }
+    SECTION("a failed identity fallback with nothing else known is RosterUnreadable, never a 404") {
+        empty.identity_degraded = true;
+        CHECK(classify_hardware_ci_read(empty) == HardwareCiRead::RosterUnreadable);
+    }
+    SECTION("an identity row is Found, even when the fallback also reports degraded") {
+        empty.identity = make_row("a1");
+        CHECK(classify_hardware_ci_read(empty) == HardwareCiRead::Found);
+        empty.identity_degraded = true;
+        CHECK(classify_hardware_ci_read(empty) == HardwareCiRead::Found);
+    }
+    SECTION("a CI record alone is Found") {
+        DeviceCiRecord rec;
+        rec.agent_id = "a1";
+        empty.ci = std::optional<DeviceCiRecord>{rec};
+        CHECK(classify_hardware_ci_read(empty) == HardwareCiRead::Found);
+    }
+    SECTION("a degraded CI read is Found (the body's ci_state says degraded), never NotFound") {
+        HardwareCiDetail d; // default ci = unexpected(kDegraded)
+        CHECK(classify_hardware_ci_read(d) == HardwareCiRead::Found);
+        d.identity_degraded = true;
+        CHECK(classify_hardware_ci_read(d) == HardwareCiRead::Found);
+    }
+    SECTION("a non-empty software or tag list is Found") {
+        empty.software = std::vector<SoftwareEntry>(1);
+        CHECK(classify_hardware_ci_read(empty) == HardwareCiRead::Found);
+        empty.software = std::nullopt;
+        empty.tags = std::vector<DeviceTag>(1);
+        CHECK(classify_hardware_ci_read(empty) == HardwareCiRead::Found);
+    }
 }

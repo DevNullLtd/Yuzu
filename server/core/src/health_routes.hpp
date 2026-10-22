@@ -205,11 +205,13 @@ class FleetTopologyStore;
 class AccessReviewStore;
 class SoftwareLicensingStore;
 class PluginConfigStore;
+class EnablementStore;
 class AppUsageStore;
 class ProductRegistryStore;
 class ProductPackStore;
 class ScimStore;
 class AnalyticsEventStore;
+class CryptoDashboardLayoutStore; // /readyz "degraded" notice only (ADR-0071 degrade posture)
 
 // /metrics ONLY.
 class NvdDatabase;
@@ -379,11 +381,16 @@ struct Deps {
     AccessReviewStore* access_review_store{nullptr};
     SoftwareLicensingStore* software_licensing_store{nullptr};
     PluginConfigStore* plugin_config_store{nullptr};
+    EnablementStore* enablement_store{nullptr}; // ADR-3006 (also a /healthz row)
     AppUsageStore* app_usage_store{nullptr}; // Wave 7 PR7.2 (gov Gate 3 sre HIGH finding)
     ProductRegistryStore* product_registry_store{nullptr};
     ProductPackStore* product_pack_store{nullptr};
     ScimStore* scim_store{nullptr};
     AnalyticsEventStore* analytics_store{nullptr};
+    /// Non-gating: a layout store that did not open at boot is reset to null by server.cpp (the
+    /// server boots without saved layouts), so null here means "did not open" - reported under
+    /// /readyz's "degraded", never in failed_stores.
+    CryptoDashboardLayoutStore* crypto_dashboard_layout_store{nullptr};
 
     // ---- /metrics ONLY ----
     NvdDatabase* nvd_db{nullptr};

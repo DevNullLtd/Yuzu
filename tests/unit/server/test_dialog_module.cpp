@@ -19,11 +19,6 @@ namespace {
 bool has(std::string_view hay, std::string_view needle) {
     return hay.find(needle) != std::string_view::npos;
 }
-std::size_t count_of(std::string_view hay, std::string_view needle) {
-    std::size_t n = 0;
-    for (auto at = hay.find(needle); at != std::string_view::npos; at = hay.find(needle, at + 1)) ++n;
-    return n;
-}
 } // namespace
 
 // -- Shared dialog module (static/yuzu-dialog.js + the Dialog block of yuzu.css) ---------
@@ -39,8 +34,11 @@ TEST_CASE("dialog module: bundle shape, CSP-clean, bounded request",
     for (const char* sink : {"innerHTML", "outerHTML", "insertAdjacentHTML", "eval(", "new Function(",
                              "document.write", "javascript:", "setTimeout(\"", "setInterval(\""})
         CHECK_FALSE(has(js, sink));
-    // Bounded fetch, built inside try/catch so an old browser degrades to no timeout.
-    CHECK(has(js, "try { init.signal = AbortSignal.timeout(15000); } catch (e)"));
+    // Bounded fetch, built inside try/catch so an old browser degrades to no timeout. The
+    // default stays 15 s; a caller may widen it, but only inside a closed range, so a bad
+    // value can never disable the bound.
+    CHECK(has(js, "try { init.signal = AbortSignal.timeout(prep.timeoutMs); } catch (e)"));
+    CHECK(has(js, "(typeof ms === 'number' && ms >= 1000 && ms <= 300000) ? ms : 15000;"));
     CHECK(has(js, "credentials: 'same-origin', cache: 'no-store'"));
     // One dialog at a time.
     CHECK(has(js, "Promise.reject(new Error('dialog busy'))"));
@@ -68,15 +66,16 @@ TEST_CASE("dialog module: request maps both error shapes and the step-up contrac
     // Only the TOTP/recovery-code challenge is prompted for; anything else goes to sign-in.
     CHECK(has(js, "meta.mfa_step_up_required === true"));
     CHECK(has(js, "challenge !== '/login/mfa/stepup'"));
+    // An OIDC session is told to sign in again at its identity provider (no code field); that
+    // path is the one challenge allowed besides the code prompt.
+    CHECK(has(js, "challenge === '/auth/oidc/start'"));
+    CHECK(has(js, "Sign in again at your identity provider. You will return to the dashboard"));
     CHECK(has(js, "location.assign('/login')"));
-    // The OIDC challenge is a redirect flow, followed ONLY for that exact fixed path (#6079);
-    // the allow-list is one literal and the /login fallback for everything else is unchanged.
-    CHECK(has(js, "if (challenge === '/auth/oidc/start') { location.assign(challenge); return res; }"));
-    CHECK(count_of(js, "challenge === '") == 1);
     // A network failure or timeout never throws and never claims nothing changed.
     CHECK(has(js, "The request may not have applied."));
-    // Secrets are cleared on error and on close.
+    // Secrets are cleared on error and on close, and a password field is not spell-checked.
     CHECK(has(js, "cleaners.push(function () { input.value = ''; });"));
+    CHECK(has(js, "if (spec.type === 'password' || spec.autocomplete === 'one-time-code') input.setAttribute('spellcheck', 'false');"));
 }
 
 TEST_CASE("dialog module: the CSS block is tokens-only and styles the module's own slots",

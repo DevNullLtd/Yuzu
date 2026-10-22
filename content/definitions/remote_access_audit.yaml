@@ -1,0 +1,168 @@
+## Remote Access Audit Definitions
+## Who can log in to this host over SSH, as CONFIGURED: the sshd_config values that matter for
+## inbound access, a SHA-256 fingerprint of every public key in the authorized_keys of the homes
+## it walks, and whether the sshd service is enabled. Nothing is changed or fetched.
+## Plugin: remote_access_audit | Actions: list
+##
+## Gated behind the SAME Forensics securable execution_artifacts and privacy_permissions use
+## (Forensics:Read + AdminOrApproval: Administrator by default) and SINGLE-TARGET -- exactly one
+## device per dispatch. See this plugin's README (agents/plugins/remote_access_audit/README.md)
+## and server/core/src/capability_decls/plugin_action_catalogue_remote_access_audit.hpp.
+##
+## DEFAULT-OFF: gated behind the server-side plugin-config kill switch
+## (`PluginConfigStore::seed_kill_switch_default_off`) -- an operator must explicitly
+## `PUT /api/v1/plugin-config/remote_access_audit/kill-switch {"enabled":true}` before this
+## action will dispatch.
+##
+## Sources by platform:
+##   Linux:   bounded reads of /etc/ssh/sshd_config (Include followed; config symlinks are
+##            followed as sshd does; 0644 on Debian-family packages, 0600 root on the RHEL
+##            family, where the unprivileged agent gets sshd_config:permission_denied) and the
+##            authorized_keys of each home directly under /home plus /root (never through a
+##            symlink); `systemctl is-enabled` for ssh.service, sshd.service, ssh.socket and
+##            sshd.socket.
+##            A home the agent cannot open is refused, not empty.
+##   macOS:   the same files, for each home under /Users owned by uid 500 or above plus
+##            /var/root (the source row counts the entries skipped); `launchctl print-disabled
+##            system` for com.openssh.sshd.
+##   Windows: PLANNED, not read yet; one `unsupported` status row, windows:planned.
+##
+## NOT read, and flagged rather than hidden: a certificate authority (TrustedUserCAKeys), keys
+## or principals supplied by a command (AuthorizedKeysCommand, AuthorizedPrincipalsCommand), a
+## principals file (AuthorizedPrincipalsFile), host-based authentication and
+## AuthenticationMethods. When sshd_config sets one of these six at global scope to a value
+## other than its inert one (none; no for HostbasedAuthentication; any for AuthenticationMethods)
+## the status is constrained with <os>:remote_access_audit:sshd_config:other_credential_sources
+## (presence only).
+##
+## NOT read, and NOT detectable: macOS Remote Login's access list and accounts whose home is
+## outside the roots above. These are documented, not flagged; no token marks them.
+##
+## CONFIGURED, not validated: a Match block is counted and never evaluated, including `Match all`
+## (the one Match that always applies: under sshd its directives override the global values, and
+## here they are not applied). A directive or value sshd would refuse (a keyword with no argument,
+## an unknown value, a bad Match condition, a mixed `none` AuthorizedKeysFile) is skipped or listed
+## as written with no token; only an unbalanced quote is flagged. `sshd -t` is the validity check.
+##
+## Fingerprints and option NAMES only: a key comment, an option value (command=, from=,
+## principals=) and a key-file path are never emitted. The AuthorizedKeysFile config row says
+## only default, none or custom:<n>.
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.security.remote_access_audit
+  displayName: Remote Access Audit
+  version: 1.0.0
+  description: >
+    The SSH public keys this host trusts through each account's authorized_keys, plus the
+    sshd_config values that govern inbound access, as configured (read as written, Include
+    followed, first occurrence wins; Match blocks are counted and not evaluated, including
+    Match all, whose directives override the global values under sshd; defaults are not
+    applied, so this is configured access and not sshd's effective policy; a directive or value
+    sshd would refuse is skipped or listed as written with no token, and only an unbalanced
+    quote is flagged: sshd -t is the validity check). It reports a
+    SHA-256 fingerprint for every public key in the authorized_keys of the homes it walks (a
+    certificate reports the fingerprint of the key it carries) with the option names it uses,
+    and whether the sshd service is enabled. A login that needs no key is governed by the
+    config rows: password, keyboard-interactive and GSSAPI are reported as written; other
+    no-key methods (KerberosAuthentication, a PAM-supplied method) are not read. It
+    does not read every way to log in: a
+    certificate authority, keys or principals supplied by a command, a principals file,
+    host-based authentication and AuthenticationMethods are not read (when sshd_config sets
+    one of these six at global scope to a value other than its inert one the status is
+    constrained, with a presence-only token). Two more gaps
+    raise no token and are documented only: macOS Remote Login's access list is not read,
+    and only homes under /home and /root (Linux) or under /Users owned by uid 500 or above
+    and /var/root (macOS) are walked, so an account with its home elsewhere is not listed.
+    Key comments, option values, principals and key-file paths are never emitted; the
+    account is the home directory's name. A home or file the agent cannot read is reported as
+    refused with a reason token (on Linux an unprivileged agent usually cannot open other
+    users' homes, so constrained is the common outcome), never as an empty result. A line
+    whose key type this plugin does not know is counted as malformed and never reported as a
+    key (its blob cannot be decoded completely). Reads one machine per request and is off
+    until enabled. The Windows leg is planned and not yet read. The first row is a status row
+    stating whether the read was complete; if a leg threw after its rows had started, a
+    second unsupported status row follows and is the one that counts.
+  tags: [remote_access, ssh, security, posture, forensics]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: remote_access_audit
+    action: list
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: row_kind
+        type: string
+        values: [status, source, config, service, file, key]
+        description: 'Row shape discriminator (field 0). Values: status, source, config, service, file, key.'
+        example: key
+        platforms: [windows, linux, darwin]
+      - name: field_1
+        type: string
+        description: 'status: the literal "list". source: sshd_config, homes or service. config: the setting (permitrootlogin, passwordauthentication, pubkeyauthentication, kbdinteractiveauthentication, gssapiauthentication, permitemptypasswords, usepam, port, authorizedkeysfile, allowusers_count, allowgroups_count, denyusers_count, denygroups_count, match_blocks). service: the unit (ssh.service, sshd.service, ssh.socket, sshd.socket, or com.openssh.sshd on macOS). file and key: the account, which is the HOME DIRECTORY NAME, not necessarily the login name.'
+        example: alice
+        platforms: [windows, linux, darwin]
+      - name: field_2
+        type: string
+        description: 'status: supported, constrained, permission_denied or unsupported (the planned Windows leg, and a leg that threw). source: read, absent, refused or failed (absent is a state, not a failure). config: the value as written in the first occurrence, "-" when unset or sshd_config was not read; authorizedkeysfile reports only default, none or custom:<n>, never a path; the counts are numbers. service: the state - systemctl is-enabled output (enabled, enabled-runtime, linked, linked-runtime, alias, masked, masked-runtime, static, indirect, disabled, generated, transient, bad, not-found) or enabled/disabled for launchd, or unknown (never read as disabled). file: authorized_keys, authorized_keys2 or custom. key: the same kind.'
+        example: supported
+        platforms: [windows, linux, darwin]
+      - name: field_3
+        type: string
+        description: 'status: reason token(s) for a non-supported read, "-" when complete; tokens look like linux:remote_access_audit:homes:permission_denied or windows:planned. source: files read (sshd_config plus includes), accounts walked, or units queried, "-" unless read. config: where the value came from (sshd_config or include:<file name>), "-" when unset. service: the mechanism. file: read, absent, refused or failed. key: the key type as written (ssh-ed25519, ssh-rsa, ecdsa-sha2-nistp256, a -cert-v01 certificate type, ...).'
+        example: ssh-ed25519
+        platforms: [windows, linux, darwin]
+      - name: field_4
+        type: string
+        description: 'source (homes row only): the number of home-root entries not treated as accounts (macOS: owned by a uid under 500, such as /Users/Shared), "-" on Linux where nothing is detectably skipped, or when the roots were not listed (counted over the homes examined: a lower bound when keys:row_cap, keys:file_cap or homes:too_many is set). file: the number of key lines listed (accepted and within the row budget; keys:row_cap in the status reason means the listing stopped before the last accepted line of the file), "-" unless read. key: the fingerprint, SHA256: plus unpadded base64, identical to ssh-keygen -lf (a certificate reports the key it carries).'
+        example: '2'
+        platforms: [linux, darwin]
+      - name: field_5
+        type: string
+        description: 'file: the number of lines sshd would not accept (unparseable key, unknown option, unknown key type, a truncated or trailing-byte blob, a certificate signature that is truncated or has trailing bytes, RSA under 1024 bits), "-" unless read. key: the key size in bits (RSA modulus, 256 for ed25519, the curve size for ECDSA).'
+        example: '256'
+        platforms: [linux, darwin]
+      - name: field_6
+        type: string
+        description: 'file: the number of lines over 16 KiB that were not parsed, "-" unless read. key: comma-separated flags from cert_authority, certificate, has_command, has_from, has_principals, or "-".'
+        example: has_command,has_from
+        platforms: [linux, darwin]
+      - name: field_7
+        type: string
+        description: 'key: the lowercased option NAMES the line carries (restrict, cert-authority, [no-]port-forwarding, [no-]agent-forwarding, [no-]x11-forwarding, [no-]touch-required, [no-]verify-required, [no-]pty, [no-]user-rc, command, principals, from, expiry-time, environment, permitopen, permitlisten, tunnel), or "-". Option VALUES are never emitted. Not used by the other kinds.'
+        example: no-pty,command,from
+        platforms: [linux, darwin]
+    aggregation:
+      groupBy:
+        - row_kind
+      operations:
+        - count
+
+  readablePayload: "Audit SSH inbound access: sshd settings, authorized key fingerprints and service state"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [remote_access_audit]
+
+status:
+  phase: active

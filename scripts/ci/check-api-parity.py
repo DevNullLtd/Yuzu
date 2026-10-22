@@ -5,13 +5,14 @@ REST/MCP/dashboard parity programme (issue #3991).
 ADR-0031 INV-31-4 requires that every capability the dashboard exposes is
 also reachable through the versioned REST API (and, per ADR-1005, through
 MCP). Nobody has ever verified this mechanically: `openapi_spec()`
-(server/core/src/rest_api_v1.cpp) is a hand-typed literal that the file's
-own comment admits can under-report the live route table. This script is
-the machine-checked backstop `docs/adr/0031-presentation-core-engine-
-decomposition.md` calls "a deliverable of migration step 3" (INV-31-4) and
-the unit-test half's sibling - `tests/unit/server/
-test_openapi_spec_completeness.cpp` covers the in-process half for
-`rest_api_v1.cpp` alone; this script is the exhaustive, whole-tree half.
+(server/core/src/rest_api_v1.cpp) is a hand-typed literal, expanded once at
+first use, that the file's own comment admits can under-report the live route
+table. This script is the machine-checked backstop
+`docs/adr/0031-presentation-core-engine-decomposition.md` calls "a
+deliverable of migration step 3" (INV-31-4) and the unit-test half's sibling
+- `tests/unit/server/test_openapi_spec_completeness.cpp` covers the
+in-process half for `rest_api_v1.cpp` alone; this script is the exhaustive,
+whole-tree half.
 
 WHAT THIS IS: a LEXICAL TRIPWIRE, NOT A PROOF. It regex-extracts route
 registrations, the OpenAPI literal, and the MCP tool table as plain text -
@@ -38,7 +39,10 @@ WHAT IT CHECKS
      scripts/ci/api-parity/<domain>.json ledger file, keyed by (method,
      canonical path - see `canonicalize()`).
   1b. A ledger row keyed on a route that is not a registered fragment/
-     legacy route is either status "retire" (stale), OR - the ONE other
+     legacy route is either status "retire" (the route is gone, OR it is still
+     registered but no twin will be built and a tracking issue named in the
+     ADR-1005 entry owns its removal; this check does NOT require absence),
+     OR - the ONE other
      legal shape (#5342) - a registered `/api/v1/*` route ledgered with an
      `exception:` status: a REST v1 capability that deliberately has NO MCP
      twin (ADR-1005 requires one by default, so the reviewed reason is
@@ -60,6 +64,34 @@ WHAT IT CHECKS
      swapping an id or rebinding is caught only in review. capability_ids are
      unique and equal the id derived from method and path, and a malformed
      ledger is reported alone.
+  2d. Every strict-shaped exception row is pinned in STRICT_EXCEPTION_PINS by
+     capability_id to its exact (issue, revisit date), and every pin must
+     still name a strict row: a new, relabelled, re-dated, twinned or retired
+     exception forces a visible edit to that table. The pin binds the id,
+     issue and date, not the reason text (a different route changes the
+     derived id, so its pin goes stale unless the new id collides). A
+     revisit date at or before today + REVISIT_WARN_DAYS is ONE aggregated
+     ::warning::, never a failure.
+  2e. The kTools[] and kResources[] slices must contain no preprocessor line
+     (a named error: the scan does not model conditional compilation).
+     KNOWN LIMITS of these text scans (they are a fast pre-check, not a C++
+     parser): kTools[] is not comment-stripped, so an entry wrapped in a block
+     comment still counts as a tool, and a line inside a raw-string schema that
+     starts with `#` is refused; kResources[] does not recognise char literals.
+     None of these occurs in the tree today. Closing them needs a check against
+     the compiled catalogue (the tool and resource names the server registers),
+     which this script does not do.
+     The MCP tool set is the UNION of the kTools[] slice and, in each
+     `mcp_tools_*.cpp` under MCP_REGISTRY_DIR, the slice from the literal
+     `constexpr ToolRecord kToolRecords[] = {` to the next `\n};` (a tool served
+     from the registry seam is not in kTools[]). Same lexical scan, same
+     preprocessor refusal, same entry pattern. A registry file with no anchor,
+     a second anchor, zero entries, fewer than MIN_REGISTRY_FILES files, a
+     name already seen (in kTools[] or another file), a file named
+     `mcp_tools_*.cpp` but not `mcp_tools_[a-z0-9_]+.cpp`, or any 4-space
+     `{` record-opener line that is not `    {"<name>",` with a name matching
+     `^[a-z][a-z0-9_]*$` (a partial miss) is a named error (file and line).
+     The file rule and the name grammar equal check-mcp-retry-hints.py's.
   3. Every registered `/api/v1/*` route either appears in the OpenAPI
      `paths` table (openapi_spec() in rest_api_v1.cpp) or is named in this
      script's ALLOWLIST_OPENAPI_MISSING with a reason. F2's job is to
@@ -84,12 +116,15 @@ USAGE
                                           # planned:#N or a strict exception
   check-api-parity.py --baseline-inventory
                                           # print current vs baseline counts
-                                          # without failing - use when
-                                          # preparing to lower a baseline
+                                          # without failing on a ratchet
+                                          # mismatch (exit 1 if the ledger is
+                                          # malformed) - use when preparing
+                                          # to lower a baseline
 """
 import argparse
 import datetime
 import json
+import os
 import re
 import sys
 import unicodedata
@@ -100,6 +135,15 @@ SERVER_SRC = ROOT / "server" / "core" / "src"
 LEDGER_DIR = ROOT / "scripts" / "ci" / "api-parity"
 REST_API_V1_CPP = SERVER_SRC / "rest_api_v1.cpp"
 MCP_SERVER_CPP = SERVER_SRC / "mcp_server.cpp"
+# Per-domain tool records (`mcp_tools_*.cpp`, each holding one `kToolRecords[]`): a tool served
+# from the registry seam is absent from kTools[]. Its own constant, so a selftest that patches
+# only MCP_SERVER_CPP can still isolate the registry scan. None means "SERVER_SRC, read at call
+# time", so a caller that repoints SERVER_SRC (check-docs-drift.py --root) repoints the registry
+# scan with it; a fixed Path here would keep reading the trusted tree.
+MCP_REGISTRY_DIR = None
+# The floor on registry files read: deleting every registry file would silently drop its tools
+# from the catalogue this script reads, so it fails loudly instead. Raise it as domains land.
+MIN_REGISTRY_FILES = 1
 LEDGER_DOC = ROOT / "docs" / "api-parity-ledger.md"
 
 DOC_BEGIN = ("<!-- BEGIN GENERATED: check-api-parity.py - do not hand-edit; "
@@ -329,7 +373,8 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # #5955: the maintainer accepted the UI-only fragment rows of the Dashboard, Integrations webhooks,
 # General and Access pages (PRs #5859, #5872, #5873, #5880) on 2026-10-15 as TEMPORARY exceptions,
 # not a general waiver (a new UI-only capability needs its own ruling); those 13 rows now carry
-# `exception:#5955 revisit:...`. Rows with exactly one machine twin are no longer plain `twinned`:
+# `exception:#5955 revisit:...`
+# (10 more were recorded by the ADR-1005 2026-10-22 entry, 23 in all). Rows with exactly one machine twin are no longer plain `twinned`:
 # they carry `twinned-rest-only` / `twinned-mcp-only` (or, for the deliberate #520 no-MCP
 # decisions, `exception:#520 revisit:...`), which count untwinned. 11 rows were reclassified that
 # way, so 216 -> 227, with no change in capability; a 12th (settings developer plugins) is
@@ -339,18 +384,128 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # GET /api/v1/audit + query_audit_log and moves nothing. The authentication sample is
 # `twinned-rest-only` (GET /api/v1/audit/auth-sample has no MCP tool) and retention is
 # `exception:#520` (its REST twin is MCP-free by decision); both count untwinned: +2 on the 225 of dev, 227.
-BASELINE_UNTWINNED = 227
+#
+# 227 (origin/dev) -> 228 (Users and roles page): GET /fragments/access/enforcement has only the REST twin
+# GET /api/v1/me, which omits the unconfirmed (degraded) bit, and no MCP twin
+# (`twinned-rest-only`); the missing REST/MCP read is tracked in #6033.
+#
+# 228 -> 225 (Seam PR2): the three hardware rows (get.fragments-hardware-list, -hardware-ci,
+# -hardware-quarantine) gained MCP twins (list_hardware_ci, get_hardware_ci, list_quarantined_devices).
+# /crypto (crypto.json): the dashboard and widget fragments compose several /api/v1/crypto reads,
+# but `composed-of:` can name only ledger capability ids and /api/v1 routes are not ledger rows,
+# so each row stays `twinned` against its primary v1 read + MCP tool; the count does not move.
+#
+# 225 -> 214 (ledger reconcile, ADR-1005 2026-10-22 entry): 11 stale rows flipped to `twinned` (both twins
+# already existed). The other 76 reclassified rows (exception, retire, composed-of) stay untwinned by design,
+# so only the flips move this number; they left the generic placeholder (see BASELINE_GENERIC_PLANNED).
+BASELINE_UNTWINNED = 214
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
 # issue. Bidirectional like BASELINE_UNTWINNED: lower it in the same change that removes rows.
+# 174 -> 87 (ledger reconcile, ADR-1005 2026-10-22 entry): 87 rows moved to twinned, exception, retire or composed-of.
 GENERIC_PLANNED_STATUS = "planned:#2146"
 GENERIC_PLANNED_ISSUE = 2146
-BASELINE_GENERIC_PLANNED = 174
+BASELINE_GENERIC_PLANNED = 87
 
-# A revisit date outside this window is a typo (9999-12-31), a shape error.
+# A revisit date outside this window is a typo (9999-12-31), a shape error. A date at or before
+# today + REVISIT_WARN_DAYS only produces ONE aggregated warning, never a failure.
 REVISIT_MIN = datetime.date(2026, 1, 1)
 REVISIT_MAX = datetime.date(2028, 12, 31)
+REVISIT_WARN_DAYS = 14
+
+# Every strict-shaped `exception:` row is pinned here by capability_id to its (issue, revisit date).
+# A strict row must be a key with exactly that issue and date, and every key must still be a strict
+# row (twinning or retiring an exception forces the pin edit). Adding, relabelling, re-dating or
+# swapping the id of a strict exception is therefore a visible constant edit; a new exception needs its own
+# recorded ruling, named in ADR-1005. The grandfather set below has no pins: a swap there stays
+# review-enforced.
+STRICT_EXCEPTION_PINS = {
+    # #5955: temporary owner-accepted UI-only fragments (Dashboard, webhooks, General, Access).
+    "get.fragments-access-principals-detail": (5955, "2026-11-30"),
+    "get.fragments-access-principals-list": (5955, "2026-11-30"),
+    "get.fragments-access-tokens-list": (5955, "2026-11-30"),
+    "get.fragments-access-users-detail": (5955, "2026-11-30"),
+    "get.fragments-access-users-list": (5955, "2026-11-30"),
+    "get.fragments-dashboard-activity": (5955, "2026-11-30"),
+    "get.fragments-dashboard-health": (5955, "2026-11-30"),
+    "get.fragments-dashboard-policies": (5955, "2026-11-30"),
+    "get.fragments-dashboard-summary": (5955, "2026-11-30"),
+    "get.fragments-settings-analytics-events": (5955, "2026-11-30"),
+    "get.fragments-settings-general-runtime": (5955, "2026-11-30"),
+    "get.fragments-settings-webhooks": (5955, "2026-11-30"),
+    "get.fragments-settings-webhooks-param-deliveries": (5955, "2026-11-30"),
+    # #520: server administration surfaces stay REST-only (the #4028 settings reads, the #4031 enrollment/OIDC reads and the audit retention read).
+    "get.fragments-access-audit-retention": (520, "2027-04-30"),
+    "get.fragments-settings-analytics": (520, "2027-04-30"),
+    "get.fragments-settings-auto-approve": (520, "2027-04-30"),
+    "get.fragments-settings-data-retention": (520, "2027-04-30"),
+    "get.fragments-settings-directory": (520, "2027-04-30"),
+    "get.fragments-settings-gateway": (520, "2027-04-30"),
+    "get.fragments-settings-https": (520, "2027-04-30"),
+    "get.fragments-settings-mcp": (520, "2027-04-30"),
+    "get.fragments-settings-pending": (520, "2027-04-30"),
+    "get.fragments-settings-plugin-signing": (520, "2027-04-30"),
+    "get.fragments-settings-server-config": (520, "2027-04-30"),
+    "get.fragments-settings-tls": (520, "2027-04-30"),
+    # #2102: stored-data fragment (ADR-1005 2026-07-13 SLE-erasure entry).
+    "get.fragments-hardware-ci-stored-data": (2102, "2027-01-13"),
+    # #5357: admin password reset has no MCP twin (ADR-1005 2026-10-04 passwords entry).
+    "post.api-v1-users-param-password": (5357, "2027-01-04"),
+    # #6061: approve/reject is a human-session act, MCP approve_request/reject_request permanently refuse (ADR-1005 exception entry).
+    "post.api-approvals-param-approve": (6061, "2027-01-18"),
+    "post.api-approvals-param-reject": (6061, "2027-01-18"),
+    # #5955: further temporary owner-accepted UI-only rows, recorded by the ADR-1005 2026-10-22 entry (it extends the 2026-10-15 waiver, including two POST rows).
+    "get.api-chargen-status": (5955, "2026-11-30"),
+    "get.api-help-autocomplete": (5955, "2026-11-30"),
+    "get.api-help-palette": (5955, "2026-11-30"),
+    "get.api-procfetch-status": (5955, "2026-11-30"),
+    "get.fragments-device-live": (5955, "2026-11-30"),
+    "get.fragments-dex-device-perf-result": (5955, "2026-11-30"),
+    "get.fragments-dex-device-procperf-result": (5955, "2026-11-30"),
+    "get.fragments-results-filter-bar": (5955, "2026-11-30"),
+    "post.api-export-json-to-csv": (5955, "2026-11-30"),
+    "post.fragments-instructions-yaml-preview": (5955, "2026-11-30"),
+    # #4099: NVD routes grandfathered by ADR-1005 (surface 2; the re-home is tracked by #4099, Phase 7, not started); ADR-1005 2026-10-22 entry.
+    "get.api-nvd-status": (4099, "2027-03-31"),
+    "post.api-nvd-match": (4099, "2027-03-31"),
+    "post.api-nvd-sync": (4099, "2027-03-31"),
+    # #6325: legacy admin-plane rows whose REST v1 twin is deferred to the 2027-Q1 re-home (no MCP twin is built); ADR-1005 2026-10-22 entry, which dates the four fragment rows itself.
+    "delete.api-settings-auto-approve-param": (6325, "2027-03-31"),
+    "delete.api-settings-enrollment-tokens-param": (6325, "2027-03-31"),
+    "delete.api-settings-pending-agents-param": (6325, "2027-03-31"),
+    "delete.api-settings-updates-param-param-param": (6325, "2027-03-31"),
+    "get.fragments-settings-dex-alerts": (6325, "2027-03-31"),
+    "get.fragments-settings-mfa": (6325, "2027-03-31"),
+    "get.fragments-settings-tokens": (6325, "2027-03-31"),
+    "get.fragments-settings-updates": (6325, "2027-03-31"),
+    "post.api-settings-auto-approve": (6325, "2027-03-31"),
+    "post.api-settings-auto-approve-mode": (6325, "2027-03-31"),
+    "post.api-settings-auto-approve-param-toggle": (6325, "2027-03-31"),
+    "post.api-settings-cert-paste": (6325, "2027-03-31"),
+    "post.api-settings-dex-alerts-blast": (6325, "2027-03-31"),
+    "post.api-settings-dex-alerts-cohort-export": (6325, "2027-03-31"),
+    "post.api-settings-dex-alerts-routing": (6325, "2027-03-31"),
+    "post.api-settings-enrollment-tokens": (6325, "2027-03-31"),
+    "post.api-settings-enrollment-tokens-batch": (6325, "2027-03-31"),
+    "post.api-settings-mcp": (6325, "2027-03-31"),
+    "post.api-settings-mfa-disable": (6325, "2027-03-31"),
+    "post.api-settings-mfa-init": (6325, "2027-03-31"),
+    "post.api-settings-mfa-recovery-codes": (6325, "2027-03-31"),
+    "post.api-settings-mfa-verify": (6325, "2027-03-31"),
+    "post.api-settings-oidc": (6325, "2027-03-31"),
+    "post.api-settings-oidc-test": (6325, "2027-03-31"),
+    "post.api-settings-pending-agents-bulk-approve": (6325, "2027-03-31"),
+    "post.api-settings-pending-agents-bulk-deny": (6325, "2027-03-31"),
+    "post.api-settings-pending-agents-param-approve": (6325, "2027-03-31"),
+    "post.api-settings-pending-agents-param-deny": (6325, "2027-03-31"),
+    "post.api-settings-plugin-signing-clear": (6325, "2027-03-31"),
+    "post.api-settings-plugin-signing-require": (6325, "2027-03-31"),
+    "post.api-settings-plugin-signing-upload": (6325, "2027-03-31"),
+    "post.api-settings-updates-param-param-param-rollout": (6325, "2027-03-31"),
+    "post.api-settings-updates-upload": (6325, "2027-03-31"),
+    "post.api-settings-users": (6325, "2027-03-31"),
+}
 
 # `exception:` rows must read `exception:#<issue> revisit:<YYYY-MM-DD> <reason>`. The rows named
 # here carry no machine-checked dated revisit (ADR-1005's 2026-10-15 entry is the one home that
@@ -397,7 +552,7 @@ DOMAINS = [
     "auto-deploy", "auto-verify", "network", "viz", "executions",
     "scope-result-sets", "instructions", "compliance-policy", "settings",
     "rbac", "auth-mfa", "engine-principals", "access-reviews", "ca-pki",
-    "ota", "enrollment", "other",
+    "ota", "enrollment", "crypto", "other",
 ]
 
 PATH_DOMAIN_RULES = [
@@ -417,6 +572,7 @@ PATH_DOMAIN_RULES = [
     (re.compile(r"^/fragments/devices"), "devices"),
     (re.compile(r"^/fragments/results"), "executions"),
     (re.compile(r"^/api/dashboard/(execute|group-from-results|tar-execute)"), "executions"),
+    (re.compile(r"^/fragments/crypto/"), "crypto"),
     (re.compile(r"^/fragments/compliance"), "compliance-policy"),
     (re.compile(r"^/api/(compliance|polic(y|ies))"), "compliance-policy"),
     # Settings sub-panels: several are administrative UI over a capability
@@ -465,6 +621,7 @@ OWNER_FILE_DOMAIN_FALLBACK = {
     "network_routes.cpp": "network",
     "viz_routes.cpp": "viz",
     "workflow_routes.cpp": "instructions",
+    "crypto_routes.cpp": "crypto",
     "compliance_routes.cpp": "compliance-policy",
     "compliance_ui.cpp": "compliance-policy",
     "settings_routes.cpp": "settings",
@@ -481,6 +638,20 @@ OWNER_FILE_DOMAIN_FALLBACK = {
     "dashboard_ui.cpp": "other",
     "rest_api_v1.cpp": "other",
 }
+
+
+def step_summary(text):
+    """Appends `text` to the GitHub step summary (the run's front page) when
+    GITHUB_STEP_SUMMARY names a file; any failure to write is ignored: a
+    summary is a convenience and must never change the gate's result."""
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text + "\n")
+    except OSError:
+        pass
 
 
 def gh(kind, msg):
@@ -570,6 +741,27 @@ def parse_adjacent_literals(text, pos):
 
 
 _VERB_CALL = re.compile(r"\b(\w+)(?:\.|->)(" + "|".join(VERBS) + r")\s*\(")
+
+# The one wrapper call extract_openapi_paths() accepts around the spec literal
+# chain: `static const std::string spec = expand_ecosystem_tokens(<literals>);`.
+_SPEC_WRAPPER = re.compile(r"\s*([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*\(")
+_SPEC_RETURN = re.compile(r"return\s+spec\s*;")
+
+
+def _skip_blank_and_line_comments(text, i):
+    """Index of the first character at or after `i` that is neither whitespace nor part of a
+    `//` line comment."""
+    n = len(text)
+    while i < n:
+        if text[i] in " \t\r\n":
+            i += 1
+        elif text[i:i + 2] == "//":
+            eol = text.find("\n", i)
+            i = n if eol < 0 else eol + 1
+        else:
+            break
+    return i
+
 
 # httplib::Client call sites (directory_sync.cpp, analytics_sinks.cpp,
 # nvd_client.cpp, offload_target_store.cpp, webhook_store.cpp, oidc_provider.cpp,
@@ -694,38 +886,95 @@ def extract_all_routes():
 
 def extract_openapi_paths():
     """Parses the openapi_spec() literal out of rest_api_v1.cpp (concatenated
-    raw-string chunks, MSVC C2026 16KB-cap split - see the source comment
-    at rest_api_v1.cpp:664) and returns the set of (METHOD, canonical "/api/
+    raw-string chunks, MSVC C2026 16KB-cap split - see the C2026 split comment
+    inside the chain) and returns the set of (METHOD, canonical "/api/
     v1"+path, or "/api/v2"+path for a path-item carrying a "/v2" server
     override - #4144, the repo's first breaking-change route) tuples in its
-    `paths` table, plus the parsed spec dict."""
-    text = REST_API_V1_CPP.read_text(encoding="utf-8")
-    anchor = text.index("static const std::string spec =")
+    `paths` table, plus the parsed spec dict. The chain may sit inside exactly
+    one wrapper call - expand_ecosystem_tokens(...) in the tree - so the served
+    document is built in one static, and the initializer must be followed by
+    `return spec;` and the function's closing `}` (a second retained copy of the
+    document is the shape this refuses); any other shape is an AnchorError."""
+    try:
+        text = REST_API_V1_CPP.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as e:
+        raise AnchorError(f"cannot read {REST_API_V1_CPP} ({_why(e)}) - the file this "
+                          f"script scans for the openapi_spec() literal")
+    anchor = _find_unique(text, "static const std::string spec =", "the openapi_spec() literal")
+    if anchor < 0:
+        raise AnchorError("the openapi_spec() literal (`static const std::string "
+                          "spec =`) was not found in rest_api_v1.cpp - the lexical "
+                          "anchor this script reads changed")
     pos = anchor + len("static const std::string spec =")
+    wrapper = _SPEC_WRAPPER.match(text, pos)
+    if wrapper:
+        pos = wrapper.end()
     chunks = []
     n = len(text)
     while True:
         i = pos
         while i < n and text[i] in " \t\r\n":
             i += 1
+        if i >= n:
+            raise AnchorError("the openapi_spec() literal runs to the end of the file "
+                              "without a terminating ';'")
         # Skip a full C++ line comment between literal chunks.
         if text[i:i + 2] == "//":
-            eol = text.index("\n", i)
+            eol = text.find("\n", i)
+            if eol < 0:
+                raise AnchorError("the openapi_spec() literal ends inside a line comment")
             pos = eol + 1
             continue
+        if wrapper and text[i] == ")":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if text[j:j + 1] != ";":
+                raise AnchorError("the openapi_spec() literal: the wrapper call must be "
+                                  "followed by ';'")
+            pos = j + 1
+            break
         if text[i] == ";":
+            if wrapper:
+                raise AnchorError("the openapi_spec() literal: ';' before the wrapper "
+                                  "call's ')' (unbalanced)")
             pos = i + 1
             break
         literal, end = parse_literal_at(text, i)
         if literal is None:
-            raise RuntimeError(
-                f"check-api-parity: could not parse openapi_spec() literal "
-                f"chunk at offset {i} (expected a string/raw-string literal "
-                f"or ';')")
+            raise AnchorError(
+                f"the openapi_spec() literal: could not parse the chunk at offset {i} "
+                f"(expected a string/raw-string literal or "
+                f"{'`)`' if wrapper else '`;`'}; at most one wrapper call may enclose "
+                f"the chain, with no nesting, no second argument and no non-literal; "
+                f"a /* */ comment is not accepted here, use //)")
         chunks.append(literal)
         pos = end
+    if not chunks:
+        raise AnchorError("the openapi_spec() literal has no string chunks")
+    # After the initializer the function may only `return spec;` and close. A second static
+    # (`static const std::string served = spec; return served;`) would retain a second copy
+    # of the document, which no runtime assertion can see. ponytail: EOF right after the `;`
+    # is accepted (the selftest fixtures end there); the real tree always carries the tail.
+    tail = _skip_blank_and_line_comments(text, pos)
+    if tail < n:
+        ret = _SPEC_RETURN.match(text, tail)
+        close = _skip_blank_and_line_comments(text, ret.end()) if ret else tail
+        if not ret or text[close:close + 1] != "}":
+            raise AnchorError("the openapi_spec() literal must be followed by exactly "
+                              "`return spec;` and the function's closing `}` - a second "
+                              "static would retain another copy of the served document; no "
+                              "other statement is accepted (a /* */ comment is not accepted "
+                              "here; use //)")
     spec_json = "".join(chunks)
-    spec = json.loads(spec_json)
+    try:
+        spec = json.loads(spec_json)
+    except json.JSONDecodeError as e:
+        raise AnchorError(
+            'the openapi_spec() literal is not valid JSON before token expansion (a token '
+            'keeps its quotes: ["@@ECOSYSTEM_ENUM@@"]): '
+            f"{e.msg} at chain offset {e.pos}; context: "
+            f"{spec_json[max(0, e.pos - 60):e.pos + 20]!r}")
 
     paths = set()
     methods = {"get": "GET", "post": "POST", "put": "PUT", "delete": "DELETE",
@@ -751,6 +1000,18 @@ def extract_openapi_paths():
 _TOOLDEF_ENTRY = re.compile(r'^\s{4}\{"([A-Za-z0-9_]+)"', re.MULTILINE)
 
 
+def _find_unique(text, anchor, label):
+    """text.find(anchor), but a second copy of the declaration (a stale
+    commented or conditionally compiled copy) is an error: the scan would read the
+    first one."""
+    n = text.count(anchor)
+    if n > 1:
+        raise AnchorError(f"{label} appears {n} times - the scan reads the first copy, "
+                          f"so a stale, commented-out or unrelated second copy of the "
+                          f"declaration text hides the live one: remove or reword it")
+    return text.find(anchor)
+
+
 class AnchorError(RuntimeError):
     """A lexical anchor in mcp_server.cpp is gone (renamed or reformatted):
     reported as a named error, never a traceback."""
@@ -769,15 +1030,101 @@ def _read_mcp_server_cpp():
                           f"file this script scans for kTools[] and kResources[]")
 
 
+_REGISTRY_ANCHOR = "constexpr ToolRecord kToolRecords[] = {"
+# The registry file-name rule and the tool-name grammar are SHARED with
+# scripts/ci/check-mcp-retry-hints.py (keep the two in step) and with build_catalogue's boot check
+# in mcp_server.cpp: a record name is `^[a-z][a-z0-9_]*$`, a registry file is
+# `mcp_tools_[a-z0-9_]+\.cpp`.
+_REGISTRY_FILE = re.compile(r"mcp_tools_[a-z0-9_]+\.cpp")
+_REGISTRY_NAME_GRAMMAR = re.compile(r"[a-z][a-z0-9_]*")
+# A record opener is any 4-space-indented `{`; a full entry is `    {"<grammar name>",`. A line that
+# opens a record but is not a full entry (an upper-case or hyphenated name, a missing comma, a
+# brace on its own line) would otherwise be dropped from the scanned set while the record still
+# compiles and is served, so it is an error, never a silent skip.
+_REGISTRY_OPENER = re.compile(r"^ {4}\{")
+_REGISTRY_ENTRY = re.compile(r'^ {4}\{"([a-z][a-z0-9_]*)",')
+
+
+def _registry_names(slice_text, first_line, fname):
+    """The record names of one kToolRecords[] slice (`first_line` = the 1-based file line of its
+    declaration). Every record-opener line must be a full entry with a grammar-valid name,
+    otherwise an AnchorError names the file and line: a partial miss must fail as loudly as a
+    total one."""
+    names = []
+    for off, line in enumerate(slice_text.split("\n")):
+        if not _REGISTRY_OPENER.match(line):
+            continue
+        m = _REGISTRY_ENTRY.match(line)
+        if not m:
+            raise AnchorError(f"{fname}:{first_line + off}: a kToolRecords[] record opener "
+                              f"({line.strip()[:48]!r}) is not `    {{\"<name>\",` with a name "
+                              f"matching {_REGISTRY_NAME_GRAMMAR.pattern} - the scan would skip it "
+                              f"while the record is still served: fix the name or the layout")
+        names.append(m.group(1))
+    return names
+
+
+def _registry_dir():
+    return SERVER_SRC if MCP_REGISTRY_DIR is None else MCP_REGISTRY_DIR
+
+
+def _extract_registry_tools(seen):
+    """Names from the kToolRecords[] slice of every mcp_tools_*.cpp in MCP_REGISTRY_DIR.
+    `seen` maps each name already found to the source that declared it; a repeat (in kTools[]
+    or in another file) is an AnchorError naming both sources, so the same tool can never be
+    served twice. Returns the new names."""
+    registry_dir = _registry_dir()
+    files = sorted(registry_dir.glob("mcp_tools_*.cpp"))
+    for path in files:
+        if not _REGISTRY_FILE.fullmatch(path.name):
+            raise AnchorError(f"{path.name} matches mcp_tools_*.cpp but not {_REGISTRY_FILE.pattern} - "
+                              f"a registry file name is lower-case [a-z0-9_] only; the scan "
+                              f"(and check-mcp-retry-hints.py) would otherwise skip its tools")
+    if len(files) < MIN_REGISTRY_FILES:
+        raise AnchorError(f"found {len(files)} mcp_tools_*.cpp file(s) in {registry_dir}, "
+                          f"expected at least {MIN_REGISTRY_FILES} - a deleted or renamed "
+                          f"registry file would silently drop its tools from the catalogue")
+    found = set()
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as e:
+            raise AnchorError(f"cannot read {path} ({_why(e)}) - a registry file this "
+                              f"script scans for kToolRecords[]")
+        start = _find_unique(text, _REGISTRY_ANCHOR, f"the kToolRecords[] declaration in {path.name}")
+        end = text.find("\n};", start) if start >= 0 else -1
+        if end < 0:
+            raise AnchorError(f"kToolRecords[] was not found (or is unterminated) in {path.name} - "
+                              f"the lexical anchor `{_REGISTRY_ANCHOR}` or its closing `}};` at "
+                              f"column 0 changed")
+        names = _registry_names(refuse_preprocessor_lines(text[start:end], f"kToolRecords[] in {path.name}"),
+                                text.count("\n", 0, start) + 1, path.name)
+        if not names:
+            raise AnchorError(f"kToolRecords[] in {path.name} yielded zero entries - the entry "
+                              "layout (a 4-space-indented `{\"name\",` line, the lexical anchor "
+                              "this script reads) changed")
+        for name in names:
+            if name in seen:
+                raise AnchorError(f"MCP tool {name!r} is declared twice: in {seen[name]} and in "
+                                  f"{path.name} - a tool is served from exactly one place")
+            seen[name] = path.name
+            found.add(name)
+    return found
+
+
 def extract_mcp_tools():
+    """The MCP tool names: kTools[] in mcp_server.cpp, unioned with the per-domain registry
+    records (mcp_tools_*.cpp). With no registry file the result is exactly the kTools[] set."""
     text = _read_mcp_server_cpp()
-    start = text.find("static const ToolDef kTools[] = {")
+    start = _find_unique(text, "static const ToolDef kTools[] = {", "the kTools[] declaration")
     # Matching closing "};" at column 0, mirroring the array's own style.
     end = text.find("\n};", start) if start >= 0 else -1
-    if end < 0:
-        raise AnchorError("kTools[] was not found in mcp_server.cpp - the "
-                          "array declaration (the lexical anchor) changed")
-    return set(_TOOLDEF_ENTRY.findall(text[start:end]))
+    found = set(_TOOLDEF_ENTRY.findall(refuse_preprocessor_lines(text[start:end], "kTools[]"))) if end >= 0 else set()
+    if not found:
+        raise AnchorError("kTools[] was not found (or yielded zero entries) in "
+                          "mcp_server.cpp - the array declaration or entry "
+                          "layout (the lexical anchor this script reads) changed")
+    return found | _extract_registry_tools({n: "kTools[] in mcp_server.cpp" for n in found})
 
 
 _RESOURCE_ENTRY = re.compile(r'\{\s*"(yuzu://[^"]+)"')
@@ -785,19 +1132,60 @@ _CPP_TOKEN = re.compile(
     r'"(?:\\.|[^"\\\n])*"|//[^\n]*|/\*.*?\*/', re.DOTALL)
 
 
+def strip_cpp_comments(text):
+    """Blanks `//` and `/* */` comments (newlines kept, so line numbers
+    survive) without touching string literals: "yuzu://x" contains `//`. Char
+    literals are not recognised (a quote character literal would open a string
+    and hide the rest of its line; none occurs in kResources[]). Not raw-string
+    aware, so it is applied to the small kResources[] array only."""
+    def blank(m):
+        t = m.group(0)
+        return re.sub(r"[^\n]", " ", t) if t.startswith("/") else t
+    return _CPP_TOKEN.sub(blank, text)
+
+
+# A preprocessor line: `#` or its digraph `%:` first on the line, or right after anything that ends
+# in `*/` (the end of a block comment, possibly one that began on an earlier line). Loose on
+# purpose: it also refuses a raw-string line that happens to read `... */ #`, which fails loudly.
+# Linear: `.*` backtracks over each `*/` once and the tail test is constant.
+_PP_LINE = re.compile(r"\s*(?:#|%:)|.*\*/\s*(?:#|%:)")
+
+
+def refuse_preprocessor_lines(text, what):
+    """Raises AnchorError at the first line that is a preprocessor directive. The
+    scan does not model #if/#ifdef/#define, so a conditionally compiled entry
+    would be counted as served (or hidden); refusing is loud. A directive is a
+    line that starts with `#` or the `%:` digraph, or has one right after a `*/`.
+    kResources[] is comment-stripped first, so a comment may mention one;
+    kTools[] is not (its raw string schemas hold `//` and `/*`), so a line
+    inside a raw-string schema that starts with `#` fails here too, and a tool
+    entry wrapped in a block comment there is still counted as a tool. LIMITS: a
+    directive outside the slice is not scanned (one wrapping the whole array
+    would break the build); `} #if 0` on a code line is not a directive; a
+    trigraph is inert in C++23."""
+    for n, line in enumerate(text.split("\n"), 1):
+        if _PP_LINE.match(line):
+            raise AnchorError(
+                f"a preprocessor line at row {n} of the {what} slice (declaration = row 1: "
+                f"{line.strip()[:40]!r}) - the scan does not model #if/#ifdef/#define, so "
+                f"a conditionally compiled entry could be counted as served or hidden: "
+                f"teach scripts/ci/check-api-parity.py the directive, move it out of the "
+                f"array, or (for kTools[]) move the line out of the raw-string schema")
+    return text
+
+
 def parse_mcp_resources(text):
     """URIs of the fixed `static const ResourceDef kResources[] = {...};`
-    entries (resource templates are not included). Block and `//` comments are
-    blanked first, string literals untouched ("yuzu://x" holds a `//`);
-    extract_mcp_tools() has the same pre-existing comment weakness. Raises
-    AnchorError when the array or its entries cannot be found."""
-    start = text.find("static const ResourceDef kResources[] = {")
+    entries (resource templates are not included). Comments are blanked first,
+    string literals untouched ("yuzu://x" holds a `//`); extract_mcp_tools() has
+    the same pre-existing comment weakness. Raises AnchorError when the array or
+    its entries cannot be found, or when a preprocessor line sits inside it."""
+    start = _find_unique(text, "static const ResourceDef kResources[] = {", "the kResources[] declaration")
     end = text.find("\n};", start) if start >= 0 else -1
     if end < 0:
         raise AnchorError("kResources[] was not found in mcp_server.cpp - the "
                           "array declaration (the lexical anchor) changed")
-    body = _CPP_TOKEN.sub(lambda m: m.group(0) if m.group(0)[0] == '"' else " ",
-                          text[start:end])
+    body = refuse_preprocessor_lines(strip_cpp_comments(text[start:end]), "kResources[]")
     found = set(_RESOURCE_ENTRY.findall(body))
     if not found:
         raise AnchorError("kResources[] in mcp_server.cpp yielded zero "
@@ -848,12 +1236,19 @@ RESOURCE_TWIN_PREFIX = "resource:"
 # A reason needs one character outside these categories (control, format, surrogate,
 # private-use, unassigned, spaces/separators, combining marks); NUL is a control char.
 _NON_CONTENT = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zs", "Zl", "Zp", "Mn", "Me"})
+# Letters that render as nothing (Braille blank, Hangul fillers): visible to the category test, empty to a reader.
+_INVISIBLE_FILLERS = frozenset("\u2800\u115f\u1160\u3164\uffa0")
+
+
+def _reason_is_blank(reason):
+    return not any(c not in _INVISIBLE_FILLERS and unicodedata.category(c) not in _NON_CONTENT
+                   for c in reason)
 
 
 def parse_exception(status):
     """(issue, date_str, reason) for a strict-shaped exception, else None."""
     m = EXCEPTION_RE.fullmatch(status)
-    if not m or not any(unicodedata.category(c) not in _NON_CONTENT for c in m.group(3)):
+    if not m or _reason_is_blank(m.group(3)):
         return None
     return int(m.group(1)), m.group(2), m.group(3)
 
@@ -889,6 +1284,69 @@ def status_errors(status, capability_id, grandfathered):
             f"the gate only pins its size), got {status[:200]!r}"]
 
 
+def revisit_lapse_warning(rows, today):
+    """ONE aggregated warning string (or None) for strict exception rows whose
+    revisit date is at or before today + REVISIT_WARN_DAYS. A WARNING only: a
+    failure would turn CI red fleet-wide on the revisit date itself. `today` is
+    injected so the selftest is deterministic."""
+    try:
+        horizon = today + datetime.timedelta(days=REVISIT_WARN_DAYS)
+    except OverflowError:
+        horizon = datetime.date.max
+    due = []
+    for row in rows.values():
+        parsed = parse_exception(row["status"])
+        if parsed:
+            d = datetime.date.fromisoformat(parsed[1])
+            if d <= horizon:
+                due.append((d, parsed[0], row["capability_id"]))
+    if not due:
+        return None
+    due.sort()
+    lapsed = sum(1 for d, _i, _c in due if d < today)
+    issues = ", ".join(f"#{n}" for n in sorted({i for _d, i, _c in due}))
+    ids = ", ".join(c for _d, _i, c in due[:3])
+    return (f"{len(due)} exception row(s) have a revisit date on or before {horizon} "
+            f"(earliest {due[0][0]}, {lapsed} already past; issues {issues}; first: "
+            f"{ids}{', ...' if len(due) > 3 else ''}): re-confirm each (pin, JSON row and "
+            f"ADR date together), twin it, or retire it")
+
+
+def pin_errors(ledger_rows, pins=None):
+    """Identity pin over the strict-shaped exception rows (selftested): every
+    strict row must be a key of `pins` with exactly that (issue, revisit date),
+    and every key must still be a strict row."""
+    if pins is None:
+        pins = STRICT_EXCEPTION_PINS
+    errors = []
+    seen = set()
+    for key, row in ledger_rows.items():
+        parsed = parse_exception(row["status"])
+        if not parsed:
+            continue
+        cid = row["capability_id"]
+        seen.add(cid)
+        actual = (parsed[0], parsed[1])
+        where = f"{row['_file']}: {key[0]} {key[1]!r}"
+        if cid not in pins:
+            errors.append(f"{where} is a new exception (#{actual[0]} revisit {actual[1]}) "
+                          f"that is not in STRICT_EXCEPTION_PINS - a new exception needs its "
+                          f"own recorded ruling: name it in ADR-1005 and add the pin in THIS "
+                          f"change (converting a grandfathered legacy row to the strict shape "
+                          f"also needs its pin)")
+        elif pins[cid] != actual:
+            errors.append(f"{where} is exception #{actual[0]} revisit {actual[1]} but is "
+                          f"pinned as #{pins[cid][0]} revisit {pins[cid][1]} - a changed "
+                          f"exception needs a recorded ruling (a pure re-confirmation edits "
+                          f"the pin, the JSON row and the ADR date together): name it in "
+                          f"ADR-1005 and edit STRICT_EXCEPTION_PINS in THIS change")
+    for cid in sorted(set(pins) - seen):
+        errors.append(f"STRICT_EXCEPTION_PINS entry {cid!r} is stale (no strict exception row "
+                      f"has that capability_id any more, e.g. it was twinned or retired) - "
+                      f"remove the pin in THIS change")
+    return errors
+
+
 def stale_grandfather_errors(rows, grandfathered):
     """The grandfather set's size must equal GRANDFATHERED_MAX and every id
     must still name a NON-strict `exception:` row. This catches growth and
@@ -918,6 +1376,14 @@ def stale_grandfather_errors(rows, grandfathered):
     return errors
 
 
+# An HTTP method as the ledger spells it: ASCII capitals only (the capability id and the
+# gate's messages embed it, so no newline or other character may ride along).
+_METHOD_RE = re.compile(r"[A-Z]{1,16}")
+# A route path as the ledger spells it (letters, digits and `_ . : / { } -`, at most 200 characters):
+# the gate's messages embed it, so no newline or other control character may ride along.
+_PATH_RE = re.compile(r"[A-Za-z0-9_.:/{}-]{1,200}")
+
+
 def row_shape_error(row):
     """Structural validation of one ledger row (pure, selftested): the first
     problem as a string, or None. Keeps later checks from raising."""
@@ -929,6 +1395,10 @@ def row_shape_error(row):
         return f"missing field(s) {sorted(missing)}"
     if not all(isinstance(row[k], str) for k in ("method", "path", "capability_id")):
         return "method, path and capability_id must be strings"
+    if not _METHOD_RE.fullmatch(row["method"]):
+        return f"method must be 1-16 upper-case ASCII letters (GET, POST, ...), got {row['method'][:20]!r}"
+    if not _PATH_RE.fullmatch(row["path"]):
+        return f"path must be 1-200 characters from A-Z a-z 0-9 _ . : / {{ }} -, got {row['path'][:40]!r}"
     rest, mcp = row["rest_v1_twin"], row["mcp_twin"]
     # A bare-string rest_v1_twin is documentary prose on a non-twinned row.
     rest_ok = (all(isinstance(rest.get(k), str) for k in ("method", "path"))
@@ -936,6 +1406,10 @@ def row_shape_error(row):
     if not rest_ok or not (mcp is None or isinstance(mcp, str)):
         return ("rest_v1_twin must be null, a string or an object with string "
                 "method and path; mcp_twin null or a string")
+    if isinstance(rest, dict) and not _METHOD_RE.fullmatch(rest["method"]):
+        return f"rest_v1_twin method must be 1-16 upper-case ASCII letters, got {rest['method'][:20]!r}"
+    if isinstance(rest, dict) and not _PATH_RE.fullmatch(rest["path"]):
+        return f"rest_v1_twin path must be 1-200 characters from A-Z a-z 0-9 _ . : / {{ }} -, got {rest['path'][:40]!r}"
     return None
 
 
@@ -951,11 +1425,18 @@ def load_ledger(ledger_dir=None):
     errors = []
     ids = {}
     ledger_dir = Path(ledger_dir) if ledger_dir is not None else LEDGER_DIR
+    missing = [d for d in DOMAINS if not (ledger_dir / f"{d}.json").is_file()]
+    if missing:
+        errors.append(f"{ledger_dir}: ledger file(s) missing for declared domain(s) {missing} "
+                      f"(a new domain's file is created by hand, containing [])")
     for f in sorted(ledger_dir.glob("*.json")):
         domain = f.stem
         if domain not in DOMAINS:
-            errors.append(f"{f}: filename '{domain}.json' is not one of the "
-                           f"declared domains {DOMAINS}")
+            # Not read further: an undeclared file's name is attacker-shaped text, so it is
+            # quoted (bounded repr) and none of its content or name is used again.
+            errors.append(f"{f.name[:60]!r}: filename is not one of the declared "
+                          f"domains {DOMAINS}")
+            continue
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
         except (ValueError, OSError, RecursionError) as e:  # ValueError: bad JSON/UTF-8, >4300-digit ints
@@ -971,7 +1452,7 @@ def load_ledger(ledger_dir=None):
                 continue
             for msg in status_errors(row["status"], row["capability_id"],
                                      GRANDFATHERED_LEGACY_EXCEPTIONS):
-                errors.append(f"{f}[{idx}] ({row['method']} {row['path']}): {msg}")
+                errors.append(f"{f}[{idx}] ({row['method'][:20]!r} {row['path'][:40]!r}): {msg}")
             expected_id = capability_id_for(row["method"], row["path"])
             if row["capability_id"] != expected_id:
                 errors.append(f"{f}[{idx}] ({row['method']} {row['path']}): "
@@ -1098,13 +1579,22 @@ def extract_doc_block(text):
     return text[start:end] + "\n"
 
 
+def _malformed_ledger_exit(mode, errors):
+    """The informational modes print counts derived from the ledger; over a
+    malformed ledger those are wrong, so say so and fail."""
+    for e in errors:
+        gh("error", f"check-api-parity {mode}: {e}")
+    print("check-api-parity: counts unreliable: ledger is malformed", file=sys.stderr)
+    return 1
+
+
 def render_doc():
+    ledger_rows, errors = load_ledger()
+    if errors:
+        return _malformed_ledger_exit("--render-doc", errors)
     bucket_a, bucket_b = extract_all_routes()
     openapi_paths, _spec = extract_openapi_paths()
     mcp_tools = extract_mcp_tools()
-    ledger_rows, errors = load_ledger()
-    for e in errors:
-        gh("warning", f"check-api-parity --render-doc: {e}")
     allowlist_set = {(m, canonicalize(p)) for m, p, _r in ALLOWLIST_OPENAPI_MISSING}
     print(render_doc_block(ledger_rows, bucket_b, openapi_paths, allowlist_set, mcp_tools))
     return 0
@@ -1182,7 +1672,8 @@ def twin_errors(ledger_rows, all_extracted, mcp_tools, mcp_resources):
                               f"mcp_server.cpp's kResources[]")
         elif mcp and mcp not in mcp_tools:
             errors.append(f"{where} claims mcp_twin {mcp!r} which is not in "
-                          f"mcp_server.cpp's kTools[]")
+                          f"the MCP tool catalogue (mcp_server.cpp's kTools[] plus the "
+                          f"mcp_tools_*.cpp registry records)")
     return errors
 
 
@@ -1218,10 +1709,11 @@ def ratchet_errors(untwinned, generic_planned):
     return errors
 
 
-def run_check(ledger_dir=None, doc_path=None, extracted=None):
+def run_check(ledger_dir=None, doc_path=None, extracted=None, today=None):
     """The CI gate. The keyword arguments let the selftest drive the real
     wiring over a temporary ledger with synthetic extraction; CI passes none.
-    `extracted` is (bucket_a, bucket_b, openapi_paths, mcp_tools, mcp_resources)."""
+    `extracted` is (bucket_a, bucket_b, openapi_paths, mcp_tools, mcp_resources);
+    `today` pins the revisit-lapse warning's clock."""
     ledger_rows, ledger_errors = load_ledger(ledger_dir)
     if ledger_errors:
         # Reported alone: every later check, above all the ratchet advice, is
@@ -1251,6 +1743,16 @@ def run_check(ledger_dir=None, doc_path=None, extracted=None):
         gh("error", f"check-api-parity: {err}")
         ok = False
 
+    # 2d. every strict exception row is identity-pinned; a lapsing revisit date
+    #     is ONE aggregated warning, never a failure.
+    for err in pin_errors(ledger_rows):
+        gh("error", f"check-api-parity: {err}")
+        ok = False
+    lapse = revisit_lapse_warning(ledger_rows, today or datetime.date.today())
+    if lapse:
+        gh("warning", f"check-api-parity: {lapse}")
+        step_summary(f"### API parity: exception revisit dates\n\n{lapse}\n")
+
     # 1. every extracted fragment/legacy route must be ledgered.
     unledgered = sorted(set(bucket_a) - set(ledger_rows))
     for method, canon in unledgered:
@@ -1260,7 +1762,12 @@ def run_check(ledger_dir=None, doc_path=None, extracted=None):
                     f"scripts/ci/api-parity/<domain>.json. `--bootstrap` writes "
                     f"`planned:#2146`, which the gate no longer lets grow: "
                     f"retag the row with a specific `planned:#N` or a strict "
-                    f"`exception:#N revisit:YYYY-MM-DD <reason>` and raise "
+                    f"`exception:#N revisit:YYYY-MM-DD <reason>` (which also needs "
+                    f"its STRICT_EXCEPTION_PINS entry; retagging a row you "
+                    f"just bootstrapped brings the generic planned count back to "
+                    f"its baseline, so lower BASELINE_GENERIC_PLANNED only when you "
+                    f"retag a row the baseline already counted, and a row written "
+                    f"directly as an exception leaves it alone) and raise "
                     f"BASELINE_UNTWINNED unless the row is born twinned")
         ok = False
 
@@ -1351,16 +1858,19 @@ def dump_json():
     bucket_a, bucket_b = extract_all_routes()
     openapi_paths, _spec = extract_openapi_paths()
     mcp_tools = extract_mcp_tools()
+    mcp_resources = extract_mcp_resources()
     out = {
         "fragments_and_legacy_api": sorted(f"{m} {p}" for m, p in bucket_a),
         "api_v1": sorted(f"{m} {p}" for m, p in bucket_b),
         "openapi_paths": sorted(f"{m} {p}" for m, p in openapi_paths),
         "mcp_tools": sorted(mcp_tools),
+        "mcp_resources": sorted(mcp_resources),
         "counts": {
             "fragments_and_legacy_api": len(bucket_a),
             "api_v1": len(bucket_b),
             "openapi_paths": len(openapi_paths),
             "mcp_tools": len(mcp_tools),
+            "mcp_resources": len(mcp_resources),
             "api_v1_missing_from_openapi": len(set(bucket_b) - openapi_paths),
         },
     }
@@ -1369,11 +1879,11 @@ def dump_json():
 
 
 def baseline_inventory():
+    ledger_rows, ledger_errors = load_ledger()
+    if ledger_errors:
+        return _malformed_ledger_exit("--baseline-inventory", ledger_errors)
     bucket_a, bucket_b = extract_all_routes()
     openapi_paths, _spec = extract_openapi_paths()
-    ledger_rows, ledger_errors = load_ledger()
-    for e in ledger_errors:
-        gh("warning", f"check-api-parity --baseline-inventory: {e}")
     untwinned = sum(1 for r in ledger_rows.values() if r["status"] != "twinned")
     missing = sorted(set(bucket_b) - openapi_paths)
     allowlist_set = {(m, canonicalize(p)) for m, p, _r in ALLOWLIST_OPENAPI_MISSING}
@@ -1392,7 +1902,7 @@ def baseline_inventory():
     return 0
 
 
-def _selftest():
+def _selftest_body():
     """Unit-tests the extraction/parsing/canonicalization logic itself against
     synthetic fixtures, per this repo's established precedent for CI tooling
     scripts of this shape (flake-retry.py, check-plugin-spawn-lexical.sh,
@@ -1535,7 +2045,8 @@ def _selftest():
                 f"exception:#2146 revisit:{day_a} r", strict + "\n", "twinned\n", "planned:#2146\n",
                 "planned:#0", "twinned-both") + tuple(
                 bad_head + ch for ch in ("", "   ", "\u200b\u200b", "\u0301", "\x01", "\u0378",
-                                         "\n", "\u2028", "\ue000", "\u20dd")):
+                                         "\n", "\u2028", "\ue000", "\u20dd", "\u2800", "\u115f", "\u1160",
+                                         "\u3164", "\uffa0")):
         check(len(status_errors(bad, "new.id", gf)) == 1, f"status: {bad[:80]!r} must be rejected")
     check(status_errors("exception:#520", "legacy.id", gf) == [], "status: a grandfathered legacy exception is accepted")
     errs = status_errors("exception:#520", "other.id", gf)
@@ -1598,7 +2109,17 @@ def _selftest():
                             (dict(good, rest_v1_twin=5), "rest_v1_twin"), (dict(good, rest_v1_twin=["GET"]), "rest_v1_twin"),
                             (dict(good, rest_v1_twin={"method": "GET"}), "rest_v1_twin"),
                             (dict(good, rest_v1_twin={"method": 1, "path": "/x"}), "rest_v1_twin"),
-                            (dict(good, mcp_twin=7), "mcp_twin"), (dict(good, mcp_twin={"a": 1}), "mcp_twin")):
+                            (dict(good, mcp_twin=7), "mcp_twin"), (dict(good, mcp_twin={"a": 1}), "mcp_twin"),
+                            (dict(good, method="get"), "upper-case"), (dict(good, method="GE T"), "upper-case"),
+                            (dict(good, method=""), "upper-case"), (dict(good, method="G\u0415T"), "upper-case"),
+                            (dict(good, method="GET\n::error::injected"), "upper-case"),
+                            (dict(good, method="A" * 17), "upper-case"),
+                            (dict(good, path="/x\n::error::injected"), "path must be"), (dict(good, path=""), "path must be"),
+                            (dict(good, path="/x y"), "path must be"), (dict(good, path="/" + "a" * 200), "path must be"),
+                            (dict(good, path="/x\u0435"), "path must be"),
+                            (dict(good, rest_v1_twin={"method": "GET", "path": "/x\n::error::x"}), "rest_v1_twin path"),
+                            (dict(good, rest_v1_twin={"method": "get", "path": "/x"}), "rest_v1_twin method"),
+                            (dict(good, rest_v1_twin={"method": "GET\n::error::x", "path": "/x"}), "rest_v1_twin method")):
         err = row_shape_error(bad_row)
         check(err is not None and needle in err, f"shape: {bad_row!r} must be rejected with {needle!r}, got {err}")
 
@@ -1610,6 +2131,79 @@ def _selftest():
         '    {\n        "yuzu://b", "B", "see http://x // not a comment", "m"},\n};\n'
         'static const ResourceTemplateDef kResourceTemplates[] = {\n    {"yuzu://t/{n}", "T", "d", "m"},\n};\n')
     check(res == {"yuzu://a", "yuzu://b"}, f"resources: comments and templates are excluded, got {res}")
+    res = parse_mcp_resources(
+        'static const ResourceDef kResources[] = {\n'
+        '    /* #if 0 */\n    {"yuzu://a", "A", "d", "m"},\n'
+        '    // #if 0\n    {"yuzu://b", "B", "d", "m"},\n'
+        '/* note:\n#if 0\n*/\n    {"yuzu://c", "C", "d", "m"},\n'
+        '    {"yuzu://d", 1\'000}, // {"yuzu://dead", 1} it\'s\n};\n')
+    check(res == {"yuzu://a", "yuzu://b", "yuzu://c", "yuzu://d"},
+          f"resources: a comment may mention a directive, and an apostrophe in a comment or number is not special, got {res}")
+    for directive in ("#if 0", "  #  ifdef NEVER", "#define X 1", "\t#endif", "/* c */ #if 0", "%:if 0", "  %: define X"):
+        try:
+            parse_mcp_resources('static const ResourceDef kResources[] = {\n    {"yuzu://a", "A"},\n'
+                                + directive + '\n    {"yuzu://b", "B"},\n};\n')
+            check(False, f"resources: the directive {directive!r} must raise AnchorError")
+        except AnchorError as e:
+            check("preprocessor line" in str(e) and "kResources[]" in str(e) and "row 3" in str(e),
+                  f"resources: the error must name the array and line, got {e}")
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dk:
+        kcpp = Path(dk) / "mcp_server.cpp"
+        for directive in ("#if 0", "#ifdef NEVER", "  #  define X 1", "/* c */ #if 0", "%:if 0"):
+            kcpp.write_text('static const ToolDef kTools[] = {\n    {"live_tool", "d"},\n' + directive
+                            + '\n    {"dead_tool", "d"},\n#endif\n};\n', encoding="utf-8")
+            try:
+                with _patched(MCP_SERVER_CPP=kcpp):
+                    extract_mcp_tools()
+                check(False, f"tools: the directive {directive!r} must raise AnchorError")
+            except AnchorError as e:
+                check("preprocessor line" in str(e) and "kTools[]" in str(e) and "row 3" in str(e),
+                      f"tools: the error must name the array and the line, got {e}")
+        kcpp.write_text('static const ToolDef kTools[] = {\n    {"a", "d"},\n/* x\n*/ #if 0\n    {"b", "d"},\n#endif\n};\n', encoding="utf-8")
+        try:
+            with _patched(MCP_SERVER_CPP=kcpp):
+                extract_mcp_tools()
+            check(False, "tools: a directive after the tail of a block comment must raise AnchorError")
+        except AnchorError as e:
+            check("row 4" in str(e), f"tools: the error must give the row of the directive, got {e}")
+        kcpp.write_text('static const ToolDef kTools[] = {\n    {"a", "d"},\n/*\n#if 0\n*/\n};\n', encoding="utf-8")
+        check(_PP_LINE.match("/**/ " * 3000 + "x") is None and _PP_LINE.match("/*" * 3000 + "x") is None,
+              "directive pattern: a long run of comments with no directive must not match (and must not backtrack)")
+        check(_PP_LINE.match("*/ %:if 0") and _PP_LINE.match(" * b */ #if 0") and _PP_LINE.match("/* a */ /* b */ #if 0") and not _PP_LINE.match("/* a */ x #if 0"),
+              "directive pattern: text before the closing '*/' of a multi-line comment may precede a directive; code after it may not")
+        kcpp.write_text('static const ToolDef kTools[] = {\n    {"a", "d"},\n/* a\n b */ #if 0\n    {"b", "d"},\n#endif\n};\n', encoding="utf-8")
+        try:
+            with _patched(MCP_SERVER_CPP=kcpp):
+                extract_mcp_tools()
+            check(False, "tools: a directive after the tail line of a multi-line comment must raise")
+        except AnchorError as e:
+            check("row 4" in str(e), f"tools: the error must give the row of the directive, got {e}")
+        check(_PP_LINE.match("/* a */ */ #if 0") and _PP_LINE.match("%:if 0") and not _PP_LINE.match("/* a */ || #"),
+              "directive pattern: comments, a comment tail and the %: digraph precede a directive; code does not")
+        try:
+            with _patched(MCP_SERVER_CPP=kcpp):
+                extract_mcp_tools()
+            check(False, "tools: kTools[] is not comment-stripped, so '#if 0' inside a block comment must raise")
+        except AnchorError as e:
+            check("kTools[]" in str(e), f"tools: the error must name the array, got {e}")
+        kcpp.write_text('static const ToolDef kTools[] = {\n    {"a", "d"},\n    // #if 0 is only a comment\n};\n',
+                        encoding="utf-8")
+        with _patched(MCP_SERVER_CPP=kcpp):
+            tools_found = extract_mcp_tools()
+        check(tools_found == {"a"}, f"tools: a comment line that mentions a directive is not a directive line, got {tools_found}")
+        for label_a, body_a, fn_a, needle_a in (
+                ("tools", 'static const ToolDef kTools[] = {\n    {"a", "d"},\n};\n// static const ToolDef kTools[] = {\n',
+                 extract_mcp_tools, "kTools[] declaration appears 2 times"),
+                ("resources", 'static const ResourceDef kResources[] = {\n    {"yuzu://a", "A"},\n};\n#if 0\n'
+                              'static const ResourceDef kResources[] = {\n    {"yuzu://old", "O"},\n};\n#endif\n',
+                 extract_mcp_resources, "kResources[] declaration appears 2 times")):
+            kcpp.write_text(body_a, encoding="utf-8")
+            try:
+                with _patched(MCP_SERVER_CPP=kcpp):
+                    fn_a()
+                check(False, f"anchor: a second {label_a} declaration must raise AnchorError")
+            except AnchorError as e:
+                check(needle_a in str(e), f"anchor: the {label_a} ambiguity error must say so, got {e}")
     for bad_cpp, why in (("int x;\n", "was not found"),
                          ("static const ResourceDef kResources[] = {\n};\n", "zero entries")):
         try:
@@ -1618,6 +2212,88 @@ def _selftest():
         except AnchorError as e:
             check("kResources[]" in str(e) and why in str(e),
                   f"resources: the error must name the symbol and say {why!r}, got {e}")
+
+    # -- registry-resident tools: kTools[] UNION every mcp_tools_*.cpp kToolRecords[] -----------
+    def _rec(*names):
+        """A registry file body shaped like the real ones: the array in an anonymous namespace,
+        each record opening `    {"name",` (4 spaces) and closing at column 0 with `};`."""
+        rows = "".join(f'    {{"{n}",\n        "d", R"({{}})", R"({{}})", "Infrastructure", "Read",\n'
+                       f'        ServiceScopeClass::denied, ToolEffect::read_only, true, "T", &handle_{n}}},\n'
+                       for n in names)
+        return f'namespace {{\nconstexpr ToolRecord kToolRecords[] = {{\n{rows}}};\n}}  // namespace\n'
+
+    def _reg_extract(ktools_body, files, floor=0):
+        """extract_mcp_tools() over a patched mcp_server.cpp + a patched registry dir."""
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dr:
+            (Path(dr) / "mcp_server.cpp").write_text(ktools_body, encoding="utf-8")
+            reg = Path(dr) / "reg"
+            reg.mkdir()
+            for fname, body in files.items():
+                (reg / fname).write_text(body, encoding="utf-8")
+            with _patched(MCP_SERVER_CPP=Path(dr) / "mcp_server.cpp", MCP_REGISTRY_DIR=reg, MIN_REGISTRY_FILES=floor):
+                return extract_mcp_tools()
+
+    kt = 'static const ToolDef kTools[] = {\n    {"legacy_a", "d"},\n    {"legacy_b", "d"},\n};\n'
+    got = _reg_extract(kt, {})
+    check(got == {"legacy_a", "legacy_b"}, f"registry: no registry file leaves exactly the kTools[] set, got {got}")
+    got = _reg_extract(kt, {"mcp_tools_one.cpp": _rec("reg_x", "reg_y"), "mcp_tools_two.cpp": _rec("reg_z"),
+                            "mcp_tools_orphan.hpp": _rec("legacy_a"), "mcp_other.cpp": _rec("legacy_a")})
+    check(got == {"legacy_a", "legacy_b", "reg_x", "reg_y", "reg_z"},
+          f"registry: the union covers every mcp_tools_*.cpp file and ignores other names, got {got}")
+    for label, files, needles in (
+            ("dup-across-files", {"mcp_tools_one.cpp": _rec("reg_x"), "mcp_tools_two.cpp": _rec("reg_x")},
+             ("reg_x", "declared twice", "mcp_tools_one.cpp", "mcp_tools_two.cpp")),
+            ("dup-within-file", {"mcp_tools_one.cpp": _rec("reg_x", "reg_x")},
+             ("reg_x", "declared twice", "mcp_tools_one.cpp")),
+            ("collides-with-ktools", {"mcp_tools_one.cpp": _rec("legacy_b")},
+             ("legacy_b", "declared twice", "kTools[] in mcp_server.cpp", "mcp_tools_one.cpp")),
+            ("zero-records", {"mcp_tools_one.cpp": "constexpr ToolRecord kToolRecords[] = {\n    // nothing\n};\n"},
+             ("zero entries", "kToolRecords[]", "mcp_tools_one.cpp")),
+            ("no-anchor", {"mcp_tools_one.cpp": "int nothing_here;\n"},
+             ("kToolRecords[] was not found", "mcp_tools_one.cpp")),
+            ("second-anchor", {"mcp_tools_one.cpp": _rec("reg_x") + "// constexpr ToolRecord kToolRecords[] = {\n"},
+             ("kToolRecords[] declaration in mcp_tools_one.cpp appears 2 times",)),
+            ("preprocessor-line", {"mcp_tools_one.cpp": _rec("reg_x").replace('    {"reg_x",', '#if 0\n    {"reg_x",')},
+             ("preprocessor line", "kToolRecords[]", "mcp_tools_one.cpp", "row 2")),
+            ("preprocessor-after-comment", {"mcp_tools_one.cpp": _rec("reg_x").replace('    {"reg_x",', '/* c */ #if 0\n    {"reg_x",')},
+             ("preprocessor line", "kToolRecords[]")),
+            ("unterminated", {"mcp_tools_one.cpp": 'constexpr ToolRecord kToolRecords[] = {\n    {"reg_x", "d"},\n'},
+             ("unterminated", "mcp_tools_one.cpp")),
+            # B1: a grammar-invalid or non-entry record opener beside a valid one is a PARTIAL miss;
+            # it must fail loudly with file:line, never be dropped while the record is still served.
+            ("partial-miss-upper-case", {"mcp_tools_one.cpp": _rec("reg_x").replace("\n};", '\n    {"Reg_Y", "d"},\n};', 1)},
+             ("mcp_tools_one.cpp:6:", "record opener", "[a-z][a-z0-9_]*")),
+            ("partial-miss-hyphen", {"mcp_tools_one.cpp": _rec("reg_x").replace("\n};", '\n    {"reg-y", "d"},\n};', 1)},
+             ("mcp_tools_one.cpp:6:", "record opener")),
+            ("partial-miss-leading-digit", {"mcp_tools_one.cpp": _rec("reg_x").replace("\n};", '\n    {"9reg", "d"},\n};', 1)},
+             ("record opener",)),
+            ("partial-miss-no-comma", {"mcp_tools_one.cpp": _rec("reg_x").replace("\n};", '\n    {"reg_y"},\n};', 1)},
+             ("record opener",)),
+            ("partial-miss-brace-alone", {"mcp_tools_one.cpp": _rec("reg_x").replace("\n};", "\n    {\n};", 1)},
+             ("record opener",)),
+            ("partial-miss-first-record", {"mcp_tools_one.cpp": _rec("reg_x").replace('{"reg_x",', '{"Reg_x",')},
+             ("mcp_tools_one.cpp:3:", "record opener")),
+            ("file-name-upper-case", {"mcp_tools_Bad.cpp": _rec("reg_x")},
+             ("mcp_tools_Bad.cpp", "mcp_tools_[a-z0-9_]+")),
+            ("file-name-empty-stem", {"mcp_tools_.cpp": _rec("reg_x")},
+             ("mcp_tools_.cpp", "mcp_tools_[a-z0-9_]+")),
+            ("file-name-hyphen", {"mcp_tools_a-b.cpp": _rec("reg_x")},
+             ("mcp_tools_a-b.cpp", "mcp_tools_[a-z0-9_]+"))):
+        try:
+            _reg_extract(kt, files)
+            check(False, f"registry: {label} must raise AnchorError")
+        except AnchorError as e:
+            check(all(n in str(e) for n in needles), f"registry: {label}: error must contain {needles}, got {e}")
+    try:
+        _reg_extract(kt, {}, floor=1)
+        check(False, "registry: fewer files than MIN_REGISTRY_FILES must raise AnchorError")
+    except AnchorError as e:
+        check("at least 1" in str(e), f"registry: the floor error must state the floor, got {e}")
+    try:
+        _reg_extract('static const ToolDef kTools[] = {\n    // nothing\n};\n', {"mcp_tools_one.cpp": _rec("reg_x")})
+        check(False, "registry: an empty kTools[] must still raise even when a registry file has tools")
+    except AnchorError as e:
+        check("kTools[]" in str(e) and "zero entries" in str(e), f"registry: kTools[] emptiness stays its own error, got {e}")
 
     # -- twin_errors: one-sided twins, canonicalization, any-status rest twin
     def _trow(status, rest, mcp):
@@ -1675,7 +2351,7 @@ def _selftest():
     opt_key = ("OPTIONS", canonicalize("/api/v1/{param}"))
     undoc_key = ("GET", "/api/v1/synthetic-undocumented")
 
-    def _drive(rows, patch=None, doc="ok", synthetic=True, extra_files=None, tweak=None):
+    def _drive(rows, patch=None, doc="ok", synthetic=True, extra_files=None, tweak=None, skip_domains=(), today=None):
         """Writes a ledger dir, tunes the baselines, grandfather set and the
         OpenAPI allowlist to the synthetic ledger (then applies `patch`, the
         one defect under test), renders the matching generated doc, and runs
@@ -1686,7 +2362,8 @@ def _selftest():
                            and r["status"].startswith("exception:") and not parse_exception(r["status"]))
         with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as d:
             for dom in DOMAINS:
-                (Path(d) / f"{dom}.json").write_text(json.dumps(rows if dom == "other" else []), encoding="utf-8")
+                if dom not in skip_domains:
+                    (Path(d) / f"{dom}.json").write_text(json.dumps(rows if dom == "other" else []), encoding="utf-8")
             for name, body in (extra_files or {}).items():
                 (Path(d) / name).write_bytes(body if isinstance(body, bytes) else body.encode("utf-8"))
             with _patched(GRANDFATHERED_LEGACY_EXCEPTIONS=legacy, GRANDFATHERED_MAX=len(legacy)):
@@ -1696,7 +2373,9 @@ def _selftest():
                 tuned = {"BASELINE_UNTWINNED": sum(1 for r in loaded.values() if r["status"] != "twinned"),
                          "BASELINE_GENERIC_PLANNED": sum(1 for r in loaded.values()
                                                          if r["status"] == GENERIC_PLANNED_STATUS),
-                         "GRANDFATHERED_LEGACY_EXCEPTIONS": legacy, "GRANDFATHERED_MAX": len(legacy)}
+                         "GRANDFATHERED_LEGACY_EXCEPTIONS": legacy, "GRANDFATHERED_MAX": len(legacy),
+                         "STRICT_EXCEPTION_PINS": {r["capability_id"]: parse_exception(r["status"])[:2]
+                                                   for r in loaded.values() if parse_exception(r["status"])}}
                 a_, b_, o_ = ({k_: [("s.cpp", k_[1])] for k_, r in loaded.items() if r["status"] != "retire"},
                               {("GET", "/api/v1/a"): [], opt_key: [], undoc_key: []}, {("GET", "/api/v1/a")})
                 if tweak:
@@ -1713,7 +2392,8 @@ def _selftest():
                     doc_path.write_text(block.replace("| **Total**", "| **Total (old)**") if doc == "stale" else block,
                                         encoding="utf-8")
                 with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
-                    rc = run_check(ledger_dir=d, doc_path=doc_path, extracted=extracted if synthetic else None)
+                    rc = run_check(ledger_dir=d, doc_path=doc_path, extracted=extracted if synthetic else None,
+                                   today=today)
             return rc, err.getvalue()
 
     def expect(label, result, rc, *needles, absent=()):
@@ -1775,11 +2455,97 @@ def _selftest():
         ("planned-fall", base_rows, {"patch": {"BASELINE_GENERIC_PLANNED": 2}}, ("Lower BASELINE_GENERIC_PLANNED to 1",)),
         ("untwinned-rise", base_rows, {"patch": {"BASELINE_UNTWINNED": 1}}, ("RATCHET",)),
         ("untwinned-fall", base_rows, {"patch": {"BASELINE_UNTWINNED": 99}}, ("Lower BASELINE_UNTWINNED",)),
-        ("unledgered", base_rows, {"tweak": _extra_route}, ("unledgered route GET /fragments/not-in-ledger",)),
+        ("unledgered", base_rows, {"tweak": _extra_route}, ("unledgered route GET /fragments/not-in-ledger", "STRICT_EXCEPTION_PINS",
+                                                                       "written directly as an exception leaves it alone")),
         ("v1-keyed", base_rows + [v1_row], {"tweak": _no_a}, ("keyed on a REST v1 route", "size-pinned", "extending it is review-enforced")),
         ("openapi-missing", base_rows, {"tweak": _unlisted}, ("registered but missing from openapi_spec()",)),
         ("stale-allowlist", base_rows, {"tweak": _no_options}, ("ALLOWLIST_OPENAPI_MISSING entry OPTIONS", "is stale")),
     )
+    # Pins: each strict exception row is identity-pinned; a swap, relabel, re-date or stale pin fails.
+    s1_id, s2_id = base_rows[7]["capability_id"], base_rows[8]["capability_id"]
+    good_pins = {s1_id: (5955, str(day_a)), s2_id: (520, str(day_a))}
+    pin_cases = (
+        ("pin-new", {s2_id: good_pins[s2_id]}, ("not in STRICT_EXCEPTION_PINS", "recorded ruling")),
+        ("pin-relabel", dict(good_pins, **{s1_id: (520, str(day_a))}), ("is pinned as #520",)),
+        ("pin-redate", dict(good_pins, **{s1_id: (5955, str(day_a + one_day))}), ("is pinned as #5955 revisit",)),
+        ("pin-stale", dict(good_pins, **{"get.fragments-ghost": (520, str(day_a))}), ("is stale", "get.fragments-ghost")),
+    )
+    for label, pins_c, needles in pin_cases:
+        expect(label, _drive(base_rows, patch={"STRICT_EXCEPTION_PINS": pins_c}), 1, *needles)
+    check(pin_errors({}, pins={}) == [], "pins: an empty ledger with no pins is clean")
+    check(STRICT_EXCEPTION_PINS and all(isinstance(v, tuple) and len(v) == 2 for v in STRICT_EXCEPTION_PINS.values()),
+          "pins: the real table maps capability ids to (issue, date)")
+
+    # Lapse: ONE aggregated warning at the horizon, never a failure, deterministic via `today`.
+    due_day = day_a
+    lapse_rows = {(i, i): {"status": f"exception:#{520 + i} revisit:{due_day + i * one_day} r",
+                           "capability_id": f"get.fragments-l{i}"} for i in range(5)}
+    check(revisit_lapse_warning(lapse_rows, due_day - datetime.timedelta(days=REVISIT_WARN_DAYS + 5)) is None,
+          "lapse: nothing due beyond the horizon -> no warning")
+    w = revisit_lapse_warning(lapse_rows, due_day + 2 * one_day)
+    check(w is not None and f"on or before {due_day + (2 + REVISIT_WARN_DAYS) * one_day}" in w and w.startswith("5 exception row(s)") and "2 already past" in w
+          and "#520" in w and "get.fragments-l0" in w and w.endswith("or retire it") and ", ..." in w,
+          f"lapse: one aggregated warning with counts, issues and the first ids, got {w}")
+    for n_due, dots in ((3, False), (4, True)):
+        rows_n = {k: v for k, v in lapse_rows.items() if k[0] < n_due}
+        wn = revisit_lapse_warning(rows_n, due_day + 5 * one_day)
+        check((", ..." in wn) == dots, f"lapse: an ellipsis only after the third id with {n_due} due, got {wn}")
+    unsorted_rows = dict(reversed(list(lapse_rows.items())))
+    wu = revisit_lapse_warning(unsorted_rows, due_day + 2 * one_day)
+    check(wu == w and f"earliest {due_day}" in wu and "first: get.fragments-l0, get.fragments-l1, get.fragments-l2, ..." in wu
+          and "get.fragments-l3" not in wu, f"lapse: the earliest rows lead and only three ids are named, got {wu}")
+    check(REVISIT_WARN_DAYS == 14, "lapse: the docs say 14 days; change them together with REVISIT_WARN_DAYS")
+    edge = {(0, 0): {"status": f"exception:#9 revisit:{due_day} r", "capability_id": "get.fragments-e"}}
+    check(revisit_lapse_warning(edge, due_day - datetime.timedelta(days=REVISIT_WARN_DAYS)) is not None,
+          "lapse: a date exactly at today + REVISIT_WARN_DAYS is due")
+    check(revisit_lapse_warning(edge, due_day - datetime.timedelta(days=REVISIT_WARN_DAYS + 1)) is None,
+          "lapse: one day beyond the horizon is not due")
+    check(revisit_lapse_warning(edge, datetime.date.max) is not None, "lapse: a max date does not overflow")
+    check(revisit_lapse_warning({(0, 0): {"status": "exception:#9 legacy", "capability_id": "x"}}, due_day) is None,
+          "lapse: a grandfathered free-form row has no date to lapse")
+    rc_l, out_l = _drive(base_rows, today=day_a + one_day)
+    check(rc_l == 0 and out_l.count("::warning::check-api-parity: ") == 1 and "or retire it" in out_l
+          and "::error::" not in out_l, f"lapse: run_check warns once and still passes, got {rc_l}: {out_l[:300]}")
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dsum:
+        summ = Path(dsum) / "summary.md"
+        summ.write_text("an earlier step\n", encoding="utf-8")
+        for env_val, want in ((str(summ), True), (str(Path(dsum) / "no_such_dir" / "x.md"), False), (None, False)):
+            saved = os.environ.get("GITHUB_STEP_SUMMARY")
+            if env_val is None:
+                os.environ.pop("GITHUB_STEP_SUMMARY", None)
+            else:
+                os.environ["GITHUB_STEP_SUMMARY"] = env_val
+            try:
+                rc_s, out_s = _drive(base_rows, today=day_a + one_day)
+            finally:
+                if saved is None:
+                    os.environ.pop("GITHUB_STEP_SUMMARY", None)
+                else:
+                    os.environ["GITHUB_STEP_SUMMARY"] = saved
+            check(rc_s == 0 and "::error::" not in out_s,
+                  f"step summary: an unwritable or unset summary path never changes the result, got {rc_s}: {out_s[:200]}")
+        body_s = summ.read_text(encoding="utf-8") if summ.exists() else ""
+        check(body_s.startswith("an earlier step\n") and "exception revisit dates" in body_s
+              and "or retire it" in body_s and body_s.count("###") == 1,
+              f"step summary: the lapse notice is appended once, after what is already there, got {body_s!r}")
+        os.environ["GITHUB_STEP_SUMMARY"] = str(summ)
+        try:
+            rc_s, out_s = _drive(base_rows, today=day_a - 100 * one_day)
+        finally:
+            os.environ.pop("GITHUB_STEP_SUMMARY", None)
+        check(rc_s == 0 and summ.read_text(encoding="utf-8").count("###") == 1,
+              "step summary: nothing is appended when no revisit date is near")
+        check(os.environ.get("GITHUB_STEP_SUMMARY") is None, "step summary: the selftest leaves the variable as it found it")
+    rc_l, out_l = _drive(base_rows, today=day_a - 100 * one_day)
+    check(rc_l == 0 and "or retire it" not in out_l, f"lapse: no warning far from the date, got {out_l[:200]}")
+
+    expect("odd-filename", _drive(base_rows, extra_files={"x\n::error::injected.json": "{bad"}), 1,
+           "not one of the declared domains", absent=("\n::error::injected",))
+    expect("bad-method", _drive(base_rows + [_mk("bm", "retire", method="GET\n::error::injected")]), 1,
+           "method must be 1-16 upper-case", absent=("\n::error::injected",))
+    expect("bad-path", _drive(base_rows + [_mk("bp", "retire", path="/x\n::error::injected")]), 1,
+           "path must be", absent=("\n::error::injected",))
+    expect("missing-domain", _drive(base_rows, skip_domains=("tar",)), 1, "missing for declared domain")
     expect("planned-lookalike", _drive(base_rows + [_mk("p21460", "planned:#21460")]), 0)
     for label, rows_c, kw, needles in cases:
         expect(label, _drive(rows_c, **kw), 1, *needles,
@@ -1796,20 +2562,115 @@ def _selftest():
             target = cpp if body is not None else Path(dc) / "absent.cpp"
             expect("cpp-" + label, _drive(base_rows, patch={"MCP_SERVER_CPP": target}, synthetic=False), 1, needle,
                    absent=("[Errno",))
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dz:
+        cpp = Path(dz) / "mcp_server.cpp"
+        cpp.write_text('static const ResourceDef kResources[] = {\n    {"yuzu://r", "R", "d", "m"},\n};\n'
+                       "static const ToolDef kTools[] = {\n    // nothing\n};\n", encoding="utf-8")
+        expect("cpp-tools-empty", _drive(base_rows, patch={"MCP_SERVER_CPP": cpp}, synthetic=False), 1,
+               "yielded zero entries", "kTools[]")
     with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dm:
         rest_cpp = Path(dm) / "rest_api_v1.cpp"  # synthetic: the selftest never reads the real tree
         rest_cpp.write_text('static const std::string spec = R"({"paths":{}})";\n', encoding="utf-8")
+        empty_ledger = Path(dm) / "ledger"
+        empty_ledger.mkdir()
+        for dom in DOMAINS:
+            (empty_ledger / f"{dom}.json").write_text("[]", encoding="utf-8")
         for mode in ("--render-doc", "--dump-json"):
             err = io.StringIO()
-            with _patched(MCP_SERVER_CPP=Path(dm) / "absent.cpp", SERVER_SRC=Path(dm), REST_API_V1_CPP=rest_cpp), \
+            with _patched(MCP_SERVER_CPP=Path(dm) / "absent.cpp", SERVER_SRC=Path(dm), REST_API_V1_CPP=rest_cpp,
+                          LEDGER_DIR=empty_ledger), \
                     contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
                 rc_m = main([mode])
             check(rc_m == 1 and "::error::" in err.getvalue() and "cannot read" in err.getvalue()
                   and "Traceback" not in err.getvalue(), f"main({mode}): a lost source is a named error, got {rc_m}: {err.getvalue()[:200]}")
+    # openapi_spec() anchor: an unreadable file or a lost anchor is a named error, never a traceback.
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dq:
+        for label, body in (("missing", None), ("anchor", b"int nothing;\n"), ("bytes", b"\xff\xfe"),
+                            ("twice", b'static const std::string spec = R"({})";\nstatic const std::string spec = 1;\n')):
+            target = Path(dq) / f"rest_{label}.cpp"
+            if body is not None:
+                target.write_bytes(body)
+            try:
+                with _patched(REST_API_V1_CPP=target):
+                    extract_openapi_paths()
+                check(False, f"openapi: a {label} rest_api_v1.cpp must raise AnchorError")
+            except AnchorError as e:
+                check("openapi_spec()" in str(e), f"openapi: the error must name the literal, got {e}")
+        # One wrapper call around the chain is accepted (a // comment between chunks, a qualified
+        # identifier); every other shape (inside the call or after it) is a named AnchorError.
+        for label, body, want in (
+                ("wrapped", 'expand_ecosystem_tokens(\n    // chunk 1\n    R"json({"paths":{"/a":{"get":{}}}})json"\n    ""\n);\n',
+                 {("GET", "/api/v1/a")}),
+                ("qualified", 'yuzu::expand_x(R"({"paths":{"/b":{"get":{}}}})");\n',
+                 {("GET", "/api/v1/b")}),
+                ("return-tail", 'f(R"({"paths":{"/c":{"get":{}}}})");\n    // done\n    return spec;\n}\n',
+                 {("GET", "/api/v1/c")})):
+            target = Path(dq) / f"rest_{label}.cpp"
+            target.write_text("static const std::string spec = " + body, encoding="utf-8")
+            with _patched(REST_API_V1_CPP=target):
+                got, _spec = extract_openapi_paths()
+            check(got == want, f"openapi: a {label} wrapper call must parse, got {got}")
+        for label, body in (
+                ("nested", 'f(g(R"({"paths":{}})"));'),
+                ("non-literal", "f(spec_text);"),
+                ("empty", "f();"),
+                ("second-arg", 'f(R"({})", 1);'),
+                ("unbalanced-open", 'f(R"({"paths":{}})";'),
+                ("unbalanced-close", 'R"({"paths":{}})");'),
+                ("literal-after-call", 'f(R"({})") R"({})";'),
+                ("block-comment", 'f(R"({})" /* c */ R"({})");'),
+                ("bad-json", 'f(R"({"paths":[@@X@@]})");'),
+                ("second-static", 'f(R"({})"); static const std::string served = spec; return served; }'),
+                ("extra-statement", 'f(R"({})"); g(); return spec; }'),
+                ("no-close", 'f(R"({})"); return spec; static int x;')):
+            target = Path(dq) / f"rest_{label}.cpp"
+            target.write_text("static const std::string spec = " + body + "\n", encoding="utf-8")
+            try:
+                with _patched(REST_API_V1_CPP=target):
+                    extract_openapi_paths()
+                check(False, f"openapi: a {label} shape (inside the call or after it) must raise AnchorError")
+            except AnchorError as e:
+                check("openapi_spec()" in str(e), f"openapi: the {label} error must name the literal, got {e}")
+                if label == "block-comment":
+                    check("/* */ comment" in str(e), f"openapi: the {label} error must name the comment, got {e}")
+        # Informational modes refuse a malformed ledger, and read it before any source.
+        bad_dir = Path(dq) / "bad"
+        bad_dir.mkdir()
+        for dom in DOMAINS:
+            (bad_dir / f"{dom}.json").write_text(
+                json.dumps([_mk("bad", "nonsense")] if dom == "other" else []), encoding="utf-8")
+        gone = Path(dq) / "absent.cpp"
+        for mode in ("--render-doc", "--baseline-inventory"):
+            err = io.StringIO()
+            with _patched(LEDGER_DIR=bad_dir, MCP_SERVER_CPP=gone, REST_API_V1_CPP=gone, SERVER_SRC=Path(dq)), \
+                    contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc_i = main([mode])
+            check(rc_i == 1 and "::error::" in err.getvalue() and "invalid status" in err.getvalue()
+                  and "counts unreliable" in err.getvalue()
+                  and "cannot read" not in err.getvalue() and "Traceback" not in err.getvalue(),
+                  f"main({mode}): a malformed ledger must fail first with the unreliable note, got {rc_i}: {err.getvalue()[:300]}")
+    # --dump-json lists the MCP resources next to the tools.
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dj:
+        jcpp = Path(dj) / "mcp_server.cpp"
+        jcpp.write_text('static const ResourceDef kResources[] = {\n    {"yuzu://r1", "R", "d", "m"},\n};\n'
+                        'static const ToolDef kTools[] = {\n    {"t1", "d"},\n};\n', encoding="utf-8")
+        jrest = Path(dj) / "rest_api_v1.cpp"
+        jrest.write_text('static const std::string spec = R"({"paths":{}})";\n', encoding="utf-8")
+        jsrc = Path(dj) / "src"
+        jsrc.mkdir()
+        out_j = io.StringIO()
+        with _patched(MCP_SERVER_CPP=jcpp, REST_API_V1_CPP=jrest, SERVER_SRC=jsrc, MCP_REGISTRY_DIR=jsrc,
+                      MIN_REGISTRY_FILES=0), \
+                contextlib.redirect_stdout(out_j), contextlib.redirect_stderr(io.StringIO()):
+            rc_j = main(["--dump-json"])
+        dumped = json.loads(out_j.getvalue()) if rc_j == 0 else {}
+        check(rc_j == 0 and dumped.get("mcp_resources") == ["yuzu://r1"] and dumped.get("mcp_tools") == ["t1"]
+              and dumped.get("counts", {}).get("mcp_resources") == 1,
+              f"dump-json: mcp_resources must be listed and counted, got rc={rc_j} {dumped}")
     with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dd:
-        (Path(dd) / "x.json").mkdir()
+        (Path(dd) / "devices.json").mkdir()
         _rows, errs = load_ledger(dd)
-        check(any("x.json" in e and "invalid JSON" in e for e in errs),
+        check(any("devices.json" in e and "invalid JSON" in e for e in errs),
               f"load_ledger: a directory named *.json is a clean error, got {errs}")
 
     if failures:
@@ -1817,6 +2678,24 @@ def _selftest():
         return 1
     print("check-api-parity selftest: OK")
     return 0
+
+
+def _selftest():
+    """Runs the selftest with GITHUB_STEP_SUMMARY removed, so its synthetic revisit
+    notices never land in the real run summary when CI sets the variable."""
+    import tempfile
+    saved = os.environ.pop("GITHUB_STEP_SUMMARY", None)
+    # Hermetic against the real registry: the selftest fixtures patch MCP_SERVER_CPP alone, so the
+    # registry scan reads an empty directory with no file floor (its own cases patch both back).
+    saved_reg = (MCP_REGISTRY_DIR, MIN_REGISTRY_FILES)
+    try:
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as empty_registry:
+            globals().update(MCP_REGISTRY_DIR=Path(empty_registry), MIN_REGISTRY_FILES=0)
+            return _selftest_body()
+    finally:
+        globals().update(MCP_REGISTRY_DIR=saved_reg[0], MIN_REGISTRY_FILES=saved_reg[1])
+        if saved is not None:
+            os.environ["GITHUB_STEP_SUMMARY"] = saved
 
 
 def main(argv=None):
@@ -1830,7 +2709,8 @@ def main(argv=None):
                           "does not let planned:#2146 grow, so retag each new row "
                           "with a specific planned:#N or a strict exception")
     ap.add_argument("--baseline-inventory", action="store_true",
-                     help="print current vs baseline counts without failing")
+                     help="print current vs baseline counts without failing on a ratchet "
+                          "mismatch (exit 1 if the ledger is malformed)")
     ap.add_argument("--render-doc", action="store_true",
                      help="print docs/api-parity-ledger.md's generated block "
                           "(splice between the BEGIN/END GENERATED markers)")

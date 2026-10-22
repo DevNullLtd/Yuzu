@@ -38,8 +38,10 @@
  * `nullptr`, i.e. unconditionally).
  */
 
+#include "crypto_library_model.hpp"
 #include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
+#include "software_catalog_rules.hpp" // kEcosystemFamilies: the published ecosystem vocabulary
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -47,6 +49,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <map>
 #include <regex>
 #include <set>
 #include <string>
@@ -162,7 +165,8 @@ void collect_ref_targets(const json& node, std::vector<std::string>& out) {
     }
 }
 
-bool ref_resolves(const json& spec, const std::string& ref) {
+/// The node a "#/a/b/c" ref points at, or nullptr when a part is missing.
+const json* resolve_ref(const json& spec, const std::string& ref) {
     // ref is "#/a/b/c" -> walk spec["a"]["b"]["c"].
     std::string path = ref.substr(1); // drop leading '#'
     const json* node = &spec;
@@ -170,10 +174,67 @@ bool ref_resolves(const json& spec, const std::string& ref) {
         if (part.empty())
             continue;
         if (!node->is_object() || !node->contains(part))
-            return false;
+            return nullptr;
         node = &(*node)[part];
     }
-    return true;
+    return node;
+}
+
+bool ref_resolves(const json& spec, const std::string& ref) {
+    return resolve_ref(spec, ref) != nullptr;
+}
+
+json param(const json& op, const char* name) {
+    // value(), not operator[]: on a const json a missing key asserts and aborts the whole shard.
+    for (const auto& p : op.value("parameters", json::array()))
+        if (p.value("name", "") == name)
+            return p;
+    return json();
+}
+
+/// One `ecosystem` parameter found in a document: where it sits and its resolved schema.
+struct EcosystemParam {
+    std::string where;
+    json schema;
+};
+
+/// Every parameter named `ecosystem` under every path item and operation (path-level
+/// `parameters` included). A Parameter Object or a schema that is a `$ref` is resolved BEFORE the
+/// name check, since a referenced parameter carries no `name` of its own.
+std::vector<EcosystemParam> ecosystem_parameter_schemas(const json& spec) {
+    std::vector<EcosystemParam> found;
+    const auto collect = [&](const json& params, const std::string& where) {
+        if (!params.is_array())
+            return;
+        for (const auto& p : params) {
+            INFO(where);
+            const json* node = &p;
+            if (p.contains("$ref")) {
+                node = resolve_ref(spec, p["$ref"].get<std::string>());
+                REQUIRE(node != nullptr);
+            }
+            if (node->value("name", "") != "ecosystem")
+                continue;
+            json schema = node->value("schema", json::object());
+            if (schema.contains("$ref")) {
+                const json* target = resolve_ref(spec, schema["$ref"].get<std::string>());
+                REQUIRE(target != nullptr);
+                schema = *target;
+            }
+            found.push_back({where, schema});
+        }
+    };
+    for (const auto& [path, item] : spec["paths"].items()) {
+        if (!item.is_object())
+            continue;
+        for (const auto& [key, node] : item.items()) {
+            if (key == "parameters")
+                collect(node, path);
+            else if (node.is_object() && node.contains("parameters"))
+                collect(node["parameters"], key + " " + path);
+        }
+    }
+    return found;
 }
 
 } // namespace
@@ -278,6 +339,23 @@ TEST_CASE("RestApiV1::register_routes vs openapi_spec_json(): every registered "
     REQUIRE(missing.empty());
 }
 
+TEST_CASE("openapi_spec_json(): info.description states the cookie-session same-site rule",
+          "[openapi]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec.contains("info"));
+    REQUIRE(spec["info"].contains("description"));
+    const std::string description = spec["info"]["description"].get<std::string>();
+    CHECK(description.find("authorised by the session cookie must carry an Origin or Referer "
+                           "header naming this site") != std::string::npos);
+    CHECK(description.find("--csrf-trusted-origin") != std::string::npos);
+    CHECK(description.find("cross-site request refused") != std::string::npos);
+    CHECK(description.find("Token callers are not affected, except routes "
+                           "that keep their own check") != std::string::npos);
+    CHECK(description.find("Cookie-session reads that dispatch work, persist state or refresh "
+                           "server state") != std::string::npos);
+}
+
 TEST_CASE("openapi_spec_json(): the app-usage Forensics path is documented (Wave 7 PR7.2)",
           "[openapi][app_usage]") {
     const auto& spec_json = yuzu::server::openapi_spec_json();
@@ -310,6 +388,73 @@ TEST_CASE("openapi_spec_json(): the app-usage Forensics path is documented (Wave
     const std::string description = get_op.value("description", "");
     CHECK(description.find("retained") != std::string::npos);
     CHECK(description.find("all-time") == std::string::npos);
+}
+
+TEST_CASE("openapi_spec_json(): the /crypto reads pin the family enum and the bounds to the model",
+          "[openapi][crypto]") {
+    namespace cl = yuzu::server::crypto_library;
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    json ids = json::array();
+    for (const auto& f : cl::families())
+        ids.push_back(std::string(f.id));
+
+    const auto& summary = spec["paths"]["/crypto/libraries"]["get"];
+    const auto& devices = spec["paths"]["/crypto/libraries/devices"]["get"];
+    const auto& cbom = spec["paths"]["/crypto/cbom"]["get"];
+    CHECK(param(summary, "family")["schema"]["enum"] == ids);
+    CHECK(param(cbom, "family")["schema"]["enum"] == ids);
+    CHECK(param(cbom, "ecosystem")["schema"]["maxLength"] == cl::kEcosystemMaxBytes);
+    CHECK(param(devices, "family")["schema"]["enum"] == ids);
+    CHECK(param(summary, "ecosystem")["schema"]["maxLength"] == cl::kEcosystemMaxBytes);
+    CHECK(param(devices, "ecosystem")["schema"]["maxLength"] == cl::kEcosystemMaxBytes);
+    // The CBOM's Vary header documents what the route actually sets, and its description opens
+    // with what the document IS (library components only).
+    CHECK(cbom["responses"]["200"]["headers"]["Vary"]["schema"]["enum"][0] ==
+          "Authorization, Cookie, X-Yuzu-Token");
+    CHECK(cbom["description"].get<std::string>().find(
+              "Vary: Authorization, Cookie, X-Yuzu-Token") != std::string::npos);
+    CHECK(cbom["description"].get<std::string>().find("cryptographic LIBRARY packages") !=
+          std::string::npos);
+    // The 8-name cap and the every-family store-ceiling flag are stated, not silent.
+    CHECK(summary["description"].get<std::string>().find("package_names_truncated") !=
+          std::string::npos);
+    CHECK(summary["responses"]["200"]["description"].get<std::string>().find(
+              "package_names_truncated") != std::string::npos);
+    CHECK(param(devices, "version")["schema"]["maxLength"] == cl::kVersionMaxBytes);
+    CHECK(param(devices, "cursor")["schema"]["maxLength"] == cl::kCursorMaxBytes);
+    CHECK(param(devices, "limit")["schema"]["maximum"] == cl::kPageMax);
+    CHECK(param(devices, "limit")["schema"]["default"] == cl::kDefaultLimit);
+    // table_version is documented on both answers; a refused cross-version cursor on the drill.
+    CHECK(summary["responses"]["200"]["description"].get<std::string>().find("table_version") !=
+          std::string::npos);
+    CHECK(devices["responses"]["200"]["description"].get<std::string>().find("table_version") !=
+          std::string::npos);
+    CHECK(devices["responses"]["400"]["description"].get<std::string>().find("table_version") !=
+          std::string::npos);
+    // The filter params are EXACT when present (even empty): none says "no filter" for empty.
+    for (const json* op : {&summary, &devices}) {
+        const auto eco = param(*op, "ecosystem")["description"].get<std::string>();
+        CHECK(eco.find("no filter") == std::string::npos);
+        CHECK(eco.find("present") != std::string::npos);
+    }
+    CHECK(param(devices, "version")["description"].get<std::string>().find("present") !=
+          std::string::npos);
+    // The drill echoes the ecosystem filter the way it echoes version; 503 names the admission bound.
+    CHECK(devices["responses"]["200"]["description"].get<std::string>().find("ecosystem|null") !=
+          std::string::npos);
+    for (const json* op : {&summary, &devices}) {
+        // Both 503 causes are named, each with its message; the not-built 503 is gone.
+        const auto d503 = (*op)["responses"]["503"]["description"].get<std::string>();
+        CHECK(d503.find("capacity in use") != std::string::npos);
+        CHECK(d503.find("crypto library read degraded") != std::string::npos);
+        CHECK(d503.find("not built") == std::string::npos);
+        // The names' source is documented on the 200 body and in the description.
+        CHECK((*op)["responses"]["200"]["description"].get<std::string>().find("names_source") !=
+              std::string::npos);
+        CHECK((*op)["description"].get<std::string>().find("names_source") != std::string::npos);
+        CHECK((*op)["description"].get<std::string>().find("live") != std::string::npos);
+    }
 }
 
 TEST_CASE("openapi_spec_json(): the RBAC role reads document 403/404/503 and the retry semantics",
@@ -511,4 +656,81 @@ TEST_CASE("openapi_spec_json(): every $ref (including discriminator.mapping "
         unresolved_list += "  " + r + "\n";
     INFO("Unresolved $ref targets:\n" << unresolved_list);
     REQUIRE(unresolved.empty());
+}
+
+TEST_CASE("openapi_spec_json(): every ecosystem parameter and the pipe-list are generated from "
+          "kEcosystemFamilies",
+          "[openapi][software][ecosystem]") {
+    const std::string raw = yuzu::server::openapi_spec_json();
+    json spec = json::parse(raw, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+
+    json table = json::array();
+    std::string pipes;
+    for (const auto& e : yuzu::server::software_catalog::kEcosystemFamilies) {
+        table.push_back(std::string(e.ecosystem));
+        if (!pipes.empty())
+            pipes += '|';
+        pipes += e.ecosystem;
+    }
+    REQUIRE(table.size() > 0);
+    json with_empty = json::array({""});
+    with_empty.insert(with_empty.end(), table.begin(), table.end());
+
+    for (const char* path : {"/inventory/software", "/inventory/software/catalogue",
+                             "/inventory/software/catalogue/versions"}) {
+        INFO(path);
+        CHECK(param(spec["paths"][path]["get"], "ecosystem")["schema"]["enum"] == table);
+    }
+    for (const char* path : {"/crypto/libraries", "/crypto/libraries/devices", "/crypto/cbom"}) {
+        INFO(path);
+        CHECK(param(spec["paths"][path]["get"], "ecosystem")["schema"]["enum"] == with_empty);
+    }
+    // The six pins above fix WHICH routes serve the with-empty form (those where a present-empty
+    // value selects rows with no ecosystem: the /crypto reads); this sweep covers EVERY served
+    // `ecosystem` parameter, so a route added later with a stale or divergent enum fails here. A
+    // table-equal hand-typed array serves the same values and passes: that provenance is
+    // test_software_vocabulary_consistency.py's to catch, in the unexpanded source.
+    const auto params = ecosystem_parameter_schemas(spec);
+    for (const auto& ep : params) {
+        INFO(ep.where);
+        REQUIRE(ep.schema.contains("enum"));
+        CHECK((ep.schema["enum"] == table || ep.schema["enum"] == with_empty));
+    }
+    REQUIRE(params.size() >= 6);
+    CHECK(spec["paths"]["/inventory/software"]["get"]["description"].get<std::string>().find(
+              "ecosystem (" + pipes + ")") != std::string::npos);
+    CHECK(raw.find("@@") == std::string::npos);
+    // The route handler and discover_routes bind this by reference: it must be one stable object.
+    CHECK(&yuzu::server::openapi_spec_json() == &yuzu::server::openapi_spec_json());
+    // The expansion reserves the exact final size; a capacity near 2x would mean the ~400 KB
+    // string grew through a reallocating replace.
+    CHECK(yuzu::server::openapi_spec_json().capacity() - raw.size() < 4096);
+}
+
+TEST_CASE("ecosystem_parameter_schemas(): resolves referenced parameters and schemas and "
+          "path-level parameters",
+          "[openapi][software][ecosystem]") {
+    const json spec = json::parse(R"json({
+      "components": {
+        "parameters": {"Eco": {"name": "ecosystem", "in": "query", "schema": {"enum": ["a"]}}},
+        "schemas": {"EcoS": {"enum": ["b"]}}
+      },
+      "paths": {"/x": {
+        "parameters": [{"name": "ecosystem", "schema": {"enum": ["c"]}}],
+        "get": {"parameters": [{"$ref": "#/components/parameters/Eco"}]},
+        "post": {"parameters": [
+          {"name": "other"},
+          {"name": "ecosystem", "schema": {"$ref": "#/components/schemas/EcoS"}}]}
+      }}
+    })json");
+    const auto found = ecosystem_parameter_schemas(spec);
+    // A name-first filter would skip the referenced parameter and return 2.
+    REQUIRE(found.size() == 3);
+    std::map<std::string, json> by_where;
+    for (const auto& ep : found)
+        by_where[ep.where] = ep.schema.at("enum");
+    CHECK(by_where["/x"] == json::array({"c"}));
+    CHECK(by_where["get /x"] == json::array({"a"}));
+    CHECK(by_where["post /x"] == json::array({"b"}));
 }

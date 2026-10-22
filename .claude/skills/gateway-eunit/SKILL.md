@@ -38,7 +38,7 @@ With `--dir apps/yuzu_gw/test`, rebar3 scans the directory directly and accepts 
 
 ## Interpreting output
 
-- **`All N tests passed.`** — clean pass. Current expected total: **148**.
+- **`All N tests passed.`** — clean pass (count changes often; a clean run's summary line reports it).
 - **`Passed: N.  One or more tests were cancelled.`** — at least one test timed out at the eunit 5-second default. The cancellation usually cancels the entire enclosing `{setup, ...}` group, so the real impact is larger than "one test". Search for `*timed out*` in the full output to find the culprit.
 - **`Module X not found in project.`** — you forgot `--dir`. See #337 above.
 - **Stray `connection_refused` / `Failed to notify stream status`** log lines — fixture leak from a prior test module. Don't ignore; they have caused real test flakes (#336).

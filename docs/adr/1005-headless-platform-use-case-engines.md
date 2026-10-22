@@ -181,7 +181,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        until an MCP destructive-operation gate exists (human confirmation /
        tier ceiling) that makes a guarded twin safe. Recorded in **#2102** (closed
        2026-07-14); no open issue tracks the work. **Revisit by 2027-01-13**
-       (not machine-checked). The fragment that probes the
+       (the date is pinned in the gate, which warns as it nears; whether the
+       revisit happens is not machine-checked). The fragment that probes the
        `Decommission:Delete` gate, `get.fragments-hardware-ci-stored-data`, is
        ledgered as `exception:#2102 revisit:2027-01-13`.
      - **Scoped to the destructive verb only — the capability's read half
@@ -347,15 +348,19 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        MCP-tier boundary, not a decision record: the decision of record is
        `mcp_policy.hpp`'s `tier_allows` and the `docs/mcp-server.md` bullet
        "Server administration surfaces stay REST-only (#520)". No open item
-       owns the 2027-04-30 re-confirmation of these eleven rows: 2027-04-30
+       owns the 2027-04-30 re-confirmation of these eleven rows (nor of the
+       audit-retention read, a twelfth #520 row recorded below): 2027-04-30
        was chosen when the dated-exceptions change was written (2026-10-16)
-       and accepted by the maintainer in that change's session; it is not a
-       recorded ruling and is not machine-checked. #4031 is open but carries
-       no re-confirmation date. The stored-data row
+       and accepted by the maintainer in that change's session, and the
+       twelfth row's status text carries the same date from a later ledger
+       reconcile; it is not a recorded ruling, and the gate pins and warns on
+       the date but does not check that the re-confirmation happens. #4031 is
+       open but carries no re-confirmation date. The stored-data row
        (`get.fragments-hardware-ci-stored-data`) is dated 2027-01-13 from the
        2026-07-13 SLE-erasure entry, and the admin reset 2027-01-04 from the
-       2026-10-04 passwords entry (earlier ADR text); neither date is
-       machine-checked. #5955 covers only its own 13 rows.
+       2026-10-04 passwords entry (earlier ADR text); neither date is a
+       recorded ruling, and the gate pins and warns on both without checking
+       that the revisit happens. #5955 covers only its own 13 rows (the 2026-10-15 set).
      - **The exception relaxes no control.** Every route requires its
        dedicated RBAC securable (`Read`) and is floored in
        `authz_topology_floor.hpp` so an RBAC-off deployment stays
@@ -650,14 +655,30 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      capability, or any extension, needs its own recorded ruling. The list
      of record is issue #5955 plus the rows carrying
      `exception:#5955 revisit:2026-11-30` in `scripts/ci/api-parity/*.json`.
-     The gate requires the dated shape for any new exception but does not yet
-     cap how many there are. Growth is review-enforced for now, as is
-     re-dating, re-pointing or relabelling an existing exception row. A
-     revisit date that has passed is not machine-checked (#5955 is the
-     reminder). The #520 dating of the eleven #520 rows (three #4031, eight
-     #4028; see the #4028 entry) is not part of the 2026-10-15 acceptance.
-     As of 2026-10-18 five free-form rows remain in a
-     size-pinned set. None carries a machine-checked dated revisit, and none
+     The gate requires the dated shape for any new exception and pins every
+     dated exception row in `STRICT_EXCEPTION_PINS` by capability id to its
+     issue and revisit date, so a new, relabelled, re-dated or removed
+     exception, and a pin whose row was twinned or retired, each need a
+     visible edit to that table. The pin is not a ruling: a new or changed
+     exception still needs its own recorded ruling. As of 2026-10-18 a
+     revisit date within 14 days of today, or already past, produces one
+     aggregated warning, never a failure; whether the revisit was done is
+     not machine-checked (#5955 is the reminder for its own rows). The pin
+     binds the capability id, the issue and the date, not the reason text,
+     so rewriting a reason stays review-only (a different route changes the
+     id derived from its method and path, so its pin goes stale; only a
+     different route whose derived id collides with the pinned one escapes).
+     The #520 dating of the twelve #520 rows (three #4031, eight #4028, and
+     `get.fragments-access-audit-retention`; see the #4028 entry) is not
+     part of the 2026-10-15 acceptance. The audit-retention row was recorded
+     in `scripts/ci/api-parity/other.json` by the Audit page parity ledger
+     rows, before this entry's pin table, as a bare `exception:#520` and
+     dated by the later 2026-10-17 ledger reconcile; its status text states
+     the no-MCP decision for its REST twin
+     `GET /api/v1/settings/data-retention` and the 2027-04-30
+     re-confirmation, and this entry records that fact without ruling on it.
+     As of 2026-10-18 five free-form rows remain in a size-pinned set. None
+     carries a machine-checked dated revisit, and none
      has an open tracker that owns a date: the two NVD fragments
      (grandfathered surface #2, 2027-Q1 target, #4099 open); the
      self-service password change (a permanent exception, ADR 2026-10-04);
@@ -665,11 +686,13 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      closed, #3994 open design issue). The two dashboard api-tokens routes
      left this set when they were recorded as `twinned` (#6009). Plain growth
      of the set is machine-caught,
-     while growth paired with a raise of the pin, a swap or a rebind to a
+     while growth paired with a raise of its maximum, a swap or a rebind to a
      row with the same slug is review-only. These five rows are a disclosed
-     residual not covered by #5955. The eight `twinned-rest-only`
-     rows are open gaps counted by the ratchet and tracked by #5963 (the two
-     hardware rows also by #4456).
+     residual not covered by #5955. Nine `twinned-rest-only` rows
+     are open gaps counted by the ratchet, all tracked by #5963 (the hardware
+     list and detail rows also by #4456); the ninth, `get.fragments-access-audit-sample`, was
+     added to #5963 by a comment on 2026-10-18 (it was not in the issue's
+     original table of eight).
 
    - **2026-10-18 - approving and rejecting is a human-session act: MCP
      `approve_request` / `reject_request` and the legacy REST
@@ -724,6 +747,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        a session statement, not a signed decision; the #6079 issue body also
        records the maintainer's ruling to ship #6061 with the MFA caveat
        documented.
+     - **Versioning basis.** No `/api/v1` route changes behaviour. The changed REST surface is the unversioned
+       legacy pair above, and the MCP tools keep their names and stay listed. `docs/api-versioning-policy.md`
+       counts a tightened auth requirement as breaking, so the change ships under a Breaking changelog entry
+       that cites #6061 and #4128.
      - **Revisit 2027-01-18** is a re-confirmation date for a standing
        decision, not a work-item deadline. The decision changes only if MCP
        gains a human-presence proof that a bearer token cannot replay, or a
@@ -769,6 +796,103 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      - Design record: `docs/auth-architecture.md` "Approver assurance
        (maker-checker, #6061)"; operator description:
        `docs/user-manual/instructions.md` "Who can approve".
+
+   - **2026-10-22 - API-parity ledger reconcile: owner rulings on 87 `planned`
+     rows.** The ADR owner (Dave Rae) ruled on the disposition of rows that were
+     still `planned` in `scripts/ci/api-parity/*.json`. One row of the 87,
+     `get.api-procfetch-status`, was added by the author during governance
+     review (it has the same shape as `get.api-chargen-status`) and was
+     confirmed by the owner on 2026-10-22. Where the rulings are recorded: the admin-plane rulings in
+     #6325, the retire ruling in #6326, and the NVD and UI-only rulings in
+     this entry only (#4099 and #5955 are not amended). Like the earlier
+     entries they are session statements, not signed decisions. Where #6325's
+     body words the MCP exclusion more strongly ("#520 alone", "most are
+     barred", create-user keeping #5357), this entry's narrower wording
+     governs. Ledger-only: no route, tool or
+     authorization behavior changes. The gate (`STRICT_EXCEPTION_PINS` in
+     `scripts/ci/check-api-parity.py`) pins each new dated exception by
+     capability id, issue and date; the pin is not itself a ruling and does not
+     bind the reason text. This entry is the ruling the pins cite, and the
+     frozen list of record is the pin table in that script at the commit that
+     lands this entry.
+     - **Legacy admin-plane rows: 34 time-boxed exceptions,
+       `exception:#6325 revisit:2027-03-31`.** The rows are the MFA, OIDC, TLS
+       certificate, plugin-signing, MCP enablement, enrollment-token and
+       pending-agent, OTA update-setting, DEX alert-setting and create-user
+       routes. Thirty of them are `/api/settings/*` routes covered by the 2026-09
+       class entry above. **Four are
+       `/fragments/settings/*` rows** (`get.fragments-settings-mfa`,
+       `get.fragments-settings-tokens`, `get.fragments-settings-updates` and
+       `get.fragments-settings-dex-alerts`). That entry says fragments "carry
+       no migration date"; this ruling extends the carve-out to those four rows
+       and gives them the same date, 2027-03-31. The date is a re-confirmation
+       point, not a delivery commitment: the class entry calls 2027-Q1
+       PO-adjustable. What is deferred is the REST v1 twin. No MCP twin is
+       built for these rows; that is the position today because the routes
+       are admin-gated (`require_admin` / `admin_fn_`) and, where the
+       securable is one of the six #520 denies in `mcp_policy.hpp`, hard-denied
+       at every MCP tier. It is not asserted here as a permanent per-route
+       decision: each twin PR decides its MCP posture and, for a route on a
+       securable that is not hard-denied, extends the deny set with a test (a
+       v1 route on such a securable would otherwise become reachable by a
+       supervised-tier token). `POST /api/settings/users` (create-user) is in
+       this set; its password argument is the same kind of reason as the
+       admin password reset in the 2026-10-04 entry (#5357 covers the reset,
+       not create-user): a password must not travel in an approval ticket's
+       persisted arguments. The 2026-09 class table's "settings-plane
+       exception, 2027-Q1" target stands for these rows. It is superseded for
+       the deployment-jobs and patches rows by the retire ruling below, for
+       `/api/export/json-to-csv`, `/api/help/autocomplete` and
+       `/api/help/palette` by the UI-only exceptions below (2026-11-30), and
+       for `/api/nvd/*` by the NVD exceptions below (2027-03-31).
+     - **NVD routes: 3 time-boxed exceptions,
+       `exception:#4099 revisit:2027-03-31`.** `GET /api/nvd/status`,
+       `POST /api/nvd/sync` and `POST /api/nvd/match` are grandfathered
+       surface 2. Their disposition is the re-home to a use-case engine
+       tracked by #4099 (Phase 7, not started); no twin is built for the
+       legacy routes, and no row is added to the grandfather set.
+     - **UI-only fragments: 10 temporary exceptions,
+       `exception:#5955 revisit:2026-11-30`**, in addition to the 13 accepted
+       on 2026-10-15 (this entry is the separate recorded ruling that entry
+       requires): `get.api-chargen-status`, `get.api-procfetch-status`,
+       `post.api-export-json-to-csv`, `get.api-help-autocomplete`,
+       `get.api-help-palette`, `post.fragments-instructions-yaml-preview`,
+       `get.fragments-results-filter-bar`,
+       `get.fragments-dex-device-perf-result`,
+       `get.fragments-dex-device-procperf-result` and
+       `get.fragments-device-live`. The 2026-10-15 entry covered 13 read
+       fragments; two of these ten are POST rows (`post.api-export-json-to-csv`,
+       a stateless transform of caller-supplied JSON that reads no server data,
+       and `post.fragments-instructions-yaml-preview`, HTML highlighting and validation messages for
+       caller-supplied YAML), and this ruling accepts them on the same terms.
+       The waiver's non-waiver of authentication, authorization, audit and
+       confinement applies unchanged. #5955's title and body still count 13;
+       the rows are the list of record.
+     - **Retired rows: 9 marked `retire`; the routes stay live.** The four
+       `/api/deployment-jobs` rows and the five `/api/patches` rows have no
+       working feature behind them and get no twin. "Retire" here means no
+       twin will be built and a named issue (#6326) owns removal; it does not
+       mean the route is gone, and the gate does not check that. The routes
+       keep answering, and are exercised by `scripts/e2e-api-test.sh`, until
+       #6326 removes them, together with those tests, the body-cap route
+       inventory and the user-manual pages, with a deprecation period to be
+       decided there. The user-manual, capability-map and roadmap entries that
+       advertised these as shipped were corrected in the same change.
+     - **Corrections, not exceptions.** Eleven rows already had a REST v1 twin
+       and an MCP tool on the same gate and flip from `planned` to `twinned`.
+       Twenty rows (fourteen UI fragments and six `/api/*` routes) become
+       `composed-of:` another ledger row. That is a
+       correction of how the fragment is classified, not a claim that the
+       composed capability is already twinned: eleven of the twenty compose
+       over a row that is itself still `planned` (two of them also over a
+       twinned row; the pressure stays on those base rows) and one over an
+       excepted row (`post.api-settings-cert-upload` over
+       `post.api-settings-cert-paste`). Composed rows count as
+       untwinned. Six further rows were examined and held back for a follow-up
+       change because the REST and MCP twins differ in gate or content
+       (`get.api-inventory-tables`, `post.api-inventory-query`,
+       `get.api-inventory-param-param`, `get.api-agents`,
+       `get.fragments-network-overview`, `get.api-tags`).
 
 ## Interim rules (until the named follow-ups ship)
 

@@ -266,11 +266,13 @@ public:
     /// Whether the caller holds `securable_type:operation`, for deciding what to DRAW. It runs
     /// `require_permission`'s own decision path (elevation, engine principals, MCP tier,
     /// service scope, RBAC, legacy role), so the answer cannot drift from the gate's, but it
-    /// writes no response and no `auth.permission_required` denial row: nobody attempted
-    /// anything, and a page that refreshes every few seconds would otherwise fill the audit
-    /// log with denials. NEVER a gate: an action must still pass `require_permission` (or a
-    /// scoped variant) on the request that performs it. (#5792 asks for this on the shared
-    /// auth seam; callers that still probe with the loud gate are listed there and in #5830.)
+    /// writes no response, and no `auth.permission_required` denial row for an interactive cookie
+    /// session (`denial_row_may_be_withheld`): nobody attempted anything, and a page that
+    /// refreshes every few seconds would otherwise fill the audit log with denials. A token or
+    /// engine caller keeps its row (it is `probe_permission` with the response discarded). NEVER
+    /// a gate: an action must still pass `require_permission` (or a scoped variant) on the
+    /// request that performs it. (#5792 asks for this on the shared auth seam; callers that
+    /// still probe with the loud gate are listed there and in #5830.)
     [[nodiscard]] bool has_permission(const httplib::Request& req,
                                       const std::string& securable_type,
                                       const std::string& operation);
@@ -292,6 +294,31 @@ public:
     [[nodiscard]] bool probe_permission(const httplib::Request& req, httplib::Response& res,
                                         const std::string& securable_type,
                                         const std::string& operation);
+
+    /// `require_list_read` for a resource that is NOT agent-scoped (plugin configuration): the same
+    /// decision (ADR-0017 admit-then-filter, elevation, engine principals, MCP tier, service
+    /// scope, RBAC, legacy), except that a management-group-CONFINED admission is refused here as
+    /// a denial: 403, `auth.permission_required` row, `admitted=false`. Such a grant has no
+    /// per-agent filter to apply, and serving the list unfiltered would widen a device-scoped
+    /// grant to fleet-wide platform configuration. The refusal is audited HERE, at the one place
+    /// that knows it is a denial: `require_list_read` rightly writes nothing for an admission,
+    /// so a route that refused the scope itself would leave the denial off the record. Sole gate
+    /// for its route; never stack it with `require_permission` or `probe_permission` for the same
+    /// securable.
+    [[nodiscard]] ListReadGate require_global_list_read(const httplib::Request& req,
+                                                        httplib::Response& res,
+                                                        const std::string& securable_type,
+                                                        const std::string& operation);
+
+    /// `require_global_list_read` with the `auth.permission_required` denial row withheld for an
+    /// interactive cookie session only (`denial_row_may_be_withheld`); a token or engine caller
+    /// keeps it. For a page fragment that loads by itself and decides what to DRAW from the same
+    /// list authority its REST and MCP twins use. `res` is meant to be a scratch response: a 503
+    /// there is an unavailable authorization store (engine principals), any other refusal a denial.
+    [[nodiscard]] ListReadGate probe_global_list_read(const httplib::Request& req,
+                                                      httplib::Response& res,
+                                                      const std::string& securable_type,
+                                                      const std::string& operation);
 
     /// `has_permission`'s twin for the fleet-read gate: `require_fleet_read`'s own decision path
     /// (so the verdict and the scope cannot drift from the gate's), with its
@@ -351,8 +378,9 @@ public:
 
     /// The SOLE production factory for a gate-less-route `TierPolicyFn` (#5047
     /// governance fix round). Returns a callable that invokes
-    /// `require_tier_policy(..., /*actionable_permission=*/false)` — both
-    /// `server.cpp` wiring sites (REST + dashboard fragments) call this
+    /// `require_tier_policy(..., /*actionable_permission=*/false)` — every
+    /// `server.cpp` wiring site (result-set REST + dashboard fragments, and the
+    /// /crypto dashboard layout routes) calls this
     /// SAME function rather than each writing its own near-identical
     /// lambda, so there is exactly one place a future reviewer needs to
     /// check for clause-5 compliance, and a unit test can exercise the
@@ -730,6 +758,29 @@ public:
                                  const std::string& detail = {},
                                  const std::string& principal_class_override = {});
 
+    /// `audit_log_for_principal` for a SESSION the caller already resolved (#6065 PR-Q,
+    /// `RestApiV1::AuditAsSessionFn`): stamps the session's username, the `principal_role`
+    /// the caller passes (it captures `effective_role` once per request), and the engine
+    /// class when `session.principal_kind == "engine"`, so a row carries the fields
+    /// `make_audit_event` would have stamped for that session without re-resolving the
+    /// request (cookie first, then bearer), which can name a different actor.
+    bool audit_log_for_session(const httplib::Request& req, const auth::Session& session,
+                               const std::string& principal_role, const std::string& action,
+                               const std::string& result, const std::string& target_type = {},
+                               const std::string& target_id = {}, const std::string& detail = {});
+
+    /// The ONE production `RestApiV1::AuditAsSessionFn` (same `std::function` type): a closure
+    /// over `this` that forwards every argument, in order, to `audit_log_for_session`. A
+    /// factory, like `gateless_tier_policy_fn()`, so server.cpp wires this and never a
+    /// hand-rolled lambda whose eight same-typed parameters could be transposed unseen; a
+    /// test drives this very closure through a real `AuditStore`. The `AuthRoutes` must
+    /// outlive every call (it is owned by `ServerImpl`, as for the other `[ar = ...]` writers).
+    using AuditAsSessionFn = std::function<bool(
+        const httplib::Request&, const auth::Session&, const std::string& principal_role,
+        const std::string& action, const std::string& result, const std::string& target_type,
+        const std::string& target_id, const std::string& detail)>;
+    [[nodiscard]] AuditAsSessionFn audit_as_session_fn();
+
     /// The `AuditEvent` `audit_log_for_principal` would write, built WITHOUT
     /// writing it (#5342 Gate 8): the identity/request fields (principal,
     /// role, class, source IP, user agent, session correlator, target) for a
@@ -847,6 +898,14 @@ public:
     static std::string extract_form_value(const std::string& body, const std::string& key);
 
 private:
+    /// SHA-256 hex of the `yuzu_session` cookie when the request carries one; empty
+    /// when it does not, so cookie-less rows never share the digest of "". Hashed
+    /// whether or not the cookie authenticated the request (`resolve_session` falls
+    /// through to Bearer / X-Yuzu-Token). A digest failure logs at debug and yields
+    /// empty. The value equals the session store key (`AuthManager::hash_token` is
+    /// `sha256_hex` today); if that ever changes, route this helper through `hash_token`.
+    static std::string session_correlator(const httplib::Request& req);
+
     /// The gates `synthesize_token_session` applies AFTER the api_tokens row itself
     /// validates: the `principal_kind` allowlist, and — for an engine token — that the
     /// backing engine principal is still Active. `revalidate_stream` must apply them

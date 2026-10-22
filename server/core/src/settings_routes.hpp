@@ -10,10 +10,12 @@
 
 #include "api_token_store.hpp"
 #include "audit_store.hpp"
+#include "deprovision_erasure.hpp"
 #include "engine_principal_store.hpp"
 #include "management_group_store.hpp"
 #include "mfa_step_up.hpp"
 #include "oidc_provider.hpp"
+#include "plugin_signing_helpers.hpp"
 #include "runtime_config_store.hpp"
 #include "settings_model.hpp" // RetentionEnforced
 #include "tag_store.hpp"
@@ -29,6 +31,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
@@ -38,6 +41,12 @@ class RbacStore;
 class AccessReviewStore;
 class DirectorySync;
 class ScimStore;
+
+/// The plugin-signing panel for a given trust-bundle read, require flag and flag-read health
+/// (see SettingsRoutes::render_plugin_signing_fragment, which gathers them).
+std::string render_plugin_signing_panel(
+    const std::optional<std::expected<plugin_signing::TrustBundleStats, std::string>>& bundle,
+    bool required, bool required_status_unknown);
 
 /// Settings page routes — all /settings, /fragments/settings/*, /api/settings/* routes.
 class SettingsRoutes {
@@ -156,6 +165,12 @@ public:
     /// set rather than failing closed — see `deprovision_revoke.hpp`'s
     /// `resolve_deprovision_principals_for_username` doc comment.
     void set_scim_store(ScimStore* store) { scim_store_ = store; }
+
+    /// The post-deprovision personal-data erasure hook (`deprovision_erasure.hpp`): run with the
+    /// resolved principal set after `DELETE /api/settings/users/{username}` has deactivated the
+    /// account - never on a refused or failed delete, and it can never change the response.
+    /// Set-once before serving (read per request, unsynchronised); unset = no erasure.
+    void set_on_deprovisioned(DeprovisionedFn fn) { on_deprovisioned_ = std::move(fn); }
 
     /// Register all settings-related routes on the given server.
     /// Production callers use this overload; internally it constructs an
@@ -316,6 +331,14 @@ private:
     std::filesystem::path cert_dir_override_;  // test seam; empty = auth::default_cert_dir()
     RetentionEnforcedFn retention_enforced_fn_; // may be empty -> every window "Unknown"
     nlohmann::json retention_view() const;      // build_data_retention_settings + enforced
+    /// Same-site gate for a page-called write (`browser_write_is_cross_site`): token callers are
+    /// exempt, a cookie session must name this site in Origin/Referer. Defence in depth: the
+    /// server-wide pre-routing gate answers a cookie-session write first. Call AFTER the
+    /// permission gate and BEFORE the body is parsed. On refusal writes the 403 and a
+    /// `csrf.denied` row and returns true.
+    [[nodiscard]] bool refuse_cross_site(const httplib::Request& req, httplib::Response& res,
+                                         const auth::Session& session,
+                                         const std::string& endpoint) const;
     Config* cfg_{};
     auth::AuthManager* auth_mgr_{};
     auth::AutoApproveEngine* auto_approve_{};
@@ -332,6 +355,7 @@ private:
     // Nullable — see set_scim_store(). Non-owning; lifetime is server.cpp's,
     // which outlives this object.
     ScimStore* scim_store_{nullptr};
+    DeprovisionedFn on_deprovisioned_; // see set_on_deprovisioned(); empty = no erasure
     ManagementGroupStore* mgmt_group_store_{};
     TagStore* tag_store_{};
     UpdateRegistry* update_registry_{};

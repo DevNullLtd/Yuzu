@@ -600,6 +600,45 @@ TEST_CASE("REST POST /api/v1/tokens: success path is unchanged (regression guard
     CHECK(h.audit_log[0].detail.find("csprng_unavailable") == std::string::npos);
 }
 
+TEST_CASE("REST POST /api/v1/tokens: the 201 carrying the raw token is never cacheable and "
+          "the raw token reaches no audit row",
+          "[pg][rest][token][nostore][audit]") {
+    RestTokensHarness h;
+    h.session_user = "alice";
+    h.session_role = auth::Role::user;
+
+    auto res = h.sink.Post("/api/v1/tokens", R"({"name":"alice-key","expires_at":0})");
+    REQUIRE(res);
+    REQUIRE(res->status == 201);
+
+    // Same contract as the rotate and engine mint routes.
+    CHECK(res->get_header_value("Cache-Control") == "no-store, no-cache, must-revalidate");
+    CHECK(res->get_header_value("Pragma") == "no-cache");
+
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    const std::string raw = body["data"]["token"].get<std::string>();
+    REQUIRE(raw.size() >= 16);
+    REQUIRE_FALSE(h.audit_log.empty());  // the loop below must have a row to inspect
+    for (const auto& a : h.audit_log) {
+        CHECK(a.action.find(raw) == std::string::npos);
+        CHECK(a.target_id.find(raw) == std::string::npos);
+        CHECK(a.detail.find(raw) == std::string::npos);
+    }
+}
+
+TEST_CASE("REST POST /api/v1/tokens: a validation 400 echoes no token",
+          "[pg][rest][token][nostore]") {
+    RestTokensHarness h;
+    h.session_user = "alice";
+    h.session_role = auth::Role::user;
+    // An MCP tier with no expiry is refused before anything is minted.
+    auto res = h.sink.Post("/api/v1/tokens", R"({"name":"k","mcp_tier":"readonly"})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(res->body.find("\"token\"") == std::string::npos);
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // PR W1.1 round 3 — UP-H1, UP-H2, sre-1, sre-2.
 //

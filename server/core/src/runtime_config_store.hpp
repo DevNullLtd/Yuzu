@@ -300,6 +300,49 @@ public:
     /// each. Returns true if either delete removed a row.
     bool remove(const std::string& key);
 
+    /// Conditional write on the OBSERVED stored text, for the plain non-secret table only
+    /// (a secret key is refused: unprefixed `unexpected`). `expected == nullopt` means "the
+    /// key must be absent" (create); otherwise the stored text must equal `*expected`.
+    /// `true` = written. `false` = STALE: the stored text is not `expected` (absent when a
+    /// text was expected, present when nullopt was expected, or different) -- never a
+    /// failure. Validation is `set()`'s per-key validation; an `expected` that
+    /// `sanitize_pg_text` would change (NUL, invalid UTF-8) can never equal a stored text,
+    /// so it is refused as caller input (unprefixed `unexpected`), never scrubbed and never
+    /// reported as stale. The comparison is exact. `unexpected` prefixed
+    /// `kRuntimeConfigDbErrorPrefix` is a store failure (lease/query), as for `set()`. A
+    /// prefixed error does NOT promise the write was not applied: when it comes back after the
+    /// statement was sent (for example the connection is lost after the commit) the OUTCOME IS
+    /// UNKNOWN, and a caller re-reads the store to learn it.
+    ///
+    /// One statement (see the "no lock" note above), so the check and the write are atomic
+    /// across replicas under READ COMMITTED.
+    ///
+    /// Live effect: a `true` result applies the same in-process effect as `set()` (today only
+    /// `log_level`, via spdlog); a stale result applies nothing. Nothing is pushed to other
+    /// instances either way.
+    ///
+    /// Deadlines: the lease wait (2 s) is a hard bound; the query runs under the pool's
+    /// SERVER-SIDE statement_timeout, which a frozen backend cannot enforce (server.cpp, the
+    /// "CONCURRENCY BOUND on the containment read" note). The call is therefore NOT hard-bounded:
+    /// a caller that holds a lock across it (DexScorePolicyProvider::write) holds it for any
+    /// stall. Even that server-side timeout is in force only when the pool injects it: the pool
+    /// skips its statement and lock timeouts when the DSN or PGOPTIONS carries its own
+    /// `options=` (pg_pool.cpp), leaving the server's defaults. A transaction-scoped bound on
+    /// this statement (as `CaStore::publish_next_crl` sets) would need a transaction wrapper; it
+    /// is an obligation of the writer route that holds a lock across this call, not of this
+    /// primitive.
+    [[nodiscard]] std::expected<bool, std::string>
+    compare_and_set(const std::string& key, const std::optional<std::string>& expected,
+                    const std::string& value, const std::string& updated_by);
+
+    /// Conditional delete: removes the plain-table row only if its text equals `expected`.
+    /// Same contract as `compare_and_set` (`true` removed, `false` stale/absent, secret and
+    /// unrepresentable `expected` refused unprefixed, store failure prefixed with the same
+    /// outcome-unknown caveat, same deadlines and the same lack of a hard bound). Applies
+    /// nothing locally: a removed `log_level` override does not reset the live level.
+    [[nodiscard]] std::expected<bool, std::string>
+    compare_and_remove(const std::string& key, const std::string& expected);
+
     /// Detect-and-warn obligation (`docs/postgres-store-playbook.md`'s Backfill
     /// bullet, ADR-0009 fresh-start-by-default): does the legacy
     /// `runtime-config.db` at `legacy_db_path` hold real operator overrides

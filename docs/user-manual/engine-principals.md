@@ -51,6 +51,7 @@ REST:
 
 ```bash
 curl -sk -X POST https://localhost:8080/api/v1/engine-principals \
+  -H "Origin: https://localhost:8080" \
   -H "Cookie: $COOKIE" -H 'Content-Type: application/json' \
   -d '{
     "slug": "vuln-uce",
@@ -72,6 +73,7 @@ REST: `POST .../credentials`):
 
 ```bash
 curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce/credentials \
+  -H "Origin: https://localhost:8080" \
   -H "Cookie: $COOKIE" -H 'Content-Type: application/json' \
   -d '{ "ttl_days": 90 }'
 ```
@@ -89,6 +91,7 @@ the consuming module has time to pick up the new secret without a hard cutover:
 
 ```bash
 curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce/credentials/rotate \
+  -H "Origin: https://localhost:8080" \
   -H "Cookie: $COOKIE" -H 'Content-Type: application/json' \
   -d '{ "overlap_secs": 604800 }'
 ```
@@ -159,6 +162,7 @@ loop explicitly instead of waiting for the sweep:
 
 ```bash
 curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce/credentials/confirm \
+  -H "Origin: https://localhost:8080" \
   -H "Cookie: $COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"token_id": "<token_id from the rotate response>", "secret": "<the raw successor secret from the rotate response>"}'
@@ -224,6 +228,7 @@ engine-principal ownership as a lever to stall its own deprovisioning:
 
 ```bash
 curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce/transfer-owner \
+  -H "Origin: https://localhost:8080" \
   -H "Cookie: $COOKIE" -H 'Content-Type: application/json' \
   -d '{ "new_owner": "bob" }'
 ```
@@ -236,6 +241,7 @@ reference the old one via `superseded_by`:
 
 ```bash
 curl -sk -X DELETE https://localhost:8080/api/v1/engine-principals/engine:vuln-uce \
+  -H "Origin: https://localhost:8080" \
   -H "Cookie: $COOKIE" -H 'Content-Type: application/json' \
   -d '{ "superseded_by": "engine:vuln-uce-2" }'
 ```

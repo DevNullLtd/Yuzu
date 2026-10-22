@@ -14,7 +14,7 @@ usage() {
     echo "Usage: $0 BACKUP_DIR [OPTIONS]"
     echo ""
     echo "Options:"
-    echo "  --data-dir DIR     Restore target for .db files (default: /var/lib/yuzu)"
+    echo "  --data-dir DIR     Restore target for .db files and enablement-anchor (default: /var/lib/yuzu)"
     echo "  --config-dir DIR   Restore target for .cfg files (default: /etc/yuzu)"
     echo ""
     echo "NOT COVERED by this script: the PostgreSQL database (pg_restore)"
@@ -107,6 +107,19 @@ for cfg in "$BACKUP_DIR"/*.cfg "$BACKUP_DIR"/*.conf; do
     FILE_COUNT=$((FILE_COUNT + 1))
     green "  $(basename "$cfg") -> $CONFIG_DIR/"
 done
+
+# The enablement continuity anchor (ADR-3006) is outside the pg_dump: restore it with the data
+# directory, from the same backup point as the dump.
+echo ""
+echo "--- Restoring the continuity anchor ---"
+if [[ -f "$BACKUP_DIR/enablement-anchor" ]]; then
+    mkdir -p "$DATA_DIR"
+    cp "$BACKUP_DIR/enablement-anchor" "$DATA_DIR/"
+    FILE_COUNT=$((FILE_COUNT + 1))
+    green "  enablement-anchor -> $DATA_DIR/"
+else
+    yellow "  no enablement-anchor in this backup: the restored server reports enablement as unwitnessed"
+fi
 
 echo ""
 echo "=== Restore Complete ==="

@@ -127,6 +127,79 @@ of the HA "safe-to-scale" gate. The design:
   (ADR-0007) and is surfaced at `/readyz` + `/healthz` via
   `AuthManager::is_session_store_ok()`.
 
+## Same-site gate for cookie-session writes
+
+Cookie-session writes require a same-site `Origin` or `Referer`, and so do the guarded
+reads, the cookie-session requests that dispatch work, persist state or force a refresh of
+server state (for those, a `Sec-Fetch-Site` header that is present decides alone). One decision,
+`evaluate_same_site_write` (`same_site_write_policy.hpp`), is applied by one
+caller, `apply_same_site_write_gate` (`same_site_write_gate.hpp`), invoked once
+from `server.cpp`'s pre-routing handler.
+
+- **Placement.** After `resolve_session` and its `401` block; before step-up
+  evaluation, step-up challenge emission, the engine-principal stash and every
+  route handler. For a request the gate refuses, the refusal happens after
+  authentication and before step-up evaluation, challenge emission and
+  route-handler effects. Coverage is by placement: every request that reaches
+  session resolution is covered, whether or not a route is registered.
+- **Keying.** The decision keys on the RESOLVED session's `auth_source`, never on
+  header presence. A request resolving to `api_token`, `mcp_token` or
+  `engine_token` is not gated; one resolving to a cookie source is gated even if
+  it also carries a token.
+- **Guarded reads.** Cookie-session requests that dispatch work, persist state or force a
+  refresh of server state are held to the same rule whichever method they use.
+  `is_guarded_read(method, path)` (`GET` or `HEAD`, exact path in the reviewed table
+  `kFetchMetadataGuardedPaths`, both in `same_site_write_policy.hpp`) widens the gate's
+  first statement; the exact path, never a query flag, selects the gate. `OPTIONS` is never
+  guarded and a path off the table is not checked. For a guarded request token sources
+  are admitted; a cookie source is decided by `Sec-Fetch-Site` first (`same-origin` or
+  `none` admitted, any other value refused `origin_mismatch`) and by the `Origin`/`Referer`
+  rule only when that header is absent. A repeated `Sec-Fetch-Site` header counts as a
+  non-matching value (`origin_mismatch`). Browsers send fetch metadata only to
+  potentially trustworthy origins (HTTPS, loopback), so a plain-HTTP non-loopback
+  listener, and Safari before 16.4, fall to the `Origin`/`Referer` rule, which for a
+  same-origin `GET` depends on `Referer` (the default `Referrer-Policy` supplies it).
+  Token callers stay exempt. No new refusal reason, metric or alert. Residuals: header
+  checks cannot tell a browser's own prefetch, prerender or link preview from a user
+  action; a client that sends neither fetch metadata nor `Origin`/`Referer` is refused; and
+  cookie-reachable reads outside the list remain there by decision. Rationale: the design record linked at the end of this section.
+- **Exemptions** are by placement only: the pre-session set in
+  `is_login_exempt_path`, the health probes and the metrics endpoint return
+  before session resolution and never reach the gate. There is no second list.
+- **Refusal shape.** `403` `cross-site request refused` in the standard error
+  envelope (A4) with a `remediation` and no `permission`; one `csrf.denied` audit
+  row (`result=denied`, `target_id` the sanitised `METHOD path`, `detail` the fixed
+  text plus a closed-set `reason=<token>`); `yuzu_server_csrf_denied_total{path_class,reason}`
+  ([observability conventions](observability-conventions.md)), watched by the
+  `yuzu-web-writes` alert rules. The check fails closed: an internal failure
+  refuses the request and counts it as `reason=gate_error`.
+- **Accepted limits.** The same-host comparison (`origin_is_same_site`) is
+  scheme-aware only where the scheme is known: on a listener that terminates TLS
+  itself (`Config::https_enabled`) the source must be `https://` and `:443` is the
+  only default port; on a plain listener behind a TLS-terminating proxy a declared
+  `https://` entry in `--csrf-trusted-origin` pins the scheme for that host, and
+  without one an `http://` source naming the same host and port is still treated as
+  same-site; the pre-session exempt endpoints are outside the check; `resolve_session`'s
+  own side effects (idle-timer slide, expired-elevation reaping and its audit row) run
+  before a refusal, as they do for any request; each refusal writes one synchronous audit
+  row, so the per-IP rate limiter (which runs before the gate and is shared by every
+  client behind one proxy) is the only flood bound and rows are not yet coalesced; the
+  control relies on the browser sending `Origin` or `Referer`.
+- **Trusted origins.** `--csrf-trusted-origin` entries are normalised once at
+  boot; the gate receives the post-normalise set. The gate is also handed the web
+  listener's TLS state (`Config::https_enabled`), which selects the scheme-aware
+  same-host comparison.
+- **Tripwires and closure evidence.** The live-stack category in
+  `scripts/e2e-security-test.sh` (run by the `/test` pipeline against a real server) is
+  the closure evidence that cookie-session writes are refused. Two source-text scans
+  are best-effort tripwires with limits stated in their headers:
+  `tests/test_same_site_wiring_lexical.py` pins the one call site and the early returns
+  ahead of it, and `tests/unit/server/test_same_site_exempt_inventory.cpp` fails on a
+  mutating registration that a pre-session bypass would carry unless a reviewed entry
+  exists, and a second scan there fails on a stale table entry or on a read-method
+  registration whose handler dispatches work or changes state but is not on the table or a reviewed ledger. Design record:
+  [`docs/security-reviews/central-same-site-write-gate-2026-10.md`](security-reviews/central-same-site-write-gate-2026-10.md).
+
 ## Account lockout (SOC 2 CC6.3)
 
 Brute-force / credential-stuffing protection on the **local-password** login
@@ -345,9 +418,12 @@ cookie sessions only — any MCP tier, service-scoped token, engine principal or
 non-interactive `auth_source` is `403 token_session`; the self route
 additionally requires `auth_source == "local"` (`409 not_local` for OIDC/SAML).
 CSRF: `Origin`/`Referer` must be same-site (`origin_is_same_site`, honouring
-`--csrf-trusted-origins`) and a cookie request lacking **both** headers is
-refused — matching the other cookie-authorized state-changing POSTs
-(`ca_routes`, `dashboard_routes`). `Content-Type` must be `application/json`
+`--csrf-trusted-origin`) and a cookie request lacking **both** headers is
+refused. Both are decided centrally, in `server.cpp`'s pre-routing handler
+(`same_site_write_gate.hpp`, after authentication and before any route; see
+[Same-site gate for cookie-session writes](#same-site-gate-for-cookie-session-writes));
+the per-route copies, this one included, are defence in depth. Invariants: the
+header banner of `same_site_write_policy.hpp`. `Content-Type` must be `application/json`
 (`415`). The admin route then runs the **canonical durable-Administrator gate**
 — `is_rbac_administrator(kRest)` (`rbac_admin_predicate.hpp`, the A2/A1
 predicate) followed by `check_caller_authorized_under_current_regime`,
@@ -646,9 +722,10 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
   reviewer account name against submitter account name, so one person holding two identities counts as two
   reviewers; this is a recorded exception (ADR-1005, 2026-10-19 addendum), not a guarantee of distinct people;
 - on the REST routes (the dashboard page included), a **same-site `Origin` (or `Referer`)** on the
-  cookie `POST`, checked after the permission gate and before the class check and the step-up, so a
-  cross-site request spends no step-up and writes no `attempted` row (`403`, audited as
-  `csrf.denied`; trusted proxies are declared with `--csrf-trusted-origin`).
+  cookie `POST`, decided centrally by the server-wide check (after authentication and before step-up
+  evaluation, challenge emission and route-handler effects; the route's own copy, after the permission
+  gate, is defence in depth), so a cross-site request spends no step-up and writes no `attempted` row
+  (`403`, audited as `csrf.denied`; trusted proxies are declared with `--csrf-trusted-origin`).
 
 Consequences, each deliberate:
 
@@ -2952,7 +3029,7 @@ counter registrations). Tests: `tests/unit/server/test_saml_scim_link.cpp`,
   - A watchdog thread shuts the socket down at that deadline, and again every 50 ms because a pre-connect shutdown does not persist on macOS (measured), so the bound also covers the TLS handshake, which httplib's own `set_max_timeout` does not. On POSIX the watchdog holds a descriptor it reserved before the client existed (an alias of the socket, made by dup2 from httplib's socket-options callback, so exhaustion fails the request closed with `request failed: no file descriptor available` rather than leaving it unwatched). On Windows it takes a private duplicate of the socket (`WSADuplicateSocketW`, so it never touches a socket number httplib may close and Windows may reuse), and a duplicate that cannot be taken fails the request closed with the same text; from the deadline it calls `CancelIoEx` on the duplicate and shuts the connection down every 50 ms, and after 10 such cuts (500 ms) closes the duplicate with `SO_LINGER` zero, an abortive close that resets the connection (the count restarts for each socket httplib hands it). httplib 0.37.1 waits with `WSAPoll` on Windows; the evidence for the cut is the end-to-end Windows drip test. Per-OS test provenance is in `docs/test-coverage.md`.
   - The token-exchange POST has per-operation timeouts only (10/15/15 s on Linux and macOS; Windows uses the WinHTTP defaults) and no total bound. Its response is capped at 256 KiB on every platform (on Windows the size of each chunk is checked against the remaining allowance before it is allocated), and the Windows request sets the WinHTTP redirect policy to never and accepts only HTTP status 200 (`WinHttpQueryHeaders`), so a 3xx answer fails the sign-in instead of being followed to an unchecked host or parsed as a token response.
   - Every IdP-directed fetch is vetted first (`oidc_egress_policy.hpp`): the host is resolved, every address classified, and the connection pinned to a permitted address; the Windows token POST is only pre-checked, and because WinHTTP may pick any address of its own answer the pre-check is strict there: one refused address in a mixed answer refuses the request outright (the other paths pin the permitted member instead). DNS rebinding between the check and WinHTTP's own lookup is not covered there (it does not follow redirects). Classification also treats the non-global parts of `2001::/23` (Teredo `2001::/32`, benchmarking `2001:2::/48`, ORCHID `2001:10::/28`, the unallocated rest) as non-global, except the sub-ranges the IANA IPv6 special-purpose registry marks globally reachable (`2001:1::1`-`2001:1::3`, `2001:3::/32`, `2001:4:112::/48`, `2001:20::/28`, `2001:30::/28`). NAT64 prefixes learned from `ipv4only.arpa` are only ever added (union across answers, kept for the process lifetime; the TTL controls when to look again, never what is kept), at most 64: an answer that would exceed that is not installed partially, the fetch is refused with a fixed reason. A configured `--oidc-nat64-prefix` is trusted to describe a translator and may therefore permit a destination its own address class would otherwise gate; only the always-refused tier is immutable. Host names are ASCII only (`authority_well_formed` refuses a byte >= 0x80; an internationalized name is given as punycode), so the check and WinHTTP cannot be asked for different names. The process flag `--oidc-allow-private-networks` is the general private-network override (a configured NAT64 prefix has the classification exception above); see `docs/user-manual/authentication.md` "Network and trust".
-  - Exactly one thread fetches discovery at a time (the in-flight mark is cleared by an RAII guard on every exit) and any other caller that needs it fails fast; a failed attempt is remembered for 30 s and a success for the provider's lifetime. Signing keys are not cached: every verification calls `fetch_jwks_snapshot()` and works from the answer it just obtained, so a key the IdP stops publishing stops verifying at the next login (#1901 UP-19; a failed or non-JWKS answer is `kJwksUnavailable`, with no stale-key fallback; related: #1900, #5983), and a token naming a `kid` the key set lacks is refused rather than checked against another key. Provider swaps: a Settings save is serialized by `oidc_save_mu_` (stored-secret read, provider build, swap, persist), replaces the provider under the exclusive `oidc_mu_`, and retires the old one after the lock drops; `/auth/oidc/start` and `/auth/callback` hold a `Lease` (taken under the shared lock) instead of the lock, and the callback compares the published provider with its leased one right after `handle_callback` (lease still held, so the address cannot be reused) and refuses with audit reason `provider_replaced` before any group, role or session work.
+  - Exactly one thread fetches discovery at a time (the in-flight mark is cleared by an RAII guard on every exit) and any other caller that needs it fails fast; a failed attempt is remembered for 30 s and a success for the provider's lifetime. Signing keys are not cached: every verification calls `fetch_jwks_snapshot()` and works from the answer it just obtained, so a key the IdP stops publishing stops verifying at the next login (#1901 UP-19; a failed or non-JWKS answer is `kJwksUnavailable`, with no stale-key fallback; related: #1900, #5983), and a token naming a `kid` the key set lacks is refused rather than checked against another key, while a token with no `kid` is checked against each usable key in turn (at most the first 16, in the order published). An RSA key with a modulus under 2048 bits, or an exponent below 3, even or over 32 bits, is skipped at parse: defence in depth against a weak IdP key, not against a tampered JWKS. Provider swaps: a Settings save is serialized by `oidc_save_mu_` (stored-secret read, provider build, swap, persist), replaces the provider under the exclusive `oidc_mu_`, and retires the old one after the lock drops; `/auth/oidc/start` and `/auth/callback` hold a `Lease` (taken under the shared lock) instead of the lock, and the callback compares the published provider with its leased one right after `handle_callback` (lease still held, so the address cannot be reused) and refuses with audit reason `provider_replaced` before any group, role or session work.
   - Verified end to end against Keycloak 26.4.0 (Linux test host, plain `http` and `https` via a TLS-terminating proxy); Entra ID is supported by the standard but not verified by the project.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
 
@@ -3134,21 +3211,29 @@ ADR-0041, currently at v3).
 
 ## Render-time permission probes (capability hints)
 
-Three `AuthRoutes` methods answer a permission question without writing a denial row, for pages
+Five `AuthRoutes` methods answer a permission question without writing a denial row for an
+interactive sign-in, for pages
 that decide what to DRAW: `has_permission` (the verdict only), `probe_permission` (the verdict
-with the gate's own response kept, so "denied" and "store unavailable" stay distinguishable) and
-`probe_fleet_read` (`require_fleet_read`'s decision and scope). Each runs the gate's own code
-under the thread-local `AuditProbeScope`, which makes `audit_log` a no-op (the `role.elevation.expired` lifecycle row, written through `audit_log_for_principal`, is still written), and withholds the
-denial row **only for an interactive cookie sign-in** (`denial_row_may_be_withheld`: `local`,
-`oidc` or `saml` and not an engine principal). A token or engine caller that reaches such a route
-keeps its row.
+with the gate's own response kept, so "denied" and "store unavailable" stay distinguishable),
+`probe_admin` (`require_admin`'s decision), `probe_fleet_read` (`require_fleet_read`'s decision and
+scope) and `probe_global_list_read` (`require_list_read`'s decision, with a management-group-
+confined admission refused as a denial, for a resource that is not agent-scoped; its loud twin
+`require_global_list_read` is the gate of the plugin-config REST list). Each runs the gate's own
+code under the thread-local `AuditProbeScope`. `require_auth`, the first step of every gate,
+records the session the gate authenticated in that scope, and `audit_log` withholds a row **only
+when that session is an interactive cookie sign-in** (`denial_row_may_be_withheld`: `local`,
+`oidc` or `saml` and not an engine principal). The decision rests on the one lookup that decided
+the verdict, never on a second one; the `role.elevation.expired` lifecycle row, written through
+`audit_log_for_principal`, is still written. A request whose gate session is a token or an engine
+principal keeps its row.
 
 What is withheld is the audit row. The denial counters (`yuzu_auth_topology_floor_denied_total`,
 `yuzu_auth_service_scope_default_denied_total`, `yuzu_server_rbac_read_degrade_total`) still tick,
 and the store's own read telemetry is untouched.
 
 A probe is a rendering hint unless a route deliberately binds it as its gate: the Dashboard panel
-fragments do (a refused sign-in is shown a note and leaves no row), while an action route must
+fragments and the Plugins and updates fragments do (a refused sign-in is shown a note and
+leaves no row), while an action route must
 re-check through `require_permission` or `require_scoped_permission`. An earlier design that
 threaded a `Quiet` argument through `require_permission` was dropped because nothing called it and
 it did not cover `require_fleet_read`.
@@ -4053,10 +4138,10 @@ this section does not restate them.
 ## Agent enrollment (3 tiers)
 
 - **Tier 1 (manual approval)** — agents without a token enter a pending queue; admin approves/denies via Settings page. Agents retry and are accepted once approved.
-- **Tier 2 (pre-shared tokens)** — admin generates time/use-limited enrollment tokens via the dashboard; agents pass `--enrollment-token <token>` at startup for auto-enrollment.
+- **Tier 2 (pre-shared tokens)** — admin generates time/use-limited enrollment tokens via the dashboard; agents pass `--enrollment-token <token>` (or `--enrollment-token-file <path>`, which keeps the token off the command line) at startup for auto-enrollment.
 - **Tier 3 (platform trust)** — proto fields reserved (`machine_certificate`, `attestation_signature`, `attestation_provider`) for future Windows cert store / cloud attestation enrollment.
 - **Enrollment token persistence** — Postgres-authoritative since HA WS-6 6.2 (`auth.enrollment_tokens` / `auth.pending_agents`, shared by every server replica), not per-replica `.cfg` files. `AuthManager`'s file mode is deleted, not deprecated: `consume_and_enroll` is a single guarded-UPDATE transaction (exactly-N winners across pooled connections AND across separate server processes — a max_uses=1 token race never double-accepts), and every enrollment/pending call fails CLOSED with no `AuthDB` attached. A pre-6.2 install's `enrollment-tokens.cfg` / `pending-agents.cfg` are imported exactly once, at the first 6.2 boot, under a per-file content-fingerprint marker (`auth.import_meta`) that never resurrects an already-removed/denied/revoked row and refuses (never merges) a mismatched-fingerprint file; see `docs/adr/2002-high-availability-architecture.md` §8.
-- **Agent `--enrollment-token` CLI flag** — passes token in `RegisterRequest.enrollment_token`.
+- **Agent `--enrollment-token` CLI flag** — passes token in `RegisterRequest.enrollment_token`. **`--enrollment-token-file <path>`** (env `YUZU_ENROLLMENT_TOKEN_FILE`) supplies the same value from a file: read once at start (under a 5 s deadline) without following a link, accepted only if the first line is a 64-hex token and the opened file is owned by SYSTEM/root, Administrators or the account the agent runs as (on POSIX also not group- or other-writable), takes precedence over `--enrollment-token`, and removed after the first accepted registration or when the server refuses the token. The Windows installer uses it so a service registered by it no longer carries the token on its command line; a service registered by an earlier installer keeps its earlier command line until the installer is run again.
 
 ## Per-session peer binding and NAT-aware relaxation
 

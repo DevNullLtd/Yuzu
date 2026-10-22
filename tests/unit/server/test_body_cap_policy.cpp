@@ -178,6 +178,12 @@ constexpr ExpectedResolution kExpected[] = {
     // inherit this row and falls to the catch-all instead.
     {"PUT",    "/api/v1/rbac/enforcement",                             1u * 1024, false, "rbac_enforcement"},
     {"PUT",    "/api/v1/rbac/enforcement-evil",                        4u * 1024 * 1024, false, "default"},
+    // body_cap_policy.hpp guardian_policy_generation row: the Guardian policy-generation
+    // raise (rest_api_v1.cpp). ANY method. Body is {"target_generation": N,
+    // "acknowledge_rule_set_replaced": true}. Segment-boundary probes prove neither a
+    // lookalike sibling nor the guardian_rule_authoring prefix swallows it.
+    {"POST",   "/api/v1/guaranteed-state/policy-generation/raise",     1u * 1024, false, "guardian_policy_generation"},
+    {"POST",   "/api/v1/guaranteed-state/policy-generation-evil/raise", 4u * 1024 * 1024, false, "default"},
     // body_cap_policy.hpp users row — the /api/v1/users REST v1 subtree
     // (#5342 password routes + unlock + elevation-eligibility). ANY method;
     // a segment-boundary probe proves "/api/v1/usersevil" does NOT inherit it.
@@ -186,6 +192,11 @@ constexpr ExpectedResolution kExpected[] = {
     {"POST",   "/api/v1/users/alice/unlock",                           16u * 1024, false, "users"},
     {"POST",   "/api/v1/users/elevation-eligibility",                  16u * 1024, false, "users"},
     {"POST",   "/api/v1/usersevil",                                    4u * 1024 * 1024, false, "default"},
+    // body_cap_policy.hpp crypto row - the /crypto REST v1 subtree; PUT dashboard/layout is the
+    // only body-bearing route (crypto_widget_catalogue.hpp kLayoutBodyMaxBytes). ANY method.
+    {"PUT",    "/api/v1/crypto/dashboard/layout",                      16u * 1024, false, "crypto"},
+    {"GET",    "/api/v1/crypto/ca/stats",                              16u * 1024, false, "crypto"},
+    {"PUT",    "/api/v1/cryptoevil",                                   4u * 1024 * 1024, false, "default"},
     // Catch-all default — ordinary JSON/form traffic.
     {"POST",   "/api/v1/some-ordinary-mutation-route",    4u * 1024 * 1024,   false, "default"},
     {"GET",    "/api/v1/devices",                         4u * 1024 * 1024,   false, "default"},
@@ -221,7 +232,9 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "hardware",
     "rbac_role_assignment",
     "rbac_enforcement",
+    "guardian_policy_generation",
     "users",
+    "crypto",
     "default",
 };
 
@@ -364,9 +377,11 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // twin, governance Gate 2) + rbac_role_assignment(1: A2 global human
     // role assignment, .claude/plans/rbac-industry-leading-DELIVERY-PLAN.md
     // §2) + rbac_enforcement(1: A1 enforcement enable/disable toggle) +
+    // guardian_policy_generation(1: the Guardian policy-generation raise) +
     // users(1: the /api/v1/users subtree, #5342 password routes) +
+    // crypto(1: the /api/v1/crypto subtree, the dashboard layout PUT) +
     // default(1).
-    CHECK(std::size(kBodyCapTable) == 32);
+    CHECK(std::size(kBodyCapTable) == 34);
 }
 
 // ── 7. requires_measurable: ON for /mcp/ and upload_session, OFF elsewhere ──

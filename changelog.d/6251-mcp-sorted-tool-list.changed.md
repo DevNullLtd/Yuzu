@@ -1,0 +1,1 @@
+- MCP `tools/list` now returns the tools sorted by tool name. The set of tools is unchanged; the order changes once (it was the legacy table order followed by registry tools), so a tool moving to the tools/call registry no longer moves in the list. Clients should already key by name, and `tools/list` still advertises `listChanged:false`.

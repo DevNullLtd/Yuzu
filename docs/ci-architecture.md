@@ -14,9 +14,15 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   (gcc-15 debug on the `yuzu-bigtam-linux` pool), one Windows variant (MSVC debug on
   the `yuzu-weetam-windows` pool), one macOS variant (appleclang debug on the
   `yuzu-bigmags-macos` pool), plus `proto-compat`. Wall target: <10 min per leg.
+  Every `ci.yml` run starts with a two-job preflight (see the runner-inventory
+  paragraph under "Persistent runner-local test history" below): a short `preflight-gate` job ("Preflight (gate)") that
+  classifies docs-only changes and probes runner-pool health, which the build
+  jobs `need`, and the `preflight` job ("Preflight (runner health)", the
+  required-check name) that carries the source gates and runs alongside the
+  builds.
 - **Tier 2 — push to dev/main** (`ci.yml` on push): full 4-way Linux matrix
   (gcc-15 / clang-21 × debug / release), 2-way Windows, 2-way macOS (except
-  a docs-only push, which runs preflight plus the required-check stubs, #5320).
+  a docs-only push, which runs the preflight jobs plus the required-check stubs, #5320).
   **No
   sanitizers, no coverage** — those moved out (#410). **Since #3443 Phase 2**,
   the Linux matrix's `pg_mode` key (via `include:`, never a third axis) means
@@ -29,7 +35,7 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   the same `include:` mechanism (debug=full, release=smoke) — Windows and
   Linux now share one `pg_mode` concept, not two independently-invented ones.
   **Since #5320** the push trigger has no `paths` filter: a docs-only push
-  (for example a changelog-only release commit) runs `preflight` and the
+  (for example a changelog-only release commit) runs the preflight jobs and the
   `docs-required-checks` stubs instead of the matrix, so the required contexts
   still appear on the `main` commit a release tags. See "Docs-only changes
   (#1978, #5320)" below.
@@ -442,7 +448,8 @@ runner.
 ### Plugin README gates (`docs` suite + `docs-lint.yml`, `docs/plugin-readme-standard.md`)
 
 Two gates keep each plugin's `agents/plugins/<name>/README.md` honest. The
-meson `docs` suite runs `tests/test_plugin_readmes.py` on every leg: the
+meson `docs` suite runs `tests/test_plugin_readmes.py` on the Linux leg (the `docs` suite
+is OS-independent and runs there only, see "Test suites by leg" below): the
 README-existence ratchet (the count of plugin directories without a README
 may only fall), the section contract, and a byte-diff of every generated
 artefact — the README fences, the user-manual plugin index,
@@ -458,6 +465,28 @@ requests only, not a required check today) runs
 must carry a visible `docs-unchanged: <section> — <reason>` line, which
 the job prints. Both scripts carry a fixture self-test that the `docs`
 suite also runs (the touch-rule one off Windows only, #5428).
+
+A third `docs-lint.yml` gate, the personal-data guard
+(`scripts/ci/check-personal-data.py`, run `--strict-baseline --ratchet`), keeps
+real home paths, SIDs, tailnet IPs, MACs, private keys, consumer e-mail and
+tracked session artifacts out of the public tree. The script header and rule 5
+of `docs/plugin-readme-standard.md` give the detectors, scope and baseline rules.
+
+### Docs drift gate (`docs` suite + `docs-lint.yml` + `doc-coupling.yml`, `docs/docs-drift-gate.md`)
+
+`scripts/ci/check-docs-drift.py` extends the plugin README idea to the rest of the
+product, in two layers. Fact parity (hermetic, in the required `changelog-order` job and
+the `docs` suite) asserts every `/api/vN/` route, MCP tool and server/agent CLI flag is
+named in the user manual, reusing `check-api-parity.py`'s extractors. It ratchets
+against the by-name `scripts/ci/docs-drift-baseline.json` with the same only-shrinks rule
+as the definition-description ratchet below. The `doc-coupling-touch-rule` job, in its
+own `doc-coupling.yml` workflow so that editing the PR body re-runs it, applies
+`scripts/ci/doc-coupling.json`: coupled code changed means a coupled doc changed, or the
+body carries `doc-coupling-exempt: <rule-id> — <reason>`. It is advisory until the
+repository owner adds it to the required checks. A Claude Code `PreToolUse` hook runs both
+layers before `gh pr create`, always using the project tree's own copy of the gate.
+Details, the runbook for a `dev` turned red by drift, and how to extend the fact
+categories: `docs/docs-drift-gate.md`.
 
 ### Definition-description ratchet (`definition-descriptions` job + `docs` suite)
 
@@ -478,9 +507,9 @@ header names only "CHANGELOG order" as its required check. It installs PyYAML fr
 `requirements-ci.txt` with `--require-hashes` (a `--user` install, skipped when PyYAML is already
 importable), so it reaches PyPI and is its own job so that an outage reds only this check. The
 same test is registered as the `definition descriptions` test in `tests/meson.build` (suite
-`docs`), and the `linux` and `windows` jobs of `ci.yml` list `--suite docs`, so the ratchet is
-enforced on the required `Linux gcc-15 debug` and `Windows MSVC debug` legs without depending on
-the advisory job. A PR that changes only `docs/**` or root `*.md` builds nothing (see "Docs-only changes"),
+`docs`), and the `linux` job of `ci.yml` lists `--suite docs` (the Linux leg is the only one that
+runs that suite, "Test suites by leg" below), so the ratchet is enforced on the required
+`Linux gcc-15 debug` leg without depending on the advisory job. A PR that changes only `docs/**` or root `*.md` builds nothing (see "Docs-only changes"),
 but it cannot touch `content/` or the baseline, which are classified as code.
 
 ### ClusterFuzzLite (`cflite-pr.yml` + `cflite-batch.yml`)
@@ -829,6 +858,19 @@ above, which carry the acknowledgement. The decision record,
 [Gateway peer authorization (minimal), 2026-10-07](security-reviews/gateway-peer-authz-minimal-2026-10-07.md),
 states what none of these cover.
 
+### Local coverage gate: fast harness subset (#5803, #6116)
+
+`scripts/test/coverage-gate.sh` is the local `/test` Phase 7b coverage gate: developer
+tooling, not a CI gate (the CI coverage job is `nightly.yml`'s, with its own gcovr
+invocation). Its behaviour (build-dir lock, inconclusive runs, DB-write handling, the
+Linux-only refusal, option and baseline validation) is pinned by the mock-based harness
+`tests/shell/test_pr2_gates.sh`. Preflight's "Shell gate tests" step runs the fast
+scenarios only, `CH-18 CH-20 CH-21 CH-22 CH-24` (about 25 s; bash, python3 with sqlite3, procps
+and findutils, all on the hosted image; the fixtures stub `ps`, `find` and `ln`). The
+slow scenarios (`CH-19`, the process-tree kill, about 2.5 minutes; `CH-23`, signal bursts,
+about 35 s) and the rest of the harness are not in CI yet; wiring them into a nightly job,
+and hardening them for the shared-identity runner pools, is #6116.
+
 ## Self-hosted runner topology
 
 | Runner | Host | Jobs |
@@ -844,7 +886,7 @@ Big Tam and Wee Tam, and removed from `.github/runner-inventory.json`.
 previously used the bare `[self-hosted, Linux, X64]` label, which Shulgi's WSL2
 runner also carried, so they could land there instead of on Big Tam. The runners
 were deregistered on the GitHub side on 2026-10-03 (per the repo admin). With the pin, `proto-compat` queues (it does not fail) while all four
-Big Tam slots are busy. When no Big Tam runner is online, the preflight job
+Big Tam slots are busy. When no Big Tam runner is online, the `preflight-gate` job
 fails (required pool `bigtam`) and `proto-compat` is skipped.
 
 ### Ubuntu 26.04 migration (Big Tam) — COMPLETE
@@ -947,7 +989,11 @@ shape. Each gated step still wraps the run in
 leaks a slot) that caps concurrent heavy test phases to **2 per box** (the
 **build** phase stays 4-wide). `Test (non-pg suites)` passes `--num-processes 4`
 (one consolidated invocation now covers what used to be five separate
-suites plus the four non-pg server shards).
+suites plus the four non-pg server shards). Since 2026-10-21 that
+invocation selects `--suite platform` instead of `--suite docs` (the
+`docs` suite is Linux-only, "Test suites by leg" below) and its
+`assert-suite-cover.py` guard names `--exclude-suite docs`, so a missed
+label still fails loud.
 
 `nightly.yml`'s `windows-asan` job now joins this same `with-test-slot.sh 2`
 gate and carries `--timeout-multiplier 2` (#4018) — previously it ran
@@ -1033,6 +1079,16 @@ identical to 11 over 8; at 14 shards k=6 is 3 rounds against 2 at k=8, see the
 stopped rather than continuing to k=8; going wider buys no
 round-reduction here and only adds CCD-thread-contention risk on Wee
 Tam's fixed 16-thread envelope.
+
+**Push 4 (staged 2026-10-21, not yet applied).** The CI test-phase tuning PR
+(#4884) lands as a push ladder (the table in "Staged widening — Linux" below)
+and its second push takes the Windows widths: `Test (pg shards, full)` 6 → 8
+and `Test (non-pg suites)` 4 → 6, each judged by the decision rule above.
+Baseline going in (2026-10-20, 14 pg shards): pg step 2,931 serial-s over
+533 s wall at k=6; non-pg step 1,188 serial-s over 411 s wall at k=4. k=8 has
+never run. Shard B (198 s) and the gateway eunit entry (167 s) are the
+non-pg floor, so widening that step has a ceiling set by them. This paragraph
+is rewritten with the two same-SHA samples when the width commit lands.
 
 ### Linux concurrency caps (within-job + cross-job)
 
@@ -1404,7 +1460,7 @@ Windows' release leg (push-only; PRs are debug-only, so only one Windows
 leg runs at all there) now run the `[pg-smoke]` subset instead. The Linux `matrix:` carries a
 `pg_mode: full|smoke` key, added via `include:` on the existing
 compiler/build_type combinations — never a third axis (would double the
-matrix and break `max-parallel: 3`'s 4-runner arithmetic) and never in the
+matrix and break `max-parallel`'s 4-runner arithmetic) and never in the
 job `name:` (job names are the branch-protection ruleset's required-check
 contexts; `docs-required-checks` mirrors them). `full` resolves on
 gcc-15/debug only (every PR, plus that leg's push); the other three push
@@ -1507,7 +1563,8 @@ incident that paragraph cites is actually an instance of THIS gap, not one
 `with-test-slot.sh` closes: a `dev`/`main` push's own 4-way Linux matrix
 could claim all 4 Big Tam runners simultaneously, leaving nothing reserving
 a runner for a concurrently-queued PR job. Fix: `ci.yml`'s Linux job's
-`strategy.max-parallel: 3` caps how many legs of that SAME matrix run
+`strategy.max-parallel: 3` (3 at the time; 4 since 2026-10-21, see the update
+below) caps how many legs of that SAME matrix run
 concurrently, leaving at least one Big Tam runner unclaimed by it — a no-op
 on `pull_request` events (already a single-leg matrix via the existing
 `exclude`). This is a mitigation, not a guarantee: the freed runner is not
@@ -1523,9 +1580,26 @@ runner-pool partitioning (dedicating a runner label to PR-fast-path jobs),
 which needs direct access to the Big Tam box and is tracked as a follow-up
 on #3443, not done here.
 
+**Update 2026-10-21 — `max-parallel` 3 → 4.** The cap is now 4 (all four Big
+Tam runners): a `dev`/`main` push's 2x2 matrix runs in one wave instead of two,
+which shortens the push's wall. The trade is the one named above, accepted by
+the owner: that push now claims every runner at once, so a concurrently-queued
+PR's Linux leg waits for a runner. `with-test-slot.sh 3` still caps the heavy
+test phases once a runner is held. Revert to 3 if PR runner-wait returns.
+
+The revert rule's observable: queue wait never reaches `test-runs.db` (its
+`started_at` is post-checkout), so it is read from GitHub. Metric: per-job
+`started_at - created_at` of a PR's `Linux gcc-15 debug` job, from
+`gh api repos/DevNullLtd/Yuzu/actions/runs/<id>/jobs`, sampled while a `dev`
+push's matrix is running. Trip: either push-1 sample of the ladder below shows
+that PR leg queued 5 minutes or more (against ~0 on the 2026-10-20 baseline and
+35 minutes in the 2026-08-25 incident the cap was introduced for). Whoever fills
+the push-1 row takes the sample.
+
 **Cross-job slot count: 2 -> 3 (2026-08-25, same day as the max-parallel
-fix above).** `max-parallel: 3` and the `with-test-slot.sh` slot gate are
-different axes, not substitutes: max-parallel governs runner acquisition
+fix above).** `max-parallel` (3 at the time, 4 since 2026-10-21) and the
+`with-test-slot.sh` slot gate are different axes, not substitutes:
+max-parallel governs runner acquisition
 for one push's own matrix; the slot gate governs box-wide heavy
 test-phase concurrency across ALL jobs (any push, any PR, nightly, manual
 dispatch) once a job already has a runner and has finished building.
@@ -1637,6 +1711,43 @@ is still short, so the within-job cap ships first per this section's "one axis
 at a time" practice; #4580's outcome may argue for cross-job gating here too,
 once the actual mechanism is understood.
 
+### Staged widening — Linux (2026-10-21)
+
+Linux has run `--num-processes 2` on every test invocation since #3443. The
+2026-10-20 baseline at that width: the 14 pg shards were 1,778 serial-s over
+907 s wall (sum/wall 1.96, so both workers were busy throughout); the non-pg
+step was 678 serial-s over 5.4 min; the worst shard, M, took 244 s, 35% of its
+700 s timeout. Widening follows the single rule in "Staged widening — the
+decision rule" under "Windows test-phase concurrency gate" above (≥2 same-SHA
+samples, median, stop on rule (b) or (c), keep only a ≥10% gain); it is not
+restated here. At np=4 rule (c) is already cleared by the baseline (244 s is
+far under 560 s).
+
+The change lands on one PR branch as a **push ladder**, each push taking two
+same-SHA samples before the next, so a wall-time delta is attributable to one
+axis ("never bundled with a topology change"):
+
+| Push | Change | Axis | Run (id/attempt) | Samples (s) | Median pg step (s) | Median non-pg step (s) | Worst shard (s, % of timeout) | Verdict |
+|---|---|---|---|---|---|---|---|---|
+| 1 | Preflight split, `platform` suite + Linux-only `docs`, `max-parallel` 4, duration summary, PGDATA/RAM probe (np stays 2) | topology | | | | | | |
+| 2 | Linux np 2 → 4 on the three invocations; Windows pg 6 → 8, non-pg 4 → 6 | width | | | | | | |
+| 3 | tmpfs PGDATA, cap from the push-1 probe (see "Postgres for server tests") | storage | | | | | | |
+| 4 | Linux np 4 → 6, then stop | width | | | | | | |
+
+Push 1 is the comparison baseline for the rest: its two samples are the new
+non-pg baselines (the docs suite left the Windows and macOS legs) and its probe
+output fills the line below.
+
+Probe (push 1, `Postgres container footprint (tmpfs sizing probe)` step):
+host RAM: pending (filled by the tmpfs commit from the probe step log); post-run PGDATA per container (residual on-disk size after the pg step, not peak): pending.
+
+Worst-case ceiling by width (14 pg shards, one shared 700 s timeout, every
+shard at its cap; the degenerate figure, not an expected case): np=2 is 7
+rounds, 4,900 s (81.7 min); np=4 is 4 rounds, 2,800 s (46.7 min); np=6 is 3
+rounds, 2,100 s (35 min). The "7 rounds" and `--num-processes 2` restatements
+in the arithmetic paragraphs above describe the width in force when they were
+written and are brought forward by the width commit, not before.
+
 ### Persistent runner-local test history
 
 Every self-hosted runner agent owns a separate `test-runs.db` outside its
@@ -1714,13 +1825,22 @@ has the check at or before its first test step.
 Inventory declared in `.github/runner-inventory.json`. The sentinel at
 `runner-inventory-sentinel.yml` (every 30 min) compares actual to expected
 and opens a `runner-inventory-drift` issue on mismatch. Both the sentinel
-and the new ci.yml `preflight` job share `scripts/ci/runner-health-check.py`
-(`--mode sentinel` vs `--mode preflight`). Preflight gates downstream
-self-hosted jobs with explicit
-`if: needs.preflight.outputs.<runner>_healthy == 'true'`. Each workflow also
+and the ci.yml `preflight-gate` job share `scripts/ci/runner-health-check.py`
+(`--mode sentinel` vs `--mode preflight`). `ci.yml` splits its preflight in two
+(2026-10-21) so the compile jobs start after a short gate instead of the whole
+serial job: `preflight-gate` ("Preflight (gate)") holds the docs-only
+classification, the pool probe and every output; `preflight` ("Preflight
+(runner health)", the name the dev ruleset requires) holds the source
+gates and runs alongside the builds. `preflight` runs under `!cancelled()` and
+its first step fails unless `preflight-gate` succeeded, so a failed gate (or a
+failed `trusted_inputs`, which skips the gate) reds the required check instead
+of leaving it skipped. Only the gate's `health` step receives the
+administration-scoped `RUNNER_INVENTORY_TOKEN`; `preflight` never does. Preflight
+gates downstream self-hosted jobs with explicit
+`if: needs.preflight-gate.outputs.<runner>_healthy == 'true'`. Each workflow also
 declares its required pools with `--require-pool`. A wholly unavailable
-required pool fails preflight red instead of silently turning its required
-jobs into successful skips. The control interface distinguishes observed
+required pool fails `preflight-gate` (and with it `preflight`) red instead of
+silently turning its required jobs into successful skips. The control interface distinguishes observed
 runner drift from authentication, API/transport, and malformed-response
 failures; missing evidence is a failure, never an inferred healthy state.
 The query requires the `RUNNER_INVENTORY_TOKEN` PAT secret (fine-grained,
@@ -1737,7 +1857,7 @@ that issue is open**. Follow `docs/ci-troubleshooting.md` before closing it.
 
 ### Docs-only changes (#1978, #5320)
 
-As of #1978, preflight also emits a `code_changed` output (from
+As of #1978, `preflight-gate` also emits a `code_changed` output (from
 `scripts/ci/detect-code-change.sh`); the build jobs additionally gate on
 `&& code_changed == 'true'`, so a docs-only PR skips the whole matrix. The
 matrix-expanded required contexts (`Linux gcc-15 debug`, `Windows MSVC debug`,
@@ -1766,7 +1886,7 @@ runs, and the codegate step's push arm sets `code_changed=false` only when:
 Any API error or other answer builds. The classification set is unchanged,
 including the BR-010 carve-out: a push touching `docs/os-capability-matrix.md`
 builds and runs its drift gate. A docs-only push therefore costs
-`trusted_inputs`, `preflight`, three stub jobs and `detect-ci-changes`, all
+`trusted_inputs`, `preflight-gate`, `preflight`, three stub jobs and `detect-ci-changes`, all
 GitHub-hosted (plus the CI canary when the push touches a workflow file — the
 CI-infrastructure classifier decides that separately). The required contexts on
 such a commit read `success` (Preflight, the three stubs, CHANGELOG order) or
@@ -1781,6 +1901,42 @@ push arm is executed against a stubbed `gh` by
 
 Which contexts are required is a repository ruleset setting ("Protect Main",
 "Protect Dev"), not part of `ci.yml`; #5320 did not change it.
+
+### Test suites by leg (`docs` and `platform`, 2026-10-21)
+
+The meson `docs` suite is OS-independent (lexical gates, selftests, lint
+tests) and runs on the **Linux leg only**. Its "runs on every leg" premise was
+false at the test-file level: nine entries pin OS-specific behaviour inside the
+test file or script itself, not behind a meson guard. Those nine carry the
+`platform` suite instead, which every leg runs:
+
+| Entry | Why it is OS-contract |
+|---|---|
+| `gateway build wrapper` | the Windows-only taskkill case and win32 branches in `tests/test_build_gateway.py`; its POSIX stdio and Ctrl-C behaviour must also keep running on Linux |
+| `gateway OTP pin resolution` | pins the `erl.exe` resolution that `scripts/erlang_toolchain.py` branches on for win32 (`tests/test_erlang_toolchain_otp.py`) |
+| `instructions runner hardening` | `WindowsConsoleBreak` (win32) next to about two thousand lines of POSIX tests |
+| `windows sdk contract` | exercises the MSYS2 bash setup contract on win32 |
+| `Windows toolchain contract` | registered only where `pwsh` is installed (not the Linux image) |
+| `build_examples=false gating smoke test` | selects the per-OS vcpkg triplet with `uname -s` and configures a real build on each leg |
+| `start-UAT.sh kill_stale scoping (#5333)` | sources `scripts/start-UAT.sh`, the macOS/Linux rig with Darwin branches; registered off Windows, so it runs on Linux and macOS |
+| `capability matrix gate shell tests (#2204 F10)` | picks `.so`/`.dylib`/`.dll` and loads the real fixture plugins through `capmatrix-gen` on each leg |
+| `healthcheck CLI contract (#5906)` | a bash test that drives the real native `yuzu-server` binary (`.exe` probe, `MSYS2_ARG_CONV_EXCL`, `cygpath`); labelled `['server', 'platform']` |
+
+Linux selects `--suite docs … --suite platform`; Windows selects `--suite platform`
+(not `docs`) with `--exclude-suite docs` on its coverage guard; macOS runs
+everything but `--no-suite docs`. The two dual-labelled node tests
+(`shell bell script behaviour`, `tokens page rotate behaviour`; `['server', 'docs']`)
+therefore no longer run on Windows or macOS, by intent.
+Before moving an entry, grep the docs-suite tests, Python and shell, for a
+Windows- or macOS-positive branch: `skipUnless(... win32`,
+`if sys.platform == "win32":` guarding assertions, a Python ternary on
+`sys.platform` (`"erl.exe" if sys.platform == "win32" else "erl"`), a shell
+`uname -s` arm, `cygpath` or `MSYS2_*` handling, a `.exe` probe, a per-OS
+triplet or extension select, an OS-tool `find_program` guard, or a test that
+drives a real built binary or plugin on each leg. A `skipIf(win32)` is not one,
+and neither is a fixture string that merely names an OS. `assert-suite-cover.py`
+fails the Windows leg on any registered entry that is neither selected nor
+excluded.
 
 ## Postgres for server tests (`YUZU_TEST_POSTGRES_DSN`)
 
@@ -1840,6 +1996,27 @@ Resolution order inside the script:
    15432 avoid colliding with native clusters (5432), the dev pg-canary
    (5433), and the UAT sidecar (15433). Lifecycle is `flock`-serialized
    per container name.
+
+   **Footprint probe and the tmpfs PGDATA experiment (2026-10-21).** The
+   Linux full-pg job ends with a `Postgres container footprint (tmpfs sizing
+   probe)` step (`if: always()`, never fails the job) that prints `free -m`
+   and `du -sm /var/lib/postgresql` for each `yuzu-ci-postgres*` container
+   after the pg shards ran. Those numbers size a later, separately-measured
+   push (the ladder in "Staged widening — Linux"): `ensure-postgres.sh`'s
+   `docker run` gains `--tmpfs /var/lib/postgresql:rw,size=<cap>` (the image's
+   PGDATA is `/var/lib/postgresql/18/docker` under its `VOLUME
+   /var/lib/postgresql`), `PG_TUNE_LABEL` moves to `v2-tmpfs-pgdata` so the
+   drift guard recreates existing per-agent containers, and the guard's
+   `docker rm -f` becomes `-fv` so a retired container's anonymous volume is
+   removed too. Cap rule: `size` = max(2g, 2x the measured post-run PGDATA, rounded
+   up to 1g); four containers x cap must be at most 50% of the probed host RAM,
+   otherwise tmpfs is not applied and the result is recorded here instead. A
+   tmpfs cluster is empty after any container restart; the entrypoint then runs
+   initdb and creates the database, the same path a brand-new container takes,
+   and the script's 120 s `pg_isready` wait covers it. The change is kept only
+   if the pg step's two samples show a gain; reverting is dropping the flag and
+   bumping the label again. Docker Linux path only. Probe output and the
+   decision: pending — filled by the push that applies or declines it.
 3. **brew** (GHA-hosted macOS, no docker) — `postgresql@18` bottle +
    throwaway trust-auth cluster under `$RUNNER_TEMP` on
    `127.0.0.1:15432`.
@@ -2085,6 +2262,40 @@ recovered listed cases into the runner's `ci_flake_events` table alongside the
 suite timings. `tests/known-flaky.json` remains the reviewed source of truth —
 the database is observation history, never an implicit allowlist. This is
 reversible test tooling — no ADR (rationale in the wrapper header).
+
+**Per-case duration summary (#4884).** The suite-budget table above is
+per meson entry. Next to it, `scripts/ci/test-durations-summary.py` appends a
+"Test durations — <label>" block to the job summary after each
+`flake-retry.py` invocation in the Linux (three), Windows (two) and macOS (one)
+Test steps: every entry's wall seconds, meson timeout and share of it, then the
+25 slowest Catch2 cases (entry, case, seconds, runs). The push-only `Test (pg smoke)`
+steps are deliberately not summarised: each runs one ~3 s entry. The case data is Catch2's
+own `--durations=yes`, now on every Catch2 entry except the two pinned exemptions
+(the push-only pg smoke entry and the `[tsan-heavy]` checkpoints entry; the `=`
+form is required: a space would add a positional
+`yes` that `check-pg-shard-partition.py` rejects as a second spec). It is
+parsed from `meson-logs/testlog.json`, which meson overwrites on every
+invocation, hence one call per invocation rather than one at the end of the
+job (each step removes the file first, so a run that selects no tests warns and
+skips instead of re-reporting the previous log); on a red invocation `bash -e` stops before the summary and the uploaded
+`meson-logs` artifact carries `testlog.json` for running the script locally.
+
+Catch2 prints a duration line at the end of every *section*, with the test
+case's own line last on each re-entry, so the script keeps a line only when its
+name is a listed case of that entry (`--list-tests --verbosity quiet`, one
+spawn per Catch2 entry, 30 s timeout) and sums per case across re-entries
+(`runs` is the number of re-entries). Section lines whose name is not also a case
+name of that entry are dropped, so a nested section does not rank beside its
+parent; a section that shares its name with another case of the same entry is
+summed into that case (a known limit, pinned by the selftest; Catch2's
+structured reporter is the fix if it ever bites). A failed listing degrades that entry
+to unfiltered lines and marks it `(unfiltered)`. The report is never a gate:
+any failure becomes a `::warning` and exit 0; only `--selftest` (meson test
+`test-durations-summary selftest`) can exit non-zero.
+
+On macOS the used share is against the nominal meson timeout; that leg runs with
+`--timeout-multiplier 2`, so the real budget is double (the same convention as
+the budget table above).
 
 **Triage note — shared-fixture files fail as a cluster on a PG blip.** The
 shared-DB + TRUNCATE fixture files (#2362, #2603: `test_software_inventory_store`,

@@ -2,6 +2,150 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: the Windows agent installer passes the enrollment token by file
+
+**What changed.** The Windows agent installer no longer puts the enrollment token on the
+registered service command line. It writes the token to `%ProgramData%\Yuzu\enrollment-token`
+(restricted to Administrators and SYSTEM, owned by Administrators), configures the service with
+`--enrollment-token-file` pointing at that file, and the agent removes the file after its first
+accepted registration or when the server refuses the token. `/TOKEN=<token>` still works; `/TOKEN_FILE=<file>` is new and keeps the
+token out of Setup's own log too (Setup's command line, and therefore its `/LOG=` log, still
+records a `/TOKEN=` value verbatim if that is the form given). A service registered by this
+installer shows `--enrollment-token-file` and no token value in `sc.exe qc YuzuAgent`.
+
+**Who is affected.** Anyone installing or upgrading the Windows agent with `/TOKEN=`, and every
+Windows agent registered by an earlier installer.
+
+- **An agent registered by an earlier installer keeps its earlier command line, token included,
+  until the installer is run again.** Nothing else rewrites it: an over-the-air agent update
+  replaces the binary only. `sc.exe qc YuzuAgent` shows which form a service has:
+  `--enrollment-token-file` with no token value, or `--enrollment-token <value>`. To move an agent
+  to the new form, run the installer again with the same `/SERVER=` and `/NOTLS` you installed it
+  with: a re-run that omits them registers the service against `localhost:50051` with TLS on (see
+  the fleet-upgrade gotcha under [Server Administration](server-admin.md)). No `/TOKEN=` or
+  `/TOKEN_FILE=` is needed on that run, because an already-enrolled agent needs no token.
+- A service whose environment still sets `YUZU_ENROLLMENT_TOKEN` keeps starting: a token read from
+  the file takes precedence, and with no usable file the environment value is used.
+- An agent binary older than this change does not know `--enrollment-token-file`: if a service
+  registered by this installer is rolled back to one, it exits with code 109 and writes no log
+  line. Run the previous installer again with the previous parameters to restore a matching
+  command line.
+
+**How to fix, and what the installer and agent now refuse.**
+
+- The installer exits with code **7** (its `/LOG=` log says why) before it installs anything or
+  stops the service when: both `/TOKEN=` and `/TOKEN_FILE=` are given (or `/TOKEN_FILE=` together
+  with a token typed in the wizard); a `/TOKEN_FILE=` file is missing, not a plain file, unreadable,
+  empty or contains NUL bytes; the token is not exactly 64 lowercase hexadecimal characters (a
+  list, a JSON document or a URL is refused); or the token file path or its staging path is a link
+  or cannot be written, or an `enrollment-token.stage` folder left beside it by an interrupted run
+  is in the way (it may hold a staged token, readable by Administrators and SYSTEM only; delete it
+  and run the installer again; uninstalling removes the folder only when it is already empty). The
+  `/TOKEN_FILE=` source file itself is left in place; delete it when the deployment is done.
+- The agent reads a token file only if it holds a 64-hex token on its first line and is owned by
+  SYSTEM or root, Administrators, or the account the agent runs as (on Linux and macOS also not
+  group- or other-writable, and readable by the agent). Anything else is ignored with a warning in
+  the agent log, and the agent registers with `--enrollment-token` / `YUZU_ENROLLMENT_TOKEN` if
+  one is set, else without a token (the approval queue).
+- When the server refuses a token the agent read from the token file (unknown, expired, revoked or
+  used up), the agent removes the file, and its next start registers without the file's token:
+  with an `--enrollment-token` / `YUZU_ENROLLMENT_TOKEN` value if one is set, otherwise without a
+  token, into the approval queue. A file that could not be removed is read and presented again on
+  the next start, so keep it where the agent can delete it. A refusal that is not about the token,
+  such as an administrator denying the agent, leaves the file in place. To enrol with a token
+  again, supply a current one (run the installer again with `/TOKEN=` or `/TOKEN_FILE=`). Do not
+  bake a token file into a golden image or VDI template: each machine started from it registers
+  with a new identity and uses one of the token's uses. A non-persistent image that still carries
+  a token the server has expired, revoked or used up adds a new entry to Pending Agent Approvals
+  on every boot (each boot is a new agent id), and the queue is not capped. Size `max_uses` and
+  the expiry to the rollout window.
+- For a new unattended install, prefer `/TOKEN_FILE=<file>` over `/TOKEN=` when the token must not
+  reach Setup's own log or deployment-tool command-line records (SCCM's AppEnforce.log, Intune).
+  An installation that fails after the token file is written leaves the file in place
+  (Administrators and SYSTEM only) and the previous service restarts with its previous command
+  line; an installation that is refused while the new file is being moved into place leaves no
+  token file at all. Either way, run the installer again with the same token. The agent removes
+  whatever is at the token-file path when its first registration is accepted or the server refuses
+  the token, so when re-staging a token for an agent that already runs with
+  `--enrollment-token-file`, write it only after that agent has registered, or stop the service
+  first.
+
+## Behaviour change: new enrollment tokens default to 72 hours and 100 uses
+
+**What changed.** A limit left blank when minting an enrollment token now defaults to 72 hours
+and 100 uses, on every create surface: the dashboard form, `POST /api/settings/enrollment-tokens`,
+`POST /api/settings/enrollment-tokens/batch` (`ttl_hours` only — its `max_uses` default stays 1),
+and the server CLI `--generate-tokens --token-ttl-hours` (its `--token-max-uses` default also
+stays 1). An explicit `0` still means unlimited uses / no expiry, exactly as before. The CLI now
+refuses a negative `--token-ttl-hours` or `--token-max-uses` (a negative `--token-ttl-hours` used
+to mint a token with no expiry, and a negative `--token-max-uses` was refused by the store rather
+than by the option parser), and its `enrollment.bulk_token_create` audit row now records `ttl_s=`
+and `label=`.
+
+**Who is affected.** A script or operator that relies on leaving a limit blank to mean
+unlimited/never-expiring now gets a 72-hour/100-use token instead. A rollout that stages tokens in
+advance, or enrolls more machines from one token than its uses, is refused once the token is
+spent or expired.
+
+**How to fix.** Pass an explicit `0` for `max_uses` and/or `ttl_hours` to keep the old
+unlimited/no-expiry behaviour, or size them to the rollout window and the number of machines.
+## Behaviour change: the DEX score policy document carries a version (#6085)
+
+**What changed.** The canonical text of the `dex_score_policy` document now includes `"version": 1`, and `version` is a recognised key. A document without the field reads as version 1. A server that meets a version above the one it supports scores under the shipped defaults, reports `fault: unsupported_version at version: N above the supported 1` on every Apps response, and logs it once. It never applies part of a document, and the revision stays the hash of the stored text. No released build reads the document yet, so a released build ignores it. A development build that has the reader but predates this change refuses a `version` key as an unknown key and serves the shipped defaults with a fault for any document that carries it.
+
+**The rule, once a release writes the document.** Nothing writes the document in this release, so this rule has no effect yet. From the release that adds the writer, do not change the score policy during a rolling upgrade or rollback: a newer server may write a document that an older server in the same fleet refuses or, if it predates the score policy reader, ignores (on a rollback, a build that predates the `version` key refuses it as an unknown key), and until every instance runs the same release the instances can score under different policies.
+
+**If a stored document is refused.** A later release that tightens validation can refuse a document an earlier release accepted. The server then serves the shipped defaults with a fault naming the field. Save the policy again through the write surface once a release ships one; until then, correct the row directly. Nothing is migrated automatically.
+
+**No action on upgrade.** There is no schema change. Nothing in the product writes the document in this release, so no policy written by the product exists to migrate (a row placed by a direct database write is read as any other document).
+
+## ⚠️ Breaking: `POST` and `DELETE /api/v1/quarantine` now apply the dispatch approval check (#6065)
+
+**What changed.** `POST /api/v1/quarantine` (and the dashboard's Quarantine device button, which calls it) now runs the same dispatch approval check as the quarantine plugin's `quarantine` action, after the scoped `Security:Execute` gate and the `whitelist` validation and before any record is written. `DELETE /api/v1/quarantine/{agent_id}` (the Release from quarantine button) now runs the same check for the plugin's `unquarantine` action, after the scoped gate and before the `attempt` audit row and the release. Neither depends on any approval-workflow setting.
+
+"Administrator" here means an account whose **account role** is `admin` (a live temporary JIT elevation counts as that role). The RBAC `Administrator` role, or a global `Security:Execute` grant, on an account whose role is `user` does not make it one.
+
+- **RBAC on, a non-administrator who holds `Security:Execute` globally:** admitted before (`201`, and the reconciler then isolated the device), now `403` `approval_required`. This includes an account that holds the RBAC `Administrator` role but whose account role is `user`. REST has no approval-ticket path, so such a caller cannot create a quarantine record through REST or the dashboard.
+- **RBAC on, a caller who holds `Security:Execute` only through a management group:** now `403` `forbidden`, the same answer MCP `quarantine_device` gives at its pre-check. So is an account that is an administrator only through a JIT elevation and has no global `Security:Execute` grant of its own: the check reads the account's own grants, not the elevated role.
+- **RBAC off (the default):** nothing changes for non-administrators, because the legacy gate already refuses `Security:Execute` without the `admin` account role, so this check adds no new refusal there. A JIT-elevated administrator is admitted as before.
+- A session that expires between the route's first authorisation check and its second look-up now ends the request at the `401`. Before, the record was written and attributed to `system`. A request whose two look-ups name different principals (a session cookie that lapsed with a bearer token for another account on the same request) also ends at `401` and writes no record, and the audit rows of both routes now name the session the route resolved, so they agree with the record's `quarantined_by`. When searching the audit log for callers relying on the old behaviour, ignore `denied` rows whose `detail` is `authenticated principal changed during the request now=<account>`: they are that `401`, not an approval refusal.
+
+A refused request writes no quarantine record and releases none. The `403` bodies carry `message` and `remediation` and no `permission` field.
+
+**Release.** The same answers apply to `DELETE`: a non-administrator who could end a record before now gets `403` `approval_required` (RBAC on, global grant) or `403` `forbidden` (group-only, or an unreadable RBAC store), the record stays active, and the refusal is audited as `quarantine.disable` with `result=denied` and no `attempt` row. Only an administrator (with RBAC on, one who also holds `Security:Execute` globally) can release a record through REST or the dashboard. A JIT elevation counts as the administrator role only if the account also holds `Security:Execute` globally; otherwise the release is refused `forbidden`. The `remediation` text names the MCP supervised flow, which can create a record but has no release tool, so for a release the only path is an administrator. Release still ends the server record only; it does not remove the endpoint firewall rules.
+
+**Rolling upgrades and rollback.** The check is enforced per server replica. During a rolling upgrade, or after rolling a replica back, a replica that has not been upgraded still accepts `POST /api/v1/quarantine` from a non-administrator who holds `Security:Execute` on the device (`201`, and the leader then isolates the device) and accepts the same caller's `DELETE` release (`200`). The check applies across the cluster only once every replica runs this version, so do not treat a `201` from a non-administrator during the rollout as a failure of the new check. Rolling back restores the old behaviour; no data changes in either direction.
+
+**What to check.** Automation that creates or releases quarantine records with a non-administrator API token or cookie session must move to a durable administrator account (not a JIT elevation; with RBAC on, one that also holds `Security:Execute` globally in its own right). For creation only, MCP `quarantine_device` on the supervised tier is the alternative, where an administrator approves the ticket in an interactive session with MFA step-up (see the #6061 note below); release has no such path and needs an administrator. To find callers that were relying on the old behaviour, search the audit log for action `quarantine.enable` (create) or `quarantine.disable` (release) with result `denied`: the principal and the device are on the row. `yuzu_server_dispatch_denied_total{reason}` shows only the fleet-wide trend; it is shared with MCP and `/api/command` and cannot name this route. For a least-privilege containment operator (`Security:Execute`, not an administrator) there is no REST or dashboard approval path yet; adding one is planned follow-up work, and until then creation can go through the MCP supervised flow or the quarantine plugin's `quarantine` action on the Instructions page (role-gated approval). Releasing through the plugin's `unquarantine` action alone clears the endpoint firewall rules but leaves the active record, so while the record is active the reconciler re-applies the stored isolation when the device next reconnects; an administrator must end the record. No configuration or data migration is required.
+
+## ⚠️ Breaking: cookie-session writes require a same-site Origin or Referer
+
+**Before you upgrade.** Do these on the version you are running now:
+
+1. If a reverse proxy fronts the dashboard, check that it forwards the client's `Host` unchanged, port included. nginx rewrites `Host` by default (it sends `$proxy_host`), so add `proxy_set_header Host $http_host;` in every `location` that proxies to Yuzu, or at `server` level. `$host` drops the port, so use `$http_host` unless the public port is 80 or 443. Behind a TLS-terminating proxy, also declare the public origin with its scheme (for example `--csrf-trusted-origin https://yuzu.example.com`) even when `Host` is forwarded: the server cannot see the public scheme, and the scheme-qualified entry makes it refuse a plain-`http://` `Origin` for that host. If the proxy cannot forward `Host`, set `--csrf-trusted-origin https://<public-origin>` (or the environment variable `YUZU_CSRF_TRUSTED_ORIGIN`) on **every** server replica first, restart, and confirm the start-up line described under "Confirming it took" in [Server Administration](server-admin.md#vnext--behind-a-reverse-proxy-declare-your-external-origin-or-csrf-gated-dashboard-actions-keep-failing-2537).
+2. Create at least one API token for your automation before upgrading. Creating a token from the dashboard is itself a cookie-session write, so it is refused on a misconfigured proxy after the upgrade.
+3. A script that reuses a login cookie jar should switch to the token.
+
+**Symptom and recovery.** On a deployment that skipped step 1, every dashboard write answers `403` `cross-site request refused`; sign-in and ordinary reads still work, API tokens cannot be created, and the step-up elevation request is refused. The check cannot be disabled: the remedies are the flag, an API token or rolling back. Recovery is to restart with the flag or environment variable, or to reach the server directly (for example an SSH tunnel to the web port, so `Host` matches `Origin`), sign in and create a token. A script that reaches the server directly must send an `Origin` naming the address it connects to (for example `http://localhost:8080`, or `https://localhost:8443` when the server terminates TLS itself, where an `http://` origin is refused). Direct access needs a local sign-in: a deployment that offers only OIDC or SAML sign-in redirects to the public URL, so for those only restarting with the flag works. There is no reload: the value is read at start. Every replica needs the same value, or the same page flaps between `200` and `403` depending on which replica answers. An `Origin: null` header, which some browser and proxy configurations send, cannot be fixed by the flag; do not set `Referrer-Policy: no-referrer` at the proxy (it removes the `Referer` fallback, and the Fetch standard makes browsers serialise the `Origin` of a non-CORS form submission as `null` under that policy; script-driven requests are unaffected), and the remedy is to remove it or roll back. `/livez` and `/readyz` stay green throughout, so a probe does not detect this. The upgrade makes no schema change, so downgrading is safe.
+
+**What changed.** Every request other than `GET`, `HEAD` or `OPTIONS` that is authorised by a **session cookie** must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`). Otherwise it answers `403` `cross-site request refused` (the standard error envelope, with a `remediation`) and is audited as `csrf.denied`. One check, applied centrally, decides this after authentication and before step-up evaluation, challenge emission and route-handler effects, and before the request body is parsed; a client that sends `Expect: 100-continue` has already been told to send the body, and a large upload may still be in flight when the `403` arrives. A request that presents a valid session cookie is treated as a cookie-session request even if it also carries a token. A request authenticated only by an API, MCP or engine token is not subject to this check, and neither is a request answered before a session is resolved. The per-route checks described elsewhere in this guide stay in place as defence in depth; a route that keeps a copy of its own that is not token-exempt, so a token caller of one of those can still be refused by it.
+
+**Guarded reads.** The same rule also covers cookie-session requests that dispatch work, persist state or force a refresh of server state, whichever method they use (the guarded reads). The exact path, never a query flag, selects the gate. The mechanism for them is the browser's fetch metadata, and a `Sec-Fetch-Site` header that is present decides alone: exactly one header with value `same-origin` or `none` is admitted, any other value (or a repeated `Sec-Fetch-Site` header) is refused with `origin_mismatch`, and `Origin` and `Referer` are not consulted. Only when `Sec-Fetch-Site` is absent does the `Origin` or `Referer` rule above apply. Browsers send `Sec-Fetch-*` headers only to potentially trustworthy origins (HTTPS and loopback), and Safari before 16.4 sends none, so on a plain-HTTP deployment at a non-loopback address these requests depend on the `Origin`/`Referer` rule; a same-origin `GET` carries no `Origin`, so it depends on `Referer`, which the server's default `Referrer-Policy` (`strict-origin-when-cross-origin`) supplies. A proxy or page policy of `no-referrer` would break those dashboard panels on such a deployment; a TLS-terminating proxy is fine, because the browser talks to the proxy over HTTPS. These requests are audited as `csrf.denied` with a `target_id` such as `GET /path`. Token callers are not gated.
+
+**Who is affected.** A script or tool that signs in with a cookie and writes without an `Origin` or `Referer` header now gets `403`. A deployment behind a reverse proxy that rewrites `Host` and has no `--csrf-trusted-origin` entry has every cookie-session write refused until the flag is set. At start-up the server prints one line to standard output: the number of origins accepted and their values when at least one is accepted, otherwise the rule and a note that none was accepted (it is not written to `--log-file`, and `--log-level` does not hide it). The first refusal of each kind logs a warning naming the flag. The dashboard and other browsers send these headers on every write and need no change. A script or tool that sends the guarded reads (cookie-session requests that dispatch work, persist state or force a refresh of server state) with a login cookie and no `Sec-Fetch-Site` header must now send a same-site `Origin` or `Referer`; one that sends `Sec-Fetch-Site` must send it once with value `same-origin` or `none`. Otherwise it gets `403`. The audit row for such a refusal still carries the fixed detail text "browser write refused". Browsers need no change. On most dashboard pages a refused write shows no error message (the page does not swap the `403` response in), so a proxy misconfiguration can look like buttons that do nothing; check the audit log and `yuzu_server_csrf_denied_total`.
+
+**How to fix.** Send `Origin` matching the console origin (for example `-H "Origin: https://yuzu.example.com"`), or `Referer` for an endpoint that validates `Origin` against its own allowlist (see [MCP](mcp.md)), or use an API token. Behind a reverse proxy, declare the public origin with `--csrf-trusted-origin`, including the scheme (for example `https://yuzu.example.com`); this is required if the proxy rewrites `Host`, and with a scheme it also makes the server refuse a plain-`http://` `Origin` for that host. A server that terminates TLS itself needs no declaration: it requires an `https://` `Origin` or `Referer`. For the guarded reads, either send no `Sec-Fetch-Site` header and a same-site `Origin` or `Referer`, or send `Sec-Fetch-Site` once with value `same-origin` or `none` (a `Sec-Fetch-Site` header that is present decides alone, so a script that sets it to any other value, or sets it twice, is refused even with a good `Origin`); or authenticate with an API token. Do not configure the proxy to inject or rewrite `Origin` or `Referer`, which would turn the control off for that deployment. No data migration is required.
+
+**What to check.** Since this release, a `csrf.denied` row for a cookie-session caller has `result` `denied`, `target_id` set to the sanitised request method and path (for example `POST /path`; the request path is truncated at 200 bytes) and a `detail` of fixed text followed by `reason=<token>`. Rows keyed on the earlier per-route `target_id` values or on `result` `error` now appear only for token callers of routes that keep their own non-token-exempt copy, so a SIEM rule keyed on those values goes quiet for cookie callers: re-key it on `action` `csrf.denied` (and `result` `denied`), and treat the date of this release as the boundary in exported evidence. The counter `yuzu_server_csrf_denied_total{path_class,reason}` records every refusal (`reason` is `no_origin_no_referer`, `origin_mismatch`, `referer_mismatch` or `gate_error`) and the shipped `yuzu-web-writes` alert rules watch it ([Metrics](metrics.md)); a rise after the upgrade is usually a script without the header or a proxy without the flag.
+
+## Behaviour change: privileged REST routes refuse cross-site cookie writes
+
+**What changed.** A call to a privileged REST write route (the routes whose reference entry carries a "Cross-site writes" note in the [REST API](rest-api.md) guide) authorised by a **session cookie** must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`). Otherwise it answers `403` `cross-site request refused` and is audited as `csrf.denied`. The central same-site check (see the section above) answers first, after authentication and before authorization; each of these routes keeps its own copy after its authorization gates and MFA step-up as defence in depth, and before the request body is read. API, MCP and engine token callers are not affected by these routes.
+
+**Who is affected.** A script or tool that signs in with a cookie and calls one of these routes without an `Origin` or `Referer` header now gets `403`. No dashboard page calls these routes.
+
+**How to fix.** Call the route with an API token, or send an `Origin` header matching the dashboard origin (for example `-H "Origin: https://yuzu.example.com"`). Behind a reverse proxy that rewrites `Host`, declare the public address with `--csrf-trusted-origin`. No configuration or data migration is required.
+
 ## ⚠️ Breaking: approving or rejecting a request now needs an interactive session and an enrolled MFA factor with a fresh proof; MCP cannot approve (#6061, #6079)
 
 **What changed.** Approve and reject (`POST /api/approvals/{id}/approve`, `POST /api/approvals/{id}/reject`,
@@ -212,7 +356,8 @@ dispatches.
    Expect `403` with message `approver_assurance_required:non_interactive_session`, and one `approval.approve`
    row with `result=denied` and `detail=approver_assurance:non_interactive_session`. The same attempt through MCP
    `approve_request` returns `-32003` with the same message. (A token without `Approval:Approve` gets the plain
-   permission `403` first, so it does not prove the new check.)
+   permission `403` first, so it does not prove the new check. Over MCP, an operator-tier or readonly-tier token is
+   refused earlier by the tier check with `-32004`; use a supervised-tier or untiered token for this step.)
 4. Repeat step 2 with one account of each kind you run and check the outcome: a SAML user (expect `403`
    `approver_assurance_required:saml_mfa_unsupported`), an OIDC user your identity provider does not send an MFA
    `amr` for (expect `403` `approver_assurance_required:mfa_proof_missing`), a local account with no enrolled factor
@@ -228,8 +373,9 @@ dispatches.
    after that (#6098), is never deleted, and, for an instruction-origin ticket, dispatches nothing. Record the
    ids of the approved test tickets in your change record so nobody mistakes them for a real decision later.
 
-**Rolling back, or running mixed versions.** This change adds no schema, so a rollback starts cleanly. What
-changes is which checks run.
+**Rolling back, or running mixed versions.** The approver-assurance change itself adds no schema; the separate
+scheduled-approval change (#6096, below) adds a data-only approvals step and a command-outbox index, both of which an
+older binary ignores, so a rollback starts cleanly. What changes is which checks run.
 
 > **Warning: mixed versions silently weaken the approver control.** The enrolled-factor and fresh-proof
 > requirement (#6079) is in force **only while every replica that serves `/api/approvals/*` runs a build that
@@ -345,13 +491,69 @@ changes is which checks run.
   (step size minus 5 minutes) before the step) is expired permanently once an accepted submission has swept it
   (until then correcting the clock restores it), and older approved tickets stay live
   (observability tracked in #6098).
-- Submission time (`submitted_at`) and the schedule's own run stamps still come from the clock of the server that
-  wrote them, not from the database. Keep every server NTP-synchronised. When the server that submitted an approval
-  and the one that advances a recurring schedule disagree about the time (a leader change under clock skew, or a clock
-  step), an approved ticket can be used for an extra occurrence or be ignored and requested again, and a submitter
-  clock far from the database's lengthens or shortens how long its pending requests live. Tracked in #6096.
+- Submission time (`submitted_at`) now also comes from the database, like the review and use times, so a server
+  whose own clock is wrong can no longer lengthen or shorten how long its pending requests live. A recurring
+  schedule no longer decides that an approval is spent by comparing clocks: when the occurrence an approved ticket
+  belongs to has been queued, the ticket is marked used (a rejected ticket is marked used when it skips its
+  occurrence), so one approval runs at most one occurrence whatever the clocks say (#6096). A used ticket keeps its
+  status (`approved` or `rejected`); only its use time and user are filled in. The schedule's own run times are
+  still stamped by the server that advances it; they only decide when an occurrence is due.
+- **Scheduled approvals are retired once on upgrade (#6096).** Before this release a spent scheduled ticket was
+  never marked used; it was recognised as spent by comparing clocks. The approvals schema step (v2) therefore marks
+  every outstanding approved or rejected ticket that belongs to a schedule as used, once per database, with no clock
+  comparison. A schedule that was holding an occurrence for an approval you had already given (approved but not yet
+  fired when you upgraded) asks again for that held occurrence, and a rejection you had already given no longer skips
+  that occurrence: the schedule asks again. Pending requests, requests from the dashboard and MCP, and tickets
+  already used are untouched. Nothing to do. The step is data only (no table or column changes). It touches
+  every unsettled approved or rejected scheduled ticket, including old rejected ones (rejected tickets never expire
+  and are never swept); that is normally small. It runs inside the upgrade transaction under a 300 s statement
+  timeout and is skipped on every later start. If the 300 s timeout is hit the step fails, nothing is applied,
+  and the approvals store does not open (the server logs a schema migration failure for that store); investigate
+  the table size and restart. The command outbox also gains a small index on its approval id
+  (`outbox_approval_idx`) at the same upgrade; its build is bounded by the same 300 s timeout.
+- **Upgrade one replica first when the outbox table is large (#6096).** Building `outbox_approval_idx` takes a share
+  lock on the outbox table for up to 300 s, so enqueue and claim on other replicas wait meanwhile. A second replica
+  that boots at the same time waits on the migration advisory lock under the pool's default lock and statement
+  timeouts and may fail its boot closed; restarting it recovers, because the migration is then applied. The
+  recommendation is to start ONE replica, wait for it to finish migrating, then start the others. These are not
+  measured numbers.
+- **Where the legacy marker lives (#6096).** The retired tickets carry `consumed_by = 'schedule:legacy-6096'` in
+  `approval_manager.approvals`. It is readable only by SQL; no API returns it. Tickets the outbox showed had already
+  been used by an earlier occurrence carry the related marker `consumed_by = 'schedule:ledger-spent:<schedule id>:<n>'`;
+  tickets settled by a normal fire or skip carry `schedule:<schedule id>:<n>`. To list the legacy ones:
+
+  ```sql
+  SELECT id, status, schedule_id, consumed_at
+  FROM approval_manager.approvals
+  WHERE consumed_by = 'schedule:legacy-6096';
+  ```
+- **Mixed versions and rollback for scheduled approvals (#6096).** Recommended practice: drain or stop every replica
+  that predates this change before anyone approves scheduled work. The command outbox records which approval ticket
+  each scheduled run used, and the new binary refuses to fire a ticket the outbox shows was already used by an
+  earlier occurrence, so a ticket fired by an older leader is inert after the upgrade. A rolled-back binary does
+  not consult the outbox ledger or the used marker, so an older binary can re-fire a ticket the new binary marked
+  used (the old clock comparison); rolling back restores the old behaviour, including that exposure. After a rollback
+  followed by a second upgrade, run this once, because a rejected ticket spent under the older binary would
+  otherwise skip one occurrence. It also retires approved-but-unfired scheduled tickets, which then ask again:
+
+  ```sql
+  UPDATE approval_manager.approvals
+  SET consumed_at = EXTRACT(EPOCH FROM now())::bigint, consumed_by = 'schedule:legacy-6096'
+  WHERE schedule_id <> '' AND consumed_at = 0 AND status IN ('approved','rejected');
+  ```
 - Tickets already approved when you upgrade keep their original `reviewed_at`; the seven days are counted
   from it.
+
+## Behaviour change: plugin-enablement tables and the continuity anchor (`plugin_config_store` schema v3, ADR-3006)
+
+The `plugin_config_store` schema moves to v3. It adds the tables of the plugin-enablement store (`enablement_rules`, `enablement_endpoints`, `enablement_meta`) and records a new store id. Nothing flips on upgrade: there is no operator surface yet and nothing issues desired state, so no endpoint's behaviour changes.
+
+- **What you will see.** `/readyz` gains an `enablement` object and `/health` an `enablement_regressed` flag; neither gates readiness. On the first boot after the upgrade the server writes `enablement-anchor` beside its data and reports `anchor_unwitnessed_at_boot: true` once. That is expected and needs no action.
+- **Rollback is safe.** v3 only adds tables, and an older server starts on it without complaint (there is no schema-ahead guard) and ignores them.
+- **Rolling upgrade.** No behaviour change: a replica on the older release ignores the new tables.
+- **Retrying a failed upgrade.** The v3 migration seeds a new store id, and the server writes `enablement-anchor` naming it. If you then restore the pre-upgrade dump and upgrade again, the new store id no longer matches the surviving anchor, and the server logs one warning naming the old and new store id. While nothing has been issued (the anchor's counter and the store's counter are both `0`) that is reported as unwitnessed (`anchor_unwitnessed_at_boot: true` once), the server rewrites the anchor with the current store id, and no regression is declared; the same applies to a fresh database with a kept data directory. If the anchor's counter or the store's counter is above `0`, the server starts with enablement declared regressed (reason `store_id_mismatch`, alert `YuzuEnablementRegressed`); before retrying, remove `enablement-anchor` from the data directory or restore it from the same backup point as the dump. If a regression was already declared, the exit is in [Enablement continuity anchor](server-admin.md#enablement-continuity-anchor).
+- **Backups.** The tables ride the existing dump. The anchor file is outside it: keep `enablement-anchor` with the data directory. `scripts/yuzu-backup.sh` and `scripts/yuzu-restore.sh` now copy it.
+- **Alerts.** The `yuzu-enablement` group in `docs/prometheus/yuzu-alerts.yml` ships with this change. Until the later change that issues desired state, only `YuzuEnablementRegressed` and `YuzuEnablementAnchorWriteFailing` can fire.
 
 ## Behaviour change: the macOS agent package installs transactionally and can refuse
 
@@ -434,6 +636,12 @@ customer-distribution lane. Before switching lanes, read the
 [packaging and recovery runbook](../../deploy/packaging/macos/README.md) and the
 [macOS development foundation](../macos-development-foundation.md).
 
+## Deprecated: `--max-agents` / `YUZU_MAX_AGENTS` has no effect and will be removed (#6165)
+
+**What changed.** `--max-agents` (env `YUZU_MAX_AGENTS`) was never enforced: the server has never capped how many agents connect. It is now marked deprecated. Setting it explicitly logs one startup warning; the default logs nothing. `GET /api/v1/settings/server-config` still returns `max_agents` for compatibility.
+
+**What to check.** Remove `--max-agents` and `YUZU_MAX_AGENTS` from your service units, compose files and environment. When the flag is removed in a later release, an explicit `--max-agents` will stop the server from starting (unknown option), while a leftover `YUZU_MAX_AGENTS` will be ignored. A malformed leftover value (for example `YUZU_MAX_AGENTS=unlimited`) still stops the server from starting today, because the value is still parsed as a number. There is no replacement: the server does not cap how many agents connect; spread a large fleet across gateways. Do not use `--grpc-max-threads` to limit agents: it is a fleet-size ceiling that must stay above the connected-agent count (size it at about 1.5x that count); set below it, every RPC fails.
+
 ## Version Compatibility
 
 | Server Version | Min Agent Version | Min Gateway Version | Notes |
@@ -450,7 +658,7 @@ customer-distribution lane. Before switching lanes, read the
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **`WorkflowEngine` now runs on PostgreSQL (ADR-0064).** `/api/workflows*` and `/api/workflow-executions/*` moved off `workflows.db` SQLite onto the shared Postgres substrate (schema `workflow_engine`). **No data carries over from a pre-Postgres install** (fresh-start-by-default, ADR-0009) — any workflow definition and its execution history that existed before upgrade is gone; re-create workflows via `POST /api/workflows` (or product-pack re-install). Server startup now fails closed if the `workflow_engine` schema can't be created/opened — a posture upgrade from the SQLite era, where construction was unconditional/best-effort and no caller ever checked whether the store had actually opened; confirm success via `/readyz` (already reported before this release) and `/healthz` (newly reported — was absent before this release). **Delete semantics changed: `DELETE /api/workflows/:id` now soft-deletes.** The response shape is unchanged (`{"deleted": true|false}`), but a deleted workflow's row and its execution history are now retained internally rather than orphaned — this is not operator-visible today (no "show deleted workflows" surface exists), but a deleted workflow's `id` can never be reused. No operator action required. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Guardian file-hash `max_bytes` now has a hard ceiling (#2233).** An authored `file-hash-equals` rule's `max_bytes` (the hashing-DoS cap) was previously accepted unbounded from the authoring API. It is now clamped to 1 GiB (`kMaxFileHashBytes`) on the agent, and the server rejects a new/edited rule authoring a value above that ceiling in either JSON wire form (400). **Operator-visible only if you have a PRE-EXISTING `file-hash-equals` rule authored (before this release) with `max_bytes` above 1 GiB, watching a file at or above that size:** after upgrade, that file reports `<oversize>` instead of being hashed — a compliance-verdict change with no authoring-time signal (the rule already exists, so the new server-side reject cannot retroactively catch it). List your rules via `GET /api/v1/guaranteed-state/rules` (the route returns every rule; there is no server-side filter), check any `file-hash-equals` rule for `max_bytes` over 1073741824, and re-author within the ceiling if the larger cap was intentional. No operator action required otherwise. **DEX and management-group reads now fail closed on a degraded read instead of answering a healthy/empty result (#4855, #1762)** — see "Behaviour change: DEX device score and management-group member reads now fail closed on a degraded read (#4855, #1762)" below. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **`BatchHeartbeatResponse` gains `unknown_session_ids` and `unknown_session_ids_truncated` (#1197), and the gateway now acts on them - restart the gateway to deploy (this disconnects every agent it holds, and released v0.13.0 and v0.14.0-rc6 agents stayed wedged after a graceful gateway restart in testing, so upgrade agents to a build with the #5183 fix first or expect to restart the agent service on them; see "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts)); no wire change and no new required configuration.** The server lists, per `BatchHeartbeat`, the session ids it does not hold, and the new gateway reads that list and re-registers exactly the sessions it still holds (the registration-replay drip, bounded by a per-session guard and a queue cap). The behavioural change is that, after a server restart, agents behind a new gateway become known to the server again without operator action; before, they stayed unknown (`/health` `agents.online` stayed 0 in the observed runs). Any pairing interoperates: an OLD server never sends the fields, so a new gateway sees an empty list and does nothing; an OLD gateway ignores the added response fields (proto3 unknown fields, field numbers 2 and 3) and keeps the old behaviour. Recovery needs the new gateway and a server that sends the fields. Observed on a local rig: the agent was known again about 17 s after the server was healthy, on its first heartbeat after that; after an outage long enough to open the gateway circuit breaker, recovery waits for the breaker's remaining backoff (58 s observed after a 300 s outage with 1 agent; with 10 and 30 agents the breaker opened in later runs and the breaker's own replay recovered them, with all agents online 85.2 s and 50.4 s after the server was healthy; the backoff is capped at 300 s, and steps above 160 s were not observed). A second operator-visible change is a new `yuzu_server_gateway_route_desync_total{op="batch_heartbeat",outcome="malformed_session_id"}` series (pre-seeded at 0, expected to stay 0, no alert): over-length (more than 64 bytes) unknown session ids in a `BatchHeartbeat` are now counted under that series, per entry, instead of under `op="renew_leases", outcome="unknown_session"`. The gateway adds three counters and two optional application-env tunables, described under [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts), which also states what the reconcile does not promise (fleet completion inside a route lease, dispatch reachability after the session is adopted, several core replicas). |
-| 0.15.x (next) | 0.12.0 | 0.12.0 | **Gateway session ids are now resolved against the durable Postgres route directory (HA WS-5 slice 2, ADR-2002 §7f); server restart only, no gateway restart, no flag, no migration, no proto field.** Heartbeat, inventory and stream-status RPCs look a presented `session_id` up in `gateway_route_store.agent_routes` instead of one replica's in-memory map. After a server-only restart the server still lists directory-known sessions in `unknown_session_ids` so the gateway replays `ProxyRegister` and rebuilds the local registry (drip-paced; ~1200 s for 10k agents at 100 ms), while leases keep renewing; this needs a gateway with the #1197 reconcile (an older gateway gives the pre-reconcile behaviour). **Rolling deploy:** an old replica reports directory-known sessions as unknown, so drain old replicas first. Run exactly ONE server replica until the safe-to-scale gate lifts (ADR-2002 §7c); this change does not lift it. Rollback to the previous binary is safe. A degraded directory read is fail-soft for heartbeats; a `NotifyStreamStatus` CONNECTED during it is accepted only for a session this replica holds locally and is otherwise refused (`connected_unverified`; the agent regains dispatch at its next reconnect). A session id matching more than one live row is refused and pages `YuzuGatewaySessionAmbiguous`; a `ProxyRegister` replay presenting an id another agent's row holds is refused and pages `YuzuGatewaySessionHeldByOtherAgent`. See [gateway.md](gateway.md#what-happens-when-the-server-restarts). |
+| 0.15.x (next) | 0.12.0 | 0.12.0 | **Gateway session ids are now resolved against the durable Postgres route directory (HA WS-5 slice 2, ADR-2002 §7f); server restart only, no gateway restart, no flag, no proto field.** (This release also carries a separate `gateway_route_store` v5 migration, a one-time exclusive lock at the first start: see [the v5 section below](#behaviour-change-gateway-sessions-are-unique-per-agent-a-one-time-migration-gateway_route_store-v5-5683).) Heartbeat, inventory and stream-status RPCs look a presented `session_id` up in `gateway_route_store.agent_routes` instead of one replica's in-memory map. After a server-only restart the server still lists directory-known sessions in `unknown_session_ids` so the gateway replays `ProxyRegister` and rebuilds the local registry (drip-paced; ~1200 s for 10k agents at 100 ms), while leases keep renewing; this needs a gateway with the #1197 reconcile (an older gateway gives the pre-reconcile behaviour). **Rolling deploy:** an old replica reports directory-known sessions as unknown, so drain old replicas first. Run exactly ONE server replica until the safe-to-scale gate lifts (ADR-2002 §7c); this change does not lift it. Rollback is safe (the previous binary boots; see the v5 section's rollback bullet for what it does on a race). A degraded directory read is fail-soft for heartbeats; a `NotifyStreamStatus` CONNECTED during it is accepted only for a session this replica holds locally and is otherwise refused (`connected_unverified`; the agent regains dispatch at its next reconnect). A session id matching more than one live row is refused and pages `YuzuGatewaySessionAmbiguous`; a `ProxyRegister` replay presenting an id another agent's row holds is refused and pages `YuzuGatewaySessionHeldByOtherAgent`. See [gateway.md](gateway.md#what-happens-when-the-server-restarts). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Gateway heartbeat admission is now bound to the connection that opened the session (gateway restart required; breaking for L7-fronted gateways).** The gateway admits an agent `Heartbeat` only on the HTTP/2 connection that opened the session's `Subscribe` stream; any other heartbeat is answered `NOT_FOUND` and not forwarded. Deploy with a gateway restart, and check for an HTTP/2-terminating hop in front of `:50051` first. A rejected agent recovers by re-registering. That logic exists from v0.13.0, but the released v0.13.0 and v0.14.0-rc6 agents wedge in their reconnect path with default settings (bug #2182, fixed by PR #5183, in no release yet) and recover only with `--no-auto-update`; v0.12.0 never recovers by itself (observed; older versions were not tested). Upgrade the agents first, then the gateway, with a build that includes the #2182 fix once released; until then restart an agent that stays rejected. Agents that do not connect through the gateway are not affected by this requirement (see Older agents). No wire or server change. See the section "Breaking: gateways fronted by an HTTP/2-terminating proxy or mesh sidecar" below and [Heartbeat admission](gateway.md#heartbeat-admission). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **`--gateway-upstream` now refuses to start without gateway peer authorization (breaking for own-certificate and plaintext installs).** The gateway-upstream service admits only a gateway whose certificate key (SPKI SHA-256) is pinned, which carries `serverAuth` and is inside its validity window; the server exits at boot, before binding a port, when `--gateway-upstream` is set and that cannot be arranged. Generated default certificates are pinned automatically; your own certificates need `--gateway-peer-pin` / `--gateway-peer-pin-file` first; a plaintext (`--no-tls`) rig needs `--insecure-gateway-peer`; the Linux package unit passes `--gateway-upstream` unconditionally. Agents and gateways are unaffected on the wire. See the section "Breaking: `--gateway-upstream` now refuses to start without gateway peer authorization" below. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **The gateway now holds stream-status notifications instead of dropping them (#4632; gateway restart required).** Deploy it with a gateway restart, which disconnects every agent the node holds, so read "Upgrade day" and "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts) first (released v0.13.0 and v0.14.0-rc6 agents do not recover by themselves after a gateway restart). **Read the [Gateway upgrade note for #4632](#gateway-upgrade-note-stream-status-notifications-and-startup-checks-4632) before you restart: a gateway whose configured `cluster_id` cannot be represented as UTF-8 now refuses to start.** There is no hot code load for this change: the upstream client's `code_change` is the identity function while its state gained fields, so deploy it by restart, not by a hot upgrade (INFERRED from the code, not run). No wire change and no change to the minimum agent or server version: `NotifyStreamStatus` is unchanged, so any pairing interoperates. What changes: a `CONNECTED` or `DISCONNECTED` notification that arrives while 10 are in flight or the circuit breaker is open is held in a bounded, memory-only store and sent first in first out, where the old gateway dropped it; when the breaker goes half open the new gateway sends one held notification as the probe, where the old one let up to 10 notifications through; and an agent-supplied peer address is sanitised and capped before it is held (a value that is not valid UTF-8 becomes `invalid`, and one over 255 bytes is cut at a character boundary). New settings `notify_pending_max` (default 10000, valid range 1 to 1000000, not present in any shipped `sys.config`; a value outside the range or not an integer falls back to the default with a WARN that names the key; see "Upstream client tuning" in [gateway.md](gateway.md)); size it at least as large as the largest `Subscribe` burst you expect; and `notify_probe_timeout_ms` (default 15000, valid range 100 to 300000, not present in any shipped `sys.config`, same fallback rule), the gateway's own deadline for the half-open notification probe: a probe worker that has not reported by then is killed and the probe fails like any failed probe. The other behaviour changes of the same restart are listed in the upgrade note below the table. Metrics: new gauges `yuzu_gw_upstream_notify_pending` and `yuzu_gw_upstream_notify_inflight` and counter `yuzu_gw_upstream_notify_coalesced_total`. The `reason` label of `yuzu_gw_upstream_notify_dropped_total` is now the closed set `at_capacity` and `unknown`: the value `circuit_open` is retired, so during a rolling upgrade old nodes still export `circuit_open` and new nodes export `at_capacity`, and a rule or dashboard that sums the family sees both. A rule or panel of your own that selects `reason="circuit_open"` stops matching once every node is upgraded: use `yuzu_gw_upstream_notify_pending` for held notifications and `reason="at_capacity"` for lost ones. The rollback is the previous gateway release. A rollback is itself a gateway restart: it disconnects every agent the node holds and carries the same agent-reconnect cost as the upgrade (see "Upgrade day" and "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts), and the released-agent caveat above), so weigh it against the problem you are fixing. It also brings back the earlier behaviours: notifications dropped at 10 in flight or with the breaker open, a request that the gateway's own validation or encoder rejected (or a server status that means the request itself was wrong) counted as an upstream failure that can open the breaker, and no `cluster_id` boot refusal. The pending store is memory only, so nothing persists and nothing needs to be cleaned up; the notifications held at that moment are lost, as they were dropped before. Runbook rows and the measured evidence: [Stream Status Notification](gateway.md#stream-status-notification) and the [evidence record](../security-reviews/gateway-notify-pending-store-2026-10-05.md). |
@@ -461,6 +669,282 @@ customer-distribution lane. Before switching lanes, read the
 | 0.12.x | 0.12.0 | 0.12.0 | **Build-time content auto-import.** All YAML files in `content/definitions/` (217 InstructionDefinitions) and `content/packs/` (10 InstructionSets at this version) are now embedded in the server binary and auto-imported on every startup. Existing operator-customised definitions with matching IDs are NEVER overwritten — conflicts are silently skipped. **Behaviour change for upgrades:** definitions that an operator previously DELETED via the REST API or dashboard will reappear after upgrade because the auto-import treats a missing row as "needs creation". To permanently suppress a shipped definition, set `enabled: false` via the dashboard or `PATCH /api/v1/definitions/{id}` rather than DELETE-ing the row. Each auto-import write emits an `audit_events.action="content.bundled_import"` row with `principal=system` so operators can audit which definitions were inserted at boot. **Yuzu dark navy palette + Inter webfont** (visual change every operator sees) and **Apache ECharts chart renderer** (replaces bespoke SVG; same payload contract — no operator migration required) ship in the same release. |
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected. A gateway at this version re-registers the sessions the server reports unknown, so a server-only restart recovers without operator action once both sides are upgraded; see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts). Behind a gateway that does not yet read that report (which includes the server restart that ships this fix, because the server is upgraded first; restart the gateway after upgrading it, and read the next sentence first), agents can read offline after a server restart (observed on one local rig after a SIGKILL restart; graceful upgrade restarts were not tested), and dispatch worked only for the remaining route lease (up to about 90 s). A gateway restart disconnects every agent that gateway holds, and the agent then has to register again by itself: in a graceful gateway restart test, released v0.13.0 and v0.14.0-rc6 agents with default settings stayed wedged and v0.12.0 never re-registered (bug #2182, fixed by #5183, which is in no release tag yet), while a build with the fix re-registered in 11 to 12 s. Upgrade the agents to a build that includes #5183 before the gateway restart where you have one, or expect to restart the agent service on the released agents behind it; see "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts).
+
+## Behaviour change: new Crypto page, REST routes and MCP tools are reachable with `Inventory:Read`
+
+**What changed.** The server adds the **Posture > Crypto** page (`/crypto`), two REST routes
+(`GET /api/v1/crypto/libraries` and `/api/v1/crypto/libraries/devices`) and two MCP tools
+(`get_crypto_libraries`, `list_crypto_library_devices`). This release also adds a CycloneDX 1.7 export of the same data
+(`GET /api/v1/crypto/cbom` and the MCP tool `export_crypto_cbom`), also reachable with `Inventory:Read` alone. All of them are gated by
+`Inventory:Read` alone, so any custom role that already holds `Inventory:Read` now reaches them.
+
+- **Same data as `/software`.** The page reads the installed-software inventory the `/software`
+  and `/inventory` pages already show, matched by package name; it adds no collection and no
+  agent change. It names the devices carrying each library family, so the exposure is the one
+  `Inventory:Read` already granted, in a new shape.
+- **RBAC-off default.** While RBAC enforcement is off (the default) every authenticated session
+  can read it, as with the other inventory reads. A service-scoped API token is refused with a
+  `403` until RBAC enforcement is on.
+- **Confinement applies.** A management-group-confined caller sees counts over its visible
+  devices only.
+- **`table_version` 3.** Every response carries `table_version`, the revision of the curated
+  package-name table ([The library table](crypto.md#the-library-table)). Windows installer builds
+  of OpenSSL are not matched by this table. A device-drill cursor is bound to the table version,
+  and records the names source (`names_source` / `names_as_of`): a walk that straddles an upgrade, or one whose
+  previous page was read on live names when the catalogue is now in use (a new or upgraded server
+  whose catalogue becomes fresh mid-walk), gets a `400` and restarts without a cursor. The restarted
+  walk is on the catalogue; the refusal can recur only if the catalogue goes stale and recovers
+  during a walk.
+- **Admission cap, per server process.** Each server process runs at most two `/crypto` store
+  reads at once (the summary and the drill share the bound; N replicas allow 2N). A read over the
+  bound is refused at once with a `503` (`crypto read capacity in use; retry`) carrying
+  `retry_after_ms`, counted as `yuzu_inventory_read_degrade_total{reason="admission_full"}`.
+  Clients that fan out `list_crypto_library_devices` calls should serialise them. A read that
+  fails in the inventory store is a different `503` (`crypto library read degraded`).
+- **Where the package names come from.** Responses carry `names_source` (`catalogue` or `live`)
+  and `names_as_of` (epoch seconds, `null` when live). While the hourly software-catalogue refresh
+  is fresh (at most two hours old) the names come from it, so a package name first reported after
+  the refresh appears after the next one; otherwise, including on a new or upgraded server whose
+  catalogue has not been built yet, the names are read live and the answer is current. Counts and
+  versions are live either way. The live read takes about 1.7 to 2.2 s (summary) at 15M rows with
+  30,000 names, and on a fleet above about 140,000 to 180,000 distinct package names with a stale
+  catalogue it can pass its 5 s bound and answer `503`; see
+  [Crypto](crypto.md#how-fresh-the-package-names-are).
+- **Large fleets.** Fleets above about 2.7M installed-package rows (roughly 6,000 endpoints at
+  about 450 packages each, about 1,800 at 1,500): the hourly catalogue does not build, so
+  `/crypto` reads names live on every call (about 2 s per summary at 15M rows / 30,000 distinct
+  names) and, with many replicas on one database, can time out. See
+  [Scale](crypto.md#scale).
+
+**Action.** None required. To keep a custom role out of the new surface, remove `Inventory:Read`
+from it. Rolling back removes the page, routes and tools; nothing is migrated.
+
+## Behaviour change: gateway sessions are unique per agent; a one-time migration (`gateway_route_store` v5, #5683)
+
+**Short answer.** A normal upgrade needs no action. The first start takes an exclusive lock on
+`agent_routes` (about 2.4 s per million rows) and the health probes are silent meanwhile. If a
+blocking session holds the lock past 30 s the server exits and a supervisor retries about every 35 s
+until it is cleared. Details follow.
+
+**What changed.** In a gateway-fronted deployment the route directory enforces at most one non-NULL
+route row per session id by a database unique index; the tombstoned-victim window is not closed; run
+one replica. Migration v5 of the gateway route directory adds a unique index on
+`gateway_route_store.agent_routes(session_id)` (tombstoned rows are not indexed) and drops the old
+non-unique one. Two agents racing to adopt one unheld session id used to both succeed; now the second
+is refused (`FAILED_PRECONDITION`, counted as
+`yuzu_server_gateway_route_desync_total{outcome="session_held_by_other_agent"}`, alert
+`YuzuGatewaySessionHeldByOtherAgent`).
+
+- **One-time lock at the first start.** The migration takes an exclusive lock on `agent_routes`,
+  removes any duplicates and builds the index. The lock blocks every other statement on that table
+  from any process (a second server replica, `pg_dump`, an analytics tool), not only writers. On a
+  single replica the gateway listener is not yet up while the migration runs, so nothing queues behind
+  it from the gateway. Build time is roughly linear in the row count. A first local measurement
+  (PostgreSQL 18, 1,000,000 rows, no duplicates, a container with `fsync=off`) took 6.4 s; a
+  re-measure on a default PostgreSQL 18.4 container gave about 0.6 s at 200,000 rows, 2.4 s at
+  1,000,000 rows and 22 s at 10,000,000 rows (about 900 MB of WAL at that size). The table is one row
+  per agent plus recent disconnects, so most deployments are far smaller. Check the size with
+  `SELECT count(*) FROM gateway_route_store.agent_routes;`.
+- **Health probes do not answer until the migration finishes**, as for the other store migrations: the
+  HTTP listener opens after the route store opens. What a probe that gives up early does depends on
+  the topology. Docker and Compose never restart a container for being unhealthy; but a service that
+  depends on the server with `condition: service_healthy` makes `docker compose up` fail once the
+  server's `start_period` plus `interval` x `retries` is exceeded (the shipped
+  `deploy/docker/docker-compose.reference-gateway.yml` gives the server about 310 s: `start_period` 10 s
+  plus 30 retries x 10 s, and its gateway service waits on it; the root `docker-compose.uat.yml` allows 50 s with
+  no `start_period`, but no service in that file waits on the server), so size those to the measured
+  build time PLUS the up-to-30 s lock wait described below. systemd's `TimeoutStartSec` does not apply
+  to the `Type=simple` `yuzu-server.service`. A Kubernetes `startupProbe` or `livenessProbe` that gives up first
+  WOULD restart the server mid-build (the build rolls back and the next start begins again); no
+  Kubernetes manifest ships with Yuzu, so allow the same total there.
+- **Seeing whether it is building or waiting.** In `psql` (opening a SQL session in each shipped topology:
+  [gateway.md](gateway.md#forged-or-colliding-session-ids)), `SELECT phase, blocks_done, blocks_total FROM
+  pg_stat_progress_create_index;` shows a build in progress. A row in `pg_stat_activity` for the server's
+  connection with `wait_event_type = 'Lock'` means it is still waiting for its lock.
+- **If the 30 s lock wait expires.** The migration waits at most 30 s for its lock. If another session
+  holds a conflicting lock for longer, it rolls back, the server logs
+  `GatewayRouteStore: schema migration failed` followed by
+  `[PG] Refusing to start: gateway-route store migration/open failed`, and **the server exits**. Under a
+  supervisor with a restart policy (a container `restart: on-failure` / `unless-stopped`, systemd
+  `Restart=on-failure` with `RestartSec=5`) it is started again and retries about every 35 s, until the
+  blocker is cleared (systemd's start limit does not trip at that cadence; a failure that exits within a second, such as an existing wrong-shape `ux_agent_routes_session_id`, does trip the shipped unit's `StartLimitBurst=3` within about 15 s, after which `systemctl reset-failed yuzu-server` is needed once the object is dropped). Nothing is half-applied.
+  End the blocking session (`pg_locks` / `pg_stat_activity`); the next attempt succeeds.
+- **Existing duplicates are cleared, not kept.** If two rows already shared a session id (expected: none),
+  every row of that group is tombstoned, because no row can be shown to be the legitimate owner. Each
+  affected agent re-establishes its route through the normal heartbeat replay within one heartbeat cycle
+  or two (up to about 6 minutes if the gateway circuit breaker had opened). The count is logged once as
+  `migration v5 tombstoned N agent_routes row(s)` and exported as
+  `yuzu_server_gateway_route_session_dedup_total`. That counter is present whenever `--gateway-upstream`
+  is configured (the route store, the migration, the lock and the counter exist only then) and is 0 on
+  a clean database. It reports the migration of THIS start only, so it reads 0 on any later restart:
+  the durable record is `SELECT value FROM gateway_route_store.route_meta WHERE key =
+  'v5_session_dedup_tombstoned_rows';`, and a later start also logs it once. A future alert on the
+  counter must use `> 0`, not `increase()`. While those agents re-register, some replays are refused
+  as `session_held_by_other_agent` and raise `YuzuGatewaySessionHeldByOtherAgent`. Those refusals are
+  the one-time migration artifact ONLY IF BOTH hold: (a) the number of `op="proxy_register"`
+  `session_held_by_other_agent` refusals since that start, summed over every server replica, is at most
+  N, the number of rows migration v5 tombstoned on that start
+  (`yuzu_server_gateway_route_session_dedup_total` on the migrating start; the `migration v5 tombstoned N`
+  WARN, or the `route_meta` value after a restart), because a tombstoned group of k rows can produce at
+  most k-1 refusals (N is a safe upper bound); count the refusal WARN lines rather than the counter if
+  any replica restarted since the migrating start (the counter resets on restart); any
+  `op="announce_connected"` refusal is NOT the artifact; and (b) they all occur within that start's
+  window: one or two agent heartbeat cycles (30 s by default, `--heartbeat` changes it), plus up to 300 s
+  of breaker backoff (cap `circuit_breaker_max_reset_timeout_ms` in `gateway/config/sys.config`), plus the
+  replay drip (about 20 ms per agent on that gateway): allow roughly 6 minutes plus 20 ms per agent at the
+  defaults. Refusals past that window, or more than N, are NOT the artifact (escalating errs on the safe
+  side): treat them as a forged or colliding id. Refusals inside the bound and the window are still NOT
+  proof of benignness (a forged presenter acting at the
+  same time could hide inside them): re-check the count after the window has passed and do not silence
+  the alert beyond it (it uses `increase()[1h]`, so a silence would hide later refusals). The counter
+  keeps its migrating-start value for the whole process lifetime, so it proves nothing about timing:
+  establish timing from the WARN timestamps (or, while the store is still at version 5,
+  `SELECT version, to_timestamp(upgraded_at) FROM public.schema_meta WHERE store =
+  'gateway_route_store';`; a later store migration overwrites it), and if the migrating start's time
+  or log cannot be found, escalate (full rule: [gateway.md](gateway.md#forged-or-colliding-session-ids)).
+- **A CONNECTED notification is covered only when the presenting agent has no directory row.** An agent
+  that still has a row, including a tombstone, is not covered: its CONNECTED lands as `session_mismatch`
+  and does not unpublish (the tombstoned-victim residual recorded in ADR-2002 7f "Still open", #6339;
+  unchanged by this change).
+- **Not a rolling-upgrade change.** Run one server replica, as before; the safe-to-scale gate is not lifted.
+- **Updated alert rules.** If you import `docs/prometheus/yuzu-alerts.yml`, re-import it: the
+  `YuzuGatewaySessionHeldByOtherAgent` expression now also matches `op="announce_connected"`, and this
+  release adds the metric `yuzu_server_gateway_route_session_dedup_total`.
+- **Rolling back** to the previous binary boots and works (it ignores the migration; its queries still
+  find the unique index), but the unique index now rejects its racing duplicate write as a generic
+  route-write error (`yuzu_server_gateway_route_write_failed_total{reason="db_error"}`, and
+  `YuzuGatewayRouteWriteFailed` after about 5 minutes if it persists). The old binary's `ProxyRegister`
+  then fails closed (`UNAVAILABLE`), while `announce_connected` stays fail-open: the in-memory placement
+  is not unpublished. The tombstones the migration wrote are not undone.
+
+**Action.** None for a normal upgrade. On a very large directory, schedule the first start for a quiet
+period and raise any startup probe timeout. To learn WHICH agents share a session id (the migration
+erases the association), run the duplicate query from step 1 of
+[gateway.md](gateway.md#forged-or-colliding-session-ids) "Recovering a missing unique session index"
+before the first start and keep the output with the change record.
+
+## Behaviour change: new `ca_store` indexes, built during the upgrade
+
+**What changed.** The CA store's migration v5 adds three indexes on `ca_issued` (one row per
+certificate Yuzu ever issued). They back the Yuzu-issued certificate counts and the certificate
+list behind them on the `/crypto` dashboard (ADR-0070 D13).
+
+- **The build blocks CA writes while it runs.** It runs at the first start of the new version
+  inside the migration and blocks writes to `ca_issued` (certificate issuance and revocation, so
+  new enrolments too) while it runs. The build time grows with the number of rows: about 1.3 s
+  per 250,000 rows and 9 s per million in local measurement (PostgreSQL 18, a 12-core machine).
+  The build itself has no time limit, so a large table is not cut off part-way. Check the row
+  count beforehand with `SELECT count(*) FROM ca_store.ca_issued;`.
+- **Health probes do not answer until the migration finishes.** The server opens its HTTP
+  listener only after the CA store has opened, so `/livez`, `/readyz` and `/healthz` refuse
+  connections during the build and during any wait for its lock. A liveness or startup check
+  that gives up first (a container `start_period`, a Kubernetes `startupProbe`, systemd
+  `TimeoutStartSec`) restarts the server mid-build, the build rolls back, and the next start
+  begins it again. On a CA store above about a million rows, or wherever the build may wait
+  behind a long transaction, allow at least two minutes for the first start of this version.
+- **Seeing whether it is building or waiting.** In `psql`, `SELECT phase, blocks_done,
+  blocks_total FROM pg_stat_progress_create_index;` shows a build in progress. A row in
+  `pg_stat_activity` for the server's connection with `wait_event_type = 'Lock'` means it is
+  still waiting for its lock; while it waits, every other write to `ca_issued` (issuance,
+  revocation) queues behind it too, for up to the 30 s below.
+- **Start one replica first.** A second replica that starts while the first is building waits up
+  to the connection pool's 10 s lock timeout for it, then logs the same two lines as below and
+  **does not start**. Start it again once the first replica is up: it finds the migration done.
+- **If the 30 s lock wait expires.** The build waits at most 30 s for its lock on `ca_issued`. If
+  another session holds a conflicting lock for longer, such as a long transaction, the migration
+  fails and rolls back, nothing is left half-built, and the
+  server logs `CaStore: schema migration failed — CA persistence disabled` followed by
+  `[PG] Refusing to start: ca store migration/open failed` and **does not start** (the CA store is
+  required). Find and end the blocking session (`pg_locks` / `pg_stat_activity`), then start the
+  server again: the migration is retried from the start.
+
+**Action.** On a large CA store, schedule the upgrade for a quiet period, and raise any startup or
+liveness probe timeout first (see "Health probes do not answer" above). Rolling back leaves the
+v5 indexes in the database; they are harmless to the older binary.
+
+## Behaviour change: new `crypto_dashboard_layout_store` schema, erased on deprovision
+
+**What changed.** The server keeps each operator's `/crypto` dashboard layout (ADR-0071) in a new
+Postgres schema, `crypto_dashboard_layout_store`, keyed by the operator's username.
+
+- **New database schema.** The server creates the `crypto_dashboard_layout_store` schema at its
+  first start, so the server's database role needs `CREATE` on the database, as for every other
+  Yuzu schema. **If the schema cannot be created or opened, the server still starts**: saved
+  layouts are unavailable until a restart with the problem fixed, the server log says so at
+  error, and `/readyz` stays `200`, listing the store under `degraded` without leaving rotation
+  (ADR-0071).
+- **Deprovision erasure.** Deprovisioning an operator (SCIM or a dashboard user delete) erases
+  their saved layout after the deprovision commits, best-effort. A failure is counted on
+  `yuzu_server_crypto_layout_erase_failures_total{reason}` and alerted by
+  `YuzuCryptoLayoutEraseFailed`; the remedy is the periodic check in
+  [Crypto: Deprovision erasure](crypto.md#deprovision-erasure).
+- **Backups.** The new schema is in the Yuzu database, so the whole-database `pg_dump` already
+  covers it. It is loss-tolerant: restoring without it leaves operators on the default layout.
+  **A restore can resurrect erased layouts:** a backup taken before an operator was
+  deprovisioned still holds their layout row (keyed by their username). After any restore, run
+  the check in [Crypto: Deprovision erasure](crypto.md#deprovision-erasure) and delete the rows
+  of principals deprovisioned since the backup.
+
+**Action.** Confirm the server's database role can create schemas (it already must, for every
+other store). Rolling back leaves the `crypto_dashboard_layout_store` schema in the database; it
+is harmless to the older binary.
+
+## Behaviour change: `/crypto` becomes a per-operator widget dashboard with Yuzu-issued certificate counts
+
+**What changed.** The **Crypto** page (`/crypto`) is now a grid of widgets each operator adds,
+removes and reorders (see [The dashboard](crypto.md#the-dashboard)). The library figures are still
+there as widgets; new widgets count the certificates **Yuzu's own internal CA** issued (agent,
+server, gateway, HTTPS and code-signing certificates alike), never the certificates on your
+devices.
+
+- **The page looks different.** Every operator starts on the default grid: the library figures
+  plus Yuzu-issued active, expiring within 30 days, revoked in the last 30 days and issued per
+  week. There is nothing to migrate; layouts start empty and each operator's first change saves
+  theirs.
+- **Who sees the Yuzu-issued counts.** The counts need `Inventory:Read` and an **unconfined** view
+  of the fleet (ADR-0070 R2): an unconfined `Inventory:Read` holder now sees how many certificates
+  Yuzu's CA has issued and revoked, and so the fleet's size and enrolment churn.
+  A management-group-confined caller, or a service-scoped token that confines its caller, sees
+  "not available to this account" instead. Remove `Inventory:Read` from a custom role to keep it
+  out.
+- **The certificate list behind a count needs `Security:Read`**, the existing permission of
+  `GET /api/v1/ca/issued`, and is withheld from a confined caller. It is served by that route
+  with new optional filter parameters (`kind`, `days`, `week`, `bucket`, `as_of`, `cursor`) and
+  by MCP `list_issued_certs` with the same arguments. A filtered list pages by **keyset cursor**
+  (`next_cursor`, `null` on the last page), never by `offset` (refused with a filter), so a
+  certificate revoked between pages never shifts another out of the walk; a pinned `as_of` is
+  checked against the database clock. Without those parameters both behave exactly as before,
+  `offset` paging included, and the unfiltered list still returns every row to any
+  `Security:Read` holder. Filtered calls are audited `crypto.ca.certificates.view`; unfiltered
+  calls are still not audited.
+- **New REST routes and MCP tools.** `GET /api/v1/crypto/widgets`, `GET`/`PUT
+  /api/v1/crypto/dashboard/layout` and `GET /api/v1/crypto/ca/stats`; MCP `list_crypto_widgets`,
+  `get_crypto_dashboard_layout`, `set_crypto_dashboard_layout` (annotated destructive: it
+  overwrites the caller's own layout) and `get_crypto_ca_stats`. New audit verbs:
+  `crypto.ca.stats.view`, `crypto.ca.certificates.view`, `crypto.dashboard.layout.update`,
+  `crypto.dashboard.layout.access_denied`. Drawing the dashboard writes one
+  `crypto.libraries.view` row and one `crypto.ca.stats.view` row per draw. A layout save names
+  the version it replaces (`expected_version`); one without it is a first save only, and over a
+  stored layout it is a `409` naming the stored version.
+- **If the layout schema did not open** (see the section above), every operator sees the default
+  layout, read-only, under a notice; the layout REST routes answer `503` with no retry hint and the
+  MCP layout tools `kInternalError` with no retry hint.
+- **Capacity.** The Yuzu-issued reads share the existing two-read `/crypto` bound per process;
+  on a connection pool of 3 or fewer (`--postgres-pool-size`) they are always refused, and on a
+  pool of one connection the library reads and the CBOM export (`GET /api/v1/crypto/cbom`,
+  MCP `export_crypto_cbom`) are refused too. That refusal lasts until a restart with a larger
+  `--postgres-pool-size`, so it carries no retry hint (REST `503` without `retry_after_ms`, an
+  MCP error without one) and names the flag; raise the pool before upgrading if it is that
+  small. The counts are never
+  cached: every call reads the CA table at request time, bounded only by that admission limit
+  (ADR-0070). Degrades are counted on
+  `yuzu_inventory_read_degrade_total` with new `source` values `ca_issued` and `crypto_layout`,
+  and the new alert `YuzuCryptoCaReadDegraded` fires after 15 minutes of Yuzu-issued read degrades
+  (see [metrics.md](metrics.md#crypto-dashboard-metrics)).
+
+**Action.** Review which custom roles hold `Inventory:Read` if enrolment counts should not be
+visible to them. Rolling back removes the widgets and routes. The two sections above cover the
+`ca_store` indexes and the layout schema this dashboard relies on.
 
 ## Behaviour change: the built-in server certificate is re-issued once with a server identity URI (#6016)
 
@@ -513,9 +997,9 @@ API-token Create and Revoke buttons) now apply the same step-up check as the RES
   probes that fetch `/home` still receive `200`.
 - **The Hardware pages no longer show quarantine controls.** The Quarantine link, the
   Quarantined pill, the Quarantined devices panel, the containment banner and tab, and the
-  quarantine plugin's rows in the Actions lens are hidden until an approval workflow for containment actions is added. Quarantine itself is unchanged: the REST API, the MCP tools, the quarantine
-  plugin and the role-gated quarantine instructions on the Instructions page all work as
-  before, and server-side enforcement does not depend on the UI. While the controls are
+  quarantine plugin's rows in the Actions lens are hidden until an approval workflow for containment actions is added. Quarantine itself is unchanged apart from the Breaking entry at the top of this page: the MCP tools, the quarantine
+  plugin and the role-gated quarantine instructions on the Instructions page work as
+  before, the REST create and release routes now run the dispatch approval check, and server-side enforcement does not depend on the UI. While the controls are
   hidden, use `GET /api/v1/quarantine` to list records. `DELETE /api/v1/quarantine/{agent_id}`
   ends the server record only; to remove the device's firewall rules, run the quarantine
   plugin's release instruction (`security.quarantine.release`, "Release Device from Quarantine")
@@ -619,6 +1103,22 @@ store is degraded (previously an empty `200`) and `404` for an unknown role
 
 **What to check.** A script that signs in with a cookie and calls the per-device sync route without `Origin` or `Referer` now gets `403`: use an API token, or send the header. The Hardware and Software pages already send it. Behind a reverse proxy that rewrites `Host`, declare the public address with `--csrf-trusted-origin`.
 
+## Behaviour change: adding, removing and re-roling a local account refuse cross-site cookie writes and are audit-first
+
+**What changed.**
+
+- `POST /api/settings/users`, `DELETE /api/settings/users/{username}` and `POST /api/settings/users/{username}/role` called with a **session cookie** must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`), otherwise they answer `403 cross-site request refused` and write a `csrf.denied` audit row. Calls authorised by an API token are not affected.
+- `POST /api/settings/users/{username}/role` accepts only `application/json` and answers `415` otherwise.
+- Each of the three writes a `result=attempted` audit row before it changes anything. If that row cannot be written the call answers `503` with `Sec-Audit-Failed: true` and changes nothing; if only the outcome row is lost the `2xx` stands and the header is set.
+
+**What to check.** A script that signs in with a cookie and calls these routes without `Origin` or `Referer`, or posts the role body as a form, now gets `403` or `415`: use an API token, send the header, or post JSON. A SIEM or alert rule that counts `csrf.denied` rows will now see the three user-management routes as targets, and a rule on `user.create`, `user.delete` or `user.role_change` rows will now also see `attempted` rows.
+
+## Behaviour change: MCP `revoke_upload_grant` is audit-first and refuses during an audit-store outage (#6169)
+
+**What changed.** The MCP tool `revoke_upload_grant` now writes an `upload_grant.revoke` audit row with result `attempted` before it revokes anything, then a `success` or `failure` row, the same rows its REST twin `DELETE /api/v1/upload-grants/{grant_id}` writes. If the `attempted` row cannot be stored, the tool answers a retryable `-32603` error carrying `retry_after_ms` and the grant is **not** revoked. It stays redeemable until it expires at its TTL. The REST route already refused the same way, with `503`, so no transport can revoke a grant while the audit store is down. The success result no longer includes `audit_persisted`. `mint_upload_grant` is unchanged.
+
+**What to check.** An MCP client that treated `revoke_upload_grant` as always succeeding while the grant store is up must handle the retryable error: retry after `retry_after_ms`, and on the supervised tier request a fresh approval, because the refused call consumed its ticket. A client that read `audit_persisted` from this tool must stop. A SIEM or alert rule that counts one `upload_grant.revoke` row per revoke now sees two (`attempted`, then the outcome), so match on `result=success`. An `attempted` row with no outcome row for the same `target_id` means the outcome is unknown: check the grant's state with `list_upload_grants`.
+
 ## Behaviour change: `PUT /api/config/{key}` is audit-first, refuses cross-site cookie writes and floors `heartbeat_timeout` at 30 seconds
 
 **What changed.**
@@ -628,6 +1128,38 @@ store is degraded (previously an empty `200`) and `404` for an unknown role
 - `heartbeat_timeout` below 30 seconds is refused with `400`. A value below 30 that an earlier build stored is raised to 30 when the server starts (a WARN line names it); `GET /api/config` keeps listing the stored override until you `PUT` a value of 30 or more.
 
 **What to check.** A script that signs in with a cookie and calls this route without `Origin` or `Referer` now gets `403`: use an API token, or send the header. A SIEM or alert rule that counts one `config.update` row per change now sees two; match on `result=success`. Behind a reverse proxy that rewrites `Host`, declare the public address with `--csrf-trusted-origin` or the General page's Save is refused. A stored value below 30 cannot be cleared by saving 30 on the General page, because that page already shows 30 as the current value: save another value first, or `PUT` it with a token. The Developer page's fragments are now administrators only (a non-admin holding `Infrastructure:Read` gets `403` from them), and the permission grid no longer writes a denial row on each load. Whatever you set, keep `heartbeat_timeout` well above the heartbeat interval your agents run with: 30 leaves no margin for a late heartbeat.
+
+## ⚠️ Breaking: OIDC refuses RSA signing keys under 2048 bits or with a degenerate exponent (#1901, #6058)
+
+OIDC sign-in no longer accepts an RSA signing key whose modulus is under 2048 bits, or whose public
+exponent is below 3, even, or wider than 32 bits (65537 is the near-universal choice). Such a key is
+skipped when the IdP's key set is parsed, with the warning
+`OidcProvider: failed to parse JWK kid=<kid> (RSA modulus under 2048 bits)` (or `(RSA exponent is 1)`,
+`(RSA exponent is even)`, `(RSA exponent over 32 bits)`), and its siblings are kept.
+
+- **Who is affected.** An IdP that signs ID tokens with such a key, for example a legacy, in-house or test
+  IdP. That includes an IdP that also publishes a larger key it does not sign with. A token that names the
+  skipped key's `kid` is refused with `no matching JWKS key found`; a token with no `kid` that the skipped
+  key signed is refused as `token may be forged`; if every key the IdP
+  serves is skipped, nobody can sign in. Settings Test Connection reports only the keys that remain, so it
+  can be green while sign-ins fail: a count lower than the number of RSA signing keys the IdP publishes means keys
+  were skipped.
+- **Check before upgrading.** Fetch the IdP's `jwks_uri` and confirm that each RSA key it signs with has a
+  modulus (`n`, base64url-decoded) of at least 2048 bits and an exponent (`e`) of 65537 or another odd value
+  of 3 or more that fits in 32 bits.
+- **`--auth-mode=sso-only`.** If every operator signs in through the IdP, a refused key locks them all out.
+  Before upgrading, confirm a break-glass account is named and enrolled, and that you can run
+  `yuzu-server --break-glass-arm` on the server host (see "Hardened auth mode" below); the local-password
+  path does not use the OIDC callback.
+- **Rollback.** There is no setting, flag or environment variable that lowers these checks; they are fixed
+  in the server. Rolling back to the previous release accepts such keys again (a weaker posture) and needs no
+  data change, because nothing is persisted. It is the recovery if you are locked out under `sso-only` with
+  no armed break-glass account.
+
+Also in this release (a fix, not a break): a token with no `kid` member is now checked against each usable
+signing key of the IdP in turn, at most the first 16 in the order published, instead of only the first. An
+IdP that omits `kid` while it publishes several signing keys, as it rotates, no longer has sign-ins refused
+intermittently.
 
 ## Behaviour change: OIDC sign-in now requires the issuer's discovery document (#5692)
 
@@ -672,6 +1204,64 @@ header rather than a redirect, so a panel never swaps the sign-in page into itse
 **What to check.** Any monitor, load-balancer health check or script that expects `GET /login` to answer `200`
 must probe `/livez`, `/readyz`, `/health` or `/home` instead (`/home` answers `200` without a session). Scripts
 that sign in with `POST /login` need no change. Bookmarks to `/login` keep working through the redirect.
+
+## Behaviour change: kill-switch audit rows carry the operator's reason
+
+The `detail` of the `plugin_config.kill_switch.set` audit rows (both the `attempted` row and the
+`success` or `failure` row, over REST and MCP) now carries `, reason="<text>"` when the caller gave a
+reason. A reason over 512 bytes is refused before anything is written; if one ever reached the audit
+writer it would be cut at a character boundary and `, reason_truncated=true` would follow the closing
+quote. Before, `detail` was exactly `enabled=true|false`, with `, protective_exempt=true` appended
+for a protective pair. A SIEM rule that matches the whole string (`detail == "enabled=false"`) stops
+matching a call that carries a reason: match `enabled=true|false` as a prefix instead. The reason is
+free text entered by an operator (at most 512 bytes before escaping; `\` and `"` are backslash-escaped),
+so do not parse it as structured data. A call without a reason is unchanged. See
+[Audit Log](audit-log.md).
+
+## Behaviour change: the plugin-config list is authorized by one list-read gate
+
+`GET /api/v1/plugin-config`, the MCP `list_plugin_config` tool and the Plugins and updates panel now
+decide from the one ADR-0017 list-read gate instead of a permission check stacked on a list check.
+What you may notice:
+
+- A session with an active just-in-time elevation is now admitted on the REST route and the MCP tool
+  (before, an elevated session with no underlying grant was refused there while other permission
+  checks admitted it).
+- A management-group-confined grant is still refused. On the REST route the refusal is still an
+  `auth.permission_required` denial row, now with the detail text `management-group-scoped grant
+  cannot read the unscoped list PluginConfig:Read`. On MCP it is now recorded as
+  `mcp.list_plugin_config` with result `denied` (it was `auth.permission_required`). Update a SIEM rule
+  that matched the old MCP verb.
+- For a non-engine caller, a closed or degraded authorization store answers 403 (it fails closed),
+  where the REST route's explicit store check could answer 503. Boot already fails closed on that
+  store, so this is rare in practice.
+
+## Behaviour change: Guardian heartbeat reconcile is admission-controlled and fails closed on a degraded tag or property store (#5513)
+
+**What changed.** The heartbeat reconcile is the re-push the server sends to an agent that reports a policy generation behind the server's (see [Guaranteed State](guaranteed-state.md)). Three things differ from the previous release:
+
+- **Admission control.** Each server replica now admits reconcile pushes against its own in-memory time budget and a soft in-flight cap of 256. A reconcile that is not admitted is **shed**: nothing is sent, no audit row is written, and the agent's 25 s per-agent slot is not consumed, so the agent retries on its next heartbeat. The per-agent limit itself is unchanged: one re-push per 25 s per agent.
+- **Fail closed on a degraded scope read.** If the tag store or the custom-properties store cannot be read while the reconcile evaluates a rule's scope for the agent, the reconcile now **aborts** and sends nothing. Previously the unreadable store was treated as "agent not in scope", and the server pushed a rule set narrowed to exclude that rule, which disarmed the scoped rule on the agent until a later push restored it.
+- **The agent refuses a lower-generation full push (#5611).** The agent binary now refuses a `full_sync` push labelled below the policy generation it holds (a push at the held generation is still applied). Agents on the previous release keep applying an older full push. If a server's generation counter ever falls below what its agents hold (for example after a database restore), upgraded agents refuse every full push until the counter catches up, and rule edits are not delivered to them meanwhile; the server counts this in `yuzu_server_guardian_agent_generation_ahead_total`. See "Restoring the policy generation" in [Guaranteed State](guaranteed-state.md).
+- **A supported, audited way to raise the server's policy generation.** `POST /api/v1/guaranteed-state/policy-generation/raise` and the MCP tool `raise_guardian_policy_generation` set the generation to a target of `1` to `9007199254740991`, never lower it, and push nothing: the heartbeat reconcile converges the agents behind the new value. They are the supported recovery for the agents-ahead state above, and take the place of a manual database edit, which remains only as a last resort. The caller must be an administrator and must send `acknowledge_rule_set_replaced: true`, because the raise converges every agent behind it to the rule set the server holds at that moment. Check the rule store and the deployed Baselines first. When the server holds no rules or no deployed Baseline (the usual state after a rebuild or the move from SQLite) the call is refused unless it also sends `acknowledge_empty_rule_set: true`, meaning every agent behind the new value converges to zero guards. REST applies MFA step-up when the account is enrolled and its proof is stale (a SAML session is refused, an API-token session is exempt, `--mfa-step-up-window-secs 0` disables the gate, and with `--mfa-enforcement optional`, the default, an administrator who has not enrolled is not stepped up, and neither is an SSO (OIDC) administrator whose identity provider sent no MFA claim), requires a same-site `Origin` or `Referer` on a cookie-session call, and refuses service-scoped and MCP-tier bearer tokens; MCP has no MFA, and its protection is the supervised tier with an approval plus the administrator check. Each call is audited as `guaranteed_state.policy_generation.raise` and counted in `yuzu_server_guardian_policy_generation_raise_total`.
+- **A read-only way to read the server's policy generation.** `GET /api/v1/guaranteed-state/policy-generation` and the MCP tool `get_guardian_policy_generation` return `generation` (the stored value) and `ceiling` (the largest target a raise accepts), so the value can be read before a raise target is chosen. They need `GuaranteedState:Read` and are refused for a service-scoped API token. A degraded read is a `503` or a retryable MCP error, never a generation of `0`. They change nothing; the REST call writes no audit row on success.
+
+**New flags (all per replica).** `--guardian-reconcile-budget-ms-per-s` (default `500`), `--guardian-reconcile-burst-ms` (default `1000`) and `--guardian-reconcile-max-per-s` (default `1000`), each with a `YUZU_GUARDIAN_RECONCILE_*` environment variable; see [Server Administration](server-admin.md#sizing-the-guardian-reconcile-budget). The defaults are provisional starting values, not derived from fleet measurement. No flag needs setting to upgrade.
+
+**Who notices.** In steady state (no policy change), only agents that are behind are re-pushed, so `shed` stays near zero. Admission matters after a policy bump or a fleet-wide restart, when many agents are behind at once. At an estimated 5 ms per admitted push (not measured end to end), one replica at the defaults admits about 100 pushes per second, so a fleet of 3,000 agents converges in about 30 seconds and a fleet of 30,000 in about 5 minutes; use the `yuzu_server_guardian_reconcile_duration_seconds` histogram to replace the estimate with your own figure.
+
+**What you will see.**
+
+- `yuzu_server_guardian_reconciles_total{result="shed"}` rising after a bump on a large fleet. This is the budget working, not a fault, and no alert ships for it.
+- `result="degraded"` and `guaranteed_state.reconcile` audit rows beginning `heartbeat reconcile ABORTED` during a tag or property store outage. These rows are new for a scope-read failure. They do not raise `YuzuGuardianReadDegraded`; `YuzuGuardianReconcileDegraded` and the tag-store and custom-properties read-degrade alerts (`YuzuTagStoreReadDegraded`, `YuzuCustomPropertiesReadDegraded`, all warning severity) are the alerts that fire for it. `YuzuGuardianReconcileDegraded` also fires when `yuzu_server_guardian_reconcile_exceptions_total` keeps rising.
+- `yuzu_server_guardian_reconcile_exceptions_total` rising: the reconcile hook threw out of the reconcile flow into the heartbeat handler. The exception is caught and logged as a warning and the rest of that heartbeat's ingestion still runs; the counter makes a persistent failure visible, and `YuzuGuardianReconcileDegraded` fires when it keeps rising.
+- Agents with an armed rule keep it during such an outage; an agent that has nothing armed yet receives no rules, scope-free rules included, until the store recovers.
+- A dashboard Baseline deploy or delete whose fan-out is abandoned because a store read degraded is audited `result=degraded` (detail containing `fan-out deferred to reconcile`) and shows a warning toast; the Baseline change itself is saved. The reconcile converges the fleet once the store recovers only if the generation bump succeeded.
+- `yuzu_server_guardian_agent_generation_ahead_total` rising: at least one agent holds a policy generation above the server's. It does not count agents, is sampled at most once a minute per replica, and the shipped alert `YuzuGuardianAgentGenerationAhead` (warning) fires on it. Follow the restore runbook in [Guaranteed State](guaranteed-state.md), which uses the raise operation above.
+
+**Rolling upgrades with more than one server.** A replica still on the previous release keeps the old behaviour (no budget, and a narrowed push on a degraded tag or property read) until it is upgraded. The REST, MCP and dashboard policy-bump fan-out now also aborts on a degraded tag or property read (#5610): REST answers `503`, MCP returns an internal error with a retry hint, and the dashboard answers `200` with a warning toast. A replica still on the previous release narrows the push instead.
+
+No config or data migration is required. The agent binary does change (the lower-generation refusal above); agents that have not been upgraded keep the previous behaviour.
 
 ## Behaviour change: an over-long facet value is left out of the response's facets (#5623)
 
@@ -3705,10 +4295,14 @@ a rollback is genuinely needed.
   up to 5 s waiting on the NVD-sync background thread, up to 15 s waiting on
   the HTTP listener thread (#2703 Gate 7 item 2), and (#3261 governance
   hardening) up to 60 s waiting for WebhookStore and OffloadTargetStore to
-  drain their delivery queues — the last of which runs the two stores
+  drain their delivery queues — that stage runs the two stores
   CONCURRENTLY, not sequentially, so it adds 60 s to the total rather than
-  120 s. Stacked, this can reach **~115 s** in the worst case if more than
-  one stage is genuinely wedged; the total and each stage's own bound are
+  120 s, and, as a separate stage right before the audit store is released,
+  up to 15 s waiting for a `registry.write` audit write that a gateway
+  forwarder thread has in flight (milliseconds unless the database is stuck
+  or slow: a connect or a lock wait can use the whole bound). Stacked, this can reach
+  **~130 s** in the worst case if more than one stage is genuinely wedged;
+  the total and each stage's own bound are
   unchanged by the reorder, only their relative sequence is. **(#3495) The policy
   evaluation, pre-flight runner, quarantine containment reconciler, and
   schedule tick background threads' gRPC dispatch calls now ride on the
@@ -3716,7 +4310,7 @@ a rollback is genuinely needed.
   `ServerImpl::stop()` now cancels in-flight gRPC RPCs before joining those
   four threads (previously it cancelled them after, so a thread genuinely
   blocked inside a gRPC stream write had no bound at
-  all — not covered by the ~115 s figure, and not fixable by raising the
+  all — not covered by the ~130 s figure, and not fixable by raising the
   grace period, since nothing in `stop()` would ever reach the cancellation
   that unblocks it). This is a strictly protective fix — no grace-period
   change is needed on upgrade, whether or not you ever hit the pre-#3495
@@ -3734,18 +4328,19 @@ a rollback is genuinely needed.
   `terminationGracePeriodSeconds` is **30**), and a pod with slow-draining
   work in more than one of those stages can be `SIGKILL`ed mid-sequence
   before the server finishes its own bounded teardown. Raise the grace
-  period to comfortably exceed ~115 s rather than relying on the platform
+  period to comfortably exceed ~130 s rather than relying on the platform
   default. **Two things a longer grace period does NOT fix:** (1) the 30 s
   drain window re-queries `execution_tracker_` for
   `running` executions on each of its one-second iterations — so it also
   picks up work that starts mid-drain, not just what was already running
   when `SIGTERM` arrived — but it never stops the HTTP listener from
   ACCEPTING new requests during that window, so a request that lands late in
-  the drain is not bounded by the ~115 s figure at all; raising the grace
+  the drain is not bounded by the ~130 s figure at all; raising the grace
   period does not close this gap, because the gap is about admission, not
-  about how long the drain itself waits. (2) if the 15 s HTTP-listener bound
-  or the 60 s WebhookStore/OffloadTargetStore bound IS exceeded, the server
-  force-exits (`std::_Exit(1)`) on its OWN internal schedule, independent of
+  about how long the drain itself waits. (2) if the 15 s HTTP-listener bound,
+  the 60 s WebhookStore/OffloadTargetStore bound or the 15 s `registry.write`
+  audit-write bound IS exceeded, the server force-exits (`std::_Exit(1)`) on
+  its OWN internal schedule, independent of
   whatever grace period the orchestrator was configured with — a longer
   external grace period only prevents the orchestrator from `SIGKILL`ing
   the process BEFORE that internal bound fires; it cannot prevent or delay

@@ -3038,7 +3038,7 @@ tests:
         exp_samples: []
 
   # ── YuzuGatewaySessionHeldByOtherAgent (HA WS-5, ADR-2002 §7f) ──────────
-  # Only the (proxy_register, session_held_by_other_agent) pair pages; no `for:`.
+  # Only the (proxy_register|announce_connected, session_held_by_other_agent) pairs page; no `for:`.
 
   # CASE — a single session_held_by_other_agent increment fires immediately.
   - interval: 1m
@@ -3052,6 +3052,33 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuGatewaySessionHeldByOtherAgent", alertstate="firing", instance="s1", job="yuzu", op="proxy_register", outcome="session_held_by_other_agent", severity="warning"}'
             value: 1
+
+  # CASE (#5683) — the CONNECTED-path refusal (op=announce_connected) pages too:
+  # RED against reverting the expr to op="proxy_register" only.
+  - interval: 1m
+    name: gateway session held by other agent - an announce_connected increment fires
+    input_series:
+      - series: 'yuzu_server_gateway_route_desync_total{job="yuzu",instance="s1",op="announce_connected",outcome="session_held_by_other_agent"}'
+        values: "0x5 1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewaySessionHeldByOtherAgent", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewaySessionHeldByOtherAgent", alertstate="firing", instance="s1", job="yuzu", op="announce_connected", outcome="session_held_by_other_agent", severity="warning"}'
+            value: 1
+
+  # CASE (#5683) — the other announce_connected outcomes still do not page.
+  - interval: 1m
+    name: gateway session held by other agent - other announce_connected outcomes do not fire
+    input_series:
+      - series: 'yuzu_server_gateway_route_desync_total{job="yuzu",instance="s1",op="announce_connected",outcome="session_mismatch"}'
+        values: "0x5 50x20"
+      - series: 'yuzu_server_gateway_route_desync_total{job="yuzu",instance="s1",op="announce_connected",outcome="malformed_home_id"}'
+        values: "0x5 50x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewaySessionHeldByOtherAgent", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
 
   # CASE — a flat zero-seeded counter stays quiet.
   - interval: 1m
@@ -3229,6 +3256,287 @@ tests:
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuGuardianReadDegraded"}'
         eval_time: 20m
+        exp_samples: []
+
+  # ── YuzuGuardianReconcileDegraded ────────────────────────────────────────
+  #
+  # `sum(increase(yuzu_server_guardian_reconciles_total{result="degraded"}
+  # [10m])) > 0` OR `sum(increase(yuzu_server_guardian_reconcile_exceptions_total
+  # [10m])) > 0`, for: 10m, warning. The reconciles counter family is
+  # pre-seeded to 0 for all five results and the exceptions counter to 0, so
+  # the healthy shape is six flat series.
+
+  # CASE: a store outage that keeps aborting reconciles pages, and only the
+  # degraded series counts: the sent series climbing alongside it is the
+  # normal post-bump shape and must not move the alert.
+  - interval: 1m
+    name: guardian reconcile degraded - a sustained abort rate pages
+    input_series:
+      - series: 'yuzu_server_guardian_reconciles_total{job="yuzu",instance="s1",result="degraded"}'
+        values: "0+1x40"
+      - series: 'yuzu_server_guardian_reconciles_total{job="yuzu",instance="s1",result="sent"}'
+        values: "0+5x40"
+    promql_expr_test:
+      # for: 10m pinned both sides (the file's bracketing convention): the
+      # increase is positive from t=1m, so firing begins ~t=11m -- still not
+      # firing at 10m, firing by 15m and again at 30m while the outage runs.
+      - expr: 'ALERTS{alertname="YuzuGuardianReconcileDegraded", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianReconcileDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianReconcileDegraded", alertstate="firing", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGuardianReconcileDegraded", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianReconcileDegraded", alertstate="firing", severity="warning"}'
+            value: 1
+
+  # CASE: an outage that ends keeps the alert firing for the rest of the
+  # 10m window and then clears. Aborts rise through t=12m and stop; the last
+  # rise stays inside the window until ~t=21m, so the alert is still firing
+  # at 19m and gone by 30m. This pins the window width: a [2m] window fires
+  # during the outage too and only this case tells the two apart.
+  - interval: 1m
+    name: guardian reconcile degraded - firing tail outlasts the outage then clears
+    input_series:
+      - series: 'yuzu_server_guardian_reconciles_total{job="yuzu",instance="s1",result="degraded"}'
+        values: "0+1x12 12x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianReconcileDegraded", alertstate="firing"}'
+        eval_time: 19m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianReconcileDegraded", alertstate="firing", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGuardianReconcileDegraded"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE: the result="degraded" matcher is load-bearing: every other result
+  # climbing (sent, rate_limited, shed, no_session) with the degraded series
+  # flat at its pre-seeded 0 must stay quiet. Drop the matcher from the rule
+  # and this case reds.
+  - interval: 1m
+    name: guardian reconcile degraded - other results climbing stay quiet
+    input_series:
+      - series: 'yuzu_server_guardian_reconciles_total{job="yuzu",instance="s1",result="degraded"}'
+        values: "0x40"
+      - series: 'yuzu_server_guardian_reconciles_total{job="yuzu",instance="s1",result="sent"}'
+        values: "0+5x40"
+      - series: 'yuzu_server_guardian_reconciles_total{job="yuzu",instance="s1",result="rate_limited"}'
+        values: "0+3x40"
+      - series: 'yuzu_server_guardian_reconciles_total{job="yuzu",instance="s1",result="shed"}'
+        values: "0+50x40"
+      - series: 'yuzu_server_guardian_reconciles_total{job="yuzu",instance="s1",result="no_session"}'
+        values: "0+1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianReconcileDegraded"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # CASE: one isolated abort (a single scrape interval's worth, then flat)
+  # must not page: a transient read blip is not an outage. The series is
+  # 0 at t=0m and 1m, then 1 from t=2m on. With left-open range selectors the
+  # increase is positive only while the 10m window still holds the 1m sample
+  # as well as the 2m one, so the expression is true at evaluation points 2m
+  # through 10m and false from 11m. The alert is therefore pending (not
+  # firing) at 8m and 10m: the expression IS true there, so a rule with no
+  # effective hold (`for: 0`) would be firing at both. Past 11m the
+  # expression is false, so it stays quiet at 12m and 25m too.
+  - interval: 1m
+    name: guardian reconcile degraded - one isolated abort stays quiet
+    input_series:
+      - series: 'yuzu_server_guardian_reconciles_total{job="yuzu",instance="s1",result="degraded"}'
+        values: "0 0 1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianReconcileDegraded", alertstate="pending"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianReconcileDegraded", alertstate="pending", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGuardianReconcileDegraded", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianReconcileDegraded", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianReconcileDegraded", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianReconcileDegraded", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # CASE: a reconcile that keeps throwing pages even though the degraded
+  # series stays at its pre-seeded 0: the exception is caught in the
+  # heartbeat handler and counted on its own counter, so the rule must watch
+  # that counter too. Drop the `or` clause and this case reds. for: 10m is
+  # pinned both sides as above: the increase is positive from t=1m, so firing
+  # begins ~t=11m.
+  - interval: 1m
+    name: guardian reconcile degraded - sustained reconcile exceptions page
+    input_series:
+      - series: 'yuzu_server_guardian_reconciles_total{job="yuzu",instance="s1",result="degraded"}'
+        values: "0x40"
+      - series: 'yuzu_server_guardian_reconcile_exceptions_total{job="yuzu",instance="s1"}'
+        values: "0+1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianReconcileDegraded", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianReconcileDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianReconcileDegraded", alertstate="firing", severity="warning"}'
+            value: 1
+
+  # CASE: the exceptions counter sitting flat (the boot-time pre-seed, or a
+  # past burst whose window has expired) is quiet on every replica, with the
+  # degraded series flat too.
+  - interval: 1m
+    name: guardian reconcile degraded - flat exceptions counter stays quiet
+    input_series:
+      - series: 'yuzu_server_guardian_reconciles_total{job="yuzu",instance="s1",result="degraded"}'
+        values: "0x40"
+      - series: 'yuzu_server_guardian_reconcile_exceptions_total{job="yuzu",instance="s1"}'
+        values: "0x40"
+      - series: 'yuzu_server_guardian_reconcile_exceptions_total{job="yuzu",instance="s2"}'
+        values: "7x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianReconcileDegraded"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE: both counters climbing at once (an abort storm that also throws) is
+  # still ONE alert with no extra labels, not one per counter.
+  - interval: 1m
+    name: guardian reconcile degraded - aborts and exceptions together page once
+    input_series:
+      - series: 'yuzu_server_guardian_reconciles_total{job="yuzu",instance="s1",result="degraded"}'
+        values: "0+1x40"
+      - series: 'yuzu_server_guardian_reconcile_exceptions_total{job="yuzu",instance="s1"}'
+        values: "0+1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianReconcileDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianReconcileDegraded", alertstate="firing", severity="warning"}'
+            value: 1
+
+  # CASE: a multi-replica fleet is one signal: one replica aborting while
+  # the other is healthy pages once, with no per-instance label on the alert.
+  - interval: 1m
+    name: guardian reconcile degraded - one aborting replica of two pages once
+    input_series:
+      - series: 'yuzu_server_guardian_reconciles_total{job="yuzu",instance="s1",result="degraded"}'
+        values: "0x40"
+      - series: 'yuzu_server_guardian_reconciles_total{job="yuzu",instance="s2",result="degraded"}'
+        values: "0+1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianReconcileDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianReconcileDegraded", alertstate="firing", severity="warning"}'
+            value: 1
+
+  # CASE: the boot-time pre-seed alone (flat 0) is the healthy steady state.
+  - interval: 1m
+    name: guardian reconcile degraded - pre-seeded flat counter stays quiet
+    input_series:
+      - series: 'yuzu_server_guardian_reconciles_total{job="yuzu",instance="s1",result="degraded"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianReconcileDegraded"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # ── YuzuGuardianAgentGenerationAhead ─────────────────────────────────────
+  #
+  # `sum(increase(yuzu_server_guardian_agent_generation_ahead_total[15m]))
+  # > 0`, for: 5m, warning. The counter is a flag sampled at most once a
+  # minute per replica, pre-seeded to 0, so even ONE increment is a
+  # confirmed agent-ahead observation and must page.
+
+  # CASE: a standing condition (an ahead agent heartbeating every 30 s,
+  # sampled once a minute) pages, and `for: 5m` is pinned both sides: the
+  # increase is positive from t=1m, so firing begins ~t=6m.
+  - interval: 1m
+    name: guardian agent generation ahead - a sustained condition pages
+    input_series:
+      - series: 'yuzu_server_guardian_agent_generation_ahead_total{job="yuzu",instance="s1"}'
+        values: "0+1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianAgentGenerationAhead", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianAgentGenerationAhead", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianAgentGenerationAhead", alertstate="firing", severity="warning"}'
+            value: 1
+
+  # CASE: a SINGLE sample pages, and clears once the 15m window has moved
+  # past it. This is the case that pins the window against the sampling
+  # cadence: a window narrower than the hold plus a scrape would never
+  # fire on one sample. The series is 0 at t=0m and 1m, then 1 from t=2m, so
+  # the expression is true from evaluation point 2m through 15m; the alert is
+  # pending from 2m, so `for: 5m` is pinned on both sides here too (quiet at
+  # 6m, firing at 7m).
+  - interval: 1m
+    name: guardian agent generation ahead - one sample pages then clears
+    input_series:
+      - series: 'yuzu_server_guardian_agent_generation_ahead_total{job="yuzu",instance="s1"}'
+        values: "0 0 1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianAgentGenerationAhead", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianAgentGenerationAhead", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianAgentGenerationAhead", alertstate="firing", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGuardianAgentGenerationAhead", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianAgentGenerationAhead", alertstate="firing", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGuardianAgentGenerationAhead"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE: a multi-replica fleet is one signal: the ahead agent heartbeats
+  # to one replica, the other stays at its pre-seeded 0, and the alert
+  # fires once with no per-instance label.
+  - interval: 1m
+    name: guardian agent generation ahead - one sampling replica of two pages once
+    input_series:
+      - series: 'yuzu_server_guardian_agent_generation_ahead_total{job="yuzu",instance="s1"}'
+        values: "0x40"
+      - series: 'yuzu_server_guardian_agent_generation_ahead_total{job="yuzu",instance="s2"}'
+        values: "0 0 1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianAgentGenerationAhead", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianAgentGenerationAhead", alertstate="firing", severity="warning"}'
+            value: 1
+
+  # CASE: healthy shapes stay quiet: the boot-time pre-seed (flat 0), and a
+  # counter that stopped moving at a nonzero value long ago (a past event
+  # whose window has expired, not a standing condition).
+  - interval: 1m
+    name: guardian agent generation ahead - flat counters stay quiet
+    input_series:
+      - series: 'yuzu_server_guardian_agent_generation_ahead_total{job="yuzu",instance="s1"}'
+        values: "0x60"
+      - series: 'yuzu_server_guardian_agent_generation_ahead_total{job="yuzu",instance="s2"}'
+        values: "7x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianAgentGenerationAhead"}'
+        eval_time: 30m
         exp_samples: []
 
   # -- Gateway-upstream peer authorization (group yuzu-security) -------------
@@ -3812,3 +4120,289 @@ tests:
       - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
         eval_time: 29m
         exp_samples: []
+
+  # ── YuzuCryptoCaReadDegraded (/crypto widgets, Gate 7 SRE-4) ─────────────
+  #
+  # The /crypto Yuzu-issued reads refused or failed for 15 minutes. The rule
+  # sums every reason of source="ca_issued" into ONE series (no reason label),
+  # so a shed and a database fault that alternate still hold it firing.
+
+  # CASE: a sustained mix of admission_full and query_error fires after the 15m
+  # hold, with no reason/instance label (sum() drops them), and not before.
+  - interval: 1m
+    name: crypto CA read degraded - sustained degrades fire after 15 minutes
+    input_series:
+      - series: 'yuzu_inventory_read_degrade_total{job="yuzu",instance="s1",source="ca_issued",reason="admission_full"}'
+        values: "0+1x40"
+      - series: 'yuzu_inventory_read_degrade_total{job="yuzu",instance="s1",source="ca_issued",reason="query_error"}'
+        values: "0+2x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCryptoCaReadDegraded", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCryptoCaReadDegraded", alertstate="firing"}'
+        eval_time: 17m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCryptoCaReadDegraded", alertstate="firing", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuCryptoCaReadDegraded", alertstate="firing"}'
+        eval_time: 35m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCryptoCaReadDegraded", alertstate="firing", severity="warning"}'
+            value: 1
+
+  # CASE: a 5-minute burst leaves the 5m window long before the 15m hold, so it
+  # never fires; and a rising degrade of ANOTHER source (the library reads, the
+  # layout store) is not this alert's business.
+  - interval: 1m
+    name: crypto CA read degraded - a short burst and other sources stay quiet
+    input_series:
+      - series: 'yuzu_inventory_read_degrade_total{job="yuzu",instance="s1",source="ca_issued",reason="admission_full"}'
+        values: "0 1 2 3 4 5 5x40"
+      - series: 'yuzu_inventory_read_degrade_total{job="yuzu",instance="s1",source="installed_software",reason="query_error"}'
+        values: "0+1x40"
+      - series: 'yuzu_inventory_read_degrade_total{job="yuzu",instance="s1",source="crypto_layout",reason="store_not_open"}'
+        values: "0+1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCryptoCaReadDegraded"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCryptoCaReadDegraded"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE: the zero-seeded healthy shape (admission_full is pre-seeded at boot)
+  # stays silent.
+  - interval: 1m
+    name: crypto CA read degraded - a flat pre-seeded series stays quiet
+    input_series:
+      - series: 'yuzu_inventory_read_degrade_total{job="yuzu",instance="s1",source="ca_issued",reason="admission_full"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCryptoCaReadDegraded"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # ── YuzuCryptoLayoutEraseFailed (ADR-0071 deprovision erasure, Gate 8 M1) ──
+  #
+  # Any increase of the erasure-failure counter in the last hour fires at once
+  # (no hold), one series per reason; it clears once the hour has passed.
+
+  # CASE: one failure fires immediately with its reason and clears after the
+  # 1h window has rolled past it.
+  - interval: 1m
+    name: crypto layout erase failed - one failure fires with its reason, then clears
+    input_series:
+      - series: 'yuzu_server_crypto_layout_erase_failures_total{job="yuzu",instance="s1",reason="pool_acquire_timeout"}'
+        values: "0x10 1x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing", reason="pool_acquire_timeout", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed"}'
+        eval_time: 100m
+        exp_samples: []
+
+  # CASE (R2-1): link_read_failed - an already-inactive SCIM user's linked
+  # identities could not be read, so only the slug's row was erased - fires
+  # like any other reason (the rule is reason-agnostic).
+  - interval: 1m
+    name: crypto layout erase failed - link_read_failed fires with its reason
+    input_series:
+      - series: 'yuzu_server_crypto_layout_erase_failures_total{job="yuzu",instance="s1",reason="link_read_failed"}'
+        values: "0x10 1x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing", reason="link_read_failed", severity="warning"}'
+            value: 1
+
+  # CASE: the pre-seeded healthy shape (every reason at a flat zero) stays
+  # silent, and two reasons failing fire as two series.
+  - interval: 1m
+    name: crypto layout erase failed - flat zeros stay quiet; two reasons, two series
+    input_series:
+      - series: 'yuzu_server_crypto_layout_erase_failures_total{job="yuzu",instance="s1",reason="store_not_open"}'
+        values: "0x30 0 1x20"
+      - series: 'yuzu_server_crypto_layout_erase_failures_total{job="yuzu",instance="s1",reason="query_error"}'
+        values: "0x30 0 2x20"
+      - series: 'yuzu_server_crypto_layout_erase_failures_total{job="yuzu",instance="s1",reason="outcome_unknown"}'
+        values: "0x50"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed"}'
+        eval_time: 25m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing", reason="query_error", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing", reason="store_not_open", severity="warning"}'
+            value: 1
+
+  # ── YuzuEnablementRegressed / YuzuEnablementRulesRejected / YuzuEnablementAnchorWriteFailing (ADR-3006) ──
+  #
+  # Cases for three of the enablement store's five alerts. YuzuEnablementUnresolvedUnits and
+  # YuzuEnablementReportAhead are the same shape as YuzuEnablementRulesRejected (a gauge above
+  # zero held for 10m, no arithmetic), which its case exercises, so they have none of their own;
+  # the repo allows an untested rule of a shape already covered.
+
+  # CASE: a held regression fires, a short blip does not, and a cleared one resolves.
+  # s1 is regressed from minute 3 to 23 (fires once held 5m, i.e. from minute 8);
+  # s2 is regressed for three minutes only (3..5) and never reaches for: 5m.
+  - interval: 1m
+    name: enablement regressed - held past for fires, a short blip stays quiet, a cleared gauge resolves
+    input_series:
+      - series: 'yuzu_server_enablement_regressed{job="yuzu",instance="s1"}'
+        values: "0x2 1x20 0x10"
+      - series: 'yuzu_server_enablement_regressed{job="yuzu",instance="s2"}'
+        values: "0x2 1x2 0x30"
+    promql_expr_test:
+      # Held for two minutes: still pending, not firing.
+      - expr: 'ALERTS{alertname="YuzuEnablementRegressed", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples: []
+      # Held past for: 5m: s1 fires; s2 (cleared at minute 6) does not.
+      - expr: 'ALERTS{alertname="YuzuEnablementRegressed", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuEnablementRegressed", alertstate="firing", instance="s1", job="yuzu", severity="critical"}'
+            value: 1
+      # Cleared at minute 24: resolved.
+      - expr: 'ALERTS{alertname="YuzuEnablementRegressed"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE: a held quarantined-rules gauge fires after for: 10m and resolves when it clears; a
+  # flat zero-seeded one stays quiet. s1 refuses three rules from minute 11 to 41 and then
+  # none (fires from minute 21); s2 never moves.
+  - interval: 1m
+    name: enablement rules rejected - a held quarantined gauge fires and a cleared or flat one stays quiet
+    input_series:
+      - series: 'yuzu_server_enablement_rules_quarantined{job="yuzu",instance="s1"}'
+        values: "0x10 3x30 0x40"
+      - series: 'yuzu_server_enablement_rules_quarantined{job="yuzu",instance="s2"}'
+        values: "0x90"
+    promql_expr_test:
+      # Held for four minutes: pending, not firing.
+      - expr: 'ALERTS{alertname="YuzuEnablementRulesRejected", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+      # Held past for: 10m: s1 fires; s2 never moved.
+      - expr: 'ALERTS{alertname="YuzuEnablementRulesRejected", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuEnablementRulesRejected", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      # Cleared at minute 42: resolved.
+      - expr: 'ALERTS{alertname="YuzuEnablementRulesRejected"}'
+        eval_time: 60m
+        exp_samples: []
+
+  # CASE: an anchor that is not writable fires once held for 5m, a short blip stays quiet, a
+  # recovered gauge resolves. The series START at the failing value (the boot writes before
+  # the first scrape). s1 is 0 throughout (fires from minute 5); s2 is healthy; s3 is 0 for
+  # three minutes only; s4 is 0 for 10 minutes and then recovers at minute 10.
+  - interval: 1m
+    name: enablement anchor not writable - held zero fires, a blip stays quiet, a recovered gauge resolves
+    input_series:
+      - series: 'yuzu_server_enablement_anchor_writable{job="yuzu",instance="s1"}'
+        values: "0x40"
+      - series: 'yuzu_server_enablement_anchor_writable{job="yuzu",instance="s2"}'
+        values: "1x40"
+      - series: 'yuzu_server_enablement_anchor_writable{job="yuzu",instance="s3"}'
+        values: "0x2 1x40"
+      - series: 'yuzu_server_enablement_anchor_writable{job="yuzu",instance="s4"}'
+        values: "0x9 1x40"
+    promql_expr_test:
+      # Minute 3: s1 and s4 are pending, not firing.
+      - expr: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing", alertstate="firing"}'
+        eval_time: 3m
+        exp_samples: []
+      # Minute 8: held past for: 5m: s1 and s4 fire; s3 blipped and recovered; s2 never moved.
+      - expr: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing", alertstate="firing", instance="s4", job="yuzu", severity="warning"}'
+            value: 1
+      # Minute 30: s4 recovered at minute 9 and resolved; s1 still fires.
+      - expr: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE: cookie-session requests refused for a cross-site Origin or Referer. s1 rises 0 0 3 6
+  # (six mismatches inside 15m: fires, and the step ages out of the window by minute 29);
+  # s4 is a flat zero-seeded series on the same reason.
+  - interval: 1m
+    name: cookie writes refused same-site - three or more mismatches in 15m fires and ages out of the window
+    input_series:
+      - series: 'yuzu_server_csrf_denied_total{job="yuzu",instance="s1",path_class="a",reason="origin_mismatch"}'
+        values: "0 0 3 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6"
+      - series: 'yuzu_server_csrf_denied_total{job="yuzu",instance="s4",path_class="a",reason="origin_mismatch"}'
+        values: "0x30"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: YuzuCookieWritesRefusedSameSite
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Cookie-session requests are being refused for a cross-site Origin, Referer or fetch metadata"
+              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#vnext--behind-a-reverse-proxy-declare-your-external-origin-or-csrf-gated-dashboard-actions-keep-failing-2537"
+              description: "Three or more cookie-session requests were refused in 15 minutes because the Origin or Referer did not name this site (or a --csrf-trusted-origin entry), or because the request's fetch metadata (Sec-Fetch-Site) was not same-origin or none. Three causes: a browser sent a request from another site, a reverse proxy rewrites the Host header and the server was started without --csrf-trusted-origin (or YUZU_CSRF_TRUSTED_ORIGIN), in which case every dashboard write fails, or a client sent a Sec-Fetch-Site value other than same-origin or none. Each refusal is audited as csrf.denied with the closed reason; this alert sums over path_class, so query yuzu_server_csrf_denied_total by path_class to see which kind of route was targeted. Check the Host and Origin the proxy forwards first."
+      - eval_time: 29m
+        alertname: YuzuCookieWritesRefusedSameSite
+        exp_alerts: []
+
+  # CASE: below the threshold, or a reason that is deliberately not alerted, stays quiet. s2 rises
+  # 0 0 1 1 (one refusal); s3 is a large header-less burst (reason no_origin_no_referer).
+  - interval: 1m
+    name: cookie writes refused same-site - one mismatch and a header-less burst stay quiet
+    input_series:
+      - series: 'yuzu_server_csrf_denied_total{job="yuzu",instance="s2",path_class="a",reason="referer_mismatch"}'
+        values: "0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1"
+      - series: 'yuzu_server_csrf_denied_total{job="yuzu",instance="s3",path_class="a",reason="no_origin_no_referer"}'
+        values: "0 0 30 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: YuzuCookieWritesRefusedSameSite
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: YuzuCookieWritesRefusedSameSite
+        exp_alerts: []
+
+  # CASE: an internal gate error alerts on the first one and stays quiet when absent. s1 has two
+  # errors from minute 2; s2 is the zero-seeded flat series every replica exposes.
+  - interval: 1m
+    name: same-site gate internal error - any error in 15m fires, a flat zero-seeded series stays quiet
+    input_series:
+      - series: 'yuzu_server_csrf_denied_total{job="yuzu",instance="s1",path_class="a",reason="gate_error"}'
+        values: "0 0 1 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2"
+      - series: 'yuzu_server_csrf_denied_total{job="yuzu",instance="s2",path_class="a",reason="gate_error"}'
+        values: "0x30"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: YuzuSameSiteGateInternalError
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "The same-site gate failed internally and refused requests"
+              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#vnext--behind-a-reverse-proxy-declare-your-external-origin-or-csrf-gated-dashboard-actions-keep-failing-2537"
+              description: "The same-site check for cookie-session requests hit an internal error and refused the request (it fails closed). A refusal that fails inside the gate may have no audit row, so the metric and the server log (at most one warning per minute) may be the only evidence. Look for the gate warning in the server log; a persistent error means cookie-session requests are failing for every operator."
+      - eval_time: 29m
+        alertname: YuzuSameSiteGateInternalError
+        exp_alerts: []

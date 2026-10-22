@@ -372,7 +372,23 @@ extern const std::string kYuzuChartsJs = R"JS((function () {
     autoRender(document);
   });
 
-  window.YuzuCharts = { render: render, autoRender: autoRender };
+  // Release every chart under `root` before its DOM is replaced: dispose the ECharts instance
+  // and remove the window resize listener render() attached, so a page that re-renders its
+  // charts (the /crypto dashboard) does not accumulate instances and listeners.
+  function dispose(root) {
+    if (!root || !window.echarts) return;
+    var els = [root].concat(Array.prototype.slice.call(root.querySelectorAll('*')));
+    els.forEach(function (el) {
+      if (el._yuzuResize) {
+        window.removeEventListener('resize', el._yuzuResize);
+        el._yuzuResize = null;
+      }
+      var inst = window.echarts.getInstanceByDom(el);
+      if (inst) { inst.dispose(); }
+    });
+  }
+
+  window.YuzuCharts = { render: render, autoRender: autoRender, dispose: dispose };
 })();
 )JS";
 
