@@ -1,21 +1,21 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-17 · interactive user (elevated; username, SID and profile path anonymised) · leg-hash 2db0b6e73233
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-17 · interactive user (elevated; username, SID and profile path anonymised) · leg-hash 8e63a482f476
 == action=get_value hive=HKLM key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" name=ProductName
 value|Windows 10 Pro
 type|REG_SZ
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=set_value hive=HKCU key=Software\YuzuCaptureTmp name=probe value=1
-audit|op=set_value|hive=HKCU|key=Software\YuzuCaptureTmp|name=probe|type=REG_SZ|len=4|result=ok|reason=-|verify=ok|dry_run=-|counted_keys=-|counted_values=-|capped=-|sid=-|old_state=absent|old_type=-|old=-|new=31000000
+audit|op=set_value|hive=HKCU|result=ok|reason=-|verify=ok|key=Software\YuzuCaptureTmp|name=probe|type=REG_SZ|len=4|dry_run=-|counted_keys=-|counted_values=-|capped=-|sid=-|old_state=absent|old_type=-|old=-|new=31000000
 status|ok
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=delete_value hive=HKCU key=Software\YuzuCaptureTmp name=probe
-audit|op=delete_value|hive=HKCU|key=Software\YuzuCaptureTmp|name=probe|type=-|len=-|result=ok|reason=-|verify=ok|dry_run=-|counted_keys=-|counted_values=-|capped=-|sid=-|old_state=present|old_type=REG_SZ|old=31000000|new=-
+audit|op=delete_value|hive=HKCU|result=ok|reason=-|verify=ok|key=Software\YuzuCaptureTmp|name=probe|type=-|len=-|dry_run=-|counted_keys=-|counted_values=-|capped=-|sid=-|old_state=present|old_type=REG_SZ|old=31000000|new=-
 status|ok
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=delete_key hive=HKCU key=Software\YuzuCaptureTmp
-audit|op=delete_key|hive=HKCU|key=Software\YuzuCaptureTmp|name=-|type=-|len=-|result=ok|reason=-|verify=ok|dry_run=0|counted_keys=1|counted_values=0|capped=0|sid=-|old_state=-|old_type=-|old=-|new=-
+audit|op=delete_key|hive=HKCU|result=ok|reason=-|verify=ok|key=Software\YuzuCaptureTmp|name=-|type=-|len=-|dry_run=0|counted_keys=1|counted_values=0|capped=0|sid=-|old_state=-|old_type=-|old=-|new=-
 status|ok
 counted_keys|1
 counted_values|0
@@ -175,20 +175,3 @@ type|REG_DWORD
 == action=list_profiles
 S-1-5-21-1111111111-2222222222-3333333333-1001|jsmith|C:\Users\jsmith|loaded
 [result_status] UNDECLARED / UNKNOWN / 
-
-== action=set_user_value username=jsmith key=Software\YuzuCaptureTmp name=probe value=1
-audit|op=set_user_value|hive=HKU|key=Software\YuzuCaptureTmp|name=probe|type=REG_SZ|len=4|result=ok|reason=-|verify=ok|dry_run=-|counted_keys=-|counted_values=-|capped=-|sid=S-1-5-21-1111111111-2222222222-3333333333-1001|old_state=absent|old_type=-|old=-|new=31000000
-status|ok
-[result_status] UNDECLARED / UNKNOWN / 
-
-== action=delete_user_value username=jsmith key=Software\YuzuCaptureTmp name=probe
-audit|op=delete_user_value|hive=HKU|key=Software\YuzuCaptureTmp|name=probe|type=-|len=-|result=ok|reason=-|verify=ok|dry_run=-|counted_keys=-|counted_values=-|capped=-|sid=S-1-5-21-1111111111-2222222222-3333333333-1001|old_state=present|old_type=REG_SZ|old=31000000|new=-
-status|ok
-[result_status] UNDECLARED / UNKNOWN / 
-
-== action=apply plan=[{"op":"create_key","key":"SOFTWARE\\YuzuCaptureTmp"}]
-item|0|create_key|HKLM|SOFTWARE\YuzuCaptureTmp|-|would_apply|-|-|1|-|-|-|-
-audit|op=apply.create_key|hive=HKLM|key=SOFTWARE\YuzuCaptureTmp|name=-|type=-|len=-|result=ok|reason=-|verify=-|dry_run=1|counted_keys=-|counted_values=-|capped=-|sid=-|old_state=-|old_type=-|old=-|new=-
-summary|1|1|0|0|0|1|1
-[result_status] UNDECLARED / UNKNOWN / 
-

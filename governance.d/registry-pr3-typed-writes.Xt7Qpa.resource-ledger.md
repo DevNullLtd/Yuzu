@@ -1,0 +1,34 @@
+# Resource Ledger -- typed verified writes and the link-safe fast open in the registry plugin
+
+Range described: `5f4064fb4..HEAD` (branch `feat/registry-pr3-typed-writes`). Symbols are cited by file and function; the tree is C++23 and every line moves with an edit.
+
+## Summary
+
+The plugin owns one kind of resource: an open registry key handle (`HKEY`). Every handle the write path opens is owned by an RAII wrapper from the moment the open succeeds, is closed on every return, and dies before `execute_windows` returns: no handle, cache or thread outlives one command. The fast open adds one early-return path to that rule (the handle is owned before it has been checked) and one process-lifetime cache (the kernel names of `HKLM` and `HKU`). The server side adds no owner: it is touched only by the render-pin test, the server test target's include directory, nine `kUnitOs` masks and wording.
+
+## Table 1 -- owned resources
+
+| # | Resource | Owner | Copy / move | Acquired | Released | Early returns / failure |
+|---|---|---|---|---|---|---|
+| 1 | an open key `HKEY` (every handle below) | `Owned` (`registry_core.hpp`): holds a `RegistryWriter*` and the `Handle`; `Win32Registry::close` is `RegCloseKey` | move-only (copy deleted); the moved-from owner is empty | `RegistryWriter::open_sub` / `open_path` / `create_sub` set `out` only on success, and the caller wraps it immediately | `~Owned` and `reset()`; assignment from another owner closes the previous handle | a predefined root (`HKEY_LOCAL_MACHINE` and the others) is a `Handle` that is never wrapped, so it is never closed |
+| 2 | the checked handle of one operation | `Opened::leaf` (an `Owned`), returned by value from `open_checked` | move-only | the walk (`open_checked`) or the fast open (`open_fast`) hands it over | end of `set_value_verified` / `delete_value_verified` / `delete_key_tree`, i.e. before `execute_windows` returns; `delete_key_tree`'s handle is the one `NtDeleteKey` marks deleted, and the same `Owned` still closes it | a refusal returns an `Opened` with no handle; the walk's intermediate `cur` / `opened` / `made_h` owners are unchanged from the reference walk and close the previous parent as the child is adopted |
+| 3 | the fast-open handle before it is accepted | `open_fast`: local `Owned leaf{reg, h}` created on the line after `open_path` succeeds | local; moved into the returned `Opened` only on ACCEPT | `RegistryWriter::open_path` (`RegOpenKeyExW` with `REG_OPTION_OPEN_LINK`) | every `return` before the move: `final_name` failed, the canonical name did not match, the leaf probe refused or failed. The caller then walks with nothing left open | the only path where a handle exists before it is checked; closed by the same `Owned`, never by a branch that could be skipped |
+| 4 | the kernel name of a predefined root | two function-local `static const std::string` (`hklm`, `hku`) in `Win32Registry::root_name` | immutable after construction; `root_name` copies the string out | first call (C++ magic static, thread-safe), from `read_root_name`: a temporary `yuzu::win::RegKey` over `RegOpenKeyExW(root, L"")` | the temporary closes at the end of `read_root_name`; the strings live for the process | a read that fails leaves the string empty, which disables the fast open for that root for the life of the process (the walk is the fallback); `HKCU` and `HKCR` are never cached and answer `ERROR_NOT_SUPPORTED` |
+| 5 | ntdll entry points | function-local `static const` pointers: `NtDeleteKey` (`delete_key_by_handle`), `NtQueryKey` (`query_key_name`), `RtlNtStatusToDosError` (`nt_failure_code`) | trivially copyable pointers | `GetModuleHandleW(L"ntdll.dll")` + `GetProcAddress` (no `LoadLibrary`, so no module reference is taken) | never freed; nothing to free | a missing module or export is a null pointer and a refusal (`ERROR_PROC_NOT_FOUND`), never a fall back to a by-name delete |
+| 6 | the name buffer | `alignas(8) unsigned char buf[4096]` in `query_key_name` | stack local | per call | scope exit | `STATUS_BUFFER_OVERFLOW`, any failing NTSTATUS, a length that is odd or past the buffer, or a name that converts to nothing is a non-zero return and `out` stays empty: a half name is never compared |
+| 7 | the read actions' handles | `yuzu::win::RegKey` in `do_get_value`, `do_key_exists`, `do_enumerate_*`, `do_get_user_value`, `read_root_name` (`agents/shared/win_reg_handle.hpp`) | move-only | `RegOpenKeyExW` through `put()` | `~RegKey` | unchanged code moved from `registry_plugin.cpp` |
+| 8 | the value-read buffer | `std::vector<std::uint8_t>` in `query_value_bounded` | local | per read | scope exit | growth is bounded (three retries, then `ERROR_MORE_DATA`); a count the buffer cannot hold never forms a copy range |
+
+## Table 2 -- borrowed state
+
+| Holder | Borrows | Lifetime |
+|---|---|---|
+| `Owned`, `Opened` | the `RegistryWriter&` that opened the handle (for `close`) | the writer (`Win32Registry reg`, a local of each `do_*` function) is declared before every `Opened` of that function, so it is destroyed after them; the test fake asserts in its destructor that no handle is left open |
+| `open_fast`, `open_checked` | `key_path`, `leaf_access` as `string_view` / value | the call; the strings are copied (`expected`, the wide path inside `open_path`) before use, and none escapes |
+| the render-pin cases (server test) | `yuzu::registry::render_audit_line`'s returned string | by value; no pointer into plugin state |
+
+## Items checked and not applicable
+
+- **Borrowed dependencies on handler or forwarder threads:** not applicable. The plugin runs synchronously inside one `execute()` call on the agent's command loop; this change adds no server seam, thread, hook, pool lease or store.
+- **Ownership-type changes:** not applicable. No `unique_ptr` -> `shared_ptr` change and no server object; the owners above are listed because the policy floor asks for every handle owner in a change that adds a new way to obtain one.
+- **Timeout and bound derivations:** not applicable. There is no wait, sleep, deadline or timer: every operation is a bounded sequence of registry calls, and the one loop that could grow (the value enumeration behind `delete_key`'s counts) stops at `kMaxTreeNodes` (10,000) even when the value set grows between calls.

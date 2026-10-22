@@ -238,7 +238,7 @@ neither controls anything at runtime.
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `minAgentVersion` | string | No | -- | Minimum agent version required to execute this definition. Agents below this version are skipped during dispatch (error `4003`). |
+| `minAgentVersion` | string | No | -- | Minimum agent version required to execute this definition. Declared and shown (dashboard, export); dispatch does not compare it today, so an older agent is NOT skipped and error `4003` is not raised. |
 | `requiredPlugins` | list of string | No | `[]` | Plugins that must be loaded on the agent. If any required plugin is missing, the agent is skipped (error `4001`). |
 
 #### `spec.legacy_shim`

@@ -1,5 +1,5 @@
 /**
- * test_registry_write_local_dispatcher.cpp -- PR11.7: the REAL registry.dll's mutating actions driven
+ * test_registry_write_local_dispatcher.cpp -- the REAL registry.dll's mutating actions driven
  * through yuzu::agent::LocalDispatcher against the live Windows registry (the pure logic is locked on
  * every host by test_registry_parsers.cpp / test_registry_core.cpp; this proves the Win32 binding).
  *

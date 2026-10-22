@@ -25,8 +25,6 @@
 using namespace yuzu::registry;
 using yuzu::profiles::kRegBinary;
 using yuzu::profiles::kRegDword;
-using yuzu::profiles::kRegMultiSz;
-using yuzu::profiles::kRegQword;
 using yuzu::profiles::kRegSz;
 using Bytes = std::vector<std::uint8_t>;
 
@@ -66,8 +64,6 @@ struct Node {
     bool deny_delete_value = false, deny_delete_key = false;
     std::set<std::string> unreadable_values;
 };
-
-std::string hex(const Bytes& b) { return yuzu::profiles::hex_encode(b); }
 
 /// The registry as the kernel presents it: `open_sub` opens ONE component of the current handle as it is
 /// (the walk always passes REG_OPTION_OPEN_LINK), while `open_path` resolves a whole path the way
@@ -142,8 +138,6 @@ public:
         const auto it = by_method.find(method);
         return it == by_method.end() ? 0 : it->second;
     }
-    /// Canonical dump of the whole tree: byte-identical comparison of two registry states.
-    std::string dump() { return dump_node(*root, ""); }
     /// The canonical path (stored names) of `target` in the tree; false when it is not in it.
     [[nodiscard]] bool canonical_path(const Node* target, std::string& out) const {
         if (target == root.get()) {
@@ -385,17 +379,6 @@ private:
             if (path_of(*k, target, p, out)) return true;
         }
         return false;
-    }
-    static std::string dump_node(const Node& n, const std::string& path) {
-        std::string out;
-        for (const auto& [name, v] : n.values)
-            out += path + "|" + name + "|" + std::to_string(v.type) + "|" + hex(v.data) + "\n";
-        for (const auto& [name, k] : n.subkeys) {
-            const std::string p = path.empty() ? ILess::fold_ascii(name) : path + "\\" + ILess::fold_ascii(name);
-            out += "[" + p + "]" + (k->is_link ? " link" : "") + "\n";
-            out += dump_node(*k, p);
-        }
-        return out;
     }
 };
 
@@ -779,6 +762,13 @@ TEST_CASE("registry core: delete_key non-recursive refuses a key with subkeys an
     }
     SECTION("a missing key") {
         CHECK(delete_key_tree(reg, FakeRegistry::kRoot, "T\\Nope", fast).reason == "key_not_found");
+    }
+    SECTION("NtDeleteKey denied: the delete fails access_denied and the key stays") {
+        reg.key("T\\C2")->deny_delete_key = true;
+        const auto o = delete_key_tree(reg, FakeRegistry::kRoot, "T\\C2", fast);
+        CHECK(o.result == "failed");
+        CHECK(o.reason == "access_denied");
+        CHECK(reg.exists("T\\C2"));
     }
 }
 

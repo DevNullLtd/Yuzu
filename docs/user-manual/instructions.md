@@ -286,7 +286,7 @@ spec:
 
 | Field | Description |
 |---|---|
-| `minAgentVersion` | Agents below this version are skipped during dispatch (error `4003`). |
+| `minAgentVersion` | Declared and shown; dispatch does not compare it today, so an older agent is NOT skipped and error `4003` is not raised. |
 | `requiredPlugins` | Agents missing any listed plugin are skipped (error `4001`). |
 
 ---
