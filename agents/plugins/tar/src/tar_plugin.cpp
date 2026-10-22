@@ -367,6 +367,14 @@ std::vector<std::string> load_redaction_patterns(yuzu::tar::TarDatabase& db) {
 // sites below are unchanged.
 using yuzu::tar::source_enabled;
 
+// Health token for a collect leg skipped at its enable gate. A confirmed false is
+// a disable (not a failure); an unreadable flag is a skipped tick and must COUNT
+// (state_unreadable), otherwise source_disabled resets the failure streak and a
+// source that silently never collects raises no failure surface.
+constexpr std::string_view skip_token(std::optional<bool> state) noexcept {
+    return state.has_value() ? "source_disabled" : "state_unreadable";
+}
+
 // Process stabilization exclusion patterns (issue #59). Empty = no exclusions.
 std::vector<std::string> load_stabilization_exclusions(yuzu::tar::TarDatabase& db) {
     auto stored = db.get_config("process_stabilization_exclusions");
@@ -982,7 +990,9 @@ public:
         // health, which is worse than an absent one. It also never received the
         // on_enabled_changed(false) that the block above argues must land
         // before the first callback can arrive, because that call is inside the
-        // same try. Found by both the architect and cpp-safety.
+        // same try. Found by both the architect and cpp-safety. A source dropped
+        // AFTER a successful start() (the unreadable-flag throw above) is unarmed by
+        // its destructor (R-007 / RAII session and fd members), so the reset is safe.
         std::erase_if(cursor_sources_, [](const auto& s) { return s == nullptr; });
 
         spdlog::info("TAR plugin initialized (fast={}s, slow={}s, db={})", fast_interval,
@@ -1516,10 +1526,7 @@ private:
                 }
             }
         } else {
-            // An unreadable flag is a skipped tick, not a disable: state_unreadable
-            // is a failure token, source_disabled would reset the failure streak.
-            note_health("process",
-                        process_state.has_value() ? "source_disabled" : "state_unreadable");
+            note_health("process", skip_token(process_state));
         }
 
         // `usage` derived fold (Wave 7 PR7.2b): ONE call, after BOTH process
@@ -1540,8 +1547,9 @@ private:
                 usage_last_fold_warn_ts_ = ts;
             }
         } else {
-            note_health("usage", source_enabled(*db_, "usage") ? "events_recorded"
-                                                               : "source_disabled");
+            const auto usage_state = yuzu::tar::source_enabled_state(*db_, "usage");
+            note_health("usage", usage_state.value_or(false) ? "events_recorded"
+                                                             : skip_token(usage_state));
         }
 
         // Network diff
@@ -1760,7 +1768,7 @@ private:
             nstat_client_->drain();
             pending_nstat_evs_.clear();
         } else {
-            note_health("tcp", tcp_state.has_value() ? "source_disabled" : "state_unreadable");
+            note_health("tcp", skip_token(tcp_state));
         }
 
         // netqual: per-connection TCP quality (BRD Workstream E). Co-sampled with
@@ -1768,7 +1776,8 @@ private:
         // events on snapshot_id. Only the privacy bucket leaves select_netqual_rows;
         // the raw remote address is dropped there and never persisted. Empty off
         // Linux (collector stub).
-        if (source_enabled(*db_, "netqual")) {
+        const auto netqual_state = yuzu::tar::source_enabled_state(*db_, "netqual");
+        if (netqual_state.value_or(false)) {
             // netqual_pre: pre-collected by the caller OUTSIDE collect_mu_ (the
             // Windows ESTATS pass is one enable+read syscall pair per tracked
             // connection — same rationale as arp_pre/dns_pre). Inline when null.
@@ -1793,7 +1802,7 @@ private:
                 note_health("netqual", "sample_recorded");
             }
         } else {
-            note_health("netqual", "source_disabled");
+            note_health("netqual", skip_token(netqual_state));
         }
 
         // ARP diff (ADR-0015). Implemented on Windows, Linux, and macOS -- see the
@@ -1814,7 +1823,8 @@ private:
         // arp_pre, when supplied, carries the OUTCOME of a precollection
         // attempt (nullopt if that threw -- do_collect_fast), not just the
         // entries.
-        if (source_enabled(*db_, "arp")) {
+        const auto arp_state = yuzu::tar::source_enabled_state(*db_, "arp");
+        if (arp_state.value_or(false)) {
             std::optional<std::vector<yuzu::tar::ArpEntry>> current;
             if (arp_pre) {
                 current = std::move(*arp_pre);
@@ -1852,13 +1862,14 @@ private:
                 note_health("arp", "capture_incomplete");
             }
         } else {
-            note_health("arp", "source_disabled");
+            note_health("arp", skip_token(arp_state));
         }
 
         // DNS-cache diff (ADR-0015). Device-level resolver-cache state; NOT
         // per-process (no pid). Same non-fatal / advance-on-success discipline as
         // the arp leg.
-        if (source_enabled(*db_, "dns")) {
+        const auto dns_state = yuzu::tar::source_enabled_state(*db_, "dns");
+        if (dns_state.value_or(false)) {
             auto current = dns_pre ? std::move(*dns_pre) : yuzu::tar::enumerate_dns();
             auto previous = json_to_dns(db_->get_state("dns"));
             auto typed = yuzu::tar::compute_dns_events(previous, current, ts, snap_id);
@@ -1876,7 +1887,7 @@ private:
                 note_health("dns", tok);
             }
         } else {
-            note_health("dns", "source_disabled");
+            note_health("dns", skip_token(dns_state));
         }
 
         // M2: module/image loads (Windows ETW). The session starts lazily below.
@@ -1900,7 +1911,7 @@ private:
         if (!module_enabled) {
             module_start_failed_ = false; // re-enable should retry a previously-failed start
         }
-        const char* module_tok = nullptr; // ledger token for this tick (see below)
+        std::string_view module_tok; // ledger token for this tick (see below); empty = unset
         if (module_stream_active_ && module_state.has_value() && !*module_state) {
             // Disabled mid-run (a true→false toggle): drain-and-discard so the
             // paused window is never stored, keeping the session warm. Mirrors
@@ -1971,8 +1982,8 @@ private:
         }
 
         if (!module_enabled) {
-            module_tok = module_state.has_value() ? "source_disabled" : "state_unreadable";
-        } else if (!module_tok) {
+            module_tok = skip_token(module_state);
+        } else if (module_tok.empty()) {
             const auto st = yuzu::tar::os_support_status("module", yuzu::tar::current_platform_os());
             module_tok = (st == yuzu::tar::OsSupportStatus::kSupported ||
                           st == yuzu::tar::OsSupportStatus::kSupportedConstrained)
@@ -2051,10 +2062,10 @@ private:
     // unregistered via perf_interval_seconds=0).
     int do_collect_perf(yuzu::CommandContext& ctx) {
         int rc = 0;
-        if (!source_enabled(*db_, "perf")) {
-            note_health("perf", yuzu::tar::kCollectStatusSourceDisabled);
-            ctx.write_output(std::format("tar|collect_perf|0|{}",
-                                         yuzu::tar::kCollectStatusSourceDisabled));
+        const auto perf_state = yuzu::tar::source_enabled_state(*db_, "perf");
+        if (!perf_state.value_or(false)) {
+            note_health("perf", skip_token(perf_state));
+            ctx.write_output(std::format("tar|collect_perf|0|{}", skip_token(perf_state)));
         } else {
             const auto cur = yuzu::tar::read_perf_counters(); // syscalls, no lock held
             if (!cur.valid) {
@@ -2065,7 +2076,7 @@ private:
                 note_health("perf", tok);
                 ctx.write_output(std::format("tar|collect_perf|0|{}", tok));
             } else {
-                bool perf_enabled_now = true;
+                std::optional<bool> perf_now = true;
                 yuzu::tar::PerfSample sample;
                 {
                     std::lock_guard lock(collect_mu_); // prev_perf_ RMW + disable re-check
@@ -2074,16 +2085,15 @@ private:
                     // disable racing a mid-flight sample never commits a post-disable
                     // row, and leave prev_perf_ untouched when disabled so the reset
                     // in the disable branch stands. (#538)
-                    perf_enabled_now = source_enabled(*db_, "perf");
-                    if (perf_enabled_now) {
+                    perf_now = yuzu::tar::source_enabled_state(*db_, "perf");
+                    if (perf_now.value_or(false)) {
                         sample = yuzu::tar::derive_sample(prev_perf_, cur);
                         prev_perf_ = cur;
                     }
                 }
-                if (!perf_enabled_now) {
-                    note_health("perf", yuzu::tar::kCollectStatusSourceDisabled);
-                    ctx.write_output(std::format("tar|collect_perf|0|{}",
-                                                 yuzu::tar::kCollectStatusSourceDisabled));
+                if (!perf_now.value_or(false)) {
+                    note_health("perf", skip_token(perf_now));
+                    ctx.write_output(std::format("tar|collect_perf|0|{}", skip_token(perf_now)));
                 } else if (!sample.valid) {
                     note_health("perf", yuzu::tar::kCollectStatusBaseline);
                     ctx.write_output(std::format("tar|collect_perf|0|{}",
@@ -2117,10 +2127,11 @@ private:
         // A2 per-app leg (independent of the device leg's outcome).
         // `procperf_enabled=false` switches off per-app sampling while
         // device-level perf stays on.
-        if (!source_enabled(*db_, "procperf")) {
-            note_health("procperf", yuzu::tar::kCollectStatusSourceDisabled);
-            ctx.write_output(std::format("tar|collect_procperf|0|{}",
-                                         yuzu::tar::kCollectStatusSourceDisabled));
+        const auto procperf_state = yuzu::tar::source_enabled_state(*db_, "procperf");
+        if (!procperf_state.value_or(false)) {
+            note_health("procperf", skip_token(procperf_state));
+            ctx.write_output(
+                std::format("tar|collect_procperf|0|{}", skip_token(procperf_state)));
             return rc;
         }
         auto proc_cur = yuzu::tar::read_proc_counters(); // one snapshot, no lock held
@@ -2135,7 +2146,7 @@ private:
                                    std::memory_order_relaxed);
         const auto ts = proc_cur.ts_epoch; // before the move; never read prev_proc_ unlocked
         const auto redaction = load_redaction_patterns(*db_);
-        bool procperf_enabled_now = true;
+        std::optional<bool> procperf_now = true;
         std::vector<yuzu::tar::ProcPerfSample> samples;
         {
             std::lock_guard lock(collect_mu_); // prev_proc_ RMW + disable re-check
@@ -2144,16 +2155,16 @@ private:
             // commit a post-disable row. Leave prev_proc_ as the disable branch
             // reset it so a later re-enable re-baselines instead of diffing across
             // the opt-out window. (#538)
-            procperf_enabled_now = source_enabled(*db_, "procperf");
-            if (procperf_enabled_now) {
+            procperf_now = yuzu::tar::source_enabled_state(*db_, "procperf");
+            if (procperf_now.value_or(false)) {
                 samples = yuzu::tar::derive_proc_samples(prev_proc_, proc_cur, redaction);
                 prev_proc_ = std::move(proc_cur);
             }
         }
-        if (!procperf_enabled_now) {
-            note_health("procperf", yuzu::tar::kCollectStatusSourceDisabled);
-            ctx.write_output(std::format("tar|collect_procperf|0|{}",
-                                         yuzu::tar::kCollectStatusSourceDisabled));
+        if (!procperf_now.value_or(false)) {
+            note_health("procperf", skip_token(procperf_now));
+            ctx.write_output(
+                std::format("tar|collect_procperf|0|{}", skip_token(procperf_now)));
             return rc;
         }
         if (samples.empty()) {
@@ -2208,7 +2219,8 @@ private:
         int total_events = 0;
 
         // Service diff (C6: check insert return)
-        if (source_enabled(*db_, "service")) {
+        const auto service_state = yuzu::tar::source_enabled_state(*db_, "service");
+        if (service_state.value_or(false)) {
             // enumerate_services() throws when the underlying capture (systemctl/
             // launchctl via run_bounded_subprocess) didn't genuinely complete --
             // spawn failure, deadline, output-cap truncation, or non-zero exit
@@ -2252,11 +2264,12 @@ private:
                 note_health("service", "events_recorded");
             }
         } else {
-            note_health("service", "source_disabled");
+            note_health("service", skip_token(service_state));
         }
 
         // User diff
-        if (source_enabled(*db_, "user")) {
+        const auto user_state = yuzu::tar::source_enabled_state(*db_, "user");
+        if (user_state.value_or(false)) {
             const std::string usr_key{yuzu::tar::diff_state_key("user")}; // #538
             auto current = yuzu::tar::enumerate_users();
             auto prev_json = db_->get_state(usr_key);
@@ -2280,7 +2293,7 @@ private:
             total_events += static_cast<int>(typed.size());
             note_health("user", "events_recorded");
         } else {
-            note_health("user", "source_disabled");
+            note_health("user", skip_token(user_state));
         }
 
         // netconn: OS-logged connectivity transitions (ADR-0020). Incremental read
@@ -2289,7 +2302,8 @@ private:
         // operator who enables the source LATER still recovers the OS-retained
         // history. The hwm advances ONLY on success, so a failed tick re-reads the
         // same window; rows carry the EVENT's own ts. Non-fatal like the netqual leg.
-        if (source_enabled(*db_, "netconn")) {
+        const auto netconn_state = yuzu::tar::source_enabled_state(*db_, "netconn");
+        if (netconn_state.value_or(false)) {
             // Empty hwm (fresh enable / init backfill failed) -> deep read bounded
             // by the operator-configurable retroactive reach; a set hwm -> forward
             // incremental read [hwm, ts). nq_netconn_plan centralises this AND the
@@ -2334,7 +2348,7 @@ private:
                 }
             }
         } else {
-            note_health("netconn", "source_disabled");
+            note_health("netconn", skip_token(netconn_state));
         }
 
         // §3.8 — mapped-drive diff (both directions). NON-FATAL on
@@ -2343,7 +2357,8 @@ private:
         // 1`); the diff baseline advances ONLY on insert success so a failed insert
         // retries the same deltas next tick. The one-time historical backfill is
         // separate (init, mapdrive_backfill_done) and does not touch this baseline.
-        if (source_enabled(*db_, "mapdrive")) {
+        const auto mapdrive_state = yuzu::tar::source_enabled_state(*db_, "mapdrive");
+        if (mapdrive_state.value_or(false)) {
             // enumerate_mapdrive() throws when its underlying LIVE capture
             // didn't genuinely complete -- WNet/NetSessionEnum on Windows,
             // /proc/mounts/smbstatus on Linux, or on macOS a getfsstat(2)
@@ -2385,7 +2400,7 @@ private:
                 }
             }
         } else {
-            note_health("mapdrive", "source_disabled");
+            note_health("mapdrive", skip_token(mapdrive_state));
         }
 
         // ── Cursor-model sources (tar_cursor.hpp: power, removable — wave 2) ──
@@ -2398,10 +2413,11 @@ private:
         // TRUE per the Alex ruling, tar_schema_registry.cpp).
         for (auto& src : cursor_sources_) {
             const std::string src_name = src->name();
-            if (!source_enabled(*db_, src_name)) {
-                note_health(src_name, yuzu::tar::kCollectStatusSourceDisabled);
-                ctx.write_output(std::format("tar|collect_{}|0|{}", src_name,
-                                             yuzu::tar::kCollectStatusSourceDisabled));
+            const auto src_state = yuzu::tar::source_enabled_state(*db_, src_name);
+            if (!src_state.value_or(false)) {
+                note_health(src_name, skip_token(src_state));
+                ctx.write_output(
+                    std::format("tar|collect_{}|0|{}", src_name, skip_token(src_state)));
                 continue;
             }
             auto cursor_read = db_->get_cursor(src_name);
@@ -2560,9 +2576,10 @@ private:
         // never ran" / "every tick errors" (the agent has no /metrics endpoint).
         db_->set_config("software_last_run_ts", std::to_string(ts));
 
-        if (!source_enabled(*db_, "software")) {
-            note_health("software", yuzu::tar::kCollectStatusSourceDisabled);
-            ctx.write_output("tar|collect_software|0|source_disabled");
+        const auto software_state = yuzu::tar::source_enabled_state(*db_, "software");
+        if (!software_state.value_or(false)) {
+            note_health("software", skip_token(software_state));
+            ctx.write_output(std::format("tar|collect_software|0|{}", skip_token(software_state)));
             return 0;
         }
 
@@ -2573,9 +2590,10 @@ private:
         // disable racing a mid-flight tick can neither insert events from the
         // paused window nor re-seed a baseline after the disable cleared it
         // (mirrors the perf/procperf post-lock re-check).
-        if (!source_enabled(*db_, "software")) {
-            note_health("software", yuzu::tar::kCollectStatusSourceDisabled);
-            ctx.write_output("tar|collect_software|0|source_disabled");
+        const auto software_locked = yuzu::tar::source_enabled_state(*db_, "software");
+        if (!software_locked.value_or(false)) {
+            note_health("software", skip_token(software_locked));
+            ctx.write_output(std::format("tar|collect_software|0|{}", skip_token(software_locked)));
             return 0;
         }
 
