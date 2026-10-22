@@ -169,7 +169,7 @@ TEST_CASE("MCP twin completeness: every registry tool is a ledger mcp_twin",
     REQUIRE(ledger.files >= kMinLedgerFiles);
     REQUIRE_FALSE(ledger.names.empty());
 
-    CHECK(kLedgerBackfill.size() <= kLedgerBackfillCap); // a new gap is fixed, not listed
+    CHECK(kLedgerBackfill.size() == kLedgerBackfillCap); // shrink-only: a fix lowers the cap in the same change
     const auto failures =
         membership_failures("the API-parity ledger", names, ledger.names, kLedgerBackfill);
     INFO("failures:" << join(failures));
@@ -186,7 +186,7 @@ TEST_CASE("MCP twin completeness: every registry tool has a kExpectedTwins row",
     const auto expected = expected_twin_names();
     REQUIRE_FALSE(expected.empty());
 
-    CHECK(kExpectedTwinsBackfill.size() <= kExpectedTwinsBackfillCap);
+    CHECK(kExpectedTwinsBackfill.size() == kExpectedTwinsBackfillCap); // shrink-only: lower the cap with the entry
     const auto failures =
         membership_failures("kExpectedTwins", names, expected, kExpectedTwinsBackfill);
     INFO("failures:" << join(failures));

@@ -120,10 +120,14 @@ WHAT IT CHECKS
      gate) fails CLOSED unless named in the size-pinned, shrink-only
      GATE_PARITY_NO_GATE_ALLOWED; a mismatch is an error unless named, with its
      exact two gates and a reason, in GATE_PARITY_KNOWN_MISMATCHES (same pin and
-     shrink-only rules; a stale or reshaped entry fails). LIMITS: first gate call
-     in the text, not the strictest on any path; an inline refusal before the gate
-     (deny_fleet_wide_service_scoped) and an in-handler second gate are not read;
-     a row with a null twin on either side compares nothing.
+     shrink-only rules; a stale or reshaped entry fails). LIMITS: it compares LABELS,
+     not effect (the REST kind is the management-group axis, the MCP kind the
+     service-scope axis, so a matching or mismatching label proves neither); first
+     gate call in the text, not the strictest on any path, and a conditional or
+     helper-lambda call that comes first is read as the route's gate; an inline
+     refusal before the gate (deny_fleet_wide_service_scoped) and an in-handler
+     second gate are not read; a row with a null twin on either side compares
+     nothing. A row whose route or tool cannot be found is an error, never a skip.
   7. REGISTRY TEST EXISTENCE. Every registry tool's domain test file
      tests/unit/server/test_mcp_tools_<domain>.cpp must exist, name the tool in a
      string literal, call `schema_violation(` and hold a CHECK/REQUIRE that mentions
@@ -484,7 +488,7 @@ STRICT_EXCEPTION_PINS = {
     "get.fragments-hardware-ci-stored-data": (2102, "2027-01-13"),
     # #5357: admin password reset has no MCP twin (ADR-1005 2026-10-04 passwords entry).
     "post.api-v1-users-param-password": (5357, "2027-01-04"),
-    # #4041: MCP list_agents is unconfined by design while GET /api/v1/devices is confined; ADR-1005 2026-10-23 entry.
+    # #4041: MCP list_agents is unconfined (a known gap) while GET /api/v1/devices is confined; ADR-1005 2026-10-23 entry.
     "get.api-agents": (4041, "2027-01-31"),
     # #6061: approve/reject is a human-session act, MCP approve_request/reject_request permanently refuse (ADR-1005 exception entry).
     "post.api-approvals-param-approve": (6061, "2027-01-18"),
@@ -1965,7 +1969,8 @@ def extract_mcp_security():
 # Check 6 allowlists. Both are SHRINK-ONLY and SIZE-PINNED (pattern: GRANDFATHERED_MAX): each entry
 # must still be a live finding, the table's size must equal its MAX, and an entry whose finding
 # changes shape (a different gate on either side) is stale. A fix removes its entry AND lowers the
-# MAX in the same change; adding an entry needs a reviewed reason, never to unblock a new twin.
+# MAX in the same change. Adding an entry (and raising the MAX) is a reviewed deferral that needs a
+# reason, a tracking issue and a ruling recorded in ADR-1005; never a way to unblock a new twin.
 #
 # KNOWN_MISMATCHES: (METHOD, canonical REST path, tool) -> (REST gate, MCP gate, reason), where a
 # gate reads `<kind>:<Securable>:<Operation>`. REST kind is plain (perm_fn / require_permission),
@@ -1977,9 +1982,9 @@ GATE_PARITY_KNOWN_MISMATCHES_MAX = 19
 GATE_PARITY_KNOWN_MISMATCHES = {
     ("GET", "/api/v1/devices", "list_agents"): (
         "fleet:Infrastructure:Read", "denied:Infrastructure:Read",
-        "REST is the confined fleet read; the MCP row stays `denied` on purpose "
-        "(kToolSecurityRows #4027 comment: service-scoped tokens are structurally denied, parity "
-        "with the device-picker REST guard)"),
+        "REST is the confined fleet read; the MCP handler applies no management-group confinement "
+        "(known gap, tracked by #4041) and its row is `denied` for service-scoped tokens "
+        "(kToolSecurityRows #4027 comment)"),
     ("GET", "/api/v1/dex/app", "get_dex_app"): (
         "plain:GuaranteedState:Read", "confined:GuaranteedState:Read",
         "REST gates on plain perm_fn behind an inline deny_fleet_wide_service_scoped refusal (a "
@@ -2015,9 +2020,8 @@ GATE_PARITY_KNOWN_MISMATCHES = {
         "MCP row is the default `denied`. Unadjudicated at seed"),
     ("GET", "/api/v1/inventory/tables", "list_inventory_tables"): (
         "plain:Inventory:Read", "denied:Infrastructure:Read",
-        "REST requires Inventory:Read, the MCP tool Infrastructure:Read: a caller holding only "
-        "one of the two reads the table list on one surface and not the other. Unadjudicated at "
-        "seed (noted in the twin-completeness design review)"),
+        "REST requires Inventory:Read, the MCP tool Infrastructure:Read. Unadjudicated at seed; "
+        "tracked by #6329"),
     ("GET", "/api/v1/network/devices", "list_network_devices"): (
         "plain:GuaranteedState:Read", "confined:GuaranteedState:Read",
         "REST gates on plain perm_fn behind an inline deny_fleet_wide_service_scoped refusal (a "
@@ -2044,7 +2048,7 @@ GATE_PARITY_KNOWN_MISMATCHES = {
         "the default `denied`. Unadjudicated at seed"),
     ("GET", "/api/v1/schedules", "list_schedules"): (
         "plain:Schedule:Read", "confined:Schedule:Read",
-        "REST gates on plain perm_fn behind an inline deny_fleet_wide_service_scoped refusal (a "
+        "REST gates on plain perm_fn behind an inline deny_service_scoped_schedule_list refusal (a "
         "service-scoped token is refused outright); the MCP row is `confined`, so the two differ "
         "in confinement kind"),
     ("GET", "/api/v1/tar/capture-sources", "list_tar_capture_sources_devices"): (
@@ -2061,8 +2065,9 @@ GATE_PARITY_KNOWN_MISMATCHES = {
         "on purpose (kToolSecurityRows #4027 comment, parity with the REST service-scope 403)"),
     ("POST", "/api/v1/result-sets", "create_result_set"): (
         "fleet:Infrastructure:Read", "denied:Infrastructure:Write",
-        "OPERATION differs: REST create is gated on the fleet read of Infrastructure:Read (after "
-        "a service-scope refusal), the MCP tool on Infrastructure:Write. Unadjudicated at seed"),
+        "The first gate call this script reads in the REST handler is a conditional one (a "
+        "device-existence read), not necessarily the route's gate, so the operation difference "
+        "may be a limit of the lexical read. Unadjudicated at seed; tracked by #6329"),
 }
 # NO_GATE_ALLOWED: (METHOD, canonical REST path, tool) -> reason. A twinned route whose handler
 # holds no gate call this script recognises (owner-only reads that call auth_fn alone, helper
@@ -2107,7 +2112,8 @@ TEST_EXISTENCE_ALLOWED_MAX = 1
 TEST_EXISTENCE_ALLOWED = {
     "discover_routes": (
         "the discovery domain has no tests/unit/server/test_mcp_tools_discovery.cpp yet (only "
-        "incidental references in test_mcp_dispatch_coverage.cpp and test_mcp_tools_hardware.cpp)"),
+        "incidental references in test_mcp_dispatch_coverage.cpp, test_mcp_server.cpp and "
+        "test_mcp_tools_hardware.cpp)"),
 }
 
 _AUDIT_ASSERT = re.compile(r"\b(?:CHECK|REQUIRE)\w*\s*\([^;]*audit", re.IGNORECASE)
@@ -2121,8 +2127,8 @@ def gate_parity_findings(ledger_rows, mcp_tools, rest_gates, mcp_security):
     """Check 6 core (pure, selftested): (mismatches, no_gates, errors). Every ledger row whose
     mcp_twin is a tool name (not `resource:`) AND whose rest_v1_twin is an object is compared;
     a row with a null twin on either side compares nothing (a REST-only or MCP-only capability
-    has no pair to hold against its other half), and a twin check 2 already reports as missing
-    is skipped here. mismatches is {key: (rest_gate, mcp_gate)}, no_gates {key: why}, where key
+    has no pair to hold against its other half), and a tool check 2 already reports as missing
+    is skipped here; a REST route this script cannot locate is an error, never a skip. mismatches is {key: (rest_gate, mcp_gate)}, no_gates {key: why}, where key
     is (METHOD, canonical REST path, tool)."""
     mismatches, no_gates, errors = {}, {}, []
     for row in ledger_rows.values():
@@ -2130,7 +2136,12 @@ def gate_parity_findings(ledger_rows, mcp_tools, rest_gates, mcp_security):
         if not tool or tool.startswith(RESOURCE_TWIN_PREFIX) or not isinstance(rest, dict):
             continue
         route = (rest["method"], canonicalize(rest["path"]))
-        if tool not in mcp_tools or route not in rest_gates:
+        if tool not in mcp_tools:
+            continue
+        if route not in rest_gates:
+            errors.append(f"{row['_file']}: gate parity could not locate the REST handler for "
+                          f"{route[0]} {route[1]} (MCP twin {tool!r}); a row that cannot be compared is "
+                          f"an error, never a silent skip")
             continue
         key = (route[0], route[1], tool)
         mcp = mcp_security.get(tool)
@@ -2178,8 +2189,9 @@ def gate_parity_errors(mismatches, no_gates, errors=()):
         if pinned is not None and pinned[:2] == (rest_desc, mcp_desc):
             continue
         out.append(f"gate parity: {key[0]} {key[1]} gates on {rest_desc} but its MCP twin {key[2]!r} "
-                   f"gates on {mcp_desc} - align the two gates, or add the row to "
-                   f"GATE_PARITY_KNOWN_MISMATCHES with a reason (and raise its MAX) in this change"
+                   f"gates on {mcp_desc} - align the two gates; a reviewed deferral is "
+                   f"named in GATE_PARITY_KNOWN_MISMATCHES with a reason and a tracking issue, and its "
+                   f"MAX changes only under a ruling recorded in ADR-1005"
                    + (f" (the pinned entry reads {pinned[0]} / {pinned[1]} - it went stale)" if pinned else ""))
     for key, why in sorted(no_gates.items()):
         if key in GATE_PARITY_NO_GATE_ALLOWED:
@@ -3341,13 +3353,18 @@ def _selftest_body():
               "t_none": ("Sec", "Read", "denied"), "t_null": ("Bad", "Bad", "denied")}
     mism, nog, errs = gate_parity_findings(gp_rows, gp_tools, gp_rest, gp_mcp)
     check(set(mism) == {("GET", "/api/v1/y", "t_sec"), ("GET", "/api/v1/z", "t_op"), ("GET", "/api/v1/w", "t_conf")}
-          and mism[("GET", "/api/v1/w", "t_conf")] == ("fleet:Sec:Read", "denied:Sec:Read") and errs == [],
-          f"gate parity: securable, operation and confinement mismatches are found (and only those), got {mism} {errs}")
+          and mism[("GET", "/api/v1/w", "t_conf")] == ("fleet:Sec:Read", "denied:Sec:Read")
+          and len(errs) == 1 and "could not locate the REST handler for GET /api/v1/gone" in errs[0],
+          f"gate parity: securable, operation and confinement mismatches are found (and only those), and "
+          f"a route the script cannot locate is an error rather than a skip, got {mism} {errs}")
     check(set(nog) == {("GET", "/api/v1/v", "t_none")},
           f"gate parity: a route with no gate fails closed; null-twin, resource and unknown-tool rows compare nothing, got {nog}")
     _m, _n, e2 = gate_parity_findings(gp_rows, gp_tools | {"t_missing_sec"}, gp_rest,
                                       {k: v for k, v in gp_mcp.items() if k != "t_ok"})
     check(any("t_ok" in e for e in e2), f"gate parity: a catalogue tool with no readable security pair is an error, got {e2}")
+    import inspect
+    check("gate_checks(" in inspect.getsource(run_check),
+          "gate parity: run_check still calls gate_checks (checks 6 and 7 are not wired out of the gate)")
     conf = ("fleet:Sec:Read", "denied:Sec:Read")
     with _patched(GATE_PARITY_KNOWN_MISMATCHES={}, GATE_PARITY_KNOWN_MISMATCHES_MAX=0,
                   GATE_PARITY_NO_GATE_ALLOWED={}, GATE_PARITY_NO_GATE_MAX=0):

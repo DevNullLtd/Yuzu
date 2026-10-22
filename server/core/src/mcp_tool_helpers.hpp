@@ -11,6 +11,11 @@
 // (test_mcp_dispatch_coverage.cpp): it names no store, agent registry, server class or
 // auth database header, only the registry seam, the JSON-RPC constants and the shared
 // audit kernel.
+//
+// The names answer, answer_unwired and dump_replace are reserved in yuzu::server::mcp: a domain
+// file that defines its own copy next to these gets an ambiguous-call error, so extend the
+// helper instead. answer_unwired answers a non-retryable kInternalError by design (the
+// retry-hint gate does not scan this header); a transient fault needs its own a4_error call.
 
 #include "mcp_jsonrpc.hpp"       // kInternalError
 #include "mcp_tool_deps.hpp"     // ToolDeps::audit_fn

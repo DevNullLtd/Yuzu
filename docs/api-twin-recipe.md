@@ -307,7 +307,10 @@ so the record is not a single point of truth: keep the two in step. (A confined 
    Either kind builds results with `ctx.tool_result`, errors with `ctx.a4_error` and audit rows with
    `ctx.audit`. Those are `std::function`s, so pass every argument: `-1` for `retry_after_ms` when
    there is none, and when it is not `-1` write the `/*retry_after_ms=*/` comment next to the value,
-   because the gate matches that token. The handler must complete synchronously and must never
+   because the gate matches that token. `answer_unwired` in `mcp_tool_helpers.hpp` is the shared
+   unwired-provider answer: it hardwires a non-retryable `kInternalError` (the retry-hint gate does
+   not scan that header), so a fault that is transient needs its own `ctx.a4_error` call with a
+   hint, and it writes a domain audit row only when you pass one. The handler must complete synchronously and must never
    capture or store `ctx` (it borrows request-frame objects). A handler that returns without
    responding is turned into an A4 internal error (-32603) plus a `failure` audit row, never an
    empty 200.
