@@ -2197,28 +2197,34 @@ rows that already shared a session id (expected: none) and logs
 `migration v5 tombstoned N agent_routes row(s)` once; the count is exported as
 `yuzu_server_gateway_route_session_dedup_total`. A non-zero value means those
 agents re-registered through the normal heartbeat replay (one or two heartbeat
-cycles, up to about 6 minutes if the gateway circuit breaker had opened); find how the duplicate arose. The counter is present when the server
-runs with `--gateway-upstream` and reads the migration of THIS start only: it
-reads 0 on any later restart. The durable record is the `route_meta` row
+cycles, up to about 6 minutes if the gateway circuit breaker had opened); find
+how the duplicate arose. The counter is present when the server runs with
+`--gateway-upstream` and reads the migration of THIS start only: it reads 0 on
+any later restart. The durable record is the `route_meta` row
 (`SELECT value FROM gateway_route_store.route_meta WHERE key = 'v5_session_dedup_tombstoned_rows';`),
 and a later start logs it once at INFO. A tombstoned agent's replay can lose the
 race to another tombstoned agent that presented the same id first; the loser is
 refused (`session_held_by_other_agent`) and re-registers with a fresh session.
 So when `YuzuGatewaySessionHeldByOtherAgent` fires, the refusals can be the
 one-time migration artifact ONLY IF BOTH hold: (a) the number of
-`op="proxy_register"` `session_held_by_other_agent` refusals since that start is
-at most N, the number of rows migration v5 tombstoned on that start
-(`yuzu_server_gateway_route_session_dedup_total` on the migrating start; the
+`op="proxy_register"` `session_held_by_other_agent` refusals since that start,
+summed over every server replica, is at most N, the number of rows migration v5
+tombstoned on that start (`yuzu_server_gateway_route_session_dedup_total` on the
+migrating start; the
 `migration v5 tombstoned N` WARN, or the `route_meta` value after a restart),
 because a tombstoned group of k rows can produce at most k-1 refusals (N is a
-safe upper bound); any `op="announce_connected"` refusal is NOT the artifact;
-and (b) they all occur within that start's window: one or two 30 s agent
-heartbeat cycles, plus up to 300 s more if the gateway circuit breaker opened
-while the server was down (cap `circuit_breaker_max_reset_timeout_ms` in
-`gateway/config/sys.config`), plus the replay drip; allow roughly 6 minutes.
-Refusals that continue past that window, or exceed N, are NOT the artifact:
-treat them as a forged or colliding id and escalate. Refusals inside the bound
-and the window are still NOT proof of benignness: a forged presenter acting at
+safe upper bound; the recovery block's own tombstones produce the same refusals
+but `route_meta` does not count them, so record that `UPDATE`'s row count and
+time and apply the same rule); any `op="announce_connected"` refusal is NOT the
+artifact; and (b) they all occur within that start's window: one or two agent
+heartbeat cycles (30 s by default, `--heartbeat` changes it), plus up to 300 s
+of breaker backoff (cap `circuit_breaker_max_reset_timeout_ms` in
+`gateway/config/sys.config`), plus the replay drip (about 20 ms per agent on
+that gateway): allow roughly 6 minutes plus 20 ms per agent at the defaults.
+Refusals that continue past that window, or exceed N, are NOT the artifact
+(escalating errs on the safe side): treat them as a forged or colliding id.
+Refusals inside the bound and the window are still NOT proof of benignness: a
+forged presenter acting at
 the same time could hide inside them, and a forger that wins the reclaim of a
 tombstoned id makes the legitimate agents' refusals look identical. The rule
 only lets you stop escalating once refusals have stopped inside the window:
@@ -2242,8 +2248,8 @@ error, `ProxyRegister` answers `UNAVAILABLE` and the gateway counts that against
 its circuit breaker.
 
 0. Check first whether the correct index exists:
-   `SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'gateway_route_store' AND c.relname = 'ux_agent_routes_session_id' AND i.indisunique AND i.indisvalid AND i.indpred IS NOT NULL;`
-   A row means the index exists, is unique, is valid and is partial: do not run
+   `SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'gateway_route_store' AND c.relname = 'ux_agent_routes_session_id' AND i.indrelid = 'gateway_route_store.agent_routes'::regclass AND i.indnatts = 1 AND i.indkey[0] = (SELECT attnum FROM pg_attribute WHERE attrelid = i.indrelid AND attname = 'session_id') AND i.indisunique AND i.indisvalid AND i.indpred IS NOT NULL;`
+   A row means the index is unique, valid, partial and on `agent_routes(session_id)`: do not run
    the block below (the duplicate is already gone and the alert clears within
    the hour; running it anyway is harmless but rebuilds the index under the
    lock). No row means it is missing, invalid or of another shape: continue.

@@ -593,7 +593,7 @@ unheld session id used to both succeed; now the second is refused (`FAILED_PRECO
   depends on the server with `condition: service_healthy` makes `docker compose up` fail once the
   server's `start_period` plus `interval` x `retries` is exceeded (the shipped
   `deploy/docker/docker-compose.reference-gateway.yml` gives the server about 310 s: `start_period` 10 s
-  plus 30 retries x 10 s, and its gateway service waits on it; `docker-compose.uat.yml` allows 50 s with
+  plus 30 retries x 10 s, and its gateway service waits on it; the root `docker-compose.uat.yml` allows 50 s with
   no `start_period`, but no service in that file waits on the server), so size those to the measured
   build time PLUS the up-to-30 s lock wait described below. systemd's `TimeoutStartSec` does not apply
   to the `Type=simple` `yuzu-server.service`. A Kubernetes `startupProbe` or `livenessProbe` that gives up first
@@ -613,7 +613,8 @@ unheld session id used to both succeed; now the second is refused (`FAILED_PRECO
 - **Existing duplicates are cleared, not kept.** If two rows already shared a session id (expected: none),
   every row of that group is tombstoned, because no row can be shown to be the legitimate owner. Each
   affected agent re-establishes its route through the normal heartbeat replay within one heartbeat cycle
-  or two (up to about 6 minutes if the gateway circuit breaker had opened). The count is logged once as `migration v5 tombstoned N agent_routes row(s)` and exported as
+  or two (up to about 6 minutes if the gateway circuit breaker had opened). The count is logged once as
+  `migration v5 tombstoned N agent_routes row(s)` and exported as
   `yuzu_server_gateway_route_session_dedup_total`. That counter is present whenever `--gateway-upstream`
   is configured (the route store, the migration, the lock and the counter exist only then) and is 0 on
   a clean database. It reports the migration of THIS start only, so it reads 0 on any later restart:
@@ -622,16 +623,18 @@ unheld session id used to both succeed; now the second is refused (`FAILED_PRECO
   counter must use `> 0`, not `increase()`. While those agents re-register, some replays are refused
   as `session_held_by_other_agent` and raise `YuzuGatewaySessionHeldByOtherAgent`. Those refusals are
   the one-time migration artifact ONLY IF BOTH hold: (a) the number of `op="proxy_register"`
-  `session_held_by_other_agent` refusals since that start is at most N, the number of rows migration v5
-  tombstoned on that start (`yuzu_server_gateway_route_session_dedup_total` on the migrating start; the
-  `migration v5 tombstoned N` WARN, or the `route_meta` value after a restart), because a tombstoned
-  group of k rows can produce at most k-1 refusals (N is a safe upper bound); any
+  `session_held_by_other_agent` refusals since that start, summed over every server replica, is at most
+  N, the number of rows migration v5 tombstoned on that start
+  (`yuzu_server_gateway_route_session_dedup_total` on the migrating start; the `migration v5 tombstoned N`
+  WARN, or the `route_meta` value after a restart), because a tombstoned group of k rows can produce at
+  most k-1 refusals (N is a safe upper bound); any
   `op="announce_connected"` refusal is NOT the artifact; and (b) they all occur within that start's
-  window: one or two 30 s agent heartbeat cycles, plus up to 300 s more if the gateway circuit breaker
-  opened while the server was down (cap `circuit_breaker_max_reset_timeout_ms` in
-  `gateway/config/sys.config`), plus the replay drip; allow roughly 6 minutes. Refusals past that window,
-  or more than N, are NOT the artifact: treat them as a forged or colliding id and escalate. Refusals
-  inside the bound and the window are still NOT proof of benignness (a forged presenter acting at the
+  window: one or two agent heartbeat cycles (30 s by default, `--heartbeat` changes it), plus up to 300 s
+  of breaker backoff (cap `circuit_breaker_max_reset_timeout_ms` in `gateway/config/sys.config`), plus the
+  replay drip (about 20 ms per agent on that gateway): allow roughly 6 minutes plus 20 ms per agent at the
+  defaults. Refusals past that window, or more than N, are NOT the artifact (escalating errs on the safe
+  side): treat them as a forged or colliding id. Refusals inside the bound and the window are still NOT
+  proof of benignness (a forged presenter acting at the
   same time could hide inside them): re-check the count after the window has passed and do not silence
   the alert beyond it (it uses `increase()[1h]`, so a silence would hide later refusals). The counter
   keeps its migrating-start value for the whole process lifetime, so it proves nothing about timing:
