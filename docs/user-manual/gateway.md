@@ -1711,8 +1711,8 @@ failures now count toward the shared breaker (see below).
   `op="announce_connected"` refusals `session_held_by_other_agent` and the
   affinity pre-check `cluster_affinity_violation`, which answer
   `acknowledged=false`; the post-write `cluster_affinity_violation` arm answers
-  `acknowledged=true` today (#5977), so the gateway sees no refusal there.
-  Recovery is the same: the agent's next reconnect.
+  `acknowledged=true` today (#5977), so the server does not count it as a
+  refusal. Recovery is the same: the agent's next reconnect.
 - Correctness on several core replicas (see below).
 - Any order beyond first-in, first-out in sorted session-id order. The gateway
   sorts the ids it keeps from one response, so each verdict's agents are queued

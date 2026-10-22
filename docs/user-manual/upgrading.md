@@ -616,7 +616,7 @@ is refused (`FAILED_PRECONDITION`, counted as
   `[PG] Refusing to start: gateway-route store migration/open failed`, and **the server exits**. Under a
   supervisor with a restart policy (a container `restart: on-failure` / `unless-stopped`, systemd
   `Restart=on-failure` with `RestartSec=5`) it is started again and retries about every 35 s, until the
-  blocker is cleared (systemd's start limit does not trip at that cadence). Nothing is half-applied.
+  blocker is cleared (systemd's start limit does not trip at that cadence; a failure that exits within a second, such as an existing wrong-shape `ux_agent_routes_session_id`, does trip the shipped unit's `StartLimitBurst=3` within about 15 s, after which `systemctl reset-failed yuzu-server` is needed once the object is dropped). Nothing is half-applied.
   End the blocking session (`pg_locks` / `pg_stat_activity`); the next attempt succeeds.
 - **Existing duplicates are cleared, not kept.** If two rows already shared a session id (expected: none),
   every row of that group is tombstoned, because no row can be shown to be the legitimate owner. Each
