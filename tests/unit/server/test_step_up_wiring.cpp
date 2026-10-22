@@ -1302,6 +1302,27 @@ TEST_CASE("wiring: with real session resolution, a credential change mid-request
     }
 }
 
+// Anchor for the order check below: with a FRESH proof the central check passes, the handler runs
+// and its same-site gate audits `csrf.denied` for the foreign Origin. This is the row the order
+// check asserts the absence of, so a harness that never emitted it could not make that check fail.
+TEST_CASE("wiring: a fresh cookie proof with a foreign Origin reaches the handler, whose cross-site "
+          "check audits csrf.denied",
+          "[stepup][wiring][approval_routes]") {
+    ApprovalWiringServer s;
+    s.set_session(make_session("alice", "local", Role::admin, 5s));
+    auto r = s.post("/api/approvals/abc123/approve", /*same_site_origin=*/false,
+                    "http://evil.example");
+    REQUIRE(r);
+    CHECK(s.gate_count("pass", "local") == 1);
+    bool csrf_row = false;
+    {
+        std::lock_guard lk(s.mu);
+        for (const auto& a : s.handler_audits)
+            csrf_row = csrf_row || a.action == "csrf.denied";
+    }
+    CHECK(csrf_row);
+}
+
 // Order check: the central step-up refusal precedes the handler's cross-site check. A stale cookie
 // proof with a foreign Origin is answered by the central check (401, step-up envelope) and the
 // handler's same-site gate, which would audit a `csrf.denied` row, never runs.

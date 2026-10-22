@@ -13,8 +13,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
+#include <fstream>
 #include <future>
+#include <iterator>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -337,6 +340,77 @@ TEST_CASE("PgPool connect_breaker_open closes at once when the breaker is cleare
     CHECK(pool.connect_breaker_open());
     PgPoolTestAccess::set_connect_blocked_until(pool, {});
     CHECK_FALSE(pool.connect_breaker_open());
+}
+
+// The case above drives the helper through a friend seam, so it cannot see a clear site that stops
+// calling the helper. This floor scans pg_pool.cpp (comments stripped): the breaker deadline is
+// assigned in exactly one place, inside `set_connect_blocked_until_locked`, together with the
+// store to the lock-free mirror `connect_breaker_open()` reads. A direct assignment at the arm or
+// clear site would update the deadline and leave the mirror stale. It is a source-text floor: it
+// fails if a second assignment appears, not if the helper is made ineffective.
+TEST_CASE("PgPool assigns the breaker deadline only inside its single writer helper",
+          "[pool][breaker][lexical]") {
+    std::ifstream in(std::string(YUZU_SERVER_SRC_DIR) + "/pg/pg_pool.cpp", std::ios::binary);
+    REQUIRE(in.good());
+    const std::string raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+
+    // Strip `//` comments line by line (the file has no `//` inside a string literal that matters
+    // here; a stray one only hides text, which makes the counts smaller and the checks fail loud).
+    std::string src;
+    for (std::size_t at = 0; at < raw.size();) {
+        auto end = raw.find('\n', at);
+        if (end == std::string::npos)
+            end = raw.size();
+        const auto line = raw.substr(at, end - at);
+        src += line.substr(0, line.find("//"));
+        src += '\n';
+        at = end + 1;
+    }
+
+    const auto is_ident = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+    };
+    // Offsets of `name` used as the target of a plain assignment (`name =`, not `name ==`), as a
+    // whole identifier (so `connect_blocked_until_rep_` does not match `connect_blocked_until_`).
+    const auto assignments = [&](std::string_view name) {
+        std::vector<std::size_t> hits;
+        for (auto at = src.find(name); at != std::string::npos; at = src.find(name, at + 1)) {
+            if (at > 0 && is_ident(src[at - 1]))
+                continue;
+            auto next = at + name.size();
+            if (next < src.size() && is_ident(src[next]))
+                continue;
+            while (next < src.size() && (src[next] == ' ' || src[next] == '\t'))
+                ++next;
+            if (next < src.size() && src[next] == '=' &&
+                (next + 1 >= src.size() || src[next + 1] != '='))
+                hits.push_back(at);
+        }
+        return hits;
+    };
+
+    const auto helper_at = src.find("void PgPool::set_connect_blocked_until_locked(");
+    REQUIRE(helper_at != std::string::npos);
+    const auto helper_end = src.find("\n}", helper_at);
+    REQUIRE(helper_end != std::string::npos);
+
+    const auto deadline = assignments("connect_blocked_until_");
+    REQUIRE(deadline.size() == 1);
+    CHECK(deadline[0] > helper_at);
+    CHECK(deadline[0] < helper_end);
+
+    // The mirror is stored from the same helper and nowhere else.
+    constexpr std::string_view kMirrorStore = "connect_blocked_until_rep_.store(";
+    std::size_t stores = 0;
+    std::size_t store_at = 0;
+    for (auto at = src.find(kMirrorStore); at != std::string::npos;
+         at = src.find(kMirrorStore, at + 1)) {
+        ++stores;
+        store_at = at;
+    }
+    REQUIRE(stores == 1);
+    CHECK(store_at > helper_at);
+    CHECK(store_at < helper_end);
 }
 
 TEST_CASE("PgPool connect_breaker_open does not wait on the pool lock", "[pool][breaker]") {

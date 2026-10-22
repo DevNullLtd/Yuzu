@@ -1653,15 +1653,11 @@ TEST_CASE("pass identity: consumed only by the principal that earned it", "[step
             StepUpChokepointResult::kPassed);
 
     // A mismatch refuses AND spends the pass: the earning principal cannot consume it afterwards
-    // either, and the post-routing report does not count a skipped gate for a pass the handler
-    // refused.
+    // either. (That the spent pass is not reported as a skipped gate is pinned separately below,
+    // where nothing consumes it before the post-routing report.)
     const auto refused_and_cleared = [&](const auth::Session& handler_session) {
         CHECK_FALSE(detail::consume_step_up_pass(req, handler_session, std::string(kTokensLabel)));
         CHECK_FALSE(detail::consume_step_up_pass(req, earned, std::string(kTokensLabel)));
-        httplib::Response done;
-        done.status = 200;
-        detail::finish_step_up_pass(req, done, &rig.metrics);
-        CHECK(rig.gate_count("handler_skipped", "local", "rest") == 0);
     };
 
     SECTION("the same identity consumes it, once") {
@@ -1696,6 +1692,16 @@ TEST_CASE("pass identity: consumed only by the principal that earned it", "[step
     }
     SECTION("an engine session with a different name is refused too") {
         refused_and_cleared(engine_session("engine:ci"));
+    }
+    SECTION("a refused pass is not reported as a skipped gate") {
+        // Nothing consumes the pass after the mismatch, so the count below is decided by the
+        // refusal alone: an unspent pass on this 2xx would be counted once.
+        CHECK_FALSE(detail::consume_step_up_pass(req, make_session("bob", "local", Role::admin),
+                                                 std::string(kTokensLabel)));
+        httplib::Response done;
+        done.status = 200;
+        detail::finish_step_up_pass(req, done, &rig.metrics);
+        CHECK(rig.gate_count("handler_skipped", "local", "rest") == 0);
     }
     SECTION("a refusal on identity leaves a later request's pass unaffected") {
         refused_and_cleared(make_session("bob", "local", Role::admin, ago(10s)));
