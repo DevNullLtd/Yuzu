@@ -24,7 +24,6 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
-#include <thread>
 #include <vector>
 
 using namespace yuzu::server;

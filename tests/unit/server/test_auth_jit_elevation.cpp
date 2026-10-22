@@ -274,8 +274,6 @@ TEST_CASE("AuthManager::reap_expired_elevation is exactly-once under concurrent 
     auto token = mgr->authenticate("grace", "secret123456");
     REQUIRE(token.has_value());
     REQUIRE(mgr->elevate_session(*token, std::chrono::seconds(1)).has_value());
-    // Moves the 1s elevation window's deadline (elevated_until and the steady
-    // deadline is_elevated reads) 2000 ms into the past, so it has lapsed.
     mgr->lapse_elevation_for_test(*token, std::chrono::milliseconds(2000));
 
     // Two threads race reap_expired_elevation on the SAME already-lapsed
@@ -921,8 +919,6 @@ TEST_CASE("role.elevation.expired is audited lazily on the next authenticated "
     // UP-1/UP-4) REJECTS a request that would clamp to `until <= now` rather
     // than granting a zero-length window.
     REQUIRE(h.auth_mgr.elevate_session(token, std::chrono::seconds(1)).has_value());
-    // Moves the 1s elevation window's deadline (elevated_until and the steady
-    // deadline is_elevated reads) 2000 ms into the past, so it has lapsed.
     h.auth_mgr.lapse_elevation_for_test(token, std::chrono::milliseconds(2000));
     CHECK(h.count_audits("role.elevation.expired", "alice") == 0);
 
@@ -963,8 +959,6 @@ TEST_CASE("a reap that fires within a request leaves THAT request's session "
     JitHarness h;
     auto token = h.session_for("alice");
     REQUIRE(h.auth_mgr.elevate_session(token, std::chrono::seconds(1)).has_value());
-    // Moves the 1s elevation window's deadline (elevated_until and the steady
-    // deadline is_elevated reads) 2000 ms into the past, so it has lapsed.
     h.auth_mgr.lapse_elevation_for_test(token, std::chrono::milliseconds(2000));
 
     // The lazy reap fires INSIDE resolve_session, on this very request — the
@@ -989,8 +983,6 @@ TEST_CASE("a lazy role.elevation.expired reap survives an unwritable audit store
     JitHarness h(/*audit_store_broken=*/true);
     auto token = h.session_for("alice");
     REQUIRE(h.auth_mgr.elevate_session(token, std::chrono::seconds(1)).has_value());
-    // Moves the 1s elevation window's deadline (elevated_until and the steady
-    // deadline is_elevated reads) 2000 ms into the past, so it has lapsed.
     h.auth_mgr.lapse_elevation_for_test(token, std::chrono::milliseconds(2000));
 
     // The AuditStore can't persist (unopenable path, db_==nullptr) — the

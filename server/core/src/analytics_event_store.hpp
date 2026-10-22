@@ -145,8 +145,9 @@ public:
 
     /// Test hook: true while the background drain thread is started and not yet
     /// stopped (`drain_thread_.joinable()`), so a test can assert the sticky-stop
-    /// latch kept `start_drain()` from restarting it. Production code MUST NOT call
-    /// this — no caller in `server/core/src/**` references it.
+    /// latch kept `start_drain()` from restarting it. Call it from the thread that
+    /// called `start_drain()`/`stop_drain()`: the read is unsynchronised. Production
+    /// code MUST NOT call this — no caller in `server/core/src/**` references it.
     [[nodiscard]] bool drain_running_for_test() const;
 
 private:

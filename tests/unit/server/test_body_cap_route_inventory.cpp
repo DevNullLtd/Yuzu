@@ -110,6 +110,7 @@
 
 #include "body_cap_policy.hpp"
 #include "route_registration_scan.hpp"
+#include "source_scan.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -131,6 +132,7 @@
 
 using yuzu::server::resolve_body_cap;
 namespace route_scan = yuzu::test::route_scan;
+namespace source_scan = yuzu::test::source_scan;
 
 namespace {
 
@@ -205,10 +207,7 @@ std::vector<RegisteredRoute> extract_routes(const std::string& file, const std::
         std::string method = std::move(reg.method);
         std::transform(method.begin(), method.end(), method.begin(),
                        [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-        const int line = static_cast<int>(std::count(
-                             text.begin(),
-                             text.begin() + static_cast<std::ptrdiff_t>(reg.pos), '\n')) +
-                         1;
+        const int line = source_scan::line_of(text, reg.pos);
         out.push_back({file, line, std::move(method), std::move(reg.raw_path)});
     }
     return out;
@@ -236,10 +235,7 @@ std::vector<int> get_handlers_reading_req_body(const std::string& text) {
         const auto start = calls[i].pos;
         const auto end = (i + 1 < calls.size()) ? calls[i + 1].pos : text.size();
         if (text.find("req.body", start) < end) {
-            lines.push_back(static_cast<int>(std::count(
-                                text.begin(), text.begin() + static_cast<std::ptrdiff_t>(start),
-                                '\n')) +
-                            1);
+            lines.push_back(source_scan::line_of(text, start));
         }
     }
     return lines;

@@ -267,8 +267,8 @@ TEST_CASE("HA WS-5: live_presence() caches within its TTL window", "[pg][ha][pre
     auto ids_second = registry.all_ids();
     CHECK_FALSE(contains(ids_second, "cache-agent-2"));
 
-    // Mark the presence cache stale (its fetch time reset to the epoch, always older
-    // than the 3 s TTL) instead of sleeping past the window.
+    // Age the presence cache by one full TTL (so the next read sees it at least a
+    // TTL old) instead of sleeping past the window.
     registry.expire_presence_cache_for_test();
     auto ids_after_ttl = registry.all_ids();
     CHECK(contains(ids_after_ttl, "cache-agent-2"));
