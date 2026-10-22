@@ -309,6 +309,34 @@ in-panel error and caches nothing rather than minting a weak token.
 - **Seed snapshot** (the original §5.1 below) — intentionally not built; revisit only
   if the no-seed completeness limit proves insufficient in the field.
 
+### 5.7 Timeline renderers (building blocks, not yet wired)
+
+`server/core/src/tar_timeline_view.hpp` defines the model of a per-device timeline
+read, and `tar_timeline_render.{hpp,cpp}` holds the pure renderers that turn it into
+the device bar, the "what is kept" chart, the lanes, the moment and selected panels
+and the "What this record cannot tell you" list. No page, route or API uses them yet,
+so nothing is operator-visible.
+
+- **What the model must say.** Each lane covers its window with typed regions (exact,
+  rolled-up, pruned, paused, not readable with a reason, capped with the point it
+  reaches back to). A stretch with no region renders as "Coverage not stated", never
+  as exact. Offline, failed and too-old-agent reads render as not readable, never as
+  empty.
+- **Retention.** An expiry is stated only from the configured policy or a row limit.
+  Measured coverage (the oldest row actually seen) is never turned into an expiry, and
+  a source whose measurement could not be made says so instead of "Gone".
+- **Wording follows the read.** Polling interval, process capture method, operating
+  system and unknown values change the wording; an unknown is worded as unknown, and
+  DNS names are never tied to a process.
+- **Bounds and escaping.** Output is bounded per lane and for the selected panel. Every
+  dynamic value is HTML-escaped; links are supplied by the caller as server-built
+  relative paths with ids percent-encoded, and no route path is fixed in the renderers.
+- **Time.** Every stated time is UTC. Windows outside the years 1970 to 9999 are not
+  drawn.
+
+The data that fills the model (the read, its permissions, audit and the API twins) is
+separate work; this section records the contract it must meet.
+
 ---
 
 <details><summary>Original seed-based design (superseded — kept for history)</summary>

@@ -73,7 +73,64 @@ struct ParkedRead {
                 entered_p.set_value();
                 gate.wait();
             }
+            if (f.down)
+                return std::unexpected(std::string("store down"));
             return f.doc;
+        };
+    }
+};
+
+// A store commit that parks inside the commit, once armed, until release() opens the gate.
+// `result` is what the commit answers; every other call answers at once.
+struct ParkedCommit {
+    std::atomic<bool> armed{false};
+    std::atomic<int> commits{0};
+    std::atomic<bool> released{false};
+    std::expected<bool, std::string> result{true};
+    std::promise<void> entered_p;
+    std::promise<void> release_p;
+    std::future<void> entered = entered_p.get_future();
+    std::shared_future<void> gate = release_p.get_future().share();
+
+    void release() {
+        if (!released.exchange(true))
+            release_p.set_value();
+    }
+    DexScorePolicyProvider::CommitFn fn() {
+        return [this]() -> std::expected<bool, std::string> {
+            ++commits;
+            if (armed.exchange(false)) {
+                entered_p.set_value();
+                gate.wait();
+            }
+            return result;
+        };
+    }
+};
+
+// A clock that parks inside the call, once armed, until release() opens the gate. The provider
+// reads its clock while it installs a written policy (inside the install critical section), so
+// a test can hold a writer exactly there.
+struct ParkedClock {
+    std::atomic<bool> armed{false};
+    std::atomic<bool> released{false};
+    std::int64_t now{1'000'000};
+    std::promise<void> entered_p;
+    std::promise<void> release_p;
+    std::future<void> entered = entered_p.get_future();
+    std::shared_future<void> gate = release_p.get_future().share();
+
+    void release() {
+        if (!released.exchange(true))
+            release_p.set_value();
+    }
+    DexScorePolicyProvider::ClockFn fn() {
+        return [this] {
+            if (armed.exchange(false)) {
+                entered_p.set_value();
+                gate.wait();
+            }
+            return now;
         };
     }
 };
@@ -90,6 +147,20 @@ std::expected<DexPolicyInForce, std::string> current_bounded(DexScorePolicyProvi
     if (fut.wait_for(kParkedWait) != std::future_status::ready) {
         pr.release();
         FAIL("a mid-refresh current() waited on the parked store read");
+    }
+    return fut.get();
+}
+
+// p.write() on its own thread with a bounded wait, like current_bounded: `parked` (a ParkedRead
+// or ParkedCommit) is released on a timeout so the call can finish.
+template <class Parked>
+std::expected<DexPolicyInForce, DexPolicyWriteFailure>
+write_bounded(DexScorePolicyProvider& p, const std::optional<std::string>& text,
+              const DexScorePolicyProvider::CommitFn& commit, Parked& parked) {
+    auto fut = std::async(std::launch::async, [&] { return p.write(text, commit); });
+    if (fut.wait_for(kParkedWait) != std::future_status::ready) {
+        parked.release();
+        FAIL("write() did not complete while the other call was parked");
     }
     return fut.get();
 }
@@ -469,4 +540,356 @@ TEST_CASE("policy provider: the time a failed read takes counts against the stal
         REQUIRE_FALSE(gone);
         CHECK(gone.error().find("store slow") != std::string::npos);
     }
+}
+
+// ── write(): commit-then-install under the writer lock (#6085) ───────────────
+
+namespace {
+const DexScorePolicyProvider::CommitFn kCommitOk = [] { return std::expected<bool, std::string>(true); };
+} // namespace
+
+TEST_CASE("policy provider: write installs at once and restarts the window from the write",
+          "[dex][policy_provider]") {
+    Fixture f;
+    int reads = 0;
+    DexScorePolicyProvider p(f.reader(&reads), f.clock());
+    REQUIRE(p.current());
+    CHECK(reads == 1);
+
+    f.now += 3000;
+    const std::string text = doc_with_excellent(95.0);
+    const auto w = p.write(text, kCommitOk);
+    REQUIRE(w);
+    CHECK(w->source == "custom");
+    CHECK(w->revision == dex_score_policy_revision(text));
+    const auto c = p.current();
+    REQUIRE(c);
+    CHECK(c->source == "custom");
+    CHECK(reads == 1);
+
+    f.now += 4999; // T+7999: the read's own stamp (T) would already have expired
+    REQUIRE(p.current());
+    CHECK(reads == 1);
+    f.now += 1; // exactly kDexPolicyRefreshMs after the write
+    REQUIRE(p.current());
+    CHECK(reads == 2);
+}
+
+TEST_CASE("policy provider: write of nothing or of an invalid document installs the defaults",
+          "[dex][policy_provider]") {
+    Fixture f;
+    int reads = 0;
+    DexScorePolicyProvider p(f.reader(&reads), f.clock());
+    int commits = 0;
+    const DexScorePolicyProvider::CommitFn count = [&commits] {
+        ++commits;
+        return std::expected<bool, std::string>(true);
+    };
+    REQUIRE(p.write(doc_with_excellent(95.0), kCommitOk));
+
+    const auto del = p.write(std::nullopt, count);
+    REQUIRE(del);
+    CHECK(del->source == "default");
+    CHECK(del->fault.empty());
+    CHECK(commits == 1);
+
+    const std::string bad = R"({"overrides":[{"image":"a.exe"},{"image":"a.exe"}]})";
+    const auto inv = p.write(bad, count);
+    REQUIRE(inv);
+    CHECK(inv->source == "default");
+    CHECK(inv->fault == "override_key_duplicate at overrides[1].image");
+    CHECK(commits == 2);
+    const auto c = p.current();
+    REQUIRE(c);
+    CHECK(c->fault == inv->fault);
+    CHECK(reads == 0);
+}
+
+TEST_CASE("policy provider: two overlapping writes both land and the later one is served",
+          "[dex][policy_provider]") {
+    Fixture f;
+    int reads = 0;
+    DexScorePolicyProvider p(f.reader(&reads), f.clock(), kParkedWait);
+    REQUIRE(p.current());
+    CHECK(reads == 1);
+    const std::string a = doc_with_excellent(95.0);
+    const std::string b = doc_with_excellent(92.0);
+    ParkedCommit pa, pb;
+    pa.armed = true;
+    pb.armed = true;
+    // An end-state smoke test: both writes land, B's document is served last and a store read
+    // agrees. It does not pin the lock (whether B's commit starts early is up to the
+    // scheduler, so it can stay green with the lock removed): the lock is pinned by the
+    // WriterBusy case and the install-before-release ordering by the parked-install case, both
+    // below. Declared before the futures and the guard so they outlive the threads that use
+    // them. B's commit records what the provider serves the moment it begins (current() takes
+    // only mu_, and the cache is fresh on the injected clock, so it reads no store).
+    std::string seen_by_b;
+    const DexScorePolicyProvider::CommitFn commit_b = [&]() -> std::expected<bool, std::string> {
+        const auto served = p.current();
+        seen_by_b = served ? served->revision : std::string("error");
+        return pb.fn()();
+    };
+    std::promise<void> b_started;
+    auto b_started_f = b_started.get_future();
+    std::future<std::expected<DexPolicyInForce, DexPolicyWriteFailure>> fb; // declared before the guard
+    auto fa = std::async(std::launch::async, [&] { return p.write(a, pa.fn()); });
+    yuzu::test::ScopeExit finish{[&] {
+        pa.release();
+        pb.release();
+    }};
+    REQUIRE(pa.entered.wait_for(kParkedWait) == std::future_status::ready);
+    // Release A only once B's thread is running, so B races A's release from the start.
+    fb = std::async(std::launch::async, [&] {
+        b_started.set_value();
+        return p.write(b, commit_b);
+    });
+    REQUIRE(b_started_f.wait_for(kParkedWait) == std::future_status::ready);
+
+    pa.release();
+    REQUIRE(pb.entered.wait_for(kParkedWait) == std::future_status::ready);
+    REQUIRE(seen_by_b == dex_score_policy_revision(a));
+    REQUIRE(fa.wait_for(kParkedWait) == std::future_status::ready);
+    const auto wa = fa.get();
+    REQUIRE(wa);
+    CHECK(wa->revision == dex_score_policy_revision(a));
+    const auto mid = p.current();
+    REQUIRE(mid);
+    CHECK(mid->revision == dex_score_policy_revision(a)); // A is installed, B not yet
+    CHECK(reads == 1);
+
+    pb.release();
+    REQUIRE(fb.wait_for(kParkedWait) == std::future_status::ready);
+    const auto wb = fb.get();
+    REQUIRE(wb);
+    CHECK(pb.commits == 1);
+    const auto last = p.current();
+    REQUIRE(last);
+    CHECK(last->revision == dex_score_policy_revision(b)); // B installed last
+    CHECK(reads == 1);
+
+    f.doc = b;
+    f.now += kDexPolicyRefreshMs;
+    const auto again = p.current();
+    REQUIRE(again);
+    CHECK(reads == 2);
+    CHECK(again->revision == dex_score_policy_revision(b));
+}
+
+TEST_CASE("policy provider: a committed-stale write installs nothing", "[dex][policy_provider]") {
+    Fixture f;
+    f.doc = doc_with_excellent(95.0);
+    ParkedRead pr(f);
+    DexScorePolicyProvider p(pr.fn(), f.clock());
+    pr.armed = true;
+    std::thread a([&] { (void)p.current(); }); // parks inside the first read
+    yuzu::test::ScopeExit finish{[&] {
+        pr.release();
+        if (a.joinable())
+            a.join();
+    }};
+    REQUIRE(pr.entered.wait_for(kParkedWait) == std::future_status::ready);
+
+    ParkedCommit pc;
+    pc.result = false;
+    const auto w = write_bounded(p, doc_with_excellent(92.0), pc.fn(), pr);
+    REQUIRE_FALSE(w);
+    CHECK(w.error().kind == DexPolicyWriteError::Stale);
+    CHECK(pc.commits == 1);
+
+    // No generation bump: the parked successful read is still applied when it lands.
+    pr.release();
+    a.join();
+    const auto c = p.current();
+    REQUIRE(c);
+    CHECK(c->revision == dex_score_policy_revision(*f.doc));
+    CHECK(pr.reads == 1);
+}
+
+TEST_CASE("policy provider: a commit error or throw installs nothing and frees the writer lock",
+          "[dex][policy_provider]") {
+    Fixture f;
+    int reads = 0;
+    DexScorePolicyProvider p(f.reader(&reads), f.clock());
+    const std::string text = doc_with_excellent(95.0);
+
+    ParkedCommit pc;
+    pc.result = std::unexpected(std::string("store: database write failed"));
+    const auto e = p.write(text, pc.fn());
+    REQUIRE_FALSE(e);
+    CHECK(e.error().kind == DexPolicyWriteError::CommitFailed);
+    CHECK(e.error().detail == "store: database write failed");
+
+    const auto t = p.write(text, []() -> std::expected<bool, std::string> {
+        throw std::runtime_error("boom");
+    });
+    REQUIRE_FALSE(t);
+    CHECK(t.error().kind == DexPolicyWriteError::CommitFailed);
+    CHECK(t.error().detail.starts_with("commit threw: boom"));
+
+    const auto n = p.write(text, []() -> std::expected<bool, std::string> { throw 7; });
+    REQUIRE_FALSE(n);
+    CHECK(n.error().detail == "commit threw");
+
+    const auto c = p.current(); // nothing was installed: the store (default) answers
+    REQUIRE(c);
+    CHECK(c->source == "default");
+    CHECK(reads == 1);
+    REQUIRE(p.write(text, kCommitOk)); // the writer lock was released each time
+}
+
+TEST_CASE("policy provider: a writer that cannot get the lock is told to retry and never commits",
+          "[dex][policy_provider]") {
+    // The production wait is what the policy write route reports as retry_after_ms and what
+    // mirrors the store's own lease wait; this case injects 0 ms, so it is pinned here at
+    // compile time.
+    STATIC_REQUIRE(kDexPolicyWriterWait == std::chrono::milliseconds(2000));
+    Fixture f;
+    int reads = 0;
+    DexScorePolicyProvider p(f.reader(&reads), f.clock(), std::chrono::milliseconds(0));
+    const std::string a = doc_with_excellent(95.0);
+    const std::string b = doc_with_excellent(92.0);
+    ParkedCommit pa, pb;
+    pa.armed = true;
+    auto fa = std::async(std::launch::async, [&] { return p.write(a, pa.fn()); });
+    yuzu::test::ScopeExit finish{[&] { pa.release(); }};
+    REQUIRE(pa.entered.wait_for(kParkedWait) == std::future_status::ready);
+
+    // Bounded: a wait that blocks behind the parked writer fails here, not at the shard timeout.
+    const auto busy = write_bounded(p, b, pb.fn(), pa);
+    REQUIRE_FALSE(busy);
+    CHECK(busy.error().kind == DexPolicyWriteError::WriterBusy);
+    CHECK(pb.commits == 0);
+
+    pa.release();
+    REQUIRE(fa.wait_for(kParkedWait) == std::future_status::ready);
+    REQUIRE(fa.get());
+    REQUIRE(p.write(b, pb.fn()));
+    CHECK(pb.commits == 1);
+}
+
+TEST_CASE("policy provider: the writer lock is still held while a committed policy installs",
+          "[dex][policy_provider]") {
+    // A is parked inside its install (in the clock read, holding mu_), after its commit
+    // returned. A second writer asks for the lock with a zero wait: a lock released before the
+    // install would let B's commit run (B would answer Stale here, and a real B would then
+    // install behind or ahead of A), so B must be told to retry and its commit must not run.
+    ParkedClock pclock;
+    int reads = 0;
+    Fixture f;
+    DexScorePolicyProvider p(f.reader(&reads), pclock.fn(), std::chrono::milliseconds(0));
+    REQUIRE(p.current());
+    ParkedCommit pa, pb;
+    pb.result = false; // if B's commit ever ran it installs nothing, so this thread never needs mu_
+    pclock.armed = true;
+    const std::string a = doc_with_excellent(95.0);
+    auto fa = std::async(std::launch::async, [&] { return p.write(a, pa.fn()); });
+    yuzu::test::ScopeExit finish{[&] { pclock.release(); }};
+    REQUIRE(pclock.entered.wait_for(kParkedWait) == std::future_status::ready);
+    CHECK(pa.commits == 1); // A's commit is done; it is installing
+
+    const auto busy = write_bounded(p, doc_with_excellent(92.0), pb.fn(), pclock);
+    REQUIRE_FALSE(busy);
+    CHECK(busy.error().kind == DexPolicyWriteError::WriterBusy);
+    CHECK(pb.commits == 0);
+
+    pclock.release();
+    REQUIRE(fa.wait_for(kParkedWait) == std::future_status::ready);
+    const auto wa = fa.get();
+    REQUIRE(wa);
+    CHECK(wa->revision == dex_score_policy_revision(a));
+}
+
+TEST_CASE("policy provider: readers are not blocked while a writer is parked in its commit",
+          "[dex][policy_provider]") {
+    Fixture f;
+    f.doc = doc_with_excellent(90.0);
+    int reads = 0;
+    DexScorePolicyProvider p(f.reader(&reads), f.clock());
+    const std::string a = doc_with_excellent(95.0);
+    ParkedCommit pa;
+    pa.armed = true;
+    // `fr` is declared before the guard: unwinding then releases the parked writer first, so a
+    // current() that blocked behind it finishes and the future's destructor returns.
+    std::future<std::expected<DexPolicyInForce, std::string>> fr;
+    auto fa = std::async(std::launch::async, [&] { return p.write(a, pa.fn()); });
+    yuzu::test::ScopeExit finish{[&] { pa.release(); }};
+    REQUIRE(pa.entered.wait_for(kParkedWait) == std::future_status::ready);
+
+    fr = std::async(std::launch::async, [&] { return p.current(); });
+    REQUIRE(fr.wait_for(kParkedWait) == std::future_status::ready);
+    const auto r = fr.get();
+    REQUIRE(r);
+    CHECK(r->revision == dex_score_policy_revision(*f.doc)); // the store's, never the parked text
+    CHECK(reads == 1);
+
+    pa.release();
+    REQUIRE(fa.wait_for(kParkedWait) == std::future_status::ready);
+    REQUIRE(fa.get());
+    const auto after = p.current();
+    REQUIRE(after);
+    CHECK(after->revision == dex_score_policy_revision(a));
+    CHECK(reads == 1); // the install restarted the window
+}
+
+TEST_CASE("policy provider: a write during a refresh in flight wins over the older successful read",
+          "[dex][policy_provider]") {
+    Fixture f;
+    f.doc = doc_with_excellent(90.0);
+    ParkedRead pr(f);
+    DexScorePolicyProvider p(pr.fn(), f.clock());
+    pr.armed = true;
+    std::optional<std::expected<DexPolicyInForce, std::string>> parked;
+    std::thread a([&] { parked = p.current(); }); // parks on the OLD document
+    yuzu::test::ScopeExit finish{[&] {
+        pr.release();
+        if (a.joinable())
+            a.join();
+    }};
+    REQUIRE(pr.entered.wait_for(kParkedWait) == std::future_status::ready);
+
+    const std::string text = doc_with_excellent(95.0);
+    REQUIRE(write_bounded(p, text, kCommitOk, pr));
+    pr.release();
+    a.join();
+    REQUIRE(parked);
+    REQUIRE(*parked);
+    CHECK((*parked)->revision == dex_score_policy_revision(text));
+    const auto c = p.current();
+    REQUIRE(c);
+    CHECK(c->revision == dex_score_policy_revision(text));
+    CHECK(pr.reads == 1);
+}
+
+TEST_CASE("policy provider: a failed read in flight across a write keeps the stale cap",
+          "[dex][policy_provider]") {
+    Fixture f;
+    f.doc = doc_with_excellent(90.0);
+    ParkedRead pr(f);
+    DexScorePolicyProvider p(pr.fn(), f.clock());
+    pr.armed = true;
+    std::optional<std::expected<DexPolicyInForce, std::string>> parked;
+    std::thread a([&] { parked = p.current(); });
+    yuzu::test::ScopeExit finish{[&] {
+        pr.release();
+        if (a.joinable())
+            a.join();
+    }};
+    REQUIRE(pr.entered.wait_for(kParkedWait) == std::future_status::ready);
+
+    REQUIRE(write_bounded(p, doc_with_excellent(95.0), kCommitOk, pr));
+    f.now += kDexPolicyStaleCapMs + 1;
+    f.down = true;
+    pr.release();
+    a.join();
+    REQUIRE(parked);
+    CHECK_FALSE(*parked); // past the cap and the store down: never the over-cap installed policy
+    if (!*parked)
+        CHECK((*parked).error().find("score policy unreadable") != std::string::npos);
+
+    f.down = false;
+    const auto c = p.current();
+    REQUIRE(c);
+    CHECK(pr.reads == 2);
+    CHECK(c->revision == dex_score_policy_revision(*f.doc));
 }

@@ -759,6 +759,8 @@ yuzu_server_core_lib = static_library(
     'src/mcp_stream.cpp',
     'src/mcp_stream_bridge.cpp',
     'src/mcp_tools_discovery.cpp',
+    'src/mcp_tools_hardware.cpp',
+    'src/mcp_tools_containment.cpp',
     'src/mcp_transport.cpp',
     'src/rest_api_v1.cpp',
     'src/compliance_model.cpp',
@@ -810,6 +812,8 @@ yuzu_server_core_lib = static_library(
     'src/crypto_api.cpp',     # /crypto slice 1: store-backed CryptoApi seam impl
     'src/crypto_routes.cpp',  # /crypto slice 1: page + fragments + REST v1 route owner
     'src/crypto_ui.cpp',      # /crypto slice 1: pure HTML renderers
+    'src/crypto_widget_catalogue.cpp', # /crypto widgets: pure catalogue + D13 windows + JSON shapers
+    'src/crypto_dashboard_layout_store.cpp', # /crypto widgets: per-operator layout (born-on-PG)
     'src/preflight_routes.cpp',
     'src/preflight_ui.cpp',
     'src/preflight_eval.cpp',
@@ -826,6 +830,7 @@ yuzu_server_core_lib = static_library(
     'src/deployment_run_store.cpp',
     'src/deployment_engine.cpp',
     'src/tar_process_tree.cpp',
+    'src/tar_timeline_render.cpp',
     'src/tar_tree_routes.cpp',
     'src/dashboard_routes.cpp',
     'src/workflow_routes.cpp',

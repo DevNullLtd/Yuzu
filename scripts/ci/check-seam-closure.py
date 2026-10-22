@@ -564,6 +564,8 @@ FAMILIES = {
             "server/core/src/crypto_types.hpp",
             "server/core/src/crypto_library_model.hpp",
             "server/core/src/crypto_library_model.cpp",
+            "server/core/src/crypto_widget_catalogue.hpp",
+            "server/core/src/crypto_widget_catalogue.cpp",
             "server/core/src/crypto_api.hpp",
             "server/core/src/crypto_api_local.hpp",
             "server/core/src/crypto_routes.hpp",

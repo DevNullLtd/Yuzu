@@ -28,8 +28,12 @@ Companion docs:
 
 **Symptom:**
 
-- `Preflight (runner health)` fails with `auth_error`, `rate_limit`,
+- `Preflight (gate)` fails with `auth_error`, `rate_limit`,
   `api_error`, or `malformed_response`.
+- `Preflight (runner health)` fails with `preflight-gate did not succeed
+  (skipped)`: `trusted_inputs` failed, so the gate never ran. Open the
+  `Preflight (gate)` job; `Re-run failed jobs` re-runs the gate and its
+  dependents.
 - Nightly preflight reports `Required runner pool unavailable: bigtam` or
   `weetam`.
 - The nightly workflow opens or updates a `nightly-broken` issue.

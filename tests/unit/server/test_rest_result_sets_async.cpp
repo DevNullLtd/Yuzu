@@ -343,6 +343,22 @@ std::optional<ResultSet> get_ok(ResultSetStore& s, const std::string& id) {
     return *r;
 }
 
+// A certificates-shaped definition: the result_schema declares the plain pipe-row columns.
+std::string make_cert_instruction(InstructionStore& s) {
+    InstructionDefinition def;
+    def.name = "Certificates list";
+    def.version = "1.0";
+    def.plugin = "certificates";
+    def.action = "list";
+    def.type = "question";
+    def.description = "list certificates";
+    def.result_schema =
+        R"([{"name":"subject","type":"string"},{"name":"issuer","type":"string"},{"name":"thumbprint","type":"string"}])";
+    def.enabled = true;
+    auto id = s.create_definition(def);
+    REQUIRE(id.has_value());
+    return *id;
+}
 std::string make_instruction(InstructionStore& s) {
     InstructionDefinition def;
     def.name = "Chrome hash check";
@@ -1062,6 +1078,50 @@ TEST_CASE("from-instruction-result: 202 pending with operator matcher persisted"
     auto row = get_ok(*h.store, j["data"]["id"].get<std::string>());
     REQUIRE(row->matcher.find("sha256") != std::string::npos);
     REQUIRE(row->matcher.find("value_set") != std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: a column matcher is bound to the declared columns; "
+          "caller-supplied server-authored keys are refused",
+          "[pg][result_set][async][instruction]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_cert_instruction(*h.instr);
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result",
+                    R"({"instruction_id":")" + iid +
+                        R"(","matcher":{"column":"issuer","op":"contains","value":"eMudhra"}})",
+                    status);
+    REQUIRE(status == 202);
+    auto row = get_ok(*h.store, j["data"]["id"].get<std::string>());
+    auto stored = nlohmann::json::parse(row->matcher);
+    CHECK(stored["declared_columns"] ==
+          nlohmann::json::array({"subject", "issuer", "thumbprint"}));
+    CHECK(stored["plugin"] == "certificates");
+    CHECK(stored["column"] == "issuer");
+
+    // A column the definition does not declare: stored unchanged.
+    j = h.post("/api/v1/result-sets/from-instruction-result",
+               R"({"instruction_id":")" + iid + R"(","matcher":{"column":"nope","op":"exists"}})",
+               status);
+    REQUIRE(status == 202);
+    stored = nlohmann::json::parse(get_ok(*h.store, j["data"]["id"].get<std::string>())->matcher);
+    CHECK_FALSE(stored.contains("declared_columns"));
+    CHECK_FALSE(stored.contains("plugin"));
+
+    const auto calls_before = h.calls.size();
+    for (const char* key : {"declared_columns", "plugin"}) {
+        const std::string val = std::string(key) == "plugin" ? "\"x\"" : "[\"issuer\"]";
+        j = h.post("/api/v1/result-sets/from-instruction-result",
+                   R"({"instruction_id":")" + iid +
+                       R"(","matcher":{"column":"issuer","op":"exists",")" + key + R"(":)" + val +
+                       "}}",
+                   status);
+        CHECK(status == 400);
+        CHECK(j["error"]["message"].get<std::string>().find(key) != std::string::npos);
+    }
+    CHECK(h.calls.size() == calls_before); // nothing dispatched
 }
 
 // #4644: a tar_rows_ge matcher's `n` is stored on the pending row and read by the maintenance

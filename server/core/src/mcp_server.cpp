@@ -13,6 +13,7 @@
 #include "discovered_devices_model.hpp" // list_discovered_devices shared builders
 #include "mcp_orientation.hpp" // shared initialize.instructions / yuzu://about source (2g PR 1)
 #include "mcp_policy.hpp"
+#include "hardware_routes.hpp"   // HardwareRoutes::*Fn: the static_asserts pinning ToolDeps
 #include "mcp_tool_registry.hpp" // ToolRecord/ToolCallContext: the registry seam (merged by catalogue())
 #include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
 #include "mcp_transport.hpp"     // Streamable HTTP transport pre-checks (2f)
@@ -46,8 +47,10 @@
 #include "guardian_generation_raise.hpp"   // raise_guardian_policy_generation: shared REST+MCP parse/audit-detail/result builders
 #include "store_errors.hpp"              // #2146 Batch B1: is_conflict_error/strip_conflict_prefix (create/update)
 #include "software_catalogue_model.hpp" // M.9: shared REST+MCP software catalogue model
+#include "software_catalog_rules.hpp"   // M.10b: kEcosystemFamilies + expand_ecosystem_tokens (ecosystem enums/pipe list)
 #include "crypto_cbom.hpp"          // export_crypto_cbom (CycloneDX 1.7 shaper)
 #include "crypto_library_model.hpp" // get_crypto_libraries / list_crypto_library_devices (shared model)
+#include "crypto_widget_catalogue.hpp" // the /crypto widget, layout and Yuzu-issued twins (shared model)
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "software_licensing_store.hpp"  // query_software_licenses (ADR-0024 discovery store)
 #include "app_usage_read_model.hpp"        // AppUsageModel, app_usage_json (Rule 1 shared builder)
@@ -124,6 +127,7 @@
 #include <chrono>
 #include <cstdio>
 #include <ctime>
+#include <deque>
 #include <iterator>
 #include <limits> // numeric_limits (query_responses status range, #4644)
 #include <map>
@@ -546,6 +550,11 @@ struct ToolDef {
 
 // kObjectOutputSchema lives in mcp_tool_registry.hpp (shared with registry handlers).
 
+// The remediation of a /crypto read refused because the Postgres pool is too small to spare it
+// (CryptoReadError::unavailable_until_restart): no retry hint, a retry fails identically.
+constexpr std::string_view kCryptoPoolTooSmallRemedy =
+    "restart the server with a larger --postgres-pool-size; a retry fails identically until then";
+
 std::string tool_result(std::string_view payload, const char* output_schema_json = nullptr) {
     JObj result;
     result.raw("content", JArr().add(JObj().add("type", "text").add("text", payload)).str());
@@ -811,7 +820,7 @@ static const ToolDef kTools[] = {
      "(ADR-0016) — machine-wide installed packages per device, fleet-wide. Each row carries name, "
      "version (upstream, release stripped), publisher (rpm PACKAGER / deb Maintainer / Windows "
      "Publisher), install_date, kind (package|app|pkg|feat), "
-     "ecosystem (rpm|deb|apk|pacman|snap|flatpak|windows|macos|macos_pkgutil|brew|optional_feature|msi), "
+     "ecosystem (@@ECOSYSTEM_LIST@@), "
      "epoch, release, arch, signature_status (rpm only, from stored header tags), "
      "distro_id and distro_version (/etc/os-release, rpm/deb/apk/pacman rows); fields an ecosystem does not "
      "store are empty strings, never synthesised. Snaps are kind app or pkg (ecosystem snap), flatpak "
@@ -2427,12 +2436,29 @@ static const ToolDef kTools[] = {
     // ── Internal-CA tools (MCP/REST parity for /api/v1/ca/*, PR4 B-2) ──────────
     {"list_issued_certs",
      "List certificates issued by the internal CA (inventory: serial, subject, purpose, status, "
-     "expiry, revocation). Mirrors GET /api/v1/ca/issued. Requires Security:Read.",
+     "expiry, revocation). Mirrors GET /api/v1/ca/issued. Requires Security:Read. With any of "
+     "kind/days/week/bucket/as_of it lists exactly the certificates behind one "
+     "get_crypto_ca_stats count (same predicate, valid through notAfter inclusive): the result "
+     "adds filter (rule_id, criterion, as_of, total) and next_cursor (pass it back as cursor for "
+     "the next page of the same snapshot; null on the last page - keyset paging, so a "
+     "certificate revoked between pages never shifts another past the page boundary), the "
+     "input is strict (an unknown kind or bucket, a days outside the kind's set, days/week/bucket "
+     "on a kind that does not take it, limit outside 1..500, any offset, a cursor that is "
+     "malformed or was issued for another filter, or an as_of earlier than 7 days before the "
+     "database clock or more than 300 seconds after it is rejected), a caller whose view is "
+     "confined is refused, a degraded store or busy reads are retryable, and the read is audited "
+     "as crypto.ca.certificates.view. Without them it answers exactly as before (offset paging).",
      R"j({"type":"object","properties":{)j"
-     R"j("limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Max rows"},)j"
-     R"j("offset":{"type":"integer","default":0,"minimum":0,"maximum":1000000,"description":"Pagination offset"})j"
+     R"j("limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Max rows (at most 500, default 100, when filtering)"},)j"
+     R"j("offset":{"type":"integer","minimum":0,"maximum":1000000,"description":"Pagination offset; unfiltered calls only, 0 when omitted. A filtered call refuses any offset, 0 included (it pages with cursor)"},)j"
+     R"j("cursor":{"type":"string","minLength":1,"maxLength":512,"description":"Filtered calls: the previous page's next_cursor (carries its as_of); bound to kind/days/week/bucket"},)j"
+     R"j("kind":{"type":"string","enum":["active","expiring","expired","revoked","issued","issued_week","revoked_week"],"description":"Filter: the rows behind one get_crypto_ca_stats count"},)j"
+     R"j("days":{"type":"integer","enum":[3,7,14,21,30,60,90],"description":"Window; required for expiring/expired/revoked/issued and in that kind's set"},)j"
+     R"j("week":{"type":"string","maxLength":8,"description":"ISO 8601 week (YYYY-Www); required for issued_week/revoked_week"},)j"
+     R"j("bucket":{"type":"string","enum":["superseded","unpublished","other"],"description":"revoked/revoked_week only: one recorded-reason bucket"},)j"
+     R"j("as_of":{"type":"integer","minimum":0,"description":"Pin the first page to a get_crypto_ca_stats as_of: from 7 days before the database clock up to 300 seconds after it"})j"
      R"j(}})j",
-     R"j({"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"serial_hex":{"type":"string"},"subject":{"type":"string"},"san":{"type":"string"},"purpose":{"type":"string"},"status":{"type":"string"},"not_after":{"type":"integer"},"issued_at":{"type":"integer"},"revoked_at":{"type":"integer"},"revocation_reason":{"type":"string"},"issued_by":{"type":"string"},"issuer_key_id":{"type":"string"}},"required":["serial_hex","subject","san","purpose","status","not_after","issued_at","revoked_at","revocation_reason","issued_by","issuer_key_id"]}},"count":{"type":"integer"},"limit":{"type":"integer"},"offset":{"type":"integer"},"has_more":{"type":"boolean"},"next_offset":{"type":"integer","description":"Present only when has_more is true"},"crl_version":{"type":["integer","null"]},"crl_published_at":{"type":["integer","null"],"description":"Epoch seconds; null when no CRL is published"},"crl_next_update":{"type":["integer","null"]},"crl_revoked_count":{"type":["integer","null"],"description":"Null when not recorded (a CRL published before counts were kept)"},"crl_stale":{"type":["boolean","null"],"description":"True when the latest CRL was not built from the current revoked set (a revocation is missing, none is published, or its count was not recorded); does not reflect expiry, compare crl_next_update; null when it could not be determined"}},"required":["items","count","limit","offset","has_more","crl_version","crl_published_at","crl_next_update","crl_revoked_count","crl_stale"]})j"},
+     R"j({"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"serial_hex":{"type":"string"},"subject":{"type":"string"},"san":{"type":"string"},"purpose":{"type":"string"},"status":{"type":"string"},"not_after":{"type":"integer"},"issued_at":{"type":"integer"},"revoked_at":{"type":"integer"},"revocation_reason":{"type":"string"},"issued_by":{"type":"string"},"issuer_key_id":{"type":"string"}},"required":["serial_hex","subject","san","purpose","status","not_after","issued_at","revoked_at","revocation_reason","issued_by","issuer_key_id"]}},"count":{"type":"integer"},"limit":{"type":"integer"},"offset":{"type":"integer","description":"Unfiltered calls only"},"has_more":{"type":"boolean"},"next_offset":{"type":"integer","description":"Unfiltered calls only; present only when has_more is true"},"next_cursor":{"type":["string","null"],"description":"Filtered calls only: pass back as cursor for the next page; null on the last page"},"filter":{"type":"object","description":"Present only on a filtered call","properties":{"kind":{"type":"string"},"days":{"type":["integer","null"]},"week":{"type":["string","null"]},"week_start":{"type":["integer","null"]},"bucket":{"type":["string","null"]},"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"as_of_iso":{"type":"string"},"total":{"type":"integer"},"scope_note":{"type":"string"}},"required":["kind","rule_id","criterion","rule_set_version","as_of","total"]},"crl_version":{"type":["integer","null"],"description":"Unfiltered calls only"},"crl_published_at":{"type":["integer","null"],"description":"Unfiltered calls only; epoch seconds; null when no CRL is published"},"crl_next_update":{"type":["integer","null"],"description":"Unfiltered calls only"},"crl_revoked_count":{"type":["integer","null"],"description":"Unfiltered calls only; null when not recorded (a CRL published before counts were kept)"},"crl_stale":{"type":["boolean","null"],"description":"Unfiltered calls only; true when the latest CRL was not built from the current revoked set (a revocation is missing, none is published, or its count was not recorded); does not reflect expiry, compare crl_next_update; null when it could not be determined"},"audit_persisted":{"type":"boolean","description":"Present and false only on a filtered call whose audit row failed to persist"}},"required":["items","count","limit","has_more"]})j"},
 
     {"revoke_certificate",
      "Revoke an issued certificate by serial and republish the CRL. Mirrors "
@@ -3914,7 +3940,7 @@ static const ToolDef kTools[] = {
      "get_software_versions, or to query_installed_software for the devices carrying it. A "
      "degraded store read is a retryable error, never an empty result. Every call that reaches "
      "the store is audited (mcp.query_software_catalogue).",
-     R"j({"type":"object","properties":{"q":{"type":"string","maxLength":128,"description":"Case-insensitive literal substring over title name, publisher, ecosystems and sources"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature","msi"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's titles"},"versions_min":{"type":"integer","minimum":0,"maximum":100000,"description":"Only titles with at least this many distinct versions"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum titles returned"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"}}})j",
+     R"j({"type":"object","properties":{"q":{"type":"string","maxLength":128,"description":"Case-insensitive literal substring over title name, publisher, ecosystems and sources"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["@@ECOSYSTEM_ENUM@@"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's titles"},"versions_min":{"type":"integer","minimum":0,"maximum":100000,"description":"Only titles with at least this many distinct versions"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum titles returned"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"}}})j",
      R"j({"type":"object","properties":{"titles":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"publisher":{"type":"string"},"installs":{"type":"integer"},"versions":{"type":"integer"},"ecosystems":{"type":"array","items":{"type":"string"}},"kinds":{"type":"array","items":{"type":"string"}},"newest_version":{"type":"string"}},"required":["name","publisher","installs","versions","ecosystems","kinds","newest_version"]}},"count":{"type":"integer"},"next_cursor":{"type":["string","null"]},"totals":{"type":"object","properties":{"titles":{"type":"integer"},"installs":{"type":"integer"}},"required":["titles","installs"]},"kpis":{"type":["object","null"]},"devices_omitted":{"type":"integer"},"newest_omitted":{"type":"boolean"},"audit_persisted":{"type":"boolean"}},"required":["titles","count","next_cursor","totals","kpis","devices_omitted"]})j"},
 
     {"get_software_versions",
@@ -3931,7 +3957,7 @@ static const ToolDef kTools[] = {
      "ecosystem is refused: omit the key. Take the title name from query_software_catalogue; "
      "query_installed_software lists the devices carrying a version. Audited as "
      "mcp.get_software_versions.",
-     R"j({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact title name"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature","msi"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's versions"},"limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Maximum versions returned"}},"required":["name"]})j",
+     R"j({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact title name"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["@@ECOSYSTEM_ENUM@@"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's versions"},"limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Maximum versions returned"}},"required":["name"]})j",
      R"j({"type":"object","properties":{"name":{"type":"string"},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},"installs":{"type":"integer"},"newest":{"type":"boolean"}},"required":["version","installs","newest"]}},"count":{"type":"integer"},"truncated":{"type":"boolean"},"devices_omitted":{"type":"integer"},"newest_omitted":{"type":"boolean"},"audit_persisted":{"type":"boolean"}},"required":["name","versions","count","truncated","devices_omitted"]})j"},
 
     // ── Software "Sync now": MCP twin of POST /api/v1/hardware/sync. Both call the SAME
@@ -4004,7 +4030,7 @@ static const ToolDef kTools[] = {
      "omit for any). Audited as mcp.get_crypto_libraries. Mirrors GET /api/v1/crypto/libraries.",
      R"j({"type":"object","properties":{)j"
      R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Restrict to one library family id; omit for every family"},)j"
-     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature","msi"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"})j"
+     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["@@ECOSYSTEM_ENUM_OR_EMPTY@@"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"})j"
      R"j(}})j",
      R"j({"type":"object","properties":{)j"
      R"j("table_version":{"type":"integer","description":"Version of the curated package-name table that produced this answer"},)j"
@@ -4046,7 +4072,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Library family id (from get_crypto_libraries)"},)j"
      R"j("version":{"type":"string","maxLength":1024,"description":"Exact version bucket; empty string selects rows with no version; omit for every version"},)j"
-     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature","msi"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"},)j"
+     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["@@ECOSYSTEM_ENUM_OR_EMPTY@@"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"},)j"
      R"j("cursor":{"type":"string","maxLength":2048,"description":"Opaque next_cursor from the previous page; bound to the family/version/ecosystem filter and the table_version; refused if the previous page was read on live names and the catalogue is now in use; restart without a cursor"},)j"
      R"j("limit":{"type":"integer","minimum":1,"maximum":1000,"default":100,"description":"Page size"})j"
      R"j(},"required":["family"]})j",
@@ -4092,7 +4118,7 @@ static const ToolDef kTools[] = {
      "BOM. Audited as mcp.export_crypto_cbom. Mirrors GET /api/v1/crypto/cbom.",
      R"j({"type":"object","additionalProperties":false,"properties":{)j"
      R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Restrict the BOM to one library family id; omit for every family"},)j"
-     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature","msi"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"})j"
+     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["@@ECOSYSTEM_ENUM_OR_EMPTY@@"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"})j"
      R"j(}})j",
      R"j({"type":"object","properties":{)j"
      R"j("bom":{"type":"string","description":"The CycloneDX 1.7 JSON document, serialised (media type application/vnd.cyclonedx+json; version=1.7)"},)j"
@@ -4101,7 +4127,113 @@ static const ToolDef kTools[] = {
      R"j("result_truncated":{"type":"boolean","description":"True when the store row cap or response byte budget cut the summary; per-family version cuts are flagged in yuzu:crypto:truncated_families and each component's versions_truncated"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
      R"j(},"required":["bom","content_type","components","result_truncated"]})j"},
+    // ── /crypto dashboard widgets (ADR-0070 D13) - MCP twins of GET /api/v1/crypto/widgets,
+    // GET/PUT /api/v1/crypto/dashboard/layout and GET /api/v1/crypto/ca/{stats,certificates},
+    // shaped by the SAME pure catalogue (crypto_widget_catalogue.hpp) and read through the SAME
+    // CryptoApi seam as the REST routes. Appended at the VERY END of kTools[] per the standing
+    // governance note above. The days enum below is the union of the closed window set; the
+    // per-kind check is strict_cert_args_error's.
+    {"list_crypto_widgets",
+     "List the /crypto dashboard widget catalogue: every widget's id, title, kind (number, bar, "
+     "line or table), group ('Crypto libraries' or 'Yuzu-issued certificates'), gate class, the "
+     "permission its data needs (securable + operation), its criterion in words (exactly what the "
+     "number counts), where a click drills to, and available / availability - whether YOU may "
+     "read it (available, not_available, confined, access_check_unavailable). Library widgets "
+     "need Inventory:Read and a confined caller gets a narrowed answer; the Yuzu-issued counts "
+     "need Inventory:Read and are WITHHELD from a confined caller (availability confined, never a "
+     "narrowed count). Yuzu-issued widgets also carry drill_available: the certificate rows behind "
+     "a count need Security:Read (list_issued_certs with kind/days/week/bucket). Facts only; the "
+     "only built-in checks are the D13 named windows, each shown with its criterion. available "
+     "decides what to draw only; each data tool keeps its own gate. Also returns the default "
+     "layout, the window set version (window_set) and the Yuzu-issued scope note. Takes no "
+     "arguments. Mirrors GET /api/v1/crypto/widgets.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{)j"
+     R"j("window_set":{"type":"string","description":"Version of the closed window set"},"scope_note":{"type":"string"},)j"
+     R"j("widgets":{"type":"array","items":)j" R"j({"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"kind":{"type":"string","enum":["number","bar","line","table"]},"group":{"type":"string"},"gate":{"type":"string","enum":["fleet_read","fleet_wide_only","global"]},"securable":{"type":"string"},"operation":{"type":"string"},"criterion":{"type":"string","description":"What the widget counts, in words"},"drill":{"type":"string","enum":["library_families","library_family_devices","ca_certificates","ca_week"]},"available":{"type":"boolean","description":"Whether the caller may read the widget's data (drawing only, never a grant)"},"availability":{"type":"string","enum":["available","not_available","confined","access_check_unavailable"]},"ca_kind":{"type":"string"},"days":{"type":["integer","null"]},"drill_securable":{"type":"string"},"drill_operation":{"type":"string"},"drill_available":{"type":"boolean"}},"required":["id","title","kind","group","gate","securable","operation","criterion","drill","available","availability"]})j" R"j(},)j"
+     R"j("default_layout":{"type":"array","items":{"type":"string"}},"max_layout_widgets":{"type":"integer"})j"
+     R"j(},"required":["window_set","widgets","default_layout","max_layout_widgets","scope_note"]})j"},
+
+    {"get_crypto_dashboard_layout",
+     "Get YOUR OWN /crypto dashboard layout: the catalogue widget ids you placed, in display "
+     "order, and its version (pass it as expected_version to set_crypto_dashboard_layout). Ids "
+     "this server version does not know (a widget another version added) are counted in "
+     "preserved_unknown - not listed, but kept on every save. is_default is true when the layout "
+     "is the catalogue default (nothing saved, version 0, or a saved copy of it). Keyed by your "
+     "session; there is no way to read another operator's layout. A degraded layout store is a "
+     "retryable error, never the default served as if nothing were stored; a stored layout that "
+     "cannot be read is a non-retryable error whose remediation names the version to overwrite. "
+     "Takes no arguments. Mirrors GET /api/v1/crypto/dashboard/layout.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"widgets":{"type":"array","items":{"type":"string"},"description":"Catalogue widget ids in display order"},"is_default":{"type":"boolean"},"version":{"type":"integer","description":"Stored version; 0 when nothing is stored"},"preserved_unknown":{"type":"integer","description":"Stored ids this server version does not know: kept, not listed"},"max_layout_widgets":{"type":"integer"},"audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"}},"required":["widgets","is_default","version","preserved_unknown","max_layout_widgets"]})j"},
+
+    {"set_crypto_dashboard_layout",
+     "Replace YOUR OWN /crypto dashboard layout with the given widget ids, in display order "
+     "(add a widget by including its id, remove one by leaving it out; an empty list is a valid, "
+     "empty dashboard). It overwrites the previous layout (destructive to that layout only; no "
+     "data, no permission and no other operator is touched). Every id must come from "
+     "list_crypto_widgets, without repeats, at most 64. Ids another server version stored are "
+     "kept after yours. Pass expected_version (the version get_crypto_dashboard_layout returned; "
+     "0 = only if nothing is saved) to refuse the save when the layout changed meanwhile - a "
+     "conflict is a non-retryable error: read it again, then save. Omit only for a first save: "
+     "without it the save succeeds only when nothing is stored, and a stored layout is the same "
+     "non-retryable conflict naming the stored version. Idempotent: the same list twice stores the same layout. Keyed by your session. "
+     "Input is strict: an unknown or repeated id, more than 64 ids, a non-string id or any other "
+     "argument is rejected. Audited as crypto.dashboard.layout.update (an attempted row first: if "
+     "it cannot be written the layout is not changed). A degraded layout store is a retryable "
+     "error; a save whose commit outcome is unknown is a retryable error that says so (read the "
+     "layout to check). Mirrors PUT /api/v1/crypto/dashboard/layout.",
+     R"j({"type":"object","properties":{)j"
+     R"j("widgets":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":64},"description":"Catalogue widget ids in display order"},)j"
+     R"j("expected_version":{"type":"integer","minimum":0,"description":"The version you last read; 0 = only when nothing is saved. Omit only for a first save (a stored layout is then a conflict)"})j"
+     R"j(},"required":["widgets"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"widgets":{"type":"array","items":{"type":"string"},"description":"Catalogue widget ids in display order"},"is_default":{"type":"boolean"},"version":{"type":"integer","description":"The new stored version"},"preserved_unknown":{"type":"integer"},"max_layout_widgets":{"type":"integer"},"audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"}},"required":["widgets","is_default","version","preserved_unknown","max_layout_widgets"]})j"},
+
+    {"get_crypto_ca_stats",
+     "Counts of certificates issued by Yuzu's OWN internal CA (the agent, server, gateway, "
+     "HTTPS and code-signing certificates Yuzu minted - never the certificates on your devices), "
+     "each against as_of, the database clock at read time (epoch seconds and ISO 8601). Facts "
+     "only; the only built-in checks are the D13 named windows, each with its criterion: active; "
+     "expiring within 3, 7, 14, 21, 30 and 60 days and expired in the last 7, 30, 60 and 90 days, "
+     "status active only (a certificate is valid through its notAfter, inclusive; a revoked one "
+     "counts only in the revoked windows); revoked in the last 7, 30, 60 and "
+     "90 days, reported in three buckets by recorded reason - superseded, unpublished (recorded, "
+     "never delivered) and other - never summed or labelled; issued in the last 7 days excluding "
+     "unpublished; and issued and revoked per ISO week for the last 52 ISO weeks (UTC, Monday "
+     "start; the current week is partial and flagged). Every count carries rule_id, "
+     "threshold (or week), criterion, rule_set_version and as_of. Nothing is stored or "
+     "graded: recompute any count from list_issued_certs with the same kind/days/week/bucket and "
+     "as_of (needs Security:Read). Requires Inventory:Read; a caller whose view is confined is "
+     "refused (these are fleet-wide figures), never given a narrowed count. A degraded CA store, "
+     "or crypto read capacity in use, is a retryable error, never zeros. Takes no arguments. "
+     "Audited as crypto.ca.stats.view. Mirrors GET /api/v1/crypto/ca/stats.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{)j"
+     R"j("scope":{"const":"yuzu_issued"},"scope_note":{"type":"string"},"window_edge_note":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer","description":"Database time (epoch seconds) every window was computed against"},"as_of_iso":{"type":"string"},)j"
+     R"j("active":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]},"expiring_within_days":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]}},"expired_within_days":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]}},"revoked_within_days":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]},"description":"Three entries per window: buckets superseded, unpublished, other"},"issued_within_days":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]},)j"
+     R"j("week_basis":{"type":"string"},"weeks":{"type":"array","items":{"type":"object","properties":{"week":{"type":"string","description":"ISO 8601 week, e.g. 2026-W40"},"week_start":{"type":"integer"},"partial":{"type":"boolean"},"issued":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]},"revoked":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"count":{"type":"integer"},"threshold":{"type":"integer"},"week":{"type":"string"},"bucket":{"type":"string","enum":["superseded","unpublished","other"]}},"required":["rule_id","criterion","rule_set_version","as_of","count"]}}},"required":["week","week_start","partial","issued","revoked"]}},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
+     R"j(},"required":["scope","scope_note","rule_set_version","as_of","as_of_iso","active","expiring_within_days","expired_within_days","revoked_within_days","issued_within_days","week_basis","weeks"]})j"},
 };
+
+// The audit-detail tag of a /crypto layout failure (never the username), shared by the two
+// MCP layout twins; the REST twin's crypto_routes.cpp layout_failure_detail is its mirror.
+static std::string layout_failure_tag(const yuzu::server::CryptoReadError& e) {
+    using K = yuzu::server::CryptoReadError::Kind;
+    switch (e.kind) {
+    case K::kOutcomeUnknown:
+        return "outcome=unknown";
+    case K::kConflict:
+        return "outcome=conflict";
+    case K::kCorrupt:
+        return "outcome=corrupt";
+    case K::kInvalid:
+        return "outcome=invalid";
+    case K::kDegraded:
+        break;
+    }
+    return e.cause == yuzu::server::CryptoReadCause::kCapacity ? "outcome=busy" : "outcome=degraded";
+}
 
 static_assert(software_catalogue::kCursorMaxBytes == mcp::kMcpCursorMaxLen,
               "the catalogue cursor bound must equal the MCP cursor input bound");
@@ -4195,6 +4327,8 @@ static const char* const kWriteToolsRaw[] = {
     "create_offload_target", "delete_offload_target", "activate_platform_license",
     "create_software_deployment", "rollback_software_deployment",
     "cancel_software_deployment",
+    // /crypto widgets — Infrastructure:Write (the caller's own layout).
+    "set_crypto_dashboard_layout",
 };
 
 // The lookup set is DERIVED by catalogue() (merged with the registry records'
@@ -4275,6 +4409,17 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"get_crypto_libraries", {"Inventory", "Read", ServiceScopeClass::confined}},
     {"list_crypto_library_devices", {"Inventory", "Read", ServiceScopeClass::confined}},
     {"export_crypto_cbom", {"Inventory", "Read", ServiceScopeClass::confined}},
+    // /crypto dashboard widgets. The catalogue and the caller's OWN layout are owner-scoped
+    // (session username, the result-set precedent: Infrastructure Read/Write for the tier, no
+    // RBAC gate in the handler) and touch no fleet data, so a service-scoped token stays
+    // `denied` (default). The Yuzu-issued counts (get_crypto_ca_stats) gate on the fleet-read
+    // Inventory:Read in the handler and the certificates behind them (list_issued_certs) on
+    // Security:Read, as GET /api/v1/ca/issued does; Yuzu's own PKI has no service scope, so
+    // both are `denied`.
+    {"list_crypto_widgets", {"Infrastructure", "Read"}},
+    {"get_crypto_dashboard_layout", {"Infrastructure", "Read"}},
+    {"set_crypto_dashboard_layout", {"Infrastructure", "Write"}},
+    {"get_crypto_ca_stats", {"Inventory", "Read"}},
     // M.9: the catalogue twins read a FLEET-WIDE rollup that cannot be scoped to a service tag,
     // so they keep the default-deny class (C8 refuses a service-scoped token before the handler).
     {"query_software_catalogue", {"Inventory", "Read"}},
@@ -5099,6 +5244,11 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"list_crypto_library_devices",
      {ToolEffect::ReadOnly, true, "List devices carrying a crypto library"}},
     {"export_crypto_cbom", {ToolEffect::ReadOnly, true, "Export crypto libraries as a CycloneDX CBOM"}},
+    {"list_crypto_widgets", {ToolEffect::ReadOnly, true, "List crypto dashboard widgets"}},
+    {"get_crypto_dashboard_layout", {ToolEffect::ReadOnly, true, "Get my crypto dashboard layout"}},
+    {"set_crypto_dashboard_layout",
+     {ToolEffect::Destructive, true, "Replace my crypto dashboard layout"}},
+    {"get_crypto_ca_stats", {ToolEffect::ReadOnly, true, "Get Yuzu-issued certificate counts"}},
     {"query_software_catalogue", {ToolEffect::ReadOnly, true, "Query the software catalogue"}},
     {"get_software_versions", {ToolEffect::ReadOnly, true, "Get a title's versions"}},
     {"list_dex_app_perf_devices",
@@ -5472,6 +5622,24 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
 static_assert(std::is_same_v<ToolCallContext::PermFn, McpServer::PermFn>,
               "ToolCallContext::PermFn drifted from McpServer::PermFn (mcp_server.hpp)");
 
+// ToolDeps spells its provider signatures out (mcp_tool_deps.hpp); these pin each
+// to the twin it must share an instance with, so a signature change on either side
+// is a build failure and not a silent copy.
+static_assert(std::is_same_v<ToolDeps::FleetReadFn, McpServer::FleetReadFn>,
+              "ToolDeps::FleetReadFn drifted from McpServer::FleetReadFn (mcp_server.hpp)");
+static_assert(std::is_same_v<ToolDeps::FleetReadFn, HardwareRoutes::FleetReadFn>,
+              "ToolDeps::FleetReadFn drifted from HardwareRoutes::FleetReadFn");
+static_assert(std::is_same_v<ToolDeps::AuditFn, McpServer::AuditFn>,
+              "ToolDeps::AuditFn drifted from McpServer::AuditFn (mcp_server.hpp)");
+static_assert(std::is_same_v<ToolDeps::AuditFn, HardwareRoutes::AuditFn>,
+              "ToolDeps::AuditFn drifted from HardwareRoutes::AuditFn");
+static_assert(std::is_same_v<ToolDeps::RosterFn, HardwareRoutes::RosterFn>,
+              "ToolDeps::RosterFn drifted from HardwareRoutes::RosterFn");
+static_assert(std::is_same_v<ToolDeps::CiDetailFn, HardwareRoutes::CiDetailFn>,
+              "ToolDeps::CiDetailFn drifted from HardwareRoutes::CiDetailFn");
+static_assert(std::is_same_v<ToolDeps::DexScoreFn, HardwareRoutes::DexScoreFn>,
+              "ToolDeps::DexScoreFn drifted from HardwareRoutes::DexScoreFn");
+
 // ── Merged tool catalogue (registry seam) ────────────────────────────────
 //
 // The registry-resident tools (mcp_tools_<domain>.cpp, see mcp_tool_registry.hpp),
@@ -5482,14 +5650,15 @@ static_assert(std::is_same_v<ToolCallContext::PermFn, McpServer::PermFn>,
 std::span<const ToolRecord> registered_tool_records() {
     static const std::vector<ToolRecord> records = [] {
         std::vector<ToolRecord> all;
-        for (const auto span : {discovery_tool_records()})
+        for (const auto span : {discovery_tool_records(), hardware_tool_records(), containment_tool_records()})
             all.insert(all.end(), span.begin(), span.end());
         return all;
     }();
     return records;
 }
 
-// Every consumer of the tool tables reads THIS, never the raw tables, so the
+// Every consumer of the tool tables reads THIS, never the raw tables (except the test hook that
+// returns the unexpanded templates), so the
 // legacy rows and the registry records cannot disagree about what is served,
 // gated, classified or dispatched.
 //
@@ -5499,10 +5668,11 @@ std::span<const ToolRecord> registered_tool_records() {
 //     first-wins collapse (#2423 review F1);
 //   * the DERIVED lookups collapse duplicates, which is safe only because the
 //     validator rejects them before the server serves.
-// Served order is the legacy kTools[] order, then the registry records in
-// registered_tool_records() order. Write-set membership for a registry record
-// is derived (`operation != "Read"`), the validator's own parity rule.
-// All string_views and const char* point at static-storage literals.
+// Served order is tool-name order (build_catalogue() sorts `served` after merging the
+// legacy kTools[] rows with the registry records). Write-set membership for a
+// registry record is derived (`operation != "Read"`), the validator's own parity rule.
+// All string_views and const char* point at static-storage literals, or at `expanded_text` for an
+// expanded description/schema.
 struct Catalogue {
     // Raw sequences, duplicates preserved (validator input).
     std::vector<ToolDef> served;
@@ -5517,6 +5687,18 @@ struct Catalogue {
     std::unordered_map<std::string, ToolAnnotation> annotations;
     std::unordered_map<std::string_view, ToolHandler> handlers;
 
+    // Owns every served text build_catalogue() expanded from a token template; `served` points
+    // into it. A deque's push_back never relocates and a container move keeps element addresses
+    // (C++17 [container.reqmts]), so the pointers survive the return from build_catalogue().
+    // Copying is deleted: a copy's `served` would point at the original's storage.
+    std::deque<std::string> expanded_text;
+
+    Catalogue() = default;
+    Catalogue(const Catalogue&) = delete;
+    Catalogue& operator=(const Catalogue&) = delete;
+    Catalogue(Catalogue&&) = default;
+    Catalogue& operator=(Catalogue&&) = default;
+
     // The registry handler for `tool_name`, or nullptr when the tool is not
     // registry-resident (every legacy tool).
     ToolHandler handler(const std::string& tool_name) const {
@@ -5528,7 +5710,8 @@ struct Catalogue {
 // `records` is a parameter so a test can hand in a malformed set (the testonly
 // build_catalogue_for_test); production passes registered_tool_records().
 //
-// Refuses a malformed record by THROWING. The catalogue is first built in the
+// Refuses a malformed record, or served text that still carries an ecosystem marker or is
+// not valid JSON after expansion, by THROWING. The catalogue is first built in the
 // ServerImpl constructor (server.cpp calls approval_gated_tool_names()
 // unconditionally, even under --mcp-disable), before and independently of the boot
 // validator, so this check must be self-contained: a null field would otherwise be
@@ -5548,6 +5731,45 @@ Catalogue build_catalogue(std::span<const ToolRecord> records) {
         c.served.push_back(t);
     for (const auto& r : records)
         c.served.push_back({r.name, r.description, r.input_schema_json, r.output_schema_json});
+
+    // M.10b: the ecosystem enums and the pipe list are generated from kEcosystemFamilies. kTools
+    // and the registry records keep token templates; each served copy whose text carries a marker
+    // is expanded ONCE here into Catalogue-owned storage and re-pointed, so every consumer of
+    // `served` (the #2383 boot validator, compiled_input_schemas, tools/list, the test hooks)
+    // sees the expanded text. A marker that survives would be served as a literal enum value, so
+    // it refuses to boot naming the tool - this runs in the ServerImpl constructor, before and
+    // independently of the McpServer validator, like the record_defect check above.
+    // No other served tool text carries `@@`.
+    constexpr auto residual = [](std::string_view s) {
+        return s.find("@@") != std::string_view::npos ||
+               s.find("@ECOSYSTEM_") != std::string_view::npos;
+    };
+    for (auto& t : c.served) {
+        const auto expand = [&](const char* label, const char*& field, bool is_json_schema) {
+            if (field == nullptr)
+                return;
+            const std::string_view text{field};
+            if (!residual(text))
+                return;
+            std::string expanded = software_catalog::expand_ecosystem_tokens(text);
+            if (residual(expanded))
+                throw std::logic_error(
+                    std::string("MCP tool '") + t.name + "' " + label +
+                    " still carries an `@@` or `@ECOSYSTEM_` marker after expansion (a misspelt, "
+                    "single-@ or unquoted @@ECOSYSTEM_ token; see software_catalog_rules.hpp "
+                    "expand_ecosystem_tokens)");
+            // Output schemas are spliced raw into tools/list and parsed nowhere at boot (input
+            // schemas are parsed later by compile_input_schema), so an expansion that yields
+            // malformed JSON is caught here. Never the description: it is prose.
+            if (is_json_schema && !nlohmann::json::accept(expanded))
+                throw std::logic_error(std::string("MCP tool '") + t.name + "' " + label +
+                                       " is not valid JSON after ecosystem token expansion");
+            field = c.expanded_text.emplace_back(std::move(expanded)).c_str();
+        };
+        expand("description", t.description, false);
+        expand("input schema", t.input_schema_json, true);
+        expand("output schema", t.output_schema_json, true);
+    }
 
     c.raw_security.reserve(std::size(kToolSecurityRows) + records.size());
     for (const auto& r : kToolSecurityRows)
@@ -5588,6 +5810,14 @@ Catalogue build_catalogue(std::span<const ToolRecord> records) {
     c.handlers.reserve(records.size());
     for (const auto& r : records)
         c.handlers.emplace(r.name, r.handler);
+
+    // tools/list is served in tool-name order, a property of the catalogue so every
+    // consumer (tools/list, tool_names_for_test) agrees and a future migration
+    // from kTools[] to the registry does not move a tool in the list. Only `served`
+    // is sorted: the raw_* sequences stay in insertion order (validator input).
+    std::sort(c.served.begin(), c.served.end(), [](const ToolDef& a, const ToolDef& b) {
+        return std::string_view{a.name} < std::string_view{b.name};
+    });
     return c;
 }
 
@@ -8763,12 +8993,34 @@ McpServer::HandlerFn McpServer::build_handler(
             // Placed AFTER the C8 block on purpose: knownness, C7, service-scope,
             // tier and approval above have already run, so tier-before-RBAC holds for
             // a registry tool exactly as for a legacy one; the handler's own
-            // tier_allows/perm_fn pair runs after them. The #2405 input-schema check
-            // above runs ONLY inside the approval-gated branch: a non-gated registry
-            // handler receives UNVALIDATED args (any JSON value) and must validate
-            // them itself. A legacy tool has no handler here and falls through to the
-            // chain below.
+            // tier_allows/perm_fn pair runs after them (a confined read gated by
+            // ToolDeps::fleet_read_fn runs neither). The #2405 input-schema check
+            // above runs ONLY inside the approval-gated branch; the central check
+            // below guarantees `args` is a JSON object, but a non-gated registry
+            // handler must still validate the keys and values itself. A legacy tool
+            // has no handler here and falls through to the chain below.
             if (const ToolHandler registry_handler = catalogue().handler(tool_name)) {
+                // ONE central shape check for every registry tool: `arguments` must be a
+                // JSON object. Placed after knownness, C7, C8, tier and approval (a
+                // tier-denied caller still gets its tier error first, the #2405 ordering)
+                // and before the context is built, so no handler ever sees a scalar,
+                // array or null `arguments`. This proves is_object() ONLY: it is not the
+                // #2405 schema check, so enum/minimum/maximum in the advertised schema are
+                // still the handler's own job for a non-approval-gated tool. Deliberately
+                // no metric: yuzu_mcp_tool_args_invalid_total bounds `tool` to the
+                // approval-gated set (docs/user-manual/metrics.md).
+                if (!args.is_object()) {
+                    const std::string cid = yuzu::server::detail::make_correlation_id();
+                    const bool audit_ok =
+                        mcp_audit("denied", "arguments must be a JSON object correlation_id=" + cid);
+                    res.set_content(
+                        a4_error(kInvalidParams, "arguments must be a JSON object",
+                                 "pass `arguments` as a JSON object matching this tool's tools/list "
+                                 "inputSchema and re-call",
+                                 -1, cid, audit_ok),
+                        "application/json");
+                    return;
+                }
                 // The two per-request lambdas are bound into std::functions; default
                 // arguments do not survive that, so a handler passes every argument.
                 const ToolCallContext::AuditFn ctx_audit = [&](const std::string& result_status,
@@ -8781,8 +9033,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         return a4_error(code, message, remediation, retry_after_ms, cid_override,
                                         audit_ok);
                     };
-                const ToolCallContext ctx{req,     res,       id,           args,        tier,
-                                          perm_fn, ctx_audit, ctx_a4_error, &tool_result};
+                const ToolCallContext ctx{req,     res,       id,           args,
+                                          tier,    perm_fn,   ctx_audit,    ctx_a4_error,
+                                          &tool_result, &tool_deps_};
                 dispatch_registry_handler(registry_handler, tool_name, ctx);
                 return;
             }
@@ -10064,6 +10317,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     mcp_audit("failure", cl::audit_detail_degraded("", read.error().cause,
                                                                    gate.scope.has_value()) +
                                              " target=" + target);
+                    if (read.error().unavailable_until_restart) { // the pool is too small for this read
+                        res.set_content(a4_error(kInternalError, read.error().message, std::string(kCryptoPoolTooSmallRemedy)), "application/json"); // retry-hint-exempt: pool too small, lasts until a restart with a larger --postgres-pool-size
+                        return;
+                    }
                     res.set_content(a4_error(kInternalError,
                                              std::string(cl::degraded_message(read.error().cause)),
                                              "retry the request",
@@ -10134,6 +10391,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     mcp_audit("failure", cl::audit_detail_degraded("", read.error().cause,
                                                                    gate.scope.has_value()) +
                                              " target=" + target);
+                    if (read.error().unavailable_until_restart) { // the pool is too small for this read
+                        res.set_content(a4_error(kInternalError, read.error().message, std::string(kCryptoPoolTooSmallRemedy)), "application/json"); // retry-hint-exempt: pool too small, lasts until a restart with a larger --postgres-pool-size
+                        return;
+                    }
                     res.set_content(a4_error(kInternalError,
                                              std::string(cl::degraded_message(read.error().cause)),
                                              "retry the request",
@@ -10150,6 +10411,225 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!audit_ok)
                     payload["audit_persisted"] = false;
                 res.set_content(success_response(id, tool_result(cl::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            // ── /crypto dashboard widget twins (ADR-0070 D13, R2) ─────────────────────────
+            // Shaped by crypto_widget_catalogue.hpp and read through the SAME CryptoApi seam
+            // instance as REST /api/v1/crypto/{widgets,dashboard/layout,ca/stats}. The catalogue
+            // and the layout are the caller's OWN (session username), tier-gated by the generic
+            // C8 check (Infrastructure Read/Write, the result-set precedent); the Yuzu-issued
+            // counts gate on fleet_read_fn_ Inventory:Read and are WITHHELD from a confined
+            // caller (R2). ONE dispatch branch per tool (the retry-hint gate scans each tool's
+            // own block).
+            if (tool_name == "list_crypto_widgets") {
+                namespace cw = crypto_widgets;
+                if (!args.is_object() || !args.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "list_crypto_widgets takes no arguments"), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                if (!crypto_access_fn_) {
+                    spdlog::error("{}: crypto_access_fn_ unwired — misconfigured call site; "
+                                  "failing closed",
+                                  tool_name);
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                cw::AccessMemo access([&](cw::WidgetGate g, std::string_view s, std::string_view o) {
+                    return crypto_access_fn_(req, g, std::string(s), std::string(o));
+                });
+                auto payload = cw::widgets_json(access);
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "get_crypto_dashboard_layout") {
+                namespace cw = crypto_widgets;
+                if (!args.is_object() || !args.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "get_crypto_dashboard_layout takes no arguments"), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                if (!crypto_api_) {
+                    res.set_content(error_response(id, kInternalError,
+                                                   "Crypto dashboard layout unavailable"),
+                                    "application/json");
+                    return;
+                }
+                // Non-retryable answers (caller input, a corrupt stored layout) go through this
+                // helper so the `if (!read)` block below holds ONLY the retryable store fault.
+                auto refuse = [&](const CryptoReadError& e) {
+                    if (e.kind == CryptoReadError::Kind::kCorrupt)
+                        res.set_content(a4_error(kInternalError, e.message, "call set_crypto_dashboard_layout with expected_version=" + std::to_string(e.version) + " to replace it"), "application/json"); // retry-hint-exempt: stored-state defect, retrying reads it again
+                    else
+                        res.set_content(error_response(id, kInvalidParams, e.message), "application/json"); // retry-hint-exempt: caller-input rejection
+                };
+                auto read = crypto_api_->dashboard_layout(session->username);
+                if (!read) {
+                    if (read.error().kind != CryptoReadError::Kind::kDegraded) {
+                        mcp_audit("failure", layout_failure_tag(read.error()));
+                        refuse(read.error());
+                        return;
+                    }
+                    if (read.error().unavailable_until_restart) {
+                        mcp_audit("failure", read.error().message);
+                        res.set_content(a4_error(kInternalError, read.error().message, "the layout store did not open at server start; the default layout applies until the server is restarted with the store fixed"), "application/json"); // retry-hint-exempt: lasts until a restart, a retry fails identically
+                        return;
+                    }
+                    mcp_audit("failure", read.error().message);
+                    res.set_content(a4_error(kInternalError, read.error().message,
+                                             "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(
+                                                                     cw::layout_json(*read)),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "set_crypto_dashboard_layout") {
+                namespace cw = crypto_widgets;
+                if (const auto bad = cw::strict_layout_args_error(args)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                const auto lr = cw::layout_request_from_args(args);
+                if (const auto bad = cw::layout_error(lr.widgets)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                if (!crypto_api_) {
+                    res.set_content(error_response(id, kInternalError,
+                                                   "Crypto dashboard layout unavailable"),
+                                    "application/json");
+                    return;
+                }
+                const std::string& user = session->username;
+                const std::string detail_base =
+                    cw::audit_detail_layout("", lr.widgets.size(), lr.expected_version);
+                // "No audit row, no mutation" (ADR-0033 section 9), as the REST twin.
+                if (!audit_fn(req, "crypto.dashboard.layout.update", "attempted",
+                              "CryptoDashboard", user, detail_base)) {
+                    mcp_audit("failure", "audit unavailable; layout not changed");
+                    res.set_content(a4_error(kInternalError,
+                                             "audit log unavailable; the change was not made",
+                                             "retry once the audit log is available",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                // Non-retryable answers (caller input, a stale expected_version, a corrupt
+                // stored layout) go through this helper so the `if (!wrote)` block below holds
+                // ONLY the retryable answers (store fault, unknown commit outcome).
+                auto refuse = [&](const CryptoReadError& e) {
+                    if (e.kind == CryptoReadError::Kind::kConflict)
+                        res.set_content(a4_error(kInvalidParams, e.message, "read the layout with get_crypto_dashboard_layout (stored version " + std::to_string(e.version) + ") and save again with that expected_version"), "application/json"); // retry-hint-exempt: stale expected_version, resending it fails identically
+                    else if (e.kind == CryptoReadError::Kind::kCorrupt)
+                        res.set_content(a4_error(kInternalError, e.message, "save again with expected_version=" + std::to_string(e.version) + " to replace it"), "application/json"); // retry-hint-exempt: stored-state defect, the same call fails identically
+                    else
+                        res.set_content(error_response(id, kInvalidParams, e.message), "application/json"); // retry-hint-exempt: caller-input rejection
+                };
+                auto wrote = crypto_api_->set_dashboard_layout(user, lr.widgets, lr.expected_version);
+                if (!wrote) {
+                    (void)audit_fn(req, "crypto.dashboard.layout.update", "failure",
+                                   "CryptoDashboard", user,
+                                   detail_base + " " + layout_failure_tag(wrote.error()));
+                    mcp_audit("failure", layout_failure_tag(wrote.error()));
+                    if (wrote.error().kind != CryptoReadError::Kind::kDegraded &&
+                        wrote.error().kind != CryptoReadError::Kind::kOutcomeUnknown) {
+                        refuse(wrote.error());
+                        return;
+                    }
+                    if (wrote.error().unavailable_until_restart) {
+                        res.set_content(a4_error(kInternalError, wrote.error().message, "the layout store did not open at server start; layouts cannot be saved until the server is restarted with the store fixed"), "application/json"); // retry-hint-exempt: lasts until a restart, a retry fails identically
+                        return;
+                    }
+                    res.set_content(a4_error(kInternalError, wrote.error().message,
+                                             wrote.error().kind == CryptoReadError::Kind::kOutcomeUnknown
+                                                 ? "read the layout with get_crypto_dashboard_layout to see whether it was saved"
+                                                 : "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const bool audit_ok =
+                    audit_fn(req, "crypto.dashboard.layout.update", "success", "CryptoDashboard",
+                             user,
+                             cw::audit_detail_layout("", wrote->widgets.size(), lr.expected_version) +
+                                 " version=" + std::to_string(wrote->version));
+                mcp_audit("success");
+                auto payload = cw::layout_json(*wrote);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "get_crypto_ca_stats") {
+                namespace cw = crypto_widgets;
+                if (!fleet_read_fn_) {
+                    spdlog::error("{}: fleet_read_fn_ unwired — misconfigured call site; failing "
+                                  "closed",
+                                  tool_name);
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Inventory", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
+                if (gate.scope.has_value()) {
+                    // ADR-0070 R2: a confined view never gets a fleet-wide count, nor a narrowed
+                    // one. No permission named: none would admit the caller.
+                    (void)audit_fn(req, "crypto.ca.stats.view", "denied", "Inventory", "yuzu_ca",
+                                   cw::audit_detail_ca_withheld(""));
+                    mcp_audit("denied", "withheld=confined");
+                    res.set_content(a4_error(kPermissionDenied, cw::kConfinedWithheldMessage), "application/json"); // retry-hint-exempt: authorization outcome, retrying cannot change it
+                    return;
+                }
+                if (!args.is_object() || !args.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "get_crypto_ca_stats takes no arguments"), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                if (!crypto_api_) {
+                    res.set_content(error_response(id, kInternalError,
+                                                   "Yuzu-issued certificate data unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto read = crypto_api_->ca_stats(std::nullopt);
+                if (!read) {
+                    (void)audit_fn(req, "crypto.ca.stats.view", "failure", "Inventory", "yuzu_ca",
+                                   cw::audit_detail_ca_degraded("", std::nullopt, read.error().cause));
+                    mcp_audit("failure", cw::audit_detail_ca_degraded("", std::nullopt, read.error().cause));
+                    if (read.error().unavailable_until_restart) { // the pool is too small for this read
+                        res.set_content(a4_error(kInternalError, read.error().message, std::string(kCryptoPoolTooSmallRemedy)), "application/json"); // retry-hint-exempt: pool too small, lasts until a restart with a larger --postgres-pool-size
+                        return;
+                    }
+                    res.set_content(a4_error(kInternalError, read.error().message,
+                                             "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, "crypto.ca.stats.view", "success", "Inventory",
+                                               "yuzu_ca", cw::audit_detail_stats("", read->as_of));
+                mcp_audit("success", cw::audit_detail_stats("", read->as_of));
+                auto payload = cw::ca_stats_json(*read);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
                                                                  kObjectOutputSchema)),
                                 "application/json");
                 return;
@@ -10219,6 +10699,10 @@ McpServer::HandlerFn McpServer::build_handler(
                               cl::audit_detail_degraded("", read.error().cause,
                                                         gate.scope.has_value()) +
                                   " target=" + target);
+                    if (read.error().unavailable_until_restart) { // the pool is too small for this read
+                        res.set_content(a4_error(kInternalError, read.error().message, std::string(kCryptoPoolTooSmallRemedy)), "application/json"); // retry-hint-exempt: pool too small, lasts until a restart with a larger --postgres-pool-size
+                        return;
+                    }
                     res.set_content(a4_error(kInternalError,
                                              std::string(cl::degraded_message(read.error().cause)),
                                              "retry the request",
@@ -14298,9 +14782,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (args.contains("params") && args["params"].is_object())
                     for (auto& [k, v] : args["params"].items())
                         params[k] = v.is_string() ? v.get<std::string>() : v.dump();
-                std::string matcher = (args.contains("matcher") && args["matcher"].is_object())
-                                          ? args["matcher"].dump()
-                                          : std::string();
+                std::string matcher;
+                if (args.contains("matcher") && args["matcher"].is_object()) {
+                    auto bound = args["matcher"];
+                    yuzu::server::rs_matcher::bind_declared_columns(bound, def.result_schema,
+                                                                    def.plugin);
+                    matcher = bound.dump();
+                }
                 // source_payload — design §3.2 instruction_result shape.
                 nlohmann::json payload;
                 payload["instruction_id"] = instruction_id;
@@ -21629,6 +22117,81 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Security", "Read"))
                     return;
+                // ADR-0070 R2-2: any filter argument lists the certificates behind one
+                // get_crypto_ca_stats count, through the CryptoApi seam (the REST twin's
+                // filtered branch in ca_routes.cpp). Without one the tool answers as before.
+                if (crypto_widgets::has_cert_filter_args(args)) {
+                    namespace cw = crypto_widgets;
+                    if (!crypto_access_fn_ || !crypto_api_) {
+                        res.set_content(error_response(id, kInternalError, "filtered certificate list unavailable"), "application/json");
+                        return;
+                    }
+                    const auto standing = crypto_access_fn_(req, cw::WidgetGate::kFleetWideOnly, "Inventory", "Read");
+                    if (standing == cw::Access::kConfined) {
+                        (void)audit_fn(req, "crypto.ca.certificates.view", "denied", "Security", "",
+                                       "withheld=confined");
+                        mcp_audit("denied", "withheld=confined");
+                        res.set_content(a4_error(kPermissionDenied, cw::kConfinedWithheldMessage), "application/json"); // retry-hint-exempt: authorization outcome, retrying cannot change it
+                        return;
+                    }
+                    if (standing == cw::Access::kDegraded) {
+                        res.set_content(a4_error(kInternalError, "access check unavailable",
+                                                 "retry the request",
+                                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                        "application/json");
+                        return;
+                    }
+                    if (const auto bad = cw::strict_cert_args_error(args)) {
+                        res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
+                        return;
+                    }
+                    const auto parsed = cw::parse_cert_params(
+                        catalogue_params(args, {"kind", "days", "week", "bucket", "as_of", "limit", "cursor"}));
+                    if (!parsed) {
+                        res.set_content(error_response(id, kInvalidParams, parsed.error()), "application/json"); // retry-hint-exempt: caller-input rejection
+                        return;
+                    }
+                    const std::string target = cw::audit_target(*parsed);
+                    auto refuse_input = [&](const std::string& message) {
+                        res.set_content(error_response(id, kInvalidParams, message), "application/json"); // retry-hint-exempt: caller-input rejection
+                    };
+                    auto read = crypto_api_->ca_certificates(*parsed);
+                    if (!read) {
+                        if (read.error().kind == CryptoReadError::Kind::kInvalid) {
+                            refuse_input(read.error().message);
+                            return;
+                        }
+                        (void)audit_fn(req, "crypto.ca.certificates.view", "failure", "Security", target,
+                                       cw::audit_detail_ca_degraded("", parsed->as_of, read.error().cause));
+                        mcp_audit("failure", "target=" + target);
+                        if (read.error().unavailable_until_restart) { // the pool is too small for this read
+                            res.set_content(a4_error(kInternalError, read.error().message, std::string(kCryptoPoolTooSmallRemedy)), "application/json"); // retry-hint-exempt: pool too small, lasts until a restart with a larger --postgres-pool-size
+                            return;
+                        }
+                        res.set_content(a4_error(kInternalError, read.error().message,
+                                                 "retry the request",
+                                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                        "application/json");
+                        return;
+                    }
+                    const bool audit_ok = audit_fn(req, "crypto.ca.certificates.view", "success",
+                                                   "Security", target, cw::audit_detail_certs("", *read));
+                    mcp_audit("success", cw::audit_detail_certs("", *read));
+                    nlohmann::json payload = {{"items", cw::ca_items_json(*read)},
+                                              {"count", read->rows.size()},
+                                              {"limit", read->query.limit},
+                                              {"has_more", read->truncated},
+                                              {"filter", cw::ca_filter_json(*read)},
+                                              {"next_cursor", read->next_cursor.empty()
+                                                                  ? nlohmann::json(nullptr)
+                                                                  : nlohmann::json(read->next_cursor)}};
+                    if (!audit_ok)
+                        payload["audit_persisted"] = false;
+                    res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
+                                                                     kObjectOutputSchema)),
+                                    "application/json");
+                    return;
+                }
                 if (!ca_store || !ca_store->is_open()) {
                     res.set_content(error_response(id, kInternalError, "CA not available"),
                                     "application/json");
@@ -28689,6 +29252,10 @@ void dispatch_registry_handler_for_test(ToolHandler handler, const ToolCallConte
     dispatch_registry_handler(handler, "dispatch_registry_handler_for_test", ctx);
 }
 
+std::span<const ToolRecord> registry_records_for_test() {
+    return registered_tool_records();
+}
+
 std::vector<std::string> registry_tool_names_for_test() {
     std::vector<std::string> names;
     for (const auto& r : registered_tool_records())
@@ -28758,6 +29325,20 @@ std::vector<ToolSchemaRowOwned> input_schemas_for_test() {
     out.reserve(catalogue().served.size());
     for (const auto& t : catalogue().served)
         out.push_back({t.name, t.input_schema_json});
+    return out;
+}
+
+std::vector<ToolTextRowOwned> tool_templates_for_test() {
+    std::vector<ToolTextRowOwned> out;
+    const auto text = [](const char* p) {
+        return p != nullptr ? std::string(p) : std::string();
+    };
+    for (const auto& t : kTools)
+        out.push_back(
+            {t.name, text(t.description), text(t.input_schema_json), text(t.output_schema_json)});
+    for (const auto& r : registered_tool_records())
+        out.push_back(
+            {r.name, text(r.description), text(r.input_schema_json), text(r.output_schema_json)});
     return out;
 }
 

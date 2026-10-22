@@ -108,6 +108,13 @@ Siblings become compliant store-by-store as they migrate to Postgres.
 | Spark claim-lifecycle reaper and orphan-key pass (agent, `guardian_spark_runtime`, #5322) | Agent-side, not a store, and **not a clock-guarded retention pass**; listed here as a recorded disposition, not an adoption. `reap_stranded_claims_locked` pops terminal `Queued` claims and `disarm_orphan_keys_locked` queues a Disarm for a watcher whose index refcount is 0; both run under `registry_mu_` from `expire_overdue_claims()` on the heartbeat. **Parts 1-4, 6 and 7 do not apply:** the state is a monotonic in-memory claim lifecycle with no wall-clock cutoff, no persisted anchor and no age-based delete (a claim is popped because of its state, not its age), and a restart empties it, so a wrong wall clock cannot destroy anything and there is no anchor for part 6 to decide about. **SINGLE-WRITER:** n/a (agent-local, process-local state). **Part 5 (an unconditional per-pass cap) declined:** the bound is structural, not a configured cap: the number of `claims_` entries for the reaper and the number of `keys_` entries for the orphan pass, both walked under `registry_mu_`, with one index-release attempt per terminal tombstone per pass (at most two in the pass that synthesizes the outcome of a head that has none); a partial pass would only lengthen recovery. Recorded in the header banner "Not a clock-guarded retention pass" above `reap_stranded_claims_locked` and `disarm_orphan_keys_locked` in `guardian_spark_runtime.hpp`. |
 | Guardian reconcile claim-map sweep (server, `GuardianReconcileGate::sweep()`, #5513) | Server-side, not a store, and **not a clock-guarded retention pass over durable data**; listed here as a recorded disposition, not an adoption. `sweep()` erases per-agent heartbeat-reconcile claims older than `2 * min_interval` (50 s, `min_interval` being the 25 s per-agent limit) from an in-memory map, called every 15 s from `health_recompute_thread_` on every replica (classified `ReplicaSafe` as `guardian_reconcile_gate.sweep` in `background_jobs.hpp`, never leader-gated). The cutoff is a `steady_clock` reading over no store and no durable data, and a restart empties the map. **Parts 1-4 and 6 do not apply:** there is no wall-clock cutoff, no persisted anchor and nothing durable to destroy, so there is no anchor for part 6 to decide about; a claim older than `min_interval` can no longer rate-limit anything, so deleting it changes no decision, and the `2x` margin only keeps an entry visible slightly longer than it is useful. A clock that jumps cannot cause a wrong bulk delete of live state: `steady_clock` is monotonic, an entry that appears older than it is is merely re-claimed on its next heartbeat, and a clock reading that moves backwards yields a negative age, which is never swept. **Part 5 adopted, as structural caps:** each call erases at most `kDefaultSweepMaxErase` (4096) entries and scans about `kDefaultSweepMaxScan` (16384) units, resuming from a persistent bucket cursor, so one call never holds the mutex for a whole 500,000-entry table; the consequence, estimated (not measured) in the gate header, is that a full cycle over about 500,000 claims takes about 90 ticks (about 20 minutes), so the sweep is a backstop and the bulk of the map is bounded by `decide()` erasing an expired claim when its agent next reports a converged generation. **Part 7 holds:** the threshold is absolute (`2 * min_interval`, never scaled) and an entry whose age is not strictly greater than it is kept. **SINGLE-WRITER:** n/a by design, because the state is per replica (each replica's claim map, budget and caches are its own, with no shared row), so the single-replica form of the rule is correct here. Reasoning recorded in the "RETENTION REASONING" block of `guardian_reconcile_gate.hpp`. |
 
+### Recorded dispositions (not adoptions)
+
+| Store | Notes |
+|---|---|
+| `CommandOutboxStore` (#6096) | No reaper exists today. Its rows are the schedule runner's SPENT-TICKET LEDGER (`approval_id`, read by `occurrences_for_approval`), so any future reaper must retain approval-bearing rows at least 7 days from creation (`kApprovalTicketTtlSeconds`), or a reaped row makes a spent ticket look unspent. Stated at the store header as well. |
+| `ApprovalManager` expiry sweeps (#6061, #6096) | Status transitions to `expired`, never a DELETE. Every stamp and cutoff is Postgres `now()` in-SQL, including `submitted_at` since #6096, so the sweep clock is no longer split between the submitting process and the database. Disposition and residuals: "`ApprovalManager` ticket liveness" below. |
+
 ### Still issuing bare wall-clock deletes
 
 The three tracked **#2508** background sweeps (`app_perf_fleet_store`,
@@ -570,10 +577,13 @@ strictly safer than falsely cancelling it, since there is no repair path today t
 `agents_targeted` from `agent_exec_status`. Verified bidirectionally: the regression test fails
 (force-cancels the row) with the clause removed from all three sites, and passes with it restored.
 
-### `ApprovalManager` ticket liveness (#6061) - a recorded disposition, not a retention pass
+### `ApprovalManager` ticket liveness (#6061, #6096) - a recorded disposition, not a retention pass
 
 Listed here because the routed trigger fires on any wall-clock cutoff in `approval_manager.cpp`, not
-because the store adopts the apparatus. An approval ticket is "live" while it is `approved`,
+because the store adopts the apparatus. Every stamp this store writes (`submitted_at`, `reviewed_at`,
+`consumed_at`) and every cutoff it compares against is Postgres `now()`, authored in-SQL; the file
+reads no process clock at all, and a source tripwire in `test_approval_manager.cpp` pins that. An
+approval ticket is "live" while it is `approved`,
 unconsumed and `reviewed_at` lies within `[db_now - 7 days, db_now + 300 s]`. That test is ONE SQL
 predicate (`ticket_live_sql()` in `approval_manager.cpp`, constants `kApprovalTicketTtlSeconds` and
 `kApprovalReviewedAtSlackSeconds` in `approval_manager.hpp`), used by four sites that must never
@@ -581,9 +591,13 @@ disagree: the `consume_ticket` CAS, its diagnostic read, `submit()`'s approved-t
 `ticket_is_live()`, which `ScheduleRunner` calls before it fires an approved schedule ticket.
 
 - **Anti-fork rule.** `ticket_is_live()` answers liveness ONLY. It carries none of the #2442 origin and
-  submitter binding, and `consume_ticket` stays the sole redemption chokepoint: `ScheduleRunner` never
-  consumes a ticket, it retires one by advancing the schedule. A caller that needs to redeem a ticket
-  calls `consume_ticket`, never `ticket_is_live` followed by its own write.
+  submitter binding, and `consume_ticket` stays the sole redemption chokepoint for the MCP recall:
+  `ScheduleRunner` never consumes a ticket through it (it refuses `kSchedule` origins on purpose). A caller
+  that needs to redeem a ticket calls `consume_ticket`, never `ticket_is_live` followed by its own write.
+  `ScheduleRunner`'s retire (`retire_schedule_tickets`, below) is NOT the forbidden shape: it does not read
+  liveness and then write on that answer. It is its own guarded UPDATE keyed on `consumed_at = 0`, so it is
+  one atomic statement whose WHERE clause is the check; the runner's liveness read and its retire are
+  independent steps, and the retire never decides authority (authority was settled by the human approval).
 - **`ScheduleRunner` and a failing store (known, pre-existing, tracked in #2878).** The comment at the
   liveness check says a store failure HOLDS the occurrence. That is true only once the first read has
   succeeded: if `ticket_is_live()` itself cannot read, `fire_with_approval` holds (no advance) and logs
@@ -598,43 +612,83 @@ disagree: the `consume_ticket` CAS, its diagnostic read, `submit()`'s approved-t
   `DELETE`; ADR-0065's "Expiry-sweep clock-guard adjudication" (and its 2026-10-18 amendment) records
   why the seven-part apparatus's trigger is not met for the sweep. Expired rows stay queryable and
   auditable.
-- **Which timestamps are database time, and which are not.** `reviewed_at`, `consumed_at` and both
-  sweep cutoffs are authored by Postgres `now()` in-SQL (the SessionStore direction, #3715), so for the
-  approved-ticket path the stored value and the cutoff share one clock domain and nothing about that
-  path depends on a replica's `system_clock`. **`submitted_at` is NOT:** `submit_stamp_epoch()` in
-  `approval_manager.cpp` stamps it from the submitting process's `system_clock`, on purpose, because
-  `ScheduleRunner`'s `ticket_is_current` compares it with `ScheduleEngine`'s `last_executed_at` /
-  `created_at`, which are also process-clock stamps; moving only one side to database time would make
-  that comparison cross-clock and let one approval fire more than once. The stale-pending sweep
-  therefore compares a process-clock `submitted_at` with the database's `now()`. Moving
-  `submitted_at` and the `ScheduleEngine` stamps to database time together is tracked in #6096.
-- **Schedule occurrences under submitter/advancer skew (known, pre-existing, narrowed by the 7-day
-  liveness bound, tracked in #6096).** `ticket_is_current` treats an approved ticket as belonging to
-  the next occurrence when its `submitted_at` is later than the schedule's `last_executed_at`. The two
-  stamps come from the clock of whichever server submitted the ticket and whichever advanced the
-  schedule. Only the leader ticks, so they are normally the same server; they differ when leadership
-  moves between the submit and the fire. If the submitter was ahead, a spent ticket still looks newer
-  than its occurrence and a recurring schedule can fire extra times until the ticket ages out (about
-  the skew divided by the schedule interval, minimum interval 60 s); a `once` schedule does not
-  re-fire. If the submitter was behind, a freshly approved ticket looks older than the last run and is
-  ignored: a fresh approval is requested again and the schedule waits. NTP-synchronised hosts differ
-  by milliseconds, so the realistic trigger is broken time sync or a clock step.
-- **Parts 1, 2 and 4 DECLINED for the approved-ticket path; part 3 is not declined (next bullet)**
-  (there is no per-replica clock reading to probe, persist or dedupe, and running the sweep on every
-  replica is safe, so the SINGLE-WRITER caveat does not apply to it). **Parts 1, 2 and 4 are not declined on the premise that nothing depends on a
-  replica's clock for the pending path:** a pending ticket's lifetime is 7 days plus the submitter's
-  clock minus the database's. A submitter 7 days or more behind the database has every ticket it mints
-  swept by the next `submit()` on any replica. A submitter weeks ahead has pending tickets the sweep
-  does not reach until the database clock catches up, and they count against the global cap of 1000
-  pending tickets; once the queue is full `submit()` fails (which also drops a schedule occurrence
-  that needed a fresh ask). The harm is
-  confined to the skewed submitter's own tickets (no caller supplies `submitted_at`; `submit()` takes
-  no timestamp), and healthy NTP-class skew moves a lifetime by milliseconds. Tracked in #6096.
+- **All approval stamps are database time (#6096).** `submitted_at`, `reviewed_at`, `consumed_at` and
+  both sweep cutoffs are authored by Postgres `now()` in-SQL (the SessionStore direction, #3715), so
+  the stored value and the cutoff share one clock domain and nothing in the approval path depends on a
+  replica's `system_clock`. `submitted_at` used to be the one process-clock stamp, kept that way for
+  `ScheduleRunner`'s clock comparison; that comparison no longer exists.
+- **One approval == at most one scheduled run is state plus a clock-free ledger, not a clock comparison
+  (#6096).** `ScheduleRunner` treats a ticket as eligible only while its `consumed_at` is 0. Before it fires
+  an eligible ticket it asks the command outbox which occurrences already used it
+  (`CommandOutboxStore::occurrences_for_approval`, a lookup by `approval_id`, indexed by
+  `outbox_approval_idx`); a row for a DIFFERENT occurrence means the ticket was already spent, whatever
+  `consumed_at` says, and it is skipped. A row for THIS occurrence is the legitimate retry (`AlreadyEnqueued`,
+  retire, advance). After the occurrence is durably enqueued (`Enqueued` or `AlreadyEnqueued`) and BEFORE the
+  schedule advances, the runner calls `ApprovalManager::retire_schedule_tickets(schedule_id, occurrence_key,
+  ids)`: one UPDATE (`WHERE schedule_id AND consumed_at = 0 AND status IN ('approved','rejected') AND id =
+  ANY(ids)`, `consumed_at` on database time, `consumed_by = 'schedule:<occurrence key>'`, or `schedule:ledger-spent:<occurrence key>` for the
+  ledger-spent site below; never empty). `ids`
+  are the unsettled tickets of that schedule the runner OBSERVED in its own snapshot this tick (matched,
+  mismatch-skipped, expired-unswept, outbox-spent; on a rejected skip, the rejected ones too), so an approved
+  mismatch-skipped ticket is retired with the one that fired (otherwise it could fire a LATER occurrence after
+  the definition is reverted) while a ticket approved after the snapshot, or a successor occurrence's ticket,
+  is never touched. Pending tickets are never touched. A retire store failure or exception HOLDS the
+  occurrence; the next tick re-enqueues the same occurrence key (idempotent) and retries the retire, so a
+  failure between the enqueue and the retire can neither lose the fire nor run it twice. A rejected ticket is
+  retired the same way after it skips its occurrence. Every retire site settles only observed ids, by a CAS
+  from unsettled: the enqueue site and the already-ran site run after the outbox row exists; the ledger-spent
+  site settles tickets whose outbox row belongs to an EARLIER occurrence; the rejected-skip site has no outbox
+  row. When no ticket is eligible but the occurrence key is
+  already in the outbox (retire ok, advance failed), the runner advances without raising a fresh ask. The
+  retire is deliberately NOT epoch-fenced: the only fenced write is the outbox INSERT (`ScheduleRunner::tick`
+  is FencedLeaderOnly); on the enqueue paths the retire only runs after the outbox row exists (whoever
+  wrote it); on the rejected-skip path the retire is an observed-ids-only CAS from unsettled, so a stale
+  leader can only settle tickets it saw (the deny direction). `ScheduleEngine`'s own stamps (`created_at`, `last_executed_at`, `next_execution_at`) stay
+  process-clock due-ness bookkeeping and are informational for approvals now; `test_approval_manager.cpp`
+  allow-lists the process-clock reads in `schedule_runner.cpp` (the audit timestamp) and
+  `schedule_engine.cpp` (the due-ness stamps) by exact count so a new site fails loudly.
+- **The outbox `approval_id` is now a spent-ticket ledger: any future outbox reaper must retain rows at least
+  as long as the 7-day ticket lifetime** (`kApprovalTicketTtlSeconds`), or a reaped row makes a spent ticket
+  look unspent. Today no reaper exists; the requirement is also stated at
+  `CommandOutboxStore::occurrences_for_approval`. An unreadable ledger HOLDS the occurrence, and an unwired
+  ledger seam fails closed.
+- **Accepted LOW items (#6096), recorded so a reviewer does not re-open them.** (1) An approval can carry across
+  a skipped occurrence within its 7-day life (an occurrence skipped for a disabled definition or a denied
+  arming check does not settle the approved ticket waiting for it, so that ticket can fire at the next
+  occurrence); it still yields at most one run per approval. (2) While a retire keeps failing, each held tick
+  creates and cancels one execution row (per-tick churn). (3) Retire ok followed by a failed advance burns one
+  approval: the occurrence already ran, the schedule advances on the next tick without a fresh ask, and the
+  spent ticket is not reused. There is deliberately no replay eligibility keyed on `consumed_by` equalling the
+  occurrence key. (4) `ScheduleEngine::advance_schedule` returns void and only logs a failure, so the runner
+  cannot observe a failed advance; the outbox guard above is what makes that safe.
+- **More accepted LOW items (#6096).** (i) Retired schedule tickets keep status `approved` and are never
+  swept, so they count in the creator's newest-100 `query()` window, and a still-unsettled older ticket can
+  fall out of that window: one wasted approval and a fresh ask (follow-up with the #6098 sweep note).
+  (ii) `consumed_by` names the occurrence that SETTLED a ticket, which for a skipped or mismatched ticket is
+  not the occurrence that used it (the outbox holds the truth); a ticket the outbox ledger showed was used by
+  an earlier occurrence carries the `ledger-spent:` marker. (iii) A stale paused leader's unfenced advance
+  only delays the next run.
+- **One-time legacy migration, clock-free (#6096).** Tickets minted before this change carry no
+  `consumed_at`, so they would all look unspent. Approvals schema migration v2 retires every unsettled
+  approved/rejected ticket that has a `schedule_id` (`consumed_by = 'schedule:legacy-6096'`), once per
+  database, with no comparison between `submitted_at` and `last_executed_at`, under a 300 s statement
+  timeout (`SET LOCAL` was observed to take effect when sent as one libpq `PQexec` message inside the
+  step's transaction, also over a shorter session-level timeout, in a one-off check on a throwaway PG16 by the
+  implementer; it is not a repo test, and the repo tests pin only that the statement carries the prefix). It touches every unsettled approved or
+  rejected scheduled ticket, including old rejected ones (rejected tickets never expire and are never swept).
+  The deny direction: a legitimate approved-but-unfired ticket at upgrade time just gets a fresh ask. See the upgrade note in `docs/user-manual/upgrading.md`.
+- **Parts 1, 2 and 4 DECLINED for the approved-ticket and the pending path; part 3 is not declined
+  (next bullet)** (there is no per-replica clock reading to probe, persist or dedupe, and running the
+  sweep on every replica is safe, so the SINGLE-WRITER caveat does not apply to it). With
+  `submitted_at` on database time, a submitter's own clock no longer moves a ticket's lifetime and no
+  caller supplies a timestamp (`submit()` takes none), so a skewed replica can neither pin the global
+  cap of 1000 pending tickets nor have its tickets swept early (both were possible while
+  `submitted_at` was process-stamped).
 - **Part 3's "ahead of now" clause is satisfied for `reviewed_at`, by the upper bound; it is not
   declined.** A lower bound alone honours a far-future `reviewed_at` for as long as the skew lasts and
   the sweep never reaches it. The 300 s slack is an absolute number chosen for a healthy row (stamped
   by the database, so never ahead of `now()`) plus statement-boundary jitter; do not copy it to another
-  store. No equivalent upper bound exists for `submitted_at` (see the previous bullet).
+  store. `submitted_at` needs no equivalent upper bound: it is database-authored too.
 - **Part 5 (cap) NOT adopted for the sweep:** it has no per-pass limit. It runs lazily inside `submit()`
   and only moves rows already past the lifetime to `expired`, which removes no data.
 - **Part 6 (missing anchor): not applicable,** there is no anchor. **Part 7:** the 7-day lifetime is an
@@ -642,14 +696,14 @@ disagree: the `consume_ticket` CAS, its diagnostic read, `submit()`'s approved-t
 - **Premise withdrawn.** The earlier reasoning that a 7-day window makes app-clock versus database-clock
   skew immaterial was wrong (governance ledger `6061-approver-assurance.yut0p2`, UP-3): a `reviewed_at`
   stamped from a replica's clock and compared with the database's passed the lower bound while it was
-  in the future. Stamping `reviewed_at` in SQL, plus the upper bound, is the fix. The same reasoning
-  still applies to `submitted_at`, which is why it is a named residual (#6096) and not closed. This
-  follows the house rule in `docs/user-manual/server-admin.md` of never comparing an app-host clock to
+  in the future. Stamping `reviewed_at` in SQL, plus the upper bound, is the fix, and #6096 applied the
+  same reasoning to `submitted_at`. This follows the house rule in `docs/user-manual/server-admin.md` of never comparing an app-host clock to
   a database-host clock.
 - **Residual, stated plainly.** The database host's own clock is still the authority, and a step in it
   is not harmless in either direction:
   - A **forward** step makes live tickets read as past their lifetime, and the sweep that runs while
-    the clock is wrong moves them to `expired` for good.
+    the clock is wrong moves them to `expired` for good. It also ages pending tickets, which expire the
+    same way.
   - A **backward** step of more than 300 s makes an approved, unconsumed ticket read as ahead of the
     database clock when its `reviewed_at` is more than 300 s ahead of the NEW database time (roughly,
     the tickets reviewed within the last (step size minus 300 s) before the step; older approved

@@ -2,7 +2,7 @@
 
 // Shared by test_runtime_config_store.cpp, test_runtime_config_secret_redaction.cpp,
 // and test_settings_routes_oidc.cpp -- promoted here once a third file needed the
-// identical helper (TrackerScope precedent, tests/unit/server/test_agent_service_impl.cpp).
+// identical helper (TrackerScope precedent, tests/unit/server/test_tracker_scope.hpp).
 
 #include "runtime_config_store.hpp"
 

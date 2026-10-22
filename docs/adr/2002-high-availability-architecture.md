@@ -234,7 +234,7 @@ outbox** with **durable monotonic event IDs** (replacing the per-process channel
   event spine**; presentation-terminated SSE/MCP consumers replay via `Last-Event-ID` / `?since=`
   against **core's spine API** (never the `yuzu` outbox directly) and **tolerate duplicates**
   (at-least-once). Cursor ownership: the client cursor is core's; presentation is a stateless relay.
-- The outbox inherits the **clock-guarded retention** rules (routed concern).
+- The outbox inherits the **clock-guarded retention** rules (routed concern). Its rows are also the schedule runner's spent-ticket ledger (#6096, `approval_id`), so any reaper must retain approval-bearing rows at least 7 days from creation.
 
 **Load-bearing prerequisite:** cross-instance correlation requires execution state in Postgres.
 `execution_tracker` (SQLite) and `cmd_execution_ids_` (in-process map, `agent_service_impl.hpp:330`)
@@ -1928,9 +1928,11 @@ per session up to `max_heartbeat_buffer` (default 10,000), so a default gateway'
 10,000 ids, i.e. at most 10 statements. Tombstoned rows (`session_id` NULL) never match. The private
 `GatewayUpstreamServiceImpl::resolve_sessions` is store-AUTHORITATIVE whenever the route store is
 configured; the local `gateway_sessions_` map is only a degrade-time hint (and a lost-race fallback).
-The `agent_routes_session_id_idx` index is non-unique, so a `session_id` matching more than one row is
-REFUSED as ambiguous (desync metric `op=session_lookup`, `outcome=ambiguous_session`); a degraded read
-is counted under route-store failure op `session_lookup`.
+Since migration v5 (#5683, see the Update below) a non-NULL `session_id` is UNIQUE, so a match
+returns at most one row; a `session_id` that still matches more than one row (only a hand-dropped
+index can cause this) is REFUSED as ambiguous (desync metric `op=session_lookup`,
+`outcome=ambiguous_session`) as defense in depth. A degraded read is counted under route-store failure
+op `session_lookup`.
 
 - **BatchHeartbeat** ingests and renews leases for every resolvable entry. `unknown_session_ids` lists a
   session id when the directory does not know it OR when the directory knows it but this replica holds
@@ -2032,13 +2034,17 @@ nothing to tear down); a session this replica itself registered (a local hint) i
 acknowledged, lease-renewed and ingested during the degrade, which suspends the ambiguity refusal for
 that window. The gateway-to-server hop is protected by the gateway peer mTLS plus SPKI pin. Evidence
 for these decisions is metrics and server logs only — there is no per-event audit row (volume is
-unbounded). The `ProxyRegister` adopt path rejects a presented session id that is not `gw-session-`
-plus 32 lowercase hex characters (`proxy_register/malformed_session_id`), and refuses to adopt an id
-that a different agent's COMMITTED directory row already holds (`proxy_register/session_held_by_other_agent`,
-expected rate zero, alert `YuzuGatewaySessionHeldByOtherAgent`). That guard is a same-statement
-`NOT EXISTS`, not a lock: two CONCURRENT adopts of one id for different agents can both land (measured
-against live Postgres), and the ambiguity refusal (`YuzuGatewaySessionAmbiguous`) is the backstop
-until the deferred UNIQUE partial index. It also cannot see a victim row that is already tombstoned
+unbounded), except the `announce_connected/session_held_by_other_agent` refusal of #5683 (see the
+Update below), which writes a best-effort `gateway.session_held_by_other_agent` row. The `ProxyRegister`
+adopt path rejects a presented session id that is not `gw-session-` plus 32 lowercase hex characters
+(`proxy_register/malformed_session_id`), and refuses to adopt an id that a different agent's COMMITTED
+directory row already holds (`proxy_register/session_held_by_other_agent`, expected rate zero, alert
+`YuzuGatewaySessionHeldByOtherAgent`). The same-statement `NOT EXISTS` is only a fast path and is not a
+lock: as merged in #5694 two CONCURRENT adopts of one id for different
+agents could both land (measured against live Postgres). Migration v5 (#5683) closes that with a UNIQUE
+partial index, so the loser now fails 23505 and is refused as `held_by_other_agent`; the ambiguity
+refusal (`YuzuGatewaySessionAmbiguous`) remains as defence in depth for a hand-dropped index only.
+The guard still cannot see a victim row that is already tombstoned
 (an outage past 270 s): a presenter of that id can reclaim it, and the id then resolves to the
 presenter until the victim's stream reconnects. If the victim was already listed for replay, its
 replay is refused and forces that reconnect; otherwise the window lasts until the victim's next
@@ -2051,7 +2057,8 @@ gateway.
 **Rolling deploy.** An OLD replica answering a batch reports directory-known sessions as unknown
 (its local map is empty after restart), so the gateway re-registers those agents. Drain old replicas
 first; the supported topology remains exactly one replica until the safe-to-scale gate lifts (§7c).
-No migration, flag or proto field is involved, the gateway needs no restart, and rollback is safe.
+No flag or proto field is involved and the gateway needs no restart; slice 2 itself shipped no
+migration (the later #5683 migration is described in the Update below), and rollback is safe.
 
 **Validation evidence.** The `[ws5]`, `[gateway_route_wiring]` and `[heartbeat_ingestion]` unit
 tags, including a restart-reconcile case (a non-owning replica lists the store-only session, the
@@ -2062,9 +2069,8 @@ honestly).
 
 **Deferred, not silent.** hp-1 (a local session with an empty `gateway_node` and no
 stream shadows the directory fallback in `GatewayRouteFallback::prepare`; reachable only with a second
-replica, which the gate forbids) and hp-2, both #5685; a UNIQUE partial index on `agent_routes(session_id)` (#5683, own
-migration — the cross-agent `NOT EXISTS` adopt guard plus the ambiguity refusal are the interim
-guards, see Security notes); the local-only surfaces that still read only
+replica, which the gate forbids) and hp-2, both #5685. The UNIQUE partial index on `agent_routes(session_id)` (#5683) is no longer
+deferred: see the Update below. Also deferred: the local-only surfaces that still read only
 the local registry (`to_json_obj()`, `agent_count()`, the guardian heartbeat reconcile) on a replica
 that has not yet been hydrated; the degraded-read CONNECTED local acceptance, which is sound only
 for one replica (a supersede handled on another replica is invisible to this replica's
@@ -2073,6 +2079,92 @@ in-memory placement for the superseded session; the durable row is untouched bec
 session-guarded) and must be revisited with hp-1 before the gate lifts (#5685); TSan coverage of the new
 paths (not landed with this change; #5278); and the WS-9 validation script (follow-on PR-B). The
 local-only surfaces and the WS-9 script are tracked in the WS-5 row of `docs/ha-delivery-matrix.md`.
+
+**Update (2026-10-22, #5683): UNIQUE partial index on `agent_routes(session_id)`.** Migration v5 of
+`GatewayRouteStore` replaces the non-unique `agent_routes_session_id_idx` with
+`ux_agent_routes_session_id` (`UNIQUE ... WHERE session_id IS NOT NULL`; NULLs are tombstones and never
+collide). It serialises the cross-agent adopt race the `NOT EXISTS` guard could not: the second
+transaction waits on the first's uncommitted index entry and then fails 23505, which
+`reclaim_tombstoned_session` maps to `held_by_other_agent` (the existing `FAILED_PRECONDITION` refusal) and
+`announce_connected`'s fallback insert maps to a new `session_held_by_other_agent` flag (the CONNECTED
+handler unpublishes the in-memory placement, answers `acknowledged=false`, counts
+`announce_connected/session_held_by_other_agent` and writes a best-effort
+`gateway.session_held_by_other_agent` audit row without the session id). This covers a presenting agent
+that has NO directory row (the fallback insert is what the unique index refuses). An agent that still has
+a row, including a tombstone, is not covered: the insert's `ON CONFLICT (agent_id) DO NOTHING` arbiter
+hides the index conflict, so its CONNECTED lands as `session_mismatch` and does not unpublish. That is
+the tombstoned-victim residual listed under "Still open", unchanged by this change.
+`register_fresh` keeps failing closed (`db_error`) on a collision: a server-minted id (128 random bits)
+can only collide through an RNG fault or a planted row, and a distinct error line is logged. Only a
+violation of THIS index is remapped; any other 23505 stays `db_error`.
+The old index is dropped, not kept: `lookup_by_sessions` and the reclaim check are served by the new one
+(an `EXPLAIN` test pins it), and `renew_leases`/`deregister` also constrain the primary key.
+
+*Duplicates that already exist.* The migration takes `LOCK TABLE agent_routes IN ACCESS EXCLUSIVE MODE`
+first (`lock_timeout` 30 s, `statement_timeout` lifted). Only `DROP INDEX` needs ACCESS EXCLUSIVE (the
+dedup `UPDATE` needs only ROW EXCLUSIVE); it is taken up front so a later lock upgrade cannot deadlock
+against another replica's read-then-write transaction and no writer can commit a new duplicate between
+the dedup and the build. The old index is dropped with `IF EXISTS` (a hand-dropped one does not abort the
+migration); the `CREATE UNIQUE INDEX` deliberately has no `IF NOT EXISTS`.
+The migration tombstones EVERY row of any group sharing a session id (the five placement columns
+NULLed; `connection_epoch` and `home_cluster_id` kept, the shape `deregister` writes), then builds the
+index; a pre-existing object of that name aborts it atomically (the tombstones roll back too), by design:
+the operator drops it and restarts. It tombstones all rows rather than keeping one: a group has no
+determinable owner (no `created_at`; the newest `updated_at` is the later adopter, i.e. the likelier
+forger) and this is exactly what the reaper already does to both rows 270 s later. Each affected agent
+recovers through the existing renew shortfall -> gateway replay -> `reclaim` path, where the first
+reclaimer wins and the other is refused and reconnects.
+Evidence is the pre-seeded counter `yuzu_server_gateway_route_session_dedup_total` (rows tombstoned by
+THIS start's migration, expected 0; present only with `--gateway-upstream`) plus one WARN log with the
+count only; there is no audit row (the audit store is built after the route store). The durable record
+is the `route_meta` key `v5_session_dedup_tombstoned_rows`; a later start logs it once at INFO and the
+counter reads 0, so a future alert on it must use `> 0`, not `increase()`. When two server processes
+migrate the same database concurrently, each reads the winner's count, so the counter may be reported
+twice. The tombstoned agents race to replay, so some replays are refused as `session_held_by_other_agent`
+and raise `YuzuGatewaySessionHeldByOtherAgent` right after the migrating boot. The operator guidance (in
+`docs/user-manual/gateway.md`) calls those refusals the one-time migration artifact ONLY IF BOTH hold:
+(a) the number of `op="proxy_register"` `session_held_by_other_agent` refusals since that start,
+summed over every server replica, is at most N, the number of rows migration v5 tombstoned on that start
+(`yuzu_server_gateway_route_session_dedup_total` on the migrating start; the `migration v5 tombstoned N`
+WARN, or the `route_meta` value after a restart), because a tombstoned group of k rows can produce at
+most k-1 refusals (N is a safe upper bound); count the refusal WARN lines rather than the counter if any
+replica restarted since the migrating start (the counter resets on restart); any `op="announce_connected"` refusal is NOT the artifact;
+and (b) they all occur within that start's window: one or two agent heartbeat cycles (30 s by default,
+`--heartbeat` changes it), plus up to 300 s of breaker backoff (cap `circuit_breaker_max_reset_timeout_ms`
+in `gateway/config/sys.config`), plus the replay drip (about 20 ms per agent on that gateway): allow
+roughly 6 minutes plus 20 ms per agent at the defaults. Refusals past that window, or more than N, are
+NOT the artifact (escalating errs on the safe side): treat them as a forged or colliding id and
+escalate. Refusals inside the bound and the window are still NOT proof of benignness (a forged presenter
+acting at the same time could hide inside them, and a forger that wins the reclaim of a tombstoned id
+makes the legitimate agents' refusals look identical): the rule only lets
+an operator stop escalating once refusals have stopped inside the window, so the count is re-checked
+after the window and the alert is not silenced beyond it. The counter keeps its migrating-start value
+for the whole process lifetime, so it proves nothing about timing; timing comes from the WARN
+timestamps, and if the migrating start's time or log cannot be found the operator escalates.
+
+*Deviation from ADR-0008, signed off.* The build is a plain transactional `CREATE UNIQUE INDEX`, not
+`CONCURRENTLY` (the migration runner has no non-transactional kind, #4432). Fraser (project lead)
+approved this on the strength of ADR-0053 "Update (2026-10-20)", the maintainer's decision that rolling
+upgrade is not supported at this stage (recorded for `SoftwareInventoryStore` v7, measured at 4M rows in
+`docs/postgres-migration-ladder.md`; ADR-0053 reports its own CaStore v5 `ca_issued` builds at 1.3 s for
+250k rows and 8.6 s for 1M). It is recorded as a controlled exception, sign-off: project lead. The
+exception ends at the first of two events: rolling upgrades become supported, or #4432 delivers the
+non-transactional migration kind (ADR-0053's sunset condition); after either, the next `agent_routes`
+index must use that kind. `agent_routes` is O(fleet) (one row per agent plus soft tombstones). A first
+measurement on a local PostgreSQL 18 container with `fsync=off` (1,000,000 rows, no duplicates) took about
+6.4 s under the lock (dedup 1.9 s, build 4.4 s); a re-measure on a default PostgreSQL 18.4 container gave
+about 0.6 s at 200k rows, 2.4 s at 1M and 22 s at 10M (about 900 MB of WAL), roughly linear. The lock
+blocks every other statement on the table from any process. On lock-timeout expiry the migration rolls
+back, the store fails to open, the server exits and a supervisor restart retries about every 35 s
+(`docs/user-manual/upgrading.md`). Rollback to an older binary boots and works (it skips versions it
+knows and its queries are served by the new index), but its racing duplicate write now fails as a generic
+route-write error (`yuzu_server_gateway_route_write_failed_total{reason="db_error"}`): `ProxyRegister`
+fails closed (`UNAVAILABLE`) and `announce_connected` stays fail-open (the in-memory placement is not
+unpublished). The dedup tombstones are not undone.
+
+*Still open.* The tombstoned-victim window above is unchanged (a tombstone holds NULL, so no index can see
+it); it is tracked in #6339. This change does not touch #5685 and does NOT lift the safe-to-scale gate: it is the first
+cross-REPLICA serialisation of a session adopt, not a second-replica safety proof.
 
 ### 8. PKI / CA high availability (Q8)
 Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced *(the

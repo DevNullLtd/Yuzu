@@ -2805,8 +2805,10 @@
       "changelog.d/2026-10-14-dex-tar-titles.changed.md",
       "changelog.d/2026-10-21-tar-all-sources-default-on.changed.md",
       "changelog.d/2026-10-21-tar-mapdrive-history-backfill.fixed.md",
+      "changelog.d/2026-10-21-tar-timeline-render.added.md",
       "changelog.d/2026-10-21-tar-windows-image-db-hardening.security.md",
-      "changelog.d/20261014-tar-adhoc-sql-moved.changed.md"
+      "changelog.d/20261014-tar-adhoc-sql-moved.changed.md",
+      "changelog.d/20261021-tar-capture-sources-paused-core.fixed.md"
     ],
     "definitions": [
       "content/definitions/tar.yaml",
@@ -2878,6 +2880,7 @@
     "privilege_row": true,
     "tests": [
       "tests/unit/server/test_tar_process_tree.cpp",
+      "tests/unit/server/test_tar_timeline_render.cpp",
       "tests/unit/server/test_tar_tree_routes.cpp",
       "tests/unit/test_tar_aggregator.cpp",
       "tests/unit/test_tar_arp.cpp",
