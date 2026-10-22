@@ -66,29 +66,21 @@ public:
     RundownGate(const RundownGate&) = delete;
     RundownGate& operator=(const RundownGate&) = delete;
 
-    /// A place inside the gate, or an empty Entry once close() has run. A failure to take the lock
-    /// refuses too: the caller drops its work, which is the safe direction.
-    [[nodiscard]] Entry try_enter() noexcept {
-        try {
-            std::lock_guard lock(mu_);
-            if (closed_)
-                return Entry{nullptr};
-            ++inside_;
-            return Entry{this};
-        } catch (...) {
+    /// A place inside the gate, or an empty Entry once close() has run. May throw (a mutex that
+    /// cannot be locked); its one caller, the audit hook, reports that as a failed write.
+    [[nodiscard]] Entry try_enter() {
+        std::lock_guard lock(mu_);
+        if (closed_)
             return Entry{nullptr};
-        }
+        ++inside_;
+        return Entry{this};
     }
 
     /// True once close() has run. Entrants poll it before each unit of work that leases what the
-    /// owner will destroy. A failure to take the lock reads as closed, the safe direction.
-    [[nodiscard]] bool closed() const noexcept {
-        try {
-            std::lock_guard lock(mu_);
-            return closed_;
-        } catch (...) {
-            return true;
-        }
+    /// owner will destroy. May throw like try_enter().
+    [[nodiscard]] bool closed() const {
+        std::lock_guard lock(mu_);
+        return closed_;
     }
 
     /// Refuse every later try_enter(). Sticky, idempotent, never waits. Not wrapped in try/catch:

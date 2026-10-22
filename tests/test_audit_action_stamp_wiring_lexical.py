@@ -48,10 +48,10 @@ Invariants:
        `const auto in_flight = registry_audit_gate_.try_enter();` followed by
        `if (!in_flight) return true;`, after the pure verdict and BEFORE the weak lock (the
        entry must die last, so the count falls after the strong reference is released); exactly
-       one `registry_audit_gate_.closed()`, after the charge and before the only `store->log(`,
-       with a `book_rows();` and a `return false;` between them (a closed gate loses the rest of
-       the frame, counted); the hook never closes or waits itself; and the weak lock is the only
-       `registry_audit_store_.lock(` in the file (a second reader would also need the gate).
+       one `registry_audit_gate_.closed()`, after the charge and before the only `store->log(`
+       (what the closed branch then does is pinned by the unit cases, not here); the hook never
+       closes or waits itself; and the weak lock is the only `registry_audit_store_.lock(` in the
+       file (a second reader would also need the gate).
 
   server.cpp
    12. `agent_service_.set_registry_audit_store(audit_store_);` appears exactly once and the setter
@@ -69,8 +69,7 @@ deleted stamp call, a deleted initialiser, a hook moved after the notification, 
 signal, a flag that is never set or is re-armed per frame, a raw store read beside the weak lock or
 in the forwarder entry, a verdict outside the try, a charge without the overflow key, a missing
 factory call, a deleted or cleared weak-store wiring, the rundown gate's entry deleted or moved
-after the lock, its per-row check deleted or moved before the charge or made to return true or to
-skip the booking, a second weak lock, the close or the wait deleted, swapped or moved after the
+after the lock, its per-row check deleted or moved before the charge, a second weak lock, the close or the wait deleted, swapped or moved after the
 reset, the wait's result ignored or its force-exit removed) and requires problems() to be
 non-empty on each; a mutation whose pattern no longer matches fails loudly rather than passing
 vacuously. A
@@ -212,15 +211,12 @@ def server_problems(src):
         at_enter, at_verdict, at_lock = body.find(enter), body.find(VERDICT), body.find(WEAK_LOCK)
         at_charge, at_closed = body.find(normalise(CHARGE)), body.find(CLOSED_CHECK)
         at_log = body.find(STORE_LOG)
-        closed_branch = body[at_closed:at_log] if 0 <= at_closed < at_log else ""
         if (
             body.count(enter) != 1
             or not 0 <= at_verdict < at_enter < at_lock
             or body.count(CLOSED_CHECK) != 1
             or body.count(STORE_LOG) != 1
             or not 0 <= at_charge < at_closed < at_log
-            or "book_rows();" not in closed_branch
-            or "return false;" not in closed_branch
             or "registry_audit_gate_.close()" in body
             or "wait_idle" in body
             or t.count("registry_audit_store_.lock(") != 1
@@ -229,10 +225,9 @@ def server_problems(src):
                 f"agent_service_impl.cpp: audit_registry_frame must enter the rundown gate with"
                 f" `{ENTER} {ENTER_GUARD}` once, after the verdict and BEFORE `{WEAK_LOCK}` (it"
                 f" must die last), check `{CLOSED_CHECK}` once, after the charge and before the"
-                f" only `{STORE_LOG}`, with `book_rows();` and `return false;` in between, never"
-                f" close or wait itself, and hold the only `registry_audit_store_.lock(` in the"
-                f" file: otherwise a forwarder between two rows leases a pool that stop() is"
-                f" destroying"
+                f" only `{STORE_LOG}`, never close or wait itself, and hold the only"
+                f" `registry_audit_store_.lock(` in the file: otherwise a forwarder between two rows"
+                f" leases a pool that stop() is destroying"
             )
     if body is None or not 0 <= body.find("try {") < body.find(VERDICT):
         out.append(
@@ -365,13 +360,6 @@ SERVER_MUTATIONS = [
         r"(?s)(const auto admit = registry_audit_budget_->try_admit\(agent_id, overflow\);.*?)"
         r"(if \(registry_audit_gate_\.closed\(\)\) \{.*?return false;\s*\})",
         "\\2\n            \\1",
-    ),
-    # a closed gate no longer fails the frame
-    (r"(?s)(if \(registry_audit_gate_\.closed\(\)\) \{.*?)return false;", r"\1return true;"),
-    # a closed gate no longer books the rows it loses
-    (
-        r"(?s)(if \(registry_audit_gate_\.closed\(\)\) \{.*?)book_rows\(\);(.*?return false;)",
-        r"\1\2",
     ),
     # the hook closes the gate itself
     (
