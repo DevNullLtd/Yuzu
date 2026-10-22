@@ -5539,7 +5539,12 @@ public:
                     q.limit = static_cast<int>(dispatched.size()) + 16;
                     // Degrade → empty this iteration; the poll loop retries
                     // until the deadline (deny-or-benign, not authz — ADR-0039).
-                    auto rows = response_store_->query(command_id, q).value_or(std::vector<StoredResponse>{});
+                    // #4990: internal consumer. Reads back the server's own system-caller
+                    // tar.fleet_snapshot dispatch for the topology graph; never returned as rows.
+                    auto rows = response_store_
+                                    ->query(command_id,
+                                            ResponseTierFilter::unrestricted_internal_consumer(), q)
+                                    .value_or(std::vector<StoredResponse>{});
                     for (const auto& r : rows) {
                         if (seen.insert(r.agent_id).second)
                             matched.push_back(r);
@@ -16578,6 +16583,7 @@ private:
                              .fleet_read_fn = fleet_read_fn,
                              .audit_fn = audit_fn,
                              .store = response_store_.get(),
+                             .forensics_plugins = forensics_plugins(),
                              .metrics = &metrics_,
                          });
 
@@ -17895,7 +17901,11 @@ private:
                             std::vector<std::string> members;
                             std::unordered_set<std::string> seen;
                             if (response_store_) {
-                                auto rows = response_store_->query_by_execution(p.source_execution_id);
+                                // #4990: internal consumer. Membership only (agent ids), owner-scoped
+                                // by the pending row; no response body leaves the server here.
+                                auto rows = response_store_->query_by_execution(
+                                    p.source_execution_id,
+                                    ResponseTierFilter::unrestricted_internal_consumer());
                                 if (!rows) {
                                     // Degraded read: skip materializing THIS pending set
                                     // this tick rather than risk a false-empty membership
@@ -18656,7 +18666,10 @@ private:
                     return out;
                 ResponseQuery q;
                 q.agent_id = agent_id; // #1634: scope the poll read AT THE STORE SEAM
-                for (const auto& r : response_store_->query(command_id, q).value_or(std::vector<StoredResponse>{}))
+                // #4990: this poll reads back a command the route dispatched itself from a
+                // fixed non-Forensics plugin, so the Forensics tier is excluded outright.
+                const auto tier = ResponseTierFilter::for_fixed_plugin_poll(forensics_plugins());
+                for (const auto& r : response_store_->query(command_id, tier, q).value_or(std::vector<StoredResponse>{}))
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },
@@ -18866,7 +18879,10 @@ private:
                     return out;
                 ResponseQuery q;
                 q.agent_id = agent_id; // #1634: scope the poll read AT THE STORE SEAM
-                for (const auto& r : response_store_->query(command_id, q).value_or(std::vector<StoredResponse>{}))
+                // #4990: this poll reads back a command the route dispatched itself from a
+                // fixed non-Forensics plugin, so the Forensics tier is excluded outright.
+                const auto tier = ResponseTierFilter::for_fixed_plugin_poll(forensics_plugins());
+                for (const auto& r : response_store_->query(command_id, tier, q).value_or(std::vector<StoredResponse>{}))
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },
@@ -19308,8 +19324,13 @@ private:
                                          return out;
                                      ResponseQuery q;
                                      q.agent_id = agent_id;
+                                     // TODO(#4990): wire ForensicsVisibilityFn and derive the
+                                     // plugin server-side - until then this reads as before.
+                                     const auto tier =
+                                         ResponseTierFilter::operator_surface_pending_wiring(
+                                             forensics_plugins());
                                      for (const auto& r :
-                                          response_store_->query(command_id, q)
+                                          response_store_->query(command_id, tier, q)
                                               .value_or(std::vector<StoredResponse>{}))
                                          out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                                      return out;
@@ -19828,8 +19849,12 @@ private:
                 q.limit = 50000; // > cohort cap (20000) with headroom; keyset paging is a follow-up
                 // Degrade → empty (ADR-0039 deny-or-benign): reads as "no agent
                 // has responded yet", never a fabricated stage transition.
+                // #4990: internal consumer. The deployment engine reads the status of its own
+                // content_dist dispatch (cohort re-authorized every tick); rows are scored, not shown.
                 return deployment::best_response_per_agent(
-                    response_store_->query_by_execution(execution_id, q)
+                    response_store_
+                        ->query_by_execution(execution_id,
+                                             ResponseTierFilter::unrestricted_internal_consumer(), q)
                         .value_or(std::vector<StoredResponse>{}));
             },
             audit_fn, preflight_run_store_.get(), deployment_run_store_.get(),
@@ -19877,7 +19902,10 @@ private:
                     return out;
                 ResponseQuery q;
                 q.agent_id = agent_id; // #1634: scope the poll read AT THE STORE SEAM
-                for (const auto& r : response_store_->query(command_id, q).value_or(std::vector<StoredResponse>{}))
+                // #4990: this poll reads back a command the route dispatched itself from a
+                // fixed non-Forensics plugin, so the Forensics tier is excluded outright.
+                const auto tier = ResponseTierFilter::for_fixed_plugin_poll(forensics_plugins());
+                for (const auto& r : response_store_->query(command_id, tier, q).value_or(std::vector<StoredResponse>{}))
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },
@@ -19946,6 +19974,7 @@ private:
         // above); wiring it here too so /fragments/results migrates onto
         // require_fleet_read as its sole gate.
         dashboard_routes_->set_fleet_read_fn(fleet_read_fn);
+        dashboard_routes_->set_forensics_plugin_set(forensics_plugins()); // #4990
         // PR6.0b — the SAME capability_registry_ classifier /api/command and MCP
         // execute_instruction consult, so the three operator-facing dispatch
         // surfaces cannot disagree about whether a plugin.action is Destructive.
@@ -20131,6 +20160,7 @@ private:
         };
         wf_deps.approval_manager = approval_manager_.get();
         wf_deps.response_store = response_store_.get();
+        wf_deps.forensics_plugins = forensics_plugins(); // #4990
         // PR 3 — SSE event bus for live execution updates. Server owns
         // the bus; ExecutionTracker publishes onto it; SSE handler
         // subscribes per-connection.
@@ -21101,6 +21131,9 @@ private:
         // BEFORE register_routes(), same timing contract as the two setters
         // immediately above.
         rest_api_v1_->set_scope_evaluate_fn(scope_evaluate_fn);
+        // #4990 - the Forensics plugin set feeding the response read tier; MUST run BEFORE
+        // register_routes() (captured by value at registration), same timing as the setters above.
+        rest_api_v1_->set_forensics_plugin_set(forensics_plugins());
         // #4983 — `POST /api/v1/result-sets`'s device_ids[] existence check.
         // registry_.all_ids() is presence-merged (HA WS-5), the SAME domain
         // scope_evaluate_fn's ScopePopulation::Fleet path above uses — NOT
@@ -21799,6 +21832,7 @@ private:
             // decision for the same caller (same conversion, same underlying
             // require_fleet_read call).
             mcp_server_->set_fleet_read_fn(fleet_read_fn);
+            mcp_server_->set_forensics_plugin_set(forensics_plugins()); // #4990
             // Registry tools reach the REST provider closures through ToolDeps: the SAME
             // closure instances HardwareRoutes::Deps received above (roster, CI detail,
             // DEX score, quarantine list, fleet_read_fn gate, audit_fn), never a store
@@ -22560,6 +22594,10 @@ private:
     /// `capability_registry_` in the constructor (empty derivation = startup_failed_). Declared
     /// after the registry it is derived from; route classes borrow `&*forensics_plugin_set_`.
     std::optional<yuzu::server::ForensicsPluginSet> forensics_plugin_set_;
+    /// #4990: the borrowed form route classes take (nullptr only when startup_failed_).
+    [[nodiscard]] const yuzu::server::ForensicsPluginSet* forensics_plugins() const noexcept {
+        return forensics_plugin_set_ ? &*forensics_plugin_set_ : nullptr;
+    }
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail
     /// closed if the DSN is empty or unreachable), reset in stop() AFTER the

@@ -73,7 +73,8 @@ struct PageResponses {
     operate_pages::ResponsesState state{operate_pages::ResponsesState::kOk};
 };
 
-PageResponses collect_page_responses(ResponseStore* store, const Execution& exec,
+PageResponses collect_page_responses(ResponseStore* store, const ResponseTierFilter& tier,
+                                     const Execution& exec,
                                      const std::vector<AgentExecStatus>& visible_agents,
                                      const authz::VisibleSet& scope) {
     PageResponses out;
@@ -85,11 +86,11 @@ PageResponses collect_page_responses(ResponseStore* store, const Execution& exec
     rq.since = exec.dispatched_at;
     rq.until = exec.completed_at > 0 ? exec.completed_at : now_epoch_seconds();
     rq.limit = 500;
-    auto primary = store->query_by_execution(exec.id, rq);
+    auto primary = store->query_by_execution(exec.id, tier, rq);
     bool degraded = !primary.has_value();
     auto responses = primary.value_or(std::vector<StoredResponse>{});
     if (responses.empty()) {
-        auto legacy = store->query(exec.definition_id, rq);
+        auto legacy = store->query(exec.definition_id, tier, rq);
         degraded = degraded || !legacy.has_value();
         std::unordered_map<std::string, bool> in_set;
         for (const auto& a : visible_agents)
@@ -218,6 +219,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     auto* policy_store = deps.policy_store;
     auto* approval_manager = deps.approval_manager;
     auto* response_store = deps.response_store;
+    const auto* forensics_plugins = deps.forensics_plugins; // #4990
     auto* execution_event_bus = deps.execution_event_bus;
     auto* metrics = deps.metrics;
     auto* capability_registry = deps.capability_registry; // BR-001
@@ -639,7 +641,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get(
         R"(/fragments/executions/([A-Za-z0-9_-]{1,128})/detail)",
         [auth_fn, fleet_read_fn, audit_fn, probe_perm_fn, execution_tracker, instruction_store,
-         response_store](const httplib::Request& req, httplib::Response& res) {
+         response_store, forensics_plugins](const httplib::Request& req, httplib::Response& res) {
+            // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
+            const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins);
             // #1712 / #3290 Phase 2 — migrated onto require_fleet_read
             // (fleet_read_fn), mirroring query_installed_software / the REST
             // /api/v1/inventory/software twin exactly: the gate is now the
@@ -823,7 +827,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 for (const auto& a : agents)
                     devs.rows.push_back({a.agent_id, a.status, a.error_detail, a.exit_code,
                                          a.dispatched_at, a.completed_at});
-                auto pr = collect_page_responses(response_store, exec, agents, gate.scope);
+                auto pr = collect_page_responses(response_store, tier, exec, agents, gate.scope);
                 devs.responses = std::move(pr.rows);
                 devs.responses_total = pr.total;
                 devs.responses_state = pr.state;
@@ -1115,11 +1119,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 // informational drawer, not a gate), but `store_degraded`
                 // stays distinguishable through to the render below so a
                 // failed read doesn't print "No responses recorded."
-                auto primary_opt = response_store->query_by_execution(exec.id, rq);
+                auto primary_opt = response_store->query_by_execution(exec.id, tier, rq);
                 bool store_degraded = !primary_opt.has_value();
                 auto responses = primary_opt.value_or(std::vector<StoredResponse>{});
                 if (responses.empty()) {
-                    auto legacy_opt = response_store->query(exec.definition_id, rq);
+                    auto legacy_opt = response_store->query(exec.definition_id, tier, rq);
                     store_degraded = store_degraded || !legacy_opt.has_value();
                     auto legacy = legacy_opt.value_or(std::vector<StoredResponse>{});
                     // Filter to agents that appear in this execution's

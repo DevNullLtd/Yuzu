@@ -32,6 +32,7 @@
 namespace yuzu::server {
 
 // Forward declarations
+class ForensicsPluginSet;
 class ResponseStore;
 class ManagementGroupStore;
 class TagStore;
@@ -179,6 +180,13 @@ public:
                                            const std::string& operation)>;
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
 
+    /// #4990 - the Forensics plugin set the stored-response read tier excludes
+    /// (`ServerImpl::forensics_plugin_set_`, borrowed: it outlives this object). Same setter idiom
+    /// as `set_fleet_read_fn`: handlers read the member per request. Unset (nullptr, a test
+    /// harness) leaves the pre-tier behaviour for the results fragments until their
+    /// `ForensicsVisibilityFn` wiring lands.
+    void set_forensics_plugin_set(const ForensicsPluginSet* plugins) { forensics_plugins_ = plugins; }
+
     /// PR6.0b — classifies a `plugin.action` pair for the Destructive
     /// TARGETING gate on `POST /api/dashboard/execute`
     /// (`dispatch_destructive_gate.hpp`). Deliberately the SAME shape and the
@@ -273,6 +281,7 @@ private:
     FleetReadFn fleet_read_fn_;
     AuditFn audit_fn_;
     ResponseStore* response_store_{nullptr};
+    const ForensicsPluginSet* forensics_plugins_{nullptr}; // #4990 - see set_forensics_plugin_set
     ManagementGroupStore* mgmt_group_store_{nullptr};
     detail::AgentRegistry* registry_{nullptr};
     TagStore* tag_store_{nullptr};

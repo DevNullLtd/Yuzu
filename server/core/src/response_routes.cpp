@@ -63,6 +63,9 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
+        // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
+        const auto tier = ResponseTierFilter::operator_surface_pending_wiring(deps.forensics_plugins);
+
         auto group_by = req.get_param_value("group_by");
         if (group_by.empty())
             group_by = "status";
@@ -132,7 +135,7 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         AggregateScope agg_scope; // nullopt = no restriction
         std::size_t agg_dropped = 0;
         if (gate.scope) {
-            auto distinct = deps.store->distinct_agent_ids(instruction_id);
+            auto distinct = deps.store->distinct_agent_ids(instruction_id, tier);
             if (!distinct) {
                 res.status = 503;
                 res.set_content(
@@ -162,7 +165,7 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
                                       " surface=aggregate"))
             return;
 
-        auto results_opt = deps.store->aggregate(instruction_id, aq, filter, agg_scope);
+        auto results_opt = deps.store->aggregate(instruction_id, tier, aq, filter, agg_scope);
         if (!results_opt) {
             res.status = 503;
             res.set_content(
@@ -213,6 +216,9 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
+        // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
+        const auto tier = ResponseTierFilter::operator_surface_pending_wiring(deps.forensics_plugins);
+
         ResponseQuery q;
         if (req.has_param("agent_id"))
             q.agent_id = req.get_param_value("agent_id");
@@ -240,7 +246,7 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         AggregateScope scope_arg; // nullopt = unrestricted
         std::size_t export_dropped = 0;
         if (gate.scope) {
-            auto distinct = deps.store->distinct_agent_ids(instruction_id);
+            auto distinct = deps.store->distinct_agent_ids(instruction_id, tier);
             if (!distinct) {
                 res.status = 503;
                 res.set_content(
@@ -264,7 +270,7 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         // output/error_detail (see ResponseStore::query_bounded). Same predicates and
         // scope push-down as query().
         const std::size_t byte_cap = export_body_byte_cap().load();
-        auto bounded_opt = deps.store->query_bounded(instruction_id, q, scope_arg, byte_cap);
+        auto bounded_opt = deps.store->query_bounded(instruction_id, tier, q, scope_arg, byte_cap);
         if (!bounded_opt) {
             res.status = 503;
             res.set_content(
@@ -374,6 +380,9 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
+        // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
+        const auto tier = ResponseTierFilter::operator_surface_pending_wiring(deps.forensics_plugins);
+
         ResponseQuery q;
         if (req.has_param("agent_id"))
             q.agent_id = req.get_param_value("agent_id");
@@ -404,7 +413,7 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         AggregateScope scope_arg; // nullopt = unrestricted
         std::size_t get_dropped = 0;
         if (gate.scope) {
-            auto distinct = deps.store->distinct_agent_ids(instruction_id);
+            auto distinct = deps.store->distinct_agent_ids(instruction_id, tier);
             if (!distinct) {
                 res.status = 503;
                 res.set_content(
@@ -423,7 +432,7 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
             scope_arg = std::move(in_scope); // engaged-empty means no rows
         }
 
-        auto results_opt = deps.store->query(instruction_id, q, scope_arg);
+        auto results_opt = deps.store->query(instruction_id, tier, q, scope_arg);
         if (!results_opt) {
             res.status = 503;
             res.set_content(

@@ -710,6 +710,13 @@ public:
     /// `set_engine_principal_store`.
     void set_user_exists_fn(UserExistsFn fn) { user_exists_fn_ = std::move(fn); }
 
+    /// #4990 - the Forensics plugin set the stored-response read tier excludes
+    /// (`ServerImpl::forensics_plugin_set_`, borrowed: it outlives this object). MUST be called
+    /// BEFORE `register_routes()`, same timing contract as `set_engine_principal_store`.
+    /// Unset (nullptr, a test harness) leaves the pre-tier behaviour for the operator surfaces,
+    /// until their `ForensicsVisibilityFn` wiring lands.
+    void set_forensics_plugin_set(const ForensicsPluginSet* plugins) { forensics_plugins_ = plugins; }
+
     /// #4981 PR-2 — see `ScopeEvaluateFn`'s doc comment above. MUST be called
     /// BEFORE `register_routes()`, same timing contract as
     /// `set_engine_principal_store`. Unset (`{}`, the default) makes
@@ -819,6 +826,7 @@ private:
     AuditAsSessionFn audit_as_session_fn_;
     EnginePrincipalStore* engine_principal_store_{nullptr};
     UserExistsFn user_exists_fn_;
+    const ForensicsPluginSet* forensics_plugins_{nullptr}; // #4990 - see set_forensics_plugin_set
     PasswordChangeDeps password_deps_;
     std::vector<std::string> csrf_trusted_origins_;
     ScopeEvaluateFn scope_evaluate_fn_;

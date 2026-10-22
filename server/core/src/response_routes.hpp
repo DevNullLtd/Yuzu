@@ -72,6 +72,7 @@
 #include <string>
 
 namespace yuzu::server {
+class ForensicsPluginSet;
 class HttpRouteSink;
 class ResponseStore;
 } // namespace yuzu::server
@@ -101,6 +102,9 @@ struct Deps {
     /// `ServerImpl::response_store_`. Null or `!is_open()` -> every route
     /// answers 503 without touching it.
     ResponseStore* store{nullptr};
+    /// #4990: `ServerImpl::forensics_plugin_set_` (null in tests that predate the tier). Feeds the
+    /// `ResponseTierFilter` every store read takes.
+    const ForensicsPluginSet* forensics_plugins{nullptr};
     /// `ServerImpl::metrics_`. Null is allowed (tests): the #4644/#4703 counters are skipped.
     yuzu::MetricsRegistry* metrics{nullptr};
 };

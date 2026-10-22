@@ -899,8 +899,12 @@ void PolicyEvaluator::collect_ready() {
         // reads as "no terminal response yet", the same as a genuinely slow
         // agent — verdict_for() below already treats an unmatched target as
         // "unknown", never a fabricated compliant/drifted verdict.
+        // #4990: internal consumer. Compliance verdicts read status and output of the policy's own
+        // check dispatch (a non-Forensics plugin), never an operator-facing read surface.
         auto rows = d_.response_store
-                        ? d_.response_store->query_by_execution(f.execution_id)
+                        ? d_.response_store
+                              ->query_by_execution(f.execution_id,
+                                                   ResponseTierFilter::unrestricted_internal_consumer())
                               .value_or(std::vector<StoredResponse>{})
                         : std::vector<StoredResponse>{};
         auto best = latest_per_agent(rows);

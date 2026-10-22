@@ -812,11 +812,52 @@ void append_scope_clause(std::string& sql, std::vector<std::string>& binds, int&
     binds.push_back(pg::to_text_array(sv));
 }
 
+// #4990: the Forensics tier, pushed into the WHERE exactly like `append_scope_clause` (same
+// ordering rule: BEFORE ORDER BY / LIMIT / OFFSET / GROUP BY, or a page/aggregate is computed over
+// rows the caller may not see). Bind parameters only. `col_prefix` qualifies the columns when the
+// predicate is evaluated against an aliased `responses` row (the facet EXISTS); "" otherwise.
+//   * unrestricted / global Forensics:Read -> nothing appended
+//   * no per-agent exemption               -> AND lower(plugin) <> ALL($n::text[])
+//   * per-agent exemption                  -> AND (lower(plugin) <> ALL($n) OR agent_id = ANY($m))
+// `plugin` is stored as the agent sent it, so it is compared lowercased against the lowercase
+// excluded set. The excluded set is never empty when `restricts()` (ForensicsPluginSet is non-empty).
+void append_tier_clause(std::string& sql, std::vector<std::string>& binds, int& idx,
+                        const ResponseTierFilter& tier, std::string_view col_prefix = {}) {
+    if (!tier.restricts())
+        return;
+    const std::string plugin_col = std::string(col_prefix) + "plugin";
+    const std::string agent_col = std::string(col_prefix) + "agent_id";
+    const auto to_views = [](const std::vector<std::string>& v) {
+        return std::vector<std::string_view>(v.begin(), v.end());
+    };
+    sql += " AND ";
+    if (!tier.exempt_agents().empty())
+        sql += "(";
+    sql += "lower(" + plugin_col + ") <> ALL($" + std::to_string(idx++) + "::text[])";
+    binds.push_back(pg::to_text_array(to_views(tier.excluded_plugins())));
+    if (!tier.exempt_agents().empty()) {
+        sql += " OR " + agent_col + " = ANY($" + std::to_string(idx++) + "::text[]))";
+        binds.push_back(pg::to_text_array(to_views(tier.exempt_agents())));
+    }
+}
+
+// #4990: the facet tables carry no `plugin`, so the tier is tested on the owning `responses` row.
+// The caller's outer query must alias `response_store.response_facets` as `f`. A no-op when the
+// filter restricts nothing.
+void append_facet_tier_clause(std::string& sql, std::vector<std::string>& binds, int& idx,
+                              const ResponseTierFilter& tier) {
+    if (!tier.restricts())
+        return;
+    sql += " AND EXISTS (SELECT 1 FROM response_store.responses r WHERE r.id = f.response_id";
+    append_tier_clause(sql, binds, idx, tier, "r.");
+    sql += ")";
+}
+
 } // namespace
 
-std::optional<std::vector<StoredResponse>> ResponseStore::query(const std::string& instruction_id,
-                                                                 const ResponseQuery& q,
-                                                                 const AggregateScope& scope) const {
+std::optional<std::vector<StoredResponse>>
+ResponseStore::query(const std::string& instruction_id, const ResponseTierFilter& tier,
+                     const ResponseQuery& q, const AggregateScope& scope) const {
     static DegradeSampler sampler;
     return resp_read<std::vector<StoredResponse>>(
         open_, pool_, metrics_, "query", sampler, [&](PGconn* conn) -> std::optional<std::vector<StoredResponse>> {
@@ -841,6 +882,7 @@ std::optional<std::vector<StoredResponse>> ResponseStore::query(const std::strin
                 binds.push_back(std::to_string(*q.until));
             }
             append_scope_clause(sql, binds, idx, scope);
+            append_tier_clause(sql, binds, idx, tier);
             sql += " ORDER BY timestamp DESC LIMIT $" + std::to_string(idx++) + "::integer";
             binds.push_back(std::to_string(sanitize_limit(q.limit)));
             if (q.offset > 0) {
@@ -858,16 +900,18 @@ std::optional<std::vector<StoredResponse>> ResponseStore::query(const std::strin
         });
 }
 
-std::optional<BoundedResponses> ResponseStore::query_bounded(const std::string& instruction_id,
-                                                              const ResponseQuery& q,
-                                                              const AggregateScope& scope,
-                                                              std::size_t max_payload_bytes) const {
+std::optional<BoundedResponses>
+ResponseStore::query_bounded(const std::string& instruction_id, const ResponseTierFilter& tier,
+                             const ResponseQuery& q, const AggregateScope& scope,
+                             std::size_t max_payload_bytes) const {
     static DegradeSampler sampler;
     return resp_read<BoundedResponses>(
         open_, pool_, metrics_, "query_bounded", sampler,
         [&](PGconn* conn) -> std::optional<BoundedResponses> {
-            // Predicates and the scope clause are byte-identical to query() (ADR-0017
-            // INV-3: scope BEFORE the limit/cut).
+            // Predicates, the scope clause and the tier clause are byte-identical to query()
+            // (ADR-0017 INV-3: scope BEFORE the limit/cut; #4990: the tier is in the same WHERE, so
+            // `total`, `cut_bytes` and therefore row_cap_hit / byte_cap_hit are computed over the
+            // permitted rows only and cannot reveal a withheld one).
             std::string where = " WHERE instruction_id = $1";
             std::vector<std::string> binds{instruction_id};
             int idx = 2;
@@ -888,6 +932,7 @@ std::optional<BoundedResponses> ResponseStore::query_bounded(const std::string& 
                 binds.push_back(std::to_string(*q.until));
             }
             append_scope_clause(where, binds, idx, scope);
+            append_tier_clause(where, binds, idx, tier);
             // bigint, not integer: the statement computes limit + 1, and an integer
             // placeholder would raise "integer out of range" at INT_MAX (a 503).
             const std::string limit_ph = "$" + std::to_string(idx++) + "::bigint";
@@ -943,8 +988,8 @@ std::optional<BoundedResponses> ResponseStore::query_bounded(const std::string& 
 }
 
 std::optional<std::vector<StoredResponse>>
-ResponseStore::query_by_execution(const std::string& execution_id, const ResponseQuery& q,
-                                  const AggregateScope& scope) const {
+ResponseStore::query_by_execution(const std::string& execution_id, const ResponseTierFilter& tier,
+                                  const ResponseQuery& q, const AggregateScope& scope) const {
     static DegradeSampler sampler;
     if (execution_id.empty()) {
         // arch-B1 (ported): empty execution_id is the legacy sentinel and
@@ -976,6 +1021,7 @@ ResponseStore::query_by_execution(const std::string& execution_id, const Respons
                 binds.push_back(std::to_string(*q.until));
             }
             append_scope_clause(sql, binds, idx, scope);
+            append_tier_clause(sql, binds, idx, tier);
             sql += " ORDER BY timestamp DESC LIMIT $" + std::to_string(idx++) + "::integer";
             binds.push_back(std::to_string(sanitize_limit(q.limit)));
             if (q.offset > 0) {
@@ -994,8 +1040,9 @@ ResponseStore::query_by_execution(const std::string& execution_id, const Respons
 }
 
 std::optional<std::vector<StoredResponse>>
-ResponseStore::get_by_instruction(const std::string& instruction_id) const {
-    return query(instruction_id);
+ResponseStore::get_by_instruction(const std::string& instruction_id,
+                                  const ResponseTierFilter& tier) const {
+    return query(instruction_id, tier);
 }
 
 const std::vector<std::string>& ResponseStore::allowed_group_by() {
@@ -1009,8 +1056,9 @@ const std::vector<std::string>& ResponseStore::allowed_op_column() {
 }
 
 std::optional<std::vector<AggregationResult>>
-ResponseStore::aggregate(const std::string& instruction_id, const AggregationQuery& aq,
-                         const ResponseQuery& filter, const AggregateScope& scope) const {
+ResponseStore::aggregate(const std::string& instruction_id, const ResponseTierFilter& tier,
+                         const AggregationQuery& aq, const ResponseQuery& filter,
+                         const AggregateScope& scope) const {
     static DegradeSampler sampler;
     return resp_read<std::vector<AggregationResult>>(
         open_, pool_, metrics_, "aggregate", sampler,
@@ -1056,6 +1104,8 @@ ResponseStore::aggregate(const std::string& instruction_id, const AggregationQue
             }
             // #1634 management-group scope (filter-BEFORE-aggregate).
             append_scope_clause(sql, binds, idx, scope);
+            // #4990: filter-BEFORE-aggregate, so a group count never includes a withheld row.
+            append_tier_clause(sql, binds, idx, tier);
             if (filter.status >= 0) {
                 sql += " AND status = $" + std::to_string(idx++) + "::integer";
                 binds.push_back(std::to_string(filter.status));
@@ -1087,16 +1137,19 @@ ResponseStore::aggregate(const std::string& instruction_id, const AggregationQue
 }
 
 std::optional<std::vector<std::string>>
-ResponseStore::distinct_agent_ids(const std::string& instruction_id) const {
+ResponseStore::distinct_agent_ids(const std::string& instruction_id,
+                                  const ResponseTierFilter& tier) const {
     static DegradeSampler sampler;
     return resp_read<std::vector<std::string>>(
         open_, pool_, metrics_, "distinct_agent_ids", sampler,
         [&](PGconn* conn) -> std::optional<std::vector<std::string>> {
-            pg::PgResult res = pg::exec_params(
-                conn,
-                "SELECT DISTINCT agent_id FROM response_store.responses WHERE instruction_id = "
-                "$1 ORDER BY agent_id",
-                std::vector<std::string>{instruction_id});
+            std::string sql =
+                "SELECT DISTINCT agent_id FROM response_store.responses WHERE instruction_id = $1";
+            std::vector<std::string> binds{instruction_id};
+            int idx = 2;
+            append_tier_clause(sql, binds, idx, tier);
+            sql += " ORDER BY agent_id";
+            pg::PgResult res = pg::exec_params(conn, sql.c_str(), binds);
             if (res.status() != PGRES_TUPLES_OK)
                 return std::nullopt;
             std::vector<std::string> ids;
@@ -1108,18 +1161,21 @@ ResponseStore::distinct_agent_ids(const std::string& instruction_id) const {
 }
 
 std::optional<std::vector<std::string>>
-ResponseStore::distinct_agent_ids_by_execution(const std::string& execution_id) const {
+ResponseStore::distinct_agent_ids_by_execution(const std::string& execution_id,
+                                               const ResponseTierFilter& tier) const {
     static DegradeSampler sampler;
     if (execution_id.empty())
         return std::vector<std::string>{}; // arch-B1 sentinel, see query_by_execution
     return resp_read<std::vector<std::string>>(
         open_, pool_, metrics_, "distinct_agent_ids_by_execution", sampler,
         [&](PGconn* conn) -> std::optional<std::vector<std::string>> {
-            pg::PgResult res = pg::exec_params(
-                conn,
-                "SELECT DISTINCT agent_id FROM response_store.responses WHERE execution_id = "
-                "$1 ORDER BY agent_id",
-                std::vector<std::string>{execution_id});
+            std::string sql =
+                "SELECT DISTINCT agent_id FROM response_store.responses WHERE execution_id = $1";
+            std::vector<std::string> binds{execution_id};
+            int idx = 2;
+            append_tier_clause(sql, binds, idx, tier);
+            sql += " ORDER BY agent_id";
+            pg::PgResult res = pg::exec_params(conn, sql.c_str(), binds);
             if (res.status() != PGRES_TUPLES_OK)
                 return std::nullopt;
             std::vector<std::string> ids;
@@ -1130,15 +1186,17 @@ ResponseStore::distinct_agent_ids_by_execution(const std::string& execution_id) 
         });
 }
 
-std::size_t ResponseStore::total_count() const {
+std::size_t ResponseStore::total_count(const ResponseTierFilter& tier) const {
     if (!open_)
         return 0;
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
         return 0;
-    pg::PgResult res =
-        pg::exec_params(lease.get(), "SELECT COUNT(*) FROM response_store.responses",
-                        std::vector<std::string>{});
+    std::string sql = "SELECT COUNT(*) FROM response_store.responses WHERE TRUE";
+    std::vector<std::string> binds;
+    int idx = 1;
+    append_tier_clause(sql, binds, idx, tier);
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), binds);
     if (res.status() != PGRES_TUPLES_OK)
         return 0;
     return static_cast<std::size_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
@@ -1147,7 +1205,8 @@ std::size_t ResponseStore::total_count() const {
 // -- Faceted query methods -----------------------------------------------------
 
 std::optional<std::vector<FacetValue>>
-ResponseStore::facet_values(const std::string& instruction_id, int col_idx,
+ResponseStore::facet_values(const std::string& instruction_id, const ResponseTierFilter& tier,
+                            int col_idx,
                             const std::optional<std::vector<std::string>>& agent_scope) const {
     // Engaged-empty scope (ADR-0017 INV-3 / #1712): zero visible agents means
     // zero facet values, without touching the pool or issuing a query —
@@ -1160,16 +1219,20 @@ ResponseStore::facet_values(const std::string& instruction_id, int col_idx,
         open_, pool_, metrics_, "facet_values", sampler,
         [&](PGconn* conn) -> std::optional<std::vector<FacetValue>> {
             std::string sql =
-                "SELECT value, SUM(line_count) FROM response_store.response_facets WHERE "
+                "SELECT value, SUM(line_count) FROM response_store.response_facets f WHERE "
                 "instruction_id = $1 AND col_idx = $2::integer";
             std::vector<std::string> binds{instruction_id, std::to_string(col_idx)};
+            int idx = 3;
             if (agent_scope.has_value()) {
                 // ADR-0017 INV-3: the visible set is applied IN SQL, before
                 // the aggregate — never a C++ post-filter.
                 std::vector<std::string_view> sv(agent_scope->begin(), agent_scope->end());
-                sql += " AND agent_id = ANY($3::text[])";
+                sql += " AND agent_id = ANY($" + std::to_string(idx++) + "::text[])";
                 binds.push_back(pg::to_text_array(sv));
             }
+            // #4990: before the GROUP BY, so a distinct value that only a withheld row carries
+            // never appears (a facet value is a slice of that row's output).
+            append_facet_tier_clause(sql, binds, idx, tier);
             sql += " GROUP BY value ORDER BY SUM(line_count) DESC";
             pg::PgResult res = pg::exec_params(conn, sql.c_str(), binds);
             if (res.status() != PGRES_TUPLES_OK)
@@ -1212,7 +1275,7 @@ void append_facet_filters(std::string& sql, std::vector<std::string>& binds, int
 } // namespace
 
 std::optional<std::vector<std::string>>
-ResponseStore::facet_agent_ids(const std::string& instruction_id,
+ResponseStore::facet_agent_ids(const std::string& instruction_id, const ResponseTierFilter& tier,
                                const std::vector<FacetFilter>& filters) const {
     static DegradeSampler sampler;
     if (filters.empty())
@@ -1220,11 +1283,12 @@ ResponseStore::facet_agent_ids(const std::string& instruction_id,
     return resp_read<std::vector<std::string>>(
         open_, pool_, metrics_, "facet_agent_ids", sampler,
         [&](PGconn* conn) -> std::optional<std::vector<std::string>> {
-            std::string sql = "SELECT DISTINCT agent_id FROM response_store.response_facets "
+            std::string sql = "SELECT DISTINCT agent_id FROM response_store.response_facets f "
                               "WHERE instruction_id = $1";
             std::vector<std::string> binds{instruction_id};
             int idx = 2;
             append_facet_filters(sql, binds, idx, instruction_id, filters);
+            append_facet_tier_clause(sql, binds, idx, tier);
             pg::PgResult res = pg::exec_params(conn, sql.c_str(), binds);
             if (res.status() != PGRES_TUPLES_OK)
                 return std::nullopt;
@@ -1237,7 +1301,7 @@ ResponseStore::facet_agent_ids(const std::string& instruction_id,
 }
 
 std::optional<int64_t>
-ResponseStore::facet_agent_count(const std::string& instruction_id,
+ResponseStore::facet_agent_count(const std::string& instruction_id, const ResponseTierFilter& tier,
                                  const std::vector<FacetFilter>& filters,
                                  const std::optional<std::vector<std::string>>& agent_scope) const {
     // Engaged-empty scope (ADR-0017 INV-3 / #1712): zero visible agents means
@@ -1257,7 +1321,7 @@ ResponseStore::facet_agent_count(const std::string& instruction_id,
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
         return std::nullopt;
-    std::string sql = "SELECT COUNT(DISTINCT agent_id) FROM response_store.response_facets "
+    std::string sql = "SELECT COUNT(DISTINCT agent_id) FROM response_store.response_facets f "
                       "WHERE instruction_id = $1";
     std::vector<std::string> binds{instruction_id};
     int idx = 2;
@@ -1269,6 +1333,7 @@ ResponseStore::facet_agent_count(const std::string& instruction_id,
         sql += " AND agent_id = ANY($" + std::to_string(idx++) + "::text[])";
         binds.push_back(pg::to_text_array(sv));
     }
+    append_facet_tier_clause(sql, binds, idx, tier);
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), binds);
     if (res.status() != PGRES_TUPLES_OK)
         return std::nullopt;
@@ -1276,7 +1341,7 @@ ResponseStore::facet_agent_count(const std::string& instruction_id,
 }
 
 std::optional<int64_t>
-ResponseStore::facet_line_count(const std::string& instruction_id,
+ResponseStore::facet_line_count(const std::string& instruction_id, const ResponseTierFilter& tier,
                                 const std::vector<FacetFilter>& filters) const {
     // See facet_agent_count's comment: no filter is a genuine 0, distinct
     // from the read-failure cases below (#2691, Doomgoose finding #7).
@@ -1291,19 +1356,20 @@ ResponseStore::facet_line_count(const std::string& instruction_id,
     // matching that filter. For multi-filter intersection, the count is an
     // upper bound (true intersection count requires row-level parsing) —
     // matches the SQLite original's documented approximation.
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "SELECT SUM(line_count) FROM response_store.response_facets WHERE instruction_id = $1 "
-        "AND col_idx = $2::integer AND value = $3",
-        std::vector<std::string>{instruction_id, std::to_string(filters[0].col_idx),
-                                 sanitize_pg_text(filters[0].value)});
+    std::string sql = "SELECT SUM(line_count) FROM response_store.response_facets f WHERE "
+                      "instruction_id = $1 AND col_idx = $2::integer AND value = $3";
+    std::vector<std::string> binds{instruction_id, std::to_string(filters[0].col_idx),
+                                   sanitize_pg_text(filters[0].value)};
+    int idx = 4;
+    append_facet_tier_clause(sql, binds, idx, tier);
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), binds);
     if (res.status() != PGRES_TUPLES_OK)
         return std::nullopt;
     return to_i64(PQgetvalue(res.get(), 0, 0));
 }
 
 std::optional<std::vector<int64_t>>
-ResponseStore::facet_response_ids(const std::string& instruction_id,
+ResponseStore::facet_response_ids(const std::string& instruction_id, const ResponseTierFilter& tier,
                                   const std::vector<FacetFilter>& filters, int limit,
                                   int offset) const {
     static DegradeSampler sampler;
@@ -1312,11 +1378,12 @@ ResponseStore::facet_response_ids(const std::string& instruction_id,
     return resp_read<std::vector<int64_t>>(
         open_, pool_, metrics_, "facet_response_ids", sampler,
         [&](PGconn* conn) -> std::optional<std::vector<int64_t>> {
-            std::string sql = "SELECT DISTINCT response_id FROM response_store.response_facets "
+            std::string sql = "SELECT DISTINCT response_id FROM response_store.response_facets f "
                               "WHERE instruction_id = $1";
             std::vector<std::string> binds{instruction_id};
             int idx = 2;
             append_facet_filters(sql, binds, idx, instruction_id, filters);
+            append_facet_tier_clause(sql, binds, idx, tier);
             const int limit_idx = idx++;
             const int offset_idx = idx++;
             sql += " ORDER BY response_id LIMIT $" + std::to_string(limit_idx) +
@@ -1335,7 +1402,8 @@ ResponseStore::facet_response_ids(const std::string& instruction_id,
 }
 
 std::optional<std::vector<StoredResponse>>
-ResponseStore::query_by_ids(const std::vector<int64_t>& response_ids) const {
+ResponseStore::query_by_ids(const std::vector<int64_t>& response_ids,
+                            const ResponseTierFilter& tier) const {
     static DegradeSampler sampler;
     if (response_ids.empty())
         return std::vector<StoredResponse>{};
@@ -1351,9 +1419,13 @@ ResponseStore::query_by_ids(const std::vector<int64_t>& response_ids) const {
                 in_list += std::to_string(response_ids[i]);
             }
             std::string sql = std::string("SELECT ") + kResponseCols +
-                              " FROM response_store.responses WHERE id IN (" + in_list +
-                              ") ORDER BY id";
-            pg::PgResult res = pg::exec_params(conn, sql.c_str(), std::vector<std::string>{});
+                              " FROM response_store.responses WHERE id IN (" + in_list + ")";
+            std::vector<std::string> binds;
+            int idx = 1;
+            // #4990: a withheld id is dropped exactly like an unknown id.
+            append_tier_clause(sql, binds, idx, tier);
+            sql += " ORDER BY id";
+            pg::PgResult res = pg::exec_params(conn, sql.c_str(), binds);
             if (res.status() != PGRES_TUPLES_OK)
                 return std::nullopt;
             std::vector<StoredResponse> out;

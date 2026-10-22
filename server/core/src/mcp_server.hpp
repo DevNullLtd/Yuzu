@@ -605,6 +605,13 @@ public:
                                            const std::string& operation)>;
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
 
+    /// #4990 - the Forensics plugin set the stored-response read tier excludes
+    /// (`ServerImpl::forensics_plugin_set_`, borrowed: it outlives this object). Same live-read
+    /// timing as `set_fleet_read_fn`: the handlers read the member per request. Unset (nullptr, a
+    /// test harness) leaves the pre-tier behaviour for the response tools until their
+    /// `ForensicsVisibilityFn` wiring lands.
+    void set_forensics_plugin_set(const ForensicsPluginSet* plugins) { forensics_plugins_ = plugins; }
+
     /// The provider closures a registry tool handler may reach (mcp_tool_deps.hpp),
     /// passed to every registry handler as `ctx.deps`. The SAME closure instances
     /// `HardwareRoutes::Deps` receives, wired beside `set_fleet_read_fn` in the
@@ -1259,6 +1266,7 @@ private:
     UploadGrantListReadFn upload_grant_list_read_fn_;
     // #3290 Phase 2 — see set_fleet_read_fn above.
     FleetReadFn fleet_read_fn_;
+    const ForensicsPluginSet* forensics_plugins_{nullptr}; // #4990 - see set_forensics_plugin_set
     // See set_tool_deps above; `&tool_deps_` is ToolCallContext::deps.
     ToolDeps tool_deps_;
     // #4037 — see set_list_read_fn above.

@@ -9881,13 +9881,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 // hidden ones the LIMIT already truncated. Mirrors aggregate_responses'
                 // resolve-then-scope pattern; `distinct_agent_ids`/`_by_execution` picks
                 // the twin matching whichever id this call used.
+                // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
+                const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins_);
                 AggregateScope scope_arg; // nullopt = unrestricted
                 bool scope_filtered = false;
                 std::size_t dropped_agents = 0;
                 if (gate.scope) {
                     auto distinct = !exec_id.empty()
-                                        ? response_store->distinct_agent_ids_by_execution(exec_id)
-                                        : response_store->distinct_agent_ids(instr_id);
+                                        ? response_store->distinct_agent_ids_by_execution(exec_id, tier)
+                                        : response_store->distinct_agent_ids(instr_id, tier);
                     if (!distinct) {
                         mcp_audit("failure", "store degraded; " + key);
                         res.set_content(
@@ -9920,8 +9922,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     poll_hint.reset();
 
                 auto responses_opt = !exec_id.empty()
-                                         ? response_store->query_by_execution(exec_id, rq, scope_arg)
-                                         : response_store->query(instr_id, rq, scope_arg);
+                                         ? response_store->query_by_execution(exec_id, tier, rq, scope_arg)
+                                         : response_store->query(instr_id, tier, rq, scope_arg);
                 if (!responses_opt) {
                     mcp_audit("failure", "store degraded; " + key);
                     res.set_content(
@@ -10837,10 +10839,12 @@ McpServer::HandlerFn McpServer::build_handler(
 
                 // #1634: resolve the gate's VisibleSet before aggregation. An engaged,
                 // empty AggregateScope is deliberate and produces zero rows.
+                // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
+                const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins_);
                 AggregateScope agg_scope; // nullopt = unrestricted
                 std::size_t dropped_agents = 0;
                 if (gate.scope) {
-                    auto distinct = response_store->distinct_agent_ids(instr_id);
+                    auto distinct = response_store->distinct_agent_ids(instr_id, tier);
                     if (!distinct) {
                         // Store-read error resolving the in-scope set. Surface it as an
                         // internal error — NOT success+empty: an empty aggregate reads as
@@ -10866,7 +10870,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     agg_scope = std::move(in_scope);
                 }
 
-                auto results_opt = response_store->aggregate(instr_id, aq, {}, agg_scope);
+                auto results_opt = response_store->aggregate(instr_id, tier, aq, {}, agg_scope);
                 if (!results_opt) {
                     mcp_audit("failure", "store degraded; " + instr_id);
                     res.set_content(
@@ -11755,8 +11759,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         agent_scope = std::vector<std::string>(scope->begin(), scope->end());
                 }
 
-                auto count =
-                    group_agent_count_preview(response_store, command_id, filters, agent_scope);
+                // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
+                const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins_);
+                auto count = group_agent_count_preview(response_store, tier, command_id, filters,
+                                                       agent_scope);
                 if (!count) {
                     mcp_audit("failure", "store degraded; preview_management_group_agent_count");
                     res.set_content(

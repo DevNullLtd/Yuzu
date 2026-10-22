@@ -241,7 +241,10 @@ BundleOrchestrator::collate(const std::string& correlation_id, const std::string
     ResponseQuery rq;
     rq.limit = 1000; // bundle <= kMaxBundleSteps; well under the cap
     rq.status = -1;  // any status (step results may ride RUNNING or terminal rows)
-    auto rows_opt = response_store_->query_by_execution(correlation_id, rq);
+    // #4990: internal consumer. Collation serves the owner of a bundle manifest, whose per-step
+    // results are produced by the dispatch authorization that already gated each (plugin, action).
+    auto rows_opt = response_store_->query_by_execution(
+        correlation_id, ResponseTierFilter::unrestricted_internal_consumer(), rq);
     if (!rows_opt) {
         // Degraded read (#2691, Doomgoose finding #3): distinct from
         // "not found" in the CALLER-FACING contract too, not just the

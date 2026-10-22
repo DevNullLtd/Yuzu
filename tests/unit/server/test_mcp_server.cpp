@@ -131,6 +131,12 @@
 using namespace yuzu::server::mcp;
 using namespace yuzu::server;
 
+// #4990: reads in this file are test oracles, not an operator surface, so they take no tier
+// restriction (the tier itself is pinned in test_response_store.cpp / test_response_tier_filter.cpp).
+namespace {
+const auto kAllRows = yuzu::server::ResponseTierFilter::unrestricted_internal_consumer();
+} // namespace
+
 namespace {
 // AuditStore migrated to Postgres (ADR-0006) — "MCP AuditStore: query with
 // mcp_tool field" below clones this pre-migrated template instead of opening
@@ -721,13 +727,13 @@ TEST_CASE("MCP ResponseStore: query with filters", "[pg][mcp][response]") {
 
     // Query all for instruction
     ResponseQuery rq;
-    auto results = store.query("instr-1", rq);
+    auto results = store.query("instr-1", kAllRows, rq);
     REQUIRE(results.has_value());
     CHECK(results->size() == 2);
 
     // Query filtered by agent
     rq.agent_id = "agent-1";
-    results = store.query("instr-1", rq);
+    results = store.query("instr-1", kAllRows, rq);
     REQUIRE(results.has_value());
     CHECK(results->size() == 1);
     CHECK((*results)[0].agent_id == "agent-1");

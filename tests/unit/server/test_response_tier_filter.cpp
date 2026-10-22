@@ -4,12 +4,16 @@
 // and the derivation (what counts as a Forensics plugin).
 #include "capability_fragments.hpp"
 #include "forensics_plugin_set.hpp"
+#include "response_store.hpp"
 #include "response_tier_filter.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <initializer_list>
+#include <optional>
 #include <span>
 #include <unordered_set>
 #include <string>
@@ -165,4 +169,96 @@ TEST_CASE("plugins_on_securable lowercases, de-duplicates and filters by securab
           std::vector<std::string>{"browser_inventory"});
     CHECK(registry.plugins_on_securable("Infrastructure") == std::vector<std::string>{"tar"});
     CHECK(registry.plugins_on_securable("NoSuchSecurable").empty());
+}
+
+// -- The tier filter is a REQUIRED argument of every public ResponseStore read --------------------
+//
+// Each block proves two things at compile time: the read is NOT callable in any form that omits the
+// filter (a default value on the parameter, or an overload without it, would flip the first assert),
+// and it IS callable with the filter (so the first assert is not vacuously true). A NEW public read
+// method on ResponseStore needs a line here; a tripwire over response_store.hpp that enforces the
+// exact set of read methods is a separate follow-up.
+
+namespace {
+
+// Dependent on S so a failed call is a substitution failure (false), not a hard error.
+#define YUZU_RS_PARAMS                                                                               \
+    S &s, const std::string &id, const std::vector<int64_t> &ids, const ResponseQuery &q,           \
+        const AggregateScope &sc, const AggregationQuery &aq, const std::vector<FacetFilter> &fl,   \
+        const ResponseTierFilter &tier, int col, std::size_t cap,                                    \
+        const std::optional<std::vector<std::string>> &as
+
+#define YUZU_TIER_REQUIRED(NAME, METHOD, ARGS_WITH)                                           \
+    template <class S>                                                                               \
+    concept NAME##Tiered = requires(YUZU_RS_PARAMS) { s.METHOD ARGS_WITH; };                         \
+    static_assert(NAME##Tiered<const ResponseStore>, #METHOD " must accept a ResponseTierFilter")
+
+#define YUZU_TIER_OMITTED(NAME, METHOD, ARGS_WITHOUT)                                                \
+    template <class S>                                                                               \
+    concept NAME##Untiered = requires(YUZU_RS_PARAMS) { s.METHOD ARGS_WITHOUT; };                    \
+    static_assert(!NAME##Untiered<const ResponseStore>,                                              \
+                  #METHOD " must not be callable without a ResponseTierFilter")
+
+YUZU_TIER_REQUIRED(Query, query, (id, tier, q, sc));
+YUZU_TIER_OMITTED(Query0, query, (id));
+YUZU_TIER_OMITTED(Query1, query, (id, q));
+YUZU_TIER_OMITTED(Query2, query, (id, q, sc));
+
+YUZU_TIER_REQUIRED(QueryBounded, query_bounded, (id, tier, q, sc, cap));
+YUZU_TIER_OMITTED(QueryBounded0, query_bounded, (id, q, sc, cap));
+
+YUZU_TIER_REQUIRED(QueryByExecution, query_by_execution, (id, tier, q, sc));
+YUZU_TIER_OMITTED(QueryByExecution0, query_by_execution, (id));
+YUZU_TIER_OMITTED(QueryByExecution1, query_by_execution, (id, q));
+YUZU_TIER_OMITTED(QueryByExecution2, query_by_execution, (id, q, sc));
+
+YUZU_TIER_REQUIRED(GetByInstruction, get_by_instruction, (id, tier));
+YUZU_TIER_OMITTED(GetByInstruction0, get_by_instruction, (id));
+
+YUZU_TIER_REQUIRED(Aggregate, aggregate, (id, tier, aq, q, sc));
+YUZU_TIER_OMITTED(Aggregate0, aggregate, (id, aq));
+YUZU_TIER_OMITTED(Aggregate1, aggregate, (id, aq, q));
+YUZU_TIER_OMITTED(Aggregate2, aggregate, (id, aq, q, sc));
+
+YUZU_TIER_REQUIRED(DistinctAgentIds, distinct_agent_ids, (id, tier));
+YUZU_TIER_OMITTED(DistinctAgentIds0, distinct_agent_ids, (id));
+
+YUZU_TIER_REQUIRED(DistinctAgentIdsByExecution, distinct_agent_ids_by_execution, (id, tier));
+YUZU_TIER_OMITTED(DistinctAgentIdsByExecution0, distinct_agent_ids_by_execution, (id));
+
+YUZU_TIER_REQUIRED(TotalCount, total_count, (tier));
+YUZU_TIER_OMITTED(TotalCount0, total_count, ());
+
+YUZU_TIER_REQUIRED(FacetValues, facet_values, (id, tier, col, as));
+YUZU_TIER_OMITTED(FacetValues0, facet_values, (id, col));
+YUZU_TIER_OMITTED(FacetValues1, facet_values, (id, col, as));
+
+YUZU_TIER_REQUIRED(FacetAgentIds, facet_agent_ids, (id, tier, fl));
+YUZU_TIER_OMITTED(FacetAgentIds0, facet_agent_ids, (id, fl));
+
+YUZU_TIER_REQUIRED(FacetAgentCount, facet_agent_count, (id, tier, fl, as));
+YUZU_TIER_OMITTED(FacetAgentCount0, facet_agent_count, (id, fl));
+YUZU_TIER_OMITTED(FacetAgentCount1, facet_agent_count, (id, fl, as));
+
+YUZU_TIER_REQUIRED(FacetLineCount, facet_line_count, (id, tier, fl));
+YUZU_TIER_OMITTED(FacetLineCount0, facet_line_count, (id, fl));
+
+YUZU_TIER_REQUIRED(QueryByIds, query_by_ids, (ids, tier));
+YUZU_TIER_OMITTED(QueryByIds0, query_by_ids, (ids));
+
+YUZU_TIER_REQUIRED(FacetResponseIds, facet_response_ids, (id, tier, fl, col, col));
+YUZU_TIER_OMITTED(FacetResponseIds0, facet_response_ids, (id, fl));
+YUZU_TIER_OMITTED(FacetResponseIds1, facet_response_ids, (id, fl, col, col));
+
+#undef YUZU_TIER_OMITTED
+#undef YUZU_TIER_REQUIRED
+#undef YUZU_RS_PARAMS
+
+} // namespace
+
+TEST_CASE("ResponseStore reads require a tier filter (compile-time, see the static_asserts above)",
+          "[server][responses][security][forensics]") {
+    // The assertions are static_asserts; this case exists so the file shows up in a test listing and
+    // a build that compiled this translation unit has, by definition, passed them.
+    SUCCEED("static_asserts hold");
 }

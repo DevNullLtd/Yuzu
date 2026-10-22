@@ -37,6 +37,12 @@
 #include <vector>
 
 using namespace yuzu::server;
+
+// #4990: reads in this file are test oracles, not an operator surface, so they take no tier
+// restriction (the tier itself is pinned in test_response_store.cpp / test_response_tier_filter.cpp).
+namespace {
+const auto kAllRows = yuzu::server::ResponseTierFilter::unrestricted_internal_consumer();
+} // namespace
 using yuzu::server::pg::PgPool;
 
 namespace {
@@ -802,7 +808,7 @@ TEST_CASE("GET /api/v1/responses/:id/export: the SERIALIZATION backstop alone fl
     {
         ResponseQuery q;
         q.limit = 10000;
-        auto sql_only = h.response_store->query_bounded("instr-backstop", q, std::nullopt, 150);
+        auto sql_only = h.response_store->query_bounded("instr-backstop", kAllRows, q, std::nullopt, 150);
         REQUIRE(sql_only.has_value());
         REQUIRE(sql_only->rows.size() == 2);
         REQUIRE_FALSE(sql_only->byte_cap_hit);

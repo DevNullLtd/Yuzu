@@ -564,9 +564,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 // degrade must not render as "0 agents", not that the
                 // no-store/no-filter cases need a NEW distinction from it.
                 std::optional<int64_t> agent_count;
-                if (response_store_ && !filters.empty())
-                    agent_count = response_store_->facet_agent_count(command_id, filters,
+                if (response_store_ && !filters.empty()) {
+                    // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
+                    const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins_);
+                    agent_count = response_store_->facet_agent_count(command_id, tier, filters,
                                                                       agent_scope);
+                }
                 else if (filters.empty())
                     agent_count = 0; // genuine: no filter → no scoped count
 
@@ -642,7 +645,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // match" — that's a wrong-result-presented-as-correct claim on
                  // a write-adjacent action (it would tell the operator their
                  // filters are bad when the store just couldn't be read).
-                 auto agent_ids_opt = response_store_->facet_agent_ids(command_id, filters);
+                 // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
+                 const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins_);
+                 auto agent_ids_opt = response_store_->facet_agent_ids(command_id, tier, filters);
                  if (!agent_ids_opt.has_value()) {
                      res.status = 503;
                      res.set_header("HX-Retarget", "#group-form-slot");
@@ -2342,6 +2347,8 @@ std::string DashboardRoutes::render_results(
         return "<tbody id=\"results-tbody\"><tr><td class=\"empty-state\">"
                "Response store not available.</td></tr></tbody>";
     }
+    // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
+    const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins_);
 
     auto col_names = resolve_render_columns(plugin, definition_id);
 
@@ -2395,7 +2402,7 @@ std::string DashboardRoutes::render_results(
         // dropped row happened to be out of this caller's scope (conservative, never silent).
         ResponseQuery q;
         q.limit = 10000; // upper bound
-        auto bounded_opt = response_store_->query_bounded(command_id, q, std::nullopt,
+        auto bounded_opt = response_store_->query_bounded(command_id, tier, q, std::nullopt,
                                                           export_body_byte_cap().load());
         store_degraded = !bounded_opt.has_value();
         if (bounded_opt) {
@@ -2405,10 +2412,10 @@ std::string DashboardRoutes::render_results(
         total_agent_count = static_cast<int64_t>(responses.size());
     } else {
         // Use faceted index to get matching response IDs, then load them
-        auto resp_ids_opt = response_store_->facet_response_ids(command_id, filters, 10000, 0);
+        auto resp_ids_opt = response_store_->facet_response_ids(command_id, tier, filters, 10000, 0);
         store_degraded = !resp_ids_opt.has_value();
         auto resp_ids = resp_ids_opt.value_or(std::vector<int64_t>{});
-        auto responses_opt = response_store_->query_by_ids(resp_ids);
+        auto responses_opt = response_store_->query_by_ids(resp_ids, tier);
         store_degraded = store_degraded || !responses_opt.has_value();
         responses = responses_opt.value_or(std::vector<StoredResponse>{});
         // facet_agent_count is degrade-distinguishable too — a degraded count
@@ -2419,7 +2426,7 @@ std::string DashboardRoutes::render_results(
         // same reasoning) — superseded by the #1712 in-handler recompute
         // plan (per the PR-4 re-enumeration); no behaviour change at this
         // site.
-        auto count_opt = response_store_->facet_agent_count(command_id, filters);
+        auto count_opt = response_store_->facet_agent_count(command_id, tier, filters);
         store_degraded = store_degraded || !count_opt.has_value();
         total_agent_count = count_opt.value_or(0);
     }
@@ -2863,7 +2870,9 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
         std::vector<FacetValue> facet_vals;
         bool facet_degraded = false;
         if (response_store_) {
-            auto facet_opt = response_store_->facet_values(command_id, col_idx, agent_scope);
+            // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
+            const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins_);
+            auto facet_opt = response_store_->facet_values(command_id, tier, col_idx, agent_scope);
             facet_degraded = !facet_opt.has_value();
             facet_vals = std::move(facet_opt).value_or(std::vector<FacetValue>{});
         }
@@ -3137,7 +3146,9 @@ DashboardRoutes::gather_tar_retention_paused(const std::string& username,
     // and every surface (HTML banner, REST/MCP JSON) reports the result as partial.
     ResponseQuery q;
     q.limit = 10000;
-    auto bounded_opt = response_store_->query_bounded(scan.scan_id, q, std::nullopt,
+    // #4990: the scan is a TAR dispatch the server issued itself (fixed plugin, not Forensics).
+    const auto tier = ResponseTierFilter::for_fixed_plugin_poll(forensics_plugins_);
+    auto bounded_opt = response_store_->query_bounded(scan.scan_id, tier, q, std::nullopt,
                                                       export_body_byte_cap().load());
     scan.store_degraded = !bounded_opt.has_value();
     std::vector<StoredResponse> responses;

@@ -61,6 +61,12 @@
 
 namespace fs = std::filesystem;
 using namespace yuzu::server;
+
+// #4990: reads in this file are test oracles, not an operator surface, so they take no tier
+// restriction (the tier itself is pinned in test_response_store.cpp / test_response_tier_filter.cpp).
+namespace {
+const auto kAllRows = yuzu::server::ResponseTierFilter::unrestricted_internal_consumer();
+} // namespace
 using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
 using yuzu::server::pg::PgResult;
@@ -2507,7 +2513,7 @@ TEST_CASE("PR2 hardening — query_by_execution includes the partial-index "
     legacy.execution_id = "";
     store.store(legacy);
 
-    auto rows = store.query_by_execution("exec-pr2");
+    auto rows = store.query_by_execution("exec-pr2", kAllRows);
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 1);
     CHECK((*rows)[0].output == "tagged");
@@ -2542,7 +2548,7 @@ TEST_CASE("PR2 hardening — multi-agent fan-out: terminal-branch does NOT erase
     a2.execution_id = "exec-fan";
     store.store(a2);
 
-    auto rows_opt = store.query_by_execution("exec-fan");
+    auto rows_opt = store.query_by_execution("exec-fan", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 2);

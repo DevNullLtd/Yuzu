@@ -227,6 +227,9 @@ public:
         CallerFn caller_fn;
         ApprovalManager* approval_manager{nullptr};
         ResponseStore* response_store{nullptr};
+        /// #4990: `ServerImpl::forensics_plugin_set_` (null in tests that predate the tier). Feeds
+        /// the `ResponseTierFilter` the drawer's response reads take.
+        const ForensicsPluginSet* forensics_plugins{nullptr};
         /// PR 3 — per-execution SSE event bus for `/sse/executions/{id}`.
         /// When non-null, `ExecutionTracker` publishers (update_agent_status,
         /// refresh_counts, mark_cancelled) emit transitions onto this bus

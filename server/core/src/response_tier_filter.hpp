@@ -95,6 +95,15 @@ public:
         return plugins ? exclude(*plugins, std::nullopt) : ResponseTierFilter{Key{}};
     }
 
+    /// A server-side poll that reads back the reply to a command the server dispatched itself from
+    /// a FIXED set of plugins, none of them Forensics-tier (the device live snapshots, the DEX and
+    /// TAR result polls). Excludes the Forensics plugins outright (present-empty visibility), so
+    /// the poll could never return a Forensics row even if the command id were tampered with. A
+    /// null set (a harness that did not wire it) yields no clause: the plugin is fixed either way.
+    [[nodiscard]] static ResponseTierFilter for_fixed_plugin_poll(const ForensicsPluginSet* plugins) {
+        return plugins ? exclude(*plugins, authz::deny_all()) : ResponseTierFilter{Key{}};
+    }
+
     // -- Accessors for response_store.cpp (the SQL builder); not a policy surface. -----------------
 
     /// True when a SQL clause is needed: the filter excludes plugins for at least some agents.

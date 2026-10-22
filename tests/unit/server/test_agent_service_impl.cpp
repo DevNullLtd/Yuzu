@@ -83,6 +83,12 @@ using yuzu::server::OffloadAuthType;
 using yuzu::server::OffloadTargetStore;
 using yuzu::server::ResponseStore;
 using yuzu::server::StoredResponse;
+
+// #4990: reads in this file are test oracles, not an operator surface, so they take no tier
+// restriction (the tier itself is pinned in test_response_store.cpp / test_response_tier_filter.cpp).
+namespace {
+const auto kAllRows = yuzu::server::ResponseTierFilter::unrestricted_internal_consumer();
+} // namespace
 using yuzu::server::WebhookStore;
 using yuzu::server::detail::AgentRegistry;
 using yuzu::server::detail::AgentServiceImpl;
@@ -219,7 +225,7 @@ TEST_CASE("record_execution_id: terminal response stamps mapped execution_id",
                                                       /*output=*/"", /*exit_code=*/0);
     h.svc.process_gateway_response("agent-1", resp);
 
-    auto rows_opt = h.responses.query_by_execution("exec-42");
+    auto rows_opt = h.responses.query_by_execution("exec-42", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1);
@@ -241,10 +247,10 @@ TEST_CASE("record_execution_id: empty execution_id removes the mapping",
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", resp);
 
-    auto by_exec = h.responses.query_by_execution("exec-42");
+    auto by_exec = h.responses.query_by_execution("exec-42", kAllRows);
     REQUIRE(by_exec.has_value());
     CHECK(by_exec->empty()); // mapping cleared → row not tagged
-    auto by_cmd_opt = h.responses.get_by_instruction("cmd-A");
+    auto by_cmd_opt = h.responses.get_by_instruction("cmd-A", kAllRows);
     REQUIRE(by_cmd_opt.has_value());
     const auto& by_cmd = *by_cmd_opt;
     REQUIRE(by_cmd.size() == 1);
@@ -270,7 +276,7 @@ TEST_CASE("process_gateway_response: RUNNING streaming row carries execution_id"
                                               /*output=*/"row-1");
     h.svc.process_gateway_response("agent-1", running);
 
-    auto rows_opt = h.responses.query_by_execution("exec-stream");
+    auto rows_opt = h.responses.query_by_execution("exec-stream", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1);
@@ -292,7 +298,7 @@ TEST_CASE("process_gateway_response: FAILURE preserves error_detail and executio
     resp.mutable_error()->set_message("plugin returned non-zero");
     h.svc.process_gateway_response("agent-1", resp);
 
-    auto rows_opt = h.responses.query_by_execution("exec-fail");
+    auto rows_opt = h.responses.query_by_execution("exec-fail", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1);
@@ -329,7 +335,7 @@ TEST_CASE("process_gateway_response: a #4672 synthetic gateway-forward terminal 
         "not delivered");
     h.svc.process_gateway_response("agent-1", synth);
 
-    auto rows_opt = h.responses.query_by_execution("exec-gwfwd");
+    auto rows_opt = h.responses.query_by_execution("exec-gwfwd", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1);
@@ -372,7 +378,7 @@ TEST_CASE("process_gateway_response: a command left RUNNING then hit by a #4672 
         "Gateway unreachable after 3 attempts — command not delivered");
     h.svc.process_gateway_response("agent-1", synth);
 
-    auto rows_opt = h.responses.query_by_execution("exec-stuck");
+    auto rows_opt = h.responses.query_by_execution("exec-stuck", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1); // updated in place, not a second orphaned row
@@ -410,7 +416,7 @@ TEST_CASE("process_gateway_response: each of the five #4672 reason codes produce
             yuzu::server::build_gateway_forward_terminal_failure(c.command_id, c.reason, c.reason);
         h.svc.process_gateway_response("agent-1", synth);
 
-        auto by_cmd_opt = h.responses.get_by_instruction(c.command_id);
+        auto by_cmd_opt = h.responses.get_by_instruction(c.command_id, kAllRows);
         REQUIRE(by_cmd_opt.has_value());
         const auto& by_cmd = *by_cmd_opt;
         REQUIRE(by_cmd.size() == 1);
@@ -434,7 +440,7 @@ TEST_CASE("process_gateway_response: unmapped command_id stamps empty execution_
     auto resp = GatewayResponseHarness::make_response("cmd-orphan", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", resp);
 
-    auto by_cmd_opt = h.responses.get_by_instruction("cmd-orphan");
+    auto by_cmd_opt = h.responses.get_by_instruction("cmd-orphan", kAllRows);
     REQUIRE(by_cmd_opt.has_value());
     const auto& by_cmd = *by_cmd_opt;
     REQUIRE(by_cmd.size() == 1);
@@ -486,7 +492,7 @@ TEST_CASE("process_gateway_response: terminal branch does NOT erase mapping "
         h.svc.process_gateway_response(t.agent, r);
     }
 
-    auto rows_opt = h.responses.query_by_execution("exec-fan");
+    auto rows_opt = h.responses.query_by_execution("exec-fan", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 4);
@@ -516,10 +522,10 @@ TEST_CASE("process_gateway_response: __timing__ sentinel takes the early-return 
                                                         /*output=*/"__timing__|elapsed=42");
     h.svc.process_gateway_response("agent-1", timing);
 
-    auto time_by_exec = h.responses.query_by_execution("exec-time");
+    auto time_by_exec = h.responses.query_by_execution("exec-time", kAllRows);
     REQUIRE(time_by_exec.has_value());
     CHECK(time_by_exec->empty());
-    auto time_by_cmd = h.responses.get_by_instruction("cmd-time");
+    auto time_by_cmd = h.responses.get_by_instruction("cmd-time", kAllRows);
     REQUIRE(time_by_cmd.has_value());
     CHECK(time_by_cmd->empty());
 }
@@ -548,7 +554,7 @@ TEST_CASE("process_gateway_response: terminal SUCCESS folds into existing RUNNIN
     auto r3 = GatewayResponseHarness::make_response("cmd-mix", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", r3);
 
-    auto rows_opt = h.responses.query_by_execution("exec-mix");
+    auto rows_opt = h.responses.query_by_execution("exec-mix", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 2);
@@ -573,7 +579,7 @@ TEST_CASE("process_gateway_response: terminal frame WITH output still inserts",
                                                       /*output=*/"final-data");
     h.svc.process_gateway_response("agent-1", only);
 
-    auto rows_opt = h.responses.query_by_execution("exec-direct");
+    auto rows_opt = h.responses.query_by_execution("exec-direct", kAllRows);
     REQUIRE(rows_opt.has_value());
     const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1);
@@ -606,13 +612,13 @@ TEST_CASE("process_gateway_response: re-mapping a command_id updates the stamp",
     auto second = GatewayResponseHarness::make_response("cmd-re", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", second);
 
-    auto old_rows_opt = h.responses.query_by_execution("exec-old");
+    auto old_rows_opt = h.responses.query_by_execution("exec-old", kAllRows);
     REQUIRE(old_rows_opt.has_value());
     const auto& old_rows = *old_rows_opt;
     REQUIRE(old_rows.size() == 1);
     CHECK(old_rows[0].status == static_cast<int>(apb::CommandResponse::RUNNING));
 
-    auto new_rows_opt = h.responses.query_by_execution("exec-new");
+    auto new_rows_opt = h.responses.query_by_execution("exec-new", kAllRows);
     REQUIRE(new_rows_opt.has_value());
     const auto& new_rows = *new_rows_opt;
     REQUIRE(new_rows.size() == 1);
@@ -2791,7 +2797,7 @@ TEST_CASE("process_gateway_response: the __keepalive__ sentinel renews the concu
     CHECK(ka_statuses[0].completed_at == 0);
 
     // Did NOT reach ResponseStore::store — no row landed for the drawer/SSE.
-    auto rows_opt = h.responses.query_by_execution(exec_id);
+    auto rows_opt = h.responses.query_by_execution(exec_id, kAllRows);
     REQUIRE(rows_opt.has_value());
     CHECK(rows_opt->empty());
 }
@@ -2855,7 +2861,7 @@ TEST_CASE("notify_exec_tracker: the by-command concurrency-claim fallback fires 
     // Confirms nothing leaked into the normal execution_id-resolved path
     // (no agent_exec_status row, since no execution was ever created/
     // correlated for this command_id).
-    CHECK(h.responses.query_by_execution("exec-unresolved")->empty());
+    CHECK(h.responses.query_by_execution("exec-unresolved", kAllRows)->empty());
 }
 
 TEST_CASE("notify_exec_tracker: a __guard__- command_id short-circuits the by-command fallback "

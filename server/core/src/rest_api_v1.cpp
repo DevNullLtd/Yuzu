@@ -2924,6 +2924,9 @@ void RestApiV1::register_routes(
     // route lambdas below capture plain values, not `this`.
     EnginePrincipalStore* eps = engine_principal_store_;
     UserExistsFn user_exists_fn = user_exists_fn_;
+    // #4990 - the Forensics plugin set feeding every ResponseStore read's tier filter (null =
+    // unwired, e.g. a test harness); snapshotted like the members above.
+    const ForensicsPluginSet* forensics_plugins = forensics_plugins_;
     // #4981 PR-2 — see set_scope_evaluate_fn's doc comment in the .hpp.
     ScopeEvaluateFn scope_evaluate_fn = scope_evaluate_fn_;
     // #4983 — see set_all_agent_ids_fn's doc comment in the .hpp.
@@ -4073,7 +4076,7 @@ void RestApiV1::register_routes(
     // call, matching the fragment's own "no filter -> no scoped count"
     // branch exactly.
     sink.Get("/api/v1/management-groups/agent-count-preview",
-             [auth_fn, perm_fn, response_store, response_visible_set_fn](
+             [auth_fn, perm_fn, response_store, response_visible_set_fn, forensics_plugins](
                  const httplib::Request& req, httplib::Response& res) {
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
@@ -4105,8 +4108,10 @@ void RestApiV1::register_routes(
                          agent_scope = std::vector<std::string>(scope->begin(), scope->end());
                  }
 
-                 auto count =
-                     group_agent_count_preview(response_store, command_id, filters, agent_scope);
+                 // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
+                 const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins);
+                 auto count = group_agent_count_preview(response_store, tier, command_id, filters,
+                                                        agent_scope);
                  if (!count) {
                      res.status = 503;
                      res.set_content(
@@ -10622,8 +10627,10 @@ void RestApiV1::register_routes(
     // response bodies to any Execution:Read holder lacking Response:Read.
     sink.Get(
         R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/responses)",
-        [fleet_read_fn, audit_fn, response_store, metrics_registry](const httplib::Request& req,
-                                                   httplib::Response& res) {
+        [fleet_read_fn, audit_fn, response_store, metrics_registry, forensics_plugins](
+            const httplib::Request& req, httplib::Response& res) {
+            // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
+            const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins);
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
             if (!fleet_read_fn) {
@@ -10693,7 +10700,7 @@ void RestApiV1::register_routes(
             // query_responses' execution_id path exactly (mcp_server.cpp).
             AggregateScope scope_arg; // nullopt = unrestricted
             if (gate.scope) {
-                auto distinct = response_store->distinct_agent_ids_by_execution(execution_id);
+                auto distinct = response_store->distinct_agent_ids_by_execution(execution_id, tier);
                 if (!distinct) {
                     res.status = 503;
                     res.set_content(detail::a4_error(res, "response store degraded",
@@ -10711,7 +10718,7 @@ void RestApiV1::register_routes(
             }
 
             auto responses_opt =
-                response_store->query_by_execution(execution_id, q, scope_arg);
+                response_store->query_by_execution(execution_id, tier, q, scope_arg);
             if (!responses_opt) {
                 res.status = 503;
                 res.set_content(
@@ -10805,8 +10812,10 @@ void RestApiV1::register_routes(
 
     sink.Get(
         R"(/api/v1/responses/([A-Za-z0-9_-]{1,128})/aggregate)",
-        [fleet_read_fn, audit_fn, response_store, metrics_registry](const httplib::Request& req,
-                                                   httplib::Response& res) {
+        [fleet_read_fn, audit_fn, response_store, metrics_registry, forensics_plugins](
+            const httplib::Request& req, httplib::Response& res) {
+            // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
+            const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins);
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
             if (!fleet_read_fn) {
@@ -10887,7 +10896,7 @@ void RestApiV1::register_routes(
             AggregateScope agg_scope; // nullopt = no restriction
             std::size_t agg_dropped = 0;
             if (gate.scope) {
-                auto distinct = response_store->distinct_agent_ids(instruction_id);
+                auto distinct = response_store->distinct_agent_ids(instruction_id, tier);
                 if (!distinct) {
                     res.status = 503;
                     res.set_content(detail::a4_error(res, "response store unavailable",
@@ -10919,7 +10928,7 @@ void RestApiV1::register_routes(
                 return;
             }
 
-            auto results_opt = response_store->aggregate(instruction_id, aq, filter, agg_scope);
+            auto results_opt = response_store->aggregate(instruction_id, tier, aq, filter, agg_scope);
             if (!results_opt) {
                 res.status = 503;
                 res.set_content(
@@ -10959,8 +10968,10 @@ void RestApiV1::register_routes(
 
     sink.Get(
         R"(/api/v1/responses/([A-Za-z0-9_-]{1,128})/export)",
-        [fleet_read_fn, audit_fn, response_store, metrics_registry](const httplib::Request& req,
-                                                   httplib::Response& res) {
+        [fleet_read_fn, audit_fn, response_store, metrics_registry, forensics_plugins](
+            const httplib::Request& req, httplib::Response& res) {
+            // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
+            const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins);
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
             if (!fleet_read_fn) {
@@ -11024,7 +11035,7 @@ void RestApiV1::register_routes(
             AggregateScope scope_arg; // nullopt = unrestricted
             std::size_t export_dropped = 0;
             if (gate.scope) {
-                auto distinct = response_store->distinct_agent_ids(instruction_id);
+                auto distinct = response_store->distinct_agent_ids(instruction_id, tier);
                 if (!distinct) {
                     res.status = 503;
                     res.set_content(detail::a4_error(res, "response store degraded",
@@ -11061,7 +11072,7 @@ void RestApiV1::register_routes(
             // output/error_detail (see ResponseStore::query_bounded). Same predicates and
             // scope push-down (ADR-0017 INV-3) as query().
             const std::size_t byte_cap = export_body_byte_cap().load();
-            auto bounded_opt = response_store->query_bounded(instruction_id, q, scope_arg, byte_cap);
+            auto bounded_opt = response_store->query_bounded(instruction_id, tier, q, scope_arg, byte_cap);
             if (!bounded_opt) {
                 res.status = 503;
                 res.set_content(
@@ -11128,8 +11139,10 @@ void RestApiV1::register_routes(
 
     sink.Get(
         R"(/api/v1/responses/([A-Za-z0-9_-]{1,128}))",
-        [fleet_read_fn, audit_fn, response_store, metrics_registry](const httplib::Request& req,
-                                                   httplib::Response& res) {
+        [fleet_read_fn, audit_fn, response_store, metrics_registry, forensics_plugins](
+            const httplib::Request& req, httplib::Response& res) {
+            // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
+            const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins);
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
             if (!fleet_read_fn) {
@@ -11193,7 +11206,7 @@ void RestApiV1::register_routes(
             AggregateScope scope_arg; // nullopt = unrestricted
             std::size_t get_dropped = 0;
             if (gate.scope) {
-                auto distinct = response_store->distinct_agent_ids(instruction_id);
+                auto distinct = response_store->distinct_agent_ids(instruction_id, tier);
                 if (!distinct) {
                     res.status = 503;
                     res.set_content(detail::a4_error(res, "response store degraded",
@@ -11225,7 +11238,7 @@ void RestApiV1::register_routes(
                 return;
             }
 
-            auto results_opt = response_store->query(instruction_id, q, scope_arg);
+            auto results_opt = response_store->query(instruction_id, tier, q, scope_arg);
             if (!results_opt) {
                 res.status = 503;
                 res.set_content(
@@ -11892,8 +11905,10 @@ void RestApiV1::register_routes(
     // all read response_store on the same gate. Governance gate C-1.
     sink.Get(
         R"(/api/v1/executions/([A-Za-z0-9._-]+)/visualization)",
-        [fleet_read_fn, audit_fn, response_store, instruction_store](
+        [fleet_read_fn, audit_fn, response_store, instruction_store, forensics_plugins](
             const httplib::Request& req, httplib::Response& res) {
+            // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
+            const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins);
             if (!fleet_read_fn) {
                 spdlog::error("execution.visualization.fetch: fleet_read_fn unwired");
                 res.status = 503;
@@ -12011,7 +12026,7 @@ void RestApiV1::register_routes(
             AggregateScope scope_arg; // nullopt = unrestricted
             std::size_t scope_dropped = 0;
             if (gate.scope) {
-                auto distinct = response_store->distinct_agent_ids(execution_id);
+                auto distinct = response_store->distinct_agent_ids(execution_id, tier);
                 if (!distinct) {
                     res.status = 503;
                     res.set_content(detail::a4_error(res, "response store degraded",
@@ -12038,7 +12053,7 @@ void RestApiV1::register_routes(
             // query_bounded applies the 50 MiB payload cap in SQL, so the PGresult and the
             // parsed vector never hold more than about that much plus one row. Same scope
             // push-down (ADR-0017 INV-3) and predicates as query().
-            auto responses_opt = response_store->query_bounded(execution_id, q, scope_arg,
+            auto responses_opt = response_store->query_bounded(execution_id, tier, q, scope_arg,
                                                                export_body_byte_cap().load());
             if (!responses_opt) {
                 res.status = 503;
@@ -16868,7 +16883,8 @@ void RestApiV1::register_routes(
     sink.Post(
         R"(/api/v1/dex/devices/([^/]+)/live)",
         [scoped_perm_fn, response_store, command_dispatch_fn, audit_fn, metrics_registry,
-         resolve_secondary_caller](const httplib::Request& req, httplib::Response& res) {
+         resolve_secondary_caller, forensics_plugins](const httplib::Request& req,
+                                                      httplib::Response& res) {
             const std::string agent_id = req.matches[1].str();
             const auto cid = detail::make_correlation_id();
             // Echo the correlation id on EVERY response path (A3), parity with the
@@ -17005,7 +17021,11 @@ void RestApiV1::register_routes(
                 bool have_output = false;
                 // Degrade → empty this iteration; the bounded poll loop retries
                 // (deny-or-benign, ADR-0039).
-                for (const auto& r : response_store->query(command_id).value_or(std::vector<StoredResponse>{})) {
+                // #4990: this poll reads back a command this handler dispatched itself from the
+                // fixed live-snapshot kinds (device info plugins, none Forensics-tier), so the
+                // Forensics tier is excluded outright rather than derived from the caller.
+                const auto tier = ResponseTierFilter::for_fixed_plugin_poll(forensics_plugins);
+                for (const auto& r : response_store->query(command_id, tier).value_or(std::vector<StoredResponse>{})) {
                     if (r.agent_id != agent_id)
                         continue; // never render another agent's row
                     if (!r.output.empty()) {
