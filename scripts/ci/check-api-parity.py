@@ -3118,6 +3118,10 @@ def _selftest_body():
     # passes, and an AnchorError becomes a failure rather than a crash
     expect("gate-fn-finding", _drive(base_rows, gate_fn=lambda *_a: ["gate parity: injected"]), 1, "gate parity: injected")
     expect("gate-fn-clean", _drive(base_rows, gate_fn=lambda *_a: []), 0)
+    # with no gate_fn (what CI passes) the runner is the module's gate_checks
+    expect("gate-default", _drive(base_rows, synthetic=False,
+                                  patch={"gate_checks": lambda *_a: ["gate parity: default stub"]}), 1,
+           "gate parity: default stub")
     def _anchor_boom(*_a):
         raise AnchorError("injected anchor failure")
     expect("gate-fn-anchor", _drive(base_rows, gate_fn=_anchor_boom), 1, "injected anchor failure")
