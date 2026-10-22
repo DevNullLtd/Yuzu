@@ -1513,9 +1513,19 @@ TEST_CASE("consume: the held overload refuses a row its OWN transaction rewrote 
     const auto run_cell = [&](const std::string& prior, const std::string& change, bool with_pre) {
         const auto id = approved_bound(mgr);
         in_txn(bundle.pool(), /*commit=*/false, [&](PGconn* conn) {
-            REQUIRE(pg::exec_params(conn, (upd + prior + " WHERE id = $1").c_str(),
-                                    std::vector<std::string>{id})
-                        .status() == PGRES_COMMAND_OK);
+            auto prior_res = pg::exec_params(conn, (upd + prior + " WHERE id = $1").c_str(),
+                                             std::vector<std::string>{id});
+            REQUIRE(prior_res.status() == PGRES_COMMAND_OK);
+            REQUIRE(std::string(PQcmdTuples(prior_res.get())) == "1"); // the prior write happened
+            // ... and it made this transaction the row's writer, which is what lets a second
+            // write keep the xmin (without it, xmin alone would refuse and prove nothing here).
+            auto mine = pg::exec_params(conn,
+                                        "SELECT xmin::text = txid_current()::text FROM "
+                                        "approval_manager.approvals WHERE id = $1",
+                                        std::vector<std::string>{id});
+            REQUIRE(mine.status() == PGRES_TUPLES_OK);
+            REQUIRE(PQntuples(mine.get()) == 1);
+            REQUIRE(std::string(PQgetvalue(mine.get(), 0, 0)) == "t");
             g_fired = 0;
             mgr.set_consume_test_hook_for_test([&](Stage got) {
                 if (got != Stage::kBeforeCas)
@@ -1576,12 +1586,99 @@ TEST_CASE("consume: the held overload refuses a row its OWN transaction rewrote 
         // not refused for having done so.
         const auto id = approved_bound(mgr);
         in_txn(bundle.pool(), /*commit=*/false, [&](PGconn* conn) {
-            REQUIRE(pg::exec_params(conn, (upd + "reviewed_by = reviewed_by WHERE id = $1").c_str(),
-                                    std::vector<std::string>{id})
-                        .status() == PGRES_COMMAND_OK);
+            auto prior_res = pg::exec_params(conn, (upd + "reviewed_by = reviewed_by WHERE id = $1").c_str(),
+                                             std::vector<std::string>{id});
+            REQUIRE(prior_res.status() == PGRES_COMMAND_OK);
+            REQUIRE(std::string(PQcmdTuples(prior_res.get())) == "1");
             CHECK(mgr.consume_ticket(conn, id, "alice", ApprovalOrigin::kGuardianDeploy, kPass)
                       .has_value());
         });
+    }
+}
+
+TEST_CASE("consume: the xmin leg of the version pin refuses a rewrite that returns the examined "
+          "tuple position (g8r6-qe-1)",
+          "[pg][approval_manager][bound][race]") {
+    // `ctid` alone is not a version: two writes by OTHER transactions with a plain VACUUM between
+    // them put the new tuple back in the slot the examined version occupied (the first write
+    // vacates it, the VACUUM frees it, the second write reuses it). Only `xmin` tells the two
+    // tuples apart. The hook performs exactly that sequence, REQUIREs that the position really
+    // came back with a different xmin (so the case cannot go green by the race not happening),
+    // and the consume must still refuse; a pin on ctid alone would spend the ticket on a row
+    // whose definition was changed.
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+
+    const auto position = [&](const std::string& id) {
+        auto lease = bundle.pool().acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(lease.get(),
+                                   "SELECT ctid::text, xmin::text FROM "
+                                   "approval_manager.approvals WHERE id = $1",
+                                   std::vector<std::string>{id});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(res.get()) == 1);
+        return std::make_pair(std::string(PQgetvalue(res.get(), 0, 0)),
+                              std::string(PQgetvalue(res.get(), 0, 1)));
+    };
+    const auto aba_hook = [&](const std::string& id, const std::pair<std::string, std::string>& examined) {
+        g_fired = 0;
+        mgr.set_consume_test_hook_for_test([&bundle, &position, id, examined](Stage got) {
+            if (got != Stage::kBeforeCas)
+                return;
+            ++g_fired;
+            auto lease = bundle.pool().acquire();
+            REQUIRE(lease);
+            const auto exec = [&](const char* sql, bool with_id = true) {
+                auto res = pg::exec_params(lease.get(), sql,
+                                           with_id ? std::vector<std::string>{id}
+                                                   : std::vector<std::string>{});
+                REQUIRE(res.status() == PGRES_COMMAND_OK);
+                return std::string(PQcmdTuples(res.get()));
+            };
+            // Rewrite, VACUUM, rewrite ... until the new tuple lands back in the examined slot.
+            // Each rewrite vacates the slot of the version before it; a plain VACUUM (autocommit;
+            // the examined read has finished) frees it for the next. Every rewrite also changes
+            // a column no explicit pin reads, so the row that comes back is not the one examined.
+            for (int round = 0; round < 8; ++round) {
+                const auto sql = "UPDATE approval_manager.approvals SET definition_id = "
+                                 "'guardian.other', review_comment = 'round " +
+                                 std::to_string(round) + "' WHERE id = $1";
+                CHECK(exec(sql.c_str()) == "1");
+                if (position(id).first == examined.first)
+                    break;
+                exec("VACUUM approval_manager.approvals", /*with_id=*/false);
+            }
+            const auto now = position(id);
+            REQUIRE(now.first == examined.first);  // the tuple position came back ...
+            REQUIRE(now.second != examined.second); // ... under a different writer
+        });
+    };
+
+    SECTION("pooled overload") {
+        const auto id = approved_bound(mgr);
+        aba_hook(id, position(id));
+        auto r = mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, {});
+        mgr.set_consume_test_hook_for_test({});
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == ConsumeFailure::kNotConsumable);
+        CHECK(r.error().message == kNotConsumableMessage);
+        CHECK(g_fired == 1);
+        CHECK(mgr.get(id)->consumed_by.empty());
+        // The row was never spent, so a retry reads the new version and succeeds.
+        CHECK(mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, {}).has_value());
+    }
+    SECTION("held overload over an autocommit connection") {
+        const auto id = approved_bound(mgr);
+        aba_hook(id, position(id));
+        auto lease = bundle.pool().acquire(); // no BEGIN: the lock does not outlive the SELECT
+        REQUIRE(lease);
+        auto r = mgr.consume_ticket(lease.get(), id, "alice", ApprovalOrigin::kGuardianDeploy, {});
+        mgr.set_consume_test_hook_for_test({});
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == ConsumeFailure::kNotConsumable);
+        CHECK(g_fired == 1);
+        CHECK(mgr.get(id)->consumed_by.empty());
     }
 }
 
