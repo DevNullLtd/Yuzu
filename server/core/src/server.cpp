@@ -15545,8 +15545,9 @@ private:
             // denied/streaming/non-engine requests, which never stash one.
             detail::tls_quota_slot().reset();
 
-            // Step-up chokepoint: a pass that the in-handler gate never consumed, on a 2xx
-            // response, is counted as handler_skipped (report-only); always clears the stash.
+            // Step-up chokepoint: a pass that the in-handler gate never spent, on a 2xx
+            // response, is counted as handler_skipped (report-only); always clears the stash,
+            // the per-request principal binding included.
             detail::finish_step_up_pass(req, res, &metrics_);
 
             // -- Security response headers (SOC2-C1) ---------------------

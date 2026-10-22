@@ -442,6 +442,18 @@ std::optional<auth::Session> AuthRoutes::synthesize_token_session(const ApiToken
 }
 
 std::optional<auth::Session> AuthRoutes::resolve_session(const httplib::Request& req) {
+    // One principal per request. Once the step-up chokepoint has passed a gated request, every
+    // later resolution for it must yield the same principal or none: the walk below falls through
+    // cookie, Bearer and X-Yuzu-Token, so a later resolution is not guaranteed to land on the
+    // principal the check was made for. The binding is applied here, to whatever the walk
+    // returns, so no path of it can skip it. A request with no binding armed is unaffected.
+    auto session = resolve_session_unbound(req);
+    if (session && !detail::step_up_binding_admits(req, *session))
+        return std::nullopt;
+    return session;
+}
+
+std::optional<auth::Session> AuthRoutes::resolve_session_unbound(const httplib::Request& req) {
     // The credential sources read here (Cookie, Authorization, X-Yuzu-Token) are mirrored by
     // health::request_carries_credential (health_routes.hpp), which decides whether /health
     // and /api/health resolve a session or charge the per-source budget. A new credential

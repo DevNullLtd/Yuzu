@@ -26,8 +26,10 @@
 /// audit rows it writes carry `stage=pre_authz` (last) so they can be told apart, and `cid=<id>`,
 /// the same value as the response's `X-Correlation-Id`.
 /// The decision is made per request and never cached across requests; the only
-/// state is a one-request thread-local stash (see `detail::consume_step_up_pass`)
-/// that lets the still-present in-handler `StepUpFn` skip a second store read.
+/// state is a one-request thread-local stash (see `detail::StepUpPassStash`) that
+/// lets the still-present in-handler `StepUpFn` skip a second store read and binds
+/// every later session resolution for the request to the principal the check passed
+/// (one principal per request, `detail::step_up_binding_admits`).
 ///
 /// Fail closed: a kRequired row with no usable auth store answers 503
 /// (`kUnwired`), distinct from the 401 challenge and the 403 SAML refusal. That check precedes
@@ -43,6 +45,7 @@
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -210,6 +213,10 @@ namespace detail {
 /// (principal_kind, auth_source, username), so no two distinct triples share an encoding and a
 /// collision needs a 128-bit match against a cryptographic hash. The username is caller-chosen
 /// text, so a pair of seeded non-cryptographic 64-bit hashes would not give that margin.
+///
+/// Coupling note: the identity omits role, mcp_tier and token_scope_service. That is safe only
+/// while `decide_step_up` ignores them for every principal it can pass; if it ever consults one,
+/// extend this identity in the same change.
 struct StepUpPassIdentity {
     bool engine{false};
     std::uint64_t h1{0};
@@ -218,29 +225,49 @@ struct StepUpPassIdentity {
 };
 
 /// Fingerprint of `session`. Returns false (and leaves `out` unspecified) if the digest could not
-/// be computed; a caller must then treat the identity as unprovable: the chokepoint does not arm a
-/// pass and `consume_step_up_pass` refuses.
+/// be computed; a caller must then treat the identity as unprovable: the chokepoint refuses the
+/// request (503, fail closed), `consume_step_up_pass` refuses and `step_up_binding_admits` refuses.
 [[nodiscard]] bool step_up_identity_of(const auth::Session& session,
                                        StepUpPassIdentity& out) noexcept;
 
-/// One request's pass stash. Written by the chokepoint on a pass, consumed by the in-handler
-/// `StepUpFn`, and cleared by pre-routing (top), post-routing (end) and `consume_step_up_pass`,
-/// so a value left by one request on a worker thread is not seen by the next. The request address
-/// recorded here is NOT a unique key (successive requests on a worker thread can share a
-/// `httplib::Request` address); what protects against a stale pass is those clears, the
-/// action-label match and the identity match in `consume_step_up_pass`. The identity is what ties
-/// a pass to the principal that earned it: a handler resolves its own session again, and that
-/// resolution can land on a different credential than the one the chokepoint decided on, so a
-/// step-up pass is honoured only for the principal that earned it.
+/// TEST-ONLY seam, false in production: while true, `step_up_identity_of` reports failure (the
+/// digest could not be computed). A process-wide flag rather than a `StepUpChokepointDeps` hook
+/// because the function is free-standing and is reached from three sites; the cost in production
+/// is one relaxed atomic load.
+[[nodiscard]] inline std::atomic<bool>& step_up_identity_fault_for_test() noexcept {
+    static std::atomic<bool> fault{false};
+    return fault;
+}
+
+/// One request's pass stash and principal binding. Written by the chokepoint on a pass, consumed
+/// by the in-handler `StepUpFn`, and cleared by pre-routing (top), post-routing (end) and the
+/// chokepoint's fail-closed path, so a value left by one request on a worker thread is not seen by
+/// the next. The request address recorded here is NOT a unique key (successive requests on a
+/// worker thread can share a `httplib::Request` address); what protects against a stale pass is
+/// those clears, the action-label match and the identity match in `consume_step_up_pass`.
 ///
-/// PR 2 deletes this stash, `consume_step_up_pass`, `finish_step_up_pass` and the
-/// `handler_skipped` outcome together with the in-handler `StepUpFn` calls.
+/// ONE PRINCIPAL PER REQUEST. The stash holds two things with different lifetimes:
+///   - the PASS (`row != nullptr`): single use, spent by `consume_step_up_pass`, honoured only for
+///     the principal that earned it (`identity`);
+///   - the BINDING (`bound`): armed with the pass and kept until the end-of-request clear, even
+///     after the pass is spent. Every later session resolution for the same request
+///     (`AuthRoutes::resolve_session`, through `step_up_binding_admits`) yields the bound
+///     principal or no session. A handler resolves its own session, which is not guaranteed to be
+///     the principal the chokepoint decided on, so the binding keeps the principal that
+///     authorises the request the principal the step-up check was made for.
+///
+/// PR 2 deletes this stash, `consume_step_up_pass`, `finish_step_up_pass`, the binding and the
+/// `handler_skipped` outcome together with the in-handler `StepUpFn` calls. Precondition for that
+/// deletion: handlers consume the centrally resolved session, or the repeated resolutions are
+/// removed (resolve once, issue #6200). Deleting the binding while handlers still resolve more
+/// than once re-opens the multi-resolution gap.
 struct StepUpPassStash {
     const httplib::Request* req{nullptr};
-    const StepUpPolicyEntry* row{nullptr};
+    const StepUpPolicyEntry* row{nullptr}; // non-null only while the pass is unspent
     StepUpSurface surface{StepUpSurface::kRest};
     std::string_view source{"other"};
     StepUpPassIdentity identity{};
+    bool bound{false}; // the binding: persists after the pass is spent, until the clear
 };
 static_assert(std::is_trivially_destructible_v<StepUpPassStash>,
               "the thread_local stash must stay trivially destructible: it holds only pointers, "
@@ -251,22 +278,32 @@ static_assert(std::is_trivially_destructible_v<StepUpPassStash>,
     return stash;
 }
 
-/// True (and the stash is cleared) iff the stash holds a pass for this request address, exactly
-/// this action label, and exactly the identity of `handler_session` (the session the handler
-/// resolved itself; see `StepUpPassStash`). An identity mismatch refuses, clears the stash (so
-/// `finish_step_up_pass` does not report a skipped gate) and logs one sampled warning naming only
-/// the route; the caller then evaluates `handler_session` afresh.
+/// True (and the pass is spent) iff the stash holds an unspent pass for this request address,
+/// exactly this action label, and exactly the identity of `handler_session` (the session the
+/// handler resolved itself; see `StepUpPassStash`). Spending the pass clears `row`, so
+/// `finish_step_up_pass` does not report a skipped gate, and leaves the binding armed. An identity
+/// mismatch (or an identity that cannot be fingerprinted) refuses, spends the pass the same way and
+/// logs one sampled warning naming only the route; the caller then evaluates `handler_session`
+/// afresh.
 [[nodiscard]] bool consume_step_up_pass(const httplib::Request& req,
                                         const auth::Session& handler_session,
                                         const std::string& action_label) noexcept;
+
+/// The binding check. True when no binding is armed for this request address; otherwise true only
+/// if `session` has exactly the bound identity (an identity that cannot be fingerprinted is not
+/// admitted). On false one sampled warning with a fixed message is logged (no username, no
+/// credential). Called by `AuthRoutes::resolve_session` on every path it returns a session on, so
+/// every later resolution for a gated request yields the bound principal or none.
+[[nodiscard]] bool step_up_binding_admits(const httplib::Request& req,
+                                          const auth::Session& session) noexcept;
 
 inline void clear_step_up_pass() noexcept {
     tls_step_up_pass() = StepUpPassStash{};
 }
 
-/// Post-routing: an unconsumed stash on a 2xx response means the handler never ran its own gate
-/// for a row the chokepoint passed; counted as outcome=handler_skipped (report-only). Always
-/// clears the stash.
+/// Post-routing: an unspent pass on a 2xx response means the handler never ran its own gate for a
+/// row the chokepoint passed; counted as outcome=handler_skipped (report-only). Always clears the
+/// stash, binding included.
 void finish_step_up_pass(const httplib::Request& req, const httplib::Response& res,
                          yuzu::MetricsRegistry* metrics) noexcept;
 

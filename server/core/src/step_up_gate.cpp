@@ -136,6 +136,21 @@ void note_pass_identity_mismatch(const std::string& label) noexcept {
     }
 }
 
+// A session resolution that the request's binding did not admit. One sampled warning with a fixed
+// message (no username, no credential, no route: the resolution site does not know one). Must not
+// throw: a logger failure is swallowed.
+void note_binding_refused() noexcept {
+    try {
+        static std::atomic<std::uint64_t> binding_refused_hits{0};
+        if (should_log_sampled(binding_refused_hits))
+            spdlog::warn("step-up gate: a session resolution for a gated request was refused because "
+                         "it is not the principal the step-up check was made for (1 log per {} "
+                         "occurrences)",
+                         kStepUpLogSample);
+    } catch (...) { // NOLINT(bugprone-empty-catch)
+    }
+}
+
 // The audit-detail suffix of a chokepoint refusal: ` cid=<id> stage=pre_authz`. The correlation id
 // is minted (or reused, if an upstream gate set it) BEFORE the audit row is written, so the row,
 // the `X-Correlation-Id` header and the body's `correlation_id` carry one value and an operator
@@ -591,19 +606,24 @@ StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req, htt
         if (!v.passed())
             return refuse(v, session->auth_source);
 
+        // Bind the request to the principal decided on. The identity is computed BEFORE the pass is
+        // counted: if it cannot be fingerprinted the request cannot be bound, and a request the gate
+        // cannot vouch for is refused (fail closed, 503), not passed on with a handler-side
+        // evaluation that would leave later session resolutions unbound.
+        StepUpPassIdentity identity;
+        if (!step_up_identity_of(*session, identity)) {
+            note_chokepoint_exception(label, "identity digest failed");
+            return fail_closed();
+        }
         count_gate(deps.metrics, "pass", session->auth_source, surface);
-        // Bind the pass to the principal decided on. If the identity cannot be fingerprinted no
-        // pass is armed and the handler's own gate evaluates (fail closed, one extra store read).
         auto& stash = tls_step_up_pass();
         stash = StepUpPassStash{};
-        StepUpPassIdentity identity;
-        if (step_up_identity_of(*session, identity)) {
-            stash.req = &req;
-            stash.row = row;
-            stash.surface = surface;
-            stash.source = step_up_source_label(session->auth_source);
-            stash.identity = identity;
-        }
+        stash.req = &req;
+        stash.row = row;
+        stash.surface = surface;
+        stash.source = step_up_source_label(session->auth_source);
+        stash.identity = identity;
+        stash.bound = true;
         return StepUpChokepointResult::kPassed;
     } catch (const std::exception& e) {
         // Fail closed: a gated row never passes because evaluating it threw.
@@ -616,6 +636,8 @@ StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req, htt
 }
 
 bool step_up_identity_of(const auth::Session& session, StepUpPassIdentity& out) noexcept {
+    if (step_up_identity_fault_for_test().load(std::memory_order_relaxed))
+        return false; // test seam, false in production
     // One SHA-256 over (len, bytes) for each of principal_kind, auth_source, username: the length
     // prefix makes the encoding injective, so no two distinct triples hash the same input.
     EvpMdCtxPtr ctx(EVP_MD_CTX_new());
@@ -652,19 +674,32 @@ bool consume_step_up_pass(const httplib::Request& req, const auth::Session& hand
     auto& stash = tls_step_up_pass();
     if (stash.req != &req || stash.row == nullptr || stash.row->action_label != action_label)
         return false;
-    // A pass is honoured only for the principal that earned it. The engine class is an exact
-    // compare, and the hashes cover kind, source and username. On any mismatch (or if the
-    // handler's identity cannot be fingerprinted) the pass is cleared so the post-routing report
-    // does not count a skipped gate, and the caller evaluates the handler's session afresh.
+    // A pass is honoured only for the principal that earned it. The identity compares the exact
+    // engine class and the hashes of kind, source and username. Whatever the outcome the pass is
+    // spent (`row` cleared, so the post-routing report does not count a skipped gate and a second
+    // consume finds nothing) and the binding stays armed until the end-of-request clear. On a
+    // mismatch (or if the handler's identity cannot be fingerprinted) the caller evaluates the
+    // handler's session afresh.
     StepUpPassIdentity handler_identity;
-    if (!step_up_identity_of(handler_session, handler_identity) ||
-        handler_identity != stash.identity) {
+    const bool earned =
+        step_up_identity_of(handler_session, handler_identity) && handler_identity == stash.identity;
+    stash.row = nullptr;
+    if (!earned) {
         note_pass_identity_mismatch(action_label);
-        clear_step_up_pass();
         return false;
     }
-    clear_step_up_pass();
     return true;
+}
+
+bool step_up_binding_admits(const httplib::Request& req, const auth::Session& session) noexcept {
+    const auto& stash = tls_step_up_pass();
+    if (!stash.bound || stash.req != &req)
+        return true; // no binding armed for this request
+    StepUpPassIdentity identity;
+    if (step_up_identity_of(session, identity) && identity == stash.identity)
+        return true;
+    note_binding_refused();
+    return false;
 }
 
 void finish_step_up_pass(const httplib::Request& req, const httplib::Response& res,

@@ -1391,9 +1391,14 @@ TEST_CASE("health_routes: resolve_session and request_carries_credential read th
         "health::request_carries_credential (health_routes.hpp), then this test's expected set.";
 
     const auto auth_code = strip_comments(read_server_src("auth_routes.cpp"));
+    // The credential walk lives in `resolve_session_unbound`; `resolve_session` wraps it with the
+    // per-request principal binding (pinned below).
     const auto resolve = function_body(
-        auth_code, "AuthRoutes::resolve_session(const httplib::Request& req)");
+        auth_code, "AuthRoutes::resolve_session_unbound(const httplib::Request& req)");
     REQUIRE(resolve.has_value()); // signature moved or renamed: re-point this pin
+    const auto wrapper = function_body(
+        auth_code, "AuthRoutes::resolve_session(const httplib::Request& req)");
+    REQUIRE(wrapper.has_value());
     const auto cookie_fn = function_body(
         auth_code, "AuthRoutes::extract_session_cookie(const httplib::Request& req)");
     REQUIRE(cookie_fn.has_value());
@@ -1428,6 +1433,13 @@ TEST_CASE("health_routes: resolve_session and request_carries_credential read th
     const auto probe_reads = header_names_read(*probe_fn);
     INFO("request_carries_credential names: " << join_names(probe_reads) << ". " << how_to_fix);
     CHECK(probe_reads == expected);
+
+    // The wrapper reads no credential itself: it walks via `resolve_session_unbound` and applies
+    // the per-request binding to whatever that returns, so no path of the walk can skip it.
+    CHECK(header_names_read(*wrapper).empty());
+    const std::set<std::string> wrapper_callees{"resolve_session_unbound",
+                                                "step_up_binding_admits"};
+    CHECK(req_argument_callees(*wrapper) == wrapper_callees);
 }
 
 // ---------------------------------------------------------------------------

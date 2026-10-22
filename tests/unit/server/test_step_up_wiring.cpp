@@ -21,15 +21,20 @@
 #include "../../../server/core/src/step_up_policy.hpp"
 #include "../../../server/core/src/step_up_wiring.hpp"
 
+#include "auth_routes.hpp"
+#include "oidc_provider.hpp"
+#include "test_api_token_pg_helper.hpp"
 #include "test_approval_manager_pg_helper.hpp"
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
+#include <yuzu/server/server.hpp>
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/interfaces/catch_interfaces_capture.hpp>
 
 #include <atomic>
@@ -39,8 +44,10 @@
 #include <expected>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -166,10 +173,20 @@ struct WiringServer {
     // Per-request inputs, mutated between requests by the test thread and read by worker threads.
     std::mutex mu;
     std::optional<auth::Session> session;
-    // When set, every resolution after the first in one request returns this instead of `session`.
-    // The first resolution is the central check's; later ones are the handler's own, so a test can
-    // make the handler resolve a different principal than the one the central check decided on.
+    // When set, every resolution from index `later_from` on in one request returns this instead of
+    // `session`. Resolution 0 is the central check's; later ones are the handler's own, so a test
+    // can make the handler resolve a different principal than the one the central check decided on.
     std::optional<auth::Session> later_session;
+    std::atomic<int> later_from{1};
+    // When set, the resolver applies the per-request binding to what it returns, with the same
+    // function `AuthRoutes::resolve_session` applies on every credential path.
+    std::atomic<bool> apply_binding{false};
+    // When set, the raise stub resolves the way a production handler does: once for its `auth_fn`,
+    // once inside `perm_fn`'s own gate, and the step-up call is made with the FIRST session.
+    std::atomic<bool> three_resolves{false};
+    // When set, the raise stub resolves once more AFTER the step-up call, as a handler does for
+    // provenance (`created_by`, the audit row's principal), and refuses 401 on no session.
+    std::atomic<bool> resolve_after_consume{false};
     std::atomic<int> resolutions{0};
     std::vector<AuditRow> audits;
 
@@ -194,10 +211,16 @@ struct WiringServer {
         st.enrolled = true;
         return st;
     };
-    StepUpSessionFn resolver = [this](const httplib::Request&) -> std::optional<auth::Session> {
+    StepUpSessionFn resolver = [this](const httplib::Request& req) -> std::optional<auth::Session> {
         const int n = resolutions.fetch_add(1);
-        std::lock_guard lk(mu);
-        return (n >= 1 && later_session) ? later_session : session;
+        std::optional<auth::Session> resolved;
+        {
+            std::lock_guard lk(mu);
+            resolved = (n >= later_from.load() && later_session) ? later_session : session;
+        }
+        if (resolved && apply_binding.load() && !detail::step_up_binding_admits(req, *resolved))
+            return std::nullopt;
+        return resolved;
     };
     StepUpAuditFn audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
                                  const std::string&, const std::string& ti,
@@ -263,9 +286,21 @@ struct WiringServer {
                 res.status = 401;
                 return;
             }
+            if (three_resolves.load()) {
+                // `perm_fn`'s own gate resolves the session again before the step-up call.
+                const auto gate_session = resolver(req);
+                if (!gate_session) {
+                    res.status = 401;
+                    return;
+                }
+            }
             const bool consumed =
                 detail::consume_step_up_pass(req, *handler_session, std::string(kRaiseLabel));
             raise_consumed_pass.store(consumed);
+            if (resolve_after_consume.load() && !resolver(req)) {
+                res.status = 401;
+                return;
+            }
             if (!consumed) {
                 const auto verdict = decide_step_up(*handler_session, mfa_status, 300, "optional");
                 if (!verdict.passed()) {
@@ -931,9 +966,10 @@ TEST_CASE("wiring: the policy-generation raise row is decided by the central che
 }
 
 // A step-up pass is honoured only for the principal that earned it. The handler resolves its own
-// session, and that resolution can land on a different principal than the one the central check
-// decided on; the resolver here returns session A on its first call per request (the central
-// check's) and session B afterwards (the handler's), as the real flow can. The raise stub is a
+// session, which is not guaranteed to be the principal the central check decided on; the resolver
+// here returns session A on its first call per request (the central check's) and session B
+// afterwards (the handler's). This pins the consume-time identity check on its own, with a
+// resolver that does not apply the per-request binding (the next case does). The raise stub is a
 // kRequired route with no class guard of its own, so only the pass decides whether it mutates.
 TEST_CASE("wiring: the in-request pass is honoured only for the principal that earned it",
           "[stepup][wiring]") {
@@ -1001,6 +1037,268 @@ TEST_CASE("wiring: the in-request pass is honoured only for the principal that e
         for (const auto& a : s.audit_rows())
             row_seen = row_seen || (a.action == "mfa.step_up.required" && a.target_id == kRaiseLabel);
         CHECK(row_seen);
+    }
+}
+
+// One principal per request. A handler resolves its session more than once (its `auth_fn`, then
+// `perm_fn`'s own gate, then the step-up call with the first session). Once the central check has
+// passed a gated request, every later resolution yields the same principal or none, so a request
+// is never authorised by one principal on the strength of a step-up pass earned by another. The
+// stub's resolver applies the binding with the function `AuthRoutes::resolve_session` applies, on
+// the resolution sequence central -> A, `auth_fn` -> A, `perm_fn` -> second principal.
+TEST_CASE("wiring: every resolution after the central check yields the principal it passed, or none",
+          "[stepup][wiring][stepbind]") {
+    const auto* row = step_up_policy_for("POST", kRaisePath);
+    REQUIRE(row != nullptr);
+    REQUIRE(row->cls == StepUpClass::kRequired);
+
+    auto engine = make_session("engine:ci", "engine_token", Role::admin, 5s);
+    engine.principal_kind = "engine";
+
+    SECTION("control: the same principal at all three resolutions mutates once") {
+        WiringServer s;
+        s.apply_binding.store(true);
+        s.three_resolves.store(true);
+        s.set_session(make_session("alice", "local", Role::admin, 5s));
+        auto r = s.post(std::string(kRaisePath));
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(s.resolutions.load() == 3);
+        CHECK(s.raise_mutations.load() == 1);
+        CHECK(s.raise_consumed_pass.load());
+        CHECK(s.gate_count("handler_skipped", "local", "rest") == 0);
+    }
+    SECTION("an engine principal at the third resolution is refused 401 and nothing mutates") {
+        WiringServer s;
+        s.apply_binding.store(true);
+        s.three_resolves.store(true);
+        s.later_from.store(2);
+        s.set_session(make_session("alice", "local", Role::admin, 5s));
+        s.set_later_session(engine);
+        auto r = s.post(std::string(kRaisePath));
+        REQUIRE(r);
+        CHECK(r->status == 401);
+        CHECK(s.raise_handler_calls.load() == 1);
+        CHECK(s.raise_mutations.load() == 0);
+        CHECK_FALSE(s.raise_consumed_pass.load());
+        CHECK(s.gate_count("pass", "local", "rest") == 1);
+    }
+    SECTION("a different human at the third resolution is refused 401 and nothing mutates") {
+        WiringServer s;
+        s.apply_binding.store(true);
+        s.three_resolves.store(true);
+        s.later_from.store(2);
+        s.set_session(make_session("alice", "local", Role::admin, 5s));
+        s.set_later_session(make_session("bob", "local", Role::admin, 5s));
+        auto r = s.post(std::string(kRaisePath));
+        REQUIRE(r);
+        CHECK(r->status == 401);
+        CHECK(s.raise_mutations.load() == 0);
+    }
+    SECTION("a different principal at the second resolution is refused 401 as well") {
+        WiringServer s;
+        s.apply_binding.store(true);
+        s.three_resolves.store(true);
+        s.later_from.store(1);
+        s.set_session(make_session("alice", "local", Role::admin, 5s));
+        s.set_later_session(engine);
+        auto r = s.post(std::string(kRaisePath));
+        REQUIRE(r);
+        CHECK(r->status == 401);
+        CHECK(s.raise_mutations.load() == 0);
+    }
+    SECTION("control: the same principal at a resolution after the pass is spent mutates once") {
+        WiringServer s;
+        s.apply_binding.store(true);
+        s.three_resolves.store(true);
+        s.resolve_after_consume.store(true);
+        s.set_session(make_session("alice", "local", Role::admin, 5s));
+        auto r = s.post(std::string(kRaisePath));
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(s.resolutions.load() == 4);
+        CHECK(s.raise_consumed_pass.load());
+        CHECK(s.raise_mutations.load() == 1);
+    }
+    SECTION("another principal at a resolution after the pass is spent is refused 401") {
+        // The binding outlives the pass: spending it does not release the request.
+        WiringServer s;
+        s.apply_binding.store(true);
+        s.three_resolves.store(true);
+        s.resolve_after_consume.store(true);
+        s.later_from.store(3);
+        s.set_session(make_session("alice", "local", Role::admin, 5s));
+        s.set_later_session(make_session("bob", "local", Role::admin, 5s));
+        auto r = s.post(std::string(kRaisePath));
+        REQUIRE(r);
+        CHECK(r->status == 401);
+        CHECK(s.raise_consumed_pass.load()); // the pass was honoured for the principal that earned it
+        CHECK(s.raise_mutations.load() == 0);
+        CHECK(s.gate_count("handler_skipped", "local", "rest") == 0);
+    }
+    SECTION("harness control: a resolver that does not apply the binding is not constrained") {
+        // Anchors the cases above: the 401s come from the binding, not from the stub.
+        WiringServer s;
+        s.three_resolves.store(true);
+        s.later_from.store(2);
+        s.set_session(make_session("alice", "local", Role::admin, 5s));
+        s.set_later_session(make_session("bob", "local", Role::admin, 5s));
+        auto r = s.post(std::string(kRaisePath));
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(s.raise_mutations.load() == 1);
+    }
+    SECTION("the binding does not outlive the request: the next request resolves freely") {
+        WiringServer s;
+        s.apply_binding.store(true);
+        s.three_resolves.store(true);
+        s.later_from.store(2);
+        s.set_session(make_session("alice", "local", Role::admin, 5s));
+        s.set_later_session(make_session("bob", "local", Role::admin, 5s));
+        auto first = s.post(std::string(kRaisePath));
+        REQUIRE(first);
+        CHECK(first->status == 401);
+        // The next gated request is bound to ITS principal, not the previous request's.
+        s.set_later_session(std::nullopt);
+        s.set_session(make_session("carol", "local", Role::admin, 5s));
+        auto second = s.post(std::string(kRaisePath));
+        REQUIRE(second);
+        CHECK(second->status == 200);
+        CHECK(s.raise_mutations.load() == 1);
+    }
+}
+
+namespace {
+// The same shape over the REAL `AuthRoutes::resolve_session`: a cookie session and a token
+// credential on one request, the cookie ceasing to validate between two resolutions.
+struct RealResolveServer {
+    httplib::Server svr;
+    int port{0};
+
+    yuzu::test::ApiTokenStorePg api_tokens;
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider;
+    std::unique_ptr<AuthRoutes> routes;
+    yuzu::MetricsRegistry metrics;
+
+    std::string alice_cookie;
+    std::string bob_token;
+    // Set by the test: end alice's cookie session between the handler's two resolutions.
+    std::atomic<bool> end_cookie_between{false};
+    std::atomic<int> raise_mutations{0};
+
+    MfaStatusFn mfa_status = [](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
+        return AuthDB::MfaStatus{}; // not enrolled: the central check passes any proof age
+    };
+    StepUpSessionFn resolver = [this](const httplib::Request& req) -> std::optional<auth::Session> {
+        return routes->resolve_session(req);
+    };
+    StepUpAuditFn audit = [](const httplib::Request&, const std::string&, const std::string&,
+                             const std::string&, const std::string&, const std::string&) -> bool {
+        return true;
+    };
+
+    RealResolveServer() {
+        routes = std::make_unique<AuthRoutes>(cfg, auth_mgr, /*rbac_store=*/nullptr,
+                                              api_tokens.get(), /*audit_store=*/nullptr,
+                                              /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                                              /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
+        REQUIRE(auth_mgr.upsert_user("yuzu_test_alice", "password1234", Role::admin));
+        REQUIRE(auth_mgr.upsert_user("yuzu_test_bob", "password1234", Role::admin));
+        alice_cookie =
+            auth_mgr.create_local_session_for_test("yuzu_test_alice", Role::admin, true);
+        const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+        const auto raw = api_tokens->create_token("wiring-bob", "yuzu_test_bob", now_s + 3600, "", "");
+        REQUIRE(raw.has_value());
+        bob_token = *raw;
+
+        svr.set_pre_routing_handler([](const httplib::Request&, httplib::Response&) {
+            detail::clear_step_up_pass();
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
+        svr.set_pre_request_handler(
+            [this](const httplib::Request& req,
+                   httplib::Response& res) -> httplib::Server::HandlerResponse {
+                const StepUpChokepointDeps deps{.resolve_session = &resolver,
+                                                .auth_db = nullptr,
+                                                .mfa_status = &mfa_status,
+                                                .audit_fn = &audit,
+                                                .metrics = &metrics,
+                                                .window_secs = 300,
+                                                .mfa_enforcement = "optional"};
+                return detail::run_pre_request_stage(req, res, deps);
+            });
+        svr.set_post_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+            detail::finish_step_up_pass(req, res, &metrics);
+        });
+        svr.Post(std::string(kRaisePath), [this](const httplib::Request& req,
+                                                 httplib::Response& res) {
+            const auto first = routes->resolve_session(req); // `auth_fn`
+            if (!first) {
+                res.status = 401;
+                return;
+            }
+            if (end_cookie_between.load())
+                (void)auth_mgr.invalidate_session(alice_cookie);
+            const auto gate = routes->resolve_session(req); // `perm_fn`'s own gate
+            if (!gate) {
+                res.status = 401;
+                return;
+            }
+            (void)detail::consume_step_up_pass(req, *first, std::string(kRaiseLabel));
+            raise_mutations.fetch_add(1);
+            res.status = 200;
+            res.set_content("{\"ok\":true}", "application/json");
+        });
+
+        port = svr.bind_to_any_port("127.0.0.1");
+        REQUIRE(port > 0);
+        listener.start();
+        CHECK(listener.wait_running());
+    }
+
+    httplib::Result post(const std::string& token_header) {
+        httplib::Client cli("127.0.0.1", port);
+        cli.set_connection_timeout(5, 0);
+        cli.set_read_timeout(5, 0);
+        cli.set_write_timeout(5, 0);
+        httplib::Headers h;
+        h.emplace("Cookie", "yuzu_session=" + alice_cookie);
+        if (token_header == "Authorization")
+            h.emplace("Authorization", "Bearer " + bob_token);
+        else
+            h.emplace("X-Yuzu-Token", bob_token);
+        return cli.Post(std::string(kRaisePath), h, "{}", "application/json");
+    }
+
+    // LAST member: destroyed first (see ListenerThread).
+    ListenerThread listener{svr};
+};
+} // namespace
+
+TEST_CASE("wiring: with real session resolution, a credential change mid-request is a 401, not a "
+          "different principal",
+          "[stepup][wiring][stepbind][pg]") {
+    const auto header = GENERATE(as<std::string>{}, "Authorization", "X-Yuzu-Token");
+    INFO("token header: " << header);
+    RealResolveServer s;
+
+    SECTION("control: the cookie validates at every resolution, so one principal mutates once") {
+        auto r = s.post(header);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(s.raise_mutations.load() == 1);
+    }
+    SECTION("the cookie stops validating between two resolutions: the request is refused 401") {
+        s.end_cookie_between.store(true);
+        auto r = s.post(header);
+        REQUIRE(r);
+        CHECK(r->status == 401);
+        CHECK(s.raise_mutations.load() == 0);
     }
 }
 

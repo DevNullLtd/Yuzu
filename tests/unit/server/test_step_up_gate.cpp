@@ -20,9 +20,14 @@
 #include "../../../server/core/src/step_up_policy.hpp"
 #include "../../../server/core/src/totp.hpp"
 
+#include "auth_routes.hpp"
+#include "oidc_provider.hpp"
+#include "test_api_token_pg_helper.hpp"
+
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
+#include <yuzu/server/server.hpp>
 
 #include "../test_log_capture.hpp"
 #include "test_auth_db_pg_helper.hpp"
@@ -39,6 +44,7 @@
 #include <expected>
 #include <functional>
 #include <memory>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -1646,8 +1652,9 @@ TEST_CASE("pass identity: consumed only by the principal that earned it", "[step
     REQUIRE(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
             StepUpChokepointResult::kPassed);
 
-    // A mismatch refuses AND clears: the earning principal cannot consume it afterwards either, and
-    // the post-routing report does not count a skipped gate for a pass the handler refused.
+    // A mismatch refuses AND spends the pass: the earning principal cannot consume it afterwards
+    // either, and the post-routing report does not count a skipped gate for a pass the handler
+    // refused.
     const auto refused_and_cleared = [&](const auth::Session& handler_session) {
         CHECK_FALSE(detail::consume_step_up_pass(req, handler_session, std::string(kTokensLabel)));
         CHECK_FALSE(detail::consume_step_up_pass(req, earned, std::string(kTokensLabel)));
@@ -1739,6 +1746,338 @@ TEST_CASE("pass identity: the fingerprint separates fields and is deterministic"
     CHECK_FALSE(fp("human", "", "local") == fp("human", "local", ""));
     CHECK(fp("engine", "local", "a").engine);
     CHECK(fp("human", "engine_token", "a").engine); // the engine auth source is an engine class
+}
+
+// ── the per-request principal binding ────────────────────────────────────────
+
+namespace {
+// Holds the digest-failure test seam on for one scope.
+struct IdentityFault {
+    IdentityFault() { detail::step_up_identity_fault_for_test().store(true); }
+    ~IdentityFault() { detail::step_up_identity_fault_for_test().store(false); }
+    IdentityFault(const IdentityFault&) = delete;
+    IdentityFault& operator=(const IdentityFault&) = delete;
+};
+} // namespace
+
+// One principal per request: once the chokepoint passes a gated request, a later session
+// resolution for that request is admitted only for the principal the check was made for.
+TEST_CASE("binding: later resolutions for a gated request are admitted only for its principal",
+          "[stepup][gate][stepbind]") {
+    Rig rig;
+    rig.session = make_session("alice", "local", Role::admin, ago(10s));
+    const auto alice = *rig.session;
+    auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
+
+    SECTION("no stash: every session is admitted") {
+        CHECK(detail::step_up_binding_admits(req, alice));
+        CHECK(detail::step_up_binding_admits(req, make_session("bob", "local", Role::user)));
+    }
+
+    httplib::Response res;
+    // The section above leaves nothing armed; the rest arm the stash for alice first.
+    const auto arm = [&] {
+        REQUIRE(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+                StepUpChokepointResult::kPassed);
+    };
+
+    SECTION("armed: the same identity is admitted, whatever its role or proof age") {
+        arm();
+        CHECK(detail::step_up_binding_admits(req, alice));
+        CHECK(detail::step_up_binding_admits(req, make_session("alice", "local", Role::user,
+                                                               ago(2h))));
+    }
+    SECTION("armed: a different username, auth source, principal kind or engine class is refused") {
+        arm();
+        CHECK_FALSE(detail::step_up_binding_admits(req, make_session("bob", "local", Role::admin)));
+        CHECK_FALSE(detail::step_up_binding_admits(req, make_session("alice", "oidc", Role::admin)));
+        CHECK_FALSE(
+            detail::step_up_binding_admits(req, make_session("alice", "api_token", Role::admin)));
+        auto other_kind = make_session("alice", "local", Role::admin);
+        other_kind.principal_kind = "service";
+        CHECK_FALSE(detail::step_up_binding_admits(req, other_kind));
+        CHECK_FALSE(detail::step_up_binding_admits(req, engine_session("alice")));
+        CHECK_FALSE(detail::step_up_binding_admits(req, engine_session("engine:ci")));
+        // A refusal does not disarm the binding: the bound principal is still admitted.
+        CHECK(detail::step_up_binding_admits(req, alice));
+    }
+    SECTION("armed for another request address: this request is unbound") {
+        arm();
+        auto other = make_request("POST", kTokensPattern, "/api/v1/tokens");
+        REQUIRE(&other != &req);
+        CHECK(detail::step_up_binding_admits(other, make_session("bob", "local", Role::admin)));
+    }
+    SECTION("the binding outlives the pass: it holds after the pass is spent") {
+        arm();
+        REQUIRE(detail::consume_step_up_pass(req, alice, std::string(kTokensLabel)));
+        CHECK(detail::step_up_binding_admits(req, alice));
+        CHECK_FALSE(detail::step_up_binding_admits(req, make_session("bob", "local", Role::admin)));
+        CHECK_FALSE(detail::step_up_binding_admits(req, engine_session("engine:ci")));
+    }
+    SECTION("the binding also outlives a pass refused for identity") {
+        arm();
+        CHECK_FALSE(detail::consume_step_up_pass(req, make_session("bob", "local", Role::admin),
+                                                 std::string(kTokensLabel)));
+        CHECK(detail::step_up_binding_admits(req, alice));
+        CHECK_FALSE(detail::step_up_binding_admits(req, make_session("bob", "local", Role::admin)));
+    }
+    SECTION("the end-of-request clears drop the binding") {
+        arm();
+        SECTION("pre-routing / fail-closed clear") {
+            detail::clear_step_up_pass();
+        }
+        SECTION("post-routing report") {
+            httplib::Response done;
+            done.status = 200;
+            detail::finish_step_up_pass(req, done, &rig.metrics);
+        }
+        CHECK(detail::step_up_binding_admits(req, make_session("bob", "local", Role::admin)));
+    }
+    SECTION("a refused request arms no binding") {
+        rig.session = make_session("alice", "local", Role::admin, ago(1h));
+        REQUIRE(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+                StepUpChokepointResult::kRefused);
+        CHECK(detail::step_up_binding_admits(req, make_session("bob", "local", Role::admin)));
+    }
+    detail::clear_step_up_pass();
+}
+
+TEST_CASE("binding: a refusal logs one fixed-text warning per hundred and never names the principal",
+          "[stepup][gate][stepbind]") {
+    Rig rig;
+    rig.session = make_session("yuzu_test_alice", "local", Role::admin, ago(10s));
+    auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
+    httplib::Response res;
+    REQUIRE(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+            StepUpChokepointResult::kPassed);
+    const auto other = make_session("yuzu_test_mallory", "local", Role::admin, ago(10s));
+
+    yuzu::test::LogCapture capture;
+    // The line is sampled and the counter is process-wide, so drive a full period.
+    for (int i = 0; i < 100; ++i)
+        REQUIRE_FALSE(detail::step_up_binding_admits(req, other));
+    capture.stop();
+    const auto logs = capture.text();
+    CHECK(count_occurrences(logs, "not the principal the step-up check was made for") == 1);
+    CHECK(logs.find("yuzu_test_alice") == std::string::npos);
+    CHECK(logs.find("yuzu_test_mallory") == std::string::npos);
+    detail::clear_step_up_pass();
+}
+
+// A digest that cannot be computed fails closed at every site that needs one.
+TEST_CASE("binding: an identity digest failure fails closed at the chokepoint, consume and binding",
+          "[stepup][gate][stepbind]") {
+    Rig rig;
+    rig.session = make_session("alice", "local", Role::admin, ago(10s));
+    const auto alice = *rig.session;
+    auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
+    httplib::Response res;
+
+    SECTION("chokepoint: the request is refused 503 and nothing is armed") {
+        {
+            const IdentityFault fault;
+            REQUIRE(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+                    StepUpChokepointResult::kRefused);
+        }
+        CHECK(res.status == 503);
+        // Counted as an unavailable evaluation, never as a pass.
+        CHECK(rig.gate_count("pass", "local", "rest") == 0);
+        CHECK(rig.gate_count("unavailable", "local", "rest") == 1);
+        REQUIRE(rig.audits.size() == 1);
+        CHECK(rig.audits[0].detail.find("reason=chokepoint_exception") != std::string::npos);
+        // No pass and no binding: a later resolution is unconstrained, and a consume finds nothing.
+        CHECK(detail::step_up_binding_admits(req, make_session("bob", "local", Role::admin)));
+        CHECK_FALSE(detail::consume_step_up_pass(req, alice, std::string(kTokensLabel)));
+    }
+    SECTION("consume: false, and the pass is spent") {
+        REQUIRE(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+                StepUpChokepointResult::kPassed);
+        {
+            const IdentityFault fault;
+            CHECK_FALSE(detail::consume_step_up_pass(req, alice, std::string(kTokensLabel)));
+        }
+        // Spent: the principal that earned it cannot consume it once the digest works again.
+        CHECK_FALSE(detail::consume_step_up_pass(req, alice, std::string(kTokensLabel)));
+        // The binding is untouched.
+        CHECK(detail::step_up_binding_admits(req, alice));
+        CHECK_FALSE(detail::step_up_binding_admits(req, make_session("bob", "local", Role::admin)));
+    }
+    SECTION("binding check: an armed binding admits nobody while the digest fails") {
+        REQUIRE(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+                StepUpChokepointResult::kPassed);
+        {
+            const IdentityFault fault;
+            CHECK_FALSE(detail::step_up_binding_admits(req, alice));
+            CHECK_FALSE(detail::step_up_binding_admits(req, make_session("bob", "local", Role::admin)));
+        }
+        CHECK(detail::step_up_binding_admits(req, alice));
+    }
+    SECTION("binding check: with no binding armed the digest is never needed") {
+        const IdentityFault fault;
+        CHECK(detail::step_up_binding_admits(req, alice));
+    }
+    detail::clear_step_up_pass();
+}
+
+// ── the binding applied by the real AuthRoutes::resolve_session ──────────────
+
+namespace {
+// A real AuthRoutes over a real AuthManager with no Postgres: cookie sessions only. An optional
+// ApiTokenStore (Postgres) adds the Bearer and X-Yuzu-Token credential paths.
+struct ResolveBindingFixture {
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
+    std::unique_ptr<AuthRoutes> routes;
+
+    explicit ResolveBindingFixture(ApiTokenStore* tokens = nullptr) {
+        routes = std::make_unique<AuthRoutes>(cfg, auth_mgr, /*rbac_store=*/nullptr, tokens,
+                                              /*audit_store=*/nullptr, /*mgmt_group_store=*/nullptr,
+                                              /*tag_store=*/nullptr, /*analytics_store=*/nullptr,
+                                              oidc_mu, oidc_provider);
+    }
+
+    // Mints a cookie session and returns its token.
+    std::string mint(const std::string& user) {
+        REQUIRE(auth_mgr.upsert_user(user, "password1234", Role::admin));
+        return auth_mgr.create_local_session_for_test(user, Role::admin, /*mfa_verified=*/true);
+    }
+
+    // A request on a kRequired row carrying the given headers.
+    static httplib::Request gated_request(
+        std::initializer_list<std::pair<const char*, std::string>> headers) {
+        auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
+        for (const auto& [k, v] : headers)
+            req.headers.emplace(k, v);
+        return req;
+    }
+
+    // Arms the stash for `req` as the central check does, on the principal `req` resolves to now.
+    StepUpChokepointResult arm_for(Rig& rig, const httplib::Request& req) {
+        rig.session = routes->resolve_session(req);
+        REQUIRE(rig.session.has_value());
+        rig.mfa_status = status_not_enrolled();
+        httplib::Response res;
+        return detail::apply_step_up_chokepoint(req, res, rig.deps());
+    }
+};
+} // namespace
+
+TEST_CASE("resolve_session: a gated request resolves to the principal it was passed for, or none",
+          "[stepup][gate][stepbind][auth_routes]") {
+    ResolveBindingFixture fix;
+    const auto alice_cookie = fix.mint("yuzu_test_alice");
+    const auto bob_cookie = fix.mint("yuzu_test_bob");
+    Rig rig;
+
+    SECTION("control: with no binding armed each credential resolves to its own principal") {
+        const auto req = ResolveBindingFixture::gated_request({{"Cookie", "yuzu_session=" + bob_cookie}});
+        const auto s = fix.routes->resolve_session(req);
+        REQUIRE(s.has_value());
+        CHECK(s->username == "yuzu_test_bob");
+    }
+    SECTION("armed for alice: her own credential still resolves, on every later resolution") {
+        const auto req =
+            ResolveBindingFixture::gated_request({{"Cookie", "yuzu_session=" + alice_cookie}});
+        REQUIRE(fix.arm_for(rig, req) == StepUpChokepointResult::kPassed);
+        for (int i = 0; i < 3; ++i) {
+            const auto s = fix.routes->resolve_session(req);
+            REQUIRE(s.has_value());
+            CHECK(s->username == "yuzu_test_alice");
+        }
+    }
+    SECTION("armed for alice: a resolution that lands on bob's cookie is no session") {
+        auto req = ResolveBindingFixture::gated_request({{"Cookie", "yuzu_session=" + alice_cookie}});
+        REQUIRE(fix.arm_for(rig, req) == StepUpChokepointResult::kPassed);
+        // The same request object now presents bob's credential, as a later resolution would see
+        // after the first credential stops validating and another takes its place.
+        req.headers.clear();
+        req.headers.emplace("Cookie", "yuzu_session=" + bob_cookie);
+        CHECK_FALSE(fix.routes->resolve_session(req).has_value());
+    }
+    SECTION("armed for alice: require_auth answers its ordinary 401 for another principal") {
+        auto req = ResolveBindingFixture::gated_request({{"Cookie", "yuzu_session=" + alice_cookie}});
+        REQUIRE(fix.arm_for(rig, req) == StepUpChokepointResult::kPassed);
+        req.headers.clear();
+        req.headers.emplace("Cookie", "yuzu_session=" + bob_cookie);
+        httplib::Response res;
+        CHECK_FALSE(fix.routes->require_auth(req, res).has_value());
+        CHECK(res.status == 401);
+    }
+    SECTION("armed for alice: another request is not constrained") {
+        const auto req =
+            ResolveBindingFixture::gated_request({{"Cookie", "yuzu_session=" + alice_cookie}});
+        REQUIRE(fix.arm_for(rig, req) == StepUpChokepointResult::kPassed);
+        const auto other =
+            ResolveBindingFixture::gated_request({{"Cookie", "yuzu_session=" + bob_cookie}});
+        const auto s = fix.routes->resolve_session(other);
+        REQUIRE(s.has_value());
+        CHECK(s->username == "yuzu_test_bob");
+    }
+    SECTION("the end-of-request clear lifts the binding") {
+        auto req = ResolveBindingFixture::gated_request({{"Cookie", "yuzu_session=" + alice_cookie}});
+        REQUIRE(fix.arm_for(rig, req) == StepUpChokepointResult::kPassed);
+        detail::clear_step_up_pass();
+        req.headers.clear();
+        req.headers.emplace("Cookie", "yuzu_session=" + bob_cookie);
+        const auto s = fix.routes->resolve_session(req);
+        REQUIRE(s.has_value());
+        CHECK(s->username == "yuzu_test_bob");
+    }
+}
+
+TEST_CASE("resolve_session: the binding holds on the Bearer and X-Yuzu-Token paths and across a "
+          "credential change",
+          "[pg][stepup][gate][stepbind][auth_routes]") {
+    yuzu::test::ApiTokenStorePg api_tokens;
+    ResolveBindingFixture fix(api_tokens.get());
+    const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+    const auto alice_cookie = fix.mint("yuzu_test_alice");
+    REQUIRE(fix.auth_mgr.upsert_user("yuzu_test_bob", "password1234", Role::admin));
+    const auto bob_raw =
+        api_tokens->create_token("binding-bob", "yuzu_test_bob", now_s + 3600, "", "");
+    REQUIRE(bob_raw.has_value());
+    Rig rig;
+
+    const auto header_name = GENERATE(as<std::string>{}, "Authorization", "X-Yuzu-Token");
+    INFO("credential header: " << header_name);
+    const auto bob_credential = header_name == "Authorization" ? "Bearer " + *bob_raw : *bob_raw;
+
+    SECTION("control: with no binding armed the token resolves to bob") {
+        const auto req = ResolveBindingFixture::gated_request({{header_name.c_str(), bob_credential}});
+        const auto s = fix.routes->resolve_session(req);
+        REQUIRE(s.has_value());
+        CHECK(s->username == "yuzu_test_bob");
+    }
+    SECTION("armed for alice: a token credential for another principal is no session") {
+        auto req = ResolveBindingFixture::gated_request({{"Cookie", "yuzu_session=" + alice_cookie}});
+        REQUIRE(fix.arm_for(rig, req) == StepUpChokepointResult::kPassed);
+        req.headers.clear();
+        req.headers.emplace(header_name, bob_credential);
+        CHECK_FALSE(fix.routes->resolve_session(req).has_value());
+    }
+    SECTION("armed for alice: when her cookie stops validating, the fall-through to bob's token "
+            "is no session") {
+        const auto req = ResolveBindingFixture::gated_request(
+            {{"Cookie", "yuzu_session=" + alice_cookie}, {header_name.c_str(), bob_credential}});
+        REQUIRE(fix.arm_for(rig, req) == StepUpChokepointResult::kPassed);
+        REQUIRE(fix.auth_mgr.invalidate_session(alice_cookie));
+        CHECK_FALSE(fix.routes->resolve_session(req).has_value());
+    }
+    SECTION("control: the same fall-through with no binding armed resolves to bob") {
+        const auto req = ResolveBindingFixture::gated_request(
+            {{"Cookie", "yuzu_session=" + alice_cookie}, {header_name.c_str(), bob_credential}});
+        const auto first = fix.routes->resolve_session(req);
+        REQUIRE(first.has_value());
+        CHECK(first->username == "yuzu_test_alice");
+        REQUIRE(fix.auth_mgr.invalidate_session(alice_cookie));
+        const auto second = fix.routes->resolve_session(req);
+        REQUIRE(second.has_value());
+        CHECK(second->username == "yuzu_test_bob");
+    }
 }
 
 TEST_CASE("pass stash: an unconsumed pass on a 2xx response is counted handler_skipped",
