@@ -413,7 +413,7 @@ groups:
       # ONLY when the presenting agent has NO directory row (the fallback
       # insert is what the index refuses). A presenter that still has a row,
       # including a tombstone, lands as session_mismatch and is not alerted
-      # (the tombstoned-victim residual, ADR-2002 7f "Still open", #5685 area).
+      # (the tombstoned-victim residual, ADR-2002 7f "Still open", #6339).
       # Kept separate from YuzuGatewaySessionAmbiguous:
       # nothing became ambiguous (the write was refused), so that alert's
       # duplicate-row query finds nothing and the remediation differs. No

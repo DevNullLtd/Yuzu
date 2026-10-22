@@ -2163,7 +2163,7 @@ fails closed (`UNAVAILABLE`) and `announce_connected` stays fail-open (the in-me
 unpublished). The dedup tombstones are not undone.
 
 *Still open.* The tombstoned-victim window above is unchanged (a tombstone holds NULL, so no index can see
-it). This change does not touch #5685 and does NOT lift the safe-to-scale gate: it is the first
+it); it is tracked in #6339. This change does not touch #5685 and does NOT lift the safe-to-scale gate: it is the first
 cross-REPLICA serialisation of a session adopt, not a second-replica safety proof.
 
 ### 8. PKI / CA high availability (Q8)

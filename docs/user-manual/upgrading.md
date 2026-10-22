@@ -653,7 +653,7 @@ is refused (`FAILED_PRECONDITION`, counted as
   or log cannot be found, escalate (full rule: [gateway.md](gateway.md#forged-or-colliding-session-ids)).
 - **A CONNECTED notification is covered only when the presenting agent has no directory row.** An agent
   that still has a row, including a tombstone, is not covered: its CONNECTED lands as `session_mismatch`
-  and does not unpublish (the tombstoned-victim residual recorded in ADR-2002 7f "Still open", #5685 area;
+  and does not unpublish (the tombstoned-victim residual recorded in ADR-2002 7f "Still open", #6339;
   unchanged by this change).
 - **Not a rolling-upgrade change.** Run one server replica, as before; the safe-to-scale gate is not lifted.
 - **Updated alert rules.** If you import `docs/prometheus/yuzu-alerts.yml`, re-import it: the

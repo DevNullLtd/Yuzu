@@ -2174,7 +2174,7 @@ The session id on the gateway-to-server hop is asserted by the gateway.
   (without the session id). An agent that still has a row, including a
   tombstone, is not covered: its CONNECTED lands as `session_mismatch` and does
   not unpublish (the tombstoned-victim residual recorded in ADR-2002 7f "Still
-  open", #5685 area, unchanged by this change). The index cannot see another
+  open", #6339, unchanged by this change). The index cannot see another
   agent's row that was already tombstoned
   (after a Postgres outage longer than 270 s): the presented id is then
   reclaimed and resolves to the presenting agent until the original agent's
