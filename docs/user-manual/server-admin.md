@@ -4590,6 +4590,8 @@ Restore `enablement-anchor` with the `--data-dir` files. Restoring a dump onto t
 
 Schedule the dump alongside the `--ca-dir` and `--data-dir` backups (and `--update-dir`, if set outside `--data-dir`); verify restores periodically against a scratch database (`createdb yuzu_restore_test && pg_restore --dbname=... `).
 
+The whole-database dump covers every Yuzu schema, including the per-operator `/crypto` dashboard layouts (`crypto_dashboard_layout_store`, ADR-0071). That schema is loss-tolerant: a restore that lacks it, or lacks an operator's row, leaves those operators on the default layout, and nothing else depends on it. It holds operator user names (personal data); rows are erased when an operator is deprovisioned, so a restore from before a deprovision can bring a deleted operator's row back until that user name is deprovisioned again or the row is deleted by hand (`DELETE FROM crypto_dashboard_layout_store.layouts WHERE username = '<name>';`).
+
 ### Key management (secrets KEK)
 
 Secret columns in PostgreSQL are **envelope-encrypted app-side** (ADR-0010): each value is sealed under a fresh data-encryption key (DEK), and the DEK is wrapped by the install's key-encryption key (KEK). The KEK is a 32-byte key file generated on first boot (`secrets-kek-v1.key`, mode 0600, in the same key directory as the CA root key — `--ca-dir`, default `/etc/yuzu/certs` on Linux and on macOS running as root, `~/Library/Application Support/Yuzu/certs` on macOS running non-root, `C:\ProgramData\Yuzu\certs` on Windows) and **never enters the database** — `kek_meta` in the `secrets` schema records only non-secret fingerprints (key-check values), which the server verifies against the key files at every boot.
