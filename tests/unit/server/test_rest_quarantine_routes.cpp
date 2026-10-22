@@ -11,8 +11,12 @@
  */
 
 #include "quarantine_store.hpp"
+#include "agent_registry.hpp"
 #include "authz_gates.hpp"
+#include "command_capability.hpp"
 #include "rest_api_v1.hpp"
+
+#include <yuzu/metrics.hpp>
 
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -21,7 +25,11 @@
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
+#include <nlohmann/json.hpp>
 
+#include <expected>
+#include <functional>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -97,13 +105,52 @@ struct QuarantineRouteHarness {
     int gate_calls{0};
     std::string gate_type_op;
 
-    explicit QuarantineRouteHarness(pg::PgPool& pool, bool wire_scope = true, bool wire_fleet = true)
+    // #6065 PR-Q: the dispatch chokepoint pre-check (RestApiV1::AuthorizeDispatchFn).
+    // The default stub ADMITS with a benign capability row so the pre-existing cases keep
+    // their intent; a case injects a denial (or leaves `wire_authorize` false for the unwired
+    // 500). `authorize_calls`/`authorize_plugin`/`authorize_action`/`authorize_caller` record
+    // what the route handed the chokepoint. `order` interleaves the scoped gate and the
+    // chokepoint so a case can prove which ran first.
+    using AuthorizeResult = std::expected<CommandCapability, detail::DispatchDenial>;
+    std::function<AuthorizeResult(const DispatchCaller&, std::string_view, std::string_view)>
+        authorize_fn;
+    int authorize_calls{0};
+    std::string authorize_plugin;
+    std::string authorize_action;
+    DispatchCaller authorize_caller;
+    std::vector<std::string> order;
+    // The caller's exec_visible derivation. Default: a present-empty set (deny-all), the
+    // production-safe shape; a case may replace it.
+    std::function<authz::VisibleSet(const auth::Session&)> exec_visible_fn;
+    // Auth seam: the Nth auth_fn call (1-based) and every later one ends in a 401 when
+    // `auth_fail_from_call` > 0. 0 = never. The quarantine POST and DELETE each resolve the session twice.
+    int auth_calls{0};
+    int auth_fail_from_call{0};
+    // The counter the denial path increments; a real registry so a case reads it back.
+    yuzu::MetricsRegistry metrics;
+
+    static AuthorizeResult admitted_capability() {
+        return CommandCapability{.plugin = "quarantine",
+                                 .action = "quarantine",
+                                 .dispatch_class = DispatchClass::Destructive,
+                                 .mutability = Mutability::Irreversible,
+                                 .securable = "Security",
+                                 .operation = authz::Operation::Execute,
+                                 .risk_tier = authz::RiskTier::Critical,
+                                 .system_reserved = false,
+                                 .execute_gate = ExecuteGate::AdminOrApproval};
+    }
+
+    explicit QuarantineRouteHarness(pg::PgPool& pool, bool wire_scope = true, bool wire_fleet = true,
+                                    bool wire_authorize = true)
         : quarantine_store(pool) {
         REQUIRE(quarantine_store.is_open());
 
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response& res) -> std::optional<auth::Session> {
-            if (session_user.empty()) {
+            ++auth_calls;
+            if (session_user.empty() ||
+                (auth_fail_from_call > 0 && auth_calls >= auth_fail_from_call)) {
                 res.status = 401;
                 return std::nullopt;
             }
@@ -121,11 +168,31 @@ struct QuarantineRouteHarness {
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
+            // The quarantine routes write through the session writer below; the one row
+            // that may reach this re-resolving writer is the unwired-writer failure row, and
+            // this harness always wires a writer. Any quarantine row here is the defect
+            // (rest-audit-principal-reresolution) that every scenario in this file guards.
+            if (action == "quarantine.enable" || action == "quarantine.disable")
+                FAIL_CHECK("a quarantine row went through the re-resolving audit_fn: "
+                           << action << "/" << result);
             if (!audit_fail_result.empty() && result == audit_fail_result)
                 return false;
             audit_calls.push_back({action, result, target_type, target_id, detail});
             return true;
         };
+        // The session writer server.cpp binds (#6065 PR-Q): same recording, same failure
+        // injection, so every existing row assertion holds through it.
+        api.set_audit_as_session_fn([this](const httplib::Request&, const auth::Session&,
+                                           const std::string&, const std::string& action,
+                                           const std::string& result,
+                                           const std::string& target_type,
+                                           const std::string& target_id,
+                                           const std::string& detail) -> bool {
+            if (!audit_fail_result.empty() && result == audit_fail_result)
+                return false;
+            audit_calls.push_back({action, result, target_type, target_id, detail});
+            return true;
+        });
 
         RestApiV1::ScopedPermFn scoped_fn{};
         if (wire_scope) {
@@ -134,6 +201,7 @@ struct QuarantineRouteHarness {
                                const std::string& agent_id) -> bool {
                 scope_fn_called = true;
                 scoped_target = agent_id;
+                order.push_back("scope");
                 if (auto it = scope_degrade_for.find(agent_id); it != scope_degrade_for.end()) {
                     res.status = it->second;
                     return false;
@@ -161,6 +229,26 @@ struct QuarantineRouteHarness {
             };
         }
 
+        authorize_fn = [](const DispatchCaller&, std::string_view,
+                          std::string_view) -> AuthorizeResult {
+            return admitted_capability();
+        };
+        exec_visible_fn = [](const auth::Session&) { return authz::deny_all(); };
+        RestApiV1::AuthorizeDispatchFn authorize_dispatch_fn{};
+        if (wire_authorize) {
+            authorize_dispatch_fn = [this](const DispatchCaller& caller, std::string_view plugin,
+                                           std::string_view action) -> AuthorizeResult {
+                ++authorize_calls;
+                order.push_back("authorize");
+                authorize_plugin = std::string(plugin);
+                authorize_action = std::string(action);
+                authorize_caller = caller;
+                return authorize_fn(caller, plugin, action);
+            };
+        }
+        RestApiV1::ExecVisibleFn exec_visible_wired =
+            [this](const auth::Session& s) { return exec_visible_fn(s); };
+
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr,
                             /*token_store=*/nullptr, &quarantine_store,
@@ -171,7 +259,7 @@ struct QuarantineRouteHarness {
                             /*tag_push_fn=*/{}, /*inventory_store=*/nullptr,
                             /*product_pack_store=*/nullptr, /*sw_deploy_store=*/nullptr,
                             /*device_token_store=*/nullptr, /*license_store=*/nullptr,
-                            /*guaranteed_state_store=*/nullptr, /*metrics_registry=*/nullptr,
+                            /*guaranteed_state_store=*/nullptr, /*metrics_registry=*/&metrics,
                             /*session_revoke_fn=*/{}, /*execution_event_bus=*/nullptr,
                             /*result_set_store=*/nullptr, /*command_dispatch_fn=*/{},
                             /*step_up_fn=*/{}, /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{},
@@ -180,8 +268,13 @@ struct QuarantineRouteHarness {
                             /*software_inventory_store=*/nullptr, /*response_scope_fn=*/{},
                             /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
                             /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
-                            /*stream_budget=*/nullptr, /*exec_visible_fn=*/{},
-                            /*list_read_fn=*/{}, fleet_fn);
+                            /*stream_budget=*/nullptr, exec_visible_wired,
+                            /*list_read_fn=*/{}, fleet_fn,
+                            /*agents_fn=*/{}, /*response_visible_set_fn=*/{},
+                            /*verify_api=*/nullptr, /*device_api=*/nullptr,
+                            /*dex_api=*/nullptr, /*dex_perf_api=*/nullptr,
+                            /*guardian_api=*/nullptr, /*tier_policy_fn=*/{},
+                            authorize_dispatch_fn);
     }
 
     auto post(const std::string& body) {
@@ -511,6 +604,45 @@ TEST_CASE("REST GET /api/v1/quarantine resolves ONE list-gate decision and pushe
     }
 }
 
+// Seam PR2 commit 4: the GET body is built by the shared quarantine_read_model.hpp
+// (ordered_json). The expected strings below were captured from the pre-change handler
+// (the TU-local JObj builder) and are the byte contract: key order, number formatting
+// and control-character escaping must not move. Only quarantined_at is store-assigned,
+// so it is spliced in from the stored record.
+TEST_CASE("REST GET /api/v1/quarantine body bytes are pinned (key order and escaping)",
+          "[rest][quarantine][pg][byte_pin]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    SECTION("an empty list is an empty array") {
+        QuarantineRouteHarness h(qpool);
+        auto res = h.get();
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body == R"({"data":[],"pagination":{"total":0,"start":0,"page_size":50},)"
+                           R"("meta":{"api_version":"v1"}})");
+    }
+    SECTION("one record with escapes in reason and whitelist") {
+        QuarantineRouteHarness h(qpool);
+        REQUIRE(h.quarantine_store.quarantine_device(
+            "agent-1", "seed", "line1\nq\"b\\s\tt\x01" "x\xc3\xa9/", "10.0.0.1,10.0.0.2"));
+        auto list = h.quarantine_store.list_quarantined();
+        REQUIRE(list.has_value());
+        REQUIRE(list->size() == 1);
+        auto res = h.get();
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const std::string expected =
+            R"({"data":[{"agent_id":"agent-1","status":"active","quarantined_by":"seed",)"
+            R"("quarantined_at":)" +
+            std::to_string((*list)[0].quarantined_at) +
+            R"(,"whitelist":"10.0.0.1,10.0.0.2",)"
+            R"("reason":"line1\nq\"b\\s\tt\u0001x)" "\xc3\xa9" R"(/",)"
+            R"("last_applied_at":0,"last_confirmed_at":0}],)"
+            R"("pagination":{"total":1,"start":0,"page_size":50},"meta":{"api_version":"v1"}})";
+        CHECK(res->body == expected);
+    }
+}
+
 TEST_CASE("REST DELETE /api/v1/quarantine admits in-scope and fails closed when unwired "
           "(CDX-P1-02)",
           "[rest][quarantine][authz][pg]") {
@@ -541,6 +673,64 @@ TEST_CASE("REST DELETE /api/v1/quarantine admits in-scope and fails closed when 
         REQUIRE(res);
         CHECK(res->status == 500);
         CHECK(h.is_quarantined("agent-B")); // untouched
+    }
+}
+
+TEST_CASE("REST DELETE /api/v1/quarantine runs the dispatch chokepoint for (quarantine, "
+          "unquarantine): the pair, the ordering, the unwired 500 and the second-session 401 "
+          "(#6065 PR-Q)",
+          "[rest][quarantine][authz][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    SECTION("consults the chokepoint for the unquarantine pair with the resolved session") {
+        QuarantineRouteHarness h(qpool);
+        REQUIRE(h.quarantine_store.quarantine_device("agent-B", "seed", "pre-seeded", ""));
+        auto res = h.del("agent-B");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(h.authorize_calls == 1);
+        CHECK(h.authorize_plugin == "quarantine");
+        CHECK(h.authorize_action == "unquarantine");
+        CHECK(h.authorize_caller.principal == "alice");
+        CHECK_FALSE(h.authorize_caller.system);
+        CHECK_FALSE(h.is_quarantined("agent-B"));
+    }
+    SECTION("a scoped-gate denial never reaches the chokepoint") {
+        QuarantineRouteHarness h(qpool);
+        h.scope_allow = false;
+        REQUIRE(h.quarantine_store.quarantine_device("agent-B", "seed", "pre-seeded", ""));
+        auto res = h.del("agent-B");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.authorize_calls == 0);
+        CHECK(h.is_quarantined("agent-B"));
+    }
+    SECTION("an unwired authorizer fails CLOSED (500, audited failure, record untouched)") {
+        QuarantineRouteHarness h(qpool, /*wire_scope=*/true, /*wire_fleet=*/true,
+                                 /*wire_authorize=*/false);
+        REQUIRE(h.quarantine_store.quarantine_device("agent-B", "seed", "pre-seeded", ""));
+        auto res = h.del("agent-B");
+        REQUIRE(res);
+        CHECK(res->status == 500);
+        CHECK(res->body.find("dispatch authorizer not configured") != std::string::npos);
+        CHECK(h.is_quarantined("agent-B"));
+        REQUIRE(h.audit_calls.size() == 1); // the failure row only: no attempt row
+        CHECK(h.audit_calls[0].action == "quarantine.disable");
+        CHECK(h.audit_calls[0].result == "failure");
+        CHECK(h.audit_calls[0].target_id == "agent-B");
+    }
+    SECTION("a session that no longer resolves at the second auth call ends at 401") {
+        QuarantineRouteHarness h(qpool);
+        h.auth_fail_from_call = 2; // succeeds once (route entry), then fails (re-resolution)
+        REQUIRE(h.quarantine_store.quarantine_device("agent-B", "seed", "pre-seeded", ""));
+        auto res = h.del("agent-B");
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        CHECK(h.auth_calls == 2);
+        CHECK(h.scope_fn_called);
+        CHECK(h.authorize_calls == 0);
+        CHECK(h.is_quarantined("agent-B"));
+        CHECK(h.audit_calls.empty()); // no attempt row, no failure row
     }
 }
 
@@ -635,4 +825,266 @@ TEST_CASE("REST POST/DELETE audit a business-error (400) failure, not just succe
         CHECK(h.audit_calls[1].detail == "device is not quarantined");
         CHECK(res->body.find(R"("retry_after_ms":null)") != std::string::npos);
     }
+}
+
+// ---------------------------------------------------------------------------
+// #6065 PR-Q: POST /api/v1/quarantine runs the shared dispatch chokepoint
+// pre-check ("quarantine","quarantine") AFTER the scoped gate and the whitelist
+// validation and BEFORE the attempt audit and the store write. These cases pin
+// the route wiring; the composed exact-recipient cases (real registry, real
+// RbacStore, real reconciler) live in test_rest_quarantine_create_gate.cpp.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+nlohmann::json parse_body(const std::string& body) {
+    auto j = nlohmann::json::parse(body, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(j.is_discarded());
+    return j;
+}
+
+// The A4 error object, wherever the envelope nests it: either the body itself or its "error"
+// member.
+const nlohmann::json& error_obj(const nlohmann::json& j) {
+    return j.contains("error") && j["error"].is_object() ? j["error"] : j;
+}
+
+bool has_audit(const QuarantineRouteHarness& h, const std::string& result) {
+    for (const auto& a : h.audit_calls)
+        if (a.action == "quarantine.enable" && a.result == result)
+            return true;
+    return false;
+}
+
+} // namespace
+
+TEST_CASE("REST POST /api/v1/quarantine consults the chokepoint for (quarantine, quarantine) "
+          "with the resolved session as the caller (#6065 PR-Q)",
+          "[rest][quarantine][authz][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineRouteHarness h(qpool);
+    h.exec_visible_fn = [](const auth::Session&) {
+        return authz::VisibleSet{std::unordered_set<std::string>{"agent-B"}};
+    };
+    auto res = h.post(kBody);
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    CHECK(h.authorize_calls == 1);
+    CHECK(h.authorize_plugin == "quarantine");
+    CHECK(h.authorize_action == "quarantine");
+    CHECK(h.authorize_caller.principal == "alice");
+    CHECK_FALSE(h.authorize_caller.system);
+    // The caller carries the route's own exec_visible derivation, never an unfiltered default.
+    REQUIRE(h.authorize_caller.exec_visible.has_value());
+    CHECK(h.authorize_caller.exec_visible->contains("agent-B"));
+}
+
+TEST_CASE("REST POST /api/v1/quarantine hands the chokepoint a present-empty exec_visible when "
+          "the derivation is the deny-all default (never nullopt)",
+          "[rest][quarantine][authz][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineRouteHarness h(qpool);
+    auto res = h.post(kBody);
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    REQUIRE(h.authorize_calls == 1);
+    REQUIRE(h.authorize_caller.exec_visible.has_value());
+    CHECK(h.authorize_caller.exec_visible->empty());
+}
+
+TEST_CASE("REST POST /api/v1/quarantine orders the scoped gate and whitelist validation BEFORE "
+          "the chokepoint (#6065 PR-Q)",
+          "[rest][quarantine][authz][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    SECTION("scoped gate false: 403 and the chokepoint is never consulted") {
+        QuarantineRouteHarness h(qpool);
+        h.scope_allow = false;
+        auto res = h.post(kBody);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.authorize_calls == 0);
+        CHECK_FALSE(h.is_quarantined("agent-B"));
+    }
+    SECTION("invalid whitelist: 400 and the chokepoint is never consulted") {
+        QuarantineRouteHarness h(qpool);
+        auto res = h.post(R"({"agent_id":"agent-B","reason":"test","whitelist":"10.0.0.0/24"})");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.scope_fn_called);
+        CHECK(h.authorize_calls == 0);
+        CHECK_FALSE(h.is_quarantined("agent-B"));
+    }
+    SECTION("an admitted request consults the scope gate first, then the chokepoint") {
+        QuarantineRouteHarness h(qpool);
+        auto res = h.post(kBody);
+        REQUIRE(res);
+        CHECK(res->status == 201);
+        REQUIRE(h.order.size() == 2);
+        CHECK(h.order[0] == "scope");
+        CHECK(h.order[1] == "authorize");
+    }
+}
+
+TEST_CASE("REST POST /api/v1/quarantine fails CLOSED (500, audited failure, no row) when the "
+          "dispatch authorizer is unwired (#6065 PR-Q)",
+          "[rest][quarantine][authz][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineRouteHarness h(qpool, /*wire_scope=*/true, /*wire_fleet=*/true,
+                             /*wire_authorize=*/false);
+    auto res = h.post(kBody);
+    REQUIRE(res);
+    CHECK(res->status == 500);
+    CHECK(res->body.find("dispatch authorizer not configured") != std::string::npos);
+    CHECK_FALSE(h.is_quarantined("agent-B"));
+    REQUIRE(h.audit_calls.size() == 1); // the failure row only: no attempt row
+    CHECK(h.audit_calls[0].action == "quarantine.enable");
+    CHECK(h.audit_calls[0].result == "failure");
+    CHECK(h.audit_calls[0].target_id == "agent-B");
+}
+
+TEST_CASE("REST POST /api/v1/quarantine ends the request at 401 when the session no longer "
+          "resolves at the second auth call (no row, no attempt audit, never 'system') "
+          "(#6065 PR-Q)",
+          "[rest][quarantine][authz][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineRouteHarness h(qpool);
+    h.auth_fail_from_call = 2; // succeeds once (route entry), then fails (re-resolution)
+    auto res = h.post(kBody);
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(h.auth_calls == 2);
+    CHECK(h.scope_fn_called); // the first session resolved and the scoped gate ran
+    CHECK(h.authorize_calls == 0);
+    CHECK_FALSE(h.is_quarantined("agent-B"));
+    CHECK_FALSE(h.is_quarantined("system"));
+    CHECK(h.audit_calls.empty()); // no attempt row, no failure row
+    auto list = h.quarantine_store.list_quarantined();
+    REQUIRE(list.has_value());
+    CHECK(list->empty());
+}
+
+TEST_CASE("REST POST /api/v1/quarantine: a chokepoint ApprovalRequired denial is a 403 with an "
+          "actionable message + remediation, no `permission`, a denied audit row, the denial "
+          "counter, no store row and no attempt row (#6065 PR-Q)",
+          "[rest][quarantine][authz][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineRouteHarness h(qpool);
+    h.authorize_fn = [](const DispatchCaller&, std::string_view,
+                        std::string_view) -> QuarantineRouteHarness::AuthorizeResult {
+        return std::unexpected(detail::DispatchDenial{detail::DispatchDenialReason::ApprovalRequired,
+                                                      "Security", authz::Operation::Execute});
+    };
+    auto& ctr = h.metrics.counter("yuzu_server_dispatch_denied_total",
+                                  {{"reason", "approval_required"}});
+    const auto before = ctr.value();
+
+    auto res = h.post(kBody);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    const auto j = parse_body(res->body);
+    const auto& err = error_obj(j);
+    REQUIRE(err.contains("message"));
+    const std::string message = err.value("message", std::string());
+    CHECK(message.find("approval required for quarantine.quarantine") != std::string::npos);
+    CHECK(message.find("admin caller or a redeemed approval ticket") != std::string::npos);
+    REQUIRE(err.contains("remediation"));
+    CHECK_FALSE(err.value("remediation", std::string()).empty());
+    // A chokepoint denial is not "granting this one permission would admit the caller".
+    CHECK_FALSE(err.contains("permission"));
+    CHECK_FALSE(j.contains("permission"));
+    CHECK(res->body.find("\"permission\"") == std::string::npos);
+
+    REQUIRE(h.audit_calls.size() == 1);
+    CHECK(h.audit_calls[0].action == "quarantine.enable");
+    CHECK(h.audit_calls[0].result == "denied");
+    CHECK(h.audit_calls[0].target_type == "Security");
+    CHECK(h.audit_calls[0].target_id == "agent-B");
+    CHECK(h.audit_calls[0].detail == "reason=approval_required securable=Security");
+    CHECK_FALSE(has_audit(h, "attempt"));
+
+    CHECK(ctr.value() == before + 1);
+    CHECK_FALSE(h.is_quarantined("agent-B"));
+    auto list = h.quarantine_store.list_quarantined();
+    REQUIRE(list.has_value());
+    CHECK(list->empty());
+}
+
+TEST_CASE("REST POST /api/v1/quarantine: a chokepoint Forbidden denial is a 403 with today's "
+          "permission-denied wording and no `permission` field (#6065 PR-Q)",
+          "[rest][quarantine][authz][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineRouteHarness h(qpool);
+    h.authorize_fn = [](const DispatchCaller&, std::string_view,
+                        std::string_view) -> QuarantineRouteHarness::AuthorizeResult {
+        return std::unexpected(detail::DispatchDenial{detail::DispatchDenialReason::Forbidden,
+                                                      "Security", authz::Operation::Execute});
+    };
+    auto& ctr = h.metrics.counter("yuzu_server_dispatch_denied_total", {{"reason", "forbidden"}});
+    const auto before = ctr.value();
+    auto res = h.post(kBody);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    const auto j = parse_body(res->body);
+    const auto& err = error_obj(j);
+    CHECK(err.value("message", std::string()) == "permission denied: Security:Execute");
+    CHECK_FALSE(err.contains("permission"));
+    REQUIRE(h.audit_calls.size() == 1);
+    CHECK(h.audit_calls[0].result == "denied");
+    CHECK(h.audit_calls[0].detail == "reason=forbidden securable=Security");
+    CHECK(ctr.value() == before + 1);
+    CHECK_FALSE(h.is_quarantined("agent-B"));
+}
+
+TEST_CASE("REST POST /api/v1/quarantine: a chokepoint Unclassified/Ambiguous denial is a 400, "
+          "and a KillSwitched or AnonymousOperator denial is a 403, none writes a row "
+          "(#6065 PR-Q)",
+          "[rest][quarantine][authz][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    using Reason = detail::DispatchDenialReason;
+    const auto [reason, status] = GENERATE(std::pair{Reason::Unclassified, 400},
+                                           std::pair{Reason::Ambiguous, 400},
+                                           std::pair{Reason::KillSwitched, 403},
+                                           std::pair{Reason::AnonymousOperator, 403});
+    CAPTURE(detail::to_string(reason), status);
+    QuarantineRouteHarness h(qpool);
+    h.authorize_fn = [reason = reason](const DispatchCaller&, std::string_view,
+                                       std::string_view) -> QuarantineRouteHarness::AuthorizeResult {
+        return std::unexpected(detail::DispatchDenial{reason, "Security", authz::Operation::Execute});
+    };
+    auto res = h.post(kBody);
+    REQUIRE(res);
+    CHECK(res->status == status);
+    CHECK(res->body.find("\"permission\"") == std::string::npos);
+    REQUIRE(h.audit_calls.size() == 1);
+    CHECK(h.audit_calls[0].result == "denied");
+    CHECK(h.audit_calls[0].detail ==
+          "reason=" + std::string(detail::to_string(reason)) + " securable=Security");
+    CHECK_FALSE(h.is_quarantined("agent-B"));
+}
+
+TEST_CASE("REST POST /api/v1/quarantine: an admitted chokepoint decision writes the row with an "
+          "attempt then a success audit and increments no denial counter (#6065 PR-Q)",
+          "[rest][quarantine][authz][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineRouteHarness h(qpool);
+    auto res = h.post(R"({"agent_id":"agent-B","reason":"test","whitelist":"10.0.0.1"})");
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    CHECK(h.is_quarantined("agent-B"));
+    CHECK_FALSE(has_audit(h, "denied"));
+    REQUIRE(h.audit_calls.size() == 2);
+    CHECK(h.audit_calls[0].result == "attempt");
+    CHECK(h.audit_calls[1].result == "success");
+    for (const char* label : {"approval_required", "forbidden", "unclassified"})
+        CHECK(h.metrics.counter("yuzu_server_dispatch_denied_total", {{"reason", label}})
+                  .value() == 0);
 }

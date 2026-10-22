@@ -58,7 +58,7 @@ TEST_CASE("audit page: the template is inline-free, single-shell and under the M
     for (std::sregex_iterator it(t.begin(), t.end(), script_src), end; it != end; ++it)
         srcs.push_back((*it)[1].str());
     CHECK(srcs == std::vector<std::string>{"/static/htmx.js", "/static/yuzu-access.js",
-                                           "/static/yuzu-audit.js"});
+                                           "/static/yuzu-dialog.js", "/static/yuzu-audit.js"});
 }
 
 TEST_CASE("audit page: the template's sentences are byte-equal to the renderer's constants",
@@ -80,10 +80,10 @@ TEST_CASE("audit page: the template's sentences are byte-equal to the renderer's
 TEST_CASE("audit page: the sample is never drawn on load and the filter form is a GET",
           "[access-audit][js]") {
     const std::string t = kAccessAuditTemplate;
-    // Only the log loads itself; the sample (which writes an audit row) and the retention
-    // read (a different permission) wait for a click.
+    // Only the log and the campaign list load themselves; the sample and the current grants
+    // (each writes an audit row) and the retention read (a different permission) wait for a click.
     const std::regex load(R"re(hx-trigger="load")re");
-    CHECK(std::distance(std::sregex_iterator(t.begin(), t.end(), load), std::sregex_iterator()) == 1);
+    CHECK(std::distance(std::sregex_iterator(t.begin(), t.end(), load), std::sregex_iterator()) == 2);
     CHECK_THAT(t, ContainsSubstring("id=\"audit-log\" hx-get=\"/fragments/access/audit/log?range=24h\" "
                                     "hx-trigger=\"load\""));
     CHECK_THAT(t, ContainsSubstring("hx-get=\"/fragments/access/audit/sample\""));
