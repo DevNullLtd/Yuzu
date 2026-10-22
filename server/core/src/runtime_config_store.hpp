@@ -147,8 +147,8 @@ enum class ConfigWriteClass : std::uint8_t {
     /// MCP-tier token, and a caller whose effective role is not admin
     /// (`authz::admin_gate_verdict`).
     AdminRoute,
-    /// Sign-in provider keys: the caller's OWN role must be admin from an interactive session,
-    /// so a JIT elevation is refused as well as an MCP-tier token.
+    /// Sign-in provider keys: the caller's OWN role must be admin, so a JIT elevation, an
+    /// MCP-tier token and a service-scoped token are all refused.
     AdminRouteInteractiveOnly,
     /// Written only through its own route; the generic PUT refuses it.
     RouteOwned,

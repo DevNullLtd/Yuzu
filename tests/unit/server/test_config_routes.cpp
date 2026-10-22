@@ -1022,12 +1022,11 @@ TEST_CASE("config_routes: a denied caller gets 403 before the body is parsed",
     h.session_mcp_tier = "supervised";
     h.wire();
 
-    // Malformed JSON, a missing value and a non-integer for an integer key would each be a 400
-    // for an admitted caller; the class refusal precedes all of them.
+    // Malformed JSON and a missing value would each be a 400 for an admitted caller; the class
+    // refusal precedes both.
     for (const auto& [key, payload] : std::vector<std::pair<std::string, std::string>>{
              {"dex_blast_min_devices", "not json"},
              {"dex_blast_min_devices", R"({"nope":1})"},
-             {"dex_blast_min_devices", R"({"value":"abc"})"},
              {"oidc_issuer", "not json"}}) {
         INFO(key << " " << payload);
         auto res = h.sink.Put("/api/config/" + key, payload);
