@@ -51,6 +51,21 @@ std::size_t pending_rows() {
     return n;
 }
 
+// Pending rows not on kMcpPendingBecauseRestTwinRequired.
+std::size_t baseline_pending_rows() {
+    std::size_t n = 0;
+    for (const auto& e : kMcpStepUpPolicy)
+        n += (e.cls == StepUpClass::kPendingRuling && !mcp_pending_because_rest_twin_required(e.tool))
+                 ? 1
+                 : 0;
+    return n;
+}
+
+// Pending rows that ARE on kMcpPendingBecauseRestTwinRequired.
+std::size_t second_list_pending_rows() {
+    return pending_rows() - baseline_pending_rows();
+}
+
 } // namespace
 
 TEST_CASE("mcp step-up policy: every non-Read tool has a row", "[stepup][mcp][policy]") {
@@ -111,22 +126,23 @@ TEST_CASE("mcp step-up policy: every class and reason is one the table may carry
     }
 }
 
-TEST_CASE("mcp step-up policy: kMcpPendingRulingMax equals the pending row count (it only goes "
-          "down, except for raise_guardian_policy_generation)",
+TEST_CASE("mcp step-up policy: the baseline ceiling equals the baseline pending count (it only "
+          "goes down)",
           "[stepup][mcp][policy]") {
-    CHECK(pending_rows() == kMcpPendingRulingMax);
+    CHECK(baseline_pending_rows() == kMcpPendingBaselineMax);
+    CHECK(kMcpPendingBaselineMax == 44);
 }
 
 namespace {
 
-// The exact tool-name set of the kPendingRuling rows, sorted. kMcpPendingRulingMax alone only
-// bounds how MANY rows are pending, so swapping one pending tool for another would pass; this
-// list pins WHICH ones. Resolving a row (moving it to kExempt with a named reason) means deleting
-// its entry here AND lowering kMcpPendingRulingMax in the same change. A NEW tool is never added
-// here: classify it kExempt with a named reason. The one exception so far is
-// raise_guardian_policy_generation: its REST twin is kRequired and no MCP consumer enforces
-// kRequired yet, so its class needs a maintainer ruling once one does.
-constexpr std::string_view kGrandfatheredMcpPending[] = {
+// The exact tool-name set of the BASELINE pending rows (the frozen set: kPendingRuling and not on
+// kMcpPendingBecauseRestTwinRequired), sorted. kMcpPendingBaselineMax alone only bounds how MANY
+// rows are pending, so swapping one pending tool for another would pass; this list pins WHICH
+// ones. Resolving a row (moving it to kExempt with a named reason) means deleting its entry here
+// AND lowering kMcpPendingBaselineMax in the same change. A NEW tool is never added here: classify
+// it kExempt with a named reason, or, only if its REST twin is kRequired, list it on
+// kMcpPendingBecauseRestTwinRequired, which is checked against the REST table.
+constexpr std::string_view kBaselineMcpPending[] = {
     "activate_platform_license",
     "add_management_group_member",
     "approve_request",
@@ -151,7 +167,6 @@ constexpr std::string_view kGrandfatheredMcpPending[] = {
     "mint_upload_grant",
     "push_guardian_rules",
     "quarantine_device",
-    "raise_guardian_policy_generation", // kRequired REST twin; ruling needed once MCP enforces it
     "reject_request",
     "revoke_api_token",
     "revoke_certificate",
@@ -176,36 +191,83 @@ constexpr std::string_view kGrandfatheredMcpPending[] = {
 
 } // namespace
 
-TEST_CASE("mcp step-up policy: every kPendingRuling tool is in the grandfathered pending list",
+TEST_CASE("mcp step-up policy: every baseline kPendingRuling tool is in the pinned baseline list",
           "[stepup][mcp][policy]") {
-    std::set<std::string_view> pinned(std::begin(kGrandfatheredMcpPending),
-                                      std::end(kGrandfatheredMcpPending));
+    std::set<std::string_view> pinned(std::begin(kBaselineMcpPending),
+                                      std::end(kBaselineMcpPending));
     for (const auto& e : kMcpStepUpPolicy) {
-        if (e.cls != StepUpClass::kPendingRuling)
+        if (e.cls != StepUpClass::kPendingRuling || mcp_pending_because_rest_twin_required(e.tool))
             continue;
-        INFO("pending tool not in the grandfathered list: " << std::string(e.tool));
+        INFO("baseline pending tool not in the pinned list: " << std::string(e.tool));
         CHECK(pinned.count(e.tool) == 1);
     }
 }
 
-TEST_CASE("mcp step-up policy: the grandfathered pending list is sorted, unique and moves with "
-          "the count",
+TEST_CASE("mcp step-up policy: the pinned baseline list is sorted, unique and moves with the count",
           "[stepup][mcp][policy]") {
     std::set<std::string_view> seen;
     std::string_view prev;
-    for (const auto tool : kGrandfatheredMcpPending) {
+    for (const auto tool : kBaselineMcpPending) {
         INFO("tool: " << std::string(tool));
         CHECK(seen.insert(tool).second);
         CHECK(prev < tool);
         prev = tool;
-        // Every listed tool is still a pending row: a resolved row must leave this list.
+        // Every listed tool is still a baseline pending row: a resolved row must leave this list,
+        // and a second-list tool must not be here.
         const auto it = std::find_if(std::begin(kMcpStepUpPolicy), std::end(kMcpStepUpPolicy),
                                      [&](const auto& e) { return e.tool == tool; });
         REQUIRE(it != std::end(kMcpStepUpPolicy));
         CHECK(it->cls == StepUpClass::kPendingRuling);
+        CHECK_FALSE(mcp_pending_because_rest_twin_required(tool));
     }
-    CHECK(std::size(kGrandfatheredMcpPending) == pending_rows());
-    CHECK(std::size(kGrandfatheredMcpPending) == kMcpPendingRulingMax);
+    CHECK(std::size(kBaselineMcpPending) == baseline_pending_rows());
+    CHECK(std::size(kBaselineMcpPending) == kMcpPendingBaselineMax);
+}
+
+TEST_CASE("mcp step-up policy: every post-baseline (second-list) tool is pending with a kRequired "
+          "REST twin and is not in the baseline",
+          "[stepup][mcp][policy]") {
+    REQUIRE(kMcpPendingBecauseRestTwinRequired.size() == 1);
+    CHECK(kMcpPendingBecauseRestTwinRequired[0] == "raise_guardian_policy_generation");
+    std::set<std::string_view> baseline(std::begin(kBaselineMcpPending),
+                                        std::end(kBaselineMcpPending));
+    std::set<std::string_view> seen;
+    std::string_view prev;
+    for (const auto tool : kMcpPendingBecauseRestTwinRequired) {
+        INFO("second-list tool: " << std::string(tool));
+        CHECK(seen.insert(tool).second);
+        CHECK(prev < tool);
+        prev = tool;
+        // (a) its row in the MCP table is kPendingRuling
+        const auto* row = mcp_step_up_policy_for(tool);
+        REQUIRE(row != nullptr);
+        CHECK(row->cls == StepUpClass::kPendingRuling);
+        // (b) its REST-twin fields resolve to a kRequired REST row
+        REQUIRE_FALSE(row->rest_method.empty());
+        const auto* twin = step_up_policy_for(row->rest_method, row->rest_pattern);
+        REQUIRE(twin != nullptr);
+        CHECK(twin->cls == StepUpClass::kRequired);
+        // (c) it is not also in the baseline list
+        CHECK(baseline.count(tool) == 0);
+    }
+}
+
+TEST_CASE("mcp step-up policy: the pending rows are the baseline plus the post-baseline list",
+          "[stepup][mcp][policy]") {
+    // Many baseline tools ALSO have a kRequired twin (they are pending because no MCP consumer
+    // enforces kRequired yet), so the second list is not the only such group. What is checked here
+    // is the count identity; the second-list case above checks each entry's twin.
+    // 45 pending rows = 44 baseline + 1 second-list.
+    CHECK(pending_rows() == kMcpPendingBaselineMax + kMcpPendingBecauseRestTwinRequired.size());
+    CHECK(pending_rows() == 45);
+    CHECK(baseline_pending_rows() + second_list_pending_rows() == pending_rows());
+    CHECK(second_list_pending_rows() == kMcpPendingBecauseRestTwinRequired.size());
+    // The MCP table shape: 63 rows, 18 exempt, 45 pending.
+    CHECK(std::size(kMcpStepUpPolicy) == 63);
+    std::size_t exempt = 0;
+    for (const auto& e : kMcpStepUpPolicy)
+        exempt += (e.cls == StepUpClass::kExempt) ? 1 : 0;
+    CHECK(exempt == 18);
 }
 
 TEST_CASE("mcp step-up policy: a twin exists in the REST table and the tool is never weaker",

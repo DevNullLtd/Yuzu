@@ -21,10 +21,17 @@
 /// gone, or is now Read, is stale and fails the same test.
 ///
 /// CLASSES in use: kExempt (reviewed, `reason` is one of `kMcpExemptReasons`) and
-/// kPendingRuling (the one neutral literal, count pinned by `kMcpPendingRulingMax`). That count
-/// only goes down, with one exception: `raise_guardian_policy_generation` is pending because
-/// its REST twin is kRequired and no MCP consumer enforces kRequired yet, so the tool can be
-/// neither kExempt nor kRequired. kRequired is accepted by the self-check but no row carries it.
+/// kPendingRuling (the one neutral literal). The pending rows are two sets:
+///   - the BASELINE: the frozen set of pending tools, i.e. every pending row that is not on the
+///     second list. Its count is pinned by `kMcpPendingBaselineMax`, which only goes down; the
+///     test file pins its identity too.
+///   - the SECOND LIST, `kMcpPendingBecauseRestTwinRequired`: tools added AFTER the baseline was
+///     frozen. It is legal only for a tool whose REST twin is kRequired (a `consteval` check
+///     below proves the twin in the REST table), so a new tool cannot be parked as pending unless
+///     it is forced to be; anything else must be classified kExempt.
+/// Every pending tool whose REST twin is kRequired (on either set) is pending because no MCP
+/// consumer enforces kRequired yet; its MCP class needs a maintainer ruling once one exists.
+/// kRequired is accepted by the self-check but no row carries it.
 ///
 /// TWIN: `rest_method`/`rest_pattern` name the REST route the tool mirrors, byte-for-byte as
 /// registered, so the self-check can prove the twin exists in `kStepUpPolicy` and that the
@@ -34,7 +41,8 @@
 ///
 /// Self-checks (`consteval`, so a bad edit is a BUILD FAILURE): no duplicate tool name, every
 /// kExempt reason from the named list, the pending literal on every kPendingRuling row, every
-/// twin present in the REST table and not weaker than it, and the pending ceiling.
+/// twin present in the REST table and not weaker than it, the baseline ceiling, and the
+/// second list (every entry a pending row whose REST twin is kRequired, none repeated).
 
 namespace yuzu::server {
 
@@ -134,7 +142,7 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
     step_up_mcp_detail::pending("import_ca_chain",                      "POST",   R"(/api/v1/ca/import-chain)"),
     step_up_mcp_detail::pending("issue_code_signing_cert",              "POST",   R"(/api/v1/ca/issue-code-signing)"),
     step_up_mcp_detail::pending("mint_engine_credential",               "POST",   R"(/api/v1/engine-principals/([^/]+)/credentials)"),
-    // The twin is kRequired, so the tool cannot be exempt; its class needs a maintainer ruling once an MCP step-up consumer exists.
+    // On kMcpPendingBecauseRestTwinRequired: added after the baseline was frozen; the twin is kRequired.
     step_up_mcp_detail::pending("raise_guardian_policy_generation",     "POST",   R"(/api/v1/guaranteed-state/policy-generation/raise)"),
     step_up_mcp_detail::pending("revoke_engine_principal",              "DELETE", R"(/api/v1/engine-principals/([^/]+))"),
     step_up_mcp_detail::pending("rewrap_secrets",                       "POST",   R"(/api/v1/secrets/kek/rewrap)"),
@@ -159,12 +167,29 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
 };
 // clang-format on
 
-/// Ceiling on the number of kPendingRuling MCP rows. It only goes down: a new tool cannot be
-/// parked as pending, it needs a real class. The one exception so far is
-/// `raise_guardian_policy_generation` (44 -> 45): its REST twin is kRequired, so the tool cannot
-/// be kExempt, and no MCP consumer enforces kRequired yet. Its class needs a maintainer ruling
-/// once one does.
-inline constexpr std::size_t kMcpPendingRulingMax = 45;
+/// Ceiling on the BASELINE pending rows: the frozen set of kPendingRuling rows that are not on
+/// `kMcpPendingBecauseRestTwinRequired`. It only goes down: a new tool cannot be parked as
+/// pending, it needs a real class.
+inline constexpr std::size_t kMcpPendingBaselineMax = 44;
+
+/// Tools added AFTER the baseline was frozen that are kPendingRuling because their REST twin is
+/// kRequired and no MCP consumer enforces kRequired yet. Each entry must be a pending row whose
+/// twin resolves to a kRequired REST row (`second_list_is_valid`), so a tool whose twin is not
+/// kRequired cannot be listed here and must be kExempt. Many baseline tools also have a kRequired
+/// twin; this list is not the only such group. The class of these entries needs a maintainer
+/// ruling once an MCP step-up consumer exists. Sorted, unique.
+inline constexpr std::array<std::string_view, 1> kMcpPendingBecauseRestTwinRequired = {
+    "raise_guardian_policy_generation",
+};
+
+/// True when `tool` is on `kMcpPendingBecauseRestTwinRequired`.
+[[nodiscard]] constexpr bool mcp_pending_because_rest_twin_required(std::string_view tool) {
+    for (const auto t : kMcpPendingBecauseRestTwinRequired) {
+        if (t == tool)
+            return true;
+    }
+    return false;
+}
 
 inline constexpr std::size_t kMcpStepUpPolicyCount = std::size(kMcpStepUpPolicy);
 
@@ -309,11 +334,46 @@ template <std::size_t Begin, std::size_t End>
     return true;
 }
 
-[[nodiscard]] consteval bool pending_rows_within_ceiling() {
-    std::size_t pending_rows = 0;
-    for (const auto& e : kMcpStepUpPolicy)
-        pending_rows += (e.cls == StepUpClass::kPendingRuling) ? 1 : 0;
-    return pending_rows <= kMcpPendingRulingMax;
+/// The baseline pending rows (pending and not on the second list) are within the ceiling.
+[[nodiscard]] consteval bool baseline_pending_rows_within_ceiling() {
+    std::size_t baseline_rows = 0;
+    for (const auto& e : kMcpStepUpPolicy) {
+        if (e.cls == StepUpClass::kPendingRuling && !mcp_pending_because_rest_twin_required(e.tool))
+            ++baseline_rows;
+    }
+    return baseline_rows <= kMcpPendingBaselineMax;
+}
+
+/// Every second-list entry is a kPendingRuling row whose REST twin resolves to a kRequired row,
+/// and none is listed twice. A twin missing from the REST table, or classed anything but
+/// kRequired, fails here, so the list cannot become a general parking lot.
+[[nodiscard]] consteval bool second_list_is_valid() {
+    for (std::size_t i = 0; i < kMcpPendingBecauseRestTwinRequired.size(); ++i) {
+        const auto tool = kMcpPendingBecauseRestTwinRequired[i];
+        for (std::size_t j = 0; j < i; ++j) {
+            if (kMcpPendingBecauseRestTwinRequired[j] == tool)
+                return false; // duplicate entry
+        }
+        // Rows are found by INDEX, never by a pointer compared with nullptr (see `twins_are_valid`).
+        int row = -1;
+        for (std::size_t k = 0; k < kMcpStepUpPolicyCount && row < 0; ++k) {
+            if (kMcpStepUpPolicy[k].tool == tool)
+                row = static_cast<int>(k);
+        }
+        if (row < 0)
+            return false;
+        const auto& r = kMcpStepUpPolicy[static_cast<std::size_t>(row)];
+        if (r.cls != StepUpClass::kPendingRuling || r.rest_method.empty())
+            return false;
+        int twin = -1;
+        for (std::size_t k = 0; k < kStepUpPolicyCount && twin < 0; ++k) {
+            if (kStepUpPolicy[k].method == r.rest_method && kStepUpPolicy[k].pattern == r.rest_pattern)
+                twin = static_cast<int>(k);
+        }
+        if (twin < 0 || kStepUpPolicy[static_cast<std::size_t>(twin)].cls != StepUpClass::kRequired)
+            return false;
+    }
+    return true;
 }
 
 [[nodiscard]] consteval std::size_t count_class(StepUpClass c) {
@@ -339,8 +399,12 @@ static_assert(step_up_mcp_detail::twins_are_valid<21, 42>(),
 static_assert(step_up_mcp_detail::twins_are_valid<42, step_up_mcp_detail::kMcpKeySlots / 3>(),
               "step_up_mcp_policy.hpp: a twin (rows 42-end) missing from the REST table, or a tool "
               "exempt where its twin is not");
-static_assert(step_up_mcp_detail::pending_rows_within_ceiling(),
-              "step_up_mcp_policy.hpp: more kPendingRuling rows than kMcpPendingRulingMax");
+static_assert(step_up_mcp_detail::baseline_pending_rows_within_ceiling(),
+              "step_up_mcp_policy.hpp: more baseline kPendingRuling rows than kMcpPendingBaselineMax "
+              "(a pending row that is not on kMcpPendingBecauseRestTwinRequired)");
+static_assert(step_up_mcp_detail::second_list_is_valid(),
+              "step_up_mcp_policy.hpp: a kMcpPendingBecauseRestTwinRequired entry that is repeated, is "
+              "not a kPendingRuling row, or whose REST twin is missing or not kRequired");
 static_assert(step_up_mcp_detail::count_class(StepUpClass::kRequired) == 0,
               "no MCP consumer evaluates kRequired rows yet");
 

@@ -785,7 +785,11 @@ by each handler.
   and approval ladder (`docs/mcp-server.md`). The MCP tools are classified in
   a second table, `step_up_mcp_policy.hpp` (63 rows: 18 `kExempt`, 45
   `kPendingRuling`, none `kRequired`), which is data only and changes no MCP
-  behaviour. PR 2 promotes pending rows; an MCP `kRequired` row will need a
+  behaviour. The pending rows are a frozen baseline of 44 whose count only goes down,
+  plus a separate list of tools added after it (today one), legal only for a tool
+  whose REST twin is `kRequired`, which a compile-time check ties to the REST
+  table. Every pending tool with a `kRequired` twin is pending because no MCP
+  consumer enforces `kRequired` yet. PR 2 promotes pending rows; an MCP `kRequired` row will need a
   design for the approval primitive first, because `decide_step_up` passes
   an `mcp_token` caller unconditionally.
 - **Metrics and alerts.**
