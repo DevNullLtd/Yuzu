@@ -2067,7 +2067,7 @@ GATE_PARITY_KNOWN_MISMATCHES = {
         "fleet:Infrastructure:Read", "denied:Infrastructure:Write",
         "The first gate call this script reads in the REST handler is a conditional one (a "
         "device-existence read), not necessarily the route's gate, so the operation difference "
-        "may be a limit of the lexical read. Unadjudicated at seed; tracked by #6329"),
+        "may be a limit of the lexical read. Unadjudicated at seed"),
 }
 # NO_GATE_ALLOWED: (METHOD, canonical REST path, tool) -> reason. A twinned route whose handler
 # holds no gate call this script recognises (owner-only reads that call auth_fn alone, helper
@@ -2170,7 +2170,7 @@ def _pinned_table_errors(label, const, table, limit, live):
     stale = sorted(k for k in table if k not in live)
     if n > limit:
         errors.append(f"{label} grew ({n} entries, {const} is {limit}): remove the added entr(ies); "
-                      f"the pin is never raised to admit a new finding")
+                      f"raising a pin needs a reviewed deferral and a ruling recorded in ADR-1005, never a way to admit a new finding")
     elif n < limit:
         errors.append(f"{label} has {n} entries, fewer than {const} {limit}: lower {const} to "
                       f"{n - len(stale) if stale else n} in THIS change")
@@ -2262,10 +2262,11 @@ def gate_checks(ledger_rows, mcp_tools, bucket_b):
             + registry_tests_errors(registry_tests_findings(registry, MCP_TOOL_TESTS_DIR)))
 
 
-def run_check(ledger_dir=None, doc_path=None, extracted=None, today=None):
+def run_check(ledger_dir=None, doc_path=None, extracted=None, today=None, gate_fn=None):
     """The CI gate. The keyword arguments let the selftest drive the real
     wiring over a temporary ledger with synthetic extraction; CI passes none.
     `extracted` is (bucket_a, bucket_b, openapi_paths, mcp_tools, mcp_resources);
+    `gate_fn` replaces gate_checks (checks 6 and 7), which a synthetic `extracted` otherwise skips;
     `today` pins the revisit-lapse warning's clock."""
     ledger_rows, ledger_errors = load_ledger(ledger_dir)
     if ledger_errors:
@@ -2293,9 +2294,9 @@ def run_check(ledger_dir=None, doc_path=None, extracted=None, today=None):
     # 6 + 7. gate parity between each twinned REST route and its MCP tool, and the registry-tool
     #     test-existence tripwire. Real extraction only: a synthetic `extracted` has no source
     #     tree to read the gates from.
-    if extracted is None:
+    if extracted is None or gate_fn is not None:
         try:
-            gate_errors = gate_checks(ledger_rows, mcp_tools, bucket_b)
+            gate_errors = (gate_fn or gate_checks)(ledger_rows, mcp_tools, bucket_b)
         except AnchorError as e:
             gate_errors = [str(e)]
         for err in gate_errors:
@@ -2916,7 +2917,8 @@ def _selftest_body():
     opt_key = ("OPTIONS", canonicalize("/api/v1/{param}"))
     undoc_key = ("GET", "/api/v1/synthetic-undocumented")
 
-    def _drive(rows, patch=None, doc="ok", synthetic=True, extra_files=None, tweak=None, skip_domains=(), today=None):
+    def _drive(rows, patch=None, doc="ok", synthetic=True, extra_files=None, tweak=None, skip_domains=(), today=None,
+               gate_fn=None):
         """Writes a ledger dir, tunes the baselines, grandfather set and the
         OpenAPI allowlist to the synthetic ledger (then applies `patch`, the
         one defect under test), renders the matching generated doc, and runs
@@ -2958,7 +2960,7 @@ def _selftest_body():
                                         encoding="utf-8")
                 with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
                     rc = run_check(ledger_dir=d, doc_path=doc_path, extracted=extracted if synthetic else None,
-                                   today=today)
+                                   today=today, gate_fn=gate_fn)
             return rc, err.getvalue()
 
     def expect(label, result, rc, *needles, absent=()):
@@ -3112,6 +3114,13 @@ def _selftest_body():
            "path must be", absent=("\n::error::injected",))
     expect("missing-domain", _drive(base_rows, skip_domains=("tar",)), 1, "missing for declared domain")
     expect("planned-lookalike", _drive(base_rows + [_mk("p21460", "planned:#21460")]), 0)
+    # checks 6 and 7 are wired into the gate: a finding from the gate runner fails the run, a clean one
+    # passes, and an AnchorError becomes a failure rather than a crash
+    expect("gate-fn-finding", _drive(base_rows, gate_fn=lambda *_a: ["gate parity: injected"]), 1, "gate parity: injected")
+    expect("gate-fn-clean", _drive(base_rows, gate_fn=lambda *_a: []), 0)
+    def _anchor_boom(*_a):
+        raise AnchorError("injected anchor failure")
+    expect("gate-fn-anchor", _drive(base_rows, gate_fn=_anchor_boom), 1, "injected anchor failure")
     for label, rows_c, kw, needles in cases:
         expect(label, _drive(rows_c, **kw), 1, *needles,
                absent=("BASELINE",) if label in ("bad-status", "malformed", "top-level") else ())
@@ -3362,9 +3371,6 @@ def _selftest_body():
     _m, _n, e2 = gate_parity_findings(gp_rows, gp_tools | {"t_missing_sec"}, gp_rest,
                                       {k: v for k, v in gp_mcp.items() if k != "t_ok"})
     check(any("t_ok" in e for e in e2), f"gate parity: a catalogue tool with no readable security pair is an error, got {e2}")
-    import inspect
-    check("gate_checks(" in inspect.getsource(run_check),
-          "gate parity: run_check still calls gate_checks (checks 6 and 7 are not wired out of the gate)")
     conf = ("fleet:Sec:Read", "denied:Sec:Read")
     with _patched(GATE_PARITY_KNOWN_MISMATCHES={}, GATE_PARITY_KNOWN_MISMATCHES_MAX=0,
                   GATE_PARITY_NO_GATE_ALLOWED={}, GATE_PARITY_NO_GATE_MAX=0):
