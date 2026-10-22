@@ -1267,8 +1267,9 @@ std::string render_tar_capture_sources(const std::string& device, const std::str
     };
     // Presentation metadata (the agent's schema registry is not linked here).
     // Category follows docs/user-manual/tar.md's five categories. always_on = the
-    // default-enabled core sources (locked here; forensic-pause uses the configure
-    // path). is_new/pii drive the badges.
+    // default-enabled core sources (the toggle is locked here; pause/resume uses the
+    // configure path, and the State cell still shows the reported <src>_enabled as
+    // "always on" or "paused"). is_new/pii drive the badges.
     static const std::array<Meta, 10> kSources = {{
         {"process", "$Process", "Processes", true, false, false},
         {"tcp", "$TCP", "Network connections", true, false, false},
@@ -1328,9 +1329,12 @@ std::string render_tar_capture_sources(const std::string& device, const std::str
             h += " <span class=\"badge badge-pii\">PII</span>";
         h += "</td><td class=\"cat\">" + std::string(m.category) + "</td><td class=\"src-dollar\">" +
              std::string(m.dollar) + "</td><td><div class=\"state-cell\">";
-        if (m.always_on) {
+        if (m.always_on && enabled) {
             h += "<label class=\"tgl locked\"><input type=\"checkbox\" checked disabled>"
                  "<span class=\"sl\"></span></label><span class=\"state-txt state-on\">always on</span>";
+        } else if (m.always_on) {
+            h += "<label class=\"tgl locked\"><input type=\"checkbox\" disabled>"
+                 "<span class=\"sl\"></span></label><span class=\"state-txt\">paused</span>";
         } else {
             h += "<label class=\"tgl\"><input type=\"checkbox\" data-source=\"" + std::string(m.name) +
                  "\" data-committed=\"" + (enabled ? "true" : "false") + "\"" +
