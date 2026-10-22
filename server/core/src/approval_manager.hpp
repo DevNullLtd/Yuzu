@@ -239,12 +239,15 @@ struct Approval {
     /// itself and refuses the ticket in this state, and any other reader that
     /// acts on `excluded_roots` must refuse on this flag too.
     bool excluded_roots_unreadable{false};
-    /// The row's Postgres version stamp (`xmin::text`) as of the read that produced this
-    /// `Approval`; empty for a value built any other way. Every UPDATE of the row gives it a new
-    /// version, so `consume_ticket` pins its consuming statement to the version it examined (see
-    /// the pin comment in approval_manager.cpp). Opaque: compare for equality, nothing else; it
-    /// is not part of any API shape.
+    /// The row's Postgres version stamp (`xmin::text`) and tuple position (`ctid::text`) as of
+    /// the read that produced this `Approval`; both empty for a value built any other way. An
+    /// UPDATE by another transaction moves `xmin`, and any UPDATE at all (a second write by the
+    /// same transaction included) moves `ctid`, so `consume_ticket` pins its consuming statement
+    /// to the pair it examined (see the pin comment in approval_manager.cpp). VACUUM FULL and
+    /// CLUSTER also move `ctid`, which can refuse a consume once; a retry clears it. Opaque:
+    /// compare for equality, nothing else; neither is part of any API shape.
     std::string row_version;
+    std::string row_position;
 };
 
 /// Bounds on a bound ticket's frozen request (#6062). `request_json` is returned by

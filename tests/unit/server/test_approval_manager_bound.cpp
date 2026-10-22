@@ -1495,6 +1495,96 @@ TEST_CASE("consume: the CAS pins the WHOLE row version, so any change after the 
     }
 }
 
+TEST_CASE("consume: the held overload refuses a row its OWN transaction rewrote after the "
+          "checks (g8r5-sg-2)",
+          "[pg][approval_manager][bound][race]") {
+    // A version pinned by `xmin` alone cannot see this: every write a transaction makes to a row
+    // carries that transaction's xid, so once the caller's transaction has written the row, a
+    // second write by it presents the SAME xmin. The pin also carries the tuple position (`ctid`),
+    // which differs for every version, so the second write still moves it.
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    const std::string now_sql = "extract(epoch from now())::bigint";
+    const std::string upd = "UPDATE approval_manager.approvals SET ";
+
+    // `prior` runs in the caller's transaction BEFORE the consume (so the examined version's xmin
+    // is already the caller's own); `change` runs on the SAME connection at kBeforeCas. The
+    // consume must then refuse uniformly and must not spend the ticket.
+    const auto run_cell = [&](const std::string& prior, const std::string& change, bool with_pre) {
+        const auto id = approved_bound(mgr);
+        in_txn(bundle.pool(), /*commit=*/false, [&](PGconn* conn) {
+            REQUIRE(pg::exec_params(conn, (upd + prior + " WHERE id = $1").c_str(),
+                                    std::vector<std::string>{id})
+                        .status() == PGRES_COMMAND_OK);
+            g_fired = 0;
+            mgr.set_consume_test_hook_for_test([&](Stage got) {
+                if (got != Stage::kBeforeCas)
+                    return;
+                ++g_fired;
+                auto res = pg::exec_params(conn, (upd + change + " WHERE id = $1").c_str(),
+                                           std::vector<std::string>{id});
+                REQUIRE(res.status() == PGRES_COMMAND_OK);
+                CHECK(std::string(PQcmdTuples(res.get())) == "1"); // the rewrite really happened
+            });
+            auto r = mgr.consume_ticket(conn, id, "alice", ApprovalOrigin::kGuardianDeploy,
+                                        with_pre ? kPass : ConsumePrecondition{});
+            mgr.set_consume_test_hook_for_test({});
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error().kind == ConsumeFailure::kNotConsumable);
+            CHECK(r.error().message == kNotConsumableMessage);
+            CHECK(g_fired == 1);
+            // Read through the caller's own transaction: the consuming statement stamped nothing.
+            auto who = pg::exec_params(conn,
+                                       "SELECT consumed_by FROM approval_manager.approvals "
+                                       "WHERE id = $1",
+                                       std::vector<std::string>{id});
+            REQUIRE(who.status() == PGRES_TUPLES_OK);
+            REQUIRE(PQntuples(who.get()) == 1);
+            CHECK(std::string(PQgetvalue(who.get(), 0, 0)).find("alice") == std::string::npos);
+        });
+    };
+
+    SECTION("consumed_at reset to 0 after an integrity-faulted row was consumed") {
+        // No precondition variant: a precondition re-reads the row and refuses a consumed one
+        // before the statement under test, so the hook (the point of the cell) is never reached.
+        run_cell("reviewed_by = submitted_by, consumed_at = " + now_sql + ", consumed_by = 'earlier'",
+                 "consumed_at = 0, consumed_by = ''", /*with_pre=*/false);
+    }
+
+    for (const bool with_pre : {false, true}) {
+        DYNAMIC_SECTION(std::string(with_pre ? "with" : "without") + " a precondition") {
+            SECTION("reviewed_at rewritten on an expired ticket makes it live again") {
+                run_cell("reviewed_at = " + now_sql + " - 8*24*3600", "reviewed_at = " + now_sql,
+                         with_pre);
+            }
+            SECTION("a column the checks never read (definition, scope, target, schedule)") {
+                for (const char* change :
+                     {"definition_id = 'guardian.other'", "scope_expression = 'all'",
+                      "target_plugin = 'other'", "target_action = 'other'",
+                      "schedule_id = 'sched-1'"}) {
+                    DYNAMIC_SECTION(change) {
+                        run_cell("reviewed_by = reviewed_by", change, with_pre);
+                    }
+                }
+            }
+        }
+    }
+
+    SECTION("control: a row the caller's transaction wrote, then consumed, is spent") {
+        // The same prior write with no second write after the checks: the position read by the
+        // consume is the position the CAS sees, so a transaction that wrote the row first is
+        // not refused for having done so.
+        const auto id = approved_bound(mgr);
+        in_txn(bundle.pool(), /*commit=*/false, [&](PGconn* conn) {
+            REQUIRE(pg::exec_params(conn, (upd + "reviewed_by = reviewed_by WHERE id = $1").c_str(),
+                                    std::vector<std::string>{id})
+                        .status() == PGRES_COMMAND_OK);
+            CHECK(mgr.consume_ticket(conn, id, "alice", ApprovalOrigin::kGuardianDeploy, kPass)
+                      .has_value());
+        });
+    }
+}
+
 TEST_CASE("consume: an absent id is an ordinary not-consumable, with or without a precondition",
           "[pg][approval_manager][bound]") {
     yuzu::test::ApprovalManagerPg bundle;

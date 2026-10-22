@@ -479,6 +479,7 @@ Approval row_to_approval(PGresult* r, int i) {
     a.request_json = col_str(r, i, 15);
     a.request_digest = col_str(r, i, 16);
     a.row_version = col_str(r, i, 18);
+    a.row_position = col_str(r, i, 19);
     if (auto roots = decode_excluded_roots(col_str(r, i, 17)))
         a.excluded_roots = std::move(*roots);
     else
@@ -492,7 +493,7 @@ constexpr const char* kSelectAllCols =
     "id, definition_id, status, submitted_by, submitted_at, "
     "reviewed_by, reviewed_at, review_comment, scope_expression, "
     "consumed_at, consumed_by, schedule_id, origin, target_plugin, target_action, "
-    "request_json, request_digest, excluded_roots, xmin::text";
+    "request_json, request_digest, excluded_roots, xmin::text, ctid::text";
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets search_path to the store schema for
@@ -1441,16 +1442,21 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
         return std::unexpected(ConsumeError{ConsumeFailure::kNotConsumable, kNotConsumableMessage});
     // The consuming CAS is PINNED to the row it examined. Two layers:
     //
-    //  1. The ROW VERSION (`xmin::text`, taken from the last read): every UPDATE of the row,
-    //     whichever column and whatever the values, gives it a new version, so a statement
-    //     pinned to the examined version can only consume the very tuple the checks saw. This
-    //     is what closes the classes the per-column pins below cannot enumerate (consumed_at,
-    //     reviewed_at, definition_id, scope_expression, target_*, schedule_id, and any column
-    //     added later).
+    //  1. The ROW VERSION: `xmin::text` AND `ctid::text`, both taken from the last read. A
+    //     statement pinned to the examined version can only consume the very tuple the checks
+    //     saw. `xmin` names the transaction that wrote the version, so an UPDATE by ANOTHER
+    //     transaction (any column, any values, a no-op rewrite included) moves it. A second
+    //     write by the SAME transaction does NOT move it (every version a transaction writes
+    //     carries its xid), which is the held overload's case when the caller's own transaction
+    //     already wrote the row, or when its precondition or the test hook writes it through
+    //     the held connection; each such write puts the row in a new tuple, so `ctid` moves
+    //     where `xmin` cannot. Together they close the classes the per-column pins below cannot
+    //     enumerate (consumed_at, reviewed_at, definition_id, scope_expression, target_*,
+    //     schedule_id, and any column added later).
     //  2. The explicit columns the checks read - status, reviewer, frozen request, digest,
-    //     excluded roots, origin, submitter - as bound parameters. Provably implied by (1) (an
-    //     unchanged version cannot have a changed column) and kept as defence in depth, so a
-    //     regression in the version pin does not silently reopen the classes they cover.
+    //     excluded roots, origin, submitter - as bound parameters. Implied by (1) for a row that
+    //     is the same tuple, and kept as defence in depth, so a regression in the version pin
+    //     does not silently reopen the classes they cover.
     //
     // The pooled overload reads on one lease and updates on another, and a precondition runs
     // arbitrary caller code between the two, so without a pin a row rewritten after the check
@@ -1465,17 +1471,18 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
     // for a row that changed between statements - an old-build replica, a stray UPDATE, a
     // restore - not a boundary against a principal with database write access: a plain UPDATE
     // cannot choose the version it writes, but a writer who can replace the row wholesale
-    // (a restore) or work below SQL is outside what it can tell. It fails CLOSED in one more direction: a
-    // no-op rewrite (`SET reviewed_by = reviewed_by`) is a new version, so it refuses a ticket
-    // whose content did not change; a retry reads the new version and succeeds. A row frozen
-    // by VACUUM FREEZE reads a stable version before and after the freeze; a freeze that lands
-    // BETWEEN the read and the CAS also refuses once, for the same reason, and a retry
-    // succeeds.
+    // (a restore) or work below SQL is outside what it can tell. It fails CLOSED in two more
+    // directions: a no-op rewrite (`SET reviewed_by = reviewed_by`) is a new version, so it
+    // refuses a ticket whose content did not change; and VACUUM FULL or CLUSTER, which rewrite
+    // the table and so move `ctid`, refuse a consume whose read and CAS straddle them. In both a
+    // retry reads the new version and succeeds. VACUUM FREEZE changes neither `xmin::text` nor
+    // `ctid`, so it refuses nothing.
     //
-    // Under the held overload's FOR UPDATE inside a real transaction the pin is redundant (the
-    // row cannot move); on an AUTOCOMMIT connection the lock drops after each statement and the
-    // pin is what holds (cs-3: refusing an autocommit connection outright, via PQTRANS_INTRANS,
-    // is deferred to PR3 - see the ADR-1009 entry conditions).
+    // Under the held overload's FOR UPDATE inside a real transaction no OTHER transaction can
+    // move the row, but the caller's own transaction can (see layer 1); on an AUTOCOMMIT
+    // connection the lock drops after each statement and the pin is what holds (cs-3: refusing
+    // an autocommit connection outright, via PQTRANS_INTRANS, is deferred to PR3 - see the
+    // ADR-1009 entry conditions).
     const auto pinned_roots = encode_excluded_roots(examined->excluded_roots);
     if (!pinned_roots) // cannot happen for a list decoded from JSON; fail closed regardless
         return std::unexpected(ConsumeError{ConsumeFailure::kNotConsumable, kNotConsumableMessage});
@@ -1508,14 +1515,15 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
         "WHERE id = $2 AND status = 'approved' AND consumed_at = 0 AND " + ticket_live_sql() +
         " AND reviewed_by = $3 AND request_json = $4 AND request_digest = $5"
         " AND excluded_roots = $6 AND origin = $7 AND submitted_by = $8 AND status = $9"
-        " AND xmin::text = $10"
+        " AND xmin::text = $10 AND ctid::text = $11"
         " RETURNING 1";
     pg::PgResult res = pg::exec_params(
         conn, consume_sql.c_str(),
         std::vector<std::string>{consumed_by, id, examined->reviewed_by, examined->request_json,
                                  examined->request_digest, *pinned_roots,
                                  to_string(examined->origin), examined->submitted_by,
-                                 examined->status, examined->row_version});
+                                 examined->status, examined->row_version,
+                                 examined->row_position});
 
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(ConsumeError{
@@ -1543,7 +1551,7 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
     // only, never values) at no extra round trip.
     const std::string why_sql =
         "SELECT status, consumed_at, NOT " + ticket_live_sql() +
-        ", reviewed_by, request_json, request_digest, excluded_roots, origin, submitted_by, xmin::text"
+        ", reviewed_by, request_json, request_digest, excluded_roots, origin, submitted_by, xmin::text, ctid::text"
         " FROM approval_manager.approvals WHERE id = $1";
     pg::PgResult why =
         pg::exec_params(conn, why_sql.c_str(), std::vector<std::string>{id});
@@ -1576,10 +1584,11 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
             note("excluded_roots", col_str(why.get(), 0, 6) != *pinned_roots);
             note("origin", col_str(why.get(), 0, 7) != to_string(examined->origin));
             note("submitted_by", col_str(why.get(), 0, 8) != examined->submitted_by);
-            // The row version also moves for a change in a column none of the checks read
-            // (consumed_at, reviewed_at, definition_id, scope, target, schedule), which is the
-            // point of pinning it.
-            note("row version", col_str(why.get(), 0, 9) != examined->row_version);
+            // The row version (xmin and tuple position) also moves for a change in a column none
+            // of the checks read (consumed_at, reviewed_at, definition_id, scope, target,
+            // schedule), which is the point of pinning it.
+            note("row version", col_str(why.get(), 0, 9) != examined->row_version ||
+                                    col_str(why.get(), 0, 10) != examined->row_position);
             static RefusalLogThrottle throttle;
             const std::string key = redact_id(id);
             if (throttle.should_warn(key))
