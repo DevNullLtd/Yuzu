@@ -2303,19 +2303,20 @@ void seed_v7_config(const fs::path& path,
         auto db = TarDatabase::open(path);
         REQUIRE(db.has_value());
     } // closed: lands at the current version
-    sqlite3* raw = nullptr;
-    REQUIRE(sqlite3_open(path.string().c_str(), &raw) == SQLITE_OK);
+    // Owner declared before the open: sqlite3_open populates the handle even on
+    // failure, so a failing REQUIRE still unwinds through a live owner.
+    yuzu::test::SqliteHandleOwner<sqlite3> owner;
+    REQUIRE(sqlite3_open(path.string().c_str(), &owner.db) == SQLITE_OK);
     auto put = [&](const std::string& k, const std::string& v) {
         const auto sql = "INSERT INTO tar_config (key, value) VALUES ('" + k + "', '" + v +
                          "') ON CONFLICT(key) DO UPDATE SET value = excluded.value";
-        REQUIRE(sqlite3_exec(raw, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(owner.db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
     };
     put("schema_version", "7");
     for (const auto& [k, v] : rows)
         put(k, v);
     if (extra_sql)
-        REQUIRE(sqlite3_exec(raw, extra_sql, nullptr, nullptr, nullptr) == SQLITE_OK);
-    sqlite3_close(raw);
+        REQUIRE(sqlite3_exec(owner.db, extra_sql, nullptr, nullptr, nullptr) == SQLITE_OK);
 }
 
 void remove_db_files(const fs::path& tmp) {
@@ -2436,11 +2437,10 @@ TEST_CASE("TarDatabase v7->v8: a failed flip rolls the whole migration back and 
         CHECK(db->get_config("netqual_enabled", "") == "false");
     }
     {
-        sqlite3* raw = nullptr;
-        REQUIRE(sqlite3_open(tmp.string().c_str(), &raw) == SQLITE_OK);
-        REQUIRE(sqlite3_exec(raw, "DROP TRIGGER yuzu_test_v8_abort", nullptr, nullptr, nullptr) ==
-                SQLITE_OK);
-        sqlite3_close(raw);
+        yuzu::test::SqliteHandleOwner<sqlite3> owner;
+        REQUIRE(sqlite3_open(tmp.string().c_str(), &owner.db) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(owner.db, "DROP TRIGGER yuzu_test_v8_abort", nullptr, nullptr,
+                             nullptr) == SQLITE_OK);
     }
     {
         auto db = TarDatabase::open(tmp);

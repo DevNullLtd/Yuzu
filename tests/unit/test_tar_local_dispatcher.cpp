@@ -98,14 +98,16 @@ int enabled_rows_in(const fs::path& db_path) {
     yuzu::test::SqliteHandleOwner<sqlite3> owner;
     REQUIRE(sqlite3_open_v2(db_path.string().c_str(), &owner.db, SQLITE_OPEN_READONLY, nullptr) ==
             SQLITE_OK);
-    sqlite3_stmt* st = nullptr;
-    REQUIRE(sqlite3_prepare_v2(owner.db,
-                               "SELECT count(*) FROM tar_config WHERE key LIKE '%\\_enabled' "
-                               "ESCAPE '\\'",
-                               -1, &st, nullptr) == SQLITE_OK);
-    REQUIRE(sqlite3_step(st) == SQLITE_ROW);
-    const int n = sqlite3_column_int(st, 0);
-    sqlite3_finalize(st);
+    // sqlite3_exec with a callback: no statement handle to finalize on a failing REQUIRE.
+    int n = -1;
+    REQUIRE(sqlite3_exec(
+                owner.db,
+                "SELECT count(*) FROM tar_config WHERE key LIKE '%\\_enabled' ESCAPE '\\'",
+                [](void* out, int, char** vals, char**) {
+                    *static_cast<int*>(out) = std::atoi(vals[0]);
+                    return 0;
+                },
+                &n, nullptr) == SQLITE_OK);
     return n;
 }
 
