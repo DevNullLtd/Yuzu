@@ -385,6 +385,89 @@ TEST_CASE("authz_model #1788: a service-scoped token is narrowed even when the m
     }
 }
 
+// #6204 root cause, store-free arm: an engine principal's only authority is an explicit RBAC
+// grant, so the legacy-open and JIT-elevation unfiltered paths must never apply to it. The
+// decision lives in the pure composer; deleting the engine arm there fails THIS case.
+TEST_CASE("authz_model #6204: an engine principal is never handed the legacy-open or elevated "
+          "unfiltered set",
+          "[authz_model][6204][engine]") {
+    yuzu::server::authz::ExecVisibleFacts f;
+    f.principal_is_engine = true;
+    f.legacy_open = true; // RBAC off: the default posture
+
+    SECTION("RBAC off: deny-all, present-empty (never nullopt)") {
+        auto visible = yuzu::server::authz::compose_exec_visible(f);
+        REQUIRE(visible.has_value());
+        CHECK(visible->empty());
+    }
+    SECTION("RBAC off beats a stray global grant fact and an elevation fact") {
+        f.global_grant = true;
+        f.elevated = true;
+        auto visible = yuzu::server::authz::compose_exec_visible(f);
+        REQUIRE(visible.has_value());
+        CHECK(visible->empty());
+    }
+    SECTION("RBAC on: an explicit global grant is unfiltered") {
+        f.legacy_open = false;
+        f.global_grant = true;
+        CHECK_FALSE(yuzu::server::authz::compose_exec_visible(f).has_value());
+    }
+    SECTION("RBAC on, no grant: the scoped set, and a store error is deny-all") {
+        f.legacy_open = false;
+        f.scoped_visible = std::unordered_set<std::string>{"a_one"};
+        auto scoped = yuzu::server::authz::compose_exec_visible(f);
+        REQUIRE(scoped.has_value());
+        CHECK(scoped->contains("a_one"));
+        f.scoped_visible.reset();
+        auto broken = yuzu::server::authz::compose_exec_visible(f);
+        REQUIRE(broken.has_value());
+        CHECK(broken->empty());
+    }
+    SECTION("the SAME legacy-open facts for a human stay unfiltered") {
+        f.principal_is_engine = false;
+        CHECK_FALSE(yuzu::server::authz::compose_exec_visible(f).has_value());
+    }
+}
+
+TEST_CASE("authz_model #6204: is_engine_principal_name matches only the reserved namespace",
+          "[authz_model][6204][engine]") {
+    using yuzu::server::authz::is_engine_principal_name;
+    CHECK(is_engine_principal_name("engine:vuln"));
+    CHECK(is_engine_principal_name("engine:"));
+    CHECK_FALSE(is_engine_principal_name("engineer"));
+    CHECK_FALSE(is_engine_principal_name("alice"));
+    CHECK_FALSE(is_engine_principal_name(""));
+    CHECK_FALSE(is_engine_principal_name("Engine:vuln"));
+}
+
+// #6204 root cause, live arm: the username-keyed list-admit resolver admits everyone when RBAC is
+// off; an engine principal must stay DenyAll, a human must not.
+TEST_CASE("authz_model #6204: authorize_list_read does not legacy-open an engine principal",
+          "[pg][authz_model][6204][engine]") {
+    Rig r;
+    SECTION("RBAC off: engine DenyAll, human AdmitAll") {
+        r.rbac.set_rbac_enabled(false);
+        REQUIRE_FALSE(r.rbac.is_rbac_enabled());
+        auto engine = r.rbac.authorize_list_read("engine:vuln", "Response", "Read", &r.mgmt);
+        CHECK(engine.decision == yuzu::server::ListReadDecision::DenyAll);
+        CHECK(engine.visible_agents.empty());
+        auto human = r.rbac.authorize_list_read("alice", "Response", "Read", &r.mgmt);
+        CHECK(human.decision == yuzu::server::ListReadDecision::AdmitAll);
+    }
+    SECTION("RBAC on: an engine with an explicit grant is AdmitAll, without one DenyAll") {
+        REQUIRE(r.rbac.is_rbac_enabled());
+        auto none = r.rbac.authorize_list_read("engine:vuln", "Response", "Read", &r.mgmt);
+        CHECK(none.decision == yuzu::server::ListReadDecision::DenyAll);
+        REQUIRE(r.rbac.create_role({"EngineResponseReader6204", "", false, 0}).has_value());
+        REQUIRE(r.rbac.set_permission({"EngineResponseReader6204", "Response", "Read", "allow"})
+                    .has_value());
+        REQUIRE(r.rbac.assign_role({"engine", "engine:vuln", "EngineResponseReader6204"})
+                    .has_value());
+        auto granted = r.rbac.authorize_list_read("engine:vuln", "Response", "Read", &r.mgmt);
+        CHECK(granted.decision == yuzu::server::ListReadDecision::AdmitAll);
+    }
+}
+
 TEST_CASE("authz_model #1788: a service-scoped token narrows to its service, over a global grant "
           "(CDX-001, live arm)",
           "[pg][authz_model][1788][service]") {

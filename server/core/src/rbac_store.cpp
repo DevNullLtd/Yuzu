@@ -3131,7 +3131,10 @@ ListReadAuthorization RbacStore::authorize_list_read(const std::string& username
     // null / load-failed store returns true from rbac_enforcement_in_effect and
     // falls through to the RBAC path, which denies (INV-1).
     if (!rbac_enforcement_in_effect(this)) {
-        out.decision = ListReadDecision::AdmitAll;
+        // An engine principal's only authority is an explicit RBAC grant (design §4.2): the
+        // legacy-open full-fleet read does not apply to it, so it stays DenyAll.
+        if (!username.starts_with(kEnginePrefix))
+            out.decision = ListReadDecision::AdmitAll;
         return out;
     }
 

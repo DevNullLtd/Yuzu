@@ -12433,6 +12433,7 @@ private:
         // so a broken store stays fail-closed (BR-002).
         facts.legacy_open = !rbac_enforcement_in_effect(rbac_store_.get());
         facts.elevated = auth::is_elevated(sess);
+        facts.principal_is_engine = sess.is_engine();
         facts.global_grant =
             rbac_store_ && rbac_store_->check_permission(sess.username, "Execution", "Execute");
         if (rbac_store_) {
@@ -12521,6 +12522,7 @@ private:
 
         yuzu::server::authz::ExecVisibleFacts facts;
         facts.legacy_open = !rbac_enforcement_in_effect(rbac_store_.get());
+        facts.principal_is_engine = yuzu::server::authz::is_engine_principal_name(username);
         facts.global_grant =
             rbac_store_ && rbac_store_->check_permission(username, "Execution", "Execute");
         if (rbac_store_) {
@@ -12794,7 +12796,9 @@ private:
                                                std::string_view securable,
                                                yuzu::server::authz::Operation op) const {
         if (!rbac_enforcement_in_effect(rbac_store_.get()))
-            return true;
+            // Legacy-open admits everyone EXCEPT an engine principal, whose only authority is an
+            // explicit RBAC grant (and RBAC is off here).
+            return !yuzu::server::authz::is_engine_principal_name(principal);
         return rbac_store_ != nullptr &&
                rbac_store_->check_permission(std::string(principal), std::string(securable),
                                              std::string(yuzu::server::authz::to_string(op)));
@@ -13330,7 +13334,9 @@ private:
     /// so a corrupt rbac.db yields zero rows, never the whole fleet (#1498 ruling).
     bool response_agent_in_scope(const std::string& username, const std::string& agent_id) const {
         if (!rbac_enforcement_in_effect(rbac_store_.get()))
-            return true; // loaded & explicitly disabled → legacy-open
+            // loaded & explicitly disabled → legacy-open, except for an engine principal
+            // (RBAC-only authority).
+            return !yuzu::server::authz::is_engine_principal_name(username);
         return rbac_store_ && rbac_store_->check_scoped_permission(username, "Response", "Read",
                                                                    agent_id, mgmt_group_store_.get());
     }
@@ -13338,6 +13344,11 @@ private:
     /// Return the agent list as JSON, filtered by RBAC visibility for the given user.
     nlohmann::json get_visible_agents_json(const std::string& username) {
         auto agents = registry_.to_json_obj();
+        // An engine principal's only authority is an explicit RBAC grant: with RBAC off it
+        // sees no agents rather than the legacy-open fleet.
+        if (yuzu::server::authz::is_engine_principal_name(username) &&
+            !rbac_enforcement_in_effect(rbac_store_.get()))
+            return nlohmann::json::array();
         // #1498 — restrict whenever RBAC enforcement is in effect, which includes
         // a missing/load-failed store (fail closed); only a loaded-and-explicitly-
         // disabled store skips filtering and returns the full fleet. Shares the
@@ -15815,6 +15826,10 @@ private:
         // fix immediately above.
         auto visible_set_fn =
             [this](const std::string& username) -> std::optional<std::set<std::string>> {
+            // Engine principal, RBAC off: legacy-open does not apply to it, so it sees nothing.
+            if (yuzu::server::authz::is_engine_principal_name(username) &&
+                !rbac_enforcement_in_effect(rbac_store_.get()))
+                return std::set<std::string>{};
             if (mgmt_group_store_ && rbac_enforcement_in_effect(rbac_store_.get())) {
                 bool global_read = rbac_store_ && rbac_store_->is_open() &&
                                    rbac_store_->check_permission(username, "Infrastructure", "Read");
@@ -15848,7 +15863,12 @@ private:
         // perm_fn_ admission gates are untouched by this resolver.
         auto response_visible_set_fn =
             [this](const std::string& username) -> std::optional<std::set<std::string>> {
-            if (!rbac_enforcement_in_effect(rbac_store_.get())) return std::nullopt;
+            if (!rbac_enforcement_in_effect(rbac_store_.get())) {
+                // Engine principal: no legacy-open fallback, so it sees nothing.
+                if (yuzu::server::authz::is_engine_principal_name(username))
+                    return std::set<std::string>{};
+                return std::nullopt;
+            }
             bool global_read = rbac_store_ && rbac_store_->is_open() &&
                                rbac_store_->check_permission(username, "Response", "Read");
             if (global_read) return std::nullopt; // global Response:Read sees all, #1715(b)
