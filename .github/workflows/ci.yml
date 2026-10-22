@@ -544,6 +544,7 @@ jobs:
           bash tests/shell/test_fork_dynamic_review_validate.sh  # quarantine-ref guard on the hosted fork review (#4471)
           bash tests/shell/test_trusted_fork_purge.sh            # trusted-fork cache-scope purge job (#4471)
           bash tests/shell/test_check_elf_floor.sh               # Linux ELF floor gate, ADR-2003 S0 (builds fixtures with gcc)
+          bash tests/shell/test_pr2_gates.sh CH-18 CH-20 CH-21 CH-22 CH-24  # local coverage gate: fast subset of the mock chaos harness, ~25 s (#5803; the full harness is #6116)
 
       # Prometheus HELP-text ASCII gate (#2128). Source-only, no build deps,
       # so it belongs on the PR fast path beside the shell gate above rather
@@ -575,11 +576,11 @@ jobs:
       # MCP retry_after_ms hard rule (A5, ADR-1005 exec-plan Decision 16 /
       # routed-concerns.md's A5 row): every NEW MCP tool's store/query-fault
       # error branch must carry a retry_after_ms hint or an inline
-      # `// retry-hint-exempt:` comment. Diff-aware (new kTools[] entries
-      # only) — see that script's module docstring for why this is NOT a
-      # repo-wide retrofit gate. pull_request only: on push (merge to
-      # dev/main) new tools were already gated at PR time, same reasoning as
-      # the Plugin README touch rule job. Reuses trusted_inputs' own base_sha
+      # `// retry-hint-exempt:` comment. Diff-aware (new tools: kTools[]
+      # entries and registry records); see that script's module docstring
+      # for why this is NOT a repo-wide retrofit gate. pull_request only: on
+      # push (merge to dev/main) new tools were already gated at PR time, same
+      # reasoning as the Plugin README touch rule job. Reuses trusted_inputs' own base_sha
       # (#2826) rather than re-deriving from the raw PR event field — this
       # job already has that output one hop away; a second independent
       # derivation of "the right base" is exactly the class of drift #2826
@@ -2959,11 +2960,15 @@ jobs:
           CXX: ccache g++-13
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
         run: |
+          # No -Dbuild_tests: the canary runs no tests (see the note after the
+          # link-provenance step), and linking the debug yuzu_server_tests binary
+          # (~1.2 GB) needs ~8 GB of RAM, which the 7 GB hosted runner does not
+          # have: the Build step was OOM-killed there (SIGTERM 143). yuzu_pg_canary,
+          # which the provenance step inspects, does not depend on tests.
           meson setup build-linux \
             --native-file meson/native/linux-gcc13.ini \
             --buildtype=debug \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
-            -Dbuild_tests=true
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux
 
       - name: Build
         id: build-canary

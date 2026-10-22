@@ -50,6 +50,7 @@
 #include "openapi_spec_access.hpp" // external-linkage accessor for discover_routes.cpp / mcp_server.cpp
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "product_pack_model.hpp" // #4029: shared row/detail builders + error classifiers
+#include "quarantine_read_model.hpp" // quarantine_list_data_json: ordered_json builder shared with the MCP twin
 #include "quarantine_visible.hpp" // quarantine_visible_records: shared admit-then-filter read (REST GET + dashboard fragments)
 #include "quarantine_reapply.hpp" // quarantine_whitelist_tokens_safe / kQuarantineWhitelistMaxLen (#3425 gate3-rest-whitelist-validation-gap)
 #include "result_set_matcher.hpp" // validate_matcher: admission check of a caller matcher (#4644)
@@ -58,6 +59,7 @@
 #include "scope_preview.hpp"    // #2146 Batch B2: shared REST v1 + MCP scope-preview builder
 #include "rest_a4_envelope.hpp"
 #include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
+#include "dispatch_denial_text.hpp" // #6065 PR-Q: describe_dispatch_denial (shared with MCP)
 #include "rest_a4_envelope_http.hpp" // detail::a4_error/a4_denial — #1470 error_json migration
 #include "service_scope_policy.hpp" // authz::service_scope_may_mutate_tag_key — #3289
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
@@ -69,6 +71,7 @@
 #include "admin_gate.hpp"
 #include "web_utils.hpp"  // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "response_templates_engine.hpp"
+#include "software_catalog_rules.hpp" // kEcosystemFamilies: the published ecosystem vocabulary
 #include "software_catalogue_model.hpp" // shared REST+MCP software catalogue model
 #include "software_inventory_store.hpp" // ADR-0016: typed installed-software fleet read
 #include "store_errors.hpp"
@@ -657,9 +660,9 @@ private:
 // directly without driving the httplib chunked content provider.
 
 // ── OpenAPI 3.0 spec ────────────────────────────────────────────────────
-// Returned as a static raw string — zero template instantiation at compile
-// time.  Previously this was a 365-line nested nlohmann::json initializer
-// list that required 56 GB+ of compiler memory.
+// A raw-string template expanded once at first use (see openapi_spec()) — zero template
+// instantiation at compile time.  Previously this was a 365-line nested nlohmann::json
+// initializer list that required 56 GB+ of compiler memory.
 
 // The agent-count-preview route text below spells out the facet bound as "2048 bytes" (a raw
 // string cannot interpolate it); a changed bound must update that text, the MCP tool text in
@@ -667,8 +670,47 @@ private:
 static_assert(kMaxFacetValueBytes == 2048,
               "update the preview route text, the MCP tool text and the docs");
 
+/// Expands the ecosystem placeholders in the spec template with values generated from
+/// kEcosystemFamilies. A missing token is not an error here; the openapi completeness test guards.
+/// One allocation, sized to the largest the string reaches (the final size, or the template's
+/// when every substitution shrinks it): reserve() runs on an empty string (no capacity doubling),
+/// so the append and the in-place replaces below never reallocate for any well-formed table.
+std::string expand_ecosystem_tokens(std::string_view tmpl) {
+    const std::string items = software_catalog::ecosystem_json_enum_items();
+    const std::pair<std::string_view, std::string> subs[] = {
+        {"\"@@ECOSYSTEM_ENUM@@\"", items},
+        {"\"@@ECOSYSTEM_ENUM_OR_EMPTY@@\"", "\"\", " + items},
+        {"@@ECOSYSTEM_LIST@@", software_catalog::ecosystem_pipe_list()},
+    };
+    // Same token order and counts as the replace loop below, so `peak` is the largest size the
+    // in-place replaces reach (a table whose substitutions mix growing and shrinking ones peaks
+    // mid-way).
+    std::size_t size = tmpl.size();
+    std::size_t peak = size;
+    for (const auto& [tok, val] : subs) {
+        for (std::size_t pos = tmpl.find(tok); pos != std::string_view::npos;
+             pos = tmpl.find(tok, pos + tok.size())) {
+            size = size - tok.size() + val.size();
+            peak = std::max(peak, size);
+        }
+    }
+    std::string out;
+    out.reserve(peak);
+    out.append(tmpl);
+    for (const auto& [tok, val] : subs) {
+        for (std::size_t pos = 0; (pos = out.find(tok, pos)) != std::string::npos;
+             pos += val.size()) {
+            out.replace(pos, tok.size(), val);
+        }
+    }
+    return out;
+}
+
 const std::string& openapi_spec() {
-    static const std::string spec =
+    // The OpenAPI template is one literal chain expanded once, on first use. The tokens and the
+    // accepted shape (exactly one wrapper call around the chain; scripts/ci/check-api-parity.py
+    // lexes this source) are documented in docs/api-twin-recipe.md, "OpenAPI entry".
+    static const std::string spec = expand_ecosystem_tokens(
         R"json({
   "openapi": "3.0.3",
   "info": {
@@ -1057,7 +1099,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Internal CA certificate revocation list (DER, public)", "tags": ["Security"], "responses": {"200": {"description": "DER-encoded CRL", "content": {"application/pkix-crl": {}}}, "503": {"description": "CRL unavailable"}}}
     },
     "/ca/issued": {
-      "get": {"summary": "List certificates issued by the internal CA", "tags": ["Security"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 200, "minimum": 1, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Issued-certificate inventory: {items, count, meta:{api_version, limit, offset, has_more, next_offset?}}. has_more=true when more rows exist beyond this page; next_offset is present only then."}, "400": {"description": "limit or offset is not a single base-10 integer, or is outside limit 1..1000 / offset 0..1000000"}, "403": {"description": "Requires Security:Read"}}}
+      "get": {"summary": "List certificates issued by the internal CA", "tags": ["Security"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 200, "minimum": 1, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Issued-certificate inventory: {items, count, meta:{api_version, limit, offset, has_more, next_offset?}}. has_more=true when more rows exist beyond this page; next_offset is present only then. meta also carries the CRL figures crl_version, crl_published_at, crl_next_update, crl_revoked_count and crl_stale (null when it could not be determined; crl_stale is true when the latest list was not built from the current revoked set, including when none is published, and does not reflect expiry, so compare crl_next_update with the current time; MCP twin: list_issued_certs)."}, "400": {"description": "limit or offset is not a single base-10 integer, or is outside limit 1..1000 / offset 0..1000000"}, "403": {"description": "Requires Security:Read"}}}
     },
     "/ca/revoke": {
       "post": {"summary": "Revoke a certificate by serial", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["serial_hex"], "properties": {"serial_hex": {"type": "string"}, "reason": {"type": "string"}}}}}}, "responses": {"200": {"description": "Revoked; CRL republished"}, "403": {"description": "Requires Security:Delete"}, "404": {"description": "Serial not found or already revoked"}}}
@@ -1092,10 +1134,10 @@ const std::string& openapi_spec() {
         R"json(,
     "/quarantine": {
       "get": {"summary": "List quarantined devices visible to the caller (admit-then-filter — #1788)", "tags": ["Security"], "responses": {"200": {"description": "List of quarantined devices in the caller's scope"}, "403": {"description": "Requires Security:Read"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable, or a degraded read (ADR-0047) — never rendered as an empty list. Two distinct causes, distinguished by message: store/pool/query failure only increments yuzu_server_quarantine_read_degrade_total; a per-record admit-then-filter anomaly (e.g. transient engine-principal-store outage) does not"}}},
-      "post": {"summary": "Quarantine a device (per-target scoped — #1788)", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "reason": {"type": "string"}, "whitelist": {"type": "string"}}}}}}, "responses": {"201": {"description": "Device quarantined"}, "400": {"description": "agent_id missing/empty, the device is already quarantined, or whitelist fails server-edge validation (>512 chars, or a token outside [0-9A-Fa-f.:], <=45 chars/token)"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
+      "post": {"summary": "Quarantine a device (per-target scoped — #1788; dispatch approval check, #6065)", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "reason": {"type": "string"}, "whitelist": {"type": "string"}}}}}}, "responses": {"201": {"description": "Device quarantined"}, "400": {"description": "agent_id missing/empty, the device is already quarantined, whitelist fails server-edge validation (>512 chars, or a token outside [0-9A-Fa-f.:], <=45 chars/token), or the dispatch approval check cannot classify the quarantine.quarantine pair (reason unclassified or ambiguous; #6065)"}, "401": {"description": "Not authenticated, or the authenticated principal changed between the route's two session look-ups (retry; #6065)"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global) AND the dispatch approval check (#6065): with RBAC on, approval_required when the caller's account role is not admin (REST has no approval-ticket path), forbidden when the caller's own Security:Execute grant is not global or the RBAC store could not be read. The body carries message and remediation and no permission field; a refusal writes no record and audits quarantine.enable as denied"}, "500": {"description": "Per-device scope gate, the dispatch approval check or the audit identity writer is not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
     },
     "/quarantine/{agent_id}": {
-      "delete": {"summary": "Release a device from quarantine (per-target scoped — #1788)", "tags": ["Security"], "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Device released"}, "400": {"description": "The device is not currently quarantined"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
+      "delete": {"summary": "Release a device from quarantine (per-target scoped — #1788; dispatch approval check, #6065)", "tags": ["Security"], "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Device released"}, "400": {"description": "The device is not currently quarantined, or the dispatch approval check cannot classify the quarantine.unquarantine pair (reason unclassified or ambiguous; #6065)"}, "401": {"description": "Not authenticated, or the authenticated principal changed between the route's two session look-ups (retry; #6065)"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global) AND the dispatch approval check for quarantine.unquarantine (#6065): with RBAC on, approval_required when the caller's account role is not admin, forbidden when the caller's own Security:Execute grant is not global or the RBAC store could not be read. The body carries message and remediation and no permission field; a refusal leaves the record active and audits quarantine.disable as denied"}, "500": {"description": "Per-device scope gate, the dispatch approval check or the audit identity writer is not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
     },
     "/rbac/roles": {
       "get": {"summary": "List RBAC roles", "tags": ["RBAC"], "description": "Requires UserManagement:Read. A degraded RBAC store is a retryable 503 (retry_after_ms 5000), never an empty 200 list.", "responses": {"200": {"description": "List of roles"}, "403": {"description": "Requires UserManagement:Read"}, "503": {"description": "RBAC store unavailable; retry after retry_after_ms"}}}
@@ -1158,7 +1200,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Query inventory across agents with filter expression", "tags": ["Inventory"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string", "description": "Filter by agent ID"}, "plugin": {"type": "string", "description": "Filter by plugin name"}, "since": {"type": "integer", "minimum": 0, "description": "Inclusive lower bound on collected_at, epoch seconds. Omit for no lower bound; 0 is accepted and matches the same rows as omitting it; a negative value or a non-integer is rejected with 400."}, "until": {"type": "integer", "minimum": 1, "description": "Inclusive upper bound on collected_at, epoch seconds. Omit for no upper bound; 0, a negative value or a non-integer is rejected with 400 (0 is not a way to say unbounded)."}, "limit": {"type": "integer", "default": 100, "minimum": 1, "maximum": 1000, "description": "Max results; an integer above 1000 is clamped to 1000, a value below 1 or a non-integer is rejected with 400."}}}}}}, "responses": {"200": {"description": "Matching inventory records"}, "400": {"description": "Malformed JSON body, a limit below 1 or not an integer, a negative or non-integer since, or an until of 0 or below or non-integer (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/inventory/software": {
-      "get": {"summary": "Fleet-wide installed-software inventory (typed daily-sync store, ADR-0016)", "tags": ["Inventory"], "description": "Installed-software rows across the fleet from the typed SoftwareInventoryStore (DISTINCT from the generic /inventory/* routes, which read the generic blob store). Rows carry name, version, publisher, install_date plus the blob-v2 package fields: kind (package|app|pkg|feat), ecosystem (rpm|deb|apk|pacman|snap|flatpak|windows|macos|macos_pkgutil|brew|optional_feature|msi), epoch, release, arch, signature_status (rpm stored-tag), distro_id, distro_version (rpm/deb/apk/pacman rows only) — fields an ecosystem does not store are empty, never synthesised. Snaps are kind app or pkg (ecosystem snap), flatpak apps kind app and runtimes kind pkg (ecosystem flatpak). Machine-context Windows Installer products are kind pkg (ecosystem msi). Requires Inventory:Read (#3290 Phase 2: the SOLE gate is the ADR-0017 admit-then-filter fleet-read gate, never stacked with a separate permission check). Results are scoped to the caller's management groups AND, for a service-scoped API token, to that token's service-tagged agents (the intersection of both when both apply); the scope is applied in SQL (up to 10000 visible devices) so a confined caller gets COMPLETE pages of its own devices; devices_omitted is 0 under push-down; for a scope wider than that bound the rows are filtered after the read and devices_omitted is the count of distinct out-of-scope devices within the scanned window(s), a bounded and audited signal that out-of-scope matches exist. A denied audit row is written when it is above zero or when the request names an agent_id outside the caller's scope. On a wide scope a page can be empty with a non-null next_cursor; the cursor re-anchors at the last row served and carries a count of the rows scanned since, never a row of another device, and an export reads at most four bounded windows. A correctly-confined service-scoped token gets a real filtered read here (incl. export), unlike the two catalogue routes which deny service-scoped tokens. Each row also carries source (<plugin>.<action>, an open set). Optional filters: version (present-empty selects the empty-version rows), q, kind, ecosystem, source. Keyset pagination: next_cursor is non-null when more rows may exist (result_truncated_by_cap=true, also in export mode); pass it back as cursor — a malformed cursor or one issued for a different filter set is a 400. format=json|csv is an export (limit is the TOTAL cap, default and max 10000; csv adds Content-Disposition, X-Result-Truncated-By-Cap and X-Next-Cursor, and a trailer record when more rows may exist) audited as inventory.software.export. Every served call is audited (inventory.software.query success, inventory.software.export for an export; continuation pages tagged page=continuation). Repeated query parameters keep the first value; a non-integer limit is a 400. On store degradation, or the caller's tag-scope lookup degrading, the endpoint returns 503 (never an empty 200) so a vulnerability query cannot read a transient outage as 'installed nowhere'.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact software-name filter (optional)"}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}, "description": "Exact agent filter (optional)"}, {"name": "version", "in": "query", "schema": {"type": "string"}, "description": "Exact version filter; present-empty selects the empty-version rows"}, {"name": "q", "in": "query", "schema": {"type": "string", "maxLength": 128}, "description": "Case-insensitive literal substring over name, publisher, ecosystem and source"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["rpm", "deb", "apk", "pacman", "snap", "flatpak", "windows", "macos", "macos_pkgutil", "brew", "optional_feature", "msi"]}}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>)"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 2048}, "description": "Opaque next_cursor from the previous page"}, {"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"]}, "description": "Export mode (limit is the total cap, max 10000)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "{data:{software[], count, next_cursor, devices_omitted, result_truncated_by_cap?, audit_persisted?}}; with format=csv the body is text/csv", "headers": {"Content-Disposition": {"schema": {"type": "string"}, "description": "format=csv only: attachment; filename=software-installs.csv"}, "X-Result-Truncated-By-Cap": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when more rows may exist (the export reached the total cap, or a wide-scope read was cut short)"}, "X-Next-Cursor": {"schema": {"type": "string"}, "description": "format=csv only: the continuation, present with X-Result-Truncated-By-Cap; pass it back as cursor"}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when an audit row of the export did not persist (the export is still served)"}}}, "400": {"description": "Non-integer limit, unknown format, text that is not valid UTF-8 or holds a NUL byte, an over-long value, or a refused cursor"}, "401": {"description": "Unauthenticated"}, "403": {"description": "No management-group grant for Inventory:Read (or a service-scoped token whose RBAC/ITServiceOwner grant is missing/RBAC disabled)"}, "503": {"description": "Software inventory store unavailable/degraded, RBAC/management-group/tag store unavailable, or the fleet-read gate unwired"}}}
+      "get": {"summary": "Fleet-wide installed-software inventory (typed daily-sync store, ADR-0016)", "tags": ["Inventory"], "description": "Installed-software rows across the fleet from the typed SoftwareInventoryStore (DISTINCT from the generic /inventory/* routes, which read the generic blob store). Rows carry name, version, publisher, install_date plus the blob-v2 package fields: kind (package|app|pkg|feat), ecosystem (@@ECOSYSTEM_LIST@@), epoch, release, arch, signature_status (rpm stored-tag), distro_id, distro_version (rpm/deb/apk/pacman rows only) — fields an ecosystem does not store are empty, never synthesised. Snaps are kind app or pkg (ecosystem snap), flatpak apps kind app and runtimes kind pkg (ecosystem flatpak). Machine-context Windows Installer products are kind pkg (ecosystem msi). Requires Inventory:Read (#3290 Phase 2: the SOLE gate is the ADR-0017 admit-then-filter fleet-read gate, never stacked with a separate permission check). Results are scoped to the caller's management groups AND, for a service-scoped API token, to that token's service-tagged agents (the intersection of both when both apply); the scope is applied in SQL (up to 10000 visible devices) so a confined caller gets COMPLETE pages of its own devices; devices_omitted is 0 under push-down; for a scope wider than that bound the rows are filtered after the read and devices_omitted is the count of distinct out-of-scope devices within the scanned window(s), a bounded and audited signal that out-of-scope matches exist. A denied audit row is written when it is above zero or when the request names an agent_id outside the caller's scope. On a wide scope a page can be empty with a non-null next_cursor; the cursor re-anchors at the last row served and carries a count of the rows scanned since, never a row of another device, and an export reads at most four bounded windows. A correctly-confined service-scoped token gets a real filtered read here (incl. export), unlike the two catalogue routes which deny service-scoped tokens. Each row also carries source (<plugin>.<action>, an open set). Optional filters: version (present-empty selects the empty-version rows), q, kind, ecosystem, source. Keyset pagination: next_cursor is non-null when more rows may exist (result_truncated_by_cap=true, also in export mode); pass it back as cursor — a malformed cursor or one issued for a different filter set is a 400. format=json|csv is an export (limit is the TOTAL cap, default and max 10000; csv adds Content-Disposition, X-Result-Truncated-By-Cap and X-Next-Cursor, and a trailer record when more rows may exist) audited as inventory.software.export. Every served call is audited (inventory.software.query success, inventory.software.export for an export; continuation pages tagged page=continuation). Repeated query parameters keep the first value; a non-integer limit is a 400. On store degradation, or the caller's tag-scope lookup degrading, the endpoint returns 503 (never an empty 200) so a vulnerability query cannot read a transient outage as 'installed nowhere'.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact software-name filter (optional)"}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}, "description": "Exact agent filter (optional)"}, {"name": "version", "in": "query", "schema": {"type": "string"}, "description": "Exact version filter; present-empty selects the empty-version rows"}, {"name": "q", "in": "query", "schema": {"type": "string", "maxLength": 128}, "description": "Case-insensitive literal substring over name, publisher, ecosystem and source"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["@@ECOSYSTEM_ENUM@@"]}}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>)"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 2048}, "description": "Opaque next_cursor from the previous page"}, {"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"]}, "description": "Export mode (limit is the total cap, max 10000)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "{data:{software[], count, next_cursor, devices_omitted, result_truncated_by_cap?, audit_persisted?}}; with format=csv the body is text/csv", "headers": {"Content-Disposition": {"schema": {"type": "string"}, "description": "format=csv only: attachment; filename=software-installs.csv"}, "X-Result-Truncated-By-Cap": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when more rows may exist (the export reached the total cap, or a wide-scope read was cut short)"}, "X-Next-Cursor": {"schema": {"type": "string"}, "description": "format=csv only: the continuation, present with X-Result-Truncated-By-Cap; pass it back as cursor"}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when an audit row of the export did not persist (the export is still served)"}}}, "400": {"description": "Non-integer limit, unknown format, text that is not valid UTF-8 or holds a NUL byte, an over-long value, or a refused cursor"}, "401": {"description": "Unauthenticated"}, "403": {"description": "No management-group grant for Inventory:Read (or a service-scoped token whose RBAC/ITServiceOwner grant is missing/RBAC disabled)"}, "503": {"description": "Software inventory store unavailable/degraded, RBAC/management-group/tag store unavailable, or the fleet-read gate unwired"}}}
     },
     "/policy-fragments": {
       "get": {"summary": "List policy fragments (api-parity #4034)", "tags": ["Compliance"], "description": "REST v1 twin of legacy GET /api/policy-fragments; MCP twin list_policy_fragments. Requires Policy:Read.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Substring name filter (optional)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100}}], "responses": {"200": {"description": "{data:[{id,name,description,check_instruction,check_compliance,fix_instruction,post_check_instruction,created_at,updated_at}], pagination}"}, "400": {"description": "Non-integer limit"}, "503": {"description": "Policy store not available/degraded"}}}
@@ -1177,15 +1219,15 @@ const std::string& openapi_spec() {
     },)json"
         // The software catalogue twins. Own segment (MSVC C2026 16,380-byte cap).
         R"json(
-    "/inventory/software/catalogue": {"get": {"summary": "Fleet software title catalogue with totals and KPIs", "tags": ["Inventory"], "description": "One row per software title rolled up across the whole fleet from the precomputed catalogue rollup, ordered by installs descending then name (per-device view: by name). MCP twin query_software_catalogue; both are shaped by one shared model. totals{titles,installs} cover EVERY row matching the filters (not just this page), so a page can say N of M; installs sums each title's distinct-device count. kpis (first page only; null on continuation pages and the per-device view) carries the headline numbers computed by the hourly refresh plus derived percentages, and coverage{reporting,connected,stale} as counts (reporting = devices with stored inventory, connected = devices currently connected, stale = not seen in 48 hours; null when that figure is unavailable). Requires a GLOBAL Inventory:Read for the fleet view: a management-group-confined caller gets 403 with permission Inventory:Read (the rollup is fleet-wide and cannot be scoped); the per-device view (agent_id) is admitted for an in-scope device, an out-of-scope device returns an empty page with devices_omitted 1, and a confined caller sees newest_version blank with newest_omitted true. Service-scoped API tokens are denied (403, no permission field). Pagination is keyset: next_cursor is non-null when the page is full; a cursor presented with a different filter set, a malformed cursor, or one issued before the latest catalogue refresh (1 second generation granularity) is a 400 and the walk must restart from the first page. Every call that serves a page is audited (inventory.software.catalog success, continuation pages tagged page=continuation); an out-of-scope per-device read writes denied only (denied plus an empty-file inventory.software.export success on format=csv). format=csv exports the titles (total cap 10000, X-Result-Truncated-By-Cap when the cap is reached; audited as inventory.software.export). An empty kind, ecosystem or source means no filter. A degraded rows, totals or refresh-metadata read is a 503 with retry_after_ms, never an empty 200. Before the first catalogue refresh the JSON page answers 200 with kpis.building true, while the fleet format=csv export is a 503 with retry_after_ms (an empty file would read as no titles; the per-device export is unaffected).", "parameters": [{"name": "q", "in": "query", "schema": {"type": "string", "maxLength": 128}, "description": "Case-insensitive literal substring over title name, publisher, ecosystems and sources (% and _ are not wildcards); clamped to 128 bytes"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}, "description": "Exact kind filter; empty means no filter"}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["rpm", "deb", "apk", "pacman", "snap", "flatpak", "windows", "macos", "macos_pkgutil", "brew", "optional_feature", "msi"]}, "description": "Exact ecosystem filter; empty means no filter"}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>); empty means no filter"}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Per-device view of one device's titles (installs are 1)"}, {"name": "versions_min", "in": "query", "schema": {"type": "integer", "minimum": 0, "maximum": 100000}, "description": "Only titles with at least this many distinct versions"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100}, "description": "Page size, clamped into 1..1000; with format=csv it is the TOTAL export cap (clamped into 1..10000, default 10000)"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 2048}, "description": "Opaque next_cursor from the previous page; bound to the filter set and to the catalogue refresh generation"}, {"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"], "default": "json"}, "description": "csv streams a titles export (REST only; audited as inventory.software.export)"}], "responses": {"200": {"description": "{data:{titles[{name,publisher,installs,versions,ecosystems[],kinds[],newest_version}],count,next_cursor,totals{titles,installs},kpis|null,devices_omitted,newest_omitted?,audit_persisted?}}; with format=csv the body is text/csv", "headers": {"Content-Disposition": {"schema": {"type": "string"}, "description": "format=csv only: attachment; filename=\"software-titles.csv\""}, "X-Result-Truncated-By-Cap": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when the walk reached the total export cap (rows may have been left behind)"}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when the export audit row did not persist, or when only the paired denied row failed to persist (the export is still served)"}}}, "400": {"description": "Repeated or malformed parameter, non-integer limit or versions_min, unknown format, a cursor sent with format=csv, or a refused cursor: invalid cursor, different filter set, or predates the current catalogue refresh (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Confined caller on the fleet view (permission Inventory:Read) or a service-scoped token (no permission field) (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Rows, totals or refresh-metadata read degraded, or (fleet format=csv) the catalogue is not built yet: retry_after_ms 5000. An absent store or an unwired fleet-read gate is a 503 without retry_after_ms (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}},
-    "/inventory/software/catalogue/versions": {"get": {"summary": "Installs per version for one software title", "tags": ["Inventory"], "description": "Distinct-device install counts per version of one title under the same filters as the catalogue; the newest flag marks the title's fleet-wide newest version. MCP twin get_software_versions. truncated is true when the limit was reached. Same access posture as the catalogue: a global Inventory:Read for the fleet view (a confined caller gets 403), the per-device view for an in-scope device (newest is false on every row and newest_omitted is true for a confined caller; an out-of-scope device returns an empty list with devices_omitted 1), service-scoped tokens denied. Every call that serves a page is audited (inventory.software.versions success); a 400 writes nothing; a confined or service-scoped refusal writes denied; the Inventory:Read gate's own refusal is audited as auth.fleet_read_required. A degraded read is a 503 with retry_after_ms, never an empty 200; so is the unfiltered read (no kind, ecosystem, source or agent_id) before the first catalogue refresh.", "parameters": [{"name": "name", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 1024}, "description": "Exact title name"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}, "description": "Exact kind filter; empty means no filter"}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["rpm", "deb", "apk", "pacman", "snap", "flatpak", "windows", "macos", "macos_pkgutil", "brew", "optional_feature", "msi"]}, "description": "Exact ecosystem filter; empty means no filter"}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>); empty means no filter"}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Per-device view of one device's versions of the title"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200}, "description": "Maximum versions returned, clamped into 1..1000"}], "responses": {"200": {"description": "{data:{name,versions[{version,installs,newest}],count,truncated,devices_omitted,newest_omitted?,audit_persisted?}}"}, "400": {"description": "name missing, repeated or malformed parameter, an over-long value, invalid UTF-8 or a NUL byte (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Confined caller on the fleet view (permission Inventory:Read) or a service-scoped token (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Versions or refresh-metadata read degraded, or the unfiltered read before the first refresh: retry_after_ms 5000. An absent store or an unwired fleet-read gate is a 503 without retry_after_ms (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}},)json"
+    "/inventory/software/catalogue": {"get": {"summary": "Fleet software title catalogue with totals and KPIs", "tags": ["Inventory"], "description": "One row per software title rolled up across the whole fleet from the precomputed catalogue rollup, ordered by installs descending then name (per-device view: by name). MCP twin query_software_catalogue; both are shaped by one shared model. totals{titles,installs} cover EVERY row matching the filters (not just this page), so a page can say N of M; installs sums each title's distinct-device count. kpis (first page only; null on continuation pages and the per-device view) carries the headline numbers computed by the hourly refresh plus derived percentages, and coverage{reporting,connected,stale} as counts (reporting = devices with stored inventory, connected = devices currently connected, stale = not seen in 48 hours; null when that figure is unavailable). Requires a GLOBAL Inventory:Read for the fleet view: a management-group-confined caller gets 403 with permission Inventory:Read (the rollup is fleet-wide and cannot be scoped); the per-device view (agent_id) is admitted for an in-scope device, an out-of-scope device returns an empty page with devices_omitted 1, and a confined caller sees newest_version blank with newest_omitted true. Service-scoped API tokens are denied (403, no permission field). Pagination is keyset: next_cursor is non-null when the page is full; a cursor presented with a different filter set, a malformed cursor, or one issued before the latest catalogue refresh (1 second generation granularity) is a 400 and the walk must restart from the first page. Every call that serves a page is audited (inventory.software.catalog success, continuation pages tagged page=continuation); an out-of-scope per-device read writes denied only (denied plus an empty-file inventory.software.export success on format=csv). format=csv exports the titles (total cap 10000, X-Result-Truncated-By-Cap when the cap is reached; audited as inventory.software.export). An empty kind, ecosystem or source means no filter. A degraded rows, totals or refresh-metadata read is a 503 with retry_after_ms, never an empty 200. Before the first catalogue refresh the JSON page answers 200 with kpis.building true, while the fleet format=csv export is a 503 with retry_after_ms (an empty file would read as no titles; the per-device export is unaffected).", "parameters": [{"name": "q", "in": "query", "schema": {"type": "string", "maxLength": 128}, "description": "Case-insensitive literal substring over title name, publisher, ecosystems and sources (% and _ are not wildcards); clamped to 128 bytes"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}, "description": "Exact kind filter; empty means no filter"}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["@@ECOSYSTEM_ENUM@@"]}, "description": "Exact ecosystem filter; empty means no filter"}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>); empty means no filter"}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Per-device view of one device's titles (installs are 1)"}, {"name": "versions_min", "in": "query", "schema": {"type": "integer", "minimum": 0, "maximum": 100000}, "description": "Only titles with at least this many distinct versions"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100}, "description": "Page size, clamped into 1..1000; with format=csv it is the TOTAL export cap (clamped into 1..10000, default 10000)"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 2048}, "description": "Opaque next_cursor from the previous page; bound to the filter set and to the catalogue refresh generation"}, {"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"], "default": "json"}, "description": "csv streams a titles export (REST only; audited as inventory.software.export)"}], "responses": {"200": {"description": "{data:{titles[{name,publisher,installs,versions,ecosystems[],kinds[],newest_version}],count,next_cursor,totals{titles,installs},kpis|null,devices_omitted,newest_omitted?,audit_persisted?}}; with format=csv the body is text/csv", "headers": {"Content-Disposition": {"schema": {"type": "string"}, "description": "format=csv only: attachment; filename=\"software-titles.csv\""}, "X-Result-Truncated-By-Cap": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when the walk reached the total export cap (rows may have been left behind)"}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when the export audit row did not persist, or when only the paired denied row failed to persist (the export is still served)"}}}, "400": {"description": "Repeated or malformed parameter, non-integer limit or versions_min, unknown format, a cursor sent with format=csv, or a refused cursor: invalid cursor, different filter set, or predates the current catalogue refresh (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Confined caller on the fleet view (permission Inventory:Read) or a service-scoped token (no permission field) (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Rows, totals or refresh-metadata read degraded, or (fleet format=csv) the catalogue is not built yet: retry_after_ms 5000. An absent store or an unwired fleet-read gate is a 503 without retry_after_ms (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}},
+    "/inventory/software/catalogue/versions": {"get": {"summary": "Installs per version for one software title", "tags": ["Inventory"], "description": "Distinct-device install counts per version of one title under the same filters as the catalogue; the newest flag marks the title's fleet-wide newest version. MCP twin get_software_versions. truncated is true when the limit was reached. Same access posture as the catalogue: a global Inventory:Read for the fleet view (a confined caller gets 403), the per-device view for an in-scope device (newest is false on every row and newest_omitted is true for a confined caller; an out-of-scope device returns an empty list with devices_omitted 1), service-scoped tokens denied. Every call that serves a page is audited (inventory.software.versions success); a 400 writes nothing; a confined or service-scoped refusal writes denied; the Inventory:Read gate's own refusal is audited as auth.fleet_read_required. A degraded read is a 503 with retry_after_ms, never an empty 200; so is the unfiltered read (no kind, ecosystem, source or agent_id) before the first catalogue refresh.", "parameters": [{"name": "name", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 1024}, "description": "Exact title name"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}, "description": "Exact kind filter; empty means no filter"}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["@@ECOSYSTEM_ENUM@@"]}, "description": "Exact ecosystem filter; empty means no filter"}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>); empty means no filter"}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Per-device view of one device's versions of the title"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200}, "description": "Maximum versions returned, clamped into 1..1000"}], "responses": {"200": {"description": "{data:{name,versions[{version,installs,newest}],count,truncated,devices_omitted,newest_omitted?,audit_persisted?}}"}, "400": {"description": "name missing, repeated or malformed parameter, an over-long value, invalid UTF-8 or a NUL byte (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Confined caller on the fleet view (permission Inventory:Read) or a service-scoped token (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Versions or refresh-metadata read degraded, or the unfiltered read before the first refresh: retry_after_ms 5000. An absent store or an unwired fleet-read gate is a 503 without retry_after_ms (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}},)json"
         // /crypto slice 1 (crypto-library presence). Own segment (MSVC C2026 16,380-byte cap).
         R"json(
-    "/crypto/libraries": {"get": {"summary": "Installed cryptographic libraries by family and version", "tags": ["Crypto"], "description": "Which cryptographic libraries (OpenSSL, GnuTLS, NSS, Mbed TLS, wolfSSL, libsodium, Bouncy Castle and others) are installed across the fleet, from the daily-synced installed-software inventory matched by package NAME against a curated table. One row per family with device_count (DISTINCT devices carrying any package of the family) and a per-(version, ecosystem) breakdown with the matching package names; families with no matching device are omitted, ordered by device_count descending then id. Presence and versions only: nothing is judged. An empty families list means no matching package rows in the caller's visible inventory, NOT proof the library is absent (statically linked, vendored and OS-bundled copies are invisible). Windows installer builds of OpenSSL are not matched. table_version names the mapping that produced the answer; names_source says where the package NAMES came from: catalogue (the hourly software catalogue, while fresh - at most 2 hours old - with names_as_of its refresh time in epoch seconds; a name first reported after it appears after the next refresh) or live (read from the inventory at call time when the catalogue is not built, is stale or was refreshed over zero titles; names_as_of is null); counts and versions for listed names are live either way; coverage gives the denominator (devices_reporting_inventory, devices_with_crypto_library); versions_truncated / result_truncated mean version rows were capped, never that devices are missing from the counts; when the 2,000-row store ceiling fires every family is flagged versions_truncated. Each version bucket lists at most 8 package names, and package_names_truncated is true when it has more. MCP twin get_crypto_libraries; both are shaped by one shared model and read through one in-process seam, and the /crypto dashboard page renders the same data. AUTHORIZATION IS require_fleet_read (Inventory:Read), the SOLE gate, never stacked with a bare permission check: a management-group or service-scope confined caller sees only its visible devices, and counts, coverage and versions are all computed over exactly that scope (a caller with no visible device gets zero rows, not the fleet). A service-scoped API token is refused 403 while RBAC enforcement is off (the default); with it on, it is admitted within the ITServiceOwner ceiling and sees only the devices tagged with its IT service. Responses carry Cache-Control: no-store, private and Vary: Authorization, Cookie, X-Yuzu-Token. Every call that serves a read is audited as crypto.libraries.view (set-and-proceed: a lost audit row is flagged by audit_persisted false in the body and the Sec-Audit-Failed header, and the data is still served); the gate's own refusal is audited by the gate. A degraded inventory read is a 503 with retry_after_ms, never an empty 200. Package names are cut to 256 bytes (a cut name ends in an ellipsis) and the whole payload is byte-budgeted (about 256 KiB, plus at most one first bucket per family: worst case about 300 KB): a cut version list sets versions_truncated and result_truncated, never a silent drop. ecosystem is matched EXACTLY (present-empty selects rows with no ecosystem; omit for any).", "parameters": [{"name": "family", "in": "query", "schema": {"type": "string", "enum": ["openssl", "libressl", "boringssl", "gnutls", "nss", "mbedtls", "wolfssl", "libgcrypt", "libsodium", "nettle", "botan", "bouncycastle"]}, "description": "Restrict to one library family id; empty means every family"}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "maxLength": 1024, "enum": ["", "rpm", "deb", "apk", "pacman", "snap", "flatpak", "windows", "macos", "macos_pkgutil", "brew", "optional_feature","msi"]}, "description": "Exact package ecosystem filter (the software catalogue's published ecosystems); a present empty value selects rows that carry no ecosystem; omit for any. Not refused: an unpublished value matches no rows"}], "responses": {"200": {"description": "{data:{table_version,names_source,names_as_of|null,families[{id,display,device_count,versions[{version,ecosystem,device_count,package_names[],package_names_truncated}],versions_truncated}],coverage{devices_reporting_inventory,devices_with_crypto_library},result_truncated,audit_persisted?}, meta}", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the access-audit row did not persist (the data is still served; the body carries audit_persisted false)"}}}, "400": {"description": "Parameter repeated with differing values, unknown family id, invalid UTF-8 or an over-long value (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Caller lacks Inventory:Read (A4 envelope, written by the gate); while RBAC enforcement is off, service-scoped tokens are refused 403", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Inventory read degraded (message: crypto library read degraded) or crypto read capacity in use (message: crypto read capacity in use; retry): retry_after_ms 5000 either way. An absent inventory store, an unwired fleet-read gate or an unavailable authorization store is a 503 too (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}},
-    "/crypto/libraries/devices": {"get": {"summary": "Devices carrying one cryptographic library family", "tags": ["Crypto"], "description": "The drill-down after GET /crypto/libraries: the devices and matching package rows behind one family, optionally one exact version and ecosystem. Each row carries agent_id, hostname (null when the registry does not know the device), package_name, version, release, ecosystem and kind; a device with several matching packages appears once per package. Ordered by agent_id then package name; keyset pagination: next_cursor is non-null when more rows exist, and a cursor presented with a different family/version/ecosystem or a malformed cursor is a 400 and the walk must restart. version is matched EXACTLY (an empty value selects rows that carry no version; omit it for every version). An empty devices list means no matching package rows in the caller's visible inventory, NOT proof the library is absent. Presence and versions only. MCP twin list_crypto_library_devices. Same authorization and caching posture as GET /crypto/libraries (a service-scoped token is refused 403 while RBAC enforcement is off; with it on, it is admitted within the ITServiceOwner ceiling and sees only the devices tagged with its IT service): require_fleet_read (Inventory:Read) is the SOLE gate and the caller's scope is pushed into the SQL, so a confined caller never sees a row for a device outside its scope. Every page served is audited as crypto.libraries.devices (continuation pages tagged page=continuation), set-and-proceed with audit_persisted false in the body and the Sec-Audit-Failed header on a lost row. A degraded inventory read is a 503 with retry_after_ms, never an empty 200. version and ecosystem are matched EXACTLY (present-empty selects rows that carry none). A cursor is bound to table_version and records the names source: one issued under another table version, or one issued on live names when the next page finds the catalogue in use (this recurs if the catalogue goes stale and recovers mid-walk), is refused with a 400 and the walk restarts. A newer catalogue or a switch to live continues; a name new in the newer source is listed for devices after the cursor, and its rows on devices already passed are missed until you restart. names_source (catalogue|live) and names_as_of (epoch seconds, null when live) say where the package NAMES came from, as on GET /crypto/libraries.", "parameters": [{"name": "family", "in": "query", "required": true, "schema": {"type": "string", "enum": ["openssl", "libressl", "boringssl", "gnutls", "nss", "mbedtls", "wolfssl", "libgcrypt", "libsodium", "nettle", "botan", "bouncycastle"]}, "description": "Library family id (from GET /crypto/libraries)"}, {"name": "version", "in": "query", "schema": {"type": "string", "maxLength": 1024}, "description": "Exact version bucket; present-but-empty selects rows with no version; omit for every version"}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "maxLength": 1024, "enum": ["", "rpm", "deb", "apk", "pacman", "snap", "flatpak", "windows", "macos", "macos_pkgutil", "brew", "optional_feature","msi"]}, "description": "Exact package ecosystem filter (the software catalogue's published ecosystems); a present empty value selects rows that carry no ecosystem; omit for any. Not refused: an unpublished value matches no rows"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 2048}, "description": "Opaque next_cursor from the previous page; bound to the family/version/ecosystem filter and the table_version, and a page whose cursor was issued on live names is refused (400) once the catalogue is in use; restart without a cursor"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100}, "description": "Page size, clamped into 1..1000"}], "responses": {"200": {"description": "{data:{table_version,names_source,names_as_of|null,family,version|null,ecosystem|null,devices[{agent_id,hostname|null,package_name,version,release,ecosystem,kind}],next_cursor|null,count,audit_persisted?}, meta}", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the access-audit row did not persist (the data is still served; the body carries audit_persisted false)"}}}, "400": {"description": "family missing, a parameter repeated with differing values or malformed, unknown family id, non-integer limit, invalid UTF-8, an over-long value, or a refused cursor (a different filter set or table_version, or a cursor issued on live names now that the catalogue is in use: restart the walk) (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Caller lacks Inventory:Read (A4 envelope, written by the gate); while RBAC enforcement is off, service-scoped tokens are refused 403", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Inventory read degraded (message: crypto library read degraded) or crypto read capacity in use (message: crypto read capacity in use; retry): retry_after_ms 5000 either way. An absent inventory store, an unwired fleet-read gate or an unavailable authorization store is a 503 too (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}},)json"
+    "/crypto/libraries": {"get": {"summary": "Installed cryptographic libraries by family and version", "tags": ["Crypto"], "description": "Which cryptographic libraries (OpenSSL, GnuTLS, NSS, Mbed TLS, wolfSSL, libsodium, Bouncy Castle and others) are installed across the fleet, from the daily-synced installed-software inventory matched by package NAME against a curated table. One row per family with device_count (DISTINCT devices carrying any package of the family) and a per-(version, ecosystem) breakdown with the matching package names; families with no matching device are omitted, ordered by device_count descending then id. Presence and versions only: nothing is judged. An empty families list means no matching package rows in the caller's visible inventory, NOT proof the library is absent (statically linked, vendored and OS-bundled copies are invisible). Windows installer builds of OpenSSL are not matched. table_version names the mapping that produced the answer; names_source says where the package NAMES came from: catalogue (the hourly software catalogue, while fresh - at most 2 hours old - with names_as_of its refresh time in epoch seconds; a name first reported after it appears after the next refresh) or live (read from the inventory at call time when the catalogue is not built, is stale or was refreshed over zero titles; names_as_of is null); counts and versions for listed names are live either way; coverage gives the denominator (devices_reporting_inventory, devices_with_crypto_library); versions_truncated / result_truncated mean version rows were capped, never that devices are missing from the counts; when the 2,000-row store ceiling fires every family is flagged versions_truncated. Each version bucket lists at most 8 package names, and package_names_truncated is true when it has more. MCP twin get_crypto_libraries; both are shaped by one shared model and read through one in-process seam, and the /crypto dashboard page renders the same data. AUTHORIZATION IS require_fleet_read (Inventory:Read), the SOLE gate, never stacked with a bare permission check: a management-group or service-scope confined caller sees only its visible devices, and counts, coverage and versions are all computed over exactly that scope (a caller with no visible device gets zero rows, not the fleet). A service-scoped API token is refused 403 while RBAC enforcement is off (the default); with it on, it is admitted within the ITServiceOwner ceiling and sees only the devices tagged with its IT service. Responses carry Cache-Control: no-store, private and Vary: Authorization, Cookie, X-Yuzu-Token. Every call that serves a read is audited as crypto.libraries.view (set-and-proceed: a lost audit row is flagged by audit_persisted false in the body and the Sec-Audit-Failed header, and the data is still served); the gate's own refusal is audited by the gate. A degraded inventory read is a 503 with retry_after_ms, never an empty 200. Package names are cut to 256 bytes (a cut name ends in an ellipsis) and the whole payload is byte-budgeted (about 256 KiB, plus at most one first bucket per family: worst case about 300 KB): a cut version list sets versions_truncated and result_truncated, never a silent drop. ecosystem is matched EXACTLY (present-empty selects rows with no ecosystem; omit for any).", "parameters": [{"name": "family", "in": "query", "schema": {"type": "string", "enum": ["openssl", "libressl", "boringssl", "gnutls", "nss", "mbedtls", "wolfssl", "libgcrypt", "libsodium", "nettle", "botan", "bouncycastle"]}, "description": "Restrict to one library family id; empty means every family"}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "maxLength": 1024, "enum": ["@@ECOSYSTEM_ENUM_OR_EMPTY@@"]}, "description": "Exact package ecosystem filter (the software catalogue's published ecosystems); a present empty value selects rows that carry no ecosystem; omit for any. Not refused: an unpublished value matches no rows"}], "responses": {"200": {"description": "{data:{table_version,names_source,names_as_of|null,families[{id,display,device_count,versions[{version,ecosystem,device_count,package_names[],package_names_truncated}],versions_truncated}],coverage{devices_reporting_inventory,devices_with_crypto_library},result_truncated,audit_persisted?}, meta}", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the access-audit row did not persist (the data is still served; the body carries audit_persisted false)"}}}, "400": {"description": "Parameter repeated with differing values, unknown family id, invalid UTF-8 or an over-long value (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Caller lacks Inventory:Read (A4 envelope, written by the gate); while RBAC enforcement is off, service-scoped tokens are refused 403", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Inventory read degraded (message: crypto library read degraded) or crypto read capacity in use (message: crypto read capacity in use; retry): retry_after_ms 5000 either way. An absent inventory store, an unwired fleet-read gate or an unavailable authorization store is a 503 too (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}},
+    "/crypto/libraries/devices": {"get": {"summary": "Devices carrying one cryptographic library family", "tags": ["Crypto"], "description": "The drill-down after GET /crypto/libraries: the devices and matching package rows behind one family, optionally one exact version and ecosystem. Each row carries agent_id, hostname (null when the registry does not know the device), package_name, version, release, ecosystem and kind; a device with several matching packages appears once per package. Ordered by agent_id then package name; keyset pagination: next_cursor is non-null when more rows exist, and a cursor presented with a different family/version/ecosystem or a malformed cursor is a 400 and the walk must restart. version is matched EXACTLY (an empty value selects rows that carry no version; omit it for every version). An empty devices list means no matching package rows in the caller's visible inventory, NOT proof the library is absent. Presence and versions only. MCP twin list_crypto_library_devices. Same authorization and caching posture as GET /crypto/libraries (a service-scoped token is refused 403 while RBAC enforcement is off; with it on, it is admitted within the ITServiceOwner ceiling and sees only the devices tagged with its IT service): require_fleet_read (Inventory:Read) is the SOLE gate and the caller's scope is pushed into the SQL, so a confined caller never sees a row for a device outside its scope. Every page served is audited as crypto.libraries.devices (continuation pages tagged page=continuation), set-and-proceed with audit_persisted false in the body and the Sec-Audit-Failed header on a lost row. A degraded inventory read is a 503 with retry_after_ms, never an empty 200. version and ecosystem are matched EXACTLY (present-empty selects rows that carry none). A cursor is bound to table_version and records the names source: one issued under another table version, or one issued on live names when the next page finds the catalogue in use (this recurs if the catalogue goes stale and recovers mid-walk), is refused with a 400 and the walk restarts. A newer catalogue or a switch to live continues; a name new in the newer source is listed for devices after the cursor, and its rows on devices already passed are missed until you restart. names_source (catalogue|live) and names_as_of (epoch seconds, null when live) say where the package NAMES came from, as on GET /crypto/libraries.", "parameters": [{"name": "family", "in": "query", "required": true, "schema": {"type": "string", "enum": ["openssl", "libressl", "boringssl", "gnutls", "nss", "mbedtls", "wolfssl", "libgcrypt", "libsodium", "nettle", "botan", "bouncycastle"]}, "description": "Library family id (from GET /crypto/libraries)"}, {"name": "version", "in": "query", "schema": {"type": "string", "maxLength": 1024}, "description": "Exact version bucket; present-but-empty selects rows with no version; omit for every version"}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "maxLength": 1024, "enum": ["@@ECOSYSTEM_ENUM_OR_EMPTY@@"]}, "description": "Exact package ecosystem filter (the software catalogue's published ecosystems); a present empty value selects rows that carry no ecosystem; omit for any. Not refused: an unpublished value matches no rows"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 2048}, "description": "Opaque next_cursor from the previous page; bound to the family/version/ecosystem filter and the table_version, and a page whose cursor was issued on live names is refused (400) once the catalogue is in use; restart without a cursor"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100}, "description": "Page size, clamped into 1..1000"}], "responses": {"200": {"description": "{data:{table_version,names_source,names_as_of|null,family,version|null,ecosystem|null,devices[{agent_id,hostname|null,package_name,version,release,ecosystem,kind}],next_cursor|null,count,audit_persisted?}, meta}", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the access-audit row did not persist (the data is still served; the body carries audit_persisted false)"}}}, "400": {"description": "family missing, a parameter repeated with differing values or malformed, unknown family id, non-integer limit, invalid UTF-8, an over-long value, or a refused cursor (a different filter set or table_version, or a cursor issued on live names now that the catalogue is in use: restart the walk) (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Caller lacks Inventory:Read (A4 envelope, written by the gate); while RBAC enforcement is off, service-scoped tokens are refused 403", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Inventory read degraded (message: crypto library read degraded) or crypto read capacity in use (message: crypto read capacity in use; retry): retry_after_ms 5000 either way. An absent inventory store, an unwired fleet-read gate or an unavailable authorization store is a 503 too (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}},)json"
         // /crypto CBOM export (CycloneDX 1.7). Own segment (MSVC C2026 16,380-byte cap).
         R"json(
-    "/crypto/cbom": {"get": {"summary": "CycloneDX 1.7 CBOM of the installed cryptographic libraries", "tags": ["Crypto"], "description": "A CycloneDX 1.7 inventory of the cryptographic LIBRARY packages installed across the fleet (library components only: no algorithms, certificates, keys or protocols yet). It is the inventory served by GET /crypto/libraries, exported as a CycloneDX 1.7 JSON bill of materials (a CBOM) that CBOM/SBOM tooling can ingest. The body is the BOM itself (not wrapped in the data/meta envelope; standard-format export bodies are the accepted raw-success-body class, errors stay the A4 envelope), served as application/vnd.cyclonedx+json; version=1.7 with Cache-Control: no-store, private and Vary: Authorization, Cookie, X-Yuzu-Token. A large fleet can produce a response of about 1 MiB. One component per (family, version, ecosystem) bucket, always type library (an installed package matched by NAME against a curated table), never cryptographic-asset; the export carries NO cryptoProperties, strength, quantum-security-level or good/bad field - interpreting a library or version is the consumer's job (decision #6051). Yuzu-specific facts are properties under the yuzu:crypto: namespace: metadata carries table_version, names_source, names_as_of (absent when names are live), result_truncated, truncated_families, devices_reporting, devices_with_crypto_library the filters applied and scope (fleet, or confined for a management-group or service-scope confined caller); the document carries compositions aggregate incomplete because a name match cannot see statically linked, vendored or OS-bundled copies; each component carries family_id, ecosystem, device_count, family_device_count, versions_truncated and one package_name per matching package. A cut is never silent: a family whose version list was cut (50 buckets per family, a 256 KiB byte budget, the store row cap) sets yuzu:crypto:versions_truncated true on its components and is listed in yuzu:crypto:truncated_families (a family with every bucket dropped has no component and appears only there). An empty components list means no matching package rows in the caller's visible inventory, NOT proof the library is absent. Each export carries a fresh random serialNumber (urn:uuid, version 4) and timestamp. MCP twin export_crypto_cbom. AUTHORIZATION IS require_fleet_read (Inventory:Read), the SOLE gate, with the same confinement, admission bound and 503 behaviour as GET /crypto/libraries: a management-group or service-scope confined caller exports only its visible devices. Every call that serves a read is audited as crypto.cbom.export (set-and-proceed: a lost audit row is flagged by the yuzu:crypto:audit_persisted false metadata property and the Sec-Audit-Failed header, and the BOM is still served).", "parameters": [{"name": "family", "in": "query", "schema": {"type": "string", "enum": ["openssl", "libressl", "boringssl", "gnutls", "nss", "mbedtls", "wolfssl", "libgcrypt", "libsodium", "nettle", "botan", "bouncycastle"]}, "description": "Restrict the BOM to one library family id; empty means every family"}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "maxLength": 1024, "enum": ["", "rpm", "deb", "apk", "pacman", "snap", "flatpak", "windows", "macos", "macos_pkgutil", "brew", "optional_feature", "msi"]}, "description": "Exact package ecosystem filter (the software catalogue's published ecosystems); a present empty value selects rows that carry no ecosystem; omit for any. Not refused: an unpublished value matches no rows"}], "responses": {"200": {"description": "A CycloneDX 1.7 BOM (bomFormat, specVersion 1.7, serialNumber, version 1, metadata{timestamp,tools,properties[]}, components[], compositions[{aggregate:incomplete}])", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the access-audit row did not persist (the BOM is still served; metadata carries yuzu:crypto:audit_persisted false)"}, "Cache-Control": {"schema": {"type": "string", "enum": ["no-store, private"]}}, "Vary": {"schema": {"type": "string", "enum": ["Authorization, Cookie, X-Yuzu-Token"]}}}, "content": {"application/vnd.cyclonedx+json; version=1.7": {"schema": {"type": "object"}}}}, "400": {"description": "Parameter repeated with differing values, unknown family id, invalid UTF-8 or an over-long value (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Caller lacks Inventory:Read (A4 envelope, written by the gate); while RBAC enforcement is off, service-scoped tokens are refused 403", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Inventory read degraded (message: crypto library read degraded) or crypto read capacity in use (message: crypto read capacity in use; retry): retry_after_ms 5000 either way. An absent inventory store, an unwired fleet-read gate, an unavailable authorization store or a failure minting the BOM serial number is a 503 too (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}},)json"
+    "/crypto/cbom": {"get": {"summary": "CycloneDX 1.7 CBOM of the installed cryptographic libraries", "tags": ["Crypto"], "description": "A CycloneDX 1.7 inventory of the cryptographic LIBRARY packages installed across the fleet (library components only: no algorithms, certificates, keys or protocols yet). It is the inventory served by GET /crypto/libraries, exported as a CycloneDX 1.7 JSON bill of materials (a CBOM) that CBOM/SBOM tooling can ingest. The body is the BOM itself (not wrapped in the data/meta envelope; standard-format export bodies are the accepted raw-success-body class, errors stay the A4 envelope), served as application/vnd.cyclonedx+json; version=1.7 with Cache-Control: no-store, private and Vary: Authorization, Cookie, X-Yuzu-Token. A large fleet can produce a response of about 1 MiB. One component per (family, version, ecosystem) bucket, always type library (an installed package matched by NAME against a curated table), never cryptographic-asset; the export carries NO cryptoProperties, strength, quantum-security-level or good/bad field - interpreting a library or version is the consumer's job (decision #6051). Yuzu-specific facts are properties under the yuzu:crypto: namespace: metadata carries table_version, names_source, names_as_of (absent when names are live), result_truncated, truncated_families, devices_reporting, devices_with_crypto_library the filters applied and scope (fleet, or confined for a management-group or service-scope confined caller); the document carries compositions aggregate incomplete because a name match cannot see statically linked, vendored or OS-bundled copies; each component carries family_id, ecosystem, device_count, family_device_count, versions_truncated and one package_name per matching package. A cut is never silent: a family whose version list was cut (50 buckets per family, a 256 KiB byte budget, the store row cap) sets yuzu:crypto:versions_truncated true on its components and is listed in yuzu:crypto:truncated_families (a family with every bucket dropped has no component and appears only there). An empty components list means no matching package rows in the caller's visible inventory, NOT proof the library is absent. Each export carries a fresh random serialNumber (urn:uuid, version 4) and timestamp. MCP twin export_crypto_cbom. AUTHORIZATION IS require_fleet_read (Inventory:Read), the SOLE gate, with the same confinement, admission bound and 503 behaviour as GET /crypto/libraries: a management-group or service-scope confined caller exports only its visible devices. Every call that serves a read is audited as crypto.cbom.export (set-and-proceed: a lost audit row is flagged by the yuzu:crypto:audit_persisted false metadata property and the Sec-Audit-Failed header, and the BOM is still served).", "parameters": [{"name": "family", "in": "query", "schema": {"type": "string", "enum": ["openssl", "libressl", "boringssl", "gnutls", "nss", "mbedtls", "wolfssl", "libgcrypt", "libsodium", "nettle", "botan", "bouncycastle"]}, "description": "Restrict the BOM to one library family id; empty means every family"}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "maxLength": 1024, "enum": ["@@ECOSYSTEM_ENUM_OR_EMPTY@@"]}, "description": "Exact package ecosystem filter (the software catalogue's published ecosystems); a present empty value selects rows that carry no ecosystem; omit for any. Not refused: an unpublished value matches no rows"}], "responses": {"200": {"description": "A CycloneDX 1.7 BOM (bomFormat, specVersion 1.7, serialNumber, version 1, metadata{timestamp,tools,properties[]}, components[], compositions[{aggregate:incomplete}])", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the access-audit row did not persist (the BOM is still served; metadata carries yuzu:crypto:audit_persisted false)"}, "Cache-Control": {"schema": {"type": "string", "enum": ["no-store, private"]}}, "Vary": {"schema": {"type": "string", "enum": ["Authorization, Cookie, X-Yuzu-Token"]}}}, "content": {"application/vnd.cyclonedx+json; version=1.7": {"schema": {"type": "object"}}}}, "400": {"description": "Parameter repeated with differing values, unknown family id, invalid UTF-8 or an over-long value (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Caller lacks Inventory:Read (A4 envelope, written by the gate); while RBAC enforcement is off, service-scoped tokens are refused 403", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Inventory read degraded (message: crypto library read degraded) or crypto read capacity in use (message: crypto read capacity in use; retry): retry_after_ms 5000 either way. An absent inventory store, an unwired fleet-read gate, an unavailable authorization store or a failure minting the BOM serial number is a 503 too (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}},)json"
         // #4029 (api-parity Batch A content/catalog half) — GET /api/v1/instructions*
         // and GET /api/v1/product-packs*. Own segment (MSVC C2026 16,380-byte cap).
         R"json(
@@ -1544,16 +1586,16 @@ const std::string& openapi_spec() {
     },
     "/access-reviews": {
       "get": {"summary": "List every review campaign (SOC 2 CC6.2 cadence evidence)", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Every campaign's metadata (NOT its attestations — use GET /access-reviews/{id} for those), newest-first, capped at the most recent 500. The surface an auditor needs to prove reviews ran on cadence. Self-audited as access_review.list.", "responses": {"200": {"description": "{data:[{campaign_id, title, status, created_by, created_at_ms, closed_by, closed_at_ms, rbac_enforcement}], meta}. rbac_enforcement (enabled|disabled|degraded) is the fleet's RBAC state AT OPEN, frozen with the rest of the campaign; \"\" for a campaign opened before this field existed."}, "403": {"description": "Requires AccessReview:Read"}, "503": {"description": "Access-review store unavailable, or a genuine read failure"}}},
-      "post": {"summary": "Open a review campaign — freeze the current grant population", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. Expands the same cross-principal export into one reviewable row per (principal, role) grant and freezes it into a new campaign — a grant created after this call returns is out of scope for THIS campaign; a grant revoked afterward stays reviewable (frozen, not re-derived). The fleet's current RBAC enforcement state (enabled|disabled|degraded) is stamped onto the campaign at this same moment — see GET /access-reviews/{id}. Self-audited as access_review.campaign_opened.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["title"], "properties": {"title": {"type": "string"}}}}}}, "responses": {"201": {"description": "Created; {campaign_id, grant_count}"}, "400": {"description": "Bad JSON or missing title"}, "403": {"description": "Requires AccessReview:Attest"}, "503": {"description": "Access-review store unavailable, or the grant-population read failed"}}}
+      "post": {"summary": "Open a review campaign — freeze the current grant population", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. Expands the same cross-principal export into one reviewable row per (principal, role) grant and freezes it into a new campaign — a grant created after this call returns is out of scope for THIS campaign; a grant revoked afterward stays reviewable (frozen, not re-derived). The fleet's current RBAC enforcement state (enabled|disabled|degraded) is stamped onto the campaign at this same moment — see GET /access-reviews/{id}. Self-audited as access_review.campaign_opened.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["title"], "properties": {"title": {"type": "string"}}}}}}, "responses": {"201": {"description": "Created; {campaign_id, grant_count}"}, "400": {"description": "Bad JSON or missing title"}, "403": {"description": "Requires AccessReview:Attest, or a cookie session whose Origin/Referer does not name this site (audited csrf.denied; token callers exempt)"}, "415": {"description": "Content-Type is not application/json"}, "503": {"description": "Access-review store unavailable, or the grant-population read failed"}}}
     },
     "/access-reviews/{id}": {
       "get": {"summary": "Full evidentiary state of one review campaign", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Campaign metadata plus every frozen attestation row (pending/attested/flagged_revoke) plus pending_count. Self-audited as access_review.get.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{campaign:{campaign_id, title, status, created_by, created_at_ms, closed_by, closed_at_ms, rbac_enforcement}, attestations[].{principal_type, principal_id, role_name, decision, reviewer, decided_at_ms, justification, grant_snapshot}, pending_count}. campaign.rbac_enforcement (enabled|disabled|degraded) is the fleet's RBAC state frozen AT OPEN; \"\" for a campaign opened before this field existed."}, "403": {"description": "Requires AccessReview:Read"}, "404": {"description": "No campaign with that id"}, "503": {"description": "Access-review store unavailable, or a genuine read failure"}}}
     },
     "/access-reviews/{id}/attestations": {
-      "post": {"summary": "Record a reviewer decision against one frozen grant", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. decision=flagged_revoke records evidence ONLY — it never itself revokes the grant (no RBAC/EnginePrincipal mutation on this path); an operator acts on the flag separately. Self-audited as access_review.attested or access_review.flagged (by decision).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["principal_type", "principal_id", "role_name", "decision"], "properties": {"principal_type": {"type": "string", "enum": ["user", "group", "engine"]}, "principal_id": {"type": "string"}, "role_name": {"type": "string"}, "decision": {"type": "string", "enum": ["attested", "flagged_revoke"]}, "justification": {"type": "string"}}}}}}, "responses": {"200": {"description": "{recorded: true}"}, "400": {"description": "Missing principal_type/principal_id/role_name, or decision not attested|flagged_revoke"}, "403": {"description": "Requires AccessReview:Attest"}, "404": {"description": "No campaign with that id, no such frozen grant in it, or the campaign is already closed"}, "503": {"description": "Access-review store unavailable, or a genuine write failure"}}}
+      "post": {"summary": "Record a reviewer decision against one frozen grant", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. decision=flagged_revoke records evidence ONLY — it never itself revokes the grant (no RBAC/EnginePrincipal mutation on this path); an operator acts on the flag separately. Self-audited as access_review.attested or access_review.flagged (by decision).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["principal_type", "principal_id", "role_name", "decision"], "properties": {"principal_type": {"type": "string", "enum": ["user", "group", "engine"]}, "principal_id": {"type": "string"}, "role_name": {"type": "string"}, "decision": {"type": "string", "enum": ["attested", "flagged_revoke"]}, "justification": {"type": "string"}}}}}}, "responses": {"200": {"description": "{recorded: true}"}, "400": {"description": "Missing principal_type/principal_id/role_name, or decision not attested|flagged_revoke"}, "403": {"description": "Requires AccessReview:Attest, or a cookie session whose Origin/Referer does not name this site (audited csrf.denied; token callers exempt)"}, "404": {"description": "No campaign with that id, no such frozen grant in it, or the campaign is already closed"}, "415": {"description": "Content-Type is not application/json"}, "503": {"description": "Access-review store unavailable, or a genuine write failure"}}}
     },
     "/access-reviews/{id}/close": {
-      "post": {"summary": "Close an open review campaign", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. Does not require every attestation to be decided first — a campaign closed with pending rows still outstanding is itself evidence, not something this route silently forces to completion. Self-audited as access_review.closed.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{closed: true}"}, "403": {"description": "Requires AccessReview:Attest"}, "404": {"description": "No campaign with that id, or already closed"}, "503": {"description": "Access-review store unavailable, or a genuine write failure"}}}
+      "post": {"summary": "Close an open review campaign", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. Does not require every attestation to be decided first — a campaign closed with pending rows still outstanding is itself evidence, not something this route silently forces to completion. Self-audited as access_review.closed.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{closed: true}"}, "403": {"description": "Requires AccessReview:Attest, or a cookie session whose Origin/Referer does not name this site (audited csrf.denied; token callers exempt)"}, "404": {"description": "No campaign with that id, or already closed"}, "503": {"description": "Access-review store unavailable, or a genuine write failure"}}}
     })json"
         // Fresh literal split (MSVC C2026 ~16 KB per-literal cap) — PR1.5c/1.6c
         // (p14) ADR-0031 operator surface: plugin config/secret/kill-switch
@@ -1565,7 +1607,7 @@ const std::string& openapi_spec() {
         // of the HTTP contract despite having no MCP twin (spec item 2/3).
         R"json(,
     "/plugin-config": {
-      "get": {"summary": "List plugin config rows", "tags": ["Plugin Config"], "description": "Requires PluginConfig:Read, routed through the ADR-0017 admit-then-filter list gate. AdmitAll (global grant, or RBAC loaded-and-disabled) serves the list; a management-group-CONFINED grant is denied (403), not silently narrowed — this resource is plugin/key configuration, not agent-scoped data, so there is no principled per-agent filter to apply.", "parameters": [{"name": "plugin", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 64}, "description": "Exact plugin filter; omit for every plugin"}], "responses": {"200": {"description": "{data: [{plugin, key, value, updated_at_ms, updated_by}], meta:{api_version, truncated}}"}, "403": {"description": "Requires PluginConfig:Read (or a management-group-confined grant, refused here by design)"}, "503": {"description": "Plugin config store or authorization store unavailable"}}}
+      "get": {"summary": "List plugin config rows", "tags": ["Plugin Config"], "description": "Requires PluginConfig:Read, via the ADR-0017 list gate (sole check). A global grant, an active JIT elevation, or RBAC loaded-and-disabled serves the list; a management-group-CONFINED grant is denied (403, audited), not narrowed: this is plugin/key configuration, not agent-scoped data. Service-scoped tokens are refused.", "parameters": [{"name": "plugin", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 64}, "description": "Exact plugin filter; omit for every plugin"}], "responses": {"200": {"description": "{data: [{plugin, key, value, updated_at_ms, updated_by}], meta:{api_version, truncated}}"}, "403": {"description": "No global PluginConfig:Read, a management-group-confined grant (refused by design), a service-scoped token, or a closed or degraded authorization store (fails closed)"}, "503": {"description": "Plugin config store unavailable, or (engine principals only) the authorization store"}}}
     },
     "/plugin-config/{plugin}/{key}": {
       "get": {"summary": "Get one plugin config value", "tags": ["Plugin Config"], "description": "Requires PluginConfig:Read.", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "key", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{plugin, key, value, updated_at_ms, updated_by}"}, "400": {"description": "Invalid plugin/key grammar"}, "404": {"description": "No such row"}, "503": {"description": "Plugin config store unavailable"}}},
@@ -1814,7 +1856,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Get OIDC SSO configuration", "tags": ["Settings"], "description": "#4031 REST v1 twin of GET /fragments/settings/directory — despite that legacy path, this is pure OIDC SSO config (Issuer/Client ID/Redirect URI/Admin Group/Skip-TLS-Verify), NOT the AD/Entra directory-sync feature (see /directory/users, /directory/status above); deliberately gated on the freshly-minted OidcConfig securable, never Directory, to avoid colliding with that unrelated capability. Requires OidcConfig:Read — REST-only, no MCP twin, same #520 exception as the enrollment routes above. Administrator-only today, floored in authz_topology_floor.hpp. Audited (settings.oidc.view, non-blocking — IdP/admin-group recon value). The client secret is never disclosed, masked/placeholder-only, only client_secret_configured (bool) is returned.", "responses": {"200": {"description": "{data: {configured, issuer, client_id, client_secret_configured, redirect_uri, admin_group, skip_tls_verify}}"}, "403": {"description": "OidcConfig:Read denied"}, "503": {"description": "Server config not available"}}}
     }
   }
-})json";
+})json");
     return spec;
 }
 
@@ -2631,6 +2673,166 @@ void register_password_routes(HttpRouteSink& sink, PasswordRouteWiring wiring) {
     });
 }
 
+// #6065 PR-Q: the DispatchCaller an already-resolved session dispatches as.
+// Split out of `resolve_secondary_caller` (register_routes) so a route that
+// has resolved its own session (POST /api/v1/quarantine) builds the caller
+// without a third `auth_fn` call. An unwired `exec_visible_fn` yields
+// deny_all() (present-empty), NEVER a defaulted VisibleSet: that default is
+// nullopt, which reads as UNFILTERED.
+[[nodiscard]] yuzu::server::DispatchCaller
+caller_from_session(const auth::Session& sess, const RestApiV1::ExecVisibleFn& exec_visible_fn) {
+    yuzu::server::DispatchCaller caller;
+    caller.principal = sess.username;
+    caller.principal_role = auth::role_to_string(sess.role);
+    // #1398: JIT-elevation-aware, matching every other session-derived caller.
+    caller.principal_is_admin = auth::effective_role(sess) == auth::Role::admin;
+    caller.exec_visible =
+        exec_visible_fn ? exec_visible_fn(sess) : yuzu::server::authz::deny_all();
+    return caller;
+}
+
+// #6065: the shared dispatch chokepoint's pre-check for one quarantine pair,
+// run AFTER the route's scoped gate and BEFORE its attempt audit row and store
+// write (POST create: quarantine.quarantine; DELETE release:
+// quarantine.unquarantine). Returns true when the request was REFUSED: the
+// A4 body, the counter, the `denied` audit row (`audit_action`, no `attempt`
+// row) and the log line are all written, and the caller returns. Fails CLOSED
+// (500 + a `failure` row) when the authorizer is unwired.
+[[nodiscard]] bool refuse_at_dispatch_chokepoint(
+    const httplib::Request& req, httplib::Response& res, const RestApiV1::AuditFn& audit_fn,
+    const RestApiV1::AuthorizeDispatchFn& authorize_dispatch_fn, const auth::Session& session,
+    const RestApiV1::ExecVisibleFn& exec_visible_fn, yuzu::MetricsRegistry* metrics_registry,
+    const std::string& audit_action, const std::string& action, const std::string& agent_id) {
+    if (!authorize_dispatch_fn) {
+        res.status = 500;
+        res.set_content(detail::a4_error(res, "dispatch authorizer not configured"),
+                        "application/json");
+        audit_fn(req, audit_action, "failure", "Security", agent_id,
+                 "dispatch authorizer not configured");
+        return true;
+    }
+    const auto caller = caller_from_session(session, exec_visible_fn);
+    const auto decision = authorize_dispatch_fn(caller, "quarantine", action);
+    if (decision)
+        return false;
+    const auto& denial = decision.error();
+    const auto text = describe_dispatch_denial(denial.reason, "quarantine", action, denial,
+                                               DenialSurface::kRest);
+    res.status = 500; // defensive default; the switch below sets all three classes
+    switch (text.cls) {
+    case DispatchDenialClass::kInvalidParams:
+        res.status = 400;
+        break;
+    case DispatchDenialClass::kPermissionDenied:
+        res.status = 403;
+        break;
+    case DispatchDenialClass::kInternal:
+        res.status = 500;
+        break;
+    }
+    const std::string_view reason_label = detail::to_string(denial.reason);
+    spdlog::warn("dispatch denied: quarantine:{} reason={} securable={} caller={}", action,
+                 reason_label, detail::sanitize_detail_value(denial.securable),
+                 detail::sanitize_detail_value(session.username));
+    if (metrics_registry) {
+        try {
+            metrics_registry
+                ->counter("yuzu_server_dispatch_denied_total",
+                          {{"reason", std::string(reason_label)}})
+                .increment();
+        } catch (...) { // NOLINT(bugprone-empty-catch)
+            // observability must never fail the request
+        }
+    }
+    // No `.permission`: the A4 `permission` field means "granting this alone
+    // would admit the caller", which a chokepoint denial (approval, identity,
+    // kill switch) does not satisfy.
+    res.set_content(detail::a4_error(res, text.message, {.remediation = text.remediation}),
+                    "application/json");
+    audit_fn(req, audit_action, "denied", "Security", agent_id,
+             "reason=" + std::string(reason_label) +
+                 " securable=" + detail::sanitize_detail_value(denial.securable));
+    return true;
+}
+
+// #6065 PR-Q (rest-audit-principal-reresolution): an `AuditFn` that stamps every row from
+// `session`, the one the route resolved, instead of letting `audit_fn` re-resolve one from
+// the request (cookie first, then bearer). Without it a credential that lapsed between the
+// route's own resolution and the audit write, or a second credential on the same request,
+// made an `attempt` or `success` row name a different actor than `quarantined_by`, with no
+// signal and `Sec-Audit-Failed` unset. `session` is copied: the returned callable may
+// outlive the caller's reference.
+[[nodiscard]] RestApiV1::AuditFn audit_as(const RestApiV1::AuditAsSessionFn& writer,
+                                          const auth::Session& session) {
+    // The effective role is read once per binding, here, not re-evaluated at each write: a
+    // JIT elevation that lapses between two rows of one binding cannot make them disagree.
+    std::string role = auth::role_to_string(auth::effective_role(session));
+    return [writer, session, role = std::move(role)](
+               const httplib::Request& req, const std::string& action, const std::string& result,
+               const std::string& target_type, const std::string& target_id,
+               const std::string& detail) {
+        return writer(req, session, role, action, result, target_type, target_id, detail);
+    };
+}
+
+// The first authentication of a quarantine route, plus the audit writer bound to it. Returns
+// the session, or nullopt once the response is written (401 from `auth_fn`, or the 500 below
+// when the writer is unwired, which is a misconfiguration: the request never falls back to the
+// re-resolving `audit_fn`, and the one `failure` row that records it is the only row written
+// through it).
+[[nodiscard]] std::optional<auth::Session>
+authenticate_for_quarantine_audit(const httplib::Request& req, httplib::Response& res,
+                                  const RestApiV1::AuthFn& auth_fn,
+                                  const RestApiV1::AuditFn& audit_fn,
+                                  const RestApiV1::AuditAsSessionFn& audit_as_session,
+                                  const std::string& audit_action) {
+    // CDX-P1-02: authenticate first (401 before any store/body work).
+    auto session = auth_fn(req, res);
+    if (!session)
+        return std::nullopt;
+    if (!audit_as_session) {
+        res.status = 500;
+        res.set_content(detail::a4_error(res, "audit identity writer not configured"),
+                        "application/json");
+        spdlog::error("{}: audit identity writer not configured; refusing the request",
+                      audit_action);
+        // The one row on these routes written through the re-resolving `audit_fn`: no
+        // session writer exists to stamp it. An empty `audit_fn` is the audit-off mode.
+        if (audit_fn)
+            audit_fn(req, audit_action, "failure", "Security", "",
+                     "audit identity writer not configured");
+        return std::nullopt;
+    }
+    return session;
+}
+
+// The re-resolution a quarantine route does after its scoped gate must name the SAME
+// principal as the first one: a request whose credentials resolve to two different
+// principals was authorized by one and would be attributed to, and checked at the
+// dispatch chokepoint as, the other. Writes the 401 and a `denied` row (as the first
+// principal) and returns false on a mismatch. The scoped gate resolves the session
+// itself and is not bound here.
+[[nodiscard]] bool same_principal_or_refuse(httplib::Response& res, const RestApiV1::AuditFn& audit,
+                                            const httplib::Request& req,
+                                            const auth::Session& first, const auth::Session& again,
+                                            const std::string& audit_action,
+                                            const std::string& agent_id) {
+    if (again.username == first.username)
+        return true;
+    res.status = 401;
+    res.set_content(detail::a4_error(res, "the authenticated principal changed during the request",
+                                     {.remediation = "retry the request"}),
+                    "application/json");
+    // `audit_token` first (control bytes, space, `=` and `,` become `_`, so a username cannot
+    // forge a key=value token), then `sanitize_detail_value` for its length cap.
+    const std::string second = detail::sanitize_detail_value(audit_token(again.username));
+    spdlog::warn("{}: the authenticated principal changed during the request first={} second={}",
+                 audit_action, detail::sanitize_detail_value(audit_token(first.username)), second);
+    audit(req, audit_action, "denied", "Security", agent_id,
+          "authenticated principal changed during the request now=" + second);
+    return false;
+}
+
 } // namespace
 
 // Production overload — wraps httplib::Server in an HttplibRouteSink and
@@ -2659,7 +2861,8 @@ void RestApiV1::register_routes(
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
     std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api,
     std::shared_ptr<const DexApi> dex_api, std::shared_ptr<const DexPerfApi> dex_perf_api,
-    std::shared_ptr<const GuardianApi> guardian_api, TierPolicyFn tier_policy_fn) {
+    std::shared_ptr<const GuardianApi> guardian_api, TierPolicyFn tier_policy_fn,
+    AuthorizeDispatchFn authorize_dispatch_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -2677,7 +2880,7 @@ void RestApiV1::register_routes(
                     std::move(response_visible_set_fn),
                     std::move(verify_api), std::move(device_api),
                     std::move(dex_api), std::move(dex_perf_api), std::move(guardian_api),
-                    std::move(tier_policy_fn));
+                    std::move(tier_policy_fn), std::move(authorize_dispatch_fn));
 }
 
 void RestApiV1::register_routes(
@@ -2703,7 +2906,8 @@ void RestApiV1::register_routes(
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
     std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api,
     std::shared_ptr<const DexApi> dex_api, std::shared_ptr<const DexPerfApi> dex_perf_api,
-    std::shared_ptr<const GuardianApi> guardian_api, TierPolicyFn tier_policy_fn) {
+    std::shared_ptr<const GuardianApi> guardian_api, TierPolicyFn tier_policy_fn,
+    AuthorizeDispatchFn authorize_dispatch_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -2878,16 +3082,12 @@ void RestApiV1::register_routes(
             if (!sess)
                 return std::nullopt;
         }
+        if (sess)
+            return caller_from_session(*sess, exec_visible_fn);
+        // No authenticator wired: keep the EMPTY principal (AnonymousOperator)
+        // paired with deny_all(), as documented above.
         yuzu::server::DispatchCaller caller;
-        if (sess) {
-            caller.principal = sess->username;
-            caller.principal_role = auth::role_to_string(sess->role);
-            // #1398: JIT-elevation-aware, matching every other session-derived
-            // caller.
-            caller.principal_is_admin = auth::effective_role(*sess) == auth::Role::admin;
-        }
-        caller.exec_visible = (exec_visible_fn && sess) ? exec_visible_fn(*sess)
-                                                        : yuzu::server::authz::deny_all();
+        caller.exec_visible = yuzu::server::authz::deny_all();
         return caller;
     };
 
@@ -6150,36 +6350,25 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            JArr arr;
-            int64_t visible = 0;
-            for (const auto& r : visible_set.records) {
-                arr.add(JObj()
-                            .add("agent_id", r.agent_id)
-                            .add("status", r.status)
-                            .add("quarantined_by", r.quarantined_by)
-                            .add("quarantined_at", r.quarantined_at)
-                            .add("whitelist", r.whitelist)
-                            .add("reason", r.reason)
-                            // #3425: endpoint-containment confirmation state
-                            // (schema v2) — 0 = never, matching
-                            // quarantined_at's own never-happened shape.
-                            // last_applied_at: a system re-dispatch of the
-                            // stored whitelist was accepted (agents_reached
-                            // > 0), NOT proof of containment.
-                            // last_confirmed_at: a follow-up quarantine.status
-                            // read reported state|active.
-                            .add("last_applied_at", r.last_applied_at)
-                            .add("last_confirmed_at", r.last_confirmed_at));
-                ++visible;
-            }
-            res.set_content(list_json(arr.str(), visible), "application/json");
+            // One builder shared with the MCP twin (quarantine_read_model.hpp): the eight
+            // keys in wire order, byte-pinned by test_rest_quarantine_routes.cpp.
+            const auto data = quarantine_dump(quarantine_list_data_json(visible_set.records));
+            res.set_content(list_json(data, static_cast<int64_t>(visible_set.records.size())),
+                            "application/json");
         });
 
-    sink.Post("/api/v1/quarantine", [auth_fn, scoped_perm_fn, audit_fn, quarantine_store](
+    sink.Post("/api/v1/quarantine", [auth_fn, scoped_perm_fn, audit_fn, quarantine_store,
+                                     authorize_dispatch_fn, exec_visible_fn, metrics_registry,
+                                     audit_as_session = audit_as_session_fn_](
                                         const httplib::Request& req, httplib::Response& res) {
-        // CDX-P1-02: authenticate first (401 before any store/body work).
-        if (!auth_fn(req, res))
+        // CDX-P1-02: authenticate first (401 before any store/body work). Every row this
+        // handler writes after this point is stamped from the session it resolves here
+        // (rebound to the re-resolved one below, which must name the same principal).
+        const auto first = authenticate_for_quarantine_audit(req, res, auth_fn, audit_fn,
+                                                             audit_as_session, "quarantine.enable");
+        if (!first)
             return;
+        RestApiV1::AuditFn audit = audit_as(audit_as_session, *first);
         if (!quarantine_store || !quarantine_store->is_open()) {
             res.status = 503;
             // gov-fix(consistency-auditor, Gate 8): matches this file's own
@@ -6193,8 +6382,8 @@ void RestApiV1::register_routes(
             // known at this point (the body hasn't been parsed), so this is
             // the one quarantine failure path that cannot carry a resource
             // id — audited anyway rather than silently skipped.
-            audit_fn(req, "quarantine.enable", "failure", "Security", "",
-                     "service unavailable — store not open");
+            audit(req, "quarantine.enable", "failure", "Security", "",
+                  "service unavailable — store not open");
             return;
         }
 
@@ -6209,19 +6398,23 @@ void RestApiV1::register_routes(
         auto reason = body.value("reason", "");
         auto whitelist = body.value("whitelist", "");
 
-        // CDX-P1-02: the SOLE per-target authorization, applied once agent_id
+        // CDX-P1-02: the per-target authorization, applied once agent_id
         // is known — a management-group-confined operator with Security:Execute
         // ONLY through a group was previously 403'd by the flat global gate
         // while the MCP quarantine_device twin (mcp_server.cpp) admitted the
         // identical caller via scoped_perm_fn. Fail CLOSED if unwired (never
         // widen to a global gate), matching set_tag/delete_tag above and the
-        // MCP twin.
+        // MCP twin. #6065 PR-Q: this is no longer the SOLE gate. The scoped
+        // gate stays the per-target dimension; the dispatch-chokepoint
+        // pre-check below is the approval/global dimension (an admin caller
+        // or an approved request, and a global grant). MCP
+        // quarantine_device already runs both.
         if (!scoped_perm_fn) {
             res.status = 500;
             res.set_content(detail::a4_error(res, "scope gate not configured"),
                             "application/json");
-            audit_fn(req, "quarantine.enable", "failure", "Security", agent_id,
-                     "scope gate not configured");
+            audit(req, "quarantine.enable", "failure", "Security", agent_id,
+                  "scope gate not configured");
             return;
         }
         if (!scoped_perm_fn(req, res, "Security", "Execute", agent_id))
@@ -6246,19 +6439,38 @@ void RestApiV1::register_routes(
                                                  "or a token contains a character outside "
                                                  "[0-9A-Fa-f.:]"),
                             "application/json");
-            audit_fn(req, "quarantine.enable", "failure", "Security", agent_id,
-                     "whitelist rejected by server-edge validation");
+            audit(req, "quarantine.enable", "failure", "Security", agent_id,
+                  "whitelist rejected by server-edge validation");
             return;
         }
 
+        // #6065 PR-Q: re-resolve the session. A session that expired since the
+        // gate above ends the request at the 401 `auth_fn` just wrote; it never
+        // falls back to a record attributed to "system".
         auto session = auth_fn(req, res);
-        std::string by = session ? session->username : "system";
+        if (!session)
+            return;
+        if (!same_principal_or_refuse(res, audit, req, *first, *session, "quarantine.enable",
+                                      agent_id))
+            return;
+        audit = audit_as(audit_as_session, *session);
+        const std::string by = session->username;
+
+        // #6065 PR-Q: the shared dispatch chokepoint's pre-check for
+        // ("quarantine","quarantine"), BEFORE the attempt audit and the store
+        // write: a denial creates no row (not even an attempt row). A copy of the
+        // same closure MCP's pre-dispatch dry run holds (server.cpp). Fails CLOSED
+        // when unwired, like the scoped gate above.
+        if (refuse_at_dispatch_chokepoint(req, res, audit, authorize_dispatch_fn, *session,
+                                          exec_visible_fn, metrics_registry, "quarantine.enable",
+                                          "quarantine", agent_id))
+            return;
 
         // ADR-0033 §9: a mutating capability fails closed on audit failure (no audit row,
         // no mutation). The attempt row is written AFTER authorisation and validation and
         // BEFORE the store write, so containment is never changed without a record; the
         // outcome row below says whether it applied (`success` keeps meaning "applied").
-        if (!detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.enable", "attempt",
+        if (!detail::emit_behavioral_audit(audit, req, res, "quarantine.enable", "attempt",
                                            "Security", agent_id, reason)) {
             res.status = 503;
             res.set_content(
@@ -6287,13 +6499,13 @@ void RestApiV1::register_routes(
             // already audits this branch (mcp_audit("failure", ...)) — REST
             // was silently skipping it, the only quarantine failure path with
             // no audit row.
-            (void)detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.enable", "failure",
+            (void)detail::emit_behavioral_audit(audit, req, res, "quarantine.enable", "failure",
                                                 "Security", agent_id, result.error());
             return;
         }
         // The change is made; a lost outcome row is signalled by Sec-Audit-Failed, and the
         // attempt row already records who asked.
-        (void)detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.enable", "success",
+        (void)detail::emit_behavioral_audit(audit, req, res, "quarantine.enable", "success",
                                             "Security", agent_id, reason);
         res.status = 201;
         res.set_content(ok_json(JObj().add("quarantined", true).str()), "application/json");
@@ -6301,11 +6513,17 @@ void RestApiV1::register_routes(
 
     sink.Delete(
         R"(/api/v1/quarantine/(.+))",
-        [auth_fn, scoped_perm_fn, audit_fn, quarantine_store](const httplib::Request& req,
-                                                              httplib::Response& res) {
-            // CDX-P1-02: authenticate first (401 before any store work).
-            if (!auth_fn(req, res))
+        [auth_fn, scoped_perm_fn, audit_fn, quarantine_store, authorize_dispatch_fn,
+         exec_visible_fn, metrics_registry,
+         audit_as_session = audit_as_session_fn_](const httplib::Request& req,
+                                                  httplib::Response& res) {
+            // CDX-P1-02: authenticate first (401 before any store work). Every row below is
+            // stamped from the session resolved here; see the POST route above.
+            const auto first = authenticate_for_quarantine_audit(
+                req, res, auth_fn, audit_fn, audit_as_session, "quarantine.disable");
+            if (!first)
                 return;
+            RestApiV1::AuditFn audit = audit_as(audit_as_session, *first);
             // Extracted before the is_open() check below (pure regex-match
             // read, no failure mode) so a store-outage 503 can still carry
             // the target agent_id in its audit row (gov-fix compliance-officer
@@ -6318,27 +6536,43 @@ void RestApiV1::register_routes(
                 res.set_content(
                     detail::a4_error(res, "service unavailable", {.retry_after_ms = 5000}),
                     "application/json");
-                audit_fn(req, "quarantine.disable", "failure", "Security", agent_id,
-                         "service unavailable — store not open");
+                audit(req, "quarantine.disable", "failure", "Security", agent_id,
+                      "service unavailable — store not open");
                 return;
             }
 
-            // CDX-P1-02: same sole per-target gate as POST above, mirroring
-            // set_tag/delete_tag and the MCP quarantine_device twin — fail
-            // CLOSED if unwired.
+            // CDX-P1-02: the per-target scoped gate first, as POST above (mirroring
+            // set_tag/delete_tag and the MCP quarantine_device twin) — fail CLOSED if
+            // unwired. The #6065 dispatch pre-check follows it, below.
             if (!scoped_perm_fn) {
                 res.status = 500;
                 res.set_content(detail::a4_error(res, "scope gate not configured"),
                                 "application/json");
-                audit_fn(req, "quarantine.disable", "failure", "Security", agent_id,
-                         "scope gate not configured");
+                audit(req, "quarantine.disable", "failure", "Security", agent_id,
+                      "scope gate not configured");
                 return;
             }
             if (!scoped_perm_fn(req, res, "Security", "Execute", agent_id))
                 return;
 
+            // #6065: release is the `unquarantine` pair of the same chokepoint, so
+            // a caller who cannot create a record cannot end one either (it was the
+            // scoped gate only before). Re-resolve the session as POST does: one
+            // that expired since the gate above ends at the 401 `auth_fn` wrote.
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (!same_principal_or_refuse(res, audit, req, *first, *session, "quarantine.disable",
+                                          agent_id))
+                return;
+            audit = audit_as(audit_as_session, *session);
+            if (refuse_at_dispatch_chokepoint(req, res, audit, authorize_dispatch_fn, *session,
+                                              exec_visible_fn, metrics_registry,
+                                              "quarantine.disable", "unquarantine", agent_id))
+                return;
+
             // ADR-0033 §9: attempt row before the store write, fail closed (see POST above).
-            if (!detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.disable", "attempt",
+            if (!detail::emit_behavioral_audit(audit, req, res, "quarantine.disable", "attempt",
                                                "Security", agent_id, "")) {
                 res.status = 503;
                 res.set_content(
@@ -6360,11 +6594,11 @@ void RestApiV1::register_routes(
                                                  db_error ? detail::A4ErrorOpts{.retry_after_ms = 5000}
                                                            : detail::A4ErrorOpts{}),
                                 "application/json");
-                (void)detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.disable",
+                (void)detail::emit_behavioral_audit(audit, req, res, "quarantine.disable",
                                                     "failure", "Security", agent_id, result.error());
                 return;
             }
-            (void)detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.disable", "success",
+            (void)detail::emit_behavioral_audit(audit, req, res, "quarantine.disable", "success",
                                                 "Security", agent_id, "");
             res.set_content(ok_json(JObj().add("released", true).str()), "application/json");
         });
@@ -8905,6 +9139,36 @@ void RestApiV1::register_routes(
             res.set_content(ok_json(arr.str()), "application/json");
         });
 
+    // Browser-write gate for the three cookie-callable access-review mutations (open, attest,
+    // close). The Audit and reviews page and the Settings panel call them with a session cookie,
+    // an ambient credential a cross-site page can ride, so a cookie session must name this site in
+    // Origin/Referer (403, `csrf.denied` row) and a JSON body must say so (415). A token caller
+    // is not riding a cookie and is exempt from the same-site rule. Runs after the permission
+    // gate, the session lookup and the engine refusal, before the body is read. Returns true when
+    // the response is already written.
+    auto ar_refuse_browser_write =
+        [audit_fn, trusted = csrf_trusted_origins_](
+            const httplib::Request& req, httplib::Response& res, const auth::Session& session,
+            const char* endpoint, const char* action, bool json_body) -> bool {
+        if (browser_write_is_cross_site(session.auth_source, req.get_header_value("Host"),
+                                        req.get_header_value("Origin"),
+                                        req.get_header_value("Referer"), trusted)) {
+            (void)audit_fn(req, "csrf.denied", "denied", "Endpoint", endpoint,
+                           "cross-site or header-less browser write refused");
+            res.status = 403;
+            res.set_content(detail::a4_error(res, "cross-site request refused"), "application/json");
+            return true;
+        }
+        if (json_body && media_type_of(req.get_header_value("Content-Type")) != "application/json") {
+            (void)audit_fn(req, action, "denied", "AccessReview", "", "content_type_not_json");
+            res.status = 415;
+            res.set_content(detail::a4_error(res, "Content-Type must be application/json"),
+                            "application/json");
+            return true;
+        }
+        return false;
+    };
+
     // POST /api/v1/access-reviews {title} — freeze the CURRENT grant
     // population into a new review campaign (R3, access_review_store.hpp):
     // every grant that exists right now gets one reviewable row; a grant
@@ -8912,7 +9176,8 @@ void RestApiV1::register_routes(
     sink.Post(
         "/api/v1/access-reviews",
         [perm_fn, auth_fn, audit_fn, access_review_store, auth_db, rbac_store, eps, token_store,
-         directory_sync, metrics_registry](const httplib::Request& req, httplib::Response& res) {
+         directory_sync, metrics_registry,
+         ar_refuse_browser_write](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "AccessReview", "Attest"))
                 return;
             if (!access_review_store || !access_review_store->is_open()) {
@@ -8926,6 +9191,9 @@ void RestApiV1::register_routes(
                 return;
             if (deny_engine_session(*session, req, res, audit_fn, "access_review.campaign_opened",
                                     "AccessReview"))
+                return;
+            if (ar_refuse_browser_write(req, res, *session, "/api/v1/access-reviews",
+                                        "access_review.campaign_opened", true))
                 return;
 
             auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -9096,8 +9364,8 @@ void RestApiV1::register_routes(
     // reviewer decision against a frozen grant.
     sink.Post(
         R"(/api/v1/access-reviews/([^/]+)/attestations)",
-        [perm_fn, auth_fn, audit_fn, access_review_store, metrics_registry](
-            const httplib::Request& req, httplib::Response& res) {
+        [perm_fn, auth_fn, audit_fn, access_review_store, metrics_registry,
+         ar_refuse_browser_write](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "AccessReview", "Attest"))
                 return;
             if (!access_review_store || !access_review_store->is_open()) {
@@ -9112,6 +9380,10 @@ void RestApiV1::register_routes(
             auto campaign_id = req.matches[1].str();
             if (deny_engine_session(*session, req, res, audit_fn, "access_review.attested",
                                     "AccessReview"))
+                return;
+            if (ar_refuse_browser_write(req, res, *session,
+                                        "/api/v1/access-reviews/{id}/attestations",
+                                        "access_review.attested", true))
                 return;
 
             auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -9197,8 +9469,8 @@ void RestApiV1::register_routes(
     // something this route silently forces to completion.
     sink.Post(
         R"(/api/v1/access-reviews/([^/]+)/close)",
-        [perm_fn, auth_fn, audit_fn, access_review_store](const httplib::Request& req,
-                                                           httplib::Response& res) {
+        [perm_fn, auth_fn, audit_fn, access_review_store, ar_refuse_browser_write](
+            const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "AccessReview", "Attest"))
                 return;
             if (!access_review_store || !access_review_store->is_open()) {
@@ -9213,6 +9485,9 @@ void RestApiV1::register_routes(
             auto campaign_id = req.matches[1].str();
             if (deny_engine_session(*session, req, res, audit_fn, "access_review.closed",
                                     "AccessReview"))
+                return;
+            if (ar_refuse_browser_write(req, res, *session, "/api/v1/access-reviews/{id}/close",
+                                        "access_review.closed", false))
                 return;
 
             auto close_res = access_review_store->close_campaign(campaign_id, session->username);

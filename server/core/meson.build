@@ -623,6 +623,8 @@ yuzu_server_core_lib = static_library(
     'src/access_audit_render.cpp', # Audit and reviews page: pure renderers (log, sample, retention)
     'src/access_audit_ui.cpp', # Audit and reviews page: template
     'src/access_audit_routes.cpp', # Audit and reviews page: /access/audit + fragments + glue
+    'src/access_reviews_render.cpp', # Audit and reviews page: Access reviews renderers
+    'src/access_reviews_routes.cpp', # Audit and reviews page: Access reviews fragments
     'src/login_ui.cpp',
     'src/settings_ui.cpp',
     'src/settings_security_ui.cpp',  # Security and sign-in page (System group)
@@ -756,6 +758,9 @@ yuzu_server_core_lib = static_library(
     'src/mcp_session.cpp',
     'src/mcp_stream.cpp',
     'src/mcp_stream_bridge.cpp',
+    'src/mcp_tools_discovery.cpp',
+    'src/mcp_tools_hardware.cpp',
+    'src/mcp_tools_containment.cpp',
     'src/mcp_transport.cpp',
     'src/rest_api_v1.cpp',
     'src/compliance_model.cpp',
@@ -807,6 +812,8 @@ yuzu_server_core_lib = static_library(
     'src/crypto_api.cpp',     # /crypto slice 1: store-backed CryptoApi seam impl
     'src/crypto_routes.cpp',  # /crypto slice 1: page + fragments + REST v1 route owner
     'src/crypto_ui.cpp',      # /crypto slice 1: pure HTML renderers
+    'src/crypto_widget_catalogue.cpp', # /crypto widgets: pure catalogue + D13 windows + JSON shapers
+    'src/crypto_dashboard_layout_store.cpp', # /crypto widgets: per-operator layout (born-on-PG)
     'src/preflight_routes.cpp',
     'src/preflight_ui.cpp',
     'src/preflight_eval.cpp',
@@ -934,7 +941,14 @@ yuzu_server_core_lib = static_library(
     'src/crl_publisher.cpp',
     'src/default_certs.cpp',
     'src/ca_routes.cpp',
+    'src/ca_panel_render.cpp',
     'src/kek_routes.cpp',
+    'src/settings_plugins_routes.cpp',
+    'src/settings_plugins_ui.cpp',
+    'src/plugin_page_model.cpp',
+    'src/kek_panel_render.cpp',
+    'src/pki_routes.cpp',
+    'src/settings_pki_ui.cpp',
     'src/security_headers.cpp',
   )],
   include_directories: ['include', '../../common/include'],

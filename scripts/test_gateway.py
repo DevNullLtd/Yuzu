@@ -4,7 +4,7 @@
 Used by Meson test() because Ninja quotes compound shell commands
 as a single argument, which breaks cmd.exe on Windows.
 
-Three responsibilities beyond the bare rebar3 invocation:
+Four responsibilities beyond the bare rebar3 invocation:
   1. Retry the rebar3 test command up to 4 times when hex.pm fetch
      fails. hex.pm is intermittently flaky and an HTTP 502 / TCP RST
      on a single fetch attempt would otherwise fail the test even
@@ -32,6 +32,10 @@ Three responsibilities beyond the bare rebar3 invocation:
      plus a deadline that dumps the process tree and force-kills it
      means a future hang is diagnosed HERE, in this log, instead of
      reported as a featureless timeout by the outer harness.
+  4. A run-private epmd (#4853, scripts/gateway_epmd.py): the run gets its
+     own ERL_EPMD_PORT unless the environment already sets one, so a
+     concurrent job's end-of-job orphan cleanup on a shared box cannot kill
+     the epmd the multinode eunit modules' `peer` nodes depend on.
 
 A previous iteration (b33f1df) added an explicit pre-fetch step
 running `rebar3 as test compile --deps_only` ahead of the actual
@@ -61,6 +65,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gateway_epmd  # noqa: E402
 from erlang_toolchain import base_env, kill_tree, rebar3_prefix, windows_stdio_isolation  # noqa: E402
 
 # Ensure locally-installed OTP 28 and rebar3 are on PATH (Meson inherits
@@ -140,6 +145,11 @@ elif suite == "eunit":
 # path) so the test path's cold _build can't hit the gpb-plugin \\tmp\
 # robocopy hang either. See scripts/erlang_toolchain.py.
 env = base_env()
+# A run-private epmd (#4853): the multinode eunit modules boot distribution and
+# `peer` nodes, and on a shared self-hosted box another job's end-of-job orphan
+# cleanup kills the box-wide epmd under them (a `peer:start_link` timeout in a
+# test the job never touched). See scripts/gateway_epmd.py.
+gateway_epmd.activate(env)
 if suite == "ct":
     env["YUZU_PERF_AGENTS"] = "10"
     env["YUZU_PERF_HEARTBEATS"] = "100"

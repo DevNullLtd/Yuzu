@@ -1778,6 +1778,14 @@ std::string SettingsRoutes::render_updates_fragment() {
             auto size_str = pkg.file_size < 1024 * 1024
                                 ? std::to_string(pkg.file_size / 1024) + " KB"
                                 : std::to_string(pkg.file_size / (1024 * 1024)) + " MB";
+            // The same decision the Signed column makes, read once and handed to the rollout
+            // confirm (data-signed) so the confirm cannot disagree with the pill.
+            const bool sig_served =
+                signature_sidecar_outcome(update_registry_->signature_path(pkg)) ==
+                SidecarOutcome::kServed;
+            const bool sig_covers =
+                sig_served && signature_sidecar_covers_binary(update_registry_->binary_path(pkg),
+                                                              update_registry_->signature_path(pkg));
 
             // platform/arch/version are operator-uploaded path segments: encode
             // each, and offer no rollout/delete URL when one is empty or only
@@ -1790,21 +1798,27 @@ std::string SettingsRoutes::render_updates_fragment() {
                 const std::string pkg_path = url_path_segment(pkg.platform) + "/" +
                                              url_path_segment(pkg.arch) + "/" +
                                              url_path_segment(pkg.version);
+                // A whole-number text input (digits 0 to 100 only: a number input also
+                // accepts 1e2, which stoi reads as 1), required and prefilled with the row's
+                // current value: a blank or non-numeric rollout_pct is read as 100 by the
+                // handler, so an empty box must never be submittable. data-* feed the page's
+                // confirm listener.
                 rollout_cell =
                     "<form style=\"display:flex;align-items:center;gap:0.4rem\" "
                     "hx-post=\"/api/settings/updates/" +
                     pkg_path +
                     "/rollout\" "
-                    "hx-target=\"#updates-section\" hx-swap=\"innerHTML\">"
-                    "<input type=\"range\" name=\"rollout_pct\" min=\"0\" max=\"100\" "
-                    "value=\"" +
+                    "hx-target=\"#updates-section\" hx-swap=\"innerHTML\" "
+                    "data-confirm=\"rollout\" data-signed=\"" +
+                    std::string(sig_covers ? "yes" : "no") + "\" data-mandatory=\"" +
+                    std::string(pkg.mandatory ? "yes" : "no") +
+                    "\">"
+                    "<input type=\"text\" inputmode=\"numeric\" name=\"rollout_pct\" "
+                    "pattern=\"(100|[1-9]?[0-9])\" required value=\"" +
                     std::to_string(pkg.rollout_pct) +
-                    "\" "
-                    "style=\"width:60px\" "
-                    "onchange=\"this.nextElementSibling.textContent=this.value+'%'\">"
-                    "<span style=\"width:2.5em\">" +
-                    std::to_string(pkg.rollout_pct) +
-                    "%</span>"
+                    "\" style=\"width:72px\" "
+                    "aria-label=\"Offered to this percentage of devices\">"
+                    "<span class=\"hint\">% of devices</span>"
                     "<button class=\"btn btn-secondary\" type=\"submit\">Set</button>"
                     "</form>";
                 delete_cell = "<button class=\"btn btn-danger\" "
@@ -1822,7 +1836,11 @@ std::string SettingsRoutes::render_updates_fragment() {
                     "<span class=\"muted\">identifier not supported for actions</span>";
             }
 
-            html += "<tr>"
+            // data-* feed the page's confirm listener (replace detection on upload, from -> to
+            // on rollout); nothing is read from them on /settings, which has no listener.
+            html += "<tr data-platform=\"" + html_escape(pkg.platform) + "\" data-arch=\"" +
+                    html_escape(pkg.arch) + "\" data-version=\"" + html_escape(pkg.version) +
+                    "\" data-rollout=\"" + std::to_string(pkg.rollout_pct) + "\">"
                     "<td>" +
                     html_escape(pkg.platform) +
                     "</td>"
@@ -1846,17 +1864,13 @@ std::string SettingsRoutes::render_updates_fragment() {
                     // disk but served as UNSIGNED, so exists() alone would tell
                     // the operator "signed" while every agent is told otherwise —
                     // the one thing this column exists to prevent.
-                    (update_registry_ &&
-                     signature_sidecar_outcome(update_registry_->signature_path(pkg)) ==
-                         SidecarOutcome::kServed
+                    (sig_served
                          // A served signature that CANNOT cover the binary beside
                          // it gets its own state. Reporting it as "signed" is the
                          // worst of the three: the docs nominate this column as
                          // the confirmation check, so the operator reads success
                          // while every anchored agent refuses the package.
-                         ? (signature_sidecar_covers_binary(
-                                update_registry_->binary_path(pkg),
-                                update_registry_->signature_path(pkg))
+                         ? (sig_covers
                                 ? std::string("<span class=\"role-badge role-ok\" "
                                               "title=\"A detached signature is stored "
                                               "for this package\">signed</span>")
@@ -1902,6 +1916,7 @@ std::string SettingsRoutes::render_updates_fragment() {
     html += "<form class=\"add-user-form\" hx-post=\"/api/settings/updates/upload\" "
             "hx-target=\"#updates-section\" hx-swap=\"innerHTML\" "
             "hx-encoding=\"multipart/form-data\" "
+            "data-confirm=\"ota-upload\" "
             "style=\"width:100%\">"
             "<div class=\"mini-field\">"
             "<label>Platform</label>"
@@ -1918,7 +1933,10 @@ std::string SettingsRoutes::render_updates_fragment() {
             "</select></div>"
             "<div class=\"mini-field\">"
             "<label>Binary</label>"
-            "<input type=\"file\" name=\"file\" required></div>"
+            "<input type=\"file\" name=\"file\" required>"
+            "<span class=\"hint\">The file name becomes the version. A name ending in .sig is "
+            "not accepted. The name identifies the file across all platforms and "
+            "architectures.</span></div>"
             // Optional detached CMS signature (#416/#3807). Without this input
             // the documented signing workflow is unreachable from the UI and an
             // operator would ship an unsigned package believing it signed.
@@ -1929,10 +1947,14 @@ std::string SettingsRoutes::render_updates_fragment() {
             // No accept filter: ".sig" is only convention — ".p7s" and ".pem" are
             // common names for the same detached CMS blob, and filtering the picker
             // to one suffix hides the operator's actual file.
-            "<input type=\"file\" name=\"signature\"></div>"
+            "<input type=\"file\" name=\"signature\">"
+            "<span class=\"hint\">PEM CMS block, up to 64 KB.</span></div>"
             "<div class=\"mini-field\">"
             "<label>Rollout %</label>"
-            "<input type=\"text\" name=\"rollout_pct\" value=\"100\" style=\"width:64px\"></div>"
+            "<input type=\"text\" inputmode=\"numeric\" name=\"rollout_pct\" "
+            "pattern=\"(100|[1-9]?[0-9])\" required value=\"100\" style=\"width:72px\">"
+            "<span class=\"hint\">0 to 100. Offered to this share of devices, chosen by device "
+            "identity.</span></div>"
             "<div class=\"mini-field\" style=\"display:flex;align-items:center;gap:0.3rem\">"
             "<label>Mandatory</label>"
             "<input type=\"checkbox\" name=\"mandatory\" value=\"true\"></div>"
@@ -2352,8 +2374,6 @@ std::optional<std::expected<TrustBundleStats, std::string>> read_on_disk_bundle(
 } // namespace
 
 std::string SettingsRoutes::render_plugin_signing_fragment() {
-    std::string html;
-
     // #4028 — shared builder (also feeds the hardened
     // GET /api/v2/agent/plugin-policy, plugin-signing's only REST twin —
     // #4144 moved it from /v1/, now deprecated);
@@ -2390,6 +2410,16 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
             required = rc->has_value() && rc->value().value == "true";
         }
     }
+    return render_plugin_signing_panel(bundle, required, required_status_unknown);
+}
+
+// Pure renderer: the three inputs are everything the panel depends on, so a unit test can
+// drive every state (bundle present or absent, required on or off, 17+ subjects) without
+// touching the real certs directory.
+std::string render_plugin_signing_panel(
+    const std::optional<std::expected<plugin_signing::TrustBundleStats, std::string>>& bundle,
+    bool required, bool required_status_unknown) {
+    std::string html;
     const auto v = settings_model::build_plugin_signing_settings(required, bundle);
     const bool enabled = v.at("enabled").get<bool>();
 
@@ -2432,8 +2462,17 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
                 v.at("sha256").get<std::string>() + "</code></div>";
         const auto subjects = v.at("subjects").get<std::vector<std::string>>();
         if (!subjects.empty()) {
+            // The helper lists at most 16 subjects but counts every certificate: say so
+            // rather than let "40 certificate(s)" sit beside 16 names.
+            const auto n_certs = static_cast<std::size_t>(v.at("cert_count").get<int>());
+            const std::string subjects_label =
+                n_certs > subjects.size()
+                    ? "Subjects (first " + std::to_string(subjects.size()) + " of " +
+                          std::to_string(n_certs) + ")"
+                    : std::string("Subjects");
             html += "<div class=\"form-row\" style=\"align-items:flex-start\">"
-                    "<label>Subjects</label>"
+                    "<label>" +
+                    subjects_label + "</label>"
                     "<div style=\"flex:1;min-width:0\">";
             for (const auto& s : subjects) {
                 html += "<div class=\"mono\" "
@@ -2468,9 +2507,18 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
     // Upload form (multipart so curl/UI both work)
     html += "<hr style=\"border:none;border-top:1px solid var(--line);"
             "margin:1rem 0\">";
+    // Key-changing: uploading replaces the trust anchor every agent verifies against.
+    // Name what is being replaced; nothing to confirm on a first upload (no bundle).
     html += "<form hx-post=\"/api/settings/plugin-signing/upload\" "
             "hx-target=\"#plugin-signing-section\" hx-swap=\"innerHTML\" "
-            "hx-encoding=\"multipart/form-data\">";
+            "hx-encoding=\"multipart/form-data\"";
+    if (enabled) {
+        html += " hx-confirm=\"Replace the trust bundle (" +
+                std::to_string(v.at("cert_count").get<int>()) + " certificate(s), SHA-256 " +
+                html_escape(v.at("sha256").get<std::string>()) +
+                ")? Agents verify against the new bundle on their next start.\"";
+    }
+    html += ">";
     html += "<div class=\"form-row\" style=\"align-items:center\">"
             "<label>PEM trust bundle</label>"
             "<input type=\"file\" name=\"file\" accept=\".pem,.crt,application/x-pem-file\" "
@@ -2492,17 +2540,28 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
     // forcing a retry is strictly safer than presenting a write control
     // whose displayed state the page itself just declared untrustworthy.
     if (enabled && !required_status_unknown) {
+        // The confirm is a static hx-confirm, attached whenever the stored flag is currently
+        // off: the browser cannot tell whether THIS save ticks the box, so the text is
+        // conditional ("If Require signed plugins is ticked ...") and carries the same
+        // Heads-up as the warning above. With the flag already on, no confirm is attached.
         html += "<form hx-post=\"/api/settings/plugin-signing/require\" "
-                "hx-target=\"#plugin-signing-section\" hx-swap=\"innerHTML\" "
-                "style=\"margin-top:0.75rem\">";
+                "hx-target=\"#plugin-signing-section\" hx-swap=\"innerHTML\" ";
+        if (!required) {
+            html += "hx-confirm=\"Save this setting? If Require signed plugins is ticked: "
+                    "Yuzu-shipped plugins do not yet include CMS signatures, so an agent "
+                    "started with --plugin-require-signature will reject every Yuzu-bundled "
+                    "plugin at its next scan. This server only records the flag; each agent "
+                    "enforces its own flags.\" ";
+        }
+        html += "style=\"margin-top:0.75rem\">";
         html += "<div class=\"form-row\">"
                 "<label>Require signed plugins</label>"
                 "<label style=\"display:flex;align-items:center;gap:0.5rem;flex:1\">"
                 "<input type=\"checkbox\" name=\"required\" value=\"true\"" +
                 std::string(required ? " checked" : "") +
                 "><span class=\"hint\">"
-                "Reject unsigned plugins instead of allowing them through (transitional vs "
-                "enforced).</span>"
+                "Recorded here and served with the trust bundle. Each agent enforces its own "
+                "<code>--plugin-require-signature</code>.</span>"
                 "</label></div>";
         html += "<div class=\"form-row\"><label></label>"
                 "<button type=\"submit\" class=\"btn btn-secondary\">Save</button></div>";
@@ -4504,6 +4563,7 @@ void SettingsRoutes::register_routes(
         // user — never on "not a SCIM user"/"SCIM store unwired", which
         // degrade to the slug-only set (see its doc comment).
         std::string revoke_detail;
+        std::vector<std::string> erase_principals; // the post-commit erasure hook's set
         if (api_token_store_) {
             auto principals = resolve_deprovision_principals_for_username(scim_store_, username);
             if (!principals.has_value()) {
@@ -4567,6 +4627,7 @@ void SettingsRoutes::register_routes(
                     "application/json");
                 return;
             }
+            erase_principals = std::move(*principals);
         } else {
             // Governance Gate 7 BLOCKING fix (UP-7): FAIL CLOSED here —
             // mirror the SCIM seam's `revoke_linked_credentials_or_fail`
@@ -4606,6 +4667,9 @@ void SettingsRoutes::register_routes(
             spdlog::info("User '{}' removed", username);
             (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "user.delete", "success",
                                                 "User", username, revoke_detail);
+            // Post-commit personal-data erasure (ADR-0071): best-effort, never changes this
+            // response - see deprovision_erasure.hpp.
+            run_deprovisioned_hook(on_deprovisioned_, erase_principals);
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"User deleted","level":"success"}})");
             res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
@@ -4647,6 +4711,8 @@ void SettingsRoutes::register_routes(
             }
             audit_fn_(req, "user.delete", "partial", "User", username,
                       "account_deactivated session_wipe_failed=true " + revoke_detail);
+            // The account IS deactivated (committed): erase as on a clean removal.
+            run_deprovisioned_hook(on_deprovisioned_, erase_principals);
             respond_lifecycle_store_unavailable(
                 res, "User deactivated, but session cleanup failed. Repeat the delete to finish");
             return;
@@ -4909,12 +4975,13 @@ void SettingsRoutes::register_routes(
         auto max_uses_s = extract_form_value(req.body, "max_uses");
         auto ttl_s = extract_form_value(req.body, "ttl_hours");
 
-        int max_uses = 0;
-        int ttl_hours = 0;
+        int max_uses = auth::kDefaultEnrollmentTokenMaxUses;
+        int ttl_hours = auth::kDefaultEnrollmentTokenTtlHours;
         try {
             // Strict: `stoi("0x5")` is 0 and max_uses 0 means UNLIMITED, so a mistyped limit
-            // used to mint an unlimited token. Only an EMPTY field or a literal 0 means
-            // "unlimited" / "no expiry"; anything else must be one base-10 integer.
+            // used to mint an unlimited token. A field left BLANK takes the bounded default
+            // above; only a literal 0 means "unlimited" / "no expiry"; anything else must be
+            // one base-10 integer.
             if (!max_uses_s.empty())
                 max_uses = yuzu::server::strict_stoi(max_uses_s);
             if (!ttl_s.empty())
@@ -4967,7 +5034,7 @@ void SettingsRoutes::register_routes(
         // shown once in the response and must never reach the audit store.
         audit_fn_(req, "enrollment.token_create", "success", "EnrollmentToken", created->token_id,
                   "by=" + session->username + " max_uses=" + std::to_string(max_uses) +
-                      " ttl_s=" + std::to_string(ttl.count()) + " label=" + label);
+                      " ttl_s=" + std::to_string(ttl.count()) + " label=" + audit_token(label));
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Enrollment token created","level":"success"}})");
         no_store_private(res); // the raw token is in this body
@@ -5012,7 +5079,7 @@ void SettingsRoutes::register_routes(
         if (!admin_fn_(req, res))
             return;
         // A blank body keeps every default; any other body must be one JSON object (a truncated
-        // document used to mint the default 10 single-use tokens with no expiry).
+        // document used to mint 10 single-use tokens that never expire).
         nlohmann::json batch_body = nlohmann::json::object();
         const bool body_blank =
             std::all_of(req.body.begin(), req.body.end(),
@@ -5033,8 +5100,9 @@ void SettingsRoutes::register_routes(
         auto label = extract_json_string(batch_body, "label");
 
         int count = 10;
+        // Batch tokens stay single-use by default; only ttl_hours gets the bounded default.
         int max_uses = 1;
-        int ttl_hours = 0;
+        int ttl_hours = auth::kDefaultEnrollmentTokenTtlHours;
         try {
             // Strict (see the single-token route): a malformed limit must never read as 0.
             read_enrollment_int(batch_body, "count", count);
@@ -5108,8 +5176,8 @@ void SettingsRoutes::register_routes(
 
         audit_fn_(req, "enrollment.bulk_token_create", "success", "EnrollmentToken", "",
                   "by=" + session->username + " max_uses=" + std::to_string(max_uses) +
-                      " ttl_s=" + std::to_string(ttl.count()) + " label=" + label + " " +
-                      bulk_audit_detail(token_ids));
+                      " ttl_s=" + std::to_string(ttl.count()) + " label=" + audit_token(label) +
+                      " " + bulk_audit_detail(token_ids));
 
         no_store_private(res); // N raw tokens are in this body
         res.set_content(nlohmann::json({{"count", tokens.size()}, {"tokens", tokens}}).dump(),

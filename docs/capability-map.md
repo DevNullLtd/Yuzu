@@ -42,8 +42,8 @@ Each capability is rated on two axes:
 > added 2026-09-17 (R0 of the Spark/Reflex/DEX macOS programme) — design-only, zero code, every
 > row `:x:` by construction; not part of the 2026-09-07/10/11 verification passes below.
 > Domain 41 (Cryptographic Asset Inventory) is new, added 2026-10-17 with `/crypto` slice 1
-> (crypto-library presence); its one `:white_check_mark:` row cites its code and was verified that
-> day, the rest are planned. The domain 32 row was corrected on the same pass (§32.7 is
+> (crypto-library presence, merged 2026-10-18 in be635620c); its one `:white_check_mark:` row cites
+> its code and was verified 2026-10-17, the rest are planned. The domain 32 row was corrected on the same pass (§32.7 is
 > `:large_orange_diamond:`, the summary table still said Not Started).**
 > Domains 1-31's regraded rows each
 > carry their own inline evidence citation and verification date. **Rows regraded or added carry
@@ -1603,7 +1603,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 
 ## 41. Cryptographic Asset Inventory
 
-*Fleet inventory of the cryptographic material and libraries on managed endpoints. Slice 1 (crypto-library presence) shipped 2026-10-17; the rest is planned. Presence and facts only, no weak/vulnerable/PQC verdicts: interpretation is out of the core's scope (ADR-1005 D2). Doc: `docs/user-manual/crypto.md`.*
+*Fleet inventory of the cryptographic material and libraries on managed endpoints. Slice 1 (crypto-library presence) merged 2026-10-18; the rest is planned. Facts in core; verdicts are use-case-engine territory (`docs/adr/0070-cryptographic-asset-inventory-placement.md`, under ADR-1005 Decision 2): no vulnerable, PQC-readiness, library end-of-life, expiry-risk or framework-mapping verdicts in core, no deprecated or broken algorithms beyond D13's four rules, and no revocation status from OCSP or from URLs a certificate supplies. Third-party revocation is core only through operator-registered CRLs (ADR-0070 D5, as amended). There are two built-in exceptions, both planned: those operator-registered CRLs (D5/R1), and ADR-0070 D13's closed set: four named weak-key rules; fixed active, expiry, expired, issued and revoked windows (Yuzu-CA revocations by reason, fleet certificates per operator-registered CRLs), with a 52-week per-week issued and revoked series; a count of registered CRLs past their `nextUpdate` (`crl_past_next_update`); and fleet-wide counts of SSH keys observed in use once slice 3's collection is permitted. Each count names its rule or window and the server time it used. Doc: `docs/user-manual/crypto.md`.*
 
 ### 41.1 Crypto-Library Presence :white_check_mark: `T2` *(verified 2026-10-17)*
 
@@ -1611,7 +1611,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 
 ### 41.2 Certificate Inventory (Fleet, Full X.509 Fields) :x: `T2` *(verified 2026-10-17)*
 
-Planned. The endpoint `certificates` plugin (§9.8) lists system-store certificates per device on demand; there is no fleet-wide, server-side, queryable certificate inventory with the full X.509 field set (subject, issuer, SAN, key algorithm and size, validity, usage).
+Planned. The endpoint `certificates` plugin (§9.8) lists certificates from a fixed set of stores per device on demand (ADR-0070 D6 lists what it does not read); there is no fleet-wide, server-side, queryable certificate inventory with the full X.509 field set (subject, issuer, SAN, key algorithm and size, validity, usage).
 
 ### 41.3 SSH Keys at Rest :x: `T2` *(verified 2026-10-17)*
 
@@ -1627,7 +1627,7 @@ Planned. Observed TLS/SSH daemon and system cryptographic-policy settings (enabl
 
 ### 41.6 CBOM Export :large_orange_diamond: `T3` *(verified 2026-10-19)*
 
-Partial (library components only). `GET /api/v1/crypto/cbom` and MCP `export_crypto_cbom` export the cryptographic-library inventory (41.1) as a CycloneDX 1.7 JSON bill of materials; algorithms, certificates, keys and protocols (41.2 to 41.5) are not exported yet, and components carry no `purl`, so scanners cannot match them.
+Partial (library components only). `GET /api/v1/crypto/cbom` and MCP `export_crypto_cbom` export the cryptographic-library inventory (41.1) as a CycloneDX 1.7 JSON bill of materials; algorithms, certificates, keys and protocols (41.2 to 41.5) are not exported yet, and components carry no `purl`, so scanners cannot match them. It carries facts only (ADR-0070 D7).
 
 ---
 
@@ -1700,6 +1700,7 @@ Partial (library components only). `GET /api/v1/crypto/cbom` and MCP `export_cry
 | printing | Y | Y | Y | Device Mgmt |
 | update_source_trust | - | Y | - | Security |
 | mgmt_posture | - | Y | Y | Security |
+| remote_access_audit | - | Y | Y | Security |
 | shares | - | Y | - | Network |
 | agent_logging | Y | Y | Y | Agent Mgmt |
 | agent_actions | Y | Y | Y | Agent Mgmt |
@@ -1710,7 +1711,7 @@ Partial (library components only). `GET /api/v1/crypto/cbom` and MCP `export_cry
 
 | software_usage | Y | Y | Y | Software | *Planned (Phase 12)* |
 
-**68 plugins** (+ 1 planned) — covering hardware, peripherals, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform and Windows-only plugins; the two test/debug plugins (`chargen`, `example`) appear in the table but are excluded from the headline count. Per-OS cells follow `docs/os-capability-matrix.md` (2026-09-07; a partial 🟡 leg is shown as Y — the matrix carries the per-action detail). Recount verified after merging `origin/dev` (`ls -d agents/plugins/*/` = 70 directories, minus `example` + `chargen` = 68). This recount adds `shares` (what this host is configured to serve over SMB and NFS, Linux exports/smb.conf leg only; macOS and Windows planned) on top of the previous recount (67), which added `mgmt_posture` (management-plane posture, Linux sssd/IPA/keytab and macOS MDM enrolment legs; Windows planned) on top of the previous recount (66), which added `update_source_trust` (Wave 10 PR10.1-d, Linux apt leg only this PR — macOS, Windows and rpm/dnf follow as their own PRs) on top of the previous recount (65), which itself added both `local_security_policy` (Wave 8 PR8.3, Linux+macOS legs first; its Windows leg and `sudoers` action are added in a follow-up PR) and `privacy_permissions` (Wave 8 PR8.5, Linux leg only this PR — macOS/Windows follow as their own PR), landing together on top of the 2026-09-27 recount (`ls -d agents/plugins/*/` = 65 directories, minus `example` + `chargen` = 63), which itself added `browser_policy` (Wave 10 PR10.2-b, Linux leg only that wave), `system_hardening` (Wave 8 PR8.1-b) and `pkg_inventory` (Wave 10 PR10.1-c) on top of the 2026-09-22 recount (60), which itself caught up `firmware_posture` (Wave 8 PR8.4), `runtimes` (Wave 10 PR10.1-b), `platform_security` (Wave 8 PR8.1-a1), `browser_inventory` (Wave 10 P2a-3, Linux leg only that wave) and `app_control` (Wave 8 PR8.6) on top of the 2026-09-18 recount (55), which itself caught up three plugins the 2026-09-15 recount (51) never added despite already being on `dev` at that point — `app_usage`, `autoruns`, `execution_artifacts` — plus `peripherals`. The `privacy_permissions` macOS leg (Wave 8 PR8.5 macOS, TCC.db grant inventory) and Windows leg (ConsentStore registry walk) land separately from this recount — an existing plugin gaining a leg, not a new plugin, so that recount stayed 66 (the 67 in the previous recount is that figure plus `mgmt_posture`, and the 68 above adds `shares`). `software_usage` remains aspirational — confirmed no such directory exists under `agents/plugins/` as of this baseline.
+**69 plugins** (+ 1 planned) — covering hardware, peripherals, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform and Windows-only plugins; the two test/debug plugins (`chargen`, `example`) appear in the table but are excluded from the headline count. Per-OS cells follow `docs/os-capability-matrix.md` (2026-09-07; a partial 🟡 leg is shown as Y — the matrix carries the per-action detail). Recount verified after merging `origin/dev` (`ls -d agents/plugins/*/` = 71 directories, minus `example` + `chargen` = 69). This recount adds `remote_access_audit` (SSH inbound-access audit: sshd_config, per-account authorized_keys fingerprints and sshd service state, Linux and macOS legs; Windows planned) on top of the previous recount (68), which added `shares` (what this host is configured to serve over SMB and NFS, Linux exports/smb.conf leg only; macOS and Windows planned) on top of the previous recount (67), which added `mgmt_posture` (management-plane posture, Linux sssd/IPA/keytab and macOS MDM enrolment legs; Windows planned) on top of the previous recount (66), which added `update_source_trust` (Wave 10 PR10.1-d, Linux apt leg only this PR — macOS, Windows and rpm/dnf follow as their own PRs) on top of the previous recount (65), which itself added both `local_security_policy` (Wave 8 PR8.3, Linux+macOS legs first; its Windows leg and `sudoers` action are added in a follow-up PR) and `privacy_permissions` (Wave 8 PR8.5, Linux leg only this PR — macOS/Windows follow as their own PR), landing together on top of the 2026-09-27 recount (`ls -d agents/plugins/*/` = 65 directories, minus `example` + `chargen` = 63), which itself added `browser_policy` (Wave 10 PR10.2-b, Linux leg only that wave), `system_hardening` (Wave 8 PR8.1-b) and `pkg_inventory` (Wave 10 PR10.1-c) on top of the 2026-09-22 recount (60), which itself caught up `firmware_posture` (Wave 8 PR8.4), `runtimes` (Wave 10 PR10.1-b), `platform_security` (Wave 8 PR8.1-a1), `browser_inventory` (Wave 10 P2a-3, Linux leg only that wave) and `app_control` (Wave 8 PR8.6) on top of the 2026-09-18 recount (55), which itself caught up three plugins the 2026-09-15 recount (51) never added despite already being on `dev` at that point — `app_usage`, `autoruns`, `execution_artifacts` — plus `peripherals`. The `privacy_permissions` macOS leg (Wave 8 PR8.5 macOS, TCC.db grant inventory) and Windows leg (ConsentStore registry walk) land separately from this recount — an existing plugin gaining a leg, not a new plugin, so that recount stayed 66 (the 67 in the previous recount is that figure plus `mgmt_posture`, the 68 added `shares`, and the 69 above adds `remote_access_audit`). `software_usage` remains aspirational — confirmed no such directory exists under `agents/plugins/` as of this baseline.
 
 ---
 

@@ -8,17 +8,19 @@
  * asserted here against the production execute()/init() paths.
  *
  * Two shapes:
- *   - UNGUARDED (no init(), so no store path and no background thread):
+ *   - NO DATA DIR (init() with no agent.data_dir, so no store path; the interval is
+ *     pinned to its 30 s floor, as in the late-sync case, so a lost check-thread wakeup
+ *     cannot stall a run for 300 s):
  *     the S19/S20 wiring through sync/status/get/changes and both error
- *     echoes. Plugin state is process-global inside the loaded library, so
- *     every assertion is relative to state this case itself establishes
- *     (the bounded log makes `change_count|50` exact after 51+ changes).
+ *     echoes. Plugin state is process-global inside the loaded library, and
+ *     init() returns it to its defaults, so every assertion is relative to
+ *     state this case itself establishes (the bounded log makes
+ *     `change_count|50` exact after 51+ changes).
  *   - StandalonePluginContext-seeded init() lifecycle: a corrupt snapshot
  *     plus a malformed interval fall back to defaults, sync persists, a
  *     persist failure reports CONSTRAINED/PARTIAL `asset_tags:persist_failed`
  *     with truthful rows; then a valid snapshot plus a floored interval load.
- *     Both cycles live in ONE case, in this order, because the interval is a
- *     process-global the second cycle overwrites. shutdown() wakes the
+ *     Both cycles live in ONE case, in this order. shutdown() wakes the
  *     plugin's check thread at once (the dedicated shutdown case below pins
  *     that), so this case runs in milliseconds and no assertion depends on
  *     time.
@@ -40,6 +42,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <expected>
 #include <filesystem>
@@ -252,23 +255,42 @@ yuzu::agent::LocalDispatcher::Result run(const LoadedPlugin& plugin, const char*
 } // namespace
 
 TEST_CASE("asset_tags plugin: sync/status/get/changes route every field through the cap, the "
-          "escape and the bounded log (unguarded, no init)",
+          "escape and the bounded log (no data dir)",
           "[agent][asset_tags_actions]") {
     auto plugin = load_asset_tags_plugin();
     if (!plugin) {
         require_plugin_or_skip();
         return;
     }
+    REQUIRE(plugin->descriptor->init != nullptr);
+    REQUIRE(plugin->descriptor->shutdown != nullptr);
+
+    // init() with no agent.data_dir: the plugin's globals can outlive an earlier case (a loader
+    // can keep the image mapped across dlclose), and init() is what returns them to their defaults
+    // -- an empty store path, an empty cache, the default interval (#6053). With no data_dir there
+    // is still no store path, so every write below is skipped.
+    yuzu::agent::StandalonePluginContext ctx("asset_tags", {{"asset_tags.check_interval", "30"}});
+    REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
+    yuzu::test::ScopeExit shutdown_on_exit{[&] { plugin->descriptor->shutdown(ctx.get()); }};
 
     // Start from a known cache: all four categories empty.
     REQUIRE(sync(*plugin, SyncParams{"", "", "", ""}).rc == 0);
+
+    // The persist-failure counters are process-lifetime by design, and the plugin image can
+    // survive from an earlier case (a loader can keep it mapped across dlclose), so an
+    // earlier case's failure may already be counted. What this case pins is that ITS writes add
+    // none: compare against the counters as they stand now, not against zero (#6053).
+    auto baseline = captured_rows(run(*plugin, "status").captured);
+    REQUIRE(baseline.size() == 10);
+    const std::string base_failures = baseline[8];
+    const std::string base_error = baseline[9];
 
     const std::string over_cap(kMaxValueBytes + 1, 'a');
     const std::string capped(kMaxValueBytes, 'a');
     const SyncParams first{over_cap, "a\r\nb", "Rack A|3", "x\\y"};
     auto r = sync(*plugin, first);
     CHECK(r.rc == 0);
-    // No store path without init(): the write is skipped and reported OK/FULL.
+    // No store path without a data dir: the write is skipped and reported OK/FULL.
     CHECK(r.result_status == YUZU_RESULT_STATUS_OK);
     CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
     CHECK(r.result_provenance.empty());
@@ -306,8 +328,8 @@ TEST_CASE("asset_tags plugin: sync/status/get/changes route every field through 
     CHECK(rows[5] == "stale|false");
     CHECK(rows[6].rfind("check_interval|", 0) == 0);
     CHECK(rows[7].rfind("change_count|", 0) == 0);
-    CHECK(rows[8] == "persist_failures|0");
-    CHECK(rows[9] == "last_persist_error|-");
+    CHECK(rows[8] == base_failures);
+    CHECK(rows[9] == base_error);
 
     // get: value escaped; caller echo in the error row escaped; missing key.
     std::string key = "location";
@@ -377,6 +399,12 @@ TEST_CASE("asset_tags plugin: init() recovery, persistence and the typed sync st
     yuzu::test::TempDir dir{"yuzu_test_asset_tags_actions_"};
     std::error_code ec;
 
+    // The persist-failure counters are process-lifetime by design and the plugin image can
+    // survive from an earlier case, so an earlier case's failure may already be counted. The
+    // counters are read once, right after cycle 1's init(), and every later assertion is
+    // relative to that baseline (#6053).
+    std::uint64_t base_failures = 0;
+
     // ── Cycle 1: corrupt snapshot + malformed interval → defaults; sync
     //    persists; a persist failure is declared, never hidden. ─────────────
     {
@@ -406,8 +434,8 @@ TEST_CASE("asset_tags plugin: init() recovery, persistence and the typed sync st
         CHECK(rows[5] == "stale|true");
         CHECK(rows[6] == "check_interval|300"); // malformed value: default kept
         CHECK(rows[7] == "change_count|0");
-        CHECK(rows[8] == "persist_failures|0");
-        CHECK(rows[9] == "last_persist_error|-");
+        REQUIRE(rows[8].rfind("persist_failures|", 0) == 0);
+        base_failures = std::stoull(rows[8].substr(std::string{"persist_failures|"}.size()));
 
         auto r = sync(*plugin, SyncParams{"db", "", "", ""});
         CHECK(r.rc == 0);
@@ -444,7 +472,7 @@ TEST_CASE("asset_tags plugin: init() recovery, persistence and the typed sync st
         CHECK(has_row(rows, "tag|role|web"));
         rows = captured_rows(run(*plugin, "status").captured);
         CHECK(has_row(rows, "tag|role|web"));
-        CHECK(has_row(rows, "persist_failures|1"));
+        CHECK(has_row(rows, "persist_failures|" + std::to_string(base_failures + 1)));
         // A non-empty, non-"-" message; no rows count dependence.
         const std::string err_prefix = "last_persist_error|";
         bool saw_err = false;
@@ -483,7 +511,7 @@ TEST_CASE("asset_tags plugin: init() recovery, persistence and the typed sync st
         CHECK(rows[6] == "check_interval|30"); // floored
         CHECK(rows[7] == "change_count|2");
         // Process-lifetime counters: cycle 1's failure is still counted.
-        CHECK(rows[8] == "persist_failures|1");
+        CHECK(rows[8] == "persist_failures|" + std::to_string(base_failures + 1));
         CHECK(rows[9] != "last_persist_error|-");
         CHECK(rows[9].rfind("last_persist_error|", 0) == 0);
     }
@@ -629,4 +657,136 @@ TEST_CASE("asset_tags plugin: shutdown() wakes the check thread at once, not aft
     shut_down = true;
     const auto elapsed = std::chrono::steady_clock::now() - t0;
     CHECK(elapsed < std::chrono::seconds{3});
+}
+
+TEST_CASE("asset_tags plugin: init() starts a new lifecycle from the default store path, cache "
+          "and interval (#6053)",
+          "[agent][asset_tags_actions][lifecycle]") {
+    // The plugin's state is process-global, and within ONE loaded image a second init() sees
+    // whatever the first lifecycle left behind: nothing here depends on whether a loader keeps
+    // the image mapped across dlclose, because both lifecycles run against the same load. So
+    // this pins init()'s reset directly, deterministically, in every order and on every
+    // platform: it fails if init() stops returning the store path, the cache or the interval to
+    // their defaults.
+    //
+    // It never makes a write fail. The persist-failure counters are process-lifetime by design
+    // (the init() recovery case asserts a failure from an earlier cycle is still counted), so a
+    // failing write here would leak a count into whichever case runs next.
+    auto plugin = load_asset_tags_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    REQUIRE(plugin->descriptor->init != nullptr);
+    REQUIRE(plugin->descriptor->shutdown != nullptr);
+
+    yuzu::test::TempDir dir{"yuzu_test_asset_tags_lifecycle_"};
+    std::error_code ec;
+    const fs::path data_dir = dir.path / "data";
+    fs::create_directories(data_dir, ec);
+    REQUIRE_FALSE(ec);
+    const fs::path store = data_dir / "asset_tags.json";
+
+    // Lifecycle 1: a real data dir, a non-default interval, two syncs.
+    std::string store_after_lifecycle_1;
+    {
+        yuzu::agent::StandalonePluginContext ctx(
+            "asset_tags",
+            {{"agent.data_dir", data_dir.string()}, {"asset_tags.check_interval", "47"}});
+        REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
+        yuzu::test::ScopeExit shutdown_on_exit{[&] { plugin->descriptor->shutdown(ctx.get()); }};
+
+        auto first = sync(*plugin, SyncParams{"web", "", "", ""});
+        REQUIRE(first.result_status == YUZU_RESULT_STATUS_OK);
+        auto second = sync(*plugin, SyncParams{"db", "", "", ""});
+        REQUIRE(second.result_status == YUZU_RESULT_STATUS_OK);
+        auto rows = captured_rows(run(*plugin, "status").captured);
+        REQUIRE(rows.size() == 10);
+        REQUIRE(rows[0] == "tag|role|db");
+        REQUIRE(rows[6] == "check_interval|47");
+        REQUIRE(rows[7] == "change_count|2");
+
+        auto text = read_state_file(store);
+        REQUIRE(text.has_value());
+        REQUIRE(text->has_value());
+        store_after_lifecycle_1 = **text;
+    }
+
+    // Lifecycle 2: no data dir and a malformed interval. Every one of lifecycle 1's leftovers
+    // must be gone: the interval is the DEFAULT (not 47 -- the #6053 "malformed value: default
+    // kept" symptom), the cache is empty, and a sync has no store path to write to.
+    {
+        yuzu::agent::StandalonePluginContext ctx("asset_tags",
+                                                 {{"asset_tags.check_interval", "30x"}});
+        REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
+        yuzu::test::ScopeExit shutdown_on_exit{[&] { plugin->descriptor->shutdown(ctx.get()); }};
+
+        auto rows = captured_rows(run(*plugin, "status").captured);
+        REQUIRE(rows.size() == 10);
+        CHECK(rows[0] == "tag|role|");
+        CHECK(rows[4] == "last_sync|0");
+        CHECK(rows[5] == "stale|true");
+        CHECK(rows[6] == "check_interval|300");
+        CHECK(rows[7] == "change_count|0");
+        const std::string failures = rows[8];
+        const std::string error = rows[9];
+
+        auto r = sync(*plugin, SyncParams{"cache", "", "", ""});
+        CHECK(r.rc == 0);
+        CHECK(r.result_status == YUZU_RESULT_STATUS_OK); // skipped, not attempted and failed
+        CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
+
+        // Nothing reached lifecycle 1's store, and nothing was counted as a failure.
+        auto text = read_state_file(store);
+        REQUIRE(text.has_value());
+        REQUIRE(text->has_value());
+        CHECK(**text == store_after_lifecycle_1);
+        rows = captured_rows(run(*plugin, "status").captured);
+        REQUIRE(rows.size() == 10);
+        CHECK(rows[8] == failures);
+        CHECK(rows[9] == error);
+    }
+}
+
+TEST_CASE("asset_tags plugin: a sync after shutdown() still persists to the store (#6053)",
+          "[agent][asset_tags_actions][lifecycle]") {
+    // The agent shuts plugins down before it drains its command pool when run() exits early, so a
+    // sync still queued then runs after shutdown(). shutdown() must therefore leave the store
+    // path alone: a reset there would make this sync report OK having written nothing. The
+    // on-disk assertion is the load-bearing one -- the sync's own status is OK either way.
+    auto plugin = load_asset_tags_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    REQUIRE(plugin->descriptor->init != nullptr);
+    REQUIRE(plugin->descriptor->shutdown != nullptr);
+
+    yuzu::test::TempDir dir{"yuzu_test_asset_tags_late_sync_"};
+    std::error_code ec;
+    const fs::path data_dir = dir.path / "data";
+    fs::create_directories(data_dir, ec);
+    REQUIRE_FALSE(ec);
+
+    yuzu::agent::StandalonePluginContext ctx(
+        "asset_tags", {{"agent.data_dir", data_dir.string()}, {"asset_tags.check_interval", "30"}});
+    REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
+    // Runs on every exit, so a failed REQUIRE below cannot leave the check thread joinable in a
+    // dlclose'd library. shutdown() is idempotent, so the explicit call below makes this a no-op.
+    yuzu::test::ScopeExit shutdown_on_exit{[&] { plugin->descriptor->shutdown(ctx.get()); }};
+    auto first = sync(*plugin, SyncParams{"web", "", "", ""});
+    REQUIRE(first.result_status == YUZU_RESULT_STATUS_OK);
+    plugin->descriptor->shutdown(ctx.get());
+
+    auto late = sync(*plugin, SyncParams{"db", "", "", ""});
+    CHECK(late.rc == 0);
+    CHECK(late.result_status == YUZU_RESULT_STATUS_OK);
+    CHECK(late.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
+
+    auto text = read_state_file(data_dir / "asset_tags.json");
+    REQUIRE(text.has_value());
+    REQUIRE(text->has_value());
+    auto parsed = parse_state(**text);
+    REQUIRE(parsed.has_value());
+    CHECK(parsed->tags.at("role") == "db");
 }
