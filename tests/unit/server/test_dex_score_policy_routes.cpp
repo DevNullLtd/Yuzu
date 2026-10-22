@@ -45,6 +45,7 @@ struct Harness {
 
     // The fake store.
     std::optional<std::string> stored;
+    bool read_fails{false};  // the store cannot be read
     std::string store_error; // non-empty: compare-and-set applies, then reports this
     int cas_calls{0};
     std::shared_ptr<DexScorePolicyProvider> provider;
@@ -102,6 +103,8 @@ struct Harness {
         if (wire_writer) {
             DexScorePolicyWriteDeps d;
             d.read_stored = [this]() -> std::expected<std::optional<std::string>, std::string> {
+                if (read_fails)
+                    return std::unexpected(std::string("store down"));
                 return stored;
             };
             d.compare_and_set = [this](const std::optional<std::string>& expected,
@@ -218,6 +221,16 @@ TEST_CASE("score-policy routes: GET returns the policy in force with its ETag an
         CHECK(j["data"]["fault"] == "unsupported_version at version: 2 above the supported 1");
         CHECK(j["data"]["revision"] == dex_score_policy_revision(*h.stored));
     }
+    SECTION("an unreadable store is a 503 with retry_after_ms, never a default policy") {
+        h.read_fails = true;
+        const auto res = h.send("GET", kPath);
+        CHECK(res->status == 503);
+        const auto j = json::parse(res->body);
+        CHECK(j["error"]["message"] == "runtime config store unavailable");
+        CHECK(j["error"]["retry_after_ms"] == 2000);
+        CHECK_FALSE(j.contains("data"));
+        CHECK(res->get_header_value("ETag").empty());
+    }
     CHECK(h.rows.empty());
 }
 
@@ -246,7 +259,8 @@ TEST_CASE("score-policy routes: an unwired session writer is a 500 with one fail
     Harness h(/*wire_writer=*/true, /*wire_session_writer=*/false);
     for (const char* method : {"PUT", "DELETE"}) {
         h.rows.clear();
-        const auto res = h.send(method, kPath, doc_with_excellent(95.0), Harness::if_match("default"));
+        const auto res =
+            h.send(method, kPath, doc_with_excellent(95.0), Harness::if_match("default"));
         CHECK(res->status == 500);
         CHECK(json::parse(res->body)["error"]["message"] == "audit identity writer not configured");
         REQUIRE(h.rows.size() == 1);
@@ -273,8 +287,8 @@ TEST_CASE("score-policy routes: a cross-site cookie write is refused with csrf.d
     SECTION("a token session is exempt") {
         h.auth_source = "api_token";
         h.rows.clear();
-        CHECK(h.send("PUT", kPath, doc_with_excellent(95.0), Harness::if_match("default"))->status ==
-              200);
+        CHECK(h.send("PUT", kPath, doc_with_excellent(95.0), Harness::if_match("default"))
+                  ->status == 200);
     }
 }
 
@@ -294,8 +308,8 @@ TEST_CASE("score-policy routes: If-Match and dry_run refusals",
               std::string::npos);
     }
     SECTION("dry_run=yes is 400 naming dry_run, with one denied row") {
-        const auto res = h.send("PUT", std::string(kPath) + "?dry_run=yes", doc_with_excellent(95.0),
-                                Harness::if_match("default"));
+        const auto res = h.send("PUT", std::string(kPath) + "?dry_run=yes",
+                                doc_with_excellent(95.0), Harness::if_match("default"));
         CHECK(res->status == 400);
         CHECK(json::parse(res->body)["error"]["message"].get<std::string>().find("dry_run") !=
               std::string::npos);
@@ -305,8 +319,30 @@ TEST_CASE("score-policy routes: If-Match and dry_run refusals",
     }
     SECTION("a stale If-Match is 409") {
         h.stored = doc_with_excellent(90.0);
-        CHECK(h.send("PUT", kPath, doc_with_excellent(95.0), Harness::if_match("default"))->status ==
-              409);
+        CHECK(h.send("PUT", kPath, doc_with_excellent(95.0), Harness::if_match("default"))
+                  ->status == 409);
+    }
+    SECTION("two If-Match headers are refused like a list, with one denied row") {
+        // The sink's header maps hold one value per name, so the second header goes in under
+        // another spelling of the name (httplib compares header names without case).
+        h.sink.default_headers["If-Match"] = "default";
+        h.sink.default_headers["if-match"] = "default";
+        const auto res = h.send("PUT", kPath, doc_with_excellent(95.0));
+        CHECK(res->status == 400);
+        CHECK(json::parse(res->body)["error"]["message"] == "If-Match: send exactly one revision");
+        REQUIRE(h.rows.size() == 1);
+        CHECK(h.rows[0].result == "denied");
+        CHECK(json::parse(h.rows[0].detail)["reason"] == "if_match_malformed");
+    }
+    SECTION("two dry_run parameters are refused, with one denied row") {
+        // (httplib itself collapses a repeat of an identical name=value pair, so the two differ)
+        const auto res = h.send("PUT", std::string(kPath) + "?dry_run=true&dry_run=false",
+                                doc_with_excellent(95.0), Harness::if_match("default"));
+        CHECK(res->status == 400);
+        CHECK(json::parse(res->body)["error"]["message"] == "dry_run must be true or false");
+        REQUIRE(h.rows.size() == 1);
+        CHECK(h.rows[0].result == "denied");
+        CHECK(json::parse(h.rows[0].detail)["field"] == "dry_run");
     }
     CHECK(h.cas_calls == 0);
 }
@@ -338,7 +374,8 @@ TEST_CASE("score-policy routes: a dry run's ETag is the current revision, not th
     h.stored = doc_with_excellent(90.0);
     const std::string current = dex_score_policy_revision(*h.stored);
     const std::string body = doc_with_excellent(95.0);
-    const auto res = h.send("PUT", std::string(kPath) + "?dry_run=true", body, Harness::if_match(current));
+    const auto res = h.send("PUT", std::string(kPath) + "?dry_run=true", body,
+                            Harness::if_match(current));
     CHECK(res->status == 200);
     const auto j = json::parse(res->body);
     CHECK(j["data"]["dry_run"] == true);
@@ -388,7 +425,8 @@ TEST_CASE("score-policy routes: a refused audit row is a fail-closed 503 with Se
     Harness h;
     SECTION("the attempted row") {
         h.refuse_result = "attempted";
-        const auto res = h.send("PUT", kPath, doc_with_excellent(95.0), Harness::if_match("default"));
+        const auto res =
+            h.send("PUT", kPath, doc_with_excellent(95.0), Harness::if_match("default"));
         CHECK(res->status == 503);
         CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
         CHECK(json::parse(res->body)["error"]["retry_after_ms"] == 5000);
@@ -396,11 +434,22 @@ TEST_CASE("score-policy routes: a refused audit row is a fail-closed 503 with Se
     }
     SECTION("the dry-run validate row") {
         h.refuse_result = "success";
-        const auto res = h.send("PUT", std::string(kPath) + "?dry_run=true", doc_with_excellent(95.0),
-                                Harness::if_match("default"));
+        const auto res = h.send("PUT", std::string(kPath) + "?dry_run=true",
+                                doc_with_excellent(95.0), Harness::if_match("default"));
         CHECK(res->status == 503);
         CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
         CHECK(json::parse(res->body)["error"]["retry_after_ms"] == 5000);
+    }
+    SECTION("a refused outcome row after a committed write keeps the 200") {
+        h.refuse_result = "success";
+        const std::string body = doc_with_excellent(95.0);
+        const auto res = h.send("PUT", kPath, body, Harness::if_match("default"));
+        CHECK(res->status == 200);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(h.stored == body);
+        CHECK(json::parse(res->body)["data"]["revision"] == dex_score_policy_revision(body));
+        REQUIRE(h.rows.size() == 1);
+        CHECK(h.rows[0].result == "attempted");
     }
 }
 

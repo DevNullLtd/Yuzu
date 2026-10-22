@@ -66,9 +66,9 @@
 /// `mcp_body_unmeasurable` rationale - so refusing an unmeasurable MCP body
 /// costs a conforming client nothing), `upload_session`, `hardware` (the
 /// Hardware CI routes carry only a tiny JSON body from the dashboard and API
-/// callers) and `dex_score_policy` (one JSON document, capped by its handler). Every other class below — public REST
-/// (bundles), SCIM, certificate import (REST + dashboard), the plugin trust
-/// bundle, product-pack/workflow authoring, and the OTA upload — keeps it
+/// callers) and `dex_score_policy` (one JSON document, capped by its handler). Every other
+/// class below — public REST (bundles), SCIM, certificate import (REST + dashboard), the
+/// plugin trust bundle, product-pack/workflow authoring, and the OTA upload — keeps it
 /// OFF and falls back to httplib's 100 MiB backstop for a body it cannot
 /// size, until a Content-Length contract is documented and a representative
 /// client population is tested against it. That is a scoping decision for

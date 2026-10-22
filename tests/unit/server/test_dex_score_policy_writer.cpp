@@ -50,7 +50,10 @@ struct World {
     int car_calls{0};
     std::optional<std::string> cas_expected;
     std::string cas_actor;
+    std::string cas_text;   // the canonical text the last compare-and-set was handed
     std::string car_expected;
+    // The audit rows that existed when the store was last touched (set and remove alike).
+    std::vector<Row> rows_at_store;
     // When set, the store reports this error after applying (or not) the write.
     std::optional<std::string> store_error;
     bool apply_before_error{true};
@@ -62,6 +65,7 @@ struct World {
 
     std::vector<Row> rows;
     std::vector<std::string> refuse_results; // audit results the audit store refuses
+    int refused{0};                          // how many rows it did refuse
     int audit_throws{0};
 
     std::shared_ptr<DexScorePolicyProvider> provider;
@@ -93,6 +97,8 @@ struct World {
             ++cas_calls;
             cas_expected = expected;
             cas_actor = actor;
+            cas_text = canonical;
+            rows_at_store = rows;
             if (store_throws)
                 throw std::runtime_error("boom");
             if (store_error && !apply_before_error)
@@ -106,14 +112,18 @@ struct World {
                 return std::unexpected(*store_error);
             return true;
         };
-        d.compare_and_remove = [this](const std::string& expected) -> std::expected<bool, std::string> {
+        d.compare_and_remove = [this](const std::string& expected)
+            -> std::expected<bool, std::string> {
             ++car_calls;
             car_expected = expected;
+            rows_at_store = rows;
             if (store_error && !apply_before_error)
                 return std::unexpected(*store_error);
             if (stored != expected)
                 return false;
             stored.reset();
+            if (after_apply)
+                after_apply();
             if (store_error)
                 return std::unexpected(*store_error);
             return true;
@@ -129,6 +139,7 @@ struct World {
             for (const auto& r : refuse_results)
                 if (r == result) {
                     rows.pop_back();
+                    ++refused;
                     return false;
                 }
             return true;
@@ -405,6 +416,74 @@ TEST_CASE("writer: PUT against a never-written policy creates it and installs it
     CHECK(cur->revision == rev);
 }
 
+TEST_CASE("writer: PUT stores the canonical form of the document, not the body as sent",
+          "[dex][score_policy_writer]") {
+    World w;
+    // Whitespace, a reordered key, an integer edge and a partial document (the rest of the
+    // policy takes its defaults): none of it is the canonical text.
+    const std::string sent =
+        "{ \"version\" : 1,\n  \"tiers\" : { \"edges\" : { \"excellent\" : 95 } } }";
+    const std::string canonical = doc_with_excellent(95.0);
+    const std::string rev = dex_score_policy_revision(canonical);
+    REQUIRE(sent != canonical);
+    REQUIRE(dex_score_policy_revision(sent) != rev);
+
+    const auto r = w.put("default", sent);
+    REQUIRE(r.status == St::Ok);
+    CHECK(w.cas_text == canonical);
+    CHECK(w.stored == canonical);
+    CHECK(r.in_force.revision == rev);
+    REQUIRE(w.rows.size() == 2);
+    CHECK(w.rows[0].detail["revision"] == rev);
+    CHECK(w.rows[1].detail["revision"] == rev);
+    // A following GET serves the revision of the stored text; the installed policy agrees.
+    CHECK(dex_policy_in_force_from_stored(w.stored).revision == rev);
+    REQUIRE(w.provider->current());
+    CHECK(w.provider->current()->revision == rev);
+}
+
+TEST_CASE("writer: the attempted row carries the whole proposal before the store is touched",
+          "[dex][score_policy_writer]") {
+    World w;
+    w.stored = doc_with_excellent(90.0);
+    const std::string prior = dex_score_policy_revision(*w.stored);
+    const std::string body = doc_with_excellent(95.0);
+
+    // The only row that existed when the store was hit must be the attempted one, complete.
+    auto attempted_row_is_complete = [&](std::string_view verb, const json& revision,
+                                         const json& document) {
+        REQUIRE(w.rows_at_store.size() == 1);
+        Row a = w.rows_at_store[0];
+        CHECK(a.verb == verb);
+        CHECK(a.result == "attempted");
+        CHECK(a.detail["if_match"] == prior);
+        CHECK(a.detail["prior_revision"] == prior);
+        CHECK(a.detail["revision"] == revision);
+        CHECK(a.detail["document"] == document);
+    };
+    SECTION("PUT") {
+        REQUIRE(w.put(prior, body).status == St::Ok);
+        attempted_row_is_complete("dex.score_policy.update", dex_score_policy_revision(body),
+                                  json::parse(body));
+    }
+    SECTION("DELETE") {
+        REQUIRE(w.del(prior).status == St::Ok);
+        attempted_row_is_complete("dex.score_policy.reset", "default", nullptr);
+    }
+    SECTION("a refused outcome row leaves the attempted row complete and the write standing") {
+        w.refuse_results = {"success"};
+        const auto r = w.put(prior, body);
+        CHECK(r.status == St::Ok);
+        CHECK(w.stored == body);
+        CHECK(w.refused == 1);
+        REQUIRE(w.rows.size() == 1);
+        CHECK(w.rows[0].result == "attempted");
+        CHECK(w.rows[0].detail["document"] == json::parse(body));
+        attempted_row_is_complete("dex.score_policy.update", dex_score_policy_revision(body),
+                                  json::parse(body));
+    }
+}
+
 TEST_CASE("writer: PUT over a present-but-empty row compares against the empty text",
           "[dex][score_policy_writer]") {
     World w;
@@ -516,6 +595,17 @@ TEST_CASE("writer: DELETE of a never-written policy is Ok: attempted then no_cha
     CHECK(w.car_calls == 0);
 }
 
+TEST_CASE("writer: a refused no_change row keeps the DELETE answer", "[dex][score_policy_writer]") {
+    World w;
+    w.refuse_results = {"no_change"};
+    const auto r = w.del("default");
+    CHECK(r.status == St::Ok);
+    CHECK(w.refused == 1);
+    REQUIRE(w.rows.size() == 1);
+    CHECK(w.rows[0].result == "attempted");
+    CHECK(w.car_calls == 0);
+}
+
 TEST_CASE("writer: DELETE removes the exact stored text", "[dex][score_policy_writer]") {
     World w;
     w.stored = doc_with_excellent(90.0);
@@ -561,7 +651,8 @@ TEST_CASE("writer: a store error with the intended text observed afterwards is a
     CHECK(w.rows[1].detail["outcome"] == "observed_after_store_error");
 }
 
-TEST_CASE("writer: applied then overwritten before the re-read: outcome unknown naming what is stored",
+TEST_CASE("writer: applied then overwritten before the re-read: outcome unknown, naming what "
+          "is stored",
           "[dex][score_policy_writer]") {
     World w;
     w.store_error = kPrefixedError;
@@ -646,6 +737,65 @@ TEST_CASE("writer: an exception escaping write() after the commit is resolved by
     w.clock_throws = false;
     const auto again = w.put(dex_score_policy_revision(body), doc_with_excellent(96.0));
     CHECK(again.status == St::Ok);
+}
+
+TEST_CASE("writer: DELETE's ambiguous outcome is resolved by what the re-read finds",
+          "[dex][score_policy_writer]") {
+    World w;
+    w.stored = doc_with_excellent(90.0);
+    w.store_error = kPrefixedError;
+    const std::string prior = dex_score_policy_revision(*w.stored);
+
+    SECTION("removed, then the connection was lost: absent is the intended state") {
+        const auto r = w.del(prior);
+        REQUIRE(r.status == St::Ok);
+        CHECK(r.in_force.revision == "default");
+        CHECK(r.previous_revision == prior);
+        REQUIRE(w.rows.size() == 2);
+        CHECK(w.rows[1].result == "success");
+        CHECK(w.rows[1].detail["outcome"] == "observed_after_store_error");
+        CHECK(w.rows[1].detail["revision"] == "default");
+    }
+    SECTION("not removed: the row is still stored") {
+        w.apply_before_error = false;
+        const auto r = w.del(prior);
+        REQUIRE(r.status == St::OutcomeUnknown);
+        CHECK(r.retry_after_ms == 2000);
+        CHECK(r.message.find(prior) != std::string::npos);
+        REQUIRE(w.rows.size() == 2);
+        CHECK(w.rows[1].result == "failure");
+        CHECK(w.rows[1].detail["reason"] == "outcome_unknown");
+        CHECK(w.rows[1].detail["observed_revision"] == prior);
+    }
+    SECTION("removed, then an empty text was stored: a present row is not an absent one") {
+        w.after_apply = [&] { w.stored = std::string(); };
+        const auto r = w.del(prior);
+        REQUIRE(r.status == St::OutcomeUnknown);
+        REQUIRE(w.rows.size() == 2);
+        // an empty text reads as the default revision, yet the row exists
+        CHECK(w.rows[1].detail["observed_revision"] == "default");
+        CHECK(w.rows[1].detail["reason"] == "outcome_unknown");
+    }
+    SECTION("the re-read fails") {
+        w.apply_before_error = false;
+        auto d = w.deps();
+        const auto read = d.read_stored;
+        int calls = 0;
+        d.read_stored = [&]() -> std::expected<std::optional<std::string>, std::string> {
+            if (++calls >= 2)
+                return std::unexpected(std::string("store down"));
+            return read();
+        };
+        DexScorePolicyWriteRequest rq;
+        rq.op = Op::Reset;
+        rq.if_match = prior;
+        const auto r = apply_dex_score_policy(rq, d);
+        REQUIRE(r.status == St::OutcomeUnknown);
+        CHECK(r.message.find("could not be re-read") != std::string::npos);
+        REQUIRE(w.rows.size() == 2);
+        CHECK(w.rows[1].detail["reread_error"] == "store_down");
+        CHECK_FALSE(w.rows[1].detail.contains("observed_revision"));
+    }
 }
 
 TEST_CASE("writer: an unprefixed store refusal is a 400 with the store's text and a failure row",

@@ -71,6 +71,9 @@ inline constexpr std::string_view kDexScorePolicyValidateVerb = "dex.score_polic
 
 /// retry_after_ms for a writer-busy or store-unavailable answer (the store's lease wait).
 inline constexpr std::int64_t kDexScorePolicyRetryMs = 2000;
+/// The 503 message for an unreadable or unwired store: spelled once, for apply and the handlers.
+inline constexpr std::string_view kDexScorePolicyStoreUnavailableMessage =
+    "runtime config store unavailable";
 /// retry_after_ms when the audit store refused a row (the other REST audit fail-closed 503s).
 inline constexpr std::int64_t kDexScorePolicyAuditRetryMs = 5000;
 /// Longest If-Match value considered at all; a revision is at most 18 bytes quoted.
@@ -312,7 +315,7 @@ apply_dex_score_policy(const DexScorePolicyWriteRequest& rq, const DexScorePolic
     };
     auto store_unavailable = [&]() -> Result {
         out.status = Status::StoreUnavailable;
-        out.message = "runtime config store unavailable";
+        out.message = std::string(kDexScorePolicyStoreUnavailableMessage);
         out.remediation = "retry shortly";
         out.retry_after_ms = kDexScorePolicyRetryMs;
         return out;

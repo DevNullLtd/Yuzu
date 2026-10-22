@@ -30,7 +30,7 @@
 ///   PUT /api/config/([a-z_]+)   (perm_fn Infrastructure:Write, THEN auth_fn for the
 ///                                 audit-attributed username and the same-site check,
 ///                                 THEN the dex_score_policy 400 (that key is written
-///                                 only through its own route, a later change), THEN the
+///                                 only through PUT /api/v1/dex/score-policy), THEN the
 ///                                 store-open 503, THEN body parsing and integer-key
 ///                                 validation, THEN the unknown-key 400, THEN the
 ///                                 audit-first attempted row)

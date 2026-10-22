@@ -19,7 +19,7 @@
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4: the public in-process VERIFY API seam
 #include "dex_api.hpp"    // ADR-0031 WS-A4: the public in-process DEX signals API seam
-#include "dex_score_policy_writer.hpp" // DexScorePolicyWriteDeps: the PUT/DELETE /dex/score-policy apply function
+#include "dex_score_policy_writer.hpp" // DexScorePolicyWriteDeps: PUT/DELETE /dex/score-policy
 #include "dex_perf_api.hpp" // ADR-0031 WS-A4: the public in-process DEX app-perf-over-time API seam
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "guardian_api.hpp" // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read API seam

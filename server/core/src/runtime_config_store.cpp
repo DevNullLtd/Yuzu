@@ -54,10 +54,11 @@ static const std::vector<std::string> kAllowedKeys = {
     // F2a PR3 cohort metrics export (Settings → DEX alerts; next gauge sweep)
     "dex_cohort_export_key",         // tag key; "" = export disabled (validated on apply)
     // Customer score policy (tiers, names, weights, per-app overrides).
-    "dex_score_policy",              // JSON document; route-owned - to be written only through
-                                     // the policy route's writer (a later change), which
-                                     // validates it whole; the generic PUT refuses it. Spelled
-                                     // as kDexScorePolicyKey in dex_score_policy_json.hpp.
+    "dex_score_policy",              // JSON document; route-owned - written only through
+                                     // PUT/DELETE /api/v1/dex/score-policy via dex_api.cpp's
+                                     // binding, which validates it whole; the generic PUT
+                                     // refuses it. Spelled as kDexScorePolicyKey in
+                                     // dex_score_policy_json.hpp.
 };
 
 const std::vector<std::string>& RuntimeConfigStore::allowed_keys() {
@@ -792,8 +793,8 @@ RuntimeConfigStore::compare_and_remove(const std::string& key, const std::string
         // The class of failure is the only thing that tells an operator a constraint from a
         // dropped connection; the caller is told "database write failed" either way.
         const char* sqlstate = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
-        spdlog::error("runtime_config compare_and_remove {}: SQLSTATE {}", ::yuzu::log_key_token(key),
-                      sqlstate ? sqlstate : "none");
+        spdlog::error("runtime_config compare_and_remove {}: SQLSTATE {}",
+                      ::yuzu::log_key_token(key), sqlstate ? sqlstate : "none");
         return std::unexpected(std::string(kRuntimeConfigDbErrorPrefix) +
                                "database write failed");
     }
