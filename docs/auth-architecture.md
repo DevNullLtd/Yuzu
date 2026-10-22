@@ -345,9 +345,15 @@ cookie sessions only — any MCP tier, service-scoped token, engine principal or
 non-interactive `auth_source` is `403 token_session`; the self route
 additionally requires `auth_source == "local"` (`409 not_local` for OIDC/SAML).
 CSRF: `Origin`/`Referer` must be same-site (`origin_is_same_site`, honouring
-`--csrf-trusted-origins`) and a cookie request lacking **both** headers is
-refused — matching the other cookie-authorized state-changing POSTs
-(`ca_routes`, `dashboard_routes`). `Content-Type` must be `application/json`
+`--csrf-trusted-origin`) and a cookie request lacking **both** headers is
+refused. The same-site check is applied route by route; there is no shared
+pre-routing gate. The routes that carry it today include the password routes,
+the response-template mutations, the hardware, offload, webhook and directory
+routes, the RBAC enforcement toggle, the role-assignment routes, Guardian push
+and the policy-generation raise route, and the handlers in `ca_routes` and
+`dashboard_routes` that call `origin_is_same_site` or
+`browser_write_is_cross_site`. Other cookie-authorised `/api/v1` write routes do
+not yet carry it. `Content-Type` must be `application/json`
 (`415`). The admin route then runs the **canonical durable-Administrator gate**
 — `is_rbac_administrator(kRest)` (`rbac_admin_predicate.hpp`, the A2/A1
 predicate) followed by `check_caller_authorized_under_current_regime`,
@@ -791,6 +797,57 @@ by each handler.
 
 Hard invariants live in §"Hard invariants" of `docs/auth-mfa-design.md` —
 do not regress them when shipping PR 2 / PR 3.
+
+### Approver assurance (maker-checker, #6061)
+
+Reviewing an approval ticket is a human-review act, so approve and reject carry more than the
+`Approval:Approve` permission. `POST /api/approvals/{id}/approve`, `POST /api/approvals/{id}/reject`,
+the dashboard Approvals page (which posts to the same routes) and the MCP tools `approve_request` /
+`reject_request` require all of:
+
+- an **interactive cookie session** (local or OIDC); API-token and MCP bearer sessions are refused
+  with a typed `403` (A4 envelope);
+- a **fresh MFA step-up** through the same `require_mfa_step_up` gate as the other step-up endpoints
+  (so the same pass-through for an account the gate cannot ask for a factor applies: a local account
+  with no enrolled factor, which `mfa_step_up.cpp` passes in every `--mfa-enforcement` mode, and an OIDC
+  session without an `amr` proof whenever the mode does not protect its role, i.e. everything except
+  `--mfa-enforcement=required` and, for admins, `admin-only`). `required` closes the OIDC case only when
+  the IdP asserts an MFA-method `amr`; otherwise an OIDC session gets `401` and loops through re-SSO
+  at every step-up endpoint, not only approval (recovery is restarting in `optional` temporarily (it weakens MFA fleet-wide, so restore your intended enforcement afterwards), not just any non-`required` mode, because an `amr`-less OIDC admin is still gated under `admin-only`; see [MFA on SSO sessions](user-manual/authentication.md#mfa-on-sso-sessions-pr-3) and the [recovery runbook](ops-runbooks/auth-db-recovery.md#locked-out-by-mfa-enforcement-misconfiguration)). A requirement
+  that the approver holds an enrolled factor in every mode is tracked in #6079;
+- a **human principal**, never an engine principal;
+- a reviewer that is **not the submitter** (unchanged, enforced in `ApprovalManager`);
+- on the REST routes (the dashboard page included), a **same-site `Origin` (or `Referer`)** on the
+  cookie `POST`, checked after the permission gate and before the class check and the step-up, so a
+  cross-site request spends no step-up and writes no `attempted` row (`403`, audited as
+  `csrf.denied`; trusted proxies are declared with `--csrf-trusted-origin`).
+
+Consequences, each deliberate:
+
+- **MCP can never approve.** The refusal is unconditional on the MCP transport, which runs no MFA step-up: the two MCP tools always
+  return the typed refusal, for a bearer token and for a cookie session that reaches `/mcp/v1/` alike. This is an exception recorded in ADR-1005's exception ledger (entry 2026-10-18, "human review
+  is a human-session act"; legacy REST rows `exception:#6061 revisit:2027-01-18`). The tools remain registered; listing pending approvals via MCP is unchanged. The MCP
+  tier/permission mapping for both tools is `Approval:Approve` (it was mapped as `Approval:Write`;
+  #3151).
+- **SAML approvers are blocked while step-up is on.** SAML sessions can never pass step-up (#4935),
+  so a SAML-authenticated user cannot approve. This is the SAML consequence of "MFA enforcement with
+  SAML" below, not a separate rule. With `--mfa-step-up-window-secs=0` the window check returns before
+  the SAML branch and a SAML session is admitted. A SAML-only deployment therefore has no working
+  approver path until #4935 is decided (known limitation, tracked in #6098).
+- **`--mfa-step-up-window-secs=0` lowers the assurance to "interactive session" only.** The step-up
+  gate is off for approvals as for every other step-up endpoint. Operators who rely on approvals as a
+  control should not set it; if they do, review every `approval.approve` row with `result=success` and check every `attempted` row that has
+  no outcome row, comparing counts per `target_id` (each decision also leaves a `result=attempted`
+  row first, and a decision whose outcome row failed to write leaves only that row; see
+  `docs/user-manual/audit-log.md`).
+- **Fail closed.** An unresolvable session (the "degraded session read", #4128) answers `503` and the
+  ticket stays pending; it is no longer recorded with the reviewer `unknown`. The approval attempt
+  is audited before the decision is applied, and an audit-write failure answers `503` with nothing
+  changed (#5823).
+- **Expiry at consume.** An approved ticket older than the 7-day window (measured from review) is
+  refused at consume using database time, even if no later submit has swept expiry.
+
+Operator-facing description: `docs/user-manual/instructions.md`, "Who can approve".
 
 ## JIT admin elevation (SOC 2 CC6.3/CC6.6)
 
@@ -1743,7 +1800,7 @@ applies to these two flags).
 session hitting any step-up-gated route (the 36 listed in the REST API
 reference under "Step-up envelope on high-risk endpoints": token, session,
 engine-principal and RBAC lifecycle, Guardian rule and guard writes, software
-deploy, user delete/role change, MFA recovery-code regeneration and disable,
+deploy, approval approve/reject, user delete/role change, MFA recovery-code regeneration and disable,
 JIT elevation)
 receives a `403` with `"MFA step-up is not available for SAML sessions in this
 release"`, regardless of `--mfa-enforcement` mode (the one exception is a disabled window: with
@@ -1763,6 +1820,9 @@ row). This means:
   via group→role mapping (see Group→role mapping above) — both are denied.
 - `--mfa-enforcement=optional` — same: the SAML-specific exit fires before
   enforcement mode is consulted.
+
+A SAML user therefore cannot approve or reject approval tickets while step-up is on
+(see "Approver assurance" above).
 
 **Recommendation:** Use `--mfa-enforcement=optional` or `--mfa-enforcement=admin-only`
 when SAML is in use, and configure your IdP to enforce MFA at login time. Avoid
@@ -3230,21 +3290,29 @@ ADR-0041, currently at v3).
 
 ## Render-time permission probes (capability hints)
 
-Three `AuthRoutes` methods answer a permission question without writing a denial row, for pages
+Five `AuthRoutes` methods answer a permission question without writing a denial row for an
+interactive sign-in, for pages
 that decide what to DRAW: `has_permission` (the verdict only), `probe_permission` (the verdict
-with the gate's own response kept, so "denied" and "store unavailable" stay distinguishable) and
-`probe_fleet_read` (`require_fleet_read`'s decision and scope). Each runs the gate's own code
-under the thread-local `AuditProbeScope`, which makes `audit_log` a no-op (the `role.elevation.expired` lifecycle row, written through `audit_log_for_principal`, is still written), and withholds the
-denial row **only for an interactive cookie sign-in** (`denial_row_may_be_withheld`: `local`,
-`oidc` or `saml` and not an engine principal). A token or engine caller that reaches such a route
-keeps its row.
+with the gate's own response kept, so "denied" and "store unavailable" stay distinguishable),
+`probe_admin` (`require_admin`'s decision), `probe_fleet_read` (`require_fleet_read`'s decision and
+scope) and `probe_global_list_read` (`require_list_read`'s decision, with a management-group-
+confined admission refused as a denial, for a resource that is not agent-scoped; its loud twin
+`require_global_list_read` is the gate of the plugin-config REST list). Each runs the gate's own
+code under the thread-local `AuditProbeScope`. `require_auth`, the first step of every gate,
+records the session the gate authenticated in that scope, and `audit_log` withholds a row **only
+when that session is an interactive cookie sign-in** (`denial_row_may_be_withheld`: `local`,
+`oidc` or `saml` and not an engine principal). The decision rests on the one lookup that decided
+the verdict, never on a second one; the `role.elevation.expired` lifecycle row, written through
+`audit_log_for_principal`, is still written. A request whose gate session is a token or an engine
+principal keeps its row.
 
 What is withheld is the audit row. The denial counters (`yuzu_auth_topology_floor_denied_total`,
 `yuzu_auth_service_scope_default_denied_total`, `yuzu_server_rbac_read_degrade_total`) still tick,
 and the store's own read telemetry is untouched.
 
 A probe is a rendering hint unless a route deliberately binds it as its gate: the Dashboard panel
-fragments do (a refused sign-in is shown a note and leaves no row), while an action route must
+fragments and the Plugins and updates fragments do (a refused sign-in is shown a note and
+leaves no row), while an action route must
 re-check through `require_permission` or `require_scoped_permission`. An earlier design that
 threaded a `Quiet` argument through `require_permission` was dropped because nothing called it and
 it did not cover `require_fleet_read`.

@@ -128,9 +128,13 @@ struct AuthRoutesHarness {
 
     AuthRoutesHarness() : tmp(yuzu::test::unique_temp_path("auth-routes-mfa-")) {
         cfg.auth_config_path = tmp.path / "auth.cfg";
-        // Tight pending-token TTL so we can assert expiry without
-        // sleeping minutes in tests.
-        cfg.mfa_login_pending_secs = 2;
+        // The pending-token TTL is left at its production default. A tight one used to live
+        // here so the expiry case could avoid sleeping minutes, but it applied to EVERY case:
+        // each one spends real time between "/login" (which mints the token) and the follow-up
+        // POST on Postgres round trips and PBKDF2, and on a sanitizer leg that outlasted the
+        // 2 s TTL, so the token was reaped and the follow-up got a 401 "pending token invalid or
+        // expired" instead of the outcome under test (#5538, the "mfa.enroll.race" case's 401 vs
+        // 409). The one case that tests expiry shortens it itself.
         cfg.https_enabled = false; // no Secure cookie suffix
 
         auth_mgr.load_config(cfg.auth_config_path);
@@ -324,7 +328,8 @@ TEST_CASE("POST /login MFA-enrolled returns 202 + mfa_pending_token, no cookie",
     CHECK(res->status == 202);
     CHECK(res->body.find(R"("status":"mfa_required")") != std::string::npos);
     CHECK(res->body.find(R"("mfa_pending_token")") != std::string::npos);
-    CHECK(res->body.find(R"("expires_in":2)") != std::string::npos);
+    CHECK(nlohmann::json::parse(res->body).at("expires_in").get<int>() ==
+          h.cfg.mfa_login_pending_secs);
     CHECK(res->get_header_value("Set-Cookie").empty());
     CHECK(h.count_audits("mfa.login.required", "admin") >= 1);
     // Crucially, auth.login is NOT emitted yet — only the .required
@@ -721,6 +726,7 @@ TEST_CASE("POST /login/mfa strict shape gate routes non-6-digit to recovery path
 
 TEST_CASE("POST /login/mfa pending token expires after TTL", "[pg][mfa][routes][auth_routes]") {
     AuthRoutesHarness h;
+    h.cfg.mfa_login_pending_secs = 2; // read at /login time, so set before the token is minted
     h.enroll_mfa("admin");
     auto step1 = h.sink.Post("/login",
                              form({{"username", "admin"}, {"password", "adminpassword1"}}),
@@ -729,7 +735,7 @@ TEST_CASE("POST /login/mfa pending token expires after TTL", "[pg][mfa][routes][
     auto p_start = body.find(R"("mfa_pending_token":")") + 21;
     auto pending = body.substr(p_start, body.find('"', p_start) - p_start);
 
-    // Sleep past the TTL (configured to 2 s in the harness). reap_mfa_
+    // Sleep past the TTL (set to 2 s at the top of this case). reap_mfa_
     // pending_locked fires on the next access via /login/mfa.
     //
     // 5000 ms = 2.5x the TTL — the conventional multiplier for wall-

@@ -2874,6 +2874,111 @@ groups:
             See #2659 for the deferred-widening posture behind this metric.
           runbook_url: "https://docs.yuzu.io/runbooks/guardian-read-degraded"
 
+      # The heartbeat reconcile aborts, sending nothing, when a store it depends on
+      # cannot be read, and counts every such abort as
+      # yuzu_server_guardian_reconciles_total{result="degraded"}. The causes are the
+      # policy generation read (the first read before admission and the fresh read
+      # after it), the rule store, the Baseline deployed-set read, a rule bundle load
+      # that timed out waiting for another load or threw, and the tag or property
+      # store during per-agent scope evaluation. YuzuGuardianReadDegraded counts only
+      # the rule store reads of those, and the policy generation read and the Baseline
+      # deployed-set read bump no read-degrade counter at all, so without this rule a
+      # generation or Baseline store outage leaves every behind agent unreconciled with
+      # nothing paging. Overlap with YuzuGuardianReadDegraded (rule store),
+      # YuzuTagStoreReadDegraded and YuzuCustomPropertiesReadDegraded (scope reads) is
+      # deliberate: this one answers "is the reconcile itself failing", the others name
+      # the store. A reconcile that throws out of the hook into the heartbeat handler is
+      # caught there and counted by yuzu_server_guardian_reconcile_exceptions_total, not
+      # by the degraded result, so the rule also fires on that counter: a reconcile that
+      # keeps throwing would otherwise be invisible here. Both counters are pre-seeded to
+      # 0 at boot (see docs/observability-conventions.md), so the first abort or throw
+      # after boot is an increase. sum() makes a multi-replica fleet one signal, and the
+      # two sums carry no labels, so a rise in both is one alert.
+      - alert: YuzuGuardianReconcileDegraded
+        expr: |
+          (sum(increase(yuzu_server_guardian_reconciles_total{result="degraded"}[10m])) > 0)
+          or
+          (sum(increase(yuzu_server_guardian_reconcile_exceptions_total[10m])) > 0)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Guardian heartbeat reconcile is aborting on an unreadable store or throwing"
+          description: >-
+            yuzu_server_guardian_reconciles_total{result="degraded"} or
+            yuzu_server_guardian_reconcile_exceptions_total increased over the last
+            10 minutes: heartbeat reconciles aborted on an unreadable store, or the
+            reconcile hook threw. Either way nothing is sent to the agents concerned
+            (the abort is fail-closed, so a narrowed or empty rule set is never
+            pushed). Agents
+            that are behind the server's policy generation stay behind until the read
+            recovers, and an agent with nothing armed yet receives no rules, unscoped
+            rules included. The counter covers the policy generation read, the rule
+            store, the Baseline deployed-set read, a rule bundle load failure, and the
+            tag or property store read during scope evaluation. Find which: the
+            guaranteed_state.reconcile audit rows with result=degraded and a detail
+            beginning "heartbeat reconcile ABORTED" name the cause ("policy generation
+            unreadable", "rule store degraded", "baseline store degraded", "rule
+            bundle load failed", "scope store degraded"), and the server warn log
+            carries the same. The first policy generation read, before admission,
+            writes no audit row, so a rising counter with no such rows points at that
+            read. A rule store cause also fires YuzuGuardianReadDegraded and a scope
+            cause also fires YuzuTagStoreReadDegraded or
+            YuzuCustomPropertiesReadDegraded; the other causes fire only this alert.
+            When only yuzu_server_guardian_reconcile_exceptions_total rose, the cause
+            is a throw, not a store abort: the server warn line "Heartbeat guardian
+            reconcile threw for agent=..." carries the exception text.
+            Check Postgres reachability and yuzu_pg_* pool saturation first. The
+            agents are retried on later heartbeats, so no operator action is needed
+            once the store recovers.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/guaranteed-state.md#4-push-to-agents"
+
+      # yuzu_server_guardian_agent_generation_ahead_total flags an agent that reports a
+      # policy generation ABOVE the server's, usually because the Guardian state store
+      # was restored to an earlier state or rebuilt while the agents kept the
+      # generation they persisted. Such an agent refuses every full push labelled below
+      # the generation it holds, so rule and Baseline edits stop reaching it, and the
+      # server cannot otherwise see that: the reconcile counts the agent as converged
+      # and sends nothing. The counter is a throttled flag, not a count: at most one
+      # increment per minute per replica, and only after a fresh store read confirms the
+      # agent is ahead. The window must stay well above one minute plus the agent
+      # heartbeat interval (30 s by default) so a sample is not missed; 15m clears about
+      # 15 minutes after the fix. Do not read rate() of this counter as a magnitude.
+      # Blind spot: an agent whose boot re-arm is unresolved reports generation 0 while
+      # it still refuses a lower-labelled push, so it is never counted here (see
+      # guaranteed-state.md, Restoring the policy generation, Detection limits).
+      - alert: YuzuGuardianAgentGenerationAhead
+        expr: |
+          sum(increase(yuzu_server_guardian_agent_generation_ahead_total[15m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "An agent holds a Guardian policy generation above the server's"
+          description: >-
+            yuzu_server_guardian_agent_generation_ahead_total increased over the last
+            15 minutes: at least one agent reports a Guardian policy generation above
+            the server's. That agent refuses every full push labelled below the
+            generation it holds, so rule and Baseline edits are not delivered to it
+            until the server's generation reaches its own. The usual cause is a
+            Guardian state store restored to an earlier state or rebuilt while agents
+            kept their persisted generation. The counter is sampled at most once a
+            minute per replica and does not count agents. The server warn line
+            "Guardian heartbeat reconcile: agent_id=... reports policy generation N
+            above the server's M" names one sampled agent with both numbers; take the
+            highest held generation from several agents' refusal log lines, not one
+            sampled value. Before raising, check that the rule store and the deployed
+            Baselines hold the policy you want enforced fleet-wide, because the raise
+            converges every behind agent to exactly that rule set. Then use the
+            supported raise (POST /api/v1/guaranteed-state/policy-generation/raise or
+            the MCP tool raise_guardian_policy_generation) with a target of the highest
+            held generation plus one. The alert stays firing for about 15 minutes after
+            the fix; confirm with
+            changes(yuzu_server_guardian_agent_generation_ahead_total[3m]) being 0 on
+            every replica rather than by waiting for it to clear. An agent whose boot
+            re-arm is unresolved reports generation 0 and is not counted by this alert.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/guaranteed-state.md#restoring-the-policy-generation"
+
   - name: yuzu-audit
     # Behavioural-data routes (guardian.device.view, dex.device.view, dex.signal.view,
     # dex.perf.device.view, network.device.view, and response.read on the v1 query,
@@ -2894,21 +2999,35 @@ groups:
           description: >-
             yuzu_server_audit_emit_failed_total is rising. Every REST route that uses
             fail-closed audit-on-open (guardian.device.view, dex.device.view,
-            dex.signal.view, dex.perf.device.view, network.device.view, plus
+            dex.signal.view, dex.perf.device.view, network.device.view, inventory.devices,
+            inventory.device.ci, plus
             response.read on the v1 query, aggregate and export routes and on the
             legacy get, aggregate and export routes) is returning 503 and withholding PII or response
             data, so a ServiceNow / CMDB poll blackouts fleet-wide. Set-and-proceed reads, including
             crypto.libraries.*, keep serving data and do not 503: their REST routes and dashboard
-            fragments set the Sec-Audit-Failed header, their MCP tools set audit_persisted:false,
-            and only the /crypto (crypto.libraries.*) pages also show an on-page "Audit not
-            recorded" notice.
+            fragments set the Sec-Audit-Failed header, their MCP tools set audit_persisted:false
+            (the hardware CI tools list_hardware_ci and get_hardware_ci, which audit as
+            inventory.devices and inventory.device.ci, fail closed instead: they withhold the
+            data and answer a retryable -32603), and only the /crypto (crypto.libraries.*) pages
+            also show an on-page "Audit not recorded" notice.
             Check audit_store health (/healthz
             stores.audit) and free disk / connection saturation on the PostgreSQL
             server (ADR-0040 — audit is Postgres-backed, not a local file). Note: a bad_alloc-class
             throw in the audit pipeline fails closed the same way but does NOT bump this
             counter (it is catch-logged only) — correlate with a spike in 503s on the
             behavioural routes. The audit-first admin writes (webhooks, offload targets,
-            directory sync, group mappings, MCP settings) 503 the same way.
+            directory sync, group mappings, MCP settings) 503 the same way. Upload-grant revoke
+            refuses on both REST (503) and MCP (retryable -32603), so a leaked grant stays
+            redeemable until the outage ends or its TTL expires, whichever is first (#6169).
+            Approval approve and reject (approval.approve, approval.reject) 503 with
+            Sec-Audit-Failed when the "attempted" row fails; then the decision is not applied
+            and the request stays pending. Their outcome rows (success or denied) are best
+            effort: a failed outcome row also moves this counter and the response carries no
+            Sec-Audit-Failed. A lost success row means the decision was applied; a lost denied
+            row means the store refused it, so this request applied nothing and the ticket keeps
+            its prior state (usually pending, but read its status). Check the status of any
+            request that has more "attempted" rows than outcome rows (compare counts per
+            target_id; the example query is in the runbook).
           runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
 
       # #2360 retention clock guard. The guard declines a cleanup pass that would
@@ -5125,3 +5244,126 @@ groups:
             the DATABASE primary's NTP / clock health; correlate with
             yuzu_exec_correlation_store_degrade_total /
             yuzu_exec_correlation_write_degrade_total.
+
+  - name: yuzu-enablement
+    # ADR-3006 — the durable plugin-enablement store (EnablementStore). Every closed-label
+    # series and every gauge is zero-seeded at boot, so increase() > 0 is
+    # meaningful and absent() stays a real signal. All series are server-side.
+    #
+    # Most of these arm with the later change that issues desired state: until then only
+    # YuzuEnablementRegressed and YuzuEnablementAnchorWriteFailing can fire, and the rest
+    # read as flat zero ("inactive") without being armed. The loader, the registration and
+    # report writers and the unit resolver have no production caller yet.
+    #
+    # Deliberately NOT alerted: yuzu_server_enablement_write_degrade_total and
+    # yuzu_server_enablement_read_degrade_total on their own. A best-effort
+    # registration or read fault is retried by the next event; the
+    # signals that matter operationally are a regression, a rule the
+    # loader refused and a continuity anchor that cannot be written. Also not alerted:
+    # yuzu_server_enablement_anchor_unwitnessed_total, which is expected once on every
+    # fresh install (the manual defines it).
+    rules:
+      # A refused rule is a standing condition (it stays unapplied until it is fixed or
+      # deactivated), so this alerts on the per-load gauge. The counter
+      # yuzu_server_enablement_rules_rejected_total{reason} keeps the rate and the reason.
+      - alert: YuzuEnablementRulesRejected
+        expr: |
+          yuzu_server_enablement_rules_quarantined > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A persisted enablement rule was refused at load and quarantined"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/adr/3005-plugin-config-store.md"
+          description: >-
+            The enablement loader re-reads every stored rule through
+            make_persisted_rule and refused at least one at its last load
+            (the reason is on yuzu_server_enablement_rules_rejected_total:
+            refused = selector, attribute or unit-name shape, provenance = an
+            unknown provenance spelling, caps = an over-cap or malformed row).
+            A refused rule is NOT applied, so the units it names are not
+            switched off by it. The server log carries one line per refused
+            rule naming its (neutralised) id and the reason.
+
+      - alert: YuzuEnablementUnresolvedUnits
+        expr: |
+          yuzu_server_enablement_unresolved_units > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Enablement rules reference units this release does not know"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/adr/3005-plugin-config-store.md"
+          description: >-
+            One or more persisted rules name a unit that this release's
+            capability catalogue knows neither as a unit nor as a recorded
+            non-unit (a unit removed or renamed since the rule was authored).
+            Such a name switches nothing off; the rule's other units still
+            apply. Review the rule or restore the unit. The loader's warn line
+            lists up to 20 of the names.
+
+      - alert: YuzuEnablementRegressed
+        expr: |
+          yuzu_server_enablement_regressed == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The enablement store is declared regressed - issuing desired state is frozen"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#enablement-continuity-anchor"
+          description: >-
+            The continuity anchor (enablement-anchor beside the server data)
+            disagrees with the enablement store. Three causes, named by the
+            reason in the boot log (grep for "declared REGRESSED"):
+            store_id_mismatch (the anchor names a different store while the
+            anchor's counter or the store's counter is above 0: a database
+            replaced, or a cloned image, after desired state was issued;
+            at counter 0 on both sides nothing was ever issued and the
+            server rewrites the anchor instead), store_behind
+            (the store's counter is below the anchor's: a dump older than the
+            anchor) or anchor_unparseable (the file is readable but is not an
+            anchor). While regressed the store issues no desired state and
+            nothing already issued is changed. The declaration is permanent in
+            the product; the runbook gives the exit for this release.
+            /readyz reports enablement.regression_pending.
+
+      - alert: YuzuEnablementReportAhead
+        expr: |
+          yuzu_server_enablement_report_ahead_endpoints > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Endpoints reported an enablement state newer than the store's"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#enablement-continuity-anchor"
+          description: >-
+            One or more endpoints reported an (epoch, counter) above the
+            enablement store's highest. That is the second witness that the
+            database was restored from an older dump (or replaced) while
+            endpoints kept their state. It is surfaced here and on /readyz
+            (enablement.report_ahead); the later change that issues desired
+            state declares the regression from it. Compare with
+            yuzu_server_enablement_regressed.
+
+      # State-shaped on purpose: the anchor is written at boot, so a counter of failures goes
+      # 0 -> 1 before the first scrape and would never show a rise. The gauge is seeded 1 and set
+      # to 0 by a failed write or an anchor that cannot be read, so it is visible from the first
+      # scrape and clears once a later boot writes the anchor.
+      - alert: YuzuEnablementAnchorWriteFailing
+        expr: |
+          yuzu_server_enablement_anchor_writable == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The enablement continuity anchor could not be written"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#enablement-continuity-anchor"
+          description: >-
+            The server could not write the continuity anchor (enablement-anchor
+            in --data-dir): the directory is read-only, full or missing, or
+            the file exists but cannot be read. Until it is fixed this host
+            cannot witness the enablement store, so every boot reads as
+            unwitnessed and a restored older dump would go unnoticed here. The
+            boot log line says which. Make the data directory writable
+            (one persistent data directory per replica; an ephemeral one makes
+            the mechanism inert).

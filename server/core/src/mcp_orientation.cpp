@@ -25,7 +25,14 @@ std::string_view about_text() {
            "owner engine principals, plus a no-admin audit) is a supervised-tier, "
            "human-admin-only surface for provisioning the durable identities behind "
            "autonomous use-case-engine modules — engine-classed sessions are structurally "
-           "barred from calling it, and every mutation is approval-gated.";
+           "barred from calling it, and every mutation is approval-gated.\n\n"
+           "Deciding an approval ticket is a human act: approve/reject run from the "
+           "dashboard or REST under an interactive login that passes the MFA step-up "
+           "gate (an un-enrolled local user passes it; requiring an enrolled factor of "
+           "the approver is tracked in #6079). "
+           "The MCP tools approve_request and reject_request are registered but always "
+           "return approver_assurance_required:* (#6061); an MCP caller can list pending "
+           "approvals and must ask a human to decide them.";
 }
 
 std::string_view operating_model_text() {
@@ -38,10 +45,13 @@ std::string_view operating_model_text() {
 
 // ── Tool-family enumeration ──────────────────────────────────────────────────
 //
-// The union of every family's `tools` list is exactly the kTools[] set. This is
+// The union of every family's `tools` list is exactly the served set: the legacy
+// kTools[] entries plus the registry records (mcp_tools_<domain>.cpp). This is
 // asserted mechanically by the family-tether test against the live tools/list
 // output, so a new tool with no family assignment (or a family dropped from the
-// blob) is a test FAILURE, not a review miss. Keep names in kTools[] order.
+// blob) is a test FAILURE, not a review miss. The test compares sets, so order is
+// not enforced; tools/list is served in tool-name order, and the order of names
+// within a family is only a readability convention.
 
 namespace {
 
@@ -64,7 +74,8 @@ constexpr std::string_view kInventory[] = {"query_inventory", "list_inventory_ta
                                            "query_software_licenses", "get_agent_app_usage",
                                            "query_software_catalogue", "get_software_versions",
                                            "get_crypto_libraries", "list_crypto_library_devices",
-                                           "export_crypto_cbom"};
+                                           "export_crypto_cbom", "list_hardware_ci",
+                                           "get_hardware_ci"};
 constexpr std::string_view kCompliance[] = {
     "list_policies",    "get_compliance_summary",       "get_fleet_compliance",
     "get_guardian_schemas", "get_policy", "list_policy_fragments",
@@ -103,7 +114,7 @@ constexpr std::string_view kNetwork[] = {"get_network_fleet", "list_network_devi
                                         "list_discovered_devices"};
 constexpr std::string_view kExecution[] = {"execute_instruction", "execute_bundle",
                                            "get_bundle_result", "sync_hardware_software"};
-constexpr std::string_view kRemediation[] = {"quarantine_device"};
+constexpr std::string_view kRemediation[] = {"quarantine_device", "list_quarantined_devices"};
 // gap-matrix #10 (ADR-1005 A5 parity): issue_code_signing_cert joins the
 // family — same Security securable domain, same "Certificates" mental model.
 // B5 (api-parity #2146): export_ca_root_csr joins too — same PKI/CA domain,
@@ -169,13 +180,17 @@ constexpr std::string_view kDiscovery[] = {"discover_permissions", "discover_ins
 // get_guardian_device_compliance) — same live-enforcement-state family, not
 // a new one; the schema-catalog/live-state distinction this family's
 // description draws still holds.
+// raise_guardian_policy_generation (recovery of a restored policy-generation
+// counter) joins this family: it acts on the same live rule-set state the push
+// tool distributes, and get_guardian_policy_generation is its read-only twin.
 constexpr std::string_view kGuardian[] = {
     "get_guardian_status",         "list_guardian_rules",
     "get_guardian_rule_status",    "list_guardian_events",
     "get_guardian_device_guards",  "create_guardian_rule",
     "get_guardian_rule",           "update_guardian_rule",
     "delete_guardian_rule",        "push_guardian_rules",
-    "get_guardian_agent_status",   "get_guardian_device_compliance"};
+    "get_guardian_agent_status",   "get_guardian_device_compliance",
+    "raise_guardian_policy_generation", "get_guardian_policy_generation"};
 // #4036 (api-parity Batch A) — the /auto pre-flight ASSESS + deploy ACT
 // stages' read twins. Own family, distinct from Fleet & agents / Live
 // execution: these are owner-scoped readiness/preview reads over the
@@ -295,7 +310,8 @@ constexpr std::array<ToolFamily, 40> kFamilies{{
     {"Command responses", "query and aggregate stored command/instruction responses", kResponses},
     {"Executions & audit", "execution status/history and the who-did-what audit log",
      kExecutionsAudit},
-    {"Inventory & software", "collected inventory tables, installed software, and licenses",
+    {"Inventory & software",
+     "collected inventory tables, installed software, hardware CI records, and licenses",
      kInventory},
     {"Policy & compliance", "policies, per-device and fleet compliance, Guardian schemas",
      kCompliance},
@@ -308,7 +324,9 @@ constexpr std::array<ToolFamily, 40> kFamilies{{
      "the hierarchical device grouping used for access scoping — list/create/get/update groups, "
      "manage static membership, and delegate group-scoped Operator/Viewer roles",
      kMgmtGroups},
-    {"Approvals", "list pending approvals and approve/reject maker-checker tickets", kApprovals},
+    {"Approvals", "list pending approvals; approve_request/reject_request always refuse "
+                  "(approver_assurance_required:*) -- deciding a ticket is a dashboard/REST act",
+     kApprovals},
     {"DEX signals", "digital-employee-experience reliability signals and their scope/detail",
      kDexSignals},
     {"DEX performance", "fleet, cohort, device, and per-app performance over time", kDexPerf},
@@ -317,7 +335,9 @@ constexpr std::array<ToolFamily, 40> kFamilies{{
      kNetwork},
     {"Live execution", "dispatch plugin actions or bundles to endpoints and collect results",
      kExecution},
-    {"Device remediation", "quarantine a device (destructive, approval-gated)", kRemediation},
+    {"Device remediation",
+     "quarantine a device (destructive, approval-gated) and list active quarantines",
+     kRemediation},
     {"Certificates",
      "list issued agent certificates, revoke one, and issue a code-signing certificate via "
      "CSR custody",
@@ -343,8 +363,8 @@ constexpr std::array<ToolFamily, 40> kFamilies{{
      kAgenticHelpers},
     {"Discovery", "enumerate permissions, instructions, routes, scope kinds, and plugins",
      kDiscovery},
-    {"Guardian", "live Guardian rule/event state and per-device guard status (not the schema "
-                "catalog -- see Policy & compliance for that)",
+    {"Guardian", "live Guardian rule/event state, per-device guard status and recovery of the "
+                "policy generation (not the schema catalog -- see Policy & compliance for that)",
      kGuardian},
     {"Pre-flight & deploy", "owner-scoped saved pre-flight runs, the deploy-config go/warn "
                             "preview for one of them, and the caller's deployments and their "

@@ -1624,18 +1624,18 @@ void GuardianRoutes::deploy_baseline(const httplib::Request& req, httplib::Respo
     // agents (management-group targeting deferred); full_sync so agents rebuild to
     // exactly the deployed set — a Guard dropped from every deployed Baseline is
     // thereby removed. The push reads the freshly-bumped generation.
-    int pushed = -2;
+    int pushed = -1;
     if (push_fn_)
         pushed = push_fn_(/*scope=*/"", /*full_sync=*/true);
 
-    // Gate 2 LOW2: -2 is "rule store degraded" (distinct from -1 "not wired /
-    // other push failure"). The Baseline IS persisted and the generation bumped,
-    // so reconcile converges once the store heals — but the operator/SIEM must
-    // not be told "deployed" when the fan-out was refused. Branch the audit
-    // result + toast on the degraded case.
+    // Gate 2 LOW2: -2 is "a store read degraded" (a rule, deployed-set, tag, property or
+    // group-membership read; distinct from -1 "not wired / other push failure"). The
+    // Baseline IS persisted and the generation bumped, so reconcile converges once the
+    // store heals, but the operator/SIEM must not be told "deployed" when the fan-out
+    // was refused. Branch the audit result + toast on the degraded case.
     const bool degraded = (pushed == -2);
     const std::string deploy = pushed >= 0 ? ("agents=" + std::to_string(pushed))
-                               : degraded  ? "store degraded — fan-out deferred to reconcile"
+                               : degraded  ? "a store read degraded - fan-out deferred to reconcile"
                                            : "push not wired/failed";
     audit_fn_(req, "guaranteed_state.baseline.deploy", degraded ? "degraded" : "success",
               "GuaranteedState", baseline_id,
@@ -1645,7 +1645,11 @@ void GuardianRoutes::deploy_baseline(const httplib::Request& req, httplib::Respo
     if (degraded)
         res.set_header(
             "HX-Trigger",
-            R"json({"showToast":{"message":"Baseline saved; fleet fan-out deferred - rule store degraded, reconcile will converge","level":"warning"}})json");
+            R"json({"showToast":{"message":"Baseline saved; fleet fan-out deferred - a store read degraded, reconcile will converge","level":"warning"}})json");
+    else if (pushed == -1)
+        res.set_header(
+            "HX-Trigger",
+            R"json({"showToast":{"message":"Baseline saved; fleet fan-out not sent - push not wired or failed","level":"warning"}})json");
     else
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Baseline deployed","level":"success"}})");
@@ -1770,24 +1774,42 @@ void GuardianRoutes::delete_baseline_action(const httplib::Request& req, httplib
     // If it was deployed, converge the fleet: bump generation + fleet-wide full_sync
     // so its Guards are torn down where no other deployed Baseline still delivers
     // them (the union recomputes without this Baseline's members).
-    int pushed = -2;
+    int pushed = -1;
     if (was_deployed) {
         if (store_)
             store_->bump_policy_generation();
         if (push_fn_)
             pushed = push_fn_(/*scope=*/"", /*full_sync=*/true);
     }
+    // -2 is "a store read degraded": the Baseline IS deleted and the generation bumped,
+    // so reconcile converges once the store heals, but the audit row must not claim a
+    // reconciled fleet (mirrors the deploy action above). -1 (push not wired or failed)
+    // is a different outcome: the Baseline is deleted either way, so the audit result
+    // stays "success", but the detail and toast say the fleet was not re-converged.
+    const bool degraded = was_deployed && pushed == -2;
+    const bool not_pushed = was_deployed && pushed == -1;
     const std::string detail =
-        nm + (was_deployed ? (" (was deployed; reconciled agents=" + std::to_string(pushed) + ")")
-                           : " (draft)");
-    audit_fn_(req, "guaranteed_state.baseline.delete", "success", "GuaranteedState", baseline_id,
-              detail);
+        nm + (!was_deployed ? " (draft)"
+              : degraded    ? " (was deployed; a store read degraded - fan-out deferred to reconcile)"
+              : not_pushed  ? " (was deployed; push not wired or failed; fleet not re-converged)"
+                            : " (was deployed; reconciled agents=" + std::to_string(pushed) + ")");
+    audit_fn_(req, "guaranteed_state.baseline.delete", degraded ? "degraded" : "success",
+              "GuaranteedState", baseline_id, detail);
 
     // Close the modal (its subject is gone) and refresh both lists out-of-band.
     // No main-target content → htmx clears #guardian-modal-content; guardianModalClose
     // then hides the overlay.
-    res.set_header("HX-Trigger",
-                   R"({"guardianModalClose":true,"showToast":{"message":"Baseline deleted","level":"success"}})");
+    if (degraded)
+        res.set_header(
+            "HX-Trigger",
+            R"json({"guardianModalClose":true,"showToast":{"message":"Baseline deleted; fleet fan-out deferred - a store read degraded, reconcile will converge","level":"warning"}})json");
+    else if (not_pushed)
+        res.set_header(
+            "HX-Trigger",
+            R"json({"guardianModalClose":true,"showToast":{"message":"Baseline deleted; the fleet push did not run, so agents were not re-converged","level":"warning"}})json");
+    else
+        res.set_header("HX-Trigger",
+                       R"({"guardianModalClose":true,"showToast":{"message":"Baseline deleted","level":"success"}})");
     std::string html = "<div id=\"guardian-baselines\" hx-swap-oob=\"innerHTML\">" +
                        render_baselines_fragment() + "</div>"
                        "<div id=\"guardian-guards\" hx-swap-oob=\"innerHTML\">" +

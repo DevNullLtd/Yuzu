@@ -188,6 +188,11 @@ TEST_CASE("AuthManager+SessionStore: create_local_session → validate round-tri
     auto by_raw = store.find(token);
     REQUIRE(by_raw.has_value());
     CHECK_FALSE(by_raw->has_value());
+    // The SHA-256 digest of the token is that key, and is also what an audit row's
+    // session_id carries for the same cookie.
+    auto by_digest = store.find(AuthManager::sha256_hex(token));
+    REQUIRE(by_digest.has_value());
+    CHECK(by_digest->has_value());
 }
 
 TEST_CASE("AuthManager+SessionStore: a session survives on a fresh replica",

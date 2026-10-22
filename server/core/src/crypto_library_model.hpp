@@ -7,11 +7,12 @@
 /// query-parameter parsing (REST clamps, MCP refuses), filter-bound keyset cursors and the JSON
 /// shapers. No httplib, no MCP, no libpq, no store types.
 ///
-/// MECHANISM, not interpretation (ADR-1005 D2, like ADR-0024's `product_normalize`): the table
-/// maps a package name to a library family by deterministic name matching and the surface
-/// reports presence and versions only. It never labels a library or version good, bad, current
-/// or out of date; that is engine territory behind the ADR-0032 interlock. Matching happens in
-/// SQL from patterns derived from this table - there is NO second copy of the rules.
+/// MECHANISM, not interpretation (ADR-1005 Decision 2; ruled identity resolution by ADR-0070
+/// D2, like ADR-0024's `product_normalize`): the table maps a package name to a library family
+/// by deterministic name matching and the surface reports presence and versions only. It never
+/// labels a library or version good, bad, current or out of date; that is engine territory
+/// behind the ADR-0032 interlock (ADR-0070 D3). Matching happens in SQL from patterns derived
+/// from this table - there is NO second copy of the rules.
 ///
 /// Editing the table bumps `kCryptoTableVersion`, which every summary returns as
 /// `table_version` so a client can tell which mapping produced an answer.
