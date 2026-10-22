@@ -118,12 +118,21 @@ struct Approval {
     // One-time-consumption stamp for the MCP approval-ticket flow (#289 / Issue
     // 13.5): epoch-seconds when an approved ticket was recalled-and-executed,
     // 0 while unconsumed. SQLite-era additive column (v2); part of the
-    // Postgres v1 DDL from creation (ADR-0065).
+    // Postgres v1 DDL from creation (ADR-0065). For a SCHEDULE ticket (#6096) this
+    // means "settled", not "an approved ticket was recalled-and-executed": it is set,
+    // for approved and rejected tickets alike, by retire_schedule_tickets when the
+    // occurrence the ticket decided has been queued or skipped. A scheduled ticket
+    // needs this to be 0, which is necessary but not sufficient: the outbox ledger also
+    // decides (see ScheduleRunner).
     int64_t consumed_at{0};
     // WHO consumed the ticket (PR #1796 review H3/N2, SOC-2 CC7.2): the
     // principal whose recall executed the gated tool. Empty while unconsumed.
     // SQLite-era additive column (v3). Completes the ticket's evidence chain:
-    // submitted_by → reviewed_by → consumed_by.
+    // submitted_by → reviewed_by → consumed_by. For a schedule ticket (#6096) it is
+    // `schedule:<schedule_id>:<next_execution_at>` (the occurrence it settled),
+    // `schedule:ledger-spent:<schedule_id>:<next_execution_at>` (a ticket the outbox ledger
+    // showed an EARLIER occurrence had used), or `schedule:legacy-6096` for a ticket the v2
+    // migration retired.
     std::string consumed_by;
     /// Empty for an interactively-submitted ticket (workflow_routes.cpp) or an
     /// MCP-minted one (mcp_server.cpp); set to the owning schedule's id for a
@@ -560,6 +569,50 @@ public:
     /// (the scheduler) holds the occurrence rather than treating an unreadable ticket as
     /// a dead one. Read-only; consumes nothing.
     [[nodiscard]] std::expected<bool, std::string> ticket_is_live(const std::string& id) const;
+
+    /// The schedule-origin retire (#6096): settle the approved or rejected tickets `ids` of
+    /// `schedule_id` once the ScheduleRunner has settled an occurrence, so a scheduled
+    /// ticket needs `consumed_at == 0` to be eligible (necessary but not sufficient: the outbox
+    /// ledger also decides). One guarded UPDATE keyed on
+    /// `consumed_at = 0` (not a read followed by a write) and on `id = ANY(ids)`, stamped from
+    /// DATABASE time, with `consumed_by = 'schedule:' + occurrence_id`, where `occurrence_id` is
+    /// the outbox key (`schedule_id:next_execution_at`) or `ledger-spent:<that key>`, so the
+    /// evidence chain is never empty.
+    /// Returns the number of rows THIS call retired; 0 is not an error (empty `ids`, nothing
+    /// unsettled, or another caller got there first). Pending tickets are never touched.
+    ///
+    /// SCOPED to the ids the caller OBSERVED in its own snapshot: the runner passes every
+    /// unsettled approved ticket of the schedule it saw this tick (matched, mismatch-skipped,
+    /// expired-unswept, outbox-spent) and, on a skip, the rejected ones. So an approved
+    /// mismatch-skipped ticket is retired with the one that fired (otherwise it could fire a
+    /// LATER occurrence after the definition is reverted), while a ticket approved after the
+    /// snapshot, or a successor occurrence's ticket, is never touched. A stale replica can
+    /// only settle tickets it saw, and each is a CAS from unsettled.
+    /// One approval == at most one scheduled run therefore needs no clock comparison.
+    ///
+    /// Accepted limitation: retire-ok followed by a failed schedule advance burns one approval.
+    /// The next tick finds the occurrence already in the outbox and advances without a fresh
+    /// ask (the outbox guard); the burnt ticket is simply spent. There is deliberately no
+    /// replay eligibility keyed on `consumed_by` equalling the occurrence key.
+    ///
+    /// Every retire site settles only observed ids, by a CAS from unsettled. The enqueue site
+    /// and the already-ran site run after the outbox row exists; the ledger-spent site settles
+    /// tickets whose outbox row belongs to an EARLIER occurrence; the rejected-skip site has no
+    /// outbox row.
+    ///
+    /// Deliberately NOT epoch-fenced. The only fenced write is the outbox INSERT
+    /// (`ScheduleRunner::tick` is FencedLeaderOnly). On the enqueue paths the retire only runs
+    /// after the outbox row exists (Enqueued or AlreadyEnqueued, whoever wrote it). On the
+    /// rejected-skip path there is no outbox row; the retire is an observed-ids-only CAS from
+    /// unsettled, so a stale leader can only settle tickets it saw (the deny direction).
+    /// Fencing it would only turn a harmless late settle into an extra held tick.
+    ///
+    /// A store failure is an error, not 0: the runner then holds the occurrence and retries,
+    /// which is safe because the enqueue is idempotent. `consume_ticket` still refuses
+    /// kSchedule origins; this is the only path that settles a scheduled ticket.
+    [[nodiscard]] std::expected<int, std::string>
+    retire_schedule_tickets(const std::string& schedule_id, const std::string& occurrence_id,
+                            const std::vector<std::string>& ids);
 
     /// consume_ticket with a pre-consume recheck (#2443). A ticket can sit
     /// approved-but-unconsumed for up to the 7-day TTL, so the state its effect
