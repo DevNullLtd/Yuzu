@@ -2709,23 +2709,38 @@ bool is_safe_install_command(std::string_view s) {
 
 } // anonymous namespace
 
-// External-linkage accessor declared in openapi_spec_access.hpp — see that
-// header for why this thin wrapper exists (openapi_spec() itself stays
-// TU-local; this just forwards to it from outside the anonymous namespace).
+// External-linkage accessors declared in openapi_spec_access.hpp (openapi_spec() itself stays
+// TU-local). openapi_spec_json() is not a plain forwarder: it derives, once per process, the
+// default form of the document (the full literal minus the per-group guides) and serves that
+// one stable string; openapi_spec_with_guides_json() below forwards to the literal as written.
+std::string openapi_strip_guides(const std::string& full, bool* fell_back) {
+    if (fell_back)
+        *fell_back = false;
+    auto doc = nlohmann::json::parse(full, nullptr, /*allow_exceptions=*/false);
+    if (doc.is_discarded() || !doc.contains("tags") || !doc["tags"].is_array()) {
+        if (fell_back)
+            *fell_back = true;
+        return full; // unparseable or no tags: serve the document as written
+    }
+    for (auto& tag : doc["tags"])
+        if (tag.is_object())
+            tag.erase("x-yuzu-guide");
+    std::string out = doc.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+    out.shrink_to_fit(); // sized exactly: one stable string for the process lifetime
+    return out;
+}
+
 const std::string& openapi_spec_json() {
     // The default form leaves out the per-group guides (tags[].x-yuzu-guide). They are
     // long prose for people reading /swagger, and an agentic worker reading
-    // yuzu://openapi or discover/routes should not pay tokens for them. Built once from the
-    // full document; the tag names and one-line descriptions stay.
+    // yuzu://openapi or discover/routes should not pay tokens for them. The tag names and
+    // one-line descriptions stay. A function-local static: initialised once, thread-safely.
     static const std::string lean = [] {
-        auto doc = nlohmann::json::parse(openapi_spec(), nullptr, /*allow_exceptions=*/false);
-        if (doc.is_discarded() || !doc.contains("tags") || !doc["tags"].is_array())
-            return openapi_spec(); // unparseable or no tags: serve the document as written
-        for (auto& tag : doc["tags"])
-            if (tag.is_object())
-                tag.erase("x-yuzu-guide");
-        std::string out = doc.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
-        out.shrink_to_fit(); // one stable string, sized exactly (the ecosystem-expansion test pins capacity)
+        bool fell_back = false;
+        auto out = openapi_strip_guides(openapi_spec(), &fell_back);
+        if (fell_back)
+            spdlog::error("openapi: the compiled-in document could not be parsed or has no tags; "
+                          "serving it with the guides included");
         return out;
     }();
     return lean;

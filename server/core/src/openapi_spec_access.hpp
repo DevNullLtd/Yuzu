@@ -17,8 +17,14 @@ namespace yuzu::server {
 
 /// Returns the exact JSON body `GET /api/v1/openapi.json` serves by default. It is the full
 /// document without the per-group guides (`tags[].x-yuzu-guide`), which are prose for the
-/// /swagger page; the MCP resource `yuzu://openapi` and the discover tools serve this form too.
+/// /swagger page. The MCP resource `yuzu://openapi` and the discover tools serve exactly this
+/// form; only `?guides=true` (see `openapi_spec_with_guides_json()`) differs from it.
 const std::string& openapi_spec_json();
+
+/// Removes `x-yuzu-guide` from every top-level tag of `full` and re-serialises it. Returns `full`
+/// unchanged, and sets `*fell_back`, when it cannot be parsed or has no `tags` array. The pure
+/// derivation behind `openapi_spec_json()`, exposed so the fallback can be tested.
+std::string openapi_strip_guides(const std::string& full, bool* fell_back = nullptr);
 
 /// The full document including the guides: what `GET /api/v1/openapi.json?guides=true`
 /// serves and what the /swagger page loads.
