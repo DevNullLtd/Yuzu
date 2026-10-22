@@ -728,9 +728,10 @@ for the tool to execute.
 > denial belt: a caller whose own MCP token is itself engine-classed
 > (`principal_kind="engine"` / `auth_source="engine_token"`) is denied on
 > every one of them, matching the REST surface's posture of denying an
-> engine-classed session on every route including the reads. An engine
-> principal can never introspect or mutate its own or another engine
-> principal's lifecycle surface via either transport.
+> engine-classed session on every engine-principal route except the three
+> `/engine-principals/{id}/roles` routes. The role tools `list_engine_roles`,
+> `assign_engine_role` and `unassign_engine_role` carry no such belt; they
+> rely on their tier and permission gates alone.
 
 > **`revoke_certificate` tier behavior:** destructive (`Security:Delete`), so it
 > follows the same rules as every other destructive MCP op — `readonly`/`operator`

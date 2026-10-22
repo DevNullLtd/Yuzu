@@ -937,7 +937,7 @@ Shipped (SOC 2 CC6.6 privileged-access MFA ladder). RFC 6238 TOTP + RFC 4648 bas
 
 ### 19.4 Hierarchical Management Groups :white_check_mark: `T2`
 
-`ManagementGroupStore` with `parent_id` for nesting. `get_children()` returns direct children. `get_ancestor_ids()` / `get_descendant_ids()` traverse the hierarchy. Static membership (manual add/remove) and dynamic membership (scope expression evaluation via `refresh_dynamic_membership()`). Well-known root group. REST CRUD + hierarchy endpoints. Group-scoped role assignments for access control.
+`ManagementGroupStore` with `parent_id` for nesting. `get_children()` returns direct children. `get_ancestor_ids()` / `get_descendant_ids()` traverse the hierarchy. Static membership (manual add/remove) and dynamic membership (a group stores a scope expression; `refresh_dynamic_membership()` replaces the dynamic members with a list of agents the caller resolved, and the server calls it once, at creation, for the auto-created `Service: {name}` groups). Well-known root group. REST CRUD + hierarchy endpoints. Group-scoped role assignments for access control.
 
 ### 19.5 Device Discovery (Unmanaged Endpoints) :white_check_mark: `T2`
 

@@ -1235,9 +1235,9 @@ Explicit maker-checker confirmation that a rotation's successor secret has been 
 
 ### Engine Principals
 
-Engine principals are the durable identities behind autonomous use-case-engine modules (ADR-1005 item 2b) — a distinct principal class from human users and human-created API tokens, with a named responsible human owner, a grant justification captured at creation, and a required `internal`/`external` classification. Design reference: `docs/auth-engine-principals-design.md`. Every credential minted against an engine principal is hard-locked to MCP tier `readonly` and can never be granted the admin/wildcard role ("no admin, ever" — independently provable via the auditor route below).
+Engine principals are the durable identities behind autonomous use-case-engine modules (ADR-1005 item 2b) — a distinct principal class from human users and human-created API tokens, with a named responsible human owner, a grant justification captured at creation, and a required `internal`/`external` classification. Design reference: `docs/auth-engine-principals-design.md`. Every credential minted against an engine principal is hard-locked to MCP tier `readonly`. Role assignment refuses the `admin`/`Administrator` roles and every built-in role, but it does not inspect the permissions of a custom role; the auditor route below reports any engine principal that holds an admin grant, a built-in role, or a grant covering every securable and operation.
 
-**Every *mutating* route is admin + MFA-step-up gated.** The read routes (`GET`/list, `GET /{id}`, and `GET /audit/no-admin`) are admin + RBAC gated (`EnginePrincipal:Read` for the two engine-principal reads, `AuditLog:Read` for `/audit/no-admin`) but do **not** require a fresh MFA step-up. Beyond that, every route — reads included — structurally denies a caller whose *own* session is engine-classed (`principal_kind="engine"` or `auth_source="engine_token"`): an engine principal can never enumerate, read, or mutate any entry on this surface, not even itself. A denied engine-classed caller gets `403`; the corresponding audit verb is recorded with `result=denied`.
+**Every *mutating* route is admin + MFA-step-up gated.** The read routes (`GET`/list, `GET /{id}`, and `GET /audit/no-admin`) are admin + RBAC gated (`EnginePrincipal:Read` for the two engine-principal reads, `AuditLog:Read` for `/audit/no-admin`) but do **not** require a fresh MFA step-up. Beyond that, every route except the three `/engine-principals/{id}/roles` routes (documented below) — reads included — structurally denies a caller whose *own* session is engine-classed (`principal_kind="engine"` or `auth_source="engine_token"`): an engine-classed session cannot list, read, or mutate engine principals through those routes, not even its own. A denied engine-classed caller gets `403`; the corresponding audit verb is recorded with `result=denied`. The three role routes carry no engine-session check and rely on their permission gate alone.
 
 **Storage failure:** if the engine-principal store failed to open at startup (no PostgreSQL configured, or a migration failure), every route on this surface returns `503 service unavailable`.
 
@@ -2810,10 +2810,12 @@ reconstructs the full `engine:<slug>` principal id internally. Grants are
 assignment is rejected pending the Phase-5 `authorize_list_read` extension
 (design §4.3).
 
-**Structural constraint (design §4.2, "no admin, ever"):** an engine principal
-can never hold the `admin`/`Administrator` role, any other built-in system
-role, or a wildcard role. `POST .../roles` **rejects** such a request outright
-(`400`) — it is never silently narrowed to something safer.
+**Structural constraint (design §4.2, "no admin, ever"):** `POST .../roles`
+**rejects** the `admin` and `Administrator` roles and every built-in system
+role outright (`400`); the request is never silently narrowed to something
+safer. The check does not look at what a custom role grants, so a custom role
+with a wildcard grant can be assigned; `GET /api/v1/engine-principals/audit/no-admin`
+flags such a grant afterwards.
 
 #### `GET /api/v1/engine-principals/{id}/roles`
 

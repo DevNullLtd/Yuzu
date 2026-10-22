@@ -2,6 +2,17 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: the OpenAPI document is larger, every operation has an `operationId`, and there is a `/swagger` page
+
+**What changed.** `GET /api/v1/openapi.json` now gives 257 of its 259 operations a success response with a content block (the earlier document did so for 17), and every operation carries an `operationId` (the earlier document had none). The default form of the document, which is also what the MCP resource `yuzu://openapi` serves, grew from about 408 KB to about 648 KB as served. A second form, `GET /api/v1/openapi.json?guides=true` (the value must be exactly `true` or `1`), adds a prose guide to each of the 47 tag groups. The MCP resource and the discover tools never serve the guide form. A new dashboard page, `/swagger`, renders the guide form in the browser. Both the route and the page need `Infrastructure:Read`, and the page has no navigation entry. The default form is re-serialised by the server, so its key order and whitespace differ from the guide form.
+
+**Who is affected.** Anyone who generates a client from the document or compares it byte for byte, and any agentic worker that reads `yuzu://openapi` into its context.
+
+**What to check.**
+
+- A client generator that derived method names from the path and verb now uses the `operationId` values, so generated method names change. Regenerate the client and review the diff.
+- An integration that reads `yuzu://openapi` or `GET /api/v1/openapi.json` into a size-limited context needs about 59 percent more room.
+
 ## Behaviour change: the Windows agent installer passes the enrollment token by file
 
 **What changed.** The Windows agent installer no longer puts the enrollment token on the

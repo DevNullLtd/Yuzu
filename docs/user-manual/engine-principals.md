@@ -4,9 +4,11 @@ Engine principals are the durable identities behind autonomous use-case-engine
 modules (ADR-1005 item 2b) — a third principal class alongside human users and
 human-created API tokens. Each engine principal has a named responsible human
 owner, a grant justification captured at creation, and a required
-`internal`/`external` classification, and it can never be granted the
-admin/wildcard role: least privilege is enforced structurally, not merely
-asserted by policy.
+`internal`/`external` classification. Role assignment refuses the
+`admin`/`Administrator` roles and every built-in role, and a read-only audit
+route reports any engine principal that holds an admin grant or a grant
+covering every securable and operation (see "What an engine principal can
+never be given" below).
 
 This page is an operator walkthrough. Full API reference:
 [REST API — Engine Principals](rest-api.md#engine-principals);
@@ -152,7 +154,9 @@ curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce
   the *specific* credential you no longer trust via
   `DELETE /api/v1/tokens/{token_id}` (never
   `DELETE /api/v1/engine-principals/{id}` — see step 4's callout below for
-  why).
+  why). That call needs the administrator role: a caller without it gets
+  `404 token not found`, the same answer as for an unknown id, and only the
+  audit log records the denial.
 
 ### 4. Confirm the rotation (optional but recommended)
 
