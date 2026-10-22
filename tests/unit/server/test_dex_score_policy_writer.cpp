@@ -478,7 +478,6 @@ TEST_CASE("writer: the attempted row carries the whole proposal before the store
         CHECK(w.refused == 1);
         REQUIRE(w.rows.size() == 1);
         CHECK(w.rows[0].result == "attempted");
-        CHECK(w.rows[0].detail["document"] == json::parse(body));
         attempted_row_is_complete("dex.score_policy.update", dex_score_policy_revision(body),
                                   json::parse(body));
     }
