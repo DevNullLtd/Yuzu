@@ -18,12 +18,14 @@
 #include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
 
 #include <algorithm>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -98,6 +100,16 @@ public:
             "UPDATE gateway_route_store.agent_routes SET connection_epoch=$2::bigint, "
             "session_id=$3 WHERE agent_id=$1",
             3, nullptr, params, nullptr, nullptr, 0)};
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+
+    // Run one raw statement on a second connection (direct row surgery, or
+    // dropping the v5 unique index to model a hand-dropped index).
+    void raw_exec(const char* sql) {
+        yuzu::server::pg::PgConn conn{PQconnectdb(dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(conn.get(), sql)};
+        INFO(PQresultErrorMessage(r.get()));
         REQUIRE(r.status() == PGRES_COMMAND_OK);
     }
 
@@ -269,7 +281,7 @@ public:
             conn.get(),
             "INSERT INTO gateway_route_store.agent_routes "
             "  (agent_id, connection_epoch, session_id, lease_until, updated_at) "
-            "SELECT $1 || lpad(g::text, 6, '0'), g, 'sess-capbulk', "
+            "SELECT $1 || lpad(g::text, 6, '0'), g, 'sess-capbulk-' || g, "
             "       now() - interval '1000 seconds', now() "
             "FROM generate_series(1, $2::int) AS g",
             2, nullptr, params, nullptr, nullptr, 0)};
@@ -1261,8 +1273,9 @@ TEST_CASE("GatewayRouteStore[pg]: lookup_by_sessions returns EVERY row for a dup
           "session id so the caller can refuse it",
           "[gateway_route][pg][store]") {
     GatewayRoutePg fx;
-    // session_id is not unique (register_fresh guards only the caller's own
-    // agent row): two agents may legitimately hold the same id.
+    // Defense-in-depth: a hand-dropped unique index can still leave
+    // one id on two rows, and the caller must be able to see that.
+    fx.raw_exec("DROP INDEX gateway_route_store.ux_agent_routes_session_id");
     REQUIRE(fx.store().register_fresh("agent-bys-dup1", "s-bys-dup").value().won);
     REQUIRE(fx.store().register_fresh("agent-bys-dup2", "s-bys-dup").value().won);
     std::vector<std::string> sids{"s-bys-dup"};
@@ -2686,4 +2699,540 @@ TEST_CASE("GatewayRouteStore: lookup_by_sessions fails closed against a closed p
     auto empty_out = store.lookup_by_sessions(std::span<const std::string>{});
     REQUIRE_FALSE(empty_out.has_value());
     CHECK(empty_out.error() == GatewayRouteStoreError::store_unavailable);
+}
+
+// ── #5683: UNIQUE partial index on agent_routes(session_id) ─────────────────
+
+namespace {
+
+using yuzu::server::pg::PgConn;
+using yuzu::server::pg::PgResult;
+
+PgConn raw_connect(const std::string& dsn) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    return conn;
+}
+
+void raw_run(PGconn* conn, const std::string& sql) {
+    PgResult r{PQexec(conn, sql.c_str())};
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+}
+
+std::string raw_scalar(PGconn* conn, const std::string& sql) {
+    PgResult r{PQexec(conn, sql.c_str())};
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(r.get()) == 1);
+    return PQgetisnull(r.get(), 0, 0) ? std::string("<null>")
+                                       : std::string(PQgetvalue(r.get(), 0, 0));
+}
+
+// Joins a still-joinable std::thread when it goes out of scope, so a REQUIRE that
+// throws between the thread's start and its explicit join() unwinds cleanly
+// instead of destroying a joinable std::thread (std::terminate). A plain
+// std::thread plus this guard, not std::jthread: Apple Clang's libc++ has no
+// std::jthread. Declare it AFTER the thread (it is destroyed first). When the
+// thread is parked on a lock `blocker` holds, the guard rolls the blocker's
+// transaction back first, otherwise the join would wait for the lock timeout.
+// The guard cannot be mutation-tested (it only matters on a throwing REQUIRE).
+struct ThreadJoinGuard {
+    std::thread& t;
+    PGconn* blocker{nullptr};
+    ThreadJoinGuard(const ThreadJoinGuard&) = delete;
+    ThreadJoinGuard& operator=(const ThreadJoinGuard&) = delete;
+    explicit ThreadJoinGuard(std::thread& thread, PGconn* blocking_conn = nullptr)
+        : t(thread), blocker(blocking_conn) {}
+    ~ThreadJoinGuard() {
+        if (!t.joinable())
+            return;
+        if (blocker != nullptr) {
+            PgResult rolled_back{PQexec(blocker, "ROLLBACK")};
+            (void)rolled_back;
+        }
+        t.join();
+    }
+};
+
+std::int64_t rows_holding(const std::string& dsn, const std::string& sid) {
+    auto conn = raw_connect(dsn);
+    return std::stoll(raw_scalar(conn.get(),
+                                 "SELECT count(*) FROM gateway_route_store.agent_routes "
+                                 "WHERE session_id = '" + sid + "'"));
+}
+
+} // namespace
+
+TEST_CASE("GatewayRouteStore[pg]: a concurrent adopt of one id is blocked by the unique index "
+          "and the loser is refused (INSERT branch)",
+          "[gateway_route][pg][store][unique_session]") {
+    GatewayRoutePg fx;
+    const std::string sid = "gw-session-" + std::string(32, 'a');
+    auto holder = raw_connect(fx.dsn());
+    auto observer = raw_connect(fx.dsn()); // autocommit: pg_stat_activity is snapshotted per transaction
+    raw_run(holder.get(), "BEGIN");
+    raw_run(holder.get(),
+            "INSERT INTO gateway_route_store.agent_routes "
+            "(agent_id, connection_epoch, session_id, updated_at) "
+            "VALUES ('yuzu_test_us_ins_a', 0, '" + sid + "', now())");
+
+    std::expected<ReclaimOutcome, GatewayRouteStoreError> loser =
+        std::unexpected(GatewayRouteStoreError::db_error);
+    std::thread t([&] { loser = fx.store().reclaim_tombstoned_session("yuzu_test_us_ins_b", sid, 90); });
+    ThreadJoinGuard join_guard(t, holder.get());
+    const bool blocked = wait_for_lock_waiter(observer.get());
+    raw_run(holder.get(), "COMMIT");
+    t.join();
+
+    REQUIRE(blocked);
+    REQUIRE(loser.has_value());
+    CHECK(*loser == ReclaimOutcome::held_by_other_agent);
+    CHECK(rows_holding(fx.dsn(), sid) == 1);
+    CHECK_FALSE(fx.raw_row_exists("yuzu_test_us_ins_b"));
+}
+
+TEST_CASE("GatewayRouteStore[pg]: a concurrent adopt of one id is blocked by the unique index "
+          "and the loser is refused (UPDATE branch)",
+          "[gateway_route][pg][store][unique_session]") {
+    GatewayRoutePg fx;
+    const std::string sid = "gw-session-" + std::string(32, 'b');
+    for (const char* agent : {"yuzu_test_us_upd_a", "yuzu_test_us_upd_b"}) {
+        REQUIRE(fx.store().register_fresh(agent, "tmp-" + std::string(agent)).value().won);
+        REQUIRE(fx.store().deregister(agent, "tmp-" + std::string(agent)).value().removed);
+    }
+    auto holder = raw_connect(fx.dsn());
+    auto observer = raw_connect(fx.dsn()); // autocommit: pg_stat_activity is snapshotted per transaction
+    raw_run(holder.get(), "BEGIN");
+    raw_run(holder.get(), "UPDATE gateway_route_store.agent_routes SET session_id = '" + sid +
+                              "' WHERE agent_id = 'yuzu_test_us_upd_a'");
+
+    std::expected<ReclaimOutcome, GatewayRouteStoreError> loser =
+        std::unexpected(GatewayRouteStoreError::db_error);
+    std::thread t([&] { loser = fx.store().reclaim_tombstoned_session("yuzu_test_us_upd_b", sid, 90); });
+    ThreadJoinGuard join_guard(t, holder.get());
+    const bool blocked = wait_for_lock_waiter(observer.get());
+    raw_run(holder.get(), "COMMIT");
+    t.join();
+
+    REQUIRE(blocked);
+    REQUIRE(loser.has_value());
+    CHECK(*loser == ReclaimOutcome::held_by_other_agent);
+    CHECK(rows_holding(fx.dsn(), sid) == 1);
+    auto b = fx.store().lookup_route("yuzu_test_us_upd_b");
+    REQUIRE(b.has_value());
+    REQUIRE(b->has_value());
+    CHECK_FALSE((*b)->session_id.has_value());
+}
+
+TEST_CASE("GatewayRouteStore[pg]: racing reclaims of one unheld id never double-land",
+          "[gateway_route][pg][store][unique_session]") {
+    GatewayRoutePg fx;
+    constexpr int kPairs = 150;
+    int doubles = 0;
+    int not_exactly_one = 0;
+    for (int i = 0; i < kPairs; ++i) {
+        const std::string tag = std::to_string(i);
+        const std::string sid = "gw-session-race-" + tag;
+        const std::string a = "yuzu_test_us_race_a" + tag;
+        const std::string b = "yuzu_test_us_race_b" + tag;
+        if (i % 2 == 1) { // UPDATE branch: both agents start as tombstones
+            for (const auto& agent : {a, b}) {
+                REQUIRE(fx.store().register_fresh(agent, "tmp-" + agent).value().won);
+                REQUIRE(fx.store().deregister(agent, "tmp-" + agent).value().removed);
+            }
+        }
+        std::barrier sync(2);
+        std::expected<ReclaimOutcome, GatewayRouteStoreError> ra =
+            std::unexpected(GatewayRouteStoreError::db_error);
+        std::expected<ReclaimOutcome, GatewayRouteStoreError> rb = ra;
+        std::thread ta([&] {
+            sync.arrive_and_wait();
+            ra = fx.store().reclaim_tombstoned_session(a, sid, 90);
+        });
+        ThreadJoinGuard join_a(ta);
+        std::thread tb([&] {
+            sync.arrive_and_wait();
+            rb = fx.store().reclaim_tombstoned_session(b, sid, 90);
+        });
+        ThreadJoinGuard join_b(tb);
+        ta.join();
+        tb.join();
+        REQUIRE(ra.has_value());
+        REQUIRE(rb.has_value());
+        const int adopted = (*ra == ReclaimOutcome::adopted) + (*rb == ReclaimOutcome::adopted);
+        if (adopted != 1)
+            ++not_exactly_one;
+        if (rows_holding(fx.dsn(), sid) > 1)
+            ++doubles;
+    }
+    CHECK(doubles == 0);
+    CHECK(not_exactly_one == 0);
+}
+
+TEST_CASE("GatewayRouteStore[pg]: announce_connected refuses a fallback insert for an id another "
+          "agent holds",
+          "[gateway_route][pg][store][unique_session]") {
+    GatewayRoutePg fx;
+    const std::string sid = "gw-session-" + std::string(32, 'c');
+    REQUIRE(fx.store().register_fresh("yuzu_test_us_ann_a", sid).value().won);
+
+    auto res = fx.store().announce_connected("yuzu_test_us_ann_b", sid, "cluster-x", "node-x", 90);
+    REQUIRE(res.has_value());
+    CHECK_FALSE(res->matched);
+    CHECK(res->session_held_by_other_agent);
+    CHECK_FALSE(res->cluster_affinity_violation);
+    CHECK_FALSE(fx.raw_row_exists("yuzu_test_us_ann_b"));
+    CHECK(rows_holding(fx.dsn(), sid) == 1);
+
+    // An ordinary session mismatch (no collision) is still a plain matched=false.
+    auto plain = fx.store().announce_connected("yuzu_test_us_ann_a", "gw-session-other", "c", "n", 90);
+    REQUIRE(plain.has_value());
+    CHECK_FALSE(plain->matched);
+    CHECK_FALSE(plain->session_held_by_other_agent);
+}
+
+TEST_CASE("GatewayRouteStore[pg]: register_fresh with an id another agent holds fails closed and "
+          "touches nothing",
+          "[gateway_route][pg][store][unique_session]") {
+    GatewayRoutePg fx;
+    const std::string sid = "gw-session-" + std::string(32, 'd');
+    REQUIRE(fx.store().register_fresh("yuzu_test_us_reg_a", sid).value().won);
+    REQUIRE(fx.store().register_fresh("yuzu_test_us_reg_b", "gw-session-b-own").value().won);
+
+    auto res = fx.store().register_fresh("yuzu_test_us_reg_b", sid);
+    REQUIRE_FALSE(res.has_value());
+    CHECK(res.error() == GatewayRouteStoreError::db_error);
+
+    auto b = fx.store().lookup_route("yuzu_test_us_reg_b");
+    REQUIRE(b.has_value());
+    REQUIRE(b->has_value());
+    CHECK((*b)->session_id == "gw-session-b-own");
+    CHECK(rows_holding(fx.dsn(), sid) == 1);
+
+    auto fresh_new = fx.store().register_fresh("yuzu_test_us_reg_c", sid);
+    REQUIRE_FALSE(fresh_new.has_value());
+    CHECK_FALSE(fx.raw_row_exists("yuzu_test_us_reg_c"));
+}
+
+TEST_CASE("GatewayRouteStore[pg]: tombstones and NULL session ids never collide",
+          "[gateway_route][pg][store][unique_session]") {
+    GatewayRoutePg fx;
+    for (int i = 0; i < 5; ++i) {
+        const std::string agent = "yuzu_test_us_null" + std::to_string(i);
+        REQUIRE(fx.store().register_fresh(agent, "tmp-" + agent).value().won);
+        REQUIRE(fx.store().deregister(agent, "tmp-" + agent).value().removed);
+    }
+    auto conn = raw_connect(fx.dsn());
+    CHECK(raw_scalar(conn.get(), "SELECT count(*) FROM gateway_route_store.agent_routes "
+                                 "WHERE session_id IS NULL") == "5");
+}
+
+TEST_CASE("GatewayRouteStore[pg]: the lookup_by_sessions statement is served by the unique index",
+          "[gateway_route][pg][store][unique_session]") {
+    GatewayRoutePg fx;
+    auto conn = raw_connect(fx.dsn());
+    raw_run(conn.get(), "SET enable_seqscan = off");
+    const char* array_param = "{a,b}";
+    const char* params[1] = {array_param};
+    PgResult plan{PQexecParams(
+        conn.get(),
+        "EXPLAIN SELECT agent_id FROM gateway_route_store.agent_routes "
+        "WHERE session_id = ANY($1::text[])",
+        1, nullptr, params, nullptr, nullptr, 0)};
+    REQUIRE(plan.status() == PGRES_TUPLES_OK);
+    std::string text;
+    for (int i = 0; i < PQntuples(plan.get()); ++i)
+        text += std::string(PQgetvalue(plan.get(), i, 0)) + "\n";
+    INFO(text);
+    CHECK(text.find("ux_agent_routes_session_id") != std::string::npos);
+    CHECK(raw_scalar(conn.get(), "SELECT count(*) FROM pg_indexes WHERE schemaname = "
+                                 "'gateway_route_store' AND indexname = 'agent_routes_session_id_idx'") ==
+          "0");
+}
+
+namespace {
+
+struct V4Schema {
+    explicit V4Schema(const std::string& dsn) {
+        auto conn = raw_connect(dsn);
+        const auto& all = GatewayRouteStore::migrations();
+        std::vector<yuzu::server::pg::PgMigration> upto4(all.begin(), all.begin() + 4);
+        REQUIRE(upto4.back().version == 4);
+        REQUIRE(yuzu::server::pg::PgMigrationRunner::run(conn.get(), "gateway_route_store", upto4));
+    }
+};
+
+void seed_row(PGconn* conn, const std::string& agent, const std::string& sid, int epoch,
+              const std::string& home_cluster) {
+    raw_run(conn, "INSERT INTO gateway_route_store.agent_routes (agent_id, cluster_id, "
+                  "gateway_node, connection_epoch, session_id, lease_until, updated_at, "
+                  "stream_home_id, home_cluster_id) VALUES ('" + agent + "', 'c1', 'n1', " +
+                      std::to_string(epoch) + ", " + (sid.empty() ? "NULL" : "'" + sid + "'") +
+                      ", now() + interval '60 seconds', now(), 'home-1', " +
+                      (home_cluster.empty() ? "NULL" : "'" + home_cluster + "'") + ")");
+}
+
+} // namespace
+
+TEST_CASE("GatewayRouteStore[pg]: migration v5 tombstones every row of a duplicate group and "
+          "builds the unique index",
+          "[gateway_route][pg][store][unique_session][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    V4Schema schema(db.dsn());
+    {
+        auto conn = raw_connect(db.dsn());
+        seed_row(conn.get(), "yuzu_test_mg_d2a", "dup-two", 11, "home-a");
+        seed_row(conn.get(), "yuzu_test_mg_d2b", "dup-two", 12, "home-b");
+        seed_row(conn.get(), "yuzu_test_mg_d3a", "dup-three", 21, "home-a");
+        seed_row(conn.get(), "yuzu_test_mg_d3b", "dup-three", 22, "home-a");
+        seed_row(conn.get(), "yuzu_test_mg_d3c", "dup-three", 23, "");
+        seed_row(conn.get(), "yuzu_test_mg_solo", "solo-sess", 31, "home-a");
+        raw_run(conn.get(), "INSERT INTO gateway_route_store.agent_routes (agent_id, "
+                            "connection_epoch) VALUES ('yuzu_test_mg_tomb1', 41), "
+                            "('yuzu_test_mg_tomb2', 42)");
+    }
+
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+    CHECK(store.boot_session_dedup_rows() == 5);
+
+    auto conn = raw_connect(db.dsn());
+    for (const char* agent :
+         {"yuzu_test_mg_d2a", "yuzu_test_mg_d2b", "yuzu_test_mg_d3a", "yuzu_test_mg_d3b",
+          "yuzu_test_mg_d3c"}) {
+        INFO(agent);
+        CHECK(raw_scalar(conn.get(),
+                         std::string("SELECT (session_id IS NULL AND lease_until IS NULL AND "
+                                     "cluster_id IS NULL AND gateway_node IS NULL AND "
+                                     "stream_home_id IS NULL)::text FROM "
+                                     "gateway_route_store.agent_routes WHERE agent_id = '") +
+                             agent + "'") == "true");
+    }
+    CHECK(raw_scalar(conn.get(), "SELECT connection_epoch::text || home_cluster_id FROM "
+                                 "gateway_route_store.agent_routes WHERE agent_id = "
+                                 "'yuzu_test_mg_d2b'") == "12home-b");
+    CHECK(raw_scalar(conn.get(), "SELECT count(*) FROM gateway_route_store.agent_routes "
+                                 "WHERE agent_id = 'yuzu_test_mg_d3c' AND "
+                                 "home_cluster_id IS NULL") == "1");
+    CHECK(raw_scalar(conn.get(), "SELECT session_id || cluster_id || stream_home_id FROM "
+                                 "gateway_route_store.agent_routes WHERE agent_id = "
+                                 "'yuzu_test_mg_solo'") == "solo-sessc1home-1");
+    CHECK(raw_scalar(conn.get(), "SELECT count(*) FROM gateway_route_store.agent_routes") == "8");
+    CHECK(raw_scalar(conn.get(), "SELECT value FROM gateway_route_store.route_meta WHERE key = "
+                                 "'v5_session_dedup_tombstoned_rows'") == "5");
+
+    CHECK(raw_scalar(conn.get(),
+                     "SELECT (i.indisunique AND i.indpred IS NOT NULL)::text FROM pg_index i "
+                     "JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = "
+                     "c.relnamespace WHERE n.nspname = 'gateway_route_store' AND c.relname = "
+                     "'ux_agent_routes_session_id'") == "true");
+    CHECK(raw_scalar(conn.get(), "SELECT count(*) FROM pg_indexes WHERE schemaname = "
+                                 "'gateway_route_store' AND indexname = "
+                                 "'agent_routes_session_id_idx'") == "0");
+    CHECK(raw_scalar(conn.get(), "SELECT version::text FROM public.schema_meta WHERE store = "
+                                 "'gateway_route_store'") == "5");
+
+    GatewayRouteStore reopened{pool};
+    REQUIRE(reopened.is_open());
+    CHECK(reopened.boot_session_dedup_rows() == 0);
+    CHECK(raw_scalar(conn.get(), "SELECT count(*) FROM gateway_route_store.agent_routes "
+                                 "WHERE session_id IS NULL") == "7");
+}
+
+TEST_CASE("GatewayRouteStore[pg]: migration v5 on a fresh database reports zero rows",
+          "[gateway_route][pg][store][unique_session][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+    CHECK(store.boot_session_dedup_rows() == 0);
+}
+
+TEST_CASE("GatewayRouteStore[pg]: migration v5 waits for an in-flight writer and dedups its row",
+          "[gateway_route][pg][store][unique_session][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    V4Schema schema(db.dsn());
+    {
+        auto conn = raw_connect(db.dsn());
+        seed_row(conn.get(), "yuzu_test_mg_late_a", "dup-late", 1, "home-a");
+    }
+    auto writer = raw_connect(db.dsn());
+    auto observer = raw_connect(db.dsn()); // autocommit: pg_stat_activity is snapshotted per transaction
+    raw_run(writer.get(), "BEGIN");
+    seed_row(writer.get(), "yuzu_test_mg_late_b", "dup-late", 2, "home-a");
+
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    std::unique_ptr<GatewayRouteStore> store;
+    std::thread t([&] { store = std::make_unique<GatewayRouteStore>(pool); });
+    ThreadJoinGuard join_guard(t, writer.get());
+    const bool blocked = wait_for_lock_waiter(observer.get());
+    raw_run(writer.get(), "COMMIT");
+    t.join();
+
+    REQUIRE(blocked);
+    REQUIRE(store != nullptr);
+    REQUIRE(store->is_open());
+    CHECK(store->boot_session_dedup_rows() == 2);
+    auto conn = raw_connect(db.dsn());
+    CHECK(raw_scalar(conn.get(), "SELECT count(*) FROM gateway_route_store.agent_routes "
+                                 "WHERE session_id = 'dup-late'") == "0");
+}
+
+TEST_CASE("GatewayRouteStore[pg]: a failed migration v5 rolls back completely and refuses to open",
+          "[gateway_route][pg][store][unique_session][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    V4Schema schema(db.dsn());
+    {
+        auto conn = raw_connect(db.dsn());
+        seed_row(conn.get(), "yuzu_test_mg_rb_a", "dup-rollback", 11, "home-a");
+        seed_row(conn.get(), "yuzu_test_mg_rb_b", "dup-rollback", 12, "home-b");
+        // A pre-existing object of the WRONG shape under the name v5 creates:
+        // CREATE UNIQUE INDEX must fail loudly (no IF NOT EXISTS), and the
+        // dedup that ran before it in the same transaction must roll back.
+        raw_run(conn.get(), "CREATE INDEX ux_agent_routes_session_id ON "
+                            "gateway_route_store.agent_routes (agent_id)");
+    }
+
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    GatewayRouteStore store{pool};
+    CHECK_FALSE(store.is_open());
+    CHECK(store.boot_session_dedup_rows() == 0);
+
+    auto conn = raw_connect(db.dsn());
+    CHECK(raw_scalar(conn.get(), "SELECT version::text FROM public.schema_meta WHERE store = "
+                                 "'gateway_route_store'") == "4");
+    CHECK(raw_scalar(conn.get(), "SELECT count(*) FROM gateway_route_store.agent_routes "
+                                 "WHERE session_id = 'dup-rollback'") == "2");
+    // The tombstone UPDATE rolled back too: every other column is untouched.
+    CHECK(raw_scalar(conn.get(), "SELECT count(*) FROM gateway_route_store.agent_routes "
+                                 "WHERE session_id = 'dup-rollback' AND cluster_id = 'c1' AND "
+                                 "gateway_node = 'n1' AND stream_home_id = 'home-1' AND "
+                                 "lease_until IS NOT NULL") == "2");
+    CHECK(raw_scalar(conn.get(), "SELECT count(*) FROM gateway_route_store.route_meta WHERE key "
+                                 "= 'v5_session_dedup_tombstoned_rows'") == "0");
+    CHECK(raw_scalar(conn.get(), "SELECT count(*) FROM pg_indexes WHERE schemaname = "
+                                 "'gateway_route_store' AND indexname = "
+                                 "'agent_routes_session_id_idx'") == "1");
+    // The foreign object is still there and still not unique (nothing adopted it).
+    CHECK(raw_scalar(conn.get(), "SELECT i.indisunique::text FROM pg_index i JOIN pg_class c ON "
+                                 "c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = "
+                                 "c.relnamespace WHERE n.nspname = 'gateway_route_store' AND "
+                                 "c.relname = 'ux_agent_routes_session_id'") == "false");
+}
+
+TEST_CASE("GatewayRouteStore[pg]: migration v5 tolerates a hand-dropped old session index",
+          "[gateway_route][pg][store][unique_session][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    V4Schema schema(db.dsn());
+    {
+        auto conn = raw_connect(db.dsn());
+        // DROP INDEX IF EXISTS is what lets v5 proceed here.
+        raw_run(conn.get(), "DROP INDEX gateway_route_store.agent_routes_session_id_idx");
+    }
+
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto conn = raw_connect(db.dsn());
+    CHECK(raw_scalar(conn.get(), "SELECT version::text FROM public.schema_meta WHERE store = "
+                                 "'gateway_route_store'") == "5");
+    CHECK(raw_scalar(conn.get(), "SELECT count(*) FROM pg_indexes WHERE schemaname = "
+                                 "'gateway_route_store' AND indexname = "
+                                 "'ux_agent_routes_session_id'") == "1");
+}
+
+TEST_CASE("GatewayRouteStore: migration v5 text pins the index name and its lock guards",
+          "[gateway_route][store][unique_session][migration]") {
+    const auto& all = GatewayRouteStore::migrations();
+    const auto it = std::find_if(all.begin(), all.end(),
+                                 [](const auto& m) { return m.version == 5; });
+    REQUIRE(it != all.end());
+    const std::string& sql = it->sql;
+    // The 23505 remap matches this exact name; a rename on either side silently
+    // turns racing adopts into db_error (and feeds the gateway breaker).
+    CHECK(sql.find("CREATE UNIQUE INDEX " + std::string(GatewayRouteStore::kSessionUniqueIndexName)) !=
+          std::string::npos);
+    CHECK(GatewayRouteStore::kSessionUniqueIndexName == "ux_agent_routes_session_id");
+    // The lock-wait bound, the lifted statement timeout and the up-front lock.
+    CHECK(sql.find("lock_timeout") != std::string::npos);
+    CHECK(sql.find("statement_timeout") != std::string::npos);
+    // The exact statements: the 30 s bound is what the operator docs promise, and
+    // `statement_timeout = 0` is what keeps a large build from being cut off.
+    CHECK(sql.find("SET LOCAL lock_timeout = '30s';") != std::string::npos);
+    CHECK(sql.find("SET LOCAL statement_timeout = 0;") != std::string::npos);
+    CHECK(sql.find("ACCESS EXCLUSIVE") != std::string::npos);
+    // IF EXISTS on the old-index drop, and NO IF NOT EXISTS on the create.
+    CHECK(sql.find("DROP INDEX IF EXISTS agent_routes_session_id_idx") != std::string::npos);
+    CHECK(sql.find("IF NOT EXISTS") == std::string::npos);
+}
+
+TEST_CASE("GatewayRouteStore[pg]: a later start reports the durable v5 count once and does not "
+          "re-count it",
+          "[gateway_route][pg][store][unique_session][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    V4Schema schema(db.dsn());
+    {
+        auto conn = raw_connect(db.dsn());
+        seed_row(conn.get(), "yuzu_test_mg_lb_a", "dup-later-boot", 1, "home-a");
+        seed_row(conn.get(), "yuzu_test_mg_lb_b", "dup-later-boot", 2, "home-a");
+    }
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    {
+        yuzu::test::LogCapture first;
+        GatewayRouteStore store{pool};
+        REQUIRE(store.is_open());
+        CHECK(store.boot_session_dedup_rows() == 2);
+        first.stop();
+        CHECK(first.text().find("migration v5 tombstoned 2 agent_routes row(s)") !=
+              std::string::npos);
+    }
+    yuzu::test::LogCapture later;
+    GatewayRouteStore reopened{pool};
+    REQUIRE(reopened.is_open());
+    later.stop();
+    CHECK(reopened.boot_session_dedup_rows() == 0);
+    const std::string text = later.text();
+    CHECK(text.find("route_meta records 2 agent_routes row(s) tombstoned by the v5 migration on "
+                    "an earlier start (not re-counted)") != std::string::npos);
+    CHECK(text.find("migration v5 tombstoned") == std::string::npos);
+}
+
+TEST_CASE("GatewayRouteStore[pg]: an unreadable route_meta count on the migrating start warns and "
+          "still opens",
+          "[gateway_route][pg][store][unique_session][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    V4Schema schema(db.dsn());
+    {
+        // route_meta exists from v2. A BEFORE INSERT trigger rewrites whatever v5
+        // writes into a non-numeric value, so the constructor's read-back cannot
+        // parse it. The trigger must exist BEFORE the store opens (v5 runs then).
+        auto conn = raw_connect(db.dsn());
+        raw_run(conn.get(), "CREATE FUNCTION gateway_route_store.yuzu_test_garble() RETURNS "
+                            "trigger LANGUAGE plpgsql AS $$ BEGIN NEW.value := 'garbage'; "
+                            "RETURN NEW; END $$");
+        raw_run(conn.get(), "CREATE TRIGGER yuzu_test_garble_trg BEFORE INSERT ON "
+                            "gateway_route_store.route_meta FOR EACH ROW EXECUTE FUNCTION "
+                            "gateway_route_store.yuzu_test_garble()");
+    }
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    yuzu::test::LogCapture capture;
+    GatewayRouteStore store{pool};
+    capture.stop();
+    // The count is advisory evidence, never a gate on opening.
+    REQUIRE(store.is_open());
+    CHECK(store.boot_session_dedup_rows() == 0);
+    CHECK(capture.text().find("could not be read") != std::string::npos);
+    auto conn = raw_connect(db.dsn());
+    CHECK(raw_scalar(conn.get(), "SELECT value FROM gateway_route_store.route_meta WHERE key = "
+                                 "'v5_session_dedup_tombstoned_rows'") == "garbage");
 }

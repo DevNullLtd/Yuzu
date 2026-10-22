@@ -705,6 +705,42 @@ TEST_CASE("render_tar_capture_sources: rows, badges, staged toggles, device attr
     CHECK(html.find("capApplyBar") != std::string::npos);           // push bar present
 }
 
+TEST_CASE("render_tar_capture_sources: a paused core source reads paused with a locked unchecked box",
+          "[tar][capture-sources]") {
+    const std::string status =
+        "config|process_enabled|true\nconfig|tcp_enabled|true\nconfig|service_enabled|false\n"
+        "config|user_enabled|true\nconfig|perf_enabled|true\nconfig|arp_enabled|false\n";
+    const std::string compat = "header|source|os|status|capture_method|notes\n";
+    const std::string html = render_tar_capture_sources("agent-123", status, compat);
+    const auto row = [&](const std::string& h, const std::string& name) {
+        const auto b = h.find("<span class=\"src-name\">" + name + "</span>");
+        REQUIRE(b != std::string::npos);
+        return h.substr(b, h.find("</tr>", b) - b);
+    };
+    const auto npos = std::string::npos;
+
+    SECTION("core enabled") {
+        const auto r = row(html, "process");
+        CHECK(r.find("checked disabled") != npos);
+        CHECK(r.find("state-on\">always on") != npos);
+    }
+    SECTION("core paused") {
+        const auto r = row(html, "service");
+        CHECK(r.find("tgl locked") != npos);
+        CHECK(r.find("type=\"checkbox\" disabled>") != npos);
+        CHECK(r.find("checked") == npos);
+        CHECK(r.find("state-txt\">paused<") != npos);
+        CHECK(r.find("always on") == npos);
+        CHECK(r.find("data-source") == npos);
+        CHECK(row(html, "tcp").find("always on") != npos);
+    }
+    SECTION("hostile device is escaped") {
+        const std::string h = render_tar_capture_sources("a\"><script>", status, compat);
+        CHECK(h.find("data-device=\"a&quot;&gt;&lt;script&gt;\"") != npos);
+        CHECK(h.find("<script>") == npos);
+    }
+}
+
 TEST_CASE("TAR page: the capture-sources push bar stays hidden until a change is staged",
           "[tar][capture-sources][page]") {
     const std::string status = "config|arp_enabled|false\n";
