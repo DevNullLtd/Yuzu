@@ -42,8 +42,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <expected>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -187,6 +189,14 @@ struct WiringServer {
     // When set, the raise stub resolves once more AFTER the step-up call, as a handler does for
     // provenance (`created_by`, the audit row's principal), and refuses 401 on no session.
     std::atomic<bool> resolve_after_consume{false};
+    // When false the pre-routing handler does NOT clear the stash, so a case can show that the
+    // post-routing clear alone ends a request's binding.
+    std::atomic<bool> pre_routing_clears{true};
+    // Set by the unclassified route's handler: whether its own resolution returned a session.
+    std::atomic<bool> unclassified_resolved{false};
+    // Set by the unclassified route's handler: whether the worker thread's stash still held a
+    // binding when the handler started (read from the same thread_local the worker owns).
+    std::atomic<bool> unclassified_saw_binding{false};
     std::atomic<int> resolutions{0};
     std::vector<AuditRow> audits;
 
@@ -202,6 +212,9 @@ struct WiringServer {
     std::atomic<bool> consume_in_handler{true};
     // The httplib::Request address each handler saw (compared, never dereferenced).
     std::atomic<const void*> rotate_req_addr{nullptr};
+    std::atomic<const void*> raise_req_addr{nullptr};
+    std::atomic<std::size_t> raise_thread{0};
+    std::atomic<std::size_t> unclassified_thread{0};
     std::atomic<const void*> unclassified_req_addr{nullptr};
 
     yuzu::MetricsRegistry metrics;
@@ -235,7 +248,8 @@ struct WiringServer {
         // thread must not be seen by this one.
         svr.set_pre_routing_handler([this](const httplib::Request&, httplib::Response&) {
             resolutions.store(0);
-            detail::clear_step_up_pass();
+            if (pre_routing_clears.load())
+                detail::clear_step_up_pass();
             return httplib::Server::HandlerResponse::Unhandled;
         });
         // The SAME function server.cpp's set_pre_request_handler lambda calls. The deps are built
@@ -277,6 +291,8 @@ struct WiringServer {
         svr.Post(std::string(kRaisePath), [this](const httplib::Request& req,
                                                  httplib::Response& res) {
             raise_handler_calls.fetch_add(1);
+            raise_req_addr.store(&req);
+            raise_thread.store(std::hash<std::thread::id>{}(std::this_thread::get_id()));
             // The production shape of a kRequired handler with no class guard of its own: resolve
             // the session, consume the central pass for it, otherwise evaluate that session afresh
             // (`require_mfa_step_up` is decide + effects + render over a real store; this stub
@@ -318,7 +334,10 @@ struct WiringServer {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      unclassified_handler_calls.fetch_add(1);
                      unclassified_req_addr.store(&req);
+                     unclassified_saw_binding.store(detail::tls_step_up_pass().bound);
+                     unclassified_thread.store(std::hash<std::thread::id>{}(std::this_thread::get_id()));
                      const auto handler_session = resolver(req);
+                     unclassified_resolved.store(handler_session.has_value());
                      unclassified_consumed_rotate_pass.store(
                          handler_session &&
                          detail::consume_step_up_pass(req, *handler_session,
@@ -1148,23 +1167,50 @@ TEST_CASE("wiring: every resolution after the central check yields the principal
         CHECK(r->status == 200);
         CHECK(s.raise_mutations.load() == 1);
     }
-    SECTION("the binding does not outlive the request: the next request resolves freely") {
+    SECTION("the binding does not outlive the request: an ungated request on the same worker "
+            "resolves freely") {
         WiringServer s;
         s.apply_binding.store(true);
         s.three_resolves.store(true);
         s.later_from.store(2);
+        // The pre-routing clear is off, so only the post-routing clear can end the binding.
+        s.pre_routing_clears.store(false);
         s.set_session(make_session("alice", "local", Role::admin, 5s));
-        s.set_later_session(make_session("bob", "local", Role::admin, 5s));
-        auto first = s.post(std::string(kRaisePath));
+
+        // One keep-alive connection is served by one worker thread, so both requests see the same
+        // thread_local stash (and, often, the same httplib::Request address). The first request
+        // succeeds so the connection stays open.
+        httplib::Client cli("127.0.0.1", s.port);
+        cli.set_keep_alive(true);
+        cli.set_connection_timeout(5, 0);
+        cli.set_read_timeout(5, 0);
+
+        auto first = cli.Post(std::string(kRaisePath), "{}", "application/json");
         REQUIRE(first);
-        CHECK(first->status == 401);
-        // The next gated request is bound to ITS principal, not the previous request's.
-        s.set_later_session(std::nullopt);
+        REQUIRE(first->status == 200); // gated: the binding was armed for alice
+        REQUIRE(s.raise_mutations.load() == 1);
+
+        // An UNGATED route resolves a different principal through a binding-applying resolver:
+        // admitted, because the first request's binding is gone.
         s.set_session(make_session("carol", "local", Role::admin, 5s));
-        auto second = s.post(std::string(kRaisePath));
+        auto second = cli.Post(std::string(kUnclassifiedPath), "{}", "application/json");
         REQUIRE(second);
         CHECK(second->status == 200);
-        CHECK(s.raise_mutations.load() == 1);
+        CHECK(s.unclassified_handler_calls.load() == 1);
+        CHECK(s.unclassified_resolved.load());
+        // Read from the worker's own thread_local, so a leaked binding is seen whatever address
+        // the second request was served at.
+        CHECK_FALSE(s.unclassified_saw_binding.load());
+        // A leaked binding is only visible when both requests ran on one worker thread.
+        if (s.raise_thread.load() != s.unclassified_thread.load())
+            WARN("the two requests were served by different worker threads in this build, so this "
+                 "case did not exercise the same-thread premise (the unit-level case does)");
+        // Whether the two requests land on one httplib::Request address is the allocator's choice
+        // (see the keep-alive case above); a leaked binding is only visible when they do, so say
+        // so when they do not. The same-address sequence is pinned at the unit level.
+        if (s.raise_req_addr.load() != s.unclassified_req_addr.load())
+            WARN("the two requests were served at different httplib::Request addresses in this "
+                 "build, so this case did not exercise the same-address premise");
     }
 }
 
@@ -1279,6 +1325,132 @@ struct RealResolveServer {
     ListenerThread listener{svr};
 };
 } // namespace
+
+namespace {
+// The REAL `AuthRoutes::resolve_session` behind the real pre-request stage with no ApiTokenStore
+// (no Postgres): cookie sessions only. The handler replaces the request's Cookie header with
+// another principal's session between its two resolutions, as a later resolution that lands on a
+// different credential would see.
+struct CookieResolveServer {
+    httplib::Server svr;
+    int port{0};
+
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider;
+    std::unique_ptr<AuthRoutes> routes;
+    yuzu::MetricsRegistry metrics;
+
+    std::string alice_cookie;
+    std::string bob_cookie;
+    std::atomic<bool> swap_cookie_between{false};
+    std::atomic<int> raise_mutations{0};
+
+    MfaStatusFn mfa_status = [](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
+        return AuthDB::MfaStatus{}; // not enrolled: the central check passes any proof age
+    };
+    StepUpSessionFn resolver = [this](const httplib::Request& req) -> std::optional<auth::Session> {
+        return routes->resolve_session(req);
+    };
+    StepUpAuditFn audit = [](const httplib::Request&, const std::string&, const std::string&,
+                             const std::string&, const std::string&, const std::string&) -> bool {
+        return true;
+    };
+
+    CookieResolveServer() {
+        routes = std::make_unique<AuthRoutes>(cfg, auth_mgr, /*rbac_store=*/nullptr,
+                                              /*api_token_store=*/nullptr, /*audit_store=*/nullptr,
+                                              /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                                              /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
+        REQUIRE(auth_mgr.upsert_user("yuzu_test_alice", "password1234", Role::admin));
+        REQUIRE(auth_mgr.upsert_user("yuzu_test_bob", "password1234", Role::admin));
+        alice_cookie = auth_mgr.create_local_session_for_test("yuzu_test_alice", Role::admin, true);
+        bob_cookie = auth_mgr.create_local_session_for_test("yuzu_test_bob", Role::admin, true);
+
+        svr.set_pre_routing_handler([](const httplib::Request&, httplib::Response&) {
+            detail::clear_step_up_pass();
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
+        svr.set_pre_request_handler(
+            [this](const httplib::Request& req,
+                   httplib::Response& res) -> httplib::Server::HandlerResponse {
+                const StepUpChokepointDeps deps{.resolve_session = &resolver,
+                                                .auth_db = nullptr,
+                                                .mfa_status = &mfa_status,
+                                                .audit_fn = &audit,
+                                                .metrics = &metrics,
+                                                .window_secs = 300,
+                                                .mfa_enforcement = "optional"};
+                return detail::run_pre_request_stage(req, res, deps);
+            });
+        svr.set_post_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+            detail::finish_step_up_pass(req, res, &metrics);
+        });
+        svr.Post(std::string(kRaisePath), [this](const httplib::Request& req,
+                                                 httplib::Response& res) {
+            const auto first = routes->resolve_session(req); // `auth_fn`
+            if (!first) {
+                res.status = 401;
+                return;
+            }
+            if (swap_cookie_between.load()) {
+                // The request is non-const underneath: httplib owns it for the whole dispatch.
+                auto& headers = const_cast<httplib::Request&>(req).headers;
+                headers.erase("Cookie");
+                headers.emplace("Cookie", "yuzu_session=" + bob_cookie);
+            }
+            const auto gate = routes->resolve_session(req); // `perm_fn`'s own gate
+            if (!gate) {
+                res.status = 401;
+                return;
+            }
+            (void)detail::consume_step_up_pass(req, *first, std::string(kRaiseLabel));
+            raise_mutations.fetch_add(1);
+            res.status = 200;
+            res.set_content("{\"ok\":true}", "application/json");
+        });
+
+        port = svr.bind_to_any_port("127.0.0.1");
+        REQUIRE(port > 0);
+        listener.start();
+        CHECK(listener.wait_running());
+    }
+
+    httplib::Result post() {
+        httplib::Client cli("127.0.0.1", port);
+        cli.set_connection_timeout(5, 0);
+        cli.set_read_timeout(5, 0);
+        cli.set_write_timeout(5, 0);
+        httplib::Headers h;
+        h.emplace("Cookie", "yuzu_session=" + alice_cookie);
+        return cli.Post(std::string(kRaisePath), h, "{}", "application/json");
+    }
+
+    // LAST member: destroyed first (see ListenerThread).
+    ListenerThread listener{svr};
+};
+} // namespace
+
+TEST_CASE("wiring: with real cookie resolution, a different session mid-request is a 401, not a "
+          "different principal",
+          "[stepup][wiring][stepbind]") {
+    CookieResolveServer s;
+
+    SECTION("control: the same cookie at every resolution, so one principal mutates once") {
+        auto r = s.post();
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(s.raise_mutations.load() == 1);
+    }
+    SECTION("another principal's session at the second resolution: refused 401, nothing mutates") {
+        s.swap_cookie_between.store(true);
+        auto r = s.post();
+        REQUIRE(r);
+        CHECK(r->status == 401);
+        CHECK(s.raise_mutations.load() == 0);
+    }
+}
 
 TEST_CASE("wiring: with real session resolution, a credential change mid-request is a 401, not a "
           "different principal",
@@ -1455,6 +1627,143 @@ TEST_CASE("wiring: server.cpp clears the pass stash at the pre-routing top and p
     const auto headers = src.find("security_headers.apply(res);", finish);
     REQUIRE(headers != std::string::npos);
     CHECK(finish < headers);
+}
+
+namespace {
+
+// Source text with comments removed and string and character literals blanked, so a mention in a
+// comment or a message cannot count as a call.
+std::string strip_comments_and_literals(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (std::size_t i = 0; i < in.size();) {
+        const char c = in[i];
+        if (c == '/' && i + 1 < in.size() && in[i + 1] == '/') {
+            while (i < in.size() && in[i] != '\n')
+                ++i;
+        } else if (c == '/' && i + 1 < in.size() && in[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < in.size() && !(in[i] == '*' && in[i + 1] == '/'))
+                ++i;
+            i += 2;
+        } else if (c == '"' || c == '\'') {
+            out += c;
+            ++i;
+            while (i < in.size() && in[i] != c) {
+                if (in[i] == '\\')
+                    ++i;
+                ++i;
+            }
+            out += c;
+            ++i;
+        } else {
+            out += c;
+            ++i;
+        }
+    }
+    return out;
+}
+
+// Member-call sites of `name(`: occurrences directly preceded by `.` or `->`. A declaration or a
+// `Class::name(` definition is not a call site.
+std::size_t member_calls_of(const std::string& code, std::string_view name) {
+    std::size_t n = 0;
+    const std::string needle = std::string(name) + "(";
+    for (auto at = code.find(needle); at != std::string::npos; at = code.find(needle, at + 1)) {
+        const bool dot = at >= 1 && code[at - 1] == '.';
+        const bool arrow = at >= 2 && code[at - 1] == '>' && code[at - 2] == '-';
+        if (dot || arrow)
+            ++n;
+    }
+    return n;
+}
+
+// The body of the function whose signature starts at `signature`, by brace matching.
+std::string body_of(const std::string& code, std::string_view signature) {
+    const auto at = code.find(signature);
+    REQUIRE(at != std::string::npos);
+    const auto open = code.find('{', at);
+    REQUIRE(open != std::string::npos);
+    int depth = 0;
+    for (auto i = open; i < code.size(); ++i) {
+        if (code[i] == '{')
+            ++depth;
+        else if (code[i] == '}' && --depth == 0)
+            return code.substr(open, i - open + 1);
+    }
+    FAIL("unbalanced braces after " << signature);
+    return {};
+}
+
+} // namespace
+
+// A direct credential validator in server/core/src decides a principal WITHOUT passing through
+// `AuthRoutes::resolve_session`, so it is not covered by the per-request principal binding. The
+// documented direct validators are listed here with the reason each does not authorise a gated
+// (kRequired) handler. A new one fails this test: route it through `resolve_session`, or add it
+// here with its reason. It is a source-text floor over member calls of `validate_session(` and
+// `validate_token(` (not `validate_token_checked(`, and not other types' free functions).
+TEST_CASE("wiring: every direct session or token validator is either the resolve_session walk or a "
+          "documented non-gated call site",
+          "[stepup][wiring][lexical][stepbind]") {
+    namespace fs = std::filesystem;
+    struct Count {
+        std::size_t session{0};
+        std::size_t token{0};
+    };
+    std::map<std::string, Count> found;
+    std::size_t files = 0;
+    for (const auto& entry : fs::recursive_directory_iterator(YUZU_SERVER_SRC_DIR)) {
+        const auto ext = entry.path().extension();
+        if (!entry.is_regular_file() || (ext != ".cpp" && ext != ".hpp"))
+            continue;
+        ++files;
+        std::ifstream in(entry.path(), std::ios::binary);
+        const std::string code = strip_comments_and_literals(
+            std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()));
+        Count c{member_calls_of(code, "validate_session"), member_calls_of(code, "validate_token")};
+        if (c.session != 0 || c.token != 0)
+            found[fs::relative(entry.path(), YUZU_SERVER_SRC_DIR).generic_string()] = c;
+    }
+    REQUIRE(files > 100); // the scan really walked the tree
+
+    const auto auth_code = [] {
+        std::ifstream in(std::string(YUZU_SERVER_SRC_DIR) + "/auth_routes.cpp", std::ios::binary);
+        return strip_comments_and_literals(
+            std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()));
+    }();
+    // The credential walk behind resolve_session: the one place the cookie and token credentials
+    // are validated for a request, bound by `resolve_session`'s wrapper.
+    const auto walk = body_of(auth_code, "AuthRoutes::resolve_session_unbound(");
+    CHECK(member_calls_of(walk, "validate_session") == 1);
+    CHECK(member_calls_of(walk, "validate_token") == 2);
+
+    // Everything else, by file. auth_routes.cpp (outside the walk): revalidate_stream (stream
+    // liveness, not a handler gate), the login and SSO callbacks that mint a session (pre-session),
+    // POST /api/v1/elevate (kOwnGate) and POST /api/v1/elevate/revoke (kExempt), all validating
+    // their own cookie only. settings_routes.cpp: the MFA enrolment confirm (kExempt), which
+    // compares the cookie session's username and auth source with the resolved session before
+    // stamping proof on it. scim_routes.cpp: the SCIM bearer store (SCIM rows are kExempt).
+    std::map<std::string, Count> allowed{
+        {"auth_routes.cpp", {1 + 5, 2}},
+        {"settings_routes.cpp", {1, 0}},
+        {"scim_routes.cpp", {0, 1}},
+    };
+    for (const auto& [file, c] : found) {
+        INFO("file: " << file << " (validate_session calls " << c.session << ", validate_token calls "
+                      << c.token << "). A new direct validator is not covered by the "
+                                    "one-principal-per-request binding: route it through AuthRoutes::resolve_session, or add "
+                                    "it to this allowlist with the reason it does not authorise a "
+                                    "gated handler.");
+        const auto it = allowed.find(file);
+        REQUIRE(it != allowed.end());
+        CHECK(c.session == it->second.session);
+        CHECK(c.token == it->second.token);
+    }
+    for (const auto& [file, c] : allowed) {
+        INFO("allowlisted file no longer has these calls: " << file);
+        CHECK(found.count(file) == 1);
+    }
 }
 
 TEST_CASE("wiring: server.cpp's in-handler StepUpFn and the pre-request deps name the right "
