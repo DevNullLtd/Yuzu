@@ -199,55 +199,88 @@ conditions (security-guardian `sec-1`, with the architect's five conditions):
    one replica until its safe-to-scale gate lifts (section 7c); it has no enumeration of
    replicas and no report of their builds (a search of `server/core/src` finds a `replica_id`
    only in `ExecutionTracker`'s own bookkeeping). So the first producer MUST either build such a
-   mechanism or cite an existing one, and it MUST establish three things, not by an operator's
+   mechanism or cite an existing one, and it MUST establish two things, not by an operator's
    say-so: the expected replica set comes from a named source (not from whatever happens to
-   answer), a replica that is unknown, unreachable or silent counts as NOT upgraded, and a
-   build older than this change cannot be started against a database holding a bound ticket
-   (the refusal is the NEW build's boot-time check; an older binary cannot refuse itself, see
-   Rollback below). Proof: `submit_bound: a fleet that contains an unknown or older replica
-   refuses to mint`, in `test_approval_manager_bound.cpp`.
+   answer), and a replica that is unknown, unreachable or silent counts as NOT upgraded. Proof:
+   `submit_bound: a fleet that contains an unknown or older replica refuses to mint`, in
+   `test_approval_manager_bound.cpp`.
+
+   The rollback leg is a different kind of requirement, and no boot-time check in the NEW build
+   can meet it: a build older than this change must not be able to act on a bound ticket, yet
+   the migration runner applies only the versions above the stored one and has no
+   newer-schema refusal, so an older binary STARTS against this schema, reads a bound row as
+   unbound and cannot refuse itself. Nothing mechanical stops that today; only the operator
+   rule in the Rollback bullet below does, and nothing mints a bound ticket yet. The first
+   producer therefore MUST either make a bound ticket structurally unusable to an older build
+   (it fails closed instead of reading the row as unbound), or adopt the operator rule as the
+   control and prove its detection query (Rollback below). It MUST NOT cite a boot-time check in
+   the new build as the control for this.
 5. PR3 lands in the same release window as PR2, or the dormant half is cut back out. Made
    checkable: let TAG be any git tag, a release candidate (`-rcN`) included, for which `git tag
    --contains <the commit that merges PR2>` is non-empty. PR3 (#6063) MUST merge before the first
    such TAG, or a change that REMOVES the dormant half MUST merge before it. "The dormant half" is
-   exactly four things: the `excluded_roots` refusal in `approve()`, `submit_bound` (with
+   four things: the `excluded_roots` refusal in `approve()`, `submit_bound` (with
    `BoundRequest`, `SubmitError` and their validation), the `kGuardianDeploy` origin, and the
    caller-held-transaction `consume_ticket(PGconn*, ...)` overload with its
    `ConsumeTestStage` seam; migration v2's columns stay (they are forward-only and harmless
-   empty). The accountable owner is the epic owner of #6060, who records which of the two applies
+   empty). Removing them also touches their compile and test dependents: the `kGuardianDeploy`
+   entry in the `yuzu_approval_precondition_denied_total` pre-seed loop in `server.cpp` (and the
+   series' documentation in `metrics.md`), and the allow-list in
+   `test_approval_dormant_code_tripwire.cpp`, whose exact counts fail once the origin is gone.
+   The `guardian.` definition-id reservation is a separate, shipped decision that a removal
+   states it keeps. The accountable owner is the epic owner of #6060, who records which of the two applies
    in a comment on #6060 before the first such TAG is cut; the deadline is that TAG. There is no
    release gate that checks this today. A tripwire keeps the question honest in between: `bound-
    approval primitives still have no production use (ADR-1009 tripwire, not proof)`, in
-   `test_approval_dormant_code_tripwire.cpp`, lexes every file under `server/core/src` (comments
-   and string, character and raw-string literals excluded) and fails when `submit_bound`, a
-   second `consume_ticket`, a new `kGuardianDeploy` or the interleaving seam appears in
-   production code, when the store, `mcp_server.cpp` or `server.cpp` is not scanned, or when the
-   known single uses are not found exactly once; its own tests plant a producer in a temp copy to
-   show it is not blind. It reads source text only: it cannot see a macro, a generated file or
-   another directory, and it proves nothing about behaviour.
+   `test_approval_dormant_code_tripwire.cpp`. It lexes the `.cpp`, `.hpp`, `.inc`, `.cc` and `.h`
+   files under `server/core/src` and nowhere else (comments, and string, character and
+   raw-string literals including their `u8`, `u`, `U` and `L` prefixes, are excluded), counts
+   `submit_bound`, `consume_ticket`, `kGuardianDeploy` and the interleaving seam in code, per
+   file, and fails unless each count equals its allow-list entry exactly. Nothing is exempt: the
+   store files are pinned like every other file (a wrapper added there that calls a primitive
+   raises a count and fails), a file with no entry is allowed none, and it also fails when the
+   store, `mcp_server.cpp` or `server.cpp` is not scanned. Its own tests plant a producer, a
+   store wrapper and prefixed literals in temp trees to show it is not blind. What it does NOT
+   see: a wrapper that is only CALLED from elsewhere under its own name (the caller names the
+   wrapper, not the primitive), the difference between the pooled `consume_ticket` overload and
+   the held one (swapping the one MCP call from one to the other stays green), anything outside
+   `server/core/src` (`server/core/include`, `common/include`, `sdk/include`, `tests/`),
+   a generated file, another extension, a macro that pastes a name together, and any behaviour.
+   It is a tripwire for a careless first producer, not a control against a deliberate one.
 
 ### PR3 entry conditions
 
 Open findings that become conditions on the PR that first wires a producer or redeemer (#6063).
-The consume-time recheck is in PR2 (`up-2`, `g8-sg-1`). Every read a consume makes runs the
-origin and submitter checks, and, for a row that is approved and not yet consumed, the integrity
+The consume-time recheck is in PR2 (`up-2`, `g8-sg-1`). Every read a consume makes before its
+consuming statement runs the origin and submitter checks, and, for a row that is approved and not yet consumed, the integrity
 checks (reviewer is not the submitter or an excluded root, an approved ticket names a reviewer,
 excluded roots readable, request matches its digest); a pending, rejected, expired or already
 consumed row keeps reading as the ordinary refusal it is. The consuming statement is pinned to the
-row VERSION (`xmin`) of the last row examined, so ANY update of the row between the checks and the
-statement, in any column (`consumed_at`, `reviewed_at`, `definition_id` and the rest included),
-makes it match nothing and read as the uniform not-consumable; the explicit status, reviewer,
-request, digest, excluded-roots, origin and submitter pins are kept as defence in depth. What
-that is NOT: the check and the statement remain two statements, a no-op rewrite of the row also
-changes its version and refuses (fail closed; a retry succeeds), and a writer who can replace the
-row wholesale or work below SQL is outside what it can tell. It detects a row that moved by
-accident or by an old build; it is not a boundary against a principal with database write
-access. On an autocommit connection (the `cs-3` item below) the held overload gets only the pin.
+row VERSION of the last row examined, which is two values: `xmin` (the transaction that wrote the
+version) and `ctid` (its tuple position). An update of the row by ANOTHER transaction between the
+checks and the statement, in any column (`consumed_at`, `reviewed_at`, `definition_id` and the
+rest included), moves `xmin`; a second write by a transaction that already wrote the row (the
+held overload, when the caller's own transaction wrote it first) keeps `xmin`, because every
+version one transaction writes carries its xid, and moves `ctid`. Either makes the statement
+match nothing and read as the uniform not-consumable; the explicit status, reviewer, request,
+digest, excluded-roots, origin and submitter pins are kept as defence in depth. What that is NOT:
+the check and the statement remain two statements, and a writer who can replace the row
+wholesale or work below SQL is outside what it can tell. It also fails closed, with a false
+refusal that a retry (a fresh read of the new version) clears: a no-op rewrite of the row is a
+new version, and VACUUM FULL or CLUSTER move `ctid` of an unchanged row; VACUUM FREEZE changes
+neither value and refuses nothing. It detects a row that moved by accident or by an old build; it
+is not a boundary against a principal with database write access. On an autocommit connection
+(the `cs-3` item below) the held overload gets only the pin.
 
-Each condition below is a MUST, and each names the test that proves it. A named test is written
-first and is red at the base of the PR that satisfies the condition; a test that cannot be made
-red first is not evidence. Test names are the case titles in `tests/unit/server/` that the PR
-adds.
+Each bullet below is a MUST. Its Proof names the case title and file that demonstrates it,
+except three that are descriptions rather than titles: the Classification proof's file (the
+producer's test file does not exist yet), the first Narrow list projection proof (a compile-time
+test) and the Rollback proof; the PR MUST pick the title and file for each and state them in its
+description before review. A test the PR adds is written first and is red at the base of that PR;
+a test that cannot be made red first is not evidence. Where a Proof says "keep green" (Display
+fidelity), the tests already exist and pass at the base, so they cannot be red there: the PR MUST
+keep them green and extend them to the new surface. Test names are the case titles in
+`tests/unit/server/` that the PR adds.
 
 - **Held-path denial observer** (`sg-4`): MUST NOT take a second pool lease while the row is
   locked, or MUST fire after the caller's transaction ends. Proof: `consume_ticket(PGconn*): with
@@ -294,9 +327,9 @@ adds.
   executed (a number such as 123456789012345678901234567890 displays rounded in the summary and in
   the API `request`, and a duplicate key displays last-wins). Proof: `submit_bound: a request with
   a duplicate key or an inexact number is refused`, in `test_approval_manager_bound.cpp`.
-- **Classification** (`co-4`): no secret-typed parameter MUST NOT be frozen into `request_json` (clear
-  text, never pruned; see the Server Administration retention note), so the producer's request
-  builder MUST refuse one. Proof: `the producer's request builder refuses a parameter marked
+- **Classification** (`co-4`): a secret-typed parameter MUST NOT be frozen into `request_json`
+  (clear text, never pruned; see the Server Administration retention note), so the producer's
+  request builder MUST refuse one. Proof: `the producer's request builder refuses a parameter marked
   secret before submit_bound is reached`, in the PR's producer test file.
 - **The decision is pinned to the digest the reviewer saw** (`g8-up-1`, `g8-up-2`, `g8-er-1`): the
   Approve request MUST carry the `request_digest` the reviewer displayed, and `approve()`'s update
@@ -366,12 +399,13 @@ adds.
   either `withdraw: only the submitter may withdraw a pending bound ticket, and it is audited` or
   `reject: the submitter is refused and the page does not offer it`, in
   `test_approval_manager_bound.cpp`.
-- **Rollback** (`g8-up-4`): condition 4 above is forward-only. A build older than migration v2
-  starts against a v2 schema (the runner skips versions it does not know and has no
-  schema-ahead guard), reads a bound row as unbound and ignores `excluded_roots`. Rolling back
-  while any bound ticket is pending or approved-and-unconsumed MUST be refused by the operator
-  runbook, or those tickets MUST be rejected first. `upgrading.md` states the rule in prose
-  today; the PR MUST add the detection query to it. Proof: a test that the query in
+- **Rollback** (`g8-up-4`): the operator-rule option of condition 4's rollback leg. A build older
+  than migration v2 starts against a v2 schema (the runner skips versions it does not know and
+  has no schema-ahead guard, so the new build's boot check cannot stop the old one), reads a
+  bound row as unbound and ignores `excluded_roots`. Rolling back while any bound ticket is
+  pending or approved-and-unconsumed MUST be refused by the operator runbook, or those tickets
+  MUST be rejected first. `upgrading.md` states the rule in prose today; the PR MUST add the
+  detection query to it, unless it takes the structural option of condition 4 instead. Proof: a test that the query in
   `upgrading.md` finds a seeded pending and a seeded approved-and-unconsumed bound ticket, in
   `test_approval_manager_bound.cpp`. The pinned consuming statement backstops redemption only
   after the upgrade, not on the older build.
