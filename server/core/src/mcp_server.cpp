@@ -21429,8 +21429,11 @@ McpServer::HandlerFn McpServer::build_handler(
             // catalogue().security).
             //
             // governance C4/sec-4: a bundle targets ONE device, so authorization is
-            // the per-target confinement below (caller_fn + in_scope) — NOT
-            // ALSO a targetless global Execution:Execute perm_fn gate. Keeping both
+            // the per-target `scoped_perm_fn` gate plus the confinement below
+            // (caller_fn + in_scope) — NOT ALSO a targetless global
+            // Execution:Execute perm_fn gate. The scoped gate carries the engine
+            // branch (RBAC-only, default-deny) that `caller_fn`'s visible set has
+            // none of: with RBAC off that set resolves unfiltered for any session. Keeping both
             // (as this handler previously did) is STRICTER than REST's
             // /api/v1/bundles twin (scoped_perm_fn only, no global gate), so a
             // management-group-scoped operator with no GLOBAL Execution:Execute
@@ -21455,6 +21458,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                if (!scoped_perm_fn) {
+                    res.set_content(error_response(id, kInternalError, "scope gate not configured"),
+                                    "application/json");
+                    return;
+                }
+                if (!scoped_perm_fn(req, res, "Execution", "Execute", agent_id))
+                    return; // the gate wrote its own 401/403
                 if (!args.contains("steps")) {
                     res.set_content(error_response(id, kInvalidParams, "steps is required"),
                                     "application/json");

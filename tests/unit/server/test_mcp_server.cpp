@@ -22670,6 +22670,17 @@ TEST_CASE("MCP list_deployments / get_deployment: service-scoped token denied at
 // collated result, the ownership (IDOR) guard, and validation errors.
 
 namespace {
+// The per-device Execution:Execute gate execute_bundle runs first (REST's /api/v1/bundles uses the
+// same `scoped_perm_fn`): the production gate carries the engine default-deny, so a test that
+// is not about that gate wires an allow-all stand-in, since an unwired gate fails closed.
+void allow_bundle_scope_gate(McpTestServer& ts) {
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+}
+} // namespace
+
+namespace {
 // Parse the JSON payload carried in result.content[0].text of an MCP tool reply.
 nlohmann::json bundle_payload(const std::unique_ptr<httplib::Response>& res) {
     auto body = nlohmann::json::parse(res->body);
@@ -22712,6 +22723,7 @@ TEST_CASE("MCP execute_bundle denies an out-of-scope target agent, dispatches an
     REQUIRE(store.is_open());
     bool dispatched = false;
     McpTestServer ts;
+    allow_bundle_scope_gate(ts);
     ts.response_store_for_test = &store;
     // Caller (service-scoped-style) can see only agent-A.
     ts.caller_fn_for_test = [](const auth::Session&) -> yuzu::server::DispatchCaller {
@@ -22756,6 +22768,7 @@ TEST_CASE("MCP execute_bundle threads the caller's principal_is_admin into Dispa
     REQUIRE(store.is_open());
     bool captured_admin = false;
     McpTestServer ts;
+    allow_bundle_scope_gate(ts);
     ts.response_store_for_test = &store;
     ts.caller_fn_for_test = [](const auth::Session&) -> yuzu::server::DispatchCaller {
         std::unordered_set<std::string> s{"agent-A"};
@@ -22797,6 +22810,7 @@ TEST_CASE("MCP #3893: execute_bundle refuses the WHOLE call when ANY step is den
 
     yuzu::MetricsRegistry reg;
     McpTestServer ts;
+    allow_bundle_scope_gate(ts);
     ts.response_store_for_test = &store;
     ts.metrics_for_test = &reg;
     // Step 1 (os_info.uptime) would be authorized; step 2 (registry.set_value)
@@ -22864,6 +22878,7 @@ TEST_CASE("MCP #3893: execute_bundle unwired authorizer fails CLOSED at the MAIN
     REQUIRE(store.is_open());
 
     McpTestServer ts;
+    allow_bundle_scope_gate(ts);
     ts.response_store_for_test = &store;
     ts.authorize_dispatch_fn_for_test = {}; // genuinely unwired
     bool dispatched = false;
@@ -22900,6 +22915,7 @@ TEST_CASE("MCP #3893 (Gate 6 UP-5 parity): ApprovalRequired at C8 pre-mint for e
     yuzu::server::ApprovalManager& appr = *appr_bundle;
 
     McpTestServer ts;
+    allow_bundle_scope_gate(ts);
     ts.approval_manager_for_test = &appr;
     ts.authorize_dispatch_fn_for_test =
         deny_with(yuzu::server::detail::DispatchDenialReason::ApprovalRequired, "Infrastructure",
@@ -22939,6 +22955,7 @@ TEST_CASE("MCP execute_bundle FAILS CLOSED when the exec-visible derivation is u
     REQUIRE(store.is_open());
     bool dispatched = false;
     McpTestServer ts;
+    allow_bundle_scope_gate(ts);
     ts.response_store_for_test = &store;
     // Genuinely UNWIRED (not the harness's nullopt default): a missing applicable
     // filter must DENY, not admit every target (ADR-0033 §1).
@@ -22973,6 +22990,7 @@ TEST_CASE("MCP execute_bundle admits a management-group-scoped operator with NO 
     REQUIRE(store.is_open());
     bool dispatched = false;
     McpTestServer ts;
+    allow_bundle_scope_gate(ts);
     ts.response_store_for_test = &store;
     ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
         // Deny the GLOBAL grant this caller lacks; every other check (e.g. the
@@ -22999,6 +23017,86 @@ TEST_CASE("MCP execute_bundle admits a management-group-scoped operator with NO 
     CHECK(dispatched);
 }
 
+TEST_CASE("MCP execute_bundle runs the per-device Execution:Execute gate before anything is "
+          "dispatched (engine default-deny parity with POST /api/v1/bundles)",
+          "[pg][mcp][bundle][scope][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    constexpr auto kCall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":6204,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-A","steps":[{"plugin":"os_info","action":"uptime"}]}}})";
+    const auto dispatch_fn = [](bool& dispatched) {
+        return [&dispatched](const std::string&, const std::string&,
+                             const std::vector<std::string>&, const std::string&,
+                             const std::unordered_map<std::string, std::string>&,
+                             const std::string&, const yuzu::server::DispatchCaller&)
+                   -> yuzu::server::ConfinedDispatchOutcome {
+            dispatched = true;
+            return {.sent = 1, .command_id = "cmd"};
+        };
+    };
+    // The visible set is unfiltered, as it is for ANY session when RBAC is off: only the
+    // scoped gate can refuse.
+    const auto unfiltered = [](const auth::Session&) -> yuzu::server::DispatchCaller {
+        return yuzu::server::DispatchCaller{.exec_visible = std::nullopt};
+    };
+
+    SECTION("a gate that refuses (an engine with no grant) stops the call: 403, nothing dispatched") {
+        bool dispatched = false;
+        std::string gated_type, gated_op, gated_agent;
+        McpTestServer ts;
+        ts.response_store_for_test = &store;
+        ts.caller_fn_for_test = unfiltered;
+        ts.scoped_perm_fn_for_test = [&](const httplib::Request&, httplib::Response& res,
+                                         const std::string& type, const std::string& op,
+                                         const std::string& agent_id) -> bool {
+            gated_type = type;
+            gated_op = op;
+            gated_agent = agent_id;
+            res.status = 403;
+            res.set_content(R"({"error":"forbidden"})", "application/json");
+            return false;
+        };
+        ts.start_with_dispatch(dispatch_fn(dispatched));
+        auto res = ts.call(kCall);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK_FALSE(dispatched);
+        CHECK(gated_type == "Execution");
+        CHECK(gated_op == "Execute");
+        CHECK(gated_agent == "agent-A");
+        CHECK(res->body.find("bundle_id") == std::string::npos);
+    }
+
+    SECTION("an unwired gate fails closed: nothing dispatched") {
+        bool dispatched = false;
+        McpTestServer ts;
+        ts.response_store_for_test = &store;
+        ts.caller_fn_for_test = unfiltered;
+        ts.start_with_dispatch(dispatch_fn(dispatched));
+        auto res = ts.call(kCall);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["message"] == "scope gate not configured");
+        CHECK_FALSE(dispatched);
+    }
+
+    SECTION("a gate that admits lets the bundle through") {
+        bool dispatched = false;
+        McpTestServer ts;
+        ts.response_store_for_test = &store;
+        ts.caller_fn_for_test = unfiltered;
+        allow_bundle_scope_gate(ts);
+        ts.start_with_dispatch(dispatch_fn(dispatched));
+        auto res = ts.call(kCall);
+        REQUIRE(res);
+        CHECK(nlohmann::json::parse(res->body).contains("result"));
+        CHECK(dispatched);
+    }
+}
+
 TEST_CASE("MCP execute_bundle fans each step out + returns bundle_id", "[pg][mcp][bundle]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -23011,6 +23109,7 @@ TEST_CASE("MCP execute_bundle fans each step out + returns bundle_id", "[pg][mcp
     std::vector<Call> calls;
 
     McpTestServer ts;
+    allow_bundle_scope_gate(ts);
     ts.response_store_for_test = &store;
     ts.start_with_dispatch([&calls](const std::string& plugin, const std::string& action,
                                     const std::vector<std::string>&, const std::string&,
@@ -23050,6 +23149,7 @@ TEST_CASE("MCP get_bundle_result collates the responses in request order", "[pg]
     REQUIRE(store.is_open());
 
     McpTestServer ts;
+    allow_bundle_scope_gate(ts);
     ts.response_store_for_test = &store;
     ts.start_with_dispatch(fake_bundle_dispatch());
 
@@ -23096,6 +23196,7 @@ TEST_CASE("MCP get_bundle_result: #3344 retry_after_ms present only while comple
 
     yuzu::MetricsRegistry reg;
     McpTestServer ts;
+    allow_bundle_scope_gate(ts);
     ts.response_store_for_test = &store;
     ts.metrics_for_test = &reg;
     ts.start_with_dispatch(fake_bundle_dispatch());
@@ -23160,6 +23261,7 @@ TEST_CASE("MCP get_bundle_result enforces ownership (IDOR)", "[pg][mcp][bundle]"
     REQUIRE(store.is_open());
 
     McpTestServer ts;
+    allow_bundle_scope_gate(ts);
     ts.response_store_for_test = &store;
     ts.start_with_dispatch(fake_bundle_dispatch());
 
@@ -23192,6 +23294,7 @@ TEST_CASE("MCP execute_bundle validation errors", "[pg][mcp][bundle][unhappy]") 
     yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     McpTestServer ts;
+    allow_bundle_scope_gate(ts);
     ts.response_store_for_test = &store;
     ts.start_with_dispatch(fake_bundle_dispatch());
 
@@ -23212,7 +23315,8 @@ TEST_CASE("MCP execute_bundle validation errors", "[pg][mcp][bundle][unhappy]") 
 TEST_CASE("MCP bundle tools error when the orchestrator is unwired", "[mcp][bundle][unhappy]") {
     // governance QE-N2: no response store wired → bundle_orch is null → both
     // tools must return a structured error, not crash.
-    McpTestServer ts; // response_store_for_test stays nullptr
+    McpTestServer ts;
+    allow_bundle_scope_gate(ts); // response_store_for_test stays nullptr
     ts.start_with_dispatch(fake_bundle_dispatch());
     auto e1 = nlohmann::json::parse(
         ts.call(
@@ -23233,6 +23337,7 @@ TEST_CASE("MCP get_bundle_result surfaces dispatch_failed + succeeded=0", "[pg][
     yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     McpTestServer ts;
+    allow_bundle_scope_gate(ts);
     ts.response_store_for_test = &store;
     ts.start_with_dispatch([](const std::string&, const std::string&,
                               const std::vector<std::string>&, const std::string&,
@@ -23263,6 +23368,7 @@ TEST_CASE("MCP get_bundle_result tolerates non-UTF-8 plugin output (no envelope 
     yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     McpTestServer ts;
+    allow_bundle_scope_gate(ts);
     ts.response_store_for_test = &store;
     ts.start_with_dispatch(fake_bundle_dispatch());
     auto disp = ts.call(
@@ -28760,6 +28866,7 @@ TEST_CASE("MCP 2405: execute_bundle step items are validated recursively",
     {
         yuzu::server::ApprovalManager& appr = *appr_bundle;
         McpTestServer ts;
+    allow_bundle_scope_gate(ts);
         ts.approval_manager_for_test = &appr;
         ts.start("supervised");
 
@@ -28795,6 +28902,7 @@ TEST_CASE("MCP 2444: execute_bundle empty step plugin/action is rejected pre-min
     yuzu::test::ApprovalManagerPg appr_bundle;
     yuzu::server::ApprovalManager& appr = *appr_bundle;
     McpTestServer ts;
+    allow_bundle_scope_gate(ts);
     ts.approval_manager_for_test = &appr;
     ts.start("supervised");
 
@@ -28826,6 +28934,7 @@ TEST_CASE("MCP 2405: malicious argument keys never reach the envelope or audit d
     {
         yuzu::server::ApprovalManager& appr = *appr_bundle;
         McpTestServer ts;
+    allow_bundle_scope_gate(ts);
         ts.approval_manager_for_test = &appr;
         ts.start("supervised");
 
@@ -29574,6 +29683,7 @@ TEST_CASE("MCP 2405: real gated schemas enforce enum, bounds and maxLength at th
         // exercises the HANDLER's `too_large`, a different site.
         yuzu::MetricsRegistry reg;
         McpTestServer ts;
+    allow_bundle_scope_gate(ts);
         ts.metrics_for_test = &reg;
         ts.approval_manager_for_test = &appr;
         ts.start("supervised");
