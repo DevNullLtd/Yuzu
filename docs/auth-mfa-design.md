@@ -757,9 +757,19 @@ regress:
    gates, a null auth store answers `503` for every caller class first, then an engine is `403` with no
    store read, ahead of the window-disabled hatch, which in turn precedes the
    SAML denial and the store read (so a window of 0 or less lets SAML through).
-   The in-handler `step_up_fn` reuses the central verdict only through a per-request pass
-   that is bound to the principal that earned it (the principal class exactly, plus a
-   fingerprint of principal kind, auth source and username): the handler resolves its own
-   session, and a pass is honoured only when that session is the same principal. A handler
-   session that differs refuses the pass, clears it, and is evaluated afresh, which is the
-   path that answers an engine principal `403`.
+   One principal per request: once the central check passes a gated request, later session
+   resolutions for that request yield the same principal or none, and a pass is honoured only
+   for the principal that earned it. The principal is identified by the principal class
+   exactly, plus a fingerprint of principal kind, auth source and username. The binding is
+   armed with the pass and kept until the end of the request, even after the pass is spent:
+   `AuthRoutes::resolve_session` applies it on every credential path (cookie, Bearer,
+   `X-Yuzu-Token`) through `detail::step_up_binding_admits`, and a resolution that would land
+   on another principal returns no session, so the handler answers its ordinary `401`. The
+   in-handler `step_up_fn` reuses the central verdict only through the per-request pass: a
+   handler session that differs refuses the pass, spends it, and is evaluated afresh, which is
+   the path that answers an engine principal `403` with a wired store. A fingerprint that
+   cannot be computed fails closed: the chokepoint answers `503`, and consume and the binding
+   check refuse. PR 2 precondition: the stash, the binding and the in-handler calls may be
+   deleted only once handlers consume the centrally resolved session or the repeated
+   resolutions are removed (resolve once, issue #6200); deleting the binding while handlers
+   still resolve more than once re-opens the multi-resolution gap.

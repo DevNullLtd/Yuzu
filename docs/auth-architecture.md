@@ -720,16 +720,24 @@ by each handler.
   `rotate`/`confirm` routes re-evaluate on every call, including an
   idempotent re-serve. A per-request stash lets the handler's own
   `step_up_fn` call (kept as a second, identical check) reuse the verdict
-  instead of reading enrollment state a second time. The stash is bound to
-  the principal the central check decided on (principal class exactly, plus a
+  instead of reading enrollment state a second time. One principal per
+  request: once the central check passes a gated request, later session
+  resolutions for that request yield the same principal or none, and a pass is
+  honoured only for the principal that earned it. The stash is bound to the
+  principal the central check decided on (principal class exactly, plus a
   fingerprint of principal kind, auth source and username) as well as to the
   request and the action label: a handler whose own resolved session is a
-  different principal does not consume it, the stash is cleared, and that
-  session is evaluated afresh. That stash, its
+  different principal does not consume it, the pass is spent, and that session
+  is evaluated afresh. The binding outlives the pass until the end of the
+  request, and `AuthRoutes::resolve_session` applies it on every credential
+  path, so a resolution that would land on another principal returns no session
+  and the handler answers its ordinary `401`. That stash, the binding, its
   consumer (`consume_step_up_pass`), the `handler_skipped` outcome (a
-  report-only tripwire raised when a 2xx follows an unconsumed pass) and the
+  report-only tripwire raised when a 2xx follows an unspent pass) and the
   in-handler calls themselves are transitional: PR 2 deletes them once the
-  chokepoint is the only enforcement. Until then the in-handler calls remain
+  chokepoint is the only enforcement, and only after handlers consume the
+  centrally resolved session or the repeated resolutions are removed (resolve
+  once, issue #6200). Until then the in-handler calls remain
   as defence in depth (38 distinct labels: one per `kRequired` row, 36, plus
   the two the elevation path uses).
 - **Audit.** Refusals written by the chokepoint go through
