@@ -1230,11 +1230,17 @@ struct LiveHarness {
     int port = 0;
     std::unique_ptr<apb::AgentService::Stub> stub;
 
-    explicit LiveHarness(const std::string& dsn) : pool({.conninfo = dsn, .size = 4}) {
+    /// `configure` runs on the service before the server starts, so nothing else can be reading
+    /// what it sets (the budget's setter is for "before the service is shared").
+    explicit LiveHarness(const std::string& dsn,
+                         const std::function<void(AgentServiceImpl&)>& configure = {})
+        : pool({.conninfo = dsn, .size = 4}) {
         auth_mgr.set_auth_db(auth_db.get());
         audit = std::make_shared<AuditStore>(pool);
         REQUIRE(audit->is_open());
         svc.set_registry_audit_store(audit);
+        if (configure)
+            configure(svc);
         grpc::ServerBuilder builder;
         builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
         builder.RegisterService(&svc);
@@ -1367,4 +1373,43 @@ TEST_CASE("registry audit live ingest: the audit-failed trailer is added once pe
                                           std::string{kOkLine}));
     CHECK(subscribe_with(h, "agent-many", frames) == 1U);
     fault.repair();
+}
+
+TEST_CASE("registry audit live ingest: a close mid-frame sets the audit-failed trailer and a frame "
+          "after the close does not",
+          "[pg][server][registry_audit][subscribe][rundown]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
+    int clock_calls = 0; // outlives the harness: the budget's clock reads it
+    LiveHarness h(db.dsn(), [&](AgentServiceImpl& svc) {
+        // Never refuses; the clock closes the hook (what ServerImpl::stop() does) on the second row
+        // of the first frame, on the handler's own thread.
+        svc.set_registry_audit_budget(std::make_unique<DenialAuditBudget>(
+            /*max_rows=*/100, /*window_ms=*/60'000,
+            [&clock_calls, &svc] {
+                if (++clock_calls == 2)
+                    svc.close_registry_audit();
+                return std::int64_t{1'000};
+            },
+            /*max_keys=*/8));
+    });
+    const std::string one{kOkLine};
+    // The frame is cut short: the first row is written, the other two are lost, and the Subscribe
+    // call ends with the trailer, as it does for any row the store failed to write.
+    CHECK(subscribe_with(h, "agent-c",
+                         {IngestHarness::frame(rid(0xe2), apb::CommandResponse::RUNNING,
+                                               "set_value", one + "\n" + one + "\n" + one)}) == 1U);
+    CHECK(h.metrics.counter("yuzu_server_registry_audit_dropped_total", {{"reason", "persist_failed"}})
+              .value() == 2.0);
+    // A frame that arrives after the close is silent, like one after the store is released: no
+    // row, no count, no trailer.
+    CHECK(subscribe_with(h, "agent-after",
+                         {IngestHarness::frame(rid(0xe3), apb::CommandResponse::RUNNING,
+                                               "set_value", one)}) == 0U);
+    AuditQuery q;
+    q.action = "registry.write";
+    const auto rows = h.audit->query(q);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].target_id == rid(0xe2));
+    CHECK(h.svc.wait_registry_audit_idle(std::chrono::milliseconds{0}));
 }

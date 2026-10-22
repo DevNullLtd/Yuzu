@@ -16,6 +16,7 @@
 #include <latch>
 #include <memory>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "rundown_gate.hpp"
@@ -23,6 +24,14 @@
 
 using namespace std::chrono_literals;
 using yuzu::server::RundownGate;
+
+// One place per Entry, given back exactly once: an Entry that could be copied or moved would give
+// it back twice, or hand it to a scope that outlives the borrow.
+static_assert(!std::is_copy_constructible_v<RundownGate::Entry> &&
+                  !std::is_move_constructible_v<RundownGate::Entry> &&
+                  !std::is_copy_assignable_v<RundownGate::Entry> &&
+                  !std::is_move_assignable_v<RundownGate::Entry>,
+              "a RundownGate::Entry is neither copyable nor movable");
 
 TEST_CASE("rundown gate: an open gate admits, a closed gate refuses for good",
           "[server][rundown]") {

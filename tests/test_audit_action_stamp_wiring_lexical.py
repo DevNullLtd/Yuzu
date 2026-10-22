@@ -320,6 +320,11 @@ SERVER_MUTATIONS = [
     ),
     # a gateway hook deleted
     (r"\(void\)audit_registry_frame\(agent_id, resp\);", ""),
+    # a gateway site logs the failure a second time
+    (
+        r"\(void\)audit_registry_frame\(agent_id, resp\);",
+        'if (!audit_registry_frame(agent_id, resp)) spdlog::error("again");',
+    ),
     # a fifth output-storing site appears
     (r"response_store_->store\(sr\);", "response_store_->store(sr);\nresponse_store_->store(sr);"),
     # the hook reads the raw store instead of the weak one
