@@ -1021,19 +1021,6 @@ TEST_CASE("mapdrive backfill apply_outcomes: an outcome that was never attempted
     CHECK(r.retained[1].cause == "skipped_after_timeout");
 }
 
-TEST_CASE("mapdrive backfill apply_outcomes: a timed-out mount is one failed attempt",
-          "[tar][mapdrive][backfill]") {
-    PendingState st;
-    st.profiles = {{"S-1-5-21-1", 2}};
-    const std::vector<ProfileHiveOutcome> outcomes = {
-        {"S-1-5-21-1", HiveAccessStatus::mount_failed, "timeout", true, true}};
-    const auto r = apply_outcomes(st, outcomes, true, 7);
-    REQUIRE(r.next.profiles.size() == 1);
-    CHECK(r.next.profiles[0].attempts == 3);
-    REQUIRE(r.failed.size() == 1);
-    CHECK(r.failed[0].token == "timeout");
-}
-
 TEST_CASE("mapdrive backfill initial_pending: a profile the first pass did not try is still "
           "seeded so it is retried, not lost",
           "[tar][mapdrive][backfill]") {

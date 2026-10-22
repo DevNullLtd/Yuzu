@@ -6,7 +6,7 @@ abandons a mount thread that outlives its bound; that thread keeps running TAR c
 joins it. The only thing standing between it and an unmapped module is the pin taken on the first
 timeout, and the Windows body cannot run in the unit suites, so this pins the shape of the wiring:
 
-  1. pin_plugin_module_once pins by address (GET_MODULE_HANDLE_EX_FLAG_PIN | ..._FROM_ADDRESS);
+  1. pin_plugin_module pins by address (GET_MODULE_HANDLE_EX_FLAG_PIN | ..._FROM_ADDRESS);
   2. the non-Completed branch asks decide_mount_call, pins when told to, and stops the walk;
   3. a halted walk records the remaining profiles as not attempted, before any further mount;
   4. the banner no longer cites dism_bounded_call.hpp as the pattern it follows (that header keeps
@@ -40,15 +40,15 @@ class MapdrivePinWiring(unittest.TestCase):
     text = SRC.read_text(encoding="utf-8")
 
     def test_pin_is_by_address(self):
-        body = body_of(self.text, "void pin_plugin_module_once() noexcept")
+        body = body_of(self.text, "void pin_plugin_module() noexcept")
         self.assertIn("GET_MODULE_HANDLE_EX_FLAG_PIN", body)
         self.assertIn("GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS", body)
-        self.assertIn("&pin_plugin_module_once", body)
+        self.assertIn("&pin_plugin_module)", body)
 
     def test_timeout_branch_pins_and_halts(self):
         walk = body_of(self.text, "void enum_registry_outbound_history(")
         self.assertRegex(walk, r"decide_mount_call\(")
-        self.assertRegex(walk, r"if \(decision\.pin_module\)\s*pin_plugin_module_once\(\);")
+        self.assertRegex(walk, r"if \(decision\.pin_module\)\s*pin_plugin_module\(\);")
         self.assertRegex(walk, r"mounts_halted\s*=\s*decision\.halt_walk;")
 
     def test_halted_walk_records_not_attempted_before_mounting(self):

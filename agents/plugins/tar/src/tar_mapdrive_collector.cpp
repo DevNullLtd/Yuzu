@@ -1121,14 +1121,11 @@ OutboundRead read_user_outbound_history(HKEY user_root, const std::string& profi
 // therefore stops mounting after the first timeout (decide_mount_call): later profiles would only
 // queue behind the stuck mount, time out, and burn attempts they never made.
 // Pins this plugin's module so FreeLibrary can never unmap it (the pin is for the life of the
-// process). Called on the dispatching thread the first time a mount times out; a no-op after.
-void pin_plugin_module_once() noexcept {
-    static std::atomic<bool> pinned{false};
-    if (pinned.exchange(true))
-        return;
+// process). Called on the dispatching thread when a mount times out; pinning again is harmless.
+void pin_plugin_module() noexcept {
     HMODULE module = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
-                            reinterpret_cast<LPCWSTR>(&pin_plugin_module_once), &module)) {
+                            reinterpret_cast<LPCWSTR>(&pin_plugin_module), &module)) {
         spdlog::error("TAR mapdrive: could not pin the plugin module after a hive-mount timeout "
                       "(GetLastError {}); an unload while the abandoned mount thread runs is "
                       "unsafe",
@@ -1223,7 +1220,7 @@ void enum_registry_outbound_history(MapDriveHistory& h, const std::vector<std::s
                     ? yuzu::tar::MountCallResult::timed_out
                     : yuzu::tar::MountCallResult::rejected);
             if (decision.pin_module)
-                pin_plugin_module_once();
+                pin_plugin_module();
             ProfileHiveOutcome outcome;
             outcome.sid = profile.sid;
             outcome.status = yuzu::win::HiveAccessStatus::mount_failed;
