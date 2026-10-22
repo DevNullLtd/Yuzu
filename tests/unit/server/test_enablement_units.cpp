@@ -1,7 +1,7 @@
 /**
  * test_enablement_units.cpp — invariants of the switchable-unit overlay
  * (enablement_units.hpp, ADR-3006) over the REAL capability catalogue,
- * composed from all 28 fragments exactly as test_capability_catalogue.cpp does
+ * composed from all 29 fragments exactly as test_capability_catalogue.cpp does
  * (test_real_capability_registry.hpp omits two fragments, #5131).
  *
  * Pure: constexpr tables only, no I/O, no clock, no process.
@@ -28,7 +28,7 @@ using namespace yuzu::server::enablement;
 
 namespace {
 
-// The 28 real fragments are spelled once, in capability_fragments.hpp
+// The 29 real fragments are spelled once, in capability_fragments.hpp
 // (YUZU_ALL_CAPABILITY_FRAGMENTS), shared with the server's dispatch registry.
 
 UnitOverlay real_overlay() {

@@ -694,7 +694,7 @@ jobs:
           # reporting RUNNING. Assert every argument actually reached the SCM.
           $path = (Get-CimInstance Win32_Service -Filter "Name='YuzuAgent'").PathName
           Write-Host "binPath: $path"
-          foreach ($arg in '--service', '--server', '--data-dir', '--plugin-dir', '--log-file', '--no-tls') {
+          foreach ($arg in '--service', '--server', '--data-dir', '--plugin-dir', '--log-file', '--enrollment-token-file', '--no-tls') {
             if ($path -notlike "*$arg*") { Write-Error "FAIL: binPath is missing $arg"; exit 1 }
           }
           Write-Host "PASS: binPath carries all service arguments"

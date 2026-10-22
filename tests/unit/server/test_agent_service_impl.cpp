@@ -3151,6 +3151,9 @@ TEST_CASE("Register: admin-denied agent does not consume the enrollment token (#
     REQUIRE(status.ok());
     CHECK_FALSE(resp.accepted());
     CHECK(resp.enrollment_status() == "denied");
+    // Not the token refusal text: an agent that read this token from a file removes the
+    // file only on that exact text, and the token here was valid.
+    CHECK(resp.reject_reason() == "enrollment denied by administrator");
     // gov #1134: the denied rejection emits the bounded SIEM-routed counter.
     CHECK(h.metrics
               .counter("yuzu_register_denied_total",
@@ -3238,6 +3241,7 @@ TEST_CASE("ProxyRegister: admin-denied agent does not consume the enrollment tok
     REQUIRE(status.ok());
     CHECK_FALSE(resp.accepted());
     CHECK(resp.enrollment_status() == "denied");
+    CHECK(resp.reject_reason() == "enrollment denied by administrator");
     CHECK(h.metrics
               .counter("yuzu_register_denied_total",
                        {{"source", "gateway_proxy"}, {"event", "security"}})

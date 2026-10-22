@@ -191,13 +191,16 @@
 #include "mcp_disabled_routes.hpp" // #2542 PR-12: the 3-route MCP-disabled stub triple, extracted onto the HttpRouteSink seam
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
-#include "capability_fragments.hpp" // YUZU_ALL_CAPABILITY_FRAGMENTS: the 28 fragments, spelled once
+#include "capability_fragments.hpp" // YUZU_ALL_CAPABILITY_FRAGMENTS: every capability fragment, spelled once
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
 #include "compliance_api_local.hpp" // ADR-0031 WS-A4: core-only compliance/policy seam factory
 #include "compliance_routes.hpp"
+#include "crypto_access.hpp" // /crypto availability composition (M4, unit-tested)
 #include "crypto_api_local.hpp" // /crypto slice 1: make_local_crypto_api (core-only store-backed factory)
+#include "crypto_dashboard_layout_store.hpp" // /crypto widgets: per-operator layout (born-on-PG, ADR-0071)
+#include "crypto_layout_erasure.hpp" // ADR-0071: erase-failure reason set + mapping
 #include "crypto_routes.hpp"
 #include "policy_admin_routes.hpp" // ADR-0031 WS-A4 Task B: policy/fragment mutator routes (no public twin)
 #include "guardian_routes.hpp"
@@ -2174,10 +2177,11 @@ public:
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
                           "(store_not_open/pool_acquire_timeout/query_error, plus "
-                          "admission_full for installed_software: a /crypto read refused by "
-                          "its in-flight bound before any store call) and source "
+                          "admission_full for installed_software and ca_issued: a /crypto read "
+                          "refused by its in-flight bound before any store call) and source "
                           "(installed_software/device_ci/software_licensing/product_registry/"
-                          "app_usage/generic - generic is the ADR-0037 InventoryStore). /readyz "
+                          "app_usage/generic - generic is the ADR-0037 InventoryStore - and "
+                          "ca_issued/crypto_layout, the /crypto Yuzu-issued and layout reads). /readyz "
                           "stays green under pure pool saturation, so "
                           "this is the read-path degrade signal",
                           "counter");
@@ -2185,6 +2189,28 @@ public:
         // present on a healthy server (the three store-side reasons are emitted on demand).
         metrics_.counter("yuzu_inventory_read_degrade_total",
                          {{"reason", "admission_full"}, {"source", "installed_software"}});
+        metrics_.counter("yuzu_inventory_read_degrade_total",
+                         {{"reason", "admission_full"}, {"source", "ca_issued"}});
+        // The /crypto layout reads and saves (L10): pre-seeded so a dashboard can tell "no
+        // degrade" from "series absent" before the first fault.
+        for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
+            metrics_.counter("yuzu_inventory_read_degrade_total",
+                             {{"reason", reason}, {"source", "crypto_layout"}});
+        // ADR-0071 deprovision erasure of /crypto dashboard layouts (M1): best-effort, so a
+        // failure is counted and alerted (YuzuCryptoLayoutEraseFailed), never a failed deprovision.
+        // The reason set and mapping live in crypto_layout_erasure.hpp (one copy, unit-tested).
+        metrics_.describe(std::string(crypto_layout_erasure::kMetric),
+                          "Deprovision erasures of a /crypto dashboard layout row that did not "
+                          "complete, by reason (store_not_open/pool_acquire_timeout/"
+                          "outcome_unknown/query_error, or link_read_failed: an already-inactive "
+                          "SCIM user's linked identities could not be read, so only the user "
+                          "name's row was erased). The deprovision itself succeeded; the row may "
+                          "remain and must be removed by hand (docs/user-manual/crypto.md, "
+                          "\"Deprovision erasure\")",
+                          "counter");
+        for (const auto reason : crypto_layout_erasure::kReasons)
+            metrics_.counter(std::string(crypto_layout_erasure::kMetric),
+                             {{"reason", std::string(reason)}});
         // Management-group CONFINEMENT store observability (ADR-0042). The
         // read-degrade counter is the fail-closed signal: a non-zero rate means
         // RbacStore's authorize_list_read / check_scoped_permission is denying
@@ -5331,6 +5357,20 @@ public:
             }
         }
 
+        // remote_access_audit ships default-off (Forensics class, like privacy_permissions);
+        // enable via PUT /api/v1/plugin-config/remote_access_audit/kill-switch.
+        if (plugin_config_store_ && !startup_failed_) {
+            if (!plugin_config_store_->seed_kill_switch_default_off(
+                    "remote_access_audit",
+                    "default-off: forensics class; enable per PUT "
+                    "/api/v1/plugin-config/remote_access_audit/kill-switch")) {
+                spdlog::error(
+                    "[PG] Refusing to start: remote_access_audit default-off kill-switch "
+                    "seed failed");
+                startup_failed_ = true;
+            }
+        }
+
         // UploadGrantStore (PR1.6a/c) — no secret codec of its own: grant
         // and session credentials are stored as SHA-256 digests, never a
         // sealed SecretCodec blob (upload_grant_store.hpp file header).
@@ -7645,6 +7685,33 @@ public:
                     *software_inventory_store_,
                     std::chrono::seconds{kCatalogueRefreshIntervalSeconds}, &metrics_);
                 software_catalog_rollup_->start();
+            }
+        }
+
+        // /crypto dashboard widget layouts — born-on-Postgres (ADR-0071), one row per
+        // operator. DELIBERATE EXCEPTION to the ADR-0007/0008 fail-closed boot (owner
+        // decision 2026-10-19): a layout is a loss-tolerant UI preference, so a store
+        // that cannot open DEGRADES — the pointer is reset, the server boots, the layout
+        // routes answer 503 "layouts unavailable" (not retryable: it lasts until a
+        // restart), the dashboard draws the default layout with a notice, and /readyz
+        // names the store under "degraded" without leaving rotation. Never set
+        // startup_failed_ here. No legacy SQLite predecessor, so nothing to detect.
+        if (pg_pool_ && !startup_failed_) {
+            crypto_dashboard_layout_store_ = std::make_unique<CryptoDashboardLayoutStore>(*pg_pool_);
+            if (!crypto_dashboard_layout_store_->is_open()) {
+                spdlog::error("[PG] Crypto dashboard layout store migration/open failed (the "
+                              "crypto_dashboard_layout_store schema could not be created/opened; "
+                              "pool last error: {}) - continuing WITHOUT saved /crypto layouts: "
+                              "every operator sees the default layout and saves are refused "
+                              "until a restart with the schema fixed",
+                              [&] {
+                                  auto e = pg_pool_->last_error();
+                                  return e.empty() ? std::string("none") : e;
+                              }());
+                crypto_dashboard_layout_store_.reset();
+            } else {
+                spdlog::info("CryptoDashboardLayoutStore initialized (schema "
+                             "crypto_dashboard_layout_store)");
             }
         }
 
@@ -10711,6 +10778,9 @@ public:
         if (gateway_service_)
             gateway_service_->set_software_inventory_store(nullptr);
         software_inventory_store_.reset();
+        // The /crypto layout store: borrowed only by crypto_api_, whose callers (the web worker
+        // pool) were joined above. Before the pool (ADR-0012 destruct-before-pool).
+        crypto_dashboard_layout_store_.reset();
         agent_service_.set_app_perf_daily_store(nullptr);
         if (gateway_service_)
             gateway_service_->set_app_perf_daily_store(nullptr);
@@ -12330,6 +12400,62 @@ private:
         if (!result)
             return {};
         return {true, result->visible_for_query()};
+    }
+
+    /// The deprovision erasure hook (ADR-0071; deprovision_erasure.hpp) for the /crypto layout
+    /// store: wired into SettingsRoutes and ScimRoutes, run AFTER a deprovision has committed,
+    /// with every principal that could key a session (slug + linked oidc:/saml:). Best-effort:
+    /// a failure is a warn line (never naming the principal) and a counted
+    /// yuzu_server_crypto_layout_erase_failures_total{reason} (alert YuzuCryptoLayoutEraseFailed),
+    /// never a failed deprovision. The warn line carries the reason and the store's fixed
+    /// message only - never a principal, hash or token.
+    /// A principal the store cannot key (kInvalidInput: oversized / non-UTF-8) can own no row,
+    /// so it is not a failure.
+    void erase_deprovisioned_layouts(const std::vector<std::string>& principals) {
+        namespace cle = crypto_layout_erasure;
+        auto failed = [this](std::string_view reason, std::string_view why) {
+            metrics_.counter(std::string(cle::kMetric), {{"reason", std::string(reason)}})
+                .increment();
+            spdlog::warn("crypto dashboard layout erasure on deprovision failed ({}: {}); the "
+                         "deprovision itself is unaffected - the row stays until erased by hand "
+                         "or by a later deprovision of the same principal",
+                         reason, why);
+        };
+        if (!crypto_dashboard_layout_store_) {
+            failed(cle::kStoreNotOpen, "the layout store did not open at server start");
+            return;
+        }
+        for (const auto& principal : principals) {
+            const auto erased = crypto_dashboard_layout_store_->erase(principal);
+            if (erased)
+                continue;
+            // nullopt: a principal the store cannot key owns no row, so there is none to erase.
+            if (const auto reason = cle::reason_for(erased.error().kind))
+                failed(*reason, erased.error().message);
+        }
+    }
+
+    /// R2-1: an already-inactive SCIM user's erasure ran on the slug alone (its linked identities
+    /// could not be read), so a linked principal's row may remain. Counted under the same metric
+    /// and alert; the warn line was written by the seam, without the principal.
+    void note_layout_erasure_degraded(std::string_view reason) {
+        metrics_
+            .counter(std::string(crypto_layout_erasure::kMetric),
+                     {{"reason", std::string(reason)}})
+            .increment();
+    }
+
+    /// The ONE /crypto availability callback (ADR-0070 R2; fix-spec B1): CryptoRoutes, the
+    /// filtered GET /api/v1/ca/issued and the MCP server all receive THIS function, so the REST
+    /// widget list, the dashboard and list_crypto_widgets cannot draw different answers. Fleet
+    /// gate classes ask the NON-auditing fleet-read probe (a confined caller has a present
+    /// VisibleSet); the global class asks the non-auditing has_permission. Never a grant.
+    yuzu::server::crypto_widgets::Access crypto_access(const httplib::Request& req,
+                                                       yuzu::server::crypto_widgets::WidgetGate gate,
+                                                       const std::string& securable,
+                                                       const std::string& operation) {
+        // The composition lives in crypto_access.hpp so it is unit-tested (M4).
+        return crypto_access_for(*auth_routes_, req, gate, securable, operation);
     }
 
     /// #1788: the per-caller Execution:Execute visible set (nullopt == unfiltered),
@@ -16288,6 +16414,8 @@ private:
                              .product_pack_store = product_pack_store_.get(),
                              .scim_store = scim_store_.get(),
                              .analytics_store = analytics_store_.get(),
+                             .crypto_dashboard_layout_store =
+                                 crypto_dashboard_layout_store_.get(),
                              .nvd_db = nvd_db_.get(),
                              .nvd_sync = nvd_sync_.get(),
                          });
@@ -16747,6 +16875,12 @@ private:
         if (scim_store_) {
             settings_routes_->set_scim_store(scim_store_.get());
         }
+        // ADR-0071: erase the deleted operator's per-operator rows after the delete commits
+        // (best-effort, never changes the delete's outcome - deprovision_erasure.hpp).
+        settings_routes_->set_on_deprovisioned(
+            [this](const std::vector<std::string>& principals) {
+                erase_deprovisioned_layouts(principals);
+            });
         settings_routes_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res) {
@@ -17291,7 +17425,9 @@ private:
                           "Scheduled instruction occurrences dispatched successfully", "counter");
         metrics_.describe("yuzu_schedule_fire_failures_total",
                           "Scheduled occurrences skipped or failed (unknown/disabled definition, "
-                          "dispatch failure, no agents in scope, approval submit failure)",
+                          "dispatch failure, no agents in scope, approval submit failure, or an "
+                          "approval ticket that could not be settled or whose outbox ledger could "
+                          "not be read, which holds the occurrence for a retry)",
                           "counter");
         metrics_.describe("yuzu_schedule_approvals_submitted_total",
                           "Approval tickets submitted by the schedule runner for approval-gated "
@@ -17384,6 +17520,21 @@ private:
                 return yuzu::server::schedule_arming_permitted(capability_registry_,
                                                                rbac_store_.get(), principal,
                                                                plugin, action);
+            },
+            // #6096: the outbox as the spent-ticket ledger (clock-free). A missing store
+            // is an error, not an empty answer, so the runner holds rather than fires.
+            .outbox_occurrences_fn =
+                [this](const std::string& approval_id)
+                -> std::expected<std::vector<std::string>, std::string> {
+                if (!command_outbox_store_)
+                    return std::unexpected("command outbox not available");
+                return command_outbox_store_->occurrences_for_approval(approval_id);
+            },
+            .outbox_exists_fn = [this](const std::string& occurrence_id)
+                -> std::expected<bool, std::string> {
+                if (!command_outbox_store_)
+                    return std::unexpected("command outbox not available");
+                return command_outbox_store_->occurrence_exists(occurrence_id);
             },
             // #3495: lets a shutdown request stop tick() from firing further
             // due schedules once stop_requested_ flips — same field and
@@ -18857,10 +19008,9 @@ private:
             return offline_identity_row(eps, agent_id, now_ms, inv_human_age);
         };
         // The full per-device CI record composition — ONE closure shared verbatim
-        // by the dashboard fragment and the REST twin, so the two can never drift
-        // on what "the CI record" means. No MCP twin exists yet (tracked as a
-        // follow-up, governance Gate 3 finding — this comment previously claimed
-        // one was already wired).
+        // by the dashboard fragment, the REST twin and the MCP get_hardware_ci
+        // twin (via ToolDeps::ci_detail_fn), so the three can never drift on what
+        // "the CI record" means.
         auto hw_ci_detail_fn = [this, hw_identity_fn](const std::string& agent_id) -> HardwareCiDetail {
             HardwareCiDetail detail;
             apply_identity_read(detail, hw_identity_fn(agent_id));
@@ -18970,26 +19120,74 @@ private:
                 },
                 .audit_fn = audit_fn});
 
-        // CryptoRoutes — /crypto, /fragments/crypto/*, GET /api/v1/crypto/* (slice 1:
-        // crypto-library presence from the installed_software inventory). ONE CryptoApi
-        // instance backs the page, the REST routes and the MCP twins (set_crypto_api below).
-        // Built only when the software-inventory store exists; without it the routes are
-        // registered with a null seam and answer 503 / the degrade banner, never an empty page.
-        if (software_inventory_store_) {
+        // CryptoRoutes — /crypto, /fragments/crypto/*, /api/v1/crypto/* (crypto-library
+        // presence from the installed_software inventory, the Yuzu-issued certificate widgets
+        // over ca_store_, and the per-operator widget layout). ONE CryptoApi instance backs the
+        // page, the REST routes and the MCP twins (set_crypto_api below). Built whenever ANY
+        // backing store exists; a missing store degrades only the methods that read it (503 /
+        // the degrade banner), never an empty answer and never the other methods.
+        if (software_inventory_store_ || ca_store_ || crypto_dashboard_layout_store_) {
             crypto_device_api_ = device_api;
-            crypto_api_ = make_local_crypto_api(*software_inventory_store_, crypto_device_api_.get());
+            // Admission is narrowed to a quarter of the pool (B9); the unconfined library summary
+            // is shared for a minute (B8) - the Yuzu-issued stats read never is (ADR-0070: bounded
+            // by admission, not a cached count); every Yuzu-issued / layout shed and degrade is
+            // counted with closed labels (B10).
+            crypto_api_ = make_local_crypto_api(LocalCryptoApiDeps{
+                .software = software_inventory_store_.get(),
+                .devices = crypto_device_api_.get(),
+                .ca = ca_store_.get(),
+                .layouts = crypto_dashboard_layout_store_.get(),
+                .pool_size = pg_pool_ ? static_cast<int>(pg_pool_->size()) : 0,
+                .shared_read_ttl = std::chrono::seconds(60),
+                .note_degrade =
+                    [this](std::string_view source, std::string_view reason) {
+                        metrics_
+                            .counter("yuzu_inventory_read_degrade_total",
+                                     {{"reason", std::string(reason)}, {"source", std::string(source)}})
+                            .increment();
+                    }});
         }
         crypto_routes_ = std::make_unique<CryptoRoutes>();
-        crypto_routes_->register_routes(*web_server_, CryptoRoutes::Deps{.auth_fn = auth_fn,
-                                                                         .fleet_read_fn = fleet_read_fn,
-                                                                         .api = crypto_api_,
-                                                                         .audit_fn = audit_fn});
+        crypto_routes_->register_routes(
+            *web_server_,
+            CryptoRoutes::Deps{.auth_fn = auth_fn,
+                               .fleet_read_fn = fleet_read_fn,
+                               .api = crypto_api_,
+                               .audit_fn = audit_fn,
+                               .perm_fn = perm_fn,
+                               .access_fn =
+                                   [this](const httplib::Request& req,
+                                          crypto_widgets::WidgetGate g, const std::string& type,
+                                          const std::string& op) {
+                                       return crypto_access(req, g, type, op);
+                                   },
+                               .write_gate = WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins},
+                               .tier_policy_fn = auth_routes_->gateless_tier_policy_fn()});
 
         // HardwareRoutes — /hardware (ServiceNow-style CI list + record).
         // Software lives at /software; /inventory redirects here.
         // `fleet_read_fn` is the SOLE gate on the list + REST twin (admit-then-filter,
         // ADR-0017) — `build_hw_roster` is deliberately UNFILTERED, matching
         // `FleetReadFn`'s own contract (never stack a second scope predicate).
+        // Devices-page merge (round 3): the same 7-day DEX score used by the standalone
+        // Devices/DEX drills. Deliberately NOT baked into RosterFn/build_hw_roster: this
+        // must only ever be called on the rows actually rendered on the current page
+        // (post filter/sort/paginate), never the whole roster (dex_device_score is one
+        // GROUP-BY query per call). Named so the MCP ToolDeps (set_tool_deps) receives the
+        // SAME closure the REST routes do.
+        auto hw_dex_score_fn = [this](const std::string& id) -> int {
+            return dex_device_score(guaranteed_state_store_.get(), id, dex_iso_since(7));
+        };
+        // List pill: the authoritative active-quarantine read (one per list render; the
+        // snapshot the dispatch gate keeps is a 20 s cache and is deliberately not reused
+        // for an operator display). Named for the same reason as hw_dex_score_fn.
+        auto hw_quarantine_list_fn =
+            [this](const std::vector<std::string>* ids,
+                   std::size_t limit) -> std::optional<std::vector<QuarantineRecord>> {
+            if (!quarantine_store_ || !quarantine_store_->is_open())
+                return std::nullopt;
+            return quarantine_store_->list_quarantined_in(ids, limit);
+        };
         hardware_routes_ = std::make_unique<HardwareRoutes>();
         hardware_routes_->register_routes(
             *web_server_, HardwareRoutes::Deps{
@@ -19094,27 +19292,10 @@ private:
                                          return std::nullopt;
                                      return sess->agent_version;
                                  },
-                             // Devices-page merge (round 3): the same 7-day DEX score
-                             // used by the standalone Devices/DEX drills. Deliberately
-                             // NOT baked into RosterFn/build_hw_roster — this must only
-                             // ever be called on the rows actually rendered on the
-                             // current page (post filter/sort/paginate), never the whole
-                             // roster (dex_device_score is one GROUP-BY query per call).
-                             .dex_score_fn =
-                                 [this](const std::string& id) -> int {
-                                     return dex_device_score(guaranteed_state_store_.get(), id,
-                                                             dex_iso_since(7));
-                                 },
-                             // List pill: the authoritative active-quarantine read (one per
-                             // list render; the snapshot the dispatch gate keeps is a 20 s
-                             // cache and is deliberately not reused for an operator display).
-                             .quarantine_list_fn =
-                                 [this](const std::vector<std::string>* ids, std::size_t limit)
-                                     -> std::optional<std::vector<QuarantineRecord>> {
-                                     if (!quarantine_store_ || !quarantine_store_->is_open())
-                                         return std::nullopt;
-                                     return quarantine_store_->list_quarantined_in(ids, limit);
-                                 },
+                             // Devices-page merge (round 3): see hw_dex_score_fn above.
+                             .dex_score_fn = hw_dex_score_fn,
+                             // List pill: see hw_quarantine_list_fn above.
+                             .quarantine_list_fn = hw_quarantine_list_fn,
                              // POST /api/v1/hardware/sync (Software "Sync now" for a scope).
                              // Type-level Execution:Execute; the targets are then resolved
                              // against the caller's OWN Execution:Execute visible set.
@@ -19208,6 +19389,9 @@ private:
                         for (const auto& a : list->approvals)
                             if (a.submitted_at > 0 && (oldest == 0 || a.submitted_at < oldest))
                                 oldest = a.submitted_at;
+                        // Display only (#6096): submitted_at is database time and the panel
+                        // subtracts this process's clock from it, so skew shifts the printed
+                        // age. No decision reads this figure.
                         if (oldest > 0)
                             f.oldest = oldest;
                     }
@@ -19955,6 +20139,14 @@ private:
         // #2537: same ordering rule as DashboardRoutes above — register_routes
         // copies the list into its handler captures, so it must be set first.
         ca_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
+        // ADR-0070 R2-2: the filtered GET /api/v1/ca/issued reads through the SAME CryptoApi
+        // instance and is withheld from a confined caller via the SAME availability callback.
+        ca_routes_->set_filtered_issued(CaRoutes::FilteredIssuedDeps{
+            .api = crypto_api_,
+            .confinement_fn = [this](const httplib::Request& req) {
+                return crypto_access(req, crypto_widgets::WidgetGate::kFleetWideOnly, "Inventory",
+                                     "Read");
+            }});
         ca_routes_->set_read_probe([this](const httplib::Request& req) {
             return auth_routes_->has_permission(req, "Security", "Read");
         });
@@ -20718,6 +20910,13 @@ private:
             // itself carries no severity field. Nullable/deferred like the
             // other optional stores above — analytics_store_ may be null
             // when --analytics-db is unset.
+            // ADR-0071: per-operator rows erased after a SCIM deprovision commits (best-effort,
+            // never changes the SCIM answer - deprovision_erasure.hpp). Set before registering.
+            scim_routes_->set_on_deprovisioned([this](const std::vector<std::string>& principals) {
+                erase_deprovisioned_layouts(principals);
+            });
+            scim_routes_->set_on_erasure_degraded(
+                [this](std::string_view reason) { note_layout_erasure_degraded(reason); });
             scim_routes_->register_routes(*web_server_, scim_store_.get(), &auth_mgr_,
                                           audit_store_.get(), cfg_.scim_admin_group,
                                           engine_principal_store_.get(),
@@ -21543,11 +21742,29 @@ private:
             // decision for the same caller (same conversion, same underlying
             // require_fleet_read call).
             mcp_server_->set_fleet_read_fn(fleet_read_fn);
+            // Registry tools reach the REST provider closures through ToolDeps: the SAME
+            // closure instances HardwareRoutes::Deps received above (roster, CI detail,
+            // DEX score, quarantine list, fleet_read_fn gate, audit_fn), never a store
+            // pointer, so an MCP twin cannot observe a different composition than REST.
+            mcp_server_->set_tool_deps(mcp::ToolDeps{.fleet_read_fn = fleet_read_fn,
+                                                     .audit_fn = audit_fn,
+                                                     .roster_fn = build_hw_roster,
+                                                     .ci_detail_fn = hw_ci_detail_fn,
+                                                     .dex_score_fn = hw_dex_score_fn,
+                                                     .quarantine_list_fn = hw_quarantine_list_fn});
             // /crypto slice 1: the SAME CryptoApi instance CryptoRoutes serves, so
             // get_crypto_libraries / list_crypto_library_devices cannot disagree with the
             // page or the REST twins. Null (no inventory store) -> the tools answer an
             // internal error, never an empty result.
             mcp_server_->set_crypto_api(crypto_api_);
+            // /crypto widgets: list_crypto_widgets' availability, get_crypto_ca_stats' R2
+            // withhold and list_issued_certs' filtered form use the SAME callback as the REST
+            // routes and the dashboard.
+            mcp_server_->set_crypto_access_fn(
+                [this](const httplib::Request& req, crypto_widgets::WidgetGate g,
+                       const std::string& type, const std::string& op) {
+                    return crypto_access(req, g, type, op);
+                });
             // #4037 — the SAME list_read_fn lambda wired into the REST
             // registration's trailing list_read_fn param below, so the REST
             // GET /guaranteed-state/status and MCP get_guardian_status twins
@@ -22943,6 +23160,10 @@ private:
     // the web server's worker pool - every handler that could call the api - BEFORE the stores
     // are reset (the same join-before-reset contract as every other route owner here).
     std::shared_ptr<DeviceApi> crypto_device_api_;
+    // Per-operator /crypto widget layouts — born-on-Postgres (ADR-0071). Declared after
+    // pg_pool_ so it destructs before the pool; crypto_api_ borrows it (same join-before-reset
+    // contract as the stores above).
+    std::unique_ptr<CryptoDashboardLayoutStore> crypto_dashboard_layout_store_;
     std::shared_ptr<CryptoApi> crypto_api_;
     std::unique_ptr<CryptoRoutes> crypto_routes_;
     // Typed per-device app-perf daily projection — born-on-Postgres (DEX

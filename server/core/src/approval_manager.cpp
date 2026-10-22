@@ -1,5 +1,6 @@
 #include "approval_manager.hpp"
 
+#include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
@@ -63,20 +64,13 @@ std::string redact_id(const std::string& id) {
 // same direction as SessionStore, ADR-2002 s4 / #3715). `now()` is fixed for a
 // transaction, so a statement or sweep sees one reading.
 //
-// `submitted_at` is the ONE deliberate exception, stamped by submit_stamp_epoch()
-// below: ScheduleRunner's occurrence anchor (`ticket_is_current`) compares it with
-// ScheduleEngine's `last_executed_at`/`created_at`, which are process-clock stamps.
-// Moving only one side to database time would make that comparison cross-clock, and
-// a database clock running ahead of the runner would make a spent, approved ticket
-// look newer than its occurrence again -- one approval firing more than once, which
-// is worse than anything this change closes. Follow-up: move ScheduleEngine's stamps
-// to database time, then this one.
-int64_t submit_stamp_epoch() {
-    return std::chrono::duration_cast<std::chrono::seconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
+// `submitted_at` is database time too (#6096): submit() authors it in-SQL from the same
+// expression, so every stamp this store writes and every comparison it makes (the
+// pending-expiry cutoff, the ticket lifetime) is on the one clock. It used to be the
+// one process-clock stamp, kept so ScheduleRunner could compare it with ScheduleEngine's
+// process-clock `last_executed_at`; that comparison is gone. One approval == one
+// scheduled run is now a guarded STATE transition (retire_schedule_tickets), not a clock
+// comparison, so no reader needs the two clocks to agree.
 constexpr const char* kDbNowEpochSql = "EXTRACT(EPOCH FROM now())::bigint";
 
 // THE ticket-liveness predicate, as a SQL boolean over `reviewed_at`. ONE definition,
@@ -323,6 +317,25 @@ const std::vector<pg::PgMigration>& migrations() {
          "CREATE INDEX idx_approvals_status_submitted ON approvals(status, submitted_at);"
          "CREATE INDEX idx_approvals_status_consumed_reviewed "
          "  ON approvals(status, consumed_at, reviewed_at);"},
+        // v2 (#6096): LEGACY MIGRATION, data only. Before #6096 a scheduled ticket was never
+        // marked used; ScheduleRunner recognised a spent one by comparing its process-clock
+        // submitted_at with the schedule's last_executed_at. That comparison is gone and a
+        // ticket is now eligible only while consumed_at = 0, so every pre-upgrade ticket
+        // the old rule would have called spent looks unspent. This retires ALL unsettled
+        // approved/rejected tickets of every schedule, once per database, with no clock
+        // comparison: the deny direction (a legitimate approved-but-unfired ticket at upgrade
+        // time just gets a fresh ask). Idempotent; a fresh database matches no row.
+        // The runner sends the step as one message inside the step's transaction, and SET
+        // LOCAL was verified to take effect in that shape (also over a shorter session-level
+        // timeout), so this one statement is bounded at 300 s without leaking onto the pooled
+        // connection. It touches EVERY unsettled approved or rejected scheduled ticket,
+        // including old rejected ones (rejected tickets never expire and are never swept);
+        // normally small, and bounded by that timeout.
+        {2,
+         std::string("SET LOCAL statement_timeout = '300s';"
+                     "UPDATE approvals SET consumed_at = ") + kDbNowEpochSql +
+             ", consumed_by = 'schedule:legacy-6096' WHERE schedule_id <> '' AND "
+             "consumed_at = 0 AND status IN ('approved','rejected');"},
     };
     return kMigrations;
 }
@@ -395,9 +408,8 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
     if (!id_r)
         return std::unexpected(id_r.error());
     auto id = *id_r;
-    // Cutoffs come from the database clock (see kDbNowEpochSql above), never from this
-    // process; only submitted_at is process-stamped, for the reason given there.
-    const std::string submitted_at = std::to_string(submit_stamp_epoch());
+    // Cutoffs and every stamp, submitted_at included, come from the database clock (see
+    // kDbNowEpochSql above), never from this process.
     const std::string ttl = std::to_string(kApprovalTicketTtlSeconds);
     const std::string db_now = kDbNowEpochSql;
     const std::string live_sql = ticket_live_sql();
@@ -491,12 +503,12 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
             "(id, definition_id, status, submitted_by, submitted_at, "
             " reviewed_by, reviewed_at, review_comment, scope_expression, schedule_id, origin, "
             " target_plugin, target_action) "
-            "VALUES ($1,$2,'pending',$3,$4,'',0,'',$5,$6,$7,$8,$9)";
+            "VALUES ($1,$2,'pending',$3," + db_now + ",'',0,'',$4,$5,$6,$7,$8)";
         pg::PgResult ins = pg::exec_params(
             conn, insert_sql.c_str(),
-            std::vector<std::string>{id, definition_id, submitted_by, submitted_at,
-                                     scope_expression, schedule_id, to_string(origin),
-                                     target_plugin, target_action});
+            std::vector<std::string>{id, definition_id, submitted_by, scope_expression,
+                                     schedule_id, to_string(origin), target_plugin,
+                                     target_action});
         if (ins.status() != PGRES_COMMAND_OK)
             return false;
         expired_pending_committed = expired_pending;
@@ -1144,6 +1156,54 @@ std::expected<void, std::string> ApprovalManager::set_review_status(const std::s
         return {};
     }
     return std::unexpected("approval already reviewed by another user");
+}
+
+// ---------------------------------------------------------------------------
+// Schedule-origin retire (#6096)
+// ---------------------------------------------------------------------------
+
+// Resource ledger: one bounded write lease (kWriteTimeout, `try_acquire_for`) released by the
+// RAII lease on every return path; one parameterised statement (the id array is a bound
+// parameter, never spliced into the SQL text); the PgResult is RAII; no thread, callback or
+// retained state, so nothing can leak on the error or exception path.
+std::expected<int, std::string>
+ApprovalManager::retire_schedule_tickets(const std::string& schedule_id,
+                                         const std::string& occurrence_id,
+                                         const std::vector<std::string>& ids) {
+    if (!open_)
+        return std::unexpected("database not open");
+    // consumed_by is the evidence chain (submitted_by -> reviewed_by -> consumed_by), so it
+    // must never be written empty: both halves of 'schedule:<occurrence>' are required.
+    if (schedule_id.empty() || occurrence_id.empty())
+        return std::unexpected("schedule id and occurrence id are required");
+    // Nothing observed, nothing to settle: no statement, no lease.
+    if (ids.empty())
+        return 0;
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected("approval store temporarily unavailable (pool exhausted)");
+
+    // pg::to_text_array double-quotes and escapes every element, so ids are bound as data.
+    const std::string array = pg::to_text_array(
+        std::vector<std::string_view>(ids.begin(), ids.end()));
+
+    // One guarded UPDATE keyed on `consumed_at = 0`, so each ticket is retired by exactly one
+    // caller and a repeat matches nothing. Scoped to the ids the caller OBSERVED (`id = ANY`),
+    // so a ticket approved after the caller's snapshot, or a successor occurrence's ticket, is
+    // never touched. Pending tickets are never touched (the status list). consumed_at is
+    // database time, the clock every other stamp here uses.
+    const std::string retire_sql =
+        std::string("UPDATE approval_manager.approvals SET consumed_at = ") + kDbNowEpochSql +
+        ", consumed_by = 'schedule:' || $2::text WHERE schedule_id = $1 AND consumed_at = 0 "
+        "AND status IN ('approved','rejected') AND id = ANY($3::text[]) RETURNING 1";
+    pg::PgResult res = pg::exec_params(lease.get(), retire_sql.c_str(),
+                                       std::vector<std::string>{schedule_id, occurrence_id, array});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ApprovalManager::retire_schedule_tickets: update failed for schedule={}: {}",
+                      schedule_id, PQresultErrorMessage(res.get()));
+        return std::unexpected("approval store temporarily unavailable (retire failed)");
+    }
+    return PQntuples(res.get());
 }
 
 } // namespace yuzu::server
