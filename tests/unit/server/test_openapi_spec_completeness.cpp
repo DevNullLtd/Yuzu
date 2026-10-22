@@ -39,9 +39,12 @@
  */
 
 #include "crypto_library_model.hpp"
+#include "device_token_store.hpp"
+#include "license_store.hpp"
 #include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
 #include "software_catalog_rules.hpp" // kEcosystemFamilies: the published ecosystem vocabulary
+#include "software_deployment_store.hpp"
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -49,10 +52,16 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <cstddef>
+#include <iterator>
+#include <optional>
 #include <map>
 #include <regex>
 #include <set>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -703,9 +712,25 @@ TEST_CASE("openapi_spec_json(): every ecosystem parameter and the pipe-list are 
     CHECK(raw.find("@@") == std::string::npos);
     // The route handler and discover_routes bind this by reference: it must be one stable object.
     CHECK(&yuzu::server::openapi_spec_json() == &yuzu::server::openapi_spec_json());
-    // The expansion reserves the exact final size; a capacity near 2x would mean the ~400 KB
-    // string grew through a reallocating replace.
+    // openapi_spec_json() is the lean copy openapi_strip_guides() builds once and trims with
+    // shrink_to_fit(), so its capacity must sit within a small slack of its size. This pins that
+    // derivation, NOT the expansion's reserve: the expansion's string is the guides-included one
+    // and is pinned separately by the expand_ecosystem_tokens test below.
     CHECK(yuzu::server::openapi_spec_json().capacity() - raw.size() < 4096);
+}
+
+TEST_CASE("expand_ecosystem_tokens(): the output is allocated once, at its final size",
+          "[openapi][software][ecosystem]") {
+    // The same body as the TU-local copy that expands the spec in rest_api_v1.cpp (which is not
+    // reachable from a test): reserve(peak) on an empty string, then in-place replaces. A grown
+    // table that made the replaces reallocate would show as a capacity well above the size.
+    // The template is long enough that reserve() is not satisfied by the small-string buffer.
+    const std::string tmpl = std::string(200, 'x') + R"( "@@ECOSYSTEM_ENUM@@" "@@ECOSYSTEM_ENUM_OR_EMPTY@@" )" +
+                             "@@ECOSYSTEM_LIST@@ " + std::string(200, 'y');
+    const std::string out = yuzu::server::software_catalog::expand_ecosystem_tokens(tmpl);
+    CHECK(out.find("@@") == std::string::npos);
+    CHECK(out.size() > tmpl.size());
+    CHECK(out.capacity() - out.size() < 64);
 }
 
 TEST_CASE("ecosystem_parameter_schemas(): resolves referenced parameters and schemas and "
@@ -733,4 +758,277 @@ TEST_CASE("ecosystem_parameter_schemas(): resolves referenced parameters and sch
     CHECK(by_where["/x"] == json::array({"c"}));
     CHECK(by_where["get /x"] == json::array({"a"}));
     CHECK(by_where["post /x"] == json::array({"b"}));
+}
+
+// ── Structural invariants over the whole document ───────────────────────────────────────────────
+
+namespace {
+
+struct SpecOp {
+    std::string method; // lower case, as in the document
+    std::string path;
+    json op;
+    std::string where() const { return method + " " + path; }
+};
+
+std::vector<SpecOp> all_operations(const json& spec) {
+    static const std::set<std::string> kVerbs = {"get", "put", "post", "delete", "options",
+                                                 "head", "patch", "trace"};
+    std::vector<SpecOp> ops;
+    for (const auto& [path, item] : spec.at("paths").items()) {
+        for (const auto& [key, op] : item.items()) {
+            if (kVerbs.contains(key))
+                ops.push_back({key, path, op});
+        }
+    }
+    return ops;
+}
+
+std::string upper(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    return s;
+}
+
+std::string first_tag(const json& op) {
+    if (op.contains("tags") && op["tags"].is_array() && !op["tags"].empty())
+        return op["tags"][0].get<std::string>();
+    return {};
+}
+
+RestApiV1::AuthFn admin_auth_fn() {
+    return [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "tester";
+        s.role = auth::Role::admin;
+        return s;
+    };
+}
+
+RestApiV1::AuditFn ok_audit_fn() {
+    return [](const httplib::Request&, const std::string&, const std::string&,
+              const std::string&, const std::string&, const std::string&) { return true; };
+}
+
+/// The routes `register_routes` registers when every store is null except the three whose routes
+/// are documented as unavailable, which are `wired` or null as asked. A "wired" store is storage
+/// the registration only tests for non-null and captures by pointer: no handler runs and nothing
+/// is dereferenced, so the address of suitably aligned bytes stands in for a PG-backed store.
+std::set<std::pair<std::string, std::string>> registered_routes(bool wire_unavailable_stores) {
+    alignas(SoftwareDeploymentStore) static unsigned char sw_bytes[sizeof(SoftwareDeploymentStore)];
+    alignas(DeviceTokenStore) static unsigned char dt_bytes[sizeof(DeviceTokenStore)];
+    alignas(LicenseStore) static unsigned char lic_bytes[sizeof(LicenseStore)];
+    auto* sw = wire_unavailable_stores ? reinterpret_cast<SoftwareDeploymentStore*>(sw_bytes)
+                                       : nullptr;
+    auto* dt = wire_unavailable_stores ? reinterpret_cast<DeviceTokenStore*>(dt_bytes) : nullptr;
+    auto* lic = wire_unavailable_stores ? reinterpret_cast<LicenseStore*>(lic_bytes) : nullptr;
+
+    RestApiV1 api;
+    yuzu::server::test::TestRouteSink sink;
+    RestApiV1::PermFn perm_fn = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&, const std::string&) { return true; };
+    api.register_routes(sink, admin_auth_fn(), perm_fn, ok_audit_fn(),
+                        /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr,
+                        /*token_store=*/nullptr, /*quarantine_store=*/nullptr,
+                        /*response_store=*/nullptr, /*instruction_store=*/nullptr,
+                        /*execution_tracker=*/nullptr, /*schedule_engine=*/nullptr,
+                        /*approval_manager=*/nullptr, /*tag_store=*/nullptr,
+                        /*audit_store=*/nullptr, /*service_group_fn=*/{}, /*tag_push_fn=*/{},
+                        /*inventory_store=*/nullptr, /*product_pack_store=*/nullptr, sw, dt, lic);
+    std::set<std::pair<std::string, std::string>> out;
+    for (const auto& [method, pattern] : sink.registered_routes()) {
+        if (pattern.starts_with("/api/v1"))
+            out.emplace(method, canonicalize(pattern));
+    }
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("openapi_spec_json(): every operation has a unique, well-formed operationId",
+          "[openapi][structure]") {
+    const json spec = json::parse(yuzu::server::openapi_spec_json());
+    const auto ops = all_operations(spec);
+    REQUIRE(ops.size() > 100);
+
+    static const std::regex kShape("^[a-z][A-Za-z0-9]*$");
+    std::map<std::string, std::string> seen; // operationId -> first operation using it
+    for (const auto& o : ops) {
+        INFO(o.where());
+        REQUIRE(o.op.contains("operationId"));
+        REQUIRE(o.op["operationId"].is_string());
+        const auto id = o.op["operationId"].get<std::string>();
+        INFO("operationId " << id);
+        CHECK(std::regex_match(id, kShape));
+        const auto [it, fresh] = seen.emplace(id, o.where());
+        if (!fresh)
+            FAIL_CHECK("operationId " << id << " is also used by " << it->second);
+    }
+}
+
+TEST_CASE("openapi_spec_json(): x-yuzu-unavailable marks exactly the operations that wiring "
+          "a store adds",
+          "[openapi][structure][unavailable]") {
+    const json spec = json::parse(yuzu::server::openapi_spec_json());
+    const auto ops = all_operations(spec);
+
+    // The groups whose routes exist only when their store is wired, and which production does not
+    // wire. A group joining or leaving this set is a decision to make here, on purpose.
+    const std::set<std::string> kUnavailableGroups = {"License Management", "Device Tokens",
+                                                      "Software Deployment"};
+
+    const auto without = registered_routes(/*wire_unavailable_stores=*/false);
+    const auto with = registered_routes(/*wire_unavailable_stores=*/true);
+    // Wiring a store only adds routes.
+    REQUIRE(std::includes(with.begin(), with.end(), without.begin(), without.end()));
+    std::set<std::pair<std::string, std::string>> gained;
+    std::set_difference(with.begin(), with.end(), without.begin(), without.end(),
+                        std::inserter(gained, gained.end()));
+    REQUIRE_FALSE(gained.empty()); // the three stores really do gate routes
+
+    std::set<std::string> marked_groups;
+    std::size_t marked = 0;
+    for (const auto& o : ops) {
+        INFO(o.where());
+        const auto key = std::make_pair(upper(o.method), canonicalize("/api/v1" + o.path));
+        const bool is_marked = o.op.contains("x-yuzu-unavailable");
+        const bool only_with_store = gained.contains(key);
+        if (is_marked) {
+            ++marked;
+            marked_groups.insert(first_tag(o.op));
+            CHECK(kUnavailableGroups.contains(first_tag(o.op)));
+            CHECK(o.op["x-yuzu-unavailable"].is_string());
+            CHECK_FALSE(o.op["x-yuzu-unavailable"].get<std::string>().empty());
+            // Documented unavailable: it must not be served when the store is null...
+            CHECK_FALSE(without.contains(key));
+            // ...and it must exist as a route at all, or the marker documents nothing.
+            CHECK(only_with_store);
+        } else {
+            // An unmarked operation is not one that only a wired store would add.
+            CHECK_FALSE(only_with_store);
+        }
+    }
+    CHECK(marked_groups == kUnavailableGroups);
+
+    // Every route a wired store adds is documented, and documented as unavailable.
+    for (const auto& g : gained) {
+        INFO(g.first << " " << g.second);
+        bool found = false;
+        for (const auto& o : ops) {
+            if (upper(o.method) == g.first && canonicalize("/api/v1" + o.path) == g.second) {
+                found = true;
+                CHECK(o.op.contains("x-yuzu-unavailable"));
+            }
+        }
+        // allowlisted_missing() routes are the exception: they are deliberately undocumented.
+        CHECK((found || allowlisted_missing().contains(g)));
+    }
+}
+
+TEST_CASE("GET /api/v1/openapi.json: gated on Infrastructure:Read for every form of the document",
+          "[openapi][security]") {
+    RestApiV1 api;
+    yuzu::server::test::TestRouteSink sink;
+    std::vector<std::pair<std::string, std::string>> asked;
+    bool admit = false;
+    RestApiV1::PermFn perm_fn = [&](const httplib::Request&, httplib::Response& res,
+                                    const std::string& securable, const std::string& op) {
+        asked.emplace_back(securable, op);
+        if (admit)
+            return true;
+        res.status = 403;
+        res.set_content(R"({"error":{"code":403,"message":"denied"}})", "application/json");
+        return false;
+    };
+    api.register_routes(sink, admin_auth_fn(), perm_fn, ok_audit_fn(),
+                        /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr,
+                        /*token_store=*/nullptr, /*quarantine_store=*/nullptr,
+                        /*response_store=*/nullptr, /*instruction_store=*/nullptr,
+                        /*execution_tracker=*/nullptr, /*schedule_engine=*/nullptr,
+                        /*approval_manager=*/nullptr, /*tag_store=*/nullptr,
+                        /*audit_store=*/nullptr);
+
+    for (const char* path :
+         {"/api/v1/openapi.json", "/api/v1/openapi.json?guides=true",
+          "/api/v1/openapi.json?guides=1", "/api/v1/openapi.json?guides=no"}) {
+        INFO(path);
+        asked.clear();
+        admit = false;
+        auto denied = sink.Get(path);
+        REQUIRE(denied);
+        CHECK(denied->status == 403);
+        // The refusal is the gate's, and the document is not in it.
+        CHECK(denied->body.find("\"openapi\"") == std::string::npos);
+        CHECK(denied->body.find("x-yuzu-guide") == std::string::npos);
+        REQUIRE(asked.size() == 1);
+        CHECK(asked[0] == std::make_pair(std::string("Infrastructure"), std::string("Read")));
+
+        admit = true;
+        auto allowed = sink.Get(path);
+        REQUIRE(allowed);
+        CHECK(allowed->status == 200);
+        CHECK_FALSE(allowed->body.empty());
+    }
+}
+
+TEST_CASE("openapi_strip_guides(): removes the guides, keeps everything else",
+          "[openapi][guides]") {
+    const std::string full = yuzu::server::openapi_spec_with_guides_json();
+    bool fell_back = true;
+    const std::string lean = yuzu::server::openapi_strip_guides(full, &fell_back);
+    CHECK_FALSE(fell_back);
+
+    json full_doc = json::parse(full);
+    const json lean_doc = json::parse(lean);
+    REQUIRE(full_doc["tags"].is_array());
+    std::size_t with_guide = 0;
+    for (auto& tag : full_doc["tags"]) {
+        if (tag.contains("x-yuzu-guide"))
+            ++with_guide;
+        tag.erase("x-yuzu-guide");
+    }
+    CHECK(with_guide > 0); // the literal does carry guides, or this test proves nothing
+    CHECK(lean_doc == full_doc);
+    for (const auto& tag : lean_doc["tags"])
+        CHECK_FALSE(tag.contains("x-yuzu-guide"));
+    CHECK(lean.size() < full.size());
+    // The accessor serves exactly this derivation.
+    CHECK(lean == yuzu::server::openapi_spec_json());
+    // A null out-parameter is allowed.
+    CHECK(yuzu::server::openapi_strip_guides(full) == lean);
+}
+
+TEST_CASE("openapi_strip_guides(): input it cannot use is returned unchanged and reported",
+          "[openapi][guides]") {
+    for (const std::string input : {std::string("{not json"), std::string(),
+                                    std::string(R"({"openapi":"3.0.3","paths":{}})"),
+                                    std::string(R"({"tags":"not-an-array"})")}) {
+        INFO("input: " << input);
+        bool fell_back = false;
+        CHECK(yuzu::server::openapi_strip_guides(input, &fell_back) == input);
+        CHECK(fell_back);
+    }
+}
+
+TEST_CASE("openapi_spec_json(): concurrent callers all get the same string",
+          "[openapi][guides][concurrency]") {
+    constexpr int kThreads = 8;
+    std::vector<const std::string*> seen(kThreads, nullptr);
+    std::atomic<bool> go{false};
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&, i] {
+            while (!go.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            seen[static_cast<std::size_t>(i)] = &yuzu::server::openapi_spec_json();
+        });
+    }
+    go.store(true, std::memory_order_release);
+    for (auto& t : threads)
+        t.join();
+    for (const auto* p : seen) {
+        REQUIRE(p != nullptr);
+        CHECK(p == &yuzu::server::openapi_spec_json());
+    }
 }

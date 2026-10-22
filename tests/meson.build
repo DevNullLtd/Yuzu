@@ -3829,6 +3829,27 @@ test('gateway-upstream guard registration lexical gate',
   timeout: 30,
 )
 
+# Static lexical gate: every raw-string segment of the OpenAPI document literal in
+# rest_api_v1.cpp stays under 15,000 bytes (MSVC C2026 rejects a string token over 16,380; the
+# Linux and macOS compilers do not, so only the Windows leg would notice). Carries its own
+# in-memory self-test. No build required. Suite 'docs' for the same reason as the gates above.
+test('OpenAPI literal segment size lexical gate',
+  _python3_test,
+  args: [files('test_openapi_literal_segments.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# The /swagger page's renderer, run under node against a fake DOM and a queued fetch: panels and rows,
+# the typed / untyped / unavailable pills, guides built on demand, oneOf tables, hostile spec text kept as
+# text, a malformed URL fragment, the v2 curl path and the failure view with Retry. Skips (77) without node.
+test('swagger page behaviour',
+  _python3_test,
+  args: [files('test_swagger_page_behaviour.py')],
+  suite: ['server', 'docs'],
+  timeout: 60,
+)
+
 # #6016: static lexical gate pinning that only default_certs.cpp mints the server identity URI
 # (`yuzu://<install>/server`) the gateway management plane will admit by: no other file names
 # server_identity_uri() or the "/server" suffix literal, issue_leaf() has one production caller,
