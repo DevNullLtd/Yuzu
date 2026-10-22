@@ -3643,6 +3643,16 @@ test('log handoff wiring lexical gate (#4666 PR-2 W3a)',
   timeout: 30,
 )
 
+# #5291 / PR #6311: static lexical gate over TAR's Windows-only bounded hive-mount call site --
+# the first timeout must pin the plugin module and stop the walk (an abandoned mount thread keeps
+# running plugin code with nothing joining it). Source text only, so Python, no build needed.
+test('TAR mapdrive hive-mount pin wiring lexical gate (#5291)',
+  _python3_test,
+  args: [files('test_tar_mapdrive_pin_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # #2182: static lexical gate pinning that agent.cpp still CALLS the tested OtaUpdateThread /
 # CtxSlot stop_seen() primitives (no AgentImpl seam exists to test that, #1492) and keeps the
 # flag-then-cancel_ctx() teardown order. Carries its own in-memory mutation self-test. No build
