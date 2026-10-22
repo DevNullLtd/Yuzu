@@ -33,6 +33,7 @@
 #include "verify_api.hpp" // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam
 #include "dex_api.hpp"    // ADR-0031 WS-A4 (fifth family): the public in-process DEX signals API seam
 #include "dex_perf_api.hpp" // ADR-0031 WS-A4 (sixth family): the public in-process DEX app-perf-over-time API seam
+#include "crypto_widget_catalogue.hpp" // crypto_widgets::Access / WidgetGate (pure)
 #include "crypto_api.hpp" // ADR-0031 WS-A4 (tenth family): the public in-process crypto-library read API seam
 #include "compliance_api.hpp" // ADR-0031 WS-A4: the public in-process compliance/policy API seam
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
@@ -825,6 +826,16 @@ public:
     /// error, never an empty result.
     void set_crypto_api(std::shared_ptr<const CryptoApi> a) { crypto_api_ = std::move(a); }
 
+    /// The ONE non-auditing /crypto availability callback (server.cpp builds it once and wires
+    /// the SAME function into CryptoRoutes): `list_crypto_widgets`' availability, the R2
+    /// confinement withhold of `get_crypto_ca_stats`' twin answers and of `list_issued_certs`'
+    /// filtered form. It decides what is DRAWN or withheld, never a grant (every data tool keeps
+    /// its own gate). Unset => those paths answer an internal error, never a guessed answer.
+    using CryptoAccessFn = std::function<crypto_widgets::Access(
+        const httplib::Request&, crypto_widgets::WidgetGate, const std::string& securable_type,
+        const std::string& operation)>;
+    void set_crypto_access_fn(CryptoAccessFn fn) { crypto_access_fn_ = std::move(fn); }
+
     /// B4 (#2146 API-parity): mirrors `RestApiV1::LockoutClearFn` (rest_api_v1.hpp)
     /// so the MCP `unlock_account` tool clears an account's lockout counter
     /// exactly as the REST `POST /api/v1/users/{name}/unlock` handler does,
@@ -1315,6 +1326,8 @@ private:
     std::shared_ptr<const GuardianApi> guardian_api_;
     // ADR-0031 WS-A4 (tenth family) - see set_crypto_api above.
     std::shared_ptr<const CryptoApi> crypto_api_;
+    // /crypto widgets - see set_crypto_access_fn above.
+    CryptoAccessFn crypto_access_fn_;
 };
 
 // The (tool, securable, operation) test-only accessors that formerly lived here

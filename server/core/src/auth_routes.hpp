@@ -378,8 +378,9 @@ public:
 
     /// The SOLE production factory for a gate-less-route `TierPolicyFn` (#5047
     /// governance fix round). Returns a callable that invokes
-    /// `require_tier_policy(..., /*actionable_permission=*/false)` — both
-    /// `server.cpp` wiring sites (REST + dashboard fragments) call this
+    /// `require_tier_policy(..., /*actionable_permission=*/false)` — every
+    /// `server.cpp` wiring site (result-set REST + dashboard fragments, and the
+    /// /crypto dashboard layout routes) calls this
     /// SAME function rather than each writing its own near-identical
     /// lambda, so there is exactly one place a future reviewer needs to
     /// check for clause-5 compliance, and a unit test can exercise the

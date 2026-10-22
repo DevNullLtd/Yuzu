@@ -33,6 +33,13 @@
 //   {"column":C,"op":O,"value":V}        ─┐ SUCCESS AND at least one parsed
 //   {"column":C,"op":O,"value_set":[..]} ─┘ output row's column C satisfies O
 //
+// A third path serves plain pipe rows: when the matcher carries the server-authored
+//   "declared_columns":[names in output order], "plugin":"<name>"
+// (written at admission by bind_declared_columns), C's index is its position in that list, each
+// output line is split with `split_fields(plugin, line)`, and a line is skipped unless its width
+// equals the list's and it is not the header row. Wrong-typed keys match nobody; a caller may not
+// supply either key.
+//
 // `op` ∈ {eq, in, contains, exists}. A non-SUCCESS response NEVER qualifies,
 // regardless of matcher — a plugin that errored is not evidence of a hit.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -65,6 +72,15 @@ std::optional<std::string> validate_matcher(std::string_view matcher_json);
 /// producer cannot admit accept-all by calling only the text check. An ABSENT matcher is the
 /// caller's own default and is not passed here.
 std::optional<std::string> validate_matcher_object(const nlohmann::json& matcher);
+
+/// Server-authored binding of a kind-less column matcher to the instruction definition's
+/// DECLARED output columns (field names in output order, from `result_schema` via
+/// `ResponseTemplatesEngine::synthesise_default` -- the dashboard's own source). When
+/// `matcher.column` is among them, stores `declared_columns` and `plugin` in `matcher` so
+/// `response_matches` can resolve the column positionally in plain pipe rows. No-op otherwise.
+/// REST and MCP both call this ONE function. `validate_matcher` refuses both keys from a caller.
+void bind_declared_columns(nlohmann::json& matcher, const std::string& result_schema_json,
+                           const std::string& plugin);
 
 /// Count the rows in a tar `tar.sql` response `output`. The tar plugin emits
 /// a `__schema__|col|col` header line, one `|`-joined line per row, then a
