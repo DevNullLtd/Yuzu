@@ -513,7 +513,7 @@ jobs:
       - name: Require preflight-gate
         run: |
           [[ "${{ needs.preflight-gate.result }}" == 'success' ]] || {
-            echo '::error::preflight-gate did not succeed (${{ needs.preflight-gate.result }}) -- failing closed'
+            echo '::error::preflight-gate did not succeed (${{ needs.preflight-gate.result }}) -- failing closed; see the Preflight (gate) job'
             exit 1
           }
 
@@ -1232,10 +1232,14 @@ jobs:
           # docs suite is OS-independent and runs on the Linux leg only; OS-contract
           # entries carry suite platform (tests/meson.build) and run on every leg.
           # Duration summary per invocation, not end-of-job: meson overwrites
-          # meson-logs/testlog.json on every run. On a red run bash -e stops before
-          # it; use the uploaded meson-logs artifact locally (#4884).
+          # meson-logs/testlog.json on every run, so it is removed first (a run
+          # that selects no tests then warns and skips instead of re-reporting a
+          # stale log). On a red run bash -e stops before the summary; use the
+          # uploaded meson-logs artifact locally (#4884).
+          rm -f build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/testlog.json
           python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 --suite agent --suite docs --suite proto --suite tar --suite gateway --suite platform
           python3 scripts/ci/test-durations-summary.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --label "Linux non-pg (cheap suites)"
+          rm -f build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/testlog.json
           python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 "server unit tests shard A" "server unit tests shard B" "server unit tests shard C" "server unit tests shard D" "mcp bridge teardown allocation budget" "guardian cache allocation-failure sweep" "server pg shard partition invariant" "dex link no presentation symbols"
           python3 scripts/ci/test-durations-summary.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --label "Linux non-pg (server shards)"
 
@@ -1406,13 +1410,14 @@ jobs:
         # implementation detail.
         #
         # Cross-job slot count: 2 -> 3 (2026-08-25, same day as max-parallel:3
-        # landed). max-parallel:3 (this job's `strategy:` block, above) and
-        # this slot gate are DIFFERENT axes, not substitutes for each other:
+        # landed; max-parallel is 4 since 2026-10-21). max-parallel (this job's
+        # `strategy:` block, above) and this slot gate are DIFFERENT axes, not
+        # substitutes for each other:
         # max-parallel governs RUNNER ACQUISITION for one push's own matrix;
         # this gate governs box-wide HEAVY TEST-PHASE concurrency across ALL
         # jobs (any push, any PR, nightly, manual dispatch) once a job already
-        # has a runner and has finished building. Raising max-parallel:3
-        # doesn't make the OLD "stays at 2" reasoning wrong on its own terms —
+        # has a runner and has finished building. Raising max-parallel to 3
+        # didn't make the OLD "stays at 2" reasoning wrong on its own terms —
         # it just no longer needs the slot gate to ALSO be the sole box-wide
         # throttle, which is what "reopen that problem" assumed.
         #
@@ -1489,6 +1494,7 @@ jobs:
           YUZU_TEST_SLOT_NAME: yuzu-bigtam-heavy
           YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
         run: |
+          rm -f build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/testlog.json
           bash scripts/ci/with-test-slot.sh 3 -- \
             python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 --suite server-pg
           # Outside the slot: pure parsing plus a --list-tests spawn per Catch2 entry.
@@ -1502,9 +1508,9 @@ jobs:
         if: always() && matrix.pg_mode == 'full'
         run: |
           free -m || true
-          for c in $(docker ps --format '{{.Names}}' | grep '^yuzu-ci-postgres'); do
+          for c in $(timeout 60 docker ps --format '{{.Names}}' | grep '^yuzu-ci-postgres'); do
             echo "$c"
-            docker exec "$c" du -sm /var/lib/postgresql || true
+            timeout 60 docker exec "$c" du -sm /var/lib/postgresql || true
           done
 
       # #3443 Phase 2: the 3 non-primary Linux push legs (pg_mode=smoke) run
@@ -2041,11 +2047,13 @@ jobs:
           python scripts/ci/assert-suite-cover.py --builddir build-windows-${{ matrix.build_type }} \
             "${suites[@]}" \
             --exclude-suite server-pg --exclude-suite server-pg-smoke --exclude-suite docs
+          rm -f build-windows-${{ matrix.build_type }}/meson-logs/testlog.json
           bash scripts/ci/with-test-slot.sh 2 -- \
             python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs --num-processes 4 \
               "${suites[@]}"
-          # Duration summary per invocation (meson overwrites testlog.json each run);
-          # on a red run bash -e stops before it, use the meson-logs artifact (#4884).
+          # Duration summary per invocation: testlog.json is removed before each run
+          # (meson overwrites it), so a run that selects no tests leaves no stale log.
+          # On a red run bash -e stops before it, use the meson-logs artifact (#4884).
           python scripts/ci/test-durations-summary.py --builddir build-windows-${{ matrix.build_type }} --label "Windows non-pg"
 
       # if: matrix.pg_mode == 'full' — see the Resolve step above; PRs are
@@ -2096,6 +2104,7 @@ jobs:
           # survives, not the non-pg step's. The non-pg step's own
           # job-summary "Suite durations vs meson budgets" table (written on
           # every invocation, not just the last) is where its numbers live.
+          rm -f build-windows-${{ matrix.build_type }}/meson-logs/testlog.json
           bash scripts/ci/with-test-slot.sh 2 -- \
             python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs --num-processes 6 \
               "${suites[@]}"
@@ -2551,6 +2560,7 @@ jobs:
           rm -f "$YUZU_TEST_PROGRESS_FILE"
           # docs suite is OS-independent and runs on the Linux leg only; OS-contract
           # entries carry suite platform (tests/meson.build) and keep running here.
+          rm -f build-macos/meson-logs/testlog.json
           python3 scripts/ci/flake-retry.py --builddir build-macos -- --print-errorlogs --timeout-multiplier 2 --no-suite docs
           python3 scripts/ci/test-durations-summary.py --builddir build-macos --label "macOS"
 

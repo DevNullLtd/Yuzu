@@ -528,14 +528,15 @@ class WorkflowWiringTests(unittest.TestCase):
                     self.assertTrue(runs)
                     self.assertEqual(runs[-1], m.group(1))
 
-    def test_catch2_server_and_agent_entries_carry_durations(self) -> None:
+    def test_every_catch2_entry_carries_durations(self) -> None:
         """The per-case summary reads Catch2's `--durations=yes` (the `=` form is
-        required, see docs/ci-architecture.md). The two exemptions are deliberate:
-        a ~3 s push-only smoke entry and the [tsan-heavy] checkpoints entry."""
+        required, see docs/ci-architecture.md). Every `*_exe` test() entry is a
+        Catch2 binary. The two exemptions are deliberate: a ~3 s push-only smoke
+        entry and the [tsan-heavy] checkpoints entry."""
         exempt = {"'server pg smoke'", "'agent tsan-heavy checkpoints'"}
         seen = set()
         for chunk in self.meson_test_chunks():
-            m = re.match(r"\s*('[^']*'(?:\s*\+\s*\w+)?)\s*,\s*(server_test_exe|agent_test_exe)\b", chunk)
+            m = re.match(r"\s*('[^']*'(?:\s*\+\s*\w+)?)\s*,\s*(\w+_exe)\b", chunk)
             if not m:
                 continue
             seen.add(m.group(1))

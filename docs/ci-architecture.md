@@ -1563,7 +1563,8 @@ incident that paragraph cites is actually an instance of THIS gap, not one
 `with-test-slot.sh` closes: a `dev`/`main` push's own 4-way Linux matrix
 could claim all 4 Big Tam runners simultaneously, leaving nothing reserving
 a runner for a concurrently-queued PR job. Fix: `ci.yml`'s Linux job's
-`strategy.max-parallel: 3` caps how many legs of that SAME matrix run
+`strategy.max-parallel: 3` (3 at the time; 4 since 2026-10-21, see the update
+below) caps how many legs of that SAME matrix run
 concurrently, leaving at least one Big Tam runner unclaimed by it — a no-op
 on `pull_request` events (already a single-leg matrix via the existing
 `exclude`). This is a mitigation, not a guarantee: the freed runner is not
@@ -1586,9 +1587,19 @@ the owner: that push now claims every runner at once, so a concurrently-queued
 PR's Linux leg waits for a runner. `with-test-slot.sh 3` still caps the heavy
 test phases once a runner is held. Revert to 3 if PR runner-wait returns.
 
+The revert rule's observable: queue wait never reaches `test-runs.db` (its
+`started_at` is post-checkout), so it is read from GitHub. Metric: per-job
+`started_at - created_at` of a PR's `Linux gcc-15 debug` job, from
+`gh api repos/DevNullLtd/Yuzu/actions/runs/<id>/jobs`, sampled while a `dev`
+push's matrix is running. Trip: either push-1 sample of the ladder below shows
+that PR leg queued 5 minutes or more (against ~0 on the 2026-10-20 baseline and
+35 minutes in the 2026-08-25 incident the cap was introduced for). Whoever fills
+the push-1 row takes the sample.
+
 **Cross-job slot count: 2 -> 3 (2026-08-25, same day as the max-parallel
-fix above).** `max-parallel: 3` and the `with-test-slot.sh` slot gate are
-different axes, not substitutes: max-parallel governs runner acquisition
+fix above).** `max-parallel` (3 at the time, 4 since 2026-10-21) and the
+`with-test-slot.sh` slot gate are different axes, not substitutes:
+max-parallel governs runner acquisition
 for one push's own matrix; the slot gate governs box-wide heavy
 test-phase concurrency across ALL jobs (any push, any PR, nightly, manual
 dispatch) once a job already has a runner and has finished building.
@@ -1716,19 +1727,19 @@ The change lands on one PR branch as a **push ladder**, each push taking two
 same-SHA samples before the next, so a wall-time delta is attributable to one
 axis ("never bundled with a topology change"):
 
-| Push | Change | Axis | Samples (s) | Median pg step (s) | Median non-pg step (s) | Worst shard (s, % of timeout) | Verdict |
-|---|---|---|---|---|---|---|---|
-| 1 | Preflight split, `platform` suite + Linux-only `docs`, `max-parallel` 4, duration summary, PGDATA/RAM probe (np stays 2) | topology | | | | | |
-| 2 | Linux np 2 → 4 on the three invocations; Windows pg 6 → 8, non-pg 4 → 6 | width | | | | | |
-| 3 | tmpfs PGDATA, cap from the push-1 probe (see "Postgres for server tests") | storage | | | | | |
-| 4 | Linux np 4 → 6, then stop | width | | | | | |
+| Push | Change | Axis | Run (id/attempt) | Samples (s) | Median pg step (s) | Median non-pg step (s) | Worst shard (s, % of timeout) | Verdict |
+|---|---|---|---|---|---|---|---|---|
+| 1 | Preflight split, `platform` suite + Linux-only `docs`, `max-parallel` 4, duration summary, PGDATA/RAM probe (np stays 2) | topology | | | | | | |
+| 2 | Linux np 2 → 4 on the three invocations; Windows pg 6 → 8, non-pg 4 → 6 | width | | | | | | |
+| 3 | tmpfs PGDATA, cap from the push-1 probe (see "Postgres for server tests") | storage | | | | | | |
+| 4 | Linux np 4 → 6, then stop | width | | | | | | |
 
 Push 1 is the comparison baseline for the rest: its two samples are the new
 non-pg baselines (the docs suite left the Windows and macOS legs) and its probe
 output fills the line below.
 
 Probe (push 1, `Postgres container footprint (tmpfs sizing probe)` step):
-host RAM: pending (filled by the tmpfs commit from the probe step log); peak PGDATA per container: pending.
+host RAM: pending (filled by the tmpfs commit from the probe step log); post-run PGDATA per container (residual on-disk size after the pg step, not peak): pending.
 
 Worst-case ceiling by width (14 pg shards, one shared 700 s timeout, every
 shard at its cap; the degenerate figure, not an expected case): np=2 is 7
@@ -1997,7 +2008,7 @@ Resolution order inside the script:
    /var/lib/postgresql`), `PG_TUNE_LABEL` moves to `v2-tmpfs-pgdata` so the
    drift guard recreates existing per-agent containers, and the guard's
    `docker rm -f` becomes `-fv` so a retired container's anonymous volume is
-   removed too. Cap rule: `size` = max(2g, 2x the measured peak PGDATA, rounded
+   removed too. Cap rule: `size` = max(2g, 2x the measured post-run PGDATA, rounded
    up to 1g); four containers x cap must be at most 50% of the probed host RAM,
    otherwise tmpfs is not applied and the result is recorded here instead. A
    tmpfs cluster is empty after any container restart; the entrypoint then runs
@@ -2259,12 +2270,14 @@ per meson entry. Next to it, `scripts/ci/test-durations-summary.py` appends a
 Test steps: every entry's wall seconds, meson timeout and share of it, then the
 25 slowest Catch2 cases (entry, case, seconds, runs). The push-only `Test (pg smoke)`
 steps are deliberately not summarised: each runs one ~3 s entry. The case data is Catch2's
-own `--durations=yes`, now on the four non-pg server shards, the 14 pg shards
-and the agent shards (the `=` form is required: a space would add a positional
+own `--durations=yes`, now on every Catch2 entry except the two pinned exemptions
+(the push-only pg smoke entry and the `[tsan-heavy]` checkpoints entry; the `=`
+form is required: a space would add a positional
 `yes` that `check-pg-shard-partition.py` rejects as a second spec). It is
 parsed from `meson-logs/testlog.json`, which meson overwrites on every
 invocation, hence one call per invocation rather than one at the end of the
-job; on a red invocation `bash -e` stops before the summary and the uploaded
+job (each step removes the file first, so a run that selects no tests warns and
+skips instead of re-reporting the previous log); on a red invocation `bash -e` stops before the summary and the uploaded
 `meson-logs` artifact carries `testlog.json` for running the script locally.
 
 Catch2 prints a duration line at the end of every *section*, with the test
@@ -2279,6 +2292,10 @@ structured reporter is the fix if it ever bites). A failed listing degrades that
 to unfiltered lines and marks it `(unfiltered)`. The report is never a gate:
 any failure becomes a `::warning` and exit 0; only `--selftest` (meson test
 `test-durations-summary selftest`) can exit non-zero.
+
+On macOS the used share is against the nominal meson timeout; that leg runs with
+`--timeout-multiplier 2`, so the real budget is double (the same convention as
+the budget table above).
 
 **Triage note — shared-fixture files fail as a cluster on a PG blip.** The
 shared-DB + TRUNCATE fixture files (#2362, #2603: `test_software_inventory_store`,

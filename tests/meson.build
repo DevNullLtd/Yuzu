@@ -888,7 +888,7 @@ if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
     # the agent suite appends that filter here too, where it never matches —
     # see the cert_store_fallback_test_exe comment below for the full
     # rationale.
-    args: ['--allow-running-no-tests'],
+    args: ['--allow-running-no-tests', '--durations=yes'],
     suite: 'agent',
     timeout: 60,
   )
@@ -919,7 +919,7 @@ if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
   test(
     'plugin ABI containment under allocation failure',
     plugin_abi_oom_exe,
-    args: ['--allow-running-no-tests'],
+    args: ['--allow-running-no-tests', '--durations=yes'],
     suite: 'agent',
     timeout: 30,
   )
@@ -1201,7 +1201,7 @@ if host_machine.system() == 'darwin'
   # what the caller actually meant: "run autoruns's tests", not "fail
   # anything that isn't autoruns's tests".
   test('cert_store macOS honest-unsupported', cert_store_fallback_test_exe,
-       args: ['--allow-running-no-tests'], suite: 'agent', timeout: 30)
+       args: ['--allow-running-no-tests', '--durations=yes'], suite: 'agent', timeout: 30)
 endif
 
 # ── TAR plugin unit tests ────────────────────────────────────────────────────
@@ -1332,7 +1332,7 @@ tar_test_exe = executable(
   link_args: host_machine.system() == 'darwin' ? apple_objcpp_link_args : [],
   dependencies: tar_test_deps,
 )
-test('tar unit tests', tar_test_exe, suite: 'tar', timeout: 90)
+test('tar unit tests', tar_test_exe, args: ['--durations=yes'], suite: 'tar', timeout: 90)
 
 # ── Server unit tests ─────────────────────────────────────────────────────────
 if build_server
@@ -2988,6 +2988,7 @@ if build_server
     test(
       'mcp bridge teardown allocation budget',
       mcp_bridge_alloc_budget_exe,
+      args: ['--durations=yes'],
       suite: ['server', 'server-checks'],
       timeout: 60,
     )
@@ -3011,6 +3012,7 @@ if build_server
     test(
       'guardian cache allocation-failure sweep',
       guardian_cache_alloc_sweep_exe,
+      args: ['--durations=yes'],
       suite: ['server', 'server-checks'],
       timeout: 60,
     )
@@ -3065,6 +3067,10 @@ test('gateway OTP pin resolution',
   timeout: 120,
 )
 
+# Entries below default to suite 'docs': OS-independent, Linux leg only. One that
+# pins OS behaviour takes suite 'platform' (marked `# platform:`) and runs on every
+# leg; see docs/testing/unit-test-conventions.md.
+#
 # scripts/ensure-erlang.sh sourced under `set -euo pipefail`, as
 # release-preflight.sh and integration-test.sh do. POSIX bash; skips itself on
 # Windows.
@@ -3463,7 +3469,7 @@ test('prometheus harness selftest',
 # #4800: pins scripts/test_gateway.py's zero-executed guard, the ct --dir that
 # points at apps/yuzu_gw/test/ct, and each gateway suite's wrapper deadline
 # sitting below its meson timeout. Hermetic (parses sources, runs no
-# rebar3), so it runs on every leg, including ones without Erlang.
+# rebar3), so it needs no Erlang; suite docs, i.e. the Linux leg only.
 test('gateway wrapper guard selftest',
   _python3_test,
   args: [files('test_gateway_test_summary.py')],
@@ -3515,7 +3521,7 @@ test('close automation logic',
 # an operator remembering the standalone command before provisioning.
 _pwsh_test = find_program('pwsh', required: false)
 if _pwsh_test.found()
-  # platform: OS-contract test, runs on every leg (docs is OS-independent and Linux-only since 2026-10-21).
+  # platform: OS-contract test, runs on every leg with pwsh (docs is OS-independent and Linux-only since 2026-10-21).
   test('Windows toolchain contract',
     _pwsh_test,
     args: ['-NoProfile', '-File', files('../deploy/windows/Test-ToolchainContract.ps1')],

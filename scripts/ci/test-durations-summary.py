@@ -13,7 +13,8 @@ the test case's own root line last on each (re-)entry, so a raw per-name sum
 would rank nested section timings next to their parent and merge identically
 named sections of different cases. This script therefore keeps a line only when
 its name is a listed test case of that entry (`--list-tests --verbosity quiet`
-is one bare case name per line), and sums those per case across re-entries
+is one case name per line, with Catch2's double-quote wrapper stripped from the
+names it quotes - those beginning with '#'), and sums those per case across re-entries
 (`runs` = re-entries). Known limit: a section named exactly like another case of the
 same entry is summed into that case. An entry whose listing fails degrades to unfiltered
 lines, marked `(unfiltered)` in the table.
@@ -22,10 +23,13 @@ Reporting only, never a gate (#4884): any failure in the reporting path becomes
 a ::warning and exit 0. `--selftest` is the only non-zero exit, and it is
 dispatched before and outside that handler.
 
-Wired once after EACH flake-retry.py invocation in ci.yml (not at end of job):
-meson overwrites testlog.json per invocation. On a red invocation `bash -e`
-stops before this runs; the uploaded meson-logs artifact carries testlog.json,
-so run this script against it locally.
+Wired once after each non-smoke flake-retry.py invocation in ci.yml (not at end
+of job): meson overwrites testlog.json per invocation, and ci.yml removes it
+before each one, so a run that selects no tests (meson writes nothing then)
+leaves no file and lands in the ::warning path rather than reporting a stale
+log. (If a second testlog.json consumer appears, clear it inside flake-retry.py
+instead.) On a red invocation `bash -e` stops before this runs; the uploaded
+meson-logs artifact carries testlog.json, so run this script against it locally.
 """
 import argparse
 import json
@@ -113,31 +117,49 @@ def render(label, entry_rows, case_rows):
 
 
 # ── thin shell (OS interaction) ──────────────────────────────────────────────
-def list_cases(cmd, run=subprocess.run):
-    """Bare case names a Catch2 entry runs, or None if the listing is unusable."""
+def spawn_env(t):
+    """Env meson launches entry t under: its `env`, PATH prefixed with its
+    `extra_paths` (the DLL dirs a Windows test binary links against)."""
+    env = dict(os.environ)
+    env.update(t.get("env") or {})
+    if t.get("extra_paths"):
+        env["PATH"] = os.pathsep.join(list(t["extra_paths"]) + ([env["PATH"]] if env.get("PATH") else []))
+    return env
+
+
+def bare(line):
+    """Catch2 wraps a listed name that begins with '#' in double quotes; the
+    duration lines print it raw, so drop that one pair."""
+    ln = line.strip()
+    return ln[1:-1] if len(ln) > 1 and ln[0] == ln[-1] == '"' else ln
+
+
+def list_cases(t, builddir, run=subprocess.run):
+    """Bare case names Catch2 entry t runs, or None if the listing is unusable."""
     # ponytail: one --list-tests spawn per Catch2 entry (~19); switch to a second
     # xml reporter if the spawns ever matter.
     try:
-        p = run(list(cmd) + ["--list-tests", "--verbosity", "quiet"],
-                capture_output=True, text=True, timeout=30)
+        p = run(list(t.get("cmd") or []) + ["--list-tests", "--verbosity", "quiet"],
+                capture_output=True, text=True, timeout=30, env=spawn_env(t), cwd=builddir)
     except (OSError, subprocess.SubprocessError):
         return None
     if p.returncode != 0:
         return None
-    return {ln.strip() for ln in p.stdout.splitlines() if ln.strip()} or None
+    return {bare(ln) for ln in p.stdout.splitlines() if ln.strip()} or None
 
 
-def collect_cases(records, tests, lister=list_cases):
+def collect_cases(records, tests, builddir, lister=list_cases):
     """{entry: set|None} for every Catch2 entry that printed duration lines."""
-    cmds = {t.get("name"): t.get("cmd") or [] for t in tests}
+    entries = {t.get("name"): t for t in tests}
     out = {}
     for rec in records:
         name = entry_name(rec.get("name", ""))
-        cmd = cmds.get(name)
+        t = entries.get(name) or {}
+        cmd = t.get("cmd") or []
         if name in out or not cmd or not CATCH2_EXE.search(os.path.basename(cmd[0])):
             continue
         if parse_durations(rec.get("stdout")):
-            out[name] = lister(cmd)
+            out[name] = lister(t, builddir)
     return out
 
 
@@ -156,7 +178,7 @@ def report(builddir, label):
     path = os.path.join(builddir, "meson-logs", "testlog.json")
     records = read_records(path)
     tests = introspect_tests(builddir)
-    rows = summarise(records, tests, collect_cases(records, tests), TOP)
+    rows = summarise(records, tests, collect_cases(records, tests, builddir), TOP)
     summary(render(label, *rows))
 
 
@@ -219,25 +241,47 @@ def _checks():
              {"name": "s - yuzu:py", "stdout": log, "duration": 1.0}]
     tests3 = tests + [{"name": "eunit", "timeout": 5, "cmd": ["/b/yuzu_gateway_eunit"]},
                       {"name": "py", "timeout": 5, "cmd": ["/usr/bin/python3", "t.py"]}]
-    got = collect_cases(recs3, tests3, lister=lambda c: calls.append(c) or {"root"})
+    got = collect_cases(recs3, tests3, "bd", lister=lambda t, b: calls.append((t["cmd"], b)) or {"root"})
     check("collect: only Catch2 entries with duration lines are listed; others never spawn",
-          sorted(got) == ["ent", "slow"] and len(calls) == 2)
-    ents, _ = summarise(recs3, tests3, got, 5)
+          sorted(got) == ["ent", "slow"] and calls == [(["/b/yuzu_server_tests"], "bd"),
+                                                      (["/b/yuzu_agent_tests"], "bd")])
+    ents, cs = summarise(recs3, tests3, got, 5)
     check("summarise: entries without duration lines still get a row",
           "eunit" in [e[0] for e in ents])
+    check("summarise: an entry absent from the case map (py has duration lines) gets no case rows",
+          {c[0] for c in cs} == {"ent", "slow"})
+
+    seen = {}
 
     def runner(rc=0, out="", exc=None):
         def run(*a, **k):
+            seen.update(k)
             if exc:
                 raise exc
             return types.SimpleNamespace(returncode=rc, stdout=out)
         return run
 
-    check("list_cases: success parses bare names", list_cases(["x"], runner(0, "a\n b \n\n")) == {"a", "b"})
+    ent = {"cmd": ["x"]}
+    check("list_cases: success parses bare names", list_cases(ent, "bd", runner(0, "a\n b \n\n")) == {"a", "b"})
     check("list_cases: nonzero / timeout / OSError / empty -> None",
-          all(list_cases(["x"], r) is None for r in (
+          all(list_cases(ent, "bd", r) is None for r in (
               runner(1, "a"), runner(exc=subprocess.TimeoutExpired("x", 30)),
               runner(exc=OSError("no exe")), runner(0, "\n"))))
+    listing = '"#5343: first run"\nplain, with comma\n"#9 say "hi" now"\n"\n'
+    names = list_cases(ent, "bd", runner(0, listing))
+    check("list_cases: strips Catch2's quote wrapper from '#' names (one pair), keeps others",
+          names == {"#5343: first run", "plain, with comma", '#9 say "hi" now', '"'})
+    _, cs = summarise([{"name": "s - yuzu:ent", "stdout": "0.5 s: #5343: first run\n", "duration": 1.0}],
+                      [], {"ent": names}, 25)
+    check("summarise: a '#' case name from the listing now matches its duration line",
+          cs == [("ent", "#5343: first run", 0.5, 1)])
+    e = spawn_env({"env": {"YUZU_K": "v"}, "extra_paths": ["/dll1", "/dll2"]})
+    check("spawn_env: entry env applied, extra_paths lead PATH",
+          e["YUZU_K"] == "v" and e["PATH"].split(os.pathsep)[:2] == ["/dll1", "/dll2"]
+          and spawn_env({}).get("PATH") == os.environ.get("PATH"))
+    list_cases({"cmd": ["x"], "extra_paths": ["/dll1"]}, "bd", runner(0, "a"))
+    check("list_cases: spawns in the build dir under the entry's env",
+          seen["cwd"] == "bd" and seen["env"]["PATH"].startswith("/dll1"))
 
     check("render: headings and both table headers",
           all(s in render("L", [], []) for s in (

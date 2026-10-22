@@ -440,7 +440,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "preflight":
         # Emit one boolean per declared runner. Downstream jobs use
         # `if: needs.<preflight job>.outputs.<slug>_healthy == 'true'`
-        # (`preflight-gate` in ci.yml, `preflight` in nightly.yml).
+        # (`preflight-gate` in ci.yml, `preflight` in nightly.yml and
+        # sanitizer-tests.yml).
         all_healthy = True
         for name in expected:
             v = "true" if healthy_map.get(name, False) else "false"
