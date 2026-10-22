@@ -9,10 +9,13 @@
  * and this test cannot check that they were met.
  *
  * WHAT IT SCANS. Source text only, under `server/core/src` (YUZU_SERVER_SRC_DIR) and nowhere
- * else: files with the extensions .cpp .hpp .inc .cc .h. Not scanned: `tests/`, `server/core/
- * include`, `common/include`, `sdk/include`, `agents/`, generated files, any other extension.
- * A macro that pastes a name together, a generated file and anything the lexer cannot see are
- * invisible to it, and it proves nothing about what a caller does.
+ * else. EVERY regular file there is lexed as C++ whatever its extension (.cpp .hpp .ipp .inl
+ * .tpp .cxx .def, none at all ...), except those on kNonSourceExtensions: documentation, data,
+ * images, fonts, certificates and archives, which cannot be compiled into the server. Not
+ * scanned: `tests/`, `server/core/include`, `common/include`, `sdk/include`, `agents/`, files
+ * reached through a directory symlink, generated files. A macro that pastes a name together, a
+ * generated file and anything the lexer cannot see are invisible to it, and it proves nothing
+ * about what a caller does.
  *
  * WHAT IT COUNTS. Each identifier of kIdentifiers, in code only, per file: the four public
  * primitives and the three names a store member needs to reach them without spelling any of the
@@ -21,9 +24,24 @@
  * exempt: the store files (`approval_manager.hpp/.cpp`) are pinned like every other, so a member
  * added there that mints or consumes through any of the seven raises a count and fails. What it
  * still cannot see: a wrapper that is merely CALLED from elsewhere under its own name (the caller
- * names the wrapper, not the primitive; only the wrapper's own use is counted), and the
- * difference between the pooled `consume_ticket` overload and the held one (it counts the
- * identifier, so swapping the one MCP call for the held overload stays green).
+ * names the wrapper, not the primitive; only the wrapper's own use is counted). The count of an
+ * identifier alone cannot tell the pooled `consume_ticket` overload from the held one; the
+ * shape check below does that for the one production call.
+ *
+ * THE POOLED CALL SHAPE. The one production `consume_ticket` call, in `mcp_server.cpp`, is
+ * additionally pinned by the text of its argument list (kCallShapes): the pooled overload takes
+ * four arguments and the caller-held one a connection first, so replacing the call with a held
+ * one changes the list and fails with a message naming the call and both lists, although the
+ * identifier count is unchanged. This is still LEXICAL: it compares text, so a different
+ * spelling that resolves to the held overload, or the same text bound to a different overload
+ * by a changed declaration, is not seen.
+ *
+ * WHO MAY CHANGE THIS. Editing kRules, kExpected, kCallShapes or kNonSourceExtensions here is
+ * the act that activates the bound-approval primitives, and the ADR requires a recorded
+ * non-author maintainer review of that change in the PR. Nothing in this file or in tooling
+ * enforces that review: an author can edit the rules and this baseline together, and the
+ * repository has no CODEOWNERS entry for these paths. The failure message names the ADR
+ * conditions; it cannot check that they were met.
  *
  * HOW IT LEXES. Line comments (a trailing backslash continues one onto the next line), block
  * comments, string, character and raw-string literals, including the encoding prefixes u8 u U L
@@ -48,6 +66,7 @@
 #include "../test_helpers.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
@@ -56,6 +75,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -205,12 +225,73 @@ struct Hit {
     int line;
 };
 
+// One occurrence of `consume_ticket` in code, with its argument list when it is a direct call.
+struct Call {
+    std::string file;
+    int line;
+    bool is_call;     // `consume_ticket` followed by `(` ... matching `)`
+    std::string args; // the text between the parentheses, whitespace collapsed
+};
+
 struct Scan {
     std::size_t files = 0;
     std::size_t lines = 0;
+    std::size_t skipped = 0; // files left out because their extension is on kNonSourceExtensions
     std::set<std::string> scanned;
     std::map<std::string, std::vector<Hit>> hits; // identifier -> where it appears as code
+    std::vector<Call> calls;                      // every `consume_ticket` occurrence
 };
+
+// Extensions that cannot be compiled into the server: documentation, data, images, fonts,
+// certificates and archives. EVERY other regular file under the scan root is lexed as C++,
+// whatever its extension (`.ipp`, `.inl`, `.tpp`, `.cxx`, `.hxx`, `.def`, no extension at all):
+// a caller moved into an included fragment must not escape by its file name. Today
+// `server/core/src` holds only `.cpp` and `.hpp`; this list is the whole of what may be skipped,
+// and extending it is as consequential as extending kRules.
+const std::set<std::string> kNonSourceExtensions = {
+    ".md",  ".txt",  ".rst", ".json", ".yaml", ".yml", ".toml", ".csv", ".html", ".css",
+    ".js",  ".svg",  ".png", ".jpg",  ".jpeg", ".gif", ".ico",  ".woff", ".woff2", ".ttf",
+    ".pem", ".crt",  ".der", ".gz",   ".zip"};
+
+std::string lowered(std::string v) {
+    std::transform(v.begin(), v.end(), v.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return v;
+}
+
+// The text between the parentheses of the call whose `(` is at `open`, whitespace runs collapsed
+// to one space and trimmed; `false` when no matching `)` exists. Strings and comments are
+// already blanked in `code`, so only real parentheses count.
+bool call_arguments(const std::string& code, std::size_t open, std::string& args) {
+    int depth = 0;
+    std::string raw;
+    for (std::size_t k = open; k < code.size(); ++k) {
+        const char c = code[k];
+        if (c == '(' || c == '[' || c == '{')
+            ++depth;
+        else if (c == ')' || c == ']' || c == '}')
+            --depth;
+        if (depth == 0) {
+            args.clear();
+            bool space = false;
+            for (std::size_t q = 0; q < raw.size(); ++q) {
+                const char r = raw[q];
+                if (r == ' ' || r == '\t' || r == '\n' || r == '\r') {
+                    space = !args.empty();
+                } else {
+                    if (space)
+                        args += ' ';
+                    space = false;
+                    args += r;
+                }
+            }
+            return true;
+        }
+        if (k > open)
+            raw += c;
+    }
+    return false;
+}
 
 // The four public primitives, and the three names a store member needs to reach them without
 // spelling any of the four: `submit_impl` (the one mint body behind submit and submit_bound),
@@ -227,9 +308,10 @@ Scan scan_tree(const fs::path& root) {
     for (const auto& e : fs::recursive_directory_iterator(root)) {
         if (!e.is_regular_file())
             continue;
-        const auto ext = e.path().extension().string();
-        if (ext != ".cpp" && ext != ".hpp" && ext != ".inc" && ext != ".cc" && ext != ".h")
+        if (kNonSourceExtensions.count(lowered(e.path().extension().string())) != 0) {
+            ++scan.skipped;
             continue;
+        }
         std::ifstream in(e.path(), std::ios::binary);
         REQUIRE(in.is_open()); // an unreadable file must not be silently skipped
         std::ostringstream ss;
@@ -238,6 +320,22 @@ Scan scan_tree(const fs::path& root) {
         const std::string code = code_only(ss.str());
         ++scan.files;
         scan.scanned.insert(rel);
+        constexpr std::string_view kConsume = "consume_ticket";
+        for (auto at = code.find(kConsume); at != std::string::npos; at = code.find(kConsume, at + 1)) {
+            const bool left = at == 0 || !is_ident_char(code[at - 1]);
+            const bool right = at + kConsume.size() >= code.size() ||
+                               !is_ident_char(code[at + kConsume.size()]);
+            if (!left || !right)
+                continue;
+            Call call{rel, 1 + static_cast<int>(std::count(code.begin(), code.begin() + at, '\n')),
+                      false, {}};
+            std::size_t k = at + kConsume.size();
+            while (k < code.size() && (code[k] == ' ' || code[k] == '\t' || code[k] == '\n' || code[k] == '\r'))
+                ++k;
+            if (k < code.size() && code[k] == '(')
+                call.is_call = call_arguments(code, k, call.args);
+            scan.calls.push_back(std::move(call));
+        }
         std::istringstream lines(code);
         std::string line;
         for (int n = 1; std::getline(lines, line); ++n) {
@@ -311,6 +409,21 @@ const Expected kExpected[] = {
     {"BoundRequest", "approval_manager.cpp", 2},
 };
 
+// The SHAPE of the one production call. The pooled overload is
+// `consume_ticket(id, consumed_by, expected, precondition)` and the caller-held one takes a
+// connection first, so a call whose argument list is anything but this exact text may be the
+// held overload even though the identifier count is unchanged. Lexical: it compares text, and
+// proves nothing about which overload a different spelling resolves to.
+struct CallShape {
+    const char* id;
+    const char* file;
+    const char* args;
+};
+const CallShape kCallShapes[] = {
+    {"consume_ticket", "mcp_server.cpp",
+     "supplied_id, session->username, ApprovalOrigin::kMcp, precondition"},
+};
+
 // One entry per violation, in a stable order, each naming the identifier and the place.
 std::vector<std::string> violations(const Scan& scan, const Rules& rules) {
     std::vector<std::string> out;
@@ -328,6 +441,21 @@ std::vector<std::string> violations(const Scan& scan, const Rules& rules) {
                 out.push_back("expected at least " + std::to_string(allow.min) + " use(s) of `" +
                               id + "` in " + file + " but found " + std::to_string(per_file[file]) +
                               " (a scanner gone blind, or the allow-list is stale)");
+        }
+    }
+    for (const auto& shape : kCallShapes) {
+        for (const auto& call : scan.calls) {
+            if (call.file != shape.file)
+                continue;
+            if (!call.is_call)
+                out.push_back(std::string("`") + shape.id + "` in " + call.file + ":" +
+                              std::to_string(call.line) +
+                              " is not a direct call of the pinned pooled shape");
+            else if (call.args != shape.args)
+                out.push_back(std::string("`") + shape.id + "` call at " + call.file + ":" +
+                              std::to_string(call.line) + " has arguments `" + call.args +
+                              "`, expected the pooled shape `" + shape.args +
+                              "` (a different shape may be the caller-held overload)");
         }
     }
     return out;
@@ -413,8 +541,14 @@ void write_expected_tree(const fs::path& root, const Expected* skip = nullptr,
             --n;
         if (&e == extra)
             ++n;
-        for (int k = 0; k < n; ++k)
-            files[e.file] += std::string("void use() { x.") + e.id + "(); }\n";
+        for (int k = 0; k < n; ++k) {
+            if (std::string(e.id) == "consume_ticket" && std::string(e.file) == "mcp_server.cpp")
+                files[e.file] +=
+                    "void use() { x.consume_ticket(supplied_id, session->username, "
+                    "ApprovalOrigin::kMcp, precondition); }\n";
+            else
+                files[e.file] += std::string("void use() { x.") + e.id + "(); }\n";
+        }
     }
     for (const auto& [file, body] : files)
         write(root / file, body);
@@ -713,9 +847,88 @@ TEST_CASE("the tripwire names the specific violation for every way the allow-lis
     SECTION("the interleaving seam named in a production file is flagged") {
         write_expected_tree(tmp.path);
         write(tmp.path / "mcp_server.cpp", "void h() { m.set_consume_test_hook_for_test({}); }\n"
-                                           "void use() { x.consume_ticket(); }\n");
+                                           "void use() { x.consume_ticket(supplied_id, session->username, "
+                                           "ApprovalOrigin::kMcp, precondition); }\n");
         const auto v = violations(scan_tree(tmp.path), kRules);
         REQUIRE(v.size() == 1);
         CHECK(v[0] == "unexpected use of `set_consume_test_hook_for_test` at mcp_server.cpp:1");
+    }
+}
+
+TEST_CASE("the tripwire lexes every file that is not listed as non-source, and pins the pooled call shape",
+          "[approval_manager][bound][tripwire]") {
+    yuzu::test::TempDir tmp("yuzu_test_tripwire_");
+
+    SECTION("the skip list holds no extension a C++ fragment can carry") {
+        for (const char* ext : {".cpp", ".hpp", ".h", ".hh", ".cc", ".cxx", ".hxx", ".c", ".inc",
+                                ".ipp", ".inl", ".tpp", ".def", ".ixx", ".cppm", ".mm"})
+            CHECK(kNonSourceExtensions.count(ext) == 0);
+    }
+    // A caller moved into any other kind of file is still a caller.
+    for (const char* name : {"fragment.ipp", "fragment.inl", "fragment.tpp", "fragment.cxx",
+                             "fragment.hxx", "fragment.def", "fragment.h", "fragment.IPP",
+                             "fragment", "sub/dir/fragment.generated"}) {
+        DYNAMIC_SECTION("a producer in " << name << " is flagged") {
+            write_expected_tree(tmp.path);
+            write(tmp.path / name, "void f() { mgr.submit_bound(a); }\n");
+            const auto v = violations(scan_tree(tmp.path), kRules);
+            REQUIRE(v.size() == 1);
+            CHECK(v[0] == std::string("unexpected use of `submit_bound` at ") + name + ":1");
+        }
+    }
+    SECTION("files with a listed non-source extension are skipped, and counted") {
+        write_expected_tree(tmp.path);
+        write(tmp.path / "notes.md", "submit_bound consume_core BoundRequest\n");
+        write(tmp.path / "data.JSON", "{\"k\": \"submit_bound\"}\n");
+        write(tmp.path / "logo.png", "submit_bound");
+        const Scan scan = scan_tree(tmp.path);
+        CHECK(scan.skipped == 3);
+        CHECK(violations(scan, kRules).empty());
+    }
+
+    // The pooled call shape: swapping the one MCP call for the held overload keeps the
+    // identifier count, so the shape is what catches it.
+    const auto mcp_with = [&](const std::string& call_text) {
+        write_expected_tree(tmp.path);
+        write(tmp.path / "mcp_server.cpp", "void use() { " + call_text + " }\n");
+        return violations(scan_tree(tmp.path), kRules);
+    };
+    const std::string expected_args = "supplied_id, session->username, ApprovalOrigin::kMcp, precondition";
+    SECTION("control: the pooled shape, however it is wrapped, is accepted") {
+        CHECK(mcp_with("x.consume_ticket(" + expected_args + ");").empty());
+        CHECK(mcp_with("if (auto c = approval_manager->consume_ticket(\n    supplied_id,\n"
+                       "    session->username,   ApprovalOrigin::kMcp,\n    precondition);\n"
+                       "    !c) {}")
+                  .empty());
+    }
+    SECTION("the caller-held overload (a connection first) is flagged with the specific shape") {
+        const auto v = mcp_with("x.consume_ticket(held_conn, " + expected_args + ");");
+        REQUIRE(v.size() == 1);
+        CHECK(v[0] == "`consume_ticket` call at mcp_server.cpp:1 has arguments `held_conn, " +
+                          expected_args + "`, expected the pooled shape `" + expected_args +
+                          "` (a different shape may be the caller-held overload)");
+    }
+    SECTION("any other change to the argument list is flagged too") {
+        for (const char* args : {"supplied_id, session->username, ApprovalOrigin::kMcp, {}",
+                                 "supplied_id, session->username, ApprovalOrigin::kInstruction, precondition",
+                                 "supplied_id, session->username, ApprovalOrigin::kMcp",
+                                 "pg_conn.get(), supplied_id, session->username, ApprovalOrigin::kMcp, precondition"}) {
+            const auto v = mcp_with(std::string("x.consume_ticket(") + args + ");");
+            REQUIRE(v.size() == 1);
+            CHECK(v[0].starts_with("`consume_ticket` call at mcp_server.cpp:1 has arguments `" +
+                                   std::string(args) + "`"));
+        }
+    }
+    SECTION("an occurrence that is not a direct call is flagged") {
+        const auto v = mcp_with("auto f = &ApprovalManager::consume_ticket;");
+        REQUIRE(v.size() == 1);
+        CHECK(v[0] == "`consume_ticket` in mcp_server.cpp:1 is not a direct call of the pinned "
+                      "pooled shape");
+    }
+    SECTION("the shape is pinned to this literal, not only to the table it is read from") {
+        REQUIRE(std::size(kCallShapes) == 1);
+        CHECK(std::string(kCallShapes[0].id) == "consume_ticket");
+        CHECK(std::string(kCallShapes[0].file) == "mcp_server.cpp");
+        CHECK(std::string(kCallShapes[0].args) == expected_args);
     }
 }
