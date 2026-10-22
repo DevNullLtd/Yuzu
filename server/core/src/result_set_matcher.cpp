@@ -150,10 +150,12 @@ bool json_column_match(std::string_view output, const std::string& column, const
 }
 
 // Column matcher over a plugin's plain pipe rows, resolved by the definition's DECLARED column
-// names (stored in the matcher at admission by bind_declared_columns). Rows are split exactly as
-// the dashboard / SSE / facets split them (`split_fields`), so the index agrees with what the
-// operator sees. A line whose width differs (status|not_found, not_available|<reason>, a
-// malformed row) or that equals the header is not a data row.
+// names (stored in the matcher at admission by bind_declared_columns). Rows are split to the
+// DECLARED width (`split_fields(plugin, line, width)`), so the index is the declared column
+// position, not the dashboard cell position: for a key/value plugin the dashboard still shows key
+// + remainder under the declared headers (a pre-existing display gap tracked separately). A line
+// whose width differs (status|not_found, not_available|<reason>, a malformed row) or that equals
+// the header is not a data row.
 bool declared_column_match(std::string_view output, const std::string& column, const std::string& op,
                            const nlohmann::json& matcher) {
     std::vector<std::string> declared;
@@ -173,7 +175,7 @@ bool declared_column_match(std::string_view output, const std::string& column, c
         std::string line(line_view);
         if (line.empty())
             continue;
-        const auto cells = yuzu::server::split_fields(plugin, line);
+        const auto cells = yuzu::server::split_fields(plugin, line, declared.size());
         if (cells.size() != declared.size() || cells == declared)
             continue;
         if (cell_satisfies(cells[idx], op, matcher))

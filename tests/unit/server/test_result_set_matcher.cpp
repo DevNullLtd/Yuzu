@@ -383,3 +383,47 @@ TEST_CASE("matcher: declared columns leave tar and json matching unchanged",
     REQUIRE(response_matches(R"({"column":"sha256","op":"eq","value":"x"})", kOk,
                              R"([{"sha256":"x"}])"));
 }
+
+// ── declared columns wider than a key/value plugin's key + remainder schema (#5624) ──
+// find_by_hash declares row_kind/path/size on the key/value `filesystem` plugin. The matcher
+// splits each row to the DECLARED width, so a three-column definition can match a row.
+namespace {
+const char* kFindByHashSchema =
+    R"([{"name":"row_kind","type":"string"},{"name":"path","type":"string"},)"
+    R"({"name":"size","type":"string"}])";
+
+const char* kFindByHashOutput = "match|/etc/hosts|413\n"
+                                "truncated|deadline|visited=5|hashed=9|skipped_unreadable=1\n"
+                                "matches_found|1";
+
+bool find_by_hash_matches(const std::string& column, const std::string& op,
+                          const std::string& value = {}) {
+    nlohmann::json m{{"column", column}, {"op", op}};
+    if (!value.empty())
+        m["value"] = value;
+    bind_declared_columns(m, kFindByHashSchema, "filesystem");
+    return response_matches(m.dump(), kOk, kFindByHashOutput);
+}
+} // namespace
+
+TEST_CASE("matcher: a three-column definition over a key/value plugin matches by declared position",
+          "[result_set][matcher]") {
+    CHECK(find_by_hash_matches("path", "contains", "/etc/hosts"));
+    CHECK(find_by_hash_matches("size", "eq", "413"));
+    CHECK(find_by_hash_matches("row_kind", "eq", "truncated"));
+    // The truncated row's third cell is the whole remainder.
+    CHECK(find_by_hash_matches("size", "contains", "skipped_unreadable=1"));
+    // matches_found|N is a two-cell summary, not a data row.
+    CHECK_FALSE(find_by_hash_matches("row_kind", "eq", "matches_found"));
+    CHECK_FALSE(find_by_hash_matches("path", "contains", "/etc/passwd"));
+    CHECK_FALSE(find_by_hash_matches("size", "eq", "414"));
+}
+
+TEST_CASE("matcher: a two-column definition over a key/value plugin is unchanged",
+          "[result_set][matcher]") {
+    nlohmann::json m{{"column", "value"}, {"op", "eq"}, {"value", "ok"}};
+    bind_declared_columns(m, R"([{"name":"key","type":"string"},{"name":"value","type":"string"}])",
+                          "filesystem");
+    CHECK(response_matches(m.dump(), kOk, "status|ok"));
+    CHECK_FALSE(response_matches(m.dump(), kOk, "status|no"));
+}
