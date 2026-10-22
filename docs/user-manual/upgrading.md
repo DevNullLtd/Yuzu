@@ -568,6 +568,40 @@ customer-distribution lane. Before switching lanes, read the
 **Action.** None required. To keep a custom role out of the new surface, remove `Inventory:Read`
 from it. Rolling back removes the page, routes and tools; nothing is migrated.
 
+## Behaviour change: gateway sessions are unique per agent; a one-time migration (`gateway_route_store` v5, #5683)
+
+**What changed.** A gateway session id can now be held by only one agent. Migration v5 of the
+gateway route directory adds a unique index on `gateway_route_store.agent_routes(session_id)`
+(tombstoned rows are not indexed) and drops the old non-unique one. Two agents racing to adopt one
+unheld session id used to both succeed; now the second is refused (`FAILED_PRECONDITION`, counted as
+`yuzu_server_gateway_route_desync_total{outcome="session_held_by_other_agent"}`, alert
+`YuzuGatewaySessionHeldByOtherAgent`). It only matters for gateway-fronted deployments.
+
+- **One-time lock at the first start.** The migration takes an exclusive lock on `agent_routes`
+  (readers and writers, so gateway heartbeats and registrations queue), removes any duplicates, and
+  builds the index. In local measurement (PostgreSQL 18, 1,000,000 rows, no duplicates) that took
+  about 6.4 s; the table is one row per agent plus recent disconnects, so most deployments are far
+  smaller. Check the size with `SELECT count(*) FROM gateway_route_store.agent_routes;`.
+- **Health probes do not answer until the migration finishes**, as for the other store migrations: the
+  HTTP listener opens after the route store opens. Allow a start period longer than the figure above.
+- **If the 30 s lock wait expires.** The migration waits at most 30 s for its lock. If another session
+  holds a conflicting lock for longer, it rolls back, the server logs
+  `GatewayRouteStore: schema migration failed` followed by
+  `[PG] Refusing to start: gateway-route store migration/open failed`, and **does not start**. End the
+  blocking session (`pg_locks` / `pg_stat_activity`) and start the server again: the migration is retried.
+- **Existing duplicates are cleared, not kept.** If two rows already shared a session id (expected: none),
+  every row of that group is tombstoned, because no row can be shown to be the legitimate owner. Each
+  affected agent re-establishes its route through the normal heartbeat replay within one heartbeat cycle
+  or two. The count is logged once as `migration v5 tombstoned N agent_routes row(s)` and exported as
+  `yuzu_server_gateway_route_session_dedup_total` (always present; a non-zero value deserves an
+  investigation into how the duplicate arose).
+- **Not a rolling-upgrade change.** Run one server replica, as before; the safe-to-scale gate is not lifted.
+- **Rolling back** to the previous binary is safe: it ignores the migration and its queries use the new index.
+  Its racing duplicate write is refused instead of landing.
+
+**Action.** None for a normal upgrade. On a very large directory, schedule the first start for a quiet
+period and raise any startup probe timeout.
+
 ## Behaviour change: new `ca_store` indexes, built during the upgrade
 
 **What changed.** The CA store's migration v5 adds three indexes on `ca_issued` (one row per

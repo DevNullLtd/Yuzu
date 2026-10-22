@@ -312,7 +312,8 @@ groups:
       # that doesn't page on a routine post-restart/failover baseline rise;
       # it remains unalerted EXCEPT two expected-zero pairs:
       # (op="session_lookup", outcome="ambiguous_session") and
-      # (op="proxy_register", outcome="session_held_by_other_agent"), see
+      # (op="proxy_register"|"announce_connected",
+      # outcome="session_held_by_other_agent"), see
       # YuzuGatewaySessionAmbiguous and YuzuGatewaySessionHeldByOtherAgent
       # below. `route_unreadable` fires the
       # command outbox's retry-with-backoff path (the SAME reschedule
@@ -368,8 +369,11 @@ groups:
             gateway_route_store.agent_routes, so the server refused to resolve
             it (never acked, never listed, never ingested). Causes: a
             duplicate placement, two concurrent ProxyRegister adopts of one id
-            for different agents (the cross-agent adopt guard is not a lock),
-            or a forged / colliding presented id.
+            for different agents (before the unique index), or a forged /
+            colliding presented id. Since the unique session
+            index (#5683) a NEW duplicate cannot be created: this fires only
+            for data from before that migration, or after the index was
+            dropped by hand.
             FIRST REMEDIATION: the id is not a metric label, so list every
             shared id from the directory: SELECT session_id,
             array_agg(agent_id) FROM gateway_route_store.agent_routes WHERE
@@ -385,23 +389,29 @@ groups:
       # HA WS-5 (ADR-2002 §7f Security notes) — ProxyRegister's replay-ADOPT
       # decision refused a presented session_id because a DIFFERENT agent's
       # committed directory row already holds it (the reclaim statement's
-      # NOT EXISTS guard). Kept separate from YuzuGatewaySessionAmbiguous:
-      # nothing became ambiguous (the adopt was refused), so that alert's
+      # NOT EXISTS guard, or the unique session index for a concurrent adopt,
+      # #5683). Also covers op="announce_connected": a CONNECTED whose session
+      # id another agent's row holds, refused by the same index (#5683).
+      # Kept separate from YuzuGatewaySessionAmbiguous:
+      # nothing became ambiguous (the write was refused), so that alert's
       # duplicate-row query finds nothing and the remediation differs. No
-      # `for:`: expected rate zero, every occurrence is actionable. The pair
-      # is pre-seeded at zero in gateway_service_impl.cpp.
+      # `for:`: expected rate zero, every occurrence is actionable. Both pairs
+      # are pre-seeded at zero in gateway_service_impl.cpp.
       - alert: YuzuGatewaySessionHeldByOtherAgent
         expr: |
-          increase(yuzu_server_gateway_route_desync_total{op="proxy_register",outcome="session_held_by_other_agent"}[1h]) > 0
+          increase(yuzu_server_gateway_route_desync_total{op=~"proxy_register|announce_connected",outcome="session_held_by_other_agent"}[1h]) > 0
         labels:
           severity: warning
         annotations:
-          summary: "A ProxyRegister replay presented a session_id another agent holds"
+          summary: "A gateway presented a session_id another agent holds"
           description: >-
-            A gateway replayed ProxyRegister for one agent presenting a
-            session_id that a different agent's directory row already holds,
-            and the server refused the adopt (FAILED_PRECONDITION; the gateway
-            disconnects that agent so it registers fresh). The expected rate
+            A gateway presented one agent a session_id that a different
+            agent's directory row already holds, and the server refused it:
+            either a ProxyRegister replay adopt (FAILED_PRECONDITION; the
+            gateway disconnects that agent so it registers fresh; op label
+            proxy_register) or a NotifyStreamStatus CONNECTED (placement
+            unpublished, op label announce_connected; also audit action
+            gateway.session_held_by_other_agent). The expected rate
             is zero: this means a forged or colliding presented id from a
             pinned gateway peer, a CC6.6 signal.
             FIRST REMEDIATION: find the server WARN "ProxyRegister: presented
@@ -410,9 +420,9 @@ groups:
             bytes), look up the holder with SELECT agent_id, gateway_node FROM
             gateway_route_store.agent_routes WHERE session_id = '<id>', identify the
             presenting gateway from its peer certificate, and escalate to
-            security. The guard only sees committed rows: two concurrent
-            adopts can both land, which YuzuGatewaySessionAmbiguous then
-            catches. Evidence is metrics and logs only (no audit row). See
+            security. Concurrent adopts of one id are serialised by the
+            unique session index; the loser is counted here. Evidence is
+            metrics and logs (plus the audit row for op announce_connected). See
             ADR-2002 §7f and docs/user-manual/gateway.md "Forged or colliding
             session ids".
 

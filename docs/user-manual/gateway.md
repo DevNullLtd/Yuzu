@@ -2082,9 +2082,9 @@ replica (see [ADR-2002](../adr/2002-high-availability-architecture.md),
 section 7c, update 2026-10-04, and section 7f). Deferred:
 the surfaces that read only the local registry (`/api/agents`, the dashboard
 device list, `yuzu_agents_connected`, the guardian heartbeat reconcile) on a
-replica that has not been hydrated by the replay, a unique index on the
-directory's `session_id` column (#5683), and the failover and restart validation
-scenarios (WS-9).
+replica that has not been hydrated by the replay, and the failover and restart
+validation scenarios (WS-9). The unique index on the directory's `session_id`
+column (#5683) has shipped (see "Forged or colliding session ids" below).
 
 **Degraded directory reads.** The posture differs per RPC on purpose.
 `BatchHeartbeat` is fail-soft: sessions the replica holds locally are still
@@ -2152,11 +2152,18 @@ The session id on the gateway-to-server hop is asserted by the gateway.
   agent's committed directory row already holds, counted under
   `yuzu_server_gateway_route_desync_total{op="proxy_register",outcome="session_held_by_other_agent"}`
   (alert `YuzuGatewaySessionHeldByOtherAgent`; expected rate zero, so any
-  increase means a forged or colliding id from a pinned gateway). The check is
-  not a lock: two concurrent adopts of one id for different agents can both
-  land (measured against live Postgres), and the ambiguity refusal above then
-  catches the duplicate until a unique index on `session_id` ships (deferred,
-  #5683). Nor can it see another agent's row that was already tombstoned
+  increase means a forged or colliding id from a pinned gateway). A unique
+  index on `session_id` (migration v5, #5683) serialises two concurrent adopts
+  of one id for different agents: the second is refused with the same
+  `FAILED_PRECONDITION` and the same counter, so no duplicate row is created
+  (the ambiguity refusal above remains as defense in depth for data from before
+  the index). The same refusal applies when a stream notification (CONNECTED)
+  presents an id another agent holds: the placement is not published, it is
+  counted under
+  `yuzu_server_gateway_route_desync_total{op="announce_connected",outcome="session_held_by_other_agent"}`
+  (same alert) and a `gateway.session_held_by_other_agent` audit row is written
+  (without the session id). The index cannot see another agent's row that was
+  already tombstoned
   (after a Postgres outage longer than 270 s): the presented id is then
   reclaimed and resolves to the presenting agent until the original agent's
   stream reconnects. If the original agent was already listed for replay, its
@@ -2170,7 +2177,16 @@ The session id on the gateway-to-server hop is asserted by the gateway.
   refusals apart.
 
 The evidence for these decisions is the metrics above and the server log (ids
-are sanitized and truncated to 64 bytes); there is no per-event audit row.
+are sanitized and truncated to 64 bytes); there is no per-event audit row,
+except the `announce_connected` refusal above.
+
+**One-time dedup at upgrade.** Migration v5 tombstones every row of a group of
+rows that already shared a session id (expected: none) and logs
+`migration v5 tombstoned N agent_routes row(s)` once; the count is exported as
+`yuzu_server_gateway_route_session_dedup_total`. A non-zero value means those
+agents re-registered through the normal heartbeat replay (one or two heartbeat
+cycles); find how the duplicate arose. See
+[upgrading](upgrading.md#behaviour-change-gateway-sessions-are-unique-per-agent-a-one-time-migration-gateway_route_store-v5-5683).
 
 **Agent dependency.** The ordinary restart path above does not need the agent
 to do anything. When the gateway does disconnect an agent process (an
