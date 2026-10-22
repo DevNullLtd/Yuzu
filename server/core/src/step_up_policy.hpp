@@ -306,6 +306,7 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::exempt("POST",  R"(/api/v1/rbac/check)",                                                      step_up_detail::kReadShaped),
     step_up_detail::exempt("PUT",   R"(/api/v1/tags)",                                                            step_up_detail::kOperationalData),
     step_up_detail::exempt("DELETE",R"(/api/v1/tags/([^/]+)/([^/]+))",                                            step_up_detail::kOperationalData),
+    step_up_detail::exempt("PUT",   R"(/api/v1/crypto/dashboard/layout)",                                         step_up_detail::kOperationalData),
     step_up_detail::exempt("POST",  R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates)",                step_up_detail::kContentAuthoring),
     step_up_detail::exempt("PUT",   R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates/([A-Za-z0-9_-]+))",step_up_detail::kContentAuthoring),
     step_up_detail::exempt("DELETE",R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates/([A-Za-z0-9_-]+))",step_up_detail::kContentAuthoring),

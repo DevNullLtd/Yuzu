@@ -262,12 +262,12 @@ TEST_CASE("mcp step-up policy: the pending rows are the baseline plus the post-b
     CHECK(pending_rows() == 45);
     CHECK(baseline_pending_rows() + second_list_pending_rows() == pending_rows());
     CHECK(second_list_pending_rows() == kMcpPendingBecauseRestTwinRequired.size());
-    // The MCP table shape: 63 rows, 18 exempt, 45 pending.
-    CHECK(std::size(kMcpStepUpPolicy) == 63);
+    // The MCP table shape: 64 rows, 19 exempt, 45 pending.
+    CHECK(std::size(kMcpStepUpPolicy) == 64);
     std::size_t exempt = 0;
     for (const auto& e : kMcpStepUpPolicy)
         exempt += (e.cls == StepUpClass::kExempt) ? 1 : 0;
-    CHECK(exempt == 18);
+    CHECK(exempt == 19);
 }
 
 TEST_CASE("mcp step-up policy: a twin exists in the REST table and the tool is never weaker",

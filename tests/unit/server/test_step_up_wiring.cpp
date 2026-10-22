@@ -18,6 +18,7 @@
 #include "../../../server/core/src/approval_manager.hpp"
 #include "../../../server/core/src/approval_routes.hpp"
 #include "../../../server/core/src/http_route_sink.hpp"
+#include "../../../server/core/src/same_site_write_gate.hpp"
 #include "../../../server/core/src/step_up_policy.hpp"
 #include "../../../server/core/src/step_up_wiring.hpp"
 
@@ -570,6 +571,12 @@ struct ApprovalWiringServer {
     std::vector<AuditRow> chokepoint_audits;
     std::vector<std::string> handler_step_up_labels;
     std::vector<AuditRow> handler_audits;
+    // The server-wide same-site gate, as server.cpp's pre-routing handler applies it. Off by
+    // default (the older cases below exercise the step-up check alone); a test turns it on
+    // before its first request. It reads the harness session directly (never `resolve_next`),
+    // so it does not disturb the per-request resolution count the step-up cases depend on.
+    std::atomic<bool> central_same_site{false};
+    std::vector<AuditRow> same_site_audits;
 
     std::atomic<int> perm_calls{0};
     std::atomic<int> handler_step_up_calls{0};
@@ -597,12 +604,32 @@ struct ApprovalWiringServer {
         chokepoint_audits.push_back({a, r, ti, d});
         return true;
     };
+    detail::SameSitePrincipalAuditFn same_site_audit =
+        [this](const httplib::Request&, const std::string& a, const std::string& r,
+               const detail::SameSiteAuditPrincipal&, const std::string&, const std::string& ti,
+               const std::string& d) -> bool {
+        std::lock_guard lk(mu);
+        same_site_audits.push_back({a, r, ti, d});
+        return true;
+    };
+    std::vector<std::string> no_trusted_origins;
 
     explicit ApprovalWiringServer(ApprovalManager* mgr = nullptr, int window = 300)
         : approval_manager(mgr), window_secs(window) {
-        svr.set_pre_routing_handler([this](const httplib::Request&, httplib::Response&) {
+        svr.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
             resolutions.store(0);
             detail::clear_step_up_pass();
+            if (central_same_site.load()) {
+                std::optional<auth::Session> held;
+                {
+                    std::lock_guard lk(mu);
+                    held = session;
+                }
+                if (held && detail::apply_same_site_write_gate(req, res, *held, no_trusted_origins,
+                                                               /*listener_is_tls=*/false, metrics,
+                                                               same_site_audit))
+                    return httplib::Server::HandlerResponse::Handled;
+            }
             return httplib::Server::HandlerResponse::Unhandled;
         });
         svr.set_pre_request_handler(
@@ -1479,9 +1506,10 @@ TEST_CASE("wiring: with real session resolution, a credential change mid-request
     }
 }
 
-// Anchor for the order check below: with a FRESH proof the central check passes, the handler runs
-// and its same-site gate audits `csrf.denied` for the foreign Origin. This is the row the order
-// check asserts the absence of, so a harness that never emitted it could not make that check fail.
+// Anchor for the step-up-alone check below: with a FRESH proof the central check passes, the
+// handler runs and its own same-site copy audits `csrf.denied` for the foreign Origin (this
+// harness has no server-wide gate unless a case turns one on). This is the row that check asserts
+// the absence of, so a harness that never emitted it could not make that check fail.
 TEST_CASE("wiring: a fresh cookie proof with a foreign Origin reaches the handler, whose cross-site "
           "check audits csrf.denied",
           "[stepup][wiring][approval_routes]") {
@@ -1500,11 +1528,13 @@ TEST_CASE("wiring: a fresh cookie proof with a foreign Origin reaches the handle
     CHECK(csrf_row);
 }
 
-// Order check: the central step-up refusal precedes the handler's cross-site check. A stale cookie
-// proof with a foreign Origin is answered by the central check (401, step-up envelope) and the
-// handler's same-site gate, which would audit a `csrf.denied` row, never runs.
-TEST_CASE("wiring: a stale cookie proof with a foreign Origin is a step-up 401 before the "
-          "handler's cross-site check",
+// The step-up check alone: it reads neither Origin nor Referer. This harness installs NO
+// server-wide same-site gate, so a stale cookie proof with a foreign Origin is answered by the
+// step-up check (401, step-up envelope) and the handler's own same-site copy, which would audit
+// a `csrf.denied` row, never runs. In production the server-wide gate answers a cross-site cookie
+// write first; the next case drives that order.
+TEST_CASE("wiring: the step-up check does not read Origin (a stale cookie proof with a foreign "
+          "Origin is a step-up 401 when no same-site gate is in front)",
           "[stepup][wiring][approval_routes]") {
     ApprovalWiringServer s;
     s.set_session(make_session("alice", "local", Role::admin, 1h));
@@ -1524,6 +1554,58 @@ TEST_CASE("wiring: a stale cookie proof with a foreign Origin is a step-up 401 b
     for (const auto& a : s.chokepoint_audits)
         step_up_row = step_up_row || a.action == "mfa.step_up.required";
     CHECK(step_up_row);
+}
+
+// Production order for a cookie session: the server-wide same-site gate (pre-routing) answers a
+// cross-site write BEFORE the step-up check. A stale proof with a foreign Origin is therefore a
+// 403 `cross-site request refused` with one `csrf.denied` row; no step-up is evaluated (no
+// `mfa.step_up.required` row, no gate metric), and no handler runs. A same-site Origin with the
+// same stale proof is the control: the gate admits it and the step-up check answers 401.
+TEST_CASE("wiring: with the server-wide same-site gate in front, a cross-site cookie write is "
+          "refused 403 before the step-up check",
+          "[stepup][wiring][approval_routes][same_site]") {
+    ApprovalWiringServer s;
+    s.central_same_site.store(true);
+    s.set_session(make_session("alice", "local", Role::admin, 1h));
+
+    SECTION("foreign Origin: same-site 403, no step-up evaluated") {
+        auto r = s.post("/api/approvals/abc123/approve", /*same_site_origin=*/false,
+                        "https://other-site.example");
+        REQUIRE(r);
+        CHECK(r->status == 403);
+        const auto body = nlohmann::json::parse(r->body, nullptr, /*allow_exceptions=*/false);
+        REQUIRE(body.is_object());
+        CHECK(body["error"].value("message", "") == "cross-site request refused");
+        CHECK(body["meta"].value("mfa_step_up_required", false) == false);
+        CHECK(s.gate_count("refused", "local") == 0);
+        CHECK(s.gate_count("pass", "local") == 0);
+        CHECK(s.perm_calls.load() == 0);
+        CHECK(s.handler_step_up_calls.load() == 0);
+        CHECK(s.handler_audit_rows.load() == 0);
+        std::lock_guard lk(s.mu);
+        CHECK(s.chokepoint_audits.empty());
+        REQUIRE(s.same_site_audits.size() == 1);
+        CHECK(s.same_site_audits[0].action == "csrf.denied");
+    }
+    SECTION("no Origin or Referer: the same refusal") {
+        auto r = s.post("/api/approvals/abc123/approve", /*same_site_origin=*/false);
+        REQUIRE(r);
+        CHECK(r->status == 403);
+        std::lock_guard lk(s.mu);
+        CHECK(s.chokepoint_audits.empty());
+        CHECK(s.same_site_audits.size() == 1);
+    }
+    SECTION("control: a same-site Origin passes the gate and the stale proof is a step-up 401") {
+        auto r = s.post("/api/approvals/abc123/approve", /*same_site_origin=*/true);
+        REQUIRE(r);
+        CHECK(r->status == 401);
+        std::lock_guard lk(s.mu);
+        CHECK(s.same_site_audits.empty());
+        bool step_up_row = false;
+        for (const auto& a : s.chokepoint_audits)
+            step_up_row = step_up_row || a.action == "mfa.step_up.required";
+        CHECK(step_up_row);
+    }
 }
 
 TEST_CASE("wiring: an over-cap body is refused 413 by the body cap, before the chokepoint",
