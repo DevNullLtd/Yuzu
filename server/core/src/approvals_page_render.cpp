@@ -23,16 +23,17 @@ constexpr std::size_t kSummaryMaxEntries = 40; // per section
 constexpr std::size_t kSummaryTotalBytes = 6000;
 // Each optional section has its OWN byte budget, so a huge section can never push another
 // out of the summary (a submitter padding the definition fields, say, must not be able to hide
-// the device list or the parameters). Definition and Hash are always shown (two values of at
-// most 512 bytes each); the budgets plus headings, omission notes and the footer sum to under
+// the device list or the parameters). The Definition line and, when `definition` is an object,
+// the Hash line are never budgeted away (two values of at most 512 bytes each); the budgets plus headings, omission notes and the footer sum to under
 // kSummaryTotalBytes, so the total cut below is a safety net that the sections never reach.
 constexpr std::size_t kTargetsBudget = 1700;
 constexpr std::size_t kParamsBudget = 1400;
 constexpr std::size_t kDefinitionFieldsBudget = 600;
 constexpr std::size_t kOtherFieldsBudget = 600;
 
-// A JSON string/number/etc as a reviewer reads it, made DISPLAY-SAFE. Output is pure ASCII
-// (`ensure_ascii`): every non-ASCII character, including bidirectional overrides (U+202E,
+// A JSON string/number/etc as a reviewer reads it, made DISPLAY-SAFE. Output is ASCII
+// (`ensure_ascii`; the one exception is the U+2026 ellipsis `truncate_utf8` appends to a value it
+// cut, which can also land inside a `\uXXXX` escape): every non-ASCII character, including bidirectional overrides (U+202E,
 // U+2066), line and paragraph separators (U+2028/2029), NEL (U+0085) and every control
 // character, appears as its visible `\uXXXX` escape and can never reorder, hide or break the
 // text around it. Strings lose the surrounding quotes but KEEP their escapes (`\n`, `\"`,

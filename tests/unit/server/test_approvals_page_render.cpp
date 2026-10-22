@@ -709,3 +709,72 @@ TEST_CASE("summarize_bound_request: a section whose first entry alone exceeds it
           std::string::npos);
     CHECK(d.text.find("Targets (1):\n  t\n") != std::string::npos);
 }
+
+// -- summary order and exact budget boundaries (Gate 8 g8r4-qe-2/3) -------------------------
+
+TEST_CASE("summarize_bound_request: section ORDER is Definition, Hash, Targets, Parameters, then "
+          "Definition fields, then Other fields",
+          "[ui][approvals][render][bound]") {
+    const auto text = summarize_bound_request(
+        R"({"definition":{"name":"n","hash":"h","extra":"e"},"targets":["t"],"params":{"p":1},)"
+        R"("other":2})",
+        kDigest);
+    const auto at = [&](const char* needle) {
+        const auto pos = text.find(needle);
+        REQUIRE(pos != std::string::npos);
+        return pos;
+    };
+    CHECK(at("Definition: n\n") < at("Hash: h\n"));
+    CHECK(at("Hash: h\n") < at("Targets (1):\n"));
+    CHECK(at("Targets (1):\n") < at("Parameters:\n"));
+    CHECK(at("Parameters:\n") < at("Definition fields:\n"));
+    CHECK(at("Definition fields:\n") < at("Other fields:\n"));
+    CHECK(at("Other fields:\n") < at("Digest: sha256:"));
+}
+
+namespace {
+// A request whose targets are the given strings (each becomes one "  <value>\n" line).
+std::string targets_request(const std::vector<std::string>& values) {
+    std::string t = "[";
+    for (std::size_t i = 0; i < values.size(); ++i)
+        t += std::string(i ? "," : "") + "\"" + values[i] + "\"";
+    return R"({"definition":{"name":"n","hash":"h"},"targets":)" + t + "]}";
+}
+} // namespace
+
+TEST_CASE("summarize_bound_request: the Targets budget (1700 bytes of whole lines) is exact, on the "
+          "ESCAPED bytes",
+          "[ui][approvals][render][bound]") {
+    // A target of 97 characters is a 100-byte line ("  " + value + "\n"): 17 of them are exactly
+    // the 1700-byte budget.
+    const std::string v97(97, 'a');
+    SECTION("exactly at the budget: all 17 shown, no omission note") {
+        const auto text = summarize_bound_request(targets_request(std::vector<std::string>(17, v97)), "");
+        CHECK(count_of(text, "  " + v97 + "\n") == 17);
+        CHECK(text.find("more not shown") == std::string::npos);
+    }
+    SECTION("one entry over: 17 shown and an explicit note for the 18th") {
+        const auto text = summarize_bound_request(targets_request(std::vector<std::string>(18, v97)), "");
+        CHECK(count_of(text, "  " + v97 + "\n") == 17);
+        CHECK(text.find("  ... and 1 more not shown (section limit)\n") != std::string::npos);
+    }
+    SECTION("one BYTE over: a 101-byte line after sixteen 100-byte lines is cut") {
+        auto values = std::vector<std::string>(16, v97);
+        values.push_back(std::string(98, 'b'));
+        const auto text = summarize_bound_request(targets_request(values), "");
+        CHECK(count_of(text, "  " + v97 + "\n") == 16);
+        CHECK(text.find(std::string(98, 'b')) == std::string::npos);
+        CHECK(text.find("  ... and 1 more not shown (section limit)\n") != std::string::npos);
+    }
+    SECTION("budgeted on the escaped form: 93 raw bytes that escape to 101 are cut") {
+        // 89 'a' plus two U+00E9 is 93 UTF-8 bytes (a 96-byte line, which would fit after
+        // sixteen 100-byte lines) but escapes to 89 + 2 x 6 = 101 bytes (a 104-byte line, which
+        // does not).
+        auto values = std::vector<std::string>(16, v97);
+        values.push_back(std::string(89, 'a') + "\xC3\xA9\xC3\xA9");
+        const auto text = summarize_bound_request(targets_request(values), "");
+        CHECK(count_of(text, "  " + v97 + "\n") == 16);
+        CHECK(text.find("\\u00e9") == std::string::npos);
+        CHECK(text.find("  ... and 1 more not shown (section limit)\n") != std::string::npos);
+    }
+}

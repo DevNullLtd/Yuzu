@@ -219,6 +219,9 @@ TEST_CASE("operate pages: Approvals copy is exact and claims no second person",
     // The Approve POST carries only a comment and matches id + pending status, so no copy may
     // promise that the request cannot change after the decision (digest-pinned Approve is a
     // PR3 entry condition in ADR-1009).
+    // The wording that remains is pinned too (both branches end the same way).
+    CHECK(has(js, "the whole request as stored under the digest ' +\n          'shown.' :"));
+    CHECK(has(js, "'stored under the digest shown.' :"));
     CHECK_FALSE(has(js, "cannot change after your decision"));
     CHECK_FALSE(has(js, "frozen under the digest"));
     CHECK_FALSE(has(js, "it is frozen on the request"));

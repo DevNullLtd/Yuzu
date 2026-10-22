@@ -83,13 +83,16 @@ struct ApprovalRowView {
 ///   Digest: sha256:<hex>
 /// Each optional section has its OWN byte budget and says on its own line when it shows fewer
 /// entries than the request holds ("... and N more not shown (section limit)"), so no section
-/// can push another out of the summary: Definition and Hash are always shown, and every
-/// section keeps its heading whatever another one holds.
+/// can push another out of the summary: the Definition line (and, when `definition` is an object,
+/// the Hash line) comes first and is never budgeted away, and every section keeps its heading
+/// whatever another one holds. When `definition` is absent or not an object the Definition line
+/// says so and there is no Hash line.
 /// `definition` ({name, hash}), `targets` and `params` are the recognised keys; every OTHER
 /// top-level key is listed under "Other fields", and every other key inside `definition`
-/// under "Definition fields", so no KEY the ticket binds is hidden from the reviewer (a
-/// long VALUE is cut, and the summary says so). DISPLAY-SAFE by construction: every string
-/// and key is shown JSON-escaped and ASCII-only (a newline prints as `\n`; U+202E, U+2028,
+/// under "Definition fields". A key beyond a section's entry cap or byte budget is not shown, but
+/// is counted and the section says "... and N more not shown (section limit)"; a long VALUE is
+/// cut and the summary says so. DISPLAY-SAFE by construction: every string and key is shown
+/// JSON-escaped and ASCII-only except for the ellipsis that marks a cut value (a newline prints as `\n`; U+202E, U+2028,
 /// U+2066 and every other non-ASCII character print as `\uXXXX`), and each value sits on a
 /// line that starts with a fixed label, so a value can neither start a line of its own (a
 /// second "Definition:" or "Digest:") nor reorder the text around it. Output is bounded (per
@@ -101,7 +104,8 @@ struct ApprovalRowView {
                                                   const std::string& request_digest);
 
 /// `summarize_bound_request` plus whether the summary was CUT (a value over 512 bytes, a
-/// list or section over 40 entries, or the 6000-byte total) and whether the request was
+/// section over its byte budget or 40 entries, or - never in practice, the section budgets sum
+/// to less - the 6000-byte total) and whether the request was
 /// readable at all. When `shortened`, the text itself carries a "Shortened:" line above
 /// the digest, and the row carries `data-shortened="1"` so the decision dialog does not
 /// claim the reviewer saw the whole effect.
