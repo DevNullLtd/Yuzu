@@ -1549,6 +1549,7 @@ if build_server
       'unit/server/test_capability_catalogue.cpp',
       'unit/server/test_operator_surface_twins.cpp',
       'unit/server/test_api_parity_ledger_catalogue.cpp', # every API-parity ledger mcp_twin claim vs the compiled kTools[]/kResources[]
+      'unit/server/test_twin_completeness.cpp', # every registry MCP tool is a ledger mcp_twin and has a kExpectedTwins row (shrink-only backfill sets)
       'unit/server/test_schedule_params.cpp',
       'unit/server/test_plugin_config_parsers.cpp',
       'unit/server/test_enablement_resolver.cpp',
@@ -1964,7 +1965,7 @@ if build_server
                (meson.project_source_root() / 'tests' / 'unit' / 'server' / 'golden').replace(
                    '\\', '/') +
                '"',
-               # test_api_parity_ledger_catalogue.cpp reads the committed API-parity
+               # test_api_parity_ledger_catalogue.cpp and test_twin_completeness.cpp read the committed API-parity
                # ledger (scripts/ci/api-parity/*.json) at run time; same
                # backslash-normalisation requirement as YUZU_SERVER_SRC_DIR above.
                '-DYUZU_API_PARITY_LEDGER_DIR="' +
