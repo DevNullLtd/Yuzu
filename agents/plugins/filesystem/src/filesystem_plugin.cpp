@@ -35,11 +35,14 @@
  *   path|/tmp/yuzu-XXXXXX.tmp, persist|true/false
  */
 
+#include <yuzu/agent/subprocess_runner.hpp> // run_bounded_subprocess, subprocess_cancel_requested
 #include <yuzu/plugin.hpp>
 #include <yuzu/string_utils.hpp>
 
 #include "filesystem_acl_parsers.hpp"
+#include "filesystem_find_by_hash.hpp"
 #include <atomic_file_write.hpp> // yuzu::shared::write_file_atomic
+#include <network_fstype.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -48,11 +51,13 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <regex>
 #include <sstream>
@@ -97,7 +102,11 @@
 #include <grp.h>
 #include <pwd.h>
 #include <unistd.h>
-#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (#2273)
+#include <posix_secure_read.hpp>
+#ifdef __APPLE__
+#include <sys/mount.h> // getmntinfo_r_np
+#include <sys/param.h>
+#endif
 #endif
 
 #ifdef __APPLE__
@@ -108,8 +117,8 @@ namespace {
 
 namespace fs = std::filesystem;
 
-// Maximum file size for hashing (10 GB)
-constexpr std::uintmax_t kMaxHashFileSize = 10ULL * 1024 * 1024 * 1024;
+// Maximum file size for hashing (10 GB); shared with the find_by_hash walk core.
+using yuzu::filesystem::find_by_hash::kMaxHashFileSize;
 
 // ── Path validation ─────────────────────────────────────────────────────
 
@@ -271,8 +280,9 @@ std::string compute_hash_unix(const std::string& path, std::string_view algorith
     // that SIGKILLs+reaps a wedged child (FIFO, stalled network mount, huge
     // adversarial file), and polls the process-wide shutdown-cancel latch --
     // none of which the old blocking `while(read>0)` drain + `waitpid(.,0)`
-    // could do. This is called per file inside do_find_by_hash's directory
-    // walk, so a single stalled hash must never wedge agent shutdown.
+    // could do. This is called only by file_hash (find_by_hash hashes
+    // in-process: filesystem_find_by_hash.hpp), so a single stalled hash must
+    // never wedge agent shutdown.
 
     // Resolve the hash tool's ABSOLUTE path. macOS ships shasum at a fixed
     // location; Linux coreutils live in /usr/bin on glibc distros but in
@@ -330,6 +340,77 @@ std::string compute_hash_unix(const std::string& path, std::string_view algorith
     if (space != std::string_view::npos)
         return std::string{out.substr(0, space)};
     return std::string{out};
+}
+
+#endif
+
+// ── find_by_hash network-mount list (#5624) ─────────────────────────────
+
+// The mount points find_by_hash must not touch, acquired ONCE per dispatch BEFORE any call that
+// names the caller's path: an open/stat/getdents on a dead hard-mounted server pins one of the
+// agent's shared command workers with no deadline, so the guard has to decide from a source that
+// never reads the target (the kernel's mount table; on Windows the raw path's own spelling).
+// Stacked filesystems, a bare `fuse` mount over a dead server and a mount made mid-walk are
+// disclosed residuals (#4875): this is a deny-list by filesystem name.
+#if defined(_WIN32)
+
+std::vector<std::string> find_by_hash_network_mounts(const std::string& directory) {
+    const fs::path raw = fs::path(directory).lexically_normal();
+    const std::string spelled = raw.string();
+    // A UNC root IS the mount. A drive letter is judged by its drive type: a mapped network drive
+    // (or a removable / optical one) is refused, a nonexistent drive falls through to the normal
+    // "directory is not accessible" error.
+    if (spelled.starts_with("\\\\") || spelled.starts_with("//"))
+        return {spelled};
+    if (raw.has_root_name()) {
+        const std::wstring root = raw.root_name().wstring() + L"\\";
+        const UINT type = GetDriveTypeW(root.c_str());
+        if (type == DRIVE_REMOTE || type == DRIVE_REMOVABLE || type == DRIVE_CDROM)
+            return {spelled};
+    }
+    return {};
+}
+
+#elif defined(__linux__)
+
+std::vector<std::string> find_by_hash_network_mounts(const std::string&) {
+    // /proc/self/mountinfo reports st_size 0, so the reader streams to the cap (16 MiB covers the
+    // fs.mount-max ceiling). When it cannot be read the walk runs unguarded and says so once.
+    constexpr std::size_t kMountinfoCap = 16 * 1024 * 1024;
+    const auto table = yuzu::shared::read_file_no_follow("/proc/self/mountinfo", kMountinfoCap);
+    if (!table.ok()) {
+        static std::once_flag warned;
+        std::call_once(warned, [&] {
+            spdlog::warn("filesystem find_by_hash: /proc/self/mountinfo unreadable (errno {}); "
+                         "the network-mount guard is off",
+                         table.err);
+        });
+        return {};
+    }
+    return yuzu::shared::network_mount_points(table.data);
+}
+
+#elif defined(__APPLE__)
+
+std::vector<std::string> find_by_hash_network_mounts(const std::string&) {
+    // getmntinfo_r_np(MNT_NOWAIT) answers from the kernel's cache and never calls into a server.
+    struct statfs* raw = nullptr;
+    const int n = ::getmntinfo_r_np(&raw, MNT_NOWAIT);
+    const std::unique_ptr<struct statfs, decltype(&::free)> table{raw, &::free};
+    std::vector<std::string> out;
+    if (n <= 0 || raw == nullptr)
+        return out;
+    for (int i = 0; i < n; ++i) {
+        if (yuzu::shared::is_network_mount_fstype(table.get()[i].f_fstypename))
+            out.emplace_back(table.get()[i].f_mntonname);
+    }
+    return out;
+}
+
+#else
+
+std::vector<std::string> find_by_hash_network_mounts(const std::string&) {
+    return {};
 }
 
 #endif
@@ -425,10 +506,14 @@ bool atomic_write_file(const fs::path& target, std::string_view content) {
 //     replace/write_content/append/delete_lines are pure std::filesystem /
 //     std::ifstream / std::ofstream / yuzu_create_temp_{file,dir} calls —
 //     native, in-process, every OS (rung 1).
-//   - file_hash/find_by_hash: BCryptHashData in-process on Windows (rung 1,
+//   - file_hash: BCryptHashData in-process on Windows (rung 1,
 //     compute_hash_win); on POSIX routed through
 //     yuzu::agent::run_bounded_subprocess exec'ing an ABSOLUTE-path
 //     shasum/sha256sum/sha1sum — argv, no shell (rung 2, compute_hash_unix).
+//   - find_by_hash: hashes in-process on every OS (rung 1) through a no-follow
+//     descriptor/handle — open(O_NOFOLLOW_ANY) on macOS, openat2
+//     (RESOLVE_NO_SYMLINKS) on Linux, CreateFileW(FILE_FLAG_OPEN_REPARSE_POINT)
+//     + BCrypt on Windows (filesystem_find_by_hash.hpp, #5624).
 //   - get_acl: Windows uses GetNamedSecurityInfo/DACL enumeration (native,
 //     rung 1). Linux reads the system.posix_acl_access/_default xattrs via
 //     getxattr (no libacl); macOS reads ACL_TYPE_EXTENDED via acl_get_file —
@@ -495,8 +580,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     },
     {
         "find_by_hash",
-        {YUZU_SUPPORT_SUPPORTED, 2, "std::filesystem+subprocess_runner:sha256sum", nullptr},
-        {YUZU_SUPPORT_SUPPORTED, 2, "std::filesystem+subprocess_runner:shasum", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::filesystem+sha256_nofollow_fd", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::filesystem+sha256_nofollow_fd", nullptr},
         {YUZU_SUPPORT_SUPPORTED, 1, "std::filesystem+bcrypt", nullptr},
     },
     {
@@ -2222,8 +2307,14 @@ private:
     }
 
     // ── find_by_hash: Search for a file by SHA256 hash ───────────────────
+    //
+    // A thin shell over the bounded walk in filesystem_find_by_hash.hpp (#5624). The ORDER here
+    // is part of the safety property: the mount list is acquired and the raw root refused
+    // BEFORE validate_path, whose exists/canonical would block on a dead hard mount.
 
     int do_find_by_hash(yuzu::CommandContext& ctx, yuzu::Params params) {
+        namespace fbh = yuzu::filesystem::find_by_hash;
+
         auto directory = params.get("directory");
         auto target_hash = params.get("sha256");
         auto max_depth_str = params.get("max_depth", "3");
@@ -2231,6 +2322,17 @@ private:
         if (directory.empty() || target_hash.empty()) {
             ctx.write_output("error|missing required parameters: directory, sha256");
             return 1;
+        }
+
+        auto mounts = find_by_hash_network_mounts(std::string{directory});
+        if (fbh::root_lexically_under_mount(directory, mounts)) {
+            fbh::WalkOutcome refused;
+            refused.c.skipped_network_mount = 1;
+            ctx.write_output(fbh::format_trailer(refused));
+            ctx.write_output("matches_found|0");
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  fbh::constrained_reason(refused));
+            return 0;
         }
 
         auto validated = validate_path(directory, {});
@@ -2256,46 +2358,36 @@ private:
         std::transform(target.begin(), target.end(), target.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
-        int found_count = 0;
-        constexpr int max_results = 100;
-
-        // Recursive directory walk with depth limit
-        auto base_depth = std::count(validated.begin(), validated.end(), '/') +
-                          std::count(validated.begin(), validated.end(), '\\');
-
-        for (auto it = fs::recursive_directory_iterator(validated,
-                 fs::directory_options::skip_permission_denied, ec);
-             it != fs::recursive_directory_iterator() && found_count < max_results;
-             it.increment(ec)) {
-            if (ec) continue;
-
-            const auto& entry = *it;
-            auto entry_path = entry.path().string();
-            auto depth = std::count(entry_path.begin(), entry_path.end(), '/') +
-                         std::count(entry_path.begin(), entry_path.end(), '\\') - base_depth;
-            if (depth > max_depth) {
-                it.disable_recursion_pending();
-                continue;
-            }
-
-            std::error_code fec;
-            if (!entry.is_regular_file(fec) || fec) continue;
-
-            auto file_size = entry.file_size(fec);
-            if (fec || file_size == 0 || file_size > kMaxHashFileSize) continue;
-
+        fbh::WalkEnv env;
+        env.cancelled = [] {
+            return yuzu::agent::subprocess_cancel_requested();
+        };
 #ifdef _WIN32
-            auto hash = compute_hash_win(entry_path, "sha256");
+        env.hash_entry = fbh::hash_entry_win;
+        env.can_enter = [](const fs::path& dir) {
+            std::error_code probe_ec;
+            fs::directory_iterator probe{dir, probe_ec};
+            return !probe_ec;
+        };
+        // The refusal was decided on the RAW root above; a canonical, real-cased path would not
+        // string-match it, so the walk core is handed no mount list here.
 #else
-            auto hash = compute_hash_unix(entry_path, "sha256");
+        env.hash_entry = fbh::hash_entry_posix;
+        env.can_enter = fbh::can_enter_posix;
+        // the core re-checks the canonical root and every entry against this list
+        env.network_mounts = std::move(mounts);
 #endif
-            if (!hash.empty() && hash == target) {
-                ctx.write_output(std::format("match|{}|{}", entry_path, file_size));
-                ++found_count;
-            }
-        }
 
-        ctx.write_output(std::format("matches_found|{}", found_count));
+        const auto outcome =
+            fbh::walk_find_by_hash(validated, target, max_depth, fbh::WalkLimits{}, env,
+                                   [&](const std::string& row) { ctx.write_output(row); });
+
+        if (outcome.trailer_needed())
+            ctx.write_output(fbh::format_trailer(outcome));
+        ctx.write_output(std::format("matches_found|{}", outcome.matches));
+        if (outcome.constrained())
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  fbh::constrained_reason(outcome));
         return 0;
     }
 };

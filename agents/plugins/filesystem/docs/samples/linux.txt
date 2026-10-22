@@ -1,4 +1,4 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-10-04 · euid 0 · leg-hash c8a3100adc66
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-10-04 · euid 0 · leg-hash 663ed6b835f6
 == action=exists path=/etc/hosts
 exists|true
 type|file
@@ -137,8 +137,9 @@ error|code signature verification is not supported on this platform
 [result_status] UNDECLARED / UNKNOWN / 
 [rc] 1
 
-== action=find_by_hash directory=/etc sha256=5ed49ae76ca451e9f063a9b28d11f6e8784a851e983664cb495206b75453c412
-match|/etc/hosts|177
+== action=find_by_hash directory=/etc sha256=ed9ab7f958d4c01aa81e80a108e2c69db299b3e7cd6577b286905f1ee4c47b4c
+match|/etc/hosts|413
+truncated|none|visited=1676|hashed=1922709|skipped_unreadable=0|skipped_symlink=720|skipped_not_regular=0|skipped_oversize=0|skipped_network_mount=0
 matches_found|1
 [result_status] UNDECLARED / UNKNOWN / 
 

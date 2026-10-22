@@ -757,12 +757,28 @@ kind: InstructionDefinition
 metadata:
   id: device.filesystem.find_by_hash
   displayName: Find File By SHA256 Hash
-  version: 0.3.0
+  version: 0.4.0
   description: >
     Search a directory tree for files matching a specific SHA256 hash.
     Useful for IOC hunting, malware detection, and file integrity
     verification. Walks the directory recursively up to the specified
-    depth limit. Returns matching file paths and sizes.
+    depth limit and returns matching file paths and sizes. The walk is
+    bounded: it stops after 20 seconds, 50,000 directory entries visited or
+    4 GiB hashed, and after 100 matches. A symlink is never followed (the
+    whole path on macOS and Linux 5.6 or later, the final component only on
+    older Linux kernels and on Windows), a file that is not a regular file is
+    never opened, a file over 10 GB is skipped, and a subtree on a network
+    mount is skipped before anything under it is read. When anything was
+    skipped or the walk stopped early, one trailing row
+    truncated|reason|visited=N|hashed=N|skipped_unreadable=N|skipped_symlink=N|
+    skipped_not_regular=N|skipped_oversize=N|skipped_network_mount=N says
+    what was not examined (reason is deadline, file_cap, byte_cap, cancelled,
+    max_results, or none when only individual entries were skipped); a clean
+    run writes no such row. The result is reported as constrained and partial
+    when a bound tripped, an entry could not be read, or a network mount was
+    skipped. Only the shutdown signal cancels a running search; there is no
+    per-command cancel. A path whose last character is a backslash is
+    reported with a forward slash in its place.
   tags: [filesystem, security, ioc, compliance, hash]
 
 spec:
@@ -804,22 +820,25 @@ spec:
           maximum: 10
 
   result:
+    # match|<path>|<size>
+    # truncated|<reason>|visited=N|hashed=N|skipped_unreadable=N|skipped_symlink=N|skipped_not_regular=N|skipped_oversize=N|skipped_network_mount=N   (only when something was skipped or the walk stopped early)
+    # matches_found|<count>   (always last)
     columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator (the wire row''s leading tag). Values: match (one per file whose SHA-256 equals the target), truncated (at most one, only when something was skipped or the walk stopped early), matches_found (exactly one, always last).'
+        values: [match, truncated, matches_found]
+        example: match
+        platforms: [windows, linux, darwin]
       - name: path
         type: string
-        description: 'Full path of a file whose SHA-256 matches the target hash. Values: free text (path).'
+        description: 'match rows: full path of a file whose SHA-256 matches the target hash. truncated rows: why the walk stopped early (deadline, file_cap, byte_cap, cancelled, max_results) or none when it ran to the end and only individual entries were skipped. matches_found rows: the total number of matching files.'
         example: "C:\\Windows\\System32\\drivers\\etc\\hosts"
         platforms: [windows, linux, darwin]
       - name: size
-        type: int64
-        description: "Matching file's size in bytes. Values: integer (bytes)."
+        type: string
+        description: 'match rows: the matching file''s size in bytes (path and size are the second and third fields). truncated rows: the REMAINDER of the row as one string, visited=N|hashed=N|skipped_unreadable=N|skipped_symlink=N|skipped_not_regular=N|skipped_oversize=N|skipped_network_mount=N (counts of entries not examined; escaped pipes kept as written). matches_found|N is a two-field summary row with no size field; column matchers do not treat it as a data row.'
         example: "1405"
-        platforms: [windows, linux, darwin]
-      - name: matches_found
-        type: int32
-        description: >-
-          Total number of matching files found, repeated on the trailing summary row. Values: integer.
-        example: "1"
         platforms: [windows, linux, darwin]
 
   readablePayload: "Find files with SHA256 ${sha256} in ${directory}"

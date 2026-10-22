@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-04 · LocalSystem (elevated) · leg-hash c8a3100adc66
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-04 · LocalSystem (elevated) · leg-hash 663ed6b835f6
 == action=exists path=C:\Windows\System32\drivers\etc\hosts
 exists|true
 type|file

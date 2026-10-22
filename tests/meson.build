@@ -255,6 +255,8 @@ agent_test_exe = executable(
     'unit/test_filesystem_read.cpp',
     'unit/test_filesystem_actions.cpp',
     'unit/test_filesystem_local_dispatcher.cpp', # #4728: real filesystem plugin via LocalDispatcher -- `replace` through the shared atomic write
+    'unit/test_filesystem_find_by_hash.cpp',  # #5624: pure find_by_hash walk core (limits, injected clock/cancel/hasher) + real no-follow fd hasher over TempDir
+    'unit/test_filesystem_find_by_hash_dispatcher.cpp',  # #5624: real filesystem plugin via LocalDispatcher -- byte-identical clean output, trailer + CONSTRAINED/PARTIAL
     'unit/test_confined_fs_rules.cpp',
     'unit/test_confined_fs_walk.cpp',
     'unit/test_confined_fs_posix.cpp',
