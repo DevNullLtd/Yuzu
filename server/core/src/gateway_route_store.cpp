@@ -168,14 +168,13 @@ const std::vector<pg::PgMigration>& GatewayRouteStore::migrations() {
     // lease_until are nullable — unknown at register-time, filled in later by
     // announce_connected.
     //
-    // The `session_id` index is load-bearing, not cosmetic: renew_leases() is
-    // the highest-frequency op (once per BatchHeartbeat batch) and (#4246 #10)
-    // joins against it via `r.session_id = t.session_id` (correlated with
-    // `agent_id` too, but `agent_id` is already the primary key), and
-    // deregister() filters on session_id too; without the index those are a
-    // seq scan of agent_routes per heartbeat tick, which grows with fleet
-    // size (governance perf/sre, WS-4 4.1). It ships in migration v1 because
-    // adding it later costs a second migration version.
+    // The `session_id` index is load-bearing, not cosmetic: lookup_by_sessions()
+    // (`session_id = ANY($1)`) and reclaim_tombstoned_session's cross-agent
+    // check are keyed on it; renew_leases() and deregister() also constrain
+    // `agent_id` (the primary key), so they do not depend on it. Migration v1
+    // shipped it NON-unique; v5 (#5683) replaced it with the UNIQUE partial
+    // `ux_agent_routes_session_id`, so a session id is now held by at most one
+    // row and a concurrent cross-agent adopt is serialised by the database.
     static const std::vector<pg::PgMigration> kMigrations = {
         {1,
          R"(
@@ -216,6 +215,44 @@ ALTER TABLE agent_routes ADD COLUMN stream_home_id TEXT;
         {4, R"(
 ALTER TABLE agent_routes ADD COLUMN home_cluster_id TEXT;
 )"},
+        // v5 (#5683): `session_id` becomes UNIQUE (partial: a tombstone's NULL
+        // is excluded), closing the READ COMMITTED window in which two agents
+        // adopting one unheld id both won. ACCESS EXCLUSIVE is taken FIRST (not
+        // a weaker mode upgraded later: DROP INDEX needs it, and an upgrade can
+        // deadlock against another replica's read-then-write txn) so no writer
+        // can commit a new duplicate between the dedup and the build. Every row
+        // of a duplicate group is tombstoned (the five placement columns NULLed,
+        // `connection_epoch` and `home_cluster_id` kept - the shape `deregister`
+        // writes): a group has no determinable owner, and each agent recovers
+        // through the existing renew -> reclaim replay, where the first reclaimer
+        // wins. The count is left in route_meta for the constructor to report.
+        // A plain (transactional) CREATE UNIQUE INDEX blocks writers while it
+        // builds: the accepted exception to ADR-0008's non-transactional rule
+        // recorded in ADR-0053 "Update (2026-10-20)" (no rolling upgrade yet).
+        // statement_timeout is lifted for the build; lock_timeout bounds the wait,
+        // on expiry the migration rolls back, boot is refused and a restart retries.
+        {5, R"(
+SET LOCAL lock_timeout = '30s';
+SET LOCAL statement_timeout = 0;
+LOCK TABLE agent_routes IN ACCESS EXCLUSIVE MODE;
+WITH dup AS (
+    SELECT session_id FROM agent_routes
+    WHERE session_id IS NOT NULL
+    GROUP BY session_id HAVING count(*) > 1
+), tomb AS (
+    UPDATE agent_routes
+    SET session_id = NULL, lease_until = NULL, cluster_id = NULL,
+        gateway_node = NULL, stream_home_id = NULL, updated_at = now()
+    WHERE session_id IN (SELECT session_id FROM dup)
+    RETURNING 1
+)
+INSERT INTO route_meta (key, value)
+SELECT 'v5_session_dedup_tombstoned_rows', count(*)::text FROM tomb
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+CREATE UNIQUE INDEX ux_agent_routes_session_id
+    ON agent_routes (session_id) WHERE session_id IS NOT NULL;
+DROP INDEX agent_routes_session_id_idx;
+)"},
     };
     return kMigrations;
 }
@@ -230,10 +267,30 @@ GatewayRouteStore::GatewayRouteStore(pg::PgPool& pool) : pool_(pool) {
                       pool_.last_error());
         return;
     }
+    const int version_before = pg::PgMigrationRunner::current_version(lease.get(), kStoreName);
     if (!pg::PgMigrationRunner::run(lease.get(), kStoreName, migrations())) {
         spdlog::error("GatewayRouteStore: schema migration failed — gateway route directory "
                       "disabled");
         return;
+    }
+    if (version_before >= 0 && version_before < 5) {
+        // v5 (#5683) left its tombstone count in route_meta. Counts only: a
+        // session id is gateway-asserted identity and is never logged here.
+        pg::PgResult meta = pg::exec_params(
+            lease.get(),
+            "SELECT value FROM gateway_route_store.route_meta "
+            "WHERE key = 'v5_session_dedup_tombstoned_rows'",
+            std::vector<std::optional<std::string>>{});
+        if (meta.status() == PGRES_TUPLES_OK && PQntuples(meta.get()) == 1) {
+            const char* v = PQgetvalue(meta.get(), 0, 0);
+            std::from_chars(v, v + std::char_traits<char>::length(v), boot_session_dedup_rows_);
+            if (boot_session_dedup_rows_ > 0) {
+                spdlog::warn("GatewayRouteStore: migration v5 tombstoned {} agent_routes row(s) "
+                             "that shared a session id (each affected agent re-establishes its "
+                             "route through the normal renew/reclaim replay)",
+                             boot_session_dedup_rows_);
+            }
+        }
     }
     open_ = true;
     // ADR-0009 fresh-start-by-default: born on Postgres, no legacy SQLite

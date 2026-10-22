@@ -867,16 +867,24 @@ public:
     [[nodiscard]] std::expected<ReapRoutesResult, GatewayRouteStoreError>
     reap_stale_routes();
 
-    /// The schema migrations for this store (version 4: v1 the `agent_routes`
+    /// The schema migrations for this store (version 5: v1 the `agent_routes`
     /// table, v2 the `route_meta` reaper-anchor table, v3 the nullable
     /// `stream_home_id` column — SLICE #4324, v4 the nullable
-    /// `home_cluster_id` column — #4669). Exposed for tests and the migration
-    /// ladder.
+    /// `home_cluster_id` column — #4669, v5 the UNIQUE partial index on
+    /// `session_id` with a one-time dedup — #5683). Exposed for tests and the
+    /// migration ladder.
     static const std::vector<pg::PgMigration>& migrations();
+
+    /// Rows migration v5 tombstoned in THIS construction because they shared a
+    /// session id (#5683); 0 when v5 did not run here or found no duplicate.
+    [[nodiscard]] std::int64_t boot_session_dedup_rows() const noexcept {
+        return boot_session_dedup_rows_;
+    }
 
 private:
     pg::PgPool& pool_;
     bool open_{false};
+    std::int64_t boot_session_dedup_rows_{0};
 };
 
 } // namespace yuzu::server
