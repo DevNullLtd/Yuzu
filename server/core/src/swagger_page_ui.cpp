@@ -198,17 +198,23 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
     var alts = d.oneOf || d.anyOf;
     if (alts && alts.length) {
       var akids = [h('div', 'sw-schema-head', [pill(d.oneOf ? 'one of' : 'any of', 'info mono'), d.description ? h('span', 'mut', [d.description]) : null])];
+      // Properties declared beside the alternatives apply to every option; show them first.
+      var shared = d.properties ? schemaRows(s, 0, [], false, [], 0) : [];
+      if (shared.length) akids.push(tableWrap(shared));
       alts.forEach(function (a, i) { akids.push(h('div', 'sw-alt', [h('h3', '', ['Option ' + (i + 1)]), schemaBlock(a)])); });
       return h('div', '', akids);
     }
     var head = h('div', 'sw-schema-head', [pill(label(s), 'info mono'), d.description ? h('span', 'mut', [d.description]) : null]);
     var rows = schemaRows(s, 0, [], false, [], 0);
     if (!rows.length) return h('div', '', [head]);
+    return h('div', '', [head, tableWrap(rows)]);
+  }
+  function tableWrap(rows) {
     var table = h('table', '', [
       h('thead', '', [h('tr', '', ['Property', 'Type', '', 'Description'].map(function (t) { return h('th', '', [t]); }))]),
       h('tbody', '', rows)
     ]);
-    return h('div', '', [head, h('div', 'tw sw-tw', [table])]);
+    return h('div', 'tw sw-tw', [table]);
   }
 
   function paramsTable(list) {
@@ -510,7 +516,7 @@ extern const char* const kSwaggerJs2 = R"SWG(    }
     if (ctl) opts.signal = ctl.signal;
     fetch(SPEC_URL, opts)
       .then(function (r) {
-        clearTimeout(timer);
+        // The timer stays armed until the body is read, so a stalled body also reaches Retry.
         if (r.ok) return r.json();
         return r.json().then(function (j) { return j; }, function () { return null; }).then(function (j) {
           var e = new Error('The API description could not be loaded (HTTP ' + r.status + ').');
@@ -519,7 +525,7 @@ extern const char* const kSwaggerJs2 = R"SWG(    }
           throw e;
         });
       })
-      .then(function (j) { spec = j; build(); })
+      .then(function (j) { clearTimeout(timer); spec = j; build(); })
       .catch(function (e) {
         clearTimeout(timer);
         var msg = e && e.name === 'AbortError' ? 'The API description took too long to load.' : (e && e.message ? e.message : 'The API description could not be loaded.');

@@ -28,6 +28,10 @@ class E {
     this.hidden = false; this.className = ''; this.L = {}; this.value = ''; this.selectedIndex = 0; this.id = ''; }
   get textContent() { return this._t + this.children.map(c => c.textContent).join(''); }
   set textContent(v) { this._t = String(v); this.children = []; }
+  set innerHTML(v) { throw new Error('innerHTML was assigned'); }
+  get innerHTML() { throw new Error('innerHTML was read'); }
+  set outerHTML(v) { throw new Error('outerHTML was assigned'); }
+  insertAdjacentHTML() { throw new Error('insertAdjacentHTML was called'); }
   get lastChild() { return this.children[this.children.length - 1] || null; }
   appendChild(c) { c.parentNode = this; this.children.push(c); return c; }
   insertBefore(c, ref) { c.parentNode = this; const i = this.children.indexOf(ref); this.children.splice(i < 0 ? this.children.length : i, 0, c); return c; }
@@ -70,7 +74,10 @@ const spec = {
         responses: R({ content: { 'application/json': { schema: { oneOf: [{ $ref: '#/components/schemas/Thing' }, { type: 'object', properties: { z: { type: 'string' } } }] } } } }) } },
     '/b': { get: { operationId: 'getB', summary: 'untyped', tags: ['Beta'], responses: R() } },
     '/gone': { delete: { operationId: 'deleteGone', summary: 'unserved', tags: ['Beta'], 'x-yuzu-unavailable': 'Not served by this build.', responses: R() } },
-    '/v2/agent/plugin-policy': { get: { operationId: 'getV2', summary: 'v2', tags: ['Beta'], responses: R() } }
+    '/v2/agent/plugin-policy': { get: { operationId: 'getV2', summary: 'v2', tags: ['Beta'], responses: R() } },
+    '/c': { post: { operationId: 'postC', summary: 'shared', tags: ['Beta'], responses: R(),
+        requestBody: { content: { 'application/json': { schema: { type: 'object', properties: { source: { type: 'string', description: 'shared field' } },
+          oneOf: [{ type: 'object', properties: { id: { type: 'string' } } }, { type: 'object', properties: { group: { type: 'string' } } }] } } } } } }
   },
   components: { schemas: { Thing: { type: 'object', required: ['id'], properties: { id: { type: 'string' }, n: { type: 'integer', nullable: true } } } } }
 };
@@ -107,6 +114,9 @@ const out = {};
   out.unavailable_note = goneRow.textContent.includes('Not served by this build.');
   const v2Row = rows.filter(r => r.textContent.includes('/v2/agent/plugin-policy'))[0]; v2Row.byClass('sw-op-h')[0].click();
   out.v2_curl = v2Row.byTag('pre')[0].textContent.includes('https://yuzu.test/api/v2/agent/plugin-policy');
+  const sharedRow = rows.filter(r => r.textContent.includes('shared'))[0]; sharedRow.byClass('sw-op-h')[0].click();
+  out.shared_props_shown = sharedRow.textContent.includes('shared field');
+  out.shared_alts = sharedRow.byClass('sw-alt').length;
   out.deep_link_hash = location.hash;
   // failure view: 403 with a correlation id, then Retry fetches again and renders
   root.textContent = '';
@@ -163,7 +173,7 @@ def main():
 
     check(out["loaded_url"] == "/api/v1/openapi.json?guides=true", "loads the full document with guides: %r" % out["loaded_url"])
     check(out["panels"] == 2, "one panel per group, got %r" % out["panels"])
-    check(out["rows"] == 5, "one row per operation, got %r" % out["rows"])
+    check(out["rows"] == 6, "one row per operation, got %r" % out["rows"])
     check(out["malformed_hash_survived"], "a malformed URL fragment took the page down")
     for pill in ("typed", "untyped", "unavailable"):
         check(pill in out["pills"], "missing %s pill" % pill)
@@ -173,6 +183,7 @@ def main():
     check(out["guide_text"], "guide text missing after opening")
     check(out["beta_has_guide_button"] == 0, "a group without a guide must not get a Guide button")
     check(out["oneof_options"] == 2 and out["oneof_tables"] >= 2, "oneOf must render both alternatives as tables")
+    check(out["shared_props_shown"] and out["shared_alts"] == 2, "properties declared beside oneOf must be shown with both options")
     check(out["unavailable_note"], "unavailable note missing from the detail view")
     check(out["v2_curl"], "the v2 route's curl line must use /api/v2")
     check(out["deep_link_hash"].startswith("#"), "opening an operation should set a fragment")
@@ -185,7 +196,7 @@ def main():
         for e in errors:
             print("  -", e)
         return 1
-    print("swagger page behaviour: OK (%d checks)" % 16)
+    print("swagger page behaviour: OK")
     return 0
 
 
