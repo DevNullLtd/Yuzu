@@ -102,6 +102,7 @@
 #include "on_behalf_guard.hpp"
 #include "principal_class.hpp"
 #include "principal_quota_gate.hpp"
+#include "same_site_write_gate.hpp" // cookie-session writes require a same-site Origin or Referer
 #include "rest_a4_envelope_http.hpp"
 #include "inventory_store.hpp"
 #include "app_perf_daily_store.hpp"
@@ -806,6 +807,17 @@ public:
             for (auto reason : {"foreign_ca", "agent_id_missing", "agent_id_mismatch"})
                 metrics_.counter("yuzu_ota_identity_audit_suppressed_total",
                                  {{"rpc", rpc}, {"reason", reason}});
+
+        // registry.write audit evidence NOT recorded (plugin_result_audit.hpp). Pre-seeded so an
+        // alert or dashboard sees zero, not "no data". Units differ by reason: rows for
+        // `suppressed` (refused by the per-agent budget) and `persist_failed`; whole frames for
+        // `unmintable_id` (ignored) and `truncated` (a bound was hit).
+        metrics_.describe("yuzu_server_registry_audit_dropped_total",
+                          "registry.write audit evidence not recorded, by reason: rows for "
+                          "suppressed and persist_failed, frames for unmintable_id and truncated",
+                          "counter");
+        for (auto reason : {"suppressed", "persist_failed", "unmintable_id", "truncated"})
+            metrics_.counter("yuzu_server_registry_audit_dropped_total", {{"reason", reason}});
 
         metrics_.describe("yuzu_ota_download_peers_tracked",
                           "Peers currently tracked by the OTA admission map", "gauge");
@@ -1897,6 +1909,23 @@ public:
                 metrics_.counter("yuzu_body_cap_rejected_total",
                                  {{"path_class", std::string(entry.path_class)},
                                   {"reason", "unmeasurable"}});
+            }
+        }
+        // Cookie-session writes refused by the pre-routing same-site gate.
+        // Bounded labels only: path_class from kBodyCapTable (never the raw
+        // path) x the closed reason set; pre-seeded so absent() alerts stay
+        // meaningful (docs/observability-conventions.md). Re-seeding a
+        // path_class shared by several table rows is idempotent.
+        metrics_.describe("yuzu_server_csrf_denied_total",
+                          "Cookie-session writes refused by the pre-routing same-site gate, by "
+                          "route class and reason (no_origin_no_referer, origin_mismatch, "
+                          "referer_mismatch, gate_error)",
+                          "counter");
+        for (const auto& entry : yuzu::server::kBodyCapTable) {
+            for (const auto reason : yuzu::server::kSameSiteDenyReasons) {
+                metrics_.counter("yuzu_server_csrf_denied_total",
+                                 {{"path_class", std::string(entry.path_class)},
+                                  {"reason", std::string(reason)}});
             }
         }
         for (auto reason : {"client_disconnect", "superseded", "session_terminated",
@@ -4962,8 +4991,17 @@ public:
                               "(database reachable but the gateway_route_store schema could not "
                               "be created/opened)");
                 startup_failed_ = true;
-            } else if (gateway_service_) {
-                gateway_service_->set_gateway_route_store(gateway_route_store_.get());
+            } else {
+                // #5683: pre-seeded so a boot that deduped nothing reads 0, not absent.
+                metrics_.describe("yuzu_server_gateway_route_session_dedup_total",
+                                  "agent_routes rows tombstoned at boot by migration v5 because "
+                                  "they shared a session id; the affected agents re-register "
+                                  "through the normal replay. Expected 0.",
+                                  "counter");
+                metrics_.counter("yuzu_server_gateway_route_session_dedup_total")
+                    .increment(static_cast<double>(gateway_route_store_->boot_session_dedup_rows()));
+                if (gateway_service_)
+                    gateway_service_->set_gateway_route_store(gateway_route_store_.get());
             }
         }
 
@@ -5662,7 +5700,7 @@ public:
         {
             if (pg_pool_ && !startup_failed_) {
                 audit_store_ =
-                    std::make_unique<AuditStore>(*pg_pool_, cfg_.audit_retention_days);
+                    std::make_shared<AuditStore>(*pg_pool_, cfg_.audit_retention_days);
                 if (!audit_store_->is_open()) {
                     spdlog::error("[PG] Refusing to start: audit store migration/open failed "
                                   "(database reachable but the audit_store schema could not be "
@@ -6322,6 +6360,10 @@ public:
         // agent reached us.
         if (audit_store_ && audit_store_->is_open()) {
             agent_service_.set_audit_store(audit_store_.get());
+            // Weak and write-once: see AgentServiceImpl::set_registry_audit_store. Not cleared in
+            // stop() (clearing a weak_ptr concurrently with lock() is a data race); the owner's
+            // reset() below expires it.
+            agent_service_.set_registry_audit_store(audit_store_);
             if (gateway_service_) {
                 gateway_service_->set_audit_store(audit_store_.get());
             }
@@ -11063,6 +11105,26 @@ public:
         // strictly after the pre-existing capture targets, so its dangle
         // window is a subset of theirs; same envelope, not widened).
         //
+        // `audit_store_` is NOT in that enumeration. The `registry.write` hook
+        // (plugin_result_audit.hpp; process_gateway_response runs it on these same
+        // forwarder threads) takes the analytics_store_ treatment below for the OBJECT:
+        // shared_ptr here, a weak_ptr in agent_service_ locked per frame and only for a
+        // frame that owes audit rows, set once at wiring and never cleared. That is NOT
+        // enough for the pg::PgPool& the store borrows. analytics_store_'s emit() does one
+        // lease and one INSERT, so a latch that refuses new entrants leaves a gap of one
+        // write; the registry hook holds its strong reference across up to 300 synchronous
+        // writes, each of which leases the pool, so a forwarder BETWEEN two rows is
+        // invisible to ~PgPool and would lease a pool being destroyed. The hook therefore
+        // runs inside a rundown gate (rundown_gate.hpp): it enters before it locks the
+        // store and checks the gate before every row, and the stage right before
+        // audit_store_.reset() below closes the gate and waits for the hooks inside, so the
+        // store and the pool are not reset while any hook is inside (a row already past its
+        // check may still lease, and the wait covers it). The retention thread is not
+        // part of this: audit_store_->stop_cleanup() joined it well above, so
+        // ~AuditStore has nothing left to join wherever it runs. What stays #3279's is the
+        // detached thread itself, agent_service_ (`this`) and metrics_; this gate is the
+        // hook's own and goes when #3279 joins the forwarders.
+        //
         // HA WS-4 4.3 (cpp-safety Gate 3, pre-push): #3279's reach set also
         // now includes a raw `Stub*` resolved from gw_mgmt_pool_
         // (GatewayMgmtStubPool::resolve(), captured per-command into the same
@@ -11113,7 +11175,8 @@ public:
         // deploy/systemd/yuzu-server.service TimeoutStopSec). 60s here,
         // run CONCURRENTLY for both stores below (not sequentially, which
         // would double the worst case), brings the documented stacked total
-        // to ~115s - comfortably inside 210s, with real headroom over the
+        // to ~115s (~130s with the 15s registry.write rundown stage further
+        // down) - comfortably inside 210s, with real headroom over the
         // "a handful of pending deliveries" case above. Update
         // upgrading.md's stacked-bound section if this constant changes.
         // This bound is exactly as heuristic, and exactly as unproven, as
@@ -11161,7 +11224,8 @@ public:
                 // this file's own comment above computes assumed the
                 // concurrent case. Worst case here is ~60s (this call) +
                 // ~60s (webhook, next) = ~120s added to the pre-existing
-                // ~55s stack = ~175s, still inside the shipped 210s
+                // ~55s stack = ~175s (~190s with the 15s registry.write
+                // rundown stage further down), still inside the shipped 210s
                 // stop_grace_period/TimeoutStopSec - not a real risk, but
                 // only reachable by genuine thread-creation exhaustion at
                 // shutdown, which is itself already a degraded state.
@@ -11284,6 +11348,44 @@ public:
         // needs to run before auth_key_provider_/audit_store_.
         crl_publisher_.reset();
         auth_key_provider_.reset();
+        // The registry.write audit hook (agent_service_impl.cpp, audit_registry_frame) runs on
+        // the detached forwarder threads of #3279 and holds the audit store across up to 300
+        // writes that each lease pg_pool_. Close its gate (no later frame enters, and one
+        // already inside stops before its next row), then wait for the hooks that are inside
+        // to leave: only then is it safe to reset the store and, below, the pool. Late on
+        // purpose, so the frames that arrive during the delivery drain above are still
+        // audited. 15s is the 4s lease wait (`kWriteTimeout`, audit_store.cpp) and 1s of
+        // slack, plus the 10s connect that a lease started just inside that deadline may still run
+        // (PgPool::Options::connect_timeout_s, the default when the DSN sets none): a DSN
+        // with a longer connect_timeout, or a host list, can keep a started connect past
+        // this bound, and so can a row whose INSERT is already running and waits on a lock
+        // (PgPool::Options::statement_timeout_ms, 30s by default). The force-exit below then
+        // ends a healthy-but-slow shutdown the way it ends a wedged database. On timeout:
+        // force-exit, the same choice as the
+        // web_thread_ and delivery-queue stages and for the same reason. Continuing past a
+        // hook that is still inside reopens exactly the use-after-free this gate closes (see
+        // the leak-and-continue discussion above), and nothing durable is lost: state is in
+        // Postgres, and this is strictly no worse than the supervisor's SIGKILL.
+        // If this constant changes, change the "within 15s" message below and the 15 s and
+        // ~130 s / ~190 s figures in upgrading.md, server-admin.md, audit-log.md, the
+        // changelog fragment and the resource ledger; the static gate pins the value.
+        static constexpr auto kRegistryAuditRundownBound = std::chrono::seconds(15);
+        agent_service_.close_registry_audit();
+        spdlog::info("Shutting down server: waiting up to {}s for a registry.write audit write "
+                     "in flight...",
+                     kRegistryAuditRundownBound.count());
+        if (!agent_service_.wait_registry_audit_idle(kRegistryAuditRundownBound)) {
+            // Same idiom as the stages above: spdlog would be legal here, the raw write()
+            // stays because _Exit() skips any buffered sink flush.
+            const char msg[] = "ServerImpl::stop: a registry.write audit write did not finish "
+                               "within 15s - force-exiting.\n";
+#ifdef _WIN32
+            _write(2, msg, sizeof(msg) - 1);
+#else
+            (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#endif
+            std::_Exit(1);
+        }
         audit_store_.reset();
         // TagStore (ADR-0050) borrows pg_pool_ — unwire the borrowed raw
         // pointer from agent_service_ (the Register sync_agent_tags ingest —
@@ -15377,6 +15479,24 @@ private:
                     // validated key so it can say "Sign in to open <area>."
                     res.set_redirect(home_ui::sign_in_location(req.path));
                 }
+                return httplib::Server::HandlerResponse::Handled;
+            }
+
+            // Cookie-session writes require a same-site Origin or Referer. ONE
+            // chokepoint: the decision keys on the RESOLVED session's
+            // auth_source (token sources are exempt), never on header presence.
+            // The audit row is stamped from the session held here (never a
+            // second resolve_session), and the counter and the A4 body live in
+            // same_site_write_gate.hpp. A refusal happens after authentication
+            // and before step-up evaluation and any route handler. Exemptions
+            // are by placement: is_login_exempt_path, the probes and the metrics
+            // endpoint return above, before resolve_session. Never add another
+            // early Unhandled beyond the pinned exempt returns. The web listener's
+            // TLS state (cfg_.https_enabled) selects the scheme-aware same-host
+            // comparison. Invariants: the header banner of same_site_write_policy.hpp.
+            if (detail::apply_same_site_write_gate(req, res, *session, cfg_.csrf_trusted_origins,
+                                                   cfg_.https_enabled, metrics_,
+                                                   same_site_audit_fn_)) {
                 return httplib::Server::HandlerResponse::Handled;
             }
 
@@ -22582,7 +22702,9 @@ private:
     /// Born-on-PG campaign persistence for Periodic Access Reviews (SOC 2 CC6.2).
     /// Borrows pg_pool_ → declared after it; reset in stop() before the pool.
     std::unique_ptr<AccessReviewStore> access_review_store_;
-    std::unique_ptr<AuditStore> audit_store_;
+    /// SHARED so the `registry.write` hook can hold it weakly (set_registry_audit_store): a
+    /// detached forwarder thread (#3279) that locks it keeps it alive for its own call.
+    std::shared_ptr<AuditStore> audit_store_;
     /// #5342: one-transaction credential-change query owner. Borrows pg_pool_
     /// and audit_store_ — declared AFTER audit_store_ so it destructs first;
     /// stop() also resets it explicitly (after nulling auth_mgr_'s pointer)
@@ -22728,6 +22850,19 @@ private:
     std::mutex peer_serial_cache_mu_;
     std::unordered_map<std::string, std::string> peer_serial_cache_;
     std::unique_ptr<AuthRoutes> auth_routes_;
+    // The csrf.denied sink for the pre-routing same-site gate: stamps the principal the
+    // gate already holds (never a second resolve_session). Initialised here, not in a
+    // constructor body, so it can never be empty (an empty function reads as audit-off
+    // to try_persist_audit_for_principal); it reads auth_routes_ at call time.
+    // Capturing `this` is safe: the only caller is the web server's pre-routing handler, and
+    // stop() joins web_thread_ before any member is destroyed (as for mcp_sessions_).
+    detail::SameSitePrincipalAuditFn same_site_audit_fn_ =
+        [this](const httplib::Request& r, const std::string& action, const std::string& result,
+               const detail::SameSiteAuditPrincipal& p, const std::string& tt,
+               const std::string& tid, const std::string& d) {
+            return auth_routes_->audit_log_for_principal(r, action, result, p.id, p.role, tt, tid,
+                                                         d, p.cls);
+        };
     std::unique_ptr<RestApiV1> rest_api_v1_;
     std::unique_ptr<SettingsRoutes> settings_routes_;
     std::unique_ptr<mcp::McpServer> mcp_server_;

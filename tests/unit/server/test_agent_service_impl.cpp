@@ -48,6 +48,7 @@
 #include "response_store.hpp"
 #include "test_auth_db_pg_helper.hpp" // WS-6 6.2: enrollment state is PG-backed
 #include "test_offload_target_store_pg_helper.hpp"
+#include "test_tracker_scope.hpp"
 #include "test_webhook_store_pg_helper.hpp"
 #include "typed_inventory_sources.hpp"
 #include "update_registry.hpp"
@@ -86,6 +87,7 @@ using yuzu::server::WebhookStore;
 using yuzu::server::detail::AgentRegistry;
 using yuzu::server::detail::AgentServiceImpl;
 using yuzu::server::detail::EventBus;
+using yuzu::test::TrackerScope;
 using yuzu::server::auth::PendingTransitionOutcome;
 using yuzu::server::pg::PgPool;
 namespace pg = yuzu::server::pg;
@@ -196,58 +198,10 @@ struct GatewayResponseHarness {
 // Bare GatewayResponseHarness leaves execution_tracker_ at nullptr, so the
 // entire notify_exec_tracker body (5-status enum mapping, empty-execution_id
 // early-return, null-tracker early-return) was dead in test. TrackerScope
-// constructs a real in-memory ExecutionTracker and wires it via
+// (test_tracker_scope.hpp) constructs a real ExecutionTracker and wires it via
 // set_execution_tracker; destruction order is managed so the borrowed pointer
 // in svc is nulled before the tracker destructs (mirrors the production
-// shutdown contract documented at agent_service_impl.hpp:113).
-
-namespace {
-
-/// MEMBER ORDER LOAD-BEARING: `tracker` is owned outright (against the
-/// caller-supplied pool), `svc` borrows `tracker.get()` (via
-/// `set_execution_tracker`). The dtor MUST run set_execution_tracker(nullptr)
-/// → tracker.reset(), in that exact order, so the borrowed-pointer chain is
-/// unwound from the outside in. Reordering the member declarations or
-/// replacing the user-defined dtor with `= default` would silently break the
-/// contract — there is no compile-time guard. Mirrors the production
-/// ServerImpl "drain gRPC → null setter → reset" shutdown sequence at
-/// agent_service_impl.hpp:113.
-struct TrackerScope {
-    std::unique_ptr<yuzu::server::ExecutionTracker> tracker;
-    AgentServiceImpl* svc{nullptr};
-
-    TrackerScope(AgentServiceImpl& s, yuzu::server::pg::PgPool& pool) : svc(&s) {
-        tracker = std::make_unique<yuzu::server::ExecutionTracker>(pool);
-        REQUIRE(tracker->is_open());
-        svc->set_execution_tracker(tracker.get());
-    }
-    ~TrackerScope() {
-        if (svc)
-            svc->set_execution_tracker(nullptr);
-        tracker.reset();
-    }
-
-    TrackerScope(const TrackerScope&) = delete;
-    TrackerScope& operator=(const TrackerScope&) = delete;
-
-    /// Create an execution row on the bound tracker, return its id. Matches
-    /// the `GatewayResponseHarness::make_response` static-factory pattern —
-    /// keeps test bodies focused on the assertion, not boilerplate. Call
-    /// sites read `auto exec_id = ts.make_exec();`.
-    std::string make_exec(int agents_targeted = 1) {
-        yuzu::server::Execution exec;
-        exec.definition_id = "def-test";
-        exec.scope_expression = "agent_id = 'agent-1'";
-        exec.dispatched_by = "tester";
-        exec.status = "running";
-        exec.agents_targeted = agents_targeted;
-        auto id = tracker->create_execution(exec);
-        REQUIRE(id.has_value());
-        return *id;
-    }
-};
-
-} // namespace
+// shutdown contract documented on AgentServiceImpl::set_execution_tracker).
 
 // ── record_execution_id ────────────────────────────────────────────────────
 

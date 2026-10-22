@@ -25,7 +25,7 @@ on:
     # allow-list on the reasoning that "post-merge docs pushes need no build and
     # gate nothing" — but a release commit is often changelog-only, and with no
     # run on it the six required contexts never appeared on the commit the
-    # release tags (v0.14.0's 50a81af91). Now every push runs, and preflight's
+    # release tags (v0.14.0's 50a81af91). Now every push runs, and preflight-gate's
     # `code_changed` output skips the heavy build jobs when the push changed
     # only the docs set, exactly as on a PR; the build legs' required names then
     # come from the `docs-required-checks` stub. That skip is fail-closed and
@@ -40,7 +40,7 @@ on:
     # backward-compat, Linux/Windows/macOS debug) permanently "Expected —
     # waiting for status", so a non-admin could never merge a docs-only PR
     # (they had to be admin-bypassed). Instead the workflow always runs and
-    # the `preflight` job's `code_changed` output gates the heavy build jobs:
+    # the `preflight-gate` job's `code_changed` output gates the heavy build jobs:
     # a docs-only PR skips them, and a *skipped* required check is satisfied
     # whereas an *absent* one is not. The `push:` trigger above now does the
     # same (#5320).
@@ -118,7 +118,7 @@ env:
 jobs:
   # The reusable-workflow entry point is intentionally protected by a
   # repository-only secret. Ordinary pull_request runs still perform the
-  # fail-closed fork check in preflight; only trusted-fork-ci.yml can invoke
+  # fail-closed fork check in preflight-gate; only trusted-fork-ci.yml can invoke
   # this workflow against a fork SHA with secrets available.
   trusted_inputs:
     name: "Validate trusted CI inputs"
@@ -263,6 +263,25 @@ jobs:
           echo "Trusted execution approved for $head_repo PR #$PR_NUMBER @ $head_sha"
 
   # ── Preflight: runner-health gate (PR-7 of CI overhaul plan) ──────────
+  # Split in two so the compile jobs start after the short gate job instead of
+  # waiting for the whole serial preflight:
+  #
+  #   preflight-gate  ("Preflight (gate)", hosted, fast) holds everything the
+  #     downstream jobs consume: the docs-only/code classification, the
+  #     runner-pool health probe, and the outputs block. proto-compat, linux,
+  #     windows, macos and docs-required-checks `need` this job and read
+  #     `needs.preflight-gate.outputs.*`.
+  #   preflight       ("Preflight (runner health)") keeps the REQUIRED-CHECK
+  #     name the dev ruleset blocks merges on, and carries the source
+  #     gates (shell gate tests, portable paths, API parity, MCP retry hints,
+  #     ...). No compile job waits on it; it runs alongside them.
+  #
+  # `preflight` runs with `!cancelled()` and its first step fails unless
+  # preflight-gate succeeded, so a failed (or, via a failed trusted_inputs,
+  # skipped) gate still reds the required check instead of leaving it skipped
+  # (skipped == satisfied). That makes a trusted_inputs failure red `preflight`
+  # where it used to skip it: stricter, intended -- do not "fix" it back.
+  #
   # Runs on a GHA-hosted runner (always available) and queries
   # /actions/runners. Each downstream job that targets a self-hosted
   # runner gates on the corresponding *_healthy output with explicit
@@ -276,10 +295,11 @@ jobs:
   #     them running and a fully-offline pool still skips them fast.
   #
   # If the runner-control query is unavailable or a required pool is wholly
-  # offline, preflight fails red. Required checks must never disappear behind
-  # a successful skip merely because their control-plane evidence is missing.
-  preflight:
-    name: "Preflight (runner health)"
+  # offline, preflight-gate fails red (and with it `preflight`). Required checks
+  # must never disappear behind a successful skip merely because their
+  # control-plane evidence is missing.
+  preflight-gate:
+    name: "Preflight (gate)"
     needs: [trusted_inputs]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -477,9 +497,30 @@ jobs:
           python3 scripts/ci/runner-health-check.py --mode preflight
           --require-pool bigtam --require-pool weetam --require-pool bigmags
 
-      # The checkout below is deliberately after the only step that receives
-      # RUNNER_INVENTORY_TOKEN. A trusted fork may execute tests from this
-      # revision, but it must never receive that administration-scoped secret.
+  preflight:
+    name: "Preflight (runner health)"
+    needs: [trusted_inputs, preflight-gate]
+    # Always run, even when preflight-gate failed or trusted_inputs did not
+    # succeed: the required-check name lives on THIS job, and a skipped
+    # required check is satisfied. The first step turns any non-success gate
+    # into a red check (fail-closed).
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require preflight-gate
+        run: |
+          [[ "${{ needs.preflight-gate.result }}" == 'success' ]] || {
+            echo '::error::preflight-gate did not succeed (${{ needs.preflight-gate.result }}) -- failing closed; see the Preflight (gate) job'
+            exit 1
+          }
+
+      # Nothing in this job receives RUNNER_INVENTORY_TOKEN (it lives only in
+      # preflight-gate's health step), so a trusted fork may execute the gates
+      # below from its own revision without ever holding that
+      # administration-scoped secret.
       - name: Checkout requested revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -631,23 +672,23 @@ jobs:
   # ── Proto backward-compatibility ───────────────────────────────────────
   proto-compat:
     name: "Proto backward-compat"
-    needs: [preflight]
+    needs: [preflight-gate]
     # Pool gate: runs if any [self-hosted, Linux, X64] runner is online
     # (yuzu-bigtam-*). Fail-closed `== 'true'`.
     # `&& code_changed` (issue #1978): a docs-only PR skips this required job
     # (skipped == satisfied), so it no longer blocks the merge on an absent check.
-    if: needs.preflight.outputs.linux_pool_healthy == 'true' && needs.preflight.outputs.code_changed == 'true'
+    if: needs.preflight-gate.outputs.linux_pool_healthy == 'true' && needs.preflight-gate.outputs.code_changed == 'true'
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: ${{ needs.preflight.outputs.checkout_repository }}
-          ref: ${{ needs.preflight.outputs.checkout_ref }}
+          repository: ${{ needs.preflight-gate.outputs.checkout_repository }}
+          ref: ${{ needs.preflight-gate.outputs.checkout_ref }}
           # Need history so buf can compare against the merge base
           fetch-depth: 0
           # A trusted fork never reuses a prior self-hosted workspace.
-          clean: ${{ needs.preflight.outputs.trusted_execution == 'true' }}
+          clean: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' }}
           persist-credentials: false
       - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
         with:
@@ -658,7 +699,7 @@ jobs:
         run: buf breaking proto --against '.git#subdir=proto,ref=origin/main'
 
       - name: Purge trusted-fork workspace
-        if: ${{ always() && needs.preflight.outputs.trusted_execution == 'true' }}
+        if: ${{ always() && needs.preflight-gate.outputs.trusted_execution == 'true' }}
         run: |
           git reset --hard
           git clean -ffdx
@@ -666,14 +707,14 @@ jobs:
   # ── Linux (GCC + Clang, self-hosted yuzu-bigtam-linux) ────────────────
   linux:
     name: "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
-    needs: [preflight]
+    needs: [preflight-gate]
     # Pinned to the Big Tam sub-pool: the GCC 15 / Clang 21 toolchain is
     # 26.04-only (the retired Shulgi runners were 24.04), so gate on
     # bigtam_pool_healthy (>=1 yuzu-bigtam-linux runner online) rather than the
     # broader linux_pool. Fail-closed `== 'true'` (NOT `!= 'false'`) — an offline
     # Big Tam skips this job fast instead of queueing against an empty pool.
     # `&& code_changed` (issue #1978): docs-only PRs skip this required job.
-    if: needs.preflight.outputs.bigtam_pool_healthy == 'true' && needs.preflight.outputs.code_changed == 'true'
+    if: needs.preflight-gate.outputs.bigtam_pool_healthy == 'true' && needs.preflight-gate.outputs.code_changed == 'true'
     # Self-hosted: Big Tam (Threadripper 9970X, native Ubuntu 26.04). Persistent
     # ccache + vcpkg state between runs on the same workspace amortizes the
     # install cost. Trade-off: the runner process serializes this matrix, so
@@ -702,30 +743,24 @@ jobs:
       YUZU_REQUIRE_TLS_TESTS: "1"
     strategy:
       fail-fast: false
-      # max-parallel: 3, not 4 — Big Tam has exactly 4 yuzu-bigtam-linux runner
-      # agents on one box. A `dev`/`main` push runs the full 2x2 matrix below
-      # and would otherwise claim all 4 simultaneously, starving a
-      # concurrently-queued PR's single Linux leg at the RUNNER-ACQUISITION
-      # level — below with-test-slot.sh, which only gates contention *inside*
-      # a job that already has a runner (docs/ci-architecture.md "Cross-job";
-      # a PR job was directly observed waiting 35 minutes for a free runner
-      # during exactly this window). Capping at 3 leaves at least one Big Tam
-      # runner unclaimed BY THIS MATRIX. No-op on `pull_request` events: the
-      # exclude below already trims that matrix to a single gcc-15/debug leg,
-      # so max-parallel never binds there. Trade-off: a `dev` push's 4th leg
-      # waits for a slot to free (two waves instead of one) — acceptable,
-      # since push-triggered runs aren't PR-fast-path latency sensitive.
-      # NOT a guarantee the freed runner reaches the intended PR job: this
-      # matrix isn't the only claimant on the pool. `proto-compat` below
-      # is pinned to the same `yuzu-bigtam-linux` label, so it draws on
-      # the same runners, and runs on the same push trigger
-      # this cap targets — it can claim the freed runner itself (its own
-      # `timeout-minutes: 5` means it self-frees quickly, but it is a real
-      # same-push competitor, not just the already-named nightly-overlap
-      # case). A stacked nightly run, another concurrent PR/push, or a
-      # manual `workflow_dispatch` can do the same. Mitigation, not a
-      # guarantee. Tracked: #3443.
-      max-parallel: 3
+      # max-parallel: 4 (raised from 3 on 2026-10-21, owner's call) — Big Tam has
+      # exactly 4 yuzu-bigtam-linux runner agents on one box, so a `dev`/`main`
+      # push's whole 2x2 matrix now runs in one wave instead of two, which cuts
+      # the push's wall time. The price: that push claims all 4 runners at once,
+      # so a concurrently-queued PR's single Linux leg waits at the
+      # RUNNER-ACQUISITION level — below with-test-slot.sh, which only gates
+      # contention *inside* a job that already has a runner (docs/ci-architecture.md
+      # "Cross-job"). That is the case the former cap of 3 was added for: with all 4
+      # runners claimed at once, a PR job was directly observed waiting 35 minutes for
+      # a free runner. The owner accepts that trade (2026-10-21). with-test-slot.sh
+      # (3 slots) still caps the heavy test phases once a runner is held. No-op on
+      # `pull_request` events: the exclude below trims that matrix to a single
+      # gcc-15/debug leg, so max-parallel never binds there.
+      # The 4th runner was never guaranteed to a PR anyway: `proto-compat` below is
+      # pinned to the same `yuzu-bigtam-linux` label, and a stacked nightly run,
+      # another concurrent PR/push, or a manual `workflow_dispatch` can claim it
+      # too. Revert to 3 if PR runner-wait returns. Tracked: #3443.
+      max-parallel: 4
       matrix:
         compiler: [gcc-15, clang-21]
         build_type: [debug, release]
@@ -734,7 +769,7 @@ jobs:
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
           - compiler: ${{ github.event_name == 'pull_request' && 'clang-21' || 'NONE' }}
         # pg_mode (#3443 Phase 2) is a DERIVED per-leg key via include:, never a
-        # third axis (2x matrix, breaks max-parallel:3's 4-runner arithmetic) and
+        # third axis (2x matrix, breaks max-parallel's 4-runner arithmetic) and
         # never in `name:` (job names are the ruleset's required-check contexts,
         # docs-required-checks below must stay in lockstep). A key-only include
         # entry attaches to every combination surviving exclude:; a later include
@@ -794,19 +829,19 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: ${{ needs.preflight.outputs.checkout_repository }}
-          ref: ${{ needs.preflight.outputs.checkout_ref }}
+          repository: ${{ needs.preflight-gate.outputs.checkout_repository }}
+          ref: ${{ needs.preflight-gate.outputs.checkout_ref }}
           submodules: recursive
           # clean:false — persist build-linux-{compiler}-{buildtype}/ +
           # vcpkg_installed/ between runs. Branch switches are handled
           # by the pre-checkout wipe step above; cache freshness is
           # handled by the vcpkg sentinel. Manual recovery: scripts/ci/
           # runner-reset.sh.
-          clean: ${{ needs.preflight.outputs.trusted_execution == 'true' }}
+          clean: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' }}
           persist-credentials: false
 
       - name: Isolate trusted-fork build caches
-        if: needs.preflight.outputs.trusted_execution == 'true'
+        if: needs.preflight-gate.outputs.trusted_execution == 'true'
         run: |
           cache_root="$RUNNER_TEMP/yuzu-trusted-fork-${GITHUB_RUN_ID}-${GITHUB_JOB}"
           mkdir -p "$cache_root/ccache"
@@ -822,7 +857,7 @@ jobs:
       - name: Start persistent CI telemetry
         continue-on-error: true
         env:
-          YUZU_TEST_DB: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-test-runs-{1}.db', runner.temp, github.run_id) || format('{0}/yuzu-test-runs/{1}/test-runs.db', runner.tool_cache, runner.name) }}
+          YUZU_TEST_DB: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-test-runs-{1}.db', runner.temp, github.run_id) || format('{0}/yuzu-test-runs/{1}/test-runs.db', runner.tool_cache, runner.name) }}
         run: >-
           python3 scripts/ci/ci-telemetry.py start
           --job-name "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
@@ -886,7 +921,7 @@ jobs:
         uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         env:
           ImageOS: ubuntu24
-          RUNNER_TOOL_CACHE: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-beam-{1}', runner.temp, github.run_id) || format('{0}/setup-beam/{1}', runner.tool_cache, runner.name) }}
+          RUNNER_TOOL_CACHE: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-beam-{1}', runner.temp, github.run_id) || format('{0}/setup-beam/{1}', runner.tool_cache, runner.name) }}
         with:
           otp-version: '28'
           rebar3-version: '3.24'
@@ -949,7 +984,7 @@ jobs:
           # one cache means the first matrix variant pays the from-source
           # cost (~25 min) and the other three restore in seconds, vs.
           # 4× from-source under per-matrix scoping. Issue #569.
-          VCPKG_DEFAULT_BINARY_CACHE: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-vcpkg-{1}', runner.temp, github.run_id) || format('{0}/yuzu-vcpkg-binary-cache-linux', runner.tool_cache) }}
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-vcpkg-{1}', runner.temp, github.run_id) || format('{0}/yuzu-vcpkg-binary-cache-linux', runner.tool_cache) }}
         run: |
           mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           ${{ github.workspace }}/vcpkg/vcpkg install \
@@ -1129,8 +1164,8 @@ jobs:
       # invocation specifically, not this non-PG one.
       - name: Test (non-pg suites)
         # Split into 2 invocations, cheap-first (fail-fast — bash -e aborts
-        # the remaining lines on the first non-zero exit): 21 tests across 5
-        # cheap suites (agent/docs/proto/tar/gateway) run first, then the 6
+        # the remaining lines on the first non-zero exit): the cheap suites
+        # (agent/docs/proto/tar/gateway/platform) run first, then the 6
         # non-pg server entries by name (4 shards — #3443 Windows
         # restructuring added shard C, a later measured-by-time follow-up
         # added shard D, carved from B's [body_cap] tests — + the mcp bridge
@@ -1194,8 +1229,19 @@ jobs:
           export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/progress.log"
           mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
           rm -f "$YUZU_TEST_PROGRESS_FILE"
-          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 --suite agent --suite docs --suite proto --suite tar --suite gateway
+          # docs suite is OS-independent and runs on the Linux leg only; OS-contract
+          # entries carry suite platform (tests/meson.build) and run on every leg.
+          # Duration summary per invocation, not end-of-job: meson overwrites
+          # meson-logs/testlog.json on every run, so it is removed first (a run
+          # that selects no tests then warns and skips instead of re-reporting a
+          # stale log). On a red run bash -e stops before the summary; use the
+          # uploaded meson-logs artifact locally (#4884).
+          rm -f build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/testlog.json
+          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 --suite agent --suite docs --suite proto --suite tar --suite gateway --suite platform
+          python3 scripts/ci/test-durations-summary.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --label "Linux non-pg (cheap suites)"
+          rm -f build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/testlog.json
           python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 "server unit tests shard A" "server unit tests shard B" "server unit tests shard C" "server unit tests shard D" "mcp bridge teardown allocation budget" "guardian cache allocation-failure sweep" "server pg shard partition invariant" "dex link no presentation symbols"
+          python3 scripts/ci/test-durations-summary.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --label "Linux non-pg (server shards)"
 
       - name: Test (pg shards, full)
         if: matrix.pg_mode == 'full'
@@ -1364,13 +1410,14 @@ jobs:
         # implementation detail.
         #
         # Cross-job slot count: 2 -> 3 (2026-08-25, same day as max-parallel:3
-        # landed). max-parallel:3 (this job's `strategy:` block, above) and
-        # this slot gate are DIFFERENT axes, not substitutes for each other:
+        # landed; max-parallel is 4 since 2026-10-21). max-parallel (this job's
+        # `strategy:` block, above) and this slot gate are DIFFERENT axes, not
+        # substitutes for each other:
         # max-parallel governs RUNNER ACQUISITION for one push's own matrix;
         # this gate governs box-wide HEAVY TEST-PHASE concurrency across ALL
         # jobs (any push, any PR, nightly, manual dispatch) once a job already
-        # has a runner and has finished building. Raising max-parallel:3
-        # doesn't make the OLD "stays at 2" reasoning wrong on its own terms —
+        # has a runner and has finished building. Raising max-parallel to 3
+        # didn't make the OLD "stays at 2" reasoning wrong on its own terms —
         # it just no longer needs the slot gate to ALSO be the sole box-wide
         # throttle, which is what "reopen that problem" assumed.
         #
@@ -1447,8 +1494,24 @@ jobs:
           YUZU_TEST_SLOT_NAME: yuzu-bigtam-heavy
           YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
         run: |
+          rm -f build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/testlog.json
           bash scripts/ci/with-test-slot.sh 3 -- \
             python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 --suite server-pg
+          # Outside the slot: pure parsing plus a --list-tests spawn per Catch2 entry.
+          python3 scripts/ci/test-durations-summary.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --label "Linux pg shards"
+
+      # Sizes the tmpfs PGDATA cap (#4884): host RAM and the
+      # persistent cluster's on-disk size after a full pg run, printed to the
+      # step log. Never fails the job. Remove once the cap is recorded in
+      # docs/ci-architecture.md "Postgres for server tests".
+      - name: Postgres container footprint (tmpfs sizing probe)
+        if: always() && matrix.pg_mode == 'full'
+        run: |
+          free -m || true
+          for c in $(timeout 60 docker ps --format '{{.Names}}' | grep '^yuzu-ci-postgres'); do
+            echo "$c"
+            timeout 60 docker exec "$c" du -sm /var/lib/postgresql || true
+          done
 
       # #3443 Phase 2: the 3 non-primary Linux push legs (pg_mode=smoke) run
       # this small tagged subset INSTEAD of the 14-shard server-pg suite
@@ -1580,7 +1643,7 @@ jobs:
         if: always()
         continue-on-error: true
         env:
-          YUZU_TEST_DB: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-test-runs-{1}.db', runner.temp, github.run_id) || format('{0}/yuzu-test-runs/{1}/test-runs.db', runner.tool_cache, runner.name) }}
+          YUZU_TEST_DB: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-test-runs-{1}.db', runner.temp, github.run_id) || format('{0}/yuzu-test-runs/{1}/test-runs.db', runner.tool_cache, runner.name) }}
           YUZU_CI_CONCLUSION: ${{ job.status }}
         run: >-
           python3 scripts/ci/ci-telemetry.py finish
@@ -1590,7 +1653,7 @@ jobs:
           --conclusion "$YUZU_CI_CONCLUSION"
 
       - name: Purge trusted-fork workspace
-        if: ${{ always() && needs.preflight.outputs.trusted_execution == 'true' }}
+        if: ${{ always() && needs.preflight-gate.outputs.trusted_execution == 'true' }}
         run: |
           # Keep this narrow to the Actions checkout. runner.tool_cache and
           # the runner-local telemetry DB are deliberately outside this path.
@@ -1600,11 +1663,11 @@ jobs:
   # ── Windows (MSVC, self-hosted Wee Tam pool) ────────────────────────────
   windows:
     name: "Windows MSVC ${{ matrix.build_type }}"
-    needs: [preflight]
+    needs: [preflight-gate]
     # Skip if the exact Wee Tam job pool is unhealthy/empty. Fail-closed
     # `== 'true'`; the generic Shulgi testbed label cannot satisfy this job.
     # `&& code_changed` (issue #1978): docs-only PRs skip this required job.
-    if: needs.preflight.outputs.weetam_pool_healthy == 'true' && needs.preflight.outputs.code_changed == 'true'
+    if: needs.preflight-gate.outputs.weetam_pool_healthy == 'true' && needs.preflight-gate.outputs.code_changed == 'true'
     # Self-hosted: 32-core / 48 GB host. gRPC alone takes ~90 min on the
     # GitHub-hosted 4-vCPU windows-2022 runners; self-hosted with cl /MP
     # finishes in a fraction of that and avoids the GitHub Actions minute
@@ -1685,16 +1748,16 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: ${{ needs.preflight.outputs.checkout_repository }}
-          ref: ${{ needs.preflight.outputs.checkout_ref }}
+          repository: ${{ needs.preflight-gate.outputs.checkout_repository }}
+          ref: ${{ needs.preflight-gate.outputs.checkout_ref }}
           submodules: recursive
           # clean:false — persist build-windows-{debug,release}/ +
           # vcpkg_installed/ between runs. Manual recovery: scripts/ci/runner-reset.sh.
-          clean: ${{ needs.preflight.outputs.trusted_execution == 'true' }}
+          clean: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' }}
           persist-credentials: false
 
       - name: Isolate trusted-fork build caches
-        if: needs.preflight.outputs.trusted_execution == 'true'
+        if: needs.preflight-gate.outputs.trusted_execution == 'true'
         run: |
           cache_root="$RUNNER_TEMP/yuzu-trusted-fork-${GITHUB_RUN_ID}-${GITHUB_JOB}"
           mkdir -p "$cache_root/ccache"
@@ -1709,7 +1772,7 @@ jobs:
         env:
           # Keep the workflow path identical to Start-PinnedRunner.ps1 even
           # before the next safe runner restart propagates its process env.
-          YUZU_TEST_DB: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-test-runs-{1}.db', runner.temp, github.run_id) || format('D:\\ci\\test-runs\\{0}\\test-runs.db', runner.name) }}
+          YUZU_TEST_DB: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-test-runs-{1}.db', runner.temp, github.run_id) || format('D:\\ci\\test-runs\\{0}\\test-runs.db', runner.name) }}
         run: >-
           python scripts/ci/ci-telemetry.py start
           --job-name "Windows MSVC ${{ matrix.build_type }}"
@@ -1809,7 +1872,7 @@ jobs:
           # triplet builds both variants in one port build (the
           # VCPKG_BUILD_TYPE override was removed in the LNK2038 fix), so
           # the zip filename is the same regardless of consumer build_type.
-          VCPKG_DEFAULT_BINARY_CACHE: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-vcpkg-{1}', runner.temp, github.run_id) || format('{0}/yuzu-vcpkg-binary-cache-windows', runner.tool_cache) }}
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-vcpkg-{1}', runner.temp, github.run_id) || format('{0}/yuzu-vcpkg-binary-cache-windows', runner.tool_cache) }}
         run: |
           # Use $GITHUB_WORKSPACE (bash env var, runtime read) instead of
           # ${{ github.workspace }} (GHA source interpolation). On Windows
@@ -1977,13 +2040,21 @@ jobs:
           # actually use (sre Gate 6 finding, governance 2026-08-28) — a
           # future edit to one without the other would let the guard pass
           # while flake-retry silently ran fewer suites than verified.
-          suites=(--suite agent --suite docs --suite proto --suite tar --suite gateway --suite server-nonpg --suite server-checks)
+          # docs suite is OS-independent and runs on the Linux leg only; OS-contract
+          # entries carry suite platform (tests/meson.build) and run on every leg, so
+          # the selection swaps docs for platform and the guard excludes docs.
+          suites=(--suite agent --suite platform --suite proto --suite tar --suite gateway --suite server-nonpg --suite server-checks)
           python scripts/ci/assert-suite-cover.py --builddir build-windows-${{ matrix.build_type }} \
             "${suites[@]}" \
-            --exclude-suite server-pg --exclude-suite server-pg-smoke
+            --exclude-suite server-pg --exclude-suite server-pg-smoke --exclude-suite docs
+          rm -f build-windows-${{ matrix.build_type }}/meson-logs/testlog.json
           bash scripts/ci/with-test-slot.sh 2 -- \
             python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs --num-processes 4 \
               "${suites[@]}"
+          # Duration summary per invocation: testlog.json is removed before each run
+          # (meson overwrites it), so a run that selects no tests leaves no stale log.
+          # On a red run bash -e stops before it, use the meson-logs artifact (#4884).
+          python scripts/ci/test-durations-summary.py --builddir build-windows-${{ matrix.build_type }} --label "Windows non-pg"
 
       # if: matrix.pg_mode == 'full' — see the Resolve step above; PRs are
       # debug-only (exclude: above), so PR coverage is unaffected. k=2 was
@@ -2025,7 +2096,7 @@ jobs:
             "${suites[@]}" \
             --exclude-suite agent --exclude-suite docs --exclude-suite proto --exclude-suite tar \
             --exclude-suite gateway --exclude-suite server-nonpg --exclude-suite server-checks \
-            --exclude-suite server-pg-smoke
+            --exclude-suite server-pg-smoke --exclude-suite platform
           # Runs LAST (after the non-pg step above): flake-retry.py /
           # ci-import-junit only import the LAST invocation's testlog.junit.xml
           # into CI telemetry per job — ordering it last means the pg-shard
@@ -2033,9 +2104,11 @@ jobs:
           # survives, not the non-pg step's. The non-pg step's own
           # job-summary "Suite durations vs meson budgets" table (written on
           # every invocation, not just the last) is where its numbers live.
+          rm -f build-windows-${{ matrix.build_type }}/meson-logs/testlog.json
           bash scripts/ci/with-test-slot.sh 2 -- \
             python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs --num-processes 6 \
               "${suites[@]}"
+          python scripts/ci/test-durations-summary.py --builddir build-windows-${{ matrix.build_type }} --label "Windows pg shards"
 
       # if: matrix.pg_mode == 'smoke' — only the release leg on a push (PRs
       # are debug-only, so this step never runs on a PR; verified post-merge
@@ -2146,7 +2219,7 @@ jobs:
         if: always()
         continue-on-error: true
         env:
-          YUZU_TEST_DB: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-test-runs-{1}.db', runner.temp, github.run_id) || format('D:\\ci\\test-runs\\{0}\\test-runs.db', runner.name) }}
+          YUZU_TEST_DB: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-test-runs-{1}.db', runner.temp, github.run_id) || format('D:\\ci\\test-runs\\{0}\\test-runs.db', runner.name) }}
           YUZU_CI_CONCLUSION: ${{ job.status }}
         run: >-
           python scripts/ci/ci-telemetry.py finish
@@ -2156,7 +2229,7 @@ jobs:
           --conclusion "$YUZU_CI_CONCLUSION"
 
       - name: Purge trusted-fork workspace
-        if: ${{ always() && needs.preflight.outputs.trusted_execution == 'true' }}
+        if: ${{ always() && needs.preflight-gate.outputs.trusted_execution == 'true' }}
         run: |
           # Keep this narrow to the Actions checkout. runner.tool_cache and
           # the runner-local telemetry DB are deliberately outside this path.
@@ -2166,7 +2239,7 @@ jobs:
   # ── macOS (Apple Clang) ────────────────────────────────────────────────
   macos:
     name: "macOS ${{ matrix.build_type }}"
-    needs: [preflight]
+    needs: [preflight-gate]
     # Pinned to the BigMags macOS pool: the Apple-Silicon toolchain exists only
     # on the BigMags Mac Minis; no GitHub-hosted or Shulgi fallback can satisfy
     # it, so gate on bigmags_pool_healthy (>=1 yuzu-bigmags-macos runner online).
@@ -2174,7 +2247,7 @@ jobs:
     # fast instead of queueing against an empty pool.
     # `&& code_changed` (issue #1978): docs-only PRs skip this required job
     # (skipped == satisfied).
-    if: needs.preflight.outputs.bigmags_pool_healthy == 'true' && needs.preflight.outputs.code_changed == 'true'
+    if: needs.preflight-gate.outputs.bigmags_pool_healthy == 'true' && needs.preflight-gate.outputs.code_changed == 'true'
     runs-on: [self-hosted, macOS, ARM64, yuzu-bigmags-macos]
     timeout-minutes: 90
     strategy:
@@ -2187,8 +2260,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: ${{ needs.preflight.outputs.checkout_repository }}
-          ref: ${{ needs.preflight.outputs.checkout_ref }}
+          repository: ${{ needs.preflight-gate.outputs.checkout_repository }}
+          ref: ${{ needs.preflight-gate.outputs.checkout_ref }}
           submodules: recursive
           # Deliberately NOT the linux/windows conditional clean:false — this
           # job keeps actions/checkout's default clean:true. A fresh workspace
@@ -2200,7 +2273,7 @@ jobs:
           persist-credentials: false
 
       - name: Isolate trusted-fork build caches
-        if: needs.preflight.outputs.trusted_execution == 'true'
+        if: needs.preflight-gate.outputs.trusted_execution == 'true'
         run: |
           cache_root="$RUNNER_TEMP/yuzu-trusted-fork-${GITHUB_RUN_ID}-${GITHUB_JOB}"
           mkdir -p "$cache_root/ccache"
@@ -2394,7 +2467,7 @@ jobs:
           # so an untrusted-fork build cannot poison the pool's binary cache;
           # trusted (non-fork) runs resolve to the shared tool_cache dir.
           # Mirrors the Linux/Windows self-hosted pattern verbatim. Issue #569.
-          VCPKG_DEFAULT_BINARY_CACHE: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-vcpkg-{1}', runner.temp, github.run_id) || format('{0}/yuzu-vcpkg-binary-cache-macos', runner.tool_cache) }}
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-vcpkg-{1}', runner.temp, github.run_id) || format('{0}/yuzu-vcpkg-binary-cache-macos', runner.tool_cache) }}
         run: |
           mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           ${{ github.workspace }}/vcpkg/vcpkg install \
@@ -2485,7 +2558,11 @@ jobs:
           export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/build-macos/meson-logs/progress.log"
           mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
           rm -f "$YUZU_TEST_PROGRESS_FILE"
-          python3 scripts/ci/flake-retry.py --builddir build-macos -- --print-errorlogs --timeout-multiplier 2
+          # docs suite is OS-independent and runs on the Linux leg only; OS-contract
+          # entries carry suite platform (tests/meson.build) and keep running here.
+          rm -f build-macos/meson-logs/testlog.json
+          python3 scripts/ci/flake-retry.py --builddir build-macos -- --print-errorlogs --timeout-multiplier 2 --no-suite docs
+          python3 scripts/ci/test-durations-summary.py --builddir build-macos --label "macOS"
 
       # Same rationale as the linux + windows upload steps: keep test
       # failures diagnosable when meson's `--print-errorlogs` truncation
@@ -2528,7 +2605,7 @@ jobs:
           exit 0
 
       - name: Purge trusted-fork workspace
-        if: ${{ always() && needs.preflight.outputs.trusted_execution == 'true' }}
+        if: ${{ always() && needs.preflight-gate.outputs.trusted_execution == 'true' }}
         run: |
           # Keep this narrow to the Actions checkout. runner.tool_cache and
           # the runner-local telemetry DB are deliberately outside this path.
@@ -2552,7 +2629,7 @@ jobs:
   #
   # proto-compat is a NON-matrix job: its skipped run reports "Proto
   # backward-compat: skipped", which already satisfies the required check, so
-  # it needs no stub. preflight always runs; "CHANGELOG order" (docs-lint.yml)
+  # it needs no stub. `preflight` always runs (`!cancelled()`); "CHANGELOG order" (docs-lint.yml)
   # runs on every PR and every push to main/dev. Together that satisfies all
   # six required contexts on a docs-only PR without a build.
   #
@@ -2563,8 +2640,8 @@ jobs:
   # gate anything.
   docs-required-checks:
     name: ${{ matrix.check }}
-    needs: [preflight]
-    if: needs.preflight.outputs.code_changed == 'false'
+    needs: [preflight-gate]
+    if: needs.preflight-gate.outputs.code_changed == 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     strategy:
@@ -2787,8 +2864,8 @@ jobs:
       # pinned tool. Every other VCPKG_DEFAULT_BINARY_CACHE in this file is on
       # a SELF-HOSTED runner where the dir persists for free — that pattern
       # does not transplant to this fresh-disk GHA-hosted job, and its
-      # `needs.preflight.outputs.trusted_execution` ternary would silently
-      # evaluate empty here (this job's `needs:` has no `preflight`).
+      # `needs.preflight-gate.outputs.trusted_execution` ternary would silently
+      # evaluate empty here (this job's `needs:` has no `preflight-gate`).
       - name: Restore vcpkg installed packages (canary)
         # Key tracks only what changes the canary's vcpkg output: the
         # manifest (vcpkg.json), the registry/baseline config

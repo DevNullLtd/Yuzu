@@ -83,6 +83,7 @@ EOF
 ```
 
 The `Origin` header on these REST examples is for the REST routes only; do not send it to `/mcp/v1/` unless it is listed in `--mcp-allowed-origin`.
+A browser-cookie MCP client must send a same-site `Referer`, or an `Origin` that both the server-wide same-site check and the endpoint's allowlist accept, or its write is refused `403` before the MCP handler runs. That `403` is the REST error envelope (`cross-site request refused`), not a JSON-RPC error. Clients authenticated only by a token are not affected.
 
 The response includes a `token` field (prefixed `yuzu_`). Copy it immediately --
 it is shown exactly once.
@@ -181,8 +182,11 @@ change: a notification POST now answers `202` instead of `204`).
   server restart drops them (re-initialize).
 - **`DELETE /mcp/v1/`** with the `Mcp-Session-Id` header ends a session (`200`; a
   second `DELETE` of the same id → `404`).
-- **`Origin`** is validated on every method (`-32008` / `403` if a present Origin
-  is not allowlisted — see `--mcp-allowed-origin`); **`MCP-Protocol-Version`** is
+- **`Origin`** is validated on every method when streaming is on (`-32008` / `403` if a
+  present Origin is not allowlisted; see `--mcp-allowed-origin`); with
+  `--mcp-no-streaming` this MCP-level check does not run, but the server-wide rule that
+  cookie-session writes need a same-site `Origin` or `Referer` applies either way;
+  **`MCP-Protocol-Version`** is
   negotiated (`-32009` / `400` for an unsupported value); the per-principal/global
   session cap returns `-32010` / `429` on `initialize` when full.
 - **`GET /mcp/v1/`** is the session's server→client **SSE channel**. It requires the

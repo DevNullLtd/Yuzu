@@ -1613,13 +1613,62 @@ executing, but you lose the dashboard YAML editor and re-import for them.
 **Who this affects.** Anyone running the dashboard behind nginx, Envoy, HAProxy, an ALB or
 Cloudflare where the proxy **rewrites the `Host` header** rather than passing the client's
 value through. Direct access, and proxies configured to preserve `Host`, are unaffected and
-need no change.
+need no change. For nginx, the `proxy_set_header Host $http_host;` snippet in
+[Security Hardening](security-hardening.md) forwards the client's `Host` with its port.
 
-**The symptom.** Every CSRF-gated dashboard action fails with `403 cross-origin POST refused`
-— CA revoke, CA import-chain, the TAR retention-paused re-enable and purge fragments, the
-gated settings POSTs, and the Guardian Guard create, Enable/Disable, edit and delete and every
-Baseline create, edit, deploy and delete (Guardian answers `403 cross-origin request refused`), the General page's runtime Save (`PUT /api/config/{key}`, `403 cross-site request refused`), the header bell's Mark read and Dismiss (`403 cross-site request refused`; the bell then says the request was refused as cross-site, not that the account is read-only), the Integrations page's webhook, offload-target, directory-sync, group-mapping and MCP-settings saves (`403 cross-site request refused`), and the Approvals page's Approve and Reject (`403 cross-site request refused`; the dialog words every `403` as "You do not have permission to decide approvals"). The dashboard renders fine and reads work; only the destructive actions
-fail.
+**The symptom.** Every dashboard write fails with `403` `cross-site request refused`: cookie-session
+writes require a same-site `Origin` or `Referer`, and that is decided by one server-wide check, applied
+after authentication and before step-up evaluation, challenge emission and route-handler effects. The
+dashboard renders fine, sign-in works and reads work; every write fails, including creating an API
+token and the step-up elevation request. Most dashboard pages do not display the refusal (the page does
+not swap an error response into itself), so the visible symptom is usually a button that does nothing.
+The response body, an error envelope with a `remediation` that names the flag, is visible in the
+browser's network tab. The refusal is also recorded as a `csrf.denied` audit row, counted in
+`yuzu_server_csrf_denied_total{path_class,reason}`, and logged as a warning that names the flag (at most
+one log per 60 seconds per reason; the counter records all of them). The per-route message texts that
+earlier releases showed for individual dashboard actions are now produced only for a token caller of a
+route that keeps a non-token-exempt copy of the check.
+
+Cookie-session requests that dispatch work, persist state or force a refresh of server state (the
+guarded requests) are held to the same rule, but a `Sec-Fetch-Site` header that is present decides
+alone: exactly one header with value `same-origin` or `none` is admitted and any other value is
+refused with `origin_mismatch`, without consulting `Origin` or `Referer`. So behind a
+TLS-terminating proxy, where the browser talks to the proxy over HTTPS, a proxy that rewrites `Host`
+does not refuse a browser's own guarded requests. Only a client that sends no `Sec-Fetch-Site` (a script,
+Safari before 16.4, or a browser talking plain HTTP to a non-loopback address, which sends no fetch
+metadata) falls back to the `Origin` or `Referer` comparison that `--csrf-trusted-origin` feeds. A
+same-origin `GET` carries no `Origin`, so for those clients the guarded requests depend on the
+`Referer` the browser sends; the server's default `Referrer-Policy` supplies it, and a proxy or page
+policy of `no-referrer` would break them. A repeated `Sec-Fetch-Site` header is refused and is
+recorded with reason `origin_mismatch`, even when a good `Origin` is sent; to cure a refusal caused by
+a `Sec-Fetch-Site` header, send it once with value `same-origin` or `none`, or remove the header so
+that a same-site `Origin` or `Referer` decides.
+
+**Alerts.** The shipped `yuzu-web-writes` group in `docs/prometheus/yuzu-alerts.yml` watches the counter:
+`YuzuCookieWritesRefusedSameSite` (warning) fires when at least 3 `origin_mismatch` or `referer_mismatch`
+refusals occur within 15 minutes, which is the signature of a proxy that rewrites `Host`, and
+`YuzuSameSiteGateInternalError` (warning) fires on any `gate_error` in 15 minutes. `no_origin_no_referer`
+is deliberately not alerted, because a script without the header is expected noise. The 15 minute window
+and the threshold of 3 are tentative and have not been tuned against fleet data.
+
+**What the lockout does and does not do.**
+
+- Restart required: the origin list is read at start, there is no reload. After changing the flag or
+  `YUZU_CSRF_TRUSTED_ORIGIN`, restart every server replica; replicas with different values answer the
+  same request `200` on one and `403` on another.
+- `/livez` and `/readyz` stay green, so a load-balancer or orchestrator health check never detects it.
+- Ordinary reads are not blocked by the check (the guarded requests are held to it, as above), but a refusal is not free: each one writes an audit row, and
+  behind a proxy every operator shares the proxy's single per-IP rate-limit bucket. With a slow or
+  degraded PostgreSQL a burst of refusals can therefore slow other requests down.
+- Bypass path: if you cannot create an API token through the proxy, reach the server directly (for
+  example an SSH tunnel to the web port, so `Host` matches the browser's `Origin`), sign in and create
+  one, or restart with the flag. A script that connects directly must send an `Origin` naming the
+  address it connects to (for example `http://localhost:8080`; `https://localhost:8443` when the server terminates TLS itself, where an `http://` origin is refused). Direct access needs a local sign-in:
+  a deployment that offers only OIDC or SAML sign-in redirects to the public URL, so for those only
+  restarting with the flag works.
+- The check cannot be disabled: the remedies are the flag, an API token or rolling back.
+- An `Origin: null` request cannot be fixed by configuration: the reserved token `null` is refused as
+  an entry, and `Referer` is not consulted once `Origin` is present.
 
 **Why.** The same-site check compares the browser's `Origin` against the server's `Host`. When
 the proxy substitutes its own `Host`, those two legitimately differ: the browser says
@@ -1646,11 +1695,19 @@ Two accepted forms, and the difference matters:
 
 | Form | Matches |
 |---|---|
-| `https://yuzu.example` | that host **over https only** — an `http://` Origin for the same host is still refused |
+| `https://yuzu.example` | that host **over https only**: an `http://` Origin for the same host is refused, including when `Host` is forwarded and matches |
 | `yuzu.example` | that host over **either** scheme |
 
-Prefer the scheme-qualified form. It also closes a weaker pre-existing behaviour in the same
-check, where `http://h` satisfied a request to `https://h`.
+Prefer the scheme-qualified form. A scheme-qualified `https://` entry also pins the scheme for
+that host: the server behind a TLS-terminating proxy listens in plain HTTP and cannot see the
+public scheme, so an `https://yuzu.example` entry is the operator's declaration that https is the
+public scheme, and an `http://yuzu.example` `Origin` is then refused even when `Host` is forwarded
+and matches. Declare it even when the proxy forwards `Host` unchanged. A server that terminates
+TLS itself (HTTPS enabled) needs no declaration for its own address: it requires the `Origin` or
+`Referer` to be `https://` and treats only `:443` as the default port, so `https://yuzu.example:80`
+is a different origin from `Host: yuzu.example:443`. Remaining limit: on a plain-HTTP listener with
+no `https://` entry declared for the host, an `http://` `Origin` naming the same host and port as
+`Host` is still treated as same-site.
 
 Entries are case-insensitive, may carry a port, and any path is ignored. **Wildcards are not
 supported** — `*.example` is accepted by the parser but will never match anything, deliberately.
@@ -1689,7 +1746,9 @@ accepted-versus-supplied counts. Before this, an all-invalid config produced boo
 to not passing the flag at all, and the first symptom was the same opaque 403 the flag exists to
 remove.
 
-**Confirming it took.** The server logs the accepted set once at boot:
+**Confirming it took.** The server prints the accepted set once at start-up, to standard output
+(check the container or service log). It is emitted before the log level and `--log-file` are
+configured, so `--log-level` does not hide it and it is not written to `--log-file`:
 
 ```
 CSRF same-site gate: accepting 1 operator-declared external origin(s) in addition to the request Host — https://yuzu.customer.example
@@ -1698,11 +1757,11 @@ CSRF same-site gate: accepting 1 operator-declared external origin(s) in additio
 If that line is absent, or lists something other than what your users type into the address
 bar, the 403s will continue. It is the fastest diagnosis for a mistyped entry.
 
-**What has NOT changed.** A request whose `Origin` already matches `Host` behaves exactly as
-before, so an unproxied deployment sees no difference. Non-browser clients sending neither
-`Origin` nor `Referer` (curl, automation) are still admitted by the shared helper, except on the routes that gate a cookie session with `browser_write_is_cross_site` (the bell, instruction and dashboard-dispatch writes, and the Integrations writes: webhooks, offload targets, directory sync, group mappings, MCP settings), which refuse a header-less cookie request; and the two
-CA endpoints still treat both-headers-absent as cross-site. Leaving the flag unset is safe: it
-means same-host only, which is the previous behaviour.
+When no valid entry is configured the server instead prints one line stating the rule and that no `--csrf-trusted-origin` value was accepted, with the same advice for a Host-rewriting proxy.
+
+**What has NOT changed.** A request whose `Origin` already matches `Host` behaves exactly as before, so an unproxied deployment sees no difference for browsers. Leaving the flag unset means same-host only, which is correct for any deployment that does not rewrite `Host`. A request authenticated only by an API, MCP or engine token is not subject to this check.
+
+**What did change.** A cookie-session write that carries neither `Origin` nor `Referer` is refused `403`, including one from curl or other automation; use an API token or send the header. The guarded requests (cookie-session requests that dispatch work, persist state or force a refresh of server state) are refused `403` unless they carry one `Sec-Fetch-Site` header with value `same-origin` or `none`, or, when they carry no `Sec-Fetch-Site` header, a same-site `Origin` or `Referer`.
 
 **Deliberately not implemented: `X-Forwarded-Host` is never consulted.** Reading it would let
 anyone able to reach the server's port declare their own external hostname and defeat the CSRF
@@ -1711,6 +1770,8 @@ networks the reference composes use, "inside the CIDR" is usually every sibling 
 the failure mode is silent: the dashboard keeps working while the control is dead. A config
 value cannot be set by an attacker, which is why the trust anchor here is a flag and not a
 header.
+
+For the same reason, never configure the proxy to inject or rewrite `Origin` or `Referer`: that turns the control off for that deployment. Declare the public origin with `--csrf-trusted-origin` instead.
 
 ### vNEXT — a device target that was supplied but names nothing is now refused, not widened to the fleet (#2500)
 
@@ -6105,10 +6166,11 @@ second Ctrl-C also terminates promptly.
 
 Mechanism: `SIGTERM`/`SIGINT` (`systemctl stop`, `docker stop`, Ctrl-C)
 triggers a graceful stop on a dedicated watcher thread — HTTP admission stop,
-background thread joins, up to ~115s of stacked waits including webhook/
-offload store quiesce (see the stacked-shutdown-bound section in
+background thread joins, up to ~130s of stacked waits including webhook/
+offload store quiesce and the wait for an in-flight `registry.write` audit write
+(see the stacked-shutdown-bound section in
 [Upgrading](upgrading.md); a rare thread-creation-exhaustion fallback path can
-push the quiesce portion alone to ~120s, worst case ~175s total), then store
+push the quiesce portion alone to ~120s, worst case ~190s total), then store
 teardown. Those figures leave out two things that can each add to them: a
 background roll-up recompute already in flight at SIGTERM (app-perf up to
 120 s, catalogue up to 60 s — the 210 s shipped grace was sized for these two,

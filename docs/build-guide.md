@@ -67,7 +67,7 @@ Per-OS build dirs prevent clobbering when one tree is built from multiple hosts 
 
 ## Test
 
-Every test target carries a `suite:` label (`agent`, `tar`, `server`) so `--suite <name>` filters directly:
+Every test target carries a `suite:` label (`agent`, `tar`, `server`, `proto`, `gateway`, `platform` for OS-contract tests that run on every CI leg, `docs` for OS-independent gates that run on the Linux leg only) so `--suite <name>` filters directly:
 
 ```bash
 meson test -C build-linux --suite <server|agent|tar> --print-errorlogs   # omit --suite for everything
