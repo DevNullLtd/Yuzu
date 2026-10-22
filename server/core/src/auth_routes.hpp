@@ -1008,6 +1008,15 @@ public:
     /// qe-B: the load-shed branch must be exercised.
     void set_mfa_pending_cap_for_test(std::size_t cap) { mfa_pending_cap_ = cap; }
 
+    /// Test hook: push the pending MFA challenge `pending_token`'s steady
+    /// `expires_at` backward by `elapsed`, so the TTL reaper
+    /// (`reap_mfa_pending_locked`) sees it as lapsed after `elapsed` more time
+    /// without sleeping. The map is keyed by the raw pending token. A no-op for an
+    /// unknown token. Production code MUST NOT call this — no caller in
+    /// `server/core/src/**` references it.
+    void expire_mfa_pending_for_test(const std::string& pending_token,
+                                     std::chrono::milliseconds elapsed);
+
     /// Override the service-scope global-safe allow-list for a test
     /// (`kServiceScopeGlobalSafe` is seeded EMPTY in production, #2298 PR 3 —
     /// see `service_scope_policy.hpp` — so `require_permission`'s

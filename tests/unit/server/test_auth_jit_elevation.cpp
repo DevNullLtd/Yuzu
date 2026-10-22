@@ -195,13 +195,15 @@ TEST_CASE("AuthManager::reap_expired_elevation fires exactly once on a passive "
     auto token = mgr->authenticate("dave", "secret123456");
     REQUIRE(token.has_value());
 
-    // A 1s window, then a real sleep past it — duration(0) no longer works
-    // here: elevate_session's dead-window guard (governance hardening round,
+    // A 1s window, then its deadline moved into the past — duration(0) no longer
+    // works here: elevate_session's dead-window guard (governance hardening round,
     // UP-1/UP-4) now REJECTS a request that would clamp to `until <= now`
     // rather than granting a zero-length window, so the smallest grantable
-    // positive window must actually lapse via real time.
+    // positive window must be lapsed by moving its deadline.
     REQUIRE(mgr->elevate_session(*token, std::chrono::seconds(1)).has_value());
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    // Moves the 1s elevation window's deadline (elevated_until and the steady
+    // deadline is_elevated reads) 2000 ms into the past, so it has lapsed.
+    mgr->lapse_elevation_for_test(*token, std::chrono::milliseconds(2000));
 
     auto reaped = mgr->reap_expired_elevation(*token);
     REQUIRE(reaped.has_value());
@@ -272,7 +274,9 @@ TEST_CASE("AuthManager::reap_expired_elevation is exactly-once under concurrent 
     auto token = mgr->authenticate("grace", "secret123456");
     REQUIRE(token.has_value());
     REQUIRE(mgr->elevate_session(*token, std::chrono::seconds(1)).has_value());
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    // Moves the 1s elevation window's deadline (elevated_until and the steady
+    // deadline is_elevated reads) 2000 ms into the past, so it has lapsed.
+    mgr->lapse_elevation_for_test(*token, std::chrono::milliseconds(2000));
 
     // Two threads race reap_expired_elevation on the SAME already-lapsed
     // token. The shared-lock-first-then-escalate-and-recheck design
@@ -912,12 +916,14 @@ TEST_CASE("role.elevation.expired is audited lazily on the next authenticated "
     auto token = h.session_for("alice");
     // Force a lapsed elevation directly via AuthManager (bypassing the REST
     // handler, which always grants at least a bounded window): a 1s window
-    // plus a real sleep past it. duration(0) is no longer usable for this —
+    // whose deadline is then moved into the past. duration(0) is no longer usable for this —
     // elevate_session's dead-window guard (governance hardening round,
     // UP-1/UP-4) REJECTS a request that would clamp to `until <= now` rather
     // than granting a zero-length window.
     REQUIRE(h.auth_mgr.elevate_session(token, std::chrono::seconds(1)).has_value());
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    // Moves the 1s elevation window's deadline (elevated_until and the steady
+    // deadline is_elevated reads) 2000 ms into the past, so it has lapsed.
+    h.auth_mgr.lapse_elevation_for_test(token, std::chrono::milliseconds(2000));
     CHECK(h.count_audits("role.elevation.expired", "alice") == 0);
 
     // The next authenticated request through resolve_session (the cookie
@@ -957,7 +963,9 @@ TEST_CASE("a reap that fires within a request leaves THAT request's session "
     JitHarness h;
     auto token = h.session_for("alice");
     REQUIRE(h.auth_mgr.elevate_session(token, std::chrono::seconds(1)).has_value());
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    // Moves the 1s elevation window's deadline (elevated_until and the steady
+    // deadline is_elevated reads) 2000 ms into the past, so it has lapsed.
+    h.auth_mgr.lapse_elevation_for_test(token, std::chrono::milliseconds(2000));
 
     // The lazy reap fires INSIDE resolve_session, on this very request — the
     // request must be evaluated against the now-lapsed (base) role, not the
@@ -981,7 +989,9 @@ TEST_CASE("a lazy role.elevation.expired reap survives an unwritable audit store
     JitHarness h(/*audit_store_broken=*/true);
     auto token = h.session_for("alice");
     REQUIRE(h.auth_mgr.elevate_session(token, std::chrono::seconds(1)).has_value());
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    // Moves the 1s elevation window's deadline (elevated_until and the steady
+    // deadline is_elevated reads) 2000 ms into the past, so it has lapsed.
+    h.auth_mgr.lapse_elevation_for_test(token, std::chrono::milliseconds(2000));
 
     // The AuditStore can't persist (unopenable path, db_==nullptr) — the
     // lazy reap at the resolve_session chokepoint must not crash or throw,

@@ -1799,15 +1799,33 @@ TEST_CASE("TAR #2361: a rolled-back retention pass does not discard another writ
     std::mutex ack_mu;
     std::condition_variable ack_cv;
     std::vector<int> acknowledged;
+    // #5170: this loop takes TarDatabase::mu_ (an unfair std::mutex) back-to-back
+    // with no pause, and run_retention's execute_atomic_batch waits on the same mutex.
+    // On a loaded box (four runner agents share one) that spin can keep the batch from
+    // ever acquiring mu_, so the test hangs instead of failing. Two bounds, both
+    // chosen to keep the burst density the ~1-in-5 detection above depends on:
+    //   - yield() after each write hands the CPU on without a timer wait. A per-write
+    //     sleep was rejected: it caps the writer at tens of writes per second on
+    //     Windows' timer granularity and takes the detection rate to ~0.
+    //   - kMaxProbeWrites bounds the total. Past it the writer stops re-taking mu_ and
+    //     waits (1 ms naps) for `stop`, so retention can never be starved indefinitely.
+    // The ceiling is far above what retention's window needs; the assertions below are
+    // unchanged (every acknowledged key must survive).
+    constexpr int kMaxProbeWrites = 50000;
     std::thread writer([&] {
         int n = 0;
         while (!stop.load(std::memory_order_relaxed)) {
+            if (n >= kMaxProbeWrites) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
             const int mine = ++n;
             if (f.db->set_config(std::format("collector_probe_{}", mine), std::to_string(mine))) {
                 std::lock_guard lk(ack_mu);
                 acknowledged.push_back(mine);
                 ack_cv.notify_one();
             }
+            std::this_thread::yield();
         }
     });
     // Join on EVERY path: run_retention is not noexcept, and destroying a

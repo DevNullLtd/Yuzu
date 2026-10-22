@@ -78,8 +78,11 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <expected>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -1216,6 +1219,13 @@ public:
                          // (kept last across the device_api merge).
                          AppUsageStore* app_usage_store = nullptr);
 
+    /// Test hook: push the cached `get_security_posture` payload's `generated_at`
+    /// backward by `elapsed`, so a test crosses the `ttl_seconds` cache window
+    /// without sleeping. A no-op while the cache is empty (nothing cached yet).
+    /// Production code MUST NOT call this — no caller in `server/core/src/**`
+    /// references it.
+    void age_posture_cache_for_test(std::chrono::milliseconds elapsed);
+
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──
     // COEXISTENCE (4.2→4.3 rebase): the 4.2 role-assignment handlers use the
@@ -1234,6 +1244,26 @@ private:
     // pre-dispatch dry run in mcp_server.cpp fails closed rather than
     // silently reverting to the pre-#3687 collapsed-envelope behaviour.
     AuthorizeDispatchFn authorize_dispatch_fn_;
+    // Posture cache shared across httplib worker threads (the POST handler lambda
+    // is captured by value, so every worker shares this one object). Reads and
+    // writes of the string fields MUST be serialised — an unsynchronised
+    // std::string read/write across threads is UB (G-S1, #1653 review). The
+    // cached `body` is the full posture payload MINUS the `data_age_seconds`
+    // field; that field is volatile (depends on read time) so it is injected
+    // per-request from the freshly computed age — never baked into the cache
+    // (G-S4: cache hits previously misreported freshness as 0).
+    //
+    // A member, not a build_handler local, so age_posture_cache_for_test can reach
+    // it. The scope widens from "per handler" to "per McpServer", which is benign:
+    // build_handler runs exactly once per McpServer (register_routes' single
+    // sink.Post("/mcp/v1/", build_handler(...)) call), so there is still exactly one
+    // cache per route. build_handler copies the shared_ptr into the handler lambda.
+    struct PostureCache {
+        std::mutex mtx;
+        std::chrono::steady_clock::time_point generated_at{};
+        std::string body; // payload JSON object string, WITHOUT data_age_seconds
+    };
+    std::shared_ptr<PostureCache> posture_cache_ = std::make_shared<PostureCache>();
     // Progress bridge core (2f PR 3a) - see set_stream_bridge above.
     McpStreamBridge* stream_bridge_{nullptr};
     // KEK rotation seam (#2395 track C) - see set_kek_ops above. Default-

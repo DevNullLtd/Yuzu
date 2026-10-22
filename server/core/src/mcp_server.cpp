@@ -6234,6 +6234,12 @@ std::vector<std::string> approval_gated_tool_names() {
     return out;
 }
 
+void McpServer::age_posture_cache_for_test(std::chrono::milliseconds elapsed) {
+    std::lock_guard<std::mutex> lk(posture_cache_->mtx);
+    posture_cache_->generated_at -=
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(elapsed);
+}
+
 // ── Handler construction ─────────────────────────────────────────────────
 //
 // build_handler() returns the POST /mcp/v1/ handler as a std::function. Both
@@ -6429,20 +6435,10 @@ McpServer::HandlerFn McpServer::build_handler(
             metrics, /*surface=*/"mcp");
     }
 
-    // Posture cache shared across httplib worker threads (the POST handler lambda
-    // is captured by value, so every worker shares this one object). Reads and
-    // writes of the string fields MUST be serialised — an unsynchronised
-    // std::string read/write across threads is UB (G-S1, #1653 review). The
-    // cached `body` is the full posture payload MINUS the `data_age_seconds`
-    // field; that field is volatile (depends on read time) so it is injected
-    // per-request from the freshly computed age — never baked into the cache
-    // (G-S4: cache hits previously misreported freshness as 0).
-    struct PostureCache {
-        std::mutex mtx;
-        std::chrono::steady_clock::time_point generated_at{};
-        std::string body; // payload JSON object string, WITHOUT data_age_seconds
-    };
-    auto posture_cache = std::make_shared<PostureCache>();
+    // The posture cache is the posture_cache_ member (see its comment in
+    // mcp_server.hpp for the locking contract). Copy the shared_ptr so the handler
+    // lambda keeps its own reference; its body below is unchanged.
+    auto posture_cache = posture_cache_;
 
     // ── POST /mcp/v1/ — Main JSON-RPC 2.0 endpoint ───────────────────────
     return [=](const httplib::Request& req, httplib::Response& res) {

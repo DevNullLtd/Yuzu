@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <memory>
 #include <thread>
+#include <vector>
 
 using namespace yuzu::server;
 using yuzu::server::auth::AuthManager;
@@ -114,16 +115,27 @@ TEST_CASE_METHOD(BreakGlassFixture, "re-arming refreshes the window", "[pg][auth
     CHECK(second->armed_until >= first->armed_until);
 }
 
-TEST_CASE_METHOD(BreakGlassFixture, "expired window auto-disarms", "[pg][auth][breakglass][slow]") {
-    // Arm with a 1-second window. SQLite datetime('now','+1 seconds') has
-    // calendar-second granularity, so the real wait is up to ~2 s; the
-    // `yuzu-local-windows` runner adds Defender I/O serialisation on top (flake
-    // #473). Sleep 3.5 s for margin. Tagged [slow] so quick runs exclude it.
+TEST_CASE_METHOD(BreakGlassFixture, "expired window auto-disarms", "[pg][auth][breakglass]") {
+    // Arm with a 1-second window, then lapse it by rewinding the stored deadline in
+    // SQL. break_glass_armed_until is authored from Postgres now() and compared with
+    // it in SQL (auth_db.cpp arm_break_glass / break_glass_status), so the test cannot
+    // shift it from the C++ side; rewinding the row leaves the PG clock as the only
+    // author of the comparison and avoids sleeping out the window. No production
+    // change.
     auto armed = db->arm_break_glass("alice", 1);
     REQUIRE(armed.has_value());
     REQUIRE(armed->armed);
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(3500));
+    {
+        auto lease = db.pool().acquire();
+        REQUIRE(lease);
+        REQUIRE(yuzu::server::pg::exec_params(
+                    lease.get(),
+                    "UPDATE auth.users SET break_glass_armed_until = now() - interval '1 second' "
+                    "WHERE username = 'alice'",
+                    std::vector<std::string>{})
+                    .ok());
+    }
 
     // The arm auto-expires with no background job — the login gate would now
     // reject the break-glass account exactly like any other local login.

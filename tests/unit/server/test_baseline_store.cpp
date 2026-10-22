@@ -442,19 +442,28 @@ TEST_CASE("set_members/set_assignment advance the parent baseline's updated_at",
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     BaselineStore store{pool};
     const std::string id = *store.create_baseline(make_baseline("touch"));
-    const int64_t created_updated_at = store.get_baseline(id)->updated_at;
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // now_epoch() is second-granular
+    // updated_at is a stored second-granular epoch bigint, so two writes inside one
+    // second would store the same value. Rewind the stored row 2 s in SQL (no
+    // production change, no sleeping) so the next write must land strictly later.
+    const auto rewind_updated_at = [&] {
+        exec_sql(db.dsn(), "UPDATE baseline_store.baselines SET updated_at = updated_at - 2 "
+                           "WHERE baseline_id = '" + id + "'");
+    };
+
+    rewind_updated_at();
+    const int64_t created_updated_at = store.get_baseline(id)->updated_at;
 
     REQUIRE(store.set_members(id, {"r1"}).has_value());
     const int64_t after_members = store.get_baseline(id)->updated_at;
     CHECK(after_members > created_updated_at);
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    rewind_updated_at();
+    const int64_t before_assignment = store.get_baseline(id)->updated_at;
 
     REQUIRE(store.set_assignment(id, {{"g1", kAssignInclude}}).has_value());
     const int64_t after_assignment = store.get_baseline(id)->updated_at;
-    CHECK(after_assignment > after_members);
+    CHECK(after_assignment > before_assignment);
 }
 
 TEST_CASE("delete_baseline cascades members and assignment", "[pg][baseline_store]") {

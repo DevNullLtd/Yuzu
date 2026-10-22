@@ -698,6 +698,19 @@ public:
     std::vector<std::string> list_securable_types() const;
     std::vector<std::string> list_operations() const;
 
+    /// Test hook: age THIS instance's local steady-clock readings by `elapsed`, so a
+    /// test crosses the refresh gate, the stale-serve bound or the breaker's probe
+    /// cooldown without sleeping. Moves `refresh_started_ms_` and
+    /// `last_successful_refresh_ms_` (under `cache_mtx_`), then
+    /// `breaker_last_probe_started_ms_` (under `breaker_mtx_`) `elapsed` into the
+    /// past — two sequential lock scopes, never nested. It ages only the object it is
+    /// called on (a second replica sharing the database is a separate instance with
+    /// its own readings), and it never touches `generation_valid_`: ageing that would
+    /// turn a "stale by elapsed time" case into an "invalid view" case and hide the
+    /// #2703 bound logic the case exists to prove. Production code MUST NOT call
+    /// this — no caller in `server/core/src/**` references it.
+    void age_refresh_state_for_test(std::chrono::milliseconds elapsed);
+
 private:
     /// Breaker-gated, `kAuthzAcquireTimeout` read of the one `role_permissions` row for a
     /// (role, securable, operation) triple, for request-path callers

@@ -735,17 +735,10 @@ TEST_CASE("POST /login/mfa pending token expires after TTL", "[pg][mfa][routes][
     auto p_start = body.find(R"("mfa_pending_token":")") + 21;
     auto pending = body.substr(p_start, body.find('"', p_start) - p_start);
 
-    // Sleep past the TTL (set to 2 s at the top of this case). reap_mfa_
-    // pending_locked fires on the next access via /login/mfa.
-    //
-    // 5000 ms = 2.5x the TTL — the conventional multiplier for wall-
-    // clock-gated tests on a nightly sanitizer runner where ASan + UBSan
-    // add 2-3x CPU overhead and scheduler preemption under load is
-    // unbounded. Earlier iterations of this test used 2200 ms (10 %
-    // margin) and 2800 ms (40 % margin); cpp-safety + qe both flagged
-    // anything below 2x as fragile. Test now takes ~3 s extra but is
-    // robust on the slowest runner in the matrix.
-    std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+    // Move the pending challenge's deadline 3000 ms into the past (past the 2 s TTL set
+    // at the top of this case) instead of sleeping. reap_mfa_pending_locked fires on
+    // the next access via /login/mfa.
+    h.auth_routes->expire_mfa_pending_for_test(pending, std::chrono::milliseconds(3000));
 
     auto r = h.sink.Post("/login/mfa",
                          form({{"mfa_pending_token", pending}, {"code", "000000"}}),

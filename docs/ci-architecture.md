@@ -1398,6 +1398,28 @@ runs were on a shared box, so treat the ordering among the top shards as
 noise-level. Re-measure on the first CI run. Priorities are now merged M
 185 and merged I 245 (all 14 distinct); see `tests/meson.build`.
 
+**2026-10-22: test hot spots (#4882, #2600) — shard re-cuts after removing the
+cost, not just moving it.** Two avoidable costs were found by measurement
+(braga, macOS debug, one shard at a time) and removed before any rebalancing.
+Non-pg shard D was 39.5 s, of which 34 s were two regular-expression passes
+over every server source file (the route inventory); linear `find` scans now
+do the same work (D 5.6 s), and the three private copies of the `//`-comment
+stripper are one helper. Several pg and non-pg cases slept through 1 s to 6 s
+store deadlines; per-store `*_for_test` seams now age the local deadline
+instead (98.7 s of sleeping removed; the two Postgres-authored deadlines,
+lockout and break-glass, are rewound in SQL). With those gone: non-pg B moves
+its four heaviest independent tags (`[oidc]`, `[retention]`, `[readyz]`,
+`[tls]`) to C (B 77.5 s -> 38.4 s, C 4.8 s -> 37.9 s) and pg shard M's
+`[pg][readyz]` clause (about 65 s of connect-deadline cases) moves to B (M 208
+s -> 119.8 s, B 109 s -> 135.0 s). The pg move departs from the "move a TAG
+between P and C, M and N, or O and F" rule above on purpose: B lost 43.6 s of
+sleeping, which the 2026-10-11 pairings could not foresee, so it became the
+natural receiver for M's heaviest clause, a pairing that rule does not name.
+No shard count changes (14 pg, 4 non-pg), the `[pg]` and non-pg populations
+are exact partitions before and after (5792 and 6732 cases on the measured
+binary), and pg B's priority is now 186. Windows MSVC measurements of this
+change: PENDING (kingsley run).
+
 **Drift risk — automated (#3443 Phase 1, 2026-08-26):** this used to hardcode
 the 10 pg shard names and the 3 non-pg server test names directly in `ci.yml`,
 hand-synced against `tests/meson.build`'s own tag filters and

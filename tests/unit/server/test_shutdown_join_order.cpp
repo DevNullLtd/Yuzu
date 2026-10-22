@@ -26,7 +26,7 @@
  *
  * MECHANISM -- no hand-copied line numbers. This test opens server.cpp (via
  * `YUZU_SERVER_SRC_DIR`, injected by tests/meson.build) AT TEST RUN TIME and
- * locates, by regex, the single call sites for:
+ * locates, by literal substring, the single call sites for:
  *   - `agent_server_->Shutdown(deadline)`
  *   - `policy_eval_thread_.join()`
  *   - `preflight_runner_thread_.join()`
@@ -70,84 +70,37 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <algorithm>
-#include <filesystem>
-#include <fstream>
-#include <regex>
-#include <sstream>
 #include <string>
 #include <vector>
 
-#ifndef YUZU_SERVER_SRC_DIR
-#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build (meson.project_source_root() / 'server' / 'core' / 'src') -- see the server_test_exe cpp_args block."
-#endif
+#include "source_scan.hpp"
 
 namespace {
 
-namespace fs = std::filesystem;
-
-std::string read_server_cpp() {
-    const fs::path path = fs::path(YUZU_SERVER_SRC_DIR) / "server.cpp";
-    REQUIRE(fs::is_regular_file(path));
-    std::ifstream in(path, std::ios::binary);
-    REQUIRE(in.is_open());
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    return ss.str();
-}
-
-int line_of(const std::string& text, std::size_t pos) {
-    return static_cast<int>(std::count(
-               text.begin(), text.begin() + static_cast<std::string::difference_type>(pos), '\n')) +
-           1;
-}
-
-std::string strip_line_comments(const std::string& text) {
-    static const std::regex re(R"(//[^\n]*)");
-    return std::regex_replace(text, re, "");
-}
-
-// Returns the line number of the SOLE match, failing loudly (rather than
-// returning an empty optional, or silently picking the first of several) if
-// the pattern is found zero or more-than-one times -- a vacuous pass here
-// would be worse than a hard failure, since it would mean the scan itself
-// broke, not that the ordering is fine. Uniqueness matters as much as
-// presence (governance Gate 2, security-guardian): a future second call site
-// matching the same pattern earlier in the file (e.g. a hoisted helper)
-// would otherwise satisfy every ordering check below while the real
-// `stop()` order silently regressed.
-int require_one_line(const std::string& text, const std::regex& re, const char* label) {
-    INFO("looking for: " << label);
-    std::vector<int> lines;
-    for (auto it = std::sregex_iterator(text.begin(), text.end(), re); it != std::sregex_iterator();
-         ++it)
-        lines.push_back(line_of(text, static_cast<std::size_t>(it->position(0))));
-    REQUIRE(lines.size() == 1);
-    return lines[0];
-}
+using yuzu::test::source_scan::occurrence_lines;
+using yuzu::test::source_scan::require_one_line;
+using yuzu::test::source_scan::stripped_source;
 
 } // namespace
 
 TEST_CASE("server.cpp: agent_server_->Shutdown(deadline) runs before the policy-eval/"
           "pre-flight/quarantine/schedule joins and the heartbeat fn-null wait (#3495)",
           "[shutdown_order]") {
-    const std::string text = strip_line_comments(read_server_cpp());
+    const std::string& text = stripped_source("server.cpp");
 
-    const int shutdown_line =
-        require_one_line(text, std::regex(R"(agent_server_->Shutdown\(deadline\))"),
-                          "agent_server_->Shutdown(deadline)");
-    const int policy_eval_join_line = require_one_line(
-        text, std::regex(R"(policy_eval_thread_\.join\(\))"), "policy_eval_thread_.join()");
+    const int shutdown_line = require_one_line(text, "agent_server_->Shutdown(deadline)",
+                                               "agent_server_->Shutdown(deadline)");
+    const int policy_eval_join_line =
+        require_one_line(text, "policy_eval_thread_.join()", "policy_eval_thread_.join()");
     const int preflight_join_line = require_one_line(
-        text, std::regex(R"(preflight_runner_thread_\.join\(\))"), "preflight_runner_thread_.join()");
-    const int quarantine_join_line =
-        require_one_line(text, std::regex(R"(quarantine_reconcile_thread_\.join\(\))"),
-                          "quarantine_reconcile_thread_.join()");
-    const int schedule_join_line = require_one_line(
-        text, std::regex(R"(schedule_tick_thread_\.join\(\))"), "schedule_tick_thread_.join()");
+        text, "preflight_runner_thread_.join()", "preflight_runner_thread_.join()");
+    const int quarantine_join_line = require_one_line(
+        text, "quarantine_reconcile_thread_.join()", "quarantine_reconcile_thread_.join()");
+    const int schedule_join_line =
+        require_one_line(text, "schedule_tick_thread_.join()", "schedule_tick_thread_.join()");
     const int fn_null_wait_line =
-        require_one_line(text, std::regex(R"(heartbeat_ingestion_->set_quarantine_reconcile_fn\(nullptr\))"),
-                          "heartbeat_ingestion_->set_quarantine_reconcile_fn(nullptr)");
+        require_one_line(text, "heartbeat_ingestion_->set_quarantine_reconcile_fn(nullptr)",
+                         "heartbeat_ingestion_->set_quarantine_reconcile_fn(nullptr)");
 
     INFO("Shutdown(deadline) at server.cpp:" << shutdown_line);
 
@@ -219,14 +172,26 @@ TEST_CASE("server.cpp: agent_server_->Shutdown(deadline) runs before the policy-
 TEST_CASE("server.cpp: web_thread_.join() runs before schedule_engine_.reset() "
           "(ADR-0031 WS-A4 schedule seam)",
           "[shutdown_order]") {
-    const std::string text = strip_line_comments(read_server_cpp());
+    const std::string& text = stripped_source("server.cpp");
 
-    const int web_join_line =
-        require_one_line(text, std::regex(R"(web_thread_\.join\(\))"), "web_thread_.join()");
-    const int schedule_engine_reset_line = require_one_line(
-        text, std::regex(R"(schedule_engine_\.reset\(\))"), "schedule_engine_.reset()");
+    const int web_join_line = require_one_line(text, "web_thread_.join()", "web_thread_.join()");
+    const int schedule_engine_reset_line =
+        require_one_line(text, "schedule_engine_.reset()", "schedule_engine_.reset()");
 
     INFO("web_thread_.join() at server.cpp:" << web_join_line);
     INFO("schedule_engine_.reset() at server.cpp:" << schedule_engine_reset_line);
     CHECK(web_join_line < schedule_engine_reset_line);
+}
+
+// require_one_line fails loudly on zero or on more than one occurrence (uniqueness kept
+// from the pattern version). The failure itself is a Catch2 REQUIRE, so the count it
+// tests is pinned directly through occurrence_lines.
+TEST_CASE("occurrence_lines: zero and two occurrences are not a sole match, "
+          "and a sole match reports its line",
+          "[shutdown_order]") {
+    CHECK(occurrence_lines("a\nb\n", "x()").empty());
+    CHECK(occurrence_lines("a\nx()\nb\n", "x()") == std::vector<int>{2});
+    CHECK(occurrence_lines("x()\nb\nx()\n", "x()") == std::vector<int>{1, 3});
+    // A needle is a literal: the pattern metacharacters in a call site are plain text.
+    CHECK(occurrence_lines("a.join() ajoin()", ".join()") == std::vector<int>{1});
 }

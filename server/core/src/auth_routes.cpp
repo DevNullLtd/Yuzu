@@ -1574,6 +1574,16 @@ AuditEvent AuthRoutes::make_audit_event(const httplib::Request& req, const std::
     return event;
 }
 
+void AuthRoutes::expire_mfa_pending_for_test(const std::string& pending_token,
+                                             std::chrono::milliseconds elapsed) {
+    std::lock_guard lock(mfa_pending_mu_);
+    const auto it = mfa_pending_.find(pending_token);
+    if (it == mfa_pending_.end())
+        return;
+    it->second.expires_at -=
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(elapsed);
+}
+
 void AuthRoutes::reap_mfa_pending_locked() {
     auto now = std::chrono::steady_clock::now();
     std::erase_if(mfa_pending_, [&](const auto& p) { return now > p.second.expires_at; });
