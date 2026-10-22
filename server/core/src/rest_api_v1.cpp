@@ -13825,9 +13825,15 @@ void RestApiV1::register_routes(
                       if (body.contains("params") && body["params"].is_object())
                           for (auto& [k, v] : body["params"].items())
                               params[k] = v.is_string() ? v.get<std::string>() : v.dump();
-                      std::string matcher = (body.contains("matcher") && body["matcher"].is_object())
-                                                ? body["matcher"].dump()
-                                                : std::string();
+                      std::string matcher;
+                      if (body.contains("matcher") && body["matcher"].is_object()) {
+                          // Server-authored declared-column binding (one shared helper, also
+                          // used by the MCP twin); the stored payload keeps the caller's text.
+                          auto bound = body["matcher"];
+                          yuzu::server::rs_matcher::bind_declared_columns(bound, def.result_schema,
+                                                                          def.plugin);
+                          matcher = bound.dump();
+                      }
                       // source_payload — design §3.2 instruction_result shape.
                       nlohmann::json payload;
                       payload["instruction_id"] = instruction_id;
