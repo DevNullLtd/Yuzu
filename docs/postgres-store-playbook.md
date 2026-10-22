@@ -519,8 +519,9 @@ kind is **deliberately not built yet** (no store needs it). The rule:
 
 Recorded exception: three plain transactional index builds on large tables are accepted for now
 (`SoftwareInventoryStore` v7 and `ca_issued`, ADR-0053 "Update (2026-10-20)"; `agent_routes`,
-ADR-2002 §7f "Update (2026-10-22, #5683)"), on the maintainer's no-rolling-upgrade decision. It ends when rolling upgrades are
-supported or #4432 delivers the non-transactional kind. It does not change the rule for new work.
+ADR-2002 §7f "Update (2026-10-22, #5683)"), on the maintainer's no-rolling-upgrade decision. It ends
+when rolling upgrades are supported or #4432 delivers the non-transactional kind. It does not change
+the rule for new work.
 
 ## Substrate quick facts (pool / runner / helpers)
 

@@ -2156,7 +2156,9 @@ The session id on the gateway-to-server hop is asserted by the gateway.
   agent's committed directory row already holds, counted under
   `yuzu_server_gateway_route_desync_total{op="proxy_register",outcome="session_held_by_other_agent"}`
   (alert `YuzuGatewaySessionHeldByOtherAgent`; expected rate zero, so any
-  increase means a forged or colliding id from a pinned gateway). A unique
+  increase means a forged or colliding id from a pinned gateway, except the
+  bounded one-time migration artifact described under "One-time dedup at
+  upgrade" below, which has its own carve-out and limits). A unique
   index on `session_id` (migration v5, #5683) serialises two concurrent adopts
   of one id for different agents: the second is refused with the same
   `FAILED_PRECONDITION` and the same counter, so no duplicate row is created
@@ -2195,27 +2197,39 @@ rows that already shared a session id (expected: none) and logs
 `migration v5 tombstoned N agent_routes row(s)` once; the count is exported as
 `yuzu_server_gateway_route_session_dedup_total`. A non-zero value means those
 agents re-registered through the normal heartbeat replay (one or two heartbeat
-cycles); find how the duplicate arose. The counter is present when the server
+cycles, up to about 6 minutes if the gateway circuit breaker had opened); find how the duplicate arose. The counter is present when the server
 runs with `--gateway-upstream` and reads the migration of THIS start only: it
 reads 0 on any later restart. The durable record is the `route_meta` row
 (`SELECT value FROM gateway_route_store.route_meta WHERE key = 'v5_session_dedup_tombstoned_rows';`),
 and a later start logs it once at INFO. A tombstoned agent's replay can lose the
 race to another tombstoned agent that presented the same id first; the loser is
 refused (`session_held_by_other_agent`) and re-registers with a fresh session.
-So when `YuzuGatewaySessionHeldByOtherAgent` fires, the refusals are the
+So when `YuzuGatewaySessionHeldByOtherAgent` fires, the refusals can be the
 one-time migration artifact ONLY IF BOTH hold: (a) the number of
-`session_held_by_other_agent` refusals since that start is at most N, the number
-of rows migration v5 tombstoned on that start
+`op="proxy_register"` `session_held_by_other_agent` refusals since that start is
+at most N, the number of rows migration v5 tombstoned on that start
 (`yuzu_server_gateway_route_session_dedup_total` on the migrating start; the
 `migration v5 tombstoned N` WARN, or the `route_meta` value after a restart),
-because a tombstoned group of k rows can produce at most k-1 refusals; and (b)
-they all occur within a few minutes of that start (about 1-2 heartbeat cycles).
+because a tombstoned group of k rows can produce at most k-1 refusals (N is a
+safe upper bound); any `op="announce_connected"` refusal is NOT the artifact;
+and (b) they all occur within that start's window: one or two 30 s agent
+heartbeat cycles, plus up to 300 s more if the gateway circuit breaker opened
+while the server was down (cap `circuit_breaker_max_reset_timeout_ms` in
+`gateway/config/sys.config`), plus the replay drip; allow roughly 6 minutes.
 Refusals that continue past that window, or exceed N, are NOT the artifact:
-treat them as a forged or colliding id and escalate. The counter keeps its
-migrating-start value for the whole process lifetime, so it proves nothing about
-timing; after any restart it reads 0 and the `route_meta` value has no
-timestamp, so use the earlier start's WARN time (or the deploy time) and the
-`route_meta` count.
+treat them as a forged or colliding id and escalate. Refusals inside the bound
+and the window are still NOT proof of benignness: a forged presenter acting at
+the same time could hide inside them, and a forger that wins the reclaim of a
+tombstoned id makes the legitimate agents' refusals look identical. The rule
+only lets you stop escalating once refusals have stopped inside the window:
+re-check the refusal count after the window has passed, and do not silence the
+alert beyond the window (it has no `for:` and uses `increase()[1h]`, so a
+silence would hide later refusals). The counter keeps its migrating-start value
+for the whole process lifetime, so it proves nothing about timing; establish
+timing from the WARN timestamps (after any restart the counter reads 0 and the
+`route_meta` value has no timestamp, so use the earlier start's WARN time or the
+deploy time, with the `route_meta` count). If the migrating start's time or log
+cannot be found, escalate.
 See
 [upgrading](upgrading.md#behaviour-change-gateway-sessions-are-unique-per-agent-a-one-time-migration-gateway_route_store-v5-5683).
 
@@ -2227,6 +2241,12 @@ other name is not recognised, so a racing adopt fails as a generic route-write
 error, `ProxyRegister` answers `UNAVAILABLE` and the gateway counts that against
 its circuit breaker.
 
+0. Check first whether the correct index exists:
+   `SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'gateway_route_store' AND c.relname = 'ux_agent_routes_session_id' AND i.indisunique AND i.indisvalid AND i.indpred IS NOT NULL;`
+   A row means the index exists, is unique, is valid and is partial: do not run
+   the block below (the duplicate is already gone and the alert clears within
+   the hour; running it anyway is harmless but rebuilds the index under the
+   lock). No row means it is missing, invalid or of another shape: continue.
 1. Find the duplicates (optional; the block below tombstones none if there are
    none):
    `SELECT session_id, array_agg(agent_id) FROM gateway_route_store.agent_routes WHERE session_id IS NOT NULL GROUP BY session_id HAVING count(*) > 1;`
@@ -2237,6 +2257,7 @@ its circuit breaker.
    ```sql
    BEGIN;
    SET LOCAL lock_timeout = '30s';
+   SET LOCAL statement_timeout = 0;
    LOCK TABLE gateway_route_store.agent_routes IN ACCESS EXCLUSIVE MODE;
    UPDATE gateway_route_store.agent_routes
    SET session_id = NULL, lease_until = NULL, cluster_id = NULL,
@@ -2244,6 +2265,9 @@ its circuit breaker.
    WHERE session_id IN (
        SELECT session_id FROM gateway_route_store.agent_routes
        WHERE session_id IS NOT NULL GROUP BY session_id HAVING count(*) > 1);
+   -- only reached when the Check-first query returned no row: this clears a
+   -- stray/invalid/wrong-shape object of that name
+   DROP INDEX IF EXISTS gateway_route_store.ux_agent_routes_session_id;
    CREATE UNIQUE INDEX ux_agent_routes_session_id
        ON gateway_route_store.agent_routes (session_id) WHERE session_id IS NOT NULL;
    COMMIT;
@@ -2262,7 +2286,10 @@ failed on purpose and rolled back. The server log shows
 `PgMigrationRunner: migration v5 failed for gateway_route_store:` carrying the
 Postgres error `relation "ux_agent_routes_session_id" already exists`, followed
 by `GatewayRouteStore: schema migration failed`. Drop that object
-(`DROP INDEX gateway_route_store.ux_agent_routes_session_id;`) and restart.
+(`DROP INDEX gateway_route_store.ux_agent_routes_session_id;`, the same clean-up
+the `DROP INDEX IF EXISTS` line in the block above performs) and restart: the
+migration then removes any duplicates and builds the correct index itself, so
+do not also run the recovery block.
 
 **Agent dependency.** The ordinary restart path above does not need the agent
 to do anything. When the gateway does disconnect an agent process (an

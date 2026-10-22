@@ -2035,11 +2035,12 @@ acknowledged, lease-renewed and ingested during the degrade, which suspends the 
 that window. The gateway-to-server hop is protected by the gateway peer mTLS plus SPKI pin. Evidence
 for these decisions is metrics and server logs only — there is no per-event audit row (volume is
 unbounded), except the `announce_connected/session_held_by_other_agent` refusal of #5683 (see the
-Update below), which writes a best-effort `gateway.session_held_by_other_agent` row. The `ProxyRegister` adopt path rejects a presented session id that is not `gw-session-`
-plus 32 lowercase hex characters (`proxy_register/malformed_session_id`), and refuses to adopt an id
-that a different agent's COMMITTED directory row already holds (`proxy_register/session_held_by_other_agent`,
-expected rate zero, alert `YuzuGatewaySessionHeldByOtherAgent`). The same-statement `NOT EXISTS` is
-only a fast path and is not a lock: as merged in #5694 two CONCURRENT adopts of one id for different
+Update below), which writes a best-effort `gateway.session_held_by_other_agent` row. The `ProxyRegister`
+adopt path rejects a presented session id that is not `gw-session-` plus 32 lowercase hex characters
+(`proxy_register/malformed_session_id`), and refuses to adopt an id that a different agent's COMMITTED
+directory row already holds (`proxy_register/session_held_by_other_agent`, expected rate zero, alert
+`YuzuGatewaySessionHeldByOtherAgent`). The same-statement `NOT EXISTS` is only a fast path and is not a
+lock: as merged in #5694 two CONCURRENT adopts of one id for different
 agents could both land (measured against live Postgres). Migration v5 (#5683) closes that with a UNIQUE
 partial index, so the loser now fails 23505 and is refused as `held_by_other_agent`; the ambiguity
 refusal (`YuzuGatewaySessionAmbiguous`) remains as defence in depth for a hand-dropped index only.
@@ -2104,11 +2105,12 @@ first (`lock_timeout` 30 s, `statement_timeout` lifted). Only `DROP INDEX` needs
 dedup `UPDATE` needs only ROW EXCLUSIVE); it is taken up front so a later lock upgrade cannot deadlock
 against another replica's read-then-write transaction and no writer can commit a new duplicate between
 the dedup and the build. The old index is dropped with `IF EXISTS` (a hand-dropped one does not abort the
-migration); the `CREATE UNIQUE INDEX` deliberately has no `IF NOT EXISTS`, so a pre-existing object of
-that name aborts the migration atomically by design; the operator drops it and restarts.
-Otherwise the migration tombstones EVERY row of any group sharing a session id (the five placement columns NULLed;
-`connection_epoch` and `home_cluster_id` kept, the shape `deregister` writes), then builds the index. All
-rows rather than "keep one": a group has no determinable owner (no `created_at`; the newest
+migration); the `CREATE UNIQUE INDEX` deliberately has no `IF NOT EXISTS`.
+The migration tombstones EVERY row of any group sharing a session id (the five placement columns
+NULLed; `connection_epoch` and `home_cluster_id` kept, the shape `deregister` writes), then builds the
+index; a pre-existing object of that name aborts it atomically (the tombstones roll back too), by design:
+the operator drops it and restarts. The
+choice is all rows rather than "keep one": a group has no determinable owner (no `created_at`; the newest
 `updated_at` is the later adopter, i.e. the likelier forger) and this is exactly what the reaper already
 does to both rows 270 s later. Each affected agent recovers through the existing renew shortfall ->
 gateway replay -> `reclaim` path, where the first reclaimer wins and the other is refused and reconnects.
@@ -2121,15 +2123,22 @@ migrate the same database concurrently, each reads the winner's count, so the co
 twice. The tombstoned agents race to replay, so some replays are refused as `session_held_by_other_agent`
 and raise `YuzuGatewaySessionHeldByOtherAgent` right after the migrating boot. The operator guidance (in
 `docs/user-manual/gateway.md`) calls those refusals the one-time migration artifact ONLY IF BOTH hold:
-(a) the number of `session_held_by_other_agent` refusals since that start is at most N, the number of
-rows migration v5 tombstoned on that start (`yuzu_server_gateway_route_session_dedup_total` on the
-migrating start; the `migration v5 tombstoned N` WARN, or the `route_meta` value after a restart),
-because a tombstoned group of k rows can produce at most k-1 refusals; and (b) they all occur within a
-few minutes of that start (about 1-2 heartbeat cycles). Refusals that continue past that window, or
-exceed N, are NOT the artifact: treat them as a forged or colliding id and escalate. The counter keeps
-its migrating-start value for the whole process lifetime, so it proves nothing about timing; after any
-restart it reads 0 and the `route_meta` value has no timestamp, so use the earlier start's WARN time (or
-the deploy time) and the `route_meta` count.
+(a) the number of `op="proxy_register"` `session_held_by_other_agent` refusals since that start is at
+most N, the number of rows migration v5 tombstoned on that start
+(`yuzu_server_gateway_route_session_dedup_total` on the migrating start; the `migration v5 tombstoned N`
+WARN, or the `route_meta` value after a restart), because a tombstoned group of k rows can produce at
+most k-1 refusals (N is a safe upper bound); any `op="announce_connected"` refusal is NOT the artifact;
+and (b) they all occur within that start's window: one or two 30 s agent heartbeat cycles, plus up to
+300 s more if the gateway circuit breaker opened while the server was down (cap
+`circuit_breaker_max_reset_timeout_ms` in `gateway/config/sys.config`), plus the replay drip; allow
+roughly 6 minutes. Refusals past that window, or more than N, are NOT the artifact: treat them as a
+forged or colliding id and escalate. Refusals inside the bound and the window are still NOT proof of
+benignness (a forged presenter acting at the same time could hide inside them, and a forger that wins
+the reclaim of a tombstoned id makes the legitimate agents' refusals look identical): the rule only lets
+an operator stop escalating once refusals have stopped inside the window, so the count is re-checked
+after the window and the alert is not silenced beyond it. The counter keeps its migrating-start value
+for the whole process lifetime, so it proves nothing about timing; timing comes from the WARN
+timestamps, and if the migrating start's time or log cannot be found the operator escalates.
 
 *Deviation from ADR-0008, signed off.* The build is a plain transactional `CREATE UNIQUE INDEX`, not
 `CONCURRENTLY` (the migration runner has no non-transactional kind, #4432). Fraser (project lead)
