@@ -320,8 +320,6 @@ TEST_CASE("registry audit: the AuditEvent shape", "[server][registry_audit]") {
     }
 }
 
-// ── the binding ──────────────────────────────────────────────────────────
-
 // ── the plugin's own renderer ────────────────────────────────────────────
 
 namespace {
@@ -373,7 +371,7 @@ TEST_CASE("registry audit: the plugin's own renderer puts result= where the extr
     }
 }
 
-TEST_CASE("registry audit: a real rendered line with a 300-byte key is one row, cut by the renderer",
+TEST_CASE("registry audit: a real rendered line with a 300-byte key is one row; cut by the renderer",
           "[server][registry_audit]") {
     const std::string line = rendered("ok", "", std::string(300, 'k'));
     CHECK(line.find("|key=" + std::string(256, 'k') + "~300|") != std::string::npos);
@@ -394,6 +392,8 @@ TEST_CASE("registry audit: a real rendered line with one trailing CR yields the 
     CHECK(crlf.events[0].detail == lf.events[0].detail); // the CR is not neutralised into the last field's hex
     CHECK(crlf.events[0].detail.ends_with("|new=02000000"));
 }
+
+// ── the binding ──────────────────────────────────────────────────────────
 
 TEST_CASE("registry audit: only the three mutating actions of the registry plugin mint rows",
           "[server][registry_audit]") {

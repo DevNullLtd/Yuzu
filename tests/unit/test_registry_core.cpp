@@ -505,7 +505,7 @@ TEST_CASE("registry core: a refused or failed set_value reports the right token"
 
 // ── open_checked ─────────────────────────────────────────────────────────
 
-TEST_CASE("registry core: a registry link is refused at every position, and nothing is written",
+TEST_CASE("registry core: a registry link is refused at every position; nothing is written",
           "[registry][core]") {
     const bool fast = GENERATE(false, true);
     FakeRegistry reg;
@@ -688,6 +688,7 @@ TEST_CASE("registry core: delete_value_verified splits not-found from denied and
         const auto o = delete_value_verified(reg, FakeRegistry::kRoot, "A", "V", fast);
         CHECK(o.result == "ok");
         CHECK(o.verify == "ok");
+        CHECK(o.has_old); // the audit line carries what was deleted
         CHECK(o.old.state == OldState::present);
         CHECK(reg.get("A", "V") == nullptr);
     }
@@ -700,6 +701,8 @@ TEST_CASE("registry core: delete_value_verified splits not-found from denied and
         const auto o = delete_value_verified(reg, FakeRegistry::kRoot, "A", "Other", fast);
         CHECK(o.result == "refused");
         CHECK(o.reason == "value_not_found");
+        CHECK(o.has_old); // refused, but the audit line still says the value was absent
+        CHECK(o.old.state == OldState::absent);
         CHECK(reg.calls("delete_value") == 0);
     }
     SECTION("the delete itself is denied") {

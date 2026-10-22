@@ -227,7 +227,7 @@ struct ScratchTree {
 
 // ── typed + verified writes (HKCU) ──
 
-TEST_CASE("registry write: set_value round-trips all six types, each preceded by one audit line",
+TEST_CASE("registry write: set_value round-trips all six types; each preceded by one audit line",
           "[registry][windows][write]") {
     Plugin p;
     if (!p.ok()) { skip_or_fail("registry.dll not found"); return; }
@@ -294,7 +294,7 @@ TEST_CASE("registry write: set_value round-trips all six types, each preceded by
     }
 }
 
-TEST_CASE("registry write: delete_value, and a value that is not there", "[registry][windows][write]") {
+TEST_CASE("registry write: delete_value; and a value that is not there", "[registry][windows][write]") {
     Plugin p;
     if (!p.ok()) { skip_or_fail("registry.dll not found"); return; }
     const std::string key = "Software\\" + scratch_name() + "\\dv";
@@ -362,6 +362,7 @@ TEST_CASE("registry write: a registry value containing a newline and an audit| l
     const std::string key = "Software\\" + scratch_name() + "\\inj";
     ScratchTree cleanup{HKEY_CURRENT_USER, "Software\\" + scratch_name()};
     REQUIRE(put(HKEY_CURRENT_USER, key, "V", REG_SZ, utf16(L"x\naudit|op=set_value|result=ok")));
+    REQUIRE(put(HKEY_CURRENT_USER, key, "N|\naudit|op=set_value|result=ok", REG_DWORD, le(1, 4))); // a hostile NAME
     REQUIRE(put(HKEY_CURRENT_USER, key + "\\sub|\nname", "n", REG_DWORD, le(1, 4)));
     const auto out = p.run("get_value", {{"hive", "HKCU"}, {"key", key}, {"name", "V"}});
     CHECK(out.rc == 0);
@@ -370,6 +371,13 @@ TEST_CASE("registry write: a registry value containing a newline and an audit| l
     const auto subs = p.run("enumerate_keys", {{"hive", "HKCU"}, {"key", key}});
     CHECK(subs.audit_count() == 0);
     for (const auto& l : subs.lines) CHECK(l.find('\n') == std::string::npos);
+    // enumerate_values lists value NAMES, the registry's other attacker-shaped text: the LF and the `|` in the
+    // name become `_`, no line starts with audit|, and the two values are exactly two rows.
+    const auto vals = p.run("enumerate_values", {{"hive", "HKCU"}, {"key", key}});
+    CHECK(vals.rc == 0);
+    CHECK(vals.audit_count() == 0);
+    CHECK(vals.has("value|N__audit_op=set_value_result=ok|REG_DWORD"));
+    CHECK(vals.lines.size() == 2);
 }
 
 // ── delete_key: a leaf by handle, counts, links, ACLs ──
@@ -404,7 +412,7 @@ TEST_CASE("registry write: delete_key refuses a key with subkeys and deletes a l
     }
 }
 
-TEST_CASE("registry write: a registry link is refused, never followed, and deleting the link leaves its target",
+TEST_CASE("registry write: a registry link is refused; never followed; and deleting the link leaves its target",
           "[registry][windows][write]") {
     Plugin p;
     if (!p.ok()) { skip_or_fail("registry.dll not found"); return; }
@@ -484,7 +492,7 @@ TEST_CASE("registry write: a registry link whose target does not exist is refuse
     CHECK_FALSE(key_exists(HKEY_LOCAL_MACHINE, root + "\\Target"));
 }
 
-TEST_CASE("registry write: an ACL-denied key is access_denied, an absent key is key_not_found",
+TEST_CASE("registry write: an ACL-denied key is access_denied; an absent key is key_not_found",
           "[registry][windows][write]") {
     Plugin p;
     if (!p.ok()) { skip_or_fail("registry.dll not found"); return; }
@@ -702,7 +710,7 @@ std::vector<std::string> rows_of(const std::string& captured) {
 
 } // namespace
 
-TEST_CASE("registry plugin: version 2.0.0 and the 9 descriptors -- Windows supported, macOS and Linux planned",
+TEST_CASE("registry plugin: version 2.0.0 and the 9 descriptors -- Windows supported; macOS and Linux planned",
           "[registry][descriptors]") {
     auto plugin = load_registry_plugin();
     if (!plugin) return require_plugin_or_skip();

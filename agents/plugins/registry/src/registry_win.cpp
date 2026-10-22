@@ -37,6 +37,7 @@
 #include <iterator>
 #include <limits>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -166,11 +167,10 @@ template <class F> [[nodiscard]] F ntdll_proc(const char* symbol) {
 
 class Win32Registry final : public RegistryWriter {
 public:
+    // The same call as open_path (one component instead of a path); they stay two seam methods so the fake
+    // can count the walk and the fast open apart.
     long open_sub(Handle parent, std::string_view name, std::uint32_t access, Handle& out) override {
-        HKEY k = nullptr;
-        const LSTATUS rc = RegOpenKeyExW(as_hkey(parent), to_wide(name).c_str(), REG_OPTION_OPEN_LINK, access, &k);
-        if (rc == ERROR_SUCCESS) out = as_handle(k);
-        return rc;
+        return open_path(parent, name, access, out);
     }
 
     long open_path(Handle root, std::string_view key_path, std::uint32_t access, Handle& out) override {
@@ -280,23 +280,21 @@ struct Target {
     bool fast = false; ///< the fast open may be tried (fast_open_hive)
 };
 
-bool parse_target(yuzu::CommandContext& ctx, yuzu::Params params, Target& t) {
+/// The hive and key every action names. Writes its own `error|...` line and returns nullopt on a miss.
+std::optional<Target> parse_target(yuzu::CommandContext& ctx, yuzu::Params params) {
     const auto hive = params.get("hive");
     const auto key = params.get("key");
     if (hive.empty() || key.empty()) {
         ctx.write_output("error|missing required parameters: hive, key");
-        return false;
+        return std::nullopt;
     }
     const auto h = parse_hive(hive);
     if (!h) {
         ctx.write_output("error|invalid hive (use HKLM, HKCU, HKCR, or HKU)");
-        return false;
+        return std::nullopt;
     }
     audit_sensitive_path(hive, key);
-    t.hive = *h;
-    t.key = std::string{key};
-    t.fast = fast_open_hive(*h);
-    return true;
+    return Target{*h, std::string{key}, fast_open_hive(*h)};
 }
 
 /// A refused single action: the audit line and `error|<token>` with rc 1.
@@ -315,11 +313,13 @@ AuditRecord base_record(std::string_view op, const Target& t, std::string_view n
     return r;
 }
 
-// ── read actions (moved unchanged apart from sanitising registry-controlled text) ───────────
+// ── read actions (moved from 1.0.0 with two changes: registry-controlled text is sanitised, and get_value
+//    reads through the guarded two-call query_value_bounded) ───────────
 
 int do_get_value(yuzu::CommandContext& ctx, yuzu::Params params) {
-    Target t;
-    if (!parse_target(ctx, params, t)) return 1;
+    const auto target = parse_target(ctx, params);
+    if (!target) return 1;
+    const Target& t = *target;
     const auto val_name = params.get("name");
 
     yuzu::win::RegKey opened;
@@ -362,8 +362,9 @@ int do_get_value(yuzu::CommandContext& ctx, yuzu::Params params) {
 }
 
 int do_key_exists(yuzu::CommandContext& ctx, yuzu::Params params) {
-    Target t;
-    if (!parse_target(ctx, params, t)) return 1;
+    const auto target = parse_target(ctx, params);
+    if (!target) return 1;
+    const Target& t = *target;
     yuzu::win::RegKey opened;
     const bool exists =
         RegOpenKeyExW(hive_root(t.hive), to_wide(t.key).c_str(), 0, KEY_READ, opened.put()) == ERROR_SUCCESS;
@@ -372,8 +373,9 @@ int do_key_exists(yuzu::CommandContext& ctx, yuzu::Params params) {
 }
 
 int do_enumerate_keys(yuzu::CommandContext& ctx, yuzu::Params params) {
-    Target t;
-    if (!parse_target(ctx, params, t)) return 1;
+    const auto target = parse_target(ctx, params);
+    if (!target) return 1;
+    const Target& t = *target;
     yuzu::win::RegKey opened;
     if (RegOpenKeyExW(hive_root(t.hive), to_wide(t.key).c_str(), 0, KEY_ENUMERATE_SUB_KEYS, opened.put()) !=
         ERROR_SUCCESS) {
@@ -390,8 +392,9 @@ int do_enumerate_keys(yuzu::CommandContext& ctx, yuzu::Params params) {
 }
 
 int do_enumerate_values(yuzu::CommandContext& ctx, yuzu::Params params) {
-    Target t;
-    if (!parse_target(ctx, params, t)) return 1;
+    const auto target = parse_target(ctx, params);
+    if (!target) return 1;
+    const Target& t = *target;
     yuzu::win::RegKey opened;
     if (RegOpenKeyExW(hive_root(t.hive), to_wide(t.key).c_str(), 0, KEY_QUERY_VALUE, opened.put()) != ERROR_SUCCESS) {
         ctx.write_output("error|key not found");
@@ -590,8 +593,9 @@ PreparedSet prepare_set(AuditRecord& au, std::string_view key, std::string_view 
 }
 
 int do_set_value(yuzu::CommandContext& ctx, yuzu::Params params) {
-    Target t;
-    if (!parse_target(ctx, params, t)) return 1;
+    const auto target = parse_target(ctx, params);
+    if (!target) return 1;
+    const Target& t = *target;
     const auto name = params.get("name");
 
     AuditRecord au = base_record("set_value", t, name);
@@ -604,8 +608,9 @@ int do_set_value(yuzu::CommandContext& ctx, yuzu::Params params) {
 }
 
 int do_delete_value(yuzu::CommandContext& ctx, yuzu::Params params) {
-    Target t;
-    if (!parse_target(ctx, params, t)) return 1;
+    const auto target = parse_target(ctx, params);
+    if (!target) return 1;
+    const Target& t = *target;
     const auto name = params.get("name");
     const AuditRecord au = base_record("delete_value", t, name);
     std::string_view err = validate_key_path(t.key);
@@ -618,8 +623,9 @@ int do_delete_value(yuzu::CommandContext& ctx, yuzu::Params params) {
 }
 
 int do_delete_key(yuzu::CommandContext& ctx, yuzu::Params params) {
-    Target t;
-    if (!parse_target(ctx, params, t)) return 1;
+    const auto target = parse_target(ctx, params);
+    if (!target) return 1;
+    const Target& t = *target;
     const AuditRecord au = base_record("delete_key", t, {});
     if (const auto err = validate_key_path(t.key); !err.empty()) return refuse(ctx, au, err, true);
 
@@ -629,6 +635,12 @@ int do_delete_key(yuzu::CommandContext& ctx, yuzu::Params params) {
 }
 
 int dispatch(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) {
+#if defined(YUZU_REGISTRY_WIN_UNIT_TEST_INTERNALS_ONLY)
+    // Test-only (the macro is defined by test_registry_win_internals.cpp alone): a dispatch that throws, so the
+    // ABI-containment catch in execute_guarded is pinned. The real build has neither action.
+    if (action == "__throw_std") throw std::runtime_error("registry test: std::exception");
+    if (action == "__throw_other") throw 42;
+#endif
     if (action == "get_value") return do_get_value(ctx, params);
     if (action == "set_value") return do_set_value(ctx, params);
     if (action == "delete_value") return do_delete_value(ctx, params);
@@ -642,12 +654,9 @@ int dispatch(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params pa
     return 1;
 }
 
-} // namespace
-
-// The guard macro is defined only by tests/unit/test_registry_win_internals.cpp, which includes this file
-// to drive Win32Registry directly (the privacy_permissions_win.cpp seam); the real build never defines it.
-#if !defined(YUZU_REGISTRY_WIN_UNIT_TEST_INTERNALS_ONLY)
-int execute_windows(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) {
+/// The ABI seam: nothing thrown by an action crosses the plugin boundary (frozen-seam rule). Its own function,
+/// built in both configurations, so test_registry_win_internals.cpp can drive it with a throwing dispatch.
+int execute_guarded(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) {
     try {
         return dispatch(ctx, action, params);
     } catch (...) {
@@ -657,6 +666,16 @@ int execute_windows(yuzu::CommandContext& ctx, std::string_view action, yuzu::Pa
         }
         return 1;
     }
+}
+
+} // namespace
+
+// The guard macro is defined only by tests/unit/test_registry_win_internals.cpp, which includes this file
+// to drive Win32Registry and execute_guarded directly (the privacy_permissions_win.cpp seam); the real build
+// never defines it.
+#if !defined(YUZU_REGISTRY_WIN_UNIT_TEST_INTERNALS_ONLY)
+int execute_windows(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) {
+    return execute_guarded(ctx, action, params);
 }
 #endif // !defined(YUZU_REGISTRY_WIN_UNIT_TEST_INTERNALS_ONLY)
 

@@ -447,8 +447,9 @@ metadata:
     (the key AT the path may itself be a link: the link object is removed and its target is untouched).
     The delete runs by handle on the checked key (no RegDeleteTreeW, which follows links) and is
     confirmed by the handle reading back as deleted. counted_keys is 1 and counted_values is the number
-    of values the key held; the value count stops at 10,000, past which capped is 1 and counted_values is
-    a lower bound (the delete still removes the key with all its values). Windows-only.
+    of values the key held; the count stops at 10,000 nodes (the key plus up to 9,999 values), past which
+    capped is 1 and counted_values is a lower bound (the delete still removes the key with all its
+    values). Windows-only.
   tags: [registry, windows, configuration]
 spec:
   type: action
@@ -498,7 +499,7 @@ spec:
         platforms: [windows]
       - name: capped
         type: bool
-        description: 'Whether the value enumeration stopped at its 10,000-value cap, making counted_values a lower bound; the delete still removes the key with all its values. Values: 1 (capped), 0 (complete) — a digit, never true/false.'
+        description: 'Whether the value enumeration stopped at its cap of 10,000 nodes (the key plus up to 9,999 values), making counted_values a lower bound; the delete still removes the key with all its values. Values: 1 (capped), 0 (complete) — a digit, never true/false.'
         example: "0"
         platforms: [windows]
   approval:

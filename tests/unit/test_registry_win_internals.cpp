@@ -8,6 +8,8 @@
  *    (key_is_link), so test_registry_write_local_dispatcher.cpp never reaches the create step with a link in
  *    place; calling create_sub on a dangling link here is that swap, deterministically.
  *  - the fast open's two kernel calls, final_name (NtQueryKey) and root_name.
+ *  - execute_guarded, the ABI seam: an action that throws (the test-only `__throw_*` actions this TU's guard
+ *    macro adds to dispatch) comes out as rc 1 and one `error|exception` line, never as an exception.
  * The pure logic is locked on every host by test_registry_core.cpp; the dispatcher cases prove the plugin end
  * to end.
  *
@@ -32,12 +34,19 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "local_dispatcher.hpp"
 #include "test_helpers.hpp"
 
+#include <yuzu/plugin.h>
+#include <yuzu/plugin.hpp>
+
 #include <cstdlib>
+#include <functional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 // The leg's anonymous-namespace helpers have no header seam; the guard macro drops the plugin-facing
 // execute_windows so this TU can include the file. Never defined by the real build. Excluding that
@@ -72,6 +81,59 @@ void skip_or_fail(const std::string& why) {
 }
 
 std::wstring widen(const std::string& s) { return std::wstring(s.begin(), s.end()); } // ASCII only
+
+// ── fake CommandContext harness ──────────────────────────────────────────
+//
+// The test_execution_artifacts_win_internals.cpp shape: an injected body runs against a REAL
+// yuzu::CommandContext, so ctx.write_output reaches the same capture LocalDispatcher uses for the real plugin.
+std::function<int(yuzu::CommandContext&)> g_body;
+
+int fake_seam_execute(YuzuCommandContext* raw_ctx, const char* /*action*/, const YuzuParam* /*params*/,
+                      std::size_t /*param_count*/) {
+    yuzu::CommandContext ctx(raw_ctx);
+    return g_body(ctx);
+}
+
+const char* const kFakeActions[] = {"seam", nullptr};
+
+const YuzuPluginDescriptor kFakeDescriptor = {
+    /*abi_version=*/YUZU_PLUGIN_ABI_VERSION,
+    /*name=*/"registry_seam",
+    /*version=*/"1.0.0",
+    /*description=*/"test-only registry internals fixture",
+    /*actions=*/kFakeActions,
+    /*init=*/nullptr,
+    /*shutdown=*/nullptr,
+    /*execute=*/fake_seam_execute,
+    /*sdk_version=*/nullptr,
+};
+
+/// Runs execute_guarded(`action`) with no params inside the fake context; the non-empty output lines.
+struct Guarded {
+    int rc = 0;
+    std::vector<std::string> lines;
+};
+
+Guarded run_guarded(std::string_view action) {
+    g_body = [action](yuzu::CommandContext& ctx) -> int {
+        return yuzu::registry::execute_guarded(ctx, action, yuzu::Params{std::span<const YuzuParam>{}});
+    };
+    const auto result = yuzu::agent::LocalDispatcher{}.run(&kFakeDescriptor, "seam");
+    g_body = nullptr;
+    Guarded out;
+    out.rc = result.rc;
+    std::string line;
+    for (const char c : result.captured) {
+        if (c == '\n' || c == '\r') {
+            if (!line.empty()) out.lines.push_back(std::move(line));
+            line.clear();
+        } else {
+            line += c;
+        }
+    }
+    if (!line.empty()) out.lines.push_back(std::move(line));
+    return out;
+}
 
 /// Creates a registry link key `link_path` under HKLM whose SymbolicLinkValue (a REG_LINK: the target path
 /// WITHOUT a terminating NUL) names HKLM\<target_path>, which need not exist. False when it cannot be made.
@@ -237,6 +299,32 @@ TEST_CASE("Win32Registry::root_name is the kernel name of HKLM and HKU and is re
     CHECK(yuzu::registry::names_equal_ascii_ci(name, "\\REGISTRY\\USER"));
     CHECK(reg.root_name(as_handle(HKEY_CURRENT_USER), name) == ERROR_NOT_SUPPORTED);
     CHECK(reg.root_name(as_handle(HKEY_CLASSES_ROOT), name) == ERROR_NOT_SUPPORTED);
+}
+
+// The frozen-seam rule: nothing a registry action throws crosses the plugin boundary. dispatch throws a
+// std::exception for `__throw_std` and a non-std value for `__throw_other` in this TU only (the guard macro).
+// Mutation: delete the catch(...) from execute_guarded and the two throwing sections go red (the exception
+// escapes the call). Needs no registry access, so it never skips.
+TEST_CASE("execute_guarded turns a throwing action into rc 1 and one error|exception line",
+          "[registry][windows][internals]") {
+    SECTION("a std::exception") {
+        const auto r = run_guarded("__throw_std");
+        CHECK(r.rc == 1);
+        REQUIRE(r.lines.size() == 1);
+        CHECK(r.lines[0] == "error|exception");
+    }
+    SECTION("a value that is not a std::exception") {
+        const auto r = run_guarded("__throw_other");
+        CHECK(r.rc == 1);
+        REQUIRE(r.lines.size() == 1);
+        CHECK(r.lines[0] == "error|exception");
+    }
+    SECTION("an ordinary refusal passes through the guard unchanged") {
+        const auto r = run_guarded("no_such_action");
+        CHECK(r.rc == 1);
+        REQUIRE(r.lines.size() == 1);
+        CHECK(r.lines[0] == "error|unknown action: no_such_action");
+    }
 }
 
 #endif // defined(_WIN32)

@@ -92,14 +92,14 @@ class RegistryDeleteKey(unittest.TestCase):
     def test_description_is_non_recursive_and_names_the_value_cap(self):
         text = _definitions()["windows.registry.delete_key"]["metadata"]["description"].lower()
         self.assertIn("key_has_subkeys", text)
-        self.assertIn("10,000", text)
+        self.assertIn("10,000 nodes (the key plus up to 9,999 values)", text)
         self.assertIn("lower bound", text)
         self.assertNotIn("recursive=true", text)
         self.assertNotIn("every value and subkey", text)
 
     def test_capped_column_is_the_value_count_cap(self):
         cols = {c["name"]: c for c in _spec("delete_key")["result"]["columns"]}
-        self.assertIn("10,000-value cap", cols["capped"]["description"])
+        self.assertIn("10,000 nodes (the key plus up to 9,999 values)", cols["capped"]["description"])
         self.assertIn("Always 0", cols["dry_run"]["description"])
 
 

@@ -116,7 +116,11 @@ template <class Raw>
 
 /// The registry as the write logic sees it. Raw `long` Win32 codes and out-parameters by design (an
 /// exception to cpp-conventions' std::expected rule): each method mirrors one Win32 call so the
-/// shell is a thin binding and the fake can inject any return code per call. Names are UTF-8.
+/// shell is a thin binding and the fake can inject any return code per call. The same exception, for
+/// the same reason, covers the two free functions that sit directly on one raw call: query_value_bounded
+/// (above; it drives the RegQueryValueExW-shaped `raw` callable and fills the seam's QueryResult) and the
+/// shell's query_key_name (registry_win.cpp; one NtQueryKey call). Everything built on the seam returns by
+/// value. Names are UTF-8.
 struct RegistryWriter {
     RegistryWriter() = default;
     RegistryWriter(const RegistryWriter&) = delete;
@@ -342,81 +346,91 @@ struct WriteOutcome {
     std::uint64_t counted_values = 0;
     bool capped = false;
     [[nodiscard]] bool ok() const noexcept { return result == "ok"; }
+
+    /// Records a failure: `attempted` false = refused (nothing was mutated), true = failed (a mutation ran).
+    void fail(std::string why, bool attempted) {
+        result = attempted ? "failed" : "refused";
+        reason = std::move(why);
+    }
+
+    /// Stamps the read-back verdict of a mutation that was applied: ok, or a verify_mismatch failure.
+    void confirm(bool verified) {
+        if (verified) {
+            verify = "ok";
+            result = "ok";
+            return;
+        }
+        verify = "mismatch";
+        fail(std::string{kTokVerifyMismatch}, true);
+    }
 };
 
-inline void fail_with(WriteOutcome& o, std::string reason, bool attempted) {
-    o.result = attempted ? "failed" : "refused";
-    o.reason = std::move(reason);
-}
-
-/// Stamps the read-back verdict of a mutation that was applied: ok, or a verify_mismatch failure.
-inline void confirm(WriteOutcome& o, bool verified) {
-    if (verified) {
-        o.verify = "ok";
-        o.result = "ok";
-        return;
-    }
-    o.verify = "mismatch";
-    fail_with(o, std::string{kTokVerifyMismatch}, true);
-}
-
 /// Writes `bytes` to `name` on the checked handle `h`, reads it back and compares (type + bytes).
-inline void write_value_on(RegistryWriter& reg, Handle h, std::string_view name, std::uint32_t type,
-                           std::span<const std::uint8_t> bytes, WriteOutcome& o) {
+[[nodiscard]] inline WriteOutcome write_value_on(RegistryWriter& reg, Handle h, std::string_view name,
+                                                 std::uint32_t type, std::span<const std::uint8_t> bytes) {
+    WriteOutcome o;
     if (const long rc = reg.set_value(h, name, type, bytes); rc != kErrorSuccess) {
-        fail_with(o, rc_token(rc, Missing::value), true);
-        return;
+        o.fail(rc_token(rc, Missing::value), true);
+        return o;
     }
     o.mutated = true;
     QueryResult q;
     const long qrc = reg.query_value(h, name, kMaxWriteBytes, q);
-    confirm(o, qrc == kErrorSuccess && q.type == type && q.size == bytes.size() &&
-                   std::equal(q.bytes.begin(), q.bytes.end(), bytes.begin(), bytes.end()));
+    o.confirm(qrc == kErrorSuccess && q.type == type && q.size == bytes.size() &&
+              std::equal(q.bytes.begin(), q.bytes.end(), bytes.begin(), bytes.end()));
+    return o;
 }
 
 /// Deletes `name` on the checked handle `h` and confirms it is gone.
-inline void delete_value_on(RegistryWriter& reg, Handle h, std::string_view name, WriteOutcome& o) {
+[[nodiscard]] inline WriteOutcome delete_value_on(RegistryWriter& reg, Handle h, std::string_view name) {
+    WriteOutcome o;
     if (const long rc = reg.delete_value(h, name); rc != kErrorSuccess) {
-        fail_with(o, rc_token(rc, Missing::value), true);
-        return;
+        o.fail(rc_token(rc, Missing::value), true);
+        return o;
     }
     o.mutated = true;
     QueryResult q;
-    confirm(o, reg.query_value(h, name, 0, q) == kErrorFileNotFound);
+    o.confirm(reg.query_value(h, name, 0, q) == kErrorFileNotFound);
+    return o;
 }
 
 [[nodiscard]] inline WriteOutcome set_value_verified(RegistryWriter& reg, Handle root, std::string_view key,
                                                      std::string_view name, std::uint32_t type,
                                                      std::span<const std::uint8_t> bytes,
                                                      bool fast_eligible = false) {
-    WriteOutcome o;
-    auto op = open_checked(reg, root, key, kKeySetValue | kKeyQueryValue, true, false, fast_eligible);
-    o.created = op.created;
+    auto op = open_checked(reg, root, key, kKeySetValue | kKeyQueryValue, /*create=*/true,
+                           /*leaf_may_be_link=*/false, fast_eligible);
     if (!op.error.empty()) {
-        fail_with(o, op.error, op.created > 0);
+        WriteOutcome o;
+        o.created = op.created;
+        o.fail(op.error, op.created > 0);
         return o;
     }
-    o.old = capture_old(reg, op.leaf.get(), name);
+    OldValue old = capture_old(reg, op.leaf.get(), name);
+    WriteOutcome o = write_value_on(reg, op.leaf.get(), name, type, bytes);
+    o.created = op.created;
+    o.old = std::move(old);
     o.has_old = true;
-    write_value_on(reg, op.leaf.get(), name, type, bytes, o);
     return o;
 }
 
 [[nodiscard]] inline WriteOutcome delete_value_verified(RegistryWriter& reg, Handle root, std::string_view key,
                                                         std::string_view name, bool fast_eligible = false) {
-    WriteOutcome o;
-    auto op = open_checked(reg, root, key, kKeySetValue | kKeyQueryValue, false, false, fast_eligible);
+    auto op = open_checked(reg, root, key, kKeySetValue | kKeyQueryValue, /*create=*/false,
+                           /*leaf_may_be_link=*/false, fast_eligible);
     if (!op.error.empty()) {
-        fail_with(o, op.error, false);
+        WriteOutcome o;
+        o.fail(op.error, false);
         return o;
     }
-    o.old = capture_old(reg, op.leaf.get(), name);
+    OldValue old = capture_old(reg, op.leaf.get(), name);
+    WriteOutcome o;
+    if (old.state == OldState::absent)
+        o.fail(std::string{kTokValueNotFound}, false);
+    else
+        o = delete_value_on(reg, op.leaf.get(), name);
+    o.old = std::move(old);
     o.has_old = true;
-    if (o.old.state == OldState::absent) {
-        fail_with(o, std::string{kTokValueNotFound}, false);
-        return o;
-    }
-    delete_value_on(reg, op.leaf.get(), name, o);
     return o;
 }
 
@@ -428,21 +442,25 @@ struct TreeCount {
     std::string error;
 };
 
-/// Counts the values of `h` (nodes are keys + values; kMaxTreeNodes bounds the enumeration at 10,000
-/// iterations even when the value set grows between calls). Past the bound `capped` is set and `values`
-/// is a lower bound; the delete still proceeds, because NtDeleteKey of a leaf removes its values.
-inline void count_values(RegistryWriter& reg, Handle h, TreeCount& c) {
+/// Counts the values of the leaf `h`: nodes are keys + values, and the key itself is node 1 (so the cap is
+/// the key plus up to kMaxTreeNodes - 1 values). kMaxTreeNodes bounds the enumeration at 10,000 iterations even
+/// when the value set grows between calls. Past the bound `capped` is set and `values` is a lower bound; the
+/// delete still proceeds, because NtDeleteKey of a leaf removes its values.
+[[nodiscard]] inline TreeCount count_values(RegistryWriter& reg, Handle h) {
+    TreeCount c;
+    c.keys = 1;
+    c.nodes = 1;
     std::string name;
     for (std::uint32_t i = 0;; ++i) {
         const long rc = reg.enum_value(h, i, name);
-        if (rc == kErrorNoMoreItems) return;
+        if (rc == kErrorNoMoreItems) return c;
         if (rc != kErrorSuccess) {
             c.error = rc_token(rc, Missing::value);
-            return;
+            return c;
         }
         if (c.nodes >= kMaxTreeNodes) {
             c.capped = true;
-            return;
+            return c;
         }
         ++c.values;
         ++c.nodes;
@@ -451,14 +469,16 @@ inline void count_values(RegistryWriter& reg, Handle h, TreeCount& c) {
 
 /// Deletes the key on the checked handle `h` with NtDeleteKey(h), verified by the deleted handle reporting
 /// ERROR_KEY_DELETED.
-inline void delete_key_on(RegistryWriter& reg, Handle h, WriteOutcome& o) {
+[[nodiscard]] inline WriteOutcome delete_key_on(RegistryWriter& reg, Handle h) {
+    WriteOutcome o;
     if (const long rc = reg.delete_key_by_handle(h); rc != kErrorSuccess) {
-        fail_with(o, rc_token(rc, Missing::key), true);
-        return;
+        o.fail(rc_token(rc, Missing::key), true);
+        return o;
     }
     o.mutated = true;
     QueryResult q;
-    confirm(o, reg.query_value(h, "", 0, q) == kErrorKeyDeleted);
+    o.confirm(reg.query_value(h, "", 0, q) == kErrorKeyDeleted);
+    return o;
 }
 
 /// Non-recursive delete_key: a key with subkeys is refused `key_has_subkeys` and nothing is deleted. A leaf's
@@ -466,35 +486,32 @@ inline void delete_key_on(RegistryWriter& reg, Handle h, WriteOutcome& o) {
 /// opened as the link object, so the delete removes the link and never its target.
 [[nodiscard]] inline WriteOutcome delete_key_tree(RegistryWriter& reg, Handle root, std::string_view key,
                                                   bool fast_eligible = false) {
-    WriteOutcome o;
     auto op = open_checked(reg, root, key,
-                           kAccessDelete | kKeyEnumerateSubKeys | kKeyQueryValue | kKeySetValue, false,
-                           /*leaf_may_be_link=*/true, fast_eligible);
+                           kAccessDelete | kKeyEnumerateSubKeys | kKeyQueryValue | kKeySetValue,
+                           /*create=*/false, /*leaf_may_be_link=*/true, fast_eligible);
     if (!op.error.empty()) {
-        fail_with(o, op.error, false);
+        WriteOutcome o;
+        o.fail(op.error, false);
         return o;
     }
     const Handle h = op.leaf.get();
     TreeCount c;
     std::string first;
     const long rc = reg.enum_subkey(h, 0, first);
-    if (rc == kErrorSuccess) {
+    if (rc == kErrorSuccess)
         c.error = std::string{kTokKeyHasSubkeys};
-    } else if (rc != kErrorNoMoreItems) {
+    else if (rc != kErrorNoMoreItems)
         c.error = rc_token(rc, Missing::key);
-    } else {
-        c.keys = 1;
-        c.nodes = 1;
-        count_values(reg, h, c);
-    }
+    else
+        c = count_values(reg, h);
+    WriteOutcome o;
+    if (c.error.empty())
+        o = delete_key_on(reg, h);
+    else
+        o.fail(c.error, false);
     o.counted_keys = c.keys;
     o.counted_values = c.values;
     o.capped = c.capped;
-    if (!c.error.empty()) {
-        fail_with(o, c.error, false);
-        return o;
-    }
-    delete_key_on(reg, h, o);
     return o;
 }
 

@@ -36,7 +36,7 @@ Bytes B(std::initializer_list<int> v) {
 
 } // namespace
 
-TEST_CASE("registry parse_reg_type: the six writable names, case-sensitive; nothing else",
+TEST_CASE("registry parse_reg_type: the six writable names; case-sensitive; nothing else",
           "[registry][parsers]") {
     CHECK(parse_reg_type("REG_SZ") == kRegSz);
     CHECK(parse_reg_type("REG_EXPAND_SZ") == kRegExpandSz);
@@ -53,7 +53,7 @@ TEST_CASE("registry parse_reg_type: the six writable names, case-sensitive; noth
     CHECK_FALSE(is_writable_type(5));  // REG_DWORD_BIG_ENDIAN
 }
 
-TEST_CASE("registry encode REG_DWORD / REG_QWORD: decimal digits only, range-checked",
+TEST_CASE("registry encode REG_DWORD / REG_QWORD: decimal digits only; range-checked",
           "[registry][parsers]") {
     SECTION("accepted values, little-endian") {
         CHECK(encode_value(kRegDword, "0", {}, false).bytes == B({0, 0, 0, 0}));
@@ -112,7 +112,7 @@ TEST_CASE("registry encode REG_SZ / REG_EXPAND_SZ: strict UTF-8 to UTF-16LE plus
     }
 }
 
-TEST_CASE("registry encode REG_MULTI_SZ: LF-separated records, empty text is the lone double NUL",
+TEST_CASE("registry encode REG_MULTI_SZ: LF-separated records; empty text is the lone double NUL",
           "[registry][parsers]") {
     CHECK(encode_value(kRegMultiSz, "", {}, false).bytes == B({0, 0, 0, 0}));
     CHECK(encode_value(kRegMultiSz, "a", {}, false).bytes == B({0x61, 0, 0, 0, 0, 0}));
@@ -129,7 +129,7 @@ TEST_CASE("registry encode REG_MULTI_SZ: LF-separated records, empty text is the
     }
 }
 
-TEST_CASE("registry encode REG_BINARY: value is hex, empty is zero bytes", "[registry][parsers]") {
+TEST_CASE("registry encode REG_BINARY: value is hex; empty is zero bytes", "[registry][parsers]") {
     CHECK(encode_value(kRegBinary, "", {}, false).bytes.empty());
     CHECK(encode_value(kRegBinary, "", {}, false).error.empty());
     CHECK(encode_value(kRegBinary, "0102ff", {}, false).bytes == B({1, 2, 0xff}));
