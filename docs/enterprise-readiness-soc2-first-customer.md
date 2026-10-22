@@ -429,8 +429,9 @@ exception-ledger entry of 2026-10-18 (`docs/adr/1005-headless-platform-use-case-
 revisit 2027-01-18, a re-confirmation date rather than a deadline). Rows an auditor can sample for
 CC6.3: `approval.approve` / `approval.reject` carry an `attempted` row before the decision and an
 outcome row (`success`, or `denied` with the store's reason) after it, plus `denied` rows whose
-`detail` starts with `approver_assurance:` for a bearer or engine credential that reached the
-decision surface, and `mcp.approve_request` / `mcp.reject_request` refusals
+`detail` starts with `approver_assurance:` for a bearer or MCP credential that reached the
+decision surface (an engine credential tried over REST is refused by the central step-up check and
+recorded as `mfa.step_up.required` with `reason=engine_principal_denied`), and `mcp.approve_request` / `mcp.reject_request` refusals
 (`docs/user-manual/audit-log.md`; the reconciliation query for a lost outcome row is in
 `docs/ops-runbooks/audit-store-clock-guard.md`).
 

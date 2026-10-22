@@ -574,7 +574,7 @@ Full design: `docs/auth-mfa-design.md`. Summary:
   sites and the `/login/mfa/stepup` proof route; it now covers 39 mutating
   routes (user delete and role change, token, session, engine-principal,
   RBAC-assignment and enforcement-toggle lifecycle, password reset and
-  unlock, Guardian rule write / push and guard update / delete,
+  unlock, Guardian rule write / push / policy-generation raise and guard update / delete,
   software-package write, software-deploy start, MFA recovery-code
   regeneration and MFA disable, JIT elevation). 36 are enforced by the
   central chokepoint described under "MFA step-up chokepoint" below; the
@@ -817,9 +817,12 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
 - a **human principal**, never an engine principal;
 - a reviewer that is **not the submitter** (unchanged, enforced in `ApprovalManager`);
 - on the REST routes (the dashboard page included), a **same-site `Origin` (or `Referer`)** on the
-  cookie `POST`, checked after the permission gate and before the class check and the step-up, so a
-  cross-site request spends no step-up and writes no `attempted` row (`403`, audited as
-  `csrf.denied`; trusted proxies are declared with `--csrf-trusted-origin`).
+  cookie `POST`, checked in the handler after the central step-up check and the permission gate, and
+  before the class check and the `attempted` row, so a cross-site request writes no `attempted` row
+  (`403`, audited as `csrf.denied`; trusted proxies are declared with `--csrf-trusted-origin`). A
+  cross-site request carrying a stale proof is refused by the central step-up check first (`401`,
+  audited as `mfa.step_up.required`); the same-site control still holds because the handler's check
+  runs before anything is decided or recorded.
 
 Consequences, each deliberate:
 

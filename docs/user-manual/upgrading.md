@@ -2,7 +2,7 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
-## Breaking: MFA step-up is checked once, before the route's own checks, and two more routes need a fresh proof
+## ⚠️ Breaking: MFA step-up is checked once, before the route's own checks, and two more routes need a fresh proof
 
 A fresh MFA proof is required on 36 named high-risk routes (the list is in
 [REST API](rest-api.md#step-up-envelope-on-high-risk-endpoints), which also names the three
@@ -25,10 +25,17 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   `mfa.enroll.verified` says `step_up_proof=stamped`, or `step_up_proof=not_stamped` when the
   session could not be stamped: a bearer principal, an absent or mismatched cookie, or a store
   failure). An account with no MFA enrolled is not affected.
-  The other 34 routes already required a fresh proof, so they are not newly gated. That includes
-  `POST /api/approvals/{id}/approve`, `POST /api/approvals/{id}/reject` and
-  `POST /api/v1/guaranteed-state/policy-generation/raise`, whose handlers already called the
-  check; for them the change is the order of checks and the engine-principal denial described below.
+- **What is newly gated, measured against the last release (v0.14.1).** Only the two Settings MFA
+  routes above are gated for the first time by this change. Of the other 34, 25 already called the
+  step-up check from their handlers in v0.14.1. The remaining nine were gated in their handlers
+  earlier in this release cycle, so an upgrade from v0.14.1 gives them a proof requirement too, but
+  not through this change: the dashboard API-token create and revoke routes (see "Behaviour change:
+  dashboard API-token create and revoke apply MFA step-up" below), the Guardian guard Edit and
+  Delete routes, the local password change and the administrator password reset,
+  `POST /api/approvals/{id}/approve` and `POST /api/approvals/{id}/reject` (documented in their own
+  Breaking section below), and `POST /api/v1/guaranteed-state/policy-generation/raise`. For those
+  nine, this change alters the order of checks and the engine-principal denial described below, not
+  the proof the caller needs.
 - **Step-up comes before authorization and the same-site check.** A session with a stale or
   missing MFA proof is answered with the `401` step-up envelope before the route's own `403`
   (permission, durable-Administrator, `csrf`, `token_session`, `not_local`) could be. An
@@ -80,7 +87,7 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   The new alert `YuzuStepUpGateUnavailable` fires on it.
 - **SAML sessions cannot satisfy step-up in this release.** They receive `403` on all 36 routes (reason
   `saml_session_no_mfa_this_release`, see #4935), unless `--mfa-step-up-window-secs` is `0` or less:
-  the disabled window is checked before the SAML refusal, so SAML sessions then pass all 33. A
+  the disabled window is checked before the SAML refusal, so SAML sessions then pass all 36. A
   deployment whose only interactive sign-in is SAML has no session route to any of them. The
   refusal's remediation says SAML sessions cannot satisfy step-up in this release (re-authenticating
   does not help) and to use an existing untiered, unscoped API token where the route accepts one, or
@@ -136,8 +143,9 @@ force no stale proof is refused (so none is recorded), and the SAML refusal and 
 authentication-store read are skipped too, so SAML sessions also pass; engine denials and
 unwired-store refusals still apply and are still recorded. The JIT-elevation routes keep a 300 s window (the global
 window when it is positive, else 300 s). The new alert `YuzuStepUpWindowDisabled` fires while the
-window is 0 or less. Rolling back to the previous release restores the old order of checks and
-un-gates the two Settings routes; nothing is migrated. A rollback also removes the new counter and
+window is 0 or less. Rolling back to v0.14.1 restores the old order of checks and un-gates the two
+Settings routes, and also the nine routes listed under "What is newly gated" above, because v0.14.1
+did not gate them in their handlers; nothing is migrated. A rollback also removes the new counter and
 window gauge, so both new alerts go silent.
 
 ## Behaviour change: /health and /api/health per-source budget
@@ -228,7 +236,7 @@ principal and not an engine principal. The existing rule that the reviewer canno
   in every mode is tracked in #6079.
 - **A same-site `Origin` (or `Referer`) is now required.** A browser or script `POST` to
   `/api/approvals/{id}/approve` or `/reject` that authenticates with a session cookie and carries no `Origin` or
-  `Referer` naming this site now gets `403` (audited as `csrf.denied`, before any step-up is spent). A script that
+  `Referer` naming this site now gets `403` (audited as `csrf.denied`; the handler runs this check after the central step-up check, so a cross-site request that also has a stale proof gets the step-up `401` first). A script that
   signs in with `curl -b` must send `-H "Origin: <the server's own base URL>"`. A deployment behind a
   TLS-terminating or Host-rewriting reverse proxy must declare the public address with `--csrf-trusted-origin`, as
   for the sibling cookie-write routes described further down this page (for example the hardware-sync and

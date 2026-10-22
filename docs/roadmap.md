@@ -1497,7 +1497,7 @@ Server-side resource registry for versioned binary blobs:
 ### Issue 13.1: 2FA for Instruction Approval (TOTP)
 **Capability:** new | **Scope:** Server | **Status:** Open (stale — TOTP + MFA step-up landed generally, not wired to instruction approval specifically)
 
-TOTP (`totp.{hpp,cpp}`) and a general step-up MFA framework (`mfa_step_up.{hpp,cpp}`) shipped as part of the auth-and-authz workstream - the step-up check is enforced centrally on 36 named REST/dashboard routes (the three JIT-elevation routes keep their own handler gate) for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`; the approval endpoint is not among them (it is classified pending), and MCP tools are not step-up gated. This issue's specific ask - a `totp_code` requirement on instruction approval - is not wired; the primitive it would reuse already exists. Original sketch:
+TOTP (`totp.{hpp,cpp}`) and a general step-up MFA framework (`mfa_step_up.{hpp,cpp}`) shipped as part of the auth-and-authz workstream - the step-up check is enforced centrally on 36 named REST/dashboard routes (the three JIT-elevation routes keep their own handler gate) for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`, and MCP tools are not step-up gated. This issue's specific ask - a `totp_code` requirement on instruction approval - is not wired; the primitive it would reuse already exists. Original sketch:
 
 TOTP (RFC 6238) second factor on instruction approval:
 - Per-user TOTP secret stored encrypted in auth store
