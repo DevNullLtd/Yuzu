@@ -357,8 +357,8 @@ TEST_CASE("upload-grants list: an engine principal is default-deny, through the 
         r.rig.rbac.set_rbac_enabled(false);
         REQUIRE_FALSE(r.rig.rbac.is_rbac_enabled());
         expect_denied(e.sink_dispatch("GET", {}, e.engine_token), 403);
-        CHECK(e.mcp_gate_status(e.engine_token) == 403);
-        // The denial is audited and attributed to the engine (the REST reference states this).
+        // The REST denial is audited and attributed to the engine (the REST reference states
+        // this). Counted BEFORE the direct gate call below, which writes the same row itself.
         auto audit_rows = r.audit_store.query({});
         REQUIRE(audit_rows.has_value());
         std::size_t engine_denials = 0;
@@ -370,6 +370,7 @@ TEST_CASE("upload-grants list: an engine principal is default-deny, through the 
             CHECK(row.principal_class == "engine");
         }
         CHECK(engine_denials >= 1);
+        CHECK(e.mcp_gate_status(e.engine_token) == 403);
         // The human minter is unchanged: RBAC off admits the whole list.
         auto res = e.sink_dispatch("GET", {}, e.gary_token);
         REQUIRE(res);
