@@ -2363,6 +2363,82 @@ returns the same five fields at the top level of its result.
 
 The MCP `list_issued_certs` tool mirrors this contract (same `has_more` / `next_offset`).
 
+The unfiltered call above is not written to the audit log and is not withheld from a
+management-group-confined caller (a known gap, unchanged by the filtered form below).
+
+**Filtered: the certificates behind one `/crypto` count (ADR-0070 R2, R8).** When any of `kind`,
+`days`, `week`, `bucket`, `as_of` or `cursor` is present, the route lists exactly the certificates behind
+one Yuzu-issued count of [`GET /api/v1/crypto/ca/stats`](#get-apiv1cryptocastats), with the same
+predicate. **Permission:** `Security:Read`, and a caller whose view of the fleet is confined is
+refused `403` with no `permission` field (`Yuzu-issued certificate figures are not available to
+this account: ...`), whatever the parameters. The input is strict, and each malformed parameter is
+a `400` whose message names it:
+
+| Parameter | Type | Description |
+|---|---|---|
+| `kind` | string | **Required** in this form: `active`, `expiring`, `expired`, `revoked`, `issued`, `issued_week` or `revoked_week` |
+| `days` | integer | Required for `expiring` (3, 7, 14, 21, 30, 60), `expired` and `revoked` (7, 30, 60, 90) and `issued` (7); refused on other kinds |
+| `week` | string | ISO week `YYYY-Www` (for example `2026-W43`); required for `issued_week` and `revoked_week`, refused on other kinds. A week that does not exist (`2026-W00`, `2027-W53`) is refused |
+| `bucket` | string | `superseded`, `unpublished` or `other`; optional, `revoked` and `revoked_week` only. Omitted lists every reason |
+| `as_of` | integer | Epoch seconds to measure the first page against (for example a `/crypto/ca/stats` count's `as_of`). Accepted from 7 days before the **database** clock up to 5 minutes after it, checked in the read's own transaction; omitted = the database clock now. A continuation page carries its `as_of` in `cursor`; an `as_of` sent beside a cursor must equal it. See [Pinned `as_of`](crypto.md#pinned-as_of-and-keyset-paging) |
+| `limit` | integer | 1 to 500, default 100 (refused outside the range, not clamped) |
+| `cursor` | string | The previous page's `next_cursor` (opaque, at most 512 bytes). Bound to `kind`, `days`, `week` and `bucket`: a cursor that is malformed, edited or issued for another filter is a `400` naming `cursor` |
+
+A parameter repeated with differing values is a `400`. **`offset` is refused in this form** (`400`
+naming it): the filtered list pages by keyset cursor only. `limit` or `offset` alone does not
+select this form (the unfiltered list above keeps its `offset` paging).
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://yuzu.example.com/api/v1/ca/issued?kind=revoked&days=30&bucket=superseded"
+```
+
+```json
+{
+  "items": [
+    {
+      "serial_hex": "3A4B5C6D...",
+      "subject": "agent-prod-01",
+      "san": "URI:yuzu://<ca-fp>/agent/agent-prod-01",
+      "purpose": "agent",
+      "status": "revoked",
+      "not_after": 1821657600,
+      "issued_at": 1790121600,
+      "revoked_at": 1791590400,
+      "revocation_reason": "superseded",
+      "issued_by": "agent:agent-prod-01",
+      "issuer_key_id": "ab12..."
+    }
+  ],
+  "count": 1,
+  "filter": {
+    "kind": "revoked", "days": 30, "week": null, "week_start": null, "bucket": "superseded",
+    "rule_id": "yuzu_ca_revoked_superseded",
+    "criterion": "Revoked after as_of - 30 days and on or before as_of, reason recorded as superseded (replaced by a same-key successor)",
+    "rule_set_version": "crypto_widget_windows_v1",
+    "as_of": 1792396800, "as_of_iso": "2026-10-19T08:00:00Z", "total": 1,
+    "scope_note": "Counts certificates Yuzu's own CA issued only (agent, server, gateway, HTTPS and code-signing); certificates on your devices are not covered."
+  },
+  "next_cursor": null,
+  "meta": { "api_version": "v1", "limit": 100, "has_more": false }
+}
+```
+
+`filter.total` counts every match at `filter.as_of`; when `meta.has_more` is `true`,
+`next_cursor` is set: request the next page with `cursor=<next_cursor>` (and the same `kind`,
+`days`, `week`, `bucket`). The cursor carries the position of the last certificate served and
+the walk's `as_of`, so every page is measured against the same time and starts strictly after
+that certificate: a certificate revoked between pages never makes the walk skip another (an
+offset would). `next_cursor` is `null` on the last page. Order: expiring soonest first, expired and revoked most recent first, the
+rest newest-issued first. Every filtered call is audited `crypto.ca.certificates.view`
+(set-and-proceed: `audit_persisted: false` in the body and `Sec-Audit-Failed: true` when the row
+is lost; a confined refusal is a `denied` row). Errors: `400` (each malformed parameter, named),
+`401`, `403` (no `Security:Read`, or a confined caller), `503` + `retry_after_ms: 5000` (`Yuzu CA
+read degraded`, `crypto read capacity in use; retry`, or `access check unavailable`; never an
+empty list), and `503` **without** `retry_after_ms` (`filtered certificate list unavailable`: the
+server was built without the `/crypto` seam, a wiring fault that lasts until a restart). MCP
+twin: `list_issued_certs` with the same arguments.
+
 #### `POST /api/v1/ca/revoke`
 
 Revoke a certificate by serial. **Permission:** `Security:Delete`. Revocation
@@ -7643,7 +7719,7 @@ A parameter repeated with differing values, an unknown `family`, a value that is
 | 400 | Parameter repeated with differing values, malformed parameter, unknown `family`, invalid UTF-8, over-long value |
 | 401 | Unauthenticated |
 | 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
-| 503 | `crypto library read degraded` (the inventory read failed or ran past its 5 s bound) or `crypto read capacity in use; retry` (the server bounds concurrent reads per process): `retry_after_ms: 5000` either way; **never an empty 200**. An absent inventory store or an unwired gate (server misconfiguration) is a `503` without `retry_after_ms` |
+| 503 | `crypto library read degraded` (the inventory read failed or ran past its 5 s bound) or `crypto read capacity in use; retry` (the server bounds concurrent reads per process): `retry_after_ms: 5000` either way; **never an empty 200**. An absent inventory store or an unwired gate (server misconfiguration) is a `503` without `retry_after_ms`. A server whose Postgres pool is smaller than 2 connections refuses these reads with a `503` and **no** `retry_after_ms` (`crypto library reads (and the CBOM export) refused: the server's Postgres pool is smaller than 2 connections; restart the server with --postgres-pool-size 2 or more`): a retry fails the same way until that restart. |
 
 #### `GET /api/v1/crypto/libraries/devices`
 
@@ -7693,7 +7769,7 @@ The devices (and matching package rows) behind one family, optionally one versio
 | 400 | `family` missing or unknown, parameter repeated with differing values, malformed parameter, invalid `limit`, over-long or non-UTF-8 value, or a refused cursor (including one from another `table_version`, or a cursor issued on live names when the catalogue is now in use) |
 | 401 | Unauthenticated |
 | 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
-| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty 200**. An absent store or an unwired gate is a `503` without `retry_after_ms` |
+| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty 200**. An absent store or an unwired gate is a `503` without `retry_after_ms`. A server whose Postgres pool is smaller than 2 connections refuses these reads with a `503` and **no** `retry_after_ms` (`crypto library reads (and the CBOM export) refused: the server's Postgres pool is smaller than 2 connections; restart the server with --postgres-pool-size 2 or more`): a retry fails the same way until that restart. |
 
 #### `GET /api/v1/crypto/cbom`
 
@@ -7748,7 +7824,138 @@ A CycloneDX **1.7** inventory of the cryptographic *library* packages installed 
 | 400 | Repeated parameter with differing values, unknown `family`, invalid UTF-8 or over-long value |
 | 401 | Unauthenticated |
 | 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
-| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty BOM**. An absent store, an unwired gate or a failure minting the serial number is a `503` too; the serial is minted before the inventory read, so that last failure takes no read slot and writes no audit row |
+| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty BOM**. An absent store, an unwired gate or a failure minting the serial number is a `503` too; the serial is minted before the inventory read, so that last failure takes no read slot and writes no audit row. A server whose Postgres pool is smaller than 2 connections refuses these reads with a `503` and **no** `retry_after_ms` (`crypto library reads (and the CBOM export) refused: the server's Postgres pool is smaller than 2 connections; restart the server with --postgres-pool-size 2 or more`): a retry fails the same way until that restart. |
+
+#### Dashboard widgets (ADR-0070 D13)
+
+The `/crypto` page is a per-operator widget dashboard (see [crypto.md](crypto.md#the-dashboard)). These routes serve the widget catalogue, the caller's own layout and the Yuzu-issued certificate counts; MCP twins `list_crypto_widgets`, `get_crypto_dashboard_layout`, `set_crypto_dashboard_layout` and `get_crypto_ca_stats`. The certificates behind a count are served by the filtered [`GET /api/v1/ca/issued`](#get-apiv1caissued) (MCP `list_issued_certs`). Every route answers `Cache-Control: no-store, private` and `Vary: Authorization, Cookie, X-Yuzu-Token`. The Yuzu-issued figures read **Yuzu's own internal CA** only, never certificates found on fleet devices (ADR-0070 D6). Facts only: the only built-in checks are the D13 named windows, each returned with its criterion and computed at read time against `as_of`, the database clock (ADR-0070 R4, R5), over the closed window set `crypto_widget_windows_v1` (active; expiring 3/7/14/21/30/60 days; expired 7/30/60/90; revoked 7/30/60/90 in three reason buckets; issued 7; 52 ISO weeks, the current partial week included); nothing grades a certificate.
+
+##### `GET /api/v1/crypto/widgets`
+
+The widget catalogue. Authentication only; not audited. `data`: `window_set`, `default_layout` (ids), `max_layout_widgets` (64), `scope_note` and `widgets[]` with `id`, `title`, `kind` (`number`, `bar`, `line`, `table`), `group`, `gate` (`fleet_read`: library widgets, answered over the caller's scope; `fleet_wide_only`: Yuzu-issued counts, withheld from a confined caller), `securable`, `operation` (`Inventory`/`Read` for every widget), `criterion` (what the widget counts, in words), `drill`, `available` and `availability` (`available`, `not_available`, `confined` or `access_check_unavailable`) and, for Yuzu-issued widgets, `ca_kind`, `days`, `drill_securable`/`drill_operation` (`Security`/`Read`) and `drill_available`. `available` and `drill_available` decide what to draw only: they come from the same non-auditing check the data routes would apply, and grant nothing. Errors: `401`, `503` (server misconfiguration).
+
+##### `GET /api/v1/crypto/dashboard/layout`
+
+The caller's OWN layout, keyed by the session user name (never another operator's). Authentication only; not audited. A service-scoped API token is refused `403` (`service-scoped tokens may not read or change a dashboard layout`, no `permission` field; audited `crypto.dashboard.layout.access_denied`), and an MCP-tier token is held to its tier's `Infrastructure:Read`. `data`: `widgets` (catalogue ids this server knows, in display order), `is_default` (`true` when the widgets are the default and no other-version ids are kept), `version` (the stored version, `0` when nothing is stored), `preserved_unknown` (stored ids this server version does not know: kept on every save, not listed) and `max_layout_widgets`.
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" https://yuzu.example.com/api/v1/crypto/dashboard/layout
+```
+
+```json
+{
+  "data": {
+    "widgets": ["lib.devices_reporting", "ca.active", "ca.expiring_30d"],
+    "is_default": false,
+    "version": 7,
+    "preserved_unknown": 0,
+    "max_layout_widgets": 64
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+Errors: `401`, `403`, `422` (the stored layout is damaged: not retryable, the `X-Crypto-Layout-Version` header carries its version; a `PUT` with `expected_version` set to that version replaces it), `503` + `retry_after_ms: 5000` (`dashboard layout read degraded`; never the default served in its place), and `503` without `retry_after_ms` when the layout store did not open at server start (`dashboard layouts unavailable: the layout store did not open at server start; saved layouts return after a restart with the store fixed`).
+
+##### `PUT /api/v1/crypto/dashboard/layout`
+
+Replace the caller's own layout. Body: `widgets` (at most 64 catalogue ids, no repeats; an empty list is valid) and optional `expected_version` (an integer, `0` or more); no other key. With `expected_version` the save is refused `409` unless the stored version is still that value (`0` = only if nothing is stored). Omit it only for a first save: without it the save succeeds only when nothing is stored, and over a stored layout (a damaged one included) it is the same `409` with `X-Crypto-Layout-Version` carrying the stored version. Ids stored by another server version are kept after yours (see `preserved_unknown`). Same caller rules as the GET (service-scoped token `403`, audited as a `crypto.dashboard.layout.update` `denied` row; MCP-tier token held to `Infrastructure:Write`). A cookie-authenticated browser write must name this site (`Origin`/`Referer`), else `403` and a `csrf.denied` row. Audited `crypto.dashboard.layout.update`: an `attempted` row first (if it cannot be written the layout is not changed: `503`, `Sec-Audit-Failed: true`), then `success` or `failure`.
+
+```bash
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"widgets":["lib.devices_reporting","ca.active","ca.expiring_30d"],"expected_version":7}' \
+  https://yuzu.example.com/api/v1/crypto/dashboard/layout
+```
+
+```json
+{
+  "data": {
+    "widgets": ["lib.devices_reporting", "ca.active", "ca.expiring_30d"],
+    "is_default": false,
+    "version": 8,
+    "preserved_unknown": 0,
+    "max_layout_widgets": 64
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`data` carries `audit_persisted: false` (and the response `Sec-Audit-Failed: true`) when the outcome row could not be written. The body cap is 16 KiB, enforced before the body is read; an over-cap body is refused with the pre-auth cap's `413` envelope:
+
+```json
+{
+  "error": {
+    "code": 413,
+    "message": "request body exceeds this route's size cap",
+    "correlation_id": "req-18f2a1c3d-2a",
+    "retry_after_ms": null,
+    "remediation": "reduce the request body size; see docs/user-manual/rest-api.md for the per-route limit"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+| Status | Condition |
+|---|---|
+| 400 | Malformed body, unknown or repeated id, too many ids, a bad `expected_version`, or another key (the message names the position, never the value) |
+| 401 | Unauthenticated |
+| 403 | Service-scoped token, MCP tier below `Infrastructure:Write`, or a cross-site cookie write |
+| 409 | `expected_version` is stale, or omitted while a layout is stored (`the layout changed since it was loaded (another tab or client saved first); reload it and save again`). `X-Crypto-Layout-Version` carries the stored version (`0` when another save landed during this one). Not retryable as sent: read the layout again, then save |
+| 413 | Body over 16 KiB |
+| 503 | `retry_after_ms: 5000`: `dashboard layout save failed` (store degraded), or `save outcome unknown — reload to check` (the connection dropped after the save was sent; the `failure` audit row says `outcome=unknown`; read the layout to see what was stored). Without `retry_after_ms`: the layout store did not open at server start, or the audit `attempted` row could not be written |
+
+##### `GET /api/v1/crypto/ca/stats`
+
+Every Yuzu-issued count against one `as_of`. **Permission:** `Inventory:Read`, and only for an unconfined view of the fleet (ADR-0070 R2): a management-group-confined caller (or one whose service-scoped token confines it) is refused `403` with `Yuzu-issued certificate figures are not available to this account: its view of the fleet is confined, and these are fleet-wide figures.` and no `permission` field (no grant would admit it), audited as a `crypto.ca.stats.view` `denied` row. Every call reads at request time (never cached), bounded by the `/crypto` read admission limit (see [crypto.md](crypto.md#yuzu-issued-certificates)). Audited `crypto.ca.stats.view` on every call (set-and-proceed: `audit_persisted: false` + `Sec-Audit-Failed: true` when the row is lost).
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" https://yuzu.example.com/api/v1/crypto/ca/stats
+```
+
+Response (trimmed: one entry of each array shown):
+
+```json
+{
+  "data": {
+    "scope": "yuzu_issued",
+    "scope_note": "Counts certificates Yuzu's own CA issued only (agent, server, gateway, HTTPS and code-signing); certificates on your devices are not covered.",
+    "window_edge_note": "as_of is the database clock; issued and revoked times are recorded from the issuing server's clock, so a window edge is accurate only to the servers' clock synchronisation.",
+    "rule_set_version": "crypto_widget_windows_v1",
+    "as_of": 1792396800,
+    "as_of_iso": "2026-10-19T08:00:00Z",
+    "active": {"rule_id": "yuzu_ca_active", "criterion": "Status active, issued on or before as_of, notAfter on or after as_of (valid through notAfter, inclusive)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 412},
+    "expiring_within_days": [
+      {"rule_id": "yuzu_ca_expiring", "criterion": "Status active, notAfter from as_of through as_of + 30 days (valid through notAfter, inclusive)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 9, "threshold": 30}
+    ],
+    "expired_within_days": [
+      {"rule_id": "yuzu_ca_expired", "criterion": "Status active, notAfter from as_of - 7 days up to, not including, as_of", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 0, "threshold": 7}
+    ],
+    "revoked_within_days": [
+      {"rule_id": "yuzu_ca_revoked_superseded", "criterion": "Revoked after as_of - 30 days and on or before as_of, reason recorded as superseded (replaced by a same-key successor)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 31, "threshold": 30, "bucket": "superseded"}
+    ],
+    "issued_within_days": {"rule_id": "yuzu_ca_issued", "criterion": "Issued after as_of - 7 days and on or before as_of, excluding unpublished (recorded, never delivered)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 14, "threshold": 7},
+    "week_basis": "last 52 ISO weeks (UTC, Monday start); the current week is partial",
+    "weeks": [
+      {"week": "2026-W43", "week_start": 1792368000, "partial": true,
+       "issued": {"rule_id": "yuzu_ca_issued_week", "criterion": "Issued in ISO week 2026-W43 (Monday 00:00 UTC start) up to as_of, excluding unpublished (recorded, never delivered)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 3, "week": "2026-W43"},
+       "revoked": [
+         {"rule_id": "yuzu_ca_revoked_week_superseded", "criterion": "Revoked in ISO week 2026-W43 (Monday 00:00 UTC start) up to as_of, reason recorded as superseded (replaced by a same-key successor)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 2, "week": "2026-W43", "bucket": "superseded"}
+       ]}
+    ]
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+- Every count object carries `rule_id`, `criterion`, `rule_set_version`, `as_of` and `count`, plus `threshold` (windowed counts: the window length in days, the ADR-0070 D10 condition-1 field), `week` (per-week counts) and `bucket` (revoked counts). These are counts of certificates, never labels.
+- `expiring_within_days` has one entry per window (3, 7, 14, 21, 30, 60), `expired_within_days` one per window (7, 30, 60, 90). `revoked_within_days` has three entries per window, one per bucket: `superseded`, `unpublished`, `other` (any other recorded reason, including an operator-typed reason stored as `operator-supplied: <text>`). They are never summed.
+- Expiring and expired cover status `active` only; a revoked certificate counts only in the revoked windows (R11). Issued excludes `unpublished` certificates (never delivered).
+- `weeks` has 52 entries, oldest first, zero-filled, ending with the week containing `as_of`, which has `partial: true`. `week_start` is that ISO week's Monday 00:00 UTC.
+- Recompute any count with `Security:Read` from the [filtered `GET /api/v1/ca/issued`](#get-apiv1caissued) with the count's `kind`, `days`/`week`, `bucket` and `as_of`.
+
+Errors: `401`, `403` (no `Inventory:Read`, written by the gate, or a confined caller, above), `503` + `retry_after_ms: 5000` (`Yuzu CA read degraded` or `crypto read capacity in use; retry`; never zeros), and `503` with **no** `retry_after_ms` when the server's Postgres pool is smaller than 4 connections (`Yuzu-issued certificate reads refused: ... restart the server with --postgres-pool-size 4 or more`; a retry fails the same way until that restart). The filtered `GET /api/v1/ca/issued` answers the same refusal the same way.
+
+The `/fragments/crypto/dashboard`, `/fragments/crypto/widget/{id}` and `/fragments/crypto/ca/certificates` fragments render the same data for the page (always HTTP 200, a note on refusal and a banner on degrade) and write the same audit verbs; for a service-scoped token, or an MCP token whose tier refuses the layout read, `/fragments/crypto/dashboard` draws the default layout read-only and never reads the minting operator's saved layout (the layout routes refuse the same tokens); the dashboard fragment writes one row per source per draw (see [crypto.md](crypto.md#audit)). `/fragments/crypto/ca/certificates` is the page's twin of the filtered `GET /api/v1/ca/issued` and needs `Security:Read`.
 
 ---
 
