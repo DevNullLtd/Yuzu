@@ -71,7 +71,9 @@
 // their free-function registrars take (they do not expose an httplib::Server&
 // overload the way KekRoutes does).
 #include "http_route_sink.hpp"
+#include "pki_routes.hpp"
 #include "plugin_config_routes.hpp"
+#include "settings_plugins_routes.hpp"
 #include "plugin_config_store.hpp"
 #include "enablement_store.hpp"        // ADR-3006: durable enablement store + continuity anchor
 #include "upload_grant_store.hpp"
@@ -165,10 +167,11 @@
 #include "dashboard_api_routes.hpp" // #2542 follow-up: /api/me, /api/agents, /api/audit, /api/export/json-to-csv, /api/scope/validate, /api/analytics/{status,recent}
 #include "nvd_routes.hpp" // #2542 follow-up: /api/nvd/{status,sync,match}, extracted onto the HttpRouteSink seam
 #include "groups_routes.hpp" // Groups and enrolment page (Phase 2 UI): /groups + its script
-#include "access_routes.hpp" // Access pages (Phase 2 UI): the read-only /access/users page
+#include "access_routes.hpp" // Access pages (Phase 2 UI): the Users and roles page (/access/users)
 #include "access_tokens_routes.hpp" // Tokens and principals page (Phase 2 UI): read-only /access/tokens
 #include "access_tokens_render.hpp"
 #include "access_audit_routes.hpp" // Audit and reviews page (Phase 2 UI): /access/audit
+#include "access_reviews_routes.hpp" // Audit and reviews page (Phase 2 UI): Access reviews fragments
 #include "custom_properties_routes.hpp" // #2542 PR-4: the 5-route Custom Properties API (7.6), extracted onto the HttpRouteSink seam
 #include "device_data_routes.hpp"
 #include "result_set_routes.hpp" // #2542 PR-5: the 6-route Result Sets fragment API, extracted onto the HttpRouteSink seam
@@ -189,13 +192,16 @@
 #include "mcp_disabled_routes.hpp" // #2542 PR-12: the 3-route MCP-disabled stub triple, extracted onto the HttpRouteSink seam
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
-#include "capability_fragments.hpp" // YUZU_ALL_CAPABILITY_FRAGMENTS: the 28 fragments, spelled once
+#include "capability_fragments.hpp" // YUZU_ALL_CAPABILITY_FRAGMENTS: every capability fragment, spelled once
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
 #include "compliance_api_local.hpp" // ADR-0031 WS-A4: core-only compliance/policy seam factory
 #include "compliance_routes.hpp"
+#include "crypto_access.hpp" // /crypto availability composition (M4, unit-tested)
 #include "crypto_api_local.hpp" // /crypto slice 1: make_local_crypto_api (core-only store-backed factory)
+#include "crypto_dashboard_layout_store.hpp" // /crypto widgets: per-operator layout (born-on-PG, ADR-0071)
+#include "crypto_layout_erasure.hpp" // ADR-0071: erase-failure reason set + mapping
 #include "crypto_routes.hpp"
 #include "policy_admin_routes.hpp" // ADR-0031 WS-A4 Task B: policy/fragment mutator routes (no public twin)
 #include "guardian_routes.hpp"
@@ -363,6 +369,7 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <utility>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1732,7 +1739,9 @@ public:
                           "for tiers that never reach C8) denying locally before the real "
                           "chokepoint would otherwise be reached. `kill_switched` is an "
                           "operator-thrown emergency stop, deliberately distinct from the "
-                          "`forbidden` authorization verdict.",
+                          "`forbidden` authorization verdict. `POST` and `DELETE "
+                          "/api/v1/quarantine` (#6065) are a third emitter: each runs the "
+                          "same pre-dispatch check before writing or releasing a record.",
                           "counter");
         for (auto reason : {"unclassified", "ambiguous", "anonymous_operator", "forbidden",
                             "approval_required", "kill_switched"}) {
@@ -2176,10 +2185,11 @@ public:
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
                           "(store_not_open/pool_acquire_timeout/query_error, plus "
-                          "admission_full for installed_software: a /crypto read refused by "
-                          "its in-flight bound before any store call) and source "
+                          "admission_full for installed_software and ca_issued: a /crypto read "
+                          "refused by its in-flight bound before any store call) and source "
                           "(installed_software/device_ci/software_licensing/product_registry/"
-                          "app_usage/generic - generic is the ADR-0037 InventoryStore). /readyz "
+                          "app_usage/generic - generic is the ADR-0037 InventoryStore - and "
+                          "ca_issued/crypto_layout, the /crypto Yuzu-issued and layout reads). /readyz "
                           "stays green under pure pool saturation, so "
                           "this is the read-path degrade signal",
                           "counter");
@@ -2187,6 +2197,28 @@ public:
         // present on a healthy server (the three store-side reasons are emitted on demand).
         metrics_.counter("yuzu_inventory_read_degrade_total",
                          {{"reason", "admission_full"}, {"source", "installed_software"}});
+        metrics_.counter("yuzu_inventory_read_degrade_total",
+                         {{"reason", "admission_full"}, {"source", "ca_issued"}});
+        // The /crypto layout reads and saves (L10): pre-seeded so a dashboard can tell "no
+        // degrade" from "series absent" before the first fault.
+        for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
+            metrics_.counter("yuzu_inventory_read_degrade_total",
+                             {{"reason", reason}, {"source", "crypto_layout"}});
+        // ADR-0071 deprovision erasure of /crypto dashboard layouts (M1): best-effort, so a
+        // failure is counted and alerted (YuzuCryptoLayoutEraseFailed), never a failed deprovision.
+        // The reason set and mapping live in crypto_layout_erasure.hpp (one copy, unit-tested).
+        metrics_.describe(std::string(crypto_layout_erasure::kMetric),
+                          "Deprovision erasures of a /crypto dashboard layout row that did not "
+                          "complete, by reason (store_not_open/pool_acquire_timeout/"
+                          "outcome_unknown/query_error, or link_read_failed: an already-inactive "
+                          "SCIM user's linked identities could not be read, so only the user "
+                          "name's row was erased). The deprovision itself succeeded; the row may "
+                          "remain and must be removed by hand (docs/user-manual/crypto.md, "
+                          "\"Deprovision erasure\")",
+                          "counter");
+        for (const auto reason : crypto_layout_erasure::kReasons)
+            metrics_.counter(std::string(crypto_layout_erasure::kMetric),
+                             {{"reason", std::string(reason)}});
         // Management-group CONFINEMENT store observability (ADR-0042). The
         // read-degrade counter is the fail-closed signal: a non-zero rate means
         // RbacStore's authorize_list_read / check_scoped_permission is denying
@@ -5333,6 +5365,20 @@ public:
             }
         }
 
+        // remote_access_audit ships default-off (Forensics class, like privacy_permissions);
+        // enable via PUT /api/v1/plugin-config/remote_access_audit/kill-switch.
+        if (plugin_config_store_ && !startup_failed_) {
+            if (!plugin_config_store_->seed_kill_switch_default_off(
+                    "remote_access_audit",
+                    "default-off: forensics class; enable per PUT "
+                    "/api/v1/plugin-config/remote_access_audit/kill-switch")) {
+                spdlog::error(
+                    "[PG] Refusing to start: remote_access_audit default-off kill-switch "
+                    "seed failed");
+                startup_failed_ = true;
+            }
+        }
+
         // UploadGrantStore (PR1.6a/c) — no secret codec of its own: grant
         // and session credentials are stored as SHA-256 digests, never a
         // sealed SecretCodec blob (upload_grant_store.hpp file header).
@@ -7653,6 +7699,33 @@ public:
                     *software_inventory_store_,
                     std::chrono::seconds{kCatalogueRefreshIntervalSeconds}, &metrics_);
                 software_catalog_rollup_->start();
+            }
+        }
+
+        // /crypto dashboard widget layouts — born-on-Postgres (ADR-0071), one row per
+        // operator. DELIBERATE EXCEPTION to the ADR-0007/0008 fail-closed boot (owner
+        // decision 2026-10-19): a layout is a loss-tolerant UI preference, so a store
+        // that cannot open DEGRADES — the pointer is reset, the server boots, the layout
+        // routes answer 503 "layouts unavailable" (not retryable: it lasts until a
+        // restart), the dashboard draws the default layout with a notice, and /readyz
+        // names the store under "degraded" without leaving rotation. Never set
+        // startup_failed_ here. No legacy SQLite predecessor, so nothing to detect.
+        if (pg_pool_ && !startup_failed_) {
+            crypto_dashboard_layout_store_ = std::make_unique<CryptoDashboardLayoutStore>(*pg_pool_);
+            if (!crypto_dashboard_layout_store_->is_open()) {
+                spdlog::error("[PG] Crypto dashboard layout store migration/open failed (the "
+                              "crypto_dashboard_layout_store schema could not be created/opened; "
+                              "pool last error: {}) - continuing WITHOUT saved /crypto layouts: "
+                              "every operator sees the default layout and saves are refused "
+                              "until a restart with the schema fixed",
+                              [&] {
+                                  auto e = pg_pool_->last_error();
+                                  return e.empty() ? std::string("none") : e;
+                              }());
+                crypto_dashboard_layout_store_.reset();
+            } else {
+                spdlog::info("CryptoDashboardLayoutStore initialized (schema "
+                             "crypto_dashboard_layout_store)");
             }
         }
 
@@ -10719,6 +10792,9 @@ public:
         if (gateway_service_)
             gateway_service_->set_software_inventory_store(nullptr);
         software_inventory_store_.reset();
+        // The /crypto layout store: borrowed only by crypto_api_, whose callers (the web worker
+        // pool) were joined above. Before the pool (ADR-0012 destruct-before-pool).
+        crypto_dashboard_layout_store_.reset();
         agent_service_.set_app_perf_daily_store(nullptr);
         if (gateway_service_)
             gateway_service_->set_app_perf_daily_store(nullptr);
@@ -12278,6 +12354,62 @@ private:
         if (!result)
             return {};
         return {true, result->visible_for_query()};
+    }
+
+    /// The deprovision erasure hook (ADR-0071; deprovision_erasure.hpp) for the /crypto layout
+    /// store: wired into SettingsRoutes and ScimRoutes, run AFTER a deprovision has committed,
+    /// with every principal that could key a session (slug + linked oidc:/saml:). Best-effort:
+    /// a failure is a warn line (never naming the principal) and a counted
+    /// yuzu_server_crypto_layout_erase_failures_total{reason} (alert YuzuCryptoLayoutEraseFailed),
+    /// never a failed deprovision. The warn line carries the reason and the store's fixed
+    /// message only - never a principal, hash or token.
+    /// A principal the store cannot key (kInvalidInput: oversized / non-UTF-8) can own no row,
+    /// so it is not a failure.
+    void erase_deprovisioned_layouts(const std::vector<std::string>& principals) {
+        namespace cle = crypto_layout_erasure;
+        auto failed = [this](std::string_view reason, std::string_view why) {
+            metrics_.counter(std::string(cle::kMetric), {{"reason", std::string(reason)}})
+                .increment();
+            spdlog::warn("crypto dashboard layout erasure on deprovision failed ({}: {}); the "
+                         "deprovision itself is unaffected - the row stays until erased by hand "
+                         "or by a later deprovision of the same principal",
+                         reason, why);
+        };
+        if (!crypto_dashboard_layout_store_) {
+            failed(cle::kStoreNotOpen, "the layout store did not open at server start");
+            return;
+        }
+        for (const auto& principal : principals) {
+            const auto erased = crypto_dashboard_layout_store_->erase(principal);
+            if (erased)
+                continue;
+            // nullopt: a principal the store cannot key owns no row, so there is none to erase.
+            if (const auto reason = cle::reason_for(erased.error().kind))
+                failed(*reason, erased.error().message);
+        }
+    }
+
+    /// R2-1: an already-inactive SCIM user's erasure ran on the slug alone (its linked identities
+    /// could not be read), so a linked principal's row may remain. Counted under the same metric
+    /// and alert; the warn line was written by the seam, without the principal.
+    void note_layout_erasure_degraded(std::string_view reason) {
+        metrics_
+            .counter(std::string(crypto_layout_erasure::kMetric),
+                     {{"reason", std::string(reason)}})
+            .increment();
+    }
+
+    /// The ONE /crypto availability callback (ADR-0070 R2; fix-spec B1): CryptoRoutes, the
+    /// filtered GET /api/v1/ca/issued and the MCP server all receive THIS function, so the REST
+    /// widget list, the dashboard and list_crypto_widgets cannot draw different answers. Fleet
+    /// gate classes ask the NON-auditing fleet-read probe (a confined caller has a present
+    /// VisibleSet); the global class asks the non-auditing has_permission. Never a grant.
+    yuzu::server::crypto_widgets::Access crypto_access(const httplib::Request& req,
+                                                       yuzu::server::crypto_widgets::WidgetGate gate,
+                                                       const std::string& securable,
+                                                       const std::string& operation) {
+        // The composition lives in crypto_access.hpp so it is unit-tested (M4).
+        return crypto_access_for(*auth_routes_, req, gate, securable, operation);
     }
 
     /// #1788: the per-caller Execution:Execute visible set (nullopt == unfiltered),
@@ -15666,8 +15798,9 @@ private:
             return require_scoped_permission(req, res, type, op, agent_id);
         };
         // ADR-0017 admit-then-filter list-read gate (wraps require_list_read).
-        // The fleet guaranteed-state status route's SOLE authorization gate —
-        // never stacked with perm_fn (see rest_api_v1.cpp's route comment).
+        // The fleet guaranteed-state status route's SOLE authorization gate, and the MCP
+        // get_guardian_status / list_plugin_config tools' — never stacked with perm_fn (see
+        // rest_api_v1.cpp's route comment). The plugin-config REST list binds the global variant.
         auto list_read_fn = [this](const httplib::Request& req, httplib::Response& res,
                                    const std::string& type,
                                    const std::string& op) -> yuzu::server::ListReadGate {
@@ -15806,11 +15939,13 @@ private:
                              .store = custom_properties_store_.get(),
                          });
 
-        // Access pages (Phase 2 UI): the read-only /access/users page, its two fragments and
-        // the page's static glue. Placed after audit_fn (which it binds for the Access PRs
-        // that follow). The read goes through AuthDB::list_users() (a std::expected: a store
-        // fault reaches the page as "could not be read", never as an empty list); the
-        // in-memory AuthManager::list_users() fallback is deliberately not used.
+        // Access pages (Phase 2 UI): the Users and roles page /access/users, its fragments
+        // (users, roles, role permissions, role assignments, enforcement) and the static glue.
+        // Placed after audit_fn. The lambdas below capture `this` and are quiesced by the
+        // web_thread_ join in stop(), before rbac_store_ is reset. The read goes through
+        // AuthDB::list_users() (a std::expected: a store fault reaches the page as "could not
+        // be read", never as an empty list); the in-memory AuthManager::list_users() fallback
+        // is deliberately not used.
         yuzu::server::access::register_access_routes(
             inline_sink,
             yuzu::server::access::Deps{
@@ -15830,6 +15965,43 @@ private:
                                                std::to_string(static_cast<int>(r.error())) + ")");
                     return std::move(*r);
                 },
+                // The checked reads the REST twins use: a closed store, a pool timeout or a
+                // query error is `unexpected`, never an empty list.
+                .list_roles_fn = [this]() -> std::expected<std::vector<RbacRole>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    return rbac_store_->list_roles_checked();
+                },
+                .role_permissions_fn =
+                    [this](const std::string& role) -> std::expected<std::vector<Permission>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    return rbac_store_->get_role_permissions_checked(role);
+                },
+                .list_assignments_fn = [this]() -> std::expected<std::vector<PrincipalRole>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    return rbac_store_->list_all_principal_roles_checked();
+                },
+                // Display accessors only: the cached view FIRST (reading it refreshes it), then the
+                // staleness flag. The enforcement-label and administrator predicates are
+                // deliberately not used here (routed A2/A1 row, clauses 3 and 4).
+                .enforcement_state_fn =
+                    [this]() -> std::expected<yuzu::server::access::EnforcementView, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    yuzu::server::access::EnforcementView v;
+                    v.enabled = rbac_store_->is_rbac_enabled();
+                    v.degraded = rbac_store_->rbac_enabled_view_degraded();
+                    return v;
+                },
+                .deny_service_scoped_fn =
+                    [this](const httplib::Request& req, httplib::Response& res,
+                           const std::string& action, const std::string& message,
+                           const std::string& target_type, const std::string& target_id) {
+                        return auth_routes_->deny_service_scoped_session(req, res, action, message,
+                                                                          target_type, target_id);
+                    },
             });
 
         // Tokens and principals page (Phase 2 UI): /access/tokens, its three
@@ -15977,6 +16149,49 @@ private:
                                             : cfg_.audit_retention_days;
                     },
                 .now_fn = []() { return static_cast<std::int64_t>(std::time(nullptr)); },
+            });
+
+        // Audit and reviews page (Phase 2 UI), Access reviews half: three read-only fragments.
+        // Every write the page makes goes to the existing REST v1 routes. `probe_perm_fn` is the
+        // quiet probe on a scratch Response: a render-time hint for the Attest controls only (never a
+        // gate), and the self-loading campaign list uses the quiet probe too, so a page view writes no
+        // denied row for a cookie session. The campaign and grants fragments keep the loud gate.
+        yuzu::server::access_reviews::register_access_reviews_routes(
+            inline_sink,
+            yuzu::server::access_reviews::ReviewsDeps{
+                .auth_fn = auth_fn,
+                .perm_fn = perm_fn,
+                .quiet_perm_fn = draw_perm_fn,
+                .probe_perm_fn = [draw_perm_fn](const httplib::Request& req, const std::string& type,
+                                                const std::string& op) -> bool {
+                    httplib::Response scratch;
+                    return draw_perm_fn(req, scratch, type, op);
+                },
+                .audit_fn = audit_fn,
+                .list_campaigns_fn = [this]()
+                    -> std::expected<std::vector<AccessReviewCampaignRow>, std::string> {
+                    if (!access_review_store_ || !access_review_store_->is_open())
+                        return std::unexpected(std::string("access review store not open"));
+                    return access_review_store_->list_campaigns();
+                },
+                .get_campaign_fn = [this](const std::string& id)
+                    -> std::expected<CampaignView, std::string> {
+                    if (!access_review_store_ || !access_review_store_->is_open())
+                        return std::unexpected(std::string("access review store not open"));
+                    return access_review_store_->get_campaign(id);
+                },
+                .grants_fn = [this]()
+                    -> std::expected<yuzu::server::access_reviews::GrantsView, std::string> {
+                    // The same read as GET /api/v1/access-reviews/export (the grant TABLE,
+                    // never a roster walk, so orphan grants are kept).
+                    auto rows = build_access_review(auth_mgr_.auth_db_ptr(), rbac_store_.get(),
+                                                    engine_principal_store_.get(),
+                                                    api_token_store_.get(), directory_sync_.get());
+                    if (!rows)
+                        return std::unexpected(rows.error());
+                    return yuzu::server::access_reviews::GrantsView{
+                        std::move(*rows), access_review_rbac_enforcement(rbac_store_.get())};
+                },
             });
 
         // #2542 PR-5: wraps AuthRoutes::deny_service_scoped_session — the
@@ -16153,6 +16368,8 @@ private:
                              .product_pack_store = product_pack_store_.get(),
                              .scim_store = scim_store_.get(),
                              .analytics_store = analytics_store_.get(),
+                             .crypto_dashboard_layout_store =
+                                 crypto_dashboard_layout_store_.get(),
                              .nvd_db = nvd_db_.get(),
                              .nvd_sync = nvd_sync_.get(),
                          });
@@ -16612,6 +16829,12 @@ private:
         if (scim_store_) {
             settings_routes_->set_scim_store(scim_store_.get());
         }
+        // ADR-0071: erase the deleted operator's per-operator rows after the delete commits
+        // (best-effort, never changes the delete's outcome - deprovision_erasure.hpp).
+        settings_routes_->set_on_deprovisioned(
+            [this](const std::vector<std::string>& principals) {
+                erase_deprovisioned_layouts(principals);
+            });
         settings_routes_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res) {
@@ -17156,7 +17379,9 @@ private:
                           "Scheduled instruction occurrences dispatched successfully", "counter");
         metrics_.describe("yuzu_schedule_fire_failures_total",
                           "Scheduled occurrences skipped or failed (unknown/disabled definition, "
-                          "dispatch failure, no agents in scope, approval submit failure)",
+                          "dispatch failure, no agents in scope, approval submit failure, or an "
+                          "approval ticket that could not be settled or whose outbox ledger could "
+                          "not be read, which holds the occurrence for a retry)",
                           "counter");
         metrics_.describe("yuzu_schedule_approvals_submitted_total",
                           "Approval tickets submitted by the schedule runner for approval-gated "
@@ -17249,6 +17474,21 @@ private:
                 return yuzu::server::schedule_arming_permitted(capability_registry_,
                                                                rbac_store_.get(), principal,
                                                                plugin, action);
+            },
+            // #6096: the outbox as the spent-ticket ledger (clock-free). A missing store
+            // is an error, not an empty answer, so the runner holds rather than fires.
+            .outbox_occurrences_fn =
+                [this](const std::string& approval_id)
+                -> std::expected<std::vector<std::string>, std::string> {
+                if (!command_outbox_store_)
+                    return std::unexpected("command outbox not available");
+                return command_outbox_store_->occurrences_for_approval(approval_id);
+            },
+            .outbox_exists_fn = [this](const std::string& occurrence_id)
+                -> std::expected<bool, std::string> {
+                if (!command_outbox_store_)
+                    return std::unexpected("command outbox not available");
+                return command_outbox_store_->occurrence_exists(occurrence_id);
             },
             // #3495: lets a shutdown request stop tick() from firing further
             // due schedules once stop_requested_ flips — same field and
@@ -18722,10 +18962,9 @@ private:
             return offline_identity_row(eps, agent_id, now_ms, inv_human_age);
         };
         // The full per-device CI record composition — ONE closure shared verbatim
-        // by the dashboard fragment and the REST twin, so the two can never drift
-        // on what "the CI record" means. No MCP twin exists yet (tracked as a
-        // follow-up, governance Gate 3 finding — this comment previously claimed
-        // one was already wired).
+        // by the dashboard fragment, the REST twin and the MCP get_hardware_ci
+        // twin (via ToolDeps::ci_detail_fn), so the three can never drift on what
+        // "the CI record" means.
         auto hw_ci_detail_fn = [this, hw_identity_fn](const std::string& agent_id) -> HardwareCiDetail {
             HardwareCiDetail detail;
             apply_identity_read(detail, hw_identity_fn(agent_id));
@@ -18835,26 +19074,74 @@ private:
                 },
                 .audit_fn = audit_fn});
 
-        // CryptoRoutes — /crypto, /fragments/crypto/*, GET /api/v1/crypto/* (slice 1:
-        // crypto-library presence from the installed_software inventory). ONE CryptoApi
-        // instance backs the page, the REST routes and the MCP twins (set_crypto_api below).
-        // Built only when the software-inventory store exists; without it the routes are
-        // registered with a null seam and answer 503 / the degrade banner, never an empty page.
-        if (software_inventory_store_) {
+        // CryptoRoutes — /crypto, /fragments/crypto/*, /api/v1/crypto/* (crypto-library
+        // presence from the installed_software inventory, the Yuzu-issued certificate widgets
+        // over ca_store_, and the per-operator widget layout). ONE CryptoApi instance backs the
+        // page, the REST routes and the MCP twins (set_crypto_api below). Built whenever ANY
+        // backing store exists; a missing store degrades only the methods that read it (503 /
+        // the degrade banner), never an empty answer and never the other methods.
+        if (software_inventory_store_ || ca_store_ || crypto_dashboard_layout_store_) {
             crypto_device_api_ = device_api;
-            crypto_api_ = make_local_crypto_api(*software_inventory_store_, crypto_device_api_.get());
+            // Admission is narrowed to a quarter of the pool (B9); the unconfined library summary
+            // is shared for a minute (B8) - the Yuzu-issued stats read never is (ADR-0070: bounded
+            // by admission, not a cached count); every Yuzu-issued / layout shed and degrade is
+            // counted with closed labels (B10).
+            crypto_api_ = make_local_crypto_api(LocalCryptoApiDeps{
+                .software = software_inventory_store_.get(),
+                .devices = crypto_device_api_.get(),
+                .ca = ca_store_.get(),
+                .layouts = crypto_dashboard_layout_store_.get(),
+                .pool_size = pg_pool_ ? static_cast<int>(pg_pool_->size()) : 0,
+                .shared_read_ttl = std::chrono::seconds(60),
+                .note_degrade =
+                    [this](std::string_view source, std::string_view reason) {
+                        metrics_
+                            .counter("yuzu_inventory_read_degrade_total",
+                                     {{"reason", std::string(reason)}, {"source", std::string(source)}})
+                            .increment();
+                    }});
         }
         crypto_routes_ = std::make_unique<CryptoRoutes>();
-        crypto_routes_->register_routes(*web_server_, CryptoRoutes::Deps{.auth_fn = auth_fn,
-                                                                         .fleet_read_fn = fleet_read_fn,
-                                                                         .api = crypto_api_,
-                                                                         .audit_fn = audit_fn});
+        crypto_routes_->register_routes(
+            *web_server_,
+            CryptoRoutes::Deps{.auth_fn = auth_fn,
+                               .fleet_read_fn = fleet_read_fn,
+                               .api = crypto_api_,
+                               .audit_fn = audit_fn,
+                               .perm_fn = perm_fn,
+                               .access_fn =
+                                   [this](const httplib::Request& req,
+                                          crypto_widgets::WidgetGate g, const std::string& type,
+                                          const std::string& op) {
+                                       return crypto_access(req, g, type, op);
+                                   },
+                               .write_gate = WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins},
+                               .tier_policy_fn = auth_routes_->gateless_tier_policy_fn()});
 
         // HardwareRoutes — /hardware (ServiceNow-style CI list + record).
         // Software lives at /software; /inventory redirects here.
         // `fleet_read_fn` is the SOLE gate on the list + REST twin (admit-then-filter,
         // ADR-0017) — `build_hw_roster` is deliberately UNFILTERED, matching
         // `FleetReadFn`'s own contract (never stack a second scope predicate).
+        // Devices-page merge (round 3): the same 7-day DEX score used by the standalone
+        // Devices/DEX drills. Deliberately NOT baked into RosterFn/build_hw_roster: this
+        // must only ever be called on the rows actually rendered on the current page
+        // (post filter/sort/paginate), never the whole roster (dex_device_score is one
+        // GROUP-BY query per call). Named so the MCP ToolDeps (set_tool_deps) receives the
+        // SAME closure the REST routes do.
+        auto hw_dex_score_fn = [this](const std::string& id) -> int {
+            return dex_device_score(guaranteed_state_store_.get(), id, dex_iso_since(7));
+        };
+        // List pill: the authoritative active-quarantine read (one per list render; the
+        // snapshot the dispatch gate keeps is a 20 s cache and is deliberately not reused
+        // for an operator display). Named for the same reason as hw_dex_score_fn.
+        auto hw_quarantine_list_fn =
+            [this](const std::vector<std::string>* ids,
+                   std::size_t limit) -> std::optional<std::vector<QuarantineRecord>> {
+            if (!quarantine_store_ || !quarantine_store_->is_open())
+                return std::nullopt;
+            return quarantine_store_->list_quarantined_in(ids, limit);
+        };
         hardware_routes_ = std::make_unique<HardwareRoutes>();
         hardware_routes_->register_routes(
             *web_server_, HardwareRoutes::Deps{
@@ -18959,27 +19246,10 @@ private:
                                          return std::nullopt;
                                      return sess->agent_version;
                                  },
-                             // Devices-page merge (round 3): the same 7-day DEX score
-                             // used by the standalone Devices/DEX drills. Deliberately
-                             // NOT baked into RosterFn/build_hw_roster — this must only
-                             // ever be called on the rows actually rendered on the
-                             // current page (post filter/sort/paginate), never the whole
-                             // roster (dex_device_score is one GROUP-BY query per call).
-                             .dex_score_fn =
-                                 [this](const std::string& id) -> int {
-                                     return dex_device_score(guaranteed_state_store_.get(), id,
-                                                             dex_iso_since(7));
-                                 },
-                             // List pill: the authoritative active-quarantine read (one per
-                             // list render; the snapshot the dispatch gate keeps is a 20 s
-                             // cache and is deliberately not reused for an operator display).
-                             .quarantine_list_fn =
-                                 [this](const std::vector<std::string>* ids, std::size_t limit)
-                                     -> std::optional<std::vector<QuarantineRecord>> {
-                                     if (!quarantine_store_ || !quarantine_store_->is_open())
-                                         return std::nullopt;
-                                     return quarantine_store_->list_quarantined_in(ids, limit);
-                                 },
+                             // Devices-page merge (round 3): see hw_dex_score_fn above.
+                             .dex_score_fn = hw_dex_score_fn,
+                             // List pill: see hw_quarantine_list_fn above.
+                             .quarantine_list_fn = hw_quarantine_list_fn,
                              // POST /api/v1/hardware/sync (Software "Sync now" for a scope).
                              // Type-level Execution:Execute; the targets are then resolved
                              // against the caller's OWN Execution:Execute visible set.
@@ -19073,6 +19343,9 @@ private:
                         for (const auto& a : list->approvals)
                             if (a.submitted_at > 0 && (oldest == 0 || a.submitted_at < oldest))
                                 oldest = a.submitted_at;
+                        // Display only (#6096): submitted_at is database time and the panel
+                        // subtracts this process's clock from it, so skew shifts the printed
+                        // age. No decision reads this figure.
                         if (oldest > 0)
                             f.oldest = oldest;
                     }
@@ -19820,6 +20093,17 @@ private:
         // #2537: same ordering rule as DashboardRoutes above — register_routes
         // copies the list into its handler captures, so it must be set first.
         ca_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
+        // ADR-0070 R2-2: the filtered GET /api/v1/ca/issued reads through the SAME CryptoApi
+        // instance and is withheld from a confined caller via the SAME availability callback.
+        ca_routes_->set_filtered_issued(CaRoutes::FilteredIssuedDeps{
+            .api = crypto_api_,
+            .confinement_fn = [this](const httplib::Request& req) {
+                return crypto_access(req, crypto_widgets::WidgetGate::kFleetWideOnly, "Inventory",
+                                     "Read");
+            }});
+        ca_routes_->set_read_probe([this](const httplib::Request& req) {
+            return auth_routes_->has_permission(req, "Security", "Read");
+        });
         ca_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, audit_fn, ca_store_.get(),
             [this]() -> std::optional<std::vector<std::uint8_t>> { return publish_crl(); },
@@ -20426,12 +20710,54 @@ private:
                 operator_surface_sink,
                 plugin_config::Deps{
                     .store = plugin_config_store_.get(),
-                    .rbac_store = rbac_store_.get(),
-                    .mgmt_store = mgmt_group_store_.get(),
+                    // The list route's SOLE gate (ADR-0017): require_list_read, plus the audited
+                    // refusal of a management-group-confined grant (this resource is not
+                    // agent-scoped). The Plugins and updates fragment binds the quiet twin of this
+                    // function; the MCP list_plugin_config tool uses the shared list_read_fn and
+                    // audits the same refusal itself.
+                    .list_read_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                           const std::string& type, const std::string& op) {
+                        return auth_routes_->require_global_list_read(req, res, type, op);
+                    },
                     .auth_fn = auth_fn,
                     .perm_fn = perm_fn,
                     .audit_fn = audit_fn,
                 });
+
+            // System > Plugins and updates: the page and the plugin read fragments.
+            settings_plugins::register_settings_plugins_routes(
+                operator_surface_sink,
+                settings_plugins::Deps{
+                    .config_store = plugin_config_store_.get(),
+                    .pack_store = product_pack_store_.get(),
+                    // The page is a navigation: the loud admin gate. The three fragments load
+                    // by themselves, so they use the quiet probes (no denial row for an
+                    // interactive cookie session; a token or engine caller keeps its row).
+                    .admin_fn = [this](const httplib::Request& req,
+                                       httplib::Response& res) { return require_admin(req, res); },
+                    .probe_admin_fn = [this](const httplib::Request& req,
+                                             httplib::Response& res) {
+                        return auth_routes_->probe_admin(req, res);
+                    },
+                    .probe_perm_fn = [this](const httplib::Request& req, const std::string& type,
+                                            const std::string& op) {
+                        return auth_routes_->has_permission(req, type, op);
+                    },
+                    .probe_list_read_fn = [this](const httplib::Request& req,
+                                                 httplib::Response& res, const std::string& type,
+                                                 const std::string& op) {
+                        return auth_routes_->probe_global_list_read(req, res, type, op);
+                    },
+                    .help_json_fn = [this]() { return registry_.help_json(); },
+                });
+
+            // System > Certificates and secrets: the page. The CA and KEK panel fragments are
+            // registered by CaRoutes / KekRoutes above, beside the data they read.
+            pki::register_pki_routes(
+                operator_surface_sink,
+                pki::Deps{.admin_fn = [this](const httplib::Request& req, httplib::Response& res) {
+                    return require_admin(req, res);
+                }});
 
             register_file_retrieval_routes(
                 operator_surface_sink,
@@ -20538,6 +20864,13 @@ private:
             // itself carries no severity field. Nullable/deferred like the
             // other optional stores above — analytics_store_ may be null
             // when --analytics-db is unset.
+            // ADR-0071: per-operator rows erased after a SCIM deprovision commits (best-effort,
+            // never changes the SCIM answer - deprovision_erasure.hpp). Set before registering.
+            scim_routes_->set_on_deprovisioned([this](const std::vector<std::string>& principals) {
+                erase_deprovisioned_layouts(principals);
+            });
+            scim_routes_->set_on_erasure_degraded(
+                [this](std::string_view reason) { note_layout_erasure_degraded(reason); });
             scim_routes_->register_routes(*web_server_, scim_store_.get(), &auth_mgr_,
                                           audit_store_.get(), cfg_.scim_admin_group,
                                           engine_principal_store_.get(),
@@ -20712,6 +21045,82 @@ private:
                                                           target_type, target_id);
             }});
         rest_api_v1_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
+        // #6065 PR-Q (rest-audit-principal-reresolution): POST and DELETE
+        // /api/v1/quarantine stamp every audit row from the session they resolved, not from
+        // a second resolution of the request that could name a different actor.
+        // AuthRoutes::audit_as_session_fn() is the one factory (a test drives that closure):
+        // it stamps the principal, the effective role the route captured per binding, the
+        // engine class and the session correlator. MUST run BEFORE register_routes().
+        rest_api_v1_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());
+        // #6065 PR-Q: the dispatch-chokepoint pre-check closure, defined ONCE and
+        // handed to BOTH REST (POST and DELETE /api/v1/quarantine, the trailing register_routes
+        // param) and MCP (set_authorize_dispatch_fn, wired further below), so the two
+        // surfaces cannot observe a different admit decision for the same caller
+        // (never bind a route-local copy). Each consumer holds its own COPY of this
+        // one lambda; the copies cannot diverge because it captures only `this` and
+        // everything it reads is live -- a stateful capture added here would break
+        // that, and tests/test_tier_policy_wiring_lexical.py pins "one definition,
+        // two uses". Formerly an inline lambda at the MCP wiring site; its
+        // rationale follows.
+        // Composes the SAME two DECISIONS build_classified_command
+        // makes, in the SAME order, and NEITHER is a re-implemented slice:
+        // the classify+authorize half calls classify_and_authorize_dispatch
+        // via the SAME has_permission binder (dispatch_has_permission
+        // above); the kill-switch half calls the SAME kill_switch_denial
+        // (agent_registry.hpp) finalize_classified_command itself calls —
+        // Gate 6 governance fix: an earlier round of this PR re-expressed
+        // that boolean inline instead of sharing code with
+        // finalize_classified_command, reintroducing the exact
+        // "from-scratch copy drifts from what production enforces" shape
+        // that function's own M6/wave1 extraction closed once already;
+        // this wiring now shares the extracted function instead.
+        // `action_allowed`'s construction (nullptr-guarded
+        // plugin_config_store_ wrap) is the SAME literal composition
+        // build_classified_command uses ahead of its own
+        // finalize_classified_command call, above. `plugin_config_store_`
+        // is read live through `this` (not captured by value), so this
+        // wiring is safe regardless of construction order relative to
+        // that store; an unset store means legacy-open for the
+        // kill-switch gate ONLY, mirroring build_classified_command's own
+        // unwired contract. Per McpServer::AuthorizeDispatchFn's
+        // fail-closed contract (mcp_server.hpp), omitting this whole call
+        // refuses every execute_instruction call outright, not merely a
+        // degraded tool.
+        const mcp::McpServer::AuthorizeDispatchFn authorize_dispatch =
+            [this](const yuzu::server::DispatchCaller& caller, std::string_view plugin,
+                   std::string_view action)
+                -> std::expected<yuzu::server::CommandCapability,
+                                 yuzu::server::detail::DispatchDenial> {
+                auto decision = yuzu::server::detail::classify_and_authorize_dispatch(
+                    capability_registry_, caller, plugin, action,
+                    [this](std::string_view principal, std::string_view securable,
+                           yuzu::server::authz::Operation op) {
+                        return dispatch_has_permission(principal, securable, op);
+                    });
+                if (!decision)
+                    return decision;
+                const yuzu::server::detail::KillSwitchFn action_allowed =
+                    plugin_config_store_ != nullptr
+                        ? yuzu::server::detail::KillSwitchFn(
+                              [this](std::string_view p, std::string_view a) {
+                                  return plugin_config_store_->kill_switch_decision(p, a);
+                              })
+                        : yuzu::server::detail::KillSwitchFn{};
+                // The dry run has no target, so it cannot see the per-OS
+                // layer (only the all-OS denial); a per-OS withhold shows
+                // up at dispatch as kill_switched_os_count > 0.
+                if (auto os_set =
+                        yuzu::server::detail::kill_switch_denial(*decision, action_allowed);
+                    !os_set) {
+                    return std::unexpected(os_set.error());
+                }
+                return decision;
+            };
+        // REST and MCP name this type separately; they must stay the SAME type, or the
+        // copies handed to each could silently drift behind a std::function conversion.
+        static_assert(std::is_same_v<RestApiV1::AuthorizeDispatchFn,
+                                     mcp::McpServer::AuthorizeDispatchFn>,
+                      "REST and MCP must take the identical authorize-dispatch callable type");
         rest_api_v1_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res)
@@ -21178,7 +21587,11 @@ private:
             // lambda; a second copy is exactly how the original clause-5
             // violation this belt exists to prevent could recur unreviewed
             // at a 9th call site.
-            auth_routes_->gateless_tier_policy_fn());
+            auth_routes_->gateless_tier_policy_fn(),
+            // #6065 PR-Q: POST and DELETE /api/v1/quarantine's dispatch-chokepoint pre-check --
+            // a copy of the SAME closure MCP's set_authorize_dispatch_fn receives
+            // below, never a route-local one. Unwired would make those routes answer 500.
+            authorize_dispatch);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -21274,71 +21687,38 @@ private:
             // #3687 — wired UNCONDITIONALLY, same reasoning as
             // set_capability_classify_fn immediately above (capability_registry_
             // is a plain ServerImpl member, never conditional on another store's
-            // presence). Composes the SAME two DECISIONS build_classified_command
-            // makes, in the SAME order, and NEITHER is a re-implemented slice:
-            // the classify+authorize half calls classify_and_authorize_dispatch
-            // via the SAME has_permission binder (dispatch_has_permission
-            // above); the kill-switch half calls the SAME kill_switch_denial
-            // (agent_registry.hpp) finalize_classified_command itself calls —
-            // Gate 6 governance fix: an earlier round of this PR re-expressed
-            // that boolean inline instead of sharing code with
-            // finalize_classified_command, reintroducing the exact
-            // "from-scratch copy drifts from what production enforces" shape
-            // that function's own M6/wave1 extraction closed once already;
-            // this wiring now shares the extracted function instead.
-            // `action_allowed`'s construction (nullptr-guarded
-            // plugin_config_store_ wrap) is the SAME literal composition
-            // build_classified_command uses ahead of its own
-            // finalize_classified_command call, above. `plugin_config_store_`
-            // is read live through `this` (not captured by value), so this
-            // wiring is safe regardless of construction order relative to
-            // that store; an unset store means legacy-open for the
-            // kill-switch gate ONLY, mirroring build_classified_command's own
-            // unwired contract. Per McpServer::AuthorizeDispatchFn's
-            // fail-closed contract (mcp_server.hpp), omitting this whole call
-            // refuses every execute_instruction call outright, not merely a
-            // degraded tool.
-            mcp_server_->set_authorize_dispatch_fn(
-                [this](const yuzu::server::DispatchCaller& caller, std::string_view plugin,
-                       std::string_view action)
-                    -> std::expected<yuzu::server::CommandCapability,
-                                     yuzu::server::detail::DispatchDenial> {
-                    auto decision = yuzu::server::detail::classify_and_authorize_dispatch(
-                        capability_registry_, caller, plugin, action,
-                        [this](std::string_view principal, std::string_view securable,
-                               yuzu::server::authz::Operation op) {
-                            return dispatch_has_permission(principal, securable, op);
-                        });
-                    if (!decision)
-                        return decision;
-                    const yuzu::server::detail::KillSwitchFn action_allowed =
-                        plugin_config_store_ != nullptr
-                            ? yuzu::server::detail::KillSwitchFn(
-                                  [this](std::string_view p, std::string_view a) {
-                                      return plugin_config_store_->kill_switch_decision(p, a);
-                                  })
-                            : yuzu::server::detail::KillSwitchFn{};
-                    // The dry run has no target, so it cannot see the per-OS
-                    // layer (only the all-OS denial); a per-OS withhold shows
-                    // up at dispatch as kill_switched_os_count > 0.
-                    if (auto os_set =
-                            yuzu::server::detail::kill_switch_denial(*decision, action_allowed);
-                        !os_set) {
-                        return std::unexpected(os_set.error());
-                    }
-                    return decision;
-                });
+            // presence). The closure itself is `authorize_dispatch`, defined before the REST
+            // registration above (#6065 PR-Q): one definition, two consumers.
+            mcp_server_->set_authorize_dispatch_fn(authorize_dispatch);
             // #3290 Phase 2 — the SAME fleet_read_fn lambda wired into the REST
             // registration's trailing fleet_read_fn param below, so the REST and MCP
             // query_installed_software twins cannot observe a different admit
             // decision for the same caller (same conversion, same underlying
             // require_fleet_read call).
             mcp_server_->set_fleet_read_fn(fleet_read_fn);
+            // Registry tools reach the REST provider closures through ToolDeps: the SAME
+            // closure instances HardwareRoutes::Deps received above (roster, CI detail,
+            // DEX score, quarantine list, fleet_read_fn gate, audit_fn), never a store
+            // pointer, so an MCP twin cannot observe a different composition than REST.
+            mcp_server_->set_tool_deps(mcp::ToolDeps{.fleet_read_fn = fleet_read_fn,
+                                                     .audit_fn = audit_fn,
+                                                     .roster_fn = build_hw_roster,
+                                                     .ci_detail_fn = hw_ci_detail_fn,
+                                                     .dex_score_fn = hw_dex_score_fn,
+                                                     .quarantine_list_fn = hw_quarantine_list_fn});
             // /crypto slice 1: the SAME CryptoApi instance CryptoRoutes serves, so
             // get_crypto_libraries / list_crypto_library_devices cannot disagree with the
             // page or the REST twins. Null (no inventory store) -> the tools answer an
             // internal error, never an empty result.
             mcp_server_->set_crypto_api(crypto_api_);
+            // /crypto widgets: list_crypto_widgets' availability, get_crypto_ca_stats' R2
+            // withhold and list_issued_certs' filtered form use the SAME callback as the REST
+            // routes and the dashboard.
+            mcp_server_->set_crypto_access_fn(
+                [this](const httplib::Request& req, crypto_widgets::WidgetGate g,
+                       const std::string& type, const std::string& op) {
+                    return crypto_access(req, g, type, op);
+                });
             // #4037 — the SAME list_read_fn lambda wired into the REST
             // registration's trailing list_read_fn param below, so the REST
             // GET /guaranteed-state/status and MCP get_guardian_status twins
@@ -22732,6 +23112,10 @@ private:
     // the web server's worker pool - every handler that could call the api - BEFORE the stores
     // are reset (the same join-before-reset contract as every other route owner here).
     std::shared_ptr<DeviceApi> crypto_device_api_;
+    // Per-operator /crypto widget layouts — born-on-Postgres (ADR-0071). Declared after
+    // pg_pool_ so it destructs before the pool; crypto_api_ borrows it (same join-before-reset
+    // contract as the stores above).
+    std::unique_ptr<CryptoDashboardLayoutStore> crypto_dashboard_layout_store_;
     std::shared_ptr<CryptoApi> crypto_api_;
     std::unique_ptr<CryptoRoutes> crypto_routes_;
     // Typed per-device app-perf daily projection — born-on-Postgres (DEX

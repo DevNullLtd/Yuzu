@@ -3087,21 +3087,29 @@ ADR-0041, currently at v3).
 
 ## Render-time permission probes (capability hints)
 
-Three `AuthRoutes` methods answer a permission question without writing a denial row, for pages
+Five `AuthRoutes` methods answer a permission question without writing a denial row for an
+interactive sign-in, for pages
 that decide what to DRAW: `has_permission` (the verdict only), `probe_permission` (the verdict
-with the gate's own response kept, so "denied" and "store unavailable" stay distinguishable) and
-`probe_fleet_read` (`require_fleet_read`'s decision and scope). Each runs the gate's own code
-under the thread-local `AuditProbeScope`, which makes `audit_log` a no-op (the `role.elevation.expired` lifecycle row, written through `audit_log_for_principal`, is still written), and withholds the
-denial row **only for an interactive cookie sign-in** (`denial_row_may_be_withheld`: `local`,
-`oidc` or `saml` and not an engine principal). A token or engine caller that reaches such a route
-keeps its row.
+with the gate's own response kept, so "denied" and "store unavailable" stay distinguishable),
+`probe_admin` (`require_admin`'s decision), `probe_fleet_read` (`require_fleet_read`'s decision and
+scope) and `probe_global_list_read` (`require_list_read`'s decision, with a management-group-
+confined admission refused as a denial, for a resource that is not agent-scoped; its loud twin
+`require_global_list_read` is the gate of the plugin-config REST list). Each runs the gate's own
+code under the thread-local `AuditProbeScope`. `require_auth`, the first step of every gate,
+records the session the gate authenticated in that scope, and `audit_log` withholds a row **only
+when that session is an interactive cookie sign-in** (`denial_row_may_be_withheld`: `local`,
+`oidc` or `saml` and not an engine principal). The decision rests on the one lookup that decided
+the verdict, never on a second one; the `role.elevation.expired` lifecycle row, written through
+`audit_log_for_principal`, is still written. A request whose gate session is a token or an engine
+principal keeps its row.
 
 What is withheld is the audit row. The denial counters (`yuzu_auth_topology_floor_denied_total`,
 `yuzu_auth_service_scope_default_denied_total`, `yuzu_server_rbac_read_degrade_total`) still tick,
 and the store's own read telemetry is untouched.
 
 A probe is a rendering hint unless a route deliberately binds it as its gate: the Dashboard panel
-fragments do (a refused sign-in is shown a note and leaves no row), while an action route must
+fragments and the Plugins and updates fragments do (a refused sign-in is shown a note and
+leaves no row), while an action route must
 re-check through `require_permission` or `require_scoped_permission`. An earlier design that
 threaded a `Quiet` argument through `require_permission` was dropped because nothing called it and
 it did not cover `require_fleet_read`.
@@ -4006,10 +4014,10 @@ this section does not restate them.
 ## Agent enrollment (3 tiers)
 
 - **Tier 1 (manual approval)** — agents without a token enter a pending queue; admin approves/denies via Settings page. Agents retry and are accepted once approved.
-- **Tier 2 (pre-shared tokens)** — admin generates time/use-limited enrollment tokens via the dashboard; agents pass `--enrollment-token <token>` at startup for auto-enrollment.
+- **Tier 2 (pre-shared tokens)** — admin generates time/use-limited enrollment tokens via the dashboard; agents pass `--enrollment-token <token>` (or `--enrollment-token-file <path>`, which keeps the token off the command line) at startup for auto-enrollment.
 - **Tier 3 (platform trust)** — proto fields reserved (`machine_certificate`, `attestation_signature`, `attestation_provider`) for future Windows cert store / cloud attestation enrollment.
 - **Enrollment token persistence** — Postgres-authoritative since HA WS-6 6.2 (`auth.enrollment_tokens` / `auth.pending_agents`, shared by every server replica), not per-replica `.cfg` files. `AuthManager`'s file mode is deleted, not deprecated: `consume_and_enroll` is a single guarded-UPDATE transaction (exactly-N winners across pooled connections AND across separate server processes — a max_uses=1 token race never double-accepts), and every enrollment/pending call fails CLOSED with no `AuthDB` attached. A pre-6.2 install's `enrollment-tokens.cfg` / `pending-agents.cfg` are imported exactly once, at the first 6.2 boot, under a per-file content-fingerprint marker (`auth.import_meta`) that never resurrects an already-removed/denied/revoked row and refuses (never merges) a mismatched-fingerprint file; see `docs/adr/2002-high-availability-architecture.md` §8.
-- **Agent `--enrollment-token` CLI flag** — passes token in `RegisterRequest.enrollment_token`.
+- **Agent `--enrollment-token` CLI flag** — passes token in `RegisterRequest.enrollment_token`. **`--enrollment-token-file <path>`** (env `YUZU_ENROLLMENT_TOKEN_FILE`) supplies the same value from a file: read once at start (under a 5 s deadline) without following a link, accepted only if the first line is a 64-hex token and the opened file is owned by SYSTEM/root, Administrators or the account the agent runs as (on POSIX also not group- or other-writable), takes precedence over `--enrollment-token`, and removed after the first accepted registration or when the server refuses the token. The Windows installer uses it so a service registered by it no longer carries the token on its command line; a service registered by an earlier installer keeps its earlier command line until the installer is run again.
 
 ## Per-session peer binding and NAT-aware relaxation
 

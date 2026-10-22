@@ -48,6 +48,7 @@
 #include "capability_decls/core_dispatch_capabilities.hpp"
 #include "capability_decls/plugin_action_catalogue_a.hpp"
 #include "command_capability.hpp"
+#include "dispatch_denial_text.hpp"
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "mcp_server_testonly.hpp"
@@ -65,6 +66,7 @@
 #include <libpq-fe.h>
 
 #include <algorithm>
+#include <expected>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -290,6 +292,15 @@ struct Harness {
                         const std::string& action) {
                       return compose_arming_check(registry, &rbac, principal, plugin, action);
                   },
+              // #6096: the outbox spent-ticket ledger. This harness's enqueue_fn writes no
+              // outbox row, so the ledger is empty and no occurrence has run.
+              .outbox_occurrences_fn = [](const std::string&)
+                  -> std::expected<std::vector<std::string>, std::string> {
+                  return std::vector<std::string>{};
+              },
+              .outbox_exists_fn = [](const std::string&) -> std::expected<bool, std::string> {
+                  return false;
+              },
           }) {
         tracker.create_tables();
         approvals.create_tables();
@@ -625,6 +636,24 @@ constexpr TwinRow kExpectedTwins[] = {
     {"get_crypto_libraries", "Inventory", "Read", true},
     {"list_crypto_library_devices", "Inventory", "Read", true},
     {"export_crypto_cbom", "Inventory", "Read", true},
+    // The hardware CI twins, pinned against GET /api/v1/hardware{,/{id}} (hardware_routes.cpp): the
+    // same Inventory:Read gate through fleet_read_fn.
+    {"list_hardware_ci", "Inventory", "Read", true},
+    {"get_hardware_ci", "Inventory", "Read", true},
+    // Seam PR2: list_quarantined_devices, pinned against GET /api/v1/quarantine
+    // (rest_api_v1.cpp): the same Security:Read gate through require_fleet_read.
+    {"list_quarantined_devices", "Security", "Read", true},
+    // /crypto dashboard widget twins (ADR-0070 D13, R2). The Yuzu-issued counts are pinned
+    // against GET /api/v1/crypto/ca/stats (crypto_routes.cpp), which gates on fleet_read_fn
+    // Inventory:Read and withholds a confined caller; the rows behind them are list_issued_certs'
+    // filtered form (Security:Read, the CA family's row). The catalogue and the caller's OWN
+    // layout follow the owner-scoped result-set rows above: Infrastructure Read/Write is the MCP
+    // tier class, and both transports key the layout by the session user with no RBAC securable
+    // (the REST layout routes apply the same tier belt and refuse a service-scoped token).
+    {"list_crypto_widgets", "Infrastructure", "Read", true},
+    {"get_crypto_dashboard_layout", "Infrastructure", "Read", true},
+    {"set_crypto_dashboard_layout", "Infrastructure", "Write", false},
+    {"get_crypto_ca_stats", "Inventory", "Read", true},
 };
 
 } // namespace
@@ -695,6 +724,9 @@ TEST_CASE("operator surface MCP twins: every tool satisfies the A5 contract",
             "list_guardian_rules",
             "get_guardian_policy_generation",
             "get_pending_approval_count",
+            "list_crypto_widgets",
+            "get_crypto_dashboard_layout",
+            "get_crypto_ca_stats",
         };
         if (!kNoArgTools.contains(expected.tool))
             CHECK(schema_it->schema_json != R"({"type":"object","properties":{}})");
@@ -729,5 +761,101 @@ TEST_CASE("operator surface MCP twins: no MCP tool exists for any agent-authenti
         CHECK(name.find("commit_upload") == std::string::npos);
         CHECK(name.find("cancel_upload") == std::string::npos);
         CHECK(name.find("open_upload") == std::string::npos);
+    }
+}
+
+// ── #6065 PR-Q: the shared dispatch-denial wording ────────────────────────
+//
+// `describe_dispatch_denial` (dispatch_denial_text.hpp) is the ONE helper both
+// POST /api/v1/quarantine (kRest) and MCP's pre-dispatch dry run (kMcp) render
+// a chokepoint denial through. Today the surface argument is accepted and
+// unused, so the two surfaces must agree byte for byte; a later change that
+// differentiates the wording must update this pin deliberately.
+
+namespace {
+
+constexpr detail::DispatchDenialReason kAllDenialReasons[] = {
+    detail::DispatchDenialReason::Unclassified,      detail::DispatchDenialReason::Ambiguous,
+    detail::DispatchDenialReason::AnonymousOperator, detail::DispatchDenialReason::Forbidden,
+    detail::DispatchDenialReason::ApprovalRequired,  detail::DispatchDenialReason::KillSwitched,
+};
+
+detail::DispatchDenial denial_for(detail::DispatchDenialReason reason) {
+    return detail::DispatchDenial{reason, "Security", authz::Operation::Execute};
+}
+
+} // namespace
+
+TEST_CASE("describe_dispatch_denial: REST and MCP wording is byte-identical for every reason "
+          "(#6065 PR-Q)",
+          "[server][routes][mcp][quarantine]") {
+    for (const auto reason : kAllDenialReasons) {
+        CAPTURE(detail::to_string(reason));
+        const auto denial = denial_for(reason);
+        const auto rest = describe_dispatch_denial(reason, "quarantine", "quarantine", denial,
+                                                   DenialSurface::kRest);
+        const auto mcp = describe_dispatch_denial(reason, "quarantine", "quarantine", denial,
+                                                  DenialSurface::kMcp);
+        CHECK(rest.cls == mcp.cls);
+        CHECK(rest.message == mcp.message);
+        CHECK(rest.remediation == mcp.remediation);
+        CHECK_FALSE(rest.message.empty());
+    }
+}
+
+// Pure-move pin: the six strings below are the ones the helper carried while it was an
+// anonymous-namespace local of mcp_server.cpp (origin/dev), copied from THAT source and not
+// from dispatch_denial_text.hpp, so a drift introduced by the move shows up here.
+TEST_CASE("describe_dispatch_denial: the six pre-existing MCP strings are preserved verbatim "
+          "(#6065 PR-Q pure move)",
+          "[server][routes][mcp][quarantine]") {
+    using Reason = detail::DispatchDenialReason;
+    const auto text = [](Reason reason) {
+        return describe_dispatch_denial(reason, "quarantine", "quarantine", denial_for(reason),
+                                        DenialSurface::kMcp);
+    };
+
+    for (const auto reason : {Reason::Unclassified, Reason::Ambiguous}) {
+        CAPTURE(detail::to_string(reason));
+        const auto t = text(reason);
+        CHECK(t.cls == DispatchDenialClass::kInvalidParams);
+        CHECK(t.message == "unknown or ambiguous plugin.action");
+        CHECK(t.remediation == "confirm the plugin/action name via discover_plugins or "
+                               "discover_instructions and re-call");
+    }
+    {
+        const auto t = text(Reason::AnonymousOperator);
+        CHECK(t.cls == DispatchDenialClass::kPermissionDenied);
+        CHECK(t.message ==
+              "dispatch denied: the caller has no resolved identity for Security:Execute");
+        CHECK(t.remediation == "this indicates a server-side identity-derivation fault, not a "
+                               "caller mistake; contact an administrator");
+    }
+    {
+        const auto t = text(Reason::Forbidden);
+        CHECK(t.cls == DispatchDenialClass::kPermissionDenied);
+        CHECK(t.message == "permission denied: Security:Execute");
+        CHECK(t.remediation == "the dispatching caller lacks this grant; request it, or dispatch "
+                               "as a caller who holds it");
+    }
+    {
+        const auto t = text(Reason::ApprovalRequired);
+        CHECK(t.cls == DispatchDenialClass::kPermissionDenied);
+        // The em dash (U+2014, UTF-8 E2 80 94) is part of the pre-existing wire string.
+        CHECK(t.message == "approval required for quarantine.quarantine \xE2\x80\x94 this action "
+                           "requires either an admin caller or a redeemed approval ticket that "
+                           "this dispatch does not carry");
+        CHECK(t.remediation == "re-call using a supervised-tier MCP token, which mints and polls "
+                               "an approval ticket for this class of call, or dispatch as an "
+                               "admin caller");
+    }
+    {
+        const auto t = text(Reason::KillSwitched);
+        CHECK(t.cls == DispatchDenialClass::kPermissionDenied);
+        CHECK(t.message ==
+              "dispatch denied: the per-action kill switch is OFF for quarantine.quarantine");
+        CHECK(t.remediation == "an operator has thrown an emergency stop for this plugin.action "
+                               "(set_plugin_kill_switch / PUT .../kill-switch); it must be "
+                               "re-enabled before this call can dispatch");
     }
 }

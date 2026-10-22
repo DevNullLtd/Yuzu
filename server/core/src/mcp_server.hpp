@@ -11,6 +11,7 @@
 #include "audit_store.hpp"
 #include "auth_routes.hpp" // #4037: ListReadGate — get_guardian_status's require_list_read confinement seam
 #include "authz_gates.hpp" // #3290 Phase 2: authz::FleetReadGate — query_installed_software's real confinement seam
+#include "mcp_tool_deps.hpp" // ToolDeps: provider closures a registry handler may reach
 #include "authz_model.hpp" // #1788: VisibleSet — MCP dispatch confinement (in_scope/filter_to_scope)
 #include "ca_routes.hpp" // IssueCodeSigningFn/CodeSigningIssuance (free at yuzu::server scope, unlike
                          // CaRoutes::PublishCrlFn below) — reused verbatim by issue_code_signing_cert
@@ -32,6 +33,7 @@
 #include "verify_api.hpp" // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam
 #include "dex_api.hpp"    // ADR-0031 WS-A4 (fifth family): the public in-process DEX signals API seam
 #include "dex_perf_api.hpp" // ADR-0031 WS-A4 (sixth family): the public in-process DEX app-perf-over-time API seam
+#include "crypto_widget_catalogue.hpp" // crypto_widgets::Access / WidgetGate (pure)
 #include "crypto_api.hpp" // ADR-0031 WS-A4 (tenth family): the public in-process crypto-library read API seam
 #include "compliance_api.hpp" // ADR-0031 WS-A4: the public in-process compliance/policy API seam
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
@@ -184,10 +186,13 @@ namespace detail {
 class McpServer {
 public:
     /// C8 fail-closed boot validator (#2383): throws std::runtime_error naming
-    /// the offenders when the served kTools[] names, the kToolSecurity
-    /// registrations, and the kWriteTools read-only guard set disagree — a
-    /// misregistered build refuses to construct (and therefore to boot) instead
-    /// of silently skipping the generic tier+approval gate for the missing tool.
+    /// the offenders when the served tool names (legacy kTools[] plus the
+    /// registry-resident records, merged by mcp_server.cpp's catalogue()), the
+    /// security registrations (catalogue().security), the --mcp-read-only write set
+    /// (catalogue().writes) and the kToolAnnotation key set (#2422) disagree: a misregistered build
+    /// refuses to construct (and therefore to boot) instead of silently skipping the generic
+    /// tier+approval gate for the missing tool. The message is capped at the first offences
+    /// (sorted) plus a count; all are logged individually.
     McpServer();
 
     using AuthFn =
@@ -600,8 +605,18 @@ public:
                                            const std::string& operation)>;
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
 
+    /// The provider closures a registry tool handler may reach (mcp_tool_deps.hpp),
+    /// passed to every registry handler as `ctx.deps`. The SAME closure instances
+    /// `HardwareRoutes::Deps` receives, wired beside `set_fleet_read_fn` in the
+    /// ServerImpl constructor, so a twin cannot observe a different composition
+    /// than the REST route. Set once before `build_handler`; the value lives as long
+    /// as this McpServer, which outlives every request. Unset leaves every closure
+    /// empty and the handlers answer an internal error.
+    void set_tool_deps(ToolDeps deps) { tool_deps_ = std::move(deps); }
+
     /// #4037 — the injected-callback twin of `AuthRoutes::require_list_read`
-    /// (ADR-0017), backing `get_guardian_status`'s real confinement. Same
+    /// (ADR-0017), backing `get_guardian_status`'s real confinement and
+    /// `list_plugin_config` (which refuses a scoped admission). Same
     /// shape as `RestApiV1::ListReadFn`/`ListReadGate` (auth_routes.hpp) reused
     /// verbatim, not redefined, so the REST `GET /guaranteed-state/status`
     /// list-read gate and this MCP twin cannot drift — server.cpp wires the
@@ -807,6 +822,16 @@ public:
     /// seams above. Unset (null, no software-inventory store) => the tools answer an internal
     /// error, never an empty result.
     void set_crypto_api(std::shared_ptr<const CryptoApi> a) { crypto_api_ = std::move(a); }
+
+    /// The ONE non-auditing /crypto availability callback (server.cpp builds it once and wires
+    /// the SAME function into CryptoRoutes): `list_crypto_widgets`' availability, the R2
+    /// confinement withhold of `get_crypto_ca_stats`' twin answers and of `list_issued_certs`'
+    /// filtered form. It decides what is DRAWN or withheld, never a grant (every data tool keeps
+    /// its own gate). Unset => those paths answer an internal error, never a guessed answer.
+    using CryptoAccessFn = std::function<crypto_widgets::Access(
+        const httplib::Request&, crypto_widgets::WidgetGate, const std::string& securable_type,
+        const std::string& operation)>;
+    void set_crypto_access_fn(CryptoAccessFn fn) { crypto_access_fn_ = std::move(fn); }
 
     /// B4 (#2146 API-parity): mirrors `RestApiV1::LockoutClearFn` (rest_api_v1.hpp)
     /// so the MCP `unlock_account` tool clears an account's lockout counter
@@ -1234,6 +1259,8 @@ private:
     UploadGrantListReadFn upload_grant_list_read_fn_;
     // #3290 Phase 2 — see set_fleet_read_fn above.
     FleetReadFn fleet_read_fn_;
+    // See set_tool_deps above; `&tool_deps_` is ToolCallContext::deps.
+    ToolDeps tool_deps_;
     // #4037 — see set_list_read_fn above.
     ListReadFn list_read_fn_;
     // #4036 (api-parity Batch A) — see set_preflight_run_store above.
@@ -1269,6 +1296,8 @@ private:
     std::shared_ptr<const GuardianApi> guardian_api_;
     // ADR-0031 WS-A4 (tenth family) - see set_crypto_api above.
     std::shared_ptr<const CryptoApi> crypto_api_;
+    // /crypto widgets - see set_crypto_access_fn above.
+    CryptoAccessFn crypto_access_fn_;
 };
 
 // The (tool, securable, operation) test-only accessors that formerly lived here

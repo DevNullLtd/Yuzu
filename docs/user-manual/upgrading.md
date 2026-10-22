@@ -18,23 +18,27 @@ from the YAML editor if the document declares `metadata.id`, and cannot be re-im
 upgrading, run the read-only check and rename anything it lists**: see
 [the `guardian.` entry in Server Administration](server-admin.md#vnext-the-guardian-instruction-definition-id-prefix-is-reserved-6062-breaking).
 
-**2. Approvals schema migration v2 (store `approval_manager`).** It adds three text columns to
+**2. Approvals schema migration v3 (store `approval_manager`).** It adds three text columns to
 `approvals` (`request_json`, `request_digest`, `excluded_roots`), each `NOT NULL DEFAULT ''`, so
 every existing row reads as "binds no request, excludes nobody" and behaves as before. The
 migration is additive and needs no operator step, but it takes a brief `ACCESS EXCLUSIVE` lock on
 `approvals`. If a long-running or idle-in-transaction session holds that table, the upgraded
 replica cannot finish the migration and refuses to start (`Refusing to start: approval manager
 migration/open failed`) rather than serve with a half-migrated schema; end the session and start
-it again.
+it again. It follows the data-only v2 step of the scheduled-approval change (#6096, below), which
+claimed v2 first, so a database upgraded from a build with neither change runs v2 and then v3 in
+two separate transactions, and one already at v2 runs only v3.
 
 - **Rolling upgrade.** An older replica never touches the new columns and keeps redeeming the
   tickets it and this build mint, all of which are unbound. The migration runner applies only
   versions above the one stored for the store and has no newer-schema refusal, so an older binary
-  starts against a v2 database. That is established by reading the runner; it has not been
-  exercised as a live rolling restart.
+  starts against a newer database: a build with neither change against a v2 or v3 database, and a
+  build with the #6096 change but not this one (highest version 2) against a v3 database. That is
+  established by reading the runner; it has not been exercised as a live rolling restart.
 - **Rollback to the previous build** is therefore expected to work while no bound ticket exists,
   which is the case for this whole release: the previous build ignores the columns and the
-  default-empty values lose nothing.
+  default-empty values lose nothing. Rolling back across the #6096 change as well has its own
+  consequences, described in that section.
 - **Rollback is NOT supported once a bound ticket exists.** The previous build does not read
   `excluded_roots`, so a reviewer who was barred from a bound ticket could approve it, and it
   redeems without comparing the frozen request. The change that first creates a bound ticket
@@ -74,6 +78,122 @@ commands: a retry then succeeds. When the other transaction was a concurrent rec
 the ticket, or a real edit, the refusal is correct and a retry is refused again ("approval
 already used"). See [MCP approvals](mcp.md) and
 [metrics](metrics.md).
+
+## Behaviour change: the Windows agent installer passes the enrollment token by file
+
+**What changed.** The Windows agent installer no longer puts the enrollment token on the
+registered service command line. It writes the token to `%ProgramData%\Yuzu\enrollment-token`
+(restricted to Administrators and SYSTEM, owned by Administrators), configures the service with
+`--enrollment-token-file` pointing at that file, and the agent removes the file after its first
+accepted registration or when the server refuses the token. `/TOKEN=<token>` still works; `/TOKEN_FILE=<file>` is new and keeps the
+token out of Setup's own log too (Setup's command line, and therefore its `/LOG=` log, still
+records a `/TOKEN=` value verbatim if that is the form given). A service registered by this
+installer shows `--enrollment-token-file` and no token value in `sc.exe qc YuzuAgent`.
+
+**Who is affected.** Anyone installing or upgrading the Windows agent with `/TOKEN=`, and every
+Windows agent registered by an earlier installer.
+
+- **An agent registered by an earlier installer keeps its earlier command line, token included,
+  until the installer is run again.** Nothing else rewrites it: an over-the-air agent update
+  replaces the binary only. `sc.exe qc YuzuAgent` shows which form a service has:
+  `--enrollment-token-file` with no token value, or `--enrollment-token <value>`. To move an agent
+  to the new form, run the installer again with the same `/SERVER=` and `/NOTLS` you installed it
+  with: a re-run that omits them registers the service against `localhost:50051` with TLS on (see
+  the fleet-upgrade gotcha under [Server Administration](server-admin.md)). No `/TOKEN=` or
+  `/TOKEN_FILE=` is needed on that run, because an already-enrolled agent needs no token.
+- A service whose environment still sets `YUZU_ENROLLMENT_TOKEN` keeps starting: a token read from
+  the file takes precedence, and with no usable file the environment value is used.
+- An agent binary older than this change does not know `--enrollment-token-file`: if a service
+  registered by this installer is rolled back to one, it exits with code 109 and writes no log
+  line. Run the previous installer again with the previous parameters to restore a matching
+  command line.
+
+**How to fix, and what the installer and agent now refuse.**
+
+- The installer exits with code **7** (its `/LOG=` log says why) before it installs anything or
+  stops the service when: both `/TOKEN=` and `/TOKEN_FILE=` are given (or `/TOKEN_FILE=` together
+  with a token typed in the wizard); a `/TOKEN_FILE=` file is missing, not a plain file, unreadable,
+  empty or contains NUL bytes; the token is not exactly 64 lowercase hexadecimal characters (a
+  list, a JSON document or a URL is refused); or the token file path or its staging path is a link
+  or cannot be written, or an `enrollment-token.stage` folder left beside it by an interrupted run
+  is in the way (it may hold a staged token, readable by Administrators and SYSTEM only; delete it
+  and run the installer again; uninstalling removes the folder only when it is already empty). The
+  `/TOKEN_FILE=` source file itself is left in place; delete it when the deployment is done.
+- The agent reads a token file only if it holds a 64-hex token on its first line and is owned by
+  SYSTEM or root, Administrators, or the account the agent runs as (on Linux and macOS also not
+  group- or other-writable, and readable by the agent). Anything else is ignored with a warning in
+  the agent log, and the agent registers with `--enrollment-token` / `YUZU_ENROLLMENT_TOKEN` if
+  one is set, else without a token (the approval queue).
+- When the server refuses a token the agent read from the token file (unknown, expired, revoked or
+  used up), the agent removes the file, and its next start registers without the file's token:
+  with an `--enrollment-token` / `YUZU_ENROLLMENT_TOKEN` value if one is set, otherwise without a
+  token, into the approval queue. A file that could not be removed is read and presented again on
+  the next start, so keep it where the agent can delete it. A refusal that is not about the token,
+  such as an administrator denying the agent, leaves the file in place. To enrol with a token
+  again, supply a current one (run the installer again with `/TOKEN=` or `/TOKEN_FILE=`). Do not
+  bake a token file into a golden image or VDI template: each machine started from it registers
+  with a new identity and uses one of the token's uses. A non-persistent image that still carries
+  a token the server has expired, revoked or used up adds a new entry to Pending Agent Approvals
+  on every boot (each boot is a new agent id), and the queue is not capped. Size `max_uses` and
+  the expiry to the rollout window.
+- For a new unattended install, prefer `/TOKEN_FILE=<file>` over `/TOKEN=` when the token must not
+  reach Setup's own log or deployment-tool command-line records (SCCM's AppEnforce.log, Intune).
+  An installation that fails after the token file is written leaves the file in place
+  (Administrators and SYSTEM only) and the previous service restarts with its previous command
+  line; an installation that is refused while the new file is being moved into place leaves no
+  token file at all. Either way, run the installer again with the same token. The agent removes
+  whatever is at the token-file path when its first registration is accepted or the server refuses
+  the token, so when re-staging a token for an agent that already runs with
+  `--enrollment-token-file`, write it only after that agent has registered, or stop the service
+  first.
+
+## Behaviour change: new enrollment tokens default to 72 hours and 100 uses
+
+**What changed.** A limit left blank when minting an enrollment token now defaults to 72 hours
+and 100 uses, on every create surface: the dashboard form, `POST /api/settings/enrollment-tokens`,
+`POST /api/settings/enrollment-tokens/batch` (`ttl_hours` only — its `max_uses` default stays 1),
+and the server CLI `--generate-tokens --token-ttl-hours` (its `--token-max-uses` default also
+stays 1). An explicit `0` still means unlimited uses / no expiry, exactly as before. The CLI now
+refuses a negative `--token-ttl-hours` or `--token-max-uses` (a negative `--token-ttl-hours` used
+to mint a token with no expiry, and a negative `--token-max-uses` was refused by the store rather
+than by the option parser), and its `enrollment.bulk_token_create` audit row now records `ttl_s=`
+and `label=`.
+
+**Who is affected.** A script or operator that relies on leaving a limit blank to mean
+unlimited/never-expiring now gets a 72-hour/100-use token instead. A rollout that stages tokens in
+advance, or enrolls more machines from one token than its uses, is refused once the token is
+spent or expired.
+
+**How to fix.** Pass an explicit `0` for `max_uses` and/or `ttl_hours` to keep the old
+unlimited/no-expiry behaviour, or size them to the rollout window and the number of machines.
+## Behaviour change: the DEX score policy document carries a version (#6085)
+
+**What changed.** The canonical text of the `dex_score_policy` document now includes `"version": 1`, and `version` is a recognised key. A document without the field reads as version 1. A server that meets a version above the one it supports scores under the shipped defaults, reports `fault: unsupported_version at version: N above the supported 1` on every Apps response, and logs it once. It never applies part of a document, and the revision stays the hash of the stored text. No released build reads the document yet, so a released build ignores it. A development build that has the reader but predates this change refuses a `version` key as an unknown key and serves the shipped defaults with a fault for any document that carries it.
+
+**The rule, once a release writes the document.** Nothing writes the document in this release, so this rule has no effect yet. From the release that adds the writer, do not change the score policy during a rolling upgrade or rollback: a newer server may write a document that an older server in the same fleet refuses or, if it predates the score policy reader, ignores (on a rollback, a build that predates the `version` key refuses it as an unknown key), and until every instance runs the same release the instances can score under different policies.
+
+**If a stored document is refused.** A later release that tightens validation can refuse a document an earlier release accepted. The server then serves the shipped defaults with a fault naming the field. Save the policy again through the write surface once a release ships one; until then, correct the row directly. Nothing is migrated automatically.
+
+**No action on upgrade.** There is no schema change. Nothing in the product writes the document in this release, so no policy written by the product exists to migrate (a row placed by a direct database write is read as any other document).
+
+## ⚠️ Breaking: `POST` and `DELETE /api/v1/quarantine` now apply the dispatch approval check (#6065)
+
+**What changed.** `POST /api/v1/quarantine` (and the dashboard's Quarantine device button, which calls it) now runs the same dispatch approval check as the quarantine plugin's `quarantine` action, after the scoped `Security:Execute` gate and the `whitelist` validation and before any record is written. `DELETE /api/v1/quarantine/{agent_id}` (the Release from quarantine button) now runs the same check for the plugin's `unquarantine` action, after the scoped gate and before the `attempt` audit row and the release. Neither depends on any approval-workflow setting.
+
+"Administrator" here means an account whose **account role** is `admin` (a live temporary JIT elevation counts as that role). The RBAC `Administrator` role, or a global `Security:Execute` grant, on an account whose role is `user` does not make it one.
+
+- **RBAC on, a non-administrator who holds `Security:Execute` globally:** admitted before (`201`, and the reconciler then isolated the device), now `403` `approval_required`. This includes an account that holds the RBAC `Administrator` role but whose account role is `user`. REST has no approval-ticket path, so such a caller cannot create a quarantine record through REST or the dashboard.
+- **RBAC on, a caller who holds `Security:Execute` only through a management group:** now `403` `forbidden`, the same answer MCP `quarantine_device` gives at its pre-check. So is an account that is an administrator only through a JIT elevation and has no global `Security:Execute` grant of its own: the check reads the account's own grants, not the elevated role.
+- **RBAC off (the default):** nothing changes for non-administrators, because the legacy gate already refuses `Security:Execute` without the `admin` account role, so this check adds no new refusal there. A JIT-elevated administrator is admitted as before.
+- A session that expires between the route's first authorisation check and its second look-up now ends the request at the `401`. Before, the record was written and attributed to `system`. A request whose two look-ups name different principals (a session cookie that lapsed with a bearer token for another account on the same request) also ends at `401` and writes no record, and the audit rows of both routes now name the session the route resolved, so they agree with the record's `quarantined_by`. When searching the audit log for callers relying on the old behaviour, ignore `denied` rows whose `detail` is `authenticated principal changed during the request now=<account>`: they are that `401`, not an approval refusal.
+
+A refused request writes no quarantine record and releases none. The `403` bodies carry `message` and `remediation` and no `permission` field.
+
+**Release.** The same answers apply to `DELETE`: a non-administrator who could end a record before now gets `403` `approval_required` (RBAC on, global grant) or `403` `forbidden` (group-only, or an unreadable RBAC store), the record stays active, and the refusal is audited as `quarantine.disable` with `result=denied` and no `attempt` row. Only an administrator (with RBAC on, one who also holds `Security:Execute` globally) can release a record through REST or the dashboard. A JIT elevation counts as the administrator role only if the account also holds `Security:Execute` globally; otherwise the release is refused `forbidden`. The `remediation` text names the MCP supervised flow, which can create a record but has no release tool, so for a release the only path is an administrator. Release still ends the server record only; it does not remove the endpoint firewall rules.
+
+**Rolling upgrades and rollback.** The check is enforced per server replica. During a rolling upgrade, or after rolling a replica back, a replica that has not been upgraded still accepts `POST /api/v1/quarantine` from a non-administrator who holds `Security:Execute` on the device (`201`, and the leader then isolates the device) and accepts the same caller's `DELETE` release (`200`). The check applies across the cluster only once every replica runs this version, so do not treat a `201` from a non-administrator during the rollout as a failure of the new check. Rolling back restores the old behaviour; no data changes in either direction.
+
+**What to check.** Automation that creates or releases quarantine records with a non-administrator API token or cookie session must move to a durable administrator account (not a JIT elevation; with RBAC on, one that also holds `Security:Execute` globally in its own right). For creation only, MCP `quarantine_device` on the supervised tier is the alternative, where an administrator approves the ticket in an interactive session with MFA step-up (see the #6061 note below); release has no such path and needs an administrator. To find callers that were relying on the old behaviour, search the audit log for action `quarantine.enable` (create) or `quarantine.disable` (release) with result `denied`: the principal and the device are on the row. `yuzu_server_dispatch_denied_total{reason}` shows only the fleet-wide trend; it is shared with MCP and `/api/command` and cannot name this route. For a least-privilege containment operator (`Security:Execute`, not an administrator) there is no REST or dashboard approval path yet; adding one is planned follow-up work, and until then creation can go through the MCP supervised flow or the quarantine plugin's `quarantine` action on the Instructions page (role-gated approval). Releasing through the plugin's `unquarantine` action alone clears the endpoint firewall rules but leaves the active record, so while the record is active the reconciler re-applies the stored isolation when the device next reconnects; an administrator must end the record. No configuration or data migration is required.
 
 ## Behaviour change: four privileged REST routes refuse cross-site cookie writes
 
@@ -270,8 +390,9 @@ dispatches.
    after that (#6098), is never deleted, and, for an instruction-origin ticket, dispatches nothing. Record the
    ids of the approved test tickets in your change record so nobody mistakes them for a real decision later.
 
-**Rolling back, or running mixed versions.** This change adds no schema, so a rollback starts cleanly. What
-changes is which checks run.
+**Rolling back, or running mixed versions.** The approver-assurance change itself adds no schema; the separate
+scheduled-approval change (#6096, below) adds a data-only approvals step and a command-outbox index, both of which an
+older binary ignores, so a rollback starts cleanly. What changes is which checks run.
 
 - A replica or a rolled-back binary that predates this change still accepts bearer and MCP approvals, and does
   not check an approved ticket's age when it is consumed or when `ScheduleRunner` fires it. While any such
@@ -296,11 +417,56 @@ changes is which checks run.
   (step size minus 5 minutes) before the step) is expired permanently once an accepted submission has swept it
   (until then correcting the clock restores it), and older approved tickets stay live
   (observability tracked in #6098).
-- Submission time (`submitted_at`) and the schedule's own run stamps still come from the clock of the server that
-  wrote them, not from the database. Keep every server NTP-synchronised. When the server that submitted an approval
-  and the one that advances a recurring schedule disagree about the time (a leader change under clock skew, or a clock
-  step), an approved ticket can be used for an extra occurrence or be ignored and requested again, and a submitter
-  clock far from the database's lengthens or shortens how long its pending requests live. Tracked in #6096.
+- Submission time (`submitted_at`) now also comes from the database, like the review and use times, so a server
+  whose own clock is wrong can no longer lengthen or shorten how long its pending requests live. A recurring
+  schedule no longer decides that an approval is spent by comparing clocks: when the occurrence an approved ticket
+  belongs to has been queued, the ticket is marked used (a rejected ticket is marked used when it skips its
+  occurrence), so one approval runs at most one occurrence whatever the clocks say (#6096). A used ticket keeps its
+  status (`approved` or `rejected`); only its use time and user are filled in. The schedule's own run times are
+  still stamped by the server that advances it; they only decide when an occurrence is due.
+- **Scheduled approvals are retired once on upgrade (#6096).** Before this release a spent scheduled ticket was
+  never marked used; it was recognised as spent by comparing clocks. The approvals schema step (v2) therefore marks
+  every outstanding approved or rejected ticket that belongs to a schedule as used, once per database, with no clock
+  comparison. A schedule that was holding an occurrence for an approval you had already given (approved but not yet
+  fired when you upgraded) asks again for that held occurrence, and a rejection you had already given no longer skips
+  that occurrence: the schedule asks again. Pending requests, requests from the dashboard and MCP, and tickets
+  already used are untouched. Nothing to do. The step is data only (no table or column changes). It touches
+  every unsettled approved or rejected scheduled ticket, including old rejected ones (rejected tickets never expire
+  and are never swept); that is normally small. It runs inside the upgrade transaction under a 300 s statement
+  timeout and is skipped on every later start. If the 300 s timeout is hit the step fails, nothing is applied,
+  and the approvals store does not open (the server logs a schema migration failure for that store); investigate
+  the table size and restart. The command outbox also gains a small index on its approval id
+  (`outbox_approval_idx`) at the same upgrade; its build is bounded by the same 300 s timeout.
+- **Upgrade one replica first when the outbox table is large (#6096).** Building `outbox_approval_idx` takes a share
+  lock on the outbox table for up to 300 s, so enqueue and claim on other replicas wait meanwhile. A second replica
+  that boots at the same time waits on the migration advisory lock under the pool's default lock and statement
+  timeouts and may fail its boot closed; restarting it recovers, because the migration is then applied. The
+  recommendation is to start ONE replica, wait for it to finish migrating, then start the others. These are not
+  measured numbers.
+- **Where the legacy marker lives (#6096).** The retired tickets carry `consumed_by = 'schedule:legacy-6096'` in
+  `approval_manager.approvals`. It is readable only by SQL; no API returns it. Tickets the outbox showed had already
+  been used by an earlier occurrence carry the related marker `consumed_by = 'schedule:ledger-spent:<schedule id>:<n>'`;
+  tickets settled by a normal fire or skip carry `schedule:<schedule id>:<n>`. To list the legacy ones:
+
+  ```sql
+  SELECT id, status, schedule_id, consumed_at
+  FROM approval_manager.approvals
+  WHERE consumed_by = 'schedule:legacy-6096';
+  ```
+- **Mixed versions and rollback for scheduled approvals (#6096).** Recommended practice: drain or stop every replica
+  that predates this change before anyone approves scheduled work. The command outbox records which approval ticket
+  each scheduled run used, and the new binary refuses to fire a ticket the outbox shows was already used by an
+  earlier occurrence, so a ticket fired by an older leader is inert after the upgrade. A rolled-back binary does
+  not consult the outbox ledger or the used marker, so an older binary can re-fire a ticket the new binary marked
+  used (the old clock comparison); rolling back restores the old behaviour, including that exposure. After a rollback
+  followed by a second upgrade, run this once, because a rejected ticket spent under the older binary would
+  otherwise skip one occurrence. It also retires approved-but-unfired scheduled tickets, which then ask again:
+
+  ```sql
+  UPDATE approval_manager.approvals
+  SET consumed_at = EXTRACT(EPOCH FROM now())::bigint, consumed_by = 'schedule:legacy-6096'
+  WHERE schedule_id <> '' AND consumed_at = 0 AND status IN ('approved','rejected');
+  ```
 - Tickets already approved when you upgrade keep their original `reviewed_at`; the seven days are counted
   from it.
 
@@ -479,6 +645,129 @@ customer-distribution lane. Before switching lanes, read the
 **Action.** None required. To keep a custom role out of the new surface, remove `Inventory:Read`
 from it. Rolling back removes the page, routes and tools; nothing is migrated.
 
+## Behaviour change: new `ca_store` indexes, built during the upgrade
+
+**What changed.** The CA store's migration v5 adds three indexes on `ca_issued` (one row per
+certificate Yuzu ever issued). They back the Yuzu-issued certificate counts and the certificate
+list behind them on the `/crypto` dashboard (ADR-0070 D13).
+
+- **The build blocks CA writes while it runs.** It runs at the first start of the new version
+  inside the migration and blocks writes to `ca_issued` (certificate issuance and revocation, so
+  new enrolments too) while it runs. The build time grows with the number of rows: about 1.3 s
+  per 250,000 rows and 9 s per million in local measurement (PostgreSQL 18, a 12-core machine).
+  The build itself has no time limit, so a large table is not cut off part-way. Check the row
+  count beforehand with `SELECT count(*) FROM ca_store.ca_issued;`.
+- **Health probes do not answer until the migration finishes.** The server opens its HTTP
+  listener only after the CA store has opened, so `/livez`, `/readyz` and `/healthz` refuse
+  connections during the build and during any wait for its lock. A liveness or startup check
+  that gives up first (a container `start_period`, a Kubernetes `startupProbe`, systemd
+  `TimeoutStartSec`) restarts the server mid-build, the build rolls back, and the next start
+  begins it again. On a CA store above about a million rows, or wherever the build may wait
+  behind a long transaction, allow at least two minutes for the first start of this version.
+- **Seeing whether it is building or waiting.** In `psql`, `SELECT phase, blocks_done,
+  blocks_total FROM pg_stat_progress_create_index;` shows a build in progress. A row in
+  `pg_stat_activity` for the server's connection with `wait_event_type = 'Lock'` means it is
+  still waiting for its lock; while it waits, every other write to `ca_issued` (issuance,
+  revocation) queues behind it too, for up to the 30 s below.
+- **Start one replica first.** A second replica that starts while the first is building waits up
+  to the connection pool's 10 s lock timeout for it, then logs the same two lines as below and
+  **does not start**. Start it again once the first replica is up: it finds the migration done.
+- **If the 30 s lock wait expires.** The build waits at most 30 s for its lock on `ca_issued`. If
+  another session holds a conflicting lock for longer, such as a long transaction, the migration
+  fails and rolls back, nothing is left half-built, and the
+  server logs `CaStore: schema migration failed — CA persistence disabled` followed by
+  `[PG] Refusing to start: ca store migration/open failed` and **does not start** (the CA store is
+  required). Find and end the blocking session (`pg_locks` / `pg_stat_activity`), then start the
+  server again: the migration is retried from the start.
+
+**Action.** On a large CA store, schedule the upgrade for a quiet period, and raise any startup or
+liveness probe timeout first (see "Health probes do not answer" above). Rolling back leaves the
+v5 indexes in the database; they are harmless to the older binary.
+
+## Behaviour change: new `crypto_dashboard_layout_store` schema, erased on deprovision
+
+**What changed.** The server keeps each operator's `/crypto` dashboard layout (ADR-0071) in a new
+Postgres schema, `crypto_dashboard_layout_store`, keyed by the operator's username.
+
+- **New database schema.** The server creates the `crypto_dashboard_layout_store` schema at its
+  first start, so the server's database role needs `CREATE` on the database, as for every other
+  Yuzu schema. **If the schema cannot be created or opened, the server still starts**: saved
+  layouts are unavailable until a restart with the problem fixed, the server log says so at
+  error, and `/readyz` stays `200`, listing the store under `degraded` without leaving rotation
+  (ADR-0071).
+- **Deprovision erasure.** Deprovisioning an operator (SCIM or a dashboard user delete) erases
+  their saved layout after the deprovision commits, best-effort. A failure is counted on
+  `yuzu_server_crypto_layout_erase_failures_total{reason}` and alerted by
+  `YuzuCryptoLayoutEraseFailed`; the remedy is the periodic check in
+  [Crypto: Deprovision erasure](crypto.md#deprovision-erasure).
+- **Backups.** The new schema is in the Yuzu database, so the whole-database `pg_dump` already
+  covers it. It is loss-tolerant: restoring without it leaves operators on the default layout.
+  **A restore can resurrect erased layouts:** a backup taken before an operator was
+  deprovisioned still holds their layout row (keyed by their username). After any restore, run
+  the check in [Crypto: Deprovision erasure](crypto.md#deprovision-erasure) and delete the rows
+  of principals deprovisioned since the backup.
+
+**Action.** Confirm the server's database role can create schemas (it already must, for every
+other store). Rolling back leaves the `crypto_dashboard_layout_store` schema in the database; it
+is harmless to the older binary.
+
+## Behaviour change: `/crypto` becomes a per-operator widget dashboard with Yuzu-issued certificate counts
+
+**What changed.** The **Crypto** page (`/crypto`) is now a grid of widgets each operator adds,
+removes and reorders (see [The dashboard](crypto.md#the-dashboard)). The library figures are still
+there as widgets; new widgets count the certificates **Yuzu's own internal CA** issued (agent,
+server, gateway, HTTPS and code-signing certificates alike), never the certificates on your
+devices.
+
+- **The page looks different.** Every operator starts on the default grid: the library figures
+  plus Yuzu-issued active, expiring within 30 days, revoked in the last 30 days and issued per
+  week. There is nothing to migrate; layouts start empty and each operator's first change saves
+  theirs.
+- **Who sees the Yuzu-issued counts.** The counts need `Inventory:Read` and an **unconfined** view
+  of the fleet (ADR-0070 R2): an unconfined `Inventory:Read` holder now sees how many certificates
+  Yuzu's CA has issued and revoked, and so the fleet's size and enrolment churn.
+  A management-group-confined caller, or a service-scoped token that confines its caller, sees
+  "not available to this account" instead. Remove `Inventory:Read` from a custom role to keep it
+  out.
+- **The certificate list behind a count needs `Security:Read`**, the existing permission of
+  `GET /api/v1/ca/issued`, and is withheld from a confined caller. It is served by that route
+  with new optional filter parameters (`kind`, `days`, `week`, `bucket`, `as_of`, `cursor`) and
+  by MCP `list_issued_certs` with the same arguments. A filtered list pages by **keyset cursor**
+  (`next_cursor`, `null` on the last page), never by `offset` (refused with a filter), so a
+  certificate revoked between pages never shifts another out of the walk; a pinned `as_of` is
+  checked against the database clock. Without those parameters both behave exactly as before,
+  `offset` paging included, and the unfiltered list still returns every row to any
+  `Security:Read` holder. Filtered calls are audited `crypto.ca.certificates.view`; unfiltered
+  calls are still not audited.
+- **New REST routes and MCP tools.** `GET /api/v1/crypto/widgets`, `GET`/`PUT
+  /api/v1/crypto/dashboard/layout` and `GET /api/v1/crypto/ca/stats`; MCP `list_crypto_widgets`,
+  `get_crypto_dashboard_layout`, `set_crypto_dashboard_layout` (annotated destructive: it
+  overwrites the caller's own layout) and `get_crypto_ca_stats`. New audit verbs:
+  `crypto.ca.stats.view`, `crypto.ca.certificates.view`, `crypto.dashboard.layout.update`,
+  `crypto.dashboard.layout.access_denied`. Drawing the dashboard writes one
+  `crypto.libraries.view` row and one `crypto.ca.stats.view` row per draw. A layout save names
+  the version it replaces (`expected_version`); one without it is a first save only, and over a
+  stored layout it is a `409` naming the stored version.
+- **If the layout schema did not open** (see the section above), every operator sees the default
+  layout, read-only, under a notice; the layout REST routes answer `503` with no retry hint and the
+  MCP layout tools `kInternalError` with no retry hint.
+- **Capacity.** The Yuzu-issued reads share the existing two-read `/crypto` bound per process;
+  on a connection pool of 3 or fewer (`--postgres-pool-size`) they are always refused, and on a
+  pool of one connection the library reads and the CBOM export (`GET /api/v1/crypto/cbom`,
+  MCP `export_crypto_cbom`) are refused too. That refusal lasts until a restart with a larger
+  `--postgres-pool-size`, so it carries no retry hint (REST `503` without `retry_after_ms`, an
+  MCP error without one) and names the flag; raise the pool before upgrading if it is that
+  small. The counts are never
+  cached: every call reads the CA table at request time, bounded only by that admission limit
+  (ADR-0070). Degrades are counted on
+  `yuzu_inventory_read_degrade_total` with new `source` values `ca_issued` and `crypto_layout`,
+  and the new alert `YuzuCryptoCaReadDegraded` fires after 15 minutes of Yuzu-issued read degrades
+  (see [metrics.md](metrics.md#crypto-dashboard-metrics)).
+
+**Action.** Review which custom roles hold `Inventory:Read` if enrolment counts should not be
+visible to them. Rolling back removes the widgets and routes. The two sections above cover the
+`ca_store` indexes and the layout schema this dashboard relies on.
+
 ## Behaviour change: the built-in server certificate is re-issued once with a server identity URI (#6016)
 
 On first boot after the upgrade, an install that uses the built-in default certificates has `default-server.pem` re-issued once, under the **same root and the same key**, with one added Subject Alternative Name: the server identity `yuzu://<ca-fingerprint>/server`. The previous certificate then appears **revoked with reason `superseded`** in the CA inventory (`GET /api/v1/ca/issued`, the CA page) and in the next CRL. That is bookkeeping, not a key compromise: the new certificate certifies the same key. Existing `mgmt_peer_pins` entries stay valid because the key is unchanged, so the gateway needs no action. The one-time event is audited as `server.default_certs_server_identity_upgraded` and logged as a WARN line. The CRL carries no revocation reason code, so the `superseded` reason is visible in the CA inventory only; a CRL consumer sees an ordinary revoked serial.
@@ -530,9 +819,9 @@ API-token Create and Revoke buttons) now apply the same step-up check as the RES
   probes that fetch `/home` still receive `200`.
 - **The Hardware pages no longer show quarantine controls.** The Quarantine link, the
   Quarantined pill, the Quarantined devices panel, the containment banner and tab, and the
-  quarantine plugin's rows in the Actions lens are hidden until an approval workflow for containment actions is added. Quarantine itself is unchanged: the REST API, the MCP tools, the quarantine
-  plugin and the role-gated quarantine instructions on the Instructions page all work as
-  before, and server-side enforcement does not depend on the UI. While the controls are
+  quarantine plugin's rows in the Actions lens are hidden until an approval workflow for containment actions is added. Quarantine itself is unchanged apart from the Breaking entry at the top of this page: the MCP tools, the quarantine
+  plugin and the role-gated quarantine instructions on the Instructions page work as
+  before, the REST create and release routes now run the dispatch approval check, and server-side enforcement does not depend on the UI. While the controls are
   hidden, use `GET /api/v1/quarantine` to list records. `DELETE /api/v1/quarantine/{agent_id}`
   ends the server record only; to remove the device's firewall rules, run the quarantine
   plugin's release instruction (`security.quarantine.release`, "Release Device from Quarantine")
@@ -636,6 +925,22 @@ store is degraded (previously an empty `200`) and `404` for an unknown role
 
 **What to check.** A script that signs in with a cookie and calls the per-device sync route without `Origin` or `Referer` now gets `403`: use an API token, or send the header. The Hardware and Software pages already send it. Behind a reverse proxy that rewrites `Host`, declare the public address with `--csrf-trusted-origin`.
 
+## Behaviour change: adding, removing and re-roling a local account refuse cross-site cookie writes and are audit-first
+
+**What changed.**
+
+- `POST /api/settings/users`, `DELETE /api/settings/users/{username}` and `POST /api/settings/users/{username}/role` called with a **session cookie** must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`), otherwise they answer `403 cross-site request refused` and write a `csrf.denied` audit row. Calls authorised by an API token are not affected.
+- `POST /api/settings/users/{username}/role` accepts only `application/json` and answers `415` otherwise.
+- Each of the three writes a `result=attempted` audit row before it changes anything. If that row cannot be written the call answers `503` with `Sec-Audit-Failed: true` and changes nothing; if only the outcome row is lost the `2xx` stands and the header is set.
+
+**What to check.** A script that signs in with a cookie and calls these routes without `Origin` or `Referer`, or posts the role body as a form, now gets `403` or `415`: use an API token, send the header, or post JSON. A SIEM or alert rule that counts `csrf.denied` rows will now see the three user-management routes as targets, and a rule on `user.create`, `user.delete` or `user.role_change` rows will now also see `attempted` rows.
+
+## Behaviour change: MCP `revoke_upload_grant` is audit-first and refuses during an audit-store outage (#6169)
+
+**What changed.** The MCP tool `revoke_upload_grant` now writes an `upload_grant.revoke` audit row with result `attempted` before it revokes anything, then a `success` or `failure` row, the same rows its REST twin `DELETE /api/v1/upload-grants/{grant_id}` writes. If the `attempted` row cannot be stored, the tool answers a retryable `-32603` error carrying `retry_after_ms` and the grant is **not** revoked. It stays redeemable until it expires at its TTL. The REST route already refused the same way, with `503`, so no transport can revoke a grant while the audit store is down. The success result no longer includes `audit_persisted`. `mint_upload_grant` is unchanged.
+
+**What to check.** An MCP client that treated `revoke_upload_grant` as always succeeding while the grant store is up must handle the retryable error: retry after `retry_after_ms`, and on the supervised tier request a fresh approval, because the refused call consumed its ticket. A client that read `audit_persisted` from this tool must stop. A SIEM or alert rule that counts one `upload_grant.revoke` row per revoke now sees two (`attempted`, then the outcome), so match on `result=success`. An `attempted` row with no outcome row for the same `target_id` means the outcome is unknown: check the grant's state with `list_upload_grants`.
+
 ## Behaviour change: `PUT /api/config/{key}` is audit-first, refuses cross-site cookie writes and floors `heartbeat_timeout` at 30 seconds
 
 **What changed.**
@@ -721,6 +1026,37 @@ header rather than a redirect, so a panel never swaps the sign-in page into itse
 **What to check.** Any monitor, load-balancer health check or script that expects `GET /login` to answer `200`
 must probe `/livez`, `/readyz`, `/health` or `/home` instead (`/home` answers `200` without a session). Scripts
 that sign in with `POST /login` need no change. Bookmarks to `/login` keep working through the redirect.
+
+## Behaviour change: kill-switch audit rows carry the operator's reason
+
+The `detail` of the `plugin_config.kill_switch.set` audit rows (both the `attempted` row and the
+`success` or `failure` row, over REST and MCP) now carries `, reason="<text>"` when the caller gave a
+reason. A reason over 512 bytes is refused before anything is written; if one ever reached the audit
+writer it would be cut at a character boundary and `, reason_truncated=true` would follow the closing
+quote. Before, `detail` was exactly `enabled=true|false`, with `, protective_exempt=true` appended
+for a protective pair. A SIEM rule that matches the whole string (`detail == "enabled=false"`) stops
+matching a call that carries a reason: match `enabled=true|false` as a prefix instead. The reason is
+free text entered by an operator (at most 512 bytes before escaping; `\` and `"` are backslash-escaped),
+so do not parse it as structured data. A call without a reason is unchanged. See
+[Audit Log](audit-log.md).
+
+## Behaviour change: the plugin-config list is authorized by one list-read gate
+
+`GET /api/v1/plugin-config`, the MCP `list_plugin_config` tool and the Plugins and updates panel now
+decide from the one ADR-0017 list-read gate instead of a permission check stacked on a list check.
+What you may notice:
+
+- A session with an active just-in-time elevation is now admitted on the REST route and the MCP tool
+  (before, an elevated session with no underlying grant was refused there while other permission
+  checks admitted it).
+- A management-group-confined grant is still refused. On the REST route the refusal is still an
+  `auth.permission_required` denial row, now with the detail text `management-group-scoped grant
+  cannot read the unscoped list PluginConfig:Read`. On MCP it is now recorded as
+  `mcp.list_plugin_config` with result `denied` (it was `auth.permission_required`). Update a SIEM rule
+  that matched the old MCP verb.
+- For a non-engine caller, a closed or degraded authorization store answers 403 (it fails closed),
+  where the REST route's explicit store check could answer 503. Boot already fails closed on that
+  store, so this is rare in practice.
 
 ## Behaviour change: Guardian heartbeat reconcile is admission-controlled and fails closed on a degraded tag or property store (#5513)
 

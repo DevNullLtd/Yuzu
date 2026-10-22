@@ -29,11 +29,11 @@ std::string_view about_text();
 std::string_view operating_model_text();
 
 // One capability area of the MCP tool surface. `tools` lists every tool name in
-// the family; the union across all families is exactly the kTools[] set, pinned
-// by the family-tether test (test_mcp_server.cpp). Adding a tool family, or a
-// tool, without updating this table fails that test rather than a judgment call
-// in review (A5 item 6: the blob is updated in the same PR that reshapes the
-// surface).
+// the family; the union across all families is exactly the served set (legacy
+// kTools[] plus registry records), pinned by the family-tether test
+// (test_mcp_server.cpp). Adding a tool family, or a tool, without updating this
+// table fails that test rather than a judgment call in review (A5 item 6: the
+// blob is updated in the same PR that reshapes the surface).
 struct ToolFamily {
     std::string_view name;
     std::string_view blurb;

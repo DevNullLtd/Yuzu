@@ -10,6 +10,7 @@
 /// out of date: that is interpretation (ADR-1005 D2, engine territory behind the ADR-0032
 /// interlock), not mechanism.
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -98,6 +99,131 @@ struct CryptoDevicesPage {
     std::int64_t names_as_of{0};          ///< as CryptoSummary::names_as_of
     std::vector<CryptoDeviceRow> devices;
     std::string next_cursor; ///< "" = last page
+};
+
+
+// ── Dashboard widgets: Yuzu-issued certificates (ADR-0070 D6/D13) ───────────
+//
+// Yuzu's OWN internal-CA certificates only (CaStore); fleet certificates are never read from
+// there (D6). Every count is computed at read time against `as_of` - Postgres `now()` read in
+// the same statement as the comparisons (ADR-0070 R4), or a caller-pinned instant - and carries
+// the window it applies (D13 conditions 1-3): nothing here is a stored verdict, and nothing
+// labels a certificate good, bad or at risk. Expiry follows RFC 5280 (valid THROUGH notAfter,
+// inclusive): the one definition is crypto_widgets::unexpired_at / expiring_within /
+// expired_within.
+
+/// Which certificate set a Yuzu-issued list selects. `days` (kExpiring/kExpired/kRevoked/
+/// kIssued) must be one of the closed window set in crypto_widget_catalogue.hpp; `week_start`
+/// (kIssuedWeek/kRevokedWeek) is a Monday 00:00 UTC, epoch seconds.
+///   kActive      status active AND issued_at <= as_of <= not_after
+///   kExpiring    status active AND as_of <= not_after <= as_of + days
+///   kExpired     status active AND as_of - days <= not_after < as_of (a revoked certificate
+///                is counted in the revoked windows only)
+///   kRevoked     as_of - days < revoked_at <= as_of
+///   kIssued      as_of - days < issued_at <= as_of, unpublished revocations excluded
+///   kIssuedWeek  week_start <= issued_at < week_start + 7 days, issued_at <= as_of,
+///                unpublished revocations excluded
+///   kRevokedWeek week_start <= revoked_at < week_start + 7 days, revoked_at <= as_of
+enum class CaCertKind { kActive, kExpiring, kExpired, kRevoked, kIssued, kIssuedWeek, kRevokedWeek };
+
+/// The three disjoint buckets every Yuzu-CA revocation falls in (ADR-0070 D13), decided by the
+/// revocation reason exactly as recorded: `superseded` and `unpublished` are the CA's own
+/// bookkeeping markers (never a compromise); `other` is any other reason, an operator reason
+/// that collided with a marker included. Never labelled "security".
+enum class RevokedBucket { kSuperseded, kUnpublished, kOther };
+
+struct CaCertQuery {
+    CaCertKind kind{CaCertKind::kActive};
+    int days{0};
+    std::int64_t week_start{0};
+    /// kRevoked / kRevokedWeek only: one bucket (nullopt = all three).
+    std::optional<RevokedBucket> bucket;
+    /// The instant to compare against: nullopt = Postgres `now()` at read time; a value pins the
+    /// read (a dashboard drill passes the as_of of the count it came from, so the list's total
+    /// equals that count). A continuation page carries its as_of inside `cursor` instead.
+    std::optional<std::int64_t> as_of;
+    int limit{100};
+    /// The opaque keyset cursor of the previous page (`CaCertPage::next_cursor`); "" = the first
+    /// page. It binds the filter (kind, days, week, bucket) and carries the position of the last
+    /// row served and the walk's as_of, so every page reads one snapshot and no row is skipped
+    /// or repeated when a served row leaves the selection between pages (H2).
+    std::string cursor;
+};
+
+/// One Yuzu-issued certificate as the list shows it: raw facts only (no PEM). The same field
+/// set `GET /api/v1/ca/issued` serves per row.
+struct CaCertRow {
+    std::string serial_hex;
+    std::string subject;
+    std::string san;
+    std::string purpose;
+    std::int64_t issued_at{0};
+    std::int64_t not_after{0};
+    std::string status; ///< "active" | "revoked"
+    std::int64_t revoked_at{0}; ///< 0 = not revoked
+    std::string revocation_reason; ///< as recorded ("" when not revoked)
+    std::string issued_by;
+    std::string issuer_key_id;
+};
+
+struct CaCertPage {
+    CaCertQuery query; ///< echoed, limit as applied, as_of = the instant actually used
+    std::int64_t as_of{0};
+    std::vector<CaCertRow> rows;
+    std::int64_t total{0}; ///< every matching certificate, counted in the same statement
+    bool truncated{false}; ///< more matching rows follow this page (next_cursor is set)
+    std::string next_cursor; ///< the cursor of the next page; "" = the last page
+};
+
+/// One fixed window's count: `days` is the window, `count` the certificates inside it.
+struct CaWindowCount {
+    int days{0};
+    std::int64_t count{0};
+};
+
+/// One revoked window, split into the three buckets (never summed into one figure).
+struct CaRevokedWindow {
+    int days{0};
+    std::int64_t superseded{0};
+    std::int64_t unpublished{0};
+    std::int64_t other{0};
+};
+
+/// One ISO week (Monday 00:00 UTC start) of the per-week series, zero-filled.
+struct CaWeekCount {
+    std::int64_t week_start{0};
+    std::string label; ///< ISO 8601 week, "2026-W40"
+    std::int64_t issued{0}; ///< unpublished revocations excluded
+    std::int64_t revoked_superseded{0};
+    std::int64_t revoked_unpublished{0};
+    std::int64_t revoked_other{0};
+    bool partial{false}; ///< the week containing as_of: its counts stop at as_of
+};
+
+/// Every Yuzu-issued count of the dashboard, read in one statement against `as_of`.
+struct CaCertStats {
+    std::int64_t as_of{0};
+    std::int64_t active{0};
+    std::vector<CaWindowCount> expiring;  ///< one per kExpiringWindowDays entry, in order
+    std::vector<CaWindowCount> expired;   ///< one per kExpiredWindowDays entry
+    std::vector<CaRevokedWindow> revoked; ///< one per kRevokedWindowDays entry
+    CaWindowCount issued;                 ///< days = kIssuedWindowDays, unpublished excluded
+    std::vector<CaWeekCount> weeks;       ///< kWeeklyBuckets ISO weeks, oldest first, the last
+                                          ///< one containing as_of (partial)
+};
+
+/// An operator's dashboard layout: catalogue widget ids in display order.
+///   `is_default`        the drawn layout IS the catalogue default (nothing stored, or a stored
+///                       layout equal to it with nothing preserved);
+///   `version`           the stored row's version, 0 when nothing is stored - a save passes it
+///                       back as `expected_version`, and a stale one is a conflict;
+///   `preserved_unknown` stored ids this build does not know (a widget a newer build added):
+///                       never drawn, but kept on every save (after the caller's ids).
+struct CryptoDashboardLayout {
+    std::vector<std::string> widgets;
+    bool is_default{false};
+    std::int64_t version{0};
+    std::size_t preserved_unknown{0};
 };
 
 } // namespace yuzu::server

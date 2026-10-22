@@ -3,6 +3,9 @@
 # created by scripts/setup.sh. Legacy names are kept ignored for old checkouts.
 build/
 build-*/
+# The coverage gate's lock files sit beside the build dir (not inside it), so `build-*/` misses them.
+/build-*.lock
+/build-*.lock.takeover
 builddir/
 builddir-*/
 clion-build/

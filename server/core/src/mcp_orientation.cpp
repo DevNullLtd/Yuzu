@@ -45,10 +45,13 @@ std::string_view operating_model_text() {
 
 // ── Tool-family enumeration ──────────────────────────────────────────────────
 //
-// The union of every family's `tools` list is exactly the kTools[] set. This is
+// The union of every family's `tools` list is exactly the served set: the legacy
+// kTools[] entries plus the registry records (mcp_tools_<domain>.cpp). This is
 // asserted mechanically by the family-tether test against the live tools/list
 // output, so a new tool with no family assignment (or a family dropped from the
-// blob) is a test FAILURE, not a review miss. Keep names in kTools[] order.
+// blob) is a test FAILURE, not a review miss. The test compares sets, so order is
+// not enforced; tools/list is served in tool-name order, and the order of names
+// within a family is only a readability convention.
 
 namespace {
 
@@ -71,7 +74,8 @@ constexpr std::string_view kInventory[] = {"query_inventory", "list_inventory_ta
                                            "query_software_licenses", "get_agent_app_usage",
                                            "query_software_catalogue", "get_software_versions",
                                            "get_crypto_libraries", "list_crypto_library_devices",
-                                           "export_crypto_cbom"};
+                                           "export_crypto_cbom", "list_hardware_ci",
+                                           "get_hardware_ci"};
 constexpr std::string_view kCompliance[] = {
     "list_policies",    "get_compliance_summary",       "get_fleet_compliance",
     "get_guardian_schemas", "get_policy", "list_policy_fragments",
@@ -110,7 +114,7 @@ constexpr std::string_view kNetwork[] = {"get_network_fleet", "list_network_devi
                                         "list_discovered_devices"};
 constexpr std::string_view kExecution[] = {"execute_instruction", "execute_bundle",
                                            "get_bundle_result", "sync_hardware_software"};
-constexpr std::string_view kRemediation[] = {"quarantine_device"};
+constexpr std::string_view kRemediation[] = {"quarantine_device", "list_quarantined_devices"};
 // gap-matrix #10 (ADR-1005 A5 parity): issue_code_signing_cert joins the
 // family — same Security securable domain, same "Certificates" mental model.
 // B5 (api-parity #2146): export_ca_root_csr joins too — same PKI/CA domain,
@@ -295,8 +299,14 @@ constexpr std::string_view kLicense[] = {"get_platform_license", "activate_platf
 constexpr std::string_view kSoftwareDeployments[] = {
     "list_software_deployments", "create_software_deployment",
     "rollback_software_deployment", "cancel_software_deployment"};
+// /crypto dashboard widgets (ADR-0070 D13): the catalogue, the caller's own layout, and the
+// Yuzu-issued certificate counts. The library reads stay in kInventory; the rows behind a
+// Yuzu-issued count are list_issued_certs' filtered form (the CA family).
+constexpr std::string_view kCryptoDashboard[] = {
+    "list_crypto_widgets", "get_crypto_dashboard_layout", "set_crypto_dashboard_layout",
+    "get_crypto_ca_stats"};
 
-constexpr std::array<ToolFamily, 40> kFamilies{{
+constexpr std::array<ToolFamily, 41> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions, their full export, and recurring "
@@ -306,7 +316,8 @@ constexpr std::array<ToolFamily, 40> kFamilies{{
     {"Command responses", "query and aggregate stored command/instruction responses", kResponses},
     {"Executions & audit", "execution status/history and the who-did-what audit log",
      kExecutionsAudit},
-    {"Inventory & software", "collected inventory tables, installed software, and licenses",
+    {"Inventory & software",
+     "collected inventory tables, installed software, hardware CI records, and licenses",
      kInventory},
     {"Policy & compliance", "policies, per-device and fleet compliance, Guardian schemas",
      kCompliance},
@@ -330,7 +341,9 @@ constexpr std::array<ToolFamily, 40> kFamilies{{
      kNetwork},
     {"Live execution", "dispatch plugin actions or bundles to endpoints and collect results",
      kExecution},
-    {"Device remediation", "quarantine a device (destructive, approval-gated)", kRemediation},
+    {"Device remediation",
+     "quarantine a device (destructive, approval-gated) and list active quarantines",
+     kRemediation},
     {"Certificates",
      "list issued agent certificates, revoke one, and issue a code-signing certificate via "
      "CSR custody",
@@ -397,6 +410,9 @@ constexpr std::array<ToolFamily, 40> kFamilies{{
     {"Software deployments", "software-package fleet deployment lifecycle (list, create, "
                              "rollback, cancel)",
      kSoftwareDeployments},
+    {"Crypto dashboard", "the /crypto widget catalogue, your own widget layout, and counts of "
+                         "certificates issued by Yuzu's own CA (fixed windows, with as_of)",
+     kCryptoDashboard},
 }};
 
 }  // namespace

@@ -2999,29 +2999,34 @@ groups:
           description: >-
             yuzu_server_audit_emit_failed_total is rising. Every REST route that uses
             fail-closed audit-on-open (guardian.device.view, dex.device.view,
-            dex.signal.view, dex.perf.device.view, network.device.view, plus
+            dex.signal.view, dex.perf.device.view, network.device.view, inventory.devices,
+            inventory.device.ci, plus
             response.read on the v1 query, aggregate and export routes and on the
             legacy get, aggregate and export routes) is returning 503 and withholding PII or response
             data, so a ServiceNow / CMDB poll blackouts fleet-wide. Set-and-proceed reads, including
             crypto.libraries.*, keep serving data and do not 503: their REST routes and dashboard
-            fragments set the Sec-Audit-Failed header, their MCP tools set audit_persisted:false,
-            and only the /crypto (crypto.libraries.*) pages also show an on-page "Audit not
-            recorded" notice.
+            fragments set the Sec-Audit-Failed header, their MCP tools set audit_persisted:false
+            (the hardware CI tools list_hardware_ci and get_hardware_ci, which audit as
+            inventory.devices and inventory.device.ci, fail closed instead: they withhold the
+            data and answer a retryable -32603), and only the /crypto (crypto.libraries.*) pages
+            also show an on-page "Audit not recorded" notice.
             Check audit_store health (/healthz
             stores.audit) and free disk / connection saturation on the PostgreSQL
             server (ADR-0040 — audit is Postgres-backed, not a local file). Note: a bad_alloc-class
             throw in the audit pipeline fails closed the same way but does NOT bump this
             counter (it is catch-logged only) — correlate with a spike in 503s on the
             behavioural routes. The audit-first admin writes (webhooks, offload targets,
-            directory sync, group mappings, MCP settings) 503 the same way. Approval approve and
-            reject (approval.approve, approval.reject) 503 with Sec-Audit-Failed when the
-            "attempted" row fails; then the decision is not applied and the request stays
-            pending. Their outcome rows (success or denied) are best effort: a failed outcome
-            row also moves this counter and the response carries no Sec-Audit-Failed. A lost
-            success row means the decision was applied; a lost denied row means the store
-            refused it, so this request applied nothing and the ticket keeps its prior
-            state (usually pending, but read its status). Check the status of any request
-            that has more "attempted" rows than outcome rows (compare counts per
+            directory sync, group mappings, MCP settings) 503 the same way. Upload-grant revoke
+            refuses on both REST (503) and MCP (retryable -32603), so a leaked grant stays
+            redeemable until the outage ends or its TTL expires, whichever is first (#6169).
+            Approval approve and reject (approval.approve, approval.reject) 503 with
+            Sec-Audit-Failed when the "attempted" row fails; then the decision is not applied
+            and the request stays pending. Their outcome rows (success or denied) are best
+            effort: a failed outcome row also moves this counter and the response carries no
+            Sec-Audit-Failed. A lost success row means the decision was applied; a lost denied
+            row means the store refused it, so this request applied nothing and the ticket keeps
+            its prior state (usually pending, but read its status). Check the status of any
+            request that has more "attempted" rows than outcome rows (compare counts per
             target_id; the example query is in the runbook).
           runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
 
@@ -3811,8 +3816,10 @@ groups:
         # dashboard-invisible: the store-agnostic yuzu_pg_acquire_timeout_total
         # moves but nothing inventory-specific does (#1675).
         # reason = store_not_open | pool_acquire_timeout | query_error, plus
-        # admission_full (source=installed_software only): a /crypto read refused by
-        # its per-process in-flight bound BEFORE any store call. Sustained for 5m
+        # admission_full (source=installed_software or ca_issued): a /crypto read
+        # refused by its per-process in-flight bound BEFORE any store call. The
+        # /crypto Yuzu-issued (source=ca_issued) and layout (source=crypto_layout)
+        # reads count here too; ca_issued has its own longer-held alert below. Sustained for 5m
         # that is saturation of the bound (a poll storm or slow summary reads), which
         # is worth the same warning. The rule is rate([5m]) > 0 held for 5m, so
         # refusals recurring within every 5m window keep it firing; a single
@@ -3843,6 +3850,70 @@ groups:
             its 5s bound (too many distinct package names): retrying will not help, fix
             the catalogue refresh (see docs/user-manual/crypto.md, "Diagnosing a degrade").
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuCryptoCaReadDegraded
+        # The /crypto Yuzu-issued certificate reads (the CA counts behind GET
+        # /api/v1/crypto/ca/stats, get_crypto_ca_stats and the dashboard cards, and
+        # the filtered GET /api/v1/ca/issued drill) refused or failed for 15
+        # minutes. One series, summed across reasons: the shorter, per-reason
+        # YuzuInventoryReadDegraded above already names the reason; this one says
+        # the CA widgets have been unanswerable long enough to page a human.
+        # Reasons: admission_full (the per-process crypto read bound stayed full,
+        # including a pool of 3 or fewer connections, where CA reads are always
+        # refused as busy), pool_acquire_timeout, query_error (incl. the 5s
+        # statement bound), store_not_open.
+        expr: |
+          sum(rate(yuzu_inventory_read_degrade_total{source="ca_issued"}[5m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "/crypto Yuzu-issued certificate reads degraded for 15 minutes"
+          description: >-
+            yuzu_inventory_read_degrade_total{source="ca_issued"} has been rising for
+            15 minutes: the Yuzu-issued certificate counts and drill answer 503 instead
+            of data. Split it by reason. admission_full is a SHED, not a database fault:
+            too many concurrent /crypto reads (a poll storm, slow stats reads) or a
+            Postgres pool of 3 connections or fewer, where CA reads are refused by
+            design - raise the pool size or find the caller, the database is fine.
+            pool_acquire_timeout and query_error are DATABASE faults: check
+            yuzu_pg_pool_* saturation, the server's CaStore warnings (they carry the
+            libpq error) and, for query_error alone, a stats read exceeding its 5s
+            statement bound on a large ca_issued table (the indexes are created at
+            upgrade). store_not_open means the CA store did not open at boot.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/crypto.md#failure-behavior"
+      - alert: YuzuCryptoLayoutEraseFailed
+        # ADR-0071: a deprovision (SCIM active:false / delete, dashboard user
+        # delete) committed, but the best-effort erasure of the operator's
+        # /crypto dashboard layout row did not complete. The deprovision itself
+        # succeeded; the row (keyed by the username - personal data) may remain
+        # and must be removed by hand. Any increase in the last hour fires; the
+        # counter is pre-seeded at boot per reason, so a healthy server shows
+        # flat zeros. One series per reason (store_not_open,
+        # pool_acquire_timeout, outcome_unknown, query_error, link_read_failed).
+        expr: |
+          sum by (reason) (increase(yuzu_server_crypto_layout_erase_failures_total[1h])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "/crypto dashboard layout erasure on deprovision failed ({{ $labels.reason }})"
+          description: >-
+            yuzu_server_crypto_layout_erase_failures_total{reason="{{ $labels.reason }}"}
+            rose in the last hour: a deprovisioned operator's saved /crypto dashboard
+            layout may still be stored. The deprovision itself completed (credentials
+            revoked, account deactivated); only this personal-data row is left behind.
+            The log line carries the reason only, never the principal. Remedy: compare
+            the usernames in crypto_dashboard_layout_store.layouts with your active
+            operator list (local users and SCIM users) and delete the rows of
+            deprovisioned principals - the exact statements are in
+            docs/user-manual/crypto.md, "Deprovision erasure". store_not_open means the
+            layout store did not open at boot (layouts are unavailable until a restart
+            with it fixed); pool_acquire_timeout and query_error correlate with
+            yuzu_pg_* saturation or outage; outcome_unknown means the connection was
+            lost after the DELETE was sent (the row may or may not be gone - check);
+            link_read_failed means an already-inactive SCIM user's linked oidc:/saml:
+            identities could not be read, so only the user name's row was erased (a
+            linked principal's row may remain - check).
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/crypto.md#deprovision-erasure"
       - alert: YuzuMgmtGroupReadDegraded
         # A CONFINEMENT-feeding management-group read (ancestors / descendants /
         # agent-groups / row/member resolution, ADR-0042 + #1762) degraded.

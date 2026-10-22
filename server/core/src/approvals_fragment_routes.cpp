@@ -159,6 +159,9 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
                 operate_pages::ApprovalListView view;
                 view.truncated = listed->truncated;
                 view.status_filter = status;
+                // Display only (#6096): the age column subtracts a database-authored
+                // submitted_at from this process's clock, so skew shifts the printed age.
+                // No decision reads it.
                 view.now = static_cast<int64_t>(std::time(nullptr));
                 view.can_decide = can_decide;
                 view.rows.reserve(listed->approvals.size());

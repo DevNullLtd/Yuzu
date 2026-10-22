@@ -459,6 +459,28 @@ must carry a visible `docs-unchanged: <section> — <reason>` line, which
 the job prints. Both scripts carry a fixture self-test that the `docs`
 suite also runs (the touch-rule one off Windows only, #5428).
 
+A third `docs-lint.yml` gate, the personal-data guard
+(`scripts/ci/check-personal-data.py`, run `--strict-baseline --ratchet`), keeps
+real home paths, SIDs, tailnet IPs, MACs, private keys, consumer e-mail and
+tracked session artifacts out of the public tree. The script header and rule 5
+of `docs/plugin-readme-standard.md` give the detectors, scope and baseline rules.
+
+### Docs drift gate (`docs` suite + `docs-lint.yml` + `doc-coupling.yml`, `docs/docs-drift-gate.md`)
+
+`scripts/ci/check-docs-drift.py` extends the plugin README idea to the rest of the
+product, in two layers. Fact parity (hermetic, in the required `changelog-order` job and
+the `docs` suite) asserts every `/api/vN/` route, MCP tool and server/agent CLI flag is
+named in the user manual, reusing `check-api-parity.py`'s extractors. It ratchets
+against the by-name `scripts/ci/docs-drift-baseline.json` with the same only-shrinks rule
+as the definition-description ratchet below. The `doc-coupling-touch-rule` job, in its
+own `doc-coupling.yml` workflow so that editing the PR body re-runs it, applies
+`scripts/ci/doc-coupling.json`: coupled code changed means a coupled doc changed, or the
+body carries `doc-coupling-exempt: <rule-id> — <reason>`. It is advisory until the
+repository owner adds it to the required checks. A Claude Code `PreToolUse` hook runs both
+layers before `gh pr create`, always using the project tree's own copy of the gate.
+Details, the runbook for a `dev` turned red by drift, and how to extend the fact
+categories: `docs/docs-drift-gate.md`.
+
 ### Definition-description ratchet (`definition-descriptions` job + `docs` suite)
 
 `scripts/ci/check-definition-descriptions.py` lints the description text of every shipped
@@ -828,6 +850,19 @@ gateway redial is required. (4) The rigs
 above, which carry the acknowledgement. The decision record,
 [Gateway peer authorization (minimal), 2026-10-07](security-reviews/gateway-peer-authz-minimal-2026-10-07.md),
 states what none of these cover.
+
+### Local coverage gate: fast harness subset (#5803, #6116)
+
+`scripts/test/coverage-gate.sh` is the local `/test` Phase 7b coverage gate: developer
+tooling, not a CI gate (the CI coverage job is `nightly.yml`'s, with its own gcovr
+invocation). Its behaviour (build-dir lock, inconclusive runs, DB-write handling, the
+Linux-only refusal, option and baseline validation) is pinned by the mock-based harness
+`tests/shell/test_pr2_gates.sh`. Preflight's "Shell gate tests" step runs the fast
+scenarios only, `CH-18 CH-20 CH-21 CH-22 CH-24` (about 25 s; bash, python3 with sqlite3, procps
+and findutils, all on the hosted image; the fixtures stub `ps`, `find` and `ln`). The
+slow scenarios (`CH-19`, the process-tree kill, about 2.5 minutes; `CH-23`, signal bursts,
+about 35 s) and the rest of the harness are not in CI yet; wiring them into a nightly job,
+and hardening them for the shared-identity runner pools, is #6116.
 
 ## Self-hosted runner topology
 

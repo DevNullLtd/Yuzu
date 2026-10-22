@@ -62,6 +62,12 @@ struct LogCapture {
     void stop() {
         if (stopped_)
             return;
+        // set_default_logger registered the capture logger under its name; its sink holds a
+        // reference to `oss_`, so leaving it in the registry would let a later flush_all or
+        // shutdown touch a destroyed stream. Drop it BEFORE restoring: spdlog's drop() also
+        // nulls the default logger when the dropped name is the default's, and dropping after
+        // the restore would do that to a restored OUTER capture (same name) when captures nest.
+        spdlog::drop("test_log_capture");
         spdlog::set_default_logger(prev_);
         spdlog::set_level(prev_level_);
         stopped_ = true;
