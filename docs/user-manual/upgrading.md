@@ -29,13 +29,14 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   routes above are gated for the first time by this change. Of the other 34, 25 already called the
   step-up check from their handlers in v0.14.1. The remaining nine were gated in their handlers
   earlier in this release cycle, so an upgrade from v0.14.1 gives them a proof requirement too, but
-  not through this change: the dashboard API-token create and revoke routes (see "Behaviour change:
-  dashboard API-token create and revoke apply MFA step-up" below), the Guardian guard Edit and
-  Delete routes, the local password change and the administrator password reset,
-  `POST /api/approvals/{id}/approve` and `POST /api/approvals/{id}/reject` (documented in their own
-  Breaking section below), and `POST /api/v1/guaranteed-state/policy-generation/raise`. For those
-  nine, this change alters the order of checks and the engine-principal denial described below, not
-  the proof the caller needs.
+  not through this change. Eight are existing routes that v0.14.1 did not step-up gate: the
+  dashboard API-token create and revoke routes (see "Behaviour change: dashboard API-token create
+  and revoke apply MFA step-up" below), the Guardian guard Edit and Delete routes, the local
+  password change and the administrator password reset, and `POST /api/approvals/{id}/approve` and
+  `POST /api/approvals/{id}/reject` (documented in their own Breaking section below). The ninth,
+  `POST /api/v1/guaranteed-state/policy-generation/raise`, is a new route that did not exist in
+  v0.14.1. For those nine, this change alters the order of checks and the engine-principal denial
+  described below, not the proof the caller needs.
 - **Step-up comes before authorization and the same-site check.** A session with a stale or
   missing MFA proof is answered with the `401` step-up envelope before the route's own `403`
   (permission, durable-Administrator, `csrf`, `token_session`, `not_local`) could be. An
@@ -136,16 +137,20 @@ The same test suite also classifies every non-Read MCP tool in a second table an
 missing or stale row; that table is data only and changes no MCP behaviour.
 
 **Action.** None required for a stock deployment. Check any script that signs in with a session
-cookie and calls one of the 36 routes: it may now see `401` where it saw `403`, and the two Settings
-MFA routes now need a proof inside the window. `--mfa-step-up-window-secs 0` (or less) disables
+cookie and calls one of the 36 routes: it may now see `401` where it saw `403`. Measured from
+v0.14.1, ten existing routes that needed no fresh proof now need one inside the window: the two
+Settings MFA routes (gated by this change) and the eight routes listed under "What is newly gated"
+above (gated earlier in this release cycle). The new policy-generation raise route needs one too.
+`--mfa-step-up-window-secs 0` (or less) disables
 the stale-proof requirement on the 36 routes and still logs a startup `WARN`. While it is in
 force no stale proof is refused (so none is recorded), and the SAML refusal and the
 authentication-store read are skipped too, so SAML sessions also pass; engine denials and
 unwired-store refusals still apply and are still recorded. The JIT-elevation routes keep a 300 s window (the global
 window when it is positive, else 300 s). The new alert `YuzuStepUpWindowDisabled` fires while the
 window is 0 or less. Rolling back to v0.14.1 restores the old order of checks and un-gates the two
-Settings routes, and also the nine routes listed under "What is newly gated" above, because v0.14.1
-did not gate them in their handlers; nothing is migrated. A rollback also removes the new counter and
+Settings routes and the eight existing routes listed under "What is newly gated" above, because
+v0.14.1 did not gate them in their handlers. It also removes the policy-generation raise route,
+which does not exist in v0.14.1. Nothing is migrated. A rollback also removes the new counter and
 window gauge, so both new alerts go silent.
 
 ## Behaviour change: /health and /api/health per-source budget

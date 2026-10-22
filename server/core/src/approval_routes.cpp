@@ -82,7 +82,9 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
                      verb, log_safe(session->username), log_safe(session->auth_source, 64),
                      log_safe(session->principal_kind, 64),
                      approval::approver_refusal_reason(refusal));
-        // Evidence that a bearer/engine caller reached the decision surface.
+        // Evidence that a non-interactive caller reached the decision surface. Over REST that
+        // is a bearer-token (or other non-interactive) caller: an engine principal is refused
+        // by the central step-up check and is reachable only via MCP.
         // Best effort: the refusal is the control, this row is the trace.
         (void)deps.audit_fn(req, audit_action, "denied", "approval", req.matches[1].str(),
                             "approver_assurance:" +

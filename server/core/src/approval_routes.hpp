@@ -72,9 +72,11 @@
 /// AUDIT ASYMMETRY (also preserved verbatim): GET /api/approvals and GET
 /// .../pending/count are both pure reads and unaudited. The store-
 /// unavailable 503 on all three gated-past routes is unaudited (it returns
-/// before `deps.audit_fn` is ever reached), as are the unresolvable-session
-/// 503 and the assurance / step-up refusals (the latter writes its own
-/// `mfa.step_up.required` row). Past those, approve/reject write an
+/// before `deps.audit_fn` is ever reached), as is the unresolvable-session
+/// 503. The same-site refusal writes its own `csrf.denied` row, an assurance
+/// refusal writes a best-effort `"denied"` row (detail
+/// `approver_assurance:<reason>`), and a step-up refusal writes its own
+/// `mfa.step_up.required` row. Past those, approve/reject write an
 /// `"attempted"` row BEFORE the store call (fail closed, see above) and then
 /// audit BOTH outcomes — a denied review (e.g. the store's
 /// self-approval segregation-of-duties block) is audited as `"denied"`

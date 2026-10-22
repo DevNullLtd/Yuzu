@@ -11532,14 +11532,15 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/approvals/REQ-001/appro
   -d '{"comment": "Reviewed, safe to proceed."}'
 ```
 
-**Errors** (checked in this order; `POST /api/approvals/{id}/reject` is identical). The first four rows are the central MFA step-up check, which runs before the route handler; the handler's own checks follow it, and the handler's step-up call only consumes the central pass:
+**Errors** (checked in this order; `POST /api/approvals/{id}/reject` is identical). The first five rows are the central MFA step-up check, which runs before the route handler (with `--mfa-step-up-window-secs=0` only the first two can fire); the handler's own checks follow it, and the handler's step-up call only consumes the central pass:
 
 | Status | Body | Cause |
 |---|---|---|
-| `401` | step-up envelope, `meta.mfa_step_up_required: true`, `meta.challenge_url` | Central check: the session's MFA proof is older than `--mfa-step-up-window-secs`. Complete the step-up and retry. A cross-site `POST` with a stale proof gets this response (and an `mfa.step_up.required` audit row) rather than the `csrf.denied` row below. |
-| `403` | step-up envelope, message `MFA step-up is not available for SAML sessions in this release` | Central check: a SAML session while step-up is on (#4935). A deployment whose approvers all sign in through SAML has no working approver path until #4935 is decided (tracked in #6098). |
+| `503` | A4 envelope, message `authentication store is temporarily unavailable` | Central check: no authentication store is wired (a defensive boot-wiring state). It answers every caller class, an engine principal included, before the engine refusal below, and is audited as `mfa.step_up.required` with `reason=auth_store_unwired`. |
 | `403` | step-up envelope, message `engine principals cannot perform this operation` | Central check: an engine principal. Audited as `mfa.step_up.required` with `reason=engine_principal_denied` in the detail and the route label as `target_id`; the handler never runs, so no `approval.approve` / `approval.reject` row is written. |
+| `403` | step-up envelope, message `MFA step-up is not available for SAML sessions in this release` | Central check: a SAML session while step-up is on (#4935). A deployment whose approvers all sign in through SAML has no working approver path until #4935 is decided (tracked in #6098). |
 | `503` | A4 envelope, message `authentication store is temporarily unavailable` | Central check: the step-up gate could not read the account's MFA status; it fails closed (a local account's status read can also answer a `401` whose remediation reads `auth_db unavailable`). |
+| `401` | step-up envelope, `meta.mfa_step_up_required: true`, `meta.challenge_url` | Central check: the session's MFA proof is older than `--mfa-step-up-window-secs`. Complete the step-up and retry. A cross-site `POST` with a stale proof gets this response (and an `mfa.step_up.required` audit row) rather than the `csrf.denied` row below. |
 | `403` | the standard permission-denied response | In the handler: the caller lacks `Approval:Approve`. |
 | `503` | A4 envelope, `retry_after_ms: 5000` | In the handler: the caller's session could not be resolved after the permission gate passed. The request stays pending and nothing is recorded. |
 | `403` | A4 envelope, message `cross-site request refused` | In the handler, after the central step-up check: a cookie-session `POST` whose `Origin`/`Referer` names another site, or carries neither header (a `--csrf-trusted-origin` entry is accepted). Audited as `csrf.denied`; the ticket is unchanged. Token callers are not subject to this check and are refused by the next row instead. |

@@ -575,7 +575,8 @@ Full design: `docs/auth-mfa-design.md`. Summary:
   routes (user delete and role change, token, session, engine-principal,
   RBAC-assignment and enforcement-toggle lifecycle, password reset and
   unlock, Guardian rule write / push / policy-generation raise and guard update / delete,
-  software-package write, software-deploy start, MFA recovery-code
+  software-package write, software-deploy start, approval approve and reject
+  (`POST /api/approvals/{id}/approve|reject`), MFA recovery-code
   regeneration and MFA disable, JIT elevation). 36 are enforced by the
   central chokepoint described under "MFA step-up chokepoint" below; the
   three JIT-elevation routes apply their own stricter gate in the handler.
@@ -836,8 +837,8 @@ Consequences, each deliberate:
   step-up envelope before the handler's own `403`s, and an engine principal receives `403`
   `engine_principal_denied` (audited as `mfa.step_up.required`) in place of the handler's approver-class
   refusal. The central check passes an API-token or MCP-token session (it has no MFA factor), so the
-  handler's refusal of those sessions is unchanged. The handler keeps its own step-up call as a second,
-  identical check that reuses the central verdict.
+  handler's refusal of those sessions is unchanged. The handler keeps its own step-up call, which only
+  consumes the central pass and evaluates nothing again.
 - **MCP can never approve.** The refusal is unconditional on the MCP transport, which runs no MFA step-up: the two MCP tools always
   return the typed refusal, for a bearer token and for a cookie session that reaches `/mcp/v1/` alike. This is an exception recorded in ADR-1005's exception ledger (entry 2026-10-18, "human review
   is a human-session act"; legacy REST rows `exception:#6061 revisit:2027-01-18`). The tools remain registered; listing pending approvals via MCP is unchanged. The MCP
