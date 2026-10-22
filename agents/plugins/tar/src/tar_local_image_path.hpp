@@ -1,6 +1,7 @@
 /**
- * tar_local_image_path.hpp — pure "is this executable image on a local fixed volume?"
- * classifier for the Windows module (image-load) and procperf (file-version) paths.
+ * tar_local_image_path.hpp — pure "may this executable image path be opened?" classifier
+ * for the Windows module (image-load) and procperf (file-version) paths. Only local paths
+ * pass; network paths are never opened.
  *
  * Both sources hand an image path to an API that OPENS it (GetFileAttributesExW,
  * CryptQueryObject, WinVerifyTrust, GetFileVersionInfoW). The agent runs as LocalSystem,
@@ -12,15 +13,25 @@
  *
  * Accepted (and nothing else):
  *   - `\Device\HarddiskVolume<digits>\...` (the shape the Kernel-Process IMAGE event
- *     delivers);
+ *     delivers). This is an NT volume path on ANY local volume, removable included: its
+ *     drive type is not asked for (procperf's QueryFullProcessImageNameW yields the
+ *     Win32 drive-letter form, so this arm is the module source's);
  *   - `X:\...` or `\\?\X:\...` when the caller-supplied drive type of `X:\` is
  *     DRIVE_FIXED (3).
  * Refused: UNC (`\\server\...`, `\\?\UNC\...`), `\Device\Mup`, `\Device\LanmanRedirector`,
  *   `\Device\WebDavRedirector`, any other `\Device\*`, `\SystemRoot\...`, `\??\...`, the
  *   converted `\\?\GLOBALROOT\...` form (callers classify the path as delivered, BEFORE the
  *   NT-to-Win32 conversion), a non-fixed drive letter, and the empty string. `\SystemRoot\`
- *   and `\??\` paths already yielded an unknown verdict (WinVerifyTrust rejects them), so
- *   refusing them changes nothing observable.
+ *   and `\??\` paths are refused conservatively: the Kernel-Process IMAGE event does not
+ *   deliver these forms.
+ *
+ * Residual: the check is lexical and the open happens by name afterwards (a tick later
+ * for module, immediately for procperf), so a local-looking path swapped for a symbolic
+ * link to a network target in that window is not caught. Creating such a link needs
+ * SeCreateSymbolicLinkPrivilege (administrators, or any user when Windows Developer Mode
+ * is on) and winning a race against the drain; a directory junction cannot point at a
+ * remote share. Closing it fully needs a handle-relative, hop-by-hop open like
+ * win_hive_file_guard.hpp, which is a separate change.
  *
  * The drive type is injected (the Windows shell calls GetDriveTypeW on drive_root_of()),
  * so this header needs no Windows API and runs in the unit suites on every host.
@@ -49,10 +60,10 @@ inline constexpr unsigned kDriveTypeFixed = 3;
     return {};
 }
 
-// True only for an image on a local fixed volume (see the banner). `drive_type_of_root` is
-// the OS drive type of drive_root_of(path); it is consulted only for the drive-letter forms.
-[[nodiscard]] inline bool is_local_fixed_image_path(std::string_view path,
-                                                    unsigned drive_type_of_root) noexcept {
+// True only for a local image path (see the banner). `drive_type_of_root` is the OS drive
+// type of drive_root_of(path); it is consulted only for the drive-letter forms.
+[[nodiscard]] inline bool is_local_image_path(std::string_view path,
+                                               unsigned drive_type_of_root) noexcept {
     constexpr std::string_view kVolume = "\\Device\\HarddiskVolume";
 
     if (path.starts_with(kVolume)) {

@@ -83,8 +83,6 @@ ModuleSignVerdict SigningCache::get(const std::string& full_path, std::int64_t m
 #include <wintrust.h>
 #include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 
-#include "tar_local_image_path.hpp" // refuse network-path images (see image_path_is_local)
-
 #include <atomic>
 #include <cstring> // std::memset (stale-session props reset)
 #include <thread>
@@ -92,12 +90,17 @@ ModuleSignVerdict SigningCache::get(const std::string& full_path, std::int64_t m
 #include <utility>
 #include <vector>
 
+#include "tar_local_image_path.hpp" // refuse network-path images (see image_path_is_local)
+
 #pragma comment(lib, "tdh.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "wintrust.lib")
 #pragma comment(lib, "crypt32.lib")
 
 namespace yuzu::tar {
+
+static_assert(kDriveTypeFixed == DRIVE_FIXED);
+
 namespace {
 
 // Microsoft-Windows-Kernel-Process: {22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}
@@ -151,13 +154,14 @@ std::string nt_path_to_win32(const std::string& p) {
 
 std::string wide_to_utf8(const std::wstring& w) { return yuzu::win::from_wide(w.c_str()); }
 
-// True when `p` (UTF-8, as delivered, BEFORE nt_path_to_win32) is on a local fixed volume
-// and so safe to hand to the file/trust APIs; see tar_local_image_path.hpp. The only
-// Windows API here is GetDriveTypeW on the 3-char drive root (drive-letter forms only).
+// True when `p` (UTF-8, as delivered, BEFORE nt_path_to_win32) is a local path (an NT
+// volume path, or a drive letter on a fixed drive) and so safe to hand to the file/trust
+// APIs; see tar_local_image_path.hpp. The only Windows API here is GetDriveTypeW on the
+// 3-char drive root (drive-letter forms only).
 bool image_path_is_local(const std::string& p) {
     const std::string root = drive_root_of(p);
     const unsigned drive_type = root.empty() ? 0U : GetDriveTypeW(utf8_to_wide(root).c_str());
-    return is_local_fixed_image_path(p, drive_type);
+    return is_local_image_path(p, drive_type);
 }
 
 // Read a named UInt32 property from a decoded event. Returns false if absent.
@@ -530,7 +534,7 @@ std::vector<ModuleEvent> ModuleEtwCollector::drain() {
         }
         full += e.module_name;
         if (!image_path_is_local(full)) {
-            // Not a local fixed volume (UNC / \Device\Mup / a network drive): the agent runs
+            // Not a local path (UNC / \Device\Mup / a network drive): the agent runs
             // as LocalSystem, so opening it would authenticate the machine account to that
             // host and could stall this drain (it runs under collect_mu_). Open NOTHING (not
             // even GetFileAttributesExW): keep the row with an unknown verdict.

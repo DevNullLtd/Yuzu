@@ -464,7 +464,7 @@ std::string resolve_one_version(std::uint32_t pid, std::int64_t create_time_100n
     const std::string root = drive_root_of(path_utf8);
     const unsigned drive_type =
         root.empty() ? 0U : ::GetDriveTypeW(yuzu::win::to_wide(root).c_str());
-    if (!is_local_fixed_image_path(path_utf8, drive_type))
+    if (!is_local_image_path(path_utf8, drive_type))
         return {};
 
     DWORD ignored = 0;

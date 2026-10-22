@@ -111,7 +111,7 @@ never a shell string — `tar_service_collector.cpp:244-247,277,305-306,329`; th
 executes `smbstatus` for the mapdrive collector, `tar_mapdrive_collector.cpp:1110,1165,1233`); a
 Windows ETW session on provider `Microsoft-Windows-Kernel-Process`
 (`tar_proc_etw.cpp:48-49,337,349,370,383,397`) and a second ETW session for module-load capture
-(`tar_module_etw.cpp:458-498`); an in-process macOS Endpoint Security client
+(`ModuleEtwCollector::start()` in `tar_module_etw.cpp`); an in-process macOS Endpoint Security client
 (`tar_proc_es.cpp:295-300,309-314`); raw sockets — `PF_SYSTEM`/`SYSPROTO_CONTROL` for the macOS nstat
 client (`tar_netqual_nstat.cpp:906,938`) and `AF_NETLINK`/`NETLINK_SOCK_DIAG` on Linux
 (`tar_network_collector.cpp:529`). No `popen`, `CreateProcess`, or `posix_spawn` call exists
@@ -182,7 +182,7 @@ per line); most, but not all, actions follow the plugin-wide `discriminator\|fie
 pipe-delimited convention (`tar_status_format.hpp:3-20`, `tar_collectors.hpp:39-57`). The four
 collection actions share one line shape, `tar\|collect_<leg>\|<events_recorded>\|<token>`, where
 `<token>` is one of `source_disabled`, `unsupported_platform`, `baseline`, `sample_recorded`,
-`apps_recorded`, `cursor_advanced`, `cursor_lost`, `capture_incomplete`, `counters_unavailable`, `state_unreadable` (`tar_collectors.hpp:51-80`).
+`apps_recorded`, `cursor_advanced`, `cursor_lost`, `capture_incomplete`, `counters_unavailable`, `state_unreadable` (the `kCollectStatus*` tokens in `tar_collectors.hpp`; `state_unreadable` is emitted by `skip_token()` in `tar_plugin.cpp`).
 `status`'s wire format is line-oriented `key\|value` pairs (`storage_state\|ok`,
 `record_count\|<n>`, `config\|<key>\|<value>`, ...), not one positional row — the five YAML columns
 below correspond to five of those lines; the rest (`config\|*`, `retention_guard\|*`,
@@ -647,7 +647,7 @@ three broken legs; it is one chokepoint. See Caveats item 1.
    (`config_unreadable`: it cannot confirm the source is disabled).** It requires the named source to
    already be disabled, holding `collect_mu_` (and `software_collect_mu_` for `software`) across
    both the enabled-check and the delete to close the scan-then-purge race a concurrent re-enable
-   would otherwise open (`tar_plugin.cpp:3013-3031`).
+   would otherwise open (`do_purge_source` in `tar_plugin.cpp`).
 4. **Several legs are declared but not implemented.** `collect_perf` on macOS (`host_statistics`)
    and `collect_software` on Linux/macOS (`dpkg_rpm`/`pkgutil`) are `planned`, not `constrained` —
    no macOS code path exists in `tar_perf.cpp` or `tar_proc_perf.cpp` at all
@@ -673,5 +673,5 @@ three broken legs; it is one chokepoint. See Caveats item 1.
 - Capability rows: `server/core/src/capability_decls/core_dispatch_capabilities.hpp` · `server/core/src/capability_decls/plugin_action_catalogue_a.hpp`
 - Tests: `tests/unit/server/test_tar_process_tree.cpp` · `tests/unit/server/test_tar_tree_routes.cpp` · `tests/unit/test_tar_aggregator.cpp` · `tests/unit/test_tar_arp.cpp` · `tests/unit/test_tar_capability_table.cpp` · `tests/unit/test_tar_capture_status.cpp` · `tests/unit/test_tar_cursor.cpp` · `tests/unit/test_tar_diff.cpp` · `tests/unit/test_tar_local_dispatcher.cpp` · `tests/unit/test_tar_mapdrive.cpp` · `tests/unit/test_tar_module_etw.cpp` · `tests/unit/test_tar_module_stream.cpp` · `tests/unit/test_tar_netconn.cpp` · `tests/unit/test_tar_netqual_nstat.cpp` · `tests/unit/test_tar_perf.cpp` · `tests/unit/test_tar_power.cpp` · `tests/unit/test_tar_proc_es.cpp` · `tests/unit/test_tar_proc_etw.cpp` · `tests/unit/test_tar_proc_perf.cpp` · `tests/unit/test_tar_removable.cpp` · `tests/unit/test_tar_schema_registry.cpp` · `tests/unit/test_tar_service.cpp` · `tests/unit/test_tar_software.cpp` · `tests/unit/test_tar_source_health.cpp` · `tests/unit/test_tar_store.cpp` · `tests/unit/test_tar_usage.cpp` · `tests/unit/test_tar_warehouse.cpp` · `tests/unit/test_tar_win_raii_guards.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-10-14-dex-tar-titles.changed.md` · `changelog.d/2026-10-21-tar-all-sources-default-on.changed.md` · `changelog.d/20261014-tar-adhoc-sql-moved.changed.md`
+- Changelog: `changelog.d/2026-10-14-dex-tar-titles.changed.md` · `changelog.d/2026-10-21-tar-all-sources-default-on-hardening.security.md` · `changelog.d/2026-10-21-tar-all-sources-default-on.changed.md` · `changelog.d/20261014-tar-adhoc-sql-moved.changed.md`
 <!-- END GENERATED -->

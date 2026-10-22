@@ -1885,6 +1885,45 @@ TEST_CASE("TarDatabase: a corrupt-and-unmovable tar.db fails closed (#559 primar
         CHECK(reopened.error().find("corrupt and unmovable") != std::string::npos);
     // dir_guard restores perms + removes the dir.
 }
+
+TEST_CASE("TarDatabase: open() sets tar.db and its WAL sidecars owner-only (0600)",
+          "[tar][store][lifecycle][hardening]") {
+    // The db is seeded group/other-readable (0644) with an explicit chmod, which no umask
+    // can alter, so the assertions fail unless open() itself re-modes an EXISTING file
+    // (and, because SQLite derives a sidecar's mode from the db file, its -wal/-shm too).
+    constexpr auto kOwnerOnly = fs::perms::owner_read | fs::perms::owner_write;
+    const auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_mode_");
+    struct Cleanup {
+        fs::path db;
+        ~Cleanup() {
+            std::error_code ec;
+            fs::remove(db, ec);
+            fs::remove(fs::path{db.string() + "-wal"}, ec);
+            fs::remove(fs::path{db.string() + "-shm"}, ec);
+        }
+    } cleanup{tmp};
+    {
+        auto created = TarDatabase::open(tmp);
+        REQUIRE(created.has_value());
+    } // closed
+    std::error_code ec;
+    fs::permissions(tmp,
+                    kOwnerOnly | fs::perms::group_read | fs::perms::others_read,
+                    fs::perm_options::replace, ec);
+    REQUIRE_FALSE(ec);
+    REQUIRE((fs::status(tmp).permissions() & fs::perms::mask) != kOwnerOnly); // seed took
+
+    auto reopened = TarDatabase::open(tmp);
+    REQUIRE(reopened.has_value());
+    for (const char* suffix : {"", "-wal", "-shm"}) {
+        const fs::path p{tmp.string() + suffix};
+        INFO("file=" << p.filename().string());
+        if (suffix[0] != '\0' && !fs::exists(p))
+            continue; // a sidecar is checked only where SQLite has created it
+        REQUIRE(fs::exists(p));
+        CHECK((fs::status(p).permissions() & fs::perms::mask) == kOwnerOnly);
+    }
+}
 #endif // _WIN32
 
 // =============================================================================

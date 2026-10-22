@@ -825,16 +825,22 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
                 spdlog::error("TarDatabase: v8 migration failed at '{}' — rolled back, schema "
                               "remains at v7, retried on the next open",
                               failed_step);
+                // v8_migration is the outermost savepoint, so RELEASE COMMITS whatever the
+                // failed steps left behind. Run it only after ROLLBACK TO has succeeded;
+                // when ROLLBACK TO fails, go straight to a plain ROLLBACK.
                 const int rollback_rc =
                     sqlite3_exec(raw_db, "ROLLBACK TO v8_migration", nullptr, nullptr, nullptr);
-                const int release_rc =
-                    sqlite3_exec(raw_db, "RELEASE v8_migration", nullptr, nullptr, nullptr);
+                int release_rc = -1; // -1 = not attempted
+                if (rollback_rc == SQLITE_OK)
+                    release_rc =
+                        sqlite3_exec(raw_db, "RELEASE v8_migration", nullptr, nullptr, nullptr);
                 if (rollback_rc != SQLITE_OK || release_rc != SQLITE_OK) {
                     // An open savepoint would leave every later write uncommitted until
                     // close. A plain ROLLBACK ends it; with no transaction open it fails
                     // harmlessly, so its result is ignored.
                     spdlog::error("TarDatabase: v8 rollback incomplete (ROLLBACK TO rc={}, "
-                                  "RELEASE rc={}): {} — ending the transaction",
+                                  "RELEASE rc={}, -1 = not attempted): {} — ending the "
+                                  "transaction",
                                   rollback_rc, release_rc, sqlite3_errmsg(raw_db));
                     sqlite3_exec(raw_db, "ROLLBACK", nullptr, nullptr, nullptr);
                 }
