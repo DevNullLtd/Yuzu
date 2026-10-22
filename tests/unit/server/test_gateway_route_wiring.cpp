@@ -3561,11 +3561,27 @@ TEST_CASE("#5683 ProxyRegister: racing replay adopts of one unheld id by two age
             ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
             ctx.AddMetadata(std::string(AgentServiceImpl::kSessionMetadataKey), sid);
             apb::RegisterResponse resp;
-            while (!go.load(std::memory_order_acquire)) {}
+            while (!go.load(std::memory_order_acquire))
+                std::this_thread::yield();
             out = harness.stub_->ProxyRegister(&ctx, req, &resp);
         };
         std::thread ta(call, std::cref(req_a), std::ref(status_a));
         std::thread tb(call, std::cref(req_b), std::ref(status_b));
+        // Declared AFTER the threads: on any unwind the release flag is set
+        // first (so a spinning thread can finish), then both are joined. A
+        // plain std::thread plus guards, not std::jthread (Apple libc++ has
+        // none); a throwing REQUIRE would otherwise destroy a joinable thread.
+        struct JoinGuard {
+            std::thread& t;
+            ~JoinGuard() {
+                if (t.joinable())
+                    t.join();
+            }
+        } join_a{ta}, join_b{tb};
+        struct ReleaseOnExit {
+            std::atomic<bool>& flag;
+            ~ReleaseOnExit() { flag.store(true, std::memory_order_release); }
+        } release_on_exit{go};
         go.store(true, std::memory_order_release);
         ta.join();
         tb.join();
@@ -3630,7 +3646,16 @@ TEST_CASE("#5683 NotifyStreamStatus CONNECTED: a fallback insert refused by the 
     notif.set_gateway_node("node-us");
     notif.add_wire_capabilities("cap-us");
     gw::StreamStatusAck ack;
+    yuzu::test::LogCapture capture;
     REQUIRE(svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack).ok());
+    capture.stop();
+
+    // A refused CONNECTED is not acknowledged and must not log the common-tail
+    // "stream CONNECTED" line for a stream the directory just refused.
+    CHECK_FALSE(ack.acknowledged());
+    CHECK(capture.text().find("stream CONNECTED") == std::string::npos);
+    CHECK(capture.text().find("that another agent's route already holds (#5683)") !=
+          std::string::npos);
 
     CHECK(metrics
               .counter("yuzu_server_gateway_route_desync_total",
@@ -3654,6 +3679,79 @@ TEST_CASE("#5683 NotifyStreamStatus CONNECTED: a fallback insert refused by the 
     CHECK(it->target_id == "yuzu_test_us_ntf_b");
     CHECK(it->result == "failure");
     CHECK(it->detail.find(sid_b) == std::string::npos);
+}
+
+// UP-2 / CH-1 pin: the CONNECTED refusal only covers a presenter with NO directory row.
+// A presenter whose row still exists (here a tombstone: session NULL) hits the fallback
+// INSERT's ON CONFLICT (agent_id) DO NOTHING arbiter before the unique index can fire, so the
+// CONNECTED lands as session_mismatch and the in-memory placement stays published. That is
+// the documented tombstoned-victim residual (ADR-2002 7f "Still open", #5685 area), pinned
+// here so the narrowed doc claim (gateway.md, the alert, the changelog) stays true.
+TEST_CASE("#5683 NotifyStreamStatus CONNECTED: a presenter with a tombstoned row for an id "
+          "another agent holds is a session_mismatch and not a held_by_other_agent refusal",
+          "[pg][gateway_route_wiring][ws5][unique_session]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    PgAuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    svc.set_gateway_route_store(&store);
+
+    auto req_y = make_gw_register(auth_mgr, "yuzu_test_us_tomb_y");
+    auto req_x = make_gw_register(auth_mgr, "yuzu_test_us_tomb_x");
+    apb::RegisterResponse resp_y;
+    apb::RegisterResponse resp_x;
+    REQUIRE(svc.ProxyRegister(/*context=*/nullptr, &req_y, &resp_y).ok());
+    REQUIRE(svc.ProxyRegister(/*context=*/nullptr, &req_x, &resp_x).ok());
+    const std::string sid_x = resp_x.session_id();
+
+    // X's row becomes a tombstone (session NULL) while its local session lives,
+    // and Y's row now carries X's session id.
+    raw_exec(db.dsn(), "UPDATE gateway_route_store.agent_routes SET session_id = NULL, "
+                       "lease_until = NULL WHERE agent_id = 'yuzu_test_us_tomb_x'");
+    raw_bump_epoch(db.dsn(), "yuzu_test_us_tomb_y", 7, sid_x);
+
+    gw::StreamStatusNotification notif;
+    notif.set_agent_id("yuzu_test_us_tomb_x");
+    notif.set_session_id(sid_x);
+    notif.set_event(gw::StreamStatusNotification::CONNECTED);
+    notif.set_cluster_id("cluster-us");
+    notif.set_gateway_node("node-us");
+    notif.add_wire_capabilities("cap-us");
+    gw::StreamStatusAck ack;
+    REQUIRE(svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack).ok());
+
+    CHECK(metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "announce_connected"}, {"outcome", "session_mismatch"}})
+              .value() == 1);
+    CHECK(metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "announce_connected"}, {"outcome", "session_held_by_other_agent"}})
+              .value() == 0);
+    // Not unpublished: the residual (a CONNECTED for a presenter that still has a row).
+    CHECK(registry.gateway_has_wire_capability("yuzu_test_us_tomb_x", "cap-us"));
+}
+
+// qe-F1: the new desync label value is pre-seeded at construction (a rate() over a series
+// that does not exist yet is silent), so a fresh service already serialises it at 0.
+TEST_CASE("GatewayUpstreamServiceImpl: the #5683 desync series exists before any traffic",
+          "[pg][gateway_route_wiring][ws5][unique_session]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture f(db.dsn());
+    // Deliberately no metrics.counter() for this series before serialising: that call
+    // would create it and make the assertion vacuous.
+    const std::string text = f.metrics.serialize();
+    CHECK(text.find("yuzu_server_gateway_route_desync_total{op=\"announce_connected\","
+                    "outcome=\"session_held_by_other_agent\"} 0") != std::string::npos);
+    CHECK(text.find("yuzu_server_gateway_route_desync_total{op=\"proxy_register\","
+                    "outcome=\"session_held_by_other_agent\"} 0") != std::string::npos);
 }
 
 TEST_CASE("WS-5 ProxyRegister: an attacker presenting a victim's session id is refused and the "

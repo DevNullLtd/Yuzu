@@ -216,7 +216,8 @@ void record_directory_desync(yuzu::MetricsRegistry* metrics, std::string_view op
                      "buggy gateway or an agent sending a malformed session_id",
                      count, outcome);
     } else if (op == "proxy_register" || op == "session_lookup" ||
-               (op == "notify_stream_status" && outcome == "connected_unverified")) {
+               (op == "notify_stream_status" && outcome == "connected_unverified") ||
+               (op == "announce_connected" && outcome == "session_held_by_other_agent")) {
         // The call site logs these itself, naming the sanitized id.
     } else if (op == "proxy_inventory" && outcome == "unknown_session") {
         spdlog::warn("[gateway] ProxyInventory: presented session matched no directory row and no "
@@ -366,8 +367,9 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "replayed id another agent's row already holds (a forged or colliding id); both are "
             "refused and both expect zero, so any increase is actionable. #5683: "
             "op=\"announce_connected\" outcome \"session_held_by_other_agent\" is the same "
-            "condition caught on the CONNECTED path (the unique session index refused the "
-            "fallback insert); the placement is unpublished and the same alert covers it. "
+            "condition caught on the CONNECTED path when the presenting agent has no directory "
+            "row (the unique session index refused the fallback insert); the placement is "
+            "unpublished and the same alert covers it. "
             "op=\"notify_stream_status\" outcome \"connected_unverified\" is a CONNECTED refused "
             "because the directory read degraded and this replica holds no matching local "
             "session (the agent recovers by reconnecting). HA WS-5 lookups: "
@@ -459,7 +461,8 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
         // HA WS-5: session-keyed RPCs now resolve against the DIRECTORY.
         // `unknown_session` under op=session_lookup/proxy_inventory means
         // unknown to the directory; `ambiguous_session` is a session_id that
-        // more than one directory row carries (session_id is not unique).
+        // more than one directory row carries (unique since v5, #5683, so this
+        // fires only after a hand-dropped index; every match is still returned).
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "session_lookup"}, {"outcome", "ambiguous_session"}});
         metrics_->counter("yuzu_server_gateway_route_desync_total",
@@ -2236,7 +2239,8 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         // RPC now would split the two (memory says connected, directory does
         // not) and risk a routing black hole for no correctness gain. The
         // reader's `routable` trust predicate, not this write, is the integrity
-        // backstop. #4669: the ONE exception is `cluster_affinity_violation`
+        // backstop. #4669: the exceptions are `cluster_affinity_violation` and
+        // (#5683) `session_held_by_other_agent`, both fail-closed arms
         // below — by this point the #4669 pre-check ABOVE has already refused
         // the common case, so reaching a violation HERE is only the narrow
         // race window that comment describes; still counted distinctly, but
@@ -2332,6 +2336,13 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                 // branch above: set_gateway_route already published the
                 // placement in memory, so revert it, and leave a best-effort
                 // audit row.
+                //
+                // Scope: this arm fires only when the presenting agent has NO
+                // directory row (the fallback insert is what the unique index
+                // refuses). An agent that still has a row, including a
+                // tombstone, is not covered: its CONNECTED lands as
+                // session_mismatch and does not unpublish (the tombstoned-victim
+                // residual recorded in ADR-2002 7f "Still open", #5685 area).
                 spdlog::warn("[gateway] NotifyStreamStatus: CONNECTED for agent {} presents "
                              "session {} that another agent's route already holds (#5683) — "
                              "refusing, not publishing this placement",
@@ -2361,6 +2372,12 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                     if (!audit_store_->log(ev))
                         signal_grpc_audit_failed(context);
                 }
+                // Refused, so say so: not acknowledged, and return before the
+                // common tail logs "stream CONNECTED" for a stream we just
+                // refused (mirrors the pre-check affinity refusal above). The
+                // sibling cluster_affinity_violation arm is #5977's scope.
+                response->set_acknowledged(false);
+                return grpc::Status::OK;
             } else if (!res->matched) {
                 record_directory_desync(metrics_, "announce_connected", "session_mismatch");
             }
