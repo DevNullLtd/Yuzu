@@ -1058,8 +1058,11 @@ OutboundRead read_user_outbound_history(HKEY user_root, const std::string& profi
                 if (!unc.empty()) {
                     RegKeyGuard sk;
                     int64_t ts = 0;
-                    if (RegOpenKeyExW(mp.h, sub, 0, KEY_READ, &sk.h) == ERROR_SUCCESS)
+                    const LONG sk_rc = RegOpenKeyExW(mp.h, sub, 0, KEY_READ, &sk.h);
+                    if (sk_rc == ERROR_SUCCESS)
                         ts = key_last_write_epoch(sk.h);
+                    else
+                        note_failure(sk_rc); // the row's timestamp is lost: not a clean read
                     MapDriveHistoryRow r;
                     r.ts = ts;
                     r.entry.direction = "outbound";
@@ -1101,12 +1104,38 @@ OutboundRead read_user_outbound_history(HKEY user_root, const std::string& profi
 // problematic, on a recurring cadence, from the SAME single-threaded dispatch that also runs TAR's
 // other four interval triggers including retention -- an uncancellable hang here would wedge all
 // of them indefinitely, with no self-recovery (governance Gate 6, sre). bounded_call_ex (this
-// plugin's first consumer of the shared primitive; see dism_bounded_call.hpp/power_health_plugin.cpp
-// for the established pattern) bounds the WAIT, not the call: the mount runs on a detached thread,
-// and the dispatching thread gives up and moves on after kHiveMountBoundMs, leaving an actually-
-// hung thread to finish (or not) on its own, still holding the process-wide offline-hive mutex --
-// that residual (another with_user_hive caller blocking behind it) is narrower and pre-existing for
-// every caller of this mutex, not something this one call site can fix.
+// plugin's first consumer of the shared primitive) bounds the WAIT, not the call: the mount runs
+// on a detached thread, and the dispatching thread gives up and moves on after kHiveMountBoundMs.
+//
+// The residual, stated plainly, because dism_bounded_call.hpp takes the OPPOSITE stance (its work
+// lives in agent-core, which is never unloaded): the abandoned thread keeps executing THIS
+// plugin's code. The agent's teardown can FreeLibrary the plugin while it runs, and the SDK's
+// Plugin::shutdown contract says such a thread must never touch the plugin's code after the
+// bounded wait. This call site cannot join it (a hung RegLoadKeyW has no cancel), so on the first
+// timeout the plugin module is PINNED (pin_plugin_module, below): unload can then never unmap code
+// the thread is running, at the price of the DLL staying loaded until process exit. Three more
+// costs of a stuck mount are accepted and recorded in the governance ledger: it holds the
+// process-wide offline-hive mutex (every other with_user_hive caller queues behind it), it keeps
+// SeBackup/SeRestore enabled on the process token (PrivilegeScope restores only when the call
+// returns), and it occupies one of the shared primitive's 64 outstanding-call slots. The walk
+// therefore stops mounting after the first timeout (decide_mount_call): later profiles would only
+// queue behind the stuck mount, time out, and burn attempts they never made.
+// Pins this plugin's module so FreeLibrary can never unmap it (the pin is for the life of the
+// process). Called on the dispatching thread the first time a mount times out; a no-op after.
+void pin_plugin_module_once() noexcept {
+    static std::atomic<bool> pinned{false};
+    if (pinned.exchange(true))
+        return;
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                            reinterpret_cast<LPCWSTR>(&pin_plugin_module_once), &module)) {
+        spdlog::error("TAR mapdrive: could not pin the plugin module after a hive-mount timeout "
+                      "(GetLastError {}); an unload while the abandoned mount thread runs is "
+                      "unsafe",
+                      GetLastError());
+    }
+}
+
 constexpr std::chrono::milliseconds kHiveMountBoundMs{30000}; // generous for a legitimately slow
                                                               // network-share read; see dism's 17s
                                                               // for a comparable Windows API bound
@@ -1137,6 +1166,8 @@ void enum_registry_outbound_history(MapDriveHistory& h, const std::vector<std::s
             key_open_rc[f.sid] = f.rc;
     }
 
+    // Set after a bounded mount timed out or was refused: no further mount is tried this run.
+    bool mounts_halted = false;
     for (const auto& profile : profiles) {
         if (only_sids) {
             bool wanted = false;
@@ -1148,6 +1179,17 @@ void enum_registry_outbound_history(MapDriveHistory& h, const std::vector<std::s
             }
             if (!wanted)
                 continue;
+        }
+        if (mounts_halted) {
+            // Not tried, so not a failed attempt (apply_outcomes keeps it unchanged); on the first
+            // pass initial_pending still seeds it so the profile is retried rather than lost.
+            ProfileHiveOutcome skipped;
+            skipped.sid = profile.sid;
+            skipped.status = yuzu::win::HiveAccessStatus::mount_failed;
+            skipped.token = "skipped_after_timeout";
+            skipped.attempted = false;
+            h.profiles.push_back(std::move(skipped));
+            continue;
         }
 
         // Copied by value, never captured by reference: a TimedOut result means the detached
@@ -1173,17 +1215,23 @@ void enum_registry_outbound_history(MapDriveHistory& h, const std::vector<std::s
         if (bounded.status != yuzu::shared::BoundedCallStatus::Completed) {
             // TimedOut (the mount is still running, detached, on its own time -- never joined,
             // never touched again) or Rejected (the shared outstanding-call ceiling was already
-            // full, so no thread was even spawned). Either way this profile is unresolved this
-            // attempt, same as any other failure: bump it through the normal retry path rather
-            // than blocking the caller, which is the one thing that must never happen here.
+            // full, so no thread was even spawned). Neither may block the caller, the one thing
+            // that must never happen here. A timeout is one real, failed attempt; a refusal is
+            // not an attempt at all. Either way the walk stops mounting (decide_mount_call).
+            const auto decision = yuzu::tar::decide_mount_call(
+                bounded.status == yuzu::shared::BoundedCallStatus::TimedOut
+                    ? yuzu::tar::MountCallResult::timed_out
+                    : yuzu::tar::MountCallResult::rejected);
+            if (decision.pin_module)
+                pin_plugin_module_once();
             ProfileHiveOutcome outcome;
             outcome.sid = profile.sid;
             outcome.status = yuzu::win::HiveAccessStatus::mount_failed;
-            outcome.token = bounded.status == yuzu::shared::BoundedCallStatus::TimedOut
-                               ? "timeout"
-                               : "mount_failed";
+            outcome.token = decision.attempted ? "timeout" : "mount_rejected";
+            outcome.attempted = decision.attempted;
             outcome.complete = true; // nothing about this profile's cap/completeness changed
             h.profiles.push_back(std::move(outcome));
+            mounts_halted = decision.halt_walk;
             continue;
         }
         BoundedProfileRead& result = *bounded.value;
@@ -1232,6 +1280,8 @@ void enum_registry_outbound_history(MapDriveHistory& h, const std::vector<std::s
         // cap-hit-stops-the-walk case below already covers every UNWALKED profile via
         // h.complete; this profile doesn't need a second, misattributed signal.
         outcome.complete = read.complete;
+        if (status == yuzu::win::HiveAccessStatus::ok && read.rc == 0 && !read.complete)
+            outcome.token = "row_cap"; // the read was cut by the row cap: an attempt, not a success
         h.profiles.push_back(std::move(outcome));
 
         // A per-profile access failure (hive corrupt, locked, or privileges

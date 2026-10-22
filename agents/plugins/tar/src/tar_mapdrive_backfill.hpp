@@ -66,14 +66,46 @@ struct PendingState {
 /// `complete` is false when the hive mounted and read fine but this profile's own walk was cut by
 /// kMapDriveHistoryCap (read ok, just not ALL of it); `read_ok` is false when the hive mounted but
 /// an inner registry key open or enumeration failed with a code other than not-found/no-more-
-/// items (the hive was readable; this one key wasn't).
+/// items (the hive was readable; this one key wasn't). `attempted` is false when no mount was
+/// actually tried for this profile in this run (the shared outstanding-call ceiling refused the
+/// call, or an earlier profile's mount timed out and the walk stopped mounting): such an outcome
+/// is never a failed attempt, so apply_outcomes keeps the entry unchanged instead of bumping it.
 struct ProfileHiveOutcome {
     std::string sid;
     yuzu::profiles::HiveAccessStatus status{yuzu::profiles::HiveAccessStatus::ok};
     std::string token;
     bool complete = true;
     bool read_ok = true;
+    bool attempted = true;
 };
+
+/// How a bounded mount-and-read call ended (the collector maps bounded_call_ex's status here so
+/// this header stays free of the shared bounded-wait primitive).
+enum class MountCallResult { completed, timed_out, rejected };
+
+/// What the per-profile walk does with a bounded call's result. A timed-out mount is abandoned,
+/// not cancelled: its thread keeps running, still holding the process-wide offline-hive mutex,
+/// so every later offline mount would queue behind it and time out too -- the walk stops mounting
+/// (`halt_walk`) and the remaining profiles are recorded as not attempted. The thread also runs
+/// plugin code, so the plugin module is pinned (`pin_module`) to keep an unload from unmapping it.
+/// A rejected call never ran the mount at all (the ceiling was full), so it is not an attempt.
+struct MountCallDecision {
+    bool attempted = true;
+    bool halt_walk = false;
+    bool pin_module = false;
+};
+
+[[nodiscard]] constexpr MountCallDecision decide_mount_call(MountCallResult r) noexcept {
+    switch (r) {
+    case MountCallResult::completed:
+        return {true, false, false};
+    case MountCallResult::timed_out:
+        return {true, true, true};
+    case MountCallResult::rejected:
+        return {false, true, false};
+    }
+    return {true, true, false}; // unreachable; a corrupt value is treated as a stop
+}
 
 /// sid abandoned this run without a further acquisition attempt, with the token that explains
 /// why: "exhausted" (already at the cap when this apply ran) or the triggering outcome's own
@@ -83,18 +115,16 @@ struct RetryAbandoned {
     std::string token;
 };
 
-/// sid retained unchanged (no bump) because this run's walk never reached it: `cause` is
-/// "profile_list_incomplete" when the ProfileList walk itself was cut short, so absence here
-/// proves nothing about this profile. (A resolved-but-cap-cut outcome -- the hive read fine, just
-/// not completely -- is NOT this case; it is unchanged too, but reported via `failed`, since this
-/// run DID observe it.)
+/// sid retained unchanged (no bump) because this run did not try it: `cause` is
+/// "profile_list_incomplete" when the ProfileList walk itself was cut short (absence proves
+/// nothing about this profile), or the token of an outcome with attempted == false (the mount
+/// was refused by the ceiling or skipped after an earlier timeout).
 struct RetryRetained {
     std::string sid;
     std::string cause;
 };
 
-/// Every retryable outcome this run actually observed, with the attempt count AFTER any bump
-/// (unchanged for the read-ok-but-incomplete case, which is retryable but never bumped).
+/// Every retryable outcome this run actually observed, with the attempt count AFTER the bump.
 struct RetryFailure {
     std::string sid;
     int attempts = 0;
@@ -237,6 +267,8 @@ retry_sids(const PendingState& st, int max_attempts = kMapDriveBackfillMaxAttemp
 /// timestamp to build the first PendingState): every outcome this run could not fully resolve
 /// (any non-ok status, an ok mount with a failed inner read, or an ok-and-read-ok walk the cap
 /// cut short) starts at attempt 1 -- the first pass itself is attempt 1, not attempt 0.
+/// A profile the first pass did not try (`attempted` false) is seeded at 1 as well: the persisted
+/// grammar has no zero count, and later retry runs never charge an attempt that was not made.
 [[nodiscard]] inline std::vector<PendingProfile>
 initial_pending(const std::vector<ProfileHiveOutcome>& outcomes) {
     std::vector<PendingProfile> out;
@@ -262,9 +294,12 @@ initial_pending(const std::vector<ProfileHiveOutcome>& outcomes) {
 ///     simply gone (vanished, dropped); `complete` false means the walk never reached it, so its
 ///     absence proves nothing (retained unchanged, cause "profile_list_incomplete").
 ///  3. ok + read_ok + complete: fully resolved, dropped silently (no longer pending).
-///  4. ok + read_ok + !complete: the hive read fine, just not completely (cap-cut) -- retained
-///     unchanged (no bump; it was not a failed attempt) but still logged in `failed`, since this
-///     run DID observe it.
+///  3a. An outcome with attempted == false (the mount was never tried this run): retained
+///     unchanged, no bump, cause = the outcome's token. It was not a failed attempt.
+///  4. ok + read_ok + !complete: the hive read fine, just not completely (cap-cut). That is a
+///     real acquisition, so it counts like any other attempt -- bump, then abandon if the bump
+///     reaches max_attempts, else retain at the bumped count. (Retaining it unchanged retried a
+///     cap-cut profile forever, against the "total number of acquisitions" contract above.)
 ///  5. Anything else (a non-ok status, or ok with !read_ok): a real failed attempt -- bump, then
 ///     abandon (with this outcome's own token) if the bump reaches max_attempts, else retain at
 ///     the bumped count; either way logged in `failed` with the post-bump count.
@@ -294,14 +329,14 @@ apply_outcomes(const PendingState& state, const std::vector<ProfileHiveOutcome>&
             }
             continue;
         }
+        if (!o->attempted) {
+            r.next.profiles.push_back(p); // never tried this run: not a failed attempt
+            r.retained.push_back(RetryRetained{p.sid, o->token});
+            continue;
+        }
         const bool ok_status = (o->status == yuzu::profiles::HiveAccessStatus::ok);
         if (ok_status && o->read_ok && o->complete)
             continue; // fully resolved
-        if (ok_status && o->read_ok && !o->complete) {
-            r.next.profiles.push_back(p); // cap-cut, not a failed attempt: no bump
-            r.failed.push_back(RetryFailure{p.sid, p.attempts, o->token});
-            continue;
-        }
         const int bumped = p.attempts + 1;
         if (bumped >= max_attempts)
             r.abandoned.push_back(RetryAbandoned{p.sid, o->token});

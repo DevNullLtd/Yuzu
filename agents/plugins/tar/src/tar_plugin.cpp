@@ -945,7 +945,12 @@ public:
                 if (!enumerated_ok) {
                     // Enumeration threw (already logged) — leave the key unset so the
                     // next restart retries rather than permanently skipping history.
-                } else if (typed.empty() || db_->insert_mapdrive_events(typed)) {
+                } else if (typed.empty() ||
+                           // skip_known_historical: a restart after the commit below failed
+                           // re-walks every profile, and the rows the failed pass already wrote
+                           // must not be written a second time (the retry path's own insert).
+                           db_->insert_mapdrive_events(typed, std::nullopt,
+                                                       /*skip_known_historical=*/true)) {
                     if (typed.empty())
                         spdlog::info("TAR: no historical mapped drives found to backfill");
                     else
@@ -2704,6 +2709,11 @@ private:
         }
         for (const auto& ret : r.retained) {
             spdlog::info("TAR mapdrive backfill: profile {} retained ({})", ret.sid, ret.cause);
+        }
+        for (const auto& sid : r.vanished) {
+            spdlog::info("TAR mapdrive backfill: profile {} is no longer in the profile list; "
+                         "dropped from the pending set",
+                         sid);
         }
         if (!db_->set_config("mapdrive_backfill_pending", r.next.profiles.empty()
                                                                ? std::string{}

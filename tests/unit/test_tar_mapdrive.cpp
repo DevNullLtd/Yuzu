@@ -968,21 +968,101 @@ TEST_CASE("mapdrive backfill apply_outcomes (complete=true): ok+read_ok+complete
     CHECK(r.next.last_ts == 1000); // carried
 }
 
-TEST_CASE("mapdrive backfill apply_outcomes (complete=true): ok+incomplete retained unchanged, "
-          "listed in failed",
+TEST_CASE("mapdrive backfill apply_outcomes (complete=true): ok+incomplete counts as an attempt "
+          "and is listed in failed",
           "[tar][mapdrive][backfill]") {
     PendingState st;
     st.profiles = {{"S-1-5-21-1", 2}};
     const std::vector<ProfileHiveOutcome> outcomes = {
-        {"S-1-5-21-1", HiveAccessStatus::ok, "ok", /*complete=*/false, /*read_ok=*/true}};
+        {"S-1-5-21-1", HiveAccessStatus::ok, "row_cap", /*complete=*/false, /*read_ok=*/true}};
     const auto r = apply_outcomes(st, outcomes, true, 7);
     REQUIRE(r.next.profiles.size() == 1);
-    CHECK(r.next.profiles[0].attempts == 2); // unchanged, no bump
+    CHECK(r.next.profiles[0].attempts == 3); // bumped: a cap-cut read is a real acquisition
     REQUIRE(r.failed.size() == 1);
     CHECK(r.failed[0].sid == "S-1-5-21-1");
-    CHECK(r.failed[0].attempts == 2);
+    CHECK(r.failed[0].attempts == 3);
+    CHECK(r.failed[0].token == "row_cap");
     CHECK(r.abandoned.empty());
     CHECK(r.retained.empty());
+}
+
+TEST_CASE("mapdrive backfill apply_outcomes: a cap-cut profile is abandoned when the bump reaches "
+          "the maximum, never retried forever",
+          "[tar][mapdrive][backfill]") {
+    PendingState st;
+    st.profiles = {{"S-1-5-21-1", 6}};
+    const std::vector<ProfileHiveOutcome> outcomes = {
+        {"S-1-5-21-1", HiveAccessStatus::ok, "row_cap", /*complete=*/false, /*read_ok=*/true}};
+    const auto r = apply_outcomes(st, outcomes, true, 7);
+    CHECK(r.next.profiles.empty());
+    REQUIRE(r.abandoned.size() == 1);
+    CHECK(r.abandoned[0].sid == "S-1-5-21-1");
+    CHECK(r.abandoned[0].token == "row_cap");
+}
+
+TEST_CASE("mapdrive backfill apply_outcomes: an outcome that was never attempted is retained "
+          "unchanged and costs no attempt",
+          "[tar][mapdrive][backfill]") {
+    PendingState st;
+    st.profiles = {{"S-1-5-21-1", 3}, {"S-1-5-21-2", 6}};
+    ProfileHiveOutcome rejected{"S-1-5-21-1", HiveAccessStatus::mount_failed, "mount_rejected"};
+    rejected.attempted = false;
+    ProfileHiveOutcome skipped{"S-1-5-21-2", HiveAccessStatus::mount_failed,
+                               "skipped_after_timeout"};
+    skipped.attempted = false;
+    const auto r = apply_outcomes(st, {rejected, skipped}, true, 7);
+    REQUIRE(r.next.profiles.size() == 2);
+    CHECK(r.next.profiles[0].attempts == 3); // unchanged
+    CHECK(r.next.profiles[1].attempts == 6); // unchanged, and not abandoned at the maximum - 1
+    CHECK(r.failed.empty());
+    CHECK(r.abandoned.empty());
+    REQUIRE(r.retained.size() == 2);
+    CHECK(r.retained[0].cause == "mount_rejected");
+    CHECK(r.retained[1].cause == "skipped_after_timeout");
+}
+
+TEST_CASE("mapdrive backfill apply_outcomes: a timed-out mount is one failed attempt",
+          "[tar][mapdrive][backfill]") {
+    PendingState st;
+    st.profiles = {{"S-1-5-21-1", 2}};
+    const std::vector<ProfileHiveOutcome> outcomes = {
+        {"S-1-5-21-1", HiveAccessStatus::mount_failed, "timeout", true, true}};
+    const auto r = apply_outcomes(st, outcomes, true, 7);
+    REQUIRE(r.next.profiles.size() == 1);
+    CHECK(r.next.profiles[0].attempts == 3);
+    REQUIRE(r.failed.size() == 1);
+    CHECK(r.failed[0].token == "timeout");
+}
+
+TEST_CASE("mapdrive backfill initial_pending: a profile the first pass did not try is still "
+          "seeded so it is retried, not lost",
+          "[tar][mapdrive][backfill]") {
+    ProfileHiveOutcome skipped{"S-1-5-21-2", HiveAccessStatus::mount_failed,
+                               "skipped_after_timeout"};
+    skipped.attempted = false;
+    const auto pending = initial_pending({skipped});
+    REQUIRE(pending.size() == 1);
+    CHECK(pending[0].sid == "S-1-5-21-2");
+    CHECK(pending[0].attempts == 1);
+}
+
+TEST_CASE("mapdrive backfill decide_mount_call: a timeout counts, halts the walk and pins the "
+          "module; a refusal halts without counting; a completed call is untouched",
+          "[tar][mapdrive][backfill]") {
+    const auto done = decide_mount_call(MountCallResult::completed);
+    CHECK(done.attempted);
+    CHECK_FALSE(done.halt_walk);
+    CHECK_FALSE(done.pin_module);
+
+    const auto timed_out = decide_mount_call(MountCallResult::timed_out);
+    CHECK(timed_out.attempted);
+    CHECK(timed_out.halt_walk);
+    CHECK(timed_out.pin_module);
+
+    const auto rejected = decide_mount_call(MountCallResult::rejected);
+    CHECK_FALSE(rejected.attempted);
+    CHECK(rejected.halt_walk);
+    CHECK_FALSE(rejected.pin_module); // no thread was spawned, so nothing runs plugin code
 }
 
 TEST_CASE("mapdrive backfill apply_outcomes (complete=true): ok+read_failed bumps attempts and "
