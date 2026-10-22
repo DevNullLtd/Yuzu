@@ -96,14 +96,16 @@ TEST_CASE("rundown gate: a drain waiting for the last entrant is woken when it l
           "[server][rundown]") {
     // The holder leaves as soon as it sees the gate closed, so across many rounds it leaves both
     // before and after the drain is parked in its wait. A missing wake-up leaves a round parked
-    // until its generous bound runs out, and the drain then reports false.
+    // until its generous bound runs out, and the drain then reports false. `give_up` only keeps a
+    // broken gate (one that never reports the close) from hanging the run: the drain fails first.
     for (int round = 0; round < 200; ++round) {
         RundownGate gate;
         std::latch entered{1};
+        std::atomic<bool> give_up{false};
         std::thread holder([&] {
             const auto in = gate.try_enter();
             entered.count_down();
-            while (!gate.closed())
+            while (!gate.closed() && !give_up.load())
                 std::this_thread::yield();
         }); // `in` leaves here
         entered.wait();
@@ -112,6 +114,7 @@ TEST_CASE("rundown gate: a drain waiting for the last entrant is woken when it l
         std::thread drainer([&] {
             gate.close();
             drained.set_value(gate.wait_idle(30s));
+            give_up.store(true);
         });
         const bool ok = result.get();
         holder.join();
@@ -128,6 +131,7 @@ TEST_CASE("rundown gate: entrants racing one close are drained or refused, never
     std::atomic<int> inside{0};
     std::atomic<long> admitted{0};
     std::atomic<bool> drained{false};
+    std::atomic<bool> stop{false}; // a broken gate that never refuses must fail, not hang
     std::atomic<int> admitted_after_drain{0};
     std::vector<std::thread> workers;
     for (int i = 0; i < kThreads; ++i)
@@ -143,6 +147,8 @@ TEST_CASE("rundown gate: entrants racing one close are drained or refused, never
                 admitted.fetch_add(1);
                 std::this_thread::yield();
                 inside.fetch_sub(1);
+                if (stop.load())
+                    return;
             }
         });
     go.arrive_and_wait();
@@ -152,6 +158,7 @@ TEST_CASE("rundown gate: entrants racing one close are drained or refused, never
     CHECK(gate.wait_idle(30s));
     CHECK(inside.load() == 0); // nobody is inside once the drain returned
     drained.store(true);
+    stop.store(true);
     for (auto& t : workers)
         t.join();
     CHECK(admitted_after_drain.load() == 0); // and nobody got in afterwards
