@@ -4954,8 +4954,17 @@ public:
                               "(database reachable but the gateway_route_store schema could not "
                               "be created/opened)");
                 startup_failed_ = true;
-            } else if (gateway_service_) {
-                gateway_service_->set_gateway_route_store(gateway_route_store_.get());
+            } else {
+                // #5683: pre-seeded so a boot that deduped nothing reads 0, not absent.
+                metrics_.describe("yuzu_server_gateway_route_session_dedup_total",
+                                  "agent_routes rows tombstoned at boot by migration v5 because "
+                                  "they shared a session id; the affected agents re-register "
+                                  "through the normal replay. Expected 0.",
+                                  "counter");
+                metrics_.counter("yuzu_server_gateway_route_session_dedup_total")
+                    .increment(static_cast<double>(gateway_route_store_->boot_session_dedup_rows()));
+                if (gateway_service_)
+                    gateway_service_->set_gateway_route_store(gateway_route_store_.get());
             }
         }
 
