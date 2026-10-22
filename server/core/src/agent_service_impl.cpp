@@ -43,6 +43,7 @@
 #include "notification_store.hpp"
 #include "offload_target_store.hpp"
 #include "peer_ip.hpp"
+#include "plugin_result_audit.hpp"
 #include "response_store.hpp"
 #include "result_parsing.hpp"
 #include "tag_store.hpp"
@@ -60,6 +61,156 @@ namespace yuzu::server::detail {
 // Bring html_escape into scope for the HTML rendering methods.
 using yuzu::server::html_escape;
 
+// The registry audit budget keys on a whole agent id (the budget treats keys that share its key
+// bound as one agent, plugin_result_audit.hpp).
+static_assert(kRegistryAuditBudgetKeyBytes >= auth::kMaxAgentIdLength,
+              "the registry audit budget must key on a whole agent id");
+
+// Persists the `registry.write` audit rows one stored output frame owes (see
+// plugin_result_audit.hpp for the binding: a minted registry command id AND an agent-stamped
+// mutating action). Called at every site that stores an output-carrying frame, immediately before
+// `notify_exec_tracker` so the row exists before the execution advances (tests/
+// test_audit_action_stamp_wiring_lexical.py pins the four sites and their order). The agent flushes
+// plugin output in RUNNING frames and its terminal frame carries none, so the terminal sites are
+// defence in depth for an agent that returns output there.
+//
+// The PURE verdict runs first and the store is touched only when the frame owes rows or a flag, so
+// no other frame ever reaches it. process_gateway_response runs on the detached forwarder threads
+// of #3279, which outlive the gRPC drain and are never joined, so two things keep this reach safe.
+// The store is held weakly and locked here: a forwarder that locks it keeps the OBJECT alive for
+// exactly this call (set_registry_audit_store). The POOL it borrows is the other half: every
+// `store->log()` leases it and the strong reference spans up to kMaxRegistryAuditLinesPerFrame of
+// them, so a forwarder BETWEEN two rows would lease a pool that stop() is destroying. The hook
+// therefore runs inside a rundown gate (rundown_gate.hpp): it enters before it locks the store
+// (`in_flight` is declared first, so it dies last), checks the gate before every row, and
+// stop() closes the gate and waits for the hooks inside before it resets the store and the pool.
+// What stays #3279's is the detached thread itself, `this` and `metrics_`. Only the weak member is
+// read here (the lexical gate pins it): the raw `audit_store_` of the other sites is unwired
+// earlier in stop().
+//
+// Every row is charged to a per-agent budget (kRegistryAuditBudget*): a bound per frame is not a
+// bound on frames, and one enrolled agent looping 300-line frames would otherwise write
+// unbounded 365-day evidence. A refused row is counted, never queued; the first failure to persist
+// ends the frame. The hook must not throw into a stream handler or a detached thread: everything
+// below, the verdict and the store lock included, runs inside one try, and an exception is
+// reported as a failed write: logged, returned as false, and counted as `persist_failed` for the
+// rows already known to be owed. That is every row of the frame once the verdict is taken, so a
+// throw out of the gate entry or the store lock books them all; an exception out of the verdict
+// itself (an allocation failure) leaves none known, and only the error line says so. An
+// allocation failure while REPORTING one is not caught; no other code around the hook guards
+// that either.
+bool AgentServiceImpl::audit_registry_frame(const std::string& agent_id,
+                                            const pb::CommandResponse& resp) {
+    if (resp.output().empty() || resp.action().empty())
+        return true;
+    // Once the verdict is taken, every row the frame owes ends up written, refused by the budget
+    // (`refused`) or lost (the row at `done` and the rows after it), even when something throws.
+    std::size_t owed = 0;
+    std::size_t done = 0;
+    std::size_t refused = 0;
+    // The metric counts what the server sees go unrecorded; the log lines below are for a human.
+    // Rows for `suppressed` and `persist_failed`, frames for `unmintable_id` and `truncated`.
+    const auto dropped = [this](const char* reason, std::size_t n) {
+        metrics_.counter("yuzu_server_registry_audit_dropped_total", {{"reason", reason}})
+            .increment(static_cast<double>(n));
+    };
+    // Idempotent: a throw after a booking (the next statement may allocate) must not book the same
+    // rows again from a catch arm.
+    const auto book_rows = [&] {
+        if (refused != 0) {
+            dropped("suppressed", refused); // a refusal of the ROWS, never a failure of the write
+            refused = 0;
+        }
+        if (done != owed) {
+            dropped("persist_failed", owed - done);
+            owed = done;
+        }
+    };
+    try {
+        const auto frame = registry_audit_events_for_frame(
+            agent_id, resp.command_id(), extract_plugin(resp.command_id()), resp.action(),
+            resp.output(), yuzu::server::now_epoch_seconds());
+        if (frame.events.empty() && !frame.truncated && !frame.unmintable_id)
+            return true;
+        owed = frame.events.size(); // known before anything below can throw (see the catch arms)
+        // Declared BEFORE `store`: locals die in reverse order, so the strong reference is
+        // released first and the count falls after it, on every exit including a throw.
+        const auto in_flight = registry_audit_gate_.try_enter();
+        if (!in_flight)
+            return true; // shutdown has closed the hook: silent, like a store its owner released
+        const auto store = registry_audit_store_.lock();
+        if (!store || !store->is_open())
+            return true; // no store (released at shutdown): silent, like the other audit sites
+        if (frame.unmintable_id) {
+            dropped("unmintable_id", 1);
+            spdlog::warn("[audit] registry.write frame ignored: command_id is not a server-minted "
+                         "shape (agent={}, {} bytes)",
+                         yuzu::log_id_token(agent_id), resp.command_id().size());
+        }
+        if (frame.truncated) {
+            dropped("truncated", 1);
+            // The id is a minted shape here, so it is safe to log.
+            spdlog::warn("[audit] registry.write frame exceeded the audit bounds (more than {} "
+                         "lines, or a line over {} bytes); the excess was not recorded "
+                         "(agent={}, command={})",
+                         kMaxRegistryAuditLinesPerFrame, kMaxRegistryAuditLineBytes,
+                         yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()));
+        }
+        // Every row is charged, so the budget's window report counts refused ROWS exactly. Once an
+        // agent is over budget every later row of the window is refused too, and none is queued.
+        const std::string overflow = registry_audit_overflow_key(agent_id);
+        for (; done < owed; ++done) {
+            const auto admit = registry_audit_budget_->try_admit(agent_id, overflow);
+            if (admit.closed_window_suppressed != 0)
+                spdlog::warn("[audit] registry.write rows refused by the per-agent budget in the "
+                             "last window: {}",
+                             admit.closed_window_suppressed);
+            if (!admit.admitted) {
+                ++refused;
+                continue;
+            }
+            // Immediately before the only call that leases the pool. A row that passed this
+            // check may still start its lease after stop() closes the gate; that is safe because
+            // this call's entry is still counted and stop() waits for it before it resets the
+            // store and the pool. What the close does guarantee is that no row that has not yet
+            // passed this check starts a lease, so the drain is bounded by one row per hook
+            // inside the gate. The rows from this one on are lost, and counted as such. A row
+            // the budget refused above never gets here: it never leases, so the close changes
+            // nothing for it (it stays `suppressed`).
+            if (registry_audit_gate_.closed()) {
+                const std::size_t not_attempted = owed - done;
+                book_rows();
+                spdlog::warn("[audit] registry.write frame cut short by shutdown (agent={}, "
+                             "command={}); {} row(s) not recorded",
+                             yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()),
+                             not_attempted);
+                return false;
+            }
+            if (!store->log(frame.events[done])) {
+                const std::size_t not_attempted = owed - done - 1;
+                book_rows();
+                spdlog::error("[audit] registry.write row failed to persist (agent={}, "
+                              "command={}); {} further row(s) of this frame not attempted",
+                              yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()),
+                              not_attempted);
+                return false;
+            }
+        }
+        book_rows();
+        return true;
+    } catch (const std::exception& e) {
+        book_rows();
+        spdlog::error("[audit] registry.write hook threw: {} (agent={}, command={})", e.what(),
+                      yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()));
+        return false;
+    } catch (...) {
+        book_rows();
+        spdlog::error("[audit] registry.write hook threw (agent={}, command={})",
+                      yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()));
+        return false;
+    }
+}
+
 
 // -- Constructor --------------------------------------------------------------
 
@@ -75,6 +226,7 @@ AgentServiceImpl::AgentServiceImpl(AgentRegistry& registry, EventBus& bus,
     // bounded even when no operator config is applied and in every test that
     // constructs this service directly. set_ota_bound_config() replaces it.
     set_ota_bound_config(ota_cfg_);
+    registry_audit_budget_ = make_registry_audit_budget();
 }
 
 // -- Register -----------------------------------------------------------------
@@ -1339,6 +1491,9 @@ grpc::Status AgentServiceImpl::Subscribe(
 
     // Read loop -- process responses from the agent
     pb::CommandResponse resp;
+    // The audit-failed trailer is added once per stream: AddTrailingMetadata appends to a multimap
+    // for the life of the call, and the trailer is delivered only when the stream closes.
+    bool audit_failed_signalled = false;
     while (stream->Read(&resp)) {
         registry_.touch_activity(agent_id);
 
@@ -1438,6 +1593,12 @@ grpc::Status AgentServiceImpl::Subscribe(
                 response_store_->store(sr);
             }
 
+            // registry.write audit rows (RUNNING frames carry the plugin output).
+            if (!audit_registry_frame(agent_id, resp) && !audit_failed_signalled) {
+                signal_grpc_audit_failed(context);
+                audit_failed_signalled = true;
+            }
+
             // UAT 2026-05-06 #8: notify the executions tracker so the
             // drawer's per-agent KPI table populates and the SSE
             // `agent-transition` event fires for live updates.
@@ -1509,6 +1670,14 @@ grpc::Status AgentServiceImpl::Subscribe(
                 // FR::Updated → row already updated in place, no insert.
                 // FR::Error → already logged inside the store; do NOT
                 //             insert — would re-create the sentinel.
+            }
+
+            // A terminal frame that carries output AND the agent-stamped action owes its audit
+            // rows too (defence in depth: this agent's terminal frame carries no output); a frame
+            // without the stamp owes none.
+            if (!audit_registry_frame(agent_id, resp) && !audit_failed_signalled) {
+                signal_grpc_audit_failed(context);
+                audit_failed_signalled = true;
             }
 
             // UAT 2026-05-06 #8: notify the executions tracker on terminal
@@ -1759,6 +1928,11 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             response_store_->store(sr);
         }
 
+        // registry.write audit rows. No gRPC context on the gateway path to carry an
+        // audit-failed trailer: the hook has logged any failure (and counted the rows it
+        // knows) itself.
+        (void)audit_registry_frame(agent_id, resp);
+
         // UAT 2026-05-06 #8: gateway-streamed RUNNING — notify tracker.
         notify_exec_tracker(resp.command_id(), agent_id, resp);
 
@@ -1815,6 +1989,10 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             }
             // FR::Updated → in-place; FR::Error → already logged, do NOT insert.
         }
+
+        // A terminal frame that carries output owes its audit rows too (see the Subscribe twin;
+        // the hook has logged any failure (and counted the rows it knows) itself).
+        (void)audit_registry_frame(agent_id, resp);
 
         // UAT 2026-05-06 #8: gateway-streamed terminal — notify tracker.
         notify_exec_tracker(resp.command_id(), agent_id, resp);

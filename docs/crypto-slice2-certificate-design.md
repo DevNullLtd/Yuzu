@@ -523,7 +523,8 @@ unclamped.
 | `cert_cdp` | (`agent_id`, `sha256`, `ord`) | `uri` |
 
 **Indexes:** `cert_fact (not_after)`, `(not_before)`, `(issuer_name_sha256, serial)`,
-`(sig_alg_oid, pss_hash_oid)`, `(key_alg_oid, rsa_modulus_bits)`, `(ec_order_bits)`, `(sha256)`;
+`(sig_alg_oid, pss_hash_oid)`, `(key_alg_oid, rsa_modulus_bits)`, `(ec_order_bits)`, `(sha256)`,
+`(spki_sha256)`, `(aki_key_id)` (see [Finding one CA's certificates](#finding-one-cas-certificates));
 `store_state (status, observed_at)` for the prune; every table has `agent_id` leading its key, for
 decommission and confinement.
 
@@ -986,9 +987,57 @@ in OpenAPI beside "not refused" on the server is the #6122 item 2 defect.
 | `is_ca`, `self_signed` | bool | Refused if not a bool. |
 | `agent_id` | free text | Exact; confined by the gate. |
 | `issuer_dn` | free text | Exact match on the RFC 4514 string. |
+| `issuer_dn_contains` | free text, 3..256 bytes | Case-insensitive substring of `issuer_dn` (ASCII case folding). The value is matched literally: `%`, `_` and `\` are escaped, never a pattern. Refused if shorter, longer or invalid UTF-8. |
+| `subject_dn_contains` | free text, 3..256 bytes | The same match on `subject_dn`, accepted **only together with `is_ca=true`**. Without it, 400 / `kInvalidParams` naming `is_ca`. |
 | `sha256` | 64 hex | Refused if malformed. |
+| `spki_sha256` | 64 hex | Exact. Every certificate over one key. Refused if malformed. |
+| `aki_key_id` | hex, 2..128 | Exact. Every certificate whose authority key identifier names one CA key. Refused if malformed. |
 | `not_after_edges` (summary histogram) | list of RFC 3339, 1..32, ascending | The caller's bucket edges (ADR-0070's derived-field table, `0070:225`). Refused if unsorted or too many. |
 | `cursor`, `limit` | opaque / int 1..500 (default 100) | REST and MCP both refuse a value out of range. |
+
+#### Finding one CA's certificates
+
+**Proposed.** An operator who learns that a CA is distrusted or compromised needs every device
+holding that CA's own certificates, and every certificate it issued. The exact `issuer_dn` filter
+alone cannot answer that: one CA issues under several names. The October 2026 eMudhra incident is
+the reference case. Eight eMudhra intermediate CAs had P-384 private keys that were small integers
+(4, 56, 115 and others), recoverable from the public certificates in under a second. Browsers
+distrusted them, but a server, appliance or application with its own trust store does not follow a
+browser update. eMudhra's names also vary: its CNs say `emSign` and its `O` says
+`eMudhra Technologies Limited`.
+
+The four filters added above answer it, each from fields the per-certificate read already
+stores. Each query goes through the same gate, confinement, audit and pagination as any other
+per-certificate read. The snapshot accepts them too, because it takes the same filters:
+
+| Question | Query |
+|---|---|
+| Which devices hold one of this CA's own certificates, under any of its names? | `is_ca=true&subject_dn_contains=eMudhra`, then `subject_dn_contains=emSign` |
+| Which certificates did any of its names issue? | `issuer_dn_contains=eMudhra`, then `issuer_dn_contains=emSign` |
+| Where is one compromised key, including cross-signed and re-issued copies of its certificate? | `spki_sha256=<the key's hash>`; copies have their own `sha256` but share the key |
+| What did one compromised CA key sign, whatever name the issuer used? | `aki_key_id=<that CA certificate's ski>` |
+
+- **`subject_dn_contains` needs `is_ca=true`.** An end-entity subject can carry a person's name or
+  e-mail address (see [Personal data](#personal-data)). A fleet-wide substring search over those
+  would be a search for a person, which this design does not build. A CA's subject names the CA.
+  `is_ca` is the certificate's own basic-constraints claim, so a non-CA certificate that falsely
+  claims it is still a raw fact about that certificate, and the filter only narrows a read the
+  caller is already admitted to.
+- **`issuer_dn_contains` has no such condition.** An issuer DN names a CA. A self-signed end-entity
+  certificate repeats its subject as its issuer, so this filter can still reach a person's name.
+  It reaches nothing that the existing exact `issuer_dn` filter, or an unfiltered read, does not
+  already return to the same caller. Filter values are audited (only counts and filters are), so a
+  person's name typed into either filter lands in the audit details. The audit-log entry for the
+  verb says so.
+- **`spki_sha256` and `aki_key_id` are filters, not identity.** The rule that `spki_sha256` is never
+  certificate identity or a join key (see [Fields collected](#fields-collected)) still holds:
+  filtering by a key returns every certificate over it, and that is the point.
+- **Indexes.** `cert_fact (spki_sha256)` and `(aki_key_id)` are added to the
+  [store's index list](#store-and-schema). The two substring filters scan the caller's visible
+  `cert_fact` rows under the read's statement timeout. That cost is unmeasured. 2a-2 measures it at
+  the target scale and adds a `pg_trgm` index only if the measured p95 needs one.
+- **Out of scope here.** Detecting a weak key from the key itself (a tiny EC private key, shared or
+  close RSA primes) needs more than these filters. It is a separate proposal.
 
 ### Response shapes
 
@@ -1839,6 +1888,14 @@ Still open for the owner:
     one transaction, is the only exact check.
 20. **Personal data in a lower-privileged projection.** A SAN or subject used as a summary group, a
     metric label or an audit detail. Guard: the personal-data rules above and CH-2's checks.
+21. **The subject substring search becomes a person search.** `subject_dn_contains` is admitted
+    without `is_ca=true`, or the condition is checked on REST but not on MCP. Guard: one shared
+    parameter validator for both twins. A test refuses the bare filter on each twin. Another test
+    sends `is_ca=true` with an end-entity row in the store and asserts that row is not returned.
+22. **A substring filter becomes a pattern.** An unescaped `%` or `_` in `issuer_dn_contains`
+    matches far more than was typed, and the caller reads it as a match. Guard: the value is
+    escaped before it reaches `ILIKE`. A test filters on a literal `%` and `_` and checks that only
+    the literal rows return.
 
 ## ADR-0070 clause map
 
