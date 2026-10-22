@@ -55,18 +55,22 @@ now leaves two rows: do not sum the two when counting denials. The older
 `yuzu_mcp_approval_precondition_denied_total{tool}` series is unchanged.
 
 **4. A redemption integrity re-check, and a row-moved refusal.** Redeeming an approved,
-unconsumed ticket (today only the MCP `confirm_engine_rotation` recall) now re-checks the stored
-row: a ticket whose reviewer is the submitter or an excluded root, that records no reviewer,
-whose excluded roots cannot be read, or whose stored request does not match its digest is
-refused. Through MCP it surfaces as the same "approval already used (one-time ticket)" refusal a replay gets, and the
+unconsumed ticket now re-checks the stored row. This applies to every MCP recall of an
+approval-gated tool (the ticket flow that runs before the tool for a supervised-tier token, for
+example `execute_instruction`, `quarantine_device`, `revoke_certificate` and
+`confirm_engine_rotation`), not only to the one that supplies a precondition. A ticket is refused if its reviewer is the submitter or an excluded root, it records no reviewer,
+its excluded roots cannot be read, or its stored request does not match its digest. Through MCP it surfaces as the same "approval already used (one-time ticket)" refusal a replay gets, and the
 audit row reads `refused: foreign_origin`; the cause is only in the server log. Approving a
 ticket always records a distinct reviewer, so ordinary operation never triggers this: it
 indicates a row edited by hand, restored from a backup or written by an older build, and such a
 ticket stays unredeemable until its seven-day lifetime ends. Separately, a ticket whose row was
 rewritten by another transaction between the check and the consuming statement (and, rarely,
 VACUUM FULL or CLUSTER running at that moment, which move the row) is also refused, audited as
-`refused: not_consumable`. Both read like a replay in the counter and the audit trail; the second
-is a false refusal and a retry clears it. See [MCP approvals](mcp.md) and
+`refused: not_consumable`. Both read like a replay in the counter and the audit trail. The
+second is a false refusal only when the cause was a no-op rewrite or one of those maintenance
+commands: a retry then succeeds. When the other transaction was a concurrent recall that spent
+the ticket, or a real edit, the refusal is correct and a retry is refused again ("approval
+already used"). See [MCP approvals](mcp.md) and
 [metrics](metrics.md).
 
 ## Behaviour change: four privileged REST routes refuse cross-site cookie writes
