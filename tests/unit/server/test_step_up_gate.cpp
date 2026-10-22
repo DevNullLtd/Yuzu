@@ -1856,7 +1856,7 @@ TEST_CASE("binding: a refusal logs one fixed-text warning per hundred and never 
     httplib::Response res;
     REQUIRE(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
             StepUpChokepointResult::kPassed);
-    const auto other = make_session("yuzu_test_mallory", "local", Role::admin, ago(10s));
+    const auto other = make_session("yuzu_test_carol", "local", Role::admin, ago(10s));
 
     yuzu::test::LogCapture capture;
     // The line is sampled and the counter is process-wide, so drive a full period.
@@ -1866,7 +1866,7 @@ TEST_CASE("binding: a refusal logs one fixed-text warning per hundred and never 
     const auto logs = capture.text();
     CHECK(count_occurrences(logs, "not the principal the step-up check was made for") == 1);
     CHECK(logs.find("yuzu_test_alice") == std::string::npos);
-    CHECK(logs.find("yuzu_test_mallory") == std::string::npos);
+    CHECK(logs.find("yuzu_test_carol") == std::string::npos);
     detail::clear_step_up_pass();
 }
 
