@@ -5943,9 +5943,9 @@ static const ResourceDef kResources[] = {
     {"yuzu://golden-prompts/enterprise-it-v1", "Enterprise IT Golden Prompts v1",
      "Versioned prompt/eval catalogue for enterprise incident workflows", "application/json"},
     {"yuzu://openapi", "OpenAPI Specification",
-     "REST API v1 OpenAPI spec, raw — byte-identical to GET /api/v1/openapi.json; the "
-     "discover_routes tool serves the same source wrapped in a distinct routes-catalog "
-     "projection, not this shape",
+     "REST API v1 OpenAPI spec, byte-identical to GET /api/v1/openapi.json (default form, "
+     "without the ?guides=true group guides); discover_routes wraps the same source in a "
+     "different routes-catalog shape",
      "application/json"},
     {"yuzu://scope-dsl", "Scope DSL Reference",
      "Scope-kind and comparison-operator catalog — same builder as GET "
@@ -7285,8 +7285,9 @@ McpServer::HandlerFn McpServer::build_handler(
             }
             // 2g PR 4 (specs-as-resources): yuzu://openapi and yuzu://scope-dsl reuse the
             // SAME source builder as their REST /discover/* and MCP discover_* tool twins
-            // (A2 shared-builder principle). yuzu://openapi serves openapi_spec_json() raw —
-            // byte-identical to REST GET /api/v1/openapi.json's body, NOT to discover_routes'
+            // (A2 shared-builder principle). yuzu://openapi serves openapi_spec_json(),
+            // byte-identical to the body of REST GET /api/v1/openapi.json in its DEFAULT form
+            // (without ?guides=true, which adds the per-group guides), NOT to discover_routes'
             // output, which wraps the same source in build_routes_catalog() as a distinct
             // projection ({"source":"openapi", routes:[...]}). yuzu://scope-dsl serves
             // scope_kinds_catalog().json raw, which IS byte-identical to both
@@ -7339,8 +7340,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     emit_compiled_json_resource(text);
             };
             if (uri == "yuzu://openapi") {
-                // Raw openapi_spec_json(): byte-identical to REST GET /api/v1/openapi.json,
-                // a different projection than discover_routes (see the block comment above).
+                // openapi_spec_json(): byte-identical to REST GET /api/v1/openapi.json without
+                // ?guides=true (the guides are not served here), a different projection than
+                // discover_routes (see the block comment above).
                 serve_compiled_json_resource(yuzu::server::openapi_spec_json());
                 return;
             }
