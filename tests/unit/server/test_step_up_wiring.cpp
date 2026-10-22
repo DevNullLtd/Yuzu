@@ -8,16 +8,20 @@
  * client with its headers, or that a pass is visible to the route handler on the same worker
  * thread. This file installs `detail::run_pre_request_stage` (step_up_wiring.hpp, the function
  * `server.cpp`'s `set_pre_request_handler` lambda calls) on a real server, with a stubbed session
- * resolver and MFA store and no Postgres, and sends real requests.
+ * resolver and MFA store, and sends real requests. It needs no Postgres except for the one `[pg]`
+ * case that gives the approval handler a real `ApprovalManager`.
  *
  * Mutation check (recorded in the commit message): making `run_pre_request_stage` skip
  * `apply_step_up_chokepoint` turns the refusal test red.
  */
 
+#include "../../../server/core/src/approval_manager.hpp"
 #include "../../../server/core/src/approval_routes.hpp"
 #include "../../../server/core/src/http_route_sink.hpp"
 #include "../../../server/core/src/step_up_policy.hpp"
 #include "../../../server/core/src/step_up_wiring.hpp"
+
+#include "test_approval_manager_pg_helper.hpp"
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
@@ -64,6 +68,10 @@ namespace {
 // A kRequired row whose registered pattern is a regex with a capture group.
 constexpr std::string_view kRotatePattern = R"(/api/v1/tokens/([^/]+)/rotate)";
 constexpr std::string_view kRotateLabel = "POST /api/v1/tokens/{id}/rotate";
+// The Guardian policy-generation raise row, registered with a STUB handler below (see the case that
+// uses it for what that does and does not cover).
+constexpr std::string_view kRaisePath = "/api/v1/guaranteed-state/policy-generation/raise";
+constexpr std::string_view kRaiseLabel = "POST /api/v1/guaranteed-state/policy-generation/raise";
 // A route with a body-cap row but no step-up row of its own to be evaluated by the chokepoint.
 constexpr std::string_view kUnclassifiedPath = "/api/v1/step-up-wiring-test/unclassified";
 
@@ -163,6 +171,8 @@ struct WiringServer {
     // Observations written by the route handlers (worker threads).
     std::atomic<int> rotate_handler_calls{0};
     std::atomic<int> unclassified_handler_calls{0};
+    std::atomic<int> raise_handler_calls{0};
+    std::atomic<bool> raise_consumed_pass{false};
     std::atomic<bool> handler_consumed_pass{false};
     // Set by the unclassified route's handler: whether it could consume a pass for the rotate row.
     std::atomic<bool> unclassified_consumed_rotate_pass{false};
@@ -228,6 +238,13 @@ struct WiringServer {
                      res.status = 200;
                      res.set_content("{\"ok\":true}", "application/json");
                  });
+        svr.Post(std::string(kRaisePath), [this](const httplib::Request& req,
+                                                 httplib::Response& res) {
+            raise_handler_calls.fetch_add(1);
+            raise_consumed_pass.store(detail::consume_step_up_pass(req, std::string(kRaiseLabel)));
+            res.status = 200;
+            res.set_content("{\"ok\":true}", "application/json");
+        });
         svr.Post(std::string(kUnclassifiedPath),
                  [this](const httplib::Request& req, httplib::Response& res) {
                      unclassified_handler_calls.fetch_add(1);
@@ -435,17 +452,25 @@ TEST_CASE("wiring: a bearer principal passes a kRequired route and an unresolved
 
 namespace {
 
-// The REAL approval routes (approval_routes.cpp) behind the same pre-request stage as production,
-// with no ApprovalManager wired: a request that gets past the handler's class check answers 503
-// ("service unavailable") before the handler's own step-up call, so no store is needed to see
-// WHERE each caller class is stopped. The handler's step-up closure is a recording stub.
+// The REAL approval routes (approval_routes.cpp) behind the same pre-request stage as production.
+// With no ApprovalManager wired (the default), a request that gets past the handler's class check
+// answers 503 ("service unavailable") before the handler's own step-up call, so no store is
+// needed to see WHERE each caller class is stopped. With a real manager (the `[pg]` case) the
+// handler runs to its decision. The handler's step-up closure records the label it is handed and
+// then makes the production decision (`detail::run_in_handler_step_up`, with no auth store: it
+// consumes the chokepoint's pass for exactly that label, and any other call fails closed 503).
 struct ApprovalWiringServer {
     httplib::Server svr;
     int port{0};
 
+    ApprovalManager* approval_manager{nullptr};
+    int window_secs{300};
+
     std::mutex mu;
     std::optional<auth::Session> session;
     std::vector<AuditRow> chokepoint_audits;
+    std::vector<std::string> handler_step_up_labels;
+    std::vector<AuditRow> handler_audits;
 
     std::atomic<int> perm_calls{0};
     std::atomic<int> handler_step_up_calls{0};
@@ -470,7 +495,8 @@ struct ApprovalWiringServer {
         return true;
     };
 
-    ApprovalWiringServer() {
+    explicit ApprovalWiringServer(ApprovalManager* mgr = nullptr, int window = 300)
+        : approval_manager(mgr), window_secs(window) {
         svr.set_pre_routing_handler([](const httplib::Request&, httplib::Response&) {
             detail::clear_step_up_pass();
             return httplib::Server::HandlerResponse::Unhandled;
@@ -483,7 +509,7 @@ struct ApprovalWiringServer {
                                                 .mfa_status = &mfa_status,
                                                 .audit_fn = &audit,
                                                 .metrics = &metrics,
-                                                .window_secs = 300,
+                                                .window_secs = window_secs,
                                                 .mfa_enforcement = "optional"};
                 return detail::run_pre_request_stage(req, res, deps);
             });
@@ -492,6 +518,7 @@ struct ApprovalWiringServer {
         });
 
         approval::Deps deps;
+        deps.approval_manager = approval_manager;
         deps.perm_fn = [this](const httplib::Request&, httplib::Response&, const std::string&,
                               const std::string&) {
             perm_calls.fetch_add(1);
@@ -501,17 +528,24 @@ struct ApprovalWiringServer {
             std::lock_guard lk(mu);
             return session;
         };
-        deps.audit_fn = [this](const httplib::Request&, const std::string&, const std::string&,
-                               const std::string&, const std::string&, const std::string&) {
+        deps.audit_fn = [this](const httplib::Request&, const std::string& a, const std::string& r,
+                               const std::string&, const std::string& ti, const std::string& d) {
             handler_audit_rows.fetch_add(1);
+            std::lock_guard lk(mu);
+            handler_audits.push_back({a, r, ti, d});
             return true;
         };
         deps.emit_event_fn = [](const std::string&, const httplib::Request&, const nlohmann::json&,
                                 const nlohmann::json&) {};
-        deps.step_up_fn = [this](const httplib::Request&, httplib::Response&, const auth::Session&,
-                                 const std::string&) {
+        deps.step_up_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                 const auth::Session& sess, const std::string& label) {
             handler_step_up_calls.fetch_add(1);
-            return true;
+            {
+                std::lock_guard lk(mu);
+                handler_step_up_labels.push_back(label);
+            }
+            return detail::run_in_handler_step_up(req, res, sess, label, /*auth_db=*/nullptr,
+                                                  window_secs, audit, "optional", &metrics);
         };
         HttplibRouteSink sink(svr);
         approval::register_approval_routes(sink, std::move(deps));
@@ -618,6 +652,197 @@ TEST_CASE("wiring: the approve and reject routes compose with the central step-u
             CHECK(s.gate_count("pass", "local") == 1);
             CHECK(s.gate_count("refused", "local") == 0);
         }
+    }
+}
+
+TEST_CASE("wiring: a SAML session is refused 403 by the central check on approve and reject, "
+          "and the handler never runs",
+          "[stepup][wiring][approval_routes]") {
+    for (const char* verb : {"approve", "reject"}) {
+        INFO(verb);
+        ApprovalWiringServer s;
+        s.set_session(make_session("saml-user", "saml", Role::admin, 5s));
+        auto r = s.post(std::string("/api/approvals/abc123/") + verb, /*same_site_origin=*/true);
+        REQUIRE(r);
+        CHECK(r->status == 403);
+        CHECK(s.perm_calls.load() == 0);
+        CHECK(s.handler_audit_rows.load() == 0);
+        CHECK(s.handler_step_up_calls.load() == 0);
+        CHECK(s.gate_count("refused", "saml") == 1);
+        CHECK(s.gate_count("pass", "saml") == 0);
+        bool row = false;
+        std::lock_guard lk(s.mu);
+        for (const auto& a : s.chokepoint_audits)
+            row = row || (a.action == "mfa.step_up.required" &&
+                          a.target_id == std::string("POST /api/approvals/{id}/") + verb);
+        CHECK(row);
+    }
+}
+
+TEST_CASE("wiring: with the step-up window disabled every non-engine caller passes the central "
+          "check and the handler's own checks decide",
+          "[stepup][wiring][approval_routes]") {
+    for (const char* verb : {"approve", "reject"}) {
+        const std::string path = std::string("/api/approvals/abc123/") + verb;
+        INFO(path);
+
+        SECTION(std::string(verb) + ": a cookie session with a stale proof reaches the handler") {
+            ApprovalWiringServer s(nullptr, /*window=*/0);
+            s.set_session(make_session("alice", "local", Role::admin, 1h));
+            auto r = s.post(path, /*same_site_origin=*/true);
+            REQUIRE(r);
+            // Past the permission, same-site and class checks; no manager is wired, so 503.
+            CHECK(r->status == 503);
+            CHECK(s.perm_calls.load() == 1);
+            CHECK(s.gate_count("pass", "local") == 1);
+            CHECK(s.gate_count("refused", "local") == 0);
+        }
+        SECTION(std::string(verb) + ": a SAML cookie session reaches the handler") {
+            ApprovalWiringServer s(nullptr, /*window=*/0);
+            s.set_session(make_session("saml-user", "saml", Role::admin, 1h));
+            auto r = s.post(path, /*same_site_origin=*/true);
+            REQUIRE(r);
+            CHECK(r->status == 503);
+            CHECK(s.perm_calls.load() == 1);
+            CHECK(s.gate_count("pass", "saml") == 1);
+            CHECK(s.gate_count("refused", "saml") == 0);
+        }
+        SECTION(std::string(verb) +
+                ": an engine principal is still a 403 engine_principal_denied") {
+            ApprovalWiringServer s(nullptr, /*window=*/0);
+            auto engine = make_session("engine:ci", "engine_token", Role::admin, 5s);
+            engine.principal_kind = "engine";
+            s.set_session(engine);
+            auto r = s.post(path, /*same_site_origin=*/false);
+            REQUIRE(r);
+            CHECK(r->status == 403);
+            CHECK(s.perm_calls.load() == 0);
+            CHECK(s.handler_audit_rows.load() == 0);
+            bool engine_row = false;
+            std::lock_guard lk(s.mu);
+            for (const auto& a : s.chokepoint_audits)
+                engine_row =
+                    engine_row || (a.action == "mfa.step_up.required" &&
+                                   a.detail.find("engine_principal_denied") != std::string::npos);
+            CHECK(engine_row);
+        }
+        SECTION(std::string(verb) + ": an API-token session is still refused by the handler") {
+            ApprovalWiringServer s(nullptr, /*window=*/0);
+            s.set_session(make_session("tok-owner", "api_token", Role::admin, 1h));
+            auto r = s.post(path, /*same_site_origin=*/false);
+            REQUIRE(r);
+            CHECK(r->status == 403);
+            CHECK(s.perm_calls.load() == 1); // the handler ran and refused it
+            CHECK(r->body.find("approver_assurance_required:non_interactive_session") !=
+                  std::string::npos);
+            CHECK(s.handler_step_up_calls.load() == 0);
+        }
+    }
+}
+
+// The one place the handler's own step-up call is reached: a real ApprovalManager (Postgres) so
+// the request runs past the store check. The handler's closure makes the production decision
+// (consume the chokepoint's pass for EXACTLY the label it is handed, else fail closed), so a
+// handler that passed the wrong verb's label, skipped the call, or took a second evaluation would
+// answer 503 or leave a recorded label that differs. Swapping the two literal labels in
+// approval_routes.cpp turns the label assertions and the 200 below red.
+TEST_CASE("wiring: the approve and reject handlers consume the central pass with their own label",
+          "[stepup][wiring][approval_routes][pg]") {
+    yuzu::test::ApprovalManagerPg mgr;
+
+    for (const char* verb : {"approve", "reject"}) {
+        const bool is_approve = std::string_view(verb) == "approve";
+        // At the default window a fresh proof is needed; with the window disabled a stale proof
+        // passes the central check and the handler still consumes that pass.
+        for (const int window : {300, 0}) {
+            const auto proof_age =
+                window > 0 ? std::chrono::seconds(5) : std::chrono::seconds(3600);
+            INFO(verb << " window=" << window);
+            auto id =
+                mgr->submit(std::string("def-wiring-") + verb + std::to_string(window),
+                            "submitter1", "ostype = 'windows'", "", ApprovalOrigin::kInstruction);
+            REQUIRE(id.has_value());
+
+            ApprovalWiringServer s(mgr.get(), window);
+            s.set_session(make_session("alice", "local", Role::admin, proof_age));
+            auto r = s.post("/api/approvals/" + *id + "/" + verb, /*same_site_origin=*/true);
+            REQUIRE(r);
+            CHECK(r->status == 200);
+            CHECK(r->body.find(is_approve ? "approved" : "rejected") != std::string::npos);
+
+            // The chokepoint passed it once, the handler's call consumed that pass (no
+            // handler_skipped), and the label is the verb's own.
+            CHECK(s.gate_count("pass", "local") == 1);
+            CHECK(s.gate_count("refused", "local") == 0);
+            CHECK(s.gate_count("handler_skipped", "local") == 0);
+            CHECK(s.handler_step_up_calls.load() == 1);
+            {
+                std::lock_guard lk(s.mu);
+                REQUIRE(s.handler_step_up_labels.size() == 1);
+                CHECK(s.handler_step_up_labels[0] ==
+                      std::string("POST /api/approvals/{id}/") + verb);
+                CHECK(s.chokepoint_audits.empty()); // no refusal row anywhere
+            }
+            CHECK(s.perm_calls.load() == 1);
+            CHECK(s.handler_audit_rows.load() == 2); // attempted + success
+
+            auto row = mgr->get(*id);
+            REQUIRE(row.has_value());
+            CHECK(row->status == (is_approve ? "approved" : "rejected"));
+        }
+    }
+}
+
+// COVERAGE NOTE (policy-generation raise). The real route's handler (rest_api_v1.cpp) is driven
+// by test_guardian_generation_raise.cpp through RbacRoleHarness, whose `TestRouteSink` does not run
+// the pre-request stage, so a test of the REAL handler behind the REAL central check would need the
+// harness re-plumbed onto a socket-backed sink and its stores. That is not done here. What covers
+// the route instead: the kRequired table row and its label (test_step_up_route_inventory.cpp pins
+// the row and that the handler's call site carries the same label), the handler's own refusals
+// (test_guardian_generation_raise.cpp), and this case, which registers a STUB handler at the real
+// path so the central decision for that row (engine, stale proof, fresh proof) runs through the
+// production pre-request stage over a socket. It proves the chokepoint's behaviour for the row, not
+// the handler's.
+TEST_CASE("wiring: the policy-generation raise row is decided by the central check before the "
+          "handler",
+          "[stepup][wiring]") {
+    const auto* row = step_up_policy_for("POST", kRaisePath);
+    REQUIRE(row != nullptr);
+    REQUIRE(row->cls == StepUpClass::kRequired);
+    REQUIRE(row->action_label == kRaiseLabel);
+
+    SECTION("an engine principal is a 403 audited as mfa.step_up.required with the route label") {
+        WiringServer s;
+        auto engine = make_session("engine:ci", "engine_token", Role::admin, 5s);
+        engine.principal_kind = "engine";
+        s.set_session(engine);
+        auto r = s.post(std::string(kRaisePath));
+        REQUIRE(r);
+        CHECK(r->status == 403);
+        CHECK(s.raise_handler_calls.load() == 0);
+        bool engine_row = false;
+        for (const auto& a : s.audit_rows())
+            engine_row =
+                engine_row || (a.action == "mfa.step_up.required" && a.target_id == kRaiseLabel &&
+                               a.detail.find("engine_principal_denied") != std::string::npos);
+        CHECK(engine_row);
+    }
+    SECTION("a stale cookie proof is a 401 and the handler is not run") {
+        WiringServer s;
+        s.set_session(make_session("alice", "local", Role::admin, 1h));
+        auto r = s.post(std::string(kRaisePath));
+        REQUIRE(r);
+        CHECK(r->status == 401);
+        CHECK(s.raise_handler_calls.load() == 0);
+    }
+    SECTION("a fresh cookie proof reaches the handler, which can consume the pass") {
+        WiringServer s;
+        s.set_session(make_session("alice", "local", Role::admin, 5s));
+        auto r = s.post(std::string(kRaisePath));
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(s.raise_handler_calls.load() == 1);
+        CHECK(s.raise_consumed_pass.load());
     }
 }
 

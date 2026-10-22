@@ -21,8 +21,10 @@
 /// gone, or is now Read, is stale and fails the same test.
 ///
 /// CLASSES in use: kExempt (reviewed, `reason` is one of `kMcpExemptReasons`) and
-/// kPendingRuling (the one neutral literal, count pinned by `kMcpPendingRulingMax`, which may
-/// only go DOWN). kRequired is accepted by the self-check but no row carries it yet.
+/// kPendingRuling (the one neutral literal, count pinned by `kMcpPendingRulingMax`). That count
+/// only goes down, with one exception: `raise_guardian_policy_generation` is pending because
+/// its REST twin is kRequired and no MCP consumer enforces kRequired yet, so the tool can be
+/// neither kExempt nor kRequired. kRequired is accepted by the self-check but no row carries it.
 ///
 /// TWIN: `rest_method`/`rest_pattern` name the REST route the tool mirrors, byte-for-byte as
 /// registered, so the self-check can prove the twin exists in `kStepUpPolicy` and that the
@@ -132,7 +134,7 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
     step_up_mcp_detail::pending("import_ca_chain",                      "POST",   R"(/api/v1/ca/import-chain)"),
     step_up_mcp_detail::pending("issue_code_signing_cert",              "POST",   R"(/api/v1/ca/issue-code-signing)"),
     step_up_mcp_detail::pending("mint_engine_credential",               "POST",   R"(/api/v1/engine-principals/([^/]+)/credentials)"),
-    // Added at the dev merge, ruling due in PR 2: the twin is kRequired, so the tool cannot be exempt.
+    // The twin is kRequired, so the tool cannot be exempt; its class needs a maintainer ruling once an MCP step-up consumer exists.
     step_up_mcp_detail::pending("raise_guardian_policy_generation",     "POST",   R"(/api/v1/guaranteed-state/policy-generation/raise)"),
     step_up_mcp_detail::pending("revoke_engine_principal",              "DELETE", R"(/api/v1/engine-principals/([^/]+))"),
     step_up_mcp_detail::pending("rewrap_secrets",                       "POST",   R"(/api/v1/secrets/kek/rewrap)"),
@@ -157,10 +159,11 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
 };
 // clang-format on
 
-/// Ceiling on the number of kPendingRuling MCP rows. May only be LOWERED: a new tool cannot be
+/// Ceiling on the number of kPendingRuling MCP rows. It only goes down: a new tool cannot be
 /// parked as pending, it needs a real class. The one exception so far is
-/// `raise_guardian_policy_generation` (44 -> 45), added at the dev merge: its REST twin is
-/// kRequired, so the tool cannot be kExempt, and kRequired is not evaluated for MCP yet.
+/// `raise_guardian_policy_generation` (44 -> 45): its REST twin is kRequired, so the tool cannot
+/// be kExempt, and no MCP consumer enforces kRequired yet. Its class needs a maintainer ruling
+/// once one does.
 inline constexpr std::size_t kMcpPendingRulingMax = 45;
 
 inline constexpr std::size_t kMcpStepUpPolicyCount = std::size(kMcpStepUpPolicy);

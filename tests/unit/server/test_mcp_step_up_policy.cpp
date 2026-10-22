@@ -111,8 +111,8 @@ TEST_CASE("mcp step-up policy: every class and reason is one the table may carry
     }
 }
 
-TEST_CASE("mcp step-up policy: kMcpPendingRulingMax equals the pending row count and may only "
-          "be lowered",
+TEST_CASE("mcp step-up policy: kMcpPendingRulingMax equals the pending row count (it only goes "
+          "down, except for raise_guardian_policy_generation)",
           "[stepup][mcp][policy]") {
     CHECK(pending_rows() == kMcpPendingRulingMax);
 }
@@ -124,7 +124,8 @@ namespace {
 // list pins WHICH ones. Resolving a row (moving it to kExempt with a named reason) means deleting
 // its entry here AND lowering kMcpPendingRulingMax in the same change. A NEW tool is never added
 // here: classify it kExempt with a named reason. The one exception so far is
-// raise_guardian_policy_generation, added at the dev merge (its REST twin is kRequired).
+// raise_guardian_policy_generation: its REST twin is kRequired and no MCP consumer enforces
+// kRequired yet, so its class needs a maintainer ruling once one does.
 constexpr std::string_view kGrandfatheredMcpPending[] = {
     "activate_platform_license",
     "add_management_group_member",
@@ -150,7 +151,7 @@ constexpr std::string_view kGrandfatheredMcpPending[] = {
     "mint_upload_grant",
     "push_guardian_rules",
     "quarantine_device",
-    "raise_guardian_policy_generation", // added at the dev merge, ruling due in PR 2
+    "raise_guardian_policy_generation", // kRequired REST twin; ruling needed once MCP enforces it
     "reject_request",
     "revoke_api_token",
     "revoke_certificate",
