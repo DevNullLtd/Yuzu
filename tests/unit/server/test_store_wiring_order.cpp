@@ -227,7 +227,7 @@ TEST_CASE("stripped_source loads server.cpp once per process: repeat calls do no
 // newline survives (line numbers are unchanged), and a `//` inside a string literal is
 // cut too (documented limit in source_scan.hpp -- pinned so a "fix" that makes it
 // string-aware is a deliberate change, not a silent one).
-TEST_CASE("strip_line_comments cuts // to end of line, keeps the newline, "
+TEST_CASE("strip_line_comments cuts // to end of line, keeps the newline "
           "and cuts inside a string literal",
           "[wiring_order]") {
     CHECK(strip_line_comments("a // c\nb\n") == "a \nb\n");

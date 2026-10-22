@@ -7,7 +7,7 @@
 //
 // Keep the C++ regular-expression library out of this file: a pattern pass over every
 // server source file took 24 s on libc++ for the registrations and 10 s for the
-// receiver-call spans (minutes on MSVC debug), and test_store_wiring_order.cpp fails
+// receiver-call spans (expected to cost far more on MSVC debug; not measured there), and test_store_wiring_order.cpp fails
 // if the library's short name appears here in any case, comments included. Everything
 // below is a linear find per method name.
 
@@ -16,6 +16,7 @@
 #include <initializer_list>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "confined_sink_scan.hpp"
@@ -118,44 +119,40 @@ inline bool first_argument(std::string_view text, std::size_t j, std::string& ou
 // Every `<receiver>.<Method>(<literal>` for `Method` in `methods`, where the receiver
 // is `sink.` / `svr.` / `web_server_->` and starts at a word boundary (`mysink.Post(`,
 // `cli.Post(` and `client.Post(` are not registrations), in ascending position.
-// Matches do not overlap: text inside a matched first-argument literal is not searched
-// again, as the former single pass over the text did not.
+// Matches do not overlap: ONE cursor walks the text for all methods, and text inside a
+// matched first-argument literal is not searched again, as the former single pass over
+// the text did not. A candidate inside a consumed literal advances nothing, so a real
+// registration after it is still found.
 inline std::vector<RouteRegistration>
 find_route_registrations(std::string_view text, std::initializer_list<std::string_view> methods) {
-    struct Hit {
-        RouteRegistration reg;
-        std::size_t end; // one past the first-argument literal
+    struct Candidate {
+        std::size_t at; // the method name's position
+        std::string_view method;
     };
-    std::vector<Hit> hits;
+    std::vector<Candidate> candidates;
     for (const std::string_view method : methods) {
         const std::string needle = std::string(method) + "(";
-        std::size_t consumed = 0;                           // end of this method's last match
-        std::size_t no_raw_close_from = std::string::npos;  // see first_argument
         for (std::size_t at = text.find(needle); at != std::string_view::npos;
-             at = text.find(needle, at + 1)) {
-            const std::size_t recv = detail::receiver_start(text, at, true);
-            if (recv == std::string::npos || recv < consumed)
-                continue;
-            std::string path;
-            std::size_t end = 0;
-            if (!detail::first_argument(text, at + needle.size(), path, end, no_raw_close_from))
-                continue;
-            consumed = end;
-            hits.push_back({{recv, std::string(method), std::move(path)}, end});
-        }
+             at = text.find(needle, at + 1))
+            candidates.push_back({at, method});
     }
-    // One list in source order: the methods were searched one at a time. A hit that
-    // starts inside an earlier hit's literal belongs to that literal's text, not to a
-    // registration of its own.
-    std::stable_sort(hits.begin(), hits.end(),
-                     [](const Hit& a, const Hit& b) { return a.reg.pos < b.reg.pos; });
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [](const Candidate& a, const Candidate& b) { return a.at < b.at; });
+
     std::vector<RouteRegistration> out;
-    std::size_t covered = 0;
-    for (auto& h : hits) {
-        if (h.reg.pos < covered)
+    std::size_t consumed = 0;                          // end of the last accepted literal
+    std::size_t no_raw_close_from = std::string::npos; // see first_argument
+    for (const Candidate& c : candidates) {
+        const std::size_t recv = detail::receiver_start(text, c.at, true);
+        if (recv == std::string::npos || recv < consumed)
             continue;
-        covered = h.end;
-        out.push_back(std::move(h.reg));
+        std::string path;
+        std::size_t end = 0;
+        if (!detail::first_argument(text, c.at + c.method.size() + 1, path, end,
+                                    no_raw_close_from))
+            continue;
+        consumed = end;
+        out.push_back({recv, std::string(c.method), std::move(path)});
     }
     return out;
 }

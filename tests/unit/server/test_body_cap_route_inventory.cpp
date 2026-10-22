@@ -697,7 +697,7 @@ TEST_CASE("body-cap route inventory: no GET registration's handler references re
 // ── 5. The route-registration matcher, on engineered input ───────────────
 
 TEST_CASE("route_registration_scan: accepts sink./svr. and web_server_-> with "
-          "Post/Put/Patch/Delete, raw-string and quoted first arguments",
+          "Post/Put/Patch/Delete with raw-string and quoted first arguments",
           "[body_cap][inventory]") {
     const std::string text =
         "sink.Post(\"/a\", h);\n"
@@ -721,8 +721,8 @@ TEST_CASE("route_registration_scan: accepts sink./svr. and web_server_-> with "
     CHECK(text.compare(regs[2].pos, 11, "web_server_") == 0);
 }
 
-TEST_CASE("route_registration_scan: rejects client receivers, a non-boundary receiver, "
-          "Get for the mutating set, and a non-literal first argument",
+TEST_CASE("route_registration_scan: rejects client receivers and a non-boundary receiver "
+          "and Get for the mutating set and a non-literal first argument",
           "[body_cap][inventory]") {
     const std::string text =
         "cli.Post(\"/x\", b);\n"
@@ -739,7 +739,7 @@ TEST_CASE("route_registration_scan: rejects client receivers, a non-boundary rec
 }
 
 TEST_CASE("route_registration_scan: a registration inside a matched literal is not a "
-          "second registration, and unterminated raw literals match nothing",
+          "second registration and unterminated raw literals match nothing",
           "[body_cap][inventory]") {
     // The former single pass consumed the outer match, so the route-looking text in its
     // raw argument was not a registration. Across methods too: the Put sits inside the Post's
@@ -752,16 +752,47 @@ TEST_CASE("route_registration_scan: a registration inside a matched literal is n
     CHECK(regs[0].raw_path == "/outer/sink.Post(\"/inner\", h)");
     CHECK(regs[1].raw_path == "/q/sink.Put(\"/inner2\", h)");
 
-    // Many candidates, none with a closing `)"`: no match, and the scan remembers the
-    // first failure instead of searching the remaining suffix once per candidate.
+    // A candidate inside a consumed literal advances nothing: the real registration
+    // after it is still found, whatever method either one is.
+    const std::string hidden = "svr.Put(\"sink.Post(\", h);\nsink.Post(\"/real\", h);\n";
+    const auto h = route_scan::find_route_registrations(hidden, route_scan::kMutatingMethods);
+    REQUIRE(h.size() == 2);
+    CHECK(h[0].method == "Put");
+    CHECK(h[0].raw_path == "sink.Post(");
+    CHECK(h[1].method == "Post");
+    CHECK(h[1].raw_path == "/real");
+
+    // Many candidates, none with a closing `)"`: no match.
     std::string unterminated;
     for (int i = 0; i < 2000; ++i)
         unterminated += "sink.Post(R\"(/x" + std::to_string(i) + "\n";
     CHECK(route_scan::find_route_registrations(unterminated, route_scan::kMutatingMethods).empty());
 }
 
+TEST_CASE("route_registration_scan: an unterminated raw literal is remembered and not rescanned",
+          "[body_cap][inventory]") {
+    // first_argument records the first raw body with no closing `)"` after it; a later
+    // body can have none either, so it is refused without another search. The second
+    // call below uses a text that DOES close: only the remembered offset refuses it,
+    // which is what makes the skip observable (the control call proves it would match).
+    std::string out;
+    std::size_t end = 0;
+    std::size_t memo = std::string::npos;
+    const std::string unclosed = "R\"(abc";
+    CHECK_FALSE(route_scan::detail::first_argument(unclosed, 0, out, end, memo));
+    CHECK(memo == 3);
+
+    const std::string closed = "R\"(abc)\"";
+    CHECK_FALSE(route_scan::detail::first_argument(closed, 0, out, end, memo));
+
+    std::size_t fresh = std::string::npos;
+    CHECK(route_scan::detail::first_argument(closed, 0, out, end, fresh));
+    CHECK(out == "abc");
+    CHECK(end == closed.size());
+}
+
 TEST_CASE("route_registration_scan: find_receiver_calls returns one position-sorted list "
-          "across verbs, so Post / Get / Get(req.body) / Post flags exactly the second Get",
+          "across verbs so Post / Get / Get(req.body) / Post flags exactly the second Get",
           "[body_cap][inventory]") {
     const std::string text =
         "sink.Post(\"/p1\", [](auto& req, auto&) { use(req.body); });\n"
@@ -782,7 +813,7 @@ TEST_CASE("route_registration_scan: find_receiver_calls returns one position-sor
     CHECK(get_handlers_reading_req_body(text) == std::vector<int>{3});
 }
 
-TEST_CASE("probe_path: non-nested groups become X, nested and unbalanced input keeps "
+TEST_CASE("probe_path: non-nested groups become X while nested and unbalanced input keeps "
           "the inner span",
           "[body_cap][inventory]") {
     CHECK(probe_path("/api/v1/tags/([^/]+)/([^/]+)") == "/api/v1/tags/X/X");

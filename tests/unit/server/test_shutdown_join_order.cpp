@@ -186,7 +186,7 @@ TEST_CASE("server.cpp: web_thread_.join() runs before schedule_engine_.reset() "
 // require_one_line fails loudly on zero or on more than one occurrence (uniqueness kept
 // from the pattern version). The failure itself is a Catch2 REQUIRE, so the count it
 // tests is pinned directly through occurrence_lines.
-TEST_CASE("occurrence_lines: zero and two occurrences are not a sole match, "
+TEST_CASE("occurrence_lines: zero and two occurrences are not a sole match "
           "and a sole match reports its line",
           "[shutdown_order]") {
     CHECK(occurrence_lines("a\nb\n", "x()").empty());

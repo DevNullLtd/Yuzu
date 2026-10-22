@@ -6,7 +6,7 @@
 // substring search.
 //
 // Keep the C++ regular-expression library out of this file: a pattern pass over a
-// ~0.76 MB source file costs seconds on libc++ and minutes on MSVC debug, and
+// ~0.76 MB source file costs seconds on libc++ and expected to cost far more on MSVC debug (not measured there), and
 // test_store_wiring_order.cpp fails if the library's short name appears here in any
 // case, comments included. Everything below is a linear find plus a copy.
 //
@@ -26,10 +26,12 @@
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #ifndef YUZU_SERVER_SRC_DIR
