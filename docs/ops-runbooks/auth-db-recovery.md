@@ -860,8 +860,8 @@ them. A gated route answers **`503`** and does not run in three cases:
   whose enrollment is read from the store. API-token and MCP-token callers pass
   before any store read, OIDC sessions are judged on the identity provider's
   assertion, SAML sessions get their `403`, and engine principals get `403`;
-- the check itself **threw an unexpected exception** (reason
-  `chokepoint_exception`), for any caller class. This is a fault in the server
+- the check itself **threw an unexpected exception**, or could not fingerprint the session
+  (reason `chokepoint_exception` for both), for any caller class. This is a fault in the server
   rather than in the store: the exception text is in the server log (sampled, one
   line in 100), and the window lever below is not a fix for it.
 
@@ -878,7 +878,7 @@ shortly" and prompt for a code only on a `401`. Each refusal writes an
 the `reason=` token in `detail` tells them apart: a missing store is
 `reason=auth_store_unwired`, an unreadable enrollment
 `reason=mfa_status_unavailable`, an unexpected failure inside the check itself
-`reason=chokepoint_exception`; the `detail` also carries `cid=<id>`, equal to the
+`reason=chokepoint_exception` (also written when the session could not be fingerprinted); the `detail` also carries `cid=<id>`, equal to the
 response's `X-Correlation-Id` header, and `stage=pre_authz`), and
 `yuzu_auth_mfa_step_up_gate_total{outcome="unavailable"}` counts the 503s. If the
 audit store is down too, the rows are lost and the counter is the only record. A

@@ -16294,8 +16294,9 @@ private:
                                      const std::string& action_label) -> bool {
             // The decision (consume the chokepoint's pass, else fail closed on an unwired store,
             // else evaluate) lives in `detail::run_in_handler_step_up` (step_up_wiring.hpp) so a
-            // test can drive it with a null store. PR 2 deletes the stash, consume_step_up_pass
-            // and the handler_skipped outcome with the in-handler calls.
+            // test can drive it with a null store. Chokepoint PR 2 deletes the pass,
+            // consume_step_up_pass and the handler_skipped outcome with the in-handler calls;
+            // the principal binding stays until resolve-once lands (#6200).
             const StepUpAuditFn audit = [this](const httplib::Request& r, const std::string& a,
                                                const std::string& rs, const std::string& tt,
                                                const std::string& ti, const std::string& d) {

@@ -756,20 +756,30 @@ regress:
    reads the MFA store). The order is: after the pre-routing
    gates, a null auth store answers `503` for every caller class first, then an engine is `403` with no
    store read, ahead of the window-disabled hatch, which in turn precedes the
-   SAML denial and the store read (so a window of 0 or less lets SAML through).
-   One principal per request: once the central check passes a gated request, later session
-   resolutions for that request yield the same principal or none, and a pass is honoured only
-   for the principal that earned it. The principal is identified by the principal class
-   exactly, plus a fingerprint of principal kind, auth source and username. The binding is
-   armed with the pass and kept until the end of the request, even after the pass is spent:
-   `AuthRoutes::resolve_session` applies it on every credential path (cookie, Bearer,
-   `X-Yuzu-Token`) through `detail::step_up_binding_admits`, and a resolution that would land
-   on another principal returns no session, so the handler answers its ordinary `401`. The
-   in-handler `step_up_fn` reuses the central verdict only through the per-request pass: a
-   handler session that differs refuses the pass, spends it, and is evaluated afresh, which is
-   the path that answers an engine principal `403` with a wired store. A fingerprint that
-   cannot be computed fails closed: the chokepoint answers `503`, and consume and the binding
-   check refuse. PR 2 precondition: the stash, the binding and the in-handler calls may be
-   deleted only once handlers consume the centrally resolved session or the repeated
-   resolutions are removed (resolve once, issue #6200); deleting the binding while handlers
+   SAML denial and the store read (so a window of 0 or less lets SAML through);
+   (g) a gated request authorised by a principal other than the one the check passed:
+   the stash, the binding or the in-handler calls removed while handlers still resolve more
+   than once. One principal per request: once the central check passes a gated request,
+   every `AuthRoutes::resolve_session` call for that request yields the same principal or
+   none, and a pass is honoured only for the principal that earned it. The principal is
+   identified by the principal class exactly, plus a fingerprint of principal kind, auth
+   source and username. The binding is armed with the pass and kept until the end of the
+   request, even after the pass is spent: `resolve_session` applies it on every credential
+   path (cookie, Bearer, `X-Yuzu-Token`) through `detail::step_up_binding_admits`, and a
+   resolution that would land on another principal returns no session, so the route answers
+   its ordinary no-session response (usually `401`; approve and reject answer `503` with
+   `retry_after_ms` 5000). The few direct validators that do not go through
+   `resolve_session` (the elevation routes, the login and SSO callbacks, the MFA enrolment
+   confirm, the SCIM bearer, stream revalidation) do not authorise a gated handler; a source
+   scan pins that list. The stash and the binding are thread-local: a resolution made on
+   another thread is unbound (admitted, as for any non-gated request), and no `kRequired`
+   route resolves off the worker thread today. The in-handler `step_up_fn` reuses the central
+   verdict only through the per-request pass: a handler session that differs refuses the
+   pass, spends it, and is evaluated afresh, which is the path that answers an engine
+   principal `403` with a wired store. A fingerprint that cannot be computed fails closed:
+   the chokepoint answers `503`, and consume and the binding check refuse. Chokepoint PR 2
+   precondition: the in-handler calls go only once handlers consume the centrally resolved
+   session, or the repeated resolves are removed (see #6200). PR 2 deletes the pass,
+   `consume_step_up_pass` and `handler_skipped`, but keeps the binding until resolve-once
+   lands (better: make the binding carry the resolved session); deleting it while handlers
    still resolve more than once re-opens the multi-resolution gap.

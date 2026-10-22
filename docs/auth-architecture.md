@@ -684,7 +684,8 @@ by each handler.
   callers pass before any store read, OIDC never reads the store, SAML gets
   its `403`. Any other read failure of a local session is a `401` whose
   remediation names the store, counted as `refused`. An
-  unexpected exception while the check evaluates a row is the same `503`,
+  unexpected exception while the check evaluates a row, or a session that cannot be
+  fingerprinted, is the same `503`,
   rendered for the request's surface like any other refusal, with
   `reason=chokepoint_exception` in a best-effort audit row and the session's
   own source on the metric (`other` only when no session resolved). A `503`
@@ -721,23 +722,28 @@ by each handler.
   idempotent re-serve. A per-request stash lets the handler's own
   `step_up_fn` call (kept as a second, identical check) reuse the verdict
   instead of reading enrollment state a second time. One principal per
-  request: once the central check passes a gated request, later session
-  resolutions for that request yield the same principal or none, and a pass is
-  honoured only for the principal that earned it. The stash is bound to the
-  principal the central check decided on (principal class exactly, plus a
-  fingerprint of principal kind, auth source and username) as well as to the
-  request and the action label: a handler whose own resolved session is a
-  different principal does not consume it, the pass is spent, and that session
-  is evaluated afresh. The binding outlives the pass until the end of the
-  request, and `AuthRoutes::resolve_session` applies it on every credential
-  path, so a resolution that would land on another principal returns no session
-  and the handler answers its ordinary `401`. That stash, the binding, its
-  consumer (`consume_step_up_pass`), the `handler_skipped` outcome (a
-  report-only tripwire raised when a 2xx follows an unspent pass) and the
-  in-handler calls themselves are transitional: PR 2 deletes them once the
-  chokepoint is the only enforcement, and only after handlers consume the
-  centrally resolved session or the repeated resolutions are removed (resolve
-  once, issue #6200). Until then the in-handler calls remain
+  request: once the central check passes a gated request, every
+  `AuthRoutes::resolve_session` call for that request yields the same principal or
+  none, and a pass is honoured only for the principal that earned it. The stash is
+  bound to the principal the central check decided on (principal class exactly, plus
+  a fingerprint of principal kind, auth source and username) as well as to the
+  request and the action label: a handler whose own resolved session is a different
+  principal does not consume it, the pass is spent, and that session is evaluated
+  afresh. The binding outlives the pass until the end of the request, and
+  `resolve_session` applies it on every credential path, so a resolution that would
+  land on another principal returns no session and the route answers its ordinary
+  no-session response (usually `401`; approve and reject answer `503` with
+  `retry_after_ms` 5000). The documented direct validators (the elevation routes, the
+  login and SSO callbacks, the MFA enrolment confirm, the SCIM bearer, stream
+  revalidation) do not authorise a gated handler. The stash and the binding are
+  thread-local: a resolution made on another thread is unbound (admitted, as for any
+  non-gated request), and no `kRequired` route resolves off the worker thread today.
+  The pass, its consumer (`consume_step_up_pass`), the `handler_skipped` outcome (a
+  report-only tripwire raised when a 2xx follows an unspent pass) and the in-handler
+  calls themselves are transitional: chokepoint PR 2 deletes them once the
+  chokepoint is the only enforcement. The binding stays until handlers consume the
+  centrally resolved session or the repeated resolutions are removed (resolve once,
+  issue #6200). Until then the in-handler calls remain
   as defence in depth (38 distinct labels: one per `kRequired` row, 36, plus
   the two the elevation path uses).
 - **Audit.** Refusals written by the chokepoint go through

@@ -18,7 +18,7 @@
 /// `run_in_handler_step_up` is the decision behind the `StepUpFn` that `server.cpp` hands to the
 /// route owners, extracted for the same reason.
 ///
-/// PR 2 deletes `run_in_handler_step_up` together with the in-handler `StepUpFn` calls (the
+/// Chokepoint PR 2 deletes `run_in_handler_step_up` together with the in-handler `StepUpFn` calls (the
 /// chokepoint then answers those routes alone, and the label-equals source pins that force an
 /// in-handler call per kRequired row go with them).
 

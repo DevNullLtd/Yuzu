@@ -1763,7 +1763,7 @@ No replacement session is issued: the caller is signed out and signs in again wi
 | Status | Audit detail | Meaning |
 |---|---|---|
 | `400` | *(not audited)* | Malformed body, or new password outside 12–1024 bytes |
-| `401` | — | No session, or MFA step-up required |
+| `401` | — | No session (including a request whose principal changed after the step-up check passed), or MFA step-up required |
 | `403` | `token_session` / `csrf` | Steps 2–3 |
 | `403` | `wrong_current` | The current password is wrong. Counts toward lockout exactly like a failed `/login` |
 | `403` | `account_locked` | The account is locked. **Same message as a wrong password** ("current password is incorrect") |
@@ -1841,7 +1841,7 @@ curl -s -X POST \
 | Status | Audit detail | Meaning |
 |---|---|---|
 | `400` | *(not audited)* | Malformed username or body, or new password outside 12–1024 bytes |
-| `401` | — | No session, or MFA step-up required |
+| `401` | — | No session (including a request whose principal changed after the step-up check passed), or MFA step-up required |
 | `403` | `durable_admin_required` | The caller is not a durable Administrator (see above) |
 | `403` | `token_session` / `csrf` / `self_target` / `break_glass_target` | See above |
 | `403` | - | A SAML session at the step-up gate (unless `--mfa-step-up-window-secs` is `0` or less, which lets SAML sessions through on the 36 step-up-gated routes) |

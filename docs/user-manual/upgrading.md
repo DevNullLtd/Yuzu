@@ -82,7 +82,8 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   before any store read, and OIDC sessions are judged on the identity provider's assertion. The
   `503` still carries `meta.mfa_step_up_required: true`, with no `challenge_url`, and writes an
   `mfa.step_up.required` audit row whose `detail` names the cause (an unexpected failure inside the
-  check itself is recorded as `reason=chokepoint_exception`). Retry; re-proving cannot help. A client
+  check itself, or a session that could not be fingerprinted, is recorded as
+  `reason=chokepoint_exception`). Retry; re-proving cannot help. A client
   must treat a `503` as "retry shortly" and prompt for a code only on a `401`. See the
   [recovery runbook](../ops-runbooks/auth-db-recovery.md#step-up-returns-503-while-the-authentication-store-is-unavailable).
   The new alert `YuzuStepUpGateUnavailable` fires on it.
@@ -97,6 +98,11 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   the password-change routes, refuse a token session), so otherwise ask an administrator who signs in
   locally or through OIDC. For the token
   routes, see "Behaviour change: dashboard API-token create and revoke apply MFA step-up" below.
+- **A request that the step-up check has passed keeps the principal it passed.** If a later
+  credential resolution in the same request would land on a different principal, that resolution
+  yields no session and the route answers its ordinary no-session response (usually `401`; approve
+  and reject answer `503` with `retry_after_ms`). Audit rows written after that point have an empty
+  `principal` (`principal_class` still reflects the presented credential).
 - **The server refuses to start when a mutating route has no step-up classification.** At boot,
   every `POST`/`PUT`/`PATCH`/`DELETE` route registered through the route sink is checked against the
   step-up table. If one is missing, the server logs one critical line per route
