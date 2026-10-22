@@ -2,13 +2,14 @@
 
 #include "step_up_gate.hpp"
 
+#include "evp_raii.hpp"
 #include "mcp_jsonrpc.hpp"
 #include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log
 #include "rest_a4_envelope_http.hpp"
 
 #include <httplib.h>
-#include <openssl/evp.h>
 #include <nlohmann/json.hpp>
+#include <openssl/evp.h>
 #include <spdlog/spdlog.h>
 #include <yuzu/metrics.hpp>
 
@@ -17,7 +18,6 @@
 #include <chrono>
 #include <cstdint>
 #include <exception>
-#include <memory>
 #include <string>
 
 namespace yuzu::server {
@@ -618,10 +618,7 @@ StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req, htt
 bool step_up_identity_of(const auth::Session& session, StepUpPassIdentity& out) noexcept {
     // One SHA-256 over (len, bytes) for each of principal_kind, auth_source, username: the length
     // prefix makes the encoding injective, so no two distinct triples hash the same input.
-    struct CtxDeleter {
-        void operator()(EVP_MD_CTX* c) const noexcept { EVP_MD_CTX_free(c); }
-    };
-    std::unique_ptr<EVP_MD_CTX, CtxDeleter> ctx(EVP_MD_CTX_new());
+    EvpMdCtxPtr ctx(EVP_MD_CTX_new());
     if (!ctx || EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) != 1)
         return false;
     const auto feed = [&](const std::string& field) noexcept {
@@ -661,7 +658,7 @@ bool consume_step_up_pass(const httplib::Request& req, const auth::Session& hand
     // does not count a skipped gate, and the caller evaluates the handler's session afresh.
     StepUpPassIdentity handler_identity;
     if (!step_up_identity_of(handler_session, handler_identity) ||
-        handler_identity.engine != stash.identity.engine || handler_identity != stash.identity) {
+        handler_identity != stash.identity) {
         note_pass_identity_mismatch(action_label);
         clear_step_up_pass();
         return false;
