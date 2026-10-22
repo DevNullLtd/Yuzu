@@ -328,9 +328,10 @@ public:
     /// stall. Even that server-side timeout is in force only when the pool injects it: the pool
     /// skips its statement and lock timeouts when the DSN or PGOPTIONS carries its own
     /// `options=` (pg_pool.cpp), leaving the server's defaults. A transaction-scoped bound on
-    /// this statement (as `CaStore::publish_next_crl` sets) would need a transaction wrapper; it
-    /// is an obligation of the writer route that holds a lock across this call, not of this
-    /// primitive.
+    /// this statement (as `CaStore::publish_next_crl` sets) would need a transaction wrapper;
+    /// the score policy route (PUT/DELETE /api/v1/dex/score-policy) documents this limit instead
+    /// of bounding it: a stalled commit holds the provider's writer lock, and other writers
+    /// answer 503 with retry_after_ms.
     [[nodiscard]] std::expected<bool, std::string>
     compare_and_set(const std::string& key, const std::optional<std::string>& expected,
                     const std::string& value, const std::string& updated_by);

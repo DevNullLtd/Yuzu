@@ -192,6 +192,11 @@ constexpr ExpectedResolution kExpected[] = {
     {"POST",   "/api/v1/users/alice/unlock",                           16u * 1024, false, "users"},
     {"POST",   "/api/v1/users/elevation-eligibility",                  16u * 1024, false, "users"},
     {"POST",   "/api/v1/usersevil",                                    4u * 1024 * 1024, false, "default"},
+    // body_cap_policy.hpp dex_score_policy row: the DEX score policy document. ANY method,
+    // measurable; a segment-boundary probe proves "/api/v1/dex/score-policyx" falls to default.
+    {"PUT",    "/api/v1/dex/score-policy",                             320u * 1024, true,  "dex_score_policy"},
+    {"DELETE", "/api/v1/dex/score-policy",                             320u * 1024, true,  "dex_score_policy"},
+    {"PUT",    "/api/v1/dex/score-policyx",                            4u * 1024 * 1024, false, "default"},
     // Catch-all default — ordinary JSON/form traffic.
     {"POST",   "/api/v1/some-ordinary-mutation-route",    4u * 1024 * 1024,   false, "default"},
     {"GET",    "/api/v1/devices",                         4u * 1024 * 1024,   false, "default"},
@@ -229,6 +234,7 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "rbac_enforcement",
     "guardian_policy_generation",
     "users",
+    "dex_score_policy",
     "default",
 };
 
@@ -373,8 +379,8 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // §2) + rbac_enforcement(1: A1 enforcement enable/disable toggle) +
     // guardian_policy_generation(1: the Guardian policy-generation raise) +
     // users(1: the /api/v1/users subtree, #5342 password routes) +
-    // default(1).
-    CHECK(std::size(kBodyCapTable) == 33);
+    // dex_score_policy(1: the DEX score policy document) + default(1).
+    CHECK(std::size(kBodyCapTable) == 34);
 }
 
 // ── 7. requires_measurable: ON for /mcp/ and upload_session, OFF elsewhere ──

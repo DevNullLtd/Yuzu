@@ -1642,6 +1642,10 @@ if build_server
       'unit/server/test_dex_score_policy_json.cpp',
       # bounded-refresh score policy provider over injected read/clock fns - no store, no sleeps, no [pg]
       'unit/server/test_dex_score_policy_provider.cpp',
+      # apply_dex_score_policy over fake read/CAS/audit closures and a real provider - no store, no sleeps, no [pg]
+      'unit/server/test_dex_score_policy_writer.cpp',
+      # GET/PUT/DELETE /api/v1/dex/score-policy route shell through TestRouteSink - no store, no [pg]
+      'unit/server/test_dex_score_policy_routes.cpp',
       'unit/server/test_dex_catalogue.cpp', # ADR-0031 WS-A4 PR-1: the Catalogue View 1 read model + FnDexApi double
       'unit/server/test_dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
       'unit/server/test_schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam (schedule read)
@@ -4016,6 +4020,16 @@ test('tier policy wiring lexical gate (#5047)',
 test('guardian/spark log-injection tripwire (#4665)',
   _python3_test,
   args: [files('test_guardian_spark_log_injection_tripwire.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #6086: the DEX score policy has ONE store writer. A write of the key anywhere but
+# dex_api.cpp would skip apply_dex_score_policy's If-Match precondition, audit-first rows and
+# the provider's commit-then-install order. Lexical; the script's docstring states its limits.
+test('dex score-policy single-writer tripwire (#6086)',
+  _python3_test,
+  args: [files('test_dex_score_policy_key_writer_tripwire.py')],
   suite: 'docs',
   timeout: 30,
 )

@@ -18514,23 +18514,24 @@ private:
         // exact readiness signal the old `if (!guaranteed_state_store)` 503
         // guard used: store present → wired; store absent → nullptr → 503
         // (byte-identical). Mirrors verify_api's "null → 503" contract.
+        // The customer score policy is one stored document read through a
+        // bounded-refresh provider, so every instance converges within
+        // kDexPolicyRefreshMs. It depends only on the runtime config store, so it exists
+        // whenever that store is open: PUT/DELETE /api/v1/dex/score-policy install through
+        // it even where the signals store is absent. With no runtime config store the Apps
+        // read scores under the shipped defaults (the empty function).
+        if (runtime_config_store_ && runtime_config_store_->is_open())
+            dex_score_policy_provider_ = std::make_shared<DexScorePolicyProvider>(
+                dex_score_policy_store_reader(*runtime_config_store_), []() -> std::int64_t {
+                    return std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+                });
         std::shared_ptr<yuzu::server::DexApi> dex_api;
         if (guaranteed_state_store_) {
-            // The customer score policy is one stored document read through a
-            // bounded-refresh provider, so every instance converges within
-            // kDexPolicyRefreshMs. With no runtime config store the Apps read scores
-            // under the shipped defaults (the empty function).
             yuzu::server::DexScorePolicyFn dex_policy_fn;
-            if (runtime_config_store_ && runtime_config_store_->is_open()) {
-                dex_score_policy_provider_ = std::make_shared<DexScorePolicyProvider>(
-                    dex_score_policy_store_reader(*runtime_config_store_),
-                    []() -> std::int64_t {
-                        return std::chrono::duration_cast<std::chrono::milliseconds>(
-                                   std::chrono::steady_clock::now().time_since_epoch())
-                            .count();
-                    });
+            if (dex_score_policy_provider_)
                 dex_policy_fn = [p = dex_score_policy_provider_] { return p->current(); };
-            }
             dex_api = make_local_dex_api(guaranteed_state_store_.get(), dex_fleet_fn,
                                          std::move(dex_policy_fn));
         }
@@ -20859,6 +20860,19 @@ private:
         // it stamps the principal, the effective role the route captured per binding, the
         // engine class and the session correlator. MUST run BEFORE register_routes().
         rest_api_v1_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());
+        // #6086: GET/PUT/DELETE /api/v1/dex/score-policy. The reader and the two conditional
+        // writes borrow runtime_config_store_ by reference, which is reset only after
+        // web_server_->stop() (the same ordering the provider's reader relies on). Without an
+        // open store the three routes answer 503. MUST run BEFORE register_routes().
+        if (dex_score_policy_provider_) {
+            auto policy_writes = dex_score_policy_store_writer(*runtime_config_store_);
+            rest_api_v1_->set_dex_score_policy_writer(
+                {.read_stored = dex_score_policy_store_reader(*runtime_config_store_),
+                 .compare_and_set = std::move(policy_writes.compare_and_set),
+                 .compare_and_remove = std::move(policy_writes.compare_and_remove),
+                 .provider = dex_score_policy_provider_,
+                 .audit = {}});
+        }
         // #6065 PR-Q: the dispatch-chokepoint pre-check closure, defined ONCE and
         // handed to BOTH REST (POST and DELETE /api/v1/quarantine, the trailing register_routes
         // param) and MCP (set_authorize_dispatch_fn, wired further below), so the two

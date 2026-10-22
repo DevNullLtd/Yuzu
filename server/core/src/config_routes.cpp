@@ -111,7 +111,7 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        // The score policy is one document that will have its own writer (a later change),
+        // The score policy is one document with its own writer (PUT /api/v1/dex/score-policy),
         // which validates it whole; a generic single-value write could leave it half-edited. Refused
         // before the store gate (the answer does not depend on the store) and with
         // no audit row, like the unknown-key refusal below.
@@ -122,8 +122,7 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
                                       "PUT /api/v1/dex/score-policy",
                                  detail::A4ErrorOpts{
                                      .remediation = "send the whole policy document to "
-                                                    "PUT /api/v1/dex/score-policy with If-Match "
-                                                    "(not yet available in this release)"}),
+                                                    "PUT /api/v1/dex/score-policy with If-Match"}),
                 "application/json");
             return;
         }

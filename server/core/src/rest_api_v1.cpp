@@ -382,6 +382,23 @@ static bool refuse_cross_site_cookie_write(const auth::Session& s, const httplib
     return true;
 }
 
+// The apply function's view of a PUT or DELETE /api/v1/dex/score-policy request: the RAW
+// dry_run query value and If-Match header (absent stays absent, so the refusal and its denied
+// row live in apply_dex_score_policy) and the body.
+static DexScorePolicyWriteRequest score_policy_write_request(DexScorePolicyWriteRequest::Op op,
+                                                             const httplib::Request& request,
+                                                             const auth::Session& session) {
+    DexScorePolicyWriteRequest out;
+    out.op = op;
+    if (request.has_param("dry_run"))
+        out.dry_run = request.get_param_value("dry_run");
+    if (request.has_header("If-Match"))
+        out.if_match = request.get_header_value("If-Match");
+    out.body = request.body;
+    out.actor = session.username;
+    return out;
+}
+
 // Maps an EnginePrincipalStore/ApiTokenStore `std::expected<..., string>`
 // failure message to an HTTP status. The stores are string-typed-error, not
 // exception-typed — this keeps the mapping in one place instead of
@@ -1510,7 +1527,14 @@ const std::string& openapi_spec() {
     "/dex/apps": {
       "get": {"summary": "App-centric stability list", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Every application with a Windows crash/hang signal in the window: the 100 applications affecting the most Windows devices (then crashes plus hangs, then name), listed by activity (crashes plus hangs descending, then name in byte order); apps_total counts every application with a Windows crash or hang signal in the window and apps_truncated flags the cut; up to 20 versions each (devices affected descending, then version), versions_truncated flags that cut. Each row carries crashes, hangs and distinct_devices (window-wide), then the figures over one population, the Windows devices online now: distinct_devices_online (the affected devices that are online now; null when no fleet source is wired), share_affected (95 percent Wilson interval of those over the population), rate_per_1000 (their events per 1,000 online devices, exact interval) and the stability score with its decomposition, so a device that crashed and went offline is in the counts but not in the share, and the score is withheld as offline_affected while any affected device is offline. Counts are Windows-scoped (the Apps tab, the Overview top apps and GET /dex/app still count every platform) and the population is Windows devices online now (population: null = no fleet source wired, 0 = no Windows device online now; population_basis names it). No device floor is applied. The version-regression term is not assessed here. No per-agent identity (a distinct-device COUNT per app, never an agent_id) — fleet aggregate, NOT audited. The data.policy block names the score policy every figure was scored under (source default|custom, revision, fault, and the four tier edges and display names; Poor's edge is the fixed 0); fault is a reason string when a stored policy document was refused and the shipped defaults are in force, otherwise null. Each application carries profile (default|override): override means a per-application override shaped its tiers or weights; its versions inherit it. A failed read, an invalid score policy, a stored policy that cannot be read within its staleness bound (60 s) or a read over its concurrency budget (4 at once) returns 503, never an empty list.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Apps list (data.window, data.population, data.population_basis, data.apps_total, data.apps_truncated, data.policy.{source, revision, fault, tiers}, data.apps[].{subject, profile, crashes, hangs, distinct_devices, distinct_devices_online, last_seen, share_affected, rate_per_1000, score, versions[], version_count, versions_truncated})"}, "400": {"description": "invalid window"}, "503": {"description": "service unavailable, or the application-stability read degraded or over its concurrency budget (retry_after_ms 2000)"}}}
     },
-    "/dex/catalogue": {
+    )json"
+        // Split again (MSVC C2026 ~16 KB per-literal cap); concatenated at compile time.
+        // #6086's score-policy path starts a fresh literal (its trailing "," is its own
+        // separator), and the catalogue entry after it starts another.
+        R"json("/dex/score-policy": {"get": {"summary": "Read the customer DEX score policy", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The policy in force, read from the store (not this instance's cache): document in the stored shape, its revision, source (custom|default) and, when the stored text is refused and the shipped defaults are served, the fault. The ETag is the revision; send it as If-Match on PUT or DELETE. Not audited (fleet-wide configuration, no per-agent data).", "responses": {"200": {"description": "{data:{document,revision,source,fault?}} with an ETag header", "headers": {"ETag": {"schema": {"type": "string"}, "description": "The quoted revision. On a dry run it is the CURRENT stored revision (the resource did not change; it is what the real PUT must send), not data.revision."}}, "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "object", "properties": {"document": {"type": "object", "description": "The policy in force in the stored shape: version, tiers.edges, tiers.names, weights, overrides. Never the Apps tiers.<tier>.{edge,name} projection."}, "revision": {"type": "string", "description": "'default' when nothing is stored, else 16 lower-hex digits (FNV-1a 64) of the stored text. For a dry run, the revision the real write WOULD produce."}, "source": {"type": "string", "enum": ["custom", "default"]}, "fault": {"type": "string", "description": "Present when the stored text is refused and the shipped defaults are in force; says why."}, "previous_revision": {"type": "string", "description": "PUT and DELETE only: the revision the store held when the If-Match was checked."}, "dry_run": {"type": "boolean", "description": "PUT with dry_run=true only."}}, "required": ["document", "revision", "source"]}, "meta": {"type": "object"}}}}}}, "401": {"description": "Unauthenticated", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "403": {"description": "No GuaranteedState:Read grant", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Runtime config store unavailable (retry_after_ms 2000)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}, "put": {"summary": "Replace the customer DEX score policy", "tags": ["DEX"], "description": "Requires Infrastructure:Write; a cookie session must be same-site. The body is the whole policy document in the stored shape (version, tiers.edges, tiers.names, weights, overrides), at most 256 KiB, validated exactly as the reader validates a stored text; the Apps policy block (tiers.<tier>.{edge,name}, source, revision, fault) is a projection and is refused with a remediation. Requires If-Match (see the header parameter). dry_run=true validates and returns the document and revision a real write would produce, stores nothing and writes one dex.score_policy.validate audit row; any other dry_run value is a 400. Every refusal writes a denied audit row; a real write writes an attempted row BEFORE touching the store (a refused row is a 503 and nothing changes) and a success or failure row after. Other instances converge within 5 seconds. A store error after the statement was sent is resolved by re-reading the store (see the 503).", "parameters": [{"name": "If-Match", "in": "header", "required": true, "schema": {"type": "string"}, "description": "The revision the change is based on: 'default' when no policy was ever written, else the revision GET returned (quoted or bare). A wildcard, a weak validator or a list is refused (400); an absent header is refused (428); a revision that is not the stored one is refused (409)."}, {"name": "dry_run", "in": "query", "required": false, "schema": {"type": "string", "enum": ["true", "false"]}, "description": "true = validate only"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "description": "The policy document: version (1), tiers.edges.{excellent,good,fair}, tiers.names.{excellent,good,fair,poor}, weights.{breadth,crashes,hangs,regression}, overrides[]. Unknown keys are refused."}}}}, "responses": {"200": {"description": "Written (or validated, for a dry run). {data:{document,revision,source,previous_revision,dry_run?}} with an ETag header", "headers": {"ETag": {"schema": {"type": "string"}, "description": "The quoted revision. On a dry run it is the CURRENT stored revision (the resource did not change; it is what the real PUT must send), not data.revision."}}, "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "object", "properties": {"document": {"type": "object", "description": "The policy in force in the stored shape: version, tiers.edges, tiers.names, weights, overrides. Never the Apps tiers.<tier>.{edge,name} projection."}, "revision": {"type": "string", "description": "'default' when nothing is stored, else 16 lower-hex digits (FNV-1a 64) of the stored text. For a dry run, the revision the real write WOULD produce."}, "source": {"type": "string", "enum": ["custom", "default"]}, "fault": {"type": "string", "description": "Present when the stored text is refused and the shipped defaults are in force; says why."}, "previous_revision": {"type": "string", "description": "PUT and DELETE only: the revision the store held when the If-Match was checked."}, "dry_run": {"type": "boolean", "description": "PUT with dry_run=true only."}}, "required": ["document", "revision", "source"]}, "meta": {"type": "object"}}}}}}, "400": {"description": "Malformed If-Match or dry_run value, a document that is not valid JSON, nests too deeply, exceeds 256 KiB, has an unknown key or a value the validator refuses (the message names the field)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "403": {"description": "No Infrastructure:Write grant, or a cross-site browser write", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "409": {"description": "The If-Match revision is not the stored one (the message names the stored revision)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "428": {"description": "If-Match header missing", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Runtime config store unavailable, another score policy write in this process is still running (retry_after_ms 2000), the audit store refused the row so nothing was changed (retry_after_ms 5000, Sec-Audit-Failed: true), or the write's OUTCOME IS UNKNOWN (retry_after_ms 2000): the store reported an error after the statement was sent and a re-read showed a state other than the one requested, or could not be made. The message names the revision now stored; GET the policy and compare its revision before retrying - the answer never says the policy was left as it was.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}, "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when an audit row did not persist"}}}}}, "delete": {"summary": "Remove the customer DEX score policy (back to the shipped defaults)", "tags": ["DEX"], "description": "Requires Infrastructure:Write; a cookie session must be same-site. Requires If-Match. Idempotent: removing a policy that was never written answers 200 with revision 'default' (attempted and no_change audit rows). dry_run is not supported (400). Same audit order, fail-closed audit and outcome-unknown handling as PUT.", "parameters": [{"name": "If-Match", "in": "header", "required": true, "schema": {"type": "string"}, "description": "The revision the change is based on: 'default' when no policy was ever written, else the revision GET returned (quoted or bare). A wildcard, a weak validator or a list is refused (400); an absent header is refused (428); a revision that is not the stored one is refused (409)."}], "responses": {"200": {"description": "Removed or already absent. {data:{document,revision:'default',source:'default',previous_revision}} with an ETag header", "headers": {"ETag": {"schema": {"type": "string"}, "description": "The quoted revision. On a dry run it is the CURRENT stored revision (the resource did not change; it is what the real PUT must send), not data.revision."}}, "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "object", "properties": {"document": {"type": "object", "description": "The policy in force in the stored shape: version, tiers.edges, tiers.names, weights, overrides. Never the Apps tiers.<tier>.{edge,name} projection."}, "revision": {"type": "string", "description": "'default' when nothing is stored, else 16 lower-hex digits (FNV-1a 64) of the stored text. For a dry run, the revision the real write WOULD produce."}, "source": {"type": "string", "enum": ["custom", "default"]}, "fault": {"type": "string", "description": "Present when the stored text is refused and the shipped defaults are in force; says why."}, "previous_revision": {"type": "string", "description": "PUT and DELETE only: the revision the store held when the If-Match was checked."}, "dry_run": {"type": "boolean", "description": "PUT with dry_run=true only."}}, "required": ["document", "revision", "source"]}, "meta": {"type": "object"}}}}}}, "400": {"description": "Malformed If-Match, or a dry_run parameter", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "403": {"description": "No Infrastructure:Write grant, or a cross-site browser write", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "409": {"description": "The If-Match revision is not the stored one", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "428": {"description": "If-Match header missing", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Runtime config store unavailable, another score policy write in this process is still running (retry_after_ms 2000), the audit store refused the row so nothing was changed (retry_after_ms 5000, Sec-Audit-Failed: true), or the write's OUTCOME IS UNKNOWN (retry_after_ms 2000): the store reported an error after the statement was sent and a re-read showed a state other than the one requested, or could not be made. The message names the revision now stored; GET the policy and compare its revision before retrying - the answer never says the policy was left as it was.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}, "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when an audit row did not persist"}}}}}},
+    )json"
+        // Split again (MSVC C2026 ~16 KB per-literal cap); concatenated at compile time.
+        R"json("/dex/catalogue": {
       "get": {"summary": "Signal catalogue family cards (Catalogue View 1)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Every catalogued signal family's card: how many of its member types a connected, in-scope platform monitors, the family's own health-score slice, its window event count, its busiest member type, plus an 'Other (uncatalogued)' list of obs_types seen on the wire but not yet in a curated family — the REST twin of the /fragments/dex/catalogue dashboard grid (ADR-0031 WS-A4 PR-1; see docs/dex-signal-catalog.md for the family names). No per-agent identity — fleet aggregate, NOT audited. A degraded fleet signal-summary read (store closed / pool-acquire timeout / query error) 503s (retry_after_ms 2000) rather than rendering a fabricated healthy, zero-event catalogue (WS-A4 PR-1 fix round, closes sec-5).", "parameters": [{"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["all", "windows", "linux", "macos"], "default": "all"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Catalogue object (os, window, monitored_types, total_types, families[].{name, monitored, total, health_score|null, events, top_obs_type|null}, uncatalogued[].{obs_type, count, distinct_devices, last_seen})"}, "400": {"description": "invalid os or window"}, "503": {"description": "service unavailable, or the fleet signal-summary read degraded (retry_after_ms 2000)"}}}
     },
     "/dex/catalogue/group": {
@@ -18420,6 +18444,115 @@ void RestApiV1::register_routes(
         }
         res.set_content(ok_json(dex_apps_json(model)), "application/json");
     });
+
+    // ── GET / PUT / DELETE /api/v1/dex/score-policy (#6086) ──
+    //
+    // The customer DEX score policy: one JSON document under the runtime-config key
+    // kDexScorePolicyKey. Every write goes through apply_dex_score_policy
+    // (dex_score_policy_writer.hpp), which owns If-Match, dry_run, validation, the
+    // audit-first order and the outcome-unknown handling; these handlers only resolve the
+    // caller and shape the HTTP answer. Registered unconditionally: until
+    // set_dex_score_policy_writer() wires the store they answer 503, like a closed store.
+    // GET is a fleet-wide configuration read (no per-agent data), so it is not audited.
+    auto score_policy_unavailable = [](httplib::Response& res) {
+        res.status = 503;
+        res.set_content(detail::a4_error(res, "runtime config store unavailable",
+                                         {.retry_after_ms = kDexScorePolicyRetryMs,
+                                          .remediation = "retry shortly"}),
+                        "application/json");
+    };
+    sink.Get("/api/v1/dex/score-policy",
+             [perm_fn, score_policy_unavailable,
+              writer = dex_score_policy_writer_](const httplib::Request& req,
+                                                 httplib::Response& res) {
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 if (!writer || !writer->read_stored) {
+                     score_policy_unavailable(res);
+                     return;
+                 }
+                 const auto stored = writer->read_stored();
+                 if (!stored) {
+                     spdlog::warn("GET /api/v1/dex/score-policy: store read failed: {}",
+                                  ::yuzu::log_key_token(stored.error()));
+                     score_policy_unavailable(res);
+                     return;
+                 }
+                 const auto in_force = dex_policy_in_force_from_stored(*stored);
+                 res.set_header("ETag", "\"" + in_force.revision + "\"");
+                 res.set_content(
+                     ok_json(dex_score_policy_in_force_json(in_force)
+                                 .dump(-1, ' ', false, nlohmann::json::error_handler_t::replace)),
+                     "application/json");
+             });
+
+    // PUT and DELETE share this body: permission, then the authenticated session every audit
+    // row is stamped from (an unwired session writer is a 500, never the re-resolving
+    // audit_fn), then the same-site gate, then the apply function.
+    auto score_policy_write =
+        [perm_fn, auth_fn, audit_fn, score_policy_unavailable, writer = dex_score_policy_writer_,
+         audit_as_session = audit_as_session_fn_, trusted = csrf_trusted_origins_](
+            const httplib::Request& req, httplib::Response& res,
+            DexScorePolicyWriteRequest::Op op) {
+            if (!perm_fn(req, res, "Infrastructure", "Write"))
+                return;
+            if (!writer || !writer->read_stored) {
+                score_policy_unavailable(res);
+                return;
+            }
+            const std::string verb(op == DexScorePolicyWriteRequest::Op::Put
+                                       ? kDexScorePolicyUpdateVerb
+                                       : kDexScorePolicyResetVerb);
+            const auto session =
+                authenticate_for_quarantine_audit(req, res, auth_fn, audit_fn, audit_as_session,
+                                                  verb);
+            if (!session)
+                return;
+            const RestApiV1::AuditFn audit = audit_as(audit_as_session, *session);
+            const std::string target(kDexScorePolicyKey);
+            if (refuse_cross_site_cookie_write(*session, req, res, audit, trusted, target))
+                return;
+
+            const DexScorePolicyWriteRequest rq = score_policy_write_request(op, req, *session);
+            DexScorePolicyWriteDeps deps = *writer;
+            deps.audit = [&](std::string_view row_verb, std::string_view result,
+                             const std::string& detail_json) {
+                return detail::emit_behavioral_audit(audit, req, res, std::string(row_verb),
+                                                     std::string(result), "RuntimeConfig", target,
+                                                     detail_json);
+            };
+
+            const auto r = apply_dex_score_policy(rq, deps);
+            res.status = dex_score_policy_http_status(r.status);
+            if (r.status == DexScorePolicyWriteStatus::Ok ||
+                r.status == DexScorePolicyWriteStatus::NoChange) {
+                auto data = dex_score_policy_in_force_json(r.in_force);
+                data["previous_revision"] = r.previous_revision;
+                if (r.dry_run)
+                    data["dry_run"] = true;
+                // A dry run changed nothing: its ETag is the CURRENT stored revision (what the
+                // real PUT must send), while data.revision is the revision it would produce.
+                res.set_header("ETag",
+                               "\"" + (r.dry_run ? r.previous_revision : r.in_force.revision) +
+                                   "\"");
+                res.set_content(
+                    ok_json(data.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace)),
+                    "application/json");
+                return;
+            }
+            res.set_content(detail::a4_error(res, r.message,
+                                             {.retry_after_ms = r.retry_after_ms,
+                                              .remediation = r.remediation}),
+                            "application/json");
+        };
+    sink.Put("/api/v1/dex/score-policy",
+             [score_policy_write](const httplib::Request& req, httplib::Response& res) {
+                 score_policy_write(req, res, DexScorePolicyWriteRequest::Op::Put);
+             });
+    sink.Delete("/api/v1/dex/score-policy",
+                [score_policy_write](const httplib::Request& req, httplib::Response& res) {
+                    score_policy_write(req, res, DexScorePolicyWriteRequest::Op::Reset);
+                });
 
     // GET /dex/catalogue?os=&window= -- the Catalogue View 1 family cards +
     // fleet coverage + the "Other (uncatalogued)" list (ADR-0031 WS-A4 PR-1 /
