@@ -184,6 +184,47 @@ TEST_CASE("ApprovalManager bound: a database at v1 runs #6096's v2 and then v3, 
     CHECK(upgraded.consume_ticket("mcp-old", "alice", ApprovalOrigin::kMcp, {}).has_value());
 }
 
+// A development or UAT database that ran an EARLIER build of this branch recorded the bound
+// columns as migration v2, before #6096's data-only v2 claimed that number. It is at version 2
+// WITH the three columns already present, so v3 must tolerate them.
+TEST_CASE("ApprovalManager bound: a database at v2 that already has the bound columns reaches v3 "
+          "and keeps its rows",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    auto& pool = bundle.pool();
+    ApprovalManager& first = *bundle;
+
+    auto bound = first.submit_bound("guardian.d", "alice", "scope", "",
+                                    ApprovalOrigin::kGuardianDeploy,
+                                    BoundRequest{R"({"k":"v","n":[1,2]})", {"carol"}});
+    REQUIRE(bound.has_value());
+    REQUIRE(first.approve(*bound, "bob", "").has_value());
+    const auto before = first.get(*bound);
+    REQUIRE(before.has_value());
+    auto unbound = first.submit("mcp.tool", "alice", "scope", "", ApprovalOrigin::kMcp);
+    REQUIRE(unbound.has_value());
+
+    // The columns stay; only the recorded version goes back to 2.
+    set_approval_store_version(pool, 2);
+    REQUIRE(approvals_has_column(pool, "request_json") == 1);
+
+    ApprovalManager upgraded{pool};
+    REQUIRE(upgraded.is_open());
+    CHECK(approval_store_version(pool) == 3);
+
+    const auto after = upgraded.get(*bound);
+    REQUIRE(after.has_value());
+    CHECK(after->request_json == before->request_json);
+    CHECK(after->request_digest == before->request_digest);
+    CHECK(after->excluded_roots == before->excluded_roots);
+    CHECK(after->excluded_roots == std::vector<std::string>{"carol"});
+    CHECK_FALSE(after->excluded_roots_unreadable);
+    CHECK(after->status == "approved");
+    CHECK(upgraded.get(*unbound).has_value());
+    // And the bound ticket still redeems on its own surface.
+    CHECK(upgraded.consume_ticket(*bound, "alice", ApprovalOrigin::kGuardianDeploy, {}).has_value());
+}
+
 // -- Reserved definition-id namespaces ----------------------------------------
 
 TEST_CASE("reserved definition ids: guardian. is reserved beside mcp., with its own message",

@@ -565,10 +565,14 @@ const std::vector<pg::PgMigration>& migrations() {
         // fetch without a null branch. They are written once, at INSERT, by
         // submit_bound(); no UPDATE in this file touches them, which is what
         // "frozen at mint" means here.
+        // IF NOT EXISTS makes the step idempotent on purpose: a development or UAT database
+        // that ran an earlier build of this branch recorded these same columns as version 2,
+        // so it reaches this step already holding them. Nothing else changes for it, and a
+        // database without them gets them exactly as before.
         {3,
-         "ALTER TABLE approvals ADD COLUMN request_json   TEXT NOT NULL DEFAULT '';"
-         "ALTER TABLE approvals ADD COLUMN request_digest TEXT NOT NULL DEFAULT '';"
-         "ALTER TABLE approvals ADD COLUMN excluded_roots TEXT NOT NULL DEFAULT '';"},
+         "ALTER TABLE approvals ADD COLUMN IF NOT EXISTS request_json   TEXT NOT NULL DEFAULT '';"
+         "ALTER TABLE approvals ADD COLUMN IF NOT EXISTS request_digest TEXT NOT NULL DEFAULT '';"
+         "ALTER TABLE approvals ADD COLUMN IF NOT EXISTS excluded_roots TEXT NOT NULL DEFAULT '';"},
     };
     return kMigrations;
 }

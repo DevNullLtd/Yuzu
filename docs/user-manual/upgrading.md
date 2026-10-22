@@ -27,7 +27,10 @@ replica cannot finish the migration and refuses to start (`Refusing to start: ap
 migration/open failed`) rather than serve with a half-migrated schema; end the session and start
 it again. It follows the data-only v2 step of the scheduled-approval change (#6096, below), which
 claimed v2 first, so a database upgraded from a build with neither change runs v2 and then v3 in
-two separate transactions, and one already at v2 runs only v3.
+two separate transactions, and one already at v2 runs only v3. The v3 step is idempotent
+(`ADD COLUMN IF NOT EXISTS`), so a development or UAT database that ran an earlier build of this
+branch, which recorded the same columns as version 2, upgrades cleanly instead of failing on a
+column that already exists.
 
 - **Rolling upgrade.** An older replica never touches the new columns and keeps redeeming the
   tickets it and this build mint, all of which are unbound. The migration runner applies only
