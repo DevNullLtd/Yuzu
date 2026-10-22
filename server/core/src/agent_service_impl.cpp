@@ -169,11 +169,14 @@ bool AgentServiceImpl::audit_registry_frame(const std::string& agent_id,
                 ++refused;
                 continue;
             }
-            // Immediately before the only call that leases the pool: once stop() has closed the
-            // gate no row starts a lease, so the pool can go as soon as the hooks inside leave.
-            // The rows from this one on are lost, and counted as such. A row the budget refused
-            // above never gets here: it never leases, so the close changes nothing for it (it
-            // stays `suppressed`).
+            // Immediately before the only call that leases the pool. A row that passed this
+            // check may still start its lease after stop() closes the gate; that is safe because
+            // this call's entry is still counted and stop() waits for it before it resets the
+            // store and the pool. What the close does guarantee is that no row that has not yet
+            // passed this check starts a lease, so the drain is bounded by one row. The rows from
+            // this one on are lost, and counted as such. A row the budget refused above never
+            // gets here: it never leases, so the close changes nothing for it (it stays
+            // `suppressed`).
             if (registry_audit_gate_.closed()) {
                 const std::size_t not_attempted = owed - done;
                 book_rows();

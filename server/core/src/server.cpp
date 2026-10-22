@@ -10991,8 +10991,9 @@ public:
         // invisible to ~PgPool and would lease a pool being destroyed. The hook therefore
         // runs inside a rundown gate (rundown_gate.hpp): it enters before it locks the
         // store and checks the gate before every row, and the stage right before
-        // audit_store_.reset() below closes the gate and waits for the hooks inside, so no
-        // row starts a lease once the pool is on its way out. The retention thread is not
+        // audit_store_.reset() below closes the gate and waits for the hooks inside, so the
+        // store and the pool are not reset while any hook is inside (a row already past its
+        // check may still lease, and the wait covers it). The retention thread is not
         // part of this: audit_store_->stop_cleanup() joined it well above, so
         // ~AuditStore has nothing left to join wherever it runs. What stays #3279's is the
         // detached thread itself, agent_service_ (`this`) and metrics_; this gate is the
@@ -11231,8 +11232,10 @@ public:
         // connect that a lease started just inside that deadline may still run
         // (PgPool::Options::connect_timeout_s, the default when the DSN sets none): a DSN
         // with a longer connect_timeout, or a host list, can keep a started connect past
-        // this bound, and the force-exit below then ends a healthy-but-slow shutdown the way
-        // it ends a wedged database. On timeout: force-exit, the same choice as the
+        // this bound, and so can a row whose INSERT is already running and waits on a lock
+        // (PgPool::Options::statement_timeout_ms, 30s by default). The force-exit below then
+        // ends a healthy-but-slow shutdown the way it ends a wedged database. On timeout:
+        // force-exit, the same choice as the
         // web_thread_ and delivery-queue stages and for the same reason. Continuing past a
         // hook that is still inside reopens exactly the use-after-free this gate closes (see
         // the leak-and-continue discussion above), and nothing durable is lost: state is in
