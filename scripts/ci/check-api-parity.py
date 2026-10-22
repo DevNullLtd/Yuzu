@@ -387,6 +387,9 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 #
 # 228 -> 225 (Seam PR2): the three hardware rows (get.fragments-hardware-list, -hardware-ci,
 # -hardware-quarantine) gained MCP twins (list_hardware_ci, get_hardware_ci, list_quarantined_devices).
+# /crypto (crypto.json): the dashboard and widget fragments compose several /api/v1/crypto reads,
+# but `composed-of:` can name only ledger capability ids and /api/v1 routes are not ledger rows,
+# so each row stays `twinned` against its primary v1 read + MCP tool; the count does not move.
 BASELINE_UNTWINNED = 225
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
