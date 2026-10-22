@@ -4562,6 +4562,7 @@ void SettingsRoutes::register_routes(
         // user — never on "not a SCIM user"/"SCIM store unwired", which
         // degrade to the slug-only set (see its doc comment).
         std::string revoke_detail;
+        std::vector<std::string> erase_principals; // the post-commit erasure hook's set
         if (api_token_store_) {
             auto principals = resolve_deprovision_principals_for_username(scim_store_, username);
             if (!principals.has_value()) {
@@ -4625,6 +4626,7 @@ void SettingsRoutes::register_routes(
                     "application/json");
                 return;
             }
+            erase_principals = std::move(*principals);
         } else {
             // Governance Gate 7 BLOCKING fix (UP-7): FAIL CLOSED here —
             // mirror the SCIM seam's `revoke_linked_credentials_or_fail`
@@ -4664,6 +4666,9 @@ void SettingsRoutes::register_routes(
             spdlog::info("User '{}' removed", username);
             (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "user.delete", "success",
                                                 "User", username, revoke_detail);
+            // Post-commit personal-data erasure (ADR-0071): best-effort, never changes this
+            // response - see deprovision_erasure.hpp.
+            run_deprovisioned_hook(on_deprovisioned_, erase_principals);
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"User deleted","level":"success"}})");
             res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
@@ -4705,6 +4710,8 @@ void SettingsRoutes::register_routes(
             }
             audit_fn_(req, "user.delete", "partial", "User", username,
                       "account_deactivated session_wipe_failed=true " + revoke_detail);
+            // The account IS deactivated (committed): erase as on a clean removal.
+            run_deprovisioned_hook(on_deprovisioned_, erase_principals);
             respond_lifecycle_store_unavailable(
                 res, "User deactivated, but session cleanup failed. Repeat the delete to finish");
             return;
@@ -4967,12 +4974,13 @@ void SettingsRoutes::register_routes(
         auto max_uses_s = extract_form_value(req.body, "max_uses");
         auto ttl_s = extract_form_value(req.body, "ttl_hours");
 
-        int max_uses = 0;
-        int ttl_hours = 0;
+        int max_uses = auth::kDefaultEnrollmentTokenMaxUses;
+        int ttl_hours = auth::kDefaultEnrollmentTokenTtlHours;
         try {
             // Strict: `stoi("0x5")` is 0 and max_uses 0 means UNLIMITED, so a mistyped limit
-            // used to mint an unlimited token. Only an EMPTY field or a literal 0 means
-            // "unlimited" / "no expiry"; anything else must be one base-10 integer.
+            // used to mint an unlimited token. A field left BLANK takes the bounded default
+            // above; only a literal 0 means "unlimited" / "no expiry"; anything else must be
+            // one base-10 integer.
             if (!max_uses_s.empty())
                 max_uses = yuzu::server::strict_stoi(max_uses_s);
             if (!ttl_s.empty())
@@ -5025,7 +5033,7 @@ void SettingsRoutes::register_routes(
         // shown once in the response and must never reach the audit store.
         audit_fn_(req, "enrollment.token_create", "success", "EnrollmentToken", created->token_id,
                   "by=" + session->username + " max_uses=" + std::to_string(max_uses) +
-                      " ttl_s=" + std::to_string(ttl.count()) + " label=" + label);
+                      " ttl_s=" + std::to_string(ttl.count()) + " label=" + audit_token(label));
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Enrollment token created","level":"success"}})");
         no_store_private(res); // the raw token is in this body
@@ -5070,7 +5078,7 @@ void SettingsRoutes::register_routes(
         if (!admin_fn_(req, res))
             return;
         // A blank body keeps every default; any other body must be one JSON object (a truncated
-        // document used to mint the default 10 single-use tokens with no expiry).
+        // document used to mint 10 single-use tokens that never expire).
         nlohmann::json batch_body = nlohmann::json::object();
         const bool body_blank =
             std::all_of(req.body.begin(), req.body.end(),
@@ -5091,8 +5099,9 @@ void SettingsRoutes::register_routes(
         auto label = extract_json_string(batch_body, "label");
 
         int count = 10;
+        // Batch tokens stay single-use by default; only ttl_hours gets the bounded default.
         int max_uses = 1;
-        int ttl_hours = 0;
+        int ttl_hours = auth::kDefaultEnrollmentTokenTtlHours;
         try {
             // Strict (see the single-token route): a malformed limit must never read as 0.
             read_enrollment_int(batch_body, "count", count);
@@ -5166,8 +5175,8 @@ void SettingsRoutes::register_routes(
 
         audit_fn_(req, "enrollment.bulk_token_create", "success", "EnrollmentToken", "",
                   "by=" + session->username + " max_uses=" + std::to_string(max_uses) +
-                      " ttl_s=" + std::to_string(ttl.count()) + " label=" + label + " " +
-                      bulk_audit_detail(token_ids));
+                      " ttl_s=" + std::to_string(ttl.count()) + " label=" + audit_token(label) +
+                      " " + bulk_audit_detail(token_ids));
 
         no_store_private(res); // N raw tokens are in this body
         res.set_content(nlohmann::json({{"count", tokens.size()}, {"tokens", tokens}}).dump(),
