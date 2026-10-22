@@ -604,6 +604,45 @@ TEST_CASE("REST GET /api/v1/quarantine resolves ONE list-gate decision and pushe
     }
 }
 
+// Seam PR2 commit 4: the GET body is built by the shared quarantine_read_model.hpp
+// (ordered_json). The expected strings below were captured from the pre-change handler
+// (the TU-local JObj builder) and are the byte contract: key order, number formatting
+// and control-character escaping must not move. Only quarantined_at is store-assigned,
+// so it is spliced in from the stored record.
+TEST_CASE("REST GET /api/v1/quarantine body bytes are pinned (key order and escaping)",
+          "[rest][quarantine][pg][byte_pin]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    SECTION("an empty list is an empty array") {
+        QuarantineRouteHarness h(qpool);
+        auto res = h.get();
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body == R"({"data":[],"pagination":{"total":0,"start":0,"page_size":50},)"
+                           R"("meta":{"api_version":"v1"}})");
+    }
+    SECTION("one record with escapes in reason and whitelist") {
+        QuarantineRouteHarness h(qpool);
+        REQUIRE(h.quarantine_store.quarantine_device(
+            "agent-1", "seed", "line1\nq\"b\\s\tt\x01" "x\xc3\xa9/", "10.0.0.1,10.0.0.2"));
+        auto list = h.quarantine_store.list_quarantined();
+        REQUIRE(list.has_value());
+        REQUIRE(list->size() == 1);
+        auto res = h.get();
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const std::string expected =
+            R"({"data":[{"agent_id":"agent-1","status":"active","quarantined_by":"seed",)"
+            R"("quarantined_at":)" +
+            std::to_string((*list)[0].quarantined_at) +
+            R"(,"whitelist":"10.0.0.1,10.0.0.2",)"
+            R"("reason":"line1\nq\"b\\s\tt\u0001x)" "\xc3\xa9" R"(/",)"
+            R"("last_applied_at":0,"last_confirmed_at":0}],)"
+            R"("pagination":{"total":1,"start":0,"page_size":50},"meta":{"api_version":"v1"}})";
+        CHECK(res->body == expected);
+    }
+}
+
 TEST_CASE("REST DELETE /api/v1/quarantine admits in-scope and fails closed when unwired "
           "(CDX-P1-02)",
           "[rest][quarantine][authz][pg]") {

@@ -66,6 +66,7 @@
 #include <libpq-fe.h>
 
 #include <algorithm>
+#include <expected>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -291,6 +292,15 @@ struct Harness {
                         const std::string& action) {
                       return compose_arming_check(registry, &rbac, principal, plugin, action);
                   },
+              // #6096: the outbox spent-ticket ledger. This harness's enqueue_fn writes no
+              // outbox row, so the ledger is empty and no occurrence has run.
+              .outbox_occurrences_fn = [](const std::string&)
+                  -> std::expected<std::vector<std::string>, std::string> {
+                  return std::vector<std::string>{};
+              },
+              .outbox_exists_fn = [](const std::string&) -> std::expected<bool, std::string> {
+                  return false;
+              },
           }) {
         tracker.create_tables();
         approvals.create_tables();
@@ -626,6 +636,13 @@ constexpr TwinRow kExpectedTwins[] = {
     {"get_crypto_libraries", "Inventory", "Read", true},
     {"list_crypto_library_devices", "Inventory", "Read", true},
     {"export_crypto_cbom", "Inventory", "Read", true},
+    // The hardware CI twins, pinned against GET /api/v1/hardware{,/{id}} (hardware_routes.cpp): the
+    // same Inventory:Read gate through fleet_read_fn.
+    {"list_hardware_ci", "Inventory", "Read", true},
+    {"get_hardware_ci", "Inventory", "Read", true},
+    // Seam PR2: list_quarantined_devices, pinned against GET /api/v1/quarantine
+    // (rest_api_v1.cpp): the same Security:Read gate through require_fleet_read.
+    {"list_quarantined_devices", "Security", "Read", true},
 };
 
 } // namespace
