@@ -40,6 +40,18 @@ struct Config {
     std::filesystem::path cert_dir;
     bool auto_provision_cert{true};        // PKI PR3: enable CSR-at-enrollment flow
     std::string enrollment_token;          // Pre-shared enrollment token (Tier 2)
+    // --enrollment-token-file: path to a file holding the enrollment token
+    // (first line). main() reads it once at start; a token read from it wins
+    // over --enrollment-token (enrollment_token_file.hpp). The path stays set
+    // ONLY while a token was consumed from it; the agent removes that file
+    // after the first accepted registration, or when the server refuses the
+    // token itself (is_enrollment_token_refusal), so the next start registers
+    // without it when the removal succeeded; otherwise it is presented again.
+    // resolve_enrollment_token (called from main()) clears the path
+    // on every other outcome and the agent never removes a path it did not read
+    // a token from. The removal is by path (a non-following, non-recursive
+    // delete): whatever sits at that path at that moment is removed.
+    std::filesystem::path enrollment_token_file;
     std::string log_level{"info"};         // Current log level
     bool debug_mode{false};                // Debug mode flag (diagnostic features)
     bool verbose_logging{false};           // Verbose logging flag
