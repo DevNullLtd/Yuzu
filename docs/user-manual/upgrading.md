@@ -2,6 +2,16 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: the DEX score policy document carries a version (#6085)
+
+**What changed.** The canonical text of the `dex_score_policy` document now includes `"version": 1`, and `version` is a recognised key. A document without the field reads as version 1. A server that meets a version above the one it supports scores under the shipped defaults, reports `fault: unsupported_version at version: N above the supported 1` on every Apps response, and logs it once. It never applies part of a document, and the revision stays the hash of the stored text. No released build reads the document yet, so a released build ignores it. A development build that has the reader but predates this change refuses a `version` key as an unknown key and serves the shipped defaults with a fault for any document that carries it.
+
+**The rule, once a release writes the document.** Nothing writes the document in this release, so this rule has no effect yet. From the release that adds the writer, do not change the score policy during a rolling upgrade or rollback: a newer server may write a document that an older server in the same fleet refuses or, if it predates the score policy reader, ignores (on a rollback, a build that predates the `version` key refuses it as an unknown key), and until every instance runs the same release the instances can score under different policies.
+
+**If a stored document is refused.** A later release that tightens validation can refuse a document an earlier release accepted. The server then serves the shipped defaults with a fault naming the field. Save the policy again through the write surface once a release ships one; until then, correct the row directly. Nothing is migrated automatically.
+
+**No action on upgrade.** There is no schema change. Nothing in the product writes the document in this release, so no policy written by the product exists to migrate (a row placed by a direct database write is read as any other document).
+
 ## ⚠️ Breaking: `POST` and `DELETE /api/v1/quarantine` now apply the dispatch approval check (#6065)
 
 **What changed.** `POST /api/v1/quarantine` (and the dashboard's Quarantine device button, which calls it) now runs the same dispatch approval check as the quarantine plugin's `quarantine` action, after the scoped `Security:Execute` gate and the `whitelist` validation and before any record is written. `DELETE /api/v1/quarantine/{agent_id}` (the Release from quarantine button) now runs the same check for the plugin's `unquarantine` action, after the scoped gate and before the `attempt` audit row and the release. Neither depends on any approval-workflow setting.
