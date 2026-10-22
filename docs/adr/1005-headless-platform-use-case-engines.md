@@ -851,6 +851,31 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `get.api-inventory-param-param`, `get.api-agents`,
        `get.fragments-network-overview`, `get.api-tags`).
 
+   - **2026-10-22 - the OpenAPI group guides (`?guides=true`) have no MCP path.**
+     A "no" on Decision 1's both-surfaces requirement for one query-parameter
+     form. `GET /api/v1/openapi.json?guides=true` returns the OpenAPI document
+     with the per-group guide text (`x-yuzu-guide` on the top-level `tags`),
+     and the dashboard `/swagger` page loads that form. The MCP resource
+     `yuzu://openapi` and the discover tools serve only the default form,
+     which leaves the guides out, and no MCP tool or resource takes a
+     `guides` argument.
+     - **Reason.** The guides are prose written for people reading the
+       reference page. An agentic worker gets the same operations, schemas and
+       permissions from the default document, which carries every operation
+       description, and the guide text would make the document larger for
+       every reader of the MCP resource.
+     - **Scope.** The exception covers the guide text only. The operations,
+       parameters, schemas and `operationId` values are identical on both
+       surfaces, and the `/swagger` page adds no capability beyond what the
+       REST document describes. The page and the `guides` parameter take the
+       same `Infrastructure:Read` gate as the MCP resource.
+     - **Not visible to the parity check.** `scripts/ci/check-api-parity.py`
+       reads routes and tool names, so it cannot see a query-parameter variant
+       or the `/swagger` page. This entry is the record that the gap is
+       deliberate.
+     - **Acceptance.** No maintainer ruling is recorded yet; the ADR owner
+       confirms or rejects this entry.
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.

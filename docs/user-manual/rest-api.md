@@ -6942,7 +6942,9 @@ Returns the OpenAPI/Swagger specification for the v1 API as JSON.
 
 **Response:** OpenAPI 3.x JSON document describing all v1 endpoints, schemas, and authentication methods.
 
-**Query parameter:** `guides` (boolean, default `false`). By default the document leaves out the per-group guides, the `x-yuzu-guide` text on the top-level `tags`, which are written for people reading the `/swagger` page. `guides=true` (or `1`) includes them. The MCP resource `yuzu://openapi` and the discover tools always serve the default form, so an agentic worker does not read the guide text.
+**Query parameter:** `guides` (default off). By default the document leaves out the per-group guides, the `x-yuzu-guide` text on the top-level `tags`, which are written for people reading the `/swagger` page. The parameter turns them on only when its value is exactly `true` or `1`, in lower case; any other value, such as `TRUE` or `yes`, returns the default form. If the parameter is repeated, only the first value is read. The two forms are not the same text with a filter applied: `?guides=true` returns the document exactly as it is written in the server, while the default form is parsed and written out again without the guides, so key order and whitespace can differ although the content is the same apart from the guides. The MCP resource `yuzu://openapi` and the discover tools always serve the default form, so an agentic worker does not read the guide text.
+
+**Extensions and identifiers in the document.** Every operation has an `operationId`, unique across the document. It is the lower-case method followed by the path in PascalCase, with each path parameter written as `By` and the parameter name, and the `/api/v1` base left out: `GET /hardware/{id}` is `getHardwareById`, `POST /hardware/{id}/sync` is `postHardwareByIdSync`, and `DELETE /upload-grants/{grant_id}` is `deleteUploadGrantsByGrantId`. An operation that the running server does not serve, because the store behind it is not started, carries an `x-yuzu-unavailable` string explaining that it is documented but not registered; 14 operations carry it today. Group guides live under `x-yuzu-guide` on the top-level `tags`, as described above.
 
 #### `GET /swagger` (dashboard)
 
@@ -6950,7 +6952,7 @@ A browsable reference for the same document, in the dashboard. It lists every op
 
 Each group opens with a one-sentence summary and a **Guide** button. The guide says what the group is for, how its data gets there where there is a flow, what it holds, which permissions and audit records apply, and what a caller should watch for, followed by the data model as expandable field tables. Selecting a group in the filter opens its guide, and `/swagger#g-Hardware` links straight to one.
 
-The page loads `/api/v1/openapi.json?guides=true` with your own session, so it shows exactly what that route returns. It takes the same `Infrastructure:Read` gate; an operator without it gets a `403`. An unauthenticated visitor is redirected to `/login`. It has no sidebar entry, and a successful load writes no audit row.
+The page loads `/api/v1/openapi.json?guides=true` with your own session, so it shows exactly what that route returns. It takes the same `Infrastructure:Read` gate; an operator without it gets a `403`. An unauthenticated visitor is redirected by the server's pre-routing session check to the sign-in landing page, `/home` (`/swagger` is not a screen the landing page can return to, so the redirect carries no `next` key). It has no sidebar entry, and a successful load writes no audit row.
 
 Operations the running server does not serve, because the store behind them is not wired in (the License Management, Device Tokens and Software Deployment groups today), are marked **unavailable** and say so at the top of their detail view. Operations whose success response has only a prose description are marked **untyped**.
 

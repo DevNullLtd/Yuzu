@@ -35,14 +35,9 @@ Every mutating operation on this surface requires:
   exist as a real Yuzu user — creation and transfer both fail closed
   (`400`) against an unknown username.
 
-**A structural rule with no exception:** a caller whose *own* session is
-itself engine-classed can never touch this surface at all, on either
-transport — not even to read. On REST, the engine-principal lifecycle and
-credential routes refuse an engine session explicitly, while the three
-`/api/v1/engine-principals/{id}/roles` routes carry no separate engine-session
-check and rely on their permission gate alone (an engine principal can never be
-given the Administrator role). For the MCP tools, see the
-[MCP tool list](mcp.md#available-tools).
+**An engine-classed session is refused on the lifecycle and credential surface.** A caller whose *own* session is engine-classed is refused, even to read, on every engine-principal lifecycle and credential route on REST (create, list, get, revoke, mint, rotate, confirm, transfer and the no-admin audit) and on the engine lifecycle MCP tools; for the MCP tools, see the [MCP tool list](mcp.md#available-tools). The three `/api/v1/engine-principals/{id}/roles` routes (list, assign, unassign) are the one REST exception: they carry no engine-session check and rely on their permission gate alone (`EnginePrincipal:Read` to list, `Security:Write` to assign or unassign).
+
+**What an engine principal can never be given.** Assignment refuses the roles named `admin` and `Administrator`, and refuses every built-in (system) role. Assignment does not inspect the permissions of a custom role, so a custom role that grants broad permissions can still be assigned. `GET /api/v1/engine-principals/audit/no-admin` reports an admin grant, a system role, or an effective grant that covers every securable and operation, so run it after assigning a custom role.
 
 ## Walkthrough: create, mint, rotate, confirm, transfer, revoke
 
