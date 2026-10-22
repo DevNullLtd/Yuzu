@@ -8360,12 +8360,12 @@ McpServer::HandlerFn McpServer::build_handler(
                     // to lose one way or another), not yet regression-tested: #2952.
                     // Also tracked: #2947, chaos-scenario coverage for this
                     // precondition's read pinning an httplib worker (CH-4).
-                    ConsumePrecondition precondition;
+                    ConsumePrecondition rotation_precondition;
                     if (tool_name == "confirm_engine_rotation") {
                         const auto rot_principal_id = param_str(args, "principal_id");
                         const auto rot_token_id = param_str(args, "token_id");
-                        precondition = [this, rot_principal_id,
-                                        rot_token_id](const Approval&) -> std::expected<void, std::string> {
+                        rotation_precondition = [this, rot_principal_id,
+                                                 rot_token_id](const Approval&) -> std::expected<void, std::string> {
                             // Same reasoning as kNoneActive below: passing this
                             // through was the bug, not the fix. The handler's
                             // own store-open guard (further down this file,
@@ -8465,6 +8465,34 @@ McpServer::HandlerFn McpServer::build_handler(
                             return {};
                         };
                     }
+                    // REQUEST MATCH, for EVERY approval-gated tool (g8r7-astra-D). The match
+                    // above (definition id and canonical arguments) was made on a read of
+                    // this handler's own. consume_ticket reads the row AGAIN and pins the
+                    // version of the row it read, so a rewrite of either field between the
+                    // two reads would be examined, pinned and spent under the NEW content
+                    // while this handler went on to run the OLD request. The precondition
+                    // receives the row consume_ticket examined (the fresher read, whose
+                    // version the consuming statement then pins), so comparing it here
+                    // closes that window. It runs BEFORE the rotation precondition, which
+                    // is unchanged and still decides on its own.
+                    //
+                    // A mismatch is answered exactly as the match above answers one (same
+                    // code, text and remediation): a caller who holds the ticket and the
+                    // request learns nothing it was not already told, and the ticket is
+                    // untouched. The store counts and audits the denial like any
+                    // precondition denial; `request_moved` only selects the client text.
+                    bool request_moved = false;
+                    const ConsumePrecondition precondition =
+                        [&](const Approval& row) -> std::expected<void, std::string> {
+                        if (row.definition_id != definition_id || row.scope_expression != canon) {
+                            request_moved = true;
+                            return std::unexpected(
+                                "the approval no longer matches this tool and arguments");
+                        }
+                        if (rotation_precondition)
+                            return rotation_precondition(row);
+                        return {};
+                    };
                     // H3/N2 (SOC-2 CC7.2): stamp WHO consumed the ticket — the
                     // authenticated principal recalling the tool.
                     if (auto consumed = approval_manager->consume_ticket(
@@ -8615,6 +8643,15 @@ McpServer::HandlerFn McpServer::build_handler(
                         // read twin is accurate now; a future #2939 caller with a
                         // different diagnostic tool needs its own arm here rather
                         // than inheriting this string unmodified.
+                        if (kind == ConsumeFailure::kPrecondition && request_moved) {
+                            res.set_content(
+                                a4_error(kPermissionDenied,
+                                         "approval_id does not match this tool and arguments",
+                                         "submit this exact call without approval_id to obtain a "
+                                         "matching approval ticket"),
+                                "application/json");
+                            return;
+                        }
                         if (kind == ConsumeFailure::kPrecondition) {
                             const std::string remediation =
                                 tool_name == "confirm_engine_rotation"

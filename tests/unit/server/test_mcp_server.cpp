@@ -27001,6 +27001,112 @@ TEST_CASE("MCP delete_tag with a mismatched-args approval_id is rejected",
     CHECK(appr.pending_count() == 0); // approved, not pending
 }
 
+TEST_CASE("MCP approval recall: a ticket rewritten after the request match and before the store's "
+          "read is refused, not consumed under the new content (g8r7-astra-D)",
+          "[pg][mcp][integration][tag][approval][security][race]") {
+    // The handler matches the ticket's tool and arguments with a read of its own, then
+    // consume_ticket reads the row again and pins the version it read. A rewrite of the matched
+    // fields between the two used to be consumed under the NEW content while the handler ran the
+    // OLD request. The kBeforeFirstRead hook is exactly that window.
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    REQUIRE(tags.set_tag("agent-1", "role", "web", "server").has_value());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    appr.create_tables();
+    yuzu::MetricsRegistry reg;
+    appr.set_metrics(&reg);
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.start("operator");
+
+    const auto mint_approved = [&] {
+        auto mint = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":300,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role"}}})");
+        const auto id = nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"]
+                            .get<std::string>();
+        REQUIRE(appr.approve(id, "reviewer-bob", "ok"));
+        return id;
+    };
+    const auto recall_body = [](const std::string& id) {
+        return R"({"jsonrpc":"2.0","method":"tools/call","id":301,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role","approval_id":")" +
+               id + R"("}}})";
+    };
+
+    SECTION("a rewrite of the scope expression in the window") {
+        const auto id = mint_approved();
+        int fired = 0;
+        appr.set_consume_test_hook_for_test([&](ApprovalManager::ConsumeTestStage at) {
+            if (at != ApprovalManager::ConsumeTestStage::kBeforeFirstRead)
+                return;
+            ++fired;
+            auto lease = appr_bundle.pool().acquire();
+            REQUIRE(lease);
+            REQUIRE(pg::exec_params(lease.get(),
+                                    "UPDATE approval_manager.approvals SET scope_expression = "
+                                    "'agent_id=agent-1;key=other' WHERE id = $1",
+                                    std::vector<std::string>{id})
+                        .status() == PGRES_COMMAND_OK);
+        });
+        auto res = ts.call(recall_body(id));
+        appr.set_consume_test_hook_for_test({});
+        CHECK(fired == 1);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+        // The same refusal the handler's own request match gives: nothing new for a caller who
+        // already holds the ticket and its request.
+        CHECK(body["error"]["message"] == "approval_id does not match this tool and arguments");
+        CHECK(appr.get(id)->consumed_at == 0);
+        CHECK(tag_val(tags, "agent-1", "role") == "web"); // the tool did not run
+        CHECK(reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "delete_tag"}}).value() ==
+              1.0);
+        CHECK(reg.counter("yuzu_approval_precondition_denied_total", {{"origin", "mcp"}}).value() ==
+              1.0);
+        REQUIRE(!ts.audit_details.empty());
+        CHECK(ts.audit_details.back().starts_with("approval_id=" + id + " refused: precondition: "));
+    }
+    SECTION("a rewrite of the definition id in the window") {
+        const auto id = mint_approved();
+        appr.set_consume_test_hook_for_test([&](ApprovalManager::ConsumeTestStage at) {
+            if (at != ApprovalManager::ConsumeTestStage::kBeforeFirstRead)
+                return;
+            auto lease = appr_bundle.pool().acquire();
+            REQUIRE(lease);
+            REQUIRE(pg::exec_params(lease.get(),
+                                    "UPDATE approval_manager.approvals SET definition_id = "
+                                    "'mcp.create_tag' WHERE id = $1",
+                                    std::vector<std::string>{id})
+                        .status() == PGRES_COMMAND_OK);
+        });
+        auto res = ts.call(recall_body(id));
+        appr.set_consume_test_hook_for_test({});
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["message"] == "approval_id does not match this tool and arguments");
+        CHECK(appr.get(id)->consumed_at == 0);
+        CHECK(tag_val(tags, "agent-1", "role") == "web");
+    }
+    SECTION("no race: the same recall consumes and runs the tool, and nothing is counted as denied") {
+        const auto id = mint_approved();
+        auto res = ts.call(recall_body(id));
+        auto payload = write_tool_payload(res);
+        CHECK(payload["deleted"] == true);
+        CHECK(appr.get(id)->consumed_at != 0);
+        CHECK(tag_val(tags, "agent-1", "role").empty());
+        CHECK(reg.counter("yuzu_approval_precondition_denied_total", {{"origin", "mcp"}}).value() ==
+              0.0);
+        CHECK(reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "delete_tag"}}).value() ==
+              0.0);
+    }
+}
+
 // ── Gate 8 round 2: the schema-inexpressible rules must not burn a ticket ──
 //
 // The whole point of check_exec_instruction_shape running INSIDE the C8 block.

@@ -610,8 +610,9 @@ public:
     }
 
     /// TEST SEAM (same precedent as `ApiTokenStore`'s `test_hook_before_*`): called by
-    /// `consume_ticket` at the two points where a concurrent writer could change the row and
-    /// where an interleaving test cannot otherwise stand - between the first read and the
+    /// `consume_ticket` at the points where a concurrent writer could change the row and where
+    /// an interleaving test cannot otherwise stand - before the first read (the window between a
+    /// caller's own earlier read of the ticket and this call), between the first read and the
     /// precondition's fresher read (only when a precondition is supplied), and after every
     /// check has passed, immediately before the consuming CAS. Never set in production. It is
     /// read without a lock, so it is installed (and cleared) only while no consume runs on
@@ -620,7 +621,7 @@ public:
     /// row lock: SQL on a SECOND lease that touches the row waits on it until the pool's
     /// lock_timeout (10 s by default, with a 30 s statement_timeout) ends it with an error, so
     /// a hook there writes through the caller's own connection instead.
-    enum class ConsumeTestStage { kBetweenReads, kBeforeCas };
+    enum class ConsumeTestStage { kBetweenReads, kBeforeCas, kBeforeFirstRead };
     void set_consume_test_hook_for_test(std::function<void(ConsumeTestStage)> hook) {
         consume_test_hook_ = std::move(hook);
     }

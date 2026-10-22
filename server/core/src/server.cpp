@@ -1024,7 +1024,9 @@ public:
         metrics_.describe("yuzu_mcp_approval_precondition_denied_total",
                           "MCP approval-ticket recalls refused by a pre-consume precondition "
                           "(#2443) - the ticket matched and was approved, but the underlying "
-                          "operation's live state had already moved on since mint. A subset "
+                          "operation's live state had already moved on since mint, or the "
+                          "ticket's own tool and arguments no longer matched the recall "
+                          "(the request match every approval-gated recall carries). A subset "
                           "of yuzu_mcp_approval_refused_total, broken out separately: unlike "
                           "the masked-denial split above, a precondition denial is already "
                           "distinguishable to the caller from the response body, so this "
@@ -1040,9 +1042,10 @@ public:
                           "the store for any redeemer that supplies a precondition, so it "
                           "mirrors yuzu_mcp_approval_precondition_denied_total (which adds the "
                           "MCP tool); each denial also writes an approval.precondition_denied "
-                          "audit row. TODAY only origin=mcp can move (the MCP "
-                          "confirm_engine_rotation recall is the sole precondition-supplying "
-                          "redeemer); the instruction, schedule and guardian_deploy series are "
+                          "audit row. TODAY only origin=mcp can move (every MCP "
+                          "approval-gated recall supplies a precondition: the request match, "
+                          "plus the rotation state check for confirm_engine_rotation); the "
+                          "instruction, schedule and guardian_deploy series are "
                           "pre-seeded at zero and stay there until a redeemer for that surface "
                           "exists",
                           "counter");
@@ -1395,6 +1398,9 @@ public:
             metrics_.counter("yuzu_mcp_approval_refused_total", {{"tool", tool}});
             // Same closed set again for the #2786 masked-denial counter.
             metrics_.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", tool}});
+            // Every approval-gated recall carries a precondition now (the request match,
+            // g8r7-astra-D), so a precondition denial can reach any tool in the set.
+            metrics_.counter("yuzu_mcp_approval_precondition_denied_total", {{"tool", tool}});
             // #2444 item 3: a HANDLER can only burn a ticket for a tool that is
             // itself approval-gated in the first place, so this is the same
             // closed `tool` set as the three counters above. `reason` is a
@@ -1414,15 +1420,6 @@ public:
                 metrics_.counter(mcp::kMcpPollTotalMetric, {{"tool", tool}, {"result", result}});
             }
         }
-        // yuzu_mcp_approval_precondition_denied_total's reachable label set is
-        // NARROWER than the two above: kPrecondition can only fire for a tool
-        // that actually has a ConsumePrecondition wired, which today is just
-        // confirm_engine_rotation (#2443) — pre-seeding the full
-        // approval-gated set here would claim reachability for tools whose
-        // precondition is always `{}`. Extend this list alongside #2939's
-        // sweep as each tool gets its own precondition wired.
-        metrics_.counter("yuzu_mcp_approval_precondition_denied_total",
-                         {{"tool", "confirm_engine_rotation"}});
         // #6062: the store-level counter's label is the ticket origin - a CLOSED set of
         // the four writable surfaces (kUnspecified/kUnrecognised are never written and
         // can never reach a precondition), so every combination is pre-seeded here.

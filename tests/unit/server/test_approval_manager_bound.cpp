@@ -1682,6 +1682,61 @@ TEST_CASE("consume: the xmin leg of the version pin refuses a rewrite that retur
     }
 }
 
+TEST_CASE("consume: a rewrite between a caller's own read and the first read is the row examined, "
+          "so a request-match precondition sees it (g8r7-astra-D)",
+          "[pg][approval_manager][race]") {
+    // The MCP recall matches a ticket to its request with a read of its own, then calls
+    // consume_ticket, which reads the row again. A rewrite of the matched fields in between is
+    // examined (and its version pinned) by consume_ticket, not by the caller's earlier match, so
+    // the caller must re-check the row consume_ticket hands its precondition.
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    const auto minted = [&] {
+        auto id = mgr.submit("tool.a", "alice", "args-a", "", ApprovalOrigin::kMcp);
+        REQUIRE(id.has_value());
+        REQUIRE(mgr.approve(*id, "bob", "").has_value());
+        return *id;
+    };
+    const std::string rewrite =
+        "UPDATE approval_manager.approvals SET scope_expression = 'args-b' WHERE id = $1";
+
+    SECTION("without a precondition the rewritten row is consumed (why the MCP recall supplies one)") {
+        const auto id = minted();
+        interleave(mgr, bundle, Stage::kBeforeFirstRead, rewrite, id);
+        auto r = mgr.consume_ticket(id, "alice", ApprovalOrigin::kMcp, {});
+        mgr.set_consume_test_hook_for_test({});
+        CHECK(g_fired == 1);
+        REQUIRE(r.has_value());
+        CHECK(mgr.get(id)->scope_expression == "args-b"); // spent under content the caller never matched
+    }
+    SECTION("a precondition that compares the row to the request refuses it, ticket untouched") {
+        const auto id = minted();
+        interleave(mgr, bundle, Stage::kBeforeFirstRead, rewrite, id);
+        const ConsumePrecondition matches = [](const Approval& row) -> std::expected<void, std::string> {
+            if (row.definition_id != "tool.a" || row.scope_expression != "args-a")
+                return std::unexpected("request does not match the approval");
+            return {};
+        };
+        auto r = mgr.consume_ticket(id, "alice", ApprovalOrigin::kMcp, matches);
+        mgr.set_consume_test_hook_for_test({});
+        CHECK(g_fired == 1);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == ConsumeFailure::kPrecondition);
+        CHECK(mgr.get(id)->consumed_at == 0);
+        CHECK(mgr.get(id)->consumed_by.empty());
+    }
+    SECTION("the same precondition consumes an unmoved row") {
+        const auto id = minted();
+        g_fired = 0;
+        const ConsumePrecondition matches = [](const Approval& row) -> std::expected<void, std::string> {
+            if (row.definition_id != "tool.a" || row.scope_expression != "args-a")
+                return std::unexpected("request does not match the approval");
+            return {};
+        };
+        CHECK(mgr.consume_ticket(id, "alice", ApprovalOrigin::kMcp, matches).has_value());
+    }
+}
+
 TEST_CASE("consume: an absent id is an ordinary not-consumable, with or without a precondition",
           "[pg][approval_manager][bound]") {
     yuzu::test::ApprovalManagerPg bundle;

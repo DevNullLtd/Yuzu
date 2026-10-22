@@ -3,7 +3,8 @@
 /// @file approval_denial_audit.hpp
 /// The audit half of "a kPrecondition denial gets an audit row plus a counter"
 /// (#6062). Only a redeemer that supplies a precondition can produce a denial, and
-/// today that is the MCP recall alone (`confirm_engine_rotation`), which ALSO writes its
+/// today that is the MCP recall alone (every approval-gated tool supplies the request match;
+/// `confirm_engine_rotation` adds its rotation-state check), which ALSO writes its
 /// own `mcp.*` audit row: an MCP denial therefore leaves two rows. `ApprovalManager` counts the denial itself and calls the observer built
 /// here; this header owns what the audit row says, so server.cpp wires one line and a
 /// unit test can drive the real row against a real `AuditStore`.

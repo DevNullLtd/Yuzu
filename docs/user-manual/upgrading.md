@@ -46,13 +46,15 @@ it again.
 `yuzu_approval_precondition_denied_total{origin}`.** When an approved ticket is refused at
 redemption because the state its effect depends on has changed, the approval store now counts the
 denial and writes an `approval.precondition_denied` audit row (`result=denied`; see
-[the audit log reference](audit-log.md)). The only redemption that supplies such a check today is
-the MCP `confirm_engine_rotation` recall, so for now the new series moves only with
-`origin="mcp"`; the other three `origin` values are present at 0 until their producers exist.
+[the audit log reference](audit-log.md)). The only redemptions that supply such a check today are
+MCP recalls (every approval-gated tool checks that the ticket still matches the recalled tool and
+arguments; `confirm_engine_rotation` also checks the rotation's state), so for now the new series
+moves only with `origin="mcp"`; the other three `origin` values are present at 0 until their producers exist.
 **For SIEM and alert owners:** add `approval.precondition_denied` to any audit-action allow-list.
 An MCP recall refused this way still writes its own `mcp.*` denied row as before, so one MCP event
 now leaves two rows: do not sum the two when counting denials. The older
-`yuzu_mcp_approval_precondition_denied_total{tool}` series is unchanged.
+`yuzu_mcp_approval_precondition_denied_total{tool}` series keeps its meaning but is now
+pre-seeded, and can move, for every approval-gated tool rather than only `confirm_engine_rotation`.
 
 **4. A redemption integrity re-check, and a row-moved refusal.** Redeeming an approved,
 unconsumed ticket now re-checks the stored row. This applies to every MCP recall of an

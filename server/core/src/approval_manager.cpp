@@ -1309,6 +1309,11 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
     // below is pinned to the row's version (and to the columns the checks read), so a decision made on
     // one state of the row can only be spent against that same state (Gate 8 g8-sg-1).
     std::optional<Approval> examined;
+    // The window between a caller's own earlier read of this ticket and the read below: a
+    // caller that matched the ticket to its request BEFORE calling here must re-check the row
+    // this function examines (the precondition receives it), not rely on its earlier read.
+    if (consume_test_hook_)
+        consume_test_hook_(ConsumeTestStage::kBeforeFirstRead);
     {
         auto row = held ? read_row(held, id, /*for_update=*/true)
                         : get_checked(id); // pooled: takes its own bounded lease
@@ -1395,7 +1400,8 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
                          redact_id(id), consumed_by, ok.error());
             // #6062: a precondition denial is counted and audited AT THE STORE, whichever
             // surface redeems. Only a redeemer that SUPPLIES a precondition can reach
-            // this, and today that is the MCP recall alone (confirm_engine_rotation);
+            // this, and today that is the MCP recall alone (every approval-gated tool, for
+            // the request match; confirm_engine_rotation adds its rotation-state check);
             // instruction and schedule tickets are never redeemed and the Guardian
             // surface mints nothing yet, so those labels stay at zero until a redeemer
             // exists. The label is the ticket's own origin, already known to be
