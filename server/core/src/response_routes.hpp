@@ -102,8 +102,8 @@ struct Deps {
     /// `ServerImpl::response_store_`. Null or `!is_open()` -> every route
     /// answers 503 without touching it.
     ResponseStore* store{nullptr};
-    /// #4990: `ServerImpl::forensics_plugin_set_` (null in tests that predate the tier). Feeds the
-    /// `ResponseTierFilter` every store read takes.
+    /// #4990: `ServerImpl::forensics_plugin_set_` (null = unwired: the routes then refuse every
+    /// row, see `tier_filter_for`). Feeds the `ResponseTierFilter` every store read takes.
     const ForensicsPluginSet* forensics_plugins{nullptr};
     /// #4990: who may read Forensics-plugin rows (see `forensics_visibility.hpp`). Unwired (empty)
     /// resolves to present-empty at the use site.

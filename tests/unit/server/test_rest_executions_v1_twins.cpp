@@ -24,6 +24,7 @@
 #include "response_export_metrics.hpp"
 #include "rest_api_v1.hpp"
 #include "response_store.hpp"
+#include "test_forensics_tier_fixture.hpp"
 #include "test_route_sink.hpp"
 
 #include <yuzu/server/auth.hpp>
@@ -40,6 +41,7 @@
 #include <algorithm>
 #include <chrono>
 #include <memory>
+#include <set>
 #include <shared_mutex>
 #include <unordered_map>
 #include <stdexcept>
@@ -98,6 +100,8 @@ struct ExecV1Harness {
     authz::VisibleSet fleet_read_scope{std::nullopt};
     std::string session_username{"tester"};
     std::vector<AuditRecord> audit_log;
+    // #4990: the caller's Forensics visibility (admin by default; the tier cases flip it).
+    yuzu::server::test::ForensicsCaller forensics;
 
     RestApiV1 api;
 
@@ -107,6 +111,8 @@ struct ExecV1Harness {
     explicit ExecV1Harness(pg::PgPool& pool, bool wire_fleet_read = true,
                            RestApiV1::FleetReadFn real_fleet_read = {}, bool wire_tracker = true) {
         yuzu::server::seed_response_metrics(metrics);
+        api.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
+        api.set_forensics_visibility_fn(forensics.fn());
         execution_tracker = std::make_unique<ExecutionTracker>(pool);
         REQUIRE(execution_tracker->is_open());
         instruction_store = std::make_unique<InstructionStore>(pool);
@@ -489,6 +495,60 @@ TEST_CASE("GET /api/v1/executions/:id/responses: mirrors query_responses' execut
             audited = true;
     }
     CHECK(audited);
+}
+
+// #4990: the Forensics tier. Real PG-backed store, exact rendered rows, a non-Forensics control row.
+TEST_CASE("GET /api/v1/executions/:id/responses: Forensics rows follow the caller's Forensics "
+          "visibility",
+          "[pg][rest][executions][v1][responses][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    auto exec_id = h.make_exec_with_agents("def-resp-tier");
+
+    auto put = [&](const std::string& agent, const std::string& plugin, const std::string& out,
+                   int64_t ts) {
+        StoredResponse r;
+        r.instruction_id = "def-resp-tier";
+        r.agent_id = agent;
+        r.timestamp = ts;
+        r.status = 0;
+        r.output = out;
+        r.plugin = plugin;
+        r.execution_id = exec_id;
+        h.response_store->store(r);
+    };
+    using yuzu::server::test::kForensicsPlugin;
+    using yuzu::server::test::kOrdinaryPlugin;
+    put("agent-A", kForensicsPlugin, "forensics-A", 1735689610);
+    put("agent-B", kForensicsPlugin, "forensics-B", 1735689611);
+    put("agent-A", kOrdinaryPlugin, "ordinary-A", 1735689612);
+    put("agent-B", kOrdinaryPlugin, "ordinary-B", 1735689613);
+
+    auto outputs = [&](const std::string& q = "") {
+        auto res = h.sink.Get("/api/v1/executions/" + exec_id + "/responses" + q);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        std::set<std::string> out;
+        for (const auto& r : body["data"])
+            out.insert(r["output"].get<std::string>());
+        return out;
+    };
+    using Outputs = std::set<std::string>;
+
+    h.forensics.viewer();
+    CHECK(outputs() == Outputs{"ordinary-A", "ordinary-B"});
+    h.forensics.admin();
+    CHECK(outputs() == Outputs{"forensics-A", "forensics-B", "ordinary-A", "ordinary-B"});
+    h.forensics.scoped({"agent-B"});
+    CHECK(outputs() == Outputs{"forensics-B", "ordinary-A", "ordinary-B"});
+
+    // A confined caller (gate scope engaged): the in-scope agent set is derived from the
+    // permitted rows, so an agent that answered only with a Forensics row is not even enumerated.
+    h.forensics.viewer();
+    h.fleet_read_scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}};
+    CHECK(outputs() == Outputs{"ordinary-A"});
 }
 
 // #4030 Gate 8 fix (happy-path, Gate 4, HIGH/I3): `offset` over this

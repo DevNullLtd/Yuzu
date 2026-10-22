@@ -63,8 +63,8 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
-        const auto tier = ResponseTierFilter::operator_surface_pending_wiring(deps.forensics_plugins);
+        // #4990: the existing gate ran first; this derives the tier filter (writes no response).
+        const auto tier = tier_filter_for(req, deps.forensics_visibility_fn, deps.forensics_plugins);
 
         auto group_by = req.get_param_value("group_by");
         if (group_by.empty())
@@ -216,8 +216,8 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
-        const auto tier = ResponseTierFilter::operator_surface_pending_wiring(deps.forensics_plugins);
+        // #4990: the existing gate ran first; this derives the tier filter (writes no response).
+        const auto tier = tier_filter_for(req, deps.forensics_visibility_fn, deps.forensics_plugins);
 
         ResponseQuery q;
         if (req.has_param("agent_id"))
@@ -380,8 +380,8 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
-        const auto tier = ResponseTierFilter::operator_surface_pending_wiring(deps.forensics_plugins);
+        // #4990: the existing gate ran first; this derives the tier filter (writes no response).
+        const auto tier = tier_filter_for(req, deps.forensics_visibility_fn, deps.forensics_plugins);
 
         ResponseQuery q;
         if (req.has_param("agent_id"))

@@ -714,8 +714,8 @@ public:
     /// #4990 - the Forensics plugin set the stored-response read tier excludes
     /// (`ServerImpl::forensics_plugin_set_`, borrowed: it outlives this object). MUST be called
     /// BEFORE `register_routes()`, same timing contract as `set_engine_principal_store`.
-    /// Unset (nullptr, a test harness) leaves the pre-tier behaviour for the operator surfaces,
-    /// until their `ForensicsVisibilityFn` wiring lands.
+    /// Unset (nullptr, a test harness) fails closed: the response routes refuse every row
+    /// (`tier_filter_for`), so a harness that reads responses must wire it.
     void set_forensics_plugin_set(const ForensicsPluginSet* plugins) { forensics_plugins_ = plugins; }
 
     /// #4990 - the resolver behind the response routes' Forensics tier (see

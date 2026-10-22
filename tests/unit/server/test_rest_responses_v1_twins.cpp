@@ -18,6 +18,7 @@
 #include "response_query_params.hpp"
 #include "response_store.hpp"
 #include "test_export_cap_guard.hpp"
+#include "test_forensics_tier_fixture.hpp"
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -29,7 +30,9 @@
 #include "../test_helpers.hpp"
 
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -71,15 +74,24 @@ struct RespV1Harness {
     authz::VisibleSet fleet_read_scope{std::nullopt};
     bool audit_persist{true}; // flip to simulate an audit-write failure
     std::vector<AuditRecord> audit_log;
+    // #4990: the caller's Forensics visibility (admin by default so tests that are not about the
+    // tier keep their meaning; the tier cases below flip it).
+    yuzu::server::test::ForensicsCaller forensics;
 
     yuzu::MetricsRegistry metrics; // #4644/#4703 counters, seeded like production
 
     RestApiV1 api;
 
-    explicit RespV1Harness(pg::PgPool& pool) {
+    // `wire_fn` / `wire_set` = false leave the Forensics resolver / plugin set unwired (#4990).
+    explicit RespV1Harness(pg::PgPool& pool, bool wire_fn = true, bool wire_set = true) {
         response_store = std::make_unique<ResponseStore>(pool, /*retention_days=*/0);
         REQUIRE(response_store->is_open());
         yuzu::server::seed_response_metrics(metrics);
+
+        if (wire_set)
+            api.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
+        if (wire_fn)
+            api.set_forensics_visibility_fn(forensics.fn());
 
         auto auth_fn = [](const httplib::Request&,
                           httplib::Response&) -> std::optional<auth::Session> {
@@ -514,6 +526,183 @@ TEST_CASE("GET /api/v1/responses/:id/export: fleet_read_fn denial -> 403",
     auto res = h.sink.Get("/api/v1/responses/anything/export");
     REQUIRE(res);
     CHECK(res->status == 403);
+}
+
+// ── #4990: the Forensics tier ───────────────────────────────────────────
+//
+// Real PG-backed store, exact rendered rows, and a non-Forensics control row in every case: a stub
+// that only recorded the filter it was handed would stay green with the SQL clause deleted.
+
+namespace {
+using yuzu::server::test::kForensicsPlugin;
+using yuzu::server::test::kOrdinaryPlugin;
+using Outputs = std::set<std::string>;
+
+void put(RespV1Harness& h, const std::string& id, const std::string& agent,
+         const std::string& plugin, const std::string& output, int64_t ts) {
+    StoredResponse r = mk_resp(id, agent, 0, output, ts);
+    r.plugin = plugin;
+    h.response_store->store(r);
+}
+
+// agent-A and agent-B each answered with a Forensics row; agent-A and agent-C with an ordinary one.
+void seed_tier(RespV1Harness& h, const std::string& id) {
+    put(h, id, "agent-A", kForensicsPlugin, "forensics-A", 100);
+    put(h, id, "agent-B", kForensicsPlugin, "forensics-B", 101);
+    put(h, id, "agent-A", kOrdinaryPlugin, "ordinary-A", 102);
+    put(h, id, "agent-C", kOrdinaryPlugin, "ordinary-C", 103);
+}
+
+Outputs data_outputs(const std::unique_ptr<httplib::Response>& res) {
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto body = nlohmann::json::parse(res->body);
+    Outputs out;
+    for (const auto& r : body["data"])
+        out.insert(r["output"].get<std::string>());
+    return out;
+}
+
+const Outputs kAllFour{"forensics-A", "forensics-B", "ordinary-A", "ordinary-C"};
+const Outputs kOrdinaryOnly{"ordinary-A", "ordinary-C"};
+const Outputs kScopedA{"forensics-A", "ordinary-A", "ordinary-C"};
+} // namespace
+
+TEST_CASE("GET /api/v1/responses/:id: Forensics rows follow the caller's Forensics visibility",
+          "[pg][rest][responses][v1][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+    seed_tier(h, "instr-tier-get");
+
+    h.forensics.viewer();
+    CHECK(data_outputs(h.sink.Get("/api/v1/responses/instr-tier-get")) == kOrdinaryOnly);
+    h.forensics.admin();
+    CHECK(data_outputs(h.sink.Get("/api/v1/responses/instr-tier-get")) == kAllFour);
+    h.forensics.scoped({"agent-A"});
+    CHECK(data_outputs(h.sink.Get("/api/v1/responses/instr-tier-get")) == kScopedA);
+}
+
+TEST_CASE("GET /api/v1/responses/:id: a filtered row looks absent, not marked",
+          "[pg][rest][responses][v1][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+    // Only Forensics rows exist for this id: a caller without the tier sees exactly what a caller
+    // sees for an id with no responses at all.
+    put(h, "instr-tier-only", "agent-A", kForensicsPlugin, "forensics-A", 100);
+    h.forensics.viewer();
+    auto filtered = h.sink.Get("/api/v1/responses/instr-tier-only");
+    auto never_existed = h.sink.Get("/api/v1/responses/instr-tier-nothing");
+    REQUIRE(filtered);
+    REQUIRE(never_existed);
+    CHECK(filtered->status == 200);
+    auto a = nlohmann::json::parse(filtered->body);
+    auto b = nlohmann::json::parse(never_existed->body);
+    CHECK(a["data"].empty());
+    CHECK(a["pagination"] == b["pagination"]);
+    CHECK(a.size() == b.size());
+}
+
+TEST_CASE("GET /api/v1/responses/:id: an unwired resolver or plugin set fails closed",
+          "[pg][rest][responses][v1][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+
+    SECTION("no resolver: present-empty, ordinary rows still served") {
+        RespV1Harness h(pool, /*wire_fn=*/false, /*wire_set=*/true);
+        seed_tier(h, "instr-tier-nofn");
+        CHECK(data_outputs(h.sink.Get("/api/v1/responses/instr-tier-nofn")) == kOrdinaryOnly);
+    }
+    SECTION("no plugin set: every row refused") {
+        RespV1Harness h(pool, /*wire_fn=*/true, /*wire_set=*/false);
+        seed_tier(h, "instr-tier-noset");
+        CHECK(data_outputs(h.sink.Get("/api/v1/responses/instr-tier-noset")).empty());
+    }
+}
+
+TEST_CASE("GET /api/v1/responses/:id: the cap flag is computed over the permitted set",
+          "[pg][rest][responses][v1][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+    put(h, "instr-tier-cap", "agent-A", kForensicsPlugin, "forensics-1", 100);
+    put(h, "instr-tier-cap", "agent-B", kForensicsPlugin, "forensics-2", 101);
+    put(h, "instr-tier-cap", "agent-C", kForensicsPlugin, "forensics-3", 102);
+    put(h, "instr-tier-cap", "agent-A", kOrdinaryPlugin, "ordinary-1", 103);
+
+    h.forensics.viewer();
+    {
+        auto res = h.sink.Get("/api/v1/responses/instr-tier-cap?limit=2");
+        CHECK(data_outputs(res) == Outputs{"ordinary-1"});
+        CHECK_FALSE(nlohmann::json::parse(res->body)["pagination"].contains("result_truncated_by_cap"));
+    }
+    h.forensics.admin();
+    {
+        auto res = h.sink.Get("/api/v1/responses/instr-tier-cap?limit=2");
+        CHECK(data_outputs(res).size() == 2);
+        CHECK(nlohmann::json::parse(res->body)["pagination"].contains("result_truncated_by_cap"));
+    }
+}
+
+TEST_CASE("GET /api/v1/responses/:id/aggregate: counts come from the permitted rows only",
+          "[pg][rest][responses][v1][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+    seed_tier(h, "instr-tier-agg");
+
+    auto counts = [&] {
+        auto res = h.sink.Get("/api/v1/responses/instr-tier-agg/aggregate?group_by=agent_id");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        std::map<std::string, int> m;
+        int total = 0;
+        for (const auto& g : body["data"]["groups"]) {
+            m[g["group_value"].get<std::string>()] = g["count"].get<int>();
+            total += g["count"].get<int>();
+        }
+        CHECK(body["data"]["total_rows"].get<int>() == total);
+        return m;
+    };
+    using M = std::map<std::string, int>;
+    h.forensics.viewer();
+    CHECK(counts() == M{{"agent-A", 1}, {"agent-C", 1}});
+    h.forensics.admin();
+    CHECK(counts() == M{{"agent-A", 2}, {"agent-B", 1}, {"agent-C", 1}});
+    h.forensics.scoped({"agent-A"});
+    CHECK(counts() == M{{"agent-A", 2}, {"agent-C", 1}});
+}
+
+TEST_CASE("GET /api/v1/responses/:id/export: json and csv rows and the cap flag come from the "
+          "permitted set",
+          "[pg][rest][responses][v1][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+    put(h, "instr-tier-exp", "agent-A", kForensicsPlugin, "forensics-1", 100);
+    put(h, "instr-tier-exp", "agent-B", kForensicsPlugin, "forensics-2", 101);
+    put(h, "instr-tier-exp", "agent-C", kForensicsPlugin, "forensics-3", 102);
+    put(h, "instr-tier-exp", "agent-A", kOrdinaryPlugin, "ordinary-1", 103);
+
+    h.forensics.viewer();
+    {
+        auto res = h.sink.Get("/api/v1/responses/instr-tier-exp/export?limit=2");
+        CHECK(data_outputs(res) == Outputs{"ordinary-1"});
+        CHECK_FALSE(nlohmann::json::parse(res->body)["pagination"].contains("result_truncated_by_cap"));
+        auto csv = h.sink.Get("/api/v1/responses/instr-tier-exp/export?limit=2&format=csv");
+        REQUIRE(csv);
+        CHECK(csv->body.find("ordinary-1") != std::string::npos);
+        CHECK(csv->body.find("forensics-") == std::string::npos);
+        CHECK(csv->get_header_value("X-Result-Truncated-By-Cap").empty());
+    }
+    h.forensics.admin();
+    {
+        auto res = h.sink.Get("/api/v1/responses/instr-tier-exp/export?limit=2");
+        CHECK(data_outputs(res).size() == 2);
+        CHECK(nlohmann::json::parse(res->body)["pagination"].contains("result_truncated_by_cap"));
+    }
 }
 
 TEST_CASE("GET /api/v1/responses/:id/export: management-group scope filters another "

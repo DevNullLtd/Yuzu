@@ -18,6 +18,7 @@
 #include "pg/pg_pool.hpp"
 #include "rest_api_v1.hpp"
 #include "response_store.hpp"
+#include "test_forensics_tier_fixture.hpp"
 #include "test_route_sink.hpp"
 #include "test_export_cap_guard.hpp"
 
@@ -76,10 +77,14 @@ struct VizHarness {
     // own TOP convention.
     authz::VisibleSet fleet_read_scope{std::nullopt};
     std::vector<AuditRecord> audit_log;
+    // #4990: the caller's Forensics visibility (admin by default; the tier case flips it).
+    yuzu::server::test::ForensicsCaller forensics;
 
     RestApiV1 api;
 
     explicit VizHarness(pg::PgPool& pool, RestApiV1::ResponseScopeFn scope_fn = {}) {
+        api.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
+        api.set_forensics_visibility_fn(forensics.fn());
         // ADR-0058: InstructionStore is now a migrated Postgres store — shares
         // the same pool/database as ResponseStore below (schema-per-store).
         instruction_store = std::make_unique<InstructionStore>(pool);
@@ -199,11 +204,12 @@ struct VizHarness {
     /// Push a response into the store keyed by `instruction_id` (a.k.a.
     /// command_id, a.k.a. the {id} path parameter on the visualization route).
     void push_response(const std::string& instruction_id, const std::string& agent,
-                       const std::string& output) {
+                       const std::string& output, const std::string& plugin = "") {
         StoredResponse r;
         r.instruction_id = instruction_id;
         r.agent_id = agent;
         r.output = output;
+        r.plugin = plugin;
         r.status = 0;
         r.timestamp = 1000;
         response_store->store(r);
@@ -355,6 +361,45 @@ TEST_CASE("REST visualization: pie chart over procfetch responses → 200 with b
     // Detail format: "<def_id> index=<N>" — issue #587 added the index
     // suffix so multi-chart fetches are distinguishable in the audit log.
     CHECK(h.audit_log[0].detail == def_id + " index=0");
+}
+
+TEST_CASE("REST visualization: Forensics rows are charted only for a caller with Forensics:Read",
+          "[pg][rest][visualization][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    VizHarness h(pool);
+    auto spec = R"({"type":"pie","processor":"single_series","labelField":1,
+                    "title":"Top procs"})";
+    auto def_id = h.make_def(spec, "procfetch");
+
+    h.push_response("cmd-tier", "agent-1", "1|ordinary-one|/x|d", "procfetch");
+    h.push_response("cmd-tier", "agent-2", "1|secret-forensics|/x|d",
+                    yuzu::server::test::kForensicsPlugin);
+
+    auto charted = [&] {
+        auto res = h.sink.Get("/api/v1/executions/cmd-tier/visualization?definition_id=" + def_id);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        std::map<std::string, double> got;
+        const auto& d = body["data"];
+        for (size_t i = 0; i < d["labels"].size(); ++i)
+            got[d["labels"][i].get<std::string>()] = d["series"][0]["data"][i].get<double>();
+        return std::make_pair(got, d["meta"]["responses_total"].get<int>());
+    };
+
+    h.forensics.viewer();
+    {
+        const auto [got, total] = charted();
+        CHECK(got == std::map<std::string, double>{{"ordinary-one", 1}});
+        CHECK(total == 1);
+    }
+    h.forensics.admin();
+    {
+        const auto [got, total] = charted();
+        CHECK(got == std::map<std::string, double>{{"ordinary-one", 1}, {"secret-forensics", 1}});
+        CHECK(total == 2);
+    }
 }
 
 TEST_CASE("REST visualization: multi-chart definition (#587)",

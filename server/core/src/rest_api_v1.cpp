@@ -2927,6 +2927,7 @@ void RestApiV1::register_routes(
     // #4990 - the Forensics plugin set feeding every ResponseStore read's tier filter (null =
     // unwired, e.g. a test harness); snapshotted like the members above.
     const ForensicsPluginSet* forensics_plugins = forensics_plugins_;
+    ForensicsVisibilityFn forensics_visibility_fn = forensics_visibility_fn_;
     // #4981 PR-2 — see set_scope_evaluate_fn's doc comment in the .hpp.
     ScopeEvaluateFn scope_evaluate_fn = scope_evaluate_fn_;
     // #4983 — see set_all_agent_ids_fn's doc comment in the .hpp.
@@ -4076,7 +4077,8 @@ void RestApiV1::register_routes(
     // call, matching the fragment's own "no filter -> no scoped count"
     // branch exactly.
     sink.Get("/api/v1/management-groups/agent-count-preview",
-             [auth_fn, perm_fn, response_store, response_visible_set_fn, forensics_plugins](
+             [auth_fn, perm_fn, response_store, response_visible_set_fn, forensics_plugins,
+              forensics_visibility_fn](
                  const httplib::Request& req, httplib::Response& res) {
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
@@ -4108,8 +4110,9 @@ void RestApiV1::register_routes(
                          agent_scope = std::vector<std::string>(scope->begin(), scope->end());
                  }
 
-                 // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
-                 const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins);
+                 // #4990: after the ManagementGroup:Write gate and the session resolve; the filter
+                 // alone closes the Forensics half (no Response:Read gate is added here).
+                 const auto tier = tier_filter_for(req, forensics_visibility_fn, forensics_plugins);
                  auto count = group_agent_count_preview(response_store, tier, command_id, filters,
                                                         agent_scope);
                  if (!count) {
@@ -10627,10 +10630,9 @@ void RestApiV1::register_routes(
     // response bodies to any Execution:Read holder lacking Response:Read.
     sink.Get(
         R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/responses)",
-        [fleet_read_fn, audit_fn, response_store, metrics_registry, forensics_plugins](
+        [fleet_read_fn, audit_fn, response_store, metrics_registry, forensics_plugins,
+         forensics_visibility_fn](
             const httplib::Request& req, httplib::Response& res) {
-            // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
-            const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins);
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
             if (!fleet_read_fn) {
@@ -10642,6 +10644,8 @@ void RestApiV1::register_routes(
             auto gate = fleet_read_fn(req, res, "Response", "Read");
             if (!gate.admitted)
                 return; // gate already wrote the response.
+            // #4990: derived after the gate (never writes a response), before scope resolution.
+            const auto tier = tier_filter_for(req, forensics_visibility_fn, forensics_plugins);
             if (!response_store || !response_store->is_open()) {
                 res.status = 503;
                 res.set_content(
@@ -10812,10 +10816,9 @@ void RestApiV1::register_routes(
 
     sink.Get(
         R"(/api/v1/responses/([A-Za-z0-9_-]{1,128})/aggregate)",
-        [fleet_read_fn, audit_fn, response_store, metrics_registry, forensics_plugins](
+        [fleet_read_fn, audit_fn, response_store, metrics_registry, forensics_plugins,
+         forensics_visibility_fn](
             const httplib::Request& req, httplib::Response& res) {
-            // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
-            const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins);
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
             if (!fleet_read_fn) {
@@ -10829,6 +10832,8 @@ void RestApiV1::register_routes(
             auto gate = fleet_read_fn(req, res, "Response", "Read");
             if (!gate.admitted)
                 return; // gate already wrote the response.
+            // #4990: derived after the gate (never writes a response), before scope resolution.
+            const auto tier = tier_filter_for(req, forensics_visibility_fn, forensics_plugins);
             if (!response_store || !response_store->is_open()) {
                 res.status = 503;
                 res.set_content(
@@ -10968,10 +10973,9 @@ void RestApiV1::register_routes(
 
     sink.Get(
         R"(/api/v1/responses/([A-Za-z0-9_-]{1,128})/export)",
-        [fleet_read_fn, audit_fn, response_store, metrics_registry, forensics_plugins](
+        [fleet_read_fn, audit_fn, response_store, metrics_registry, forensics_plugins,
+         forensics_visibility_fn](
             const httplib::Request& req, httplib::Response& res) {
-            // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
-            const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins);
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
             if (!fleet_read_fn) {
@@ -10985,6 +10989,8 @@ void RestApiV1::register_routes(
             auto gate = fleet_read_fn(req, res, "Response", "Read");
             if (!gate.admitted)
                 return; // gate already wrote the response.
+            // #4990: derived after the gate (never writes a response), before scope resolution.
+            const auto tier = tier_filter_for(req, forensics_visibility_fn, forensics_plugins);
             if (!response_store || !response_store->is_open()) {
                 res.status = 503;
                 res.set_content(
@@ -11139,10 +11145,9 @@ void RestApiV1::register_routes(
 
     sink.Get(
         R"(/api/v1/responses/([A-Za-z0-9_-]{1,128}))",
-        [fleet_read_fn, audit_fn, response_store, metrics_registry, forensics_plugins](
+        [fleet_read_fn, audit_fn, response_store, metrics_registry, forensics_plugins,
+         forensics_visibility_fn](
             const httplib::Request& req, httplib::Response& res) {
-            // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
-            const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins);
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
             if (!fleet_read_fn) {
@@ -11155,6 +11160,8 @@ void RestApiV1::register_routes(
             auto gate = fleet_read_fn(req, res, "Response", "Read");
             if (!gate.admitted)
                 return; // gate already wrote the response.
+            // #4990: derived after the gate (never writes a response), before scope resolution.
+            const auto tier = tier_filter_for(req, forensics_visibility_fn, forensics_plugins);
             if (!response_store || !response_store->is_open()) {
                 res.status = 503;
                 res.set_content(
@@ -11905,10 +11912,9 @@ void RestApiV1::register_routes(
     // all read response_store on the same gate. Governance gate C-1.
     sink.Get(
         R"(/api/v1/executions/([A-Za-z0-9._-]+)/visualization)",
-        [fleet_read_fn, audit_fn, response_store, instruction_store, forensics_plugins](
+        [fleet_read_fn, audit_fn, response_store, instruction_store, forensics_plugins,
+         forensics_visibility_fn](
             const httplib::Request& req, httplib::Response& res) {
-            // TODO(#4990): wire ForensicsVisibilityFn - until then this reads as before.
-            const auto tier = ResponseTierFilter::operator_surface_pending_wiring(forensics_plugins);
             if (!fleet_read_fn) {
                 spdlog::error("execution.visualization.fetch: fleet_read_fn unwired");
                 res.status = 503;
@@ -11918,6 +11924,8 @@ void RestApiV1::register_routes(
             auto gate = fleet_read_fn(req, res, "Response", "Read");
             if (!gate.admitted)
                 return; // gate already wrote the response.
+            // #4990: derived after the gate (never writes a response), before scope resolution.
+            const auto tier = tier_filter_for(req, forensics_visibility_fn, forensics_plugins);
             if (!response_store || !instruction_store || !response_store->is_open() ||
                 !instruction_store->is_open()) {
                 res.status = 503;

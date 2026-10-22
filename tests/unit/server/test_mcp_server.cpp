@@ -56,6 +56,7 @@
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "rest_api_v1.hpp"      // M.9 PR-2b: cross-transport cursor walk (REST + MCP)
+#include "test_forensics_tier_fixture.hpp" // #4990: the Forensics tier fixture
 #include "test_route_sink.hpp"  // M.9 PR-2b: in-process sink for that REST half
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
@@ -25428,8 +25429,13 @@ struct PreviewRestTwin {
     yuzu::MetricsRegistry metrics;
     yuzu::server::RestApiV1 api;
     yuzu::server::test::TestRouteSink sink;
+    // #4990: the caller's Forensics visibility (admin by default; a twin comparison is about the
+    // two surfaces agreeing, so both sides see the same caller).
+    yuzu::server::test::ForensicsCaller forensics;
 
     explicit PreviewRestTwin(yuzu::server::ResponseStore* store) {
+        api.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
+        api.set_forensics_visibility_fn(forensics.fn());
         auto auth_fn = [](const httplib::Request&,
                           httplib::Response&) -> std::optional<yuzu::server::auth::Session> {
             yuzu::server::auth::Session session;
