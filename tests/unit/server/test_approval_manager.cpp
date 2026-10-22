@@ -1362,8 +1362,11 @@ TEST_CASE("ApprovalManager: every stamp and expiry cutoff is authored in-SQL fro
     CHECK(sweep_pending.find("db_now") != std::string::npos);
     // submitted_at (#6096): the INSERT concatenates db_now into the VALUES list rather than
     // binding a C++-authored value, so there is no `submitted_at` parameter left to stamp.
+    // The INSERT also carries #6062's three bound columns as the LAST parameters ($9..$11), so
+    // "no $9" no longer says this; the position does: db_now sits in the submitted_at slot
+    // (fifth VALUES entry, between submitted_by's $3 and the reviewed_by/at/comment literals).
     CHECK(insert.find("db_now") != std::string::npos);
-    CHECK(insert.find("$9") == std::string::npos);
+    CHECK(insert.find("$3,\" + db_now + \",'',0,'',$4,") != std::string::npos);
     CHECK(live_now.find("kDbNowEpochSql") != std::string::npos); // the liveness predicate
     CHECK(live_stmt.find("ticket_live_sql()") != std::string::npos);
     CHECK(sweep_approved.find("live_sql") != std::string::npos); // approved sweep cutoff
@@ -1609,10 +1612,15 @@ TEST_CASE("ApprovalManager::retire_schedule_tickets: settles a schedule's unsett
     SECTION("consume_ticket still refuses a schedule-origin ticket") {
         const auto id = mint("sched-a");
         REQUIRE(mgr.approve(id, "boss", "ok").has_value());
-        auto c = mgr.consume_ticket(id, "operator1", {});
-        REQUIRE_FALSE(c.has_value());
-        CHECK(c.error().kind == ConsumeFailure::kForeignOrigin);
-        CHECK(mgr.get(id)->consumed_at == 0);
+        // consume_ticket now takes the surface the CALLER redeems for (#6062). The MCP recall
+        // is the only production caller and declares kMcp; a schedule-origin ticket is not
+        // an MCP ticket. An undeclared surface (kUnspecified) refuses whatever the row says.
+        for (const auto declared : {ApprovalOrigin::kMcp, ApprovalOrigin::kUnspecified}) {
+            auto c = mgr.consume_ticket(id, "operator1", declared, {});
+            REQUIRE_FALSE(c.has_value());
+            CHECK(c.error().kind == ConsumeFailure::kForeignOrigin);
+            CHECK(mgr.get(id)->consumed_at == 0);
+        }
     }
 }
 

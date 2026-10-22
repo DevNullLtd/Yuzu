@@ -1,6 +1,6 @@
 /**
  * test_approval_manager_bound.cpp -- the bound-approval primitive (#6062, four-eyes
- * MVP PR2): migration v2 columns and old-row compatibility; origin-declared consume
+ * MVP PR2): migration v3 columns and old-row compatibility; origin-declared consume
  * (origin mismatch, kUnspecified/kUnrecognised, the caller-held-connection overload);
  * submit_bound's frozen request/digest/excluded roots and its refusals; approve()'s
  * excluded-root refusal; and the precondition-denial counter + audit observer.
@@ -49,33 +49,84 @@ pg::PgResult run_sql(pg::PgPool& pool, const std::string& sql,
 
 } // namespace
 
-// -- Migration v2 / old-row compatibility -------------------------------------
+// -- Migration v3 / old-row compatibility -------------------------------------
+//
+// The bound columns are migration v3: #6096's data-only v2 (a legacy scheduled-ticket
+// retire) claimed v2 first and ships unchanged, so v3 must be ordered after it.
 
-TEST_CASE("ApprovalManager bound: a row minted before migration v2 survives it and reads "
-          "as binding nothing",
-          "[pg][approval_manager][bound]") {
-    yuzu::test::ApprovalManagerPg bundle;
-    auto& pool = bundle.pool();
+namespace {
 
-    // Rewind the live schema to its v1 shape: drop the three v2 columns and reset
-    // the recorded version, then mint an "old" row with only the v1 columns.
+// schema_meta.version for the approval store, or -1 if unreadable.
+int approval_store_version(pg::PgPool& pool) {
+    auto r = run_sql(pool, "SELECT version FROM public.schema_meta WHERE store = "
+                           "'approval_manager'");
+    if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) != 1)
+        return -1;
+    return std::stoi(PQgetvalue(r.get(), 0, 0));
+}
+
+// Does approval_manager.approvals have `col`? 1 / 0, or -1 if unreadable.
+int approvals_has_column(pg::PgPool& pool, const std::string& col) {
+    auto r = run_sql(pool,
+                     "SELECT count(*) FROM information_schema.columns WHERE table_schema = "
+                     "'approval_manager' AND table_name = 'approvals' AND column_name = $1",
+                     {col});
+    if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) != 1)
+        return -1;
+    return std::string(PQgetvalue(r.get(), 0, 0)) == "1" ? 1 : 0;
+}
+
+void drop_bound_columns(pg::PgPool& pool) {
     REQUIRE(run_sql(pool,
                     "ALTER TABLE approval_manager.approvals DROP COLUMN request_json, "
                     "DROP COLUMN request_digest, DROP COLUMN excluded_roots")
                 .status() == PGRES_COMMAND_OK);
-    REQUIRE(run_sql(pool, "UPDATE public.schema_meta SET version = 1 WHERE store = "
-                          "'approval_manager'")
+}
+
+void set_approval_store_version(pg::PgPool& pool, int v) {
+    REQUIRE(run_sql(pool, "UPDATE public.schema_meta SET version = $1::int WHERE store = "
+                          "'approval_manager'",
+                    {std::to_string(v)})
                 .status() == PGRES_COMMAND_OK);
+}
+
+} // namespace
+
+TEST_CASE("ApprovalManager bound: a row minted before migration v3 survives it and reads "
+          "as binding nothing",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    auto& pool = bundle.pool();
+    REQUIRE(approval_store_version(pool) == 3);
+
+    // Rewind the live schema to the state of a database already at #6096's v2: drop the
+    // three bound columns and reset the recorded version, then mint an "old" row with only
+    // the pre-v3 columns.
+    drop_bound_columns(pool);
+    set_approval_store_version(pool, 2);
     REQUIRE(run_sql(pool,
                     "INSERT INTO approval_manager.approvals (id, definition_id, status, "
                     "submitted_by, submitted_at, reviewed_by, reviewed_at, scope_expression, "
                     "origin) VALUES ('old-row','mcp.tool','approved','alice',1,'bob',"
                     "extract(epoch from now())::bigint,'{}','mcp')")
                 .status() == PGRES_COMMAND_OK);
+    // A schedule ticket the v2 step had retired, and one it had not (approved after v2 ran):
+    // v3 must run ONLY the ALTERs, so neither is touched.
+    REQUIRE(run_sql(pool,
+                    "INSERT INTO approval_manager.approvals (id, definition_id, status, "
+                    "schedule_id, consumed_at, consumed_by, origin) VALUES "
+                    "('sched-retired','d','approved','sched-a',42,'schedule:legacy-6096',"
+                    "'schedule'),"
+                    "('sched-open','d','approved','sched-a',0,'','schedule')")
+                .status() == PGRES_COMMAND_OK);
 
-    // A fresh manager re-runs the ladder: v2 applies to a POPULATED table.
+    // A fresh manager re-runs the ladder: v3 (and only v3) applies to a POPULATED table.
     ApprovalManager upgraded{pool};
     REQUIRE(upgraded.is_open());
+    CHECK(approval_store_version(pool) == 3);
+    CHECK(approvals_has_column(pool, "request_json") == 1);
+    CHECK(approvals_has_column(pool, "request_digest") == 1);
+    CHECK(approvals_has_column(pool, "excluded_roots") == 1);
 
     auto old = upgraded.get("old-row");
     REQUIRE(old.has_value());
@@ -84,9 +135,53 @@ TEST_CASE("ApprovalManager bound: a row minted before migration v2 survives it a
     CHECK(old->excluded_roots.empty());
     CHECK_FALSE(old->excluded_roots_unreadable);
 
+    auto retired = upgraded.get("sched-retired");
+    REQUIRE(retired.has_value());
+    CHECK(retired->consumed_at == 42);
+    CHECK(retired->consumed_by == "schedule:legacy-6096");
+    auto open = upgraded.get("sched-open");
+    REQUIRE(open.has_value());
+    CHECK(open->consumed_at == 0); // v2's data step did not run a second time
+    CHECK(open->request_json.empty());
+
     // ...and it is still redeemable through the normal MCP path.
     auto consumed = upgraded.consume_ticket("old-row", "alice", ApprovalOrigin::kMcp, {});
     CHECK(consumed.has_value());
+}
+
+TEST_CASE("ApprovalManager bound: a database at v1 runs #6096's v2 and then v3, in that order",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    auto& pool = bundle.pool();
+
+    drop_bound_columns(pool);
+    set_approval_store_version(pool, 1);
+    REQUIRE(run_sql(pool,
+                    "INSERT INTO approval_manager.approvals (id, definition_id, status, "
+                    "submitted_by, submitted_at, reviewed_by, reviewed_at, scope_expression, "
+                    "schedule_id, origin) VALUES "
+                    "('sched-old','d','approved','alice',1,'bob',"
+                    "extract(epoch from now())::bigint,'{}','sched-a','schedule'),"
+                    "('mcp-old','mcp.tool','approved','alice',1,'bob',"
+                    "extract(epoch from now())::bigint,'{}','','mcp')")
+                .status() == PGRES_COMMAND_OK);
+
+    ApprovalManager upgraded{pool};
+    REQUIRE(upgraded.is_open());
+    CHECK(approval_store_version(pool) == 3);
+    CHECK(approvals_has_column(pool, "request_json") == 1);
+    CHECK(approvals_has_column(pool, "excluded_roots") == 1);
+
+    // v2 ran: the unsettled schedule ticket is retired; the MCP one is untouched.
+    auto sched = upgraded.get("sched-old");
+    REQUIRE(sched.has_value());
+    CHECK(sched->consumed_at != 0);
+    CHECK(sched->consumed_by == "schedule:legacy-6096");
+    CHECK(sched->request_json.empty());
+    auto mcp = upgraded.get("mcp-old");
+    REQUIRE(mcp.has_value());
+    CHECK(mcp->consumed_at == 0);
+    CHECK(upgraded.consume_ticket("mcp-old", "alice", ApprovalOrigin::kMcp, {}).has_value());
 }
 
 // -- Reserved definition-id namespaces ----------------------------------------
@@ -1270,6 +1365,81 @@ TEST_CASE("consume: a row examined as not-approved cannot be spent after a statu
         REQUIRE_FALSE(r.has_value());
         CHECK(mgr.get(id)->consumed_at == 0);
         CHECK(g_fired == 1);
+    }
+}
+
+// -- consume vs #6096's schedule retire: a retire is a writer like any other -----------------
+//
+// `retire_schedule_tickets` settles a scheduled ticket (consumed_at, consumed_by) and so moves
+// the row to a new version. A consume that examined the row before the retire must be refused
+// by the pinned consuming statement, never spend a settled ticket. consume_ticket has no
+// production caller that declares kSchedule (the tripwire pins that); the declaration is used
+// here only to get past the origin check and reach the CAS, which is the part under test.
+
+TEST_CASE("consume: a schedule retire between the read and the CAS makes the consume refuse "
+          "(row moved; #6096 x #6062)",
+          "[pg][approval_manager][bound][race][6096]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+
+    const auto mint = [&] {
+        auto id = mgr.submit("def-sched", "alice", "scope", "sched-a", ApprovalOrigin::kSchedule,
+                             "procs", "list");
+        REQUIRE(id.has_value());
+        REQUIRE(mgr.approve(*id, "bob", "").has_value());
+        return *id;
+    };
+    const auto retire_it = [&](const std::string& id) {
+        auto n = mgr.retire_schedule_tickets("sched-a", "sched-a:1", {id});
+        REQUIRE(n.has_value());
+        CHECK(*n == 1);
+    };
+
+    for (const auto stage : {Stage::kBeforeFirstRead, Stage::kBeforeCas, Stage::kBetweenReads}) {
+        INFO("stage " << static_cast<int>(stage));
+        const auto id = mint();
+        int fired = 0;
+        mgr.set_consume_test_hook_for_test([&](Stage got) {
+            if (got != stage)
+                return;
+            ++fired;
+            retire_it(id);
+        });
+        // kBetweenReads only runs when a precondition is supplied.
+        auto r = mgr.consume_ticket(id, "alice", ApprovalOrigin::kSchedule, kPass);
+        mgr.set_consume_test_hook_for_test({});
+        CHECK(fired == 1);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().message == kNotConsumableMessage);
+        // The row is the RETIRE's, not the consume's: settled once, by the schedule.
+        const auto row = mgr.get(id);
+        REQUIRE(row.has_value());
+        CHECK(row->consumed_at != 0);
+        CHECK(row->consumed_by == "schedule:sched-a:1");
+    }
+
+    SECTION("a ticket retired BEFORE the consume starts is refused, and a second retire is a no-op") {
+        const auto id = mint();
+        retire_it(id);
+        auto r = mgr.consume_ticket(id, "alice", ApprovalOrigin::kSchedule, {});
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().message == kNotConsumableMessage);
+        auto again = mgr.retire_schedule_tickets("sched-a", "sched-a:2", {id});
+        REQUIRE(again.has_value());
+        CHECK(*again == 0);
+        CHECK(mgr.get(id)->consumed_by == "schedule:sched-a:1");
+    }
+
+    SECTION("the legacy retire marker is as final as a normal retire") {
+        const auto id = mint();
+        REQUIRE(run_sql(bundle.pool(),
+                        "UPDATE approval_manager.approvals SET consumed_at = 7, consumed_by = "
+                        "'schedule:legacy-6096' WHERE id = $1",
+                        {id})
+                    .status() == PGRES_COMMAND_OK);
+        auto r = mgr.consume_ticket(id, "alice", ApprovalOrigin::kSchedule, {});
+        REQUIRE_FALSE(r.has_value());
+        CHECK(mgr.get(id)->consumed_at == 7);
     }
 }
 
