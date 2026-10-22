@@ -303,14 +303,15 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
     });
 
     // -- API reference (/swagger) ----------------------------------------
-    // Renders GET /api/v1/openapi.json in the browser. No store, no audit (the
-    // spec route itself is unaudited). The page carries the same
-    // Infrastructure:Read gate as that route so a denied operator gets the
-    // 403 here rather than a shell whose only fetch would fail. No nav entry.
+    // Renders GET /api/v1/openapi.json?guides=true in the browser. No store, no audit (the
+    // spec route itself is unaudited). The page carries the same Infrastructure:Read gate as
+    // that route and shows no more than it returns, so a denied operator gets the 403 here
+    // rather than a shell whose only fetch would fail. No nav entry. The signed-out redirect
+    // below is the same landing-page redirect the pre-routing gate and the sibling pages use.
     sink.Get("/swagger", [deps](const httplib::Request& req, httplib::Response& res) {
         auto session = deps.auth_fn(req, res);
         if (!session) {
-            res.set_redirect("/login");
+            res.set_redirect(home_ui::sign_in_location(req.path));
             return;
         }
         if (!deps.perm_fn(req, res, "Infrastructure", "Read"))

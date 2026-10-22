@@ -4,6 +4,7 @@
 /// text that a regression would silently break. The renderer itself runs in
 /// the browser; what is pinned here is what the C++ side can promise.
 
+#include "home_ui.hpp"
 #include "page_routes.hpp"
 #include "test_route_sink.hpp"
 
@@ -62,17 +63,19 @@ struct Harness {
 
 } // namespace
 
-TEST_CASE("swagger page: unauthenticated is redirected to /login", "[server][routes][swagger]") {
+TEST_CASE("swagger page: a signed-out request is redirected to the landing page",
+          "[server][routes][swagger]") {
     Harness h;
     h.session_present = false;
     h.wire();
     auto r = h.sink.Get("/swagger");
     REQUIRE(r);
     CHECK(r->status == 302);
-    CHECK(r->get_header_value("Location") == "/login");
+    // The same redirect the pre-routing gate and the sibling pages use.
+    CHECK(r->get_header_value("Location") == home_ui::sign_in_location("/swagger"));
 }
 
-TEST_CASE("swagger page: gated on Infrastructure:Read, the same gate as /api/v1/openapi.json",
+TEST_CASE("swagger page: gated on Infrastructure:Read like /api/v1/openapi.json",
           "[server][routes][swagger]") {
     Harness h;
     h.perm_allow = false;
@@ -93,20 +96,22 @@ TEST_CASE("swagger page: gated on Infrastructure:Read, the same gate as /api/v1/
     CHECK(r->body.find("API reference") != std::string::npos);
 }
 
-TEST_CASE("swagger page: renders from the live spec, builds DOM safely, avoids the banned patterns",
+TEST_CASE("swagger page: renders from the live spec and builds the DOM safely",
           "[server][routes][swagger]") {
     const std::string html(kSwaggerPageHtml);
     // Reads the same document the API serves, with the operator's own session.
     CHECK(html.find("/api/v1/openapi.json") != std::string::npos);
     CHECK(html.find("credentials: 'same-origin'") != std::string::npos);
     // Spec text contains "<plugin>"-style text: it must never reach innerHTML or the parser.
-    CHECK(html.find("innerHTML") == std::string::npos);
-    CHECK(html.find("insertAdjacentHTML") == std::string::npos);
-    CHECK(html.find("document.write") == std::string::npos);
-    CHECK(html.find("eval(") == std::string::npos);
+    for (const char* sink : {"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(",
+                             "new Function", "srcdoc", "DOMParser", "createContextualFragment"}) {
+        INFO(sink);
+        CHECK(html.find(sink) == std::string::npos);
+    }
     // htmx hx-on compiles handlers with new Function(); the dashboard CSP blocks it (CLAUDE.md).
     CHECK(html.find("hx-on") == std::string::npos);
-    // No sidebar entry: the page is reached by URL.
+    // The shell fills this marker pair in; the page has no nav entry because its shell context
+    // names no active item, so it is reached by URL.
     CHECK(html.find("<!--yuzu:shell-->") != std::string::npos);
 }
 

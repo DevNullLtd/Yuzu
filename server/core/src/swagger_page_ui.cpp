@@ -5,8 +5,8 @@
 // fetched by the browser with the operator's own session, so the existing
 // Infrastructure:Read gate on /api/v1/openapi.json still decides what is readable;
 // /swagger takes the same gate so a denied operator gets a 403 instead of a shell that
-// cannot load. The renderer builds the DOM with textContent only: spec text contains
-// literal "<plugin>" and similar.
+// cannot load. The renderer builds the DOM with textContent only, because spec text contains
+// literal "<plugin>" and similar, which innerHTML would parse as markup.
 //
 // The page is assembled from named pieces so each raw literal can be measured against
 // MSVC's 16,380-byte C2026 cap (docs/cpp-conventions.md); test_swagger_page.cpp keeps
@@ -96,7 +96,9 @@ extern const char* const kSwaggerCss = R"SWG(.sw-page{padding:22px 28px 36px;dis
 .panel .sw-guide tr:last-child td{border-bottom:0}
 .panel .sw-guide table{width:100%;border-collapse:collapse}
 .sw-unavail{display:flex;gap:10px;align-items:baseline;margin-top:12px;padding:8px 12px;border:1px solid color-mix(in srgb,var(--warn) 50%,var(--line2));border-radius:var(--rad-ctl);background:var(--mds-color-bg-warning-tinted);color:var(--ink2)}
-.sw-unavail .pill{flex:none})SWG";
+.sw-unavail .pill{flex:none}
+.sw-alt{margin-top:6px;padding-left:10px;border-left:2px solid var(--line)}
+.sw-error .btn{margin-top:10px})SWG";
 
 // End of <style>, the shell marker, the page header and the opening <script>.
 extern const char* const kSwaggerBody = R"SWG(
@@ -193,6 +195,12 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
   }
   function schemaBlock(s) {
     var d = deref(s.allOf && s.allOf.length === 1 ? s.allOf[0] : s);
+    var alts = d.oneOf || d.anyOf;
+    if (alts && alts.length) {
+      var akids = [h('div', 'sw-schema-head', [pill(d.oneOf ? 'one of' : 'any of', 'info mono'), d.description ? h('span', 'mut', [d.description]) : null])];
+      alts.forEach(function (a, i) { akids.push(h('div', 'sw-alt', [h('h3', '', ['Option ' + (i + 1)]), schemaBlock(a)])); });
+      return h('div', '', akids);
+    }
     var head = h('div', 'sw-schema-head', [pill(label(s), 'info mono'), d.description ? h('span', 'mut', [d.description]) : null]);
     var rows = schemaRows(s, 0, [], false, [], 0);
     if (!rows.length) return h('div', '', [head]);
@@ -247,7 +255,8 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
     var op = o.op, kids = [];
     if (o.unavail) kids.push(h('div', 'sw-unavail', [pill('unavailable', 'warn'), h('span', '', [o.unavail])]));
     if (op.description) kids.push(h('p', 'sw-text', [op.description]));
-    var curl = 'curl -s -X ' + o.method.toUpperCase() + ' \\\n  -H "Authorization: Bearer $YUZU_TOKEN" \\\n  "' + location.origin + '/api/v1' + o.path + '"';
+    var base = o.path.indexOf('/v2/') === 0 ? '/api' : '/api/v1'; // the only v2 route is keyed /v2/... and served at /api/v2/...
+    var curl = 'curl -s -X ' + o.method.toUpperCase() + ' \\\n  -H "Authorization: Bearer $YUZU_TOKEN" \\\n  "' + location.origin + base + o.path + '"';
     kids.push(h('h3', '', ['Request']));
     kids.push(h('pre', '', [curl]));
     if (op.parameters && op.parameters.length) { kids.push(h('h3', '', ['Parameters'])); kids.push(paramsTable(op.parameters)); }
@@ -308,10 +317,7 @@ extern const char* const kSwaggerJs1 = R"SWG((function () {
         var open = btn.getAttribute('aria-expanded') !== 'true';
         btn.setAttribute('aria-expanded', open ? 'true' : 'false');
         btn.lastChild.textContent = open ? 'Hide fields' : 'Show fields';
-)SWG";
-
-// Renderer, part 2 of 2.
-extern const char* const kSwaggerJs2 = R"SWG(        if (open && !body) { body = schemaBlock({ $ref: '#/components/schemas/' + n }); wrap.appendChild(body); }
+        if (open && !body) { body = schemaBlock({ $ref: '#/components/schemas/' + n }); wrap.appendChild(body); }
         if (body) body.hidden = !open;
       });
       kids.push(wrap);
@@ -325,7 +331,10 @@ extern const char* const kSwaggerJs2 = R"SWG(        if (open && !body) { body =
       kids.push(h('div', 'sw-flow', g.how_it_works.map(function (s) {
         return h('div', '', [h('b', '', [s.title]), h('span', '', [s.text])]);
       })));
-    }
+)SWG";
+
+// Renderer, part 2 of 2.
+extern const char* const kSwaggerJs2 = R"SWG(    }
     (g.tables || []).forEach(function (t) {
       kids.push(h('h3', '', [t.title]));
       if (t.caption) kids.push(h('p', 'mut sw-cap', [t.caption]));
@@ -344,6 +353,7 @@ extern const char* const kSwaggerJs2 = R"SWG(        if (open && !body) { body =
   }
 
   function build() {
+    ops = []; tags = []; guides = {}; st = { q: '', method: '', tag: '', typed: '' };
     (spec.tags || []).forEach(function (t) {
       var g = t['x-yuzu-guide'];
       if (g) { g.summary = t.description || ''; guides[t.name] = g; }
@@ -399,12 +409,13 @@ extern const char* const kSwaggerJs2 = R"SWG(        if (open && !body) { body =
       if (g) {
         entry.toggleGuide = function (force) {
           var open = force !== undefined ? force : gbtn.getAttribute('aria-expanded') !== 'true';
-          gbtn.setAttribute('aria-expanded', open ? 'true' : 'false');
-          gbtn.textContent = open ? 'Hide guide' : 'Guide';
           if (open && !gbody) {
-            gbody = guideBlock(g, ops.filter(function (o) { return o.tag === t; }));
+            try { gbody = guideBlock(g, ops.filter(function (o) { return o.tag === t; })); }
+            catch (e) { gbody = h('div', 'sw-guide', [h('div', 'sw-error', ['This guide could not be shown.'])]); }
             panel.insertBefore(gbody, list);
           }
+          gbtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+          gbtn.textContent = open ? 'Hide guide' : 'Guide';
           if (gbody) gbody.hidden = !open;
         };
         gbtn.addEventListener('click', function () { entry.toggleGuide(); });
@@ -426,8 +437,11 @@ extern const char* const kSwaggerJs2 = R"SWG(        if (open && !body) { body =
       var body = null;
       function toggle(force) {
         var open = force !== undefined ? force : head.getAttribute('aria-expanded') !== 'true';
+        if (open && !body) {
+          try { body = detail(o); } catch (e) { body = h('div', 'sw-detail', [h('div', 'sw-error', ['This operation could not be shown.'])]); }
+          row.appendChild(body);
+        }
         head.setAttribute('aria-expanded', open ? 'true' : 'false');
-        if (open && !body) { body = detail(o); row.appendChild(body); }
         if (body) body.hidden = !open;
         if (open && force === undefined) { try { history.replaceState(null, '', '#' + encodeURIComponent(o.key)); } catch (e) {} }
       }
@@ -470,22 +484,49 @@ extern const char* const kSwaggerJs2 = R"SWG(        if (open && !body) { body =
     root.appendChild(h('div', 'sw-grid', [toc, main]));
     apply();
 
-    var hash = decodeURIComponent((location.hash || '').slice(1));
+    var hash = '';
+    try { hash = decodeURIComponent((location.hash || '').slice(1)); } catch (e) { /* a malformed fragment selects nothing */ }
     tags.forEach(function (t) { if (hash === 'g-' + t.replace(/[^A-Za-z0-9]+/g, '-') && panels[t].toggleGuide) { panels[t].toggleGuide(true); panels[t].panel.scrollIntoView(); } });
     ops.forEach(function (o) { if (o.key === hash) { o.toggle(true); o.el.scrollIntoView(); } });
   }
 
-  function fail(msg) {
+  function fail(msg, status, cid) {
     root.textContent = '';
-    root.appendChild(h('div', 'sw-error', [msg]));
+    var box = h('div', 'sw-error', [h('div', '', [msg])]);
+    if (status === 401) box.appendChild(h('div', 'mut', ['Your session may have ended. Sign in again, then reload this page.']));
+    if (status === 403) box.appendChild(h('div', 'mut', ['Your account needs the Infrastructure:Read permission to read the API description.']));
+    if (cid) box.appendChild(h('div', 'mut mono', ['Correlation id: ' + cid]));
+    var retry = h('button', 'btn btn-sm', ['Retry']);
+    retry.type = 'button';
+    retry.addEventListener('click', load);
+    box.appendChild(retry);
+    root.appendChild(box);
   }
-  fetch(SPEC_URL, { credentials: 'same-origin', headers: { Accept: 'application/json' } })
-    .then(function (r) {
-      if (!r.ok) throw new Error('The API description could not be loaded (HTTP ' + r.status + ').');
-      return r.json();
-    })
-    .then(function (j) { spec = j; build(); })
-    .catch(function (e) { fail(e && e.message ? e.message : 'The API description could not be loaded.'); });
+  function load() {
+    root.textContent = 'Loading the API description...';
+    var ctl = typeof AbortController === 'function' ? new AbortController() : null;
+    var timer = setTimeout(function () { if (ctl) ctl.abort(); }, 30000);
+    var opts = { credentials: 'same-origin', headers: { Accept: 'application/json' } };
+    if (ctl) opts.signal = ctl.signal;
+    fetch(SPEC_URL, opts)
+      .then(function (r) {
+        clearTimeout(timer);
+        if (r.ok) return r.json();
+        return r.json().then(function (j) { return j; }, function () { return null; }).then(function (j) {
+          var e = new Error('The API description could not be loaded (HTTP ' + r.status + ').');
+          e.status = r.status;
+          e.cid = j && j.error && j.error.correlation_id;
+          throw e;
+        });
+      })
+      .then(function (j) { spec = j; build(); })
+      .catch(function (e) {
+        clearTimeout(timer);
+        var msg = e && e.name === 'AbortError' ? 'The API description took too long to load.' : (e && e.message ? e.message : 'The API description could not be loaded.');
+        fail(msg, e && e.status, e && e.cid);
+      });
+  }
+  load();
 })();)SWG";
 
 // Closing tags.
