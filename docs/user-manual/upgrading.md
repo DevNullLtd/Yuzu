@@ -101,8 +101,10 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
 - **A request that the step-up check has passed keeps the principal it passed.** If a later
   credential resolution in the same request would land on a different principal, that resolution
   yields no session and the route answers its ordinary no-session response (usually `401`; approve
-  and reject answer `503` with `retry_after_ms`). Audit rows written after that point have an empty
-  `principal` (`principal_class` still reflects the presented credential).
+  and reject answer `503` with `retry_after_ms` when the change falls between the handler's two
+  resolutions). Audit rows built from the request after that point have an empty `principal`,
+  `principal_role` and `session_id` (`principal_class` still reflects the presented credential);
+  rows that name their principal explicitly keep it.
 - **The server refuses to start when a mutating route has no step-up classification.** At boot,
   every `POST`/`PUT`/`PATCH`/`DELETE` route registered through the route sink is checked against the
   step-up table. If one is missing, the server logs one critical line per route

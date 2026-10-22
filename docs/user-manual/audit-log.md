@@ -53,7 +53,7 @@ Every audit event contains the following fields:
 | Field | Type | Description |
 |---|---|---|
 | `timestamp` | integer (Unix epoch) | When the event occurred |
-| `principal` | string | Username of the operator who performed the action. Empty on a row written after a step-up-gated request changed principal mid-request (the later resolution yields no session); `principal_class` still reflects the presented credential |
+| `principal` | string | Username of the operator who performed the action. Empty (as are `principal_role` and `session_id`) on a row built from the request after a step-up-gated request changed principal mid-request, because the later resolution yields no session; `principal_class` still reflects the presented credential, and rows that name their principal explicitly keep it |
 | `principal_role` | string | Role of the principal at the time of the action (`admin`, `user`) |
 | `action` | string | Dot-notated action identifier (see table below) |
 | `target_type` | string | Category of the affected object (`Tag`, `Agent`, `Session`, etc.) |

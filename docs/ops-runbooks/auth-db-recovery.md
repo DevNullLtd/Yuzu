@@ -861,9 +861,12 @@ them. A gated route answers **`503`** and does not run in three cases:
   before any store read, OIDC sessions are judged on the identity provider's
   assertion, SAML sessions get their `403`, and engine principals get `403`;
 - the check itself **threw an unexpected exception**, or could not fingerprint the session
-  (reason `chokepoint_exception` for both), for any caller class. This is a fault in the server
-  rather than in the store: the exception text is in the server log (sampled, one
-  line in 100), and the window lever below is not a fix for it.
+  (reason `chokepoint_exception` for both). An exception can arise for any caller class; a
+  fingerprint failure is reached only after the decision has passed, so an engine principal or a
+  SAML session still gets its `403`. This is a fault in the server rather than in the store: the
+  server log (sampled, one line in 100) holds the exception text for a thrown exception, or
+  `could not fingerprint the session for <route label>` for a fingerprint failure, and the
+  window lever below is not a fix for either.
 
 ```json
 {"error": {"code": 503, "message": "authentication store is temporarily unavailable", ...},

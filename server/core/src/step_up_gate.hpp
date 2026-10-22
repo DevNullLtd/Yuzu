@@ -217,9 +217,11 @@ namespace detail {
 /// Coupling note: the identity omits the role, the MFA proof timestamps, mcp_tier and
 /// token_scope_service, although `decide_step_up` does read the role (the OIDC no-proof branch,
 /// through `mfa_enforcement_protects`) and the proof timestamps. It is sufficient because one
-/// request resolves ONE cookie session or ONE token class, so those inputs come from a single
-/// session record per credential. If a credential kind can carry a differing role or proof for
-/// the same (principal kind, auth source, username), extend this identity in the same change.
+/// request resolves ONE cookie session record, or a token session that `decide_step_up` exempts
+/// (both api_token and mcp_token) before it reads role, scope or proof, so those inputs come from
+/// a single record per credential. If a credential kind can carry a differing role or proof for
+/// the same (principal kind, auth source, username), or the token exemption narrows, extend this
+/// identity in the same change.
 struct StepUpPassIdentity {
     bool engine{false};
     std::uint64_t h1{0};
@@ -263,12 +265,11 @@ struct StepUpPassIdentity {
 /// thread other than the one that ran the pre-request stage is unbound (admitted, as for any
 /// non-gated request). No kRequired route resolves off the worker thread today.
 ///
-/// Chokepoint PR 2 deletes the pass, `consume_step_up_pass`, `finish_step_up_pass` and the
-/// `handler_skipped` outcome together with the in-handler `StepUpFn` calls, but KEEPS the binding
-/// until handlers consume the centrally resolved session or the repeated resolutions are removed
-/// (resolve once, issue #6200); ideally the binding then carries the resolved session itself.
-/// Deleting the binding while handlers still resolve more than once re-opens the
-/// multi-resolution gap.
+/// Chokepoint PR 2: the pass and the in-handler calls (with `consume_step_up_pass`,
+/// `finish_step_up_pass` and the `handler_skipped` outcome) may be deleted once handlers consume
+/// the centrally resolved session or the repeated resolves are removed (#6200); the binding stays
+/// until then, and ideally then carries the resolved session itself. Deleting the binding while
+/// handlers still resolve more than once re-opens the multi-resolution gap.
 struct StepUpPassStash {
     const httplib::Request* req{nullptr};
     const StepUpPolicyEntry* row{nullptr}; // non-null only while the pass is unspent

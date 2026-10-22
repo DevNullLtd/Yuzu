@@ -131,8 +131,8 @@ groups:
 
       # MFA step-up check answered 503: the auth store could not be read, the
       # stored second factor could not be decrypted, there is no usable auth store, or the
-      # check itself threw or could not fingerprint the session. The gated routes stay closed. The >= 3 debounce keeps one
-      # stray 503 from paging.
+      # check itself threw or could not fingerprint the session. The gated routes
+      # stay closed. The >= 3 debounce keeps one stray 503 from paging.
       - alert: YuzuStepUpGateUnavailable
         expr: sum by (job, instance, surface) (increase(yuzu_auth_mfa_step_up_gate_total{outcome="unavailable"}[10m])) >= 3
         for: 5m

@@ -18,8 +18,8 @@
 /// `run_in_handler_step_up` is the decision behind the `StepUpFn` that `server.cpp` hands to the
 /// route owners, extracted for the same reason.
 ///
-/// Chokepoint PR 2 deletes `run_in_handler_step_up` together with the in-handler `StepUpFn` calls (the
-/// chokepoint then answers those routes alone, and the label-equals source pins that force an
+/// Chokepoint PR 2 deletes `run_in_handler_step_up` together with the in-handler `StepUpFn` calls
+/// (the chokepoint then answers those routes alone, and the label-equals source pins that force an
 /// in-handler call per kRequired row go with them).
 
 #include "body_cap_policy.hpp"
@@ -105,10 +105,10 @@ run_pre_request_stage(const httplib::Request& req, httplib::Response& res,
 /// The in-handler step-up decision, behind the `StepUpFn` `server.cpp` hands to the route owners.
 ///   1. The chokepoint already passed this request for this action AND for the principal `session`
 ///      (the one the handler resolved): consume the pass and allow (skips a second MFA store
-///      read). The address is not a key; the end-of-request clears, the label match and the identity match
-///      are what protect against a stale pass or one earned by another principal (see
-///      `StepUpPassStash`). A pass for a different principal is refused and spent, and step 2/3
-///      evaluate `session` afresh. The request's principal binding outlives the pass.
+///      read). The address is not a key; the end-of-request clears, the label match and the
+///      identity match are what protect against a stale pass or one earned by another principal
+///      (see `StepUpPassStash`). A pass for a different principal is refused and spent, and
+///      step 2/3 evaluate `session` afresh. The request's principal binding outlives the pass.
 ///   2. No auth store: fail closed with the 503 (`refuse_step_up_store_unwired`) for EVERY caller
 ///      class, before any decision is made.
 ///   3. Otherwise evaluate and render exactly as `require_mfa_step_up` does.

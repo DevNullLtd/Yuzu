@@ -733,17 +733,17 @@ by each handler.
   `resolve_session` applies it on every credential path, so a resolution that would
   land on another principal returns no session and the route answers its ordinary
   no-session response (usually `401`; approve and reject answer `503` with
-  `retry_after_ms` 5000). The documented direct validators (the elevation routes, the
+  `retry_after_ms` 5000 when the change falls between the handler's two resolutions). The documented direct validators (the elevation routes, the
   login and SSO callbacks, the MFA enrolment confirm, the SCIM bearer, stream
   revalidation) do not authorise a gated handler. The stash and the binding are
   thread-local: a resolution made on another thread is unbound (admitted, as for any
   non-gated request), and no `kRequired` route resolves off the worker thread today.
   The pass, its consumer (`consume_step_up_pass`), the `handler_skipped` outcome (a
   report-only tripwire raised when a 2xx follows an unspent pass) and the in-handler
-  calls themselves are transitional: chokepoint PR 2 deletes them once the
-  chokepoint is the only enforcement. The binding stays until handlers consume the
-  centrally resolved session or the repeated resolutions are removed (resolve once,
-  issue #6200). Until then the in-handler calls remain
+  calls themselves are transitional. Chokepoint PR 2: the pass and the in-handler
+  calls may be deleted once handlers consume the centrally resolved session or the
+  repeated resolves are removed (#6200); the binding stays until then. Until then
+  the in-handler calls remain
   as defence in depth (38 distinct labels: one per `kRequired` row, 36, plus
   the two the elevation path uses).
 - **Audit.** Refusals written by the chokepoint go through

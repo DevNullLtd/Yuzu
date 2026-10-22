@@ -4890,8 +4890,9 @@ groups:
       # chokepoint"). `unavailable` is a 503 on a step-up route: the auth store
       # could not be read, an enrolled account's second factor could not be
       # decrypted, the server has no usable auth store, or the check itself threw
-      # or could not fingerprint the session (chokepoint_exception). The counter is zero-seeded over its closed label
-      # set, so increase() is meaningful from the first scrape. The >= 3 debounce
+      # or could not fingerprint the session (chokepoint_exception). The counter is
+      # zero-seeded over its closed label set, so increase() is meaningful from the
+      # first scrape. The >= 3 debounce
       # keeps one stray 503 (a single failed read, one request that raced a
       # restart) from paging; it also means the first two refusals of an outage
       # never alert. The rule only sees REFUSED-as-503: a read failure that the
