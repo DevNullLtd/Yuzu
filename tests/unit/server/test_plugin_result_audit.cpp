@@ -640,6 +640,7 @@ TEST_CASE("registry audit live ingest: a RUNNING frame with output then the empt
     CHECK(rows[0].detail.find("status|ok") ==
           std::string::npos); // only the audit line, not the output
     CHECK(h.dropped("suppressed") == 0.0);
+    CHECK(h.svc.wait_registry_audit_idle(std::chrono::milliseconds{0})); // the hook left its gate
 }
 
 TEST_CASE("registry audit live ingest: a refused write is a failure row and read actions and old "
@@ -728,6 +729,8 @@ TEST_CASE("registry audit live ingest: no audit store means no audit work and no
     // is a real absence and not a sink that saw nothing.
     CHECK(count_of(text, "[gateway] Command " + rid(0xa1) + " completed") == 1);
     CHECK(text.find("registry.write") == std::string::npos);
+    // The hook entered its gate before it found no store, and left again.
+    CHECK(svc.wait_registry_audit_idle(std::chrono::milliseconds{0}));
 }
 
 TEST_CASE("registry audit live ingest: a store its owner has reset is neither used nor required "
@@ -794,6 +797,8 @@ TEST_CASE("registry audit live ingest: a store that fails ends the frame at the 
                 ", command=" + rid(0xf1) + ")") == 1);
     CHECK(count("[gateway] registry.write audit row failed to persist (agent=" + who +
                 ", command=" + rid(0xf2) + ")") == 1);
+    // a failed write leaves its gate too
+    CHECK(h.svc.wait_registry_audit_idle(std::chrono::milliseconds{0}));
 }
 
 TEST_CASE("registry audit live ingest: a row that fails after earlier ones keeps the earlier ones",
@@ -831,10 +836,14 @@ namespace {
 void check_a_raising_hook(const std::string& dsn, const std::function<void()>& raise,
                           const std::string& threw) {
     int clock_calls = 0; // outlives the harness: the budget's clock reads it
+    bool inside_seen = false;
     IngestHarness h(dsn);
     h.svc.set_registry_audit_budget(std::make_unique<DenialAuditBudget>(
         /*max_rows=*/1, /*window_ms=*/60'000,
         [&] {
+            // The hook is inside its gate for the whole frame, so a 0 ms wait must fail here.
+            if (clock_calls == 0)
+                inside_seen = !h.svc.wait_registry_audit_idle(std::chrono::milliseconds{0});
             if (++clock_calls == 3)
                 raise();
             return std::int64_t{1'000};
@@ -854,6 +863,9 @@ void check_a_raising_hook(const std::string& dsn, const std::function<void()>& r
     CHECK(count_of(text, "[audit] registry.write hook threw" + threw + ids) == 1);
     // The hook returned false, so the gateway site reports the gap.
     CHECK(count_of(text, "[gateway] registry.write audit row failed to persist" + ids) == 1);
+    // It was inside its gate while it raised, and a raise does not keep it there.
+    CHECK(inside_seen);
+    CHECK(h.svc.wait_registry_audit_idle(std::chrono::milliseconds{0}));
 }
 
 } // namespace
@@ -910,6 +922,98 @@ TEST_CASE("registry audit live ingest: a frame's rows are written or refused or 
     CHECK(h.dropped("persist_failed") == 2.0); // row 2, which failed, and row 3, not attempted
     CHECK(count_of(cap.text(), "in the last window: 1") == 1);
     CHECK(count_of(cap.text(), "); 1 further row(s) of this frame not attempted") == 1);
+}
+
+// ── the shutdown rundown ──────────────────────────────────────────────────
+
+namespace {
+
+/// Four rows from one agent through a budget that never refuses, whose clock closes the hook (what
+/// ServerImpl::stop() does) on its `close_at`-th call, on the hook's own thread. The clock runs
+/// once per row, in the charge and before the check that precedes the write, so closing on call N
+/// keeps rows 0..N-2 and loses N-1..3. It also asks, on the first call, whether the hook is inside
+/// its gate.
+void check_a_close_mid_frame(const std::string& dsn, int close_at, std::size_t kept) {
+    int clock_calls = 0; // outlives the harness: the budget's clock reads it
+    bool inside_seen = false;
+    IngestHarness h(dsn);
+    h.svc.set_registry_audit_budget(std::make_unique<DenialAuditBudget>(
+        /*max_rows=*/100, /*window_ms=*/60'000,
+        [&] {
+            ++clock_calls;
+            if (clock_calls == 1)
+                inside_seen = !h.svc.wait_registry_audit_idle(std::chrono::milliseconds{0});
+            if (clock_calls == close_at)
+                h.svc.close_registry_audit(); // never waits, so it cannot wait for itself
+            return std::int64_t{1'000};
+        },
+        /*max_keys=*/8));
+    const std::string one{kOkLine};
+    yuzu::test::LogCapture cap;
+    h.svc.process_gateway_response(
+        "agent-1", IngestHarness::frame(rid(0xc3), apb::CommandResponse::RUNNING, "set_value",
+                                        one + "\n" + one + "\n" + one + "\n" + one));
+    cap.stop();
+    const std::size_t lost = 4 - kept;
+    CHECK(inside_seen);
+    CHECK(h.rows().size() == kept);
+    CHECK(h.dropped("persist_failed") == static_cast<double>(lost));
+    CHECK(h.dropped("suppressed") == 0.0);
+    const std::string text = cap.text();
+    const std::string ids = " (agent=agent-1, command=" + rid(0xc3) + ")";
+    CHECK(count_of(text, "[audit] registry.write frame cut short by shutdown" + ids + "; " +
+                             std::to_string(lost) + " row(s) not recorded") == 1);
+    // The hook returned false, so the gateway site reports the gap as it does for any lost row.
+    CHECK(count_of(text, "[gateway] registry.write audit row failed to persist" + ids) == 1);
+    CHECK(h.svc.wait_registry_audit_idle(std::chrono::milliseconds{0})); // and the hook left
+}
+
+} // namespace
+
+TEST_CASE("registry audit live ingest: shutdown closing the hook mid-frame keeps the rows written "
+          "and counts the rest",
+          "[pg][server][registry_audit][rundown]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
+    SECTION("closed during the third row's charge: two rows are kept") {
+        check_a_close_mid_frame(db.dsn(), /*close_at=*/3, /*kept=*/2);
+    }
+    SECTION("closed during the first row's charge: none is written") {
+        check_a_close_mid_frame(db.dsn(), /*close_at=*/1, /*kept=*/0);
+    }
+}
+
+TEST_CASE("registry audit live ingest: a frame after the shutdown close records and counts nothing",
+          "[pg][server][registry_audit][rundown]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
+    IngestHarness h(db.dsn());
+    h.svc.close_registry_audit();
+    h.svc.close_registry_audit(); // idempotent
+    std::string over_the_cap;
+    for (int i = 0; i < 301; ++i)
+        over_the_cap += std::string{kOkLine} + "\n";
+    yuzu::test::LogCapture cap;
+    // While the hook is open each of these writes a row or moves a counter: a minted id, an id the
+    // server could not have minted (`unmintable_id`) and a frame past the line cap (`truncated`).
+    h.svc.process_gateway_response(
+        "agent-1", IngestHarness::frame(rid(0xc1), apb::CommandResponse::RUNNING, "set_value",
+                                        std::string{kOkLine}));
+    h.svc.process_gateway_response(
+        "agent-1", IngestHarness::frame("registry-oops", apb::CommandResponse::RUNNING, "set_value",
+                                        std::string{kOkLine}));
+    h.svc.process_gateway_response(
+        "agent-1", IngestHarness::frame(rid(0xc2), apb::CommandResponse::RUNNING, "set_value",
+                                        over_the_cap));
+    // A terminal frame that owes rows too; it also proves the capture is live (it logs at info).
+    h.svc.process_gateway_response(
+        "agent-1", IngestHarness::frame(rid(0xc1), apb::CommandResponse::FAILURE, "delete_key",
+                                        std::string{kOkLine}));
+    cap.stop();
+    CHECK(count_of(cap.text(), "[gateway] Command " + rid(0xc1) + " completed") == 1);
+    CHECK(cap.text().find("registry.write") == std::string::npos);
+    CHECK(h.rows().empty());
+    for (const char* reason : {"suppressed", "persist_failed", "unmintable_id", "truncated"})
+        CHECK(h.dropped(reason) == 0.0);
+    CHECK(h.svc.wait_registry_audit_idle(std::chrono::milliseconds{0}));
 }
 
 TEST_CASE("registry audit live ingest: agents past the exact table are charged to their own "

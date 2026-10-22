@@ -6018,10 +6018,11 @@ second Ctrl-C also terminates promptly.
 
 Mechanism: `SIGTERM`/`SIGINT` (`systemctl stop`, `docker stop`, Ctrl-C)
 triggers a graceful stop on a dedicated watcher thread — HTTP admission stop,
-background thread joins, up to ~115s of stacked waits including webhook/
-offload store quiesce (see the stacked-shutdown-bound section in
+background thread joins, up to ~130s of stacked waits including webhook/
+offload store quiesce and the wait for an in-flight `registry.write` audit write
+(see the stacked-shutdown-bound section in
 [Upgrading](upgrading.md); a rare thread-creation-exhaustion fallback path can
-push the quiesce portion alone to ~120s, worst case ~175s total), then store
+push the quiesce portion alone to ~120s, worst case ~190s total), then store
 teardown. Those figures leave out two things that can each add to them: a
 background roll-up recompute already in flight at SIGTERM (app-perf up to
 120 s, catalogue up to 60 s — the 210 s shipped grace was sized for these two,

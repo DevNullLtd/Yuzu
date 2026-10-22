@@ -41,11 +41,25 @@ Invariants:
        at fleet scale). A live unit case pins the behaviour; this pin names the statements.
    10. The file calls `make_registry_audit_budget();` exactly once, the one place the production
        numbers meet (unit tests pin them).
+   11. The hook runs inside the shutdown rundown gate (rundown_gate.hpp), which closes the pool
+       half of the #3279 reach that the weak store does not: exactly one
+       `const auto in_flight = registry_audit_gate_.try_enter();` followed by
+       `if (!in_flight) return true;`, after the pure verdict and BEFORE the weak lock (the
+       entry must die last, so the count falls after the strong reference is released); exactly
+       one `registry_audit_gate_.closed()`, after the charge and before the only `store->log(`,
+       with a `book_rows();` and a `return false;` between them (a closed gate loses the rest of
+       the frame, counted); the hook never closes or waits itself; and the weak lock is the only
+       `registry_audit_store_.lock(` in the file (a second reader would also need the gate).
 
   server.cpp
-   11. `agent_service_.set_registry_audit_store(audit_store_);` appears exactly once and the setter
+   12. `agent_service_.set_registry_audit_store(audit_store_);` appears exactly once and the setter
        is called nowhere else: deleting the line turns every row off silently, and clearing a weak
        pointer that a forwarder may be locking is a data race (the #3350 precedent).
+   13. In stop(), `agent_service_.close_registry_audit();` then `if (!agent_service_.
+       wait_registry_audit_idle(` ... `std::_Exit(1);` appear exactly once each, in that order,
+       and both BEFORE the one `audit_store_.reset();`: reset the store or the pool while a
+       forwarder is between two rows and the next row leases a pool that is going (the wait is
+       what makes that impossible; on its timeout the process exits rather than go on).
 
 `//` comments are stripped and whitespace runs collapsed before matching, so line wrapping and
 comment text cannot satisfy or break a check. The gateway error statement is matched as a whole
@@ -53,8 +67,12 @@ comment text cannot satisfy or break a check. The gateway error statement is mat
 deleted stamp call, a deleted initialiser, a hook moved after the notification, a dropped failure
 signal, a flag that is never set or is re-armed per frame, a raw store read beside the weak lock or
 in the forwarder entry, a verdict outside the try, a charge without the overflow key, a missing
-factory call, a deleted or cleared weak-store wiring) and requires problems() to be non-empty on
-each; a mutation whose pattern no longer matches fails loudly rather than passing vacuously. A
+factory call, a deleted or cleared weak-store wiring, the rundown gate's entry deleted or moved
+after the lock, its per-row check deleted or moved before the charge or made to return true or to
+skip the booking, a second weak lock, the close or the wait deleted, swapped or moved after the
+reset, the wait's result ignored or its force-exit removed) and requires problems() to be
+non-empty on each; a mutation whose pattern no longer matches fails loudly rather than passing
+vacuously. A
 second set of BENIGN edits (a comment or a string naming the raw store, a re-wrapped call) must
 leave problems() empty.
 
@@ -96,6 +114,14 @@ FLAG_DECL = "bool audit_failed_signalled = false;"
 HOOK_SIG = "bool AgentServiceImpl::audit_registry_frame("
 FORWARDER_SIG = "void AgentServiceImpl::process_gateway_response("
 WEAK_LOCK = "const auto store = registry_audit_store_.lock();"
+ENTER = "const auto in_flight = registry_audit_gate_.try_enter();"
+ENTER_GUARD = "if (!in_flight) return true;"
+CLOSED_CHECK = "registry_audit_gate_.closed()"
+STORE_LOG = "store->log("
+CLOSE_CALL = "agent_service_.close_registry_audit();"
+WAIT_COND = "if (!agent_service_.wait_registry_audit_idle("
+EXIT_CALL = "std::_Exit(1);"
+STORE_RESET = "audit_store_.reset();"
 VERDICT = "registry_audit_events_for_frame("
 LITERAL = re.compile(r'"(?:[^"\\]|\\.)*"')
 OVERFLOW_KEY = "const std::string overflow = registry_audit_overflow_key(agent_id);"
@@ -142,15 +168,27 @@ def raw_store_read(body):
 
 def main_problems(src):
     t = normalise(src)
+    out = []
     wired, calls = t.count(normalise(WIRING)), t.count("set_registry_audit_store(")
-    if wired == 1 and calls == 1:
-        return []
-    return [
-        f"server.cpp: expected exactly one `{WIRING}` and no other call of set_registry_audit_store"
-        f" (found {wired} wiring line(s) and {calls} setter call(s)): without the wiring no row is"
-        " written, and clearing"
-        " a weak pointer that a forwarder thread may be locking is a data race"
-    ]
+    if wired != 1 or calls != 1:
+        out.append(
+            f"server.cpp: expected exactly one `{WIRING}` and no other call of"
+            f" set_registry_audit_store (found {wired} wiring line(s) and {calls} setter call(s)):"
+            " without the wiring no row is written, and clearing a weak pointer that a forwarder"
+            " thread may be locking is a data race"
+        )
+    close, wait, reset = normalise(CLOSE_CALL), normalise(WAIT_COND), normalise(STORE_RESET)
+    n_close, n_wait, n_reset = t.count(close), t.count(wait), t.count(reset)
+    c, w, r = t.find(close), t.find(wait), t.find(reset)
+    if (n_close, n_wait, n_reset) != (1, 1, 1) or not 0 <= c < w < r or EXIT_CALL not in t[w:r]:
+        out.append(
+            f"server.cpp: stop() must call `{CLOSE_CALL}`, then wait with `{WAIT_COND}...` and"
+            f" `{EXIT_CALL}` on its timeout, each exactly once, all BEFORE the one `{STORE_RESET}`"
+            f" (found {n_close} close, {n_wait} wait and {n_reset} reset statement(s)): reset the"
+            " store or the pool while a forwarder thread is between two rows and its next row"
+            " leases a pool that is going"
+        )
+    return out
 
 
 def server_problems(src):
@@ -170,6 +208,33 @@ def server_problems(src):
             f" `{WEAK_LOCK}` and process_gateway_response not at all (never the raw `audit_store_`,"
             " which stop() unwires and frees while detached forwarder threads still run)"
         )
+    if body is not None:
+        enter = normalise(f"{ENTER} {ENTER_GUARD}")
+        at_enter, at_verdict, at_lock = body.find(enter), body.find(VERDICT), body.find(WEAK_LOCK)
+        at_charge, at_closed = body.find(normalise(CHARGE)), body.find(CLOSED_CHECK)
+        at_log = body.find(STORE_LOG)
+        closed_branch = body[at_closed:at_log] if 0 <= at_closed < at_log else ""
+        if (
+            body.count(enter) != 1
+            or not 0 <= at_verdict < at_enter < at_lock
+            or body.count(CLOSED_CHECK) != 1
+            or body.count(STORE_LOG) != 1
+            or not 0 <= at_charge < at_closed < at_log
+            or "book_rows();" not in closed_branch
+            or "return false;" not in closed_branch
+            or "registry_audit_gate_.close()" in body
+            or "wait_idle" in body
+            or t.count("registry_audit_store_.lock(") != 1
+        ):
+            out.append(
+                f"agent_service_impl.cpp: audit_registry_frame must enter the rundown gate with"
+                f" `{ENTER} {ENTER_GUARD}` once, after the verdict and BEFORE `{WEAK_LOCK}` (it"
+                f" must die last), check `{CLOSED_CHECK}` once, after the charge and before the"
+                f" only `{STORE_LOG}`, with `book_rows();` and `return false;` in between, never"
+                f" close or wait itself, and hold the only `registry_audit_store_.lock(` in the"
+                f" file: otherwise a forwarder between two rows leases a pool that stop() is"
+                f" destroying"
+            )
     if body is None or not 0 <= body.find("try {") < body.find(VERDICT):
         out.append(
             "agent_service_impl.cpp: the try in audit_registry_frame must open before the verdict"
@@ -277,6 +342,43 @@ SERVER_MUTATIONS = [
     ),
     # only the overflow declaration deleted (the charge still names it)
     (r"const std::string overflow = registry_audit_overflow_key\(agent_id\);", ""),
+    # the rundown gate's entry deleted
+    (
+        r"const auto in_flight = registry_audit_gate_\.try_enter\(\);\s*if \(!in_flight\)\s*"
+        r"return true;[^\n]*\n",
+        "",
+    ),
+    # the entry moved after the weak lock: the strong reference would then die AFTER the count
+    (
+        r"(const auto in_flight = registry_audit_gate_\.try_enter\(\);\s*if \(!in_flight\)\s*"
+        r"return true;[^\n]*\n\s*)(const auto store = registry_audit_store_\.lock\(\);)",
+        "\\2\n        \\1",
+    ),
+    # the per-row check deleted
+    (r"(?s)if \(registry_audit_gate_\.closed\(\)\) \{.*?return false;\s*\}", ""),
+    # the per-row check moved before the charge
+    (
+        r"(?s)(const auto admit = registry_audit_budget_->try_admit\(agent_id, overflow\);.*?)"
+        r"(if \(registry_audit_gate_\.closed\(\)\) \{.*?return false;\s*\})",
+        "\\2\n            \\1",
+    ),
+    # a closed gate no longer fails the frame
+    (r"(?s)(if \(registry_audit_gate_\.closed\(\)\) \{.*?)return false;", r"\1return true;"),
+    # a closed gate no longer books the rows it loses
+    (
+        r"(?s)(if \(registry_audit_gate_\.closed\(\)\) \{.*?)book_rows\(\);(.*?return false;)",
+        r"\1\2",
+    ),
+    # the hook closes the gate itself
+    (
+        r"if \(registry_audit_gate_\.closed\(\)\) \{",
+        "registry_audit_gate_.close();\n            if (registry_audit_gate_.closed()) {",
+    ),
+    # a second reader of the weak store
+    (
+        r"(const auto store = registry_audit_store_\.lock\(\);)",
+        r"\1 (void)registry_audit_store_.lock();",
+    ),
     # the verdict outside the try
     (r"(?s)    try \{\n(        const auto frame = .*?return true;\n)", r"\1    try {\n"),
 ]
@@ -297,6 +399,16 @@ BENIGN_SERVER_EDITS = [
         r"registry_audit_budget_->try_admit\(agent_id, overflow\)",
         "registry_audit_budget_->try_admit(\n                agent_id,\n                overflow)",
     ),
+    # the gate entry re-wrapped across lines
+    (
+        r"const auto in_flight = registry_audit_gate_\.try_enter\(\);",
+        "const auto in_flight =\n            registry_audit_gate_.try_enter();",
+    ),
+    # a comment naming what only stop() may do
+    (
+        r"(const auto in_flight = registry_audit_gate_\.try_enter\(\);)",
+        "// registry_audit_gate_.close() is stop()'s, never the hook's\n        \\1",
+    ),
 ]
 BENIGN_MAIN_EDITS = [
     # the wiring line also kept in a comment
@@ -304,10 +416,46 @@ BENIGN_MAIN_EDITS = [
         r"(agent_service_\.set_registry_audit_store\(audit_store_\);)",
         r"// agent_service_.set_registry_audit_store(audit_store_);\n            \1",
     ),
+    # the reset also named in a comment ahead of the close
+    (
+        r"(agent_service_\.close_registry_audit\(\);)",
+        "// audit_store_.reset(); follows the wait\n        \\1",
+    ),
 ]
 MAIN_MUTATIONS = [
     # the wiring line deleted
     (r"agent_service_\.set_registry_audit_store\(audit_store_\);", ""),
+    # the gate is never closed
+    (r"agent_service_\.close_registry_audit\(\);", ""),
+    # the wait (and its force-exit) deleted
+    (
+        r"(?s)if \(!agent_service_\.wait_registry_audit_idle\(kRegistryAuditRundownBound\)\) \{"
+        r".*?std::_Exit\(1\);\s*\}",
+        "",
+    ),
+    # the close moved after the wait
+    (
+        r"(?s)(agent_service_\.close_registry_audit\(\);)(\s*)(if \(!agent_service_\."
+        r"wait_registry_audit_idle\(kRegistryAuditRundownBound\)\) \{.*?std::_Exit\(1\);\s*\})",
+        r"\3\2\1",
+    ),
+    # the wait moved after the reset it must precede
+    (
+        r"(?s)(if \(!agent_service_\.wait_registry_audit_idle\(kRegistryAuditRundownBound\)\) \{"
+        r".*?std::_Exit\(1\);\s*\})(\s*)(audit_store_\.reset\(\);)",
+        r"\3\2\1",
+    ),
+    # the force-exit removed: a timed-out wait would go on to reset
+    (
+        r"(?s)(wait_registry_audit_idle\(kRegistryAuditRundownBound\)\) \{.*?)std::_Exit\(1\);",
+        r"\1(void)0;",
+    ),
+    # the wait's result ignored
+    (
+        r"if \(!agent_service_\.wait_registry_audit_idle\(kRegistryAuditRundownBound\)\)",
+        "(void)agent_service_.wait_registry_audit_idle(kRegistryAuditRundownBound);"
+        "\n        if (false)",
+    ),
     # the weak pointer cleared at shutdown (a data race against lock())
     (
         r"(agent_service_\.set_registry_audit_store\(audit_store_\);)",

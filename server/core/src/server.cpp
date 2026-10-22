@@ -10981,12 +10981,22 @@ public:
         //
         // `audit_store_` is NOT in that enumeration. The `registry.write` hook
         // (plugin_result_audit.hpp; process_gateway_response runs it on these same
-        // forwarder threads) takes the analytics_store_ treatment below: shared_ptr here,
-        // a weak_ptr in agent_service_ locked per frame and only for a frame that owes
-        // audit rows, set once at wiring and never cleared. The object lifetime is closed
-        // structurally. The pg::PgPool& it borrows and the detached thread itself stay
-        // #3279's, and the gap between lock() and the pool's acquire is small in
-        // practice, not zero, like analytics_store_'s.
+        // forwarder threads) takes the analytics_store_ treatment below for the OBJECT:
+        // shared_ptr here, a weak_ptr in agent_service_ locked per frame and only for a
+        // frame that owes audit rows, set once at wiring and never cleared. That is NOT
+        // enough for the pg::PgPool& the store borrows. analytics_store_'s emit() enqueues
+        // and returns, so a latch that refuses new entrants leaves a gap of nanoseconds;
+        // the registry hook holds its strong reference across up to 300 synchronous
+        // writes, each of which leases the pool, so a forwarder BETWEEN two rows is
+        // invisible to ~PgPool and would lease a pool being destroyed. The hook therefore
+        // runs inside a rundown gate (rundown_gate.hpp): it enters before it locks the
+        // store and checks the gate before every row, and the stage right before
+        // audit_store_.reset() below closes the gate and waits for the hooks inside, so no
+        // row starts a lease once the pool is on its way out. The retention thread is not
+        // part of this: audit_store_->stop_cleanup() joined it well above, so
+        // ~AuditStore has nothing left to join wherever it runs. What stays #3279's is the
+        // detached thread itself, agent_service_ (`this`) and metrics_; this gate is the
+        // hook's own and goes when #3279 joins the forwarders.
         //
         // HA WS-4 4.3 (cpp-safety Gate 3, pre-push): #3279's reach set also
         // now includes a raw `Stub*` resolved from gw_mgmt_pool_
@@ -11038,7 +11048,8 @@ public:
         // deploy/systemd/yuzu-server.service TimeoutStopSec). 60s here,
         // run CONCURRENTLY for both stores below (not sequentially, which
         // would double the worst case), brings the documented stacked total
-        // to ~115s - comfortably inside 210s, with real headroom over the
+        // to ~115s (~130s with the 15s registry.write rundown stage further
+        // down) - comfortably inside 210s, with real headroom over the
         // "a handful of pending deliveries" case above. Update
         // upgrading.md's stacked-bound section if this constant changes.
         // This bound is exactly as heuristic, and exactly as unproven, as
@@ -11086,7 +11097,8 @@ public:
                 // this file's own comment above computes assumed the
                 // concurrent case. Worst case here is ~60s (this call) +
                 // ~60s (webhook, next) = ~120s added to the pre-existing
-                // ~55s stack = ~175s, still inside the shipped 210s
+                // ~55s stack = ~175s (~190s with the 15s registry.write
+                // rundown stage further down), still inside the shipped 210s
                 // stop_grace_period/TimeoutStopSec - not a real risk, but
                 // only reachable by genuine thread-creation exhaustion at
                 // shutdown, which is itself already a degraded state.
@@ -11209,6 +11221,34 @@ public:
         // needs to run before auth_key_provider_/audit_store_.
         crl_publisher_.reset();
         auth_key_provider_.reset();
+        // The registry.write audit hook (agent_service_impl.cpp, audit_registry_frame) runs on
+        // the detached forwarder threads of #3279 and holds the audit store across up to 300
+        // writes that each lease pg_pool_. Close its gate (no later frame enters, and one
+        // already inside stops before its next row), then wait for the hooks that are inside
+        // to leave: only then is it safe to reset the store and, below, the pool. Late on
+        // purpose, so the frames that arrive during the delivery drain above are still
+        // audited. 15s is a 4s lease wait (AuditStore::kWriteTimeout) plus the 10s connect
+        // that a lease started just inside that deadline may still run
+        // (PgPool::Options::connect_timeout_s). On timeout: force-exit, the same choice as
+        // the web_thread_ and delivery-queue stages and for the same reason. Continuing past
+        // a hook that is still inside reopens exactly the use-after-free this gate closes
+        // (see the leak-and-continue discussion above), and nothing durable is lost: state
+        // is in Postgres, and this is strictly no worse than the supervisor's SIGKILL.
+        // Update upgrading.md's stacked-bound section if this constant changes.
+        static constexpr auto kRegistryAuditRundownBound = std::chrono::seconds(15);
+        agent_service_.close_registry_audit();
+        if (!agent_service_.wait_registry_audit_idle(kRegistryAuditRundownBound)) {
+            // Same idiom as the stages above: spdlog would be legal here, the raw write()
+            // stays because _Exit() skips any buffered sink flush.
+            const char msg[] = "ServerImpl::stop: a registry.write audit write did not finish "
+                               "within 15s - force-exiting.\n";
+#ifdef _WIN32
+            _write(2, msg, sizeof(msg) - 1);
+#else
+            (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#endif
+            std::_Exit(1);
+        }
         audit_store_.reset();
         // TagStore (ADR-0050) borrows pg_pool_ — unwire the borrowed raw
         // pointer from agent_service_ (the Register sync_agent_tags ingest —

@@ -75,11 +75,18 @@ static_assert(kRegistryAuditBudgetKeyBytes >= auth::kMaxAgentIdLength,
 // defence in depth for an agent that returns output there.
 //
 // The PURE verdict runs first and the store is touched only when the frame owes rows or a flag, so
-// no other frame ever reaches it. The store is held weakly and locked here: process_gateway_response
-// runs on the detached forwarder threads of #3279, which outlive the gRPC drain, and a forwarder
-// that locks the store keeps it alive for exactly this call (set_registry_audit_store). What the
-// store borrows (the pool) is #3279's, unchanged. Only the weak member is read here (the lexical
-// gate pins it): the raw `audit_store_` of the other sites is unwired earlier in stop().
+// no other frame ever reaches it. process_gateway_response runs on the detached forwarder threads
+// of #3279, which outlive the gRPC drain and are never joined, so two things keep this reach safe.
+// The store is held weakly and locked here: a forwarder that locks it keeps the OBJECT alive for
+// exactly this call (set_registry_audit_store). The POOL it borrows is the other half: every
+// `store->log()` leases it and the strong reference spans up to kMaxRegistryAuditLinesPerFrame of
+// them, so a forwarder BETWEEN two rows would lease a pool that stop() is destroying. The hook
+// therefore runs inside a rundown gate (rundown_gate.hpp): it enters before it locks the store
+// (`in_flight` is declared first, so it dies last), checks the gate before every row, and
+// stop() closes the gate and waits for the hooks inside before it resets the store and the pool.
+// What stays #3279's is the detached thread itself, `this` and `metrics_`. Only the weak member is
+// read here (the lexical gate pins it): the raw `audit_store_` of the other sites is unwired
+// earlier in stop().
 //
 // Every row is charged to a per-agent budget (kRegistryAuditBudget*): a bound per frame is not a
 // bound on frames, and one enrolled agent looping 300-line frames would otherwise write
@@ -123,6 +130,11 @@ bool AgentServiceImpl::audit_registry_frame(const std::string& agent_id,
             resp.output(), yuzu::server::now_epoch_seconds());
         if (frame.events.empty() && !frame.truncated && !frame.unmintable_id)
             return true;
+        // Declared BEFORE `store`: locals die in reverse order, so the strong reference is
+        // released first and the count falls after it, on every exit including a throw.
+        const auto in_flight = registry_audit_gate_.try_enter();
+        if (!in_flight)
+            return true; // shutdown has closed the hook: silent, like a store its owner released
         const auto store = registry_audit_store_.lock();
         if (!store || !store->is_open())
             return true; // no store (released at shutdown): silent, like the other audit sites
@@ -154,6 +166,18 @@ bool AgentServiceImpl::audit_registry_frame(const std::string& agent_id,
             if (!admit.admitted) {
                 ++refused;
                 continue;
+            }
+            // Immediately before the only call that leases the pool: once stop() has closed the
+            // gate no row starts a lease, so the pool can go as soon as the hooks inside leave.
+            // The rows from this one on are lost, and counted as such.
+            if (registry_audit_gate_.closed()) {
+                const std::size_t not_attempted = owed - done;
+                book_rows();
+                spdlog::warn("[audit] registry.write frame cut short by shutdown (agent={}, "
+                             "command={}); {} row(s) not recorded",
+                             yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()),
+                             not_attempted);
+                return false;
             }
             if (!store->log(frame.events[done])) {
                 const std::size_t not_attempted = owed - done - 1;

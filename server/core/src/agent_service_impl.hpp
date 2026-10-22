@@ -35,6 +35,7 @@
 #include "ota_total_admission.hpp"
 #include "principal_quota.hpp"
 #include "rate_limiter.hpp"
+#include "rundown_gate.hpp"
 
 namespace yuzu::server {
 
@@ -212,13 +213,27 @@ public:
     /// and locked per frame, unlike the raw `audit_store_` above, because the gateway-ingress hook
     /// runs inside `process_gateway_response`, which is called from detached
     /// `forward_gateway_pending` threads that outlive the gRPC drain (#3279). A forwarder that
-    /// locks the store keeps it alive for exactly its own call, whatever `stop()` does: the object
-    /// lifetime is closed structurally, the way `analytics_store_` closed it in #3350. This member
-    /// is written ONCE, before any concurrent reader exists, and is never cleared: clearing a
-    /// weak_ptr concurrently with `lock()` is a data race. The owner's `reset()` expires it once
-    /// the calls that hold a lock on it return.
+    /// locks the store keeps the OBJECT alive for exactly its own call, whatever `stop()` does,
+    /// the way `analytics_store_` closed it in #3350. That does NOT cover the `pg::PgPool&` the
+    /// store borrows: the hook holds the store across up to 300 writes, each of which leases the
+    /// pool, so a forwarder between two rows would lease a pool `stop()` is destroying. The hook
+    /// therefore runs inside the rundown gate below. This member is written ONCE, before any
+    /// concurrent reader exists, and is never cleared: clearing a weak_ptr concurrently with
+    /// `lock()` is a data race.
     void set_registry_audit_store(std::weak_ptr<AuditStore> store) {
         registry_audit_store_ = std::move(store);
+    }
+    /// Shutdown, step 1 (ServerImpl::stop(), immediately before it resets the audit store): refuse
+    /// every later `registry.write` hook, and make one already running stop before its next row.
+    /// Never waits, so it is safe to call from inside the hook (the tests do, from the budget's
+    /// clock). Idempotent. A frame that arrives afterwards records and counts nothing, like a
+    /// frame that arrives after the store is released.
+    void close_registry_audit() noexcept { registry_audit_gate_.close(); }
+    /// Shutdown, step 2: wait up to `bound` for the hooks that are inside to finish their current
+    /// row and leave. True when none is left; false at the deadline, in which case the caller must
+    /// NOT reset the store or the pool (stop() force-exits). See rundown_gate.hpp.
+    [[nodiscard]] bool wait_registry_audit_idle(std::chrono::milliseconds bound) noexcept {
+        return registry_audit_gate_.wait_idle(bound);
     }
     /// Replaces the per-agent `registry.write` row budget (tests inject a small one with a fake
     /// clock). Call before the service is shared; the default is make_registry_audit_budget() in
@@ -586,6 +601,9 @@ private:
     AuditStore* audit_store_{nullptr};
     /// See set_registry_audit_store: weak, locked per frame, write-once, never cleared.
     std::weak_ptr<AuditStore> registry_audit_store_;
+    /// The hook enters before it locks the store and leaves after it releases it; stop() closes
+    /// the gate and waits for the hooks inside before it resets the store and the pool.
+    RundownGate registry_audit_gate_;
     /// Per-agent row budget for the `registry.write` hook; built in the constructor.
     std::unique_ptr<DenialAuditBudget> registry_audit_budget_;
     AgentHealthStore* health_store_{nullptr};
