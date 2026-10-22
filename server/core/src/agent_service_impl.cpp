@@ -182,10 +182,10 @@ bool AgentServiceImpl::audit_registry_frame(const std::string& agent_id,
             if (!store->log(frame.events[done])) {
                 const std::size_t not_attempted = owed - done - 1;
                 book_rows();
-                spdlog::warn("[audit] registry.write row failed to persist (agent={}, "
-                             "command={}); {} further row(s) of this frame not attempted",
-                             yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()),
-                             not_attempted);
+                spdlog::error("[audit] registry.write row failed to persist (agent={}, "
+                              "command={}); {} further row(s) of this frame not attempted",
+                              yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()),
+                              not_attempted);
                 return false;
             }
         }
@@ -1922,11 +1922,8 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         }
 
         // registry.write audit rows. No gRPC context on the gateway path to carry an
-        // audit-failed trailer, so a failed write is logged here.
-        if (!audit_registry_frame(agent_id, resp))
-            spdlog::error("[gateway] registry.write audit row failed to persist (agent={}, "
-                          "command={})",
-                          yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()));
+        // audit-failed trailer: the hook has logged and counted any failure itself.
+        (void)audit_registry_frame(agent_id, resp);
 
         // UAT 2026-05-06 #8: gateway-streamed RUNNING — notify tracker.
         notify_exec_tracker(resp.command_id(), agent_id, resp);
@@ -1985,11 +1982,9 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             // FR::Updated → in-place; FR::Error → already logged, do NOT insert.
         }
 
-        // A terminal frame that carries output owes its audit rows too (see the Subscribe twin).
-        if (!audit_registry_frame(agent_id, resp))
-            spdlog::error("[gateway] registry.write audit row failed to persist (agent={}, "
-                          "command={})",
-                          yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()));
+        // A terminal frame that carries output owes its audit rows too (see the Subscribe twin;
+        // the hook has logged and counted any failure itself).
+        (void)audit_registry_frame(agent_id, resp);
 
         // UAT 2026-05-06 #8: gateway-streamed terminal — notify tracker.
         notify_exec_tracker(resp.command_id(), agent_id, resp);

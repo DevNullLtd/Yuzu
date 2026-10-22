@@ -683,8 +683,11 @@ private:
     /// Persists the `registry.write` audit rows one stored output frame owes (see
     /// plugin_result_audit.hpp for the binding). Called at every site that stores an
     /// output-carrying frame, immediately before `notify_exec_tracker`, so the row exists before the
-    /// execution advances. Returns false when a row failed to persist (or the hook threw); true
-    /// when nothing was owed, no store is wired, or the rows were written or refused by the budget.
+    /// execution advances. Returns false when a row failed to persist (or the hook threw, or
+    /// shutdown closed it mid-frame); true when nothing was owed, no store is wired, or the rows
+    /// were written or refused by the budget. The hook logs and counts every failure itself, so a
+    /// caller only needs the signal: the Subscribe sites add the audit-failed trailer once per
+    /// stream, and the gateway sites, which have none, ignore it.
     [[nodiscard]] bool audit_registry_frame(const std::string& agent_id,
                                             const pb::CommandResponse& resp);
 

@@ -27,7 +27,9 @@ Invariants:
     5. Each hook is IMMEDIATELY followed by its failure signal and then by
        `notify_exec_tracker(resp.command_id(), agent_id, resp);`: the audit row is written
        before the execution advances. Two Subscribe forms, which add the audit-failed trailer
-       once per stream through `audit_failed_signalled`, and two gateway forms (an error line).
+       once per stream through `audit_failed_signalled`, and two gateway forms,
+       `(void)audit_registry_frame(agent_id, resp);` (the hook logs and counts every failure
+       itself and the gateway has no trailer, so it adds no second line).
     6. `audit_failed_signalled` is declared exactly once, BEFORE the Subscribe read loop: declared
        inside it, it would be re-armed per frame and the trailer would be added per failed frame.
     7. The hook body reads the store only through the statement
@@ -62,8 +64,7 @@ Invariants:
        what makes that impossible; on its timeout the process exits rather than go on).
 
 `//` comments are stripped and whitespace runs collapsed before matching, so line wrapping and
-comment text cannot satisfy or break a check. The gateway error statement is matched as a whole
-(its wording is pinned by the unit test, not here). The self-test applies in-memory mutations (a
+comment text cannot satisfy or break a check. The self-test applies in-memory mutations (a
 deleted stamp call, a deleted initialiser, a hook moved after the notification, a dropped failure
 signal, a flag that is never set or is re-armed per frame, a raw store read beside the weak lock or
 in the forwarder entry, a verdict outside the try, a charge without the overflow key, a missing
@@ -133,9 +134,7 @@ SUBSCRIBE_FORM = normalise(
     f"if (!{HOOK} && !audit_failed_signalled) {{ signal_grpc_audit_failed(context);"
     f" audit_failed_signalled = true; }} {NOTIFY}"
 )
-GATEWAY_RE = re.compile(
-    re.escape(normalise(f"if (!{HOOK}) spdlog::error(")) + r"[^;]*" + re.escape(normalise(f"); {NOTIFY}"))
-)
+GATEWAY_FORM = normalise(f"(void){HOOK}; {NOTIFY}")
 
 
 def agent_problems(src):
@@ -262,12 +261,12 @@ def server_problems(src):
             f" `{SUBSCRIBE_FORM}` (found {subscribe}): the row is written before the execution"
             " advances, and the trailer is added once per stream"
         )
-    gateway = len(GATEWAY_RE.findall(t))
+    gateway = t.count(GATEWAY_FORM)
     if gateway != 2:
         out.append(
             f"agent_service_impl.cpp: expected exactly two gateway hooks of the form"
-            f" `if (!{HOOK}) spdlog::error(...); {NOTIFY}` (found {gateway}): the row is written"
-            " before the execution advances"
+            f" `(void){HOOK}; {NOTIFY}` (found {gateway}): the row is written before the"
+            " execution advances"
         )
     decls = t.count(FLAG_DECL)
     loops = t.count(normalise(READ_LOOP))
@@ -315,12 +314,12 @@ SERVER_MUTATIONS = [
     ),
     # a gateway hook moved after the notification
     (
-        r"(if \(!audit_registry_frame\(agent_id, resp\)\)\s*spdlog::error\([^;]*;)"
+        r"(\(void\)audit_registry_frame\(agent_id, resp\);)"
         r"(\s*(?://[^\n]*\n\s*)*)(notify_exec_tracker\(resp\.command_id\(\), agent_id, resp\);)",
         r"\3\2\1",
     ),
     # a gateway hook deleted
-    (r"if \(!audit_registry_frame\(agent_id, resp\)\)\s*spdlog::error\([^;]*;", ""),
+    (r"\(void\)audit_registry_frame\(agent_id, resp\);", ""),
     # a fifth output-storing site appears
     (r"response_store_->store\(sr\);", "response_store_->store(sr);\nresponse_store_->store(sr);"),
     # the hook reads the raw store instead of the weak one

@@ -802,16 +802,13 @@ TEST_CASE("registry audit live ingest: a store that fails ends the frame at the 
 
     const std::string text = cap.text();
     const auto count = [&](const std::string& needle) { return count_of(text, needle); };
-    // The early-out warning: once per frame, naming the agent, the command and the two rows that
-    // were not attempted.
+    // The early-out error line: once per frame, naming the agent, the command and the two rows
+    // that were not attempted.
     for (const auto& id : {rid(0xf1), rid(0xf2)})
         CHECK(count("[audit] registry.write row failed to persist (agent=" + who + ", command=" +
                     id + "); 2 further row(s) of this frame not attempted") == 1);
-    // The gateway path has no trailer, so each frame's failure is an error line naming both ids.
-    CHECK(count("[gateway] registry.write audit row failed to persist (agent=" + who +
-                ", command=" + rid(0xf1) + ")") == 1);
-    CHECK(count("[gateway] registry.write audit row failed to persist (agent=" + who +
-                ", command=" + rid(0xf2) + ")") == 1);
+    // The gateway path has no trailer and the hook's line is its only signal: no second line.
+    CHECK(count("[gateway] registry.write audit row failed to persist") == 0);
     // a failed write leaves its gate too
     CHECK(h.svc.wait_registry_audit_idle(std::chrono::milliseconds{0}));
 }
@@ -876,8 +873,8 @@ void check_a_raising_hook(const std::string& dsn, const std::function<void()>& r
     const std::string text = cap.text();
     const std::string ids = " (agent=agent-1, command=" + rid(0xa2) + ")";
     CHECK(count_of(text, "[audit] registry.write hook threw" + threw + ids) == 1);
-    // The hook returned false, so the gateway site reports the gap.
-    CHECK(count_of(text, "[gateway] registry.write audit row failed to persist" + ids) == 1);
+    // The hook's own line is the only report of the gap.
+    CHECK(count_of(text, "[gateway] registry.write audit row failed to persist") == 0);
     // It was inside its gate while it raised, and a raise does not keep it there.
     CHECK(inside_seen);
     CHECK(h.svc.wait_registry_audit_idle(std::chrono::milliseconds{0}));
@@ -978,8 +975,8 @@ void check_a_close_mid_frame(const std::string& dsn, int close_at, std::size_t k
     const std::string ids = " (agent=agent-1, command=" + rid(0xc3) + ")";
     CHECK(count_of(text, "[audit] registry.write frame cut short by shutdown" + ids + "; " +
                              std::to_string(lost) + " row(s) not recorded") == 1);
-    // The hook returned false, so the gateway site reports the gap as it does for any lost row.
-    CHECK(count_of(text, "[gateway] registry.write audit row failed to persist" + ids) == 1);
+    // The hook's own line is the only report of the gap.
+    CHECK(count_of(text, "[gateway] registry.write audit row failed to persist") == 0);
     CHECK(h.svc.wait_registry_audit_idle(std::chrono::milliseconds{0})); // and the hook left
 }
 
