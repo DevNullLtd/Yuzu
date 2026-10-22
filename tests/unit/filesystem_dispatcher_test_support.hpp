@@ -14,7 +14,9 @@
 
 #include "test_helpers.hpp"
 
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -24,7 +26,16 @@
 #include <utility>
 #include <vector>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <winioctl.h> // FSCTL_SET_REPARSE_POINT (AFTER windows.h)
+#else
 #include <unistd.h>
 #endif
 
@@ -130,6 +141,83 @@ struct Tree {
 #ifndef _WIN32
 inline bool running_as_root() {
     return ::geteuid() == 0;
+}
+#else
+// Privilege-free reparse-point fixtures. create_junction() is copied from
+// tests/unit/test_confined_fs_win.cpp (CreateSymbolicLinkW needs a privilege, an NTFS mount point
+// built with FSCTL_SET_REPARSE_POINT does not); folding the copies into one is a follow-up.
+
+/// A junction (NTFS mount point) at `link` -> `target`. `link` must not exist yet.
+inline bool create_junction(const fs::path& link, const fs::path& target) {
+    if (!CreateDirectoryW(link.c_str(), nullptr))
+        return false;
+    const HANDLE raw =
+        CreateFileW(link.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (raw == INVALID_HANDLE_VALUE)
+        return false;
+    // Hand-built IO_REPARSE_TAG_MOUNT_POINT buffer: REPARSE_DATA_BUFFER is WDK-only. The
+    // substitute name is the NT form of the absolute target (the \??\ prefix), the print name the
+    // plain absolute path.
+    const std::wstring substitute = L"\\??\\" + fs::absolute(target).wstring();
+    const std::wstring print_name = fs::absolute(target).wstring();
+    const std::size_t sub_bytes = (substitute.size() + 1) * sizeof(wchar_t);
+    const std::size_t print_bytes = (print_name.size() + 1) * sizeof(wchar_t);
+    constexpr std::size_t kFixedHeaderSize =
+        8; // ReparseTag(4) + ReparseDataLength(2) + Reserved(2)
+    constexpr std::size_t kMountFieldsSize = 8; // 4 USHORTs: sub/print offset+length
+    std::vector<std::byte> buf(kFixedHeaderSize + kMountFieldsSize + sub_bytes + print_bytes);
+    const auto put16 = [&](std::size_t off, std::uint16_t v) {
+        std::memcpy(buf.data() + off, &v, sizeof(v));
+    };
+    const auto put32 = [&](std::size_t off, std::uint32_t v) {
+        std::memcpy(buf.data() + off, &v, sizeof(v));
+    };
+    put32(0, IO_REPARSE_TAG_MOUNT_POINT);
+    put16(4, static_cast<std::uint16_t>(kMountFieldsSize + sub_bytes + print_bytes));
+    put16(6, 0);
+    put16(8, 0);
+    put16(10, static_cast<std::uint16_t>(sub_bytes - sizeof(wchar_t)));
+    put16(12, static_cast<std::uint16_t>(sub_bytes));
+    put16(14, static_cast<std::uint16_t>(print_bytes - sizeof(wchar_t)));
+    std::memcpy(buf.data() + kFixedHeaderSize + kMountFieldsSize, substitute.c_str(), sub_bytes);
+    std::memcpy(buf.data() + kFixedHeaderSize + kMountFieldsSize + sub_bytes, print_name.c_str(),
+                print_bytes);
+    DWORD returned = 0;
+    const bool ok =
+        DeviceIoControl(raw, FSCTL_SET_REPARSE_POINT, buf.data(), static_cast<DWORD>(buf.size()),
+                        nullptr, 0, &returned, nullptr) != 0;
+    CloseHandle(raw);
+    return ok;
+}
+
+/// Removes the junction ITSELF on destruction (RemoveDirectory on a reparse-point directory never
+/// touches its target). Declare it after the Tree so it runs first.
+struct JunctionCleanup {
+    fs::path path;
+    ~JunctionCleanup() { RemoveDirectoryW(path.c_str()); }
+};
+
+/// Turns the existing regular file `file` into a reparse point tagged IO_REPARSE_TAG_AF_UNIX (the
+/// tag NTFS stores for an AF_UNIX socket file; no data, no privilege). NTFS rejects an arbitrary
+/// non-Microsoft tag here with ERROR_INVALID_REPARSE_DATA, so a Microsoft tag is the portable
+/// fixture. std::filesystem does not classify it, so a walk lists it as an ordinary file; only a
+/// handle opened with FILE_FLAG_OPEN_REPARSE_POINT sees the attribute. Returns false if the volume
+/// refuses the fixture.
+inline bool make_file_reparse_point(const fs::path& file) {
+    const HANDLE raw = CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+                                   FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (raw == INVALID_HANDLE_VALUE)
+        return false;
+    // The 8-byte header only: ReparseTag, ReparseDataLength = 0, Reserved.
+    std::uint8_t buf[8]{};
+    const std::uint32_t tag = 0x80000023; // IO_REPARSE_TAG_AF_UNIX
+    std::memcpy(buf, &tag, sizeof(tag));
+    DWORD returned = 0;
+    const bool ok = DeviceIoControl(raw, FSCTL_SET_REPARSE_POINT, buf, sizeof(buf), nullptr, 0,
+                                    &returned, nullptr) != 0;
+    CloseHandle(raw);
+    return ok;
 }
 #endif
 

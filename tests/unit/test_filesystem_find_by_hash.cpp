@@ -22,9 +22,11 @@
 #include <cerrno>
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #ifndef _WIN32
@@ -38,6 +40,10 @@ namespace fs = std::filesystem;
 using yuzu::test::filesystem_dispatcher_support::Tree;
 #ifndef _WIN32
 using yuzu::test::filesystem_dispatcher_support::running_as_root;
+#else
+using yuzu::test::filesystem_dispatcher_support::create_junction;
+using yuzu::test::filesystem_dispatcher_support::JunctionCleanup;
+using yuzu::test::filesystem_dispatcher_support::make_file_reparse_point;
 #endif
 
 namespace {
@@ -115,10 +121,27 @@ fbh::WalkEnv real_env() {
     return env;
 }
 
-fbh::HashOutcome hash_direct(const fs::path& p, const fbh::WalkLimits& lim = {}) {
+/// One run of the real hasher over `p` with the budget's observable end state: the outcome, why the
+/// budget stopped (if it did) and the admitted-byte counter.
+struct HashRun {
+    fbh::HashOutcome outcome;
+    fbh::StopReason stop{fbh::StopReason::none};
     fbh::WalkCounters counters;
-    fbh::HashBudget budget{lim, [] { return fbh::Clock::now(); }, [] { return false; }, counters};
-    return real_hash(fs::directory_entry{p}, budget, lim);
+};
+
+HashRun hash_run(
+    const fs::path& p, const fbh::WalkLimits& lim = {},
+    std::function<bool()> cancelled = [] { return false; }) {
+    HashRun run;
+    fbh::HashBudget budget{lim, [] { return fbh::Clock::now(); }, std::move(cancelled),
+                           run.counters};
+    run.outcome = real_hash(fs::directory_entry{p}, budget, lim);
+    run.stop = budget.stop();
+    return run;
+}
+
+fbh::HashOutcome hash_direct(const fs::path& p, const fbh::WalkLimits& lim = {}) {
+    return hash_run(p, lim).outcome;
 }
 
 /// A manually advanced clock.
@@ -548,6 +571,68 @@ TEST_CASE("find_by_hash can_enter_posix: a listable directory, and nothing else"
 
 #endif // !_WIN32
 
+#ifdef _WIN32
+
+// -- Windows reparse points ---------------------------------------------------------------------
+// Real NTFS reparse points, built without a privilege (tests/unit/filesystem_dispatcher_test_
+// support.hpp). They pin the three Windows no-follow anchors: the junction check in the walk, the
+// FILE_FLAG_OPEN_REPARSE_POINT open and the reparse-attribute check in hash_entry_win.
+
+TEST_CASE("find_by_hash junctions: a junction is counted and never entered or hashed through",
+          "[find_by_hash]") {
+    Tree t;
+    const auto secret = t.write("tree/real/secret.txt", "secret");
+    const fs::path link = t.root / "tree" / "link";
+    REQUIRE(create_junction(link, t.root / "tree" / "real"));
+    const JunctionCleanup cleanup{link}; // removes the junction itself, before the Tree goes
+    Probe probe;
+    auto env = real_env();
+    env.hash_entry = [&](const fs::directory_entry& e, fbh::HashBudget& b,
+                         const fbh::WalkLimits& l) {
+        probe.hashed.push_back(e.path());
+        return real_hash(e, b, l);
+    };
+    const auto w = walk(t, 5, {}, env, yuzu::shared::sha256_hex("secret"));
+    CHECK(w.out.c.skipped_symlink == 1);
+    CHECK(w.out.c.visited == 4); // tree, tree/real, tree/real/secret.txt, tree/link
+    CHECK(probe.hashed == std::vector<fs::path>{secret}); // nothing under tree/link was reached
+    CHECK(matched_paths(w) == std::set<std::string>{secret.string()});
+    CHECK(w.out.trailer_needed());
+    CHECK_FALSE(w.out.constrained()); // a by-design exclusion alone does not constrain
+}
+
+TEST_CASE("find_by_hash reparse points: the real Windows hasher reports a file reparse point",
+          "[find_by_hash]") {
+    Tree t;
+    const auto p = t.write("tagged.bin", "x");
+    REQUIRE(make_file_reparse_point(p));
+    CHECK(hash_direct(p).kind == fbh::HashKind::symlink);
+    // Through the walk the file is never read through: whether std::filesystem lists the tagged
+    // file as a regular file (the hasher then reports the reparse point) or as something else, it
+    // is counted as skipped and its content is not matched.
+    const auto w = walk(t, 3, {}, real_env(), yuzu::shared::sha256_hex("x"));
+    CHECK(w.out.matches == 0);
+    CHECK(w.out.c.skipped_symlink + w.out.c.skipped_not_regular == 1);
+}
+
+TEST_CASE("find_by_hash win_root_drive_refused: only a fixed disk or a nonexistent drive proceeds",
+          "[find_by_hash]") {
+    const struct {
+        UINT type;
+        bool refused;
+    } cases[] = {
+        {DRIVE_UNKNOWN, true}, {DRIVE_NO_ROOT_DIR, false}, {DRIVE_REMOVABLE, true},
+        {DRIVE_FIXED, false},  {DRIVE_REMOTE, true},       {DRIVE_CDROM, true},
+        {DRIVE_RAMDISK, true},
+    };
+    for (const auto& c : cases) {
+        INFO("GetDriveTypeW answer " << c.type);
+        CHECK(fbh::win_root_drive_refused(c.type) == c.refused);
+    }
+}
+
+#endif // _WIN32
+
 // -- Real hasher --------------------------------------------------------------------------------
 
 TEST_CASE("find_by_hash real hasher: digest equals the in-memory SHA-256 across chunk boundaries",
@@ -566,6 +651,32 @@ TEST_CASE("find_by_hash real hasher: digest equals the in-memory SHA-256 across 
     REQUIRE(w.rows.size() == 1);
     CHECK(w.rows[0] == "match|" + p.string() + "|" + std::to_string(content.size()));
     CHECK(w.out.c.hashed_bytes == content.size());
+}
+
+TEST_CASE("find_by_hash real hasher: the byte cap stops a large file mid-stream",
+          "[find_by_hash]") {
+    // The real per-OS hasher (hash_entry_win on Windows, hash_entry_posix elsewhere), not a fake:
+    // without the per-chunk budget.consume() a large file would be read to the end however small
+    // the cap.
+    Tree t;
+    const auto p = t.write("big.bin", std::string(3 * fbh::kHashChunk + 17, 'q'));
+    fbh::WalkLimits lim;
+    lim.max_bytes_hashed = 2 * fbh::kHashChunk;
+    const auto got = hash_run(p, lim);
+    CHECK(got.outcome.kind == fbh::HashKind::stopped);
+    CHECK(got.stop == fbh::StopReason::byte_cap);
+    CHECK(got.counters.hashed_bytes ==
+          2 * fbh::kHashChunk); // two chunks admitted, the third refused
+}
+
+TEST_CASE("find_by_hash real hasher: a cancelled budget stops a large file before it hashes a byte",
+          "[find_by_hash]") {
+    Tree t;
+    const auto p = t.write("big.bin", std::string(3 * fbh::kHashChunk + 17, 'q'));
+    const auto got = hash_run(p, {}, [] { return true; });
+    CHECK(got.outcome.kind == fbh::HashKind::stopped);
+    CHECK(got.stop == fbh::StopReason::cancelled);
+    CHECK(got.counters.hashed_bytes == 0);
 }
 
 TEST_CASE("find_by_hash empty files are hashed, not skipped", "[find_by_hash]") {

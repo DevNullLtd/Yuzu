@@ -768,8 +768,9 @@ metadata:
     whole path on macOS and Linux 5.6 or later, the final component only on
     older Linux kernels and on Windows), a file that is not a regular file is
     never opened, a file over 10 GB is skipped, and a subtree on a network
-    mount is skipped before anything under it is read. When anything was
-    skipped or the walk stopped early, one trailing row
+    mount is skipped before anything under it is read (on Windows a root on
+    any non-fixed drive, or a UNC root, is refused the same way). When
+    anything was skipped or the walk stopped early, one trailing row
     truncated|reason|visited=N|hashed=N|skipped_unreadable=N|skipped_symlink=N|
     skipped_not_regular=N|skipped_oversize=N|skipped_network_mount=N says
     what was not examined (reason is deadline, file_cap, byte_cap, cancelled,
@@ -837,7 +838,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: size
         type: string
-        description: 'match rows: the matching file''s size in bytes (path and size are the second and third fields). truncated rows: the REMAINDER of the row as one string, visited=N|hashed=N|skipped_unreadable=N|skipped_symlink=N|skipped_not_regular=N|skipped_oversize=N|skipped_network_mount=N (counts of entries not examined; escaped pipes kept as written). matches_found|N is a two-field summary row with no size field; column matchers do not treat it as a data row.'
+        description: 'match rows: the matching file''s size in bytes (path and size are the second and third fields). truncated rows: the REMAINDER of the row as one string, visited=N|hashed=N|skipped_unreadable=N|skipped_symlink=N|skipped_not_regular=N|skipped_oversize=N|skipped_network_mount=N (counts of entries not examined; pipe-unescaped). matches_found|N is a two-field summary row with no size field; column matchers do not treat it as a data row.'
         example: "1405"
         platforms: [windows, linux, darwin]
 

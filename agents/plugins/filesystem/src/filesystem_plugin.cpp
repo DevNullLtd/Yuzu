@@ -357,15 +357,14 @@ std::string compute_hash_unix(const std::string& path, std::string_view algorith
 std::vector<std::string> find_by_hash_network_mounts(const std::string& directory) {
     const fs::path raw = fs::path(directory).lexically_normal();
     const std::string spelled = raw.string();
-    // A UNC root IS the mount. A drive letter is judged by its drive type: a mapped network drive
-    // (or a removable / optical one) is refused, a nonexistent drive falls through to the normal
-    // "directory is not accessible" error.
+    // A UNC root IS the mount. A drive letter is judged by its drive type: anything but a fixed
+    // disk (a mapped network drive, removable, optical, RAM disk, unknown) is refused; a
+    // nonexistent drive falls through to the normal "directory is not accessible" error.
     if (spelled.starts_with("\\\\") || spelled.starts_with("//"))
         return {spelled};
     if (raw.has_root_name()) {
         const std::wstring root = raw.root_name().wstring() + L"\\";
-        const UINT type = GetDriveTypeW(root.c_str());
-        if (type == DRIVE_REMOTE || type == DRIVE_REMOVABLE || type == DRIVE_CDROM)
+        if (yuzu::filesystem::find_by_hash::win_root_drive_refused(GetDriveTypeW(root.c_str())))
             return {spelled};
     }
     return {};
@@ -2324,15 +2323,23 @@ private:
             return 1;
         }
 
+        // The one report of a finished (or refused) walk: the trailer when anything was skipped or
+        // stopped short, the count, then the typed status when part of the tree was not examined.
+        const auto emit_outcome = [&ctx](const fbh::WalkOutcome& o) {
+            if (o.trailer_needed())
+                ctx.write_output(fbh::format_trailer(o));
+            ctx.write_output(std::format("matches_found|{}", o.matches));
+            if (o.constrained())
+                ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
+                                      YUZU_RESULT_COMPLETENESS_PARTIAL, fbh::constrained_reason(o));
+            return 0;
+        };
+
         auto mounts = find_by_hash_network_mounts(std::string{directory});
         if (fbh::root_lexically_under_mount(directory, mounts)) {
             fbh::WalkOutcome refused;
             refused.c.skipped_network_mount = 1;
-            ctx.write_output(fbh::format_trailer(refused));
-            ctx.write_output("matches_found|0");
-            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                  fbh::constrained_reason(refused));
-            return 0;
+            return emit_outcome(refused);
         }
 
         auto validated = validate_path(directory, {});
@@ -2382,13 +2389,7 @@ private:
             fbh::walk_find_by_hash(validated, target, max_depth, fbh::WalkLimits{}, env,
                                    [&](const std::string& row) { ctx.write_output(row); });
 
-        if (outcome.trailer_needed())
-            ctx.write_output(fbh::format_trailer(outcome));
-        ctx.write_output(std::format("matches_found|{}", outcome.matches));
-        if (outcome.constrained())
-            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                  fbh::constrained_reason(outcome));
-        return 0;
+        return emit_outcome(outcome);
     }
 };
 

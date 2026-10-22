@@ -52,6 +52,7 @@
 #include <windows.h>  // must precede bcrypt.h (defines NTSTATUS)
 // clang-format on
 #include <bcrypt.h>
+#include <yuzu/agent/confined_fs.hpp> // confined_fs::WinHandle, the shared HANDLE owner
 #pragma comment(lib, "bcrypt.lib")
 #else
 #include <cerrno>
@@ -60,6 +61,14 @@
 #include <unistd.h>
 #ifdef __linux__
 #include <sys/syscall.h>
+// openat2 (Linux 5.6) is syscall 437 on x86, arm, arm64 and riscv. An old linux-libc-dev only lacks
+// the SYS_ macro, not the kernel the agent runs on, so the whole-path no-follow must not depend on
+// the build host's headers. Architectures with their own numbering (alpha, mips, ia64) are left
+// undefined: they get the leaf-only fallback, never a wrong syscall.
+#if !defined(SYS_openat2) && (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) ||  \
+                              defined(__arm__) || defined(__riscv))
+#define SYS_openat2 437
+#endif
 #endif
 #include <yuzu/agent/scoped_fd.hpp> // yuzu::agent::ScopedFd
 #endif
@@ -513,21 +522,20 @@ template <class ReadChunk>
 
 #else // _WIN32
 
+/// A drive root this walk refuses before touching it: anything but a fixed disk. UNKNOWN fails
+/// closed; REMOVABLE, CDROM, REMOTE and RAMDISK are refused (win_hive_file_guard.hpp refuses
+/// `!= DRIVE_FIXED` the same way). NO_ROOT_DIR is the one other answer let through: no such drive
+/// exists, so validate_path reports the honest `directory is not accessible` error instead of a
+/// network-mount skip that never happened.
+[[nodiscard]] inline bool win_root_drive_refused(UINT drive_type) noexcept {
+    return drive_type != DRIVE_FIXED && drive_type != DRIVE_NO_ROOT_DIR;
+}
+
 namespace detail {
 
-struct WinHandle {
-    HANDLE h{INVALID_HANDLE_VALUE};
-    explicit WinHandle(HANDLE handle) : h(handle) {}
-    WinHandle(const WinHandle&) = delete;
-    WinHandle& operator=(const WinHandle&) = delete;
-    ~WinHandle() {
-        if (h != INVALID_HANDLE_VALUE)
-            CloseHandle(h);
-    }
-    [[nodiscard]] bool valid() const noexcept { return h != INVALID_HANDLE_VALUE; }
-};
-
-/// BCrypt SHA-256 context with scope-exit cleanup on every path.
+/// BCrypt SHA-256 context with scope-exit cleanup on every path. Kept beside the hasher rather than
+/// folded onto a shared helper: compute_hash_win (file_hash) drives BCrypt by hand and is outside
+/// this change, so unifying the two is a file_hash refactor of its own.
 struct BcryptSha256 {
     BCRYPT_ALG_HANDLE alg{nullptr};
     BCRYPT_HASH_HANDLE hash{nullptr};
@@ -539,6 +547,7 @@ struct BcryptSha256 {
             return;
         DWORD object_length = 0;
         DWORD got = 0;
+        // BCryptGetProperty writes a DWORD through a PUCHAR; sizeof(object_length) bounds it.
         if (BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&object_length),
                               sizeof(object_length), &got, 0) != 0)
             return;
@@ -554,6 +563,7 @@ struct BcryptSha256 {
             BCryptCloseAlgorithmProvider(alg, 0);
     }
     bool update(const unsigned char* data, std::size_t len) {
+        // BCryptHashData takes a non-const PUCHAR for its C signature but never writes the input.
         return BCryptHashData(hash, const_cast<PUCHAR>(data), static_cast<ULONG>(len), 0) == 0;
     }
     bool finish(std::string& hex) {
@@ -578,17 +588,18 @@ struct BcryptSha256 {
 /// junction after enumeration is a disclosed residual.
 [[nodiscard]] inline HashOutcome hash_entry_win(const fs::directory_entry& entry,
                                                 HashBudget& budget, const WalkLimits& limits) {
-    detail::WinHandle file{CreateFileW(
+    const yuzu::agent::confined_fs::WinHandle file{CreateFileW(
         entry.path().c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr)};
     if (!file.valid())
         return {HashKind::unreadable, {}, 0};
     BY_HANDLE_FILE_INFORMATION info{};
-    if (!GetFileInformationByHandle(file.h, &info))
+    if (!GetFileInformationByHandle(file.get(), &info))
         return {HashKind::unreadable, {}, 0};
     if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
         return {HashKind::symlink, {}, 0};
-    if ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || GetFileType(file.h) != FILE_TYPE_DISK)
+    if ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+        GetFileType(file.get()) != FILE_TYPE_DISK)
         return {HashKind::not_regular, {}, 0};
     const std::uintmax_t size =
         (static_cast<std::uintmax_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
@@ -601,7 +612,7 @@ struct BcryptSha256 {
     std::vector<unsigned char> buf(kHashChunk);
     for (;;) {
         DWORD n = 0;
-        if (!ReadFile(file.h, buf.data(), static_cast<DWORD>(buf.size()), &n, nullptr))
+        if (!ReadFile(file.get(), buf.data(), static_cast<DWORD>(buf.size()), &n, nullptr))
             return {HashKind::unreadable, {}, 0};
         if (n == 0)
             break;

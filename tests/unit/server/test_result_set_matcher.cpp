@@ -387,6 +387,8 @@ TEST_CASE("matcher: declared columns leave tar and json matching unchanged",
 // ── declared columns wider than a key/value plugin's key + remainder schema (#5624) ──
 // find_by_hash declares row_kind/path/size on the key/value `filesystem` plugin. The matcher
 // splits each row to the DECLARED width, so a three-column definition can match a row.
+// kFindByHashSchema is a literal copy (this binary has no YAML loader); the shipped definition is
+// pinned to the same names, types and row_kind values by tests/test_filesystem_definition.py.
 namespace {
 const char* kFindByHashSchema =
     R"([{"name":"row_kind","type":"string"},{"name":"path","type":"string"},)"

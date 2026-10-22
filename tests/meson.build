@@ -3359,6 +3359,16 @@ test('runtimes definition columns',
   timeout: 30,
 )
 
+# filesystem.find_by_hash's definition (content/definitions/filesystem.yaml): version 0.4.0, the
+# three declared columns and the row_kind values the declared-column result matcher binds to
+# (#5624); the C++ matcher test keeps a copy of the schema, this pins it to the shipped definition.
+test('filesystem definition columns',
+  _python3_test,
+  args: [files('test_filesystem_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # browser_policy's definition-column contract (content/definitions/browser_policy.yaml):
 # row_kind first and the column order match the wire row browser_policy_parsers.hpp emits;
 # parses the YAML directly -- catches a reordered or renamed column the C++ test's
