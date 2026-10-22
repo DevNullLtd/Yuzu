@@ -50,6 +50,7 @@
 ///   GET /api/help/autocomplete              (perm_fn Infrastructure:Read)
 ///   GET /api/help/palette                   (perm_fn Infrastructure:Read)
 ///   GET /help                               -
+///   GET /swagger                            (auth_fn + perm_fn Infrastructure:Read)
 ///   GET /tar                                (auth_fn)
 ///   GET /result-sets                        (auth_fn)
 ///   GET /viz/fleet                          (auth_fn + viz kill switch)
