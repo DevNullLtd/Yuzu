@@ -149,8 +149,10 @@ AdaptedRows failed(std::string reason) {
 // (agents/shared/inventory_status_row.hpp, the helper both plugins format it
 // with): it owns the field positions, the level vocabulary and the same-action
 // rule, and returns field 4 at every level. Status decides success; malformed
-// DATA rows are dropped. A status row answering a different action is not counted
-// (-> "bad status"), nor is an unknown level.
+// DATA rows are dropped. A status row answering a different action (or too short) is
+// not counted; zero counted rows -> "bad status". A same-action row with an unknown
+// level IS counted but carries no level, so it fails validation as "bad status" too
+// (alone, or as the second row beside a valid one).
 //
 // What a `constrained` level does is the action's `policy` (the table's
 // `constrained` column). ConstrainedPolicy::fail: the action fails the cycle

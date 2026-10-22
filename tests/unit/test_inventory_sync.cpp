@@ -2653,6 +2653,8 @@ void check_status_matrix(const Grammar& g) {
     CHECK(run({st(other, "supported", "-"), g.mapped}) == bad);
     for (const char* level : {"bogus", "", "Supported", "supported ", "SUPPORTED", "constrained2"})
         CHECK(run({st(g.action, level, "-"), g.mapped}) == bad);
+    // an unknown-level row still counts: beside a valid one that is two status rows
+    CHECK(run({st(g.action, "bogus", "-"), st(g.action, "supported", "-"), g.mapped}) == bad);
     // a status row for another action, or a too-short one, is not counted: it neither fails the
     // action nor stands in for its own status row
     CHECK(run({st(other, "supported", "-"), st(g.action, "supported", "-"), g.mapped}) == ok1);
