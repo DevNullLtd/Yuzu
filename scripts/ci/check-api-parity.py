@@ -433,7 +433,9 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # 225 -> 214 (ledger reconcile, ADR-1005 2026-10-22 entry): 11 stale rows flipped to `twinned` (both twins
 # already existed). The other 76 reclassified rows (exception, retire, composed-of) stay untwinned by design,
 # so only the flips move this number; they left the generic placeholder (see BASELINE_GENERIC_PLANNED).
-BASELINE_UNTWINNED = 214
+# 214 -> 215 (MCP twin completeness tooling, ADR-1005 2026-10-23 entry): get.fragments-devices-list moved from twinned
+# to the #4041 exception, because its MCP tool list_agents is unconfined; see get.api-agents.
+BASELINE_UNTWINNED = 215
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
@@ -490,6 +492,7 @@ STRICT_EXCEPTION_PINS = {
     "post.api-v1-users-param-password": (5357, "2027-01-04"),
     # #4041: MCP list_agents is unconfined (a known gap) while GET /api/v1/devices is confined; ADR-1005 2026-10-23 entry.
     "get.api-agents": (4041, "2027-01-31"),
+    "get.fragments-devices-list": (4041, "2027-01-31"),
     # #6061: approve/reject is a human-session act, MCP approve_request/reject_request permanently refuse (ADR-1005 exception entry).
     "post.api-approvals-param-approve": (6061, "2027-01-18"),
     "post.api-approvals-param-reject": (6061, "2027-01-18"),
@@ -1978,13 +1981,8 @@ def extract_mcp_security():
 # kind is the tool's ServiceScopeClass (denied / confined / global_safe). The comparison is the
 # securable, the operation, and whether the surface is confined (REST scoped or fleet == MCP
 # confined); denied and global_safe both count as unconfined.
-GATE_PARITY_KNOWN_MISMATCHES_MAX = 19
+GATE_PARITY_KNOWN_MISMATCHES_MAX = 18
 GATE_PARITY_KNOWN_MISMATCHES = {
-    ("GET", "/api/v1/devices", "list_agents"): (
-        "fleet:Infrastructure:Read", "denied:Infrastructure:Read",
-        "REST is the confined fleet read; the MCP handler applies no management-group confinement "
-        "(known gap, tracked by #4041) and its row is `denied` for service-scoped tokens "
-        "(kToolSecurityRows #4027 comment)"),
     ("GET", "/api/v1/dex/app", "get_dex_app"): (
         "plain:GuaranteedState:Read", "confined:GuaranteedState:Read",
         "REST gates on plain perm_fn behind an inline deny_fleet_wide_service_scoped refusal (a "

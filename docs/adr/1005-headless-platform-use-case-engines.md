@@ -877,9 +877,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      known gap, the World A gap tracked by #4041, not a design choice) while
      `GET /api/v1/devices` is confined through `require_fleet_read`, so it is
      not a twin until `list_agents` is confined. The legacy row
-     `get.fragments-devices-list` still records the same pair as `twinned`; it
-     is left as it stands in this change and the pair is carried in the
-     gate-parity table until #4041 closes. The pin is `(4041, "2027-01-31")` in
+     `get.fragments-devices-list` recorded the same pair as `twinned`; it moves
+     to the same exception so the ledger holds one answer for the pair
+     (untwinned 214 to 215). The pins are `(4041, "2027-01-31")` for both rows in
      `STRICT_EXCEPTION_PINS`; like the 2026-10-22 entry this is a session
      statement by the ADR owner, not a signed decision.
 
