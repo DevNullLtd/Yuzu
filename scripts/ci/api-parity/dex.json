@@ -5,7 +5,7 @@
     "capability_id": "post.api-settings-dex-alerts-blast",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "exception:#6325 revisit:2027-03-31 DEX alert settings are admin-only (admin_fn_); REST v1 twin deferred to the 2027-Q1 re-home (ADR-1005 2026-10-22 entry, #6325); no MCP twin is built (#520)"
+    "status": "exception:#6325 revisit:2027-03-31 DEX alert settings are admin-only (admin_fn_); REST v1 twin deferred to the 2027-Q1 re-home (ADR-1005 2026-10-22 entry, #6325); no MCP twin is built; admin-gated (require_admin / admin_fn_), with #520 hard-denying the securable where it applies (see the ADR-1005 2026-10-22 entry)"
   },
   {
     "method": "POST",
@@ -13,7 +13,7 @@
     "capability_id": "post.api-settings-dex-alerts-cohort-export",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "exception:#6325 revisit:2027-03-31 DEX alert settings are admin-only (admin_fn_); REST v1 twin deferred to the 2027-Q1 re-home (ADR-1005 2026-10-22 entry, #6325); no MCP twin is built (#520)"
+    "status": "exception:#6325 revisit:2027-03-31 DEX alert settings are admin-only (admin_fn_); REST v1 twin deferred to the 2027-Q1 re-home (ADR-1005 2026-10-22 entry, #6325); no MCP twin is built; admin-gated (require_admin / admin_fn_), with #520 hard-denying the securable where it applies (see the ADR-1005 2026-10-22 entry)"
   },
   {
     "method": "POST",
@@ -21,7 +21,7 @@
     "capability_id": "post.api-settings-dex-alerts-routing",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "exception:#6325 revisit:2027-03-31 DEX alert settings are admin-only (admin_fn_); REST v1 twin deferred to the 2027-Q1 re-home (ADR-1005 2026-10-22 entry, #6325); no MCP twin is built (#520)"
+    "status": "exception:#6325 revisit:2027-03-31 DEX alert settings are admin-only (admin_fn_); REST v1 twin deferred to the 2027-Q1 re-home (ADR-1005 2026-10-22 entry, #6325); no MCP twin is built; admin-gated (require_admin / admin_fn_), with #520 hard-denying the securable where it applies (see the ADR-1005 2026-10-22 entry)"
   },
   {
     "method": "GET",
@@ -259,7 +259,7 @@
     "capability_id": "get.fragments-settings-dex-alerts",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "exception:#6325 revisit:2027-03-31 DEX alert settings are admin-only (admin_fn_); REST v1 twin deferred to the 2027-Q1 re-home (ADR-1005 2026-10-22 entry, #6325); no MCP twin is built (#520)"
+    "status": "exception:#6325 revisit:2027-03-31 DEX alert settings are admin-only (admin_fn_); REST v1 twin deferred to the 2027-Q1 re-home (ADR-1005 2026-10-22 entry, #6325); no MCP twin is built; admin-gated (require_admin / admin_fn_), with #520 hard-denying the securable where it applies (see the ADR-1005 2026-10-22 entry)"
   },
   {
     "method": "GET",

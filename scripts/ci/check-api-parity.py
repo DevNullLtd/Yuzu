@@ -41,7 +41,8 @@ WHAT IT CHECKS
   1b. A ledger row keyed on a route that is not a registered fragment/
      legacy route is either status "retire" (the route is gone, OR it is still
      registered but no twin will be built and a tracking issue named in the
-     ADR-1005 entry owns its removal - this check does NOT require absence), OR - the ONE other
+     ADR-1005 entry owns its removal; this check does NOT require absence),
+     OR - the ONE other
      legal shape (#5342) - a registered `/api/v1/*` route ledgered with an
      `exception:` status: a REST v1 capability that deliberately has NO MCP
      twin (ADR-1005 requires one by default, so the reviewed reason is
@@ -372,7 +373,8 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # #5955: the maintainer accepted the UI-only fragment rows of the Dashboard, Integrations webhooks,
 # General and Access pages (PRs #5859, #5872, #5873, #5880) on 2026-10-15 as TEMPORARY exceptions,
 # not a general waiver (a new UI-only capability needs its own ruling); those 13 rows now carry
-# `exception:#5955 revisit:...` (10 more were recorded by the ADR-1005 2026-10-22 entry, 23 in all). Rows with exactly one machine twin are no longer plain `twinned`:
+# `exception:#5955 revisit:...`
+# (10 more were recorded by the ADR-1005 2026-10-22 entry, 23 in all). Rows with exactly one machine twin are no longer plain `twinned`:
 # they carry `twinned-rest-only` / `twinned-mcp-only` (or, for the deliberate #520 no-MCP
 # decisions, `exception:#520 revisit:...`), which count untwinned. 11 rows were reclassified that
 # way, so 216 -> 227, with no change in capability; a 12th (settings developer plugins) is

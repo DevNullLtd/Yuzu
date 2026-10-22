@@ -198,7 +198,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 4: Agent Infrastructure | 8 | 0 | 8 | 100% |
 | 5: Policy Engine | 5 | 0 | 5 | 100% |
 | 6: Windows Depth | 6 | 0 | 6 | 100% |
-| 7: Scale & Integration | 19 | 1 | 20 | 95% — 7.8 is **Partial**, not Done (patch deploy records + audits only; dispatch #4138 and ingestion #3676 are unwired) |
+| 7: Scale & Integration | 18 | 2 | 20 | 90% — 7.7 is **Not implemented** (deployment jobs are record-only, #6326) and 7.8 is **Partial**, not Done (patch deploy records + audits only; dispatch #4138 and ingestion #3676 are unwired) |
 | 8: Visualization & Response Experience | 3 | 0 | 3 | 100% |
 | 9: Connector Framework & Multi-Source Inventory | 0 | 8 | 8 | 0% — **Deferred** (owner decision 2026-09-07: placement — core vs. use-case-engine — is an open question to be settled before any re-plan, see Phase 9 body note); demoted out of the #2 execution-order slot it held since 2026-03 |
 | 10: Software Catalog & License Compliance | 0 | 4 | 4 | 0% — 10.1 (product registry) is **Partial** (store compiled/tested, no production writer/reader at the pin); 10.2–10.4 closed NOT_PLANNED with no delivery, see Phase 10 note |
@@ -208,7 +208,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 14: Scale & Enterprise Readiness | 0 | 6 | 6 | 0% — 14.3 is **Partial** (not implemented as designed; the underlying need is addressed differently by the Postgres substrate migration) |
 | 15: TAR Dashboard & Scope Walking | 8 | 0 | 8 | 100% |
 | 16: System Guardian — Real-Time GS | 0 | 3 | 3 | 0% — issue-closure only; substantial implementation progress not reflected here, see 16.A/16.B body notes |
-| **Total** | **86** | **40** | **126** | **68%** |
+| **Total** | **85** | **41** | **126** | **67%** |
 
 **Done** requires verified delivery: closed COMPLETED, or closed NOT_PLANNED *with* a cited delivery-evidence path/ADR (e.g. 12.12/#283 shipped differently as ADR-0016's hash-skip sync). A row whose annotation itself negates delivery (contains "not shipped"/"not built"/"not implemented") MUST carry the **Partial** literal, never `Done` — the annotation may qualify a `Done` row's *manner* of delivery, never contradict *that* delivery happened. **Open** is everything else, including issues closed **NOT_PLANNED with no delivery** (a real decision not to build the thing, distinct from a still-open backlog item — see the Issue Index's "Closed — not planned" rows for the per-issue distinction and `stateReason`) and **Partial** items (real but narrower delivery than "Done" implies: 2.9 per-device-only concurrency; 7.8 patch deploy records+audits with no working dispatch/ingestion path; 10.1 store+normalizer compiled/tested with zero production writer/reader at the pin; 14.3 not implemented as designed, underlying need addressed differently). The number moved from 94/126 (75%) → 90/126 (71%) → 89/126 (71%) → 88/126 (70%) → 87/126 (69%) → **86/126 (68%)** across five corrective passes: first, the initial pull used `state` without `stateReason` and miscounted 5 NOT_PLANNED-with-no-delivery closures (9.8, 10.2, 10.3, 10.4, 11.1) as Done while missing 1 NOT_PLANNED-with-delivery closure (12.12) that should have counted — net **−4**; second, 2.9 was reverted from Done to **Partial** per ADR-1007's own text ("Issue 2.9 no longer claims 'Done'; it reflects the real, narrower scope this ADR ships," `docs/adr/1007-concurrency-enforcement-scope.md:986`) — net **−1**; third, 7.8 was reverted from Done to **Partial** — the HTTP deploy path audits "Deployed … to N agents" but dispatches nothing (#4138) and patch inventory ingestion has zero production callers (#3676) — net **−1**; fourth, 10.1 was reverted from Done to **Partial** — `ProductRegistryStore` is constructed at boot and `/readyz`-wired but has zero production call sites invoking its data methods anywhere outside itself and its unit tests (`product_normalize.cpp` likewise uncalled in production; the SLE matcher that would use both is PR4, `product_registry_store.cpp:43`) — net **−1**; fifth, 14.3 was reverted from Done to **Partial** — its own annotation said "not implemented as designed," which the anti-negation rule above now forces onto the honest literal rather than leaving as a self-contradicting `Done` cell — net **−1**. 94 − 4 − 1 − 1 − 1 − 1 = **86**.
 
@@ -2154,9 +2154,9 @@ Route-sink refactor (#2542) — cross-cutting, ongoing
 
 ## Recommended Execution Order
 
-Phases 0, 1, 3, 4, 5, 6, 8, and 15 are complete (all-Done). Phase 2 and Phase 7 are 92%/95% Done
-respectively — each has exactly one Partial item (2.9 concurrency, 7.8 patch deployment; see the Index
-for both). Phase 10 is 0/4 Done — 10.1 is placed in-server but Partial (no production writer/reader at
+Phases 0, 1, 3, 4, 5, 6, 8, and 15 are complete (all-Done). Phase 2 and Phase 7 are 92%/90% Done
+respectively — Phase 2 has exactly one Partial item (2.9 concurrency); Phase 7 has 7.7 (Not implemented,
+deployment jobs) and 7.8 (Partial, patch deployment); see the Index for each. Phase 10 is 0/4 Done — 10.1 is placed in-server but Partial (no production writer/reader at
 the pin); 10.2–10.4 closed NOT_PLANNED with no delivery (see Phase 10 note).
 Phase 9 is demoted (deferred pending an owner placement decision, not an ADR-1005 consequence — see
 Phase 9 body banner — no longer the #2 slot it held since 2026-03). The order below leads with the fronts the commit log and

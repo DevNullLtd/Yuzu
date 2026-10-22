@@ -360,7 +360,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        2026-07-13 SLE-erasure entry, and the admin reset 2027-01-04 from the
        2026-10-04 passwords entry (earlier ADR text); neither date is a
        recorded ruling, and the gate pins and warns on both without checking
-       that the revisit happens. #5955 covers only its own 13 rows.
+       that the revisit happens. #5955 covers only its own 13 rows (the 2026-10-15 set).
      - **The exception relaxes no control.** Every route requires its
        dedicated RBAC securable (`Read`) and is floored in
        `authz_topology_floor.hpp` so an RBAC-off deployment stays
@@ -755,10 +755,18 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `docs/user-manual/instructions.md` "Who can approve".
 
    - **2026-10-22 - API-parity ledger reconcile: owner rulings on 87 `planned`
-     rows.** The ADR owner (Dave Rae) ruled on 87 rows that were still
-     `planned` in `scripts/ci/api-parity/*.json`. The rulings are recorded here
-     and in #6325 and #6326; like the earlier entries they are session
-     statements, not signed decisions. Ledger-only: no route, tool or
+     rows.** The ADR owner (Dave Rae) ruled on the disposition of rows that were
+     still `planned` in `scripts/ci/api-parity/*.json`. One row of the 87,
+     `get.api-procfetch-status`, was added by the author during governance
+     review (it has the same shape as `get.api-chargen-status`) and awaits the
+     owner's confirmation; treat it as proposed until this sentence is
+     amended. Where the rulings are recorded: the admin-plane rulings in
+     #6325, the retire ruling in #6326, and the NVD and UI-only rulings in
+     this entry only (#4099 and #5955 are not amended). Like the earlier
+     entries they are session statements, not signed decisions. Where #6325's
+     body words the MCP exclusion more strongly ("#520 alone", "most are
+     barred", create-user keeping #5357), this entry's narrower wording
+     governs. Ledger-only: no route, tool or
      authorization behavior changes. The gate (`STRICT_EXCEPTION_PINS` in
      `scripts/ci/check-api-parity.py`) pins each new dated exception by
      capability id, issue and date; the pin is not itself a ruling and does not
@@ -790,8 +798,11 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        admin password reset in the 2026-10-04 entry (#5357 covers the reset,
        not create-user): a password must not travel in an approval ticket's
        persisted arguments. The 2026-09 class table's "settings-plane
-       exception, 2027-Q1" target stands for these rows; for the deployment-jobs
-       and patches rows it is superseded by the retire ruling below.
+       exception, 2027-Q1" target stands for these rows. It is superseded for
+       the deployment-jobs and patches rows by the retire ruling below, for
+       `/api/export/json-to-csv`, `/api/help/autocomplete` and
+       `/api/help/palette` by the UI-only exceptions below (2026-11-30), and
+       for `/api/nvd/*` by the NVD exceptions below (2027-03-31).
      - **NVD routes: 3 time-boxed exceptions,
        `exception:#4099 revisit:2027-03-31`.** `GET /api/nvd/status`,
        `POST /api/nvd/sync` and `POST /api/nvd/match` are grandfathered
@@ -810,7 +821,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `get.fragments-device-live`. The 2026-10-15 entry covered 13 read
        fragments; two of these ten are POST rows (`post.api-export-json-to-csv`,
        a stateless transform of caller-supplied JSON that reads no server data,
-       and `post.fragments-instructions-yaml-preview`, HTML highlighting of
+       and `post.fragments-instructions-yaml-preview`, HTML highlighting and validation messages for
        caller-supplied YAML), and this ruling accepts them on the same terms.
        The waiver's non-waiver of authentication, authorization, audit and
        confinement applies unchanged. #5955's title and body still count 13;
@@ -827,7 +838,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        advertised these as shipped were corrected in the same change.
      - **Corrections, not exceptions.** Eleven rows already had a REST v1 twin
        and an MCP tool on the same gate and flip from `planned` to `twinned`.
-       Twenty UI fragments become `composed-of:` another ledger row. That is a
+       Twenty rows (fourteen UI fragments and six `/api/*` routes) become
+       `composed-of:` another ledger row. That is a
        correction of how the fragment is classified, not a claim that the
        composed capability is already twinned: eleven of the twenty compose
        over a row that is itself still `planned` (two of them also over a

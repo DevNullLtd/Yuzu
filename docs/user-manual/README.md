@@ -56,7 +56,7 @@ The following features are documented within the files listed above:
 | IOC Checking | [Security Hardening](security-hardening.md#ioc-checking) | Indicator of Compromise scanning for threat hunting |
 | Certificate Inventory | [Security Hardening](security-hardening.md#certificate-inventory) | System certificate enumeration, inspection, and deletion |
 | WiFi & WoL | [Agent Plugins](agent-plugins.md) · `agents/plugins/wifi/README.md`, `agents/plugins/wol/README.md` | WiFi network scanning and Wake-on-LAN magic packets |
-| Patch Management | [REST API](rest-api.md) | Patch records only: deployments are recorded but not dispatched and patch inventory is never populated, so lists are empty (#3669, #3676, #4138); `/api/patches*` removal tracked by #6326 |
+| Patch Management | [REST API](rest-api.md) | Patch records only: deployments are recorded but not dispatched and patch inventory is never populated, so `GET /api/patches` is always empty (#3669, #3676, #4138); `/api/patches*` removal tracked by #6326 |
 | Webhooks | [REST API](rest-api.md) | Event-driven HTTP notifications to external systems |
 | Product Packs | [REST API](rest-api.md) | Signed YAML bundles containing definitions, policies, and templates |
 
