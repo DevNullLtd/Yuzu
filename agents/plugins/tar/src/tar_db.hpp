@@ -632,8 +632,22 @@ public:
                              const std::optional<StateWrite>& state = std::nullopt);
     bool insert_dns_events(const std::vector<DnsEvent>& events,
                              const std::optional<StateWrite>& state = std::nullopt);
+    /**
+     * `skip_known_historical` (default false): when set, the insert is
+     * `INSERT ... SELECT ... WHERE NOT EXISTS` against every row already recorded with
+     * `origin='historical'` and the same mapping identity (direction, local_mount, remote_path,
+     * remote_host, username) -- the bounded per-profile retry's own call (tar_plugin.cpp), so a
+     * SID retried after already being recorded once adds no duplicate. `mapdrive_live` is
+     * append-only (the only statement touching it is the INSERT this function issues; nothing
+     * ever UPDATEs a row), so a row already recorded keeps its FIRST-recorded timestamp forever
+     * -- a later insert attempt with the same identity, whatever ts it carries, is simply
+     * skipped. The only merge of timestamps across duplicate identities is dedup_history's own
+     * earliest-sighting rule, and that applies ONLY within one enumeration's own row set, never
+     * across runs or against what is already on disk.
+     */
     bool insert_mapdrive_events(const std::vector<MapDriveEvent>& events,
-                             const std::optional<StateWrite>& state = std::nullopt);
+                             const std::optional<StateWrite>& state = std::nullopt,
+                             bool skip_known_historical = false);
     bool insert_perf_sample(const PerfRow& row);
     bool insert_proc_perf_samples(const std::vector<ProcPerfRow>& rows);
     bool insert_netqual_samples(const std::vector<NetQualRow>& rows);

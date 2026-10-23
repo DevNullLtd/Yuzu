@@ -2486,7 +2486,8 @@ bool TarDatabase::insert_dns_events(const std::vector<DnsEvent>& events,
 }
 
 bool TarDatabase::insert_mapdrive_events(const std::vector<MapDriveEvent>& events,
-                                       const std::optional<StateWrite>& state) {
+                                       const std::optional<StateWrite>& state,
+                                       bool skip_known_historical) {
     std::lock_guard lock(mu_);
     if (!db_)
         return false;
@@ -2502,7 +2503,19 @@ bool TarDatabase::insert_mapdrive_events(const std::vector<MapDriveEvent>& event
     }
     sqlite3_free(err_msg);
 
-    const char* sql = R"(
+    // skip_known_historical (the bounded per-profile retry's own call): an INSERT...SELECT whose
+    // WHERE NOT EXISTS subquery is scoped to origin='historical' rows sharing this event's mapping
+    // identity. mapdrive_live is append-only -- nothing ever UPDATEs it -- so a row already
+    // recorded keeps its first-recorded ts regardless of what this retry's own (always later or
+    // equal) ts carries; the plain VALUES form is unchanged for the live-diff path, which never
+    // wants this dedup (a live event is action-tagged, never origin='historical').
+    const char* sql = skip_known_historical ? R"(
+        INSERT INTO mapdrive_live (ts, snapshot_id, action, direction, local_mount, remote_path, remote_host, username, provider, origin)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (
+            SELECT 1 FROM mapdrive_live WHERE origin = 'historical'
+                AND direction = ? AND local_mount = ? AND remote_path = ? AND remote_host = ? AND username = ?
+        )
+    )" : R"(
         INSERT INTO mapdrive_live (ts, snapshot_id, action, direction, local_mount, remote_path, remote_host, username, provider, origin)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     )";
@@ -2529,6 +2542,13 @@ bool TarDatabase::insert_mapdrive_events(const std::vector<MapDriveEvent>& event
         sqlite3_bind_text(stmt.get(), 8, ev.username.c_str(), -1, SQLITE_STATIC);
         sqlite3_bind_text(stmt.get(), 9, ev.provider.c_str(), -1, SQLITE_STATIC);
         sqlite3_bind_text(stmt.get(), 10, ev.origin.c_str(), -1, SQLITE_STATIC);
+        if (skip_known_historical) {
+            sqlite3_bind_text(stmt.get(), 11, ev.direction.c_str(), -1, SQLITE_STATIC);
+            sqlite3_bind_text(stmt.get(), 12, ev.local_mount.c_str(), -1, SQLITE_STATIC);
+            sqlite3_bind_text(stmt.get(), 13, ev.remote_path.c_str(), -1, SQLITE_STATIC);
+            sqlite3_bind_text(stmt.get(), 14, ev.remote_host.c_str(), -1, SQLITE_STATIC);
+            sqlite3_bind_text(stmt.get(), 15, ev.username.c_str(), -1, SQLITE_STATIC);
+        }
 
         if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
             spdlog::error("insert_mapdrive_events step: {}", sqlite3_errmsg(db_));

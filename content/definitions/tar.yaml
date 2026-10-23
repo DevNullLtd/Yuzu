@@ -603,6 +603,15 @@ spec:
           AFTER you enable this (or after upgrade, where it is now on by
           default). See software_enabled for disable semantics (disabling leaves
           existing rows queryable).
+          degrades to empty otherwise. NOTE: the HISTORICAL backfill (all
+          PREVIOUSLY mapped drives, from the registry / fstab / event logs) runs
+          its first pass at agent init, so it materializes on the first agent
+          restart AFTER you enable this; any profile whose hive could not be read
+          on that first pass (including a logged-out profile the offline
+          hive-file guard refuses) is retried individually, bounded at 7 attempts
+          per profile 24 hours apart, until it resolves or is abandoned. See
+          software_enabled for disable semantics (same opt-in posture; disabling
+          leaves existing rows queryable).
           Requires agent v0.12.0+; older agents silently ignore. Valid:
           "true" | "false".
         validation:
