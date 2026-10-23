@@ -84,18 +84,18 @@ counter or a store rather than a read, the PR says so, and the next PR in the ch
 |---|---|---|---|---|
 | 2a-1 | Typed-source read filter | One exported array of typed source names in `typed_inventory_sources.hpp`, **already including the reserved name `certificate_inventory`**, used by the predicate (and so the gateway skip), the boot purge and a new read-time filter on every generic `InventoryStore` read. No certificate code. Amends the app-usage read-surface routed-concern row in the same change. | It closes today's accepted stray-row window for `app_usage` and `device_ci` (see [Typed set](#typed-set-purge-and-read-filter)). D12 forbids that window for certificates, so it must exist, with the certificate source name reserved, before any agent sends the source. | — |
 | 2a-1b | Background typed-source purge | The boot purge becomes a bounded, batched background pass, classified in `background_jobs.hpp`, started at every boot and no longer awaited before serving. | Boot no longer waits on an unbounded delete; the pass's progress is counted. | 2a-1 |
-| 2a-2a | Certificate store and ingest | `CertificateInventoryStore` (schema `cert_inventory`) and the shared ingest seam on the direct and gateway paths: blob parse, hash-skip, per-store replace rules, the per-agent lock, decommission cascade membership (erase only; no tombstone), `/readyz` membership, `yuzu_server_cert_inventory_ingest_total`, and the schema lint. | A report from an agent (or a test) is stored, counted by result and reason, erased on decommission, and covered by `/readyz`. | 2a-1 |
+| 2a-2a | Certificate store and ingest | `CertificateInventoryStore` (schema `certificate_inventory_store`) and the shared ingest seam on the direct and gateway paths: blob parse, hash-skip, per-store replace rules, the per-agent lock, decommission cascade membership (erase only; no tombstone), `/readyz` membership, `yuzu_server_cert_inventory_ingest_total`, and the schema lint. | A report from an agent (or a test) is stored, counted by result and reason, erased on decommission, and covered by `/readyz`. | 2a-1 |
 | 2a-2b | Certificate read surface | The `CertificateInventory` securable, its seeding and floor entry; the per-certificate read and the raw-value summary (REST + MCP + `/crypto` fragment) with every filter in [Parameters](#parameters-strict-or-free-text-the-same-on-both-twins); admission, truncation, audit (OD-2), the D10 lint, and the `cert_inventory.fleet_store_status` gauge job. | Operators read fleet certificates, including the [one-CA queries](#finding-one-cas-certificates). | 2a-2a |
 | 2a-2c | Decommission tombstones | The decommission tombstone itself (written by `delete_agent`, checked by ingest), the admin-only tombstone list and purge (REST + MCP, OD-4), `coverage.tombstoned_agents_registered`, and the cross-schema enrolment clear (`CertificateEnrolmentTombstoneOwner`) at every approval write. | An administrator lists and purges tombstones; approving a tombstoned agent clears it. | 2a-2b, and the DPIA screening |
 | 2a-2d | Certificate retention prune | The [prune](#retention-and-the-prune), at store and location grain, with its metrics and its clock-guarded-retention register entry. | Stores unread for 30 days are pruned and counted. | 2a-2a |
-| 2a-2e | Agent collector: action, daily-sync source and Linux | `certificates.list_inventory` (no catalogue row, OD-1), the `certificate_inventory` daily-sync source and blob writer, and the Linux store reads. | A Linux agent reports its certificates daily. | 2a-2b, 2a-2c, 2a-2d |
+| 2a-2e | Agent collector: action, daily-sync source and Linux | `certificates.list_inventory` (no catalogue row, OD-1), the `certificate_inventory` daily-sync source and blob writer, and the Linux store reads; the daily sync never sends one report over the transport limit (the certificate blob is sent on its own when the combined report would exceed it). | A Linux agent reports its certificates daily. | 2a-2b, 2a-2c, 2a-2d |
 | 2a-2f | Agent collector: Windows | The Windows machine-store reads and the private-key metadata. | A Windows agent reports its certificates. | 2a-2e |
 | 2a-2g | Agent collector: macOS | The System keychain and SystemRoots reads. | A macOS agent reports its certificates. | 2a-2e |
 | 2a-3 | D13 certificate counts | The counts read (REST + MCP), the snapshot export, the D13 condition-1 lint entries and the recompute test; the data the certificate widgets read. | Operators see the counts on `/crypto` and through MCP. | 2a-2b |
 | 2a-4 | CBOM certificate half | Certificate, algorithm and public-key components in `GET /api/v1/crypto/cbom` and `export_crypto_cbom`, gated by the certificate securable. | The CBOM gains its certificate half. | 2a-2b |
 | 2b-1a | Revocation sources | `RevocationSourceStore`; registration REST + MCP, with the registration-time address checks and the resolved address-class display; the admin-only predicate and the floor-header amendment; `/readyz` membership. | An administrator registers, lists and removes a CA and its CRL URLs. | — |
 | 2b-1b | CRL fetcher | The fetcher and its egress checks; CRL verification and acceptance; the leader-gated refresh job; `crl_past_next_update` on the source read; metrics and alerts. | A registered source shows its fetch status, held CRL, `thisUpdate`, `nextUpdate` and entry count; the alerts fire. | 2b-1a |
-| 2b-2 | Revocation statements | Read-time matching on the per-certificate read (`CertificateRevocationReader`); the revoked windows in the counts read; the signature-verification job; the widgets' revoked data. | Certificates read "revoked on …", "on hold", "not listed on …" or "revocation not checked", with the cause. | 2a-3, 2b-1b |
+| 2b-2 | Revocation statements | Read-time matching on the per-certificate read (`CertificateRevocationReader`); the revoked windows in the counts read; the signature-verification job; the server re-parse of stored DER and `claim_mismatch`; the widgets' revoked data. | Certificates read "revoked on …", "on hold", "not listed on …" or "revocation not checked", with the cause. | 2a-3, 2b-1b |
 | 2b-3 | Delta CRLs (optional, last) | Delta CRL use together with its base. | Until it lands, a delta CRL is verified and recorded but never used, and the source shows `delta_not_supported`. | 2b-2 |
 
 **Order.** Each PR is raised once everything in its "Needs" column has merged. 2a-1, 2b-1a and
@@ -326,7 +326,9 @@ shipped DER carries `der_omitted` = `self_signed`, `oversize` or `budget`. The s
 its signature, so its revocation statement uses the "matched by issuer and serial" basis
 (`0070:539-546`). Where DER is present, the server re-parses it and uses the server-parsed facts. A
 disagreement with the agent's claimed fields is counted
-(`yuzu_server_cert_inventory_claim_mismatch_total`), and the server's values are stored.
+(`yuzu_server_cert_inventory_claim_mismatch_total`), and the server's values are stored. The
+re-parse ships in 2b-2, beside the signature check that already reads stored DER; until then
+`server_parsed` is false and the stored facts are the agent's, which every read states.
 
 ### Private-key metadata
 
@@ -528,7 +530,7 @@ the per-user identifier for per-user rows. Every count is of distinct (device, S
 carries the server-receipt `last_seen`. Each store has its own `observed_at` (ADR-0070 D12,
 `0070:977-1038`).
 
-**Proposed:** `CertificateInventoryStore`, schema `cert_inventory`. All `*_at` and `*_seen`
+**Proposed:** `CertificateInventoryStore`, schema `certificate_inventory_store`. All `*_at` and `*_seen`
 columns are `TIMESTAMPTZ` set from `now()` in SQL. Certificate validity columns are `TIMESTAMPTZ`
 from the certificate. Postgres covers 4713 BC to 294276 AD, so pre-1970 and year-9999 dates fit
 unclamped.
@@ -605,7 +607,7 @@ the PR chooses). A report from such an agent is acknowledged, writes no row, and
   Because an approved record survives decommission, none of these runs for an agent that was
   approved before it was decommissioned. **For such an agent the audited admin purge (below) is the
   only way back.** These writes are in the `auth` schema and the tombstone is in
-  `cert_inventory`, so the clear is cross-schema SQL with its own named query owner (see
+  `certificate_inventory_store`, so the clear is cross-schema SQL with its own named query owner (see
   [The store](#the-store)). Each site is checked by a test that approves a tombstoned agent through
   it and asserts the tombstone is gone.
 - **A live agent decommissioned in error drops out silently.** Its reports are acknowledged and
@@ -701,34 +703,42 @@ hold: the store's latest report says `unreadable` or `not_observed`, and its `ob
 than a stated bound. Age alone never prunes. The prune follows the clock-guarded-retention routed
 concern. The design states how a pruned store's rows are re-sent despite hash-skip.
 
-**Proposed:**
+**Proposed (prune rule pending owner ruling R16; see [Decisions](#decisions)):**
 - **Bound:** 30 days.
-- **Predicate:** `status IN ('unreadable','not_observed') AND observed_at < now() - interval '30
-  days'`.
-- **A store that stays `constrained`.** Its reported locations refresh on every report; a location
-  it stops reporting is kept, because a partial read cannot prove a removal. Without a rule those
-  kept locations would grow for ever. Rule (Decided, owner 2026-10-23, decision 6; ADR-0070 R15): such a location is treated as not observed
-  at location grain once it has been missing from every report the server received over 30 days,
-  that is, when `store_state.status_at - cert_location.last_seen > 30 days`, and the same pass
-  prunes it. Both times are server receipt times. An offline device sends no reports, so its
-  `status_at` stops and nothing of its is pruned: age alone still never prunes. D12 states the
-  prune condition at store grain, so this location-grain reading is listed under
-  [Decisions](#decisions) (decision 6), and the owner confirmed it.
-- **Mechanics:** a single-writer pass under `pg_advisory_xact_lock`, capped per pass (500 stores).
-  For each agent it prunes, it also takes the same per-agent lock that ingest and decommission take
-  (see [Ingest](#ingest)) and rechecks the prune predicate under it, so a fresh ingest that
-  refreshed the store between selection and delete is never undone. It follows the seven parts of
+- **One rule, at location grain.** A `cert_location` row is pruned when all three hold:
+  its store's latest status is `unreadable`, `not_observed` or `constrained` (an `ok` or `absent`
+  store is replaced by ingest and never pruned); `agent_state.last_seen - cert_location.last_seen >
+  30 days`; and `agent_state.last_seen <= now()`. Both operands of the bound are server receipt
+  times, so an offline device, whose `last_seen` stops, is never pruned, and a location seen within
+  the bound is never pruned even if its store later reads `unreadable`. A store whose first read
+  was `constrained` (so its `observed_at` is NULL) is covered the same way. This replaces the
+  store-grain predicate on `observed_at < now()`, which governance showed pruned an offline
+  device's rows once a store had read `unreadable` before it went offline. It is at least as strict
+  as D12's store-grain condition wherever that condition applies, and extends R15's location grain
+  to `unreadable` and `not_observed` stores; the extension is ruling R16.
+- **Accepted residual (pending R16):** a forward step of the database clock that is in force when
+  an agent next reports is added to that agent's `last_seen`, so its kept locations can age out
+  that much early. `last_seen <= now()` stops a stored future value, not a step that `now()`
+  itself carries.
+- **Mechanics:** a single-writer pass under `pg_try_advisory_xact_lock` (a replica that does not
+  get it skips the pass; governance endorsed the try form over a blocking lock), capped per pass
+  (500 (agent, store) units), paged by agent so the candidate read stays index-driven at fleet
+  scale. For each agent it takes the per-agent lock ingest and decommission take (see
+  [Ingest](#ingest)) with a try-lock, skips and counts a contended agent, and restates the
+  predicate inside the DELETE, so a fresh ingest is never undone. It commits in batches, so one
+  contended agent never rolls back the pass. It follows the seven parts of
   `docs/clock-guarded-retention.md`, and the per-store adoption register records each part's
   decision. The cutoff reads Postgres `now()`, not the replica clock.
 - **Re-send:** the same transaction that prunes a store clears `agent_state.content_hash` for that
   agent. The agent's next report then mismatches, the server answers `need_full`, and the agent
   resends the full blob. If the store has come back, its rows return on that report.
-- **An offline device** sends no reports, so its stores keep their last status and are never
-  pruned. Its rows stay until decommission, shown "last observed" at their `observed_at`. A
+- **An offline device** sends no reports, so its `agent_state.last_seen` stops and none of its
+  locations is ever pruned. Its rows stay until decommission, shown "last observed" at their `observed_at`. A
   fleet-wide outage behaves the same way.
-- **Metrics:** `yuzu_server_cert_inventory_pruned_total{grain}` (`store`, `location`) and
-  `yuzu_server_cert_inventory_prune_capped_total`, which counts passes that stopped at the per-pass
-  cap.
+- **Metrics:** `yuzu_server_cert_inventory_pruned_total` (locations removed),
+  `yuzu_server_cert_inventory_prune_capped_total` (passes that stopped at the per-pass cap),
+  `yuzu_server_cert_inventory_prune_passes_total{result}` (`completed`, `capped`, `skipped_lock`,
+  `failed`) and a last-success gauge, so a pass that never completes is visible.
 
 ### Background jobs
 
@@ -1472,7 +1482,7 @@ review, as a new egress surface.
 **Decided (ADR-0070 D12, `0070:947-948`):** a Postgres store for registered CAs and CRL entries,
 separate from `ca_store`, in the readiness conjunction.
 
-**Proposed:** `RevocationSourceStore`, schema `revocation_source`. It never touches `ca_store`
+**Proposed:** `RevocationSourceStore`, schema `revocation_source_store`. It never touches `ca_store`
 (D6, `0070:632-639`).
 
 | Table | Key | Columns |
@@ -1495,8 +1505,8 @@ separate from `ca_store`, in the readiness conjunction.
   and the retention pass deletes a row once no `cert_fact` row on any agent carries its
   `cert_sha256`.
 
-**Cross-schema reads have one owner.** Read-time matching joins `cert_inventory` and
-`revocation_source` in one statement, which R4's same-statement `as_of` needs for the revoked
+**Cross-schema reads have one owner.** Read-time matching joins `certificate_inventory_store` and
+`revocation_source_store` in one statement, which R4's same-statement `as_of` needs for the revoked
 windows. The signature-check job also reads `cert_fact.der` and writes `cert_signature_check`, and
 its prune reads `cert_fact`. Under ADR-0012 §3, all of that cross-schema SQL lives in one named
 query owner, as `RbacAdminAuthorityOwner` is for the RBAC/auth join (the access-control routed
@@ -1504,7 +1514,7 @@ concerns). Proposed: `CertificateRevocationReader`, depending on both stores sha
 the RBAC precedent does (decision 2, decided as proposed).
 
 The tombstone clear crosses the other way, from the `auth` schema's enrolment writes into
-`cert_inventory`. Proposed: a second named owner, `CertificateEnrolmentTombstoneOwner`, holding the
+`certificate_inventory_store`. Proposed: a second named owner, `CertificateEnrolmentTombstoneOwner`, holding the
 clear statement each approval write calls inside its own transaction, and the tombstone list's
 join against the agent registry. It carries the same one-PgPool assumption, which decision 2
 also covers.
@@ -1847,7 +1857,7 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
    screening, owned by the owner and the compliance-officer, with no works-council trigger because
    the data is not behavioural. The screening also records the tombstone's Art. 17 path and that
    slice 2 builds no per-subject purge ([Personal data](#personal-data)).
-2. **Cross-schema matching.** Two schemas (`cert_inventory`, `revocation_source`) with one named
+2. **Cross-schema matching.** Two schemas (`certificate_inventory_store`, `revocation_source_store`) with one named
    query owner each way (`CertificateRevocationReader`, `CertificateEnrolmentTombstoneOwner`), on
    one PgPool, as the RBAC precedent does ([The store](#the-store)).
 3. **An outbound proxy for the CRL fetcher.** None in 2b-1b. `server-admin.md` states the
@@ -1861,6 +1871,11 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
    report the server received over 30 days is treated as not observed at location grain and pruned
    by the same pass. The owner confirmed this reading of D12's store-grain condition over a
    per-store ceiling ([Retention and the prune](#retention-and-the-prune)).
+
+**Pending the owner's ruling (raised by governance on 2a-2d, 2026-10-23):**
+
+7. **R16, one location-grain prune rule** (ADR-0070 D12, proposed). See
+   [Retention and the prune](#retention-and-the-prune). 2a-2d does not merge before this ruling.
 
 ## How this could ship wrong
 

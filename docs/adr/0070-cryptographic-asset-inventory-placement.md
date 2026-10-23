@@ -1002,6 +1002,17 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
     no reports, so nothing of it is pruned: age alone still never prunes. Ruled by the owner
     (liamsomerville) on 2026-10-23 and recorded as decision 6 in the Decisions section of
     `docs/crypto-slice2-certificate-design.md`, whose governance ledger is under `governance.d/`.
+  - **R16 — one location-grain prune rule (PROPOSED, awaiting the owner's ruling; not in force).**
+    Governance on the prune PR showed that the store-grain condition, compared against the
+    server's current time, prunes an offline device's rows once a store read `unreadable` before
+    the device went offline, and never prunes a store whose first read was `constrained`. The
+    proposed rule: a location is pruned only when its store's latest status is `unreadable`,
+    `not_observed` or `constrained`, it has been missing from every report the server received
+    from that device over the bound (the device's last receipt time minus the location's last
+    receipt time), and the device's last receipt time is not in the future. An offline device is
+    never pruned, and a location seen within the bound never is. Accepted residual: a forward step
+    of the database clock in force when the device next reports shortens the bound by that step.
+    The prune PR does not merge until the owner rules on this.
 - A capped or timed-out capture is reported `constrained`, and the report is never an
   empty success.
 - An empty blob is never sent for a failed or constrained capture (the ADR-0016
