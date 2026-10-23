@@ -23,6 +23,8 @@
 
 #include "../test_helpers.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
@@ -116,6 +118,49 @@ void drop_session_schema(PgPool& pool) {
 }
 
 } // namespace
+
+TEST_CASE("AuthManager+SessionStore: mark_session_mfa_verified authors the proof from the DB clock "
+          "and advances the generation",
+          "[auth][session_store][pg][stepup]") {
+    // The Settings enrol-confirm stamp and POST /login/mfa/stepup both go through this primitive; the
+    // bare-AuthManager route tests only reach its legacy system_clock branch, so this is the case
+    // that pins the production (durable) one.
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    auto mgr = make_mgr(store);
+
+    auto token = mgr->create_local_session_for_test("alice", Role::admin, /*mfa_verified=*/false);
+    REQUIRE_FALSE(token.empty());
+    auto before = mgr->validate_session(token);
+    REQUIRE(before.has_value());
+    CHECK(before->steady_mfa_verified.time_since_epoch().count() == 0);
+
+    auto g0 = store.read_generation();
+    REQUIRE(g0.has_value());
+    REQUIRE(mgr->mark_session_mfa_verified(token));
+    auto g1 = store.read_generation();
+    REQUIRE(g1.has_value());
+    CHECK(*g1 > *g0); // every replica's cache drops its stale copy on the next refresh
+
+    auto after = mgr->validate_session(token);
+    REQUIRE(after.has_value());
+    CHECK(after->steady_mfa_verified.time_since_epoch().count() != 0);
+    // A fresh proof: derived from the DB-authored instant, so its age is small and never negative.
+    const auto age = std::chrono::steady_clock::now() - after->steady_mfa_verified;
+    CHECK(age >= std::chrono::steady_clock::duration::zero());
+    CHECK(age < std::chrono::seconds(30));
+
+    // A second manager on the same store (another replica) sees the proof through the durable row.
+    auto other = make_mgr(store);
+    auto seen = other->validate_session(token);
+    REQUIRE(seen.has_value());
+    CHECK(seen->steady_mfa_verified.time_since_epoch().count() != 0);
+
+    // No such durable session: nothing is stamped and the caller is told so.
+    CHECK_FALSE(mgr->mark_session_mfa_verified("no-such-session-token"));
+}
 
 TEST_CASE("AuthManager+SessionStore: create_local_session → validate round-trips",
           "[auth][session_store][pg]") {
@@ -461,4 +506,64 @@ TEST_CASE("AuthManager+SessionStore: the validate cache is trusted only after th
         drop_session_schema(pool);
         CHECK_FALSE(a->validate_session(tok).has_value());
     }
+}
+
+TEST_CASE("AuthManager+SessionStore: an empty token is refused without touching the store",
+          "[auth][session_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    auto mgr = make_mgr(store);
+    mgr->set_metrics_registry(&metrics);
+
+    // The observable for "the store was consulted": with the schema gone every lookup fails and
+    // is counted as a validate degrade, so a store call shows up as a counter increment.
+    drop_session_schema(pool);
+    REQUIRE_FALSE(store.read_generation().has_value()); // schema is really gone
+    // Two store touches are observable: the cache-generation read that precedes a lookup
+    // (`generation_refresh`) and the lookup itself (`validate`). An empty token must reach
+    // neither, so both counters are asserted.
+    const auto degrades = [&](const std::string& op) {
+        const std::string needle =
+            "yuzu_auth_session_store_degrade_total{op=\"" + op + "\"}";
+        const auto text = metrics.serialize();
+        const auto pos = text.find(needle);
+        if (pos == std::string::npos)
+            return 0;
+        return std::stoi(text.substr(pos + needle.size() + 1));
+    };
+    const auto validate_degrades = [&] { return degrades("validate"); };
+    const auto refresh_degrades = [&] { return degrades("generation_refresh"); };
+
+    // An empty token (the no-cookie case) never reaches the store.
+    CHECK_FALSE(mgr->validate_session("").has_value());
+    CHECK(validate_degrades() == 0);
+    CHECK(refresh_degrades() == 0);
+
+    // Positive control: a non-empty token the replica has not seen DOES go to the store, so
+    // both counters above are able to move.
+    CHECK_FALSE(mgr->validate_session("not-a-session-token").has_value());
+    CHECK(validate_degrades() == 1);
+    CHECK(refresh_degrades() == 1);
+
+    // And the empty token still does not move either of them.
+    CHECK_FALSE(mgr->validate_session("").has_value());
+    CHECK(validate_degrades() == 1);
+    CHECK(refresh_degrades() == 1);
+}
+
+// A behaviour pin only: the legacy in-memory path has no store to touch and an empty token
+// misses its map whether or not validate_session short-circuits it, so this case does not
+// fail if the early return is removed. The store-call coverage above is what guards that.
+TEST_CASE("AuthManager legacy path: an empty token never matches a session",
+          "[auth][session]") {
+    AuthManager mgr;
+    CHECK_FALSE(mgr.validate_session("").has_value());
+    const auto token = mgr.create_local_session_for_test("alice", Role::user, /*mfa=*/false);
+    REQUIRE_FALSE(token.empty());
+    CHECK(mgr.validate_session(token).has_value());
+    CHECK_FALSE(mgr.validate_session("").has_value());
 }

@@ -1555,14 +1555,19 @@ std::expected<AuthDB::MfaStatus, AuthDBError> AuthDB::mfa_status(const std::stri
 
     // Recovery-code count is best-effort display metadata (matches the
     // SQLite-era contract — a failure here does not fail the whole read).
-    auto lease2 = impl_->pool.try_acquire_for(kReadTimeout);
-    if (lease2) {
-        pg::PgResult cres = pg::exec_params(
-            lease2.get(), "SELECT COUNT(*) FROM auth.mfa_recovery_codes WHERE username = $1 AND consumed_at IS NULL",
-            std::vector<std::string>{username});
-        if (cres.status() == PGRES_TUPLES_OK && PQntuples(cres.get()) > 0)
-            status.recovery_codes_remaining = static_cast<int>(to_i64(col(cres.get(), 0, 0)));
-    }
+    //
+    // Reuses the lease already held above. It must NEVER acquire a second one
+    // while this one is live: the pre-routing MFA step-up chokepoint calls
+    // mfa_status on every gated request, so N concurrent requests each holding
+    // one pooled connection while waiting for another exhaust the pool (the
+    // waits surface as StoreBusy, which the gate answers 503 "authentication store is
+    // temporarily unavailable"). One connection,
+    // two sequential statements.
+    pg::PgResult cres = pg::exec_params(
+        lease.get(), "SELECT COUNT(*) FROM auth.mfa_recovery_codes WHERE username = $1 AND consumed_at IS NULL",
+        std::vector<std::string>{username});
+    if (cres.status() == PGRES_TUPLES_OK && PQntuples(cres.get()) > 0)
+        status.recovery_codes_remaining = static_cast<int>(to_i64(col(cres.get(), 0, 0)));
     return status;
 }
 
