@@ -635,6 +635,37 @@ TEST_CASE("openapi_spec_json(): the execution-statistics reads document their de
     }
 }
 
+TEST_CASE("openapi_spec_json(): the stored-response reads document the unresolved-Forensics-authority 503 "
+          "(#4990), and only the ones that write a forensics audit row name that audit failure",
+          "[openapi][forensics_tier]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const auto desc503 = [&](const char* path) {
+        REQUIRE(spec["paths"].contains(path));
+        const auto& r = spec["paths"][path]["get"]["responses"];
+        REQUIRE(r.contains("503"));
+        CHECK(r["503"]["content"]["application/json"]["schema"]["$ref"] ==
+              "#/components/schemas/A4ErrorEnvelope");
+        return r["503"].value("description", "");
+    };
+    constexpr std::string_view kAuthority = "Forensics authority could not be determined (retryable)";
+    constexpr std::string_view kForensicsAudit = "response.forensics.read audit row could not persist";
+    for (const char* path : {"/responses/{id}", "/responses/{id}/export"}) {
+        INFO("path: " << path);
+        const auto d = desc503(path);
+        CHECK(d.find(kAuthority) != std::string::npos);
+        CHECK(d.find(kForensicsAudit) != std::string::npos);
+    }
+    {
+        // The aggregate returns only counts and writes no response.forensics.read row, so it names
+        // the unresolved authority but not that audit failure.
+        const auto d = desc503("/responses/{id}/aggregate");
+        CHECK(d.find(kAuthority) != std::string::npos);
+        CHECK(d.find(kForensicsAudit) == std::string::npos);
+        CHECK(d.find("response.read audit row could not persist") != std::string::npos);
+    }
+}
+
 TEST_CASE("openapi_spec_json(): every $ref (including discriminator.mapping "
           "values) resolves to an existing component",
           "[openapi][refs]") {
