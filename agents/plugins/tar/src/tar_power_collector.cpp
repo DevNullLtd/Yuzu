@@ -33,7 +33,7 @@
  * gate / cursor load / rule-1 retry, per tar_cursor.hpp's collect() doc).
  */
 
-#include "tar_aggregator.hpp"     // yuzu::tar::source_enabled -- R-002 disabled-window guard on start()
+#include "tar_aggregator.hpp"     // yuzu::tar::source_enabled_state -- R-002 disabled-window guard on start()
 #include "tar_capture_status.hpp" // yuzu::tar::{classify_subprocess_capture,IncompleteCaptureError}
 #include "tar_cursor.hpp"         // yuzu::tar::{CursorSource,BoundedPendingQueue,make_power_cursor_source}
 #include "tar_db.hpp"             // yuzu::tar::{TarDatabase,PowerEvent}
@@ -378,7 +378,10 @@ public:
         // from callbacks the OS still delivers to this (kept-warm,
         // per tar_cursor.hpp) subscription while the app-level source is
         // disabled.
-        enabled_.store(source_enabled(db, name()), std::memory_order_release);
+        // A failed read leaves enabled_ as it was (tar_aggregator.hpp: nullopt = unknown): storing
+        // the fail-closed source_enabled() here would drop power events until a toggle/restart.
+        if (const auto state = source_enabled_state(db, name()))
+            enabled_.store(*state, std::memory_order_release);
 
         // RAII-owned before any early-exit check (P-002 handle-ownership
         // rule): both handles are member-owned from construction. Per-handle
@@ -813,7 +816,9 @@ public:
     [[nodiscard]] std::string name() const noexcept override { return "power"; }
 
     void start(TarDatabase& db) override {
-        enabled_.store(source_enabled(db, name()), std::memory_order_release); // R-002
+        // R-002; a failed read leaves enabled_ as it was (see the Windows leg's start()).
+        if (const auto state = source_enabled_state(db, name()))
+            enabled_.store(*state, std::memory_order_release);
 #ifdef YUZU_HAVE_LIBSYSTEMD
         std::lock_guard<std::mutex> lock(thread_mu_);
         if (arm_failed_.exchange(false, std::memory_order_acq_rel) && bus_thread_.joinable()) {

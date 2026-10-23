@@ -244,7 +244,7 @@ std::vector<DexPerfDeviceRow> dex_perf_device_list(const DexPerfSnapshot& snap, 
 //    in the httplib-coupled route header) ──────────────────────────────────
 
 /// One per-application row out of the device's `$ProcPerf_Hourly` edge tier
-/// (A2 — names only, NEVER command lines; opt-in `procperf_enabled`).
+/// (A2 — names only, NEVER command lines; `procperf_enabled`).
 struct DexProcPerfRow {
     std::string name; ///< image name — agent bytes, HTML-escape at render
     std::int64_t samples{0};
