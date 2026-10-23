@@ -113,6 +113,7 @@
   tl.shell = function (env) {
     var doc = env.document;
     var run, clockEl, playBtn, speedBtn, noteEl, copyBtn;
+    var copyIdle = '';      // the copy button's own label, restored when the moment moves
     var moment = { el: null, ctl: null };
     var selected = { el: null, ctl: null };
     var st = null;          // the bound run instance, or null
@@ -143,7 +144,8 @@
       slot.el.classList.add('busy');
       env.fetch(url, { credentials: 'same-origin', headers: { Accept: 'text/html' }, signal: ctl.signal })
         .then(function (res) {
-          if (res.status === 401) { env.location.assign('/login'); return null; }
+          // Stop first: no flush (it would request again, and 401 again) and no timer left firing.
+          if (res.status === 401) { stopPlayback(false); env.location.assign('/login'); return null; }
           if (!res.ok) { fail(slot, ctl, 'Could not load this panel (HTTP ' + res.status + ').'); return null; }
           return res.text().then(function (html) {
             if (slot.ctl === ctl) slot.el.innerHTML = html;
@@ -186,6 +188,7 @@
       setT(t);
       lastCommit = env.now();
       st.committed = Math.floor(st.t);
+      if (copyBtn) copyBtn.textContent = copyIdle; // "Link copied" is about the moment that has just moved on
       request(moment, tl.momentUrl(run.getAttribute('data-moment-url') || '', st.t));
       if (st.ref) request(selected, tl.selectedUrl(run.getAttribute('data-selected-url') || '', st.ref, st.t));
     }
@@ -341,6 +344,7 @@
       speedBtn = doc.getElementById('tl-speed');
       noteEl = doc.getElementById('tl-play-note');
       copyBtn = doc.getElementById('tl-copy');
+      copyIdle = copyBtn ? copyBtn.textContent : '';
 
       run.addEventListener('pointerdown', onPointerDown);
       run.addEventListener('pointermove', onPointerMove);

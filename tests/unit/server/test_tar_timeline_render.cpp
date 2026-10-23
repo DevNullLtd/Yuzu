@@ -1854,6 +1854,31 @@ TEST_CASE("tar timeline css: one .tl- block, tokens only, no text on a filled hi
     CHECK(rules > 100);
     // the two time chips sit on the surface with an --hl border
     CHECK(count_of(block, "background: var(--surface); color: var(--ink); border: 1px solid var(--hl);") == 2);
+
+    // The interaction states yuzu-tar-timeline.js toggles: one bounded block, tokens only, every
+    // rule a .tl rule (the .tl- block above stops where this one starts, so it is pinned here).
+    const std::string open = "/* -- Timeline page interaction states";
+    const auto istart = css.find(open);
+    REQUIRE(istart != std::string::npos);
+    CHECK(count_of(css, open) == 1);
+    const auto iend = css.find("/* -- end Timeline page interaction states", istart);
+    REQUIRE(iend != std::string::npos);
+    const std::string ib = css.substr(istart, iend - istart);
+    for (const char* needle : {".tl-ctl .btn.play[aria-pressed=\"true\"]", ".tl-det.busy", ".tl.scrubbing .tl-body",
+                               ".tl-body:focus-visible", "var(--hl)"})
+        contains(ib, needle);
+    for (const char* banned : {"#", "gradient", "url(", "@import"})
+        CHECK(count_of(ib, banned) == 0);
+    std::size_t ipos = ib.find('\n') + 1;
+    while (ipos < ib.size()) {
+        auto eol = ib.find('\n', ipos);
+        if (eol == std::string::npos)
+            eol = ib.size();
+        const std::string line = ib.substr(ipos, eol - ipos);
+        ipos = eol + 1;
+        INFO("interaction rule: " << line);
+        CHECK((line.empty() || line.rfind(".tl", 0) == 0));
+    }
 }
 
 // ═══ the markup the page script reads ═════════════════════════════════════════════════

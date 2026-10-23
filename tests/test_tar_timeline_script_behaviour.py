@@ -325,8 +325,12 @@ const key = (ctx, k, init) => fire(ctx.t.body, 'keydown', Object.assign({ key: k
     eq([c.moment.textContent, c.moment.classes.has('busy')], ['Could not reach the server.', true], 'an aborted request writes nothing and the slot stays busy');
     ok200(c.fetches[3], '<b>ok</b>'); await flush();
     eq([c.moment.innerHTML, c.moment.classes.has('busy')], ['<b>ok</b>', false], 'the replacement lands and clears busy');
-    key(c, 'ArrowRight'); status(c.fetches[4], 401); await flush();
-    eq(c.assigned, ['/login'], '401 goes to the sign-in page');
+    key(c, 'ArrowRight'); fire(c.play, 'click', {});
+    eq(c.play.attrs['aria-pressed'], 'true', '401 case: playback is running when the answer arrives');
+    status(c.fetches[4], 401); await flush();
+    eq([c.assigned, c.play.attrs['aria-pressed'], c.intervals.size], [['/login'], 'false', 0],
+       '401 goes to the sign-in page and stops playback (no timer left to 401 again)');
+    eq(c.fetches.length, 5, '401 stops without a flush request');
     const inner = new El('div'); c.run.children[0].appendChild(inner);
     fire(inner, 'htmx:responseError', { detail: { xhr: { status: 500 } } });
     eq([c.run.textContent, c.run.children.length], ['Could not load the record (HTTP 500).', 0], 'a failed poll inside the run slot is reported there');
@@ -351,6 +355,8 @@ const key = (ctx, k, init) => fire(ctx.t.body, 'keydown', Object.assign({ key: k
     key(c, 'ArrowRight');
     fire(c.copy, 'click', {}); await flush();
     eq([c.clip, c.copy.textContent], [['https://yuzu.test/tar/timeline?id=agent-1&at=151'], 'Link copied'], 'copy link is absolute and keeps only id');
+    key(c, 'ArrowRight');
+    eq(c.copy.textContent, 'Copy link to this moment', 'the label returns when the moment moves on');
     const d = build({ clipFail: true }); show(d);
     fire(d.copy, 'click', {}); await flush();
     eq(d.copy.textContent, 'Could not copy', 'copy failure is said');
@@ -382,6 +388,18 @@ const key = (ctx, k, init) => fire(ctx.t.body, 'keydown', Object.assign({ key: k
     eq(urls(c)[4], MOM + '163', 'and carries the latest t (153 + 4 ticks of 2.5 s)');
     fire(c.speed, 'click', {}); eq(c.speed.textContent, 'Speed 60x', '10x to 60x');
     fire(c.speed, 'click', {}); eq(c.speed.textContent, 'Speed 1x', '60x back to 1x');
+  }
+
+  // ---- playback with an item selected: both panels are requested together at each second
+  {
+    const c = build(); const t = show(c);
+    fire(t.buttons[0], 'click', {});    // p1 at 130
+    fire(c.play, 'click', {});
+    for (let i = 0; i < 4; i++) c.tick();
+    eq(urls(c).slice(1), [MOM + '130', SEL + 'p1&at=130', MOM + '131', SEL + 'p1&at=131'],
+       'one second of playback refreshes the moment and the selected panel at the same t');
+    for (let i = 0; i < 4; i++) c.tick();
+    eq(urls(c).slice(5), [MOM + '132', SEL + 'p1&at=132'], 'and the next second does the same');
   }
 
   // ---- playback: Pause flushes the exact stop time once; Play resumes from there

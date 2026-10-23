@@ -14,7 +14,6 @@ namespace yuzu::server {
 /// The page and its script are registered only when this is true. This is the DEFAULT of
 /// page::Deps::tar_timeline_ui, so a test can drive both states. While false the routes
 /// do not exist at all (an unregistered path, not a disabled page) and nothing links to them.
-// ponytail: page hidden until the timeline fragments land; flip to true to expose it
 inline constexpr bool kTarTimelineUi = false;
 
 /// The page for one device. `agent_id` is percent-encoded then HTML-escaped wherever it

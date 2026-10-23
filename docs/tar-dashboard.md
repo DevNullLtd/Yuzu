@@ -371,7 +371,9 @@ operator-visible. A signed-out request is redirected to sign in; a missing `id` 
   "Could not reach the server.".
 - **Playback.** Play/Pause and a 1x / 10x / 60x speed move the moment line through the
   window already loaded; they do not show live data. Each step advances the line by
-  speed times elapsed time, clamped to the window. It stops at the window end (no loop),
+  speed times elapsed time, clamped to the window; a stalled timer (a throttled or
+  suspended tab) counts at most one second of elapsed time per step, so the line never
+  leaps. It stops at the window end (no loop),
   on Pause, on any manual move, on a failed panel request, when the tab is hidden and
   when the run instance is replaced. Panel requests during playback are throttled to one
   a second (the newest time wins); stopping on Pause, the window end or a hidden tab
