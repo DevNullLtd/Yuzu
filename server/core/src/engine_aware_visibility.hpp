@@ -55,7 +55,8 @@ namespace yuzu::server::visibility {
 }
 
 /// The agent list (`agents` is the registry's JSON array) filtered to what `username` may see.
-[[nodiscard]] inline nlohmann::json visible_agents_json(const nlohmann::json& agents,
+/// Taken BY VALUE so the unfiltered path returns it with a move, not a deep copy of the fleet.
+[[nodiscard]] inline nlohmann::json visible_agents_json(nlohmann::json agents,
                                                         const RbacStore* rbac,
                                                         const ManagementGroupStore* mgmt,
                                                         const std::string& username) {
