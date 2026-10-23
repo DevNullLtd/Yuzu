@@ -130,12 +130,12 @@ enforces that order, so the design does not rely on it:
 |---|---|
 | 2a-1 | `upgrading.md`: the `app_usage`/`device_ci` behaviour change (stray generic rows stop being readable), the deploy order, and the downgrade note above. The app-usage read-surface routed-concern row: its accepted mixed-version window becomes closed. A changelog fragment. |
 | 2a-1b | The purge metric where inventory metrics are documented, and `upgrading.md` (boot no longer waits on the purge). |
-| 2a-2a | `rest-api.md`/`server-admin.md` for the ingest metric and `/readyz` membership; `inventory.md` for the new daily-sync source. |
+| 2a-2a | `rest-api.md`/`server-admin.md` for the ingest metric and `/readyz` membership; `inventory.md` for the server side of the new daily-sync source. |
 | 2a-2b | `crypto.md`, `rest-api.md`, `mcp.md`, `audit-log.md` (the read verbs), `rbac.md` and the SOC 2 access-control inventory (`CertificateInventory`). |
 | 2a-2c | `crypto.md`, `rest-api.md`, `mcp.md`, `audit-log.md` (`crypto.certificates.tombstones.view`, `crypto.certificates.tombstone_purge`). The A2/A1 RBAC-administration routed-concern row (`.claude/routed-concerns-access-control.md`), amended for the new `is_rbac_administrator()` call sites, as that row requires. |
 | 2a-2d | `crypto.md` (retention) and the clock-guarded-retention adoption register, with a separate decision for the location grain, whose cutoff compares two stored receipt times (`status_at`, `last_seen`) rather than the pass's own `now()`. |
 | 2a-2e, 2a-2f, 2a-2g | The generated plugin README and the OS capability matrix, per OS. 2a-2c links the DPIA screening record, which must exist before it merges. |
-| #6125 (owed request, not an edit) | Ask that D6's "never opens ... key blocks in PEM files" (`0070:630`) be worded as the exact property in [Linux link and file rules](#stores-read-per-os): key-block lines discarded unretained, never base64-decoded, buffer cleansed. Tracked until #6125 answers; this design does not edit the ADR. |
+| #6125 (owed request, not an edit) | Ask that D6's "never opens ... key blocks in PEM files" (`0070:630`) be worded as the exact property in [Linux link and file rules](#stores-read-per-os): key-block lines discarded unretained, never base64-decoded, buffer cleansed. Tracked until #6125 answers; this design does not edit D6 (it amends D12 only through R15). |
 | 2a-3 | `crypto.md`, `rest-api.md`, `mcp.md` and `audit-log.md` for the snapshot export (`GET /api/v1/crypto/certificates/snapshot`, `export_crypto_certificate_snapshot`, verb `crypto.certificates.snapshot`), including that paged reads make no cross-page consistency promise. `crypto.md` (each count's rule, window and boundary), the D10 lint's allow-list entries. |
 | 2a-4 | `crypto.md` and `rest-api.md`/`mcp.md` (the certificate half of the CBOM, its securable and its `halves_omitted` metadata). |
 | 2b-1a, 2b-1b | The A2/A1 RBAC-administration routed-concern row (`.claude/routed-concerns-access-control.md`), amended for 2b-1a's new `is_rbac_administrator()`-style call sites. `server-admin.md` and `security-hardening.md`: CRL egress, the address rules, and firewall guidance for the server's outbound CRL fetches. `rbac.md`, `audit-log.md` and the SOC 2 inventory (`RevocationSource`). The fetcher's security review record. |
@@ -696,7 +696,7 @@ mixed-version window becomes closed), and ships a changelog fragment and the `up
 
 ### Retention and the prune
 
-**Decided (ADR-0070 D12 "Honest capture", `0070:986-995`):** kept rows are pruned only when both
+**Decided (ADR-0070 D12 "Honest capture", `0070:986-995`, and its R15 amendment):** kept rows are pruned only when both
 hold: the store's latest report says `unreadable` or `not_observed`, and its `observed_at` is older
 than a stated bound. Age alone never prunes. The prune follows the clock-guarded-retention routed
 concern. The design states how a pruned store's rows are re-sent despite hash-skip.
@@ -707,7 +707,7 @@ concern. The design states how a pruned store's rows are re-sent despite hash-sk
   days'`.
 - **A store that stays `constrained`.** Its reported locations refresh on every report; a location
   it stops reporting is kept, because a partial read cannot prove a removal. Without a rule those
-  kept locations would grow for ever. Rule (Proposed): such a location is treated as not observed
+  kept locations would grow for ever. Rule (Decided, owner 2026-10-23, decision 6; ADR-0070 R15): such a location is treated as not observed
   at location grain once it has been missing from every report the server received over 30 days,
   that is, when `store_state.status_at - cert_location.last_seen > 30 days`, and the same pass
   prunes it. Both times are server receipt times. An offline device sends no reports, so its
@@ -939,12 +939,12 @@ typed output schema and per-error recovery metadata, with the values in
 | `GET /api/v1/crypto/certificates/snapshot` | `export_crypto_certificate_snapshot` | `CertificateInventory:Read` | 2a-3 |
 | `GET /api/v1/crypto/certificates/counts` | `get_crypto_certificate_counts` | `CertificateInventory:Read` | 2a-3 (revoked windows 2b-2) |
 | `GET /api/v1/crypto/cbom` (certificate half) | `export_crypto_cbom` | per half: `Inventory:Read` / `CertificateInventory:Read` | 2a-4 |
-| `GET /api/v1/crypto/revocation-sources` (carries the `crl_past_next_update` count) | `list_revocation_sources` | `RevocationSource:Read` | 2b-1 |
-| `GET /api/v1/crypto/revocation-sources/{id}` | `get_revocation_source` | `RevocationSource:Read` | 2b-1 |
-| `POST /api/v1/crypto/revocation-sources` | `register_revocation_source` | `RevocationSource:Write` | 2b-1 |
-| `PUT /api/v1/crypto/revocation-sources/{id}` | `update_revocation_source` | `RevocationSource:Write` | 2b-1 |
-| `DELETE /api/v1/crypto/revocation-sources/{id}` | `remove_revocation_source` (`destructiveHint: true`) | `RevocationSource:Write` | 2b-1 |
-| `POST /api/v1/crypto/revocation-sources/{id}/reset-high-water` | `reset_revocation_source_high_water` (`destructiveHint: true`) | `RevocationSource:Write` | 2b-1 |
+| `GET /api/v1/crypto/revocation-sources` (carries the `crl_past_next_update` count) | `list_revocation_sources` | `RevocationSource:Read` | 2b-1a (fetch fields filled by 2b-1b) |
+| `GET /api/v1/crypto/revocation-sources/{id}` | `get_revocation_source` | `RevocationSource:Read` | 2b-1a |
+| `POST /api/v1/crypto/revocation-sources` | `register_revocation_source` | `RevocationSource:Write` | 2b-1a |
+| `PUT /api/v1/crypto/revocation-sources/{id}` | `update_revocation_source` | `RevocationSource:Write` | 2b-1a |
+| `DELETE /api/v1/crypto/revocation-sources/{id}` | `remove_revocation_source` (`destructiveHint: true`) | `RevocationSource:Write` | 2b-1a |
+| `POST /api/v1/crypto/revocation-sources/{id}/reset-high-water` | `reset_revocation_source_high_water` (`destructiveHint: true`) | `RevocationSource:Write` | 2b-1a |
 | `GET /api/v1/crypto/certificates/tombstones` | `list_certificate_tombstones` | administrator predicate + `CertificateInventory:Write` (OD-4) | 2a-2c |
 | `DELETE /api/v1/crypto/certificates/tombstones/{agent_id}` | `purge_certificate_tombstone` (`destructiveHint: true`) | administrator predicate + `CertificateInventory:Write` (OD-4) | 2a-2c |
 | `/fragments/crypto/certificates`, `/fragments/crypto/certificates/devices` | — (dashboard, twin of the REST reads) | `CertificateInventory:Read` | 2a-2b |
@@ -1305,8 +1305,8 @@ A caller holding `Inventory:Read` but not `CertificateInventory:Read` gets the l
   for named pairs and any `Delete` (`:156`, `:158`, `:184`). Neither `RevocationSource:Write` nor
   `CertificateInventory:Write` is among them, and this design maps removal, reset and purge to
   `Write`, not `Delete`. Left as is, a supervised MCP token held by an administrator would
-  register, update, remove, reset and purge with no ticket. So **2b-1 adds
-  `RevocationSource:Write`, and 2a-2c adds `CertificateInventory:Write`, to `requires_approval`'s
+  register, update, remove, reset and purge with no ticket. So **2b-1a adds
+  `RevocationSource:Write` (in the same PR as the routes, with the supervised-token test), and 2a-2c adds `CertificateInventory:Write`, to `requires_approval`'s
   supervised list.** The REST mirror needs no second list: `AuthRoutes` already applies the same
   predicate to an MCP token on every non-MCP transport (`auth_routes.cpp:1017`, `:1156`), so the
   one edit covers both. Each PR adds a test that a supervised MCP token gets `approval_required`
@@ -1956,6 +1956,7 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
 | D12: lifecycle | [Typed set](#typed-set-purge-and-read-filter); [Decommission and readiness](#decommission-and-readiness); [Background jobs](#background-jobs) |
 | D12: R1 registration, fetcher, job, store, alerts | [Registration](#registration); [The fetcher](#the-fetcher); [Background jobs](#background-jobs); [The store](#the-store); [Metrics and alerts](#metrics-and-alerts) |
 | D12: chaos CH-1..CH-6 | [Chaos mapping](#chaos-mapping) |
+| D12: R15 (location-grain prune) | [Retention and the prune](#retention-and-the-prune); [Decisions](#decisions) (decision 6) |
 | D13: four rules, windows, `crl_past_next_update` | [D13 counts](#d13-counts) |
 | D13: conditions 1–5 and mechanical checks | [D13 counts](#d13-counts) (count object, one statement, lint); [Store](#store-and-schema) (schema lint); [Tests](#unit-and-integration-tests-proposed) (recompute test) |
 | D13: R2 | Not slice 2's surface; [Dashboard widgets](#dashboard-widgets-the-data-they-read) keeps the Yuzu-CA widgets separate |

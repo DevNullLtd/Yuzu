@@ -287,7 +287,7 @@ by entry when the table is written, never by parsing a name at run time:
 
 | `evidence_kind` | Source | Status | Securable |
 |---|---|---|---|
-| `certificate` | slice 2a's `CertificateInventoryStore` `cert_fact` rows (`s2:498-522`) | after 2a-2 | `CertificateInventory:Read` (P7) |
+| `certificate` | slice 2a's `CertificateInventoryStore` `cert_fact` rows (`s2:498-522`) | after 2a-2b | `CertificateInventory:Read` (P7) |
 | `ssh_host_key` | slice 3 host public keys | pending the slice-3 ADR (`0070:715-783`) | undecided (D8) |
 | `configured` | `crypto_config` (this design) | after the collector ships | proposed `Security:Read` ([open decision 3](#open-owner-decisions)) |
 | `observed` | none | **reserved**; needs the TLS-probing threat model | — |
@@ -1615,7 +1615,7 @@ for 2a-2 (coordination item C5).
   name), and description text. D10's description sentence is checked separately.
 - **No allow-list entries** for these tokens. D13's closed allow-list (`0070:1332-1338`) covers three
   D13 count fields, on D13 count reads only, and the view is not one (P11).
-- **Where it lands.** AV-1 depends on 2a-2, so 2a-2's lint always exists first. 2a-2 builds it
+- **Where it lands.** AV-1 depends on 2a-2b, so 2a-2b's lint always exists first. 2a-2b builds it
   with the base list and, if it adopts C5, these rules; otherwise AV-1 adds these rules to it. The
   D13 allow-list entries are not part of either: they arrive with 2a-3, the PR that adds the D13
   count reads (`s2:84`, `:1126-1128`).
