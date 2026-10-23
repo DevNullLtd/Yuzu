@@ -2309,6 +2309,16 @@ public:
         for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error",
                                   "invalid_key", "stale"})
             metrics_.counter("yuzu_inventory_ingest_dropped_total", {{"reason", reason}});
+        metrics_.describe("yuzu_inventory_typed_purge_rows_total",
+                          "Stray typed-source rows removed from the generic InventoryStore by the "
+                          "once-per-boot background purge",
+                          "counter");
+        metrics_.describe("yuzu_inventory_typed_purge_failures_total",
+                          "Background typed-source purge passes that gave up after a failed batch "
+                          "(retried with backoff first); stray rows stay unreadable regardless",
+                          "counter");
+        metrics_.counter("yuzu_inventory_typed_purge_rows_total");
+        metrics_.counter("yuzu_inventory_typed_purge_failures_total");
         metrics_.describe("yuzu_inventory_query_truncated_total",
                           "Generic InventoryStore query() calls whose result hit the effective "
                           "row limit or aggregate byte cap - more rows may exist past what was "
@@ -7758,30 +7768,13 @@ public:
                 // never belong in the generic store — is_typed_inventory_source is
                 // the PRIMARY control (the gateway ProxyInventory generic-blob loop
                 // skips these sources outright) and the read filter makes any stray
-                // row unreadable (ADR-0070 D12); this sweep is hygiene that reclaims
+                // row unreadable (ADR-0070 D12); the purge is hygiene that reclaims
                 // the space. It runs in the BACKGROUND, bounded and batched, and is
-                // never awaited before serving: boot no longer blocks on an unbounded
-                // DELETE per source. Started at every boot, drains until no typed
-                // row remains, then stops for this boot. A failure is logged and
-                // non-fatal (never sets startup_failed_). It is a delete with no clock
-                // cutoff, so the clock-guarded-retention apparatus does not apply.
-                // Readiness is not gated on it either (nothing waits on this thread).
-                // Iterates kTypedInventorySources, the one list the gateway skip and
-                // the read filter also use; never a second hand-written list here.
-                typed_purge_thread_ = std::thread([this]() {
-                    YUZU_ASSERT_BACKGROUND_JOB("inventory_store.purge_typed_sources"); // WS-10 ReplicaSafe
-                    constexpr int kTypedPurgeBatchRows = 5000;
-                    const auto n = inventory_store_->drain_typed_sources(
-                        kTypedPurgeBatchRows,
-                        [this] { return stop_requested_.load(std::memory_order_acquire); });
-                    if (n)
-                        spdlog::info("[PG] Typed-source purge finished: {} stray row(s) removed "
-                                     "from the generic inventory store",
-                                     *n);
-                    else
-                        spdlog::warn("[PG] Typed-source purge failed (non-fatal — hygiene sweep, "
-                                     "not a startup gate; stray rows are unreadable regardless)");
-                });
+                // never awaited before serving, so boot no longer blocks on an
+                // unbounded DELETE per source. The thread is started in run(), NOT
+                // here: ~16 store constructions follow and a throw would destroy a
+                // joinable std::thread (std::terminate) -- see the start site and
+                // tests/test_typed_purge_wiring_lexical.py.
             }
         }
 
@@ -17824,6 +17817,38 @@ private:
             // matching line for the full rationale.
             spdlog::info("Schedule runner thread stopped");
         });
+
+        // Typed-source purge (inventory_store.purge_typed_sources, 2a-1b): one-shot
+        // background hygiene pass over the generic InventoryStore, started HERE (after the
+        // post-start_web_server startup_failed_ recheck) so a server that refused to start
+        // never runs it and a constructor throw never leaves a joinable thread. Never awaited
+        // and not part of readiness. Not std::jthread: stop_requested_ is declared after the
+        // thread member, so an implicit join at member destruction would outlive it.
+        // A delete of rows that must not exist, with no clock cutoff: clock-guarded-retention
+        // parts 1-4, 6 and 7 are n/a (recorded in docs/clock-guarded-retention.md); the
+        // bounded batch is part 5.
+        if (inventory_store_ && inventory_store_->is_open()) {
+            typed_purge_thread_ = std::thread([this]() {
+                YUZU_ASSERT_BACKGROUND_JOB("inventory_store.purge_typed_sources"); // WS-10 ReplicaSafe
+                const auto r = inventory_store_->drain_typed_sources(
+                    InventoryStore::TypedPurgeOptions{},
+                    [this] { return stop_requested_.load(std::memory_order_acquire); });
+                using St = InventoryStore::TypedPurgeStatus;
+                if (r.status == St::kFailed)
+                    spdlog::warn("[PG] Typed-source purge failed after removing {} row(s): {} "
+                                 "(non-fatal hygiene sweep; stray rows stay unreadable)",
+                                 r.rows, r.cause);
+                else if (r.status == St::kStopped)
+                    spdlog::info("[PG] Typed-source purge stopped by shutdown after {} row(s)",
+                                 r.rows);
+                else if (r.rows > 0)
+                    spdlog::info("[PG] Typed-source purge finished: {} stray row(s) removed "
+                                 "from the generic inventory store",
+                                 r.rows);
+                else
+                    spdlog::debug("[PG] Typed-source purge finished: no stray rows");
+            });
+        }
 
         // Result-set maintenance thread (capability §30) — materialises pending
         // result sets once their producing execution reaches a terminal state,

@@ -3929,6 +3929,15 @@ test('access users production wiring lexical gate',
   timeout: 30,
 )
 
+# 2a-1b: the typed-source purge thread must start in run(), never the ServerImpl constructor
+# (a later constructor throw would std::terminate on the joinable thread). Source-text only.
+test('typed-source purge wiring lexical gate (2a-1b)',
+  _python3_test,
+  args: [files('test_typed_purge_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Audit and reviews page: pins the production wiring in server.cpp (the loud perm_fn gate, the
 # audit store read that returns nullopt for a closed store). Source-text only, so Python.
 # Suite 'docs' for the same reason as the Users page gate above.

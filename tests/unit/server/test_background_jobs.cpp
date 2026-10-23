@@ -89,6 +89,12 @@ TEST_CASE("background-job table classifies every audited pass correctly",
         CHECK(j->cls == BackgroundJobClass::ReplicaSafe);
         CHECK(j->owning_thread == "result_set_maint_thread_");
     }
+    SECTION("2a-1b: the typed-source purge is ReplicaSafe on its own one-shot thread") {
+        auto* j = find("inventory_store.purge_typed_sources");
+        REQUIRE(j != nullptr);
+        CHECK(j->cls == BackgroundJobClass::ReplicaSafe);
+        CHECK(j->owning_thread == "typed_purge_thread_");
+    }
     SECTION("the sweep-added MUST-run-per-replica / idempotent passes are ReplicaSafe") {
         for (std::string_view p : {"cert_reloader.run_loop",
                                    "software_catalog_rollup.refresh_catalog_rollup",

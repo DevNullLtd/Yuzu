@@ -19,6 +19,7 @@
 #include <cctype>
 #include <cstdint>
 #include <string_view>
+#include <thread>
 #include <utility>
 
 namespace yuzu::server {
@@ -532,71 +533,136 @@ bool InventoryStore::delete_agent(const std::string& agent_id) {
 
 // ── Bounded purge of typed-source rows ───────────────────────────────────────
 
-std::optional<std::int64_t>
-InventoryStore::purge_typed_sources_batch(std::span<const std::string_view> sources,
-                                          int max_rows) {
-    if (sources.empty() || max_rows <= 0)
-        return std::int64_t{0};
+namespace {
+// One keyset batch: select at most $2 rows of the typed sources strictly after the
+// (agent_id, plugin) cursor in primary-key order, delete exactly those, and report the
+// count plus the last key deleted so the next batch resumes there instead of
+// rescanning the head of the table. The typed list is the read filter's own bind.
+constexpr const char* kPurgeBatchSql =
+    "WITH b AS (SELECT agent_id, plugin FROM inventory_store.inventory_data "
+    "WHERE plugin = ANY($1::text[]) AND (agent_id, plugin) > ($3::text, $4::text) "
+    "ORDER BY agent_id, plugin LIMIT $2::int), "
+    "del AS (DELETE FROM inventory_store.inventory_data d USING b "
+    "WHERE d.agent_id = b.agent_id AND d.plugin = b.plugin RETURNING 1) "
+    "SELECT (SELECT count(*) FROM del), l.agent_id, l.plugin FROM (SELECT 1) x "
+    "LEFT JOIN (SELECT agent_id, plugin FROM b ORDER BY agent_id DESC, plugin DESC LIMIT 1) l "
+    "ON true";
+// Per-batch server-side bound (SET LOCAL, so it never leaks onto the pooled connection).
+constexpr const char* kPurgeBegin = "BEGIN";
+constexpr const char* kPurgeTimeout = "SET LOCAL statement_timeout = '20s'";
+} // namespace
+
+std::optional<InventoryStore::PurgeBatch>
+InventoryStore::purge_batch(int max_rows, const std::string& after_agent,
+                            const std::string& after_plugin) {
     if (!open_) {
-        spdlog::debug("InventoryStore: purge_typed_sources_batch skipped, store not open");
+        spdlog::debug("InventoryStore: typed purge batch skipped, store not open");
         return std::nullopt;
     }
-    // The names are plain identifiers (kTypedInventorySources), so no element needs
-    // array-literal quoting; an empty name is skipped so it can never match a row.
-    std::string param = "{";
-    for (const auto name : sources) {
-        if (name.empty())
-            continue;
-        if (param.size() > 1)
-            param += ',';
-        param += name;
-    }
-    param += '}';
-    if (param.size() == 2)
-        return std::int64_t{0};
-
     auto lease = pool_.try_acquire_for(kIngestAcquireTimeout);
     if (!lease) {
-        spdlog::debug("InventoryStore: purge_typed_sources_batch skipped, no connection ({})",
+        spdlog::debug("InventoryStore: typed purge batch skipped, no connection ({})",
                       pool_.last_error());
         return std::nullopt;
     }
-    // ctid-bounded: the inner SELECT picks at most max_rows physical rows through
-    // inventory_data_plugin_idx, so one statement never deletes (or locks) an
-    // unbounded set. No clock cutoff, so the clock-guarded-retention apparatus does
-    // not apply: these rows must not exist at all.
+    pg::PgResult begin{PQexec(lease.get(), kPurgeBegin)};
+    if (begin.status() != PGRES_COMMAND_OK)
+        return std::nullopt;
+    pg::PgTxn txn{lease.get()};
+    pg::PgResult to{PQexec(lease.get(), kPurgeTimeout)};
+    if (to.status() != PGRES_COMMAND_OK)
+        return std::nullopt;
     pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "DELETE FROM inventory_store.inventory_data WHERE ctid IN ("
-        "SELECT ctid FROM inventory_store.inventory_data "
-        "WHERE plugin = ANY($1::text[]) LIMIT $2::int)",
-        std::vector<std::string>{param, std::to_string(max_rows)});
-    if (res.status() != PGRES_COMMAND_OK) {
-        spdlog::debug("InventoryStore: purge_typed_sources_batch failed: {}",
-                      PQerrorMessage(lease.get()));
+        lease.get(), kPurgeBatchSql,
+        std::vector<std::string>{typed_sources_param(), std::to_string(max_rows), after_agent,
+                                 after_plugin});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
+        spdlog::debug("InventoryStore: typed purge batch failed: {}", PQerrorMessage(lease.get()));
         return std::nullopt;
     }
-    return affected_rows(res);
+    PurgeBatch out;
+    const char* cnt = PQgetvalue(res.get(), 0, 0);
+    std::from_chars(cnt, cnt + std::string_view(cnt).size(), out.deleted);
+    if (!PQgetisnull(res.get(), 0, 1)) {
+        out.last_agent = PQgetvalue(res.get(), 0, 1);
+        out.last_plugin = PQgetvalue(res.get(), 0, 2);
+    }
+    if (!txn.commit())
+        return std::nullopt;
+    return out;
 }
 
-std::optional<std::int64_t>
-InventoryStore::drain_typed_sources(int batch_rows, const std::function<bool()>& should_stop) {
-    std::int64_t total = 0;
-    for (;;) {
-        if (should_stop && should_stop())
-            return total;
-        const auto n = purge_typed_sources_batch(kTypedInventorySources, batch_rows);
-        if (!n) {
-            if (metrics_)
-                metrics_->counter("yuzu_inventory_typed_purge_failures_total").increment();
-            return std::nullopt;
+std::optional<std::int64_t> InventoryStore::purge_typed_sources_batch(int max_rows) {
+    if (max_rows <= 0)
+        return std::int64_t{0};
+    const auto b = purge_batch(max_rows, {}, {});
+    if (!b)
+        return std::nullopt;
+    return b->deleted;
+}
+
+InventoryStore::TypedPurgeResult
+InventoryStore::drain_typed_sources(const TypedPurgeOptions& opt,
+                                    const std::function<bool()>& should_stop) {
+    TypedPurgeResult r;
+    const auto stopped = [&] { return should_stop && should_stop(); };
+    // Sleep in <=50 ms slices so a shutdown is never held up by a pause or a backoff.
+    const auto nap = [&](std::chrono::milliseconds d) {
+        while (d.count() > 0 && !stopped()) {
+            const auto slice = std::min(d, std::chrono::milliseconds{50});
+            std::this_thread::sleep_for(slice);
+            d -= slice;
         }
-        if (*n == 0)
-            return total;
-        total += *n;
+    };
+    int batch = std::max(1, opt.batch_rows);
+    const int floor_rows = std::max(1, std::min(opt.min_batch_rows, batch));
+    int failures = 0;
+    std::string cur_agent, cur_plugin;
+    bool rescanned = false;
+    for (;;) {
+        if (stopped()) {
+            r.status = TypedPurgeStatus::kStopped;
+            return r;
+        }
+        const auto b = purge_batch(batch, cur_agent, cur_plugin);
+        if (!b) {
+            if (++failures > opt.max_attempts) {
+                r.status = TypedPurgeStatus::kFailed;
+                r.cause = "batch failed after " + std::to_string(opt.max_attempts) +
+                          " retries (last batch size " + std::to_string(batch) + "): " +
+                          pool_.last_error();
+                if (metrics_)
+                    metrics_->counter("yuzu_inventory_typed_purge_failures_total").increment();
+                return r;
+            }
+            batch = std::max(floor_rows, batch / 2);
+            nap(opt.backoff * failures);
+            continue;
+        }
+        failures = 0;
+        if (b->deleted == 0) {
+            // The cursor only moves forward; one rescan from the start catches a stray
+            // row an older server wrote behind it while we drained.
+            if (!cur_agent.empty() || !cur_plugin.empty()) {
+                if (rescanned) {
+                    r.status = TypedPurgeStatus::kCompleted;
+                    return r;
+                }
+                rescanned = true;
+                cur_agent.clear();
+                cur_plugin.clear();
+                continue;
+            }
+            r.status = TypedPurgeStatus::kCompleted;
+            return r;
+        }
+        r.rows += b->deleted;
         if (metrics_)
             metrics_->counter("yuzu_inventory_typed_purge_rows_total")
-                .increment(static_cast<double>(*n));
+                .increment(static_cast<double>(b->deleted));
+        cur_agent = b->last_agent;
+        cur_plugin = b->last_plugin;
+        nap(opt.pause);
     }
 }
 

@@ -943,10 +943,12 @@ ingest is failing. Four further series sharpen the picture:
   remains non-zero for 15 minutes, avoiding alerts for a single self-healing report or
   expected clock-step stale suppression.
 - `yuzu_inventory_typed_purge_rows_total` (counter) — stray typed-source rows removed from the
-  generic store by the background boot purge. Non-zero only after an upgrade or rollback that
-  left such rows; the pass runs once per boot and then stops, so a flat counter is normal.
-- `yuzu_inventory_typed_purge_failures_total` (counter) — background purge passes that stopped on a
-  failed batch (closed store, pool timeout, SQL error). The pass is not retried until the next boot;
+  generic store by the background boot purge. Present at 0 on every boot; it rises only after
+  an upgrade or rollback that left such rows. The pass runs once per boot and then stops, so a
+  flat counter after the first minutes is normal.
+- `yuzu_inventory_typed_purge_failures_total` (counter) — background purge passes that gave up after a failed
+  batch (closed store, pool timeout, SQL error, 20 s statement timeout) and its retries with backoff
+  at smaller batch sizes. The pass is not retried until the next boot;
   stray rows stay unreadable meanwhile. Any non-zero value after a boot is worth a look at the
   Postgres pool, not a page. Readiness does not depend on the pass.
 - `yuzu_inventory_query_truncated_total` (counter) — generic-store reads that hit their

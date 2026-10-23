@@ -18,7 +18,8 @@
 ///
 /// The ONE list. Three consumers iterate it, so none may keep its own copy:
 /// - the gateway skip, through `is_typed_inventory_source`;
-/// - the boot-time purge in server.cpp, which deletes each source's generic rows;
+/// - the background purge (`InventoryStore::drain_typed_sources`, started from run() in
+///   server.cpp), which deletes each source's stray generic rows;
 /// - the read filter in `InventoryStore::list_tables`/`get`/`query`/`count`, which excludes
 ///   every source here in SQL, so a stray row (an older server, or a server rolled
 ///   back below the change that added the source) is never readable through the

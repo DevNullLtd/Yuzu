@@ -53,11 +53,11 @@
 /// legacy `inventory.db`: a leftover legacy file is never read and never scrubbed by this
 /// store — see `docs/user-manual/upgrading.md`'s InventoryStore section for the operator note.
 
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <functional>
 #include <optional>
-#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -188,30 +188,50 @@ public:
     /// cannot report a false "erased".
     [[nodiscard]] bool delete_agent(const std::string& agent_id);
 
-    /// Delete at most `max_rows` rows belonging to any of `sources` (across ALL
-    /// agents) in ONE bounded statement; the caller loops until it returns 0. This is
-    /// the hygiene sweep for a typed source's stray rows (ADR-0016 §5 / ADR-0070 D12):
-    /// the read filter and the gateway skip are the controls, this only reclaims the
-    /// space. Returns the rows deleted (0 = nothing left, or empty input), or
-    /// `std::nullopt` on a closed store, a lease timeout or a SQL failure (never
-    /// throws) -- a caller must not treat nullopt as fatal.
-    [[nodiscard]] std::optional<std::int64_t>
-    purge_typed_sources_batch(std::span<const std::string_view> sources, int max_rows);
+    /// How a `drain_typed_sources` pass ended.
+    enum class TypedPurgeStatus { kCompleted, kStopped, kFailed };
+    struct TypedPurgeResult {
+        TypedPurgeStatus status{TypedPurgeStatus::kCompleted};
+        std::int64_t rows{0}; ///< rows removed so far, whatever the status
+        std::string cause;    ///< set when status == kFailed
+    };
+    struct TypedPurgeOptions {
+        int batch_rows{5000};
+        int min_batch_rows{100};  ///< a failing batch halves down to this floor
+        int max_attempts{4};      ///< retries after a failed batch before giving up
+        std::chrono::milliseconds pause{100};   ///< between batches (interruptible)
+        std::chrono::milliseconds backoff{500}; ///< x failure count, interruptible
+    };
 
-    /// The background pass: loops `purge_typed_sources_batch` over every
-    /// `kTypedInventorySources` name, `batch_rows` at a time, until a batch deletes
-    /// nothing (or `should_stop()` turns true, checked between batches). Counts each
-    /// batch into `yuzu_inventory_typed_purge_rows_total`. Returns the total deleted
-    /// this call, or `std::nullopt` when a batch failed (the rows already deleted are
-    /// still counted; the pass is not retried this boot).
-    [[nodiscard]] std::optional<std::int64_t>
-    drain_typed_sources(int batch_rows, const std::function<bool()>& should_stop = {});
+    /// Delete at most `max_rows` stray rows of `kTypedInventorySources` (across ALL
+    /// agents) in ONE bounded, time-limited statement. Returns the rows deleted (0 =
+    /// nothing left, or a non-positive bound), or `std::nullopt` on a closed store, a
+    /// lease timeout or a SQL failure (never throws). The typed list is bound
+    /// internally (the read filter's own), so no caller can name other sources.
+    [[nodiscard]] std::optional<std::int64_t> purge_typed_sources_batch(int max_rows);
+
+    /// The background pass (ADR-0070 D12 hygiene -- the read filter and the gateway
+    /// skip are the controls; this reclaims space): keyset batches in primary-key
+    /// order until none remain. A failed batch is retried with backoff at half the
+    /// size (down to the floor) before the pass gives up; `should_stop` is polled
+    /// between batches and during every pause. Counts
+    /// `yuzu_inventory_typed_purge_rows_total` per batch and
+    /// `yuzu_inventory_typed_purge_failures_total` once when a pass fails.
+    [[nodiscard]] TypedPurgeResult
+    drain_typed_sources(const TypedPurgeOptions& opt, const std::function<bool()>& should_stop = {});
 
     /// Count inventory records, typed sources excluded. AUTHORITATIVE read: `std::nullopt` on a
     /// store/pool/query degrade, NEVER a silent zero.
     [[nodiscard]] std::optional<int64_t> count() const;
 
 private:
+    struct PurgeBatch {
+        std::int64_t deleted{0};
+        std::string last_agent, last_plugin; ///< last key deleted; empty when none
+    };
+    [[nodiscard]] std::optional<PurgeBatch> purge_batch(int max_rows, const std::string& after_agent,
+                                                        const std::string& after_plugin);
+
     pg::PgPool& pool_;
     bool open_{false};
     yuzu::MetricsRegistry* metrics_{nullptr};

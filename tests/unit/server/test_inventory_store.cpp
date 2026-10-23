@@ -143,13 +143,20 @@ TEST_CASE("InventoryStore degrades (not empty) on a broken pool", "[inventory]")
     CHECK(!typed.has_value());
     CHECK(typed.error() == yuzu::server::InventoryReadError::kDegraded);
     CHECK_FALSE(store.delete_agent("a"));       // ingest/delete: fail-soft, false, no crash
-    CHECK(!store.purge_typed_sources_batch(yuzu::server::kTypedInventorySources, 10));
-    // CH-2: a failing pass reports failure, never throws, and counts the failure.
+    CHECK(!store.purge_typed_sources_batch(10));
+    // CH-2: a failing pass reports failure (never throws), counts it once, removes nothing,
+    // and leaves the reads filtered/degraded rather than empty-looking.
     yuzu::MetricsRegistry purge_metrics;
     store.set_metrics(&purge_metrics);
-    CHECK(!store.drain_typed_sources(10).has_value());
+    InventoryStore::TypedPurgeOptions fast;
+    fast.pause = fast.backoff = std::chrono::milliseconds{0};
+    const auto failed = store.drain_typed_sources(fast);
+    CHECK(failed.status == InventoryStore::TypedPurgeStatus::kFailed);
+    CHECK(failed.rows == 0);
+    CHECK_FALSE(failed.cause.empty());
     CHECK(purge_metrics.counter("yuzu_inventory_typed_purge_failures_total").value() == 1.0);
     CHECK(purge_metrics.counter("yuzu_inventory_typed_purge_rows_total").value() == 0.0);
+    CHECK(!store.get_agent_inventory("a").has_value());
     store.upsert("a", "p", "{}", 1);            // fail-soft: does not throw
 }
 
@@ -313,10 +320,13 @@ TEST_CASE("InventoryStore purge_typed_sources_batch deletes only typed rows, bou
     store.upsert("agent-0", "hardware_info", R"({"n":3})", 1000);
     REQUIRE(raw_row_count(pool, "app_usage") == 5);
 
-    const auto typed = yuzu::server::kTypedInventorySources;
+    InventoryStore::TypedPurgeOptions opt;
+    opt.batch_rows = 2;
+    opt.pause = opt.backoff = std::chrono::milliseconds{0};
+    using St = InventoryStore::TypedPurgeStatus;
 
     SECTION("a batch never exceeds max_rows") {
-        auto n = store.purge_typed_sources_batch(typed, 4);
+        auto n = store.purge_typed_sources_batch(4);
         REQUIRE(n.has_value());
         CHECK(*n == 4);
         CHECK(raw_row_count(pool, "app_usage") + raw_row_count(pool, "certificate_inventory") == 2);
@@ -324,7 +334,7 @@ TEST_CASE("InventoryStore purge_typed_sources_batch deletes only typed rows, bou
     SECTION("looping drains everything typed and leaves generic rows") {
         std::int64_t total = 0;
         for (int guard = 0; guard < 10; ++guard) {
-            auto n = store.purge_typed_sources_batch(typed, 4);
+            auto n = store.purge_typed_sources_batch(4);
             REQUIRE(n.has_value());
             if (*n == 0)
                 break;
@@ -334,34 +344,37 @@ TEST_CASE("InventoryStore purge_typed_sources_batch deletes only typed rows, bou
         CHECK(raw_row_count(pool, "app_usage") == 0);
         CHECK(raw_row_count(pool, "certificate_inventory") == 0);
         CHECK(raw_row_count(pool, "hardware_info") == 1);
-        // Idempotent: nothing left is a successful 0, not a failure.
-        auto again = store.purge_typed_sources_batch(typed, 4);
+        auto again = store.purge_typed_sources_batch(4); // idempotent: a successful 0
         REQUIRE(again.has_value());
         CHECK(*again == 0);
     }
-    SECTION("empty input and a non-positive bound are no-ops") {
-        CHECK(store.purge_typed_sources_batch({}, 10) == std::optional<std::int64_t>{0});
-        CHECK(store.purge_typed_sources_batch(typed, 0) == std::optional<std::int64_t>{0});
+    SECTION("a zero or negative bound is a no-op, not a failure") {
+        CHECK(store.purge_typed_sources_batch(0) == std::optional<std::int64_t>{0});
+        CHECK(store.purge_typed_sources_batch(-5) == std::optional<std::int64_t>{0});
         CHECK(raw_row_count(pool, "app_usage") == 5);
     }
-    SECTION("drain_typed_sources drains a multi-batch backlog and reports the total") {
-        auto n = store.drain_typed_sources(2); // 6 rows -> 3 batches
-        REQUIRE(n.has_value());
-        CHECK(*n == 6);
-        CHECK(raw_row_count(pool, "app_usage") == 0);
-        CHECK(raw_row_count(pool, "hardware_info") == 1);
-    }
-    SECTION("drain_typed_sources counts purged rows and no failure") {
+    SECTION("drain drains a multi-batch backlog, reports completed and the total") {
         yuzu::MetricsRegistry m;
         store.set_metrics(&m);
-        REQUIRE(store.drain_typed_sources(2).has_value());
+        const auto r = store.drain_typed_sources(opt); // 6 rows -> 3 batches
+        CHECK(r.status == St::kCompleted);
+        CHECK(r.rows == 6);
+        CHECK(raw_row_count(pool, "app_usage") == 0);
+        CHECK(raw_row_count(pool, "hardware_info") == 1);
         CHECK(m.counter("yuzu_inventory_typed_purge_rows_total").value() == 6.0);
         CHECK(m.counter("yuzu_inventory_typed_purge_failures_total").value() == 0.0);
     }
-    SECTION("drain_typed_sources stops between batches when asked") {
-        auto n = store.drain_typed_sources(2, [] { return true; });
-        REQUIRE(n.has_value());
-        CHECK(*n == 0);
+    SECTION("drain stops between batches: predicate false once then true runs exactly one batch") {
+        int polls = 0;
+        const auto r = store.drain_typed_sources(opt, [&] { return polls++ >= 1; });
+        CHECK(r.status == St::kStopped);
+        CHECK(r.rows == 2);
+        CHECK(raw_row_count(pool, "app_usage") + raw_row_count(pool, "certificate_inventory") == 4);
+    }
+    SECTION("drain with an already-true predicate runs no batch") {
+        const auto r = store.drain_typed_sources(opt, [] { return true; });
+        CHECK(r.status == St::kStopped);
+        CHECK(r.rows == 0);
         CHECK(raw_row_count(pool, "app_usage") == 5);
     }
 }
@@ -417,9 +430,12 @@ TEST_CASE("InventoryStore reads never return a typed source's stray row (ADR-007
         // arch-A2: covers every kTypedInventorySources member, seeded above.
         for (const auto typed : yuzu::server::kTypedInventorySources)
             REQUIRE(raw_row_count(pool, std::string(typed)) == 1);
-        auto n = store.drain_typed_sources(2);
-        REQUIRE(n.has_value());
-        CHECK(*n == static_cast<std::int64_t>(yuzu::server::kTypedInventorySources.size()));
+        InventoryStore::TypedPurgeOptions opt;
+        opt.batch_rows = 2;
+        opt.pause = opt.backoff = std::chrono::milliseconds{0};
+        const auto r = store.drain_typed_sources(opt);
+        CHECK(r.status == InventoryStore::TypedPurgeStatus::kCompleted);
+        CHECK(r.rows == static_cast<std::int64_t>(yuzu::server::kTypedInventorySources.size()));
         for (const auto typed : yuzu::server::kTypedInventorySources)
             CHECK(raw_row_count(pool, std::string(typed)) == 0);
         CHECK(raw_row_count(pool, "hardware_info") == 1);
