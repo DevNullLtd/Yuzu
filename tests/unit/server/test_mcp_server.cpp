@@ -5520,9 +5520,12 @@ TEST_CASE("MCP Guardian: get_guardian_device_guards denies an out-of-scope devic
             return std::vector<GuardianDeviceGuardRow>{};
         });
     ts.guardian_api_for_test = seam_api;
-    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response& res,
-                                    const std::string&, const std::string&,
-                                    const std::string& agent_id) -> bool {
+    std::string securable_seen, operation_seen;
+    ts.scoped_perm_fn_for_test = [&](const httplib::Request&, httplib::Response& res,
+                                     const std::string& sec, const std::string& op,
+                                     const std::string& agent_id) -> bool {
+        securable_seen = sec;
+        operation_seen = op;
         if (agent_id == "WS-9") {
             res.status = 403;
             res.set_content(R"({"error":"forbidden"})", "application/json");
@@ -5538,6 +5541,8 @@ TEST_CASE("MCP Guardian: get_guardian_device_guards denies an out-of-scope devic
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(res->body.find("\"result\"") == std::string::npos);
+    CHECK(securable_seen == "GuaranteedState");
+    CHECK(operation_seen == "Read");
     CHECK(device_guards_calls == 0); // the gate answered before the seam was touched
     for (const auto& a : ts.audit_log)
         CHECK(a.rfind("guardian.device.view", 0) != 0); // no access row for a refused read
@@ -5571,9 +5576,12 @@ TEST_CASE("MCP Guardian: get_guardian_device_guards hands the requested agent_id
             return std::vector<GuardianDeviceGuardRow>{row};
         });
     ts.guardian_api_for_test = seam_api;
+    std::string securable_seen, operation_seen;
     ts.scoped_perm_fn_for_test = [&](const httplib::Request&, httplib::Response&,
-                                     const std::string&, const std::string&,
+                                     const std::string& sec, const std::string& op,
                                      const std::string& agent_id) -> bool {
+        securable_seen = sec;
+        operation_seen = op;
         gate_agents.push_back(agent_id);
         calls_at_gate = device_guards_calls;
         return true;
@@ -5587,6 +5595,8 @@ TEST_CASE("MCP Guardian: get_guardian_device_guards hands the requested agent_id
     CHECK(res->status == 200);
     REQUIRE(gate_agents.size() == 1);
     CHECK(gate_agents[0] == "WS-1");
+    CHECK(securable_seen == "GuaranteedState");
+    CHECK(operation_seen == "Read");
     CHECK(calls_at_gate == 0); // gate ran before the seam read
     CHECK(device_guards_calls == 1);
     auto body = nlohmann::json::parse(res->body);
@@ -9861,9 +9871,12 @@ TEST_CASE("MCP DEX: get_dex_observation denies an out-of-scope device before the
           "is consulted",
           "[mcp][integration][dex]") {
     McpTestServer ts; // no store wired: proves the gate short-circuits first
-    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response& res,
-                                    const std::string&, const std::string&,
-                                    const std::string& agent_id) -> bool {
+    std::string securable_seen, operation_seen;
+    ts.scoped_perm_fn_for_test = [&](const httplib::Request&, httplib::Response& res,
+                                     const std::string& sec, const std::string& op,
+                                     const std::string& agent_id) -> bool {
+        securable_seen = sec;
+        operation_seen = op;
         if (agent_id == "WS-9") {
             res.status = 403;
             res.set_content(R"({"error":"forbidden"})", "application/json");
@@ -9879,6 +9892,8 @@ TEST_CASE("MCP DEX: get_dex_observation denies an out-of-scope device before the
     CHECK(res->status == 403);
     CHECK(res->body.find("Guaranteed State store unavailable") == std::string::npos);
     CHECK(res->body.find("\"result\"") == std::string::npos);
+    CHECK(securable_seen == "GuaranteedState");
+    CHECK(operation_seen == "Read");
 }
 
 TEST_CASE("MCP DEX: get_dex_observation hands the requested agent_id to the scope gate "
@@ -9891,9 +9906,12 @@ TEST_CASE("MCP DEX: get_dex_observation hands the requested agent_id to the scop
     McpTestServer ts;
     ts.mock_token_scope_service = "printers";
     std::vector<std::string> gate_agents;
+    std::string securable_seen, operation_seen;
     ts.scoped_perm_fn_for_test = [&](const httplib::Request&, httplib::Response&,
-                                     const std::string&, const std::string&,
+                                     const std::string& sec, const std::string& op,
                                      const std::string& agent_id) -> bool {
+        securable_seen = sec;
+        operation_seen = op;
         gate_agents.push_back(agent_id);
         return true;
     };
@@ -9905,6 +9923,8 @@ TEST_CASE("MCP DEX: get_dex_observation hands the requested agent_id to the scop
     CHECK(res->status == 200);
     REQUIRE(gate_agents.size() == 1);
     CHECK(gate_agents[0] == "WS-1");
+    CHECK(securable_seen == "GuaranteedState");
+    CHECK(operation_seen == "Read");
     // Past the gate, the unwired store answers: the call reached the read path.
     CHECK(res->body.find("Guaranteed State store unavailable") != std::string::npos);
     CHECK(res->body.find("\"result\"") == std::string::npos);
