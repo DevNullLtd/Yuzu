@@ -463,7 +463,13 @@ TEST_CASE("group-from-results: an Unknown Forensics decision shows a visible not
     CHECK(res->body.find("class=\"feedback-error\"") != std::string::npos);
     CHECK(res->body.find("could not be completed") != std::string::npos);
     CHECK(res->body.find("Nothing was created") != std::string::npos);
-    CHECK(res->get_header_value("HX-Retarget") == "#group-form-slot");
+    // The form is hx-swap="none": the body and HX-Retarget are never displayed. The operator sees
+    // the refusal through the page's toast channel (the HX-Trigger showToast event every other
+    // handler of this page uses), carrying exactly this constant message at the error level.
+    CHECK(res->get_header_value("HX-Trigger") ==
+          R"({"showToast":{"message":"The permission check for this action could not be completed. )"
+          R"(Nothing was created. Retry shortly.","level":"error"}})");
+    CHECK(res->get_header_value("HX-Retarget").empty());
     // This action materialises membership: an Unknown answer must create nothing, not a group from
     // the ordinary rows alone.
     CHECK_FALSE(h.mg.find_group_by_name("tier-unknown-group").has_value());
@@ -473,6 +479,7 @@ TEST_CASE("group-from-results: an Unknown Forensics decision shows a visible not
     auto ok = h.post(GroupFromResultsHarness::form_body("tier-denied-group"));
     CHECK(ok->status != 503);
     CHECK(ok->body.find("Nothing was created") == std::string::npos);
+    CHECK(ok->get_header_value("HX-Trigger").find("could not be completed") == std::string::npos);
     CHECK(h.mg.find_group_by_name("tier-denied-group").has_value());
 }
 
@@ -555,6 +562,11 @@ TEST_CASE("group-from-results: a degraded response store 503s with the "
     auto res = h.post(GroupFromResultsHarness::form_body("degrade-group"));
     CHECK(res->status == 503);
     CHECK(contains(res->body, "could not be read"));
+    // The form never swaps a body (hx-swap="none"), so the refusal also travels on the toast
+    // channel: exactly this constant message, at the error level.
+    CHECK(res->get_header_value("HX-Trigger") ==
+          R"({"showToast":{"message":"Agent count unavailable. The response store could not be read. )"
+          R"(Nothing was created. Retry shortly.","level":"error"}})");
 
     CHECK(h.audits_for("response.read", "denied") == 0);
     CHECK_FALSE(h.mg.find_group_by_name("degrade-group").has_value());

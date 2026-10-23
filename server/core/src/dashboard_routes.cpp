@@ -704,10 +704,15 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  if (!tier) {
                      // Unknown: this action materialises membership, so it refuses outright rather
                      // than proceeding on a filter computed from a partial answer (#4990).
-                     // Answered 200 with the notice in the body: htmx drops a 4xx/5xx body
-                     // (the console's sibling refusals render at 200 for the same reason), so a
-                     // 503 here would show the operator only a generic failure toast.
-                     res.set_header("HX-Retarget", "#group-form-slot");
+                     // The form is hx-swap="none", so neither a body nor HX-Retarget is ever
+                     // shown; the operator sees the refusal through the page's toast channel
+                     // (an HX-Trigger showToast event, rendered with textContent). The message is
+                     // a constant: no caller or plugin data. Answered 200 (htmx drops a 4xx/5xx
+                     // body); the body repeats the notice for a non-htmx caller.
+                     res.set_header(
+                         "HX-Trigger",
+                         R"({"showToast":{"message":"The permission check for this action could )"
+                         R"(not be completed. Nothing was created. Retry shortly.","level":"error"}})");
                      res.set_content(
                          "<span class=\"feedback-error\">"
                          "The permission check for this action could not be completed. "
@@ -718,7 +723,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  auto agent_ids_opt = response_store_->facet_agent_ids(command_id, *tier, filters);
                  if (!agent_ids_opt.has_value()) {
                      res.status = 503;
-                     res.set_header("HX-Retarget", "#group-form-slot");
+                     // Same toast channel as the refusal above (the form never swaps a body).
+                     res.set_header(
+                         "HX-Trigger",
+                         R"({"showToast":{"message":"Agent count unavailable. The response store )"
+                         R"(could not be read. Nothing was created. Retry shortly.","level":"error"}})");
                      res.set_content(
                          "<span class=\"feedback-error\">"
                          "Agent count unavailable — the response store could not be read. "
