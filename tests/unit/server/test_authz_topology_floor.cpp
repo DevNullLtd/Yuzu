@@ -1442,3 +1442,130 @@ TEST_CASE("forensics visibility: a degraded or unwired input is Unknown, a defin
         CHECK(rig.withheld("scope_read_failed") == 0.0);
     }
 }
+
+// ── Resolver skip rules (#4990, wave D) ──────────────────────────────────────────────────────
+// Step 2 of resolve_forensics_visible (the scoped composition) deliberately skips three caller
+// classes whose authority is not "the user's own scoped grants". Each of these cases gives the
+// OWNER a scoped-only Forensics:Read grant (no global one), so deleting the skip rule would widen
+// the caller to that subset, and asserts the skipped class gets nothing while the ordinary
+// session with the same owner gets the subset. A Denied answer is silent: no counter moves.
+
+TEST_CASE("forensics visibility: a service-scoped token minted by a scoped-grant holder gets nothing, "
+          "its plain sibling gets the subset",
+          "[pg][auth_routes][authz_topology_floor][forensics][service_scope]") {
+    ForensicsVisRig rig;
+    rig.rbac.set_rbac_enabled(true);
+    REQUIRE(rig.auth_mgr.upsert_user("sk1", "password1234", auth::Role::user));
+    REQUIRE(rig.mgmt.assign_role({rig.group_id, "user", "sk1", "ForensicsScoped"}).has_value());
+
+    auto cookie = rig.cookie_request("sk1", auth::Role::user);
+    auto base = resolve_forensics_visible(rig.deps(), cookie);
+    REQUIRE(base.has_value());
+    REQUIRE(base->has_value());
+    CHECK(**base == std::unordered_set<std::string>{"agent-1", "agent-2"});
+
+    auto plain = rig.api_tokens->create_token("plain", "sk1", forensics_vis_now() + 3600);
+    REQUIRE(plain.has_value());
+    auto plain_req = rig.bearer_request(*plain);
+    auto plain_v = resolve_forensics_visible(rig.deps(), plain_req);
+    REQUIRE(plain_v.has_value());
+    REQUIRE(plain_v->has_value());
+    CHECK(**plain_v == std::unordered_set<std::string>{"agent-1", "agent-2"});
+
+    auto svc = rig.api_tokens->create_token("svc", "sk1", forensics_vis_now() + 3600, "billing");
+    REQUIRE(svc.has_value());
+    auto svc_req = rig.bearer_request(*svc);
+    auto session = rig.ar->resolve_session(svc_req);
+    REQUIRE(session.has_value());
+    REQUIRE_FALSE(session->token_scope_service.empty()); // prove it really is a service-scoped session
+    CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), svc_req)));
+
+    for (const auto why : kForensicsUnknownReasons)
+        CHECK(rig.withheld(std::string(to_string(why))) == 0.0); // a refusal is never counted
+}
+
+TEST_CASE("forensics visibility: an MCP-tier token minted by a scoped-grant holder gets nothing, "
+          "and a global holder's MCP-tier token keeps the global read",
+          "[pg][auth_routes][authz_topology_floor][forensics]") {
+    ForensicsVisRig rig;
+    rig.rbac.set_rbac_enabled(true);
+    REQUIRE(rig.auth_mgr.upsert_user("mk1", "password1234", auth::Role::user));
+    REQUIRE(rig.mgmt.assign_role({rig.group_id, "user", "mk1", "ForensicsScoped"}).has_value());
+
+    auto mcp = rig.api_tokens->create_token("mcp", "mk1", forensics_vis_now() + 3600, "", "readonly");
+    REQUIRE(mcp.has_value());
+    auto mcp_req = rig.bearer_request(*mcp);
+    auto session = rig.ar->resolve_session(mcp_req);
+    REQUIRE(session.has_value());
+    REQUIRE_FALSE(session->mcp_tier.empty()); // prove it really is an MCP-tier session
+    CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), mcp_req)));
+
+    // A user who holds the GLOBAL read keeps it through a read-tier MCP token (Read is allowed at
+    // the readonly tier; the tier narrows operations, it does not remove a global grant).
+    REQUIRE(rig.auth_mgr.upsert_user("mk2", "password1234", auth::Role::user));
+    REQUIRE(rig.rbac.assign_role({"user", "mk2", "ForensicsAnalyst"}).has_value());
+    auto mcp2 = rig.api_tokens->create_token("mcp2", "mk2", forensics_vis_now() + 3600, "", "readonly");
+    REQUIRE(mcp2.has_value());
+    auto mcp2_req = rig.bearer_request(*mcp2);
+    CHECK(is_global(resolve_forensics_visible(rig.deps(), mcp2_req)));
+
+    for (const auto why : kForensicsUnknownReasons)
+        CHECK(rig.withheld(std::string(to_string(why))) == 0.0);
+}
+
+TEST_CASE("forensics visibility: an engine principal holding only a scoped grant gets nothing",
+          "[pg][auth_routes][authz_topology_floor][forensics][engine_principal]") {
+    ForensicsVisRig rig;
+    rig.rbac.set_rbac_enabled(true);
+    REQUIRE(rig.auth_mgr.upsert_user("owner3", "password1234", auth::Role::admin));
+    REQUIRE(rig.engines->create("Vuln Sync 3", "owner3", "forensics visibility test", "internal",
+                                "admin", "engine:vuln3")
+                .has_value());
+    // The store API refuses a scoped engine grant ("engine principals cannot hold scoped role
+    // assignments"), so the only way such a row can exist is direct SQL. Insert one and prove the
+    // resolver still gives the engine nothing: the skip rule, not the store guard, is the bar.
+    auto refused = rig.mgmt.assign_role({rig.group_id, "engine", "engine:vuln3", "ForensicsScoped"});
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("cannot hold scoped") != std::string::npos);
+    {
+        yuzu::server::pg::PgPool pool{{.conninfo = rig.mgmt_bundle.dsn(), .size = 1}};
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        REQUIRE(yuzu::server::pg::exec_params(
+                    lease.get(),
+                    "INSERT INTO management_group_store.management_group_roles "
+                    "(group_id, principal_type, principal_id, role_name) VALUES ($1, 'engine', "
+                    "'engine:vuln3', 'ForensicsScoped')",
+                    std::vector<std::string>{rig.group_id})
+                    .status() == PGRES_COMMAND_OK);
+    }
+    auto raw = rig.api_tokens->create_token("engine-token3", "engine:vuln3",
+                                            forensics_vis_now() + 3600, "", "readonly", "engine");
+    REQUIRE(raw.has_value());
+    auto req = rig.bearer_request(*raw);
+    auto session = rig.ar->resolve_session(req);
+    REQUIRE(session.has_value());
+    REQUIRE(session->is_engine());
+    CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), req)));
+    for (const auto why : kForensicsUnknownReasons)
+        CHECK(rig.withheld(std::string(to_string(why))) == 0.0);
+}
+
+TEST_CASE("forensics visibility: an engine principal cannot be granted a Forensics read fleet-wide "
+          "through a built-in role",
+          "[pg][auth_routes][authz_topology_floor][forensics][engine_principal][forensics_analyst]") {
+    ForensicsVisRig rig;
+    rig.rbac.set_rbac_enabled(true);
+    REQUIRE(rig.auth_mgr.upsert_user("owner4", "password1234", auth::Role::admin));
+    REQUIRE(rig.engines->create("Vuln Sync 4", "owner4", "forensics visibility test", "internal",
+                                "admin", "engine:vuln4")
+                .has_value());
+    // The delegable role is a built-in system role, so the engine-principal bar refuses it; the
+    // resolver therefore never sees an engine principal with a global Forensics:Read from it.
+    CHECK_FALSE(rig.rbac.assign_role({"engine", "engine:vuln4", "ForensicsAnalyst"}).has_value());
+    auto raw = rig.api_tokens->create_token("engine-token4", "engine:vuln4",
+                                            forensics_vis_now() + 3600, "", "readonly", "engine");
+    REQUIRE(raw.has_value());
+    auto req = rig.bearer_request(*raw);
+    CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), req)));
+}
