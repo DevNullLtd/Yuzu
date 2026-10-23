@@ -10,8 +10,10 @@
 /// The offset constant below is NOT the standard FNV-1a offset basis. The standard value is
 /// 14695981039346656037; this one is that number with its last digit dropped, a transcription
 /// slip carried by every copy of the function. It is kept on purpose: correcting it would change
-/// every ETag the server has handed out, once, for no benefit. Two other files carry the same
-/// constant for non-ETag hashes (inventory_ui.cpp, model_param_helpers.hpp); do not "harmonise"
+/// every ETag the server has handed out, once, for no benefit. At least three other files carry the
+/// same constant for non-ETag hashes (inventory_ui.cpp, model_param_helpers.hpp and
+/// agents/core/src/sync_scheduler.cpp, where it fixes each agent's daily-sync phase offset, so
+/// changing it would reshuffle the fleet's sync schedule, ADR-0016 section 3); do not "harmonise"
 /// any of them. tests/unit/server/test_openapi_spec_completeness.cpp pins known vectors.
 
 #include <cstdint>

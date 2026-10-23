@@ -113,6 +113,14 @@ TEST_CASE("swagger page: renders from the live spec and builds the DOM safely",
     // The shell fills this marker pair in; the page has no nav entry because its shell context
     // names no active item, so it is reached by URL.
     CHECK(html.find("<!--yuzu:shell-->") != std::string::npos);
+    // The live region that announces loading, failure and the filter count: the script only
+    // writes text into it, so the markup that makes a screen reader speak it must stay on the
+    // element (role=status, aria-live=polite).
+    const auto at = html.find("id=\"sw-status\"");
+    REQUIRE(at != std::string::npos);
+    const std::string region = html.substr(at, html.find('>', at) - at);
+    CHECK(region.find("role=\"status\"") != std::string::npos);
+    CHECK(region.find("aria-live=\"polite\"") != std::string::npos);
 }
 
 TEST_CASE("swagger page: every raw literal stays under the MSVC C2026 ceiling",

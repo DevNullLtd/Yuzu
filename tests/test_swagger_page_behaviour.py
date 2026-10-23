@@ -326,6 +326,9 @@ const out = {};
   reset();
   setSel(tsel, 1); out.f_alpha = shown();
   out.f_beta_panel_hidden = root.byTag('section').filter(p => p.byTag('h2')[0].textContent === 'Beta')[0].hidden;
+  // The table-of-contents link of a group with no matching row is hidden with its panel.
+  const tocHidden = () => root.byClass('sw-toc')[0].byTag('a').map(a => a.textContent + ':' + a.hidden);
+  out.f_alpha_toc = tocHidden();
   out.f_alpha_sub = root.byTag('section').filter(p => p.byTag('h2')[0].textContent === 'Alpha')[0].byClass('sub')[0].textContent;
   reset();
   setQ('NEEDLE-desc'); out.f_search_desc = shown();           // matches the description, case-insensitively
@@ -334,7 +337,8 @@ const out = {};
   reset();
   setQ('no-such-operation'); out.f_none = shown().length; out.f_none_count = countEl().textContent;
   out.f_none_empty = emptyEl().hidden; out.f_none_panels = root.byTag('section').filter(p => !p.hidden).length;
-  setQ(''); out.f_back_empty = emptyEl().hidden; out.f_back_shown = shown().length;
+  out.f_none_toc = tocHidden();
+  setQ(''); out.f_back_toc = tocHidden(); out.f_back_empty = emptyEl().hidden; out.f_back_shown = shown().length;
 
   // ---- the real document: every operation drawn, every pill and filter agreeing with it ----
   const real = JSON.parse(require('fs').readFileSync(process.argv[2], 'utf8'));
@@ -394,6 +398,8 @@ def real_spec():
     text = (text.replace('"@@ECOSYSTEM_ENUM@@"', '"eco-a", "eco-b"')
                 .replace('"@@ECOSYSTEM_ENUM_OR_EMPTY@@"', '"", "eco-a", "eco-b"')
                 .replace("@@ECOSYSTEM_LIST@@", "eco-a|eco-b"))
+    # A renamed token would otherwise sit through json.loads as an ordinary string.
+    assert "@@ECOSYSTEM_" not in text, "an ecosystem token was left unsubstituted in the spec literal"
     doc = json.loads(text)
     if len(doc.get("paths", {})) < 100:
         raise ValueError("only %d paths in the literal: the chain was probably cut" % len(doc.get("paths", {})))
@@ -530,6 +536,10 @@ def main():
     check(out["f_delete"] == ["DELETE /x1"] and out["f_delete_count"] == "1 of 6 operations", "the DELETE filter: %r" % out["f_delete"])
     check(out["f_alpha"] == ["GET /t1", "POST /t2"] and out["f_beta_panel_hidden"] is True and out["f_alpha_sub"] == "2 of 2 operations",
           "the group filter must hide the other group's panel: %r" % out["f_alpha"])
+    check(out["f_alpha_toc"] == ["Alpha 2:false", "Beta 0:true"] and out["f_none_toc"] == ["Alpha 0:true", "Beta 0:true"]
+          and out["f_back_toc"] == ["Alpha 2:false", "Beta 4:false"],
+          "a group with no matching row must hide its table-of-contents link, and show it again: %r %r %r" % (
+              out["f_alpha_toc"], out["f_none_toc"], out["f_back_toc"]))
     check(out["f_search_desc"] == ["PUT /d1"], "search must match descriptions, ignoring case: %r" % out["f_search_desc"])
     check(out["f_search_summary"] == ["GET /t1", "GET /u1", "POST /t2"], "search must match summaries: %r" % out["f_search_summary"])
     check(out["f_search_and_typed"] == ["GET /t1", "POST /t2"], "search and the typed filter must combine: %r" % out["f_search_and_typed"])
