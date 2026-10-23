@@ -120,14 +120,12 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
-#include <cctype>
 #include <cstddef>
 #include <filesystem>
-#include <fstream>
 #include <set>
-#include <sstream>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -698,6 +696,78 @@ TEST_CASE("route_registration_scan: find_receiver_calls returns one position-sor
     // The first Post's own req.body (before the first Get) and the last Post's (after the
     // second Get's span) are not attributed to a Get; only the second Get flags, on line 3.
     CHECK(get_handlers_reading_req_body(text) == std::vector<int>{3});
+}
+
+TEST_CASE("route_registration_scan: find_step_up_calls reads the label of a literal call and names "
+          "every other shape",
+          "[body_cap][inventory]") {
+    const std::string text =
+        "step_up_fn(req, res, *session, \"a.b\");\n"
+        "  step_up_fn_(req ,\n res , *session ,\n \"c\" ) ;\n"
+        "step_up_fn(req, res, *session, \"d\\\"e\");\n"
+        "step_up_fn(req, res, *session, label);\n"
+        "step_up_fn(req, res, session, \"x\");\n"
+        "step_up_fn(req, res, *session, R\"(raw)\");\n"
+        "step_up_fn(req, res, *session, \"unterminated);\n";
+    const auto calls = route_scan::find_step_up_calls(text);
+    REQUIRE(calls.size() == 7);
+    CHECK(calls[0].readable);
+    CHECK(calls[0].label == "a.b");
+    CHECK(calls[0].pos == 0);
+    CHECK(calls[1].readable);
+    CHECK(calls[1].label == "c");
+    CHECK(text.compare(calls[1].pos, 12, "step_up_fn_(") == 0);
+    CHECK(calls[2].readable);
+    // The escaped quote is kept verbatim and does not end the literal.
+    CHECK(calls[2].label == "d\\\"e");
+    for (std::size_t i = 3; i < calls.size(); ++i) {
+        INFO("call " << i);
+        CHECK_FALSE(calls[i].readable);
+        CHECK(calls[i].label.empty());
+    }
+}
+
+TEST_CASE("route_registration_scan: find_step_up_calls skips a longer name, a longer first "
+          "argument and a non-boundary prefix",
+          "[body_cap][inventory]") {
+    CHECK(route_scan::find_step_up_calls("mystep_up_fn(req, res, *session, \"x\");").empty());
+    CHECK(route_scan::find_step_up_calls("step_up_fn_x(req, res, *session, \"x\");").empty());
+    CHECK(route_scan::find_step_up_calls("step_up_fn__(req, res, *session, \"x\");").empty());
+    CHECK(route_scan::find_step_up_calls("step_up_fn(request, res, *session, \"x\");").empty());
+    CHECK(route_scan::find_step_up_calls("step_up_fn(").empty());
+    CHECK(route_scan::find_step_up_calls("step_up_fn (req, res, *session, \"x\");").empty());
+    CHECK(route_scan::find_step_up_calls("step_up_fn(req").size() == 1);
+    CHECK_FALSE(route_scan::find_step_up_calls("step_up_fn(req")[0].readable);
+}
+
+TEST_CASE("route_inventory_scan: extract_routes keeps the file, the receiver's line, the upper-cased "
+          "method and the literal bytes",
+          "[body_cap][inventory]") {
+    const std::string text =
+        "\n\n  sink.Post(\n \"/a\", h);\n"
+        "svr.Put(R\"(/b/([x]+))\", h);\n";
+    const auto routes = extract_routes("fixture.cpp", text);
+    REQUIRE(routes.size() == 2);
+    CHECK(routes[0].file == "fixture.cpp");
+    CHECK(routes[0].line == 3);
+    CHECK(routes[0].method == "POST");
+    CHECK(routes[0].raw_path == "/a");
+    CHECK(routes[1].file == "fixture.cpp");
+    CHECK(routes[1].line == 5);
+    CHECK(routes[1].method == "PUT");
+    CHECK(routes[1].raw_path == "/b/([x]+)");
+}
+
+TEST_CASE("route_inventory_scan: the corpus readers return the one memoised copy by reference",
+          "[body_cap][inventory]") {
+    using Corpus = std::vector<std::pair<std::string, std::string>>;
+    static_assert(std::is_same_v<decltype(read_all_cpp_files(std::declval<const fs::path&>())),
+                                 const Corpus&>);
+    static_assert(std::is_same_v<decltype(read_all_header_files(std::declval<const fs::path&>())),
+                                 const Corpus&>);
+    const fs::path dir(YUZU_SERVER_SRC_DIR);
+    CHECK(&read_all_cpp_files(dir) == &read_all_cpp_files(dir));
+    CHECK(&read_all_header_files(dir) == &read_all_header_files(dir));
 }
 
 TEST_CASE("probe_path: non-nested groups become X while nested and unbalanced input keeps "

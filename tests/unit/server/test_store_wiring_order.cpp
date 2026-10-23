@@ -460,7 +460,7 @@ TEST_CASE("server.cpp + dispatch_scope_ladder.hpp: every production "
 // scan. Reading the headers rather than timing the scan keeps this independent of
 // the machine. It guards those headers only: it cannot see the regexes this file
 // still uses, another header, a macro, or a slow scan that does not use one.
-TEST_CASE("the source-scan headers do not use the regular-expression library",
+TEST_CASE("the source-scan headers and the step-up inventory do not use the regular-expression library",
           "[wiring_order]") {
     struct Header {
         const char* file;
@@ -470,7 +470,8 @@ TEST_CASE("the source-scan headers do not use the regular-expression library",
          {Header{"confined_sink_scan.hpp", "find_confined_dispatch_sink_sites"},
           Header{"source_scan.hpp", "stripped_source"},
           Header{"route_registration_scan.hpp", "find_route_registrations"},
-          Header{"route_inventory_scan.hpp", "discover_mutating_routes"}}) {
+          Header{"route_inventory_scan.hpp", "discover_mutating_routes"},
+          Header{"test_step_up_route_inventory.cpp", "find_step_up_calls"}}) {
         // YUZU_SERVER_SRC_DIR is <repo>/server/core/src, so three `..` reach the repo root.
         std::string text = read_text_file(fs::path(YUZU_SERVER_SRC_DIR) / ".." / ".." / ".." /
                                           "tests" / "unit" / "server" / h.file);

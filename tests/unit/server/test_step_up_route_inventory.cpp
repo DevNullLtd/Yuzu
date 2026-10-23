@@ -14,7 +14,7 @@
  *    production while a lexical test says "covered". Blind spot: an owner registers a route only
  *    behind a non-null store (`if (store)`) shows up here only if this harness wires that store, and
  *    several owners are not constructible without a database. L1 therefore sees a SUBSET.
- * L3 (lexical, honestly). `route_inventory_scan.hpp` regex-scans the route sources for
+ * L3 (lexical, honestly). `route_inventory_scan.hpp` scans the route sources (a literal find per method name) for
  *    `sink.`/`svr.`/`web_server_->` calls (a receiver-agnostic scan further down also covers headers
  *    and every other receiver). It sees registrations no harness can construct, but only
  *    as source text (see that header for what it cannot see). It checks that every scanned
@@ -29,21 +29,24 @@
  * here; the fix is a row in step_up_policy.hpp, never an entry in this file.
  *
  * SHARD PLACEMENT. Eight cases read the route-source tree (the text corpus is memoised per
- * process). Six of them run a std::regex pass over it and carry the `[body_cap]` tag: the five that
- * use `discover_mutating_routes` (directly or through `l3_scanned()`; one cached pass of ~10 s on
- * Linux, paid by whichever runs first) and the kRequired label-pin case (its own ~10 s pass). The
- * other two (the foreign-receiver and header scans) use plain string search over the cached
- * corpus and stay untagged. `[body_cap]` is a placement tag, not a topic: it routes the six to the
- * non-pg 'server unit tests shard D' (see tests/meson.build), which already holds the other slow
- * in-process cases, instead of leaving ~20 s of regex scanning in shard B. All six move together
- * on purpose: the discovery pass is cached per process, so moving only some would just move the
- * cost to the next case in B that reads it. A new case that uses `discover_mutating_routes` should
- * carry the tag too.
+ * process). Six of them walk the whole tree with a linear scan (route_registration_scan.hpp; before
+ * #4882 each was a pattern-engine pass of ~10 s on Linux) and carry the `[body_cap]` tag: the five that
+ * use `discover_mutating_routes` (directly or through `l3_scanned()`; one cached pass, paid by
+ * whichever runs first) and the kRequired label-pin case (its own pass). The other two (the
+ * foreign-receiver and header scans) use plain string search over the cached corpus and stay
+ * untagged. `[body_cap]` is a placement tag, not a topic: it routes the six to the non-pg
+ * 'server unit tests shard D' (see tests/meson.build), which already holds the other in-process
+ * route-source cases, instead of leaving them in shard B. All six move together on purpose: the
+ * discovery pass is cached per process, so moving only some would just move the cost to the next
+ * case in B that reads it. A new case that uses `discover_mutating_routes` should carry the tag
+ * too.
  */
 
 #include "../../../server/core/src/step_up_gate.hpp"
 #include "../../../server/core/src/step_up_policy.hpp"
 #include "route_inventory_scan.hpp"
+#include "route_registration_scan.hpp"
+#include "source_scan.hpp"
 #include "test_route_sink.hpp"
 
 #include "../../../server/core/src/approval_routes.hpp"
@@ -92,7 +95,6 @@
 #include <map>
 #include <optional>
 #include <memory>
-#include <regex>
 #include <set>
 #include <shared_mutex>
 #include <string>
@@ -467,7 +469,7 @@ TEST_CASE("step-up route inventory: no server source registers a route on a rece
     CHECK(foreign.empty());
 
     // The one spelling that was banned outright before this rule stays banned whatever the
-    // arguments are (plain substring search: four fixed strings, no regex over the tree).
+    // arguments are (plain substring search: four fixed strings, no pattern engine over the tree).
     for (const auto& [file, text] : scan::read_all_cpp_files(YUZU_SERVER_SRC_DIR)) {
         for (const char* verb : {"Post", "Put", "Delete", "Patch"}) {
             INFO(file << ": web_server_->" << verb << "(");
@@ -597,29 +599,18 @@ TEST_CASE("step-up route inventory: every kRequired row is registered (its handl
 // it.
 TEST_CASE("step-up route inventory (lexical): kRequired labels equal the in-handler step_up_fn labels",
           "[stepup][inventory][label_pin][body_cap]") {
-    static const std::regex literal_call(
-        R"regex(\bstep_up_fn_?\(\s*req\s*,\s*res\s*,\s*\*session\s*,\s*"((?:[^"\\]|\\.)*)"\s*\))regex");
-    static const std::regex any_call(R"regex(\bstep_up_fn_?\(\s*req\b)regex");
-
-    const auto line_of = [](const std::string& text, std::size_t pos) {
-        return static_cast<int>(std::count(text.begin(), text.begin() + static_cast<std::ptrdiff_t>(pos),
-                                           '\n')) + 1;
-    };
+    namespace linear = ::yuzu::test::route_scan;
+    namespace text_scan = ::yuzu::test::source_scan;
 
     std::map<std::string, std::vector<std::string>> handler_labels; // label -> "file:line" sites
     std::vector<std::string> unreadable;
     for (const auto& [file, text] : scan::read_all_cpp_files(std::filesystem::path(YUZU_SERVER_SRC_DIR))) {
-        std::set<std::size_t> literal_at;
-        for (auto it = std::sregex_iterator(text.begin(), text.end(), literal_call);
-             it != std::sregex_iterator(); ++it) {
-            literal_at.insert(static_cast<std::size_t>(it->position(0)));
-            handler_labels[(*it)[1].str()].push_back(file + ":" +
-                                                     std::to_string(line_of(text, it->position(0))));
-        }
-        for (auto it = std::sregex_iterator(text.begin(), text.end(), any_call);
-             it != std::sregex_iterator(); ++it) {
-            if (!literal_at.contains(static_cast<std::size_t>(it->position(0))))
-                unreadable.push_back(file + ":" + std::to_string(line_of(text, it->position(0))));
+        for (const auto& call : linear::find_step_up_calls(text)) {
+            const std::string site = file + ":" + std::to_string(text_scan::line_of(text, call.pos));
+            if (call.readable)
+                handler_labels[call.label].push_back(site);
+            else
+                unreadable.push_back(site);
         }
     }
 

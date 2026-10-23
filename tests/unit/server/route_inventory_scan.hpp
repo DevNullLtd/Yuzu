@@ -241,7 +241,7 @@ using ::yuzu::test::route_scan::probe_path;
 /// in exactly one place. Memoized (see this header's comment).
 inline std::vector<RegisteredRoute> discover_mutating_routes() {
     static const std::vector<RegisteredRoute> cached = [] {
-        auto files = read_all_cpp_files(fs::path(YUZU_SERVER_SRC_DIR));
+        const auto& files = read_all_cpp_files(fs::path(YUZU_SERVER_SRC_DIR));
         REQUIRE_FALSE(files.empty());
 
         std::vector<RegisteredRoute> routes;

@@ -1,7 +1,8 @@
 #pragma once
 
-// Finds HTTP route registrations in a source text, for the body-cap route inventory
-// (test_body_cap_route_inventory.cpp). Pure and lexical: no I/O, no comment stripping
+// Finds HTTP route registrations (and the step-up gate's `step_up_fn(...)` calls) in a source
+// text, for the route inventories (route_inventory_scan.hpp, test_body_cap_route_inventory.cpp,
+// test_step_up_route_inventory.cpp). Pure and lexical: no I/O, no comment stripping
 // (a registration inside a comment is counted), and string literals other than the
 // first argument are not understood.
 //
@@ -69,6 +70,29 @@ inline std::size_t receiver_start(std::string_view text, std::size_t at, bool wi
     return std::string::npos;
 }
 
+// A plain "..." literal starting at text[j]: escapes are kept verbatim and a backslash escapes
+// any byte except a line break. On success `end` is one past the closing quote.
+inline bool plain_literal(std::string_view text, std::size_t j, std::string& out, std::size_t& end) {
+    if (j >= text.size() || text[j] != '"')
+        return false;
+    std::size_t k = j + 1;
+    while (k < text.size()) {
+        const char c = text[k];
+        if (c == '\\') {
+            if (k + 1 >= text.size() || text[k + 1] == '\n' || text[k + 1] == '\r')
+                return false;
+            k += 2;
+        } else if (c == '"') {
+            out.assign(text.substr(j + 1, k - (j + 1)));
+            end = k + 1;
+            return true;
+        } else {
+            ++k;
+        }
+    }
+    return false;
+}
+
 // Parses the first argument starting at `j` (after the opening parenthesis):
 // optional whitespace, then `R"(...)"` or `"..."`. Returns false if neither shape. On
 // success `end` is one past the literal. `no_raw_close_from` remembers the first raw
@@ -93,25 +117,7 @@ inline bool first_argument(std::string_view text, std::size_t j, std::string& ou
         end = close + 2;
         return true;
     }
-    if (text[j] != '"')
-        return false;
-    std::size_t k = j + 1;
-    while (k < text.size()) {
-        const char c = text[k];
-        if (c == '\\') {
-            // A backslash escapes any byte except a line break.
-            if (k + 1 >= text.size() || text[k + 1] == '\n' || text[k + 1] == '\r')
-                return false;
-            k += 2;
-        } else if (c == '"') {
-            out.assign(text.substr(j + 1, k - (j + 1)));
-            end = k + 1;
-            return true;
-        } else {
-            ++k;
-        }
-    }
-    return false;
+    return plain_literal(text, j, out, end);
 }
 
 } // namespace detail
@@ -195,6 +201,72 @@ inline std::string probe_path(std::string_view raw) {
             }
         }
         out += raw[i++];
+    }
+    return out;
+}
+
+
+struct StepUpCall {
+    std::size_t pos;   // start of `step_up_fn` / `step_up_fn_`
+    bool readable;     // the whole `(req, res, *session, "label")` shape matched
+    std::string label; // the literal's bytes, escapes verbatim; empty unless readable
+};
+
+// Every `step_up_fn(req` / `step_up_fn_(req` call (the name at a word boundary, optional spaces
+// around the tokens), in ascending position. A call is `readable` when its arguments are exactly
+// `req, res, *session, "<plain string literal>")`; any other shape is reported with
+// `readable == false` so the caller can name it rather than skip it.
+inline std::vector<StepUpCall> find_step_up_calls(std::string_view text) {
+    constexpr std::string_view kName = "step_up_fn";
+    std::vector<StepUpCall> out;
+    for (std::size_t at = text.find(kName); at != std::string_view::npos;
+         at = text.find(kName, at + 1)) {
+        if (at > 0 && is_word(text[at - 1]))
+            continue;
+        std::size_t j = at + kName.size();
+        if (j < text.size() && text[j] == '_')
+            ++j;
+        const auto skip = [&] {
+            while (j < text.size() && is_space(text[j]))
+                ++j;
+        };
+        const auto eat = [&](std::string_view token) {
+            if (text.compare(j, token.size(), token) != 0)
+                return false;
+            j += token.size();
+            return true;
+        };
+        if (!eat("("))
+            continue;
+        skip();
+        if (!eat("req") || (j < text.size() && is_word(text[j])))
+            continue;
+        StepUpCall call{at, false, {}};
+        std::size_t end = 0;
+        skip();
+        if (eat(",")) {
+            skip();
+            if (eat("res")) {
+                skip();
+                if (eat(",")) {
+                    skip();
+                    if (eat("*session")) {
+                        skip();
+                        if (eat(",")) {
+                            skip();
+                            if (detail::plain_literal(text, j, call.label, end)) {
+                                j = end;
+                                skip();
+                                call.readable = eat(")");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (!call.readable)
+            call.label.clear();
+        out.push_back(std::move(call));
     }
     return out;
 }
