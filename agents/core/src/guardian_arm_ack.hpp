@@ -48,8 +48,8 @@
  * Suppressed) from a genuine failure (retry Reapplied) - see decide_retry().
  *
  * One current application, never a history (Astra opine review: "New
- * application: stale receipts cannot acknowledge it"). begin_application() and
- * begin_full_application() replace whatever was there; begin_delta_application()
+ * application: stale receipts cannot acknowledge it"). begin_full_application()
+ * replaces whatever was there; begin_delta_application()
  * (#5547) replaces it too but CARRIES every unresolved per-rule outcome of a rule the
  * delta does not name (see its comment). A receipt from a superseded
  * application resolving later touches nothing unless it was carried - it is simply no
@@ -102,8 +102,8 @@ inline constexpr std::size_t kAckDrainMaxPerTick = 1024;
 /// recapture; the flip gate's AC-10 lists the cases) but does NOT unstick the wedged
 /// claim - an identical re-observation returns the existing claim. It bounds the
 /// dependence on the suppress classification; it is NOT a recovery guarantee against
-/// a classifier that misidentifies a dead claim. Reset by begin_application(),
-/// begin_full_application(), begin_delta_application() and retire().
+/// a classifier that misidentifies a dead claim. Reset by begin_full_application(),
+/// begin_delta_application() and retire().
 inline constexpr std::size_t kWedgeSuppressMaxDecisions = 10;
 
 /// Content identity for a push: a rule_id, its enabled flag, enforcement_mode,
@@ -141,8 +141,11 @@ public:
     GuardianArmAckLedger(const GuardianArmAckLedger&) = delete;
     GuardianArmAckLedger& operator=(const GuardianArmAckLedger&) = delete;
 
-    /// Starts tracking a new application, discarding whatever the previous one
-    /// still had pending (see the file header: no history, no carry-over).
+    /// Starts tracking a new application. There are two entry points, and the caller (the
+    /// engine's apply_rules() and start_local()) picks by the push's full_sync flag. #5547
+    /// removed the third, which replaced the open application wholesale for every push: a delta
+    /// that did so dropped the retry obligation of every rule it omitted (design doc R5.3 known
+    /// limits, flip-gate AC-11).
     /// `content_id` is a caller-computed identity over the push's actual rule
     /// contents plus its full_sync flag (a generation number alone is not
     /// content identity - two different pushes can share one; see the design
@@ -151,20 +154,8 @@ public:
     /// map<string,string> spark params). `applied` is the count the caller's
     /// own apply_rules() already computed for this push - stashed so a
     /// Suppress decision (decide_retry(), below) can hand it straight back
-    /// without recomputing anything. Known limit of the delta-push case (a partial push
-    /// that omits an unresolved rule drops that rule's retry obligation, because this
-    /// replaces the open application wholesale): design doc R5.3 known limits, flip-gate
-    /// AC-11.
+    /// without recomputing anything.
     ///
-    /// #5547 (C1, ledger only): this overload deliberately KEEPS its pre-change
-    /// wholesale-replacement body and carries NOTHING - no obligation, no inherited_latch, no
-    /// boot_claims. The engine still calls it, because switching apply_rules() to the two entry
-    /// points below is C2, together with the full-sync discharge of the inherited latch (carrying
-    /// an inherited_latch that nothing discharges would hold every later generation).
-    /// Removed in C2.
-    void begin_application(std::uint64_t generation, std::string content_id, bool full_sync,
-                           std::size_t applied);
-
     /// #5547: starts an application for an authoritative full_sync push (Application::full_sync
     /// is true). The only OBLIGATION it carries is the unattributed legacy debt:
     /// `inherited_latch = old.inherited_latch || old.latched_failure` (Ruling 22 (b); it is
@@ -205,7 +196,7 @@ public:
     /// its very next tick either way. Caller's responsibility: only ever
     /// called for a rule_id reconcile_rule_locked mapped to
     /// ReconcileOutcome::Accepted, for the application currently open (i.e.
-    /// after begin_application() for this push - never across a push
+    /// after begin_*_application() for this push - never across a push
     /// boundary, and never with no current application). A no-op (logged, not
     /// asserted - this is bookkeeping, not a safety property) if called with
     /// no current application.
@@ -314,7 +305,7 @@ public:
     /// checked above, independent of whether pending is empty.
     bool can_advance() const;
 
-    /// The `applied` count stashed at begin_application() time (or updated by
+    /// The `applied` count stashed at begin_*_application() time (or updated by
     /// set_applied(), below). Valid only when there is a current application;
     /// 0 otherwise.
     std::size_t applied_count() const;
@@ -399,19 +390,19 @@ public:
     /// arm_stats() - still layers its OWN prefer_spark_/stopped_/spark_availability_
     /// dormancy gate on top; this ledger still has no notion of prefer_spark_ and
     /// must not gain one, it only reports whether IT has an application). A LIVE,
-    /// EMPTY application (begin_application() called, add_pending() never - every
+    /// EMPTY application (begin_*_application() called, add_pending() never - every
     /// accepted rule resolved synchronously) is a real, present {0, 0} - the common
     /// case, not the same as no application at all. Production caller:
     /// GuardianEngine::arm_stats(), called under mtx_ like every other
     /// engine-owned accessor.
     [[nodiscard]] std::optional<GuardianArmStats> arm_stats() const;
 
-    /// rung 9c PR-2 Unit 6: apply_rules() calls begin_application() BEFORE its
+    /// rung 9c PR-2 Unit 6: apply_rules() calls begin_*_application() BEFORE its
     /// per-rule loop (so reconcile_rule_locked's add_pending() calls during
     /// that loop land in the right application) but does not know the real
     /// applied count until the loop finishes - this updates it afterward, so
     /// a later same-generation Suppress decision hands back the true count
-    /// rather than begin_application()'s placeholder. A no-op if there is no
+    /// rather than the begin_*_application() placeholder. A no-op if there is no
     /// current application.
     void set_applied(std::size_t applied);
 
@@ -499,7 +490,7 @@ private:
         /// receipt_recovery_status() (rung 9c PR-5e's atomic accessor - see below)
         /// that the runtime has since adopted it (rung 9c PR-5d's own concern 1)
         /// and clear its contribution to resolved_failed -
-        /// scoped to THIS application's own bookkeeping only: begin_application()/
+        /// scoped to THIS application's own bookkeeping only: begin_*_application()/
         /// retire() replace `current_` wholesale (see the file header), so a
         /// receipt whose application was superseded before recovering is simply
         /// gone, same as every other per-application field here. This is NOT the

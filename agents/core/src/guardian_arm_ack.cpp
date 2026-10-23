@@ -126,33 +126,13 @@ std::string guardian_push_content_id(const gpb::GuaranteedStatePush& push) {
 GuardianArmAckLedger::GuardianArmAckLedger() = default;
 GuardianArmAckLedger::~GuardianArmAckLedger() = default;
 
-void GuardianArmAckLedger::begin_application(std::uint64_t generation, std::string content_id,
-                                             bool full_sync, std::size_t applied) {
-    // Unconditionally replaces whatever was open - Astra opine review: "New
-    // application: stale receipts cannot acknowledge it." The old Application's
-    // pending map (if any) is simply destroyed here; its receipts' claims stay
-    // owned by the runtime's own claims_ registry regardless (ArmReceipt is an
-    // observation handle - see the header). Built LOCALLY and published only at the
-    // end (rung 9c PR-5e, governance finding UP-1's own precedent applied here too):
-    // a make_unique/allocation throw here leaves current_ completely untouched,
-    // matching apply_rules()'s own firewall around this call. A fresh Application also
-    // starts wedge_suppress_count at 0 (#5459): the safety valve's budget is reset by this
-    // overload, by begin_full_application()/begin_delta_application() and in retire().
-    // Replacing the open application wholesale also drops the retry obligation of any rule
-    // a partial (delta) push omits: a known limit, see the design doc R5.3 known limits
-    // and flip-gate AC-11. This overload is kept unchanged in #5547 C1 and carries nothing;
-    // begin_delta_application() is the entry point that carries (see the header).
-    auto next = std::make_unique<Application>();
-    next->generation = generation;
-    next->content_id = std::move(content_id);
-    next->full_sync = full_sync;
-    next->applied = applied;
-    current_ = std::move(next);
-}
-
 void GuardianArmAckLedger::begin_full_application(std::uint64_t generation, std::string content_id,
                                                   std::size_t applied) {
-    // Built LOCALLY and published last, like begin_application(): a throw anywhere below
+    // Built LOCALLY and published last (rung 9c PR-5e, governance finding UP-1's precedent: an
+    // allocation throw must leave current_ untouched, matching apply_rules()'s own firewall
+    // around this call; the open application's pending receipts are destroyed only at the
+    // assignment, and their claims stay owned by the runtime's claims_ registry regardless,
+    // ArmReceipt being an observation handle): a throw anywhere below
     // (including the test hook) leaves current_, its obligations and its suppress budget
     // exactly as they were.
     auto next = std::make_unique<Application>();
@@ -727,7 +707,7 @@ GuardianArmAckLedger::RetryDecision GuardianArmAckLedger::decide_retry(
 
     // Safety valve (#5459): a decision-count bound on wedge/compensation suppression.
     // See kWedgeSuppressMaxDecisions for what it does and does not buy. The counter is
-    // incremented ONLY here, and reset only by begin_application()/begin_*_application()/retire().
+    // incremented ONLY here, and reset only by begin_*_application()/retire().
     if (app.wedge_suppress_count >= kWedgeSuppressMaxDecisions)
         return RetryDecision::Reapply;
     ++app.wedge_suppress_count;
@@ -736,7 +716,7 @@ GuardianArmAckLedger::RetryDecision GuardianArmAckLedger::decide_retry(
 
 void GuardianArmAckLedger::retire() {
     current_.reset(); // §R5.5: in-flight workers finish on their own schedule; this just
-                      // stops watching them, exactly as begin_application() already does
+                      // stops watching them, exactly as begin_*_application() already do
                       // for a superseded application.
 }
 

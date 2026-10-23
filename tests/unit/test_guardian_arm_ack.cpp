@@ -332,7 +332,7 @@ struct Rig5459 {
         REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key_of(path)) == 0; },
                                        std::chrono::seconds(10)));
     }
-    void open_app(std::size_t applied = 1) { ledger.begin_application(1, digest, false, applied); }
+    void open_app(std::size_t applied = 1) { ledger.begin_delta_application(1, digest, applied, {"r1"}); }
     [[nodiscard]] RD retry() { return ledger.decide_retry(1, digest, false, *rt); }
     /// #5547: a delta application (full_sync == false, so retry() matches it) naming `named`.
     void open_delta(const NamedRules& named = {}, std::size_t applied = 1) {
@@ -422,14 +422,14 @@ TEST_CASE("GuardianArmAckLedger: a superseded application's stale receipt cannot
     auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(/*generation=*/1, "content-a", /*full_sync=*/false, /*applied=*/1);
+    ledger.begin_delta_application(/*generation=*/1, "content-a", /*applied=*/1, {"r1"});
     auto r1 = accept(*rt, "r1", "/a");
     ledger.add_pending("r1", r1);
     CHECK_FALSE(ledger.can_advance()); // r1 still pending
 
     // A higher-generation application supersedes it before r1 ever resolves - r1's own
     // claim is NOT re-added to generation 2; generation 2 gets its own, different rule.
-    ledger.begin_application(/*generation=*/2, "content-b", /*full_sync=*/false, /*applied=*/1);
+    ledger.begin_delta_application(/*generation=*/2, "content-b", /*applied=*/1, {"r1"});
     auto r2 = accept(*rt, "r2", "/b");
     ledger.add_pending("r2", r2);
     CHECK_FALSE(ledger.can_advance()); // r2 still pending - not vacuously true
@@ -467,7 +467,7 @@ TEST_CASE("GuardianArmAckLedger: can_advance() is false with zero pending, zero 
     REQUIRE(rt->receipt_status(receipt) == GuardianSparkRuntime::ReceiptStatus::Failed);
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, "content", false, 0);
+    ledger.begin_delta_application(1, "content", 0, {"r1"});
     ledger.add_pending("r1", receipt);
     ledger.drain_locked(*rt, 10);
     CHECK(ledger.can_advance() == false);
@@ -482,7 +482,7 @@ TEST_CASE("GuardianArmAckLedger: a latched teardown failure holds the generation
     auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, "content", false, 0);
+    ledger.begin_delta_application(1, "content", 0, {"r1"});
     ledger.latch_failure(); // e.g. this generation's full_sync kv sweep failed
     auto receipt = accept(*rt, "r1");
     ledger.add_pending("r1", receipt);
@@ -515,7 +515,7 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): identical (generation, content,
     const std::string content_y(64, 'b');
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(5, content_x, false, 3);
+    ledger.begin_delta_application(5, content_x, 3, {"r1"});
     ledger.add_pending("r1", accept(*rt, "r1"));
     REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
 
@@ -550,7 +550,7 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): once a pending receipt resolves
     const std::string content_x(64, 'a'); // see the sibling Suppress test above for why
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(5, content_x, false, 1);
+    ledger.begin_delta_application(5, content_x, 1, {"r1"});
     auto receipt = accept(*rt, "r1");
     ledger.add_pending("r1", receipt);
     REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
@@ -572,7 +572,7 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): bounded per call - 3 pending "
     auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, "content", false, 3);
+    ledger.begin_delta_application(1, "content", 3, {"r1"});
     // 3 DISTINCT keys (paths) - same-key siblings would queue behind one shared
     // arm instead of each dispatching (and parking) their own, per R5.2.
     auto r1 = accept(*rt, "r1", "/a");
@@ -606,7 +606,7 @@ TEST_CASE("GuardianArmAckLedger::retire(): drops the current application without
     auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, "content", false, 1);
+    ledger.begin_delta_application(1, "content", 1, {"r1"});
     ledger.add_pending("r1", accept(*rt, "r1"));
     REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
 
@@ -642,7 +642,7 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): no pending receipts and no reta
     GuardianArmAckLedger ledger;
     // Nothing was ever Accepted this application (the ordinary case at
     // prefer_spark_=false) - pending stays empty for its whole lifetime.
-    ledger.begin_application(5, content, false, 3);
+    ledger.begin_delta_application(5, content, 3, {"r1"});
     CHECK(ledger.can_advance()); // trivially true - nothing to hold the generation
 
     // TARGET (sec-1/arch-1): before the fix, an identical (generation, content,
@@ -671,7 +671,7 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): default-path pin - with nothing
     Rig5459 f;
     CHECK(f.retry() == RD::Reapply); // no current application at all
 
-    f.ledger.begin_application(5, f.digest, false, 3); // nothing is ever add_pending()ed
+    f.ledger.begin_delta_application(5, f.digest, 3, {"r1"}); // nothing is ever add_pending()ed
     CHECK(f.ledger.decide_retry(5, f.digest, false, *f.rt) == RD::Reapply); // identical retry
     CHECK(f.ledger.decide_retry(6, f.digest, false, *f.rt) == RD::Reapply);
     CHECK(f.ledger.decide_retry(5, std::string(64, 'b'), false, *f.rt) == RD::Reapply);
@@ -686,7 +686,7 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): default-path pin - with nothing
     // A sentinel content_id on the OPEN application never matches either, even against
     // itself, and even with an outstanding wedge in it.
     auto w = f.wedge("r1", "/a");
-    f.ledger.begin_application(5, "", false, 1);
+    f.ledger.begin_delta_application(5, "", 1, {"r1"});
     f.ledger.add_pending("r1", w);
     CHECK(f.ledger.drain_locked(*f.rt, 10) == 1);
     CHECK(f.ledger.decide_retry(5, "", false, *f.rt) == RD::Reapply);
@@ -694,7 +694,7 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): default-path pin - with nothing
     // An EMPTY application (nothing add_pending()ed) is Reapply even while the runtime
     // itself holds a live outstanding wedge: the ledger only reasons about receipts ITS
     // application accepted, so a wedge it never saw can never turn a decision into Suppress.
-    f.ledger.begin_application(7, f.digest, false, 1);
+    f.ledger.begin_delta_application(7, f.digest, 1, {"r1"});
     CHECK(f.rt->receipt_recovery_status(w) == RT::RecoveryStatus::WedgeEligible);
     CHECK(f.ledger.decide_retry(7, f.digest, false, *f.rt) == RD::Reapply);
     CHECK(f.ledger.drain_locked(*f.rt, 10) == 0);
@@ -715,7 +715,7 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): failed_out feeds an async arm "
     auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, std::string(64, 'd'), false, 1);
+    ledger.begin_delta_application(1, std::string(64, 'd'), 1, {"r1"});
     auto receipt = accept(*rt, "r1");
     ledger.add_pending("r1", receipt);
     REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
@@ -755,7 +755,7 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): failed_out feeds an async arm "
     b->hang_next_arm.store(true);
     yuzu::test::ScopeExit release_guard{[&] { b->release_hang(); }};
     GuardianArmAckLedger ledger2;
-    ledger2.begin_application(2, std::string(64, 'e'), false, 1);
+    ledger2.begin_delta_application(2, std::string(64, 'e'), 1, {"r1"});
     auto receipt2 = accept(*rt, "r2");
     ledger2.add_pending("r2", receipt2);
     REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
@@ -827,7 +827,7 @@ TEST_CASE("GuardianArmAckLedger::arm_stats(): a live empty application reads a "
           "PRESENT {0, 0} - the common case, not the same as no application at all",
           "[spark][ack][arm_stats]") {
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, "content", false, 0);
+    ledger.begin_delta_application(1, "content", 0, {"r1"});
     const auto s = ledger.arm_stats();
     REQUIRE(s.has_value());
     CHECK(s->pending == 0);
@@ -846,7 +846,7 @@ TEST_CASE("GuardianArmAckLedger::arm_stats(): an accepted receipt increases pend
     REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, "content", false, 1);
+    ledger.begin_delta_application(1, "content", 1, {"r1"});
     ledger.add_pending("r1", receipt);
     {
         const auto s = ledger.arm_stats();
@@ -866,7 +866,7 @@ TEST_CASE("GuardianArmAckLedger::arm_stats(): an accepted receipt increases pend
 }
 
 TEST_CASE("GuardianArmAckLedger::arm_stats(): a Failed drain increases failed; "
-          "RED-FIRST - replacing the application via begin_application() (the "
+          "RED-FIRST - replacing the application via begin_delta_application() (the "
           "same path decide_retry()'s Reapply takes on an ordinary retry) "
           "brings a PRESENT failed back to 0",
           "[spark][ack][arm_stats]") {
@@ -891,7 +891,7 @@ TEST_CASE("GuardianArmAckLedger::arm_stats(): a Failed drain increases failed; "
     REQUIRE(rt->receipt_status(receipt) == GuardianSparkRuntime::ReceiptStatus::Failed);
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, "content", false, 1);
+    ledger.begin_delta_application(1, "content", 1, {"r1"});
     ledger.add_pending("r1", receipt);
     ledger.drain_locked(*rt, 10);
 
@@ -906,7 +906,7 @@ TEST_CASE("GuardianArmAckLedger::arm_stats(): a Failed drain increases failed; "
     // NEXT push for a generation decide_retry() sent to Reapply because
     // resolved_failed > 0 (see the "identical (generation, content, full_sync) is
     // Suppress" test above, which pins that Reapply trigger).
-    ledger.begin_application(2, "content-2", false, 0);
+    ledger.begin_delta_application(2, "content-2", 0, {"r1"});
     const auto s = ledger.arm_stats();
     REQUIRE(s.has_value()); // PRESENT zero, not merely "no longer 1", and not absent
     CHECK(s->pending == 0);
@@ -943,7 +943,7 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): a Wedged receipt (timed out whi
     REQUIRE(rt->receipt_status(receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, "content", false, 1);
+    ledger.begin_delta_application(1, "content", 1, {"r1"});
     ledger.add_pending("r1", receipt);
 
     std::size_t failed_out = 0;
@@ -991,7 +991,7 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): concern 2 (rung 9c PR-5d) - a W
     // #5459: a real SHA-256-shaped content_id (decide_retry() never trusts a sentinel).
     const std::string digest(64, 'a');
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, digest, false, 1);
+    ledger.begin_delta_application(1, digest, 1, {"r1"});
     ledger.add_pending("r1", receipt);
 
     // First drain: resolves Wedged as an ordinary failure, exactly like the sibling
@@ -1070,7 +1070,7 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): concern 2 - a Wedged receipt th
 
     const std::string digest(64, 'a');
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, digest, false, 1);
+    ledger.begin_delta_application(1, digest, 1, {"r1"});
     ledger.add_pending("r1", receipt);
     std::size_t failed_out = 0;
     CHECK(ledger.drain_locked(*rt, /*max_per_tick=*/10, &failed_out) == 1);
@@ -1164,7 +1164,7 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): a CongestionExpired receipt (ti
     REQUIRE(rt->receipt_status(r2_receipt) == GuardianSparkRuntime::ReceiptStatus::CongestionExpired);
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, "content", false, 2);
+    ledger.begin_delta_application(1, "content", 2, {"r1"});
     ledger.add_pending("r1", r1_receipt);
     ledger.add_pending("r2", r2_receipt);
 
@@ -1218,8 +1218,9 @@ TEST_CASE("GuardianArmAckLedger::can_advance(): never acknowledges an outstandin
 
     // The old waiver acknowledged after 3 identical re-applies. There is none now: six
     // identical re-applications, each re-observing the same retained claim, never
-    // acknowledge. (Each begin_application() replaces the application wholesale, so each
-    // starts with fresh accounting and a fresh suppression budget.)
+    // acknowledge. (Each open_app() names r1, the only rule in play, so the delta drops r1's
+    // old entry and each application starts with fresh accounting and a fresh suppression
+    // budget.)
     for (int i = 1; i <= 6; ++i) {
         f.open_app();
         f.ledger.add_pending("r1", accept(*f.rt, "r1", "/a")); // Reobserved: same underlying claim
@@ -1236,7 +1237,7 @@ TEST_CASE("GuardianArmAckLedger::can_advance(): never acknowledges an outstandin
     }
 
     // A DISTINCT push (different content) is a fresh application with clean accounting.
-    f.ledger.begin_application(1, std::string(64, 'b'), false, 1);
+    f.ledger.begin_delta_application(1, std::string(64, 'b'), 1, {"r1"});
     CHECK(f.ledger.failed_receipt_count_for_test() == 0); // no leak
     CHECK(f.ledger.can_advance()); // trivially true - nothing pending or failed YET
 }
@@ -1396,7 +1397,7 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): a wedge plus an UNDRAINED ordin
 
 TEST_CASE("GuardianArmAckLedger::decide_retry(): safety valve - kWedgeSuppressMaxDecisions "
           "wedge Suppresses, then Reapply; Pending-only suppression never spends the "
-          "budget; only begin_application()/retire() reset it (#5459)",
+          "budget; only begin_*_application()/retire() reset it (#5459)",
           "[spark][ack][5459]") {
     Rig5459 f;
     auto w = f.wedge("r1", "/a");
@@ -1452,7 +1453,7 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): the safety valve bounds EVERY w
           "[spark][ack][5459]") {
     // Exhausts the budget through whatever branch the rig set up: exactly
     // kWedgeSuppressMaxDecisions Suppresses, then Reapply, and the budget does not come
-    // back (a Reapply decision is not a reset, only begin_application()/retire() are).
+    // back (a Reapply decision is not a reset, only begin_*_application()/retire() are).
     auto exhaust = [](Rig5459& f) {
         for (std::size_t i = 0; i < kWedgeSuppressMaxDecisions; ++i)
             REQUIRE(f.retry() == RD::Suppress);
@@ -1659,7 +1660,7 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): identity is checked BEFORE any 
     SECTION("a sentinel on the OPEN application never matches, even against a sentinel") {
         Rig5459 f;
         auto w = f.wedge("r1", "/a");
-        f.ledger.begin_application(1, not_hex, false, 1);
+        f.ledger.begin_delta_application(1, not_hex, 1, {"r1"});
         f.ledger.add_pending("r1", w);
         REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
         CHECK(f.ledger.decide_retry(1, not_hex, false, *f.rt) == RD::Reapply);
@@ -1814,7 +1815,7 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): a Blocking failed_receipts entr
     CHECK(f.retry() == RD::Reapply);
 }
 
-TEST_CASE("GuardianArmAckLedger::begin_application(): a fresh application starts with clean "
+TEST_CASE("GuardianArmAckLedger::begin_*_application(): a fresh application starts with clean "
           "failure accounting and a fresh suppression budget; retire() likewise (#5459)",
           "[spark][ack][5459]") {
     Rig5459 f;
@@ -1835,7 +1836,7 @@ TEST_CASE("GuardianArmAckLedger::begin_application(): a fresh application starts
     establish(false);
     exhaust_budget();
 
-    // An identical begin_application() (what the forced Reapply does): no stale failure
+    // An identical begin_delta_application() (what the forced Reapply does): no stale failure
     // state leaks, and an application with nothing outstanding is a Reapply.
     f.open_app();
     CHECK(f.ledger.failed_receipt_count_for_test() == 0);
@@ -1891,7 +1892,7 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): a genuinely dispatched claim th
     REQUIRE(rt->receipt_wedge_k_eligible(receipt)); // genuinely outstanding right now
 
     GuardianArmAckLedger ledger;
-    ledger.begin_application(1, std::string(64, '2'), false, 1);
+    ledger.begin_delta_application(1, std::string(64, '2'), 1, {"r1"});
     ledger.add_pending("r1", receipt);
     CHECK(ledger.drain_locked(*rt, 10) == 1);
     CHECK(ledger.failed_receipt_count_for_test() == 1); // retained - genuinely eligible right now
@@ -2590,25 +2591,6 @@ TEST_CASE("GuardianArmAckLedger: a recovery drops the carried obligation and its
         CHECK(f.ledger.pending_count_for_test() == 0);
         CHECK(f.ledger.can_advance());
     }
-}
-
-TEST_CASE("GuardianArmAckLedger::begin_application(): the legacy overload still carries "
-          "nothing - no obligation, no inherited latch (#5547)",
-          "[spark][ack][5547]") {
-    Rig5459 f;
-    const auto keep_alive = build_all_kinds(f);
-    (void)keep_alive;
-    f.open_app(); // the OLD overload
-    for (const char* id : {"r1", "r2", "r3", "r4"})
-        CHECK(f.ledger.obligation_for_test(id) == OB::None);
-    CHECK(f.ledger.failed_id_count_for_test() == 0);
-    CHECK(f.ledger.sync_failed_count_for_test() == 0);
-    CHECK(f.ledger.pending_count_for_test() == 0);
-    CHECK(f.ledger.failed_receipt_count_for_test() == 0);
-    CHECK(f.failed_gauge() == 0);
-    CHECK_FALSE(f.ledger.inherited_latch_for_test());
-    CHECK_FALSE(f.ledger.latched_failure_for_test());
-    CHECK(f.ledger.can_advance());
 }
 
 // ── decide_retry arithmetic ───────────────────────────────────────────────

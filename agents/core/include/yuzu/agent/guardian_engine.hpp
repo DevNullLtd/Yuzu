@@ -287,7 +287,7 @@ public:
     /// own zero-timestamp check would eventually catch even without the flag,
     /// ack_ledger_->arm_stats() alone cannot tell "spark dormant" from "spark live,
     /// currently clean" - GuardianEngine::apply_rules() calls
-    /// GuardianArmAckLedger::begin_application() UNCONDITIONALLY on every push,
+    /// GuardianArmAckLedger::begin_*_application() UNCONDITIONALLY on every push,
     /// regardless of prefer_spark_, so a legacy (non-spark) agent has a live,
     /// empty Application (pending={}, resolved_failed=0) exactly like a spark
     /// agent with nothing currently pending or failed - the ledger's own
@@ -445,7 +445,7 @@ public:
     [[nodiscard]] GuardianHealthStats spark_claim_health_stats() const;
     /// #5404 (P2): throws caught by the ack-bookkeeping maintenance firewall - the heartbeat
     /// thread's ack drain / generation advance in journal_maintenance_tick, and the content-id
-    /// hash and begin_application preamble in apply_rules. A throw that recurs every tick
+    /// hash and begin_*_application preamble in apply_rules. A throw that recurs every tick
     /// repeats the skip of that tick's remaining ack drain. Lock-free; zero is steady state.
     [[nodiscard]] std::uint64_t ack_maint_exceptions() const noexcept {
         return ack_maint_exceptions_.load(std::memory_order_relaxed);
@@ -1057,8 +1057,8 @@ private:
     /// boot_unresolved_ (the companion tag stays set during holdoff), nor policy_generation()
     /// (the __guard__ reply text keeps reading 0). Under mtx_, no atomics.
     std::uint32_t boot_report_holdoff_{0};
-    /// #5513: true from the boot application's begin_application() succeeding until
-    /// apply_rules' own begin_application() succeeds (which supersedes it) or stop(). Only the
+    /// #5513: true from the boot application's begin_*_application() succeeding until
+    /// apply_rules' own begin_*_application() succeeds (which supersedes it) or stop(). Only the
     /// SET side (boot_unresolved_ from a drained failure) reads it, so an ordinary held push's
     /// failure never reports 0. Under mtx_, no atomics.
     bool boot_app_open_{false};
@@ -1071,7 +1071,7 @@ private:
     /// #5513: the ONE place a boot re-arm failure is recorded, shared by start_local's
     /// returned-Failed arm and both catch arms. mtx_ held. noexcept and allocation-free: it
     /// runs inside the exhaustion catch. Sets boot_unresolved_, counts the failure into
-    /// arm_failures_, and latches the boot application (a no-op when begin_application failed:
+    /// arm_failures_, and latches the boot application (a no-op when the boot begin_full_application failed:
     /// no current application) so the tick's can_advance() cannot clear the flag before the
     /// server's catch-up push has applied cleanly.
     void note_boot_rearm_failure_locked() noexcept;

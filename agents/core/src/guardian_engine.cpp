@@ -1023,8 +1023,8 @@ std::expected<void, std::string> GuardianEngine::start_local() {
     // hash for it would buy nothing.
     //
     // #5513: this application is also the carrier of the boot re-arm's unresolved state.
-    // boot_app_open_ marks it as still current: it is set right after begin_application()
-    // succeeds below and cleared only when apply_rules' own begin_application() succeeds
+    // boot_app_open_ marks it as still current: it is set right after begin_*_application()
+    // succeeds below and cleared only when apply_rules' own begin_*_application() succeeds
     // (which supersedes it; a rejected or Suppressed push leaves it current) or in stop().
     // While it is open, the maintenance tick sets boot_unresolved_ when one of ITS receipts
     // drains as a failure (the late variant: a Spark arm accepted at boot that later
@@ -1034,7 +1034,7 @@ std::expected<void, std::string> GuardianEngine::start_local() {
     // can_advance() clear cannot erase them before the server has been told (a latched
     // application's effect is can_advance() == false: decide_retry() also reads the latch, but
     // the boot application's empty content_id sentinel returns Reapply before that check).
-    // Contract: if this begin_application() throws there is no boot application, so the late
+    // Contract: if this begin_*_application() throws there is no boot application, so the late
     // variant is invisible (late receipts are dropped by add_pending) and the latch is a
     // no-op; the synchronous variants are still covered.
     //
@@ -1046,13 +1046,18 @@ std::expected<void, std::string> GuardianEngine::start_local() {
     // (SparkReconcileFixture's constructor) selects the production order, and the #5513
     // cases that need a Spark boot arm use it.
     // Governance finding UP-1 (Gate 4, folded): same unguarded-allocation class as
-    // apply_rules()'s own begin_application() call, fixed alongside it. Non-fatal
+    // apply_rules()'s own begin_*_application() call, fixed alongside it. Non-fatal
     // here - a failure to open the boot bookkeeping application must not block
     // startup; the boot re-arm loop below re-arms every cached rule directly via
     // reconcile_rule_locked() regardless of whether this ledger call succeeded.
+    //
+    // #5547: this opens the boot application through begin_full_application(), which sets
+    // Application::full_sync to true (the previous overload left it false). Harmless here: the
+    // empty content id is not a SHA-256 digest, so decide_retry() returns Reapply on the
+    // content-id test before it ever compares full_sync, and no ledger state is carried from
+    // before the boot (there is no earlier application).
     try {
-        ack_ledger_->begin_application(policy_generation_, "", /*full_sync=*/false,
-                                       /*applied=*/0);
+        ack_ledger_->begin_full_application(policy_generation_, "", /*applied=*/0);
         boot_app_open_ = true;
     } catch (const std::exception& e) {
         spdlog::warn("Guardian: failed to begin boot ack application: {}", e.what());
@@ -1982,7 +1987,7 @@ std::uint32_t GuardianEngine::boot_report_holdoff_for_test() const {
 std::optional<GuardianArmStats> GuardianEngine::arm_stats() const {
     std::lock_guard lock(mtx_);
     // Check A (rung 9c PR-3 KICKOFF-v2, see this accessor's own doc comment in
-    // guardian_engine.hpp): begin_application() runs unconditionally in
+    // guardian_engine.hpp): begin_*_application() runs unconditionally in
     // apply_rules() regardless of prefer_spark_, so ack_ledger_->arm_stats() alone
     // cannot distinguish "spark dormant" from "spark live, currently clean" - a
     // legacy agent has a live, empty Application on every push. Gate on all three
@@ -2118,23 +2123,23 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
 
     // #4665: reject the WHOLE push on ANY invalid rule_id, before touching
     // anything else - including the full_sync teardown below AND
-    // ack_ledger_->begin_application()'s own bookkeeping mutation further
+    // ack_ledger_->begin_*_application()'s own bookkeeping mutation further
     // down. A full_sync push that tore down every existing guard, then
     // skipped just the one rule with a bad id while arming the rest, would
     // still advance policy_generation_ to the pushed value - silently
     // dropping that rule's enforcement while reporting the agent as
     // caught-up on the generation. Pure read-only scan over push.rules() -
     // no reconcile_rule_locked call, no guard/spark state touched, and (by
-    // running before begin_application()) no ack-ledger application exists
+    // running before begin_*_application()) no ack-ledger application exists
     // yet for this push to disturb, so a PRIOR push's still-pending
     // application is left completely untouched by this push's rejection.
-    // Same rationale as the UP-1 comment on begin_application()'s own
+    // Same rationale as the UP-1 comment on begin_*_application()'s own
     // allocation firewall below: nothing has been reconciled or staged yet
     // at this point, so returning std::unexpected here is a clean,
     // side-effect-free abort - ack_ledger_->latch_failure() is deliberately
     // NOT called (unlike put_rule_locked's failure path further down): it is
     // a no-op with no current application (its own doc comment), and there
-    // is no current application until begin_application() runs, below this
+    // is no current application until begin_*_application() runs, below this
     // check.
     for (const auto& rule : push.rules()) {
         if (!is_valid_rule_id(rule.rule_id())) {
@@ -2142,6 +2147,40 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
                 "rejecting push: rule '" + log_id_token(rule.rule_id()) + "' (name='" +
                 log_key_token(rule.name()) + "') has an invalid or missing rule_id");
         }
+    }
+
+    // #5547: the id set of this push, built ONCE here. It names the rules a delta covers
+    // (begin_delta_application() carries every other rule's unresolved outcome), and it is the set
+    // the full_sync sweep, teardown and unsupported_rules_ pruning below keep. A duplicate rule id
+    // is rejected here with the invalid-id error shape: it would leave one id in two sets of the
+    // ack application (a receipt and a failure for the same rule), and the second occurrence would
+    // silently overwrite the first. The server cannot emit one (guaranteed_state_rules.rule_id is
+    // the primary key and pushes are built from list_rules()), so this is defensive against a
+    // hand-built push. Built in its OWN try returning std::unexpected, like the begin-application
+    // firewall below: this is pre-publication, so a failure is a clean side-effect-free abort.
+    // (The error-string allocation in the invalid-id and duplicate returns is unfirewalled, as it
+    // was before this change.)
+    // transparent comparator: contains(string_view) allocates nothing
+    std::set<std::string, std::less<>> push_ids;
+    const gpb::GuaranteedStateRule* duplicate_rule = nullptr;
+    try {
+        for (const auto& rule : push.rules()) {
+            if (!push_ids.insert(rule.rule_id()).second) {
+                duplicate_rule = &rule;
+                break;
+            }
+        }
+    } catch (const std::exception& e) {
+        ack_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
+        return std::unexpected(std::string("failed to index push rules: ") + e.what());
+    } catch (...) {
+        ack_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
+        return std::unexpected("failed to index push rules: unknown exception");
+    }
+    if (duplicate_rule != nullptr) {
+        return std::unexpected("rejecting push: rule '" + log_id_token(duplicate_rule->rule_id()) +
+                               "' (name='" + log_key_token(duplicate_rule->name()) +
+                               "') appears more than once");
     }
 
     // rung 9c PR-2 Unit 6 (§R5.3 duplicate-retry suppression): the server's 25s
@@ -2157,7 +2196,7 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // stays the cheap path. Before #4415 each retry tore down and re-armed every rule,
     // withdrawing and re-dispatching a claim that was already correctly in flight (an
     // arm slower than the retry interval would never converge). content_id is
-    // computed BEFORE begin_application() below can supersede the application this
+    // computed BEFORE begin_*_application() below can supersede the application this
     // checks against. guardian_push_content_id() allocates on the unguarded dispatch
     // thread (#2037) - contained; on a throw, an empty id never matches a real one,
     // so this degrades to Reapply (always safe), never a wrongly-suppressed retry.
@@ -2183,15 +2222,25 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // applied_count().
     //
     // Governance finding UP-1 (Gate 4, unhappy-path, verified): this allocation
-    // (std::make_unique<Application>() inside begin_application()) sat immediately
+    // (std::make_unique<Application>() inside begin_*_application()) sat immediately
     // after the ONE call this preamble already firewalls (guardian_push_content_id(),
     // #2037) with no firewall of its own - a bad_alloc here would have escaped onto
     // the unfirewalled dispatch thread before GuardianRollback's own scope guard is
     // even declared below. Nothing has been reconciled or staged yet at this point,
     // so returning std::unexpected is a clean, side-effect-free abort of this push.
+    //
+    // #5547: a full_sync replaces the open application and carries only the unattributed legacy
+    // debt (inherited_latch); a delta carries every unresolved per-rule outcome of a rule the push
+    // does NOT name (pending receipts, retained wedges, drained failures, synchronous failures),
+    // so omitting a rule cannot drop its retry obligation. Both build the new application in
+    // full before publishing it, so a throw here leaves the open one exactly as it was.
     try {
-        ack_ledger_->begin_application(push.policy_generation(), content_id, push.full_sync(),
-                                       /*applied=*/0);
+        if (push.full_sync())
+            ack_ledger_->begin_full_application(push.policy_generation(), content_id,
+                                                /*applied=*/0);
+        else
+            ack_ledger_->begin_delta_application(push.policy_generation(), content_id,
+                                                 /*applied=*/0, push_ids);
     } catch (const std::exception& e) {
         ack_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
         return std::unexpected(std::string("failed to begin ack application: ") + e.what());
@@ -2202,7 +2251,7 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // #5513: only now has this push superseded the boot application. The #4665 reject above and
     // the Suppress return above both leave the boot application current (and its unresolved
     // flag owned by it), so this is NOT cleared at the top of the function. A throw out of
-    // begin_application() above returns before this line, so the boot application stays open
+    // begin_*_application() above returns before this line, so the boot application stays open
     // and the next push retries.
     boot_app_open_ = false;
 
@@ -2243,25 +2292,42 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     if (apply_post_drain_hook_for_test_)
         apply_post_drain_hook_for_test_();
     std::size_t applied = 0;
+    // #5547 (F9): reconcile_failures is the TOTAL of this call's synchronous failures; it drives
+    // `clean` at the tail and the failed= field of the final log line. unattributed_failures is
+    // the SUBSET with no rule id to record them against (the full_sync sweep, del_keys and
+    // teardown failures, and a per-rule failure whose note_sync_failure() itself threw); only
+    // that subset latches the whole application at the tail. A per-rule failure is recorded
+    // against its rule id instead, so a later push naming the rule can clear exactly it.
     std::size_t reconcile_failures = 0;
+    std::size_t unattributed_failures = 0;
+    // Records a per-rule synchronous failure against its rule (so it survives a replacing delta
+    // that omits the rule). note_sync_failure() allocates and can throw; the callers are catch
+    // blocks and failure branches that must not, so a throw falls back to the application-wide
+    // latch (and counts as unattributed, which keeps the tail consistent with it).
+    const auto note_rule_failure = [this, &unattributed_failures](const std::string& rule_id) noexcept {
+        try {
+            ack_ledger_->note_sync_failure(rule_id, /*boot_origin=*/false);
+        } catch (...) {
+            ack_ledger_->latch_failure();
+            ++unattributed_failures;
+        }
+    };
     // rung 9c PR-2 Unit 6 (R5.3): rules ACCEPTED this push whose arm has not yet
     // resolved - a diagnostic count only (the "pending" field in the log line
     // below); the actual generation-hold gate reads ack_ledger_->can_advance(),
     // never this counter (arm_failures_/reconcile_failures stay a genuine-failure
     // signal only, unaffected by Accepted).
     std::size_t pending_arms = 0;
-    // F7: rule_ids seen in a full_sync push, for the unsupported_rules_ sweep below, and (#4415)
-    // the set the spark teardown below keeps. Legacy guards are still torn down and rebuilt
+    // F7: push_ids (built before the ack application above, #5547) is, for a full_sync push, the
+    // set for the unsupported_rules_ sweep below and (#4415) the set the spark teardown below
+    // keeps. Legacy guards are still torn down and rebuilt
     // wholesale by stop_all_guards_locked() + the loop below, but a spark-attached rule the push
     // still carries is left to reconcile_rule_locked, which skips it when healthy and unchanged;
     // only an omitted one is detached here. unsupported_rules_ is passive bookkeeping, not a live
     // resource, so it is deliberately NOT blanket-cleared (see the comment further down) - it
-    // needs this set instead. Filled for EVERY rule in the push, disabled ones included:
+    // needs this set instead. It holds EVERY rule in the push, disabled ones included:
     // reconcile_rule_locked detaches a disabled rule itself.
-    std::set<std::string, std::less<>> full_sync_ids; // transparent: contains(string_view) allocates nothing
     if (push.full_sync()) {
-        for (const auto& rule : push.rules())
-            full_sync_ids.insert(rule.rule_id());
         // #4021: NEVER kv_->clear(kKvNamespace) here — a blanket clear would also
         // wipe every kBaselinePrefix baseline record, reintroducing exactly the
         // silent-relaunder bug this file's baseline persistence exists to close (a
@@ -2272,7 +2338,7 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         // guardian_seed_baseline's doc for why absence-from-a-push must not sweep
         // a baseline either).
         // #4415: within kRulePrefix the sweep removes only the rows the push OMITS
-        // (absent from full_sync_ids). A row the push still carries is left in place and
+        // (absent from push_ids). A row the push still carries is left in place and
         // put_rule_locked rewrites it only when the stored bytes differ, so an identical
         // re-push no longer deletes and re-inserts every rule row (~2R KV events per push).
         // Every latch below is unchanged and now applies to the omitted set: it is the set
@@ -2299,6 +2365,7 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         auto rule_key_rows = kv_->list_entries(kKvNamespace, kRulePrefix);
         if (!rule_key_rows) {
             ++reconcile_failures;
+            ++unattributed_failures;
             arm_failures_.fetch_add(1, std::memory_order_relaxed);
             spdlog::error("Guardian: full_sync rule-key sweep failed ({}) - holding "
                          "policy_generation for retry rather than risk a partial delete",
@@ -2327,10 +2394,10 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
                                                   ? key_view.substr(kRulePrefix.size())
                                                   : std::string_view{};
                 // #4415: a row the push still carries is kept (put_rule_locked below
-                // decides whether to rewrite it). full_sync_ids holds only ids the
+                // decides whether to rewrite it). push_ids holds only ids the
                 // up-front validation accepted, so a non-conforming stored row never
                 // matches and is still swept and counted.
-                if (full_sync_ids.contains(rid))
+                if (push_ids.contains(rid))
                     continue;
                 if (!is_valid_rule_id(rid))
                     ++non_conforming;
@@ -2357,6 +2424,7 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
                     // rule: key lingering one extra cycle is safe, a failed delete
                     // silently reported as ordinary success is not.
                     ++reconcile_failures;
+                    ++unattributed_failures;
                     arm_failures_.fetch_add(1, std::memory_order_relaxed);
                     spdlog::error("Guardian: full_sync del_keys cleared {}/{} rule(s) - "
                                  "holding policy_generation for retry rather than trust a "
@@ -2378,7 +2446,7 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         // Full sync replaces the active set - tear down the legacy backend and the spark
         // rules the push omits before re-arming (rung 7: a spark-attached rule the new push
         // omits must be withdrawn too, not left dangling - Sol's rev-2 review; #4415: a rule it
-        // still carries is NOT detached here, see full_sync_ids above). FIREWALLED like the
+        // still carries is NOT detached here, see push_ids above). FIREWALLED like the
         // per-rule reconcile below: stop_all_guards_locked/detach_rules_except allocate (lifecycle
         // enqueue, disarm, Key strings), and a bad_alloc here would otherwise escape
         // apply_rules onto the un-firewalled dispatch/run() thread and abort the whole
@@ -2388,15 +2456,16 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         try {
             stop_all_guards_locked();
             if (spark_runtime_)
-                spark_runtime_->detach_rules_except(full_sync_ids);
+                spark_runtime_->detach_rules_except(push_ids);
             // F7: deliberately NOT unsupported_rules_.clear() here - that would make
             // every rule the loop below re-classifies Unsupported look "newly"
             // unsupported (the per-outcome erase/insert in reconcile_rule_locked can't
             // detect "already tracked" against an emptied map), spamming the
             // edge-triggered log on every full_sync. Swept precisely, after the loop,
-            // against full_sync_ids instead.
+            // against push_ids instead.
         } catch (...) {
             ++reconcile_failures;
+            ++unattributed_failures;
             arm_failures_.fetch_add(1, std::memory_order_relaxed);
             try {
                 spdlog::error("Guardian: full_sync teardown threw - partial teardown, "
@@ -2435,6 +2504,7 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         } catch (...) {
             ++reconcile_failures;
             arm_failures_.fetch_add(1, std::memory_order_relaxed);
+            note_rule_failure(rule.rule_id()); // #5547: attributed, survives a delta omitting it
             try {
                 spdlog::error("Guardian: reconcile threw for rule '{}' - persisted; whether its "
                               "previous arm survives is not guaranteed",
@@ -2452,6 +2522,7 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         if (outcome == ReconcileOutcome::Failed) {
             ++reconcile_failures;
             arm_failures_.fetch_add(1, std::memory_order_relaxed);
+            note_rule_failure(rule.rule_id()); // #5547: attributed, survives a delta omitting it
             continue; // not counted as applied - reconcile_rule_locked already logged why
         }
         // rung 9c PR-2 Unit 6 (§R5.3): Accepted is not a failure - the rule was
@@ -2495,7 +2566,7 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         // mid-rebuild on that path (generation held, existing pre-F7 behavior), and
         // the next successful push's sweep heals it; not a new gap F7 introduces.
         for (auto it = unsupported_rules_.begin(); it != unsupported_rules_.end();) {
-            if (!full_sync_ids.count(it->first))
+            if (!push_ids.count(it->first))
                 it = unsupported_rules_.erase(it);
             else
                 ++it;
@@ -2510,9 +2581,28 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // otherwise see nothing latched and no resolved_failed once every accepted rule's
     // arm eventually commits, and wrongly advance a generation that had a genuine
     // failure this call.
-    if (reconcile_failures > 0)
+    // #5547: only a failure with no rule id latches the whole application. A per-rule failure
+    // was recorded against its rule above (note_rule_failure) and holds can_advance() through
+    // that record instead, so it is carried by a delta that omits the rule and cleared by a push
+    // that names it; latching it here too would make it unclearable by a delta (the latch is
+    // inherited by every later application).
+    if (unattributed_failures > 0)
         ack_ledger_->latch_failure();
     ack_ledger_->set_applied(applied);
+    // #5547 (Ruling 22 (b)): a full_sync whose synchronous phases ALL succeeded is the
+    // authoritative repair of the unattributed debt earlier applications handed down
+    // (inherited_latch), so it is discharged here. ORDER IS LOAD-BEARING: after set_applied() and
+    // BEFORE `clean` is computed below. Computed after, the repairing full_sync would judge itself
+    // unclean (can_advance() reads inherited_latch), leave the boot flag set, not advance the
+    // generation and extend the #5513 holdoff; at prefer_spark=false there is no tick to advance
+    // it later. The condition is the TOTAL failure count: a full_sync that swept fine but failed
+    // to reconcile one rule has not repaired anything, so its inherited debt stays. This clears
+    // only the inherited debt; this application's own failures (latched above, sync_failed_ids,
+    // failed_ids) are a separate obligation and still hold can_advance(). Known limit: a clean
+    // synchronous tail proves withdrawals were issued and queued, not that each backend disarm()
+    // completed (the ledger does not track Disarm claims).
+    if (push.full_sync() && reconcile_failures == 0)
+        ack_ledger_->discharge_inherited_latch();
 
     // Do NOT advance the policy generation when any rule failed to arm. The server's
     // heartbeat reconcile fn re-pushes only while the agent reports a generation BEHIND
@@ -2578,7 +2668,7 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         // #5513 back-off (governance finding P-1): this catch-up did not resolve the boot
         // re-arm, and reporting 0 on every heartbeat would make the server re-push a full sync
         // about every heartbeat for as long as the rule keeps failing. Only an application that
-        // reached this tail counts: the #4665 reject, the Suppress return, the begin_application
+        // reached this tail counts: the #4665 reject, the Suppress return, the begin_*_application
         // and put_rule early returns above all leave the counters alone. A pending Spark arm
         // also lands here (!can_advance()); the tick clears the flag, and the counters, once it
         // commits, so at worst the real generation is reported for a few heartbeats first. The
@@ -2798,7 +2888,7 @@ void GuardianEngine::note_boot_rearm_failure_locked() noexcept {
     // reads latched_failure, but the boot application's empty content_id sentinel returns
     // Reapply before that check is reached. Calls GuardianArmAckLedger::latch_failure(), which
     // is noexcept: this function is noexcept and runs inside the exhaustion catch.
-    // A no-op when begin_application() failed (no current application).
+    // A no-op when begin_*_application() failed (no current application).
     ack_ledger_->latch_failure();
 }
 
