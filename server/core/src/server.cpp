@@ -2314,8 +2314,9 @@ public:
                           "once-per-boot background purge",
                           "counter");
         metrics_.describe("yuzu_inventory_typed_purge_failures_total",
-                          "Background typed-source purge passes that gave up after a failed batch "
-                          "(retried with backoff first); stray rows stay unreadable regardless",
+                          "Background typed-source purge passes that gave up after a failed batch or "
+                          "rows that stayed locked by another session (retried with backoff "
+                          "first); stray rows stay unreadable regardless",
                           "counter");
         metrics_.counter("yuzu_inventory_typed_purge_rows_total");
         metrics_.counter("yuzu_inventory_typed_purge_failures_total");
@@ -8990,8 +8991,16 @@ public:
         // per-batch bound is part 5 (the per-pass total is not bounded).
         {
             std::lock_guard<std::mutex> life(lifecycle_mu_);
-            if (!teardown_complete_ && !stop_requested_.load(std::memory_order_acquire) &&
-                inventory_store_ && inventory_store_->is_open()) {
+            if (teardown_complete_ || stop_requested_.load(std::memory_order_acquire)) {
+                // stop() already ran (or began) -- a SIGTERM during boot. Every thread
+                // started below has its join only in stop(), which will not run again
+                // (~ServerImpl's call returns early), so starting any of them would leave a
+                // joinable std::thread to be destroyed (std::terminate). Do not serve.
+                spdlog::info("run(): shutdown requested during startup; not starting "
+                             "background threads");
+                return;
+            }
+            if (inventory_store_ && inventory_store_->is_open()) {
                 typed_purge_thread_ = std::thread([this]() {
                     YUZU_ASSERT_BACKGROUND_JOB("inventory_store.purge_typed_sources"); // WS-10 ReplicaSafe
                     const auto r = inventory_store_->drain_typed_sources(

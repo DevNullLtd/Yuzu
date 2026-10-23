@@ -36,6 +36,10 @@ MSG_COUNT = "expected exactly one `typed_purge_thread_ = std::thread` start site
 MSG_NOT_IN_RUN = "typed_purge_thread_ is started outside run()'s own body (constructor, start_web_server() or elsewhere)"
 MSG_BEFORE_RECHECK = ("typed_purge_thread_ is started before run()'s startup_failed_ recheck that follows "
                       "start_web_server()")
+MSG_NOT_LOCKED = ("typed_purge_thread_ is started outside the lifecycle_mu_ lock_guard scope in run() "
+                  "(a watcher-thread stop() could finish before the start)")
+MSG_NO_EARLY_RETURN = ("run() no longer returns early under lifecycle_mu_ when teardown_complete_ || "
+                       "stop_requested_ (the threads started after it would be destroyed joinable)")
 MSG_NO_JOIN = "stop() no longer joins typed_purge_thread_"
 MSG_JTHREAD = "typed_purge_thread_ must not be a std::jthread (stop_requested_ is declared after it)"
 
@@ -84,6 +88,29 @@ def problems(src):
                           "`if (startup_failed_)` recheck (stale pattern)"]
         if pos < recheck:
             out.append(MSG_BEFORE_RECHECK)
+    if not out:
+        lock = None
+        for m in re.finditer(r"std::lock_guard<std::mutex> \w+\(lifecycle_mu_\);", t[:pos]):
+            lock = m
+        if lock is None:
+            out.append(MSG_NOT_LOCKED)
+        else:
+            # the lock's enclosing brace scope must still be open at the start site
+            depth = 0
+            closed = False
+            for ch in t[lock.end():pos]:
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth < 0:
+                        closed = True
+                        break
+            if closed:
+                out.append(MSG_NOT_LOCKED)
+            elif not re.search(r"^ ?if \(teardown_complete_ \|\| stop_requested_\.load\([^)]*\)\) \{[^{}]*\breturn;[^{}]*\}",
+                               t[lock.end():pos]):
+                out.append(MSG_NO_EARLY_RETURN)
     if "typed_purge_thread_.join()" not in t:
         out.append(MSG_NO_JOIN)
     if re.search(r"std::jthread typed_purge_thread_", t):
@@ -102,7 +129,7 @@ class TypedPurgeWiring(unittest.TestCase):
         # move the start into the ctor body: just after its opening brace
         m2 = self.src
         i = m2.index(START)
-        j = m2.index("});", i) + 3
+        j = m2.index("\n                });", i) + len("\n                });")
         stmt = m2[i:j]
         rest = m2[:i] + m2[j:]
         ctor = rest.index("explicit ServerImpl(Config cfg, auth::AuthManager& auth_mgr)")
@@ -113,7 +140,7 @@ class TypedPurgeWiring(unittest.TestCase):
     def test_moved_into_start_web_server(self):
         m = self.src
         i = m.index(START)
-        j = m.index("});", i) + 3
+        j = m.index("\n                });", i) + len("\n                });")
         stmt = m[i:j]
         rest = m[:i] + m[j:]
         head = rest.index("void start_web_server() {")
@@ -124,13 +151,30 @@ class TypedPurgeWiring(unittest.TestCase):
     def test_moved_before_recheck(self):
         m = self.src
         i = m.index(START)
-        j = m.index("});", i) + 3
+        j = m.index("\n                });", i) + len("\n                });")
         stmt = m[i:j]
         rest = m[:i] + m[j:]
         web = rest.index("start_web_server();", rest.index("void run() override {"))
         end = web + len("start_web_server();")
         m = rest[:end] + "\n" + stmt + "\n" + rest[end:]
         self.assertEqual(problems(m), [MSG_BEFORE_RECHECK])
+
+    def test_early_return_removed(self):
+        m = self.src.replace("                return;\n            }\n            if (inventory_store_ && inventory_store_->is_open()) {",
+                             "            }\n            if (inventory_store_ && inventory_store_->is_open()) {", 1)
+        self.assertNotEqual(m, self.src)
+        self.assertEqual(problems(m), [MSG_NO_EARLY_RETURN])
+
+    def test_moved_outside_lock(self):
+        m = self.src
+        i = m.index(START)
+        j = m.index("\n                });", i) + len("\n                });")
+        stmt = m[i:j]
+        rest = m[:i] + m[j:]
+        anchor = "// Start certificate hot-reload watcher"
+        k = rest.index(anchor, rest.index("void run() override {"))
+        m = rest[:k] + stmt + "\n" + rest[k:]
+        self.assertEqual(problems(m), [MSG_NOT_LOCKED])
 
     def test_missing_join(self):
         m = self.src.replace("typed_purge_thread_.join()", "typed_purge_thread_.detach()")

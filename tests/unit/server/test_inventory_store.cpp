@@ -438,9 +438,38 @@ TEST_CASE("InventoryStore drain_typed_sources retries, halves, rescans once and 
         CHECK(r.rows == 6);
         CHECK(calls == 3);
     }
+    SECTION("non-consecutive failures do not accumulate: the failure count resets on success") {
+        opt.batch_rows = 2;
+        opt.max_attempts = 1;
+        int calls = 0;
+        opt.test_fail_batch = [&](int) {
+            ++calls;
+            return calls == 1 || calls == 3; // fail, ok, fail, ok ... never twice in a row
+        };
+        const auto r = store.drain_typed_sources(opt);
+        CHECK(r.status == St::kCompleted);
+        CHECK(r.rows == 6);
+    }
+    SECTION("the rescan finds a stray row written behind the cursor") {
+        opt.batch_rows = 10;
+        int calls = 0;
+        opt.test_fail_batch = [&](int) {
+            if (++calls == 2) // the cursor is past agent-5; a row lands behind it
+                store.upsert("agent-0", "device_ci", R"({"n":9})", 1000);
+            return false;
+        };
+        const auto r = store.drain_typed_sources(opt);
+        CHECK(r.status == St::kCompleted);
+        CHECK(r.rows == 7);
+        CHECK(raw_row_count(pool, "device_ci") == 0);
+    }
     SECTION("rows locked by a peer end the pass as failed, never completed; unlocking drains") {
         auto peer = pool.acquire();
         REQUIRE(peer);
+        struct RollbackGuard { // never leave the peer's lock held if a REQUIRE throws
+            PGconn* c;
+            ~RollbackGuard() { pg::PgResult rb{PQexec(c, "ROLLBACK")}; }
+        } guard{peer.get()};
         pg::PgResult begin{PQexec(peer.get(), "BEGIN")};
         REQUIRE(begin.status() == PGRES_COMMAND_OK);
         pg::PgResult lock{PQexec(peer.get(),

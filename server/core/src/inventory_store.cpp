@@ -538,7 +538,8 @@ namespace {
 // out) at most $2 rows of the typed sources strictly after the (agent_id, plugin) cursor
 // in primary-key order, delete exactly those, and report the count, the last key deleted
 // (so the next batch resumes there instead of rescanning the head of the table) and
-// whether typed rows remain that this batch did not take (a peer holds them locked).
+// whether typed rows remain that this batch did not take (a peer holds them locked);
+// the remaining-rows probe only runs when the batch took nothing.
 constexpr const char* kPurgeBatchSql =
     "WITH b AS (SELECT agent_id, plugin FROM inventory_store.inventory_data "
     "WHERE plugin = ANY($1::text[]) AND (agent_id, plugin) > ($3::text, $4::text) "
@@ -546,9 +547,9 @@ constexpr const char* kPurgeBatchSql =
     "del AS (DELETE FROM inventory_store.inventory_data d USING b "
     "WHERE d.agent_id = b.agent_id AND d.plugin = b.plugin RETURNING 1) "
     "SELECT (SELECT count(*) FROM del), l.agent_id, l.plugin, "
-    "EXISTS (SELECT 1 FROM inventory_store.inventory_data u WHERE u.plugin = ANY($1::text[]) "
-    "AND (u.agent_id, u.plugin) > ($3::text, $4::text) AND NOT EXISTS "
-    "(SELECT 1 FROM b WHERE b.agent_id = u.agent_id AND b.plugin = u.plugin)) "
+    "CASE WHEN EXISTS (SELECT 1 FROM b) THEN false ELSE EXISTS (SELECT 1 FROM "
+    "inventory_store.inventory_data u WHERE u.plugin = ANY($1::text[]) AND (u.agent_id, "
+    "u.plugin) > ($3::text, $4::text)) END "
     "FROM (SELECT 1) x LEFT JOIN (SELECT agent_id, plugin FROM b "
     "ORDER BY agent_id DESC, plugin DESC LIMIT 1) l ON true";
 // Per-batch server-side bound (SET LOCAL, so it never leaks onto the pooled connection).
