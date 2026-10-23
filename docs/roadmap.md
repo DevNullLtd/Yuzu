@@ -164,7 +164,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 12.11 | [#282](https://github.com/Tr3kkR/Yuzu/issues/282) | Application Whitelisting | Open |
 | | 12.12 | [#283](https://github.com/Tr3kkR/Yuzu/issues/283) | Inventory Replication (Delta Sync) | **Done** (NOT_PLANNED, 2026-07-14, delivered differently: ADR-0016's hash-skip conditional sync, `sync_scheduler.hpp`) |
 | | 12.13 | [#284](https://github.com/Tr3kkR/Yuzu/issues/284) | Binary Resource Distribution | Open |
-| **13** | 13.1 | [#285](https://github.com/Tr3kkR/Yuzu/issues/285) | 2FA for Instruction Approval (TOTP) | Open (stale — TOTP/MFA step-up shipped generally and is wired to approve/reject by #6061 and #6079; close this issue when #6079 merges, see body note) |
+| **13** | 13.1 | [#285](https://github.com/Tr3kkR/Yuzu/issues/285) | 2FA for Instruction Approval (TOTP) | Open (stale - TOTP/MFA step-up shipped generally and is wired to approve/reject by #6061 and #6079; close this issue when #6079 merges, see body note) |
 | | 13.2 | [#286](https://github.com/Tr3kkR/Yuzu/issues/286) | Composable Instruction Chains | **Done** (NOT_PLANNED, 2026-07-14, delivered: `workflow_engine.cpp` `foreach_source` step field + step interpolation) |
 | | 13.3 | [#287](https://github.com/Tr3kkR/Yuzu/issues/287) | Process / Sync Logging UI | Open |
 | | 13.4 | [#288](https://github.com/Tr3kkR/Yuzu/issues/288) | Dashboard Branding | Open |
