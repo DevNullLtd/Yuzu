@@ -973,10 +973,6 @@ TEST_CASE("response tier SQL folds the plugin name as ASCII (observable on a loc
     // U+0130 (LATIN CAPITAL LETTER I WITH DOT ABOVE): a locale-aware lower() folds it to a plain
     // "i" under some database locales, which would turn this into the Forensics plugin's name.
     // An ASCII fold leaves it alone, so the row is NOT the Forensics plugin, exactly as in C++.
-    const std::string lookalike = "BROWSER_\xC4\xB0NVENTORY";
-    REQUIRE_FALSE(test::forensics_plugin_set().contains(lookalike));
-    put_source_row(store, "exec-fold", "agent-1", "BROWSER_INVENTORY", "upper-ascii");
-    put_source_row(store, "exec-fold", "agent-2", lookalike, "lookalike");
     //
     // WHAT THIS CAN OBSERVE: only a database whose lower() is locale-aware. On a cluster created
     // with the C/POSIX locale a plain lower() already leaves U+0130 alone, so this case passes
@@ -993,6 +989,10 @@ TEST_CASE("response tier SQL folds the plugin name as ASCII (observable on a loc
         INFO("database lower() folds U+0130 to i (locale-aware, this case discriminates): "
              << PQgetvalue(probe.get(), 0, 0));
     }
+    const std::string lookalike = "BROWSER_\xC4\xB0NVENTORY";
+    REQUIRE_FALSE(test::forensics_plugin_set().contains(lookalike));
+    put_source_row(store, "exec-fold", "agent-1", "BROWSER_INVENTORY", "upper-ascii");
+    put_source_row(store, "exec-fold", "agent-2", lookalike, "lookalike");
     put_source_row(store, "exec-fold", "agent-3", test::kOrdinaryPlugin, "ordinary");
 
     const auto non_holder = ResponseTierFilter::exclude(test::forensics_plugin_set(),
