@@ -5466,8 +5466,9 @@ void RestApiV1::register_routes(
         auto token_id = req.matches[1].str();
 
         // Owner-scoped revocation (fixes #222). `ApiToken:Delete` alone is
-        // not sufficient — callers must either own the token or hold the
-        // global admin role. Without this a user with Delete permission
+        // not sufficient — callers must either own the token or be an
+        // effective admin (global admin role or a JIT admin elevation).
+        // Without this a user with Delete permission
         // could enumerate and revoke any other user's tokens (IDOR).
         //
         // Both the missing-id and the not-owner cases return 404 with an
