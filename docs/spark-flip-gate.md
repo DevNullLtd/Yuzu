@@ -1328,8 +1328,7 @@ flip, with a red-first test each:
     at the generation the agent already holds is not followed by an automatic full_sync, and the
     hold lasts until an operator sends a full_sync or the generation moves. Baseline deploy and
     delete of a DEPLOYED Baseline DO bump it and push a fleet-wide full_sync (`guardian_routes.cpp`,
-    the `bump_policy_generation()` calls followed by `push_fn_("", true)`); a deploy retries the hold (a wedged rule stays held until its hung call
-    returns), but a delete is not a repair: it withdraws every Guard no other deployed Baseline
+    the `bump_policy_generation()` calls followed by `push_fn_("", true)`); a deploy retries the hold (a wedged rule stays held until its hung call returns, a full push drops it, an edit re-keys it, or the agent restarts with the target no longer hung; AC-1), but a delete is not a repair: it withdraws every Guard no other deployed Baseline
     delivers, so the hold on such a rule ends because the rule is no longer pushed. A delta-only hold is
     therefore not self-repairing, and its visibility is limited: on the Spark path an arm
     failure or wedge shows in `arm_failed`, but a carried synchronous failure is not counted
