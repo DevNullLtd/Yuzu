@@ -407,10 +407,10 @@ and 300 when that is `0` or negative, independent of `--mfa-enforcement`, so nei
 token, not that a second factor was presented again at approval time, and any single MFA-method
 `amr` value the gate accepts counts; real re-authentication (`auth_time` with `max_age`) is a planned
 follow-up; (b) `--mfa-reset` ends the account's sessions (and records `sessions_ended` in its audit row) and
-disabling MFA in Settings ends the account's other sessions; the comparison of the proof with the
+disabling MFA in Settings ends every session of the account, the caller's included; the comparison of the proof with the
 current enrolment stops an older proof being reused after re-enrolment and assumes the database
-primary clock does not step backward (ADR-2002 section 4 treats that clock as a monitored security
-dependency); (c) a non-admin
+primary clock does not step backward (ADR-2002 section 4 treats that clock as a security
+dependency; the shipped control is the `YuzuSessionReapClockAnomaly` alert, which sees a backward step only when it exceeds the time since the last session reap pass, about 15 minutes at most, and a forward step only when it exceeds about a year); (c) a non-admin
 cannot enrol itself under `--mfa-enforcement=optional` or `admin-only` (this refuses the approver
 `mfa_not_enrolled` only with RBAC enforcement on; with enforcement off, the shipped default, a non-admin
 is refused `403` "admin role required" before the MFA gate, so enrolment achieves nothing until

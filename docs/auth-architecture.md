@@ -757,15 +757,19 @@ Consequences, each deliberate:
   in `AuthRoutes::require_permission` requires the `admin` role for `Approval:Approve`, so a non-admin
   is refused `403` "admin role required" before the MFA gate, and the enrolment paths achieve nothing
   until enforcement is turned on.
-- **Session ending on every factor clear.** `yuzu-server --mfa-reset` deletes the account's durable
+- **Sessions ended on every factor clear (API tokens are not).** `yuzu-server --mfa-reset` deletes the account's durable
   sessions in the same one-shot (`SessionStore::invalidate_user`, which bumps the generation so every
   replica drops its cached copy), and exits non-zero if that fails; the audit row records
-  `sessions_ended` either way. Disabling MFA from Settings (`mfa_disable`) deletes the account's OTHER
-  sessions (`SessionStore::invalidate_user_except`, same generation bump) and keeps the one making the
-  request; the audit row records `other_sessions_ended`. These are the only two production callers of
+  `sessions_ended` either way. Disabling MFA from Settings (`mfa_disable`) deletes EVERY session of the account, the caller's
+  included (`AuthManager::invalidate_user_sessions`, same generation bump), clears the cookie and sends the
+  browser to `/home`; the audit row records `sessions_ended=<n>`, or result `partial` with
+  `sessions_ended=failed` when the durable delete failed (the factor stays cleared, and pressing Disable
+  again retries the delete). Neither path ends API tokens. These are the only two production callers of
   `mfa_disable`. The proof-versus-enrolment comparison above remains the second line: it assumes the
   database primary clock does not step backward (ADR-2002 section 4 treats database clock integrity as
-  a monitored security dependency). The check is an admission boundary: a clearance committed before the read is honoured, one
+  a security dependency; the shipped control is the `YuzuSessionReapClockAnomaly` alert, which fires only when a
+  session reap pass declines: it sees a backward step only when it exceeds the time since the last accepted
+  pass, about 15 minutes at most, and a forward step only when it exceeds about a year). The check is an admission boundary: a clearance committed before the read is honoured, one
   committed after it is seen from the next request, and the two session resolves on the route are not
   atomic.
 - **Mixed versions and rollback.** The enrolled-factor requirement is in force only while every replica

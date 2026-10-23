@@ -303,7 +303,8 @@ until they expire. A failover to a standby that was behind loses the same recent
    changed since the dump has reverted unless step 3 re-applied it). Where the
    audit store survived, or in the SIEM copy, also look for `mfa.disabled` (an
    administrator cleared their own factor; failed attempts write the same action
-   with `result=error`), `mfa.reset.breakglass` (an operator cleared one with
+   with `result=error`, and `result=partial` means the factor was cleared but its
+   sessions were not ended), `mfa.reset.breakglass` (an operator cleared one with
    the `--mfa-reset` CLI), `mfa.enroll.verified` and `mfa.recovery_code.used`
    rows after the dump's timestamp. Then clear again or enrol again as
    intended (see "Enrolling a non-admin approver" below). The same restore can
@@ -686,8 +687,20 @@ command exits non-zero with `error: MFA cleared but the account's sessions were
 not ended`. The audit row is still written, with `sessions_ended=failed`. Treat
 that as an incomplete reset. Run `DELETE /api/v1/sessions?username=<name>`
 yourself and record the manual session deletion in your change-management
-system. Disabling MFA from Settings ends the account's **other** sessions and
-keeps the one making the request.
+system. Disabling MFA from Settings ends **every** session of the account, the
+caller's included, and sends the browser to the landing page; if the durable
+delete fails there, the audit row is `mfa.disabled` with `result=partial` and
+`sessions_ended=failed`, and the user presses Disable again to retry. Neither
+path ends API tokens; revoke those through the token endpoints.
+
+**Re-running `--mfa-reset`.** Running it again after a `sessions_ended=failed`
+is safe for sessions (the delete is idempotent), but it also clears any factor
+the user has enrolled in the meantime. Re-run it only before the user enrols
+again; once they have, end the sessions with
+`DELETE /api/v1/sessions?username=<name>` instead. That route needs
+`UserManagement:Write` and an MFA step-up when the caller is enrolled, so use a
+different administrator; in a sole-administrator lockout there is no other
+caller, so re-run `--mfa-reset` before they enrol again.
 
 **Detective control.** Because the CLI exits without serving, it emits no
 Prometheus metric — the audit row is the only signal. Alert on
@@ -713,6 +726,25 @@ UPDATE auth.users
 DELETE FROM auth.mfa_recovery_codes WHERE username = 'alice';
 SQL
 ```
+
+This clears the factor only. It ends **no session**, and a session made under the
+old factor may hold an MFA proof from it. End the account's sessions in the same
+sitting, either with `DELETE /api/v1/sessions?username=alice` (needs a different
+administrator holding `UserManagement:Write`; not possible in a sole-administrator
+lockout) or with the same statements the server runs:
+
+```bash
+psql -v ON_ERROR_STOP=1 "$YUZU_POSTGRES_DSN" <<'SQL'
+BEGIN;
+DELETE FROM session_store.sessions WHERE username = 'alice';
+INSERT INTO session_store.session_meta (key, value) VALUES ('write_generation', '1')
+ON CONFLICT (key) DO UPDATE SET value = (session_store.session_meta.value::bigint + 1)::text;
+COMMIT;
+SQL
+```
+
+The generation bump is required for the same reason as in
+[Sessions are durable](#sessions-are-durable). API tokens are not touched.
 
 Clearing the secret needs no KEK (you are writing NULL, not reading
 ciphertext), so this works even when the KEK is unavailable.

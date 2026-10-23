@@ -206,10 +206,14 @@ principal and not an engine principal. The existing rule that the reviewer canno
     enrolled, authorised approver exists who is not the submitter of each request you expect to be decided: until
     then nothing can be approved. A seeded administrator that has never enrolled is in the same position. Self-service
     enrolment for non-admins is a planned follow-up and is not part of this change. `yuzu-server --mfa-reset`
-    ends the account's sessions, and disabling MFA in Settings ends the account's other sessions and keeps the
-    one you are using. **With RBAC enforcement off (the shipped default),** the legacy gate requires the `admin` role for
+    ends the account's sessions, and disabling MFA in Settings ends every session of the account, the one you
+    are using included (neither ends API tokens). **With RBAC enforcement off (the shipped default),** the legacy gate requires the `admin` role for
     approving, so a non-admin is refused `403` "admin role required" before the MFA check and enrolling a non-admin
     approver achieves nothing until RBAC enforcement is turned on.
+  - **Mixed versions and clearing a factor.** Until every replica and the CLI image run this build, an old binary's
+    `--mfa-reset` or Settings disable clears the factor without ending the account's sessions. Afterwards run the new
+    binary's `--mfa-reset` (before the user enrols again, because it clears the factor) or
+    `DELETE /api/v1/sessions?username=<name>`.
   - **An unreadable MFA store, or an unreadable stored session proof,** answers `503` with `retry_after_ms` and increments
     `yuzu_auth_secret_unavailable_total{route="approval"}`; nothing is decided.
 - **A same-site `Origin` (or `Referer`) is now required.** A browser or script `POST` to
@@ -315,6 +319,8 @@ ORDER BY username;
 
 `role` is the account's legacy role column, not its RBAC grants, so compare the result with who holds
 `Approval:Approve`. An account listed here is refused as an approver (`mfa_not_enrolled`) after the upgrade, so enrol it first if it is meant to approve; a non-admin needs the enrolment sign-in window described above.
+With RBAC enforcement off (the shipped default), a non-admin account is refused `403` "admin role required" before
+the MFA check, so `mfa_not_enrolled` is what an administrator sees, and a non-admin sees it only once enforcement is on.
 
 **After upgrading, verify approvals on a test request.** Use a test device and a harmless, read-only
 instruction, and do not skip the safety notes in step 1: an execute call that is not held for approval really
@@ -369,7 +375,10 @@ dispatches.
    `approver_assurance:mfa_not_enrolled`), and an enrolled local account whose last MFA proof is older than the
    window (expect the step-up `401`, then success after the code). Then enrol a non-admin approver through the
    runbook and confirm it succeeds. Each repeat needs its own pending test request, submitted by someone other than
-   the account being tried, and a decided request cannot be decided again.
+   the account being tried, and a decided request cannot be decided again. **With RBAC enforcement off (the shipped
+   default),** only administrator accounts reach the MFA check (any other account is refused `403` "admin role
+   required" first), so this step can only be run with administrator accounts, and the non-admin enrolment
+   outcome cannot be observed until enforcement is on.
 5. Clean up. Reject every test request that is still pending, from the dashboard Approvals page or with
    `POST /api/approvals/{id}/reject` (same gates as approve: a human session with a fresh step-up, a same-site
    `Origin`, and not the submitter). A ticket that is already `approved` cannot be rejected; it stays listed as
