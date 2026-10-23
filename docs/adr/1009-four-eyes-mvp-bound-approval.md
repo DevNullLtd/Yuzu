@@ -464,8 +464,16 @@ keep them green and extend them to the new surface. Test names are the case titl
   `submit_bound: a bound mint cannot name a schedule`, in `test_approval_manager_bound.cpp`
   (`static_assert`s that pin the whole `submit_bound` signature and that the old schedule-id call
   shape does not compile, plus a mint that stores an empty schedule id), and
-  `ScheduleRunner: a bound ticket is never selected or fired`, in `test_schedule_runner.cpp`
-  (an approved bound ticket for the schedule's creator, definition and scope does not fire).
+  `ScheduleRunner: a bound ticket is never selected or fired (#6062)`, in `test_schedule_runner.cpp`
+  (an approved bound ticket for the schedule's creator, definition, scope and target plugin/action,
+  differing only in its empty schedule id, is not selected, and a control with the schedule's id
+  fires).
+- **Enforced review of the activation** (maintainer ruling 2026-10-23, ledger row
+  `sec-1-dormant-authz-cluster`): no change that wires the first producer of bound tickets merges
+  until an enforced review of that activation exists, either CODEOWNERS entries for the approval
+  store, the dormant-code tripwire and this ADR together with branch protection that requires
+  code-owner review, or a recorded procedural exception by the maintainer. Reviewing this PR does
+  not satisfy it; it constrains #6063.
 
 ## Honest residuals and not in the MVP
 

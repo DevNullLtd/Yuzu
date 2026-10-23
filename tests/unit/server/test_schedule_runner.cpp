@@ -615,35 +615,58 @@ TEST_CASE("ScheduleRunner: approving the ticket fires the held occurrence exactl
 // #6062 (pm3): a bound ticket is never schedule-fired. The runner matches approved tickets on
 // (schedule_id, definition, scope) with no origin check, so the barrier is that a bound ticket is
 // minted with an empty schedule id (submit_bound has no schedule-id parameter) and no schedule's id
-// is empty. This is the behavioural half of that argument: an approved bound ticket for the
-// schedule's creator, definition and scope is not selected, nothing fires, and the runner raises
-// its own ask instead.
+// is empty. This is the behavioural half of that argument.
+//
+// The bound ticket is minted with the schedule's own creator, definition, scope AND target
+// plugin/action, so `schedule_id` is the ONLY leg of the runner's match that differs. Without the
+// matching target the runner would refuse it as stale review (approval_content_mismatch) whether
+// or not the schedule_id comparison existed, and the test could not tell the two causes apart.
+// The control section runs the same shape with the schedule's id and must fire, which proves the
+// other legs do match.
 TEST_CASE("ScheduleRunner: a bound ticket is never selected or fired (#6062)",
           "[schedule][runner][approval][pg][6062]") {
     Harness h;
     auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
 
-    auto bound = h.approvals.submit_bound("test.def", "admin", "", ApprovalOrigin::kGuardianDeploy,
-                                          BoundRequest{R"({"k":1})", {}});
-    REQUIRE(bound.has_value());
-    REQUIRE(h.approvals.approve(*bound, "boss", "ok").has_value());
-    const auto row = h.approvals.get(*bound);
-    REQUIRE(row.has_value());
-    REQUIRE(row->schedule_id.empty());
+    SECTION("a bound ticket matching every leg except schedule_id is not selected") {
+        // The Harness definition resolves to procs.list (see its definition fixture).
+        auto bound = h.approvals.submit_bound("test.def", "admin", "",
+                                              ApprovalOrigin::kGuardianDeploy,
+                                              BoundRequest{R"({"k":1})", {}}, "procs", "list");
+        REQUIRE(bound.has_value());
+        REQUIRE(h.approvals.approve(*bound, "boss", "ok").has_value());
+        const auto row = h.approvals.get(*bound);
+        REQUIRE(row.has_value());
+        REQUIRE(row->schedule_id.empty());
+        REQUIRE(row->target_plugin == "procs");
+        REQUIRE(row->target_action == "list");
 
-    h.runner.tick();
+        h.runner.tick();
 
-    CHECK(h.enqueues.empty()); // nothing fired under the bound approval
-    CHECK(h.get(id).execution_count == 0);
-    CHECK(h.get(id).next_execution_at == 1); // occurrence held, not advanced
-    auto pending = h.approvals.query({.status = "pending"});
-    REQUIRE(pending.size() == 1); // the runner raised its own ask
-    CHECK(pending[0].id != *bound);
-    CHECK(pending[0].schedule_id == id);
-    auto after = h.approvals.get(*bound);
-    REQUIRE(after.has_value());
-    CHECK(after->status == "approved");
-    CHECK(after->consumed_at == 0); // untouched, not retired by the runner
+        CHECK(h.enqueues.empty()); // nothing fired under the bound approval
+        CHECK(h.get(id).execution_count == 0);
+        CHECK(h.get(id).next_execution_at == 1); // occurrence held, not advanced
+        auto pending = h.approvals.query({.status = "pending"});
+        REQUIRE(pending.size() == 1); // the runner raised its own ask
+        CHECK(pending[0].id != *bound);
+        CHECK(pending[0].schedule_id == id);
+        auto after = h.approvals.get(*bound);
+        REQUIRE(after.has_value());
+        CHECK(after->status == "approved");
+        CHECK(after->consumed_at == 0); // untouched, not retired by the runner
+    }
+
+    SECTION("control: the same shape carrying the schedule's id does fire") {
+        auto unbound = h.approvals.submit("test.def", "admin", "", id, ApprovalOrigin::kSchedule,
+                                          "procs", "list");
+        REQUIRE(unbound.has_value());
+        REQUIRE(h.approvals.approve(*unbound, "boss", "ok").has_value());
+
+        h.runner.tick();
+
+        REQUIRE(h.enqueues.size() == 1);
+        CHECK(h.enqueues[0].approval_id == *unbound);
+    }
 }
 
 // #6061 (governance SG-2): the runner retires a ticket via retire_schedule_tickets (before #6096,
