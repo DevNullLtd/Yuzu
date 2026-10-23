@@ -16,6 +16,10 @@
  * author never looked at. Only a comparison against the ACTUAL REGISTERED
  * ROUTE TABLE — this file — can catch that.
  *
+ * The scan helpers (`discover_mutating_routes`, `read_all_cpp_files`, `probe_path`, the memoisation
+ * described under CACHING) live in route_inventory_scan.hpp, shared with
+ * test_step_up_route_inventory.cpp; the description below is of what that scan does.
+ *
  * MECHANISM — no hand-copied route list. A hand-copied list goes stale
  * exactly like the thing it's testing. This test opens every `*.cpp` AND
  * `*.inc` file under `server/core/src` (recursively, via
@@ -106,6 +110,7 @@
  */
 
 #include "body_cap_policy.hpp"
+#include "route_inventory_scan.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -122,143 +127,13 @@
 #include <utility>
 #include <vector>
 
-#ifndef YUZU_SERVER_SRC_DIR
-#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build (meson.project_source_root() / 'server' / 'core' / 'src') — see the server_test_exe cpp_args block."
-#endif
-
 using yuzu::server::resolve_body_cap;
 
 namespace {
 
 namespace fs = std::filesystem;
 
-/// One mechanically-extracted `sink.<Method>(...)` / `svr.<Method>(...)`
-/// route registration.
-struct RegisteredRoute {
-    std::string file; // basename, e.g. "rest_api_v1.cpp"
-    int line;
-    std::string method;   // "POST" / "PUT" / "PATCH"
-    std::string raw_path; // exactly as it appears in source — may be an httplib regex pattern
-};
-
-/// Read every `.cpp` AND `.inc` file under `dir` (recursively — server/core/src
-/// has a `pg/` subdirectory today; nothing forbids a route file landing
-/// under a future one) and return `{basename, contents}` pairs. `.inc` is
-/// scanned alongside `.cpp` because a route registration living in a
-/// textually-`#include`d fragment is still source text this scan must not
-/// silently skip; no `.inc` file exists under server/core/src today, but a
-/// future one that IS live must not regress this guard back to invisible.
-/// No other extension under server/core/src carries a route
-/// registration (verified: `.cpp`/`.hpp`/`.inc` are the only three
-/// extensions present, and no `.hpp` matches the route-registration regex).
-///
-/// Memoized (see the file header's CACHING note) — computed once per test
-/// process, on the assumption every call site in this TU passes the same
-/// `dir`.
-std::vector<std::pair<std::string, std::string>> read_all_cpp_files(const fs::path& dir) {
-    static const std::vector<std::pair<std::string, std::string>> cached = [&dir] {
-        // F7: fs::recursive_directory_iterator throws filesystem_error on a
-        // missing directory, which would otherwise surface as an opaque
-        // Catch2 "unexpected exception" abort before the REQUIRE_FALSE
-        // below ever runs — fail with an actionable message instead.
-        REQUIRE(fs::is_directory(dir));
-
-        std::vector<std::pair<std::string, std::string>> out;
-        for (const auto& entry : fs::recursive_directory_iterator(dir)) {
-            if (!entry.is_regular_file())
-                continue;
-            const auto ext = entry.path().extension();
-            if (ext != ".cpp" && ext != ".inc")
-                continue;
-            std::ifstream in(entry.path(), std::ios::binary);
-            REQUIRE(in.is_open());
-            std::ostringstream ss;
-            ss << in.rdbuf();
-            out.emplace_back(entry.path().filename().string(), ss.str());
-        }
-        return out;
-    }();
-    return cached;
-}
-
-/// Extract every body-bearing route registration (`sink.`/`svr.`/
-/// `web_server_->` receiver — see the file header's MECHANISM note —
-/// Post/Put/Patch/Delete method) from one file's raw source text. Matches
-/// either a plain `"..."` string literal or an `R"(...)"` raw string
-/// literal as the first argument — the path/pattern is always a literal in
-/// this codebase (never a computed std::string), which is exactly the
-/// assumption the sanity floor in `discover_mutating_routes` exists to
-/// catch if it ever stops being true.
-std::vector<RegisteredRoute> extract_routes(const std::string& file, const std::string& text) {
-    std::vector<RegisteredRoute> out;
-    // The receiver alternation is non-capturing — `sink.`/`svr.` use `.`,
-    // `web_server_` uses `->`, and neither spelling's IDENTITY is needed by
-    // any caller, only which method/path it registered. Group 1: method.
-    // Group 2: raw-string body (R"(...)"). Group 3: quoted-string body
-    // ("...", escapes intact). A leading `\b` on each receiver alternative
-    // keeps this from matching a CLIENT-side call sharing a method name on
-    // an unrelated receiver (`cli.Post(...)`/`client.Post(...)` in
-    // analytics_sinks.cpp/directory_sync.cpp/offload_target_store.cpp/
-    // webhook_store.cpp — verified excluded: neither "cli" nor "client" ends
-    // in "sink"/"svr", and "web_server_->" requires the literal receiver
-    // name, not just any `->Post(`).
-    static const std::regex re(
-        R"regex((?:\b(?:sink|svr)\.|\bweb_server_->)(Post|Put|Patch|Delete)\(\s*(?:R"\(([\s\S]*?)\)"|"((?:[^"\\]|\\.)*)"))regex");
-    for (auto it = std::sregex_iterator(text.begin(), text.end(), re); it != std::sregex_iterator();
-         ++it) {
-        const auto& m = *it;
-        std::string method = m[1].str();
-        std::transform(method.begin(), method.end(), method.begin(),
-                        [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-        std::string path = m[2].matched ? m[2].str() : m[3].str();
-        int line =
-            static_cast<int>(std::count(text.begin(), text.begin() + m.position(0), '\n')) + 1;
-        out.push_back({file, line, std::move(method), std::move(path)});
-    }
-    return out;
-}
-
-/// Build a representative concrete probe path for `resolve_body_cap` from a
-/// (possibly regex) registered path: every `(...)` capture group is
-/// replaced with a fixed placeholder segment. See the file header for why
-/// this is exact for this codebase's route patterns today.
-std::string probe_path(const std::string& raw_path) {
-    static const std::regex group_re(R"(\([^()]*\))");
-    return std::regex_replace(raw_path, group_re, "X");
-}
-
-/// Scan every `.cpp`/`.inc` under `YUZU_SERVER_SRC_DIR` and return every
-/// POST/PUT/PATCH/DELETE route registration found. Shared by every
-/// TEST_CASE below so the extraction logic — and its sanity floor — lives
-/// in exactly one place. Memoized (see the file header's CACHING note).
-std::vector<RegisteredRoute> discover_mutating_routes() {
-    static const std::vector<RegisteredRoute> cached = [] {
-        auto files = read_all_cpp_files(fs::path(YUZU_SERVER_SRC_DIR));
-        REQUIRE_FALSE(files.empty());
-
-        std::vector<RegisteredRoute> routes;
-        for (const auto& [file, text] : files) {
-            auto found = extract_routes(file, text);
-            routes.insert(routes.end(), found.begin(), found.end());
-        }
-        // Sanity floor: this repo has 215 mutating route registrations as
-        // measured against server/core/src at the time this floor was set
-        // (137 pre-existing sink./svr. POST/PUT/PATCH + 39 web_server_->
-        // POST/PUT/PATCH the F1 receiver fix newly sees + 39 DELETE the F3
-        // method-widening newly sees, across both receiver families). Set
-        // to 200 — comfortably above ordinary churn (a handful of routes
-        // added/removed/renamed between runs) but close enough to 215 that
-        // losing a whole receiver family or method again (as this scan
-        // previously did, silently, for 22% of the surface) still trips it.
-        // A near-zero count means the SCAN is broken (wrong directory, or a
-        // receiver/method spelling drifted), not that the route surface
-        // shrank to nothing — fail loud rather than pass vacuously on an
-        // empty or badly-undercounted inventory.
-        REQUIRE(routes.size() >= 200);
-        return routes;
-    }();
-    return cached;
-}
+using namespace yuzu::server::test::route_scan;
 
 /// `{method, EXACT raw registered path text (as it appears in source —
 /// regex patterns included verbatim), why the 4 MiB catch-all default is
