@@ -15818,6 +15818,117 @@ TEST_CASE("MCP #3685: supervised-tier execute_instruction fails closed at the C8
     CHECK_FALSE(dispatched);
 }
 
+// ── #4990: ForensicsAnalyst alone cannot dispatch a Forensics-class plugin, ticket or not ─────────
+//
+// Forensics:Read is also the RBAC pair `classify_and_authorize_dispatch` asks of a Forensics-class
+// plugin, so the dispatch chokepoint alone would admit a ForensicsAnalyst holder to the approval
+// check. What stops them is the tool's own `Execution:Execute` gate, which the role does not carry.
+// This drives the real McpServer handler at the supervised tier (approval tickets in play), with the
+// real catalogue and the real chokepoint over a real RbacStore, and pins the observed outcome.
+TEST_CASE("MCP execute_instruction: a caller holding only ForensicsAnalyst is refused at the "
+          "Execution:Execute gate, with or without an approval ticket",
+          "[mcp][pg][integration][execute][security][forensics_analyst]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+    rbac.set_rbac_enabled(true);
+    REQUIRE(rbac.assign_role({"user", "test-user", "ForensicsAnalyst"}).has_value());
+    // Control: the same chokepoint admits a holder of Execution:Execute that is not an admin.
+    REQUIRE(rbac.assign_role({"user", "ops-user", "Operator"}).has_value());
+    REQUIRE(rbac.assign_role({"user", "ops-user", "ForensicsAnalyst"}).has_value());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    static const yuzu::server::CommandCapabilityRegistry registry{YUZU_ALL_CAPABILITY_FRAGMENTS};
+    const auto has_permission = [&](std::string_view principal, std::string_view securable,
+                                    yuzu::server::authz::Operation op) {
+        return rbac.check_permission(std::string(principal), std::string(securable),
+                                     std::string(yuzu::server::authz::to_string(op)));
+    };
+
+    struct Outcome {
+        int mint_code{0};
+        int recall_status{0};
+        std::string recall_body;
+        bool dispatched{false};
+        int64_t consumed_at{0};
+    };
+    const auto run = [&](const std::string& user) {
+        Outcome out;
+        McpTestServer ts;
+        ts.mock_username = user;
+        ts.mock_role = auth::Role::user; // not an effective admin
+        ts.perm_override_for_test = [&](const std::string& securable, const std::string& op) {
+            return rbac.check_permission(user, securable, op);
+        };
+        ts.classify_fn_for_test = [](std::string_view p, std::string_view a) {
+            return registry.classify(p, a);
+        };
+        ts.authorize_dispatch_fn_for_test = [&](const yuzu::server::DispatchCaller& c,
+                                                std::string_view p, std::string_view a) {
+            return yuzu::server::detail::classify_and_authorize_dispatch(registry, c, p, a,
+                                                                          has_permission);
+        };
+        ts.caller_fn_for_test = [](const auth::Session& sess) {
+            return yuzu::server::DispatchCaller{.principal = sess.username,
+                                                .principal_role = "user",
+                                                .exec_visible = std::nullopt,
+                                                .principal_is_admin = false};
+        };
+        ts.approval_manager_for_test = &appr;
+        ts.start_with_dispatch(
+            [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                const std::string&, const std::unordered_map<std::string, std::string>&,
+                const std::string&,
+                const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+                out.dispatched = true;
+                return {.sent = 1, .command_id = "cmd-forensics"};
+            },
+            "supervised");
+        const std::string args =
+            R"("arguments":{"plugin":"browser_inventory","action":"profiles","agent_ids":["dev-1"])";
+        auto mint = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":)"
+                            R"("execute_instruction",)" +
+                            args + "}}}");
+        REQUIRE(mint);
+        const auto mint_body = nlohmann::json::parse(mint->body);
+        REQUIRE(mint_body.contains("error"));
+        out.mint_code = mint_body["error"]["code"].get<int>();
+        const auto approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+        REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+        auto recall = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":)"
+                              R"("execute_instruction",)" +
+                              args + R"(,"approval_id":")" + approval_id + R"("}}})");
+        REQUIRE(recall);
+        out.recall_status = recall->status;
+        out.recall_body = recall->body;
+        const auto ticket = appr.get(approval_id);
+        REQUIRE(ticket.has_value());
+        out.consumed_at = ticket->consumed_at;
+        return out;
+    };
+
+    // Control: Operator + ForensicsAnalyst holds Execution:Execute and Forensics:Read, so a recall
+    // with the approved ticket reaches the dispatch.
+    const auto ops = run("ops-user");
+    INFO("ops recall body: " << ops.recall_body);
+    CHECK(ops.mint_code == yuzu::server::mcp::kApprovalRequired);
+    CHECK(ops.recall_status == 200);
+    CHECK(ops.dispatched);
+
+    // ForensicsAnalyst alone: the first call still mints a ticket (the approval gate runs before the
+    // tool's own RBAC check, for every approval-gated tool), but the recall is refused 403 at the
+    // tool's Execution:Execute gate and nothing is dispatched. The ticket is spent by that recall.
+    const auto ana = run("test-user");
+    INFO("analyst recall body: " << ana.recall_body);
+    CHECK(ana.mint_code == yuzu::server::mcp::kApprovalRequired);
+    CHECK(ana.recall_status == 403);
+    CHECK(ana.recall_body == R"({"error":"forbidden"})");
+    CHECK_FALSE(ana.dispatched);
+    CHECK(ana.consumed_at != 0);
+}
+
 // ── 25. Missing plugin ───────────────────────────────────────────────────
 
 TEST_CASE("MCP Integration: execute_instruction missing plugin", "[mcp][integration][execute]") {

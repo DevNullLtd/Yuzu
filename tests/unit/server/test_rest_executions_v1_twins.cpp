@@ -562,7 +562,7 @@ TEST_CASE("GET /api/v1/executions/:id/responses: Forensics rows follow the calle
 // `resolve_forensics_visible` over a real AuthRoutes + RbacStore + ManagementGroupStore from the
 // caller's session cookie.
 TEST_CASE("GET /api/v1/executions/:id/responses through the REAL resolver: a ForensicsAnalyst holder "
-          "reads Forensics rows, a Viewer does not, and neither can dispatch",
+          "reads Forensics rows, a Viewer does not, and the role carries no Execution:Execute",
           "[pg][rest][executions][v1][responses][security][forensics][forensics_analyst]") {
     YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 6}};
@@ -640,8 +640,10 @@ TEST_CASE("GET /api/v1/executions/:id/responses through the REAL resolver: a For
     REQUIRE(rbac.assign_role({"user", "oli", "ForensicsAnalyst"}).has_value());
     CHECK(outputs(oli) == Outputs{"forensics-A", "forensics-B", "ordinary-A", "ordinary-B"});
 
-    // Reading is all the role does: the analyst cannot dispatch, the combined holder keeps only the
-    // Operator's own Execute, and the Forensics tier gains no write.
+    // Reading is all the role grants: it carries no Execution:Execute (the gate the dispatch routes
+    // ask first; their refusal of an analyst is pinned in test_command_routes.cpp and
+    // test_mcp_server.cpp, and the chokepoint alone would not stop one, see test_rbac_store.cpp),
+    // the combined holder keeps only the Operator's own Execute, and the Forensics tier gains no write.
     auto probe = [&](const std::unordered_map<std::string, std::string>& headers,
                      const char* securable, const char* op) {
         httplib::Request req;

@@ -656,7 +656,7 @@ TEST_CASE("RbacStore: ForensicsAnalyst seeding is idempotent across restarts",
     CHECK(store.list_roles().size() == role_count);
 }
 
-TEST_CASE("RbacStore: a user holding only ForensicsAnalyst reads Forensics-tier rows but cannot dispatch",
+TEST_CASE("RbacStore: a user holding only ForensicsAnalyst reads Forensics-tier rows and holds no Execute",
           "[rbac_store][pg][forensics_analyst]") {
     RBAC_STORE(store);
     REQUIRE(store.assign_role({"user", "ana", "ForensicsAnalyst"}).has_value());
@@ -814,11 +814,17 @@ TEST_CASE("RbacStore: Operator + ForensicsAnalyst gets only approval-gated Foren
     CHECK(opo.error().reason == detail::DispatchDenialReason::Forbidden);
 
     // ForensicsAnalyst alone: passes RBAC for the Forensics read but holds no Execute, and the
-    // gate still demands an approval; nothing about the role dispatches anything by itself.
+    // gate still demands an approval.
     auto ana = verdict("ana", ApprovalProvenance::None);
     REQUIRE_FALSE(ana.has_value());
     CHECK(ana.error().reason == detail::DispatchDenialReason::ApprovalRequired);
     CHECK_FALSE(store.check_permission("ana", "Execution", "Execute"));
+    // Characterised: THIS chokepoint, on its own, admits that holder once a real approval ticket is
+    // present (the RBAC pair a Forensics-class plugin is dispatched under is Forensics:Read). What
+    // stops an analyst is the dispatch routes' own Execution:Execute gate, which sits in front of
+    // this decision: /api/command (test_command_routes.cpp) and MCP execute_instruction
+    // (test_mcp_server.cpp) pin that refusal. Do not read this line as "the analyst can dispatch".
+    CHECK(verdict("ana", ApprovalProvenance::Ticket).has_value());
 }
 
 TEST_CASE("RbacStore: RBAC disabled by default", "[rbac_store][pg]") {
