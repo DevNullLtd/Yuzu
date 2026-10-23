@@ -1030,10 +1030,12 @@ std::expected<void, std::string> GuardianEngine::start_local() {
     // drains as a failure (the late variant: a Spark arm accepted at boot that later
     // resolves to a non-Committed outcome), and never for any other application. The
     // synchronous variants (a returned Failed or a throw in the walk below) go through
-    // note_boot_rearm_failure_locked(), which also latches this application, so the tick's
-    // can_advance() clear cannot erase them before the server has been told (a latched
-    // application's effect is can_advance() == false: decide_retry() also reads the latch, but
-    // the boot application's empty content_id sentinel returns Reapply before that check).
+    // note_boot_rearm_failure_locked(), which records the failure against its rule (tagged
+    // boot-origin, #5547) in this application, so the tick's can_advance() clear cannot erase
+    // them before the server has been told (the recorded failure's effect is can_advance() ==
+    // false: decide_retry() also reads it, but the boot application's empty content_id
+    // sentinel returns Reapply before that check). If the record itself cannot be made
+    // (allocation failure) it falls back to the application-wide latch.
     // Contract: if this begin_*_application() throws there is no boot application, so the late
     // variant is invisible (late receipts are dropped by add_pending) and the latch is a
     // no-op; the synchronous variants are still covered.
@@ -1162,7 +1164,7 @@ std::expected<void, std::string> GuardianEngine::start_local() {
                 ++rearmed;
                 break;
             case ReconcileOutcome::Failed:
-                note_boot_rearm_failure_locked();
+                note_boot_rearm_failure_locked(rule.rule_id());
                 ++boot_rearm_failed;
                 break;
             case ReconcileOutcome::Accepted:
@@ -1170,7 +1172,7 @@ std::expected<void, std::string> GuardianEngine::start_local() {
                 break;
             }
         } catch (const std::exception& e) {
-            note_boot_rearm_failure_locked(); // #5513 (noexcept, allocates nothing)
+            note_boot_rearm_failure_locked(rule.rule_id()); // #5513/#5547 (noexcept)
             ++boot_rearm_failed;
             // Build once, log, and record for last_rearm_degrade_message_for_test - a single
             // source of truth rather than a second copy of this text. spdlog::error("{}", msg),
@@ -1206,7 +1208,7 @@ std::expected<void, std::string> GuardianEngine::start_local() {
             // The failure is recorded first (noexcept). The message names the rule like the
             // sibling arm does; log_id_token() allocates, so it is built in its own nested
             // try/catch and falls back to a fixed literal if that throws.
-            note_boot_rearm_failure_locked();
+            note_boot_rearm_failure_locked(rule.rule_id());
             ++boot_rearm_failed;
             try {
                 const std::string degrade_msg =
@@ -1791,20 +1793,41 @@ void GuardianEngine::journal_maintenance_tick() {
         // synchronous refusal already bumps. That counter is read only by tests today (no
         // heartbeat tag or metric, #4062), so this does not make the failure fleet-visible.
         std::size_t ack_arm_failures_this_tick = 0;
-        ack_ledger_->drain_locked(*spark_runtime_, kAckDrainMaxPerTick,
-                                  &ack_arm_failures_this_tick);
+        // #5547: the drain publishes its results by reference at each receipt's commit
+        // (drain_locked's contract), so a throw part-way leaves the failures it already
+        // committed in these two locals. They are consumed BELOW whether or not the drain
+        // threw: a receipt the drain committed as a failure and then left in `pending` is not
+        // counted again by the next drain (the insert is idempotent), so dropping the outputs
+        // with the exception would lose that failure, and for a boot-origin receipt the
+        // boot flag with it, permanently.
+        bool boot_origin_failed = false;
+        bool drain_threw = false;
+        try {
+            ack_ledger_->drain_locked(*spark_runtime_, kAckDrainMaxPerTick,
+                                      &ack_arm_failures_this_tick, &boot_origin_failed);
+        } catch (...) {
+            drain_threw = true;
+            ack_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
+        }
         if (ack_arm_failures_this_tick > 0) {
             arm_failures_.fetch_add(ack_arm_failures_this_tick, std::memory_order_relaxed);
             // #5513 (the late variant, dormant until prefer_spark_ flips): a receipt of the
-            // still-open BOOT application drained as a failure, so the boot re-arm did not
-            // complete. Guarded by boot_app_open_: a failure on any later application is an
-            // ordinary held push and must never report 0. NOT latched here (unlike the
-            // synchronous variants): a drained wedge stays retained and recoverable, and a
-            // late success adopted by the drain's recovery scan clears resolved_failed and
-            // lets the clear below fire with no push at all.
-            if (boot_app_open_)
+            // BOOT application drained as a failure, so the boot re-arm did not complete. Two
+            // ways to know: the boot application is still the open one (boot_app_open_), or
+            // the failing entry is boot-origin (#5547: the ledger tags an entry added while
+            // boot_app_open_ was set and carries the tag across a replacing delta that omits
+            // the rule, so the failure surfaces here even after boot_app_open_ was cleared).
+            // boot_app_open_ itself is NOT widened to "the application that carries a boot
+            // entry": a rule the replacing push NAMES and that then fails is an ordinary held
+            // push and must never report 0. NOT latched here (unlike the synchronous variants):
+            // a drained wedge stays retained and recoverable, and a late success adopted by
+            // the drain's recovery scan clears resolved_failed and lets the clear below fire
+            // with no push at all.
+            if (boot_app_open_ || boot_origin_failed)
                 boot_unresolved_ = true;
         }
+        if (drain_threw)
+            return; // the pre-#5547 posture: a throwing drain ends this tick's ack work
         if (ack_ledger_->can_advance()) {
             // #5513: any application that can advance is a clean one, the boot application
             // included (a latched or failed one cannot reach here), so the boot re-arm is
@@ -1972,6 +1995,26 @@ std::size_t GuardianEngine::ack_pending_count_for_test() const {
 std::size_t GuardianEngine::ack_failed_receipt_count_for_test() const {
     std::lock_guard lock(mtx_);
     return ack_ledger_->failed_receipt_count_for_test();
+}
+
+bool GuardianEngine::ack_boot_origin_for_test(const std::string& rule_id) const {
+    std::lock_guard lock(mtx_);
+    return ack_ledger_->boot_origin_for_test(rule_id);
+}
+
+void GuardianEngine::set_ack_drain_after_accounting_hook_for_test(
+    std::function<void(std::string_view)> hook) {
+    std::lock_guard lock(mtx_);
+    if (!hook) {
+        ack_ledger_->set_drain_fault_hook_for_test(nullptr);
+        return;
+    }
+    ack_ledger_->set_drain_fault_hook_for_test(
+        [hook = std::move(hook)](GuardianArmAckLedger::DrainFaultSite site,
+                                 std::string_view rule_id) {
+            if (site == GuardianArmAckLedger::DrainFaultSite::AfterAccounting)
+                hook(rule_id);
+        });
 }
 
 bool GuardianEngine::ack_latched_for_test() const {
@@ -2695,12 +2738,18 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
                      "failure; a legacy arm that returned false is not detected, #2797), "
                      "reporting policy_generation={} again",
                      policy_generation_);
-    } else if (!clean && boot_unresolved_) {
+    } else if (!clean && boot_unresolved_ && push.full_sync()) {
         // #5513 back-off (governance finding P-1): this catch-up did not resolve the boot
         // re-arm, and reporting 0 on every heartbeat would make the server re-push a full sync
         // about every heartbeat for as long as the rule keeps failing. Only an application that
         // reached this tail counts: the #4665 reject, the Suppress return, the begin_*_application
-        // and put_rule early returns above all leave the counters alone. A pending Spark arm
+        // and put_rule early returns above all leave the counters alone.
+        // #5547: and only a FULL_SYNC counts. The catch-up the server sends for a boot failure is
+        // always a full_sync (the heartbeat reconcile re-pushes full_sync=true), whereas a delta
+        // now carries the boot debt (a delta that omits the failed rule is unclean by
+        // construction), so counting it would let a stream of unrelated operator deltas keep
+        // extending the holdoff and postpone the real catch-up indefinitely. The whole update is
+        // gated, not only the increment: a delta also leaves the existing holdoff untouched. A pending Spark arm
         // also lands here (!can_advance()); the tick clears the flag, and the counters, once it
         // commits, so at worst the real generation is reported for a few heartbeats first. The
         // internal generation is untouched; only the next generation_report() calls change.
@@ -2911,16 +2960,27 @@ bool GuardianEngine::boot_rearm_unresolved() const {
     return boot_unresolved_;
 }
 
-void GuardianEngine::note_boot_rearm_failure_locked() noexcept {
+void GuardianEngine::note_boot_rearm_failure_locked(const std::string& rule_id) noexcept {
     boot_unresolved_ = true;
     arm_failures_.fetch_add(1, std::memory_order_relaxed);
-    // For the boot application the latch's effect is can_advance() == false, the predicate the
-    // tick's clear reads (see start_local()'s boot-application comment). decide_retry() also
-    // reads latched_failure, but the boot application's empty content_id sentinel returns
-    // Reapply before that check is reached. Calls GuardianArmAckLedger::latch_failure(), which
-    // is noexcept: this function is noexcept and runs inside the exhaustion catch.
-    // A no-op when begin_*_application() failed (no current application).
-    ack_ledger_->latch_failure();
+    // #5547 (Ruling 22 (d)): the failure is recorded AGAINST ITS RULE, tagged boot-origin,
+    // instead of as the application-wide latch. Its effect on this application is the same
+    // (note_sync_failure() makes can_advance() false, the predicate the tick's clear reads; see
+    // start_local()'s boot-application comment; decide_retry() returns Reapply on the boot
+    // application's empty content_id sentinel before any of that is consulted), but the identity
+    // travels: a replacing delta that omits the rule carries it, so an unrelated delta cannot
+    // clear the flag, and a push that NAMES the rule and arms it cleanly drops exactly this
+    // entry. note_sync_failure() allocates (a set insertion) and can throw, and this function is
+    // noexcept and runs inside the exhaustion catch; a throw falls back to the application-wide
+    // latch, which is strictly more conservative (it survives every delta and is cleared only by
+    // a clean full_sync) but loses the rule's identity. Both are no-ops when the boot
+    // begin_full_application() failed (no current application): identity is lost then and the
+    // synchronous flag set above is all that remains, as before.
+    try {
+        ack_ledger_->note_sync_failure(rule_id, /*boot_origin=*/true);
+    } catch (...) {
+        ack_ledger_->latch_failure(); // noexcept
+    }
 }
 
 bool GuardianEngine::put_rule_locked(const gpb::GuaranteedStateRule& rule) {

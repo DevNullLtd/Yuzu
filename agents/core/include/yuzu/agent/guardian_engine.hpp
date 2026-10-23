@@ -814,6 +814,17 @@ public:
         apply_pre_begin_hook_for_test_ = std::move(hook);
     }
 
+    /// TEST-ONLY (#5547): whether `rule_id` is tagged boot-origin in the CURRENT ack application
+    /// (see GuardianArmAckLedger::boot_origin_for_test). Takes mtx_. No production caller.
+    [[nodiscard]] bool ack_boot_origin_for_test(const std::string& rule_id) const;
+
+    /// TEST-ONLY (#5547): installs a hook on the ack ledger's drain that fires, with the rule id,
+    /// after a failed receipt's insertion and counters are committed and before it is erased from
+    /// `pending` (GuardianArmAckLedger::DrainFaultSite::AfterAccounting) - the exact window a
+    /// mid-drain throw would leave a receipt counted but still pending. Runs under mtx_ (the
+    /// tick drains under it); must not re-enter the engine. Null clears it. No production caller.
+    void set_ack_drain_after_accounting_hook_for_test(std::function<void(std::string_view)> hook);
+
     /// TEST-ONLY (#5547): whether the CURRENT ack application holds an application-wide latched
     /// failure (this application's own, not the inherited debt). Defined out-of-line like
     /// ack_pending_count_for_test(); takes mtx_. No production caller.
@@ -1045,7 +1056,8 @@ private:
     /// (policy_generation_ itself is never touched, so the persisted value and the two
     /// `> policy_generation_` advance gates are unchanged). Set by
     /// note_boot_rearm_failure_locked() (start_local's walk) and by the maintenance tick when a
-    /// receipt of the still-open boot application drains as a failure; cleared by any clean
+    /// receipt of the still-open boot application, or one tagged boot-origin that a replacing
+    /// delta carried (#5547), drains as a failure; cleared by any clean
     /// application (apply_rules' tail, or the tick's can_advance() block). Under mtx_, no atomics.
     bool boot_unresolved_{false};
     /// #5513 back-off (governance finding P-1): the number of catch-up applications (apply_rules
@@ -1084,12 +1096,17 @@ private:
     std::atomic<std::uint64_t> arm_failures_{0};
 
     /// #5513: the ONE place a boot re-arm failure is recorded, shared by start_local's
-    /// returned-Failed arm and both catch arms. mtx_ held. noexcept and allocation-free: it
-    /// runs inside the exhaustion catch. Sets boot_unresolved_, counts the failure into
-    /// arm_failures_, and latches the boot application (a no-op when the boot begin_full_application failed:
-    /// no current application) so the tick's can_advance() cannot clear the flag before the
-    /// server's catch-up push has applied cleanly.
-    void note_boot_rearm_failure_locked() noexcept;
+    /// returned-Failed arm and both catch arms. mtx_ held. noexcept: it runs inside the
+    /// exhaustion catch. Sets boot_unresolved_, counts the failure into arm_failures_, and
+    /// records the failure in the boot application AGAINST `rule_id`, tagged boot-origin
+    /// (#5547; GuardianArmAckLedger::note_sync_failure), so can_advance() cannot clear the flag
+    /// before the server's catch-up push has applied cleanly, a replacing delta that omits the
+    /// rule carries the record, and a push that names the rule and arms it cleanly drops it.
+    /// That call allocates and can throw, so this function CATCHES it and falls back to the
+    /// application-wide latch_failure() (noexcept; strictly more conservative, but without the
+    /// rule's identity). Both are no-ops when the boot begin_full_application() failed: there
+    /// is no current application, identity is lost, and boot_unresolved_ alone remains.
+    void note_boot_rearm_failure_locked(const std::string& rule_id) noexcept;
     bool put_rule_locked(const yuzu::guardian::v1::GuaranteedStateRule& rule);
     void refresh_count_locked();
     /// Persists `gen` to the policy-generation KV key. Returns kv_->set()'s own
