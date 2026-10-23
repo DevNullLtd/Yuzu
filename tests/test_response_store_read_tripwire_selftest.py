@@ -157,7 +157,21 @@ def main() -> int:
             "(authz::VisibleSet)std::nullopt",
             "(std::nullopt)",
             "((std::nullopt))",
-            "static_cast<authz::VisibleSet>((std::nullopt))"):
+            "static_cast<authz::VisibleSet>((std::nullopt))",
+            # g8p2-qe-2: the spellings the first hardening missed.
+            "::yuzu::server::authz::VisibleSet{std::nullopt}",
+            "::yuzu::server::authz::VisibleSet{}",
+            "::std::nullopt",
+            "::std::optional<std::unordered_set<std::string>>{}",
+            "authz::VisibleSet{std::nullopt,}",
+            "{std::nullopt,}",
+            "std::move(std::optional<authz::VisibleSet>{})",
+            "std::move(authz::VisibleSet{})",
+            "::std::move(std::nullopt)",
+            "auto{std::nullopt}",
+            "auto(std::nullopt)",
+            "decltype(vis){}",
+            "decltype(vis)()"):
         expect(any_mentions(idiom(f"auto f = ResponseTierFilter::exclude(*set, {spelling});"), "idiom.cpp"),
                f"exclude(set, {spelling}) must fail")
     for fixed in ("static_cast<const ForensicsPluginSet*>(nullptr)",
@@ -188,6 +202,11 @@ def main() -> int:
            "a cast of the accessor is not the null literal")
     expect(idiom("auto f = ResponseTierFilter::exclude(*set, authz::VisibleSet{ids});") == [],
            "exclude(set, VisibleSet{<non-empty>}) is a real set, not the unrestricted literal")
+    for real in ("::yuzu::server::authz::deny_all()", "std::move(ids)", "std::move(authz::deny_all())",
+                 "auto{ids}", "decltype(vis){ids}", "::authz::VisibleSet{ids}",
+                 "authz::VisibleSet{std::nullopt_like}"):
+        expect(idiom(f"auto f = ResponseTierFilter::exclude(*set, {real});") == [],
+               f"exclude(set, {real}) is a real argument, not the unrestricted literal")
     expect(any_mentions(idiom("auto f = ResponseTierFilter::for_fixed_plugin_poll(nullptr);"), "idiom.cpp"),
            "for_fixed_plugin_poll(nullptr) must fail")
     expect(idiom("auto f = ResponseTierFilter::exclude(*set, authz::deny_all());") == [],

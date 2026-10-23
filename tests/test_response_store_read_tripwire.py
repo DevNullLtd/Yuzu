@@ -373,19 +373,25 @@ def check_internal_sites(files: dict[str, str]) -> list[str]:
 
 
 # The literal spellings of "no restriction" for the second argument of exclude(): `std::nullopt`,
-# a value-initialised nullopt_t, a bare `{}` or `{std::nullopt}`, a value-initialised VisibleSet or
-# `std::optional<...>` built from nothing or from `std::nullopt` (braces or parentheses), each
-# optionally wrapped in a `static_cast<...>(...)`, a C-style cast or redundant parentheses. A
-# VARIABLE holding a nullopt cannot be seen lexically (review-enforced, and `tier_filter_for` is the
-# sanctioned shape that derives it from the resolver).
+# a value-initialised nullopt_t, a bare `{}` or `{std::nullopt}` (a trailing comma allowed), a
+# value-initialised VisibleSet or `std::optional<...>` built from nothing or from `std::nullopt`
+# (braces or parentheses), `auto{std::nullopt}` / `auto(std::nullopt)`, `decltype(x){}`, each with an
+# optional leading `::`, and each optionally wrapped in a `static_cast<...>(...)`, a C-style cast,
+# `std::move(...)` or redundant parentheses. A VARIABLE holding a nullopt cannot be seen lexically
+# (review-enforced, and `tier_filter_for` is the sanctioned shape that derives it from the
+# resolver), nor can a spelling through a user-defined alias of the VisibleSet type or a macro.
+_GLOBAL = r"(?:::)?"
+_NULLOPT = _GLOBAL + r"std::nullopt"
 _EMPTY_INIT = r"(?:\{\s*\}|\(\s*\))"
-_NULLOPT_INIT = r"(?:\{\s*std::nullopt\s*\}|\(\s*std::nullopt\s*\))"
+_NULLOPT_INIT = r"(?:\{\s*" + _NULLOPT + r"\s*,?\s*\}|\(\s*" + _NULLOPT + r"\s*\))"
 _UNRESTRICTED_VISIBLE = re.compile(
-    r"^(?:std::nullopt(?:_t\s*" + _EMPTY_INIT + r")?"
+    r"^(?:" + _NULLOPT + r"(?:_t\s*" + _EMPTY_INIT + r")?"
     r"|\{\s*\}"
-    r"|\{\s*std::nullopt\s*\}"
-    r"|(?:\w+::)*VisibleSet\s*(?:" + _EMPTY_INIT + r"|" + _NULLOPT_INIT + r")"
-    r"|std::optional\s*<.*>\s*(?:" + _EMPTY_INIT + r"|" + _NULLOPT_INIT + r"))$")
+    r"|\{\s*" + _NULLOPT + r"\s*,?\s*\}"
+    r"|" + _GLOBAL + r"(?:\w+::)*VisibleSet\s*(?:" + _EMPTY_INIT + r"|" + _NULLOPT_INIT + r")"
+    r"|" + _GLOBAL + r"std::optional\s*<.*>\s*(?:" + _EMPTY_INIT + r"|" + _NULLOPT_INIT + r")"
+    r"|auto\s*" + _NULLOPT_INIT +
+    r"|decltype\s*\([^()]*\)\s*" + _EMPTY_INIT + r")$")
 _NULL_PLUGIN_SET = re.compile(r"^(?:nullptr|NULL|0|\{\s*\})$")
 _C_CAST = re.compile(r"^\(\s*[\w:<>,\s*&]+\)\s*(?=[\w{(:])")
 
@@ -404,8 +410,8 @@ def _balanced_end(s: str, i: int, open_c: str, close_c: str) -> int:
 
 
 def _peel(arg: str) -> str:
-    """The argument text with redundant wrappers removed: outer parentheses, `static_cast<T>(x)`
-    and a C-style `(T)x`. What is left is matched against the literal spellings above, so peeling
+    """The argument text with redundant wrappers removed: outer parentheses, `static_cast<T>(x)`,
+    `std::move(x)` and a C-style `(T)x`. What is left is matched against the literal spellings above, so peeling
     can only reveal a literal, never invent one."""
     a = " ".join(arg.split())
     while True:
@@ -417,6 +423,12 @@ def _peel(arg: str) -> str:
             j = _balanced_end(a, m.end() - 1, "<", ">")
             rest = a[j:].lstrip() if j > 0 else ""
             if rest.startswith("(") and _balanced_end(rest, 0, "(", ")") == len(rest):
+                a = rest[1:-1].strip()
+                continue
+        m = re.match(r"(?:::)?std::move\s*(?=\()", a)
+        if m:
+            rest = a[m.end():]
+            if _balanced_end(rest, 0, "(", ")") == len(rest):
                 a = rest[1:-1].strip()
                 continue
         m = _C_CAST.match(a)
