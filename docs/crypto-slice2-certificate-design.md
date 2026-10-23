@@ -1736,8 +1736,9 @@ this account (<permission> is required)", never zeros (D12, `0070:901-905`).
 | Revoked within N days; revoked per ISO week | counts `revoked_within_days[]`, `revoked_per_iso_week` | 2b-2 |
 | Registered CRLs past `nextUpdate` | the revocation-source list's `crl_past_next_update` (`RevocationSource:Read`) | 2b-1 |
 
-Each widget drills into the per-certificate read with the matching filter, at the counts
-response's `as_of`. A paged drill is not guaranteed to recompute the widget's number exactly (paged
+Each widget drills into the per-certificate read with the matching filter. The drill is not
+pinned to the counts response's `as_of` and can include certificates not yet valid or
+future-dated, so it is a filtered view, not an exact list. A paged drill is not guaranteed to recompute the widget's number exactly (paged
 reads make no cross-page promise); the snapshot export is the exact check, and the D13 recompute
 test pins it. The Yuzu-CA widgets (R2) are not certificate widgets: ADR-0070
 gates them on `Inventory:Read`, with the confined-caller note, and they are never joined to these.
@@ -1915,13 +1916,15 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
    2a-2e.
 
 9. **D13 counts at fleet scale** (raised by 2a-3, measured 2026-10-23). Computed from raw rows
-   in one statement, the counts finish inside the 10 s read bound only up to about 1.3M
-   certificates in scope (about 7 µs per certificate; 13.5 s for 2M on a laptop Postgres). The
-   capacity target is 30–60M. Above the limit the counts answer 503 with a retry hint, never a
-   partial figure. The owner chooses: a stored rollup keyed to its `as_of` (which needs an
-   amendment to D13 condition 3, "never stored"), a longer bound with its own read slot, or an
-   asynchronous count job. 2a-3 ships the read-time counts with the limit stated; the chosen fix is
-   its own PR.
+   in one statement, the counts finish inside their 15 s read budget only up to about 1.3M
+   certificates in scope with a warm cache and two parallel workers (about 450k on a serial plan);
+   the capacity target is 30–60M. Above the limit the counts answer 503 with reason `scale_limit`
+   and no retry hint (a retry cannot succeed), never a partial figure. Counts and snapshots are a
+   long-read class that holds at most one of the read gate's slots, so an ordinary read admits
+   while one runs. The owner chooses the fleet-scale fix: a stored rollup keyed to its `as_of`
+   (an amendment to D13 condition 3, "never stored"), a longer bound with its own read slot, or
+   an asynchronous count job. 2a-3 ships the read-time counts with the limit stated; the chosen
+   fix is its own PR.
 
 10. **CBOM audit posture** (raised by 2a-4's governance, owner acknowledgement pending). The CBOM
     certificate half writes its own `crypto.certificates.view` row (`via=cbom`) and is omitted,
