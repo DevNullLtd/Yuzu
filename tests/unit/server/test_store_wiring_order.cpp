@@ -326,19 +326,16 @@ TEST_CASE("server.cpp: response_visible_set_fn is both defined and passed to "
     // empty or mangled, not that the file legitimately shrank.
     REQUIRE(text.size() > 100000);
 
-    // POSITIVE anchor 1: the resolver is defined, and its body is the real
-    // decision ladder -- not a stub that always returns nullopt/fleet-wide.
-    // Requiring both calls it actually makes (not just its name) means a
-    // resolver silently downgraded to "return std::nullopt;" still fails
-    // this, even though `response_visible_set_fn` itself would still exist.
+    // POSITIVE anchor 1: the resolver is defined, and its body DELEGATES to the real decision
+    // ladder (engine_aware_visibility.hpp's response_visible_set, which holds the
+    // check_permission / visible_agents_for_permission calls and is tested behaviourally against
+    // real stores in test_engine_aware_visibility.cpp, #6204). A resolver silently downgraded to
+    // "return std::nullopt;" no longer contains the delegation, so it still fails here.
     static const std::regex definition_re(R"(auto response_visible_set_fn =)");
     CHECK(std::regex_search(text, definition_re));
-    static const std::regex global_check_re(
-        R"(check_permission\(username, "Response", "Read"\))");
-    CHECK(std::regex_search(text, global_check_re));
-    static const std::regex scoped_check_re(
-        R"(visible_agents_for_permission\(username, "Response", "Read")");
-    CHECK(std::regex_search(text, scoped_check_re));
+    static const std::regex delegation_re(
+        R"(auto response_visible_set_fn =[^;]*visibility::response_visible_set\()");
+    CHECK(std::regex_search(text, delegation_re));
 
     // POSITIVE anchor 2: the resolver is actually PASSED to
     // register_routes, not merely defined and left unused. This is what
@@ -741,13 +738,14 @@ TEST_CASE("find_confined_dispatch_sink_sites recognises the documented construct
     }
 }
 
-// #6204: the username-keyed visibility and dispatch-permission resolvers in server.cpp must keep
-// their engine arm (an engine principal's only authority is an explicit RBAC grant, so the
-// legacy-open fallback must never apply to it). ServerImpl is not unit-constructible, so these
-// resolvers cannot be driven behaviourally; the pure composer and RbacStore halves are covered in
-// test_authz_model.cpp. This is a STRING-PRESENCE pin: it catches a dropped engine arm, not a
-// wrong one, the same limit the other cases in this file document.
-TEST_CASE("server.cpp: every username-keyed legacy-open resolver keeps its engine arm (#6204)",
+// #6204: ServerImpl must keep BINDING the engine-aware resolvers. The resolver logic itself lives in
+// engine_aware_visibility.hpp and is tested behaviourally against real stores in
+// test_engine_aware_visibility.cpp; ServerImpl is not unit-constructible, so this source scan pins
+// only the WIRING: each seam delegates to its resolver exactly once, and the two ExecVisibleFacts
+// builders still set the engine fact. A string-presence pin: it catches a seam rebound to inline
+// logic or a dropped call, not a wrong argument.
+TEST_CASE("server.cpp: every username-keyed resolver seam delegates to the engine-aware "
+          "resolver (#6204)",
           "[wiring_order][6204]") {
     const std::string& text = cached_server_cpp_text();
     const auto count = [&text](std::string_view needle) {
@@ -757,16 +755,14 @@ TEST_CASE("server.cpp: every username-keyed legacy-open resolver keeps its engin
             ++n;
         return n;
     };
-    // The session-keyed and username-keyed exec-visible derivations both feed the composer.
+    CHECK(count("yuzu::server::visibility::dispatch_permission(") == 1);
+    CHECK(count("yuzu::server::visibility::response_agent_in_scope(") == 1);
+    CHECK(count("yuzu::server::visibility::visible_agents_json(") == 1);
+    CHECK(count("yuzu::server::visibility::infrastructure_visible_set(") == 1);
+    CHECK(count("yuzu::server::visibility::response_visible_set(") == 1);
+    // The exec-visible derivations (session-keyed and headless username-keyed) feed the composer.
     CHECK(count("facts.principal_is_engine = sess.is_engine();") == 1);
     CHECK(count("facts.principal_is_engine = yuzu::server::authz::is_engine_principal_name(username);") == 1);
-    // dispatch_has_permission: legacy-open admits everyone EXCEPT an engine principal.
-    CHECK(count("return !yuzu::server::authz::is_engine_principal_name(principal);") == 1);
-    // response_agent_in_scope shares the same shape with `username`.
-    CHECK(count("return !yuzu::server::authz::is_engine_principal_name(username);") == 1);
-    // get_visible_agents_json and visible_set_fn take ONE enforcement snapshot per decision (two
-    // reads could disagree across a concurrent toggle and let an engine through both branches).
-    CHECK(count("!enforced && yuzu::server::authz::is_engine_principal_name(username)") == 2);
-    // response_visible_set_fn returns no agents for an engine under legacy-open.
-    CHECK(count("if (yuzu::server::authz::is_engine_principal_name(username))") == 1);
+    // No resolver was re-inlined: server.cpp holds no engine-prefix test of its own besides the one above.
+    CHECK(count("authz::is_engine_principal_name(") == 1);
 }
