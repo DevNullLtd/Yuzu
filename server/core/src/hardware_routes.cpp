@@ -381,10 +381,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     // `__sync__-` id: the sync command is a fixed system one that is never
                     // Forensics-tier. The read excludes the Forensics plugins outright, so that
                     // does not rest on the id check alone.
-                    const auto tier = deps_.forensics_plugins
-                                          ? ResponseTierFilter::exclude(*deps_.forensics_plugins,
-                                                                        authz::deny_all())
-                                          : ResponseTierFilter::refuse_unwired();
+                    const auto tier =
+                        ResponseTierFilter::for_fixed_plugin_poll(deps_.forensics_plugins);
                     for (const auto& r : deps_.responses_fn(command_id, tier, id)) {
                         if (r.agent_id != id) continue;
                         if (r.status >= 2) {

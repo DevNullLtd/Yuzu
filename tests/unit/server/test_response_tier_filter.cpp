@@ -10,6 +10,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -177,8 +178,8 @@ TEST_CASE("plugins_on_securable lowercases, de-duplicates and filters by securab
 // Each block proves two things at compile time: the read is NOT callable in any form that omits the
 // filter (a default value on the parameter, or an overload without it, would flip the first assert),
 // and it IS callable with the filter (so the first assert is not vacuously true). A NEW public read
-// method on ResponseStore needs a line here; a tripwire over response_store.hpp that enforces the
-// exact set of read methods is a separate follow-up.
+// method on ResponseStore needs a line here; tests/test_response_store_read_tripwire.py enforces the
+// exact set of read methods and the call-site rules.
 
 namespace {
 
@@ -316,6 +317,9 @@ TEST_CASE("ResponseTierFilter::refuse_unwired and for_fixed_plugin_poll",
     CHECK(poll.restricts());
     CHECK(poll.excluded_plugins() == set.names());
     CHECK(poll.exempt_agents().empty());
-    // ...and an unwired harness (no set) simply has no clause: the plugin is fixed either way.
-    CHECK_FALSE(ResponseTierFilter::for_fixed_plugin_poll(nullptr).restricts());
+    // ...and an unwired surface (no set) refuses every row: a fixed plugin does not make an
+    // unwired poll safe to run unfiltered.
+    const auto unwired = ResponseTierFilter::for_fixed_plugin_poll(nullptr);
+    CHECK(unwired.restricts());
+    CHECK(unwired.refuses_every_row());
 }

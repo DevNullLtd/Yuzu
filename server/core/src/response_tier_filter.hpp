@@ -25,21 +25,10 @@
 #include <utility>
 #include <vector>
 
+#include "ascii_fold.hpp" // ascii_lower: the one plugin-name fold
 #include "authz_model.hpp"
 
 namespace yuzu::server {
-
-/// ASCII lowercase of a plugin name. The ONE fold the Forensics tier uses in C++ (set
-/// construction, membership checks, audit summaries); the SQL predicate folds with
-/// `lower(plugin COLLATE "C")`, which is ASCII-only by construction, so the two always agree
-/// regardless of the database locale.
-[[nodiscard]] inline std::string ascii_lower(std::string_view s) {
-    std::string out(s);
-    for (auto& c : out)
-        if (c >= 'A' && c <= 'Z')
-            c = static_cast<char>(c - 'A' + 'a');
-    return out;
-}
 
 /// The plugins whose stored rows are Forensics-tier: lowercase, sorted, unique, NON-EMPTY.
 /// The only ways to obtain one are `from_names` (which refuses an empty set) and the catalogue
@@ -76,8 +65,9 @@ private:
 };
 
 /// What a `ResponseStore` read may return with respect to the Forensics tier. Not
-/// default-constructible; built only through the two factories below so every call site names its
-/// decision.
+/// default-constructible; built only through the factories below (`exclude`,
+/// `for_fixed_plugin_poll`, `refuse_unwired`, `unrestricted_internal_consumer`) so every call site
+/// names its decision.
 class ResponseTierFilter {
 public:
     ResponseTierFilter() = delete;
@@ -105,9 +95,11 @@ public:
     /// a FIXED set of plugins, none of them Forensics-tier (the device live snapshots, the DEX and
     /// TAR result polls). Excludes the Forensics plugins outright (present-empty visibility), so
     /// the poll could never return a Forensics row even if the command id were tampered with. A
-    /// null set (a harness that did not wire it) yields no clause: the plugin is fixed either way.
+    /// null set (a surface that was never wired; impossible in production, boot refuses without
+    /// one) is `refuse_unwired()`: the fixed plugin does not make an unwired poll safe to run
+    /// unfiltered, since the same wiring gap would then hide a real filter.
     [[nodiscard]] static ResponseTierFilter for_fixed_plugin_poll(const ForensicsPluginSet* plugins) {
-        return plugins ? exclude(*plugins, authz::deny_all()) : ResponseTierFilter{Key{}};
+        return plugins ? exclude(*plugins, authz::deny_all()) : refuse_unwired();
     }
 
     /// Fail-closed sink for a surface whose plugin set was never wired (impossible in production:

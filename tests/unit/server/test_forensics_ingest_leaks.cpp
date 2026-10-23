@@ -20,6 +20,7 @@
 #include "forensics_error_detail.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
+#include "preflight_parse.hpp"
 #include "response_store.hpp"
 #include "result_set_members.hpp"
 #include "test_forensics_tier_fixture.hpp"
@@ -402,5 +403,54 @@ TEST_CASE("result-set materialiser: membership is never derived from a Forensics
         auto content = result_set_members(store, nullptr, pending("exec-ordinary", kContentMatcher));
         REQUIRE(content.has_value());
         CHECK(content->empty());
+    }
+}
+
+// -- A6: the SQL fold is ASCII-only, like the C++ one --------------------------------------------
+
+TEST_CASE("response tier SQL folds the plugin name as ASCII, whatever the database locale",
+          "[pg][server][forensics_tier][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, leaks_responsestore_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store{pool};
+    REQUIRE(store.is_open());
+    // U+0130 (LATIN CAPITAL LETTER I WITH DOT ABOVE): a locale-aware lower() folds it to a plain
+    // "i" under some database locales, which would turn this into the Forensics plugin's name.
+    // An ASCII fold leaves it alone, so the row is NOT the Forensics plugin, exactly as in C++.
+    const std::string lookalike = "BROWSER_\xC4\xB0NVENTORY";
+    REQUIRE_FALSE(test::forensics_plugin_set().contains(lookalike));
+    put_source_row(store, "exec-fold", "agent-1", "BROWSER_INVENTORY", "upper-ascii");
+    put_source_row(store, "exec-fold", "agent-2", lookalike, "lookalike");
+    put_source_row(store, "exec-fold", "agent-3", test::kOrdinaryPlugin, "ordinary");
+
+    const auto non_holder = ResponseTierFilter::exclude(test::forensics_plugin_set(),
+                                                        authz::deny_all());
+    auto rows = store.query_by_execution("exec-fold", non_holder);
+    REQUIRE(rows.has_value());
+    std::vector<std::string> outputs;
+    for (const auto& r : *rows)
+        outputs.push_back(r.output);
+    std::ranges::sort(outputs);
+    // The ASCII-upper spelling is excluded; the lookalike is not the Forensics plugin.
+    CHECK(outputs == std::vector<std::string>{"lookalike", "ordinary"});
+}
+
+// -- The frozen internal-consumer sites read back only fixed, non-Forensics plugins ---------------
+//
+// tests/test_response_store_read_tripwire.py freezes the four remaining
+// `unrestricted_internal_consumer()` sites and justifies each as "a command the server dispatches
+// itself from a fixed plugin set". This pins that set against the catalogue-derived Forensics set,
+// so a Forensics plugin added to one of those fixed lists fails here, not silently in production.
+
+TEST_CASE("the plugins behind the frozen internal-consumer reads are not Forensics-tier",
+          "[server][forensics_tier][security]") {
+    const auto& set = test::forensics_plugin_set();
+    for (const char* plugin : {"tar", "content_dist", "quarantine"}) {
+        INFO(plugin);
+        CHECK_FALSE(set.contains(plugin));
+    }
+    for (const auto& check : yuzu::server::preflight::kPreflightChecks) {
+        INFO(check.plugin);
+        CHECK_FALSE(set.contains(check.plugin));
     }
 }

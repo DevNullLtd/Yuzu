@@ -4797,9 +4797,12 @@ public:
         // would silently exclude nothing, so boot REFUSES, same posture as the substrate checks.
         forensics_plugin_set_ = yuzu::server::derive_forensics_plugin_set(capability_registry_);
         if (!forensics_plugin_set_) {
-            spdlog::error("[Forensics] Refusing to start: the capability catalogue yields no "
-                          "plugin on the Forensics securable, so the stored-response read tier "
-                          "would exclude nothing (#4990) - fail-closed");
+            const auto defect = yuzu::server::forensics_catalogue_defect(capability_registry_);
+            spdlog::error("[Forensics] Refusing to start: {} (#4990) - fail-closed",
+                          defect ? *defect
+                                 : std::string{"the capability catalogue yields no plugin on the "
+                                               "Forensics securable, so the stored-response read "
+                                               "tier would exclude nothing"});
             startup_failed_ = true;
         }
 
@@ -18681,7 +18684,7 @@ private:
                 // fixed non-Forensics plugin, so the Forensics tier is excluded outright.
                 const auto tier = ResponseTierFilter::for_fixed_plugin_poll(forensics_plugins());
                 for (const auto& r : response_store_->query(command_id, tier, q).value_or(std::vector<StoredResponse>{}))
-                    out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                    out.push_back({r.agent_id, r.status, r.output, r.error_detail, /*plugin=*/{}});
                 return out;
             },
             // Per-device scope gate (same require_scoped_permission the /device routes
@@ -18894,7 +18897,7 @@ private:
                 // fixed non-Forensics plugin, so the Forensics tier is excluded outright.
                 const auto tier = ResponseTierFilter::for_fixed_plugin_poll(forensics_plugins());
                 for (const auto& r : response_store_->query(command_id, tier, q).value_or(std::vector<StoredResponse>{}))
-                    out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                    out.push_back({r.agent_id, r.status, r.output, r.error_detail, /*plugin=*/{}});
                 return out;
             },
             audit_fn);
@@ -19325,8 +19328,9 @@ private:
                                      return out;
                                  },
                              // Narrow ResponseStore seam for the Actions-lens result poll
-                             // (byte-identical shape to DexRoutes' own — #1634: scope the
-                             // poll read AT THE STORE SEAM).
+                             // (the same seam shape as DexRoutes' own responses_fn; the
+                             // caller supplies the tier filter — #1634: scope the poll read
+                             // AT THE STORE SEAM).
                              .responses_fn =
                                  [this](const std::string& command_id, const ResponseTierFilter& tier,
                                         const std::string& agent_id) -> std::vector<DexAgentResponse> {
@@ -19923,7 +19927,7 @@ private:
                 // fixed non-Forensics plugin, so the Forensics tier is excluded outright.
                 const auto tier = ResponseTierFilter::for_fixed_plugin_poll(forensics_plugins());
                 for (const auto& r : response_store_->query(command_id, tier, q).value_or(std::vector<StoredResponse>{}))
-                    out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                    out.push_back({r.agent_id, r.status, r.output, r.error_detail, /*plugin=*/{}});
                 return out;
             },
             audit_fn,

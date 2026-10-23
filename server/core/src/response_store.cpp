@@ -818,10 +818,12 @@ void append_scope_clause(std::string& sql, std::vector<std::string>& binds, int&
 // predicate is evaluated against an aliased `responses` row (the facet EXISTS); "" otherwise.
 //   * unrestricted / global Forensics:Read -> nothing appended
 //   * refuse_unwired (no plugin set wired) -> AND 1=0
-//   * no per-agent exemption               -> AND lower(plugin) <> ALL($n::text[])
-//   * per-agent exemption                  -> AND (lower(plugin) <> ALL($n) OR agent_id = ANY($m))
+//   * no per-agent exemption               -> AND lower(plugin COLLATE "C") <> ALL($n::text[])
+//   * per-agent exemption                  -> AND (lower(plugin COLLATE "C") <> ALL($n) OR agent_id = ANY($m))
 // `plugin` is stored as the agent sent it, so it is compared lowercased against the lowercase
-// excluded set. The excluded set is never empty when `restricts()` (ForensicsPluginSet is non-empty).
+// excluded set. COLLATE "C" makes the fold ASCII-only whatever the database's LC_CTYPE, matching
+// `ascii_lower` (ascii_fold.hpp) on the C++ side; a locale-aware lower() could fold a non-ASCII
+// letter into an excluded name. The excluded set is never empty when `restricts()` (ForensicsPluginSet is non-empty).
 void append_tier_clause(std::string& sql, std::vector<std::string>& binds, int& idx,
                         const ResponseTierFilter& tier, std::string_view col_prefix = {}) {
     if (!tier.restricts())
@@ -838,7 +840,7 @@ void append_tier_clause(std::string& sql, std::vector<std::string>& binds, int& 
     sql += " AND ";
     if (!tier.exempt_agents().empty())
         sql += "(";
-    sql += "lower(" + plugin_col + ") <> ALL($" + std::to_string(idx++) + "::text[])";
+    sql += "lower(" + plugin_col + " COLLATE \"C\") <> ALL($" + std::to_string(idx++) + "::text[])";
     binds.push_back(pg::to_text_array(to_views(tier.excluded_plugins())));
     if (!tier.exempt_agents().empty()) {
         sql += " OR " + agent_col + " = ANY($" + std::to_string(idx++) + "::text[]))";

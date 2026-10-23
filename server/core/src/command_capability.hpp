@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include "ascii_fold.hpp" // #4990: the one ASCII plugin-name fold
 
 #include "authz_model.hpp"
 
@@ -224,6 +225,16 @@ public:
         return false;
     }
 
+    /// Calls `f(const CommandCapability&)` for every row of every composed source (boot-time and
+    /// test use; a handful of fragments). Lets a consistency check read the catalogue without
+    /// the registry growing one accessor per question.
+    template <class F>
+    void for_each_row(F&& f) const {
+        for (std::size_t i = 0; i < source_count_; ++i)
+            for (const auto& cap : sources_[i])
+                f(cap);
+    }
+
     /// Every distinct plugin name carrying at least one row whose `securable` equals `securable`,
     /// lowercased and sorted. Derived from the composed sources on each call (a handful of
     /// fragments, boot-time use), so a new fragment row is reflected with no second list to keep.
@@ -235,10 +246,7 @@ public:
             for (const auto& cap : sources_[i]) {
                 if (cap.securable != securable)
                     continue;
-                std::string name(cap.plugin);
-                for (auto& c : name)
-                    c = to_lower_ascii(c);
-                out.push_back(std::move(name));
+                out.push_back(ascii_lower(cap.plugin));
             }
         }
         std::ranges::sort(out);
@@ -247,15 +255,11 @@ public:
     }
 
 private:
-    [[nodiscard]] static constexpr char to_lower_ascii(char c) noexcept {
-        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
-    }
-
     [[nodiscard]] static bool ci_equal(std::string_view a, std::string_view b) noexcept {
         if (a.size() != b.size())
             return false;
         for (std::size_t i = 0; i < a.size(); ++i) {
-            if (to_lower_ascii(a[i]) != to_lower_ascii(b[i]))
+            if (ascii_lower_char(a[i]) != ascii_lower_char(b[i]))
                 return false;
         }
         return true;

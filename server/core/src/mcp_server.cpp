@@ -9895,7 +9895,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // hidden ones the LIMIT already truncated. Mirrors aggregate_responses'
                 // resolve-then-scope pattern; `distinct_agent_ids`/`_by_execution` picks
                 // the twin matching whichever id this call used.
-                // #4990: derived after the Response:Read gate (never writes a response), before the store read.
+                // #4990: derived after the ManagementGroup:Write gate and the scope derivation above, before
+                // the store read (the resolver never writes a response).
                 const auto tier = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
                 AggregateScope scope_arg; // nullopt = unrestricted
                 bool scope_filtered = false;
