@@ -13,6 +13,8 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <atomic>
+#include <functional>
 #include <array>
 #include <charconv>
 #include <set>
@@ -256,6 +258,7 @@ constexpr const char* kTimeSql = "SELECT clock_timestamp()::text";
 constexpr std::chrono::seconds kIngestTxnBudgetBase{8};
 constexpr std::chrono::milliseconds kIngestTxnBudgetPerRow{5};
 constexpr std::chrono::seconds kIngestTxnBudgetMax{60};
+constexpr int kMaxConcurrentFull = 4;
 
 std::chrono::steady_clock::duration txn_budget(std::size_t rows) {
     const auto b = kIngestTxnBudgetBase + kIngestTxnBudgetPerRow * static_cast<long>(rows);
@@ -283,7 +286,7 @@ Json opt_json(const std::optional<bool>& v) { return v ? Json(*v) : Json(nullptr
 std::string digest_hex(const char* algo, std::string_view bytes) {
     unsigned char md[EVP_MAX_MD_SIZE];
     unsigned int len = 0;
-    const EVP_MD* type = std::string_view(algo) == "md5" ? EVP_md5() : EVP_sha256();
+    const EVP_MD* type = EVP_sha256(); (void)algo;
     if (EVP_Digest(bytes.data(), bytes.size(), md, &len, type, nullptr) != 1)
         return {};
     static const char* kHex = "0123456789abcdef";
@@ -296,7 +299,7 @@ std::string digest_hex(const char* algo, std::string_view bytes) {
 }
 
 // Canonical, length-prefixed digest of the child rows (order matters: `ord` is stored).
-std::string child_digest(const CertFactRow& f) {
+std::string child_digest_input(const CertFactRow& f) {
     std::string c;
     const auto put = [&](char tag, std::string_view a, std::string_view b = {}) {
         c += tag;
@@ -309,10 +312,10 @@ std::string child_digest(const CertFactRow& f) {
         put('e', e);
     for (const auto& d : f.cdps)
         put('c', d);
-    return digest_hex("sha256", c);
+    return c;
 }
 
-Json fact_json(const CertFactRow& f) {
+Json fact_json(const CertFactRow& f, const std::string& child_digest) {
     Json j;
     j["sha256"] = f.sha256;
     j["sha1"] = opt_json(f.sha1);
@@ -346,7 +349,7 @@ Json fact_json(const CertFactRow& f) {
     j["der_omitted"] = opt_json(f.der_omitted);
     j["der"] = opt_json(f.der_base64);
     j["constrained_fields"] = f.constrained_fields;
-    j["child_digest"] = child_digest(f);
+    j["child_digest"] = child_digest;
     return j;
 }
 
@@ -362,10 +365,10 @@ std::int64_t result_i64(const pg::PgResult& res, int row, int col) {
 // parameters; the statement text is fixed.
 template <typename Row, typename MakeParams>
 bool for_each_chunk(PGconn* c, const char* sql, const std::vector<Row>& rows,
-                    std::chrono::steady_clock::time_point deadline, MakeParams&& make_params) {
+                    const std::function<bool()>& over, MakeParams&& make_params) {
     for (std::size_t i = 0; i < rows.size(); i += kChunkRows) {
-        if (std::chrono::steady_clock::now() > deadline)
-            return false; // over the transaction budget: roll back (the caller names it)
+        if (over())
+            return false; // over the transaction budget: `over` records it, the caller names it
         const auto end = std::min(rows.size(), i + kChunkRows);
         pg::PgResult r = pg::exec_params(c, sql, make_params(i, end));
         if (!cmd_ok(r))
@@ -376,14 +379,13 @@ bool for_each_chunk(PGconn* c, const char* sql, const std::vector<Row>& rows,
 
 } // namespace
 
-std::string cert_path_key(std::string_view path) { return digest_hex("md5", path); }
-
 const std::vector<pg::PgMigration>& certificate_inventory_migrations() {
     return build_migrations();
 }
 
 CertificateInventoryStore::CertificateInventoryStore(pg::PgPool& pool) : pool_(pool) {
     ingest_budget_ = [](std::size_t rows) { return txn_budget(rows); };
+    child_hash_ = [](std::string_view in) { return digest_hex("sha256", in); };
     auto lease = pool_.acquire();
     if (!lease) {
         spdlog::error("CertificateInventoryStore: no database connection at construction ({}) — "
@@ -408,15 +410,16 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
     const std::string id{agent_id};
 
     // Defensive de-duplication: the seam already de-duplicates, but a duplicate key inside one
-    // INSERT ... ON CONFLICT statement is an error that would nack the report for ever.
+    // INSERT ... ON CONFLICT statement is an error that would fail the report on every attempt.
     std::unordered_map<std::string, std::string> store_status; // store_id -> status
     std::vector<const CertStoreReport*> stores;
     for (const auto& s : report.stores)
         if (store_status.emplace(s.store_id, s.status).second)
             stores.push_back(&s);
 
-    // Keyed like the table: by md5(path), not the path, so two different paths that collide on
-    // md5 are one row here too instead of an ON CONFLICT error that would fail every cycle.
+    // Exact duplicates are dropped here. Two DIFFERENT paths that collide on md5(path) (the table's
+    // key) are folded in SQL (DISTINCT ON the same md5() expression the generated column uses), so
+    // the application never computes the key itself - md5 is unavailable under FIPS.
     std::set<std::tuple<std::string, std::string, std::string>> seen_loc;
     std::vector<const CertLocationRow*> locs; // locations that land in ok/constrained stores
     std::set<std::string> live_shas;
@@ -426,7 +429,7 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
             continue;
         if (it->second != cert_status::kOk && it->second != cert_status::kConstrained)
             continue;
-        if (!seen_loc.emplace(l.store_id, cert_path_key(l.path), l.sha256).second)
+        if (!seen_loc.emplace(l.store_id, l.path, l.sha256).second)
             continue;
         locs.push_back(&l);
         live_shas.insert(l.sha256);
@@ -437,13 +440,45 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
         if (live_shas.contains(f.sha256) && seen_fact.insert(f.sha256).second)
             facts.push_back(&f);
 
+    // At most kMaxConcurrentFull long ingests at once, so a few 60 s budgets cannot hold many
+    // pooled connections: beyond that the report is deferred (counted deferred/agent_busy).
+    struct FullSlot {
+        std::atomic<int>& n;
+        bool ok;
+        explicit FullSlot(std::atomic<int>& a) : n(a), ok(a.fetch_add(1) < kMaxConcurrentFull) {
+            if (!ok)
+                n.fetch_sub(1);
+        }
+        ~FullSlot() {
+            if (ok)
+                n.fetch_sub(1);
+        }
+    } slot(active_full_);
+    if (!slot.ok) {
+        CertIngestResult r;
+        r.outcome = CertIngestOutcome::kBusy;
+        return r;
+    }
+    // Child digests, SHA-256 (always available). A failed digest is an ERROR, never an empty
+    // string stored as if it were a value.
+    std::vector<std::string> digests;
+    digests.reserve(facts.size());
+    for (const auto* f : facts) {
+        std::string d = child_hash_(child_digest_input(*f));
+        if (d.empty()) {
+            spdlog::warn("CertificateInventoryStore: child digest failed for agent={} - not stored",
+                         agent_id);
+            return CertIngestResult{}; // kError
+        }
+        digests.push_back(std::move(d));
+    }
     bool budget_hit = false;
     const bool committed = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
         std::size_t rows = facts.size() + locs.size();
         for (const auto* f : facts)
             rows += f->sans.size() + f->ekus.size() + f->cdps.size();
         const auto deadline = std::chrono::steady_clock::now() + ingest_budget_(rows);
-        const auto over = [&] {
+        const std::function<bool()> over = [&] {
             if (std::chrono::steady_clock::now() > deadline) {
                 budget_hit = true;
                 return true;
@@ -451,7 +486,7 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
             return false;
         };
         const auto chunked = [&](const char* sql, const auto& rs, auto&& mk) {
-            return for_each_chunk(c, sql, rs, deadline, mk);
+            return for_each_chunk(c, sql, rs, over, mk);
         };
         bool got = false;
         if (!take_lock(c, id, /*blocking=*/false, got))
@@ -491,7 +526,7 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
             const auto e = std::min(facts.size(), i + kChunkRows);
             Json arr = Json::array();
             for (std::size_t k = i; k < e; ++k)
-                arr.push_back(fact_json(*facts[k]));
+                arr.push_back(fact_json(*facts[k], digests[k]));
             pg::PgResult fr =
                 pg::exec_params(c, fact_upsert_sql().c_str(), std::vector<std::string>{id, arr.dump()});
             if (!tup_ok(fr))
@@ -499,6 +534,8 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
             for (int r = 0; r < PQntuples(fr.get()); ++r)
                 changed.insert(PQgetvalue(fr.get(), r, 0));
         }
+        if (test_hook_after_facts_)
+            test_hook_after_facts_();
         std::vector<const CertFactRow*> child_facts;
         for (const auto* f : facts)
             if (changed.contains(f->sha256))
@@ -580,9 +617,9 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
         // report did not carry), `absent` removes all, `constrained` keeps the rest.
         if (!chunked("INSERT INTO certificate_inventory_store.cert_location (agent_id, store_id, user_ref, path, "
                 "sha256, first_seen, last_seen, full_report_at) "
-                "SELECT $1, t.store_id, '', t.path, t.sha256, $3::timestamptz, $3::timestamptz, "
-                "$3::timestamptz FROM jsonb_to_recordset($2::jsonb) AS t(store_id text, "
-                "path text, sha256 text) "
+                "SELECT DISTINCT ON (t.store_id, md5(t.path), t.sha256) $1, t.store_id, '', t.path, t.sha256, "
+                "$3::timestamptz, $3::timestamptz, $3::timestamptz FROM jsonb_to_recordset($2::jsonb) "
+                "AS t(store_id text, path text, sha256 text) ORDER BY t.store_id, md5(t.path), t.sha256 "
                 "ON CONFLICT (agent_id, store_id, user_ref, path_md5, sha256) DO UPDATE SET "
                 "  first_seen = LEAST(certificate_inventory_store.cert_location.first_seen, EXCLUDED.first_seen), "
                 "  last_seen = EXCLUDED.last_seen, full_report_at = EXCLUDED.full_report_at",

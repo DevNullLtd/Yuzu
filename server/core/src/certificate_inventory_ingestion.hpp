@@ -180,7 +180,7 @@ inline constexpr auto kPairs = std::to_array<std::pair<std::string_view, std::st
 });
 /// Register the HELP text and zero-seed every pair, so the series exist on an idle server.
 void register_metrics(::yuzu::MetricsRegistry& metrics);
-/// Count a seam exception caught at a call site (the call sites nack; this makes it visible).
+/// Count a seam exception caught at a call site (the call sites then apply handle_exception's leg rule; this makes it visible).
 void count_exception(::yuzu::MetricsRegistry* metrics);
 /// The single exception policy for the call sites (direct and gateway): count it
 /// (error/exception) and, ONLY for a full-payload report, ask for a resend. A hash-only report

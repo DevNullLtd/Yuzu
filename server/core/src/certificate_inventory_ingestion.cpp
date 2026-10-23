@@ -843,6 +843,11 @@ void cert_ingest_metric::register_metrics(::yuzu::MetricsRegistry& metrics) {
     for (const auto& [result, reason] : kPairs)
         metrics.counter(std::string(kName),
                         {{"result", std::string(result)}, {"reason", std::string(reason)}});
+    metrics.describe("yuzu_server_cert_inventory_delete_failed_total",
+                     "Certificate-inventory delete_agent calls that did not commit (including a "
+                     "5 s lock timeout); the decommission cascade reports the store failed",
+                     "counter");
+    metrics.counter("yuzu_server_cert_inventory_delete_failed_total");
 }
 
 void cert_ingest_metric::count_exception(::yuzu::MetricsRegistry* metrics) {

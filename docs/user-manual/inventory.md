@@ -1196,7 +1196,12 @@ points. It never lands in the generic inventory store, on either path.
   version against the server's (unknown major version) and its store count. A
   transaction that runs past its time budget (scaled with the report size) is rolled
   back, counted as `error`/`budget_exceeded`, and is likewise acknowledged and retried
-  next interval.
+  next interval. **A device whose report deterministically exceeds the budget is frozen
+  the same way** (never stored, retried once per interval) and is covered by the same
+  alert. An unexpected exception in the ingest seam is counted `error`/`exception`: a
+  full report is then asked to resend, a hash-only report is acknowledged and retries
+  next interval. At most four full-report ingests run at once; a fifth is deferred
+  (`deferred`/`agent_busy`).
 - **Busy device.** Reports for one device are serialised. A report that finds another
   for the same device in flight is counted `deferred`/`agent_busy`; a full report is asked
   to resend, and a hash-only report just retries next cycle. A hash-only claim must be

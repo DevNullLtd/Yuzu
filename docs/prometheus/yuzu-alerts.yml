@@ -4804,7 +4804,10 @@ groups:
           summary: "Installed-software ingest dropping over-cap blobs"
           description: >-
             yuzu_inventory_ingest_total{outcome="dropped"} is non-zero: one or more
-            agents are sending an installed-software blob over the 3 MiB cap, which
+            agents are sending an installed-software blob over the 3 MiB cap (the label
+            source says which; source="certificate_inventory" also counts an unknown
+            major version or an unparseable header, which are NOT resent - see
+            YuzuCertInventoryReportsRejected for those), which
             is dropped + nacked and will NOT self-heal (the agent resends the same
             payload). Likely an agent/server cap-constant drift after a version skew,
             or a non-conforming agent — check the agent version and the warn-level
@@ -4838,17 +4841,20 @@ groups:
         # acknowledged WITHOUT a resend and writes nothing, so the device's stored inventory
         # freezes and nothing else shows it. Sustained = a device (or a fleet after an agent
         # upgrade ahead of the server) is stuck.
+        # increase over a day with NO hold: a single device refused once a day is enough, and a
+        # rate()-with-for would never fire for it. budget_exceeded freezes a device the same way.
         expr: |
-          sum(rate(yuzu_server_cert_inventory_ingest_total{result="rejected"}[15m])) > 0
-        for: 30m
+          sum by (result, reason) (increase(yuzu_server_cert_inventory_ingest_total{result="rejected"}[1d])) > 0
+          or
+          sum by (result, reason) (increase(yuzu_server_cert_inventory_ingest_total{result="error",reason="budget_exceeded"}[1d])) > 0
         labels:
           severity: warning
         annotations:
           summary: "Certificate inventory reports being rejected"
           description: >-
-            yuzu_server_cert_inventory_ingest_total{result="rejected"} has been non-zero for
-            30m. The rejected devices' certificate inventory is frozen (acknowledged, not
-            stored, not resent). By reason label: unknown_version = an agent newer than the
+            yuzu_server_cert_inventory_ingest_total{result="rejected"} (or
+            error/budget_exceeded) increased in the last day. The affected devices'
+            certificate inventory is frozen (acknowledged, not stored, not resent). By reason label: unknown_version = an agent newer than the
             server (upgrade the server first); bad_header / over_cap / blob_too_large = a
             malformed or oversize report - find the agent in the warn log line
             "certificate_inventory: blob from agent=... refused".
