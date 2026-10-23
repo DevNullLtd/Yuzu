@@ -299,8 +299,14 @@ constexpr std::string_view kLicense[] = {"get_platform_license", "activate_platf
 constexpr std::string_view kSoftwareDeployments[] = {
     "list_software_deployments", "create_software_deployment",
     "rollback_software_deployment", "cancel_software_deployment"};
+// /crypto dashboard widgets (ADR-0070 D13): the catalogue, the caller's own layout, and the
+// Yuzu-issued certificate counts. The library reads stay in kInventory; the rows behind a
+// Yuzu-issued count are list_issued_certs' filtered form (the CA family).
+constexpr std::string_view kCryptoDashboard[] = {
+    "list_crypto_widgets", "get_crypto_dashboard_layout", "set_crypto_dashboard_layout",
+    "get_crypto_ca_stats"};
 
-constexpr std::array<ToolFamily, 40> kFamilies{{
+constexpr std::array<ToolFamily, 41> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions, their full export, and recurring "
@@ -404,6 +410,9 @@ constexpr std::array<ToolFamily, 40> kFamilies{{
     {"Software deployments", "software-package fleet deployment lifecycle (list, create, "
                              "rollback, cancel)",
      kSoftwareDeployments},
+    {"Crypto dashboard", "the /crypto widget catalogue, your own widget layout, and counts of "
+                         "certificates issued by Yuzu's own CA (fixed windows, with as_of)",
+     kCryptoDashboard},
 }};
 
 }  // namespace

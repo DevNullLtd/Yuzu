@@ -152,6 +152,8 @@ API tokens are created via `POST /api/v1/tokens` and can be scoped to the creati
 
 State-changing examples (POST, PUT, DELETE) that authenticate with a session cookie send a same-site `Origin` header (the scheme, host and port of the server you are calling); API-token requests do not need it.
 
+**Cookie-session writes.** Every request other than `GET`, `HEAD` or `OPTIONS` that is authorised by the `yuzu_session` cookie must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`). Otherwise it is refused `403` `cross-site request refused` (the standard error envelope, with a `remediation` and no `permission` field) and audited as `csrf.denied`. One check, applied centrally, decides this after authentication and before step-up evaluation, challenge emission and route-handler effects, and before the request body is read. A request that presents a valid session cookie is treated as a cookie-session request even if it also carries a token; a request authenticated only by an API, MCP or engine token is not subject to this check, except on the routes that keep a copy of their own that is not token-exempt. Browsers send these headers on every write (the dashboard needs no change); a script that reuses a login cookie sends `-H "Origin: https://yuzu.example.com"` or uses an API token. Behind a reverse proxy, declare the public origin with its scheme (`--csrf-trusted-origin https://yuzu.example.com`; required if the proxy rewrites `Host`, and a plain-`http://` origin for that host is then refused) and do not configure the proxy to inject or rewrite `Origin` or `Referer`. A server that terminates TLS itself requires an `https://` `Origin` or `Referer`. The audit row's `result` is `denied`, its `target_id` is the sanitised request method and path (the request path is truncated at 200 bytes) and its `detail` is fixed text plus `reason=<token>`; each refusal increments `yuzu_server_csrf_denied_total{path_class,reason}` (see [Metrics](metrics.md)). Cross-site checks described per route elsewhere in this reference are defence in depth: for a cookie-session caller the central check answers first and writes the `csrf.denied` row, so the per-route `target_id` values documented below are written only by a copy that is actually reached, which in practice means a token caller of a route whose copy is not token-exempt. Cookie-session requests that dispatch work, persist state or force a refresh of server state (the guarded reads) are held to the same rule whichever method they use, and the exact path, never a query flag, selects the gate. For them a `Sec-Fetch-Site` header that is present decides alone: exactly one header with value `same-origin` or `none` is admitted, any other value or a repeated header is refused with `origin_mismatch`, and `Origin` and `Referer` are not consulted. Only a request without `Sec-Fetch-Site` falls back to the `Origin` or `Referer` rule. So a script that reuses a login cookie for such a request either sends no `Sec-Fetch-Site` and a same-site `Origin` or `Referer`, or sends `Sec-Fetch-Site` once with value `same-origin` or `none`; or it uses an API token. Token callers are not gated. The audit row's detail text for such a refusal is the fixed write wording (see [CSRF protection](security-hardening.md#csrf-protection)).
+
 **Reserved headers — do not send.** Five header names are reserved for future
 server-verifiable delegation and are **rejected on every endpoint** (sole
 exception: the four unauthenticated health-probe paths, which ignore them —
@@ -283,7 +285,7 @@ Routes that parse strictly (the response routes are listed in
 | Dashboard fragments | `GET /fragments/results`: `page`, `per_page`; the three software inventory fragments (`/fragments/inventory/software`, `/software/devices`, `/software/versions`): a malformed `limit` answers `200` with an `inv-caveat` note, not a JSON `400` (htmx drops `4xx` bodies), and the store is not read; a well-formed `limit` is validated and then ignored, because these fragments use a fixed page size; the DEX perf devices fragment and the network quality devices fragment: `limit`; the hardware list fragment and `GET /api/v1/hardware`: `offset`, `limit` (a negative value is refused too, it used to be clamped to `0`); the hardware sync poll: `await_since` (a malformed freshness bound used to read as "no bound", so a stale snapshot could be served as fresh); `GET /fragments/tar/process-tree/detail`: `node` (`stoul` read `-1` as the largest node id and `5x` as `5`) |
 | Delivery and list routes | `GET /api/notifications`: `limit`, `offset` (a negative value is `400` too, where the store answered an empty `200`); `GET /api/webhooks/{id}/deliveries` and `GET /api/v1/offload-targets/{id}/deliveries`: `limit`; `GET /api/v1/ca/issued`: `limit`, `offset`; `GET /api/v1/preflight/runs`: `limit`; the pre-flight run form: `min_gib` and `window` (a malformed value is `400`; a negative `min_gib` is `400` too) and the version thresholds `app_min`, `app_max` and `os_min` (empty, or a dotted-decimal version with an optional `-beta` / `+build` suffix; anything else is `400`, see [Pre-flight readiness checks](preflight.md)); `GET /api/v1/result-sets` and `GET /api/v1/result-sets/{id}/members`: `limit` (trailing characters are `400`, not their numeric prefix; an integer outside the route's page range still uses the default page size); `GET /api/v1/dex/signals/{obs_type}`, `GET /api/v1/dex/perf/devices` and `GET /api/v1/network/devices`: `limit`; `GET /api/v1/guaranteed-state/events`: `limit` and `offset` (a negative value is `400` too; both are parsed before the `dex.device.view` audit row is written, so a `400` leaves no access row) |
 | Event streams | `GET /api/v1/events`: `since` (a non-negative integer; a malformed value is `400`, answered before the stream budget is touched). A malformed `Last-Event-ID` **header** on `GET /api/v1/events` or the workflow execution stream is served **live only**: nothing buffered is replayed (never the whole ring buffer) and it is not a `400`, because the header is browser-supplied inference and a `400` would fail a reconnect. The cursor is parsed strictly, so `-1` and `5abc` are never accepted as a position (`5abc` used to replay from position 5; `-1` wrapped past every event and also replayed nothing, so that input's outcome is unchanged); valid ids replay exactly as before. A rejected `?since` leaves no success audit row, because it is parsed before the audit write |
-| Settings forms | `POST /api/settings/dex-alerts/blast` (`min_devices`, `window_seconds`, `cooldown_seconds`): a malformed value is `400` and nothing is saved (it used to persist the clamped minimum); `POST /api/settings/enrollment-tokens` and `/batch` (`max_uses`, `ttl_hours`, `count`): `0x5` used to read as `0`, and `max_uses` `0` means unlimited, so a mistyped limit minted an unlimited token (only an **empty** field, or a value that parses to a literal `0` such as `0`, `-0` or `00`, means unlimited or no expiry now; on `/batch` an empty `max_uses` defaults to `1`, not unlimited; a **negative** `ttl_hours` is refused with `400` because it would compute `0`, a token that never expires); the API-token create form `ttl_hours` (the same `0x5` read as a token that never expires; it is refused with the form's usual `200` feedback span, `Invalid TTL value.`, a negative value too, and nothing is minted); the OTA package `rollout_pct` on upload and on the rollout route (an out-of-range integer on upload is clamped to 0..100 as before): a malformed value used to become `100`, a full-fleet rollout. **Behaviour change on the rollout change route only:** an empty `rollout_pct` and a value above `100` are also `400` there (an empty value used to mean `100` and a larger one was clamped to `100`), while a negative value still clamps to `0` (the least exposure); the upload route is unchanged. Each enrollment and OTA `400` also sets an error toast (`HX-Trigger`), because the dashboard drops `4xx` bodies |
+| Settings forms | `POST /api/settings/dex-alerts/blast` (`min_devices`, `window_seconds`, `cooldown_seconds`): a malformed value is `400` and nothing is saved (it used to persist the clamped minimum); `POST /api/settings/enrollment-tokens` and `/batch` (`max_uses`, `ttl_hours`, `count`): `0x5` used to read as `0`, and `max_uses` `0` means unlimited, so a mistyped limit minted an unlimited token (only a value that parses to a literal `0` such as `0`, `-0` or `00` means unlimited or no expiry; an **empty** field takes the default of 100 uses and 72 hours, and on `/batch` an empty `max_uses` defaults to `1` and an empty `ttl_hours` to 72 hours; a **negative** `ttl_hours` is refused with `400` because it would compute `0`, a token that never expires); the API-token create form `ttl_hours` (the same `0x5` read as a token that never expires; it is refused with the form's usual `200` feedback span, `Invalid TTL value.`, a negative value too, and nothing is minted); the OTA package `rollout_pct` on upload and on the rollout route (an out-of-range integer on upload is clamped to 0..100 as before): a malformed value used to become `100`, a full-fleet rollout. **Behaviour change on the rollout change route only:** an empty `rollout_pct` and a value above `100` are also `400` there (an empty value used to mean `100` and a larger one was clamped to `100`), while a negative value still clamps to `0` (the least exposure); the upload route is unchanged. Each enrollment and OTA `400` also sets an error toast (`HX-Trigger`), because the dashboard drops `4xx` bodies |
 | JSON request bodies (security-gating numbers) | `POST /api/v1/tokens` `expires_at` (a negative value or one above 9223372036854775807 minted a token that never expires, `5.5` or `1e3` an already-expired one, and a wrong type threw a bare `500`; now `400`, and `0` or omitted still means never expires); `POST /api/v1/tokens/{id}/rotate` and `POST /api/v1/engine-principals/{id}/credentials/rotate` `overlap_secs` (a truncated or non-object body used to rotate with the 7-day default; now `400`, and an empty body still takes the default); `POST /api/v1/guaranteed-state/rules` `version` (`5.5` was stored as `5` and a wrong type threw; now `400`); `POST /api/v1/upload-grants` `ttl_secs` (a wrong type, `0` or a negative value was ignored and the grant got the 900 s maximum; now `400`); `POST /api/settings/enrollment-tokens/batch` `count`, `max_uses`, `ttl_hours` (a JSON number was silently ignored, so the documented example minted single-use tokens that never expire; now a JSON integer **and** a numeric string are both read, an empty string keeps the default, and a float, boolean, `null`, overflow or a truncated or non-object body is `400` and mints nothing). The `ip_subnet` auto-approve rule value is validated when it is added (`POST /api/settings/auto-approve`, `400` for anything but an IPv4 address or `a.b.c.d/0` to `/32`) |
 
 On the query-parameter routes in the table above, a parameter that is **present but empty** (`?limit=`) is malformed, not absent (`GET /api/v1/audit` `limit` included). Two exceptions. The software list and catalogue routes (`GET /api/v1/inventory/software` and `/software/catalogue`, and the three software fragments) share one parser in which an EMPTY `limit=` means the default; a non-empty malformed or overflowing `limit` is still refused (`400` on the REST routes, a `200` `inv-caveat` note on the fragments). And the auth-sample export: a present but empty `from` or `to` on `GET /api/v1/audit/auth-sample` is accepted as unbounded on that side. The admin forms are different: an EMPTY form field means that field's default.
@@ -1722,9 +1724,10 @@ Change the caller's own **local-account** password (#5342). The caller proves th
 
 1. Authentication (`401` without a session).
 2. Session class: an API, MCP or engine token, or a service-scoped token, is `403 token_session`; an OIDC or SAML session is `409 not_local` (change it at the identity provider).
-3. Same-site request: `Origin`/`Referer` must be the dashboard's own origin (or a `--csrf-trusted-origin` entry), and a request carrying **neither** header is refused — `403 csrf`. `Content-Type` must be `application/json` — `415` (not audited).
+3. Same-site request (this route's own copy): `Origin`/`Referer` must be the dashboard's own origin (or a `--csrf-trusted-origin` entry), and a request carrying **neither** header is refused with `403 csrf`. `Content-Type` must be `application/json`, else `415` (not audited). A cookie-session caller never reaches the `csrf` refusal: the server-wide check (see Authentication) answers first, with message `cross-site request refused` and no `csrf` code, and this copy is defence in depth.
 4. MFA step-up, when the account is enrolled and its proof is stale — `401` step-up envelope (`meta.mfa_step_up_required`, `meta.challenge_url`).
 5. Body and length policy — `400`, **not audited** (nothing security-relevant was attempted, and a policy rejection never records the length). The body is never echoed, because it may hold a password.
+
 6. The current password, through the same lockout-accounted check as `POST /login`: a wrong password is `403 wrong_current` and counts toward [account lockout](server-admin.md#server-cli-flags); a locked account gets the **same** `403` and message (`account_locked` in the audit row only — no lock-state oracle). A password that could not be verified — the auth store could not be read, or the stored password changed while it was being checked — is a retryable `503 verify_transient` and never counts. If the lockout counter cannot be recorded the answer is `503 store_unavailable` (fail closed: an uncounted guess is never answered as an ordinary wrong password). A correct current password clears a non-zero failure counter (`auth.lockout.cleared`, `detail=reset_on_password_change`).
 7. **One transaction.** Under the account's row lock, the server re-checks that the stored password is still exactly the one step 6 verified and that the account is still an active local account, then — together, or not at all — writes the new password, deletes every session of the account (**including the caller's own**, durably and on every replica), wipes a provisional (not yet enrolled) TOTP secret, and writes the `user.password_change` audit row. A refusal here changes **nothing** (your session stays valid): `409 conflict` (the password changed concurrently, e.g. an admin reset), `409 not_local` (the account became SCIM-managed in between), `404 not_found` (it was deactivated). If the audit row cannot be written the change is not made: `503 audit_unavailable` with `Sec-Audit-Failed: true`. Any other store failure is `503 store_unavailable`. A `503` body says what is true: nothing was changed unless the server lost contact with the database at commit; a successful sign-in with the new password confirms the change, which is audited either way.
 
@@ -1765,7 +1768,7 @@ No replacement session is issued: the caller is signed out and signs in again wi
 |---|---|---|
 | `400` | *(not audited)* | Malformed body, or new password outside 12–1024 bytes |
 | `401` | — | No session, or MFA step-up required |
-| `403` | `token_session` / `csrf` | Steps 2–3 |
+| `403` | `token_session` / `csrf` | Steps 2 and 3 (`csrf` is this route's own copy; a cookie-session caller gets `cross-site request refused` from the server-wide check instead) |
 | `403` | `wrong_current` | The current password is wrong. Counts toward lockout exactly like a failed `/login` |
 | `403` | `account_locked` | The account is locked. **Same message as a wrong password** ("current password is incorrect") |
 | `403` | `sso_only_local_disabled` | `--auth-mode=sso-only` and this is not an armed break-glass account. No password was evaluated and nothing counts toward lockout |
@@ -1796,7 +1799,7 @@ Reset another user's **local-account** password (#5342) without knowing the curr
 
 A JIT elevation, an IdP-group-derived session role (an OIDC session whose admin role comes only from `--oidc-admin-group`), a group-held `Administrator` grant, or a custom role holding `UserManagement:Write` is refused `403 durable_admin_required`. If the stores cannot confirm the caller's authority the answer is `503 admin_gate_unavailable` (retryable; never downgraded to a `403`). The caller must use an interactive dashboard session; API, MCP, engine and service-scoped tokens are refused `403 token_session`. A SAML session that passes the administrator check is then refused `403` by the shared MFA step-up gate, which has no SAML MFA attestation in this release.
 
-**Order of checks:** authentication → username format (`400`, not audited) → session class (`403 token_session`) → same-site `Origin`/`Referer` (`403 csrf`) and `Content-Type: application/json` (`415`, not audited) → the durable-Administrator check (`403 durable_admin_required` / `503 admin_gate_unavailable`) → **not yourself** (`403 self_target`) → **not the break-glass account** (`403 break_glass_target`) → MFA step-up (when the caller is enrolled) → body and 12–1024-byte policy (`400`, not audited) → **one transaction** (below).
+**Order of checks:** authentication → username format (`400`, not audited) → session class (`403 token_session`) → same-site `Origin`/`Referer` (`403 csrf`; this route's own copy, defence in depth, since the server-wide check answers a cookie-session caller first with `cross-site request refused`) and `Content-Type: application/json` (`415`, not audited) → the durable-Administrator check (`403 durable_admin_required` / `503 admin_gate_unavailable`) → **not yourself** (`403 self_target`) → **not the break-glass account** (`403 break_glass_target`) → MFA step-up (when the caller is enrolled) → body and the 12 to 1024 byte policy (`400`, not audited) → **one transaction** (below).
 
 - **Not yourself:** targeting your own username is `403 self_target` — use `POST /api/v1/users/me/password`, which requires your current password, so a stolen admin cookie cannot re-key its own account.
 - **Not the break-glass account:** the account named by `--break-glass-user` is `403 break_glass_target`. It is re-keyed only out of band on the server host, or by signing in as it while armed and using `POST /api/v1/users/me/password`, so an identity-provider compromise cannot invalidate the escape hatch.
@@ -1844,7 +1847,7 @@ curl -s -X POST \
 | `400` | *(not audited)* | Malformed username or body, or new password outside 12–1024 bytes |
 | `401` | — | No session, or MFA step-up required |
 | `403` | `durable_admin_required` | The caller is not a durable Administrator (see above) |
-| `403` | `token_session` / `csrf` / `self_target` / `break_glass_target` | See above |
+| `403` | `token_session` / `csrf` / `self_target` / `break_glass_target` | See above (`csrf` is this route's own copy; a cookie-session caller gets `cross-site request refused` from the server-wide check instead) |
 | `403` | — | A SAML session at the step-up gate |
 | `404` | `not_found` | No active account by that name (nothing changed) |
 | `409` | `not_local` | SSO/SCIM account (nothing changed) |
@@ -2363,6 +2366,82 @@ returns the same five fields at the top level of its result.
 ```
 
 The MCP `list_issued_certs` tool mirrors this contract (same `has_more` / `next_offset`).
+
+The unfiltered call above is not written to the audit log and is not withheld from a
+management-group-confined caller (a known gap, unchanged by the filtered form below).
+
+**Filtered: the certificates behind one `/crypto` count (ADR-0070 R2, R8).** When any of `kind`,
+`days`, `week`, `bucket`, `as_of` or `cursor` is present, the route lists exactly the certificates behind
+one Yuzu-issued count of [`GET /api/v1/crypto/ca/stats`](#get-apiv1cryptocastats), with the same
+predicate. **Permission:** `Security:Read`, and a caller whose view of the fleet is confined is
+refused `403` with no `permission` field (`Yuzu-issued certificate figures are not available to
+this account: ...`), whatever the parameters. The input is strict, and each malformed parameter is
+a `400` whose message names it:
+
+| Parameter | Type | Description |
+|---|---|---|
+| `kind` | string | **Required** in this form: `active`, `expiring`, `expired`, `revoked`, `issued`, `issued_week` or `revoked_week` |
+| `days` | integer | Required for `expiring` (3, 7, 14, 21, 30, 60), `expired` and `revoked` (7, 30, 60, 90) and `issued` (7); refused on other kinds |
+| `week` | string | ISO week `YYYY-Www` (for example `2026-W43`); required for `issued_week` and `revoked_week`, refused on other kinds. A week that does not exist (`2026-W00`, `2027-W53`) is refused |
+| `bucket` | string | `superseded`, `unpublished` or `other`; optional, `revoked` and `revoked_week` only. Omitted lists every reason |
+| `as_of` | integer | Epoch seconds to measure the first page against (for example a `/crypto/ca/stats` count's `as_of`). Accepted from 7 days before the **database** clock up to 5 minutes after it, checked in the read's own transaction; omitted = the database clock now. A continuation page carries its `as_of` in `cursor`; an `as_of` sent beside a cursor must equal it. See [Pinned `as_of`](crypto.md#pinned-as_of-and-keyset-paging) |
+| `limit` | integer | 1 to 500, default 100 (refused outside the range, not clamped) |
+| `cursor` | string | The previous page's `next_cursor` (opaque, at most 512 bytes). Bound to `kind`, `days`, `week` and `bucket`: a cursor that is malformed, edited or issued for another filter is a `400` naming `cursor` |
+
+A parameter repeated with differing values is a `400`. **`offset` is refused in this form** (`400`
+naming it): the filtered list pages by keyset cursor only. `limit` or `offset` alone does not
+select this form (the unfiltered list above keeps its `offset` paging).
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://yuzu.example.com/api/v1/ca/issued?kind=revoked&days=30&bucket=superseded"
+```
+
+```json
+{
+  "items": [
+    {
+      "serial_hex": "3A4B5C6D...",
+      "subject": "agent-prod-01",
+      "san": "URI:yuzu://<ca-fp>/agent/agent-prod-01",
+      "purpose": "agent",
+      "status": "revoked",
+      "not_after": 1821657600,
+      "issued_at": 1790121600,
+      "revoked_at": 1791590400,
+      "revocation_reason": "superseded",
+      "issued_by": "agent:agent-prod-01",
+      "issuer_key_id": "ab12..."
+    }
+  ],
+  "count": 1,
+  "filter": {
+    "kind": "revoked", "days": 30, "week": null, "week_start": null, "bucket": "superseded",
+    "rule_id": "yuzu_ca_revoked_superseded",
+    "criterion": "Revoked after as_of - 30 days and on or before as_of, reason recorded as superseded (replaced by a same-key successor)",
+    "rule_set_version": "crypto_widget_windows_v1",
+    "as_of": 1792396800, "as_of_iso": "2026-10-19T08:00:00Z", "total": 1,
+    "scope_note": "Counts certificates Yuzu's own CA issued only (agent, server, gateway, HTTPS and code-signing); certificates on your devices are not covered."
+  },
+  "next_cursor": null,
+  "meta": { "api_version": "v1", "limit": 100, "has_more": false }
+}
+```
+
+`filter.total` counts every match at `filter.as_of`; when `meta.has_more` is `true`,
+`next_cursor` is set: request the next page with `cursor=<next_cursor>` (and the same `kind`,
+`days`, `week`, `bucket`). The cursor carries the position of the last certificate served and
+the walk's `as_of`, so every page is measured against the same time and starts strictly after
+that certificate: a certificate revoked between pages never makes the walk skip another (an
+offset would). `next_cursor` is `null` on the last page. Order: expiring soonest first, expired and revoked most recent first, the
+rest newest-issued first. Every filtered call is audited `crypto.ca.certificates.view`
+(set-and-proceed: `audit_persisted: false` in the body and `Sec-Audit-Failed: true` when the row
+is lost; a confined refusal is a `denied` row). Errors: `400` (each malformed parameter, named),
+`401`, `403` (no `Security:Read`, or a confined caller), `503` + `retry_after_ms: 5000` (`Yuzu CA
+read degraded`, `crypto read capacity in use; retry`, or `access check unavailable`; never an
+empty list), and `503` **without** `retry_after_ms` (`filtered certificate list unavailable`: the
+server was built without the `/crypto` seam, a wiring fault that lasts until a restart). MCP
+twin: `list_issued_certs` with the same arguments.
 
 #### `POST /api/v1/ca/revoke`
 
@@ -3033,7 +3112,7 @@ are all structurally denied before any store read — an MCP-tiered credential
 must use the `assign_rbac_role` MCP tool instead, which carries its own
 supervised-tier + approval-ticket gate ([#520](https://github.com/Tr3kkR/Yuzu/issues/520)).
 
-**Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied` (`target_id` `rbac_role_assignment`). API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The check runs after the administrator gate, the current-regime re-check and MFA step-up and before the body is read.
+**Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The server-wide same-site check (see Authentication) answers first; this route also keeps its own copy, which is defence in depth.
 
 **Request body:**
 
@@ -3125,7 +3204,7 @@ unassigning a role the principal did not hold still returns success.
 **Permission:** Same dedicated `is_rbac_administrator` check as the `POST`
 above (including the MCP-tier-token structural denial), plus MFA step-up.
 
-**Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied` (`target_id` `rbac_role_assignment`). API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The check runs after the administrator gate, the current-regime re-check and MFA step-up and before the body is read.
+**Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The server-wide same-site check (see Authentication) answers first; this route also keeps its own copy, which is defence in depth.
 
 **Response:**
 
@@ -3176,7 +3255,7 @@ accepted deviation `docs/user-manual/rbac.md`'s SSO/break-glass callout
 notes for the equivalent case. A service-scoped API token and an engine
 session are both structurally denied before any store read.
 
-**Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied` (`target_id` `rbac_enforcement`). API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The check runs after the administrator gate and MFA step-up and before the body is read.
+**Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The server-wide same-site check (see Authentication) answers first; this route also keeps its own copy, which is defence in depth.
 
 **Request body:**
 
@@ -4988,7 +5067,7 @@ Update a single runtime configuration value. The key must be one of the allowed 
 
 **Dangling `attempted` row.** An `attempted` `config.update` row with no `success` or `failure` row after it means the outcome is unknown (the server stopped between the two, or the outcome row was lost); read `GET /api/config` to see what is in force. A `failure` row for a database error records `store error; outcome unknown`, because the write may have committed before the acknowledgement was lost.
 
-**Cross-site writes.** A session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API, MCP and engine token callers are exempt.
+**Cross-site writes.** A session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API, MCP and engine token callers are exempt. This is the server-wide rule (see Authentication); this route also keeps its own check, which is defence in depth.
 
 **Allowed keys** (the full set; source of truth is `kAllowedKeys` in
 `server/core/src/runtime_config_store.cpp`):
@@ -7276,6 +7355,7 @@ re-eval, unchanged.
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result` or `re-eval`, `instruction_id` exceeds 256 bytes, `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB, or `params` is present but not a JSON object. On `re-eval` only, the original's `sql` may also exceed 100 KiB (#4373) |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `re-eval` only, the original's live parent set was deleted and its persisted `scope_input_id` shows it was narrowed at creation (#4306) — audited `result_set.create\|denied`, `reason=parent_gone` |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` with `"kind":"tar_rows_ge"` whose `n` is present but not a JSON integer from `1` to `2147483647` (a wrong type or a wrapped value used to throw in the maintenance tick, which re-threw every 2 seconds and starved the result-set GC; an `n` or `kind` already stored that is malformed, or an `n` below 1, now matches no device). A `matcher` that is present but not a JSON object, or a `kind` that is not a string, is refused too, and so is a column matcher (no `kind`) whose `column`, `op` or `value` is present but not a string or whose `value_set` is present but not an array (`{"column":5,"op":"eq"}` used to qualify every responder; a stored one now matches no device, while a MISSING key keeps the accept-all default so a typo cannot silently empty the set); it used to be dropped, which meant every responder qualified (omit `matcher` for that default). Nothing is dispatched (#4644) |
+| 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` that carries `declared_columns` or `plugin`. These two keys are server-authored: when the matcher's `column` is a column the instruction definition declares in its `result_schema`, the server stores them (`declared_columns` = field names in output order, `plugin` = the definition's plugin) so a column matcher works on any plugin's pipe-row output, not only TAR or JSON. The header row and short status rows (`status\|not_found`, `not_available\|<reason>`) are skipped. A column the definition does not declare stores nothing extra |
 | 400 | `sql`/`instruction_id`/`name` present but not a JSON string (a clean 400 rather than an uncaught exception, #4406); `name` over 256 bytes on `from-tar-query` or `from-instruction-result` |
 | 404 | Unknown `instruction_id`, unknown parent set, or (on re-eval) a set the caller does not own |
 | 429 | `RESULT_SET_QUOTA_EXCEEDED` — owner is at the per-owner set cap |
@@ -7645,7 +7725,7 @@ A parameter repeated with differing values, an unknown `family`, a value that is
 | 400 | Parameter repeated with differing values, malformed parameter, unknown `family`, invalid UTF-8, over-long value |
 | 401 | Unauthenticated |
 | 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
-| 503 | `crypto library read degraded` (the inventory read failed or ran past its 5 s bound) or `crypto read capacity in use; retry` (the server bounds concurrent reads per process): `retry_after_ms: 5000` either way; **never an empty 200**. An absent inventory store or an unwired gate (server misconfiguration) is a `503` without `retry_after_ms` |
+| 503 | `crypto library read degraded` (the inventory read failed or ran past its 5 s bound) or `crypto read capacity in use; retry` (the server bounds concurrent reads per process): `retry_after_ms: 5000` either way; **never an empty 200**. An absent inventory store or an unwired gate (server misconfiguration) is a `503` without `retry_after_ms`. A server whose Postgres pool is smaller than 2 connections refuses these reads with a `503` and **no** `retry_after_ms` (`crypto library reads (and the CBOM export) refused: the server's Postgres pool is smaller than 2 connections; restart the server with --postgres-pool-size 2 or more`): a retry fails the same way until that restart. |
 
 #### `GET /api/v1/crypto/libraries/devices`
 
@@ -7695,7 +7775,7 @@ The devices (and matching package rows) behind one family, optionally one versio
 | 400 | `family` missing or unknown, parameter repeated with differing values, malformed parameter, invalid `limit`, over-long or non-UTF-8 value, or a refused cursor (including one from another `table_version`, or a cursor issued on live names when the catalogue is now in use) |
 | 401 | Unauthenticated |
 | 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
-| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty 200**. An absent store or an unwired gate is a `503` without `retry_after_ms` |
+| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty 200**. An absent store or an unwired gate is a `503` without `retry_after_ms`. A server whose Postgres pool is smaller than 2 connections refuses these reads with a `503` and **no** `retry_after_ms` (`crypto library reads (and the CBOM export) refused: the server's Postgres pool is smaller than 2 connections; restart the server with --postgres-pool-size 2 or more`): a retry fails the same way until that restart. |
 
 #### `GET /api/v1/crypto/cbom`
 
@@ -7750,7 +7830,138 @@ A CycloneDX **1.7** inventory of the cryptographic *library* packages installed 
 | 400 | Repeated parameter with differing values, unknown `family`, invalid UTF-8 or over-long value |
 | 401 | Unauthenticated |
 | 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
-| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty BOM**. An absent store, an unwired gate or a failure minting the serial number is a `503` too; the serial is minted before the inventory read, so that last failure takes no read slot and writes no audit row |
+| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty BOM**. An absent store, an unwired gate or a failure minting the serial number is a `503` too; the serial is minted before the inventory read, so that last failure takes no read slot and writes no audit row. A server whose Postgres pool is smaller than 2 connections refuses these reads with a `503` and **no** `retry_after_ms` (`crypto library reads (and the CBOM export) refused: the server's Postgres pool is smaller than 2 connections; restart the server with --postgres-pool-size 2 or more`): a retry fails the same way until that restart. |
+
+#### Dashboard widgets (ADR-0070 D13)
+
+The `/crypto` page is a per-operator widget dashboard (see [crypto.md](crypto.md#the-dashboard)). These routes serve the widget catalogue, the caller's own layout and the Yuzu-issued certificate counts; MCP twins `list_crypto_widgets`, `get_crypto_dashboard_layout`, `set_crypto_dashboard_layout` and `get_crypto_ca_stats`. The certificates behind a count are served by the filtered [`GET /api/v1/ca/issued`](#get-apiv1caissued) (MCP `list_issued_certs`). Every route answers `Cache-Control: no-store, private` and `Vary: Authorization, Cookie, X-Yuzu-Token`. The Yuzu-issued figures read **Yuzu's own internal CA** only, never certificates found on fleet devices (ADR-0070 D6). Facts only: the only built-in checks are the D13 named windows, each returned with its criterion and computed at read time against `as_of`, the database clock (ADR-0070 R4, R5), over the closed window set `crypto_widget_windows_v1` (active; expiring 3/7/14/21/30/60 days; expired 7/30/60/90; revoked 7/30/60/90 in three reason buckets; issued 7; 52 ISO weeks, the current partial week included); nothing grades a certificate.
+
+##### `GET /api/v1/crypto/widgets`
+
+The widget catalogue. Authentication only; not audited. `data`: `window_set`, `default_layout` (ids), `max_layout_widgets` (64), `scope_note` and `widgets[]` with `id`, `title`, `kind` (`number`, `bar`, `line`, `table`), `group`, `gate` (`fleet_read`: library widgets, answered over the caller's scope; `fleet_wide_only`: Yuzu-issued counts, withheld from a confined caller), `securable`, `operation` (`Inventory`/`Read` for every widget), `criterion` (what the widget counts, in words), `drill`, `available` and `availability` (`available`, `not_available`, `confined` or `access_check_unavailable`) and, for Yuzu-issued widgets, `ca_kind`, `days`, `drill_securable`/`drill_operation` (`Security`/`Read`) and `drill_available`. `available` and `drill_available` decide what to draw only: they come from the same non-auditing check the data routes would apply, and grant nothing. Errors: `401`, `503` (server misconfiguration).
+
+##### `GET /api/v1/crypto/dashboard/layout`
+
+The caller's OWN layout, keyed by the session user name (never another operator's). Authentication only; not audited. A service-scoped API token is refused `403` (`service-scoped tokens may not read or change a dashboard layout`, no `permission` field; audited `crypto.dashboard.layout.access_denied`), and an MCP-tier token is held to its tier's `Infrastructure:Read`. `data`: `widgets` (catalogue ids this server knows, in display order), `is_default` (`true` when the widgets are the default and no other-version ids are kept), `version` (the stored version, `0` when nothing is stored), `preserved_unknown` (stored ids this server version does not know: kept on every save, not listed) and `max_layout_widgets`.
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" https://yuzu.example.com/api/v1/crypto/dashboard/layout
+```
+
+```json
+{
+  "data": {
+    "widgets": ["lib.devices_reporting", "ca.active", "ca.expiring_30d"],
+    "is_default": false,
+    "version": 7,
+    "preserved_unknown": 0,
+    "max_layout_widgets": 64
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+Errors: `401`, `403`, `422` (the stored layout is damaged: not retryable, the `X-Crypto-Layout-Version` header carries its version; a `PUT` with `expected_version` set to that version replaces it), `503` + `retry_after_ms: 5000` (`dashboard layout read degraded`; never the default served in its place), and `503` without `retry_after_ms` when the layout store did not open at server start (`dashboard layouts unavailable: the layout store did not open at server start; saved layouts return after a restart with the store fixed`).
+
+##### `PUT /api/v1/crypto/dashboard/layout`
+
+Replace the caller's own layout. Body: `widgets` (at most 64 catalogue ids, no repeats; an empty list is valid) and optional `expected_version` (an integer, `0` or more); no other key. With `expected_version` the save is refused `409` unless the stored version is still that value (`0` = only if nothing is stored). Omit it only for a first save: without it the save succeeds only when nothing is stored, and over a stored layout (a damaged one included) it is the same `409` with `X-Crypto-Layout-Version` carrying the stored version. Ids stored by another server version are kept after yours (see `preserved_unknown`). Same caller rules as the GET (service-scoped token `403`, audited as a `crypto.dashboard.layout.update` `denied` row; MCP-tier token held to `Infrastructure:Write`). A cookie-authenticated browser write must name this site (`Origin`/`Referer`), else `403` and a `csrf.denied` row. Audited `crypto.dashboard.layout.update`: an `attempted` row first (if it cannot be written the layout is not changed: `503`, `Sec-Audit-Failed: true`), then `success` or `failure`.
+
+```bash
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"widgets":["lib.devices_reporting","ca.active","ca.expiring_30d"],"expected_version":7}' \
+  https://yuzu.example.com/api/v1/crypto/dashboard/layout
+```
+
+```json
+{
+  "data": {
+    "widgets": ["lib.devices_reporting", "ca.active", "ca.expiring_30d"],
+    "is_default": false,
+    "version": 8,
+    "preserved_unknown": 0,
+    "max_layout_widgets": 64
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`data` carries `audit_persisted: false` (and the response `Sec-Audit-Failed: true`) when the outcome row could not be written. The body cap is 16 KiB, enforced before the body is read; an over-cap body is refused with the pre-auth cap's `413` envelope:
+
+```json
+{
+  "error": {
+    "code": 413,
+    "message": "request body exceeds this route's size cap",
+    "correlation_id": "req-18f2a1c3d-2a",
+    "retry_after_ms": null,
+    "remediation": "reduce the request body size; see docs/user-manual/rest-api.md for the per-route limit"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+| Status | Condition |
+|---|---|
+| 400 | Malformed body, unknown or repeated id, too many ids, a bad `expected_version`, or another key (the message names the position, never the value) |
+| 401 | Unauthenticated |
+| 403 | Service-scoped token, MCP tier below `Infrastructure:Write`, or a cross-site cookie write |
+| 409 | `expected_version` is stale, or omitted while a layout is stored (`the layout changed since it was loaded (another tab or client saved first); reload it and save again`). `X-Crypto-Layout-Version` carries the stored version (`0` when another save landed during this one). Not retryable as sent: read the layout again, then save |
+| 413 | Body over 16 KiB |
+| 503 | `retry_after_ms: 5000`: `dashboard layout save failed` (store degraded), or `save outcome unknown — reload to check` (the connection dropped after the save was sent; the `failure` audit row says `outcome=unknown`; read the layout to see what was stored). Without `retry_after_ms`: the layout store did not open at server start, or the audit `attempted` row could not be written |
+
+##### `GET /api/v1/crypto/ca/stats`
+
+Every Yuzu-issued count against one `as_of`. **Permission:** `Inventory:Read`, and only for an unconfined view of the fleet (ADR-0070 R2): a management-group-confined caller (or one whose service-scoped token confines it) is refused `403` with `Yuzu-issued certificate figures are not available to this account: its view of the fleet is confined, and these are fleet-wide figures.` and no `permission` field (no grant would admit it), audited as a `crypto.ca.stats.view` `denied` row. Every call reads at request time (never cached), bounded by the `/crypto` read admission limit (see [crypto.md](crypto.md#yuzu-issued-certificates)). Audited `crypto.ca.stats.view` on every call (set-and-proceed: `audit_persisted: false` + `Sec-Audit-Failed: true` when the row is lost).
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" https://yuzu.example.com/api/v1/crypto/ca/stats
+```
+
+Response (trimmed: one entry of each array shown):
+
+```json
+{
+  "data": {
+    "scope": "yuzu_issued",
+    "scope_note": "Counts certificates Yuzu's own CA issued only (agent, server, gateway, HTTPS and code-signing); certificates on your devices are not covered.",
+    "window_edge_note": "as_of is the database clock; issued and revoked times are recorded from the issuing server's clock, so a window edge is accurate only to the servers' clock synchronisation.",
+    "rule_set_version": "crypto_widget_windows_v1",
+    "as_of": 1792396800,
+    "as_of_iso": "2026-10-19T08:00:00Z",
+    "active": {"rule_id": "yuzu_ca_active", "criterion": "Status active, issued on or before as_of, notAfter on or after as_of (valid through notAfter, inclusive)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 412},
+    "expiring_within_days": [
+      {"rule_id": "yuzu_ca_expiring", "criterion": "Status active, notAfter from as_of through as_of + 30 days (valid through notAfter, inclusive)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 9, "threshold": 30}
+    ],
+    "expired_within_days": [
+      {"rule_id": "yuzu_ca_expired", "criterion": "Status active, notAfter from as_of - 7 days up to, not including, as_of", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 0, "threshold": 7}
+    ],
+    "revoked_within_days": [
+      {"rule_id": "yuzu_ca_revoked_superseded", "criterion": "Revoked after as_of - 30 days and on or before as_of, reason recorded as superseded (replaced by a same-key successor)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 31, "threshold": 30, "bucket": "superseded"}
+    ],
+    "issued_within_days": {"rule_id": "yuzu_ca_issued", "criterion": "Issued after as_of - 7 days and on or before as_of, excluding unpublished (recorded, never delivered)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 14, "threshold": 7},
+    "week_basis": "last 52 ISO weeks (UTC, Monday start); the current week is partial",
+    "weeks": [
+      {"week": "2026-W43", "week_start": 1792368000, "partial": true,
+       "issued": {"rule_id": "yuzu_ca_issued_week", "criterion": "Issued in ISO week 2026-W43 (Monday 00:00 UTC start) up to as_of, excluding unpublished (recorded, never delivered)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 3, "week": "2026-W43"},
+       "revoked": [
+         {"rule_id": "yuzu_ca_revoked_week_superseded", "criterion": "Revoked in ISO week 2026-W43 (Monday 00:00 UTC start) up to as_of, reason recorded as superseded (replaced by a same-key successor)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 2, "week": "2026-W43", "bucket": "superseded"}
+       ]}
+    ]
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+- Every count object carries `rule_id`, `criterion`, `rule_set_version`, `as_of` and `count`, plus `threshold` (windowed counts: the window length in days, the ADR-0070 D10 condition-1 field), `week` (per-week counts) and `bucket` (revoked counts). These are counts of certificates, never labels.
+- `expiring_within_days` has one entry per window (3, 7, 14, 21, 30, 60), `expired_within_days` one per window (7, 30, 60, 90). `revoked_within_days` has three entries per window, one per bucket: `superseded`, `unpublished`, `other` (any other recorded reason, including an operator-typed reason stored as `operator-supplied: <text>`). They are never summed.
+- Expiring and expired cover status `active` only; a revoked certificate counts only in the revoked windows (R11). Issued excludes `unpublished` certificates (never delivered).
+- `weeks` has 52 entries, oldest first, zero-filled, ending with the week containing `as_of`, which has `partial: true`. `week_start` is that ISO week's Monday 00:00 UTC.
+- Recompute any count with `Security:Read` from the [filtered `GET /api/v1/ca/issued`](#get-apiv1caissued) with the count's `kind`, `days`/`week`, `bucket` and `as_of`.
+
+Errors: `401`, `403` (no `Inventory:Read`, written by the gate, or a confined caller, above), `503` + `retry_after_ms: 5000` (`Yuzu CA read degraded` or `crypto read capacity in use; retry`; never zeros), and `503` with **no** `retry_after_ms` when the server's Postgres pool is smaller than 4 connections (`Yuzu-issued certificate reads refused: ... restart the server with --postgres-pool-size 4 or more`; a retry fails the same way until that restart). The filtered `GET /api/v1/ca/issued` answers the same refusal the same way.
+
+The `/fragments/crypto/dashboard`, `/fragments/crypto/widget/{id}` and `/fragments/crypto/ca/certificates` fragments render the same data for the page (always HTTP 200, a note on refusal and a banner on degrade) and write the same audit verbs; for a service-scoped token, or an MCP token whose tier refuses the layout read, `/fragments/crypto/dashboard` draws the default layout read-only and never reads the minting operator's saved layout (the layout routes refuse the same tokens); the dashboard fragment writes one row per source per draw (see [crypto.md](crypto.md#audit)). `/fragments/crypto/ca/certificates` is the page's twin of the filtered `GET /api/v1/ca/issued` and needs `Security:Read`.
 
 ---
 
@@ -9746,7 +9957,7 @@ Per-device all-guards view (#4037, api-parity #2146 Batch A) — every guard's s
 Queue a push of the active rule set to scoped agents. Returns `202 Accepted` — agent delivery is asynchronous. The fan-out is live: the server resolves `scope` to the in-scope agents and delivers each a per-agent filtered rule set (only rules whose `os_target` and `scope_expr` match that agent).
 
 - **Permission:** `GuaranteedState:Push`
-- **Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied` (`target_id` `guaranteed_state_push`), not as `guaranteed_state.push`. API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The check runs after the permission check and MFA step-up and before the body is read.
+- **Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The server-wide same-site check (see Authentication) answers first; this route also keeps its own copy, which is defence in depth.
 - **Request body:**
 
 | Field | Type | Required | Description |
@@ -9787,8 +9998,8 @@ Read the Guardian policy generation the server holds. It is the value `POST /api
 
 Raise the server's Guardian policy generation to a chosen value. This is the supported recovery for the state in which agents hold a generation above the server's and refuse every full push (see "Restoring the policy generation" in [Guaranteed State](guaranteed-state.md)). The generation is one counter shared by the whole fleet; the call sets it to the target when the target is higher than the stored value and changes nothing otherwise. It never pushes to an agent: the heartbeat reconcile converges every agent that is behind the new value, to the rule set the server holds at that moment, which replaces the rules the agent holds. That is why the request must acknowledge it.
 
-- **Permission:** a durable Administrator, the same dedicated `is_rbac_administrator` check as `PUT /api/v1/rbac/enforcement`, not `GuaranteedState:Push` and not an ordinary permission check. With RBAC enforcement off, the caller's own local account must hold the `admin` role; with it on, the caller must hold a user-principal `Administrator` grant. A JIT elevation or a group-held grant does not satisfy it. After that check the route re-checks the caller's authority under the current RBAC regime, as the RBAC grant routes do (a caller admitted under a stale cached view is refused). MFA step-up applies when the account is enrolled and its proof is stale (`401` with the step-up envelope); a SAML session gets `403` at the step-up gate, an SSO (OIDC) session is judged on the identity provider's MFA assertion and the `--mfa-enforcement` mode instead of a local enrolment, an `api_token` or `mcp_token` bearer session is exempt from step-up (`mfa_step_up.cpp`), the same accepted deviation as the RBAC enforcement toggle, and `--mfa-step-up-window-secs 0` disables the gate. Limit: with `--mfa-enforcement optional` (the default) an administrator who has not enrolled in MFA is not stepped up, and neither is an SSO (OIDC) administrator whose identity provider sent no MFA claim, and any administrator API-token session is exempt, so on this route such administrators are not MFA-gated. **Order of checks:** authentication, session class, durable-Administrator check, current-regime re-check, MFA step-up, same-site `Origin`/`Referer` (cookie sessions), Guardian store availability, body validation, the rule and deployed-Baseline counts and the empty-rule-set check, then the attempted audit row and the raise.
-- **Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API-token callers are exempt, so the curl example in "Restoring the policy generation" in [Guaranteed State](guaranteed-state.md), which uses a token, needs no `Origin`. A cookie-session variant of that call sends `-H "Cookie: yuzu_session=$COOKIE" -H "Origin: https://yuzu.example.com"` instead of the `Authorization` header. The check runs after the administrator gate and step-up and before the body is read.
+- **Permission:** a durable Administrator, the same dedicated `is_rbac_administrator` check as `PUT /api/v1/rbac/enforcement`, not `GuaranteedState:Push` and not an ordinary permission check. With RBAC enforcement off, the caller's own local account must hold the `admin` role; with it on, the caller must hold a user-principal `Administrator` grant. A JIT elevation or a group-held grant does not satisfy it. After that check the route re-checks the caller's authority under the current RBAC regime, as the RBAC grant routes do (a caller admitted under a stale cached view is refused). MFA step-up applies when the account is enrolled and its proof is stale (`401` with the step-up envelope); a SAML session gets `403` at the step-up gate, an SSO (OIDC) session is judged on the identity provider's MFA assertion and the `--mfa-enforcement` mode instead of a local enrolment, an `api_token` or `mcp_token` bearer session is exempt from step-up (`mfa_step_up.cpp`), the same accepted deviation as the RBAC enforcement toggle, and `--mfa-step-up-window-secs 0` disables the gate. Limit: with `--mfa-enforcement optional` (the default) an administrator who has not enrolled in MFA is not stepped up, and neither is an SSO (OIDC) administrator whose identity provider sent no MFA claim, and any administrator API-token session is exempt, so on this route such administrators are not MFA-gated. **Order of checks:** authentication, session class, durable-Administrator check, current-regime re-check, MFA step-up, this route's own copy (defence in depth) of the same-site `Origin`/`Referer` check (cookie sessions; the server-wide check has already answered first), Guardian store availability, body validation, the rule and deployed-Baseline counts and the empty-rule-set check, then the attempted audit row and the raise.
+- **Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API-token callers are exempt, so the curl example in "Restoring the policy generation" in [Guaranteed State](guaranteed-state.md), which uses a token, needs no `Origin`. A cookie-session variant of that call sends `-H "Cookie: yuzu_session=$COOKIE" -H "Origin: https://yuzu.example.com"` instead of the `Authorization` header. The server-wide same-site check (see Authentication) answers first; this route also keeps its own copy, which is defence in depth.
 - **Request body:**
 
 | Field | Type | Required | Description |
@@ -10574,7 +10785,7 @@ Create a new local account.
 | `role` | string | (ignored) | Field is parsed but discarded; new users always land as `user`. Documented for backwards-compatibility — scripts that pass `role=admin` will not error, but the field has no effect. |
 
 - **Response (200):** Re-rendered user table fragment with the new account visible. `HX-Trigger: {"showToast":{"message":"User created","level":"success"}}`. Audit event recorded as `user.create / success`.
-- **Response (403) cross-site / (503) audit:** a session-cookie caller without an `Origin` or `Referer` naming this site is refused with `403` (audit `csrf.denied`, target `/api/settings/users`); API-token callers are exempt. If the `attempted` audit row cannot be written the server answers `503` with `Sec-Audit-Failed: true` and creates nothing (safe to retry).
+- **Response (403) cross-site / (503) audit:** a session-cookie caller without an `Origin` or `Referer` naming this site is refused with `403` (audit `csrf.denied`); API-token callers are exempt. If the `attempted` audit row cannot be written the server answers `503` with `Sec-Audit-Failed: true` and creates nothing (safe to retry).
 - **Response (400):** Returned when `username` is invalid, `password` is empty, or the password is shorter than 12 bytes or longer than 1024 bytes. Audit `user.create / denied / weak_password` (too short), `too_long` (over 1024 bytes, #5342), or `invalid_username`.
 - **Response (409):** Returned when `username` already exists. Body is the A4 error `Username already exists` (with the duplicate-username toast header). Audit `user.create / denied / duplicate_username`. Also returned (A4 error body "The account could not be created. The name may still belong to a removed account, or the user store did not answer.") when a password that meets the policy is refused by the store, which is what re-creating a removed username does: removed accounts keep their name. Audit `user.create / denied / create_refused`.
 - **Response (401):** Defensive — admin gate passed but session not re-resolvable.
@@ -10596,7 +10807,7 @@ The `role` field must be exactly `admin` or `user`.
 
 - **Response (200) success:** Role changed. Body is the re-rendered user table fragment. `HX-Trigger: {"showToast":{"message":"Role updated","level":"success"}}`. Audit `user.role_change / success` with `detail=old_role=user,new_role=admin` (or vice versa). **All active sessions for the target user are invalidated atomically** — the user must re-authenticate.
 - **Response (200) no-op:** Same role requested as already assigned. Body is the re-rendered fragment with `HX-Trigger: {"showToast":{"message":"Role unchanged","level":"info"}}`. Audit `user.role_change / no_op` with `detail=same_role={admin\|user}`.
-- **Response (403) cross-site / (415) / (503) audit:** a session-cookie caller without a same-site `Origin` or `Referer` is refused with `403` (audit `csrf.denied`, target `/api/settings/users/{username}/role`); API-token callers are exempt. A body that is not `application/json` is refused with `415` (audit `user.role_change / denied / content_type_not_json`). If the `attempted` audit row cannot be written the server answers `503` with `Sec-Audit-Failed: true` and changes nothing (distinct from the store-failure `503` below; safe to retry).
+- **Response (403) cross-site / (415) / (503) audit:** a session-cookie caller without a same-site `Origin` or `Referer` is refused with `403` (audit `csrf.denied`); API-token callers are exempt. A body that is not `application/json` is refused with `415` (audit `user.role_change / denied / content_type_not_json`). If the `attempted` audit row cannot be written the server answers `503` with `Sec-Audit-Failed: true` and changes nothing (distinct from the store-failure `503` below; safe to retry).
 - **Response (400) invalid request:**
   - `invalid_username` — `:username` fails the allowlist (alphanumeric + `.` `_` `-`, 1-64 chars).
   - `invalid_json` — body is not valid JSON.

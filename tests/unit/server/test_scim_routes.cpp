@@ -1699,6 +1699,182 @@ TEST_CASE("ScimRoutes: PATCH active=false fails closed when a token revoke does 
     CHECK((*rows)[0].detail.find("api_tokens_db_error=true") != std::string::npos);
 }
 
+// ── Post-deprovision erasure hook (ADR-0071, deprovision_erasure.hpp) ───────
+//
+// The hook erases per-operator rows (the /crypto dashboard layout) AFTER a deprovision commits,
+// for every principal that could key a session. It is outside the ADR-2001 chokepoint: it runs
+// only on a committed deprovision and can never change the answer.
+
+namespace {
+/// A second ScimRoutes over the fixture's stores whose hook records every call (or throws).
+struct HookedScim {
+    test::TestRouteSink sink;
+    ScimRoutes routes;
+    std::vector<std::vector<std::string>> calls;
+    std::vector<std::string> degraded; // R2-1: erasure-degrade reports, in order
+    explicit HookedScim(Fixture& f, bool throws = false, ApiTokenStore* token_store = nullptr) {
+        routes.set_on_deprovisioned([this, throws](const std::vector<std::string>& principals) {
+            calls.push_back(principals);
+            if (throws)
+                throw std::runtime_error("erasure exploded");
+        });
+        routes.set_on_erasure_degraded(
+            [this](std::string_view reason) { degraded.emplace_back(reason); });
+        routes.register_routes(sink, f.scim_store.get(), &f.auth_mgr, f.audit_store.get(),
+                               /*scim_admin_group=*/{}, /*engine_principal_store=*/nullptr,
+                               token_store ? token_store : f.token_store.get(),
+                               f.analytics_store.get());
+    }
+    auto send(Fixture& f, const std::string& method, const std::string& path,
+              const std::string& body = {}) {
+        return sink.dispatch(method, path, body, "application/scim+json", f.auth_header());
+    }
+};
+const json kDeactivate{{"Operations", json::array({{{"op", "replace"},
+                                                    {"value", {{"active", false}}}}})}};
+} // namespace
+
+TEST_CASE("ScimRoutes: erasure hook - PATCH active=false and PUT active=false pass the slug and "
+          "every linked principal, once, after the commit",
+          "[pg][scim][routes][deprovision][erasure]") {
+    Fixture f;
+    HookedScim h{f};
+    auto id = json::parse(f.post("/scim/v2/Users", {{"userName", "xena"}})->body)["id"]
+                  .get<std::string>();
+    const std::string iss = "https://idp.example.com/";
+    REQUIRE(f.scim_store->upsert_link(iss, "sub-xena", id));
+    auto res = h.send(f, "PATCH", "/scim/v2/Users/" + id, kDeactivate.dump());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    REQUIRE(h.calls.size() == 1);
+    const auto got = h.calls[0]; // a copy: the replay below appends to h.calls
+    CHECK(std::ranges::find(got, std::string("xena")) != got.end());
+    CHECK(std::ranges::find(got, oidc::oidc_principal_id(iss, "sub-xena")) != got.end());
+    // M1: a replay that finds the account already inactive runs no deprovision, but still runs
+    // the (idempotent) erasure over the slug AND the linked identities, and answers as before.
+    CHECK(h.send(f, "PATCH", "/scim/v2/Users/" + id, kDeactivate.dump())->status == 200);
+    REQUIRE(h.calls.size() == 2);
+    CHECK(h.calls[1] == got);
+    h.calls.pop_back();
+
+    auto id2 = json::parse(f.post("/scim/v2/Users", {{"userName", "yara"}})->body)["id"]
+                   .get<std::string>();
+    auto put = h.send(f, "PUT", "/scim/v2/Users/" + id2,
+                      json{{"userName", "yara"}, {"active", false}}.dump());
+    REQUIRE(put);
+    CHECK(put->status == 200);
+    REQUIRE(h.calls.size() == 2);
+    CHECK(h.calls[1] == std::vector<std::string>{"yara"});
+    // M1: the PUT replay on the now-inactive account erases again (idempotent), same answer.
+    auto replay = h.send(f, "PUT", "/scim/v2/Users/" + id2,
+                         json{{"userName", "yara"}, {"active", false}}.dump());
+    REQUIRE(replay);
+    CHECK(replay->status == 200);
+    REQUIRE(h.calls.size() == 3);
+    CHECK(h.calls[2] == std::vector<std::string>{"yara"});
+}
+
+TEST_CASE("ScimRoutes: erasure hook - DELETE of an active and of an already-inactive user, and "
+          "create-with-active:false",
+          "[pg][scim][routes][deprovision][erasure]") {
+    Fixture f;
+    HookedScim h{f};
+    auto id = json::parse(f.post("/scim/v2/Users", {{"userName", "zane"}})->body)["id"]
+                  .get<std::string>();
+    CHECK(h.send(f, "DELETE", "/scim/v2/Users/" + id)->status == 204);
+    REQUIRE(h.calls.size() == 1);
+    CHECK(h.calls[0] == std::vector<std::string>{"zane"});
+
+    // M1: already inactive - no revoke runs, but the erasure resolves the linked identities
+    // too (read-only), so an inactive user's oidc:/saml: rows are erased with the slug's.
+    auto id2 = json::parse(f.post("/scim/v2/Users", {{"userName", "abel"}})->body)["id"]
+                   .get<std::string>();
+    const std::string iss = "https://idp.example.com/";
+    REQUIRE(f.scim_store->upsert_link(iss, "sub-abel", id2));
+    REQUIRE(f.patch("/scim/v2/Users/" + id2, kDeactivate)->status == 200); // un-hooked routes
+    CHECK(h.send(f, "DELETE", "/scim/v2/Users/" + id2)->status == 204);
+    REQUIRE(h.calls.size() == 2);
+    CHECK(h.calls[1] ==
+          std::vector<std::string>{"abel", oidc::oidc_principal_id(iss, "sub-abel")});
+
+    auto created = h.send(f, "POST", "/scim/v2/Users",
+                          json{{"userName", "bree"}, {"active", false}}.dump());
+    REQUIRE(created);
+    CHECK(created->status == 201);
+    REQUIRE(h.calls.size() == 3);
+    CHECK(h.calls[2] == std::vector<std::string>{"bree"});
+    // A plain create deprovisions nothing.
+    CHECK(h.send(f, "POST", "/scim/v2/Users", json{{"userName", "cato"}}.dump())->status == 201);
+    CHECK(h.calls.size() == 3);
+}
+
+TEST_CASE("ScimRoutes: erasure hook - an already-inactive user whose linked identities cannot be "
+          "read is erased by slug alone, observably, and the answer is unchanged",
+          "[pg][scim][routes][deprovision][erasure]") {
+    // R2-1: the erasure-only link read fails (the table is gone); the replay and the DELETE
+    // still answer as before, erase the slug, and report link_read_failed (the server counts it
+    // on yuzu_server_crypto_layout_erase_failures_total) - never a silent fallback.
+    Fixture f;
+    HookedScim h{f};
+    auto id = json::parse(f.post("/scim/v2/Users", {{"userName", "faye"}})->body)["id"]
+                  .get<std::string>();
+    REQUIRE(f.patch("/scim/v2/Users/" + id, kDeactivate)->status == 200); // un-hooked routes
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(f.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult drop{
+            PQexec(conn.get(), "DROP TABLE scim_store.saml_identity_links")};
+        REQUIRE(drop.ok());
+    }
+    CHECK(h.send(f, "PATCH", "/scim/v2/Users/" + id, kDeactivate.dump())->status == 200);
+    REQUIRE(h.calls.size() == 1);
+    CHECK(h.calls[0] == std::vector<std::string>{"faye"});
+    CHECK(h.degraded == std::vector<std::string>{"link_read_failed"});
+    CHECK(h.send(f, "PUT", "/scim/v2/Users/" + id,
+                 json{{"userName", "faye"}, {"active", false}}.dump())
+              ->status == 200);
+    REQUIRE(h.calls.size() == 2);
+    CHECK(h.calls[1] == std::vector<std::string>{"faye"});
+    CHECK(h.degraded.size() == 2);
+    CHECK(h.send(f, "DELETE", "/scim/v2/Users/" + id)->status == 204);
+    REQUIRE(h.calls.size() == 3);
+    CHECK(h.calls[2] == std::vector<std::string>{"faye"});
+    CHECK(h.degraded == std::vector<std::string>{"link_read_failed", "link_read_failed",
+                                                 "link_read_failed"});
+}
+
+TEST_CASE("ScimRoutes: erasure hook - a throwing hook never changes the deprovision's answer, and "
+          "a deprovision that fails closed never runs it",
+          "[pg][scim][routes][deprovision][erasure]") {
+    Fixture f;
+    {
+        HookedScim h{f, /*throws=*/true};
+        auto id = json::parse(f.post("/scim/v2/Users", {{"userName", "dina"}})->body)["id"]
+                      .get<std::string>();
+        auto res = h.send(f, "PATCH", "/scim/v2/Users/" + id, kDeactivate.dump());
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(h.calls.size() == 1);
+        CHECK_FALSE(f.auth_mgr.get_user_role("dina").has_value());
+    }
+    {
+        // A token revoke that cannot persist fails the deprovision closed (500): no erasure.
+        yuzu::server::pg::PgPool starved_pool{{.conninfo = f.auth_db.dsn(), .size = 1}};
+        ApiTokenStore starved{starved_pool};
+        REQUIRE(starved.is_open());
+        HookedScim h{f, /*throws=*/false, &starved};
+        auto id = json::parse(f.post("/scim/v2/Users", {{"userName", "egon"}})->body)["id"]
+                      .get<std::string>();
+        auto hog = starved_pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(hog);
+        auto res = h.send(f, "PATCH", "/scim/v2/Users/" + id, kDeactivate.dump());
+        hog.reset();
+        REQUIRE(res);
+        CHECK(res->status == 500);
+        CHECK(h.calls.empty());
+    }
+}
+
 TEST_CASE("ScimRoutes: D1 — role-refused deprovision WITH an active linked identity is a "
          "LOUD signal: a proper-result audit row + the role-refused metric + a "
          "Severity::kCritical analytics event",

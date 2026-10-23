@@ -339,6 +339,23 @@ TEST_CASE("RestApiV1::register_routes vs openapi_spec_json(): every registered "
     REQUIRE(missing.empty());
 }
 
+TEST_CASE("openapi_spec_json(): info.description states the cookie-session same-site rule",
+          "[openapi]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec.contains("info"));
+    REQUIRE(spec["info"].contains("description"));
+    const std::string description = spec["info"]["description"].get<std::string>();
+    CHECK(description.find("authorised by the session cookie must carry an Origin or Referer "
+                           "header naming this site") != std::string::npos);
+    CHECK(description.find("--csrf-trusted-origin") != std::string::npos);
+    CHECK(description.find("cross-site request refused") != std::string::npos);
+    CHECK(description.find("Token callers are not affected, except routes "
+                           "that keep their own check") != std::string::npos);
+    CHECK(description.find("Cookie-session reads that dispatch work, persist state or refresh "
+                           "server state") != std::string::npos);
+}
+
 TEST_CASE("openapi_spec_json(): the app-usage Forensics path is documented (Wave 7 PR7.2)",
           "[openapi][app_usage]") {
     const auto& spec_json = yuzu::server::openapi_spec_json();
