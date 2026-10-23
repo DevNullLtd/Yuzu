@@ -6935,7 +6935,7 @@ the query route above. The v1 twin of `GET /api/responses/{id}/aggregate` above,
 `timestamp`/`status`/`id`, defaulting to `id` when omitted. An invalid `group_by`/`op_column` is a
 `400`, validated against `ResponseStore`'s own allow-list before the aggregate query runs — never
 mapped to a `503` (a client typo must not read as store degradation). A `503` (with `retry_after_ms`)
-means the response store is degraded or not initialised, the `response.read` audit row could not persist,
+means the response store is degraded or not initialized, the `response.read` audit row could not persist,
 or the caller's Forensics authority could not be determined (retryable). Rows of Forensics-tier plugins
 are absent from every group and total for a caller without `Forensics:Read`, with no marker, so a small or
 zero total does not prove that no data exists; an aggregate writes no `response.forensics.read` row (see

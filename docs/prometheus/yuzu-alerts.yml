@@ -2232,7 +2232,7 @@ groups:
       # it is not served as a 200 with the Forensics rows silently missing. The one disclosed
       # exception is a degrade of ONLY the global permission read for a caller other than an
       # engine principal, which classifies as a definitive refusal; YuzuRbacReadDegraded is its signal. A definitive
-      # refusal is correct behaviour and is not counted, so the series is flat on a healthy
+      # refusal is correct behavior and is not counted, so the series is flat on a healthy
       # server whatever the callers' roles. The series is pre-seeded to 0 for every reason at
       # boot, so the first event is a rate. `for: 10m` over a 5m rate window (the shape of
       # YuzuResponseReadDegrade): one refusal keeps the expression true for under 5 minutes, so

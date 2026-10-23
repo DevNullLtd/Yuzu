@@ -234,7 +234,7 @@ materialises empty for every creator), and bundle collation applies the caller's
 wires the plugin set and the resolver into each of these.
 
 **Not covered by this tier.** A separate follow-up (#6065) tracks the dispatch-side authorization of policy
-checks. Failure text stored before the sanitiser is reduced on read only
+checks. Failure text stored before the sanitizer is reduced on read only
 while the execution's command correlation (24 hours) is still held (`ExecutionTracker::get_execution()`
 applies the same reduction as its siblings; a failed correlation lookup reduces the text rather than
 showing it, with one warning per 60 seconds). The same bounded token is what the failure
