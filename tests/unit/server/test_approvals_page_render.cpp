@@ -435,7 +435,10 @@ TEST_CASE("bound_request_is_readable: bounded size, bounded depth, a JSON object
     CHECK(bound_request_is_readable(nested(kMaxRequestJsonDepth - 1)));
     CHECK_FALSE(bound_request_is_readable(nested(kMaxRequestJsonDepth)));
     // Brackets inside a string literal (even an escaped quote before them) are not depth.
-    CHECK(bound_request_is_readable(R"({"k":"[[[[[[[[[[[[[[[[[[[[\"[[[[["})"));
+    // Held in a variable: MSVC mis-lexes this raw literal when it sits inside the CHECK macro
+    // argument (it reads the "[[" as an attribute opener).
+    const std::string brackets_in_string = R"({"k":"[[[[[[[[[[[[[[[[[[[[\"[[[[["})";
+    CHECK(bound_request_is_readable(brackets_in_string));
 }
 
 TEST_CASE("summarize_bound_request: an oversized or hostile-deep request takes the notice path "
@@ -453,7 +456,8 @@ TEST_CASE("summarize_bound_request: an oversized or hostile-deep request takes t
     CHECK(summarize_bound_request(deep_doc, kDigest) == notice);
     CHECK(summarize_bound_request(std::string(R"({"k":)") + deep + std::string(8192, ']') + "}",
                                   kDigest) == notice);
-    CHECK(summarize_bound_request(std::string(R"({"k":")") + std::string(20000, 'a') + "\"}",
+    // A plain escaped literal, not a raw one: MSVC mis-lexes the raw form inside a CHECK argument.
+    CHECK(summarize_bound_request(std::string("{\"k\":\"") + std::string(20000, 'a') + "\"}",
                                   kDigest) == notice);
 }
 
