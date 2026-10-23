@@ -867,7 +867,11 @@ TEST_CASE("config_routes: a non-administrator Infrastructure:Write holder and an
     res = h.sink.Put("/api/config/oidc_admin_group", R"({"value":"g"})");
     REQUIRE(res);
     CHECK(res->status == 403);
+    CHECK(res->body.find("administrator account is required") != std::string::npos);
     CHECK(w.store.get_value("oidc_admin_group").empty());
+    // The token class has its own detail, not the missing-role one: the role was fine.
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].detail == "token_session_oidc_setting_blocked");
 }
 
 TEST_CASE("config_routes: an elevated-only session can still write non-oidc keys; an "
@@ -979,11 +983,11 @@ TEST_CASE("config_routes: the administrator-only keys refuse a supervised MCP-ti
     for (const auto& key : keys)
         check_refused(h, key, "own administrator role", "admin_role_required_setting_blocked");
 
-    // The oidc_* keys refuse a service-scoped session too, with the oidc wording and detail.
+    // The oidc_* keys refuse a service-scoped session too, with the token wording and detail.
     h.session_role = auth::Role::admin;
     h.session_token_scope_service = "svc-a";
-    check_refused(h, "oidc_admin_group", "sign-in provider settings",
-                  "admin_role_required_oidc_setting_blocked");
+    check_refused(h, "oidc_admin_group", "administrator account is required",
+                  "token_session_oidc_setting_blocked");
 
     // An admin with a null store is still answered 503 for a key the class lets through, and the
     // route-owned key keeps its 400: the class lookup did not change either answer.
@@ -1133,8 +1137,9 @@ TEST_CASE("config_routes: an MCP-tier token can still write the general keys",
 // writers: a Settings route that writes a runtime-config key through
 // `runtime_config_store_->set("key", ...)` is an administrator route by construction, so the
 // generic PUT must not let a weaker caller write the same key. This fails when a settings writer
-// names a key classified General. It sees literal keys and `plugin_signing::
-// kPluginSigningRequiredKey` only; a key built at runtime is invisible to it.
+// names a key classified General. It names literal keys and `plugin_signing::
+// kPluginSigningRequiredKey` only; a `set(` call with any other first argument fails the call
+// count below, so a key built at runtime cannot slip past it unseen.
 TEST_CASE("config_routes: every key a Settings route writes is not classified General",
           "[server][routes][config_routes]") {
 #ifndef YUZU_SERVER_SRC_DIR
@@ -1154,10 +1159,24 @@ TEST_CASE("config_routes: every key a Settings route writes is not classified Ge
         REQUIRE(in.is_open());
         const std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
         if (name == "settings_routes.cpp") {
+            std::size_t recognised = 0;
             for (auto it = std::sregex_iterator(src.begin(), src.end(), kSet);
-                 it != std::sregex_iterator(); ++it)
+                 it != std::sregex_iterator(); ++it, ++recognised)
                 written.insert((*it)[1].matched ? (*it)[1].str()
                                                 : std::string("plugin_signing_required"));
+            // Every set() call must be one the scan can name. A call whose key is computed
+            // (a variable, a constant other than the one above, a formatted string) matches
+            // kAnySet but not kSet, so it fails here instead of slipping past the class check.
+            const auto any = static_cast<std::size_t>(std::distance(
+                std::sregex_iterator(src.begin(), src.end(), kAnySet), std::sregex_iterator()));
+            INFO("settings_routes.cpp has "
+                 << any
+                 << " runtime_config_store_->set( calls and the "
+                    "scan names the key of "
+                 << recognised
+                 << ": use a string literal or "
+                    "plugin_signing::kPluginSigningRequiredKey, or extend kSet");
+            CHECK(any == recognised);
         } else if (name != "config_routes.cpp" && std::regex_search(src, kAnySet)) {
             other_writers.insert(name);
         }

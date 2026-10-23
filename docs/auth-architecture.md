@@ -829,8 +829,9 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   `oidc.configure / denied / elevated_session_oidc_change_blocked` and
   `config.update / denied / elevated_session_oidc_setting_blocked` (or
   `admin_role_required_oidc_setting_blocked` when the caller was not elevated). The
-  `oidc_*` config rule refuses an MCP-tier token; the handler also refuses a
-  service-scoped token (defence in depth; the permission gate already does).
+  `oidc_*` config rule refuses an MCP-tier token whatever its creator's role, audited
+  `token_session_oidc_setting_blocked`; the handler also refuses a
+  service-scoped token the same way (defence in depth; the permission gate already does).
 - **Administrator-only runtime-config keys.** `PUT /api/config/{key}` for
   `plugin_signing_required`, `dex_alert_routing`, `dex_blast_min_devices`,
   `dex_blast_window_seconds`, `dex_blast_cooldown_seconds`, `dex_cohort_export_key` and
@@ -842,8 +843,8 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   enforced today, the enforced window being `--audit-retention-days` plus a restart. The Settings
   routes are behind `require_admin`; the generic route uses the same predicate: `authz::admin_gate_verdict` (`admin_gate.hpp`) refuses a
   service-scoped token and an MCP-tier token whatever the creator's role, and otherwise
-  requires the EFFECTIVE role to be `admin`. That role is the account's own (legacy)
-  `Session::role`, not an RBAC grant: an RBAC Administrator grant alone does not count,
+  requires the EFFECTIVE role to be `admin`. That role is the account's legacy
+  `Session::role`, or a live JIT elevation, never an RBAC grant: an RBAC Administrator grant alone does not count,
   and an engine principal is refused. Any administrator account session passes,
   including an administrator API token that is not MCP-tier. Unlike the `oidc_*` rule
   above, an active JIT elevation is admitted, as it is on those Settings routes. `Infrastructure:Write` alone

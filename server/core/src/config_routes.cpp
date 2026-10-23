@@ -165,11 +165,18 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
             case ConfigWriteClass::AdminRouteInteractiveOnly:
                 refusal_message =
                     "changing sign-in provider settings needs your own administrator role";
-                if (session->role != auth::Role::admin || !session->mcp_tier.empty() ||
-                    !session->token_scope_service.empty())
+                // The cause picks the detail: a token credential (whatever its creator's
+                // role), then an elevation, then a plain non-administrator.
+                if (!session->mcp_tier.empty() || !session->token_scope_service.empty()) {
+                    refusal_detail = "token_session_oidc_setting_blocked";
+                    refusal_message = "an administrator account is required; MCP-tier and "
+                                      "service-scoped tokens cannot change sign-in provider "
+                                      "settings";
+                } else if (session->role != auth::Role::admin) {
                     refusal_detail = auth::is_elevated(*session)
                                          ? "elevated_session_oidc_setting_blocked"
                                          : "admin_role_required_oidc_setting_blocked";
+                }
                 break;
             case ConfigWriteClass::AdminRoute:
                 switch (authz::admin_gate_verdict(*session)) {
