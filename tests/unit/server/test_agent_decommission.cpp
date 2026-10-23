@@ -296,7 +296,7 @@ TEST_CASE("InventoryStore::delete_agent guards an empty id and reports commit st
     REQUIRE(pool.valid());
     yuzu::server::InventoryStore inv{pool};
     REQUIRE(inv.is_open());
-    inv.upsert("agent-x", "installed_software", R"({"seed":"1"})", 1000);
+    inv.upsert("agent-x", "hardware_info", R"({"seed":"1"})", 1000);
 
     // Empty id: guarded — never a `WHERE agent_id = ''` — reports false (no
     // commit), and the real row is untouched.
@@ -347,8 +347,8 @@ void seed_agent(const std::string& agent_id, yuzu::server::InventoryStore& inv,
     using yuzu::server::InventoryIngestOutcome;
     using yuzu::server::SoftwareEntry;
 
-    // Generic SQLite inventory.
-    inv.upsert(agent_id, "installed_software", R"({"seed":"1"})", 1000);
+    // Generic inventory (a non-typed source; typed ones are filtered from its reads).
+    inv.upsert(agent_id, "hardware_info", R"({"seed":"1"})", 1000);
 
     // Typed installed-software projection.
     std::vector<SoftwareEntry> sw = {{"Chrome", "119", "Google", "2026-01-01"}};

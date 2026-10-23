@@ -385,16 +385,16 @@ no-existence-oracle posture `tar_events` already gets (#760 UP-8). #4260 tracked
 this exclusion. #2744 (the app_usage measurand ADR) is superseded by the machine-scope decision
 above and closes without a code change.
 
-**Residual read path, accepted not closed:** `app_usage` is also a typed daily-sync source
-(`typed_inventory_sources.hpp`) excluded from the generic `InventoryStore` only on the gateway's
-*write* path, with a boot-time purge cleaning up any stray row from a mixed-version deployment
-window (an older gateway writing before an upgraded server's boot purge runs). The generic *read*
-path (`InventoryStore::get`/`query`/`list_tables`) carries no typed-source filter, so a stray row
-from that window — or a failed purge — stays readable via the far lower-privileged
-`Infrastructure:Read`/`Inventory:Read` securable until the next boot purge. This is the same
-architectural gap `device_ci` already carries (per `typed_inventory_sources.hpp`'s own header
-comment) and is not being retrofitted here either; it was accepted at this feature's planning gate
-in favor of purge-on-upgrade over a read-time filter.
+**Residual read path, closed (ADR-0070 D12):** `app_usage` is also a typed daily-sync source
+(`typed_inventory_sources.hpp`). The gateway's generic *write* path skips it, and a boot-time purge
+removes any stray row an older server wrote during a mixed-version window. This was once an
+accepted gap, because the generic *read* path had no typed-source filter, so such a row stayed
+readable via the far lower-privileged `Infrastructure:Read`/`Inventory:Read` securable until the
+next purge. Every generic read (`InventoryStore::list_tables`/`get`/`query`/`count`) now excludes
+each member of `kTypedInventorySources` in SQL, which closes that window for `app_usage`,
+`device_ci` and every other typed source. A server older than that change, or one rolled back below
+it, still shows such rows. The gateway skip, the boot purge and the read filter iterate the same
+one list.
 
 ## Testing
 

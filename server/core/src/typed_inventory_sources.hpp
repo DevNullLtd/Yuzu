@@ -13,26 +13,46 @@
 /// on `Infrastructure:Read`, not the per-source gate (e.g. `Inventory:Read`), so the
 /// device_ci serial/UUID/MAC would be readable without `Inventory:Read`.
 ///
-/// ADDING A TYPED SOURCE = add its wire key here (one place), or it silently
-/// double-stores into the generic store on the gateway path.
+/// ADDING A TYPED SOURCE = add its wire key to `kTypedInventorySources` (one place),
+/// or it silently double-stores into the generic store on the gateway path.
+///
+/// The ONE list. Three consumers iterate it, so none may keep its own copy:
+/// - the gateway skip, through `is_typed_inventory_source`;
+/// - the boot-time purge in server.cpp, which deletes each source's generic rows;
+/// - the read filter in `InventoryStore::list_tables`/`get`/`query`, which excludes
+///   every source here in SQL, so a stray row (an older server, or a server rolled
+///   back below the change that added the source) is never readable through the
+///   generic store's `Infrastructure:Read`/`Inventory:Read` surface.
 
+#include <algorithm>
+#include <array>
 #include <string_view>
 
 namespace yuzu::server {
 
-[[nodiscard]] inline bool is_typed_inventory_source(std::string_view source) {
+inline constexpr std::array<std::string_view, 6> kTypedInventorySources = {
+    "installed_software",
+    "app_perf",
+    "device_ci",
     // software_licensing (ADR-0024 Decision 5): registered in the SAME change
     // as its seam (software_licensing_ingestion) — omission would double-store
     // detected-licence rows (incl. `user_ref`) into the generic store on the
     // gateway path, readable under Infrastructure:Read, i.e. a leak past the
     // SoftwareLicensing securable.
-    // app_usage (Wave 7b, Part 20): this identical hunk lives in BOTH PR7b.2 and PR7b.3 so
-    // no release can carry the agent-side app_usage daily-sync source without this skip —
-    // otherwise a gateway-proxied blob lands in the generic InventoryStore, readable under
-    // Infrastructure:Read (query_inventory/get_agent_inventory), i.e. a leak past the
-    // Forensics securable. Registered here, never inline in the gateway loop.
-    return source == "installed_software" || source == "app_perf" || source == "device_ci" ||
-           source == "software_licensing" || source == "app_usage";
+    "software_licensing",
+    // app_usage (Wave 7b, Part 20): registered before any agent could send it, so
+    // a gateway-proxied blob never lands in the generic InventoryStore, readable
+    // under Infrastructure:Read, i.e. a leak past the Forensics securable.
+    "app_usage",
+    // certificate_inventory (ADR-0070 D12, slice-2 PR 2a-1): reserved BEFORE the
+    // source or its store exists. Until the seam lands its only effects are the
+    // gateway skip and the read filter, which close the stray-row window for every
+    // server at or after this change.
+    "certificate_inventory",
+};
+
+[[nodiscard]] constexpr bool is_typed_inventory_source(std::string_view source) {
+    return std::ranges::find(kTypedInventorySources, source) != kTypedInventorySources.end();
 }
 
 } // namespace yuzu::server
