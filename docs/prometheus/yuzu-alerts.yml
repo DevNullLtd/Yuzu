@@ -2232,11 +2232,13 @@ groups:
       # it is NEVER served as a 200 with the Forensics rows silently missing. A definitive
       # refusal is correct behaviour and is not counted, so the series is flat on a healthy
       # server whatever the callers' roles. The series is pre-seeded to 0 for every reason at
-      # boot, so the first event is an increase. `for: 10m` over a 10m window: a single blip
-      # does not alert, a sustained or recurring failure does.
+      # boot, so the first event is a rate. `for: 10m` over a 5m rate window (the shape of
+      # YuzuResponseReadDegrade): one refusal keeps the expression true for under 5 minutes, so
+      # it never fires, and neither does a burst shorter than about 5 minutes; a failure that
+      # keeps recurring (an event every few minutes) fires after about 10 minutes.
       - alert: YuzuForensicsTierUnresolved
         expr: |
-          sum by (instance, reason) (increase(yuzu_server_forensics_tier_withheld_total[10m])) > 0
+          sum by (instance, reason) (rate(yuzu_server_forensics_tier_withheld_total[5m])) > 0
         for: 10m
         labels:
           severity: warning
@@ -2244,8 +2246,8 @@ groups:
           summary: "Forensics-tier reads are being refused because caller authority cannot be determined on {{ $labels.instance }} (reason={{ $labels.reason }})"
           description: >-
             Reads of stored responses could not determine whether the caller may see
-            Forensics-tier rows (reason={{ $labels.reason }}) for at least 10 minutes on
-            {{ $labels.instance }}. Those reads are refused with a retryable error (a 503 on the
+            Forensics-tier rows (reason={{ $labels.reason }}) repeatedly over at least 10
+            minutes on {{ $labels.instance }}. Those reads are refused with a retryable error (a 503 on the
             REST and legacy routes, a JSON-RPC internal error carrying retry_after_ms on MCP)
             or show a notice (dashboard); no Forensics row is served and no partial result is
             returned. rbac_unavailable: the authorization store answered
