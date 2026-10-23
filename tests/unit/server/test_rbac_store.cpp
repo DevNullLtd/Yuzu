@@ -598,6 +598,43 @@ TEST_CASE("RbacStore: ForensicsAnalyst is seed-only - assigned to nobody and par
         CHECK(pr.role_name != "ForensicsAnalyst");
 }
 
+// The management-group-scoped arm of `resolve_forensics_visible` (step 2, `visible_agents_for_permission`
+// for the "Forensics" securable) and the `exempt_agents` subset arm of `ResponseTierFilter::exclude`
+// consume a scoped Forensics:Read grant that no production route can author today: the scoped
+// (group) assignment surfaces accept only Operator and Viewer, and neither holds Forensics:Read.
+// That branch is dormant on purpose and fails closed. This case pins the SEED half of that
+// statement against the real store, over every role the seed pass creates, so a change that makes
+// the branch reachable cannot do so silently.
+TEST_CASE("RbacStore: no role assignable at management-group scope holds Forensics:Read "
+          "(the resolver's scoped Forensics branch is dormant)",
+          "[rbac_store][pg][forensics_analyst][security]") {
+    RBAC_STORE(store);
+    const char* const why =
+        "A role that can be assigned at management-group scope now holds Forensics:Read, or a "
+        "further role holds it fleet-wide. That makes the resolver's scoped Forensics branch "
+        "(forensics_visibility.cpp, step 2, and ResponseTierFilter's exempt_agents arm) reachable "
+        "from production, where it has had no review. Re-review that branch, then update this pin.";
+
+    // Exactly the seeded roles that hold the grant today.
+    std::vector<std::string> holders;
+    for (const auto& role : store.list_roles())
+        if (role_grants(store, role.name, "Forensics", "Read"))
+            holders.push_back(role.name);
+    std::sort(holders.begin(), holders.end());
+    INFO(why);
+    CHECK(holders == std::vector<std::string>{"Administrator", "ForensicsAnalyst"});
+
+    // The roles the group-scope assignment routes (REST and MCP) accept, and the broad role the
+    // scoped surfaces never mint, none of which may hold it.
+    for (const char* mg_assignable : {"Operator", "Viewer"}) {
+        INFO(mg_assignable);
+        INFO(why);
+        CHECK(role_denies(store, mg_assignable, "Forensics", "Read"));
+    }
+    INFO(why);
+    CHECK(role_denies(store, "ITServiceOwner", "Forensics", "Read"));
+}
+
 TEST_CASE("RbacStore: ForensicsAnalyst seeding is idempotent across restarts",
           "[rbac_store][pg][forensics_analyst]") {
     RBAC_STORE(store);
