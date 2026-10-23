@@ -39,6 +39,9 @@ _hspec.loader.exec_module(hook)
 PLANT = "import pathlib; pathlib.Path(__file__).with_name('EXECUTED').write_text('x')\n"
 
 
+_DIAG_TRACE = os.path.join(tempfile.gettempdir(), "yuzu_test_dd_trace_%d.json" % os.getpid())  # TEMPORARY DIAGNOSTIC
+
+
 def hermetic_env(**extra):
     """The environment for every git / hook subprocess here: no inherited GIT_*
     (a git-hook context sets GIT_DIR / GIT_INDEX_FILE), and no global or
@@ -46,6 +49,7 @@ def hermetic_env(**extra):
     break or leak into a test commit."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", **extra)
+    env["GIT_TRACE2_EVENT"] = _DIAG_TRACE  # TEMPORARY DIAGNOSTIC (PR #6377)
     return env
 
 
@@ -374,6 +378,22 @@ class SyntheticRepo(unittest.TestCase):
                     lines.append(f"--- {' '.join(cmd)} (rc={r.returncode})\n{out.rstrip()}{r.stderr.rstrip()}")
                 except Exception as e2:  # diagnostics only
                     lines.append(f"--- {' '.join(cmd)} failed: {e2!r}")
+            try:  # git's own trace: which command ran which, with start times
+                ev = []
+                with open(_DIAG_TRACE, encoding="utf-8", errors="replace") as fh:
+                    for ln in fh:
+                        try:
+                            j = json.loads(ln)
+                        except ValueError:
+                            continue
+                        if j.get("event") in ("start", "cmd_name", "child_start", "exit"):
+                            what = j.get("argv") or j.get("name") or j.get("hierarchy") or j.get("code")
+                            ev.append(f"{j.get('time','')[11:26]} sid={j.get('sid','')[-24:]} {j['event']} {str(what)[:140]}")
+                sus = [e for e in ev if re.search(r"maintenance|gc|repack|update-server-info|pack-objects|prune|commit-graph", e)]
+                lines.append("--- git trace2: %d events, %d maintenance-like (first 60)\n%s" % (len(ev), len(sus), "\n".join(sus[:60])))
+                lines.append("--- git trace2 (last 80 events)\n%s" % "\n".join(ev[-80:]))
+            except Exception as e3:
+                lines.append(f"--- trace unreadable: {e3!r}")
             print("\n".join(lines), file=sys.stderr, flush=True)
             raise
 
