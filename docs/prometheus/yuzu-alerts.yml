@@ -2229,7 +2229,9 @@ groups:
       # Forensics:Read. When the caller's authority itself cannot be determined (the
       # authorization read answered unavailable, the scoped-visibility lookup failed, or a
       # dependency was never wired) the read is refused with a retryable 503 or shows a notice;
-      # it is NEVER served as a 200 with the Forensics rows silently missing. A definitive
+      # it is not served as a 200 with the Forensics rows silently missing. The one disclosed
+      # exception is a degrade of ONLY the global permission read for an ordinary session,
+      # which classifies as a definitive refusal; YuzuRbacReadDegraded is its signal. A definitive
       # refusal is correct behaviour and is not counted, so the series is flat on a healthy
       # server whatever the callers' roles. The series is pre-seeded to 0 for every reason at
       # boot, so the first event is a rate. `for: 10m` over a 5m rate window (the shape of
