@@ -118,6 +118,9 @@ elif host_machine.system() == 'windows'
   agent_test_native_deps += cxx.find_library('oleaut32')
   # test_msi_packages_actions.cpp's live per-user cross-check calls MsiEnumProductsExW directly.
   agent_test_native_deps += cxx.find_library('msi')
+  # test_app_usage_local_dispatcher.cpp's foreign-owner case calls SetNamedSecurityInfoW and
+  # AdjustTokenPrivileges directly, as tar_test_deps' Windows block does for its DACL cases.
+  agent_test_native_deps += cxx.find_library('advapi32')
 endif
 
 # ── Test fixture: FROZEN ABI3-layout plugin (PLAN-03 — real backward-compat) ──
@@ -1216,7 +1219,11 @@ if host_machine.system() == 'windows'
   tar_test_deps += cxx.find_library('iphlpapi')
   tar_test_deps += cxx.find_library('tdh') # tar_proc_etw.cpp / tar_module_etw.cpp ETW decode
   tar_test_deps += cxx.find_library('wintrust') # tar_module_etw.cpp WinVerifyTrust
-  tar_test_deps += cxx.find_library('crypt32')  # tar_module_etw.cpp CryptQueryObject
+  tar_test_deps += cxx.find_library('crypt32')  # tar_module_etw.cpp CertGetNameStringW (signer from the WinVerifyTrust chain)
+  # advapi32, declared deliberately: tar_db.cpp's owner-only DACL
+  # (ConvertStringSecurityDescriptorToSecurityDescriptorW, SetSecurityInfo, GetSecurityInfo) and
+  # the test_tar_store.cpp DACL readback/owner calls.
+  tar_test_deps += cxx.find_library('advapi32')
   tar_test_deps += cxx.find_library('version')  # tar_proc_perf.cpp GetFileVersionInfoW
   tar_test_deps += cxx.find_library('wevtapi')  # tar_netconn_win.cpp EvtQuery/EvtRender
   tar_test_deps += cxx.find_library('ws2_32')   # winsock2 symbols the iphlpapi/netioapi headers in tar_netqual_boot.cpp pull in
@@ -1358,6 +1365,13 @@ if build_server
       'unit/server/test_settings_routes_mfa.cpp',
       'unit/server/test_totp.cpp',
       'unit/server/test_mfa_step_up.cpp',
+      'unit/server/test_step_up_policy.cpp', # MFA step-up policy table self-checks (pure, no PG)
+      'unit/server/test_mcp_step_up_policy.cpp', # MCP step-up policy table vs the real MCP tool catalogue (L2; pure, no PG)
+      'unit/server/test_step_up_route_inventory.cpp', # step-up policy table vs the registered routes: L1 compiled TestRouteSink registrations, L3 lexical source scan (no PG)
+      'unit/server/test_route_inventory.cpp', # HttplibRouteSink records registrations in RouteInventory (bare httplib::Server, no listen)
+      'unit/server/test_step_up_wiring.cpp', # step-up chokepoint wired into the pre-request handler, over a real httplib::Server (no PG)
+      'unit/server/test_step_up_null_store.cpp', # the two unwired-auth-store 503 sites (server.cpp step_up_fn, auth_routes elevation_step_up); [stepup][null_store] pure + [pg] route cases
+      'unit/server/test_step_up_gate.cpp',   # step-up decide/render split + request chokepoint; [stepup][gate] pure, [pg][mfa][stepup] equivalence matrix
       'unit/server/test_mfa_qr.cpp',
       'unit/server/test_mfa_store.cpp',
       'unit/server/test_auth_lockout.cpp',
@@ -1620,6 +1634,7 @@ if build_server
       'unit/server/test_software_catalog_rollup.cpp',
       'unit/server/test_tar_process_tree.cpp',
       'unit/server/test_tar_timeline_render.cpp', # TAR timeline: pure renderer, goldens, CSS pin
+      'unit/server/test_tar_timeline_page.cpp', # TAR timeline page: shell pins, flag default, escaping, script pins
       'unit/server/test_tar_tree_routes.cpp',
       'unit/server/test_dex_perf_model.cpp',
       # #1845 registry tripwire: pins detail::dex_perf_os_collects to the tar plugin's
@@ -2202,6 +2217,11 @@ if build_server
   # any time measurement (case-count only, its own comment says so), and D's
   # 16.58s isn't on the same measured baseline as C's unmeasured population,
   # so this ordering is a reasonable placement, not a claimed comparison.
+  # Shard D also holds six step-up route-inventory cases (test_step_up_route_inventory.cpp) that
+  # carry [body_cap] only as a PLACEMENT tag: each scans the whole route-source tree (~10 s on
+  # Linux, cached per process), which does not belong in the heavier shard B. Tagging them
+  # [body_cap] moves them with no change to either filter, so flake-retry.py's verbatim non-pg
+  # spec pin and this partition are untouched; the file's header comment names them.
   test('server unit tests shard D', server_test_exe,
        args: ['[body_cap]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]', '--durations=yes'],
        suite: ['server', 'server-nonpg'], timeout: 600, priority: 48)
@@ -3213,6 +3233,16 @@ test('tokens page rotate behaviour',
   timeout: 60,
 )
 
+# TAR timeline page script: runs server/core/static/yuzu-tar-timeline.js under node (pure helpers as
+# tables; the DOM shell against a fake DOM, a recording fetch and a fake clock, never a sleep).
+# Skips (77) without node.
+test('tar timeline script behaviour',
+  _python3_test,
+  args: [files('test_tar_timeline_script_behaviour.py')],
+  suite: ['server', 'docs'],
+  timeout: 60,
+)
+
 # README Docker Compose quickstart (#5419): the compose the README downloads must
 # pull released images at ${YUZU_VERSION}, persist /etc/yuzu/certs, publish 8443,
 # and take the headless admin seed at the image's --config path. Stdlib only;
@@ -3715,6 +3745,17 @@ endif
 test('log handoff wiring lexical gate (#4666 PR-2 W3a)',
   _python3_test,
   args: [files('test_log_handoff_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# #5291 / PR #6311: static lexical gate over TAR's Windows-only bounded hive-mount call site --
+# the module must be pinned before the first mount and the walk must stop mounting after a timeout
+# (a detached mount thread, abandoned or not, keeps running plugin code with nothing joining it).
+# Source text only, so Python, no build needed.
+test('TAR mapdrive hive-mount pin wiring lexical gate (#5291)',
+  _python3_test,
+  args: [files('test_tar_mapdrive_pin_lexical.py')],
   suite: 'agent',
   timeout: 30,
 )
