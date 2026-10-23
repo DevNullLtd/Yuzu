@@ -105,11 +105,12 @@
  * binary run: the GET-span case below walks the same memoized corpus (by
  * reference, no copy) instead of re-reading it. The scans are linear finds, not
  * pattern passes: the former `std::regex` passes cost 24 s (registrations) and
- * 10 s (GET spans) on macOS debug and minutes on MSVC debug, and this cost is
- * O(tree size). Both caches assume every call in this TU passes the same
- * `YUZU_SERVER_SRC_DIR` directory, which is true today (there is exactly one
- * call site for each with a hard-coded argument) — do not reuse either helper
- * with a different directory without splitting the cache key.
+ * 10 s (GET spans) on macOS debug (the MSVC debug cost was not measured, and is
+ * expected to be far larger), and this cost is O(tree size). Both caches live in
+ * route_inventory_scan.hpp and are shared by every test case in the binary. They
+ * assume every call passes the same `YUZU_SERVER_SRC_DIR` directory, which is true
+ * today (every caller passes it) — do not reuse either helper with a different
+ * directory without splitting the cache key.
  */
 
 #include "body_cap_policy.hpp"
@@ -727,7 +728,7 @@ TEST_CASE("route_registration_scan: find_step_up_calls reads the label of a lite
     }
 }
 
-TEST_CASE("route_registration_scan: find_step_up_calls skips a longer name, a longer first "
+TEST_CASE("route_registration_scan: find_step_up_calls skips a longer name and a longer first "
           "argument and a non-boundary prefix",
           "[body_cap][inventory]") {
     CHECK(route_scan::find_step_up_calls("mystep_up_fn(req, res, *session, \"x\");").empty());
@@ -740,14 +741,38 @@ TEST_CASE("route_registration_scan: find_step_up_calls skips a longer name, a lo
     CHECK_FALSE(route_scan::find_step_up_calls("step_up_fn(req")[0].readable);
 }
 
-TEST_CASE("route_inventory_scan: extract_routes keeps the file, the receiver's line, the upper-cased "
-          "method and the literal bytes",
+TEST_CASE("route_registration_scan: find_step_up_calls reports every other argument shape as "
+          "unreadable",
+          "[body_cap][inventory]") {
+    // Each is one `step_up_fn(req` call that is NOT exactly `req, res, *session, "<literal>")`.
+    const char* const shapes[] = {
+        "step_up_fn(req, res, *session, \"x\", y);",       // an extra argument
+        "step_up_fn(req, other, *session, \"x\");",        // a different second argument
+        "step_up_fn(req, *session, \"x\");",               // the second argument missing
+        "step_up_fn(req, res, *session, \"x\" \"y\");",  // concatenated literals
+        "step_up_fn(req, res, *session, \"x\" + s);",     // a computed label
+        "step_up_fn(req, res, *session, \"a\\\nb\");",    // backslash then LF inside the literal
+        "step_up_fn(req, res, *session, \"a\\\rb\");",    // backslash then CR inside the literal
+    };
+    for (const char* shape : shapes) {
+        INFO(shape);
+        const auto calls = route_scan::find_step_up_calls(shape);
+        REQUIRE(calls.size() == 1);
+        CHECK_FALSE(calls[0].readable);
+        CHECK(calls[0].label.empty());
+    }
+}
+
+TEST_CASE("route_inventory_scan: extract_routes keeps the file and the receiver line and the "
+          "upper-cased method and the literal bytes",
           "[body_cap][inventory]") {
     const std::string text =
         "\n\n  sink.Post(\n \"/a\", h);\n"
-        "svr.Put(R\"(/b/([x]+))\", h);\n";
+        "svr.Put(R\"(/b/([x]+))\", h);\n"
+        "sink.Patch(\"/c\", h);\n"
+        "web_server_->Delete(\"/d\", h);\n";
     const auto routes = extract_routes("fixture.cpp", text);
-    REQUIRE(routes.size() == 2);
+    REQUIRE(routes.size() == 4);
     CHECK(routes[0].file == "fixture.cpp");
     CHECK(routes[0].line == 3);
     CHECK(routes[0].method == "POST");
@@ -756,6 +781,10 @@ TEST_CASE("route_inventory_scan: extract_routes keeps the file, the receiver's l
     CHECK(routes[1].line == 5);
     CHECK(routes[1].method == "PUT");
     CHECK(routes[1].raw_path == "/b/([x]+)");
+    CHECK(routes[2].method == "PATCH");
+    CHECK(routes[2].line == 6);
+    CHECK(routes[3].method == "DELETE");
+    CHECK(routes[3].line == 7);
 }
 
 TEST_CASE("route_inventory_scan: the corpus readers return the one memoised copy by reference",

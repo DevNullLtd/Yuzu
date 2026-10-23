@@ -29,14 +29,18 @@
  * lexical layer that still sees registrations no in-process harness can construct.
  *
  * The file corpus and the extracted route list are each memoised behind a function-local
- * `static const` (the pattern passes this replaced cost 24 s and 10 s on macOS debug and more on
- * MSVC debug, see tests/meson.build's shard-D note), computed once per test PROCESS and shared by
+ * `static const` (the registration pass this replaced cost 24 s on macOS debug, and more on MSVC
+ * debug where it was not measured; see tests/meson.build's shard-D note), computed once per test PROCESS and shared by
  * every test case and translation unit that includes this header. Both assume every call passes
  * the same `YUZU_SERVER_SRC_DIR`, which is true today: do not call them with a different
  * directory without splitting the cache key.
  *
  * Keep the C++ regular-expression library out of this file: test_store_wiring_order.cpp fails if
  * its short name appears here in any case, comments included.
+ *
+ * Namespaces: this header's names are in yuzu::server::test::route_scan; the pure scanners it calls
+ * are in yuzu::test::route_scan and are named fully qualified here. Both end in `route_scan`, so a
+ * test that aliases one must not also write `using namespace yuzu::server::test;`.
  */
 
 #include "route_registration_scan.hpp"
@@ -84,7 +88,7 @@ struct RegisteredRoute {
 /// extensions present, and no `.hpp` carries a route registration).
 ///
 /// Memoized (see this header's comment), computed once per test
-/// process, on the assumption every call site in this TU passes the same
+/// process, on the assumption every call site in this test binary passes the same
 /// `dir`.
 inline const std::vector<std::pair<std::string, std::string>>& read_all_cpp_files(const fs::path& dir) {
     static const std::vector<std::pair<std::string, std::string>> cached = [&dir] {
@@ -92,6 +96,7 @@ inline const std::vector<std::pair<std::string, std::string>>& read_all_cpp_file
         // missing directory, which would otherwise surface as an opaque
         // Catch2 "unexpected exception" abort before the REQUIRE_FALSE
         // below ever runs, fail with an actionable message instead.
+        INFO("source directory: " << dir.string());
         REQUIRE(fs::is_directory(dir));
 
         std::vector<std::pair<std::string, std::string>> out;
@@ -102,6 +107,7 @@ inline const std::vector<std::pair<std::string, std::string>>& read_all_cpp_file
             if (ext != ".cpp" && ext != ".inc")
                 continue;
             std::ifstream in(entry.path(), std::ios::binary);
+            INFO("source file: " << entry.path().string());
             REQUIRE(in.is_open());
             std::ostringstream ss;
             ss << in.rdbuf();
@@ -118,6 +124,7 @@ inline const std::vector<std::pair<std::string, std::string>>& read_all_cpp_file
 inline const std::vector<std::pair<std::string, std::string>>&
 read_all_header_files(const fs::path& dir) {
     static const std::vector<std::pair<std::string, std::string>> cached = [&dir] {
+        INFO("source directory: " << dir.string());
         REQUIRE(fs::is_directory(dir));
         std::vector<std::pair<std::string, std::string>> out;
         for (const auto& entry : fs::recursive_directory_iterator(dir)) {
@@ -127,6 +134,7 @@ read_all_header_files(const fs::path& dir) {
             if (ext != ".hpp" && ext != ".h")
                 continue;
             std::ifstream in(entry.path(), std::ios::binary);
+            INFO("source file: " << entry.path().string());
             REQUIRE(in.is_open());
             std::ostringstream ss;
             ss << in.rdbuf();

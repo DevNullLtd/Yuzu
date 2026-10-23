@@ -1,7 +1,8 @@
 #pragma once
 
 // Shared helpers for the source-scan tripwires (test_shutdown_join_order.cpp,
-// test_store_wiring_order.cpp, test_legacy_executions_scope_authz.cpp): read a file
+// test_store_wiring_order.cpp, test_legacy_executions_scope_authz.cpp, and line_of for
+// route_inventory_scan.hpp and test_step_up_route_inventory.cpp): read a file
 // under server/core/src, cut its `//` comments, and locate literal anchors by plain
 // substring search.
 //

@@ -1424,7 +1424,7 @@ cost, not just moving it.** Two avoidable costs were found by measurement
 (braga, macOS debug, one shard at a time) and removed before any rebalancing.
 Non-pg shard D was 39.5 s, of which 34 s were two regular-expression passes
 over every server source file (the route inventory); linear `find` scans now
-do the same work (D 5.6 s), and the three private copies of the `//`-comment
+do the same work (D 5.6 s; after the dev merge brought dev's step-up inventory cases into D, whose own pattern pass is now linear too, 7.9 s), and the three private copies of the `//`-comment
 stripper are one helper. Several pg and non-pg cases slept through 1 s to 6 s
 store deadlines; per-store `*_for_test` seams now age the local deadline
 instead (about 99 s of sleeping removed; the two Postgres-authored deadlines,

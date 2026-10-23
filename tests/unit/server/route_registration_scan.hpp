@@ -3,8 +3,8 @@
 // Finds HTTP route registrations (and the step-up gate's `step_up_fn(...)` calls) in a source
 // text, for the route inventories (route_inventory_scan.hpp, test_body_cap_route_inventory.cpp,
 // test_step_up_route_inventory.cpp). Pure and lexical: no I/O, no comment stripping
-// (a registration inside a comment is counted), and string literals other than the
-// first argument are not understood.
+// (a registration inside a comment is counted), and string literals other than a
+// registration's first argument and a step_up_fn call's label are not understood.
 //
 // Keep the C++ regular-expression library out of this file: a pattern pass over every
 // server source file took 24 s on libc++ for the registrations and 10 s for the
@@ -205,7 +205,6 @@ inline std::string probe_path(std::string_view raw) {
     }
     return out;
 }
-
 
 struct StepUpCall {
     std::size_t pos;   // start of `step_up_fn` / `step_up_fn_`

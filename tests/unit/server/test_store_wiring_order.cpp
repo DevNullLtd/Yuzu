@@ -458,7 +458,7 @@ TEST_CASE("server.cpp + dispatch_scope_ladder.hpp: every production "
 // The matchers must not use the C++ regular-expression library: scanning server.cpp
 // with it takes minutes on MSVC debug, and nothing else here notices a merely slow
 // scan. Reading the headers rather than timing the scan keeps this independent of
-// the machine. It guards those headers only: it cannot see the regexes this file
+// the machine. It guards those files only: it cannot see the regexes this file
 // still uses, another header, a macro, or a slow scan that does not use one.
 TEST_CASE("the source-scan headers and the step-up inventory do not use the regular-expression library",
           "[wiring_order]") {
@@ -480,7 +480,7 @@ TEST_CASE("the source-scan headers and the step-up inventory do not use the regu
         REQUIRE(text.find(h.marker) != std::string::npos);
         std::transform(text.begin(), text.end(), text.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        INFO("the matcher header must not contain \"regex\" in any case, comments included");
+        INFO("the scan file must not contain \"regex\" in any case, comments included");
         CHECK(text.find("regex") == std::string::npos);
     }
 }

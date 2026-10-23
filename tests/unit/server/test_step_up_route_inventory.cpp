@@ -30,7 +30,8 @@
  *
  * SHARD PLACEMENT. Eight cases read the route-source tree (the text corpus is memoised per
  * process). Six of them walk the whole tree with a linear scan (route_registration_scan.hpp; before
- * #4882 each was a pattern-engine pass of ~10 s on Linux) and carry the `[body_cap]` tag: the five that
+ * #4882 the five shared one cached pattern-engine pass, 24 s on macOS debug, and the label-pin case
+ * made two, 19.7 s) and carry the `[body_cap]` tag: the five that
  * use `discover_mutating_routes` (directly or through `l3_scanned()`; one cached pass, paid by
  * whichever runs first) and the kRequired label-pin case (its own pass). The other two (the
  * foreign-receiver and header scans) use plain string search over the cached corpus and stay
@@ -595,8 +596,9 @@ TEST_CASE("step-up route inventory: every kRequired row is registered (its handl
 // re-reads the store, and the call reports a skipped pre-pass on every request. This test is
 // LEXICAL: it reads source text, so it sees only calls whose last argument is a string literal
 // and whose leading arguments are spelled `req, res, *session` (every call today). The
-// shape-guard below fails by file and line for any call it cannot read, rather than passing over
-// it.
+// shape-guard below fails by file and line for any `step_up_fn(req` call whose arguments it cannot
+// read, rather than passing over it. A call spelled so that it is not recognised as one at all
+// (`step_up_fn (req`, a first argument that is not `req`) is not seen by this scan.
 TEST_CASE("step-up route inventory (lexical): kRequired labels equal the in-handler step_up_fn labels",
           "[stepup][inventory][label_pin][body_cap]") {
     namespace linear = ::yuzu::test::route_scan;
