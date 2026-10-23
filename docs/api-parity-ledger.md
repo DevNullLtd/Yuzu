@@ -141,8 +141,9 @@ change raises it with a stated reviewed reason - a newly-discovered fragment
 route, or extraction-completeness catching up to a route that already
 existed); this document's generated block going stale relative to a
 fresh render; a twinned row whose REST route and MCP tool disagree on securable,
-operation or confinement kind (check 6, gate parity: the REST gate and the MCP handler's
-own gate calls are both held to the tool's declared pair, a label-and-call-site tripwire
+operation or confinement kind (check 6, gate parity: the REST gate is compared with the tool's
+declared pair, and for a compared row a derived MCP handler's own gate calls are held to that
+pair too, a label-and-call-site tripwire
 with a size-pinned, shrink-only allowlist, `GATE_PARITY_KNOWN_MISMATCHES`, plus
 `GATE_PARITY_NO_GATE_ALLOWED` for routes whose gate it cannot read); a registry
 tool whose test file does not name it, assert a schema refusal and an audit row, or

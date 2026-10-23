@@ -175,8 +175,9 @@ WHAT IT CHECKS
      tests/meson.build (outside a `#` comment), hold a TEST_CASE that both names the tool
      in a string literal and calls `schema_violation(` (a call-shaped token outside any string or
      character literal), and a TEST_CASE that both names it and has a CHECK/REQUIRE that mentions an
-     audit row and does not assert an absence (not CHECK_FALSE / a leading `!`, no `.empty()`, no
-     comparison with zero). Two shapes are accepted: the schema
+     audit row and does not assert an absence (an absence shape such as `.empty()` or a comparison
+     with zero counts as an absence unless the assertion is negated: `CHECK(audit.empty())` is
+     not an audit-row assertion, `REQUIRE(!audit.empty())` and `CHECK_FALSE(audit.empty())` are). Two shapes are accepted: the schema
      pair and the audit pair may sit in different TEST_CASEs (schema conformance and audit are
      normally separate tests), and one TEST_CASE may satisfy several tools. A table-driven test
      whose tool names sit outside any TEST_CASE body (a file-scope list the cases loop over) is
@@ -2047,7 +2048,9 @@ def unconditional_refusals(span_text):
     or ends in `;`, `{` or `}`, so an `else if` and the unbraced body of another `if`, `while`,
     `for` or a label are not recognised. `if (!helper(...))`, `a && helper(...)`, a call that is not
     in an `if`, one behind another branch, or one whose branch does not return, are NOT
-    recognised, so the route keeps its `plain` kind (fail closed). `span_text` is comment-blanked."""
+    recognised, so the route keeps its `plain` kind (fail closed). Preprocessor lines are not
+    modelled: a directive line before the `if` can make a refusal read as plain (fails closed), or,
+    if it ends in `;` `{` or `}`, count as a statement boundary. `span_text` is comment-blanked."""
     found = []
     for m in _REFUSAL_CALL.finditer(span_text):
         opener = _IF_OPENER.search(span_text[:m.start()])
@@ -3769,6 +3772,12 @@ def _selftest_body():
             ("refusal-under-case-label", f"switch (k) {{ case 1: if ({deny}) return; }}\n{gate}", ("plain", "Sec", "Read")),
             ("refusal-after-braced-block", f"{{ touch(); }}\nif ({deny}) return;\n{gate}", ("refused", "Sec", "Read")),
             ("refusal-after-statement", f"touch();\nif ({deny}) return;\n{gate}", ("refused", "Sec", "Read")),
+            ("refusal-block-nested-return", f"if ({deny}) {{ if (c) {{ return; }} }}\n{gate}", ("plain", "Sec", "Read")),
+            ("refusal-block-bare-return", f"if ({deny}) {{ return; }}\n{gate}", ("refused", "Sec", "Read")),
+            ("refusal-block-statement-then-return", f"if ({deny}) {{ log(); return; }}\n{gate}",
+             ("refused", "Sec", "Read")),
+            ("refusal-block-returned-identifier", f"if ({deny}) {{ returned = 1; }}\n{gate}", ("plain", "Sec", "Read")),
+            ("refusal-after-label", f"retry:\nif ({deny}) return;\n{gate}", ("plain", "Sec", "Read")),
             ("refusal-after-else-block", f"if (x) {{ touch(); }} else {{ touch(); }}\nif ({deny}) return;\n{gate}",
              ("refused", "Sec", "Read")),
             ("refusal-behind-branch", f"if (x) {{ if ({deny}) return; }}\n{gate}", ("plain", "Sec", "Read")),
