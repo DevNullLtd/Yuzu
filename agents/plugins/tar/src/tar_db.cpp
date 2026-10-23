@@ -19,13 +19,32 @@
 #include <sqlite3.h>
 #include <spdlog/spdlog.h>
 
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <format>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
+#include <vector>
+
+#ifdef _WIN32
+// windows.h first; aclapi.h/sddl.h follow it. Confined to this TU (the owner-only DACL block).
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+#include <aclapi.h> // SetSecurityInfo, GetSecurityInfo
+#include <sddl.h>   // the SDDL -> security descriptor conversion, ConvertSidToStringSidW
+#include <win_str.hpp>
+#include <win_tar_db_owner_probe.hpp> // the owner / hard-link test app_usage shares
+#endif
 
 namespace yuzu::tar {
 
@@ -176,15 +195,25 @@ bool integrity_ok(sqlite3* db) noexcept {
     return ok;
 }
 
-// Move a corrupt tar.db (and its -wal/-shm sidecars) aside to a timestamped
-// `.corrupt-<epoch>` path for forensic review, so open() can re-initialise a
-// fresh, trustworthy database rather than refusing to load TAR entirely.
+// The integer in a tar_config `schema_version` value; an unparseable one reads as 0.
+int parse_schema_version(const std::string& text) {
+    try {
+        return std::stoi(text);
+    } catch (...) {
+        return 0;
+    }
+}
+
+// Move a corrupt tar.db (and its -wal/-shm/-journal sidecars, the four files SQLite reads for
+// it) aside to a timestamped `.corrupt-<epoch>` path for forensic review, so open() can
+// re-initialise a fresh, trustworthy database rather than refusing to load TAR entirely.
 // Returns the quarantine path, or std::nullopt if the corrupt main file could
 // NOT be moved aside (read-only mount, locked file on Windows, permissions) —
 // in which case the caller MUST fail closed rather than re-open-and-trust the
 // still-corrupt file (#559 / UP-1). A sidecar that can't be moved is removed
-// instead, so the freshly-created DB can never adopt a stale -wal/-shm; the
+// instead, so the freshly-created DB can never adopt a stale -wal/-shm/-journal; the
 // caller's post-reopen integrity re-check is the backstop if even that fails.
+// An EMPTY sidecar is removed rather than kept: it holds no evidence.
 std::optional<std::filesystem::path>
 quarantine_corrupt_db(const std::filesystem::path& path) {
     const auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
@@ -208,11 +237,18 @@ quarantine_corrupt_db(const std::filesystem::path& path) {
     std::filesystem::rename(path, dest, ec);
     if (ec)
         return std::nullopt; // could not move the corrupt DB aside — fail closed
-    for (const char* suffix : {"-wal", "-shm"}) {
+    for (const char* suffix : {"-wal", "-shm", "-journal"}) {
         std::filesystem::path side = path;
         side += suffix;
         std::error_code ec2;
         if (std::filesystem::exists(side, ec2)) {
+            // A zero-length sidecar holds nothing to preserve (the Windows open() pre-creates both,
+            // protected): drop it, so one corruption leaves one quarantine file, not three.
+            std::error_code size_ec;
+            if (std::filesystem::file_size(side, size_ec) == 0) {
+                std::filesystem::remove(side, ec2);
+                continue;
+            }
             std::filesystem::path side_dest = dest;
             side_dest += suffix;
             std::filesystem::rename(side, side_dest, ec2);
@@ -319,6 +355,219 @@ int exec_ddl_batch(sqlite3* db, const char* ddl, char** err_msg) {
     return rc;
 }
 
+#ifdef _WIN32
+// ── Windows: protected owner-only DACL on tar.db, tar.db-wal, -shm and -journal ─────────────
+//
+// The state directory inherits C:\ProgramData's ACL (Users: read), and tar.db now holds every
+// capture source. The four files SQLite reads for this database get a PROTECTED DACL (SYSTEM,
+// Administrators and the agent's account, FILE_ALL_ACCESS, no inheritance) -- the counterpart of
+// the 0600 pass in open(), built from one SDDL string as agents/core temp_file.cpp and updater.cpp
+// do (explicit SIDs, not the Owner Rights alias "OW": execution_artifacts_win.cpp stores that one
+// literally). It runs before each sqlite3_open_v2 and once at the end of open():
+//  - a missing file is CREATED here with the protected DACL (no inheritance window; SQLite
+//    then creates nothing, and a 0-byte tar.db is a valid empty database);
+//  - an existing file is re-secured in place (an upgraded tar.db on its first open);
+//  - the end pass exists because, on a FRESH (0-page) database, SQLite deletes the pre-created
+//    -wal and recreates it with the inherited ACL on the first write.
+// -journal is on the list because SQLite replays a HOT rollback journal found beside the
+// database BEFORE it looks at the WAL, as the agent: a journal planted by a local user would
+// otherwise rewrite tar_config (the #559 class). An empty journal is inert, so the one created
+// here is.
+// A file owned by anyone but SYSTEM, Administrators or the agent account, or carrying more than
+// one hard link, is PLANTED: a foreign WAL or journal is replayed into tar.db, a foreign tar.db is
+// attacker-controlled config (#559 class), and a hard link shares its target's owner and
+// security descriptor, so re-securing or WAL-initialising it would rewrite the OTHER name's
+// target (the owner test cannot see that). A sidecar is therefore deleted and re-created and
+// such a tar.db refuses the open. Only POSITIVE evidence refuses; a failed owner read
+// (FAT/exFAT: no ACL), link-count query or DACL apply is logged and never fails the open. The
+// tests are yuzu::win::TarDbOwnerProbe's, shared with app_usage, which reads the same files.
+// A file that denies us WRITE_DAC (its owner can do that to dodge the checks) is looked at
+// through a READ_CONTROL-only handle and gets the same two tests; if it passes it keeps its
+// ACL, logged. SQLite's own GENERIC_READ includes READ_CONTROL, so a file we cannot look at
+// that way SQLite cannot open either. FILE_FLAG_OPEN_REPARSE_POINT examines a planted symlink
+// as the link, never its target. Lock-out: a later run under a different non-admin account
+// cannot open tar.db. An account switch is not undone by `icacls /reset` (it rewrites the DACL,
+// never the owner): the open fails until the new account holds an ACE for the files (the open
+// asks FILE_READ_ATTRIBUTES, which owning a file does not grant) and, when the former owner is
+// neither SYSTEM nor Administrators, until it owns them too, since the owner test refuses them
+// first. A former owner of SYSTEM or Administrators passes the owner test, so no owner is named:
+// the log shows "could not open ... (error 5)", then "failed to open tar.db". Not yet verified
+// on a Windows host.
+
+using LocalPtr = std::unique_ptr<void, decltype(&::LocalFree)>;
+using HandlePtr = std::unique_ptr<void, decltype(&::CloseHandle)>;
+
+class TarDbDacl {
+public:
+    TarDbDacl() { build(); }
+    TarDbDacl(const TarDbDacl&) = delete;
+    TarDbDacl& operator=(const TarDbDacl&) = delete;
+
+    [[nodiscard]] bool ok() const noexcept { return ok_; }
+    [[nodiscard]] DWORD build_error() const noexcept { return error_; } // set at the failing call
+    // For CreateFileW: a file created with this SD has the protected DACL from creation.
+    [[nodiscard]] SECURITY_ATTRIBUTES* sa() noexcept { return ok_ ? &sa_ : nullptr; }
+    [[nodiscard]] PACL acl() const noexcept { return acl_; } // points into the SD; valid when ok()
+    [[nodiscard]] const yuzu::win::TarDbOwnerProbe& owner_probe() const noexcept { return probe_; }
+
+private:
+    void build() {
+        if (!probe_.ok()) { // the token user could not be read
+            error_ = probe_.error();
+            return;
+        }
+        // "D:P" = SE_DACL_PROTECTED (a file created with it merges none of the parent's
+        // inheritable ACEs); "FA" = FILE_ALL_ACCESS; an ACE with no flags is NO_INHERITANCE.
+        LPWSTR raw_sid = nullptr;
+        if (!::ConvertSidToStringSidW(probe_.user_sid(), &raw_sid)) {
+            error_ = ::GetLastError();
+            return;
+        }
+        const LocalPtr sid_text{raw_sid, ::LocalFree};
+        std::wstring sddl = L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;";
+        sddl += raw_sid;
+        sddl += L')';
+        PSECURITY_DESCRIPTOR raw_sd = nullptr;
+        if (!::ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1,
+                                                                    &raw_sd, nullptr)) {
+            error_ = ::GetLastError();
+            return;
+        }
+        sd_.reset(raw_sd);
+        BOOL present = FALSE;
+        BOOL defaulted = FALSE;
+        if (!::GetSecurityDescriptorDacl(sd_.get(), &present, &acl_, &defaulted)) {
+            error_ = ::GetLastError();
+            return;
+        }
+        if (!present || acl_ == nullptr) { // never hand SetSecurityInfo a NULL DACL (= everyone)
+            error_ = ERROR_INVALID_ACL;
+            return;
+        }
+        sa_.nLength = sizeof(sa_);
+        sa_.lpSecurityDescriptor = sd_.get();
+        sa_.bInheritHandle = FALSE;
+        ok_ = true;
+    }
+
+    yuzu::win::TarDbOwnerProbe probe_; // the token user the DACL names; also the owner test
+    LocalPtr sd_{nullptr, ::LocalFree}; // the self-relative protected SD; acl_ points into it
+    PACL acl_ = nullptr;
+    SECURITY_ATTRIBUTES sa_ = {};
+    DWORD error_ = ERROR_SUCCESS;
+    bool ok_ = false;
+};
+
+// Creates or re-secures tar.db, tar.db-wal, -shm and -journal (see the block comment above).
+// Returns a refusal message when a planted file must stop the open, else nullopt.
+std::optional<std::string> secure_tar_db_files(const std::filesystem::path& db,
+                                               TarDbDacl& dacl) {
+    if (!dacl.ok())
+        return std::nullopt; // open() warned once, when it built the DACL
+    // FILE_READ_ATTRIBUTES is for the link count below. None of these asks for data or DELETE
+    // access, so share arbitration never weighs the open: no holder's share mode can refuse it.
+    constexpr DWORD kAccess = READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES;
+    constexpr DWORD kLookOnly = READ_CONTROL | FILE_READ_ATTRIBUTES; // no WRITE_DAC
+    constexpr DWORD kShareAll = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    constexpr DWORD kFlags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT;
+    const yuzu::win::TarDbOwnerProbe& probe = dacl.owner_probe();
+    for (const char* suffix : {"", "-wal", "-shm", "-journal"}) {
+        std::filesystem::path file = db;
+        file += suffix;
+        // from_wide, not path::string(): that narrows through the ANSI code page and would
+        // mangle a non-ASCII state directory in the log text and the remedy.
+        const std::string name = yuzu::win::from_wide(file.c_str());
+
+        HANDLE raw = ::CreateFileW(file.c_str(), kAccess, kShareAll, dacl.sa(), OPEN_ALWAYS,
+                                   kFlags, nullptr);
+        const DWORD open_err = ::GetLastError(); // ERROR_ALREADY_EXISTS when it pre-existed
+        bool existed = open_err == ERROR_ALREADY_EXISTS;
+        bool can_secure = true; // the handle carries WRITE_DAC
+        if (raw == INVALID_HANDLE_VALUE && open_err == ERROR_ACCESS_DENIED) {
+            // Either the file cannot be created, or it exists and its DACL withholds WRITE_DAC
+            // from us. The second is how a planted file would dodge the checks below, so look
+            // at it without WRITE_DAC; a file that is not there fails this open too.
+            raw = ::CreateFileW(file.c_str(), kLookOnly, kShareAll, nullptr, OPEN_EXISTING,
+                                kFlags, nullptr);
+            if (raw != INVALID_HANDLE_VALUE) {
+                existed = true;
+                can_secure = false;
+            }
+        }
+        if (raw == INVALID_HANDLE_VALUE) {
+            spdlog::warn("TarDatabase: could not open {} to secure it (error {}); it keeps its "
+                         "current ACL",
+                         name, open_err);
+            continue;
+        }
+        HandlePtr h{raw, ::CloseHandle};
+        if (!existed)
+            continue; // created just now WITH the protected DACL
+
+        // Positive evidence only: a foreign owner, or a second hard link (which shares the
+        // target's owner and so passes the owner test). A failed owner read or link-count query
+        // is no evidence.
+        DWORD owner_rc = ERROR_SUCCESS;
+        std::string why;
+        std::string remedy;
+        if (auto owned_by = probe.foreign_owner(h.get(), &owner_rc)) {
+            why = std::move(*owned_by);
+            remedy = "move it aside or remove it, then restart the agent; if its owner SID is a "
+                     "former agent account's, take ownership of tar.db, tar.db-wal, tar.db-shm "
+                     "and tar.db-journal and grant the agent account full access instead";
+        } else if (auto linked = yuzu::win::TarDbOwnerProbe::extra_links(h.get())) {
+            why = std::move(*linked);
+            remedy = std::format("remove the other links (fsutil hardlink list \"{}\" names "
+                                 "them) or remove it, then restart the agent",
+                                 name);
+        }
+        if (owner_rc != ERROR_SUCCESS) {
+            spdlog::warn("TarDatabase: could not read the owner of {} (error {}); the owner test "
+                         "is skipped for it",
+                         name, owner_rc);
+        }
+        if (!why.empty()) {
+            if (suffix[0] == '\0')
+                return std::format("tar.db at {} {}, and was not opened: {}", name, why, remedy);
+            h.reset(); // release our handle before deleting; a link loses only OUR name
+            if (!::DeleteFileW(file.c_str())) {
+                return std::format("{} {}, and could not be removed (error {}): {}", name, why,
+                                   ::GetLastError(), remedy);
+            }
+            raw = ::CreateFileW(file.c_str(), kAccess, kShareAll, dacl.sa(), CREATE_NEW, kFlags,
+                                nullptr);
+            if (raw == INVALID_HANDLE_VALUE) {
+                return std::format("{} {}; it was removed but could not be re-created (error "
+                                   "{}), so tar.db was not opened",
+                                   name, why, ::GetLastError());
+            }
+            h.reset(raw);
+            spdlog::warn("TarDatabase: replaced {}, which {}", name, why);
+            continue; // re-created WITH the protected DACL
+        }
+        if (!can_secure) {
+            // Ours by owner and link count, but its DACL withholds WRITE_DAC: nothing to apply.
+            spdlog::warn("TarDatabase: could not open {} to secure it (error {}); it keeps its "
+                         "current ACL",
+                         name, open_err);
+            continue;
+        }
+        // Owner read failed (no ACL on this filesystem) or the owner is ours: re-secure in
+        // place. Best-effort -- availability of a diagnostics DB over confidentiality.
+        constexpr SECURITY_INFORMATION kDaclInfo =
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+        if (const DWORD rc = ::SetSecurityInfo(h.get(), SE_FILE_OBJECT, kDaclInfo, nullptr,
+                                               nullptr, dacl.acl(), nullptr);
+            rc != ERROR_SUCCESS) {
+            spdlog::warn("TarDatabase: could not apply the owner-only DACL to {} (error {}); it "
+                         "keeps its current ACL",
+                         name, rc);
+        }
+    }
+    return std::nullopt;
+}
+#endif // _WIN32
+
 } // namespace
 
 // ── Construction / destruction ───────────────────────────────────────────────
@@ -376,6 +625,19 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
     std::optional<int64_t> quarantined_at;
     std::string quarantined_file;
 
+#ifdef _WIN32
+    // Create or re-secure tar.db, -wal, -shm and -journal BEFORE SQLite touches them, and
+    // refuse a planted file (foreign owner or extra hard link); see the DACL block above.
+    TarDbDacl dacl;
+    if (!dacl.ok()) {
+        spdlog::warn("TarDatabase: owner-only DACL not built (error {}); tar.db keeps the "
+                     "directory's inherited ACL",
+                     dacl.build_error());
+    }
+    if (auto refusal = secure_tar_db_files(path, dacl))
+        return std::unexpected(*refusal);
+#endif
+
     sqlite3* raw_db = nullptr;
     int rc = sqlite3_open_v2(path.string().c_str(), &raw_db,
                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
@@ -413,6 +675,11 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
         spdlog::error("TAR: tar.db failed PRAGMA integrity_check (tar.db.corruption_detected) — "
                       "quarantined to {} and re-initialising a fresh database",
                       quarantined->string());
+#ifdef _WIN32
+        // The quarantine rename left no tar.db: pre-create it (and any sidecar) protected again.
+        if (auto refusal = secure_tar_db_files(path, dacl))
+            return std::unexpected(*refusal);
+#endif
         rc = sqlite3_open_v2(path.string().c_str(), &raw_db,
                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
                              nullptr);
@@ -496,9 +763,14 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
     // insert_perf_sample failed every 30 s; found during A2). The version
     // marker keeps its legacy meaning (>=2 = typed warehouse present).
     if (db.create_warehouse_tables()) {
-        if (db.schema_version() < 2) {
-            db.set_config("schema_version", "2");
-            spdlog::info("TarDatabase: migrated to schema version 2 (typed warehouse tables)");
+        // One read, through try_get_config: a FAILED read falling to get_config's "0" default
+        // would rewrite the version to 2 and replay the whole ladder (v8 included, which flips an
+        // operator's disable back on). Only a confirmed-absent or unparseable row migrates.
+        if (const auto stored = db.try_get_config("schema_version")) {
+            if ((stored->has_value() ? parse_schema_version(**stored) : 0) < 2) {
+                db.set_config("schema_version", "2");
+                spdlog::info("TarDatabase: migrated to schema version 2 (typed warehouse tables)");
+            }
         }
     } else {
         // A failed batch that could neither commit nor roll back leaves this
@@ -761,6 +1033,113 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
             sqlite3_exec(raw_db, "RELEASE v7_migration", nullptr, nullptr, nullptr);
         }
     }
+
+    // Version 8: every capture source ships enabled. The eight sources that
+    // were formerly opt-in (below) had `<src>_enabled` stored as "false" on
+    // agents that seeded it (or whose operator wrote it); flip that stored
+    // value to "true" ONCE and clear the paused marker, matching the enable
+    // edge of apply_source_enabled_transition (flag + paused_at "0" in one
+    // transaction; that function lives in tar_aggregator and cannot be called
+    // from here — the aggregator depends on this file). Only the literal
+    // "false" is touched: "true" / "errored" / absent rows are left alone, and
+    // the eight already-on sources are not listed so a deliberate pause on
+    // them survives. Version-gated, so an opt-out written after this migration
+    // sticks; any failed step rolls the whole savepoint back and the version
+    // stays 7 (retried on the next open).
+    if (db.schema_version() == 7) {
+        static constexpr std::string_view kFormerlyOptIn =
+            "'procperf_enabled','netqual_enabled','module_enabled','software_enabled',"
+            "'arp_enabled','dns_enabled','netconn_enabled','mapdrive_enabled'";
+        // Order matters: the paused_at upsert keys on value = 'false', which the
+        // flip then erases. The SELECT's WHERE also lets SQLite parse ON CONFLICT.
+        const std::array<std::string, 2> steps = {
+            std::format("INSERT INTO tar_config(key, value) "
+                        "SELECT replace(key, '_enabled', '_paused_at'), '0' FROM tar_config "
+                        "WHERE value = 'false' AND key IN ({}) "
+                        "ON CONFLICT(key) DO UPDATE SET value = '0'",
+                        kFormerlyOptIn),
+            std::format("UPDATE tar_config SET value = 'true' "
+                        "WHERE value = 'false' AND key IN ({})",
+                        kFormerlyOptIn)};
+        SqliteErrMsg emsg;
+        std::lock_guard lock(db.mu_);
+        if (sqlite3_exec(raw_db, "SAVEPOINT v8_migration", nullptr, nullptr, nullptr) !=
+            SQLITE_OK) {
+            spdlog::error("TarDatabase: v8 SAVEPOINT failed: {} — schema remains at v7, retried "
+                          "on the next open",
+                          sqlite3_errmsg(raw_db));
+        } else {
+            bool ok = true;
+            std::string failed_step;
+            for (const auto& sql : steps) {
+                if (sqlite3_exec(raw_db, sql.c_str(), nullptr, nullptr, emsg.addr()) !=
+                    SQLITE_OK) {
+                    ok = false;
+                    failed_step = std::format("flip: {}", emsg.text());
+                    break;
+                }
+            }
+            if (ok && !db.set_config_locked("schema_version", "8")) {
+                ok = false;
+                failed_step = "write schema_version";
+            }
+            if (ok && sqlite3_exec(raw_db, "RELEASE v8_migration", nullptr, nullptr, nullptr) !=
+                          SQLITE_OK) {
+                ok = false;
+                failed_step = std::format("RELEASE: {}", sqlite3_errmsg(raw_db));
+            }
+            if (ok) {
+                spdlog::info("TarDatabase: migrated to schema version 8 (capture sources "
+                             "default-on)");
+            } else {
+                spdlog::error("TarDatabase: v8 migration failed at '{}' — rolled back, schema "
+                              "remains at v7, retried on the next open",
+                              failed_step);
+                // v8_migration is the outermost savepoint, so RELEASE COMMITS whatever the
+                // failed steps left behind. Run it only after ROLLBACK TO has succeeded;
+                // when ROLLBACK TO fails, go straight to a plain ROLLBACK.
+                const int rollback_rc =
+                    sqlite3_exec(raw_db, "ROLLBACK TO v8_migration", nullptr, nullptr, nullptr);
+                int release_rc = -1; // -1 = not attempted
+                if (rollback_rc == SQLITE_OK)
+                    release_rc =
+                        sqlite3_exec(raw_db, "RELEASE v8_migration", nullptr, nullptr, nullptr);
+                if (rollback_rc != SQLITE_OK || release_rc != SQLITE_OK) {
+                    // An open savepoint would leave every later write uncommitted until
+                    // close. A plain ROLLBACK ends it; with no transaction open it fails
+                    // harmlessly, so its result is ignored.
+                    spdlog::error("TarDatabase: v8 rollback incomplete (ROLLBACK TO rc={}, "
+                                  "RELEASE rc={}, -1 = not attempted): {} — ending the "
+                                  "transaction",
+                                  rollback_rc, release_rc, sqlite3_errmsg(raw_db));
+                    sqlite3_exec(raw_db, "ROLLBACK", nullptr, nullptr, nullptr);
+                }
+            }
+        }
+    }
+
+#ifndef _WIN32
+    // Owner-only (0600) on the db and its WAL sidecars, as command_dedup_store does
+    // (security-hardening.md "chmod 600 *.db"): the packaged state directory is not a
+    // confidentiality boundary (agent-privilege-model.md), and tar.db now holds every
+    // capture source. Best-effort per file (-wal/-shm/-journal may not exist yet); a chmod
+    // failure never fails an otherwise-healthy open. SQLite derives later sidecar modes from
+    // the db file. POSIX mode bits only; Windows applies a protected DACL in the #else arm.
+    for (const char* suffix : {"", "-wal", "-shm", "-journal"}) {
+        std::error_code pec;
+        std::filesystem::permissions(path.string() + suffix,
+                                     std::filesystem::perms::owner_read |
+                                         std::filesystem::perms::owner_write,
+                                     std::filesystem::perm_options::replace, pec);
+    }
+#else
+    // The pre-open pass created or re-secured the four files, but on a FRESH (0-page)
+    // database SQLite deletes the pre-created -wal and recreates it with the inherited ACL on
+    // the first write. This end-of-open pass closes that one-time window and refuses a foreign
+    // file raced in meanwhile. `db` owns raw_db, so returning here closes it.
+    if (auto refusal = secure_tar_db_files(path, dacl))
+        return std::unexpected(*refusal);
+#endif
 
     // Open a dedicated read-only, authorizer-sandboxed connection for untrusted
     // operator SQL (the tar.sql action). On this handle writes are structurally
@@ -1468,12 +1847,7 @@ bool TarDatabase::set_config_locked(const std::string& key, const std::string& v
 // ── Warehouse schema management ─────────────────────────────────────────────
 
 int TarDatabase::schema_version() {
-    auto v = get_config("schema_version", "0");
-    try {
-        return std::stoi(v);
-    } catch (...) {
-        return 0;
-    }
+    return parse_schema_version(get_config("schema_version", "0"));
 }
 
 bool TarDatabase::create_warehouse_tables() {
@@ -2112,7 +2486,8 @@ bool TarDatabase::insert_dns_events(const std::vector<DnsEvent>& events,
 }
 
 bool TarDatabase::insert_mapdrive_events(const std::vector<MapDriveEvent>& events,
-                                       const std::optional<StateWrite>& state) {
+                                       const std::optional<StateWrite>& state,
+                                       bool skip_known_historical) {
     std::lock_guard lock(mu_);
     if (!db_)
         return false;
@@ -2128,7 +2503,19 @@ bool TarDatabase::insert_mapdrive_events(const std::vector<MapDriveEvent>& event
     }
     sqlite3_free(err_msg);
 
-    const char* sql = R"(
+    // skip_known_historical (the bounded per-profile retry's own call): an INSERT...SELECT whose
+    // WHERE NOT EXISTS subquery is scoped to origin='historical' rows sharing this event's mapping
+    // identity. mapdrive_live is append-only -- nothing ever UPDATEs it -- so a row already
+    // recorded keeps its first-recorded ts regardless of what this retry's own (always later or
+    // equal) ts carries; the plain VALUES form is unchanged for the live-diff path, which never
+    // wants this dedup (a live event is action-tagged, never origin='historical').
+    const char* sql = skip_known_historical ? R"(
+        INSERT INTO mapdrive_live (ts, snapshot_id, action, direction, local_mount, remote_path, remote_host, username, provider, origin)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (
+            SELECT 1 FROM mapdrive_live WHERE origin = 'historical'
+                AND direction = ? AND local_mount = ? AND remote_path = ? AND remote_host = ? AND username = ?
+        )
+    )" : R"(
         INSERT INTO mapdrive_live (ts, snapshot_id, action, direction, local_mount, remote_path, remote_host, username, provider, origin)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     )";
@@ -2155,6 +2542,13 @@ bool TarDatabase::insert_mapdrive_events(const std::vector<MapDriveEvent>& event
         sqlite3_bind_text(stmt.get(), 8, ev.username.c_str(), -1, SQLITE_STATIC);
         sqlite3_bind_text(stmt.get(), 9, ev.provider.c_str(), -1, SQLITE_STATIC);
         sqlite3_bind_text(stmt.get(), 10, ev.origin.c_str(), -1, SQLITE_STATIC);
+        if (skip_known_historical) {
+            sqlite3_bind_text(stmt.get(), 11, ev.direction.c_str(), -1, SQLITE_STATIC);
+            sqlite3_bind_text(stmt.get(), 12, ev.local_mount.c_str(), -1, SQLITE_STATIC);
+            sqlite3_bind_text(stmt.get(), 13, ev.remote_path.c_str(), -1, SQLITE_STATIC);
+            sqlite3_bind_text(stmt.get(), 14, ev.remote_host.c_str(), -1, SQLITE_STATIC);
+            sqlite3_bind_text(stmt.get(), 15, ev.username.c_str(), -1, SQLITE_STATIC);
+        }
 
         if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
             spdlog::error("insert_mapdrive_events step: {}", sqlite3_errmsg(db_));
