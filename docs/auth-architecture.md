@@ -127,6 +127,79 @@ of the HA "safe-to-scale" gate. The design:
   (ADR-0007) and is surfaced at `/readyz` + `/healthz` via
   `AuthManager::is_session_store_ok()`.
 
+## Same-site gate for cookie-session writes
+
+Cookie-session writes require a same-site `Origin` or `Referer`, and so do the guarded
+reads, the cookie-session requests that dispatch work, persist state or force a refresh of
+server state (for those, a `Sec-Fetch-Site` header that is present decides alone). One decision,
+`evaluate_same_site_write` (`same_site_write_policy.hpp`), is applied by one
+caller, `apply_same_site_write_gate` (`same_site_write_gate.hpp`), invoked once
+from `server.cpp`'s pre-routing handler.
+
+- **Placement.** After `resolve_session` and its `401` block; before step-up
+  evaluation, step-up challenge emission, the engine-principal stash and every
+  route handler. For a request the gate refuses, the refusal happens after
+  authentication and before step-up evaluation, challenge emission and
+  route-handler effects. Coverage is by placement: every request that reaches
+  session resolution is covered, whether or not a route is registered.
+- **Keying.** The decision keys on the RESOLVED session's `auth_source`, never on
+  header presence. A request resolving to `api_token`, `mcp_token` or
+  `engine_token` is not gated; one resolving to a cookie source is gated even if
+  it also carries a token.
+- **Guarded reads.** Cookie-session requests that dispatch work, persist state or force a
+  refresh of server state are held to the same rule whichever method they use.
+  `is_guarded_read(method, path)` (`GET` or `HEAD`, exact path in the reviewed table
+  `kFetchMetadataGuardedPaths`, both in `same_site_write_policy.hpp`) widens the gate's
+  first statement; the exact path, never a query flag, selects the gate. `OPTIONS` is never
+  guarded and a path off the table is not checked. For a guarded request token sources
+  are admitted; a cookie source is decided by `Sec-Fetch-Site` first (`same-origin` or
+  `none` admitted, any other value refused `origin_mismatch`) and by the `Origin`/`Referer`
+  rule only when that header is absent. A repeated `Sec-Fetch-Site` header counts as a
+  non-matching value (`origin_mismatch`). Browsers send fetch metadata only to
+  potentially trustworthy origins (HTTPS, loopback), so a plain-HTTP non-loopback
+  listener, and Safari before 16.4, fall to the `Origin`/`Referer` rule, which for a
+  same-origin `GET` depends on `Referer` (the default `Referrer-Policy` supplies it).
+  Token callers stay exempt. No new refusal reason, metric or alert. Residuals: header
+  checks cannot tell a browser's own prefetch, prerender or link preview from a user
+  action; a client that sends neither fetch metadata nor `Origin`/`Referer` is refused; and
+  cookie-reachable reads outside the list remain there by decision. Rationale: the design record linked at the end of this section.
+- **Exemptions** are by placement only: the pre-session set in
+  `is_login_exempt_path`, the health probes and the metrics endpoint return
+  before session resolution and never reach the gate. There is no second list.
+- **Refusal shape.** `403` `cross-site request refused` in the standard error
+  envelope (A4) with a `remediation` and no `permission`; one `csrf.denied` audit
+  row (`result=denied`, `target_id` the sanitised `METHOD path`, `detail` the fixed
+  text plus a closed-set `reason=<token>`); `yuzu_server_csrf_denied_total{path_class,reason}`
+  ([observability conventions](observability-conventions.md)), watched by the
+  `yuzu-web-writes` alert rules. The check fails closed: an internal failure
+  refuses the request and counts it as `reason=gate_error`.
+- **Accepted limits.** The same-host comparison (`origin_is_same_site`) is
+  scheme-aware only where the scheme is known: on a listener that terminates TLS
+  itself (`Config::https_enabled`) the source must be `https://` and `:443` is the
+  only default port; on a plain listener behind a TLS-terminating proxy a declared
+  `https://` entry in `--csrf-trusted-origin` pins the scheme for that host, and
+  without one an `http://` source naming the same host and port is still treated as
+  same-site; the pre-session exempt endpoints are outside the check; `resolve_session`'s
+  own side effects (idle-timer slide, expired-elevation reaping and its audit row) run
+  before a refusal, as they do for any request; each refusal writes one synchronous audit
+  row, so the per-IP rate limiter (which runs before the gate and is shared by every
+  client behind one proxy) is the only flood bound and rows are not yet coalesced; the
+  control relies on the browser sending `Origin` or `Referer`.
+- **Trusted origins.** `--csrf-trusted-origin` entries are normalised once at
+  boot; the gate receives the post-normalise set. The gate is also handed the web
+  listener's TLS state (`Config::https_enabled`), which selects the scheme-aware
+  same-host comparison.
+- **Tripwires and closure evidence.** The live-stack category in
+  `scripts/e2e-security-test.sh` (run by the `/test` pipeline against a real server) is
+  the closure evidence that cookie-session writes are refused. Two source-text scans
+  are best-effort tripwires with limits stated in their headers:
+  `tests/test_same_site_wiring_lexical.py` pins the one call site and the early returns
+  ahead of it, and `tests/unit/server/test_same_site_exempt_inventory.cpp` fails on a
+  mutating registration that a pre-session bypass would carry unless a reviewed entry
+  exists, and a second scan there fails on a stale table entry or on a read-method
+  registration whose handler dispatches work or changes state but is not on the table or a reviewed ledger. Design record:
+  [`docs/security-reviews/central-same-site-write-gate-2026-10.md`](security-reviews/central-same-site-write-gate-2026-10.md).
+
 ## Account lockout (SOC 2 CC6.3)
 
 Brute-force / credential-stuffing protection on the **local-password** login
@@ -346,14 +419,11 @@ non-interactive `auth_source` is `403 token_session`; the self route
 additionally requires `auth_source == "local"` (`409 not_local` for OIDC/SAML).
 CSRF: `Origin`/`Referer` must be same-site (`origin_is_same_site`, honouring
 `--csrf-trusted-origin`) and a cookie request lacking **both** headers is
-refused. The same-site check is applied route by route; there is no shared
-pre-routing gate. The routes that carry it today include the password routes,
-the response-template mutations, the hardware, offload, webhook and directory
-routes, the RBAC enforcement toggle, the role-assignment routes, Guardian push
-and the policy-generation raise route, and the handlers in `ca_routes` and
-`dashboard_routes` that call `origin_is_same_site` or
-`browser_write_is_cross_site`. Other cookie-authorised `/api/v1` write routes do
-not yet carry it. `Content-Type` must be `application/json`
+refused. Both are decided centrally, in `server.cpp`'s pre-routing handler
+(`same_site_write_gate.hpp`, after authentication and before any route; see
+[Same-site gate for cookie-session writes](#same-site-gate-for-cookie-session-writes));
+the per-route copies, this one included, are defence in depth. Invariants: the
+header banner of `same_site_write_policy.hpp`. `Content-Type` must be `application/json`
 (`415`). The admin route then runs the **canonical durable-Administrator gate**
 — `is_rbac_administrator(kRest)` (`rbac_admin_predicate.hpp`, the A2/A1
 predicate) followed by `check_caller_authorized_under_current_regime`,
@@ -622,9 +692,10 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
 - a **human principal**, never an engine principal;
 - a reviewer that is **not the submitter** (unchanged, enforced in `ApprovalManager`);
 - on the REST routes (the dashboard page included), a **same-site `Origin` (or `Referer`)** on the
-  cookie `POST`, checked after the permission gate and before the class check and the step-up, so a
-  cross-site request spends no step-up and writes no `attempted` row (`403`, audited as
-  `csrf.denied`; trusted proxies are declared with `--csrf-trusted-origin`).
+  cookie `POST`, decided centrally by the server-wide check (after authentication and before step-up
+  evaluation, challenge emission and route-handler effects; the route's own copy, after the permission
+  gate, is defence in depth), so a cross-site request spends no step-up and writes no `attempted` row
+  (`403`, audited as `csrf.denied`; trusted proxies are declared with `--csrf-trusted-origin`).
 
 Consequences, each deliberate:
 

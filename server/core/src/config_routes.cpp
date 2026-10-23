@@ -98,10 +98,11 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
             return;
 
         // Same-site gate for the cookie-authorised write the General page calls (API, MCP and
-        // engine token callers are exempt). After the permission gate, so an unauthorised caller
-        // still gets the 403 it always did, and before any refusal or the body is read, so a
-        // cross-site write is audited as `csrf.denied` best effort (the row is attempted; the
-        // refusal does not depend on its outcome). auth_fn writes its own 401 when there is no session.
+        // engine token callers are exempt). Defence in depth behind the central pre-routing
+        // gate, which answers a cookie-session write first; this copy runs before the body is
+        // read, so a cross-site write is audited as `csrf.denied` best effort (the row is
+        // attempted; the refusal does not depend on its outcome). auth_fn writes its own 401 when
+        // there is no session.
         auto session = deps.auth_fn(req, res);
         if (!session)
             return;

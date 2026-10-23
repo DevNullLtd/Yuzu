@@ -31,7 +31,7 @@ Each capability is rated on two axes:
 > outside its own domain, and each entry counts once against its `T1`/`T2`/`T3` tier label.
 > Reproduce with:
 > `awk '/^### [0-9]+\.[0-9]+/ { if ($0 ~ /:white_check_mark:/) d++; else if ($0 ~ /:large_orange_diamond:/) p++; else if ($0 ~ /:x:/) n++ } END { print d, p, n, d+p+n }' docs/capability-map.md`
-> → `193 29 53 275`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
+> → `192 29 54 275`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
 > awk pattern filtered on `` `T1` ``/`` `T2` ``/`` `T3` ``. The former "New (Ph 8-16)" interim
 > row is retired — those phases are now ordinary domains 25-31, and 2026 additions land as
 > domains 32-39 rather than an undifferentiated bucket. **Domains 32-39 were verified for
@@ -68,10 +68,10 @@ Each capability is rated on two axes:
 
 ```
 Foundation   [==============================--]  55/59 done  (93%) (1 partial)
-Advanced     [=======================---------]  128/178 done  (72%) (22 partial)
+Advanced     [=======================---------]  127/178 done  (71%) (22 partial)
 Future       [========------------------------]  10/38 done  (26%) (6 partial)
 ─────────────────────────────────────────────────────────────────
-Overall      [======================----------]  193/275 done  (70%) (29 partial)
+Overall      [======================----------]  192/275 done  (70%) (29 partial)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -94,7 +94,7 @@ Overall      [======================----------]  193/275 done  (70%) (29 partial
 | 16. Policy and Compliance Engine | 8 | 7 | 1 | 0 |
 | 17. Triggers and Event-Driven Automation | 7 | 5 | 1 | 1 |
 | 18. Server: Authentication and Authorization | 10 | 9 | 1 | 0 |
-| 19. Server: Device and Group Management | 7 | 7 | 0 | 0 |
+| 19. Server: Device and Group Management | 7 | 6 | 0 | 1 |
 | 20. Server: Response Collection and Reporting | 8 | 8 | 0 | 0 |
 | 21. Server: Notifications and Audit | 6 | 5 | 0 | 1 |
 | 22. Server: System and Infrastructure | 10 | 4 | 3 | 3 |
@@ -115,10 +115,10 @@ Overall      [======================----------]  193/275 done  (70%) (29 partial
 | 37. Internal PKI / Certificate Authority | 5 | 5 | 0 | 0 |
 | 38. Server Storage Substrate — PostgreSQL | 4 | 4 | 0 | 0 |
 | 39. Headless Platform — Engine Principals & On-Behalf-Of (ADR-1005) | 3 | 3 | 0 | 0 |
-| **Subtotal (domains 1–39)** | **265** | **192** | **28** | **45** |
+| **Subtotal (domains 1–39)** | **265** | **191** | **28** | **46** |
 | 40. Reflex — Agent-Local Automated Response | 4 | 0 | 0 | 4 |
 | 41. Cryptographic Asset Inventory | 6 | 1 | 1 | 4 |
-| **TOTAL** | **275** | **193** | **29** | **53** |
+| **TOTAL** | **275** | **192** | **29** | **54** |
 
 > **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. "Done" means "implemented and functional" — not "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit (figures as of 2026-05 — its counts predate this v4.0 tally) is the source for the production-quality dimension; subsequent reviews should keep it current.
 
@@ -947,9 +947,9 @@ Shipped (SOC 2 CC6.6 privileged-access MFA ladder). RFC 6238 TOTP + RFC 4648 bas
 
 `CustomPropertiesStore` (462 LOC). Typed key-value properties per device: string, int, bool, datetime. Schema CRUD with validation regex. Usable in scope expressions via `props.<key>`. Property validation against schemas. REST API for property and schema CRUD. Key validation (1-64 chars, `[a-zA-Z0-9_.-:]`), value limit 1024 bytes.
 
-### 19.7 Agent Deployment Jobs :white_check_mark: `T2`
+### 19.7 Agent Deployment Jobs :x: `T2`
 
-`DeploymentStore` with job management. Create deployment jobs targeting discovered hosts by IP, OS, and method (ssh, group_policy, manual). Job lifecycle: pending → running → completed/failed/cancelled. REST API for job CRUD, status updates, and cancellation.
+**Not implemented: record-only, scheduled for removal (#6326).** `DeploymentStore` (PostgreSQL) stores job rows and the unversioned `/api/deployment-jobs` routes (`discovery_routes.cpp`) create, list, get and cancel them. Nothing executes a job and no caller advances one past `pending`; the `ssh` and `group_policy` methods are accepted by validation but have no implementation, and `manual` returns a placeholder install command. There is no `/api/v1/deployment-jobs` route. This is distinct from the live `/auto` Deploy workflow (§36.2). *(Regraded 2026-10-22 on the owner's ruling; previously mis-graded Done.)*
 
 ---
 

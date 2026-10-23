@@ -310,9 +310,10 @@ groups:
       # counter is expected at a low background rate (see its own doc
       # comment) and alerting on it needs real fleet data to set a threshold
       # that doesn't page on a routine post-restart/failover baseline rise;
-      # it remains unalerted EXCEPT two expected-zero pairs:
+      # it remains unalerted EXCEPT three expected-zero pairs:
       # (op="session_lookup", outcome="ambiguous_session") and
-      # (op="proxy_register", outcome="session_held_by_other_agent"), see
+      # (op="proxy_register", outcome="session_held_by_other_agent") and
+      # (op="announce_connected", outcome="session_held_by_other_agent"), see
       # YuzuGatewaySessionAmbiguous and YuzuGatewaySessionHeldByOtherAgent
       # below. `route_unreadable` fires the
       # command outbox's retry-with-backoff path (the SAME reschedule
@@ -368,8 +369,29 @@ groups:
             gateway_route_store.agent_routes, so the server refused to resolve
             it (never acked, never listed, never ingested). Causes: a
             duplicate placement, two concurrent ProxyRegister adopts of one id
-            for different agents (the cross-agent adopt guard is not a lock),
-            or a forged / colliding presented id.
+            for different agents (before the unique index), or a forged /
+            colliding presented id. Since the unique session index (#5683,
+            migration v5, which also removes existing duplicates) a NEW
+            duplicate cannot be created: this fires only after the index
+            `ux_agent_routes_session_id` was dropped by hand. Check first:
+            SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname =
+            'gateway_route_store' AND c.relname = 'ux_agent_routes_session_id'
+            AND i.indrelid = 'gateway_route_store.agent_routes'::regclass AND
+            i.indnatts = 1 AND i.indkey[0] = (SELECT attnum FROM pg_attribute
+            WHERE attrelid = i.indrelid AND attname = 'session_id') AND
+            i.indisunique AND i.indisvalid AND pg_get_expr(i.indpred,
+            i.indrelid) = '(session_id IS NOT NULL)';
+            (a row means the index is unique, valid, on
+            agent_routes(session_id) and partial with exactly that predicate;
+            a same-named index of another shape, column, table or predicate,
+            or an invalid one, returns no row). If it returns
+            a row the duplicate is already gone and this alert clears within
+            the hour. If it returns no row, follow the
+            recovery procedure in
+            docs/user-manual/gateway.md "Recovering a missing unique session
+            index" (tombstone the duplicates, then recreate the index under
+            that exact name).
             FIRST REMEDIATION: the id is not a metric label, so list every
             shared id from the directory: SELECT session_id,
             array_agg(agent_id) FROM gateway_route_store.agent_routes WHERE
@@ -385,36 +407,83 @@ groups:
       # HA WS-5 (ADR-2002 §7f Security notes) — ProxyRegister's replay-ADOPT
       # decision refused a presented session_id because a DIFFERENT agent's
       # committed directory row already holds it (the reclaim statement's
-      # NOT EXISTS guard). Kept separate from YuzuGatewaySessionAmbiguous:
-      # nothing became ambiguous (the adopt was refused), so that alert's
+      # NOT EXISTS guard, or the unique session index for a concurrent adopt,
+      # #5683). Also covers op="announce_connected": a CONNECTED whose session
+      # id another agent's row holds, refused by the same index (#5683) - but
+      # ONLY when the presenting agent has NO directory row (the fallback
+      # insert is what the index refuses). A presenter that still has a row,
+      # including a tombstone, lands as session_mismatch and is not alerted
+      # (the tombstoned-victim residual, ADR-2002 7f "Still open", #6339).
+      # Kept separate from YuzuGatewaySessionAmbiguous:
+      # nothing became ambiguous (the write was refused), so that alert's
       # duplicate-row query finds nothing and the remediation differs. No
-      # `for:`: expected rate zero, every occurrence is actionable. The pair
-      # is pre-seeded at zero in gateway_service_impl.cpp.
+      # `for:`: expected rate zero, every occurrence is actionable. Both pairs
+      # are pre-seeded at zero in gateway_service_impl.cpp.
       - alert: YuzuGatewaySessionHeldByOtherAgent
         expr: |
-          increase(yuzu_server_gateway_route_desync_total{op="proxy_register",outcome="session_held_by_other_agent"}[1h]) > 0
+          increase(yuzu_server_gateway_route_desync_total{op=~"proxy_register|announce_connected",outcome="session_held_by_other_agent"}[1h]) > 0
         labels:
           severity: warning
         annotations:
-          summary: "A ProxyRegister replay presented a session_id another agent holds"
+          summary: "A gateway presented a session_id another agent holds"
           description: >-
-            A gateway replayed ProxyRegister for one agent presenting a
-            session_id that a different agent's directory row already holds,
-            and the server refused the adopt (FAILED_PRECONDITION; the gateway
-            disconnects that agent so it registers fresh). The expected rate
-            is zero: this means a forged or colliding presented id from a
-            pinned gateway peer, a CC6.6 signal.
-            FIRST REMEDIATION: find the server WARN "ProxyRegister: presented
-            session <id> for agent <agent> is already held by a different
-            agent's directory row" (the id is sanitized and truncated to 64
-            bytes), look up the holder with SELECT agent_id, gateway_node FROM
-            gateway_route_store.agent_routes WHERE session_id = '<id>', identify the
-            presenting gateway from its peer certificate, and escalate to
-            security. The guard only sees committed rows: two concurrent
-            adopts can both land, which YuzuGatewaySessionAmbiguous then
-            catches. Evidence is metrics and logs only (no audit row). See
-            ADR-2002 §7f and docs/user-manual/gateway.md "Forged or colliding
-            session ids".
+            Possible forged or colliding gateway session id, a CC6.6 signal;
+            expected rate zero. Likely benign only if a server upgrade to this
+            version started within about the last 6 minutes and the count is
+            at most the tombstoned-row count; otherwise treat it as a security
+            event and escalate to security.
+            A gateway presented one agent a session_id that a different
+            agent's directory row already holds, and the server refused it:
+            either a ProxyRegister replay adopt (FAILED_PRECONDITION; the
+            gateway disconnects that agent so it registers fresh; op label
+            proxy_register) or a NotifyStreamStatus CONNECTED (placement
+            unpublished, op label announce_connected; also audit action
+            gateway.session_held_by_other_agent). The CONNECTED refusal covers
+            a presenting agent that has NO directory row; an agent that still
+            has a row, including a tombstone, is not covered (its CONNECTED is
+            a session_mismatch and does not unpublish: the tombstoned-victim
+            residual, ADR-2002 7f).
+            FIRST REMEDIATION: rule out the migration artifact. The refusals
+            can be the one-time v5 dedup artifact ONLY IF BOTH hold: (a) the
+            number of op="proxy_register" refusals since that start, summed
+            over every server replica, is at most N, the number of rows
+            migration v5 tombstoned on that start
+            (yuzu_server_gateway_route_session_dedup_total on the migrating
+            start; the "migration v5 tombstoned N" WARN, or the route_meta
+            value after a restart); count the refusal WARN lines rather than
+            the counter if any replica restarted since (the counter resets on
+            restart); any op="announce_connected" refusal is NOT the
+            artifact; and (b) they all occur within that start's window: one
+            or two agent heartbeat cycles (30 s by default, --heartbeat
+            changes it), plus up to 300 s of breaker backoff (cap
+            circuit_breaker_max_reset_timeout_ms in gateway/config/sys.config),
+            plus the replay drip (about 20 ms per agent on that gateway):
+            roughly 6 minutes plus 20 ms per agent at the defaults. Refusals
+            past that window, or more than N, are NOT the artifact. Refusals
+            inside the bound and window are NOT proof of benignness (a forged
+            presenter could hide inside them): the rule only lets you stop
+            escalating once refusals have stopped inside the window, so
+            re-check the count after the window and do not silence this alert
+            beyond it (it has no for: and uses increase()[1h]). The counter
+            keeps its migrating-start value for the process lifetime, so
+            establish timing from the WARN timestamps, or, while the store is
+            still at version 5, SELECT version, to_timestamp(upgraded_at) FROM
+            public.schema_meta WHERE store = 'gateway_route_store' (a later
+            store migration overwrites it); if the migrating start's time
+            cannot be found, escalate (details: docs/user-manual/gateway.md
+            "One-time dedup at upgrade"). Find the server WARN, one of two
+            texts: "ProxyRegister: presented session <id> for agent <agent> is
+            already held by a different agent's directory row" (op
+            proxy_register) or "NotifyStreamStatus: CONNECTED for agent
+            <agent> presents session <id> that another agent's route already
+            holds (#5683)" (op announce_connected); ids are sanitized and
+            truncated. Paste an id into SQL only if it matches
+            ^gw-session-[0-9a-f]{32}$. Look up the holder with SELECT
+            agent_id, gateway_node FROM gateway_route_store.agent_routes
+            WHERE session_id = '<id>' and identify the presenting gateway from
+            its peer certificate. Evidence is metrics and logs (plus the audit
+            row for op announce_connected). See ADR-2002 §7f and docs/user-manual/gateway.md "Forged or
+            colliding session ids".
 
       # HA WS-4 rest-of-4.3 (ADR-2002 §7d) — cross-cluster gateway fan-out.
       # No `for:`, matching YuzuGatewayMgmtAuthRejected's own reasoning
@@ -5379,3 +5448,61 @@ groups:
             boot log line says which. Make the data directory writable
             (one persistent data directory per replica; an ephemeral one makes
             the mechanism inert).
+
+  - name: yuzu-web-writes
+    # Cookie-session requests refused by the pre-routing same-site gate
+    # (yuzu_server_csrf_denied_total{path_class,reason}). Every path_class x
+    # reason series is zero-seeded at boot, so increase() sees the first
+    # refusal and an absent() would stay a real signal.
+    #
+    # Deliberately NOT alerted: reason="no_origin_no_referer". A header-less
+    # cookie write is what a curl script reusing a cookie jar sends, and the
+    # reason is common and benign at low volume; the two mismatch reasons are
+    # the ones that mean a browser sent a request from another site (or a proxy
+    # rewrote Host without --csrf-trusted-origin). A refused Sec-Fetch-Site
+    # value also counts as origin_mismatch.
+    #
+    # The rule name YuzuCookieWritesRefusedSameSite is kept from when only
+    # writes were refused; renaming it would break existing consumers.
+    rules:
+      - alert: YuzuCookieWritesRefusedSameSite
+        expr: |
+          sum(
+            increase(yuzu_server_csrf_denied_total{reason=~"origin_mismatch|referer_mismatch"}[15m])
+          ) >= 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cookie-session requests are being refused for a cross-site Origin, Referer or fetch metadata"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#vnext--behind-a-reverse-proxy-declare-your-external-origin-or-csrf-gated-dashboard-actions-keep-failing-2537"
+          description: >-
+            Three or more cookie-session requests were refused in 15 minutes because
+            the Origin or Referer did not name this site (or a --csrf-trusted-origin
+            entry), or because the request's fetch metadata (Sec-Fetch-Site) was not
+            same-origin or none. Three causes: a browser sent a request from another
+            site, a reverse proxy rewrites the Host header and the server was started
+            without --csrf-trusted-origin (or YUZU_CSRF_TRUSTED_ORIGIN), in which case
+            every dashboard write fails, or a client sent a Sec-Fetch-Site value other
+            than same-origin or none. Each refusal is audited as csrf.denied with the
+            closed reason; this alert sums over path_class, so query
+            yuzu_server_csrf_denied_total by path_class to see which kind of route was
+            targeted. Check the Host and Origin the proxy forwards first.
+
+      - alert: YuzuSameSiteGateInternalError
+        expr: |
+          sum(
+            increase(yuzu_server_csrf_denied_total{reason="gate_error"}[15m])
+          ) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "The same-site gate failed internally and refused requests"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#vnext--behind-a-reverse-proxy-declare-your-external-origin-or-csrf-gated-dashboard-actions-keep-failing-2537"
+          description: >-
+            The same-site check for cookie-session requests hit an internal
+            error and refused the request (it fails closed). A refusal that
+            fails inside the gate may have no audit row, so the metric and the
+            server log (at most one warning per minute) may be the only
+            evidence. Look for
+            the gate warning in the server log; a persistent error means
+            cookie-session requests are failing for every operator.
