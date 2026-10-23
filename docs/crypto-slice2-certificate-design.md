@@ -1916,12 +1916,17 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
    2a-2e.
 
 9. **D13 counts at fleet scale** (raised by 2a-3, measured 2026-10-23). Computed from raw rows
-   in one statement, the counts finish inside their 15 s read budget only up to about 1.3M
-   certificates in scope with a warm cache and two parallel workers (about 450k on a serial plan);
+   in one statement, the counts finish inside the 10 s statement cap only up to about 1.3M
+   certificates in scope with a warm cache and two parallel workers (about 450k on a serial plan).
+   The 15 s whole-read budget never binds first, because the counting statement is the only heavy
+   one;
    the capacity target is 30–60M. Above the limit the counts answer 503 with reason `scale_limit`
    and no retry hint (a retry cannot succeed), never a partial figure. Counts and snapshots are a
    long-read class that holds at most one of the read gate's slots, so an ordinary read admits
-   while one runs. The owner chooses the fleet-scale fix: a stored rollup keyed to its `as_of`
+   while one runs. That holds at the default bound of two, which needs a pool of 8 or more; a
+   pool of 4 to 7 gives a bound of one and a pool under 4 refuses the certificate reads. A
+   per-replica fairness yield reduces, but does not eliminate, one principal starving others of
+   the long slot. The owner chooses the fleet-scale fix: a stored rollup keyed to its `as_of`
    (an amendment to D13 condition 3, "never stored"), a longer bound with its own read slot, or
    an asynchronous count job. 2a-3 ships the read-time counts with the limit stated; the chosen
    fix is its own PR.
