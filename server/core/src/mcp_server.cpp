@@ -777,10 +777,14 @@ static const ToolDef kTools[] = {
      "before the row-limit cap so a confined caller's page is never truncated by "
      "hidden rows; a global Response:Read holder sees every agent's rows unchanged. "
      "Rows written by Forensics-tier plugins (those with an action on the Forensics securable) "
-     "are served only to a caller who also holds Forensics:Read, globally or, while RBAC is "
-     "enforced, on that agent's management group; for any other caller they are absent from "
-     "the rows and from the row cap, with no marker (with RBAC off, Forensics:Read is "
-     "administrator-only). "
+     "are served only to a caller who also holds Forensics:Read. An MCP-tier token needs a "
+     "GLOBAL Forensics:Read: a management-group-scoped grant applies to ordinary sessions and "
+     "plain API tokens, not to MCP-tier or service-scoped tokens, and with RBAC off "
+     "Forensics:Read is administrator-only. For any other caller those rows are absent from "
+     "the rows and from the row cap, with no marker, so an empty or short result does NOT prove "
+     "that no data exists. If the caller's Forensics authority cannot be determined the call "
+     "fails with a retryable internal error (retry_after_ms) instead of returning a partial "
+     "result. "
      "Fails closed (zero rows) when the RBAC store is corrupt. Each row also carries "
      "the response's own row id, its instruction_id, error_detail (populated on a "
      "failed/errored response), the originating plugin name, and received_at_ms "
@@ -801,10 +805,13 @@ static const ToolDef kTools[] = {
      "grouping (filter-before-aggregate), so a confined caller's totals cover only their in-scope "
      "agents; a global Response:Read holder's totals are unchanged. Rows written by Forensics-tier "
      "plugins (those with an action on the Forensics securable) are counted only for a caller "
-     "who also holds Forensics:Read, globally or, while RBAC is enforced, on that agent's "
-     "management group; for any other caller they add to no group or total, with no marker "
-     "(with RBAC off, Forensics:Read is administrator-only). Fails closed (a JSON-RPC error, "
-     "never empty totals) when the RBAC store is corrupt or the response read errors. A denied-scope "
+     "who also holds Forensics:Read; an MCP-tier token needs a GLOBAL Forensics:Read (a "
+     "management-group-scoped grant does not apply to MCP-tier or service-scoped tokens), and "
+     "with RBAC off Forensics:Read is administrator-only. For any other caller those rows add "
+     "to no group or total, with no marker, so a small or zero total does NOT prove no such "
+     "data exists. Fails closed (a JSON-RPC error, never empty totals) when the RBAC store is "
+     "corrupt or the response read errors, and with a retryable error (retry_after_ms) when "
+     "the caller's Forensics authority cannot be determined. A denied-scope "
      "audit row is emitted on a drop.",
      R"({"type":"object","properties":{"instruction_id":{"type":"string"},"group_by":{"type":"string"},"aggregate":{"type":"string","enum":["count","sum","avg","min","max"]},"op_column":{"type":"string","enum":["timestamp","status","id"],"description":"Column for sum/avg/min/max; ignored for count. Defaults to \"id\" when omitted."}},"required":["instruction_id","group_by"]})",
      R"j({"type":"object","properties":{"results":{"type":"array","items":{"type":"object","properties":{"group_value":{"type":"string"},"count":{"type":"integer"},"aggregate_value":{"type":"number"}},"required":["group_value","count","aggregate_value"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["results"]})j"},
@@ -916,7 +923,10 @@ static const ToolDef kTools[] = {
      "Get one policy's per-agent compliance statuses (fan-out list) plus a summary tallied "
      "from exactly the agents returned. Confined by management group / service scope: a "
      "confined caller's summary counts only its own visible agents, never the fleet-wide "
-     "total. REST v1 twin: GET /api/v1/compliance/{id} (same shape).",
+     "total. A policy whose check instruction runs a Forensics-tier plugin (an action on the "
+     "Forensics securable) is scored unknown for every agent with an empty check_result: the "
+     "evaluator never reads Forensics-tier output, so unknown there is by design and says "
+     "nothing about the device. REST v1 twin: GET /api/v1/compliance/{id} (same shape).",
      R"({"type":"object","properties":{"policy_id":{"type":"string","minLength":1,"description":"Policy ID"}},"required":["policy_id"]})",
      R"j({"type":"object","properties":{"policy_id":{"type":"string"},"summary":{"type":"object","properties":{"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"fixing":{"type":"integer"},"error":{"type":"integer"},"total":{"type":"integer"}}},"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"last_check_at":{"type":"integer"},"last_fix_at":{"type":"integer"},"check_result":{"type":"string"}},"required":["agent_id","status"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["policy_id","summary","agents"]})j"},
 
@@ -953,9 +963,11 @@ static const ToolDef kTools[] = {
      "tier maker-checker), matching every other ManagementGroup:Write surface, even "
      "though this tool itself performs no mutation. An agent is counted only through response "
      "rows the caller may read: rows written by Forensics-tier plugins (those with an action "
-     "on the Forensics securable) count only for a caller who also holds Forensics:Read, "
-     "globally or, while RBAC is enforced, on that agent's management group (with RBAC off, "
-     "Forensics:Read is administrator-only). When unindexed_filter_keys is "
+     "on the Forensics securable) count only for a caller who also holds Forensics:Read (an "
+     "MCP-tier token needs a GLOBAL one; with RBAC off Forensics:Read is administrator-only), "
+     "so a count that omits such agents does NOT prove they did not answer. A retryable error "
+     "(retry_after_ms) is returned when the caller's Forensics authority cannot be "
+     "determined. When unindexed_filter_keys is "
      "non-empty, agent_count can be 0 or an undercount because filter values over "
      "2048 bytes (measured as ingest stores it: a NUL or invalid UTF-8 byte counts as 3) "
      "are not indexed in newly stored responses; its keys are in a stable "
@@ -1081,7 +1093,13 @@ static const ToolDef kTools[] = {
      "\"(redacted - confined view)\" for a confined caller, exactly like "
      "scope_expression), plus completed_at/parent_id/rerun_of, which stay "
      "truthful for every caller - the REST v1 twin GET /api/v1/executions/{id} "
-     "already returned all four; this closes the MCP field-parity gap.",
+     "already returned all four; this closes the MCP field-parity gap. "
+     "error_detail (per agent, and the error preview): for a command of a Forensics-tier "
+     "plugin (an action on the Forensics securable) a failure message is kept only when it "
+     "is a short machine token (scope:cause[:detail], e.g. windows:amcache:hive_locked); "
+     "any other text is replaced by the fixed value forensics_error. Status and exit code are "
+     "unchanged, and a failure stored before this applied may still hold its original text "
+     "once its command correlation (24 hours) has aged out.",
      R"({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID"},"include":{"type":"array","items":{"type":"string","enum":["agents"]},"description":"Optional; \"agents\" adds a confined per-agent array + kpi summary"}},"required":["execution_id"]})",
      R"j({"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"scope_expression":{"type":"string"},"parameter_values":{"type":"string","description":"Redacted to \"(redacted - confined view)\" for a confined caller"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"},"progress_pct":{"type":"integer"},"completed_at":{"type":"integer"},"parent_id":{"type":"string"},"rerun_of":{"type":"string"},"retry_after_ms":{"type":"integer","description":"Present only while status is non-terminal — minimum ms before polling again"},"agents":{"type":"array","description":"Present only when include contains \"agents\"","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"dispatched_at":{"type":"integer"},"first_response_at":{"type":"integer"},"completed_at":{"type":"integer"},"exit_code":{"type":"integer"},"error_detail":{"type":"string"}}}},"kpi":{"type":"object","description":"Present only when include contains \"agents\"","properties":{"total":{"type":"integer"},"succeeded":{"type":"integer"},"failed":{"type":"integer"},"p50_ms":{"type":["number","null"]},"p95_ms":{"type":["number","null"]}}},"audit_persisted":{"type":"boolean","description":"Present and false only when the per-agent expansion's audit row failed to persist"}},"required":["id","definition_id","status","scope_expression","parameter_values","dispatched_by","dispatched_at","agents_targeted","agents_responded","agents_success","agents_failure","progress_pct","completed_at","parent_id","rerun_of"]})j"},
 
@@ -1302,7 +1320,10 @@ static const ToolDef kTools[] = {
      "accepts every responder. Dispatches to parent_id's CURRENT members when supplied, else "
      "broadcasts — same omit-to-broadcast / refuse-if-resolves-to-nothing contract as "
      "create_result_set_from_tar_query. Find valid instruction_id values via list_definitions "
-     "or discover_instructions — do not guess. REST v1 twin: POST "
+     "or discover_instructions — do not guess. If the definition runs a Forensics-tier "
+     "plugin (an action on the Forensics securable) the set materializes with no members "
+     "for every creator, because the materializer never reads Forensics-tier output; an "
+     "empty set from such a definition says nothing about the fleet. REST v1 twin: POST "
      "/api/v1/result-sets/from-instruction-result. NEVER re-send this call on a timeout or "
      "an ambiguous/post-dispatch error - it dispatches a real command to the fleet; poll "
      "instead. Two distinct fault tokens distinguish when retry is safe: a pre-dispatch "
@@ -2433,7 +2454,12 @@ static const ToolDef kTools[] = {
      "retry_after_ms, the minimum wait in milliseconds before polling again — bundles emit no "
      "progress notifications, so polling at that cadence is the contract (see execute_bundle). "
      "Mirrors GET /api/v1/bundles/{id}, plus this MCP-only retry_after_ms hint. "
-     "Requires Response:Read.",
+     "Requires Response:Read. Approval to dispatch a Forensics-tier step (a plugin with an "
+     "action on the Forensics securable) does not include reading its output: for a caller "
+     "without a GLOBAL Forensics:Read (an MCP-tier token needs the global grant) that step "
+     "stays state=pending with an empty output, so such a bundle never reports complete=true "
+     "to that caller and polling it will not end. An authorization read that cannot be "
+     "completed returns a retryable error (retry_after_ms) instead of a partial result.",
      R"j({"type":"object","properties":{)j"
      R"j("bundle_id":{"type":"string","minLength":1,"description":"The bundle id (bundle-…) returned by execute_bundle"})j"
      R"j(},"required":["bundle_id"]})j",

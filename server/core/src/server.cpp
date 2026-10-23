@@ -19657,8 +19657,8 @@ private:
         // AppUsageRoutes — /api/v1/forensics/agents/{agent_id}/app-usage (Wave 7
         // PR7.2). Same fail-closed enforcement primitive as SleRoutes above
         // (sle_gate_usable/G-1) — a corrupt/load-failed rbac.db is REFUSED (503),
-        // never served a legacy-open Forensics read. Forensics is
-        // Administrator-only by design (absent from the seeded Viewer read-list,
+        // never served a legacy-open Forensics read. Forensics:Read is held by
+        // default only by Administrator and ForensicsAnalyst (absent from the seeded Viewer read-list,
         // docs/authz-model.md §4).
         auto app_usage_scoped_perm_fn = [this, sle_gate_usable](
                                             const httplib::Request& req, httplib::Response& res,
