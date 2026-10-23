@@ -716,10 +716,10 @@ TEST_CASE("openapi_spec_json(): every ecosystem parameter and the pipe-list are 
     CHECK(&yuzu::server::openapi_spec_json() == &yuzu::server::openapi_spec_json());
     // openapi_spec_json() is the lean copy openapi_strip_guides() builds once and trims with
     // shrink_to_fit(). The standard makes that call a non-binding request, so these two pins
-    // are deliberately coarse and detect only a large excess: a missed trim leaves capacity
-    // below 1.5x the size only when the push_back growth happened to land close, so the pin
-    // holds while the document's growth-doubled capacity is at least 1.5x its size and says
-    // nothing about a smaller excess. libstdc++ and libc++ trim to the byte; an STL that rounds
+    // are deliberately coarse and detect only a large excess: the check fails only if the
+    // capacity is at least 1.5x the size, so it detects a missed trim only when the growth
+    // overshot that far, and says nothing about a smaller excess. libstdc++ and libc++ trim
+    // to the byte; an STL that rounds
     // up (MSVC's allocation granularity) must still pass, so the bound is half the size, not a
     // byte count. The exact bound lives on the synthetic expand test below.
     CHECK(yuzu::server::openapi_spec_json().capacity() - raw.size() < raw.size() / 2);
