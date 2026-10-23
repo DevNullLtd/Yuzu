@@ -101,6 +101,7 @@
 #include "on_behalf_guard.hpp"
 #include "principal_class.hpp"
 #include "principal_quota_gate.hpp"
+#include "same_site_write_gate.hpp" // cookie-session writes require a same-site Origin or Referer
 #include "rest_a4_envelope_http.hpp"
 #include "inventory_store.hpp"
 #include "app_perf_daily_store.hpp"
@@ -197,7 +198,10 @@
 #include "auth_routes.hpp"
 #include "compliance_api_local.hpp" // ADR-0031 WS-A4: core-only compliance/policy seam factory
 #include "compliance_routes.hpp"
+#include "crypto_access.hpp" // /crypto availability composition (M4, unit-tested)
 #include "crypto_api_local.hpp" // /crypto slice 1: make_local_crypto_api (core-only store-backed factory)
+#include "crypto_dashboard_layout_store.hpp" // /crypto widgets: per-operator layout (born-on-PG, ADR-0071)
+#include "crypto_layout_erasure.hpp" // ADR-0071: erase-failure reason set + mapping
 #include "crypto_routes.hpp"
 #include "policy_admin_routes.hpp" // ADR-0031 WS-A4 Task B: policy/fragment mutator routes (no public twin)
 #include "guardian_routes.hpp"
@@ -802,6 +806,17 @@ public:
             for (auto reason : {"foreign_ca", "agent_id_missing", "agent_id_mismatch"})
                 metrics_.counter("yuzu_ota_identity_audit_suppressed_total",
                                  {{"rpc", rpc}, {"reason", reason}});
+
+        // registry.write audit evidence NOT recorded (plugin_result_audit.hpp). Pre-seeded so an
+        // alert or dashboard sees zero, not "no data". Units differ by reason: rows for
+        // `suppressed` (refused by the per-agent budget) and `persist_failed`; whole frames for
+        // `unmintable_id` (ignored) and `truncated` (a bound was hit).
+        metrics_.describe("yuzu_server_registry_audit_dropped_total",
+                          "registry.write audit evidence not recorded, by reason: rows for "
+                          "suppressed and persist_failed, frames for unmintable_id and truncated",
+                          "counter");
+        for (auto reason : {"suppressed", "persist_failed", "unmintable_id", "truncated"})
+            metrics_.counter("yuzu_server_registry_audit_dropped_total", {{"reason", reason}});
 
         metrics_.describe("yuzu_ota_download_peers_tracked",
                           "Peers currently tracked by the OTA admission map", "gauge");
@@ -1877,6 +1892,23 @@ public:
                                   {"reason", "unmeasurable"}});
             }
         }
+        // Cookie-session writes refused by the pre-routing same-site gate.
+        // Bounded labels only: path_class from kBodyCapTable (never the raw
+        // path) x the closed reason set; pre-seeded so absent() alerts stay
+        // meaningful (docs/observability-conventions.md). Re-seeding a
+        // path_class shared by several table rows is idempotent.
+        metrics_.describe("yuzu_server_csrf_denied_total",
+                          "Cookie-session writes refused by the pre-routing same-site gate, by "
+                          "route class and reason (no_origin_no_referer, origin_mismatch, "
+                          "referer_mismatch, gate_error)",
+                          "counter");
+        for (const auto& entry : yuzu::server::kBodyCapTable) {
+            for (const auto reason : yuzu::server::kSameSiteDenyReasons) {
+                metrics_.counter("yuzu_server_csrf_denied_total",
+                                 {{"path_class", std::string(entry.path_class)},
+                                  {"reason", std::string(reason)}});
+            }
+        }
         for (auto reason : {"client_disconnect", "superseded", "session_terminated",
                             "credential_revoked", "auth_unavailable", "internal_error",
                             // 2f PR 3b streamed-POST close reasons — producers land in C6c/C7;
@@ -2163,10 +2195,11 @@ public:
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
                           "(store_not_open/pool_acquire_timeout/query_error, plus "
-                          "admission_full for installed_software: a /crypto read refused by "
-                          "its in-flight bound before any store call) and source "
+                          "admission_full for installed_software and ca_issued: a /crypto read "
+                          "refused by its in-flight bound before any store call) and source "
                           "(installed_software/device_ci/software_licensing/product_registry/"
-                          "app_usage/generic - generic is the ADR-0037 InventoryStore). /readyz "
+                          "app_usage/generic - generic is the ADR-0037 InventoryStore - and "
+                          "ca_issued/crypto_layout, the /crypto Yuzu-issued and layout reads). /readyz "
                           "stays green under pure pool saturation, so "
                           "this is the read-path degrade signal",
                           "counter");
@@ -2174,6 +2207,28 @@ public:
         // present on a healthy server (the three store-side reasons are emitted on demand).
         metrics_.counter("yuzu_inventory_read_degrade_total",
                          {{"reason", "admission_full"}, {"source", "installed_software"}});
+        metrics_.counter("yuzu_inventory_read_degrade_total",
+                         {{"reason", "admission_full"}, {"source", "ca_issued"}});
+        // The /crypto layout reads and saves (L10): pre-seeded so a dashboard can tell "no
+        // degrade" from "series absent" before the first fault.
+        for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
+            metrics_.counter("yuzu_inventory_read_degrade_total",
+                             {{"reason", reason}, {"source", "crypto_layout"}});
+        // ADR-0071 deprovision erasure of /crypto dashboard layouts (M1): best-effort, so a
+        // failure is counted and alerted (YuzuCryptoLayoutEraseFailed), never a failed deprovision.
+        // The reason set and mapping live in crypto_layout_erasure.hpp (one copy, unit-tested).
+        metrics_.describe(std::string(crypto_layout_erasure::kMetric),
+                          "Deprovision erasures of a /crypto dashboard layout row that did not "
+                          "complete, by reason (store_not_open/pool_acquire_timeout/"
+                          "outcome_unknown/query_error, or link_read_failed: an already-inactive "
+                          "SCIM user's linked identities could not be read, so only the user "
+                          "name's row was erased). The deprovision itself succeeded; the row may "
+                          "remain and must be removed by hand (docs/user-manual/crypto.md, "
+                          "\"Deprovision erasure\")",
+                          "counter");
+        for (const auto reason : crypto_layout_erasure::kReasons)
+            metrics_.counter(std::string(crypto_layout_erasure::kMetric),
+                             {{"reason", std::string(reason)}});
         // Management-group CONFINEMENT store observability (ADR-0042). The
         // read-degrade counter is the fail-closed signal: a non-zero rate means
         // RbacStore's authorize_list_read / check_scoped_permission is denying
@@ -4917,8 +4972,17 @@ public:
                               "(database reachable but the gateway_route_store schema could not "
                               "be created/opened)");
                 startup_failed_ = true;
-            } else if (gateway_service_) {
-                gateway_service_->set_gateway_route_store(gateway_route_store_.get());
+            } else {
+                // #5683: pre-seeded so a boot that deduped nothing reads 0, not absent.
+                metrics_.describe("yuzu_server_gateway_route_session_dedup_total",
+                                  "agent_routes rows tombstoned at boot by migration v5 because "
+                                  "they shared a session id; the affected agents re-register "
+                                  "through the normal replay. Expected 0.",
+                                  "counter");
+                metrics_.counter("yuzu_server_gateway_route_session_dedup_total")
+                    .increment(static_cast<double>(gateway_route_store_->boot_session_dedup_rows()));
+                if (gateway_service_)
+                    gateway_service_->set_gateway_route_store(gateway_route_store_.get());
             }
         }
 
@@ -5617,7 +5681,7 @@ public:
         {
             if (pg_pool_ && !startup_failed_) {
                 audit_store_ =
-                    std::make_unique<AuditStore>(*pg_pool_, cfg_.audit_retention_days);
+                    std::make_shared<AuditStore>(*pg_pool_, cfg_.audit_retention_days);
                 if (!audit_store_->is_open()) {
                     spdlog::error("[PG] Refusing to start: audit store migration/open failed "
                                   "(database reachable but the audit_store schema could not be "
@@ -6277,6 +6341,10 @@ public:
         // agent reached us.
         if (audit_store_ && audit_store_->is_open()) {
             agent_service_.set_audit_store(audit_store_.get());
+            // Weak and write-once: see AgentServiceImpl::set_registry_audit_store. Not cleared in
+            // stop() (clearing a weak_ptr concurrently with lock() is a data race); the owner's
+            // reset() below expires it.
+            agent_service_.set_registry_audit_store(audit_store_);
             if (gateway_service_) {
                 gateway_service_->set_audit_store(audit_store_.get());
             }
@@ -7644,6 +7712,33 @@ public:
                     *software_inventory_store_,
                     std::chrono::seconds{kCatalogueRefreshIntervalSeconds}, &metrics_);
                 software_catalog_rollup_->start();
+            }
+        }
+
+        // /crypto dashboard widget layouts — born-on-Postgres (ADR-0071), one row per
+        // operator. DELIBERATE EXCEPTION to the ADR-0007/0008 fail-closed boot (owner
+        // decision 2026-10-19): a layout is a loss-tolerant UI preference, so a store
+        // that cannot open DEGRADES — the pointer is reset, the server boots, the layout
+        // routes answer 503 "layouts unavailable" (not retryable: it lasts until a
+        // restart), the dashboard draws the default layout with a notice, and /readyz
+        // names the store under "degraded" without leaving rotation. Never set
+        // startup_failed_ here. No legacy SQLite predecessor, so nothing to detect.
+        if (pg_pool_ && !startup_failed_) {
+            crypto_dashboard_layout_store_ = std::make_unique<CryptoDashboardLayoutStore>(*pg_pool_);
+            if (!crypto_dashboard_layout_store_->is_open()) {
+                spdlog::error("[PG] Crypto dashboard layout store migration/open failed (the "
+                              "crypto_dashboard_layout_store schema could not be created/opened; "
+                              "pool last error: {}) - continuing WITHOUT saved /crypto layouts: "
+                              "every operator sees the default layout and saves are refused "
+                              "until a restart with the schema fixed",
+                              [&] {
+                                  auto e = pg_pool_->last_error();
+                                  return e.empty() ? std::string("none") : e;
+                              }());
+                crypto_dashboard_layout_store_.reset();
+            } else {
+                spdlog::info("CryptoDashboardLayoutStore initialized (schema "
+                             "crypto_dashboard_layout_store)");
             }
         }
 
@@ -10710,6 +10805,9 @@ public:
         if (gateway_service_)
             gateway_service_->set_software_inventory_store(nullptr);
         software_inventory_store_.reset();
+        // The /crypto layout store: borrowed only by crypto_api_, whose callers (the web worker
+        // pool) were joined above. Before the pool (ADR-0012 destruct-before-pool).
+        crypto_dashboard_layout_store_.reset();
         agent_service_.set_app_perf_daily_store(nullptr);
         if (gateway_service_)
             gateway_service_->set_app_perf_daily_store(nullptr);
@@ -10978,6 +11076,26 @@ public:
         // strictly after the pre-existing capture targets, so its dangle
         // window is a subset of theirs; same envelope, not widened).
         //
+        // `audit_store_` is NOT in that enumeration. The `registry.write` hook
+        // (plugin_result_audit.hpp; process_gateway_response runs it on these same
+        // forwarder threads) takes the analytics_store_ treatment below for the OBJECT:
+        // shared_ptr here, a weak_ptr in agent_service_ locked per frame and only for a
+        // frame that owes audit rows, set once at wiring and never cleared. That is NOT
+        // enough for the pg::PgPool& the store borrows. analytics_store_'s emit() does one
+        // lease and one INSERT, so a latch that refuses new entrants leaves a gap of one
+        // write; the registry hook holds its strong reference across up to 300 synchronous
+        // writes, each of which leases the pool, so a forwarder BETWEEN two rows is
+        // invisible to ~PgPool and would lease a pool being destroyed. The hook therefore
+        // runs inside a rundown gate (rundown_gate.hpp): it enters before it locks the
+        // store and checks the gate before every row, and the stage right before
+        // audit_store_.reset() below closes the gate and waits for the hooks inside, so the
+        // store and the pool are not reset while any hook is inside (a row already past its
+        // check may still lease, and the wait covers it). The retention thread is not
+        // part of this: audit_store_->stop_cleanup() joined it well above, so
+        // ~AuditStore has nothing left to join wherever it runs. What stays #3279's is the
+        // detached thread itself, agent_service_ (`this`) and metrics_; this gate is the
+        // hook's own and goes when #3279 joins the forwarders.
+        //
         // HA WS-4 4.3 (cpp-safety Gate 3, pre-push): #3279's reach set also
         // now includes a raw `Stub*` resolved from gw_mgmt_pool_
         // (GatewayMgmtStubPool::resolve(), captured per-command into the same
@@ -11028,7 +11146,8 @@ public:
         // deploy/systemd/yuzu-server.service TimeoutStopSec). 60s here,
         // run CONCURRENTLY for both stores below (not sequentially, which
         // would double the worst case), brings the documented stacked total
-        // to ~115s - comfortably inside 210s, with real headroom over the
+        // to ~115s (~130s with the 15s registry.write rundown stage further
+        // down) - comfortably inside 210s, with real headroom over the
         // "a handful of pending deliveries" case above. Update
         // upgrading.md's stacked-bound section if this constant changes.
         // This bound is exactly as heuristic, and exactly as unproven, as
@@ -11076,7 +11195,8 @@ public:
                 // this file's own comment above computes assumed the
                 // concurrent case. Worst case here is ~60s (this call) +
                 // ~60s (webhook, next) = ~120s added to the pre-existing
-                // ~55s stack = ~175s, still inside the shipped 210s
+                // ~55s stack = ~175s (~190s with the 15s registry.write
+                // rundown stage further down), still inside the shipped 210s
                 // stop_grace_period/TimeoutStopSec - not a real risk, but
                 // only reachable by genuine thread-creation exhaustion at
                 // shutdown, which is itself already a degraded state.
@@ -11199,6 +11319,44 @@ public:
         // needs to run before auth_key_provider_/audit_store_.
         crl_publisher_.reset();
         auth_key_provider_.reset();
+        // The registry.write audit hook (agent_service_impl.cpp, audit_registry_frame) runs on
+        // the detached forwarder threads of #3279 and holds the audit store across up to 300
+        // writes that each lease pg_pool_. Close its gate (no later frame enters, and one
+        // already inside stops before its next row), then wait for the hooks that are inside
+        // to leave: only then is it safe to reset the store and, below, the pool. Late on
+        // purpose, so the frames that arrive during the delivery drain above are still
+        // audited. 15s is the 4s lease wait (`kWriteTimeout`, audit_store.cpp) and 1s of
+        // slack, plus the 10s connect that a lease started just inside that deadline may still run
+        // (PgPool::Options::connect_timeout_s, the default when the DSN sets none): a DSN
+        // with a longer connect_timeout, or a host list, can keep a started connect past
+        // this bound, and so can a row whose INSERT is already running and waits on a lock
+        // (PgPool::Options::statement_timeout_ms, 30s by default). The force-exit below then
+        // ends a healthy-but-slow shutdown the way it ends a wedged database. On timeout:
+        // force-exit, the same choice as the
+        // web_thread_ and delivery-queue stages and for the same reason. Continuing past a
+        // hook that is still inside reopens exactly the use-after-free this gate closes (see
+        // the leak-and-continue discussion above), and nothing durable is lost: state is in
+        // Postgres, and this is strictly no worse than the supervisor's SIGKILL.
+        // If this constant changes, change the "within 15s" message below and the 15 s and
+        // ~130 s / ~190 s figures in upgrading.md, server-admin.md, audit-log.md, the
+        // changelog fragment and the resource ledger; the static gate pins the value.
+        static constexpr auto kRegistryAuditRundownBound = std::chrono::seconds(15);
+        agent_service_.close_registry_audit();
+        spdlog::info("Shutting down server: waiting up to {}s for a registry.write audit write "
+                     "in flight...",
+                     kRegistryAuditRundownBound.count());
+        if (!agent_service_.wait_registry_audit_idle(kRegistryAuditRundownBound)) {
+            // Same idiom as the stages above: spdlog would be legal here, the raw write()
+            // stays because _Exit() skips any buffered sink flush.
+            const char msg[] = "ServerImpl::stop: a registry.write audit write did not finish "
+                               "within 15s - force-exiting.\n";
+#ifdef _WIN32
+            _write(2, msg, sizeof(msg) - 1);
+#else
+            (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#endif
+            std::_Exit(1);
+        }
         audit_store_.reset();
         // TagStore (ADR-0050) borrows pg_pool_ — unwire the borrowed raw
         // pointer from agent_service_ (the Register sync_agent_tags ingest —
@@ -12269,6 +12427,62 @@ private:
         if (!result)
             return {};
         return {true, result->visible_for_query()};
+    }
+
+    /// The deprovision erasure hook (ADR-0071; deprovision_erasure.hpp) for the /crypto layout
+    /// store: wired into SettingsRoutes and ScimRoutes, run AFTER a deprovision has committed,
+    /// with every principal that could key a session (slug + linked oidc:/saml:). Best-effort:
+    /// a failure is a warn line (never naming the principal) and a counted
+    /// yuzu_server_crypto_layout_erase_failures_total{reason} (alert YuzuCryptoLayoutEraseFailed),
+    /// never a failed deprovision. The warn line carries the reason and the store's fixed
+    /// message only - never a principal, hash or token.
+    /// A principal the store cannot key (kInvalidInput: oversized / non-UTF-8) can own no row,
+    /// so it is not a failure.
+    void erase_deprovisioned_layouts(const std::vector<std::string>& principals) {
+        namespace cle = crypto_layout_erasure;
+        auto failed = [this](std::string_view reason, std::string_view why) {
+            metrics_.counter(std::string(cle::kMetric), {{"reason", std::string(reason)}})
+                .increment();
+            spdlog::warn("crypto dashboard layout erasure on deprovision failed ({}: {}); the "
+                         "deprovision itself is unaffected - the row stays until erased by hand "
+                         "or by a later deprovision of the same principal",
+                         reason, why);
+        };
+        if (!crypto_dashboard_layout_store_) {
+            failed(cle::kStoreNotOpen, "the layout store did not open at server start");
+            return;
+        }
+        for (const auto& principal : principals) {
+            const auto erased = crypto_dashboard_layout_store_->erase(principal);
+            if (erased)
+                continue;
+            // nullopt: a principal the store cannot key owns no row, so there is none to erase.
+            if (const auto reason = cle::reason_for(erased.error().kind))
+                failed(*reason, erased.error().message);
+        }
+    }
+
+    /// R2-1: an already-inactive SCIM user's erasure ran on the slug alone (its linked identities
+    /// could not be read), so a linked principal's row may remain. Counted under the same metric
+    /// and alert; the warn line was written by the seam, without the principal.
+    void note_layout_erasure_degraded(std::string_view reason) {
+        metrics_
+            .counter(std::string(crypto_layout_erasure::kMetric),
+                     {{"reason", std::string(reason)}})
+            .increment();
+    }
+
+    /// The ONE /crypto availability callback (ADR-0070 R2; fix-spec B1): CryptoRoutes, the
+    /// filtered GET /api/v1/ca/issued and the MCP server all receive THIS function, so the REST
+    /// widget list, the dashboard and list_crypto_widgets cannot draw different answers. Fleet
+    /// gate classes ask the NON-auditing fleet-read probe (a confined caller has a present
+    /// VisibleSet); the global class asks the non-auditing has_permission. Never a grant.
+    yuzu::server::crypto_widgets::Access crypto_access(const httplib::Request& req,
+                                                       yuzu::server::crypto_widgets::WidgetGate gate,
+                                                       const std::string& securable,
+                                                       const std::string& operation) {
+        // The composition lives in crypto_access.hpp so it is unit-tested (M4).
+        return crypto_access_for(*auth_routes_, req, gate, securable, operation);
     }
 
     /// #1788: the per-caller Execution:Execute visible set (nullopt == unfiltered),
@@ -15239,6 +15453,24 @@ private:
                 return httplib::Server::HandlerResponse::Handled;
             }
 
+            // Cookie-session writes require a same-site Origin or Referer. ONE
+            // chokepoint: the decision keys on the RESOLVED session's
+            // auth_source (token sources are exempt), never on header presence.
+            // The audit row is stamped from the session held here (never a
+            // second resolve_session), and the counter and the A4 body live in
+            // same_site_write_gate.hpp. A refusal happens after authentication
+            // and before step-up evaluation and any route handler. Exemptions
+            // are by placement: is_login_exempt_path, the probes and the metrics
+            // endpoint return above, before resolve_session. Never add another
+            // early Unhandled beyond the pinned exempt returns. The web listener's
+            // TLS state (cfg_.https_enabled) selects the scheme-aware same-host
+            // comparison. Invariants: the header banner of same_site_write_policy.hpp.
+            if (detail::apply_same_site_write_gate(req, res, *session, cfg_.csrf_trusted_origins,
+                                                   cfg_.https_enabled, metrics_,
+                                                   same_site_audit_fn_)) {
+                return httplib::Server::HandlerResponse::Handled;
+            }
+
             // principal_class metric (PR 4.5) — stash whether this RESOLVED
             // session is an engine principal, for the post-routing metric
             // emission (principal_class.hpp's principal_class_resolved).
@@ -16227,6 +16459,8 @@ private:
                              .product_pack_store = product_pack_store_.get(),
                              .scim_store = scim_store_.get(),
                              .analytics_store = analytics_store_.get(),
+                             .crypto_dashboard_layout_store =
+                                 crypto_dashboard_layout_store_.get(),
                              .nvd_db = nvd_db_.get(),
                              .nvd_sync = nvd_sync_.get(),
                          });
@@ -16686,6 +16920,12 @@ private:
         if (scim_store_) {
             settings_routes_->set_scim_store(scim_store_.get());
         }
+        // ADR-0071: erase the deleted operator's per-operator rows after the delete commits
+        // (best-effort, never changes the delete's outcome - deprovision_erasure.hpp).
+        settings_routes_->set_on_deprovisioned(
+            [this](const std::vector<std::string>& principals) {
+                erase_deprovisioned_layouts(principals);
+            });
         settings_routes_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res) {
@@ -17230,7 +17470,9 @@ private:
                           "Scheduled instruction occurrences dispatched successfully", "counter");
         metrics_.describe("yuzu_schedule_fire_failures_total",
                           "Scheduled occurrences skipped or failed (unknown/disabled definition, "
-                          "dispatch failure, no agents in scope, approval submit failure)",
+                          "dispatch failure, no agents in scope, approval submit failure, or an "
+                          "approval ticket that could not be settled or whose outbox ledger could "
+                          "not be read, which holds the occurrence for a retry)",
                           "counter");
         metrics_.describe("yuzu_schedule_approvals_submitted_total",
                           "Approval tickets submitted by the schedule runner for approval-gated "
@@ -17323,6 +17565,21 @@ private:
                 return yuzu::server::schedule_arming_permitted(capability_registry_,
                                                                rbac_store_.get(), principal,
                                                                plugin, action);
+            },
+            // #6096: the outbox as the spent-ticket ledger (clock-free). A missing store
+            // is an error, not an empty answer, so the runner holds rather than fires.
+            .outbox_occurrences_fn =
+                [this](const std::string& approval_id)
+                -> std::expected<std::vector<std::string>, std::string> {
+                if (!command_outbox_store_)
+                    return std::unexpected("command outbox not available");
+                return command_outbox_store_->occurrences_for_approval(approval_id);
+            },
+            .outbox_exists_fn = [this](const std::string& occurrence_id)
+                -> std::expected<bool, std::string> {
+                if (!command_outbox_store_)
+                    return std::unexpected("command outbox not available");
+                return command_outbox_store_->occurrence_exists(occurrence_id);
             },
             // #3495: lets a shutdown request stop tick() from firing further
             // due schedules once stop_requested_ flips — same field and
@@ -18908,20 +19165,49 @@ private:
                 },
                 .audit_fn = audit_fn});
 
-        // CryptoRoutes — /crypto, /fragments/crypto/*, GET /api/v1/crypto/* (slice 1:
-        // crypto-library presence from the installed_software inventory). ONE CryptoApi
-        // instance backs the page, the REST routes and the MCP twins (set_crypto_api below).
-        // Built only when the software-inventory store exists; without it the routes are
-        // registered with a null seam and answer 503 / the degrade banner, never an empty page.
-        if (software_inventory_store_) {
+        // CryptoRoutes — /crypto, /fragments/crypto/*, /api/v1/crypto/* (crypto-library
+        // presence from the installed_software inventory, the Yuzu-issued certificate widgets
+        // over ca_store_, and the per-operator widget layout). ONE CryptoApi instance backs the
+        // page, the REST routes and the MCP twins (set_crypto_api below). Built whenever ANY
+        // backing store exists; a missing store degrades only the methods that read it (503 /
+        // the degrade banner), never an empty answer and never the other methods.
+        if (software_inventory_store_ || ca_store_ || crypto_dashboard_layout_store_) {
             crypto_device_api_ = device_api;
-            crypto_api_ = make_local_crypto_api(*software_inventory_store_, crypto_device_api_.get());
+            // Admission is narrowed to a quarter of the pool (B9); the unconfined library summary
+            // is shared for a minute (B8) - the Yuzu-issued stats read never is (ADR-0070: bounded
+            // by admission, not a cached count); every Yuzu-issued / layout shed and degrade is
+            // counted with closed labels (B10).
+            crypto_api_ = make_local_crypto_api(LocalCryptoApiDeps{
+                .software = software_inventory_store_.get(),
+                .devices = crypto_device_api_.get(),
+                .ca = ca_store_.get(),
+                .layouts = crypto_dashboard_layout_store_.get(),
+                .pool_size = pg_pool_ ? static_cast<int>(pg_pool_->size()) : 0,
+                .shared_read_ttl = std::chrono::seconds(60),
+                .note_degrade =
+                    [this](std::string_view source, std::string_view reason) {
+                        metrics_
+                            .counter("yuzu_inventory_read_degrade_total",
+                                     {{"reason", std::string(reason)}, {"source", std::string(source)}})
+                            .increment();
+                    }});
         }
         crypto_routes_ = std::make_unique<CryptoRoutes>();
-        crypto_routes_->register_routes(*web_server_, CryptoRoutes::Deps{.auth_fn = auth_fn,
-                                                                         .fleet_read_fn = fleet_read_fn,
-                                                                         .api = crypto_api_,
-                                                                         .audit_fn = audit_fn});
+        crypto_routes_->register_routes(
+            *web_server_,
+            CryptoRoutes::Deps{.auth_fn = auth_fn,
+                               .fleet_read_fn = fleet_read_fn,
+                               .api = crypto_api_,
+                               .audit_fn = audit_fn,
+                               .perm_fn = perm_fn,
+                               .access_fn =
+                                   [this](const httplib::Request& req,
+                                          crypto_widgets::WidgetGate g, const std::string& type,
+                                          const std::string& op) {
+                                       return crypto_access(req, g, type, op);
+                                   },
+                               .write_gate = WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins},
+                               .tier_policy_fn = auth_routes_->gateless_tier_policy_fn()});
 
         // HardwareRoutes — /hardware (ServiceNow-style CI list + record).
         // Software lives at /software; /inventory redirects here.
@@ -19148,6 +19434,9 @@ private:
                         for (const auto& a : list->approvals)
                             if (a.submitted_at > 0 && (oldest == 0 || a.submitted_at < oldest))
                                 oldest = a.submitted_at;
+                        // Display only (#6096): submitted_at is database time and the panel
+                        // subtracts this process's clock from it, so skew shifts the printed
+                        // age. No decision reads this figure.
                         if (oldest > 0)
                             f.oldest = oldest;
                     }
@@ -19895,6 +20184,14 @@ private:
         // #2537: same ordering rule as DashboardRoutes above — register_routes
         // copies the list into its handler captures, so it must be set first.
         ca_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
+        // ADR-0070 R2-2: the filtered GET /api/v1/ca/issued reads through the SAME CryptoApi
+        // instance and is withheld from a confined caller via the SAME availability callback.
+        ca_routes_->set_filtered_issued(CaRoutes::FilteredIssuedDeps{
+            .api = crypto_api_,
+            .confinement_fn = [this](const httplib::Request& req) {
+                return crypto_access(req, crypto_widgets::WidgetGate::kFleetWideOnly, "Inventory",
+                                     "Read");
+            }});
         ca_routes_->set_read_probe([this](const httplib::Request& req) {
             return auth_routes_->has_permission(req, "Security", "Read");
         });
@@ -20658,6 +20955,13 @@ private:
             // itself carries no severity field. Nullable/deferred like the
             // other optional stores above — analytics_store_ may be null
             // when --analytics-db is unset.
+            // ADR-0071: per-operator rows erased after a SCIM deprovision commits (best-effort,
+            // never changes the SCIM answer - deprovision_erasure.hpp). Set before registering.
+            scim_routes_->set_on_deprovisioned([this](const std::vector<std::string>& principals) {
+                erase_deprovisioned_layouts(principals);
+            });
+            scim_routes_->set_on_erasure_degraded(
+                [this](std::string_view reason) { note_layout_erasure_degraded(reason); });
             scim_routes_->register_routes(*web_server_, scim_store_.get(), &auth_mgr_,
                                           audit_store_.get(), cfg_.scim_admin_group,
                                           engine_principal_store_.get(),
@@ -21498,6 +21802,14 @@ private:
             // page or the REST twins. Null (no inventory store) -> the tools answer an
             // internal error, never an empty result.
             mcp_server_->set_crypto_api(crypto_api_);
+            // /crypto widgets: list_crypto_widgets' availability, get_crypto_ca_stats' R2
+            // withhold and list_issued_certs' filtered form use the SAME callback as the REST
+            // routes and the dashboard.
+            mcp_server_->set_crypto_access_fn(
+                [this](const httplib::Request& req, crypto_widgets::WidgetGate g,
+                       const std::string& type, const std::string& op) {
+                    return crypto_access(req, g, type, op);
+                });
             // #4037 — the SAME list_read_fn lambda wired into the REST
             // registration's trailing list_read_fn param below, so the REST
             // GET /guaranteed-state/status and MCP get_guardian_status twins
@@ -22361,7 +22673,9 @@ private:
     /// Born-on-PG campaign persistence for Periodic Access Reviews (SOC 2 CC6.2).
     /// Borrows pg_pool_ → declared after it; reset in stop() before the pool.
     std::unique_ptr<AccessReviewStore> access_review_store_;
-    std::unique_ptr<AuditStore> audit_store_;
+    /// SHARED so the `registry.write` hook can hold it weakly (set_registry_audit_store): a
+    /// detached forwarder thread (#3279) that locks it keeps it alive for its own call.
+    std::shared_ptr<AuditStore> audit_store_;
     /// #5342: one-transaction credential-change query owner. Borrows pg_pool_
     /// and audit_store_ — declared AFTER audit_store_ so it destructs first;
     /// stop() also resets it explicitly (after nulling auth_mgr_'s pointer)
@@ -22507,6 +22821,19 @@ private:
     std::mutex peer_serial_cache_mu_;
     std::unordered_map<std::string, std::string> peer_serial_cache_;
     std::unique_ptr<AuthRoutes> auth_routes_;
+    // The csrf.denied sink for the pre-routing same-site gate: stamps the principal the
+    // gate already holds (never a second resolve_session). Initialised here, not in a
+    // constructor body, so it can never be empty (an empty function reads as audit-off
+    // to try_persist_audit_for_principal); it reads auth_routes_ at call time.
+    // Capturing `this` is safe: the only caller is the web server's pre-routing handler, and
+    // stop() joins web_thread_ before any member is destroyed (as for mcp_sessions_).
+    detail::SameSitePrincipalAuditFn same_site_audit_fn_ =
+        [this](const httplib::Request& r, const std::string& action, const std::string& result,
+               const detail::SameSiteAuditPrincipal& p, const std::string& tt,
+               const std::string& tid, const std::string& d) {
+            return auth_routes_->audit_log_for_principal(r, action, result, p.id, p.role, tt, tid,
+                                                         d, p.cls);
+        };
     std::unique_ptr<RestApiV1> rest_api_v1_;
     std::unique_ptr<SettingsRoutes> settings_routes_;
     std::unique_ptr<mcp::McpServer> mcp_server_;
@@ -22891,6 +23218,10 @@ private:
     // the web server's worker pool - every handler that could call the api - BEFORE the stores
     // are reset (the same join-before-reset contract as every other route owner here).
     std::shared_ptr<DeviceApi> crypto_device_api_;
+    // Per-operator /crypto widget layouts — born-on-Postgres (ADR-0071). Declared after
+    // pg_pool_ so it destructs before the pool; crypto_api_ borrows it (same join-before-reset
+    // contract as the stores above).
+    std::unique_ptr<CryptoDashboardLayoutStore> crypto_dashboard_layout_store_;
     std::shared_ptr<CryptoApi> crypto_api_;
     std::unique_ptr<CryptoRoutes> crypto_routes_;
     // Typed per-device app-perf daily projection — born-on-Postgres (DEX

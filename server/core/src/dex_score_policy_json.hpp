@@ -22,18 +22,25 @@
  *   - nothing stored        -> the shipped defaults, source "default", no fault.
  *   - stored text invalid   -> the shipped defaults, source "default", `fault`
  *                              names the reason. Never half-applied.
+ *   - version above the one this build supports
+ *                           -> the shipped defaults, source "default", `fault`
+ *                              "unsupported_version at version: N above the supported 1",
+ *                              checked BEFORE the strict parse so a newer document with
+ *                              keys this reader does not know still falls back whole.
  *   - store unreadable      -> not decided here; the provider serves the last
  *                              good policy for a bounded time, then refuses.
  *
  * Wire shape (every key optional on read except an override's "image"; unknown
  * keys are refused):
- *   { "tiers":   { "edges": {excellent, good, fair},
+ *   { "version": 1,
+ *     "tiers":   { "edges": {excellent, good, fair},
  *                  "names": {excellent, good, fair, poor} },
  *     "weights": { breadth, crashes, hangs, regression },
  *     "overrides": [ { "image": "<exact image name>",
  *                      "tiers":   { "edges": {..}, "names": {..} },
  *                      "weights": {..} } ] }
- * An override sets only the fields it names; the rest inherit the global policy.
+ * "version" is an integer of at least 1; absent reads as 1, and the canonical text
+ * always carries it. An override sets only the fields it names; the rest inherit the global policy.
  * Numbers must be JSON numbers (the string "90" is refused). Poor's lower edge
  * is fixed at 0 and is not part of the document. The `tiers` block of an Apps
  * response is a read-model projection (tiers.<tier>.{edge,name}), not this stored
@@ -58,6 +65,7 @@
 #include <expected>
 #include <format>
 #include <initializer_list>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -67,6 +75,8 @@ namespace yuzu::server {
 
 /// Runtime-config key holding the policy document.
 inline constexpr std::string_view kDexScorePolicyKey = "dex_score_policy";
+/// The document version this build reads and writes.
+inline constexpr std::int64_t kDexScorePolicyVersion = 1;
 /// Revision reported when no document is stored.
 inline constexpr std::string_view kDexScorePolicyDefaultRevision = "default";
 /// Largest stored text that is parsed. A legitimate document is about 100 KB at the
@@ -203,6 +213,31 @@ template <class T>
 
 } // namespace dex_score_policy_json_detail
 
+/// The document's version: absent (or a non-object root, which the parser reports) reads
+/// as 1; anything that is not an integer of at least 1 is a parse error at `version`.
+[[nodiscard]] inline std::expected<std::int64_t, DexPolicyParseError>
+dex_score_policy_document_version(const nlohmann::json& doc) {
+    if (!doc.is_object())
+        return 1;
+    const auto it = doc.find("version");
+    if (it == doc.end())
+        return 1;
+    if (!it->is_number_integer())
+        return std::unexpected(
+            DexPolicyParseError{"version", "must be an integer of at least 1"});
+    // An unsigned value above INT64_MAX would wrap negative in get<std::int64_t>() and read
+    // as "< 1" instead of "above the supported version": clamp it, it is still above.
+    constexpr auto kMax = (std::numeric_limits<std::int64_t>::max)();
+    const std::int64_t v =
+        it->is_number_unsigned() && it->get<std::uint64_t>() > static_cast<std::uint64_t>(kMax)
+            ? kMax
+            : it->get<std::int64_t>();
+    if (v < 1)
+        return std::unexpected(
+            DexPolicyParseError{"version", "must be an integer of at least 1"});
+    return v;
+}
+
 /// Strict parse. Refuses an unknown key, a wrong type and a non-object where an
 /// object is required, naming the offending path; nothing is partially returned.
 /// Each override image is ASCII-folded here (the writer's job per the
@@ -214,7 +249,16 @@ dex_score_policy_from_json(const nlohmann::json& doc) {
     using namespace dex_score_policy_json_detail;
     if (!doc.is_object())
         return std::unexpected(Err{"document", "must be an object"});
-    if (const auto e = unknown_key(doc, "", {"tiers", "weights", "overrides"}))
+    // The writer side: a bad version, or one above what this build writes, is refused
+    // FIRST, so a newer document with keys this build does not know is reported as
+    // what it is rather than as its first unknown key.
+    const auto ver = dex_score_policy_document_version(doc);
+    if (!ver)
+        return std::unexpected(ver.error());
+    if (*ver > kDexScorePolicyVersion)
+        return std::unexpected(Err{"version", "above the supported " +
+                                                  std::to_string(kDexScorePolicyVersion)});
+    if (const auto e = unknown_key(doc, "", {"version", "tiers", "weights", "overrides"}))
         return std::unexpected(*e);
     DexScorePolicy p;
     const auto to = object_at(doc, "", "tiers");
@@ -274,7 +318,8 @@ dex_score_policy_from_json(const nlohmann::json& doc) {
                {"good", p.tiers.names[1]},
                {"fair", p.tiers.names[2]},
                {"poor", p.tiers.names[3]}};
-    json doc{{"tiers", {{"edges", std::move(edges)}, {"names", std::move(names)}}},
+    json doc{{"version", kDexScorePolicyVersion},
+             {"tiers", {{"edges", std::move(edges)}, {"names", std::move(names)}}},
              {"weights",
               {{"breadth", p.weights.breadth},
                {"crashes", p.weights.crashes},
@@ -381,6 +426,14 @@ dex_policy_in_force_from_stored(const std::optional<std::string>& stored) {
     const auto doc = nlohmann::json::parse(*stored, nullptr, /*allow_exceptions=*/false);
     if (doc.is_discarded()) {
         out.fault = "unparseable at document: not valid JSON";
+        return out;
+    }
+    // A newer document may carry keys this reader does not know, so its version is read
+    // BEFORE the strict parse: it falls back whole, never half-applied. A malformed
+    // version falls through to the parser, which reports it at `version`.
+    if (const auto v = dex_score_policy_document_version(doc); v && *v > kDexScorePolicyVersion) {
+        out.fault = "unsupported_version at version: " + std::to_string(*v) +
+                    " above the supported " + std::to_string(kDexScorePolicyVersion);
         return out;
     }
     auto parsed = dex_score_policy_from_json(doc);

@@ -74,6 +74,11 @@
 /// `unexpected(db_error)`, never a silently-empty vector that reads as "nothing
 /// owed" (which would silently drop every scheduled fire).
 ///
+/// SPENT-TICKET LEDGER (#6096). `ScheduleRunner` reads each row's `approval_id` back
+/// (`occurrences_for_approval`) to decide that an approved scheduled ticket was already used.
+/// Any FUTURE outbox reaper must therefore retain rows at least as long as the 7-day ticket
+/// lifetime (`kApprovalTicketTtlSeconds`): a reaped row makes a spent ticket look unspent.
+///
 /// This store is a DUMB durable queue: it owns the idempotency key, the epoch
 /// fence, the state machine, and the pending index — NOT the encoding of
 /// `parameters` / `agent_ids` / `scope_expr`, which are opaque producer-owned
@@ -308,7 +313,27 @@ public:
     reschedule(const std::string& occurrence_id, const std::string& leader_lock_name,
                std::int64_t leader_epoch, std::chrono::seconds delay);
 
-    /// The schema migrations for this store (version 1). Exposed for tests and
+    /// Every occurrence key committed for approval ticket `approval_id` (#6096; order is not
+    /// promised). This is the schedule runner's SPENT-TICKET LEDGER: an
+    /// approved scheduled ticket that already has an outbox row for a different occurrence
+    /// has been used, whatever its `consumed_at` says (an old-binary leader that fired it
+    /// without settling it, or a skip-advance that passed over a failed retire). A clock-free
+    /// read by the `outbox_approval_idx` partial index. A degraded read is an error, never an
+    /// empty vector (an empty answer reads as "unspent" and would let a spent ticket fire).
+    /// Refuses an empty id. RETENTION REQUIREMENT: because the runner now reads `approval_id`
+    /// as that ledger, any FUTURE outbox reaper must retain rows at least as long as the
+    /// 7-day approval-ticket lifetime (`kApprovalTicketTtlSeconds`), or a reaped row makes a
+    /// spent ticket look unspent.
+    [[nodiscard]] std::expected<std::vector<std::string>, std::string>
+    occurrences_for_approval(const std::string& approval_id) const;
+
+    /// Does an outbox row exist for `occurrence_id` (primary-key lookup, no clock)? The
+    /// runner uses it to tell "this occurrence already ran" (retire ok, advance failed) from
+    /// "never ran". A degraded read is an error, not `false`.
+    [[nodiscard]] std::expected<bool, std::string>
+    occurrence_exists(const std::string& occurrence_id) const;
+
+    /// The schema migrations for this store (versions 1 and 2). Exposed for tests and
     /// the migration ladder.
     static const std::vector<pg::PgMigration>& migrations();
 

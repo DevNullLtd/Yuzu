@@ -25,6 +25,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/agent/trigger_engine.hpp>
 #include <yuzu/agent/updater.hpp>
 #include <yuzu/agent/update_signature_mode.hpp>
+#include <yuzu/enrollment_token_shape.hpp>
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
 #include <yuzu/version.hpp>
@@ -42,6 +43,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "plugin_heartbeat_tags.hpp" // #1567 plugin heartbeat.* KV -> status tags
 #include "local_dispatcher.hpp"
 #include "ctx_slot.hpp"         // CtxSlot / cancel_ctx_slot (unit-tested, #2182)
+#include "command_frames.hpp"   // make_output_frame / make_final_frame (CommandResponse.action)
 #include "ota_update_thread.hpp" // OTA update thread lifecycle (unit-tested, #2182)
 #include "shutdown_deadline_guard.hpp" // #2233 item 3: end-to-end stop() deadline
 #include "sync_now_decision.hpp"               // __sync__.now decision core (pure, unit-tested)
@@ -277,6 +279,9 @@ struct CommandContextImpl {
     std::shared_ptr<SubscribeStream> stream;
     std::mutex* write_mu; // protects concurrent stream->Write()
     std::string command_id;
+    // the dispatched action, stamped on every plugin-output flush; the final frame stamps
+    // cmd.action() itself (command_frames.hpp; proto CommandResponse.action)
+    std::string action;
     std::chrono::steady_clock::time_point start_time;
     std::atomic<bool> first_output_sent{false};
 
@@ -380,10 +385,7 @@ private:
         output_buffer.clear();
         output_buffer_bytes = 0;
 
-        pb::CommandResponse resp;
-        resp.set_command_id(command_id);
-        resp.set_status(pb::CommandResponse::RUNNING);
-        resp.set_output(std::move(combined));
+        const auto resp = yuzu::agent::make_output_frame(command_id, action, std::move(combined));
 
         std::lock_guard lock(*write_mu);
         stream->Write(resp, grpc::WriteOptions());
@@ -1693,6 +1695,28 @@ public:
         constexpr auto kRegisterTimeout = std::chrono::seconds{30};
         constexpr int kMaxCsrAttempts = 5; // PKI: bound enrolled-but-no-cert retries
 
+        // Remove the enrollment token file (a non-following, non-recursive delete) and
+        // say what happened; true when it is gone, whether this call removed it or it was
+        // already absent. The path is set only when main() read a token from the file (see
+        // agent.hpp); each caller decides what a failed removal means for it.
+        const auto remove_enrollment_token_file = [this](std::string_view why,
+                                                         std::string_view on_failure) {
+            std::error_code ec;
+            const bool removed = std::filesystem::remove(cfg_.enrollment_token_file, ec);
+            if (ec) {
+                spdlog::warn("Could not remove the enrollment token file {}: {} ({})",
+                             cfg_.enrollment_token_file.string(), ec.message(), on_failure);
+                return false;
+            }
+            if (removed)
+                spdlog::info("Removed the enrollment token file {} {}",
+                             cfg_.enrollment_token_file.string(), why);
+            else
+                spdlog::info("The enrollment token file {} was already gone {}",
+                             cfg_.enrollment_token_file.string(), why);
+            return true;
+        };
+
         while (!stop_requested_.load(std::memory_order_acquire)) {
             if (reconnect_count > 0) {
                 // Exponential backoff: 2^n seconds, capped at 5 minutes
@@ -1865,13 +1889,32 @@ public:
                     continue; // Retry registration
                 }
                 if (!resp.accepted()) {
-                    if (resp.reject_reason().find("pending") != std::string::npos) {
+                    // The server's pending reply is accepted=false with
+                    // enrollment_status "pending" (reason "awaiting admin approval");
+                    // the status is the discriminator, the reason is free text.
+                    if (resp.enrollment_status() == "pending") {
                         spdlog::warn("Registration pending admin approval — retrying");
                         ++reconnect_count;
                         continue; // Retry until approved
                     }
                     spdlog::error("Server permanently rejected registration: {}",
                                   resp.reject_reason());
+                    // The server refused the token itself (unknown, expired, revoked or
+                    // used up): the file holds a dead credential, so remove it and the
+                    // next start registers without one and joins the approval queue,
+                    // instead of presenting it and being refused on every start. Any
+                    // other refusal (an administrator's denial of this agent, where the
+                    // token was valid and its use was rolled back) keeps the file. The
+                    // path is cleared after the attempt (run() returns next); a file that
+                    // could not be removed is presented, refused and retried by the next
+                    // start.
+                    if (!cfg_.enrollment_token_file.empty() &&
+                        yuzu::is_enrollment_token_refusal(resp.enrollment_status(),
+                                                          resp.reject_reason())) {
+                        remove_enrollment_token_file("after the server refused the token",
+                                                     "will retry on the next start");
+                        cfg_.enrollment_token_file.clear();
+                    }
                     return; // Hard rejection — no retry
                 }
 
@@ -1883,6 +1926,18 @@ public:
                 }
 
                 reconnect_count = 0; // Registration succeeded — reset backoff
+
+                // Remove the token file now that it has done its one job. A failed
+                // remove keeps the path set so the next accepted Register retries.
+                // cfg_.enrollment_token (in memory) is deliberately left as-is:
+                // clearing it would flip the server's enrollment_method label
+                // on a reconnect from "token" to "approval"
+                // (agent_service_impl.cpp, agent.registered analytics event).
+                if (!cfg_.enrollment_token_file.empty() &&
+                    remove_enrollment_token_file("after the accepted registration",
+                                                 "will retry after the next accepted "
+                                                 "registration"))
+                    cfg_.enrollment_token_file.clear();
 
                 // PKI PR3: the server signed our CSR. Persist the leaf + key (0600)
                 // + issuing chain, point the config at it, and rebuild the channel
@@ -4001,6 +4056,7 @@ private:
             .stream = stream,
             .write_mu = &stream_write_mu_,
             .command_id = cmd.command_id(),
+            .action = cmd.action(),
             .start_time = std::chrono::steady_clock::now(),
         };
         auto* raw_ctx = reinterpret_cast<YuzuCommandContext*>(&ctx_impl);
@@ -4081,11 +4137,7 @@ private:
 
         // Send final status (must be the last statement — see above)
         {
-            pb::CommandResponse final_resp;
-            final_resp.set_command_id(cmd.command_id());
-            final_resp.set_status(rc == 0 ? pb::CommandResponse::SUCCESS
-                                          : pb::CommandResponse::FAILURE);
-            final_resp.set_exit_code(rc);
+            auto final_resp = yuzu::agent::make_final_frame(cmd.command_id(), cmd.action(), rc);
             // BR-006: serialize the RAW reported status, never the rc-derived
             // one. agent.proto pins 0/UNDECLARED as "the plugin never called
             // yuzu_ctx_set_result_status() (including every ABI<4 plugin)", so

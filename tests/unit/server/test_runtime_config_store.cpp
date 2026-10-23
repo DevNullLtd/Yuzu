@@ -14,11 +14,14 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <expected>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "key_provider.hpp"
@@ -34,6 +37,7 @@
 #include "test_runtime_config_helpers.hpp"
 
 #include <libpq-fe.h>
+#include <spdlog/spdlog.h>
 #include <sqlite3.h>
 
 using yuzu::server::FileKeyProvider;
@@ -78,6 +82,14 @@ TEST_CASE("a store that failed to open reports every read/write as unexpected, n
     auto set_result = store.set("log_level", "debug", "tester");
     REQUIRE_FALSE(set_result.has_value());
     CHECK(set_result.error().starts_with(kRuntimeConfigDbErrorPrefix));
+
+    // A conditional write on a degraded store is a store failure, never "stale".
+    auto cas = store.compare_and_set("log_level", std::nullopt, "debug", "tester");
+    REQUIRE_FALSE(cas.has_value());
+    CHECK(cas.error().starts_with(kRuntimeConfigDbErrorPrefix));
+    auto cad = store.compare_and_remove("log_level", "debug");
+    REQUIRE_FALSE(cad.has_value());
+    CHECK(cad.error().starts_with(kRuntimeConfigDbErrorPrefix));
 
     // The non-typed convenience getter collapses a degraded read to "" (the
     // same as "not set") -- documented, not a bug; see the header.
@@ -352,6 +364,50 @@ bool wait_for_advisory_waiter(PGconn* conn, std::chrono::milliseconds deadline) 
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     return false;
+}
+
+// Polls pg_stat_activity on `conn` until another backend of THIS database is waiting on a
+// heavyweight lock (a row-lock wait shows as Lock/transactionid), or `deadline` elapses.
+// Scoped to current_database() for the same shared-container reason as the helper above.
+bool wait_for_lock_waiter(PGconn* conn, std::chrono::milliseconds deadline) {
+    const auto start = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - start < deadline) {
+        PgResult r{PQexec(conn, "SELECT count(*) FROM pg_stat_activity WHERE "
+                                "wait_event_type = 'Lock' AND pid <> pg_backend_pid() "
+                                "AND datname = current_database()")};
+        if (r.status() == PGRES_TUPLES_OK && PQntuples(r.get()) > 0 &&
+            std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10) > 0)
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return false;
+}
+
+// Runs `call` on its own thread while a second connection holds the UNCOMMITTED `locker_sql`
+// (an UPDATE of an existing row, or an INSERT of an absent key), so the call's single
+// UPDATE/DELETE/INSERT blocks on that row lock or speculative-insertion wait. The locker
+// commits only once the call is observed blocked (a commit that beat the call would leave the
+// test passing against any implementation), then the thread is joined BEFORE this returns, so
+// nothing the caller asserts can unwind past a joinable std::thread. Returns false if the
+// locker failed or the call was never seen blocked.
+template <class Call>
+bool run_blocked_on_row_lock(const std::string& dsn, const char* locker_sql, Call&& call) {
+    PgConn locker{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    {
+        PgResult r{PQexec(locker.get(), "BEGIN")};
+        REQUIRE(r.ok());
+    }
+    {
+        PgResult r{PQexec(locker.get(), locker_sql)}; // returns with the lock held
+        REQUIRE(r.ok());
+    }
+    std::thread t([&] { call(); });
+    const bool queued = wait_for_lock_waiter(locker.get(), std::chrono::seconds(5));
+    PgResult commit{PQexec(locker.get(), "COMMIT")}; // also releases `t` when never seen queued
+    const bool commit_ok = commit.ok();
+    t.join();
+    return queued && commit_ok;
 }
 
 } // namespace
@@ -737,4 +793,191 @@ TEST_CASE("read_secret() surfaces a genuine decrypt failure as unexpected, never
     auto secret = w.store.read_secret("oidc_client_secret");
     REQUIRE_FALSE(secret.has_value());
     CHECK(secret.error().starts_with(kRuntimeConfigDbErrorPrefix));
+}
+
+// ── Conditional writes (#6085). Tagged WITHOUT [store] on purpose: they are homed in pg
+//    shard L by tests/meson.build, not shard A. ─────────────────────────────
+
+TEST_CASE("RuntimeConfigStore: compare_and_set creates when absent and reports stale when a row appeared",
+          "[pg][runtime_config]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, rtcfg_store_tpl);
+    Wired w{db.dsn()};
+
+    auto made = w.store.compare_and_set("log_level", std::nullopt, "debug", "alice");
+    REQUIRE(made.has_value());
+    CHECK(*made);
+    auto e = w.store.get("log_level");
+    REQUIRE(e.has_value());
+    REQUIRE(e->has_value());
+    CHECK((*e)->value == "debug");
+    CHECK((*e)->updated_by == "alice");
+
+    auto again = w.store.compare_and_set("log_level", std::nullopt, "warn", "bob");
+    REQUIRE(again.has_value());
+    CHECK_FALSE(*again); // stale, not an error
+    CHECK(w.store.get_value("log_level") == "debug");
+}
+
+TEST_CASE("RuntimeConfigStore: compare_and_set replaces only the observed text",
+          "[pg][runtime_config]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, rtcfg_store_tpl);
+    Wired w{db.dsn()};
+    // log_level is applied live by a successful write; save the process level to restore it.
+    const auto prev_level = spdlog::get_level();
+    yuzu::test::ScopeExit restore_level{[prev_level] { spdlog::set_level(prev_level); }};
+    REQUIRE(w.store.set("log_level", "debug", "alice").has_value());
+
+    auto ok = w.store.compare_and_set("log_level", std::string("debug"), "warn", "bob");
+    REQUIRE(ok.has_value());
+    CHECK(*ok);
+    CHECK(spdlog::get_level() == spdlog::level::warn); // the winner's value took effect live
+    auto stale = w.store.compare_and_set("log_level", std::string("debug"), "error", "carol");
+    REQUIRE(stale.has_value());
+    CHECK_FALSE(*stale);
+    CHECK(spdlog::get_level() == spdlog::level::warn); // a stale write changes nothing live
+    CHECK(w.store.get_value("log_level") == "warn");
+    auto e = w.store.get("log_level");
+    REQUIRE(e.has_value());
+    REQUIRE(e->has_value());
+    CHECK((*e)->updated_by == "bob");
+
+    // An absent key with a text expected is stale, not an error.
+    auto absent = w.store.compare_and_set("audit_retention_days", std::string("30"), "60", "bob");
+    REQUIRE(absent.has_value());
+    CHECK_FALSE(*absent);
+    CHECK_FALSE(w.store.get("audit_retention_days").value().has_value());
+}
+
+TEST_CASE("RuntimeConfigStore: compare_and_set refuses a secret key or an unknown key or a bad value without a write",
+          "[pg][runtime_config]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, rtcfg_store_tpl);
+    Wired w{db.dsn()};
+    const auto plain = count_rows(db.dsn(), "runtime_config_store.runtime_config");
+    const auto sealed = count_rows(db.dsn(), "runtime_config_store.runtime_config_secrets");
+
+    for (const auto& [key, value] : {std::pair<const char*, const char*>{"oidc_client_secret", "s3cret"},
+                                     {"not_a_real_key", "x"},
+                                     {"heartbeat_timeout", "1"}}) {
+        INFO(key);
+        auto r = w.store.compare_and_set(key, std::nullopt, value, "alice");
+        REQUIRE_FALSE(r.has_value());
+        CHECK_FALSE(r.error().starts_with(kRuntimeConfigDbErrorPrefix)); // caller input
+    }
+    CHECK(count_rows(db.dsn(), "runtime_config_store.runtime_config") == plain);
+    CHECK(count_rows(db.dsn(), "runtime_config_store.runtime_config_secrets") == sealed);
+}
+
+TEST_CASE("RuntimeConfigStore: an unrepresentable expected is refused on both methods and never matched or truncated",
+          "[pg][runtime_config]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, rtcfg_store_tpl);
+    Wired w{db.dsn()};
+    REQUIRE(w.store.set("log_level", "debug", "alice").has_value());
+    const auto rows = count_rows(db.dsn(), "runtime_config_store.runtime_config");
+
+    const std::string with_nul("debug\0suffix", 12);
+    const std::string bad_utf8("debug\xFF");
+    for (const auto& expected : {with_nul, bad_utf8}) {
+        auto set = w.store.compare_and_set("log_level", expected, "warn", "bob");
+        REQUIRE_FALSE(set.has_value());
+        CHECK_FALSE(set.error().starts_with(kRuntimeConfigDbErrorPrefix));
+        auto del = w.store.compare_and_remove("log_level", expected);
+        REQUIRE_FALSE(del.has_value());
+        CHECK_FALSE(del.error().starts_with(kRuntimeConfigDbErrorPrefix));
+    }
+    CHECK(w.store.get_value("log_level") == "debug");
+    CHECK(count_rows(db.dsn(), "runtime_config_store.runtime_config") == rows);
+}
+
+TEST_CASE("RuntimeConfigStore: compare_and_remove deletes only the observed text",
+          "[pg][runtime_config]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, rtcfg_store_tpl);
+    Wired w{db.dsn()};
+    REQUIRE(w.store.set("log_level", "debug", "alice").has_value());
+
+    auto stale = w.store.compare_and_remove("log_level", "warn");
+    REQUIRE(stale.has_value());
+    CHECK_FALSE(*stale);
+    CHECK(w.store.get_value("log_level") == "debug");
+
+    auto ok = w.store.compare_and_remove("log_level", "debug");
+    REQUIRE(ok.has_value());
+    CHECK(*ok);
+    CHECK_FALSE(w.store.get("log_level").value().has_value());
+
+    auto gone = w.store.compare_and_remove("log_level", "debug");
+    REQUIRE(gone.has_value());
+    CHECK_FALSE(*gone);
+
+    const auto rows = count_rows(db.dsn(), "runtime_config_store.runtime_config");
+    auto unknown = w.store.compare_and_remove("not_a_real_key", "x");
+    REQUIRE_FALSE(unknown.has_value());
+    CHECK_FALSE(unknown.error().starts_with(kRuntimeConfigDbErrorPrefix));
+    CHECK(count_rows(db.dsn(), "runtime_config_store.runtime_config") == rows);
+
+    auto secret = w.store.compare_and_remove("oidc_client_secret", "x");
+    REQUIRE_FALSE(secret.has_value());
+    CHECK_FALSE(secret.error().starts_with(kRuntimeConfigDbErrorPrefix));
+}
+
+// The cross-session contract of both conditional writes: each is ONE statement, and under
+// READ COMMITTED a concurrent commit to the row re-evaluates its WHERE before it writes. A
+// refactor into a read followed by an unconditional write would pass every sequential case
+// above and fail here. A second connection holds the row lock (as the advisory-lock cases
+// above do, so the store is made to genuinely block rather than hoping two threads race)
+// and rewrites the observed text; the blocked write must then report stale and change nothing.
+TEST_CASE("RuntimeConfigStore: a conditional write that loses a concurrent commit is stale and not applied",
+          "[pg][runtime_config]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, rtcfg_store_tpl);
+    Wired w{db.dsn()};
+    const auto prev_level = spdlog::get_level();
+    yuzu::test::ScopeExit restore_level{[prev_level] { spdlog::set_level(prev_level); }};
+    REQUIRE(w.store.set("log_level", "debug", "alice").has_value());
+
+    std::expected<bool, std::string> cas{false};
+    const bool set_blocked = run_blocked_on_row_lock(
+        db.dsn(), "UPDATE runtime_config_store.runtime_config SET value='warn' WHERE key='log_level'",
+        [&] { cas = w.store.compare_and_set("log_level", std::string("debug"), "error", "bob"); });
+    REQUIRE(set_blocked);
+    INFO((cas.has_value() ? std::string() : cas.error()));
+    REQUIRE(cas.has_value());
+    CHECK_FALSE(*cas);
+    CHECK(w.store.get_value("log_level") == "warn"); // the committed rewrite, not the lost write
+
+    // Re-seed so this half does not depend on how the first one ended.
+    REQUIRE(w.store.set("log_level", "warn", "alice").has_value());
+    std::expected<bool, std::string> car{true};
+    const bool remove_blocked = run_blocked_on_row_lock(
+        db.dsn(), "UPDATE runtime_config_store.runtime_config SET value='info' WHERE key='log_level'",
+        [&] { car = w.store.compare_and_remove("log_level", "warn"); });
+    REQUIRE(remove_blocked);
+    INFO((car.has_value() ? std::string() : car.error()));
+    REQUIRE(car.has_value());
+    CHECK_FALSE(*car);
+    CHECK(w.store.get_value("log_level") == "info"); // the row survives
+}
+
+// The create arm's contract across sessions: with `expected == nullopt` the key must be absent,
+// and a concurrent INSERT of the same key wins. A second connection holds an uncommitted INSERT
+// of the key, so the create's INSERT ... ON CONFLICT DO NOTHING waits on it; once that commits
+// the create must report stale (false), not a database error and not an overwrite. A
+// SELECT-then-INSERT or SELECT-then-upsert regression passes every sequential case.
+TEST_CASE("RuntimeConfigStore: a create that loses a concurrent insert is stale and not applied",
+          "[pg][runtime_config]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, rtcfg_store_tpl);
+    Wired w{db.dsn()};
+    const auto prev_level = spdlog::get_level();
+    yuzu::test::ScopeExit restore_level{[prev_level] { spdlog::set_level(prev_level); }};
+    REQUIRE_FALSE(w.store.get("log_level").value().has_value());
+
+    std::expected<bool, std::string> cas{true};
+    const bool blocked = run_blocked_on_row_lock(
+        db.dsn(),
+        "INSERT INTO runtime_config_store.runtime_config (key, value, updated_by, updated_at) "
+        "VALUES ('log_level', 'warn', 'alice', 0)",
+        [&] { cas = w.store.compare_and_set("log_level", std::nullopt, "error", "bob"); });
+    REQUIRE(blocked);
+    INFO((cas.has_value() ? std::string() : cas.error()));
+    REQUIRE(cas.has_value());
+    CHECK_FALSE(*cas);
+    CHECK(w.store.get_value("log_level") == "warn"); // the committed insert, not the lost create
 }

@@ -3038,7 +3038,7 @@ tests:
         exp_samples: []
 
   # ── YuzuGatewaySessionHeldByOtherAgent (HA WS-5, ADR-2002 §7f) ──────────
-  # Only the (proxy_register, session_held_by_other_agent) pair pages; no `for:`.
+  # Only the (proxy_register|announce_connected, session_held_by_other_agent) pairs page; no `for:`.
 
   # CASE — a single session_held_by_other_agent increment fires immediately.
   - interval: 1m
@@ -3052,6 +3052,33 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuGatewaySessionHeldByOtherAgent", alertstate="firing", instance="s1", job="yuzu", op="proxy_register", outcome="session_held_by_other_agent", severity="warning"}'
             value: 1
+
+  # CASE (#5683) — the CONNECTED-path refusal (op=announce_connected) pages too:
+  # RED against reverting the expr to op="proxy_register" only.
+  - interval: 1m
+    name: gateway session held by other agent - an announce_connected increment fires
+    input_series:
+      - series: 'yuzu_server_gateway_route_desync_total{job="yuzu",instance="s1",op="announce_connected",outcome="session_held_by_other_agent"}'
+        values: "0x5 1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewaySessionHeldByOtherAgent", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewaySessionHeldByOtherAgent", alertstate="firing", instance="s1", job="yuzu", op="announce_connected", outcome="session_held_by_other_agent", severity="warning"}'
+            value: 1
+
+  # CASE (#5683) — the other announce_connected outcomes still do not page.
+  - interval: 1m
+    name: gateway session held by other agent - other announce_connected outcomes do not fire
+    input_series:
+      - series: 'yuzu_server_gateway_route_desync_total{job="yuzu",instance="s1",op="announce_connected",outcome="session_mismatch"}'
+        values: "0x5 50x20"
+      - series: 'yuzu_server_gateway_route_desync_total{job="yuzu",instance="s1",op="announce_connected",outcome="malformed_home_id"}'
+        values: "0x5 50x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewaySessionHeldByOtherAgent", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
 
   # CASE — a flat zero-seeded counter stays quiet.
   - interval: 1m
@@ -4094,6 +4121,134 @@ tests:
         eval_time: 29m
         exp_samples: []
 
+  # ── YuzuCryptoCaReadDegraded (/crypto widgets, Gate 7 SRE-4) ─────────────
+  #
+  # The /crypto Yuzu-issued reads refused or failed for 15 minutes. The rule
+  # sums every reason of source="ca_issued" into ONE series (no reason label),
+  # so a shed and a database fault that alternate still hold it firing.
+
+  # CASE: a sustained mix of admission_full and query_error fires after the 15m
+  # hold, with no reason/instance label (sum() drops them), and not before.
+  - interval: 1m
+    name: crypto CA read degraded - sustained degrades fire after 15 minutes
+    input_series:
+      - series: 'yuzu_inventory_read_degrade_total{job="yuzu",instance="s1",source="ca_issued",reason="admission_full"}'
+        values: "0+1x40"
+      - series: 'yuzu_inventory_read_degrade_total{job="yuzu",instance="s1",source="ca_issued",reason="query_error"}'
+        values: "0+2x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCryptoCaReadDegraded", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCryptoCaReadDegraded", alertstate="firing"}'
+        eval_time: 17m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCryptoCaReadDegraded", alertstate="firing", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuCryptoCaReadDegraded", alertstate="firing"}'
+        eval_time: 35m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCryptoCaReadDegraded", alertstate="firing", severity="warning"}'
+            value: 1
+
+  # CASE: a 5-minute burst leaves the 5m window long before the 15m hold, so it
+  # never fires; and a rising degrade of ANOTHER source (the library reads, the
+  # layout store) is not this alert's business.
+  - interval: 1m
+    name: crypto CA read degraded - a short burst and other sources stay quiet
+    input_series:
+      - series: 'yuzu_inventory_read_degrade_total{job="yuzu",instance="s1",source="ca_issued",reason="admission_full"}'
+        values: "0 1 2 3 4 5 5x40"
+      - series: 'yuzu_inventory_read_degrade_total{job="yuzu",instance="s1",source="installed_software",reason="query_error"}'
+        values: "0+1x40"
+      - series: 'yuzu_inventory_read_degrade_total{job="yuzu",instance="s1",source="crypto_layout",reason="store_not_open"}'
+        values: "0+1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCryptoCaReadDegraded"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCryptoCaReadDegraded"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE: the zero-seeded healthy shape (admission_full is pre-seeded at boot)
+  # stays silent.
+  - interval: 1m
+    name: crypto CA read degraded - a flat pre-seeded series stays quiet
+    input_series:
+      - series: 'yuzu_inventory_read_degrade_total{job="yuzu",instance="s1",source="ca_issued",reason="admission_full"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCryptoCaReadDegraded"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # ── YuzuCryptoLayoutEraseFailed (ADR-0071 deprovision erasure, Gate 8 M1) ──
+  #
+  # Any increase of the erasure-failure counter in the last hour fires at once
+  # (no hold), one series per reason; it clears once the hour has passed.
+
+  # CASE: one failure fires immediately with its reason and clears after the
+  # 1h window has rolled past it.
+  - interval: 1m
+    name: crypto layout erase failed - one failure fires with its reason, then clears
+    input_series:
+      - series: 'yuzu_server_crypto_layout_erase_failures_total{job="yuzu",instance="s1",reason="pool_acquire_timeout"}'
+        values: "0x10 1x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing", reason="pool_acquire_timeout", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed"}'
+        eval_time: 100m
+        exp_samples: []
+
+  # CASE (R2-1): link_read_failed - an already-inactive SCIM user's linked
+  # identities could not be read, so only the slug's row was erased - fires
+  # like any other reason (the rule is reason-agnostic).
+  - interval: 1m
+    name: crypto layout erase failed - link_read_failed fires with its reason
+    input_series:
+      - series: 'yuzu_server_crypto_layout_erase_failures_total{job="yuzu",instance="s1",reason="link_read_failed"}'
+        values: "0x10 1x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing", reason="link_read_failed", severity="warning"}'
+            value: 1
+
+  # CASE: the pre-seeded healthy shape (every reason at a flat zero) stays
+  # silent, and two reasons failing fire as two series.
+  - interval: 1m
+    name: crypto layout erase failed - flat zeros stay quiet; two reasons, two series
+    input_series:
+      - series: 'yuzu_server_crypto_layout_erase_failures_total{job="yuzu",instance="s1",reason="store_not_open"}'
+        values: "0x30 0 1x20"
+      - series: 'yuzu_server_crypto_layout_erase_failures_total{job="yuzu",instance="s1",reason="query_error"}'
+        values: "0x30 0 2x20"
+      - series: 'yuzu_server_crypto_layout_erase_failures_total{job="yuzu",instance="s1",reason="outcome_unknown"}'
+        values: "0x50"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed"}'
+        eval_time: 25m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing", reason="query_error", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing", reason="store_not_open", severity="warning"}'
+            value: 1
+
   # ── YuzuEnablementRegressed / YuzuEnablementRulesRejected / YuzuEnablementAnchorWriteFailing (ADR-3006) ──
   #
   # Cases for three of the enablement store's five alerts. YuzuEnablementUnresolvedUnits and
@@ -4187,3 +4342,67 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1
+
+  # CASE: cookie-session requests refused for a cross-site Origin or Referer. s1 rises 0 0 3 6
+  # (six mismatches inside 15m: fires, and the step ages out of the window by minute 29);
+  # s4 is a flat zero-seeded series on the same reason.
+  - interval: 1m
+    name: cookie writes refused same-site - three or more mismatches in 15m fires and ages out of the window
+    input_series:
+      - series: 'yuzu_server_csrf_denied_total{job="yuzu",instance="s1",path_class="a",reason="origin_mismatch"}'
+        values: "0 0 3 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6"
+      - series: 'yuzu_server_csrf_denied_total{job="yuzu",instance="s4",path_class="a",reason="origin_mismatch"}'
+        values: "0x30"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: YuzuCookieWritesRefusedSameSite
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Cookie-session requests are being refused for a cross-site Origin, Referer or fetch metadata"
+              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#vnext--behind-a-reverse-proxy-declare-your-external-origin-or-csrf-gated-dashboard-actions-keep-failing-2537"
+              description: "Three or more cookie-session requests were refused in 15 minutes because the Origin or Referer did not name this site (or a --csrf-trusted-origin entry), or because the request's fetch metadata (Sec-Fetch-Site) was not same-origin or none. Three causes: a browser sent a request from another site, a reverse proxy rewrites the Host header and the server was started without --csrf-trusted-origin (or YUZU_CSRF_TRUSTED_ORIGIN), in which case every dashboard write fails, or a client sent a Sec-Fetch-Site value other than same-origin or none. Each refusal is audited as csrf.denied with the closed reason; this alert sums over path_class, so query yuzu_server_csrf_denied_total by path_class to see which kind of route was targeted. Check the Host and Origin the proxy forwards first."
+      - eval_time: 29m
+        alertname: YuzuCookieWritesRefusedSameSite
+        exp_alerts: []
+
+  # CASE: below the threshold, or a reason that is deliberately not alerted, stays quiet. s2 rises
+  # 0 0 1 1 (one refusal); s3 is a large header-less burst (reason no_origin_no_referer).
+  - interval: 1m
+    name: cookie writes refused same-site - one mismatch and a header-less burst stay quiet
+    input_series:
+      - series: 'yuzu_server_csrf_denied_total{job="yuzu",instance="s2",path_class="a",reason="referer_mismatch"}'
+        values: "0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1"
+      - series: 'yuzu_server_csrf_denied_total{job="yuzu",instance="s3",path_class="a",reason="no_origin_no_referer"}'
+        values: "0 0 30 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: YuzuCookieWritesRefusedSameSite
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: YuzuCookieWritesRefusedSameSite
+        exp_alerts: []
+
+  # CASE: an internal gate error alerts on the first one and stays quiet when absent. s1 has two
+  # errors from minute 2; s2 is the zero-seeded flat series every replica exposes.
+  - interval: 1m
+    name: same-site gate internal error - any error in 15m fires, a flat zero-seeded series stays quiet
+    input_series:
+      - series: 'yuzu_server_csrf_denied_total{job="yuzu",instance="s1",path_class="a",reason="gate_error"}'
+        values: "0 0 1 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2"
+      - series: 'yuzu_server_csrf_denied_total{job="yuzu",instance="s2",path_class="a",reason="gate_error"}'
+        values: "0x30"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: YuzuSameSiteGateInternalError
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "The same-site gate failed internally and refused requests"
+              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#vnext--behind-a-reverse-proxy-declare-your-external-origin-or-csrf-gated-dashboard-actions-keep-failing-2537"
+              description: "The same-site check for cookie-session requests hit an internal error and refused the request (it fails closed). A refusal that fails inside the gate may have no audit row, so the metric and the server log (at most one warning per minute) may be the only evidence. Look for the gate warning in the server log; a persistent error means cookie-session requests are failing for every operator."
+      - eval_time: 29m
+        alertname: YuzuSameSiteGateInternalError
+        exp_alerts: []

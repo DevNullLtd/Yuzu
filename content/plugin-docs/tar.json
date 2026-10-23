@@ -2803,7 +2803,9 @@
     ],
     "changelog": [
       "changelog.d/2026-10-14-dex-tar-titles.changed.md",
-      "changelog.d/20261014-tar-adhoc-sql-moved.changed.md"
+      "changelog.d/2026-10-21-tar-timeline-render.added.md",
+      "changelog.d/20261014-tar-adhoc-sql-moved.changed.md",
+      "changelog.d/20261021-tar-capture-sources-paused-core.fixed.md"
     ],
     "definitions": [
       "content/definitions/tar.yaml",
@@ -2876,6 +2878,7 @@
     "tests": [
       "tests/test_tar_mapdrive_pin_lexical.py",
       "tests/unit/server/test_tar_process_tree.cpp",
+      "tests/unit/server/test_tar_timeline_render.cpp",
       "tests/unit/server/test_tar_tree_routes.cpp",
       "tests/unit/test_tar_aggregator.cpp",
       "tests/unit/test_tar_arp.cpp",
