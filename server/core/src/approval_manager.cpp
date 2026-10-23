@@ -107,7 +107,9 @@ constexpr const char* kDbWallEpochSql = "EXTRACT(EPOCH FROM clock_timestamp())::
 // live after (an over-grant), and one begun before `reviewed_at` was stamped would see the
 // ticket as dated in the future and misreport it as expired (#6062 sg-6). The consume
 // CAS and its diagnostic read therefore ask for the wall clock; the sweep and
-// `ticket_is_live()` keep `now()`, where the statement IS the transaction.
+// `ticket_is_live()` keep `now()`: the sweep runs first inside the mint's own short
+// transaction (opened and bounded here, never a caller's) and `ticket_is_live()` is one
+// statement, so neither can age the way a caller-held transaction does.
 std::string ticket_live_sql(bool wall_clock = false) {
     const std::string now = wall_clock ? kDbWallEpochSql : kDbNowEpochSql;
     return "(reviewed_at >= (" + now + " - " + std::to_string(kApprovalTicketTtlSeconds) +
