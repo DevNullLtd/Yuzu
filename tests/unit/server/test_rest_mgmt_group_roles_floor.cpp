@@ -248,6 +248,37 @@ TEST_CASE("POST /management-groups/{id}/roles: fleet-wide ManagementGroup:Write 
     CHECK(res->status == 201);
 }
 
+TEST_CASE("POST /management-groups/{id}/roles: ForensicsAnalyst is refused at group scope exactly "
+          "like the other fleet-only roles (#4990)",
+          "[pg][rest][mgmt_group][authz][security_scope][forensics_analyst]") {
+    GroupRolesHarness h;
+    ManagementGroup g;
+    g.name = "floor-test-fa";
+    g.membership_type = "static";
+    g.created_by = "tester";
+    auto grp = h.mgmt_bundle->create_group(g);
+    REQUIRE(grp.has_value());
+    const std::string gid = *grp;
+
+    // The refusal is the same status as every other non-delegable role, and nothing is stored.
+    for (const char* role : {"ForensicsAnalyst", "Reviewer", "Administrator"}) {
+        INFO(role);
+        auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles",
+                               std::string(R"({"principal_id":"someone","role_name":")") + role +
+                                   R"("})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(res->body.find("only Operator and Viewer roles can be delegated") != std::string::npos);
+    }
+    CHECK(h.mgmt_bundle->get_group_roles(gid).empty());
+
+    // Operator is still delegable, so the refusal above is the role and not the route.
+    auto ok = h.sink.Post("/api/v1/management-groups/" + gid + "/roles",
+                          R"({"principal_id":"someone","role_name":"Operator"})");
+    REQUIRE(ok);
+    CHECK(ok->status == 201);
+}
+
 TEST_CASE("POST /management-groups/{id}/roles: ITServiceOwner OF THIS GROUP is "
           "allowed without ManagementGroup:Write (regression)",
           "[pg][rest][mgmt_group][authz][security_scope]") {

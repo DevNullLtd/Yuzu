@@ -2143,3 +2143,119 @@ TEST_CASE("REST GET .../rbac/roles/assignments: still 200 on a dropped audit "
     REQUIRE(res);
     CHECK(res->status == 200);
 }
+
+// ── ForensicsAnalyst (#4990): fleet-wide assignable, read-only, never an administrator ───────
+
+TEST_CASE("ForensicsAnalyst is on the closed assignable list and is the only addition to the six",
+          "[rbac][a2][forensics_analyst]") {
+    CHECK(is_rbac_assignable_role("ForensicsAnalyst"));
+    // The literal set, spelled out on purpose: comparing with the array the code reads would stay
+    // green if someone also added ITServiceOwner or a custom role to it.
+    std::vector<std::string> got(std::begin(kRbacAssignableRoles), std::end(kRbacAssignableRoles));
+    std::sort(got.begin(), got.end());
+    CHECK(got == std::vector<std::string>{"Administrator", "ApiTokenManager", "ForensicsAnalyst",
+                                          "Operator", "PlatformEngineer", "Reviewer", "Viewer"});
+    CHECK_FALSE(is_rbac_assignable_role("ITServiceOwner"));
+    CHECK_FALSE(is_rbac_assignable_role("forensicsanalyst")); // exact, case-sensitive
+    CHECK(rbac_role_rejection_reason("NoSuchRole", "NoSuchRole") ==
+          "NoSuchRole: not one of the 7 fleet-wide-assignable roles");
+}
+
+TEST_CASE("REST assign/unassign ForensicsAnalyst: RBAC-on durable admin, audited with the role name, "
+          "and the holder is not an administrator",
+          "[pg][rest][rbac][a2][forensics_analyst]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/true);
+
+    auto res = h.assign_rest("ForensicsAnalyst",
+                             R"({"principal_type":"user","principal_id":"ana"})");
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    auto roles = h.rbac->get_principal_roles("user", "ana");
+    REQUIRE(roles.size() == 1);
+    CHECK(roles[0].role_name == "ForensicsAnalyst");
+
+    // The audit row carries the role name through the existing detail path.
+    const AuditRecord* row = nullptr;
+    for (const auto& a : h.audit_log)
+        if (a.action == "rbac.role.assigned" && a.result == "success" && a.target_id == "ana")
+            row = &a;
+    REQUIRE(row != nullptr);
+    CHECK(row->detail.rfind("ForensicsAnalyst;", 0) == 0);
+
+    // Holding the role confers no administrator authority on either branch of the predicate.
+    auth::Session analyst;
+    analyst.username = "ana";
+    analyst.role = auth::Role::user;
+    CHECK(is_rbac_administrator(analyst, h.auth_db.get(), h.rbac.get(), RbacAdminSurface::kRest) ==
+          RbacAdminGate::kDenied);
+    CHECK(is_rbac_administrator(analyst, h.auth_db.get(), h.rbac.get(), RbacAdminSurface::kMcp) ==
+          RbacAdminGate::kDenied);
+    h.rbac->set_rbac_enabled(false);
+    REQUIRE(h.auth_db->upsert_user("ana", "hash", "salt", auth::Role::user).has_value());
+    CHECK(is_rbac_administrator(analyst, h.auth_db.get(), h.rbac.get(), RbacAdminSurface::kRest) ==
+          RbacAdminGate::kDenied);
+    h.rbac->set_rbac_enabled(true);
+
+    // Removing it is an ordinary unassign: the last-Administrator guard has no say, even though
+    // the caller is the fleet's only administrator.
+    auto un = h.unassign_rest("ForensicsAnalyst", "ana");
+    REQUIRE(un);
+    CHECK(un->status == 200);
+    CHECK(h.rbac->get_principal_roles("user", "ana").empty());
+    CHECK(h.rbac->list_all_principal_roles_checked().value().size() == 1); // only the admin remains
+}
+
+TEST_CASE("REST assign ForensicsAnalyst: a non-administrator is denied and the role is not granted",
+          "[pg][rest][rbac][a2][forensics_analyst]") {
+    RbacRoleHarness h;
+    h.rbac->set_rbac_enabled(true);
+    REQUIRE(h.auth_db->upsert_user(h.session_user, "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", h.session_user, "ForensicsAnalyst"}).has_value());
+
+    // A ForensicsAnalyst holder is not an administrator, so it cannot hand the role (or any other)
+    // to anyone, including itself.
+    auto res = h.assign_rest("ForensicsAnalyst",
+                             R"({"principal_type":"user","principal_id":"mallory"})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.rbac->get_principal_roles("user", "mallory").empty());
+}
+
+TEST_CASE("MCP assign_rbac_role/unassign_rbac_role: ForensicsAnalyst round-trips and is in the schema enum",
+          "[pg][mcp][rbac][a2][forensics_analyst]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+
+    auto res = h.mcp_call_tool_approved(
+        "assign_rbac_role",
+        {{"principal_type", "user"}, {"principal_id", "ana"}, {"role", "ForensicsAnalyst"}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("\"error\"") == std::string::npos);
+    auto roles = h.rbac->get_principal_roles("user", "ana");
+    REQUIRE(roles.size() == 1);
+    CHECK(roles[0].role_name == "ForensicsAnalyst");
+
+    auto un = h.mcp_call_tool_approved("unassign_rbac_role",
+                                       {{"principal_id", "ana"}, {"role", "ForensicsAnalyst"}});
+    REQUIRE(un);
+    CHECK(un->body.find("\"unassigned\":true") != std::string::npos);
+    CHECK(h.rbac->get_principal_roles("user", "ana").empty());
+}
+
+TEST_CASE("assign_management_group_role's input schema still offers only Operator and Viewer "
+          "(ForensicsAnalyst is fleet-wide only)",
+          "[mcp][rbac][a2][forensics_analyst]") {
+    const auto schemas = yuzu::server::mcp::input_schemas_for_test();
+    const auto it = std::find_if(schemas.begin(), schemas.end(), [](const auto& s) {
+        return s.name == "assign_management_group_role";
+    });
+    REQUIRE(it != schemas.end());
+    auto schema = nlohmann::json::parse(it->schema_json, nullptr, false);
+    REQUIRE_FALSE(schema.is_discarded());
+    std::vector<std::string> roles;
+    for (const auto& v : schema["properties"]["role_name"]["enum"])
+        roles.push_back(v.get<std::string>());
+    CHECK(roles == std::vector<std::string>{"Operator", "Viewer"});
+}
