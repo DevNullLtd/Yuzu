@@ -6,19 +6,16 @@ attached removable volume (`exec_from_removable`). Like every other TAR
 capture source it is **forensic evidence**, not a policy engine — it records
 what happened, it does not block anything.
 
-**This source ships DEFAULT-ON.** Every other TAR capture source added since
-1.5 has shipped opt-in (`<source>_enabled` defaulting to `false`) pending an
-explicit enablement decision. `removable` diverges from that pattern: it is
-enabled out of the box, on every OS, from this release. If your fleet
-standardises on opt-in capture sources, set `removable_enabled=false`
-per-agent or fleet-wide the same way as any other TAR source
+**This source ships enabled by default**, on every OS, like every other TAR
+capture source. To opt out, set `removable_enabled=false` per-agent or
+fleet-wide the same way as any other TAR source
 (`docs/user-manual/tar.md#configuration`).
 
 Default-on is **not** a finding that this source is privacy-neutral. It
 records vendor/product/serial and executed-binary paths — identity and
-usage-class data — so the works-council posture applies in full. Under the
-Wave 6 ruling (`docs/tar-implementer.md`) that posture attaches to the
-**lookback control** rather than to the enable flag: set
+usage-class data — so the works-council posture applies in full. Because every
+TAR source ships enabled, that posture attaches to the **lookback control**
+rather than to the enable flag: set
 `removable_lookback_seconds=0` for forward-only collection on a host where a
 retrospective read of the OS's retained removable history is not lawful.
 Because the obligation now lands at *upgrade* rather than at an operator's

@@ -15,15 +15,38 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
+#include <iterator>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #ifndef _WIN32
 #include <unistd.h> // geteuid — the unmovable-quarantine test is POSIX-only
+#else
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+#include <aclapi.h> // GetNamedSecurityInfoW, SetNamedSecurityInfoW, SetEntriesInAclW
+#include <sddl.h>   // ConvertSidToStringSidW, ConvertStringSidToSidW
+
+#include <win_str.hpp>
 #endif
 
 namespace fs = std::filesystem;
@@ -43,6 +66,7 @@ struct TestTarDb {
         fs::remove(path, ec);
         fs::remove(fs::path{path.string() + "-wal"}, ec);
         fs::remove(fs::path{path.string() + "-shm"}, ec);
+        fs::remove(fs::path{path.string() + "-journal"}, ec); // pre-created empty on Windows
     }
 };
 
@@ -1345,6 +1369,7 @@ TEST_CASE("TarDatabase: missing warehouse tables are re-created on reopen (upgra
     fs::remove(tmp, ec);
     fs::remove(fs::path{tmp.string() + "-wal"}, ec);
     fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+    fs::remove(fs::path{tmp.string() + "-journal"}, ec);
 }
 
 TEST_CASE("TarDatabase: a fresh open creates no tar_events table (#760 UP-8)",
@@ -1371,7 +1396,7 @@ TEST_CASE("TarDatabase: a fresh open creates no tar_events table (#760 UP-8)",
     { TarDatabase discard = std::move(t.db); }
     auto reopened = TarDatabase::open(t.path);
     REQUIRE(reopened.has_value());
-    CHECK(reopened->schema_version() == 7);
+    CHECK(reopened->schema_version() == 8);
     auto q2 = reopened->execute_query(count_sql);
     REQUIRE(q2.has_value());
     CHECK(q2->rows[0][0] == "0");
@@ -1405,7 +1430,7 @@ TEST_CASE("TarDatabase: a pre-v3 database still has tar_events dropped on open",
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 7); // the 2→3→4→5→6→7 walk ran
+        CHECK(db->schema_version() == 8); // the 2→3→4→5→6→7→8 walk ran
         auto q =
             db->execute_query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'tar_events' OR "
                               "name LIKE 'idx_tar_events%'");
@@ -1417,6 +1442,7 @@ TEST_CASE("TarDatabase: a pre-v3 database still has tar_events dropped on open",
     fs::remove(tmp, ec);
     fs::remove(fs::path{tmp.string() + "-wal"}, ec);
     fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+    fs::remove(fs::path{tmp.string() + "-journal"}, ec);
 }
 
 TEST_CASE("TarDatabase: schema v5 drops tar_events from an ALREADY-MIGRATED database",
@@ -1445,7 +1471,7 @@ TEST_CASE("TarDatabase: schema v5 drops tar_events from an ALREADY-MIGRATED data
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 7);
+        CHECK(db->schema_version() == 8);
         auto q = db->execute_query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'tar_events' "
                                    "OR name LIKE 'idx_tar_events%'");
         REQUIRE(q.has_value());
@@ -1456,6 +1482,7 @@ TEST_CASE("TarDatabase: schema v5 drops tar_events from an ALREADY-MIGRATED data
     fs::remove(tmp, ec);
     fs::remove(fs::path{tmp.string() + "-wal"}, ec);
     fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+    fs::remove(fs::path{tmp.string() + "-journal"}, ec);
 }
 
 TEST_CASE("TarDatabase: create_warehouse_tables joins a transaction the caller already holds",
@@ -1522,7 +1549,7 @@ TEST_CASE("TarDatabase: schema v4 ALTERs version onto a pre-existing procperf ti
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 7); // the v3→v4→v5→v6→v7 walk ran
+        CHECK(db->schema_version() == 8); // the v3→v4→v5→v6→v7→v8 walk ran
 
         // Both tiers now carry `version` (added by the ALTER, not the DDL).
         for (const char* tbl : {"procperf_live", "procperf_hourly"}) {
@@ -1553,6 +1580,7 @@ TEST_CASE("TarDatabase: schema v4 ALTERs version onto a pre-existing procperf ti
     fs::remove(tmp, ec);
     fs::remove(fs::path{tmp.string() + "-wal"}, ec);
     fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+    fs::remove(fs::path{tmp.string() + "-journal"}, ec);
 }
 
 TEST_CASE("TarDatabase: schema v7 ALTERs is_kthread onto a pre-existing procperf tier "
@@ -1584,7 +1612,7 @@ TEST_CASE("TarDatabase: schema v7 ALTERs is_kthread onto a pre-existing procperf
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 7); // the v6→v7 walk ran
+        CHECK(db->schema_version() == 8); // the v6→v7→v8 walk ran
 
         // Both tiers now carry `is_kthread` (added by the ALTER, not the DDL).
         for (const char* tbl : {"procperf_live", "procperf_hourly"}) {
@@ -1617,6 +1645,7 @@ TEST_CASE("TarDatabase: schema v7 ALTERs is_kthread onto a pre-existing procperf
     fs::remove(tmp, ec);
     fs::remove(fs::path{tmp.string() + "-wal"}, ec);
     fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+    fs::remove(fs::path{tmp.string() + "-journal"}, ec);
 }
 
 TEST_CASE("TarDatabase: insert and query arp events (ADR-0015)", "[tar][store][crud][arp]") {
@@ -1683,12 +1712,12 @@ TEST_CASE("TarDatabase: a corrupt tar.db is quarantined and re-initialised fresh
         CHECK(db.get_config("process_enabled", "true") == "false");
     } // connection closed; WAL checkpointed into the main file on close
 
-    // 2. Corrupt it: drop any WAL/SHM sidecars and clobber the whole file with
-    //    non-SQLite bytes so PRAGMA integrity_check fails deterministically.
-    for (const char* suffix : {"-wal", "-shm"}) {
-        std::error_code ec;
-        fs::remove(fs::path{tmp.string() + suffix}, ec);
-    }
+    // 2. Corrupt it: leave EMPTY WAL/SHM sidecars beside it (the Windows open() pre-creates
+    //    them that way) and clobber the whole file with non-SQLite bytes so PRAGMA
+    //    integrity_check fails deterministically.
+    for (const char* suffix : {"-wal", "-shm"})
+        REQUIRE(std::ofstream(fs::path{tmp.string() + suffix}, std::ios::binary | std::ios::trunc)
+                    .is_open());
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
         REQUIRE(f.is_open());
@@ -1706,17 +1735,19 @@ TEST_CASE("TarDatabase: a corrupt tar.db is quarantined and re-initialised fresh
     // CLEAN database, not a silent read-failure default over corrupt bytes.
     CHECK(db2.get_config("process_enabled", "true") == "true");
 
-    // A timestamped quarantine sidecar exists next to the original path.
-    bool found_quarantine = false;
+    // Exactly one timestamped quarantine file exists next to the original path: the sidecars
+    // were seeded empty (as the Windows open() pre-creates them) and an empty sidecar holds no
+    // evidence, so it is dropped, not kept as a forensic artifact of its own.
+    int quarantine_files = 0;
     const std::string prefix = tmp.filename().string() + ".corrupt-";
     for (const auto& entry : fs::directory_iterator(tmp.parent_path())) {
         if (entry.path().filename().string().rfind(prefix, 0) == 0) {
-            found_quarantine = true;
+            ++quarantine_files;
             std::error_code ec;
             fs::remove(entry.path(), ec); // tidy up the quarantine artifact
         }
     }
-    CHECK(found_quarantine);
+    CHECK(quarantine_files == 1);
 
     // #1567: this open knows it quarantined, and the fact is persisted (epoch +
     // basename only) so it survives a restart and can be published fleet-wide.
@@ -1744,9 +1775,9 @@ TEST_CASE("TarDatabase: a corrupt tar.db is quarantined and re-initialised fresh
             fs::remove(entry.path(), ec);
         }
     }
-    {
+    for (const char* suffix : {"", "-wal", "-shm", "-journal"}) {
         std::error_code ec;
-        fs::remove(tmp, ec);
+        fs::remove(fs::path{tmp.string() + suffix}, ec);
     }
 }
 
@@ -1790,6 +1821,7 @@ TEST_CASE("TarDatabase: a second corruption never overwrites the first quarantin
     fs::remove(tmp, ec);
     fs::remove(fs::path{tmp.string() + "-wal"}, ec);
     fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+    fs::remove(fs::path{tmp.string() + "-journal"}, ec);
 }
 
 TEST_CASE("TarDatabase: a valid DB opens cleanly with no quarantine and preserves data (#559)",
@@ -1817,6 +1849,153 @@ TEST_CASE("TarDatabase: a valid DB opens cleanly with no quarantine and preserve
     fs::remove(tmp, ec);
     fs::remove(fs::path{tmp.string() + "-wal"}, ec);
     fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+    fs::remove(fs::path{tmp.string() + "-journal"}, ec);
+}
+
+namespace {
+
+std::vector<unsigned char> read_bytes(const fs::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    return std::vector<unsigned char>(std::istreambuf_iterator<char>(in),
+                                      std::istreambuf_iterator<char>());
+}
+
+void put_be32(std::vector<unsigned char>& out, std::uint32_t x) {
+    for (int shift = 24; shift >= 0; shift -= 8)
+        out.push_back(static_cast<unsigned char>(x >> shift));
+}
+
+// Writes the rollback journal that, replayed onto `victim`, restores `evil`'s version of every
+// page that differs (sqlite.org/fileformat.html, "The Rollback Journal"). It is HOT: a valid
+// header with a non-zero first byte, and no lock held on the database it sits beside.
+void write_hot_journal(const fs::path& victim, const fs::path& evil, const fs::path& journal) {
+    const auto v = read_bytes(victim);
+    const auto e = read_bytes(evil);
+    REQUIRE(v.size() > 100);
+    std::size_t page = (std::size_t{v[16]} << 8) | v[17]; // big-endian page size at offset 16
+    if (page == 1)
+        page = 65536;
+    REQUIRE(e.size() >= page);
+    REQUIRE(e.size() % page == 0);
+    constexpr std::uint32_t kNonce = 0x12345678;
+    constexpr std::size_t kSector = 512;
+    const std::size_t evil_pages = e.size() / page;
+
+    std::vector<unsigned char> records;
+    std::uint32_t changed = 0;
+    for (std::size_t pg = 1; pg <= evil_pages; ++pg) {
+        const unsigned char* ep = e.data() + (pg - 1) * page;
+        if (pg * page <= v.size() && std::equal(ep, ep + page, v.data() + (pg - 1) * page))
+            continue; // identical on both sides: nothing to restore
+        ++changed;
+        put_be32(records, static_cast<std::uint32_t>(pg));
+        records.insert(records.end(), ep, ep + page);
+        std::uint32_t checksum = kNonce; // the journal's sparse checksum: every 200th byte from the end
+        for (auto j = static_cast<std::ptrdiff_t>(page) - 200; j > 0; j -= 200)
+            checksum += ep[j];
+        put_be32(records, checksum);
+    }
+    REQUIRE(changed > 0);
+
+    std::vector<unsigned char> header = {0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7};
+    put_be32(header, changed);
+    put_be32(header, kNonce);
+    put_be32(header, static_cast<std::uint32_t>(evil_pages));
+    put_be32(header, static_cast<std::uint32_t>(kSector));
+    put_be32(header, static_cast<std::uint32_t>(page));
+    header.resize(kSector, 0);
+    std::ofstream out(journal, std::ios::binary | std::ios::trunc);
+    REQUIRE(out.is_open());
+    out.write(reinterpret_cast<const char*>(header.data()),
+              static_cast<std::streamsize>(header.size()));
+    out.write(reinterpret_cast<const char*>(records.data()),
+              static_cast<std::streamsize>(records.size()));
+}
+
+// Leaves a CLOSED tar.db at `db` (retention_days = "7") with a hot rollback journal beside it
+// that would rewrite retention_days to "EVIL". `db`'s directory must exist.
+void plant_evil_journal(const fs::path& db) {
+    {
+        auto created = TarDatabase::open(db);
+        REQUIRE(created.has_value());
+        REQUIRE(created->set_config("retention_days", "7"));
+    } // closed: the WAL is empty, so the main file holds everything
+    const fs::path evil = db.parent_path() / "evil.db";
+    fs::copy_file(db, evil, fs::copy_options::overwrite_existing);
+    {
+        yuzu::test::SqliteHandleOwner<sqlite3> owner;
+        REQUIRE(sqlite3_open(evil.string().c_str(), &owner.db) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(owner.db,
+                             "UPDATE tar_config SET value = 'EVIL' WHERE key = 'retention_days';"
+                             "PRAGMA wal_checkpoint(TRUNCATE);",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+    write_hot_journal(db, evil, fs::path{db.string() + "-journal"});
+}
+
+} // namespace
+
+// The premise of the Windows planted-journal case below, runnable everywhere: a hot journal is
+// replayed by open() when nothing says it is foreign. That is crash recovery working, and it is
+// why the Windows pass looks at the journal's OWNER before SQLite does.
+TEST_CASE("TarDatabase: a hot rollback journal beside tar.db is replayed by open()",
+          "[tar][store][lifecycle][hardening]") {
+    yuzu::test::TempDir dir{"yuzu_test_tar_journal_"};
+    fs::create_directories(dir.path);
+    const fs::path db = dir.path / "tar.db";
+    plant_evil_journal(db);
+    REQUIRE(fs::file_size(fs::path{db.string() + "-journal"}) > 0);
+
+    auto reopened = TarDatabase::open(db);
+    REQUIRE(reopened.has_value());
+    CHECK(reopened->get_config("retention_days", "") == "EVIL");
+}
+
+// The journal is one of the four files SQLite reads for a database, so quarantine moves it with
+// the rest: it is evidence that belongs beside the quarantine (an empty one is dropped, like
+// -wal and -shm), and the fresh database must not serve it. SQLite consumes a HOT journal at the
+// integrity probe, before quarantine runs, so the journal planted here has a zero first byte
+// (what journal_mode=PERSIST leaves behind): not hot, so the probe leaves it, byte-ful, for
+// quarantine to deal with.
+TEST_CASE("TarDatabase: a corrupt tar.db's rollback journal is quarantined with it (#559)",
+          "[tar][store][lifecycle][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_tar_qjournal_"};
+    fs::create_directories(dir.path);
+    const fs::path db = dir.path / "tar.db";
+    plant_evil_journal(db);
+    const fs::path journal{db.string() + "-journal"};
+    const auto journal_size = fs::file_size(journal);
+    REQUIRE(journal_size > 0);
+    {
+        std::fstream f(journal, std::ios::binary | std::ios::in | std::ios::out);
+        REQUIRE(f.is_open());
+        f.put('\0');
+    }
+    {
+        std::ofstream f(db, std::ios::binary | std::ios::trunc);
+        REQUIRE(f.is_open());
+        f << "this is not a valid sqlite database -- corrupt tar.db beside a journal";
+    }
+
+    auto reopened = TarDatabase::open(db);
+    REQUIRE(reopened.has_value());
+    REQUIRE(reopened->quarantined_this_open().has_value());
+    CHECK(reopened->get_config("retention_days", "") != "EVIL");
+
+    // The journal sits beside the quarantine, byte for byte, and not beside the fresh database.
+    const std::string prefix = db.filename().string() + ".corrupt-";
+    int moved = 0;
+    for (const auto& entry : fs::directory_iterator(dir.path)) {
+        const std::string name = entry.path().filename().string();
+        if (name.rfind(prefix, 0) == 0 && name.ends_with("-journal")) {
+            ++moved;
+            CHECK(fs::file_size(entry.path()) == journal_size);
+        }
+    }
+    CHECK(moved == 1);
+    // Nothing byte-ful stays beside the fresh database (the Windows open() pre-creates an EMPTY
+    // protected journal there, so absence is not the portable statement).
+    CHECK((!fs::exists(journal) || fs::file_size(journal) == 0));
 }
 
 #ifndef _WIN32
@@ -1880,6 +2059,400 @@ TEST_CASE("TarDatabase: a corrupt-and-unmovable tar.db fails closed (#559 primar
     if (!reopened.has_value())
         CHECK(reopened.error().find("corrupt and unmovable") != std::string::npos);
     // dir_guard restores perms + removes the dir.
+}
+
+TEST_CASE("TarDatabase: open() sets tar.db and its WAL sidecars owner-only (0600)",
+          "[tar][store][lifecycle][hardening]") {
+    // The db is seeded group/other-readable (0644) with an explicit chmod, which no umask
+    // can alter, so the assertions fail unless open() itself re-modes an EXISTING file
+    // (and, because SQLite derives a sidecar's mode from the db file, its -wal/-shm too).
+    constexpr auto kOwnerOnly = fs::perms::owner_read | fs::perms::owner_write;
+    const auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_mode_");
+    struct Cleanup {
+        fs::path db;
+        ~Cleanup() {
+            std::error_code ec;
+            fs::remove(db, ec);
+            fs::remove(fs::path{db.string() + "-wal"}, ec);
+            fs::remove(fs::path{db.string() + "-shm"}, ec);
+            fs::remove(fs::path{db.string() + "-journal"}, ec);
+        }
+    } cleanup{tmp};
+    {
+        auto created = TarDatabase::open(tmp);
+        REQUIRE(created.has_value());
+    } // closed
+    std::error_code ec;
+    fs::permissions(tmp,
+                    kOwnerOnly | fs::perms::group_read | fs::perms::others_read,
+                    fs::perm_options::replace, ec);
+    REQUIRE_FALSE(ec);
+    REQUIRE((fs::status(tmp).permissions() & fs::perms::mask) != kOwnerOnly); // seed took
+
+    auto reopened = TarDatabase::open(tmp);
+    REQUIRE(reopened.has_value());
+    for (const char* suffix : {"", "-wal", "-shm"}) {
+        const fs::path p{tmp.string() + suffix};
+        INFO("file=" << p.filename().string());
+        if (suffix[0] != '\0' && !fs::exists(p))
+            continue; // a sidecar is checked only where SQLite has created it
+        REQUIRE(fs::exists(p));
+        CHECK((fs::status(p).permissions() & fs::perms::mask) == kOwnerOnly);
+    }
+}
+#else // _WIN32
+// ── Windows: protected owner-only DACL on tar.db and its sidecars ─────────────────────
+// The directory carries an INHERITABLE BUILTIN\Users read ACE (as C:\ProgramData does), so a
+// sidecar SQLite creates itself WOULD inherit it: every case fails unless open() pre-creates or
+// re-secures the file before SQLite does.
+namespace {
+
+using LocalPtr = std::unique_ptr<void, decltype(&::LocalFree)>;
+
+constexpr const char* kUsers = "S-1-5-32-545";
+constexpr const char* kSystem = "S-1-5-18";
+constexpr const char* kAdministrators = "S-1-5-32-544";
+
+std::string sid_string(PSID sid) {
+    LPWSTR raw = nullptr;
+    REQUIRE(::ConvertSidToStringSidW(sid, &raw));
+    const LocalPtr guard{raw, ::LocalFree};
+    return yuzu::win::from_wide(raw);
+}
+
+std::string token_user_sid() {
+    HANDLE token = nullptr;
+    REQUIRE(::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token));
+    DWORD len = 0;
+    ::GetTokenInformation(token, TokenUser, nullptr, 0, &len);
+    std::vector<BYTE> buf(len);
+    const BOOL got = ::GetTokenInformation(token, TokenUser, buf.data(), len, &len);
+    ::CloseHandle(token);
+    REQUIRE(got);
+    // Aligned cast: vector<BYTE>::data() is a heap block aligned to the default new alignment.
+    return sid_string(reinterpret_cast<TOKEN_USER*>(buf.data())->User.Sid);
+}
+
+// What a file's DACL says: whether it is protected, and the SIDs of its ALLOW aces.
+struct DaclFacts {
+    bool dacl_protected{false};
+    std::vector<std::string> allowed;
+    [[nodiscard]] bool allows(const std::string& sid) const {
+        return std::find(allowed.begin(), allowed.end(), sid) != allowed.end();
+    }
+};
+
+DaclFacts dacl_facts(const fs::path& p) {
+    DaclFacts out;
+    PACL dacl = nullptr;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    REQUIRE(::GetNamedSecurityInfoW(p.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
+                                    nullptr, &dacl, nullptr, &sd) == ERROR_SUCCESS);
+    const LocalPtr sd_guard{sd, ::LocalFree};
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    REQUIRE(::GetSecurityDescriptorControl(sd, &control, &revision));
+    out.dacl_protected = (control & SE_DACL_PROTECTED) != 0;
+    for (WORD i = 0; dacl != nullptr && i < dacl->AceCount; ++i) { // a NULL DACL lists nothing
+        void* ace = nullptr;
+        if (::GetAce(dacl, i, &ace) &&
+            static_cast<const ACE_HEADER*>(ace)->AceType == ACCESS_ALLOWED_ACE_TYPE) {
+            auto* allow = static_cast<ACCESS_ALLOWED_ACE*>(ace);
+            out.allowed.push_back(sid_string(reinterpret_cast<PSID>(&allow->SidStart)));
+        }
+    }
+    return out;
+}
+
+std::string owner_sid(const fs::path& p) {
+    PSID owner = nullptr;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    REQUIRE(::GetNamedSecurityInfoW(p.c_str(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                                    &owner, nullptr, nullptr, nullptr, &sd) == ERROR_SUCCESS);
+    const LocalPtr sd_guard{sd, ::LocalFree};
+    return sid_string(owner);
+}
+
+void assert_owner_only(const fs::path& p) {
+    INFO("file=" << p.filename().string());
+    REQUIRE(fs::exists(p));
+    const DaclFacts f = dacl_facts(p);
+    CHECK(f.dacl_protected);
+    for (const char* wide_group : {kUsers, "S-1-1-0" /*Everyone*/, "S-1-5-11" /*Authenticated*/})
+        CHECK_FALSE(f.allows(wide_group));
+    CHECK(f.allows(kSystem));
+    CHECK(f.allows(kAdministrators));
+    CHECK(f.allows(token_user_sid()));
+}
+
+// Adds an allow-read ACE for BUILTIN\Users and leaves the DACL UNPROTECTED -- which also strips
+// a protected file back to the pre-upgrade shape. `inheritable` is for a directory.
+void seed_users_ace(const fs::path& p, bool inheritable) {
+    PSID users = nullptr;
+    REQUIRE(::ConvertStringSidToSidW(L"S-1-5-32-545", &users));
+    const LocalPtr users_guard{users, ::LocalFree};
+    PACL old_dacl = nullptr;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    REQUIRE(::GetNamedSecurityInfoW(p.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
+                                    nullptr, &old_dacl, nullptr, &sd) == ERROR_SUCCESS);
+    const LocalPtr sd_guard{sd, ::LocalFree};
+    EXPLICIT_ACCESS_W ea{};
+    ea.grfAccessPermissions = FILE_GENERIC_READ;
+    ea.grfAccessMode = GRANT_ACCESS;
+    ea.grfInheritance = inheritable ? (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) : NO_INHERITANCE;
+    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    ea.Trustee.ptstrName = reinterpret_cast<LPWSTR>(users);
+    PACL new_dacl = nullptr;
+    REQUIRE(::SetEntriesInAclW(1, &ea, old_dacl, &new_dacl) == ERROR_SUCCESS);
+    const LocalPtr acl_guard{new_dacl, ::LocalFree};
+    std::wstring name = p.wstring(); // SetNamedSecurityInfoW takes a mutable LPWSTR
+    REQUIRE(::SetNamedSecurityInfoW(
+                name.data(), SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION, nullptr,
+                nullptr, new_dacl, nullptr) == ERROR_SUCCESS);
+    REQUIRE(dacl_facts(p).allows(kUsers)); // the seed took
+}
+
+// Lets this process hand a file to another owner; false when the privilege is not held.
+bool enable_restore_privilege() {
+    HANDLE token = nullptr;
+    if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+        return false;
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    const bool ok =
+        ::LookupPrivilegeValueW(nullptr, L"SeRestorePrivilege", &tp.Privileges[0].Luid) &&
+        ::AdjustTokenPrivileges(token, FALSE, &tp, 0, nullptr, nullptr) &&
+        ::GetLastError() != ERROR_NOT_ALL_ASSIGNED;
+    ::CloseHandle(token);
+    return ok;
+}
+
+void set_owner(const fs::path& p, const std::string& sid_text) {
+    PSID sid = nullptr;
+    REQUIRE(::ConvertStringSidToSidW(yuzu::win::to_wide(sid_text).c_str(), &sid));
+    const LocalPtr sid_guard{sid, ::LocalFree};
+    std::wstring name = p.wstring();
+    REQUIRE(::SetNamedSecurityInfoW(name.data(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, sid,
+                                    nullptr, nullptr, nullptr) == ERROR_SUCCESS);
+    REQUIRE(owner_sid(p) == sid_text); // the owner change took
+}
+
+// Gives ONLY the token user and SYSTEM read/write on `p` (protected, no WRITE_DAC, no DELETE):
+// what a planting user would set so the service can use the file but not re-secure it. Call it
+// while the test still owns `p`.
+void set_read_write_only_dacl(const fs::path& p) {
+    PSID system_sid = nullptr;
+    REQUIRE(::ConvertStringSidToSidW(L"S-1-5-18", &system_sid));
+    const LocalPtr system_guard{system_sid, ::LocalFree};
+    PSID user_sid = nullptr;
+    REQUIRE(::ConvertStringSidToSidW(yuzu::win::to_wide(token_user_sid()).c_str(), &user_sid));
+    const LocalPtr user_guard{user_sid, ::LocalFree};
+    PSID sids[] = {system_sid, user_sid};
+    EXPLICIT_ACCESS_W ea[2]{};
+    for (int i = 0; i < 2; ++i) {
+        ea[i].grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+        ea[i].grfAccessMode = GRANT_ACCESS;
+        ea[i].grfInheritance = NO_INHERITANCE;
+        ea[i].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        ea[i].Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN;
+        ea[i].Trustee.ptstrName = reinterpret_cast<LPWSTR>(sids[i]);
+    }
+    PACL acl = nullptr;
+    REQUIRE(::SetEntriesInAclW(2, ea, nullptr, &acl) == ERROR_SUCCESS);
+    const LocalPtr acl_guard{acl, ::LocalFree};
+    std::wstring name = p.wstring();
+    REQUIRE(::SetNamedSecurityInfoW(
+                name.data(), SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, nullptr,
+                nullptr, acl, nullptr) == ERROR_SUCCESS);
+}
+
+std::string read_file(const fs::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+// A directory carrying the inheritable Users ACE, and the tar.db path inside it.
+struct AclDir {
+    yuzu::test::TempDir dir{"yuzu_test_tar_acl_"};
+    fs::path db;
+    AclDir() {
+        fs::create_directories(dir.path);
+        seed_users_ace(dir.path, true);
+        db = dir.path / "tar.db";
+    }
+    [[nodiscard]] fs::path file(const char* suffix) const { return fs::path{db.string() + suffix}; }
+};
+
+constexpr const char* kFiles[] = {"", "-wal", "-shm", "-journal"};
+
+} // namespace
+
+TEST_CASE("TarDatabase (Windows): a fresh db and its sidecars are created owner-only",
+          "[tar][store][lifecycle][hardening]") {
+    AclDir d;
+    auto opened = TarDatabase::open(d.db);
+    REQUIRE(opened.has_value());
+    REQUIRE(opened->set_config("acl_probe", "1")); // the WAL is live
+    for (const char* sfx : kFiles)
+        assert_owner_only(d.file(sfx)); // exists (REQUIRE) so the sidecar half is not vacuous
+}
+
+TEST_CASE("TarDatabase (Windows): an upgraded world-readable db is re-secured on open",
+          "[tar][store][lifecycle][hardening]") {
+    AclDir d;
+    { REQUIRE(TarDatabase::open(d.db).has_value()); } // created, then closed
+    seed_users_ace(d.db, false); // the pre-upgrade shape: unprotected, Users can read
+    REQUIRE_FALSE(dacl_facts(d.db).dacl_protected);
+
+    auto reopened = TarDatabase::open(d.db);
+    REQUIRE(reopened.has_value());
+    REQUIRE(reopened->set_config("acl_probe", "1"));
+    for (const char* sfx : kFiles)
+        assert_owner_only(d.file(sfx));
+}
+
+TEST_CASE("TarDatabase (Windows): a foreign-owned sidecar is replaced, not adopted",
+          "[tar][store][lifecycle][hardening]") {
+    if (!enable_restore_privilege())
+        SKIP("SeRestorePrivilege unavailable");
+    AclDir d;
+    { REQUIRE(TarDatabase::open(d.db).has_value()); } // created, then closed
+    const fs::path wal = d.file("-wal");
+    { std::ofstream plant(wal, std::ios::binary | std::ios::trunc); }
+    set_owner(wal, kUsers);
+
+    auto reopened = TarDatabase::open(d.db);
+    REQUIRE(reopened.has_value());
+    REQUIRE(reopened->set_config("acl_probe", "1"));
+    const std::string owner = owner_sid(wal);
+    CHECK((owner == token_user_sid() || owner == kSystem || owner == kAdministrators));
+    assert_owner_only(wal);
+}
+
+// SQLite replays a hot rollback journal beside the database before it reads the WAL. The journal
+// planted here is the one the portable premise test above shows being replayed; only its owner
+// differs, so what keeps "EVIL" out is the owner test.
+TEST_CASE("TarDatabase (Windows): a foreign-owned hot journal is replaced, not replayed",
+          "[tar][store][lifecycle][hardening]") {
+    if (!enable_restore_privilege())
+        SKIP("SeRestorePrivilege unavailable");
+    AclDir d;
+    plant_evil_journal(d.db);
+    const fs::path journal = d.file("-journal");
+    REQUIRE(fs::file_size(journal) > 0); // the attack is armed
+    set_owner(journal, kUsers);
+
+    auto reopened = TarDatabase::open(d.db);
+    REQUIRE(reopened.has_value());
+    CHECK(reopened->get_config("retention_days", "") == "7"); // not "EVIL"
+    CHECK(fs::file_size(journal) == 0); // swapped for the protected empty one, which is inert
+    const std::string owner = owner_sid(journal);
+    CHECK((owner == token_user_sid() || owner == kSystem || owner == kAdministrators));
+    assert_owner_only(journal);
+}
+
+TEST_CASE("TarDatabase (Windows): a foreign-owned tar.db refuses the open",
+          "[tar][store][lifecycle][hardening]") {
+    if (!enable_restore_privilege())
+        SKIP("SeRestorePrivilege unavailable");
+    AclDir d;
+    { REQUIRE(TarDatabase::open(d.db).has_value()); } // created, then closed
+    set_owner(d.db, kUsers);
+
+    auto refused = TarDatabase::open(d.db);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("owner") != std::string::npos);
+    CHECK(refused.error().find("move it aside or remove it") != std::string::npos);
+    CHECK(refused.error().find("grant the agent account full access") != std::string::npos);
+
+    set_owner(d.db, token_user_sid()); // reversible: back to ours, the next open works
+    CHECK(TarDatabase::open(d.db).has_value());
+}
+
+// A hard link shares its target's owner and security descriptor, so the owner test passes it:
+// only the link count tells it from a file of ours.
+TEST_CASE("TarDatabase (Windows): a hard-linked sidecar is replaced and its target left alone",
+          "[tar][store][lifecycle][hardening]") {
+    AclDir d;
+    { REQUIRE(TarDatabase::open(d.db).has_value()); } // created, then closed
+    const fs::path decoy = d.dir.path / "decoy.bin"; // ours, inherits the directory's Users ACE
+    { std::ofstream(decoy, std::ios::binary) << "not a wal"; }
+    REQUIRE(dacl_facts(decoy).allows(kUsers));
+    REQUIRE_FALSE(dacl_facts(decoy).dacl_protected);
+
+    const fs::path wal = d.file("-wal");
+    std::error_code ec;
+    fs::remove(wal, ec); // SQLite normally removes it on close; a plant needs the name free
+    fs::create_hard_link(decoy, wal, ec);
+    REQUIRE_FALSE(ec);
+    REQUIRE(fs::hard_link_count(wal) == 2);
+
+    auto reopened = TarDatabase::open(d.db);
+    REQUIRE(reopened.has_value());
+    REQUIRE(reopened->set_config("acl_probe", "1"));
+    CHECK(fs::hard_link_count(wal) == 1); // our name was replaced, not rewritten in place
+    assert_owner_only(wal);
+    // The target kept its bytes and its descriptor: nothing re-secured or initialised it.
+    CHECK(fs::hard_link_count(decoy) == 1);
+    CHECK(read_file(decoy) == "not a wal");
+    CHECK_FALSE(dacl_facts(decoy).dacl_protected);
+    CHECK(dacl_facts(decoy).allows(kUsers));
+}
+
+TEST_CASE("TarDatabase (Windows): a hard-linked tar.db refuses the open",
+          "[tar][store][lifecycle][hardening]") {
+    AclDir d;
+    { REQUIRE(TarDatabase::open(d.db).has_value()); } // created, then closed
+    const fs::path alias = d.dir.path / "alias.db";
+    std::error_code ec;
+    fs::create_hard_link(d.db, alias, ec);
+    REQUIRE_FALSE(ec);
+
+    auto refused = TarDatabase::open(d.db);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("hard link") != std::string::npos);
+    CHECK(refused.error().find("fsutil") != std::string::npos);
+
+    REQUIRE(fs::remove(alias)); // reversible: one name again, the next open works
+    CHECK(TarDatabase::open(d.db).has_value());
+}
+
+// The planting user owns the file, so it can deny the service WRITE_DAC: the re-secure open then
+// fails ACCESS_DENIED, and without a fallback look the owner test would never run on it. The
+// owner is a SID outside this token (a group such as BUILTIN\Users in the token would hand the
+// service implicit WRITE_DAC and hide the case).
+TEST_CASE("TarDatabase (Windows): a foreign sidecar that denies WRITE_DAC is still replaced",
+          "[tar][store][lifecycle][hardening]") {
+    if (!enable_restore_privilege())
+        SKIP("SeRestorePrivilege unavailable");
+    AclDir d;
+    { REQUIRE(TarDatabase::open(d.db).has_value()); } // created, then closed
+    const fs::path wal = d.file("-wal");
+    { std::ofstream plant(wal, std::ios::binary | std::ios::trunc); }
+    set_read_write_only_dacl(wal);
+    set_owner(wal, "S-1-5-21-1111111111-2222222222-3333333333-1001");
+
+    // The premise: the open secure_tar_db_files makes first is refused for this file.
+    HANDLE probe = ::CreateFileW(wal.c_str(), READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                 OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    const DWORD probe_err = ::GetLastError();
+    if (probe != INVALID_HANDLE_VALUE)
+        ::CloseHandle(probe);
+    REQUIRE(probe == INVALID_HANDLE_VALUE);
+    REQUIRE(probe_err == ERROR_ACCESS_DENIED);
+
+    auto reopened = TarDatabase::open(d.db);
+    REQUIRE(reopened.has_value());
+    REQUIRE(reopened->set_config("acl_probe", "1"));
+    const std::string owner = owner_sid(wal);
+    CHECK((owner == token_user_sid() || owner == kSystem || owner == kAdministrators));
+    assert_owner_only(wal);
 }
 #endif // _WIN32
 
@@ -2284,4 +2857,278 @@ TEST_CASE("TarDatabase: set_state reports a failed baseline write (#1654)",
     drop_state_fault(t.db);
     CHECK(t.db.set_state("process", "x"));
     CHECK(t.db.get_state("process") == "x");
+}
+
+// ── v7 -> v8: every capture source ships enabled ─────────────────────────────
+namespace {
+
+// Seed a closed tar.db at schema v7 with the given tar_config rows (raw sqlite
+// so no migration or registry default is involved). `extra_sql` runs after the
+// rows are in (used to install a fault-injecting trigger).
+void seed_v7_config(const fs::path& path,
+                    const std::vector<std::pair<std::string, std::string>>& rows,
+                    const char* extra_sql = nullptr) {
+    {
+        auto db = TarDatabase::open(path);
+        REQUIRE(db.has_value());
+    } // closed: lands at the current version
+    // Owner declared before the open: sqlite3_open populates the handle even on
+    // failure, so a failing REQUIRE still unwinds through a live owner.
+    yuzu::test::SqliteHandleOwner<sqlite3> owner;
+    REQUIRE(sqlite3_open(path.string().c_str(), &owner.db) == SQLITE_OK);
+    auto put = [&](const std::string& k, const std::string& v) {
+        const auto sql = "INSERT INTO tar_config (key, value) VALUES ('" + k + "', '" + v +
+                         "') ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+        REQUIRE(sqlite3_exec(owner.db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+    };
+    put("schema_version", "7");
+    for (const auto& [k, v] : rows)
+        put(k, v);
+    if (extra_sql)
+        REQUIRE(sqlite3_exec(owner.db, extra_sql, nullptr, nullptr, nullptr) == SQLITE_OK);
+}
+
+void remove_db_files(const fs::path& tmp) {
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    fs::remove(fs::path{tmp.string() + "-wal"}, ec);
+    fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+    fs::remove(fs::path{tmp.string() + "-journal"}, ec); // pre-created empty by the Windows open()
+}
+
+} // namespace
+
+TEST_CASE("TarDatabase: a fresh open lands at schema_version 8", "[tar][store][migration][v8]") {
+    auto t = make_test_db();
+    CHECK(t.db.schema_version() == 8);
+}
+
+TEST_CASE("TarDatabase v7->v8: stored opt-outs of every formerly-off source flip once",
+          "[tar][store][migration][v8]") {
+    // Table-driven over all eight so a dropped or misspelt name in the migration's
+    // literal list fails here. The eight already-on sources are seeded "false" as
+    // negative controls: a deliberate pause on them must survive untouched.
+    static constexpr std::array<std::string_view, 8> kFormerlyOff = {
+        "procperf", "netqual", "module", "software", "arp", "dns", "netconn", "mapdrive"};
+    static constexpr std::array<std::string_view, 8> kAlreadyOn = {
+        "process", "tcp", "service", "user", "perf", "power", "removable", "usage"};
+    std::vector<std::pair<std::string, std::string>> rows;
+    int64_t paused = 1'700'000'000;
+    for (const auto* group : {&kFormerlyOff, &kAlreadyOn}) {
+        for (const auto src : *group) {
+            rows.emplace_back(std::format("{}_enabled", src), "false");
+            rows.emplace_back(std::format("{}_paused_at", src), std::to_string(paused++));
+        }
+    }
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_v8_");
+    seed_v7_config(tmp, rows);
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        CHECK(db->schema_version() == 8);
+        int64_t expect = 1'700'000'000;
+        for (const auto src : kFormerlyOff) {
+            INFO("formerly-off source=" << src);
+            CHECK(db->get_config(std::format("{}_enabled", src), "") == "true");
+            CHECK(db->get_config(std::format("{}_paused_at", src), "") == "0");
+            ++expect;
+        }
+        for (const auto src : kAlreadyOn) {
+            INFO("already-on source=" << src);
+            CHECK(db->get_config(std::format("{}_enabled", src), "") == "false");
+            CHECK(db->get_config(std::format("{}_paused_at", src), "") == std::to_string(expect));
+            ++expect;
+        }
+    }
+    remove_db_files(tmp);
+}
+
+TEST_CASE("TarDatabase v7->v8: errored / already-on / absent rows are left alone",
+          "[tar][store][migration][v8]") {
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_v8_");
+    seed_v7_config(tmp, {{"netqual_enabled", "errored"},
+                         {"process_enabled", "false"},
+                         {"process_paused_at", "5"},
+                         {"software_enabled", "true"}});
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        CHECK(db->schema_version() == 8);
+        CHECK(db->get_config("netqual_enabled", "") == "errored");
+        // An already-on source's deliberate pause survives.
+        CHECK(db->get_config("process_enabled", "") == "false");
+        CHECK(db->get_config("process_paused_at", "") == "5");
+        CHECK(db->get_config("software_enabled", "") == "true");
+        // No row stays no row (the registry default supplies "true").
+        CHECK(db->get_config("arp_enabled", "") == "");
+    }
+    remove_db_files(tmp);
+}
+
+TEST_CASE("TarDatabase v7->v8: an opt-out written after the migration sticks",
+          "[tar][store][migration][v8]") {
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_v8_");
+    seed_v7_config(tmp, {{"procperf_enabled", "false"}});
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        REQUIRE(db->get_config("procperf_enabled", "") == "true");
+        REQUIRE(db->set_config("procperf_enabled", "false"));
+    }
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        CHECK(db->schema_version() == 8);
+        CHECK(db->get_config("procperf_enabled", "") == "false");
+    }
+    remove_db_files(tmp);
+}
+
+TEST_CASE("TarDatabase v7->v8: a failed flip rolls the whole migration back and retries",
+          "[tar][store][migration][v8][atomic]") {
+    // The trigger fails the flip UPDATE after the paused_at upsert already ran
+    // inside the same savepoint: the rollback must undo that, schema stays at 7,
+    // and a reopen with the fault removed completes.
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_v8_");
+    seed_v7_config(tmp,
+                   {{"procperf_enabled", "false"},
+                    {"procperf_paused_at", "7"},
+                    {"netqual_enabled", "false"},
+                    {"netqual_paused_at", "9"}},
+                   "CREATE TRIGGER yuzu_test_v8_abort BEFORE UPDATE ON tar_config "
+                   "WHEN NEW.key = 'netqual_enabled' "
+                   "BEGIN SELECT RAISE(ABORT, 'injected'); END;");
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        CHECK(db->schema_version() == 7);
+        CHECK(db->get_config("procperf_enabled", "") == "false");
+        CHECK(db->get_config("procperf_paused_at", "") == "7");
+        CHECK(db->get_config("netqual_enabled", "") == "false");
+    }
+    {
+        yuzu::test::SqliteHandleOwner<sqlite3> owner;
+        REQUIRE(sqlite3_open(tmp.string().c_str(), &owner.db) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(owner.db, "DROP TRIGGER yuzu_test_v8_abort", nullptr, nullptr,
+                             nullptr) == SQLITE_OK);
+    }
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        CHECK(db->schema_version() == 8);
+        CHECK(db->get_config("procperf_enabled", "") == "true");
+        CHECK(db->get_config("procperf_paused_at", "") == "0");
+        CHECK(db->get_config("netqual_enabled", "") == "true");
+        CHECK(db->get_config("netqual_paused_at", "") == "0");
+    }
+    remove_db_files(tmp);
+}
+
+TEST_CASE("TarDatabase v7->v8: a disable written while a failed migration is pending is reset by "
+          "the retry",
+          "[tar][store][migration][v8][atomic]") {
+    // Pins the documented limit (upgrading.md, tar.md): the opt-out guarantee holds once the v8
+    // migration has SUCCEEDED. One failed v8 step leaves the agent running at schema 7, and the
+    // retry on the next start reads a "false" an operator wrote in that window as a pre-upgrade
+    // opt-out of one of the eight formerly-off sources.
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_v8_");
+    seed_v7_config(tmp, {{"procperf_enabled", "false"}},
+                   "CREATE TRIGGER yuzu_test_v8_abort BEFORE UPDATE ON tar_config "
+                   "WHEN NEW.key = 'procperf_enabled' "
+                   "BEGIN SELECT RAISE(ABORT, 'injected'); END;");
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        REQUIRE(db->schema_version() == 7); // the v8 step failed; the agent runs on
+        REQUIRE(db->set_config("arp_enabled", "false")); // tar.configure arp enabled=false
+        REQUIRE(db->set_config("arp_paused_at", "1761000000"));
+    }
+    {
+        yuzu::test::SqliteHandleOwner<sqlite3> owner;
+        REQUIRE(sqlite3_open(tmp.string().c_str(), &owner.db) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(owner.db, "DROP TRIGGER yuzu_test_v8_abort", nullptr, nullptr,
+                             nullptr) == SQLITE_OK);
+    }
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        CHECK(db->schema_version() == 8);
+        CHECK(db->get_config("arp_enabled", "") == "true");
+        CHECK(db->get_config("arp_paused_at", "") == "0");
+    }
+    remove_db_files(tmp);
+}
+
+namespace {
+
+// Denies the Nth read of tar_config.value on the FIRST connection a later TarDatabase::open()
+// creates. Inside open() that connection's reads of the column are, in order: the retention_days
+// probe (1), then the schema_version read (2) that decides whether the version needs writing.
+// A SQLITE_DENY at prepare time makes get_config fall to its default, which is a failed read.
+std::atomic<int> g_value_reads{0};
+std::atomic<int> g_deny_value_read{-1};
+std::atomic<bool> g_denied{false};
+std::atomic<bool> g_instrument_next{false};
+
+int deny_nth_value_read(void*, int action, const char* table, const char* column, const char*,
+                        const char*) {
+    if (action == SQLITE_READ && table != nullptr && column != nullptr &&
+        std::strcmp(table, "tar_config") == 0 && std::strcmp(column, "value") == 0 &&
+        ++g_value_reads == g_deny_value_read.load()) {
+        g_denied = true;
+        return SQLITE_DENY;
+    }
+    return SQLITE_OK;
+}
+
+int instrument_first_connection(sqlite3* db, char**, const sqlite3_api_routines*) {
+    if (g_instrument_next.exchange(false))
+        sqlite3_set_authorizer(db, deny_nth_value_read, nullptr);
+    return SQLITE_OK;
+}
+
+// Unregisters the process-wide hook on every exit path, so no later test's connection sees it.
+struct AutoExtensionGuard {
+    AutoExtensionGuard() {
+        sqlite3_auto_extension(reinterpret_cast<void (*)()>(instrument_first_connection));
+    }
+    ~AutoExtensionGuard() {
+        sqlite3_cancel_auto_extension(reinterpret_cast<void (*)()>(instrument_first_connection));
+        g_instrument_next = false;
+        g_deny_value_read = -1;
+    }
+    AutoExtensionGuard(const AutoExtensionGuard&) = delete;
+    AutoExtensionGuard& operator=(const AutoExtensionGuard&) = delete;
+};
+
+} // namespace
+
+TEST_CASE("TarDatabase: one failed schema_version read at open does not replay the migrations",
+          "[tar][store][migration][v8]") {
+    // A post-upgrade operator state that must survive: module disabled and paused. A schema_version
+    // read that FAILS used to read as 0, rewrite the version to 2 and walk the whole ladder again,
+    // v8 included, which flips every formerly-off source's "false" back to "true".
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_v8_");
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        REQUIRE(db->schema_version() == 8);
+        REQUIRE(db->set_config("module_enabled", "false"));
+        REQUIRE(db->set_config("module_paused_at", "1761000000"));
+    }
+    {
+        const AutoExtensionGuard hook;
+        g_value_reads = 0;
+        g_denied = false;
+        g_deny_value_read = 2;
+        g_instrument_next = true;
+        auto db = TarDatabase::open(tmp);
+        g_deny_value_read = -1;
+        REQUIRE(db.has_value());
+        REQUIRE(g_denied.load()); // the fault reached the schema_version read
+        CHECK(db->schema_version() == 8);
+        CHECK(db->get_config("module_enabled", "") == "false");
+        CHECK(db->get_config("module_paused_at", "") == "1761000000");
+    }
+    remove_db_files(tmp);
 }

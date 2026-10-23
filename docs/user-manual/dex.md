@@ -276,7 +276,7 @@ numbers match.
   working set. This is a **top-N sample, not a census**: it lists devices
   where the exact app-version was among that device's own top resource
   consumers that day, not every device that has it installed (per-application
-  sampling is opt-in and only retains the top-N heaviest processes per
+  sampling only retains the top-N heaviest processes per
   device) — use the [software inventory](inventory.md) for a full install
   census instead. It also reads a **shorter retention window** than the trend
   above: per-device data (B1) keeps 31 days, the fleet trend (B2) keeps 180,
@@ -336,14 +336,15 @@ numbers match.
   the cohort comparison is withheld only when the cohort has no reporting
   devices (the floor is one device), with an honest caption.
 
-  A separate **Top applications** panel queries the device's opt-in per-app
+  A separate **Top applications** panel queries the device's per-app
   tier (`$ProcPerf_Hourly`, process **names only** — never command lines)
   behind its **own** "Load applications" click. Per-app data is usage-class
   telemetry — it observes what people run, not just how the machine behaves —
   so it carries its **own audit action (`dex.device.procperf.query`)**,
   keeping usage reads separately countable from machine-health reads. An
-  empty result states plainly that per-app sampling is **off by default** on
-  every device (or that no hourly rollup has completed yet) — the device's
+  empty result states plainly that per-app sampling (`procperf_enabled`) is
+  **on by default**, so either it has been disabled on the device or no hourly
+  rollup has completed yet — the device's
   read-only query surface deliberately hides plugin config, so the server
   does not guess which. App rows cross-link to the per-application
   reliability drill.
