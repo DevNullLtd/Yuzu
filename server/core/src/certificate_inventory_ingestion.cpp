@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -205,6 +206,8 @@ bool is_rfc3339_utc_seconds(std::string_view s) {
 bool valid_reason(std::string_view r) {
     if (r.empty())
         return true;
+    if (r.size() > 256)
+        return false;
     std::size_t len = 0;
     for (char c : r) {
         if (c == ',') {
@@ -320,6 +323,7 @@ private:
     std::set<std::tuple<std::string, std::string, std::string>> seen_loc_;
     std::size_t der_total_{0};
     bool whole_report_error_{false};
+    bool cap_hit_{false}; // the last failed clean() was a size cap, not a content defect
 
     bool parse_version(const std::string& v) {
         std::size_t dot = v.find('.');
@@ -368,8 +372,10 @@ private:
             if (mark)
                 add_token(std::string("utf8_replaced:") + field);
         }
-        if (s.size() > cap)
+        if (s.size() > cap) {
+            cap_hit_ = true;
             return false;
+        }
         out = std::move(s);
         return true;
     }
@@ -390,7 +396,7 @@ private:
         CertStoreReport s;
         std::string reason;
         if (!clean(f[1], 512, s.store_id, "store_id", false) || s.store_id.empty() ||
-            !clean(f[4], 256, reason, "reason", false)) {
+            !clean(f[4], 4096, reason, "reason", false)) {
             out_.nack = CertBlobNack::kBadHeader;
             return false;
         }
@@ -430,22 +436,24 @@ private:
         out_.data.stores.push_back(std::move(s));
         if (!reason_ok) {
             ++out_.refused_records;
-            mark_store(id);
+            mark_store(id, "parse_error");
         }
         return true;
     }
 
-    void mark_store(const std::string& store_id) {
+    // `token` is the reason the store is constrained: "parse_error" for a defective record,
+    // "row_cap" when a record was refused for a size cap (never labelled as a parse defect).
+    void mark_store(const std::string& store_id, std::string_view token = "parse_error") {
         out_.any_parse_error = true;
         auto& s = out_.data.stores[store_index_.at(store_id)];
         if (s.status == cert_status::kUnreadable)
             return; // untouched whatever the defect: the more specific status stays
         if (s.status == cert_status::kConstrained) {
-            if (s.reason.find("parse_error") == std::string::npos)
-                s.reason += s.reason.empty() ? "parse_error" : ",parse_error";
+            if (s.reason.find(token) == std::string::npos)
+                s.reason += (s.reason.empty() ? "" : ",") + std::string(token);
         } else {
             s.status = std::string(cert_status::kConstrained);
-            s.reason = "parse_error";
+            s.reason = std::string(token);
         }
     }
 
@@ -467,7 +475,7 @@ private:
         bool tied = false;
         for (const auto& [store_id, path] : g_.locs) {
             if (store_index_.contains(store_id)) {
-                mark_store(store_id);
+                mark_store(store_id, over_cap ? "row_cap" : "parse_error");
                 tied = true;
             } else {
                 whole_report_error_ = true;
@@ -480,6 +488,7 @@ private:
     void open_group(const std::vector<std::string>& f) {
         g_ = Group{};
         g_.open = true;
+        cap_hit_ = false;
         // Fields 0-10 are mandatory.
         if (f.size() < 12) {
             g_.bad = true;
@@ -518,6 +527,12 @@ private:
                 return false;
             dst = field(i);
             return true;
+        };
+        // `?` is "could not determine"; the typed column reads NULL either way, so the three fields
+        // below whose unknown matters to a reader get a named token (empty = not applicable).
+        const auto note_unknown = [&](std::size_t i, const char* name) {
+            if (has(i) && field(i) == "?")
+                add_token(std::string("unknown:") + name);
         };
         const auto integer = [&](std::size_t i, std::optional<int>& dst) -> bool {
             if (!has(i) || field(i) == "?" || field(i).empty())
@@ -597,7 +612,14 @@ private:
             ok = false;
         // flags: the agent's comma-joined tokens. They are kept verbatim in constrained_fields,
         // merged with the tokens this parse added; serial_negative is also a column.
-        if (ok && has(32) && field(32) != "?" && !field(32).empty()) {
+        if (ok) {
+            note_unknown(21, "is_ca");
+            note_unknown(22, "path_len");
+            note_unknown(24, "self_signed");
+        }
+        if (ok && has(32) && field(32) == "?") {
+            add_token("flags_unknown"); // the writer could not determine its flags
+        } else if (ok && has(32) && !field(32).empty()) {
             std::string s;
             if (!clean(field(32), 512, s, "flags", false))
                 ok = false;
@@ -612,7 +634,7 @@ private:
         }
         if (!ok) {
             g_.bad = true;
-            g_.over_cap = false;
+            g_.over_cap = cap_hit_;
         }
     }
 
@@ -772,7 +794,7 @@ private:
             if (!certs.contains(g.sha) && certs.size() >= kCertMaxCertsPerStore) {
                 ++out_.refused_records;
                 out_.any_over_cap = true;
-                mark_store(store_id);
+                mark_store(store_id, "row_cap");
                 continue;
             }
             certs.insert(g.sha);
@@ -816,7 +838,7 @@ std::string certificate_inventory_raw_hash(std::string_view blob) { return sha25
 void cert_ingest_metric::register_metrics(::yuzu::MetricsRegistry& metrics) {
     metrics.describe(std::string(kName),
                      "Certificate-inventory daily-sync ingest outcomes by result (stored, touched, "
-                     "need_full, nacked, error) and a closed reason set",
+                     "need_full, rejected, deferred, error) and a closed reason set",
                      "counter");
     for (const auto& [result, reason] : kPairs)
         metrics.counter(std::string(kName),
@@ -826,18 +848,40 @@ void cert_ingest_metric::register_metrics(::yuzu::MetricsRegistry& metrics) {
 void ingest_certificate_inventory_report(CertificateInventoryStore& store,
                                          const std::string& agent_id, const pb::InventoryReport& report,
                                          pb::InventoryAck& ack, ::yuzu::MetricsRegistry* metrics) {
+    // The source's own counter, plus the generic per-source family every typed source shares
+    // (yuzu_inventory_ingest_total / _duration_seconds), so the pool alerts can attribute load.
     const auto emit = [&](std::string_view result, std::string_view reason) {
+        if (!metrics)
+            return;
+        metrics
+            ->counter(std::string(cert_ingest_metric::kName),
+                      {{"result", std::string(result)}, {"reason", std::string(reason)}})
+            .increment();
+        const char* outcome = result == "stored"      ? "stored"
+                              : result == "touched"   ? "touched"
+                              : result == "need_full" ? "need_full"
+                              : result == "rejected"  ? "rejected"
+                              : result == "deferred"  ? "deferred"
+                                                      : "error";
+        metrics
+            ->counter("yuzu_inventory_ingest_total",
+                      {{"source", kSource}, {"outcome", outcome}})
+            .increment();
+    };
+    const auto observe = [&](const char* phase, std::chrono::steady_clock::time_point t0) {
         if (metrics)
             metrics
-                ->counter(std::string(cert_ingest_metric::kName),
-                          {{"result", std::string(result)}, {"reason", std::string(reason)}})
-                .increment();
+                ->histogram("yuzu_inventory_ingest_duration_seconds",
+                            {{"source", kSource}, {"phase", phase}},
+                            yuzu::Histogram::seconds_buckets_60s())
+                .observe(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+                             .count());
     };
     const auto need_full = [&] { ack.add_need_full(kSource); };
-    const auto nack = [&](std::string_view reason) {
-        need_full();
-        emit("nacked", reason);
-    };
+    // A refusal that would repeat byte-for-byte (too large, unknown version, bad header, over a
+    // cap) is a TERMINAL acknowledgement, not a need_full: asking for the same bytes again would
+    // loop the agent. It is counted, and the agent's next cycle starts cold.
+    const auto reject = [&](std::string_view reason) { emit("rejected", reason); };
     if (agent_id.empty())
         return;
     if (report.content_hashes_size() > kMaxSources || report.plugin_data_size() > kMaxSources) {
@@ -845,7 +889,7 @@ void ingest_certificate_inventory_report(CertificateInventoryStore& store,
                      "(hashes={}, blobs={}, cap={}) — skipping",
                      agent_id, report.content_hashes_size(), report.plugin_data_size(),
                      kMaxSources);
-        nack("too_many_sources");
+        reject("too_many_sources");
         return;
     }
     const auto hit = report.content_hashes().find(kSource);
@@ -853,7 +897,10 @@ void ingest_certificate_inventory_report(CertificateInventoryStore& store,
         return; // not due this cycle
     const std::string& claimed_hash = hit->second;
 
-    const auto map_result = [&](const CertIngestResult& r, std::string_view stored_reason) {
+    // `hash_only`: a hash-skip leg. Its failures do NOT ask for a full resend (that would turn a
+    // transient store error into a 3 MiB upload); the agent simply retries the hash next cycle.
+    const auto map_result = [&](const CertIngestResult& r, std::string_view stored_reason,
+                                bool hash_only) {
         switch (r.outcome) {
         case CertIngestOutcome::kStored:
             emit("stored", stored_reason);
@@ -866,8 +913,14 @@ void ingest_certificate_inventory_report(CertificateInventoryStore& store,
             emit("need_full", r.need_full_cause == CertNeedFullCause::kCold ? "cold"
                                                                             : "hash_mismatch");
             return;
+        case CertIngestOutcome::kBusy:
+            if (!hash_only)
+                need_full();
+            emit("deferred", "agent_busy");
+            return;
         case CertIngestOutcome::kError:
-            need_full();
+            if (!hash_only)
+                need_full();
             emit("error", "store_error");
             return;
         }
@@ -875,8 +928,22 @@ void ingest_certificate_inventory_report(CertificateInventoryStore& store,
 
     const auto bit = report.plugin_data().find(kSource);
     if (bit == report.plugin_data().end()) {
+        // A claim that is not exactly 64 lowercase hex characters (empty included) can never
+        // equal a stored hash, so it is answered need_full here and never reaches the store: no
+        // agent claim may equal a stored sentinel (an empty stored hash means "pruned").
+        if (claimed_hash.size() != 64 ||
+            !std::ranges::all_of(claimed_hash, [](unsigned char c) {
+                return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+            })) {
+            need_full();
+            emit("need_full", "bad_claim");
+            return;
+        }
         // Hash-only leg: compare and touch inside the store's per-agent transaction.
-        map_result(store.ingest_touch(agent_id, claimed_hash), "none");
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto r = store.ingest_touch(agent_id, claimed_hash);
+        observe("hash_only", t0);
+        map_result(r, "none", /*hash_only=*/true);
         return;
     }
 
@@ -892,21 +959,21 @@ void ingest_certificate_inventory_report(CertificateInventoryStore& store,
     }
     CertBlobParse parsed = parse_certificate_inventory_blob(blob);
     if (parsed.nack != CertBlobNack::kNone) {
-        spdlog::warn("certificate_inventory: blob from agent={} refused (nack reason {}) — "
-                     "nacking",
+        spdlog::warn("certificate_inventory: blob from agent={} refused (reason {}) — "
+                     "acknowledged, not stored",
                      agent_id, static_cast<int>(parsed.nack));
         switch (parsed.nack) {
         case CertBlobNack::kBlobTooLarge:
-            nack("blob_too_large");
+            reject("blob_too_large");
             break;
         case CertBlobNack::kUnknownVersion:
-            nack("unknown_version");
+            reject("unknown_version");
             break;
         case CertBlobNack::kOverCap:
-            nack("over_cap");
+            reject("over_cap");
             break;
         default:
-            nack("bad_header");
+            reject("bad_header");
             break;
         }
         return;
@@ -923,7 +990,10 @@ void ingest_certificate_inventory_report(CertificateInventoryStore& store,
     if (parsed.any_parse_error)
         spdlog::warn("certificate_inventory: agent={} report stored with {} refused record(s)",
                      agent_id, parsed.refused_records);
-    map_result(store.ingest_full(agent_id, parsed.data, raw_hash), stored_reason);
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto r = store.ingest_full(agent_id, parsed.data, raw_hash);
+    observe("full", t0);
+    map_result(r, stored_reason, /*hash_only=*/false);
 }
 
 } // namespace yuzu::server

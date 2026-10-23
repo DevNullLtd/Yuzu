@@ -64,13 +64,20 @@
 ///
 /// PARSE ERRORS. A record-level error (a bad field, a count mismatch, a wrong hash, an over-cap
 /// record) refuses only that record; the stores the group's `loc|` records name read
-/// `constrained`, reason `parse_error`, and keep their rows. A record that cannot be tied to a
+/// `constrained`, reason `parse_error` (`row_cap` when the refusal was a size cap), and keep their
+/// rows. A record that cannot be tied to a
 /// store (no `loc|`, an unknown store id, a stray child) makes every `ok`/`absent`/`constrained`
 /// store of the report read `constrained`/`parse_error`. Either way the blob is ACKED and stored,
 /// so the agent neither resends it for ever nor hides the defect (every hash-skip replay of the
 /// same bytes keeps it visibly constrained). An unparseable header (`ver|`, `store|`) or an
 /// unknown major version, an over-cap blob, more than 64 stores or 10,000 distinct certificates
-/// NACKs the blob (need_full) and writes nothing.
+/// is REJECTED: acknowledged without need_full (the same bytes would be refused again, so
+/// asking for them again would loop), counted result="rejected", and nothing is written.
+///
+/// BUSY. Ingest TRIES the per-agent advisory lock; if another report for the agent holds it, the
+/// report is answered result="deferred" reason="agent_busy" and nothing is written. A full report
+/// asks for need_full (resend); a hash-only report does not (it simply retries next cycle).
+/// A store error on the hash-only leg likewise does not ask for a full resend.
 ///
 /// RAW-BYTE HASH. The stored hash is the SHA-256 of the received blob bytes, recomputed here;
 /// the agent's claim is only compared on the hash-only leg.
@@ -150,7 +157,7 @@ void ingest_certificate_inventory_report(CertificateInventoryStore& store,
 namespace cert_ingest_metric {
 inline constexpr std::string_view kName = "yuzu_server_cert_inventory_ingest_total";
 /// The closed (result, reason) set. Every increment is one of these pairs.
-inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> kPairs = {{
+inline constexpr std::array<std::pair<std::string_view, std::string_view>, 17> kPairs = {{
     {"stored", "none"},
     {"stored", "parse_error"},
     {"stored", "over_cap"},
@@ -159,11 +166,13 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> k
     {"touched", "none"},
     {"need_full", "cold"},
     {"need_full", "hash_mismatch"},
-    {"nacked", "blob_too_large"},
-    {"nacked", "unknown_version"},
-    {"nacked", "bad_header"},
-    {"nacked", "over_cap"},
-    {"nacked", "too_many_sources"},
+    {"need_full", "bad_claim"},
+    {"rejected", "blob_too_large"},
+    {"rejected", "unknown_version"},
+    {"rejected", "bad_header"},
+    {"rejected", "over_cap"},
+    {"rejected", "too_many_sources"},
+    {"deferred", "agent_busy"},
     {"error", "store_error"},
     {"error", "digest_error"},
 }};

@@ -6339,3 +6339,24 @@ The following server administration features are on the roadmap but not yet impl
 | Runtime Configuration API | Phase 7 (7.3) | Change retention TTLs, connection limits, and other server parameters via REST API. **Not all keys apply live** - retention TTLs are stored and reported immediately but enforced only after a restart, and OIDC keys apply only via Settings -> OIDC. See [REST API -> When a change takes effect](rest-api.md#when-a-change-takes-effect). |
 | AD/Entra Integration | Phase 7 (7.5) | Sync users and groups from Active Directory (LDAP) or Microsoft Entra ID. Auto-create Yuzu principals from directory membership. |
 | System Health Monitoring | Phase 7 (7.2) | Server-side health dashboard showing memory, CPU, disk, database size, connected agent count, and gRPC stream health. Prometheus metrics for server internals. |
+
+## Fleet certificate inventory storage
+
+The fleet certificate inventory (`certificate_inventory_store` schema, one row per device and
+certificate) is written by the `certificate_inventory` daily-sync source.
+
+- **Schema and privileges.** Created at boot; the database role needs `CREATE` on the database.
+  The server refuses to start if it cannot be created. Rolling the server back leaves the schema
+  (and any rows) in place, unread.
+- **Capacity.** A device reports at most 10,000 distinct certificates and 1 MiB of DER. Facts are
+  stored once per (device, certificate) with its locations; a typical Linux device is a few hundred
+  rows. The optional DER column is the bulk of the storage: allow up to about 1 MiB per device
+  (about 50 GB at 50,000 devices) plus the matching WAL, and size backups and PITR retention
+  accordingly. Unchanged facts are not rewritten on a repeat full report.
+- **Per-agent lock.** Reports for one device are serialised by a Postgres advisory lock. A report
+  that cannot take it is answered `deferred`/`agent_busy` (a full report is asked to resend; a
+  hash-only report retries next cycle) instead of waiting on a pooled connection.
+- **Metrics.** `yuzu_server_cert_inventory_ingest_total{result,reason}` and the generic
+  `yuzu_inventory_ingest_total{source="certificate_inventory"}`; see [Metrics](metrics.md).
+- **Restore.** A restore from backup brings back rows for devices erased since the backup. Re-run
+  the decommission for those devices afterwards.

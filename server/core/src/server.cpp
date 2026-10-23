@@ -7849,7 +7849,7 @@ public:
             }
         }
         // Typed fleet certificate inventory — born-on-Postgres (slice-2 PR 2a-2a, ADR-0070 D12,
-        // ADR-0016 §5, schema `cert_inventory`). Independent of the stores above (its own schema,
+        // ADR-0016 §5, schema `certificate_inventory_store`). Independent of the stores above (its own schema,
         // its own fail-closed). Wires BOTH server entry points (direct ReportInventory + gateway
         // ProxyInventory) to the certificate_inventory ingest seam. A store that failed to open
         // would make ingest acknowledge nothing and (from 2a-2b) every certificate read answer
@@ -7858,7 +7858,7 @@ public:
             certificate_inventory_store_ = std::make_unique<CertificateInventoryStore>(*pg_pool_);
             if (!certificate_inventory_store_->is_open()) {
                 spdlog::error("[PG] Refusing to start: certificate_inventory store migration/open "
-                              "failed (database reachable but the cert_inventory schema could not "
+                              "failed (database reachable but the certificate_inventory_store schema could not "
                               "be created/opened)");
                 startup_failed_ = true;
             } else {

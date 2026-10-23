@@ -1143,7 +1143,7 @@ seconds, first/last-seen, and a distinct-user count over a 30-day sliding window
 A further daily-sync source, **`certificate_inventory`**, is received by the server
 (ADR-0070 D12; the agent collector and the read surface ship in later changes, so on
 its own this change stores reports and exposes nothing). It is persisted in the typed
-Postgres schema **`cert_inventory`**: one row per (device, certificate) with its X.509
+Postgres schema **`certificate_inventory_store`**: one row per (device, certificate) with its X.509
 facts, the places it was seen (store and path), and its SANs, EKUs and CRL distribution
 points. It never lands in the generic inventory store, on either path.
 

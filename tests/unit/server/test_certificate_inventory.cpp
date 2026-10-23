@@ -194,6 +194,35 @@ bool nacked(const agentpb::InventoryAck& a) {
     return std::find(a.need_full().begin(), a.need_full().end(), kSource) != a.need_full().end();
 }
 
+// Exact value of one (result, reason) series; -1 when the series is absent. Matches the whole
+// line, label order either way, so a substring of another series can never satisfy it.
+long metric_count(yuzu::MetricsRegistry& m, std::string_view result, std::string_view reason) {
+    const std::string text = m.serialize();
+    for (const std::string& labels :
+         {"reason=\"" + std::string(reason) + "\",result=\"" + std::string(result) + "\"",
+          "result=\"" + std::string(result) + "\",reason=\"" + std::string(reason) + "\""}) {
+        const std::string prefix = "yuzu_server_cert_inventory_ingest_total{" + labels + "} ";
+        const auto at = text.find(prefix);
+        if (at != std::string::npos && (at == 0 || text[at - 1] == '\n'))
+            return std::stol(text.substr(at + prefix.size(), 20));
+    }
+    return -1;
+}
+
+// The generic per-source family value for source=certificate_inventory (either label order).
+long generic_count(yuzu::MetricsRegistry& m, std::string_view outcome) {
+    const std::string text = m.serialize();
+    for (const std::string& labels :
+         {"outcome=\"" + std::string(outcome) + "\",source=\"certificate_inventory\"",
+          "source=\"certificate_inventory\",outcome=\"" + std::string(outcome) + "\""}) {
+        const std::string prefix = "yuzu_inventory_ingest_total{" + labels + "} ";
+        const auto at = text.find(prefix);
+        if (at != std::string::npos)
+            return std::stol(text.substr(at + prefix.size(), 20));
+    }
+    return -1;
+}
+
 const CertStoreReport* find_store(const CertBlobParse& p, const std::string& id) {
     for (const auto& s : p.data.stores)
         if (s.store_id == id)
@@ -237,7 +266,7 @@ void cert_reset() {
     auto lease = cert_shared().pool->acquire();
     REQUIRE(lease);
     auto t = pg::exec_params(lease.get(),
-                             "TRUNCATE cert_inventory.agent_state CASCADE",
+                             "TRUNCATE certificate_inventory_store.agent_state CASCADE",
                              std::vector<std::string>{});
     REQUIRE(t.status() == PGRES_COMMAND_OK);
 }
@@ -250,6 +279,28 @@ void cert_reset() {
     [[maybe_unused]] PgPool& pool = *cert_shared().pool;                                           \
     CertificateInventoryStore store{pool};                                                         \
     REQUIRE(store.is_open())
+
+void exec_ok(PgPool& pool, const char* sql) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    REQUIRE(pg::exec_params(lease.get(), sql, std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+}
+
+// Renames a table away for the scope's lifetime (to force a SQL failure), always restoring it.
+struct TableOff {
+    PgPool& pool;
+    std::string name;
+    TableOff(PgPool& p, std::string n) : pool(p), name(std::move(n)) {
+        exec_ok(pool, ("ALTER TABLE certificate_inventory_store." + name + " RENAME TO " + name + "_off").c_str());
+    }
+    ~TableOff() {
+        auto l = pool.acquire();
+        pg::exec_params(l.get(),
+                        ("ALTER TABLE certificate_inventory_store." + name + "_off RENAME TO " + name).c_str(),
+                        std::vector<std::string>{});
+    }
+};
 
 std::string scalar(PgPool& pool, const char* sql, const std::vector<std::string>& params = {}) {
     auto lease = pool.acquire();
@@ -427,7 +478,7 @@ TEST_CASE("cert parse: an over-cap record is refused, never truncated", "[certin
         CHECK(find_fact(p, 1) == nullptr);
         CHECK(find_fact(p, 2) != nullptr);
         CHECK(find_store(p, "S")->status == "constrained");
-        CHECK(find_store(p, "S")->reason == "parse_error");
+        CHECK(find_store(p, "S")->reason == "row_cap"); // a cap, not a parse defect
         CHECK(find_store(p, "U")->status == "ok");
     }
     SECTION("a 257-byte SAN value") {
@@ -441,8 +492,9 @@ TEST_CASE("cert parse: an over-cap record is refused, never truncated", "[certin
         Cert c = cert(1, {{"S", ""}});
         c.subject = "CN=" + std::string(1022, 'a');
         const auto p = parse_certificate_inventory_blob(blob(stores, {c}));
-        CHECK(p.any_parse_error);
+        CHECK(p.any_over_cap);
         CHECK(find_fact(p, 1) == nullptr);
+        CHECK(find_store(p, "S")->reason == "row_cap");
     }
     SECTION("33 EKUs and 9 CRL DPs") {
         Cert c = cert(1, {{"S", ""}});
@@ -471,7 +523,7 @@ TEST_CASE("cert parse: an over-cap record is refused, never truncated", "[certin
         const auto p = parse_certificate_inventory_blob(blob(store_rec("S", "ok"), certs));
         CHECK(p.any_over_cap);
         CHECK(p.data.facts.size() == 2000);
-        CHECK(find_store(p, "S")->reason == "parse_error");
+        CHECK(find_store(p, "S")->reason == "row_cap");
     }
 }
 
@@ -641,11 +693,15 @@ TEST_CASE("cert metric: every (result, reason) pair is seeded and the set is clo
     std::set<std::pair<std::string_view, std::string_view>> seen;
     for (const auto& pr : cert_ingest_metric::kPairs) {
         CHECK(seen.insert(pr).second); // no duplicates
-        CHECK(text.find(std::string("result=\"") + std::string(pr.first) + "\"") !=
-              std::string::npos);
-        CHECK(text.find(std::string("reason=\"") + std::string(pr.second) + "\"") !=
-              std::string::npos);
+        CHECK(metric_count(m, pr.first, pr.second) == 0); // seeded, exactly this series, at zero
     }
+    // No series outside the closed set exists.
+    std::size_t series = 0;
+    for (std::size_t at = 0; (at = text.find("yuzu_server_cert_inventory_ingest_total{", at)) !=
+                             std::string::npos;
+         ++at)
+        ++series;
+    CHECK(series == cert_ingest_metric::kPairs.size());
     CHECK(seen.contains({"stored", "parse_error"}));
     CHECK(text.find("yuzu_server_cert_inventory_ingest_total") != std::string::npos);
 }
@@ -661,7 +717,7 @@ TEST_CASE("CertificateInventoryStore: opens and migrates on a fresh database",
     CHECK(store.is_open());
     CHECK(scalar(pool,
                  "SELECT count(*) FROM information_schema.tables WHERE table_schema = "
-                 "'cert_inventory'") == "7");
+                 "'certificate_inventory_store'") == "7");
 }
 
 TEST_CASE("CertificateInventoryStore: a report round-trips facts, children and locations",
@@ -687,22 +743,22 @@ TEST_CASE("CertificateInventoryStore: a report round-trips facts, children and l
     CHECK(rc->cert_eku == 2);
     CHECK(rc->cert_cdp == 1);
     CHECK(scalar(pool, "SELECT to_char(not_after AT TIME ZONE 'UTC', "
-                       "'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') FROM cert_inventory.cert_fact") ==
+                       "'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') FROM certificate_inventory_store.cert_fact") ==
           "9999-12-31T23:59:59Z");
     CHECK(scalar(pool, "SELECT to_char(not_before AT TIME ZONE 'UTC', 'YYYY-MM-DD') FROM "
-                       "cert_inventory.cert_fact") == "1950-06-01");
-    CHECK(scalar(pool, "SELECT string_agg(value, ',' ORDER BY ord) FROM cert_inventory.cert_san") ==
+                       "certificate_inventory_store.cert_fact") == "1950-06-01");
+    CHECK(scalar(pool, "SELECT string_agg(value, ',' ORDER BY ord) FROM certificate_inventory_store.cert_san") ==
           "b.example,10.0.0.1,CN=\xC3\xA9");
-    CHECK(scalar(pool, "SELECT rsa_modulus_bits::text || key_alg_oid FROM cert_inventory.cert_fact") ==
+    CHECK(scalar(pool, "SELECT rsa_modulus_bits::text || key_alg_oid FROM certificate_inventory_store.cert_fact") ==
           "20481.2.840.113549.1.1.1");
-    CHECK(scalar(pool, "SELECT ec_curve_oid IS NULL FROM cert_inventory.cert_fact") == "t"); // n/a -> NULL
-    CHECK(scalar(pool, "SELECT content_hash FROM cert_inventory.agent_state") ==
+    CHECK(scalar(pool, "SELECT ec_curve_oid IS NULL FROM certificate_inventory_store.cert_fact") == "t"); // n/a -> NULL
+    CHECK(scalar(pool, "SELECT content_hash FROM certificate_inventory_store.agent_state") ==
           raw_hash(blob(store_rec("LocalMachine\\Root", "ok", "", "1"), {c})));
-    CHECK(scalar(pool, "SELECT cert_count::text FROM cert_inventory.store_state") == "1");
+    CHECK(scalar(pool, "SELECT cert_count::text FROM certificate_inventory_store.store_state") == "1");
     // Slice 2 reads no per-user store: no row ever carries a user_ref.
-    CHECK(scalar(pool, "SELECT count(*) FROM cert_inventory.store_state WHERE user_ref <> ''") ==
+    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.store_state WHERE user_ref <> ''") ==
           "0");
-    CHECK(scalar(pool, "SELECT count(*) FROM cert_inventory.cert_location WHERE user_ref <> ''") ==
+    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.cert_location WHERE user_ref <> ''") ==
           "0");
 }
 
@@ -711,8 +767,8 @@ TEST_CASE("CertificateInventoryStore: the stored hash is of the received bytes, 
     CERT_SHARED(store, pool);
     const auto b = blob(store_rec("S", "ok"), {cert(1, {{"S", ""}})});
     ingest(store, "agent-1", full_report(b));
-    CHECK(scalar(pool, "SELECT content_hash FROM cert_inventory.agent_state") == raw_hash(b));
-    CHECK(scalar(pool, "SELECT content_hash FROM cert_inventory.agent_state") != "claimed-hash");
+    CHECK(scalar(pool, "SELECT content_hash FROM certificate_inventory_store.agent_state") == raw_hash(b));
+    CHECK(scalar(pool, "SELECT content_hash FROM certificate_inventory_store.agent_state") != "claimed-hash");
 }
 
 // ── Store: the per-store replace rules ───────────────────────────────────────
@@ -721,19 +777,19 @@ TEST_CASE("CertificateInventoryStore: every status row of the ingest table", "[c
     CERT_SHARED(store, pool);
     const std::string a = "agent-1";
     const auto fact = [&](int id) {
-        return scalar(pool, "SELECT count(*) FROM cert_inventory.cert_fact WHERE sha256 = $1",
+        return scalar(pool, "SELECT count(*) FROM certificate_inventory_store.cert_fact WHERE sha256 = $1",
                       {hexn(id)});
     };
     const auto state = [&](const char* s, const char* col) {
         return scalar(pool,
                       (std::string("SELECT ") + col +
-                       " FROM cert_inventory.store_state WHERE store_id = $1")
+                       " FROM certificate_inventory_store.store_state WHERE store_id = $1")
                           .c_str(),
                       {s});
     };
     const auto observed_after = [&](const char* s, const std::string& before) {
         return scalar(pool,
-                      "SELECT observed_at > $2::timestamptz FROM cert_inventory.store_state "
+                      "SELECT observed_at > $2::timestamptz FROM certificate_inventory_store.store_state "
                       "WHERE store_id = $1",
                       {s, before});
     };
@@ -811,14 +867,14 @@ TEST_CASE("CertificateInventoryStore: a parse error keeps the store's rows and s
     const auto b = blob(store_rec("S", "ok"), {bad});
     const auto ack = ingest(store, "agent-1", full_report(b));
     CHECK_FALSE(nacked(ack)); // acked, so the agent does not resend for ever
-    CHECK(scalar(pool, "SELECT status || '/' || reason FROM cert_inventory.store_state") ==
-          "constrained/parse_error");
+    CHECK(scalar(pool, "SELECT status || '/' || reason FROM certificate_inventory_store.store_state") ==
+          "constrained/row_cap");
     CHECK(store.row_counts("agent-1")->cert_fact == 2); // nothing was lost
     // A hash-skip replay of the same bytes keeps it visibly constrained.
     const auto ack2 = ingest(store, "agent-1", hash_only(raw_hash(b)));
     CHECK_FALSE(nacked(ack2));
-    CHECK(scalar(pool, "SELECT status || '/' || reason FROM cert_inventory.store_state") ==
-          "constrained/parse_error");
+    CHECK(scalar(pool, "SELECT status || '/' || reason FROM certificate_inventory_store.store_state") ==
+          "constrained/row_cap");
 }
 
 TEST_CASE("CertificateInventoryStore: invalid UTF-8 is stored replaced and marked",
@@ -827,8 +883,8 @@ TEST_CASE("CertificateInventoryStore: invalid UTF-8 is stored replaced and marke
     Cert c = cert(1, {{"S", ""}});
     c.subject = std::string("CN=bad\xff");
     ingest(store, "agent-1", full_report(blob(store_rec("S", "ok"), {c})));
-    CHECK(scalar(pool, "SELECT subject_dn FROM cert_inventory.cert_fact") == "CN=bad\xEF\xBF\xBD");
-    CHECK(scalar(pool, "SELECT constrained_fields FROM cert_inventory.cert_fact") ==
+    CHECK(scalar(pool, "SELECT subject_dn FROM certificate_inventory_store.cert_fact") == "CN=bad\xEF\xBF\xBD");
+    CHECK(scalar(pool, "SELECT constrained_fields FROM certificate_inventory_store.cert_fact") ==
           "utf8_replaced:subject_dn");
 }
 
@@ -841,7 +897,7 @@ TEST_CASE("CertificateInventoryStore: a stored certificate with an over-cap chil
     ingest(store, "agent-1", full_report(blob(store_rec("S", "ok"), {bad})));
     CHECK(store.row_counts("agent-1")->cert_fact == 0);
     CHECK(store.row_counts("agent-1")->cert_san == 0); // never truncated to 64
-    CHECK(scalar(pool, "SELECT reason FROM cert_inventory.store_state") == "parse_error");
+    CHECK(scalar(pool, "SELECT reason FROM certificate_inventory_store.store_state") == "row_cap");
 }
 
 // ── Hash-skip and need_full ──────────────────────────────────────────────────
@@ -865,13 +921,13 @@ TEST_CASE("CertificateInventoryStore: hash-skip refreshes exactly what the last 
 
     const auto loc_seen = [&](int id) {
         return scalar(pool,
-                      "SELECT last_seen::text FROM cert_inventory.cert_location WHERE sha256 = $1",
+                      "SELECT last_seen::text FROM certificate_inventory_store.cert_location WHERE sha256 = $1",
                       {hexn(id)});
     };
     const auto st = [&](const char* s, const char* col) {
         return scalar(pool,
                       (std::string("SELECT ") + col +
-                       " FROM cert_inventory.store_state WHERE store_id = $1")
+                       " FROM certificate_inventory_store.store_state WHERE store_id = $1")
                           .c_str(),
                       {s});
     };
@@ -879,8 +935,8 @@ TEST_CASE("CertificateInventoryStore: hash-skip refreshes exactly what the last 
     const std::string obs1 = st("S1", "observed_at::text");
     const std::string sat1 = st("S1", "status_at::text"), sat2 = st("S2", "status_at::text"),
                       sat3 = st("S3", "status_at::text");
-    const std::string agent_seen = scalar(pool, "SELECT last_seen::text FROM cert_inventory.agent_state");
-    const std::string agent_full = scalar(pool, "SELECT last_full_at::text FROM cert_inventory.agent_state");
+    const std::string agent_seen = scalar(pool, "SELECT last_seen::text FROM certificate_inventory_store.agent_state");
+    const std::string agent_full = scalar(pool, "SELECT last_full_at::text FROM certificate_inventory_store.agent_state");
 
     yuzu::MetricsRegistry m;
     cert_ingest_metric::register_metrics(m);
@@ -896,8 +952,8 @@ TEST_CASE("CertificateInventoryStore: hash-skip refreshes exactly what the last 
     CHECK(st("S2", "observed_at") == "<null>");   // ...observed_at does not
     CHECK(st("S3", "status_at::text") != sat3);   // unreadable: status_at advances...
     CHECK(st("S3", "observed_at") == "<null>");   // ...observed_at does not
-    CHECK(scalar(pool, "SELECT last_seen::text FROM cert_inventory.agent_state") != agent_seen);
-    CHECK(scalar(pool, "SELECT last_full_at::text FROM cert_inventory.agent_state") == agent_full);
+    CHECK(scalar(pool, "SELECT last_seen::text FROM certificate_inventory_store.agent_state") != agent_seen);
+    CHECK(scalar(pool, "SELECT last_full_at::text FROM certificate_inventory_store.agent_state") == agent_full);
     CHECK(m.serialize().find("touched") != std::string::npos);
 }
 
@@ -908,18 +964,28 @@ TEST_CASE("CertificateInventoryStore: cold cache and hash mismatch ask for a ful
     cert_ingest_metric::register_metrics(m);
     // Cold: no state for the agent.
     CHECK(nacked(ingest(store, "cold-agent", hash_only(std::string(64, 'a')), &m)));
-    CHECK(scalar(pool, "SELECT count(*) FROM cert_inventory.agent_state") == "0");
+    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.agent_state") == "0");
     // Mismatch: the stored hash differs from the claim.
     ingest(store, "agent-1", full_report(blob(store_rec("S", "ok"), {cert(1, {{"S", ""}})})));
     CHECK(nacked(ingest(store, "agent-1", hash_only(std::string(64, 'b')), &m)));
     CHECK(store.row_counts("agent-1")->cert_fact == 1); // untouched
 }
 
-TEST_CASE("CertificateInventoryStore: a nacked blob writes nothing", "[certinv][pg]") {
+TEST_CASE("CertificateInventoryStore: a rejected blob writes nothing and is a TERMINAL ack",
+          "[certinv][pg]") {
     CERT_SHARED(store, pool);
-    const auto ack = ingest(store, "agent-1", full_report("ver|2\n" + store_rec("S", "ok")));
-    CHECK(nacked(ack));
+    yuzu::MetricsRegistry m;
+    cert_ingest_metric::register_metrics(m);
+    // The same bytes would be refused again, so asking for them again would loop the agent.
+    const auto ack = ingest(store, "agent-1", full_report("ver|2\n" + store_rec("S", "ok")), &m);
+    CHECK_FALSE(nacked(ack));
     CHECK(store.row_counts("agent-1")->agent_state == 0);
+    CHECK(metric_count(m, "rejected", "unknown_version") == 1);
+    CHECK(metric_count(m, "stored", "none") == 0);
+    CHECK_FALSE(nacked(ingest(store, "agent-1", full_report("garbage"), &m)));
+    CHECK(metric_count(m, "rejected", "bad_header") == 1);
+    // The generic per-source family is emitted too.
+    CHECK(generic_count(m, "rejected") == 2);
 }
 
 // ── Decommission ─────────────────────────────────────────────────────────────
@@ -991,16 +1057,19 @@ TEST_CASE("CertificateInventoryStore: an ingest racing delete_agent ends as one 
         CHECK(shape(store, "agent-1") == std::vector<std::int64_t>(7, 0));
     }
 
-    SECTION("an ingest starts while delete_agent holds the lock: the erase commits first, the "
-            "report then wins wholly") {
+    SECTION("an ingest starts while delete_agent holds the lock: it is DEFERRED (never parked on "
+            "a pooled connection), and its retry then wins wholly") {
         ingest(store, "agent-1", full_report(b)); // something to erase
         std::atomic<bool> ingest_done{false};
-        std::atomic<bool> ingest_done_at_hook_return{true};
+        std::atomic<bool> deferred_ack_nacked{false};
+        std::atomic<bool> ingest_done_at_hook_return{false};
         std::thread reporter;
         CertificateInventoryStore other{pool};
+        yuzu::MetricsRegistry m;
+        cert_ingest_metric::register_metrics(m);
         store.set_test_hook_after_erase([&] {
             reporter = std::thread([&] {
-                (void)ingest(other, "agent-1", full_report(b));
+                deferred_ack_nacked = nacked(ingest(other, "agent-1", full_report(b), &m));
                 ingest_done = true;
             });
             std::this_thread::sleep_for(std::chrono::milliseconds(400));
@@ -1009,8 +1078,12 @@ TEST_CASE("CertificateInventoryStore: an ingest racing delete_agent ends as one 
         REQUIRE(store.delete_agent("agent-1"));
         store.set_test_hook_after_erase(nullptr);
         reporter.join();
-        CHECK_FALSE(ingest_done_at_hook_return.load()); // the report waited for the erase's lock
-        CHECK(shape(store, "agent-1") == whole);        // no partial rows
+        CHECK(ingest_done_at_hook_return.load()); // it did not wait for the erase's lock
+        CHECK(deferred_ack_nacked.load());        // the agent is told to resend
+        CHECK(metric_count(m, "deferred", "agent_busy") == 1);
+        CHECK(shape(store, "agent-1") == std::vector<std::int64_t>(7, 0)); // the erase won wholly
+        ingest(store, "agent-1", full_report(b));                          // the retry
+        CHECK(shape(store, "agent-1") == whole);                           // no partial rows
     }
 }
 
@@ -1142,7 +1215,7 @@ TEST_CASE("cert parse: the agent writer's golden blob lands every field where it
     CHECK(*b->der_omitted == "self_signed");
     CHECK_FALSE(b->der_base64.has_value());
     CHECK(b->sans.empty());
-    CHECK(b->constrained_fields.empty());
+    CHECK(b->constrained_fields == "unknown:is_ca"); // `?` is named, not silently NULL
 
     REQUIRE(p.data.locations.size() == 3);
     std::set<std::string> paths;
@@ -1219,7 +1292,7 @@ TEST_CASE("CertificateInventoryStore: a location with an empty path (a keychain 
     ingest(store, "agent-1",
            full_report(blob(store_rec("/Library/Keychains/System.keychain", "ok", "", "1"),
                             {cert(1, {{"/Library/Keychains/System.keychain", ""}})})));
-    CHECK(scalar(pool, "SELECT count(*) FROM cert_inventory.cert_location WHERE path = ''") == "1");
+    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.cert_location WHERE path = ''") == "1");
 }
 
 TEST_CASE("cert ingest: a DER that does not hash to its certificate is dropped and COUNTED",
@@ -1232,9 +1305,223 @@ TEST_CASE("cert ingest: a DER that does not hash to its certificate is dropped a
     cert_ingest_metric::register_metrics(m);
     ingest(store, "agent-1", full_report(blob(store_rec("S", "ok"), {c})), &m);
     CHECK(store.row_counts("agent-1")->cert_fact == 1);
-    CHECK(scalar(pool, "SELECT der IS NULL FROM cert_inventory.cert_fact") == "t");
-    CHECK(scalar(pool, "SELECT constrained_fields FROM cert_inventory.cert_fact") ==
+    CHECK(scalar(pool, "SELECT der IS NULL FROM certificate_inventory_store.cert_fact") == "t");
+    CHECK(scalar(pool, "SELECT constrained_fields FROM certificate_inventory_store.cert_fact") ==
           "der_hash_mismatch");
     CHECK(m.serialize().find("result=\"stored\",reason=\"der_hash_mismatch\"} 1") !=
           std::string::npos);
+}
+
+// ── Concurrency, clock, keys, rewrite avoidance, error paths ─────────────────
+
+namespace {
+// Holds the per-agent advisory lock on its own connection until destroyed.
+struct HeldAgentLock {
+    pg::PgPool::Lease lease;
+    explicit HeldAgentLock(PgPool& pool, const std::string& agent) : lease(pool.acquire()) {
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(), "BEGIN", std::vector<std::string>{}).status() ==
+                PGRES_COMMAND_OK);
+        auto r = pg::exec_params(
+            lease.get(), "SELECT pg_advisory_xact_lock(hashtextextended($1::text || $2::text, 0))",
+            std::vector<std::string>{std::string(kCertInventoryAgentLockPrefix), agent});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+    }
+    ~HeldAgentLock() { pg::exec_params(lease.get(), "ROLLBACK", std::vector<std::string>{}); }
+};
+} // namespace
+
+TEST_CASE("CertificateInventoryStore: concurrent reports for one agent never park pooled "
+          "connections; they are deferred",
+          "[certinv][pg]") {
+    CERT_SHARED(store, pool);
+    const auto b = blob(store_rec("S", "ok"), {cert(1, {{"S", ""}})});
+    ingest(store, "agent-1", full_report(b));
+    yuzu::MetricsRegistry m;
+    cert_ingest_metric::register_metrics(m);
+
+    HeldAgentLock held(pool, "agent-1"); // another replica's report is mid-flight
+    constexpr int kN = 12;               // more than the shared pool's size (4)
+    std::vector<std::thread> ts;
+    std::atomic<int> full_nacked{0}, hash_nacked{0};
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kN; ++i)
+        ts.emplace_back([&, i] {
+            CertificateInventoryStore other{pool};
+            if (i % 2 == 0) {
+                if (nacked(ingest(other, "agent-1", full_report(b), &m)))
+                    ++full_nacked;
+            } else if (nacked(ingest(other, "agent-1", hash_only(raw_hash(b)), &m))) {
+                ++hash_nacked;
+            }
+        });
+    for (auto& t : ts)
+        t.join();
+    const auto took = std::chrono::steady_clock::now() - t0;
+    CHECK(took < std::chrono::seconds(5)); // nobody waited on the lock
+    CHECK(full_nacked == kN / 2);          // a full report is told to resend
+    CHECK(hash_nacked == 0);               // a hash-only report just retries next cycle
+    CHECK(metric_count(m, "deferred", "agent_busy") == kN);
+    CHECK(store.row_counts("agent-1")->cert_fact == 1); // untouched
+}
+
+TEST_CASE("CertificateInventoryStore: a DB clock step does not freeze sweeps", "[certinv][pg]") {
+    CERT_SHARED(store, pool);
+    ingest(store, "agent-1", full_report(blob(store_rec("S", "ok"), {cert(1, {{"S", ""}})})));
+    // Simulate the clock having been AHEAD (or restored from a later snapshot): the stored report
+    // time is far in the future of the real DB clock.
+    scalar(pool, "UPDATE certificate_inventory_store.agent_state SET last_full_at = "
+                 "'2099-01-01'::timestamptz RETURNING 1");
+    scalar(pool, "UPDATE certificate_inventory_store.cert_location SET full_report_at = "
+                 "'2099-01-01'::timestamptz RETURNING 1");
+    // The next ok report no longer carries certificate 1: its location must be swept.
+    ingest(store, "agent-1", full_report(blob(store_rec("S", "ok"), {cert(2, {{"S", ""}})})));
+    CHECK(scalar(pool, "SELECT string_agg(sha256, ',') FROM certificate_inventory_store.cert_location") ==
+          hexn(2));
+    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.cert_fact") == "1");
+    // And last_full_at is the real DB time again, not latched in the future.
+    CHECK(scalar(pool, "SELECT last_full_at < now() + interval '1 minute' FROM "
+                       "certificate_inventory_store.agent_state") == "t");
+}
+
+TEST_CASE("CertificateInventoryStore: a very long path is keyed by its md5, not the btree",
+          "[certinv][pg]") {
+    CERT_SHARED(store, pool);
+    std::string path = "/";
+    unsigned x = 12345;
+    while (path.size() < 3500) { // incompressible: defeats TOAST compression
+        x = x * 1103515245u + 12345u;
+        path.push_back(static_cast<char>('a' + (x >> 16) % 26));
+    }
+    const auto ack = ingest(store, "agent-1",
+                            full_report(blob(store_rec("S", "ok"), {cert(1, {{"S", path}})})));
+    CHECK_FALSE(nacked(ack));
+    CHECK(store.row_counts("agent-1")->cert_location == 1);
+    CHECK(scalar(pool, "SELECT length(path) FROM certificate_inventory_store.cert_location") ==
+          "3500");
+    // The same report again is an upsert on the md5 key, not a second row.
+    ingest(store, "agent-1", full_report(blob(store_rec("S", "ok"), {cert(1, {{"S", path}})})));
+    CHECK(store.row_counts("agent-1")->cert_location == 1);
+}
+
+TEST_CASE("CertificateInventoryStore: an unchanged fact is not rewritten", "[certinv][pg]") {
+    CERT_SHARED(store, pool);
+    Cert c = cert(1, {{"S", ""}});
+    c.sans = {{"dns", "a"}, {"dns", "b"}};
+    const auto b1 = blob(store_rec("S", "ok"), {c});
+    ingest(store, "agent-1", full_report(b1));
+    const auto fact_x = scalar(pool, "SELECT xmin::text FROM certificate_inventory_store.cert_fact");
+    const auto san_x = scalar(pool, "SELECT string_agg(xmin::text, ',') FROM certificate_inventory_store.cert_san");
+    // Same facts, different bytes (an extra store), so the report is a real full replace.
+    ingest(store, "agent-1", full_report(blob(store_rec("S", "ok") + store_rec("T", "absent"), {c})));
+    CHECK(scalar(pool, "SELECT xmin::text FROM certificate_inventory_store.cert_fact") == fact_x);
+    CHECK(scalar(pool, "SELECT string_agg(xmin::text, ',') FROM certificate_inventory_store.cert_san") == san_x);
+    // A changed fact IS rewritten.
+    c.subject = "CN=changed";
+    ingest(store, "agent-1", full_report(blob(store_rec("S", "ok"), {c})));
+    CHECK(scalar(pool, "SELECT subject_dn FROM certificate_inventory_store.cert_fact") == "CN=changed");
+}
+
+TEST_CASE("CertificateInventoryStore: a failure mid-transaction rolls everything back and nacks",
+          "[certinv][pg]") {
+    CERT_SHARED(store, pool);
+    ingest(store, "agent-1", full_report(blob(store_rec("S", "ok"), {cert(1, {{"S", ""}})})));
+    const auto before = shape(store, "agent-1");
+    yuzu::MetricsRegistry m;
+    cert_ingest_metric::register_metrics(m);
+    {
+        // Break a LATE write (the cdp insert), after the earlier statements already ran.
+        TableOff off(pool, "cert_cdp");
+        Cert c2 = cert(2, {{"S", ""}});
+        c2.cdps = {"http://x/y.crl"};
+        const auto ack = ingest(store, "agent-1", full_report(blob(store_rec("S", "ok"), {c2})), &m);
+        CHECK(nacked(ack));
+        CHECK(metric_count(m, "error", "store_error") == 1);
+    }
+    CHECK(shape(store, "agent-1") == before); // the failed full report left no partial rows
+    {
+        // A hash-only error does not ask for a full resend (a 3 MiB upload for a transient error).
+        TableOff off(pool, "agent_state");
+        CHECK_FALSE(nacked(ingest(store, "agent-1", hash_only(std::string(64, 'a')), &m)));
+        CHECK(metric_count(m, "error", "store_error") == 2);
+    }
+    CHECK(shape(store, "agent-1") == before);
+}
+
+TEST_CASE("cert parse: cap boundaries, N accepted and N+1 refused", "[certinv][parse]") {
+    const auto stores = store_rec("S", "ok");
+    SECTION("SANs 64 / 65") {
+        Cert c = cert(1, {{"S", ""}});
+        for (int i = 0; i < 64; ++i)
+            c.sans.push_back({"dns", "h" + std::to_string(i)});
+        CHECK(find_fact(parse_certificate_inventory_blob(blob(stores, {c})), 1) != nullptr);
+    }
+    SECTION("SAN value 256 bytes accepted") {
+        Cert c = cert(1, {{"S", ""}});
+        c.sans = {{"dns", std::string(256, 'a')}};
+        CHECK(find_fact(parse_certificate_inventory_blob(blob(stores, {c})), 1) != nullptr);
+    }
+    SECTION("EKUs 32 / 33") {
+        Cert c = cert(1, {{"S", ""}});
+        for (int i = 0; i < 32; ++i)
+            c.ekus.push_back("1.3.6.1.5.5.7.3." + std::to_string(i));
+        CHECK(find_fact(parse_certificate_inventory_blob(blob(stores, {c})), 1) != nullptr);
+    }
+    SECTION("CRL DPs 8 / 9, 512-byte URI accepted") {
+        Cert c = cert(1, {{"S", ""}});
+        for (int i = 0; i < 8; ++i)
+            c.cdps.push_back("http://c/" + std::string(500, 'a') + std::to_string(i));
+        CHECK(find_fact(parse_certificate_inventory_blob(blob(stores, {c})), 1) != nullptr);
+    }
+    SECTION("DN 1024 bytes accepted") {
+        Cert c = cert(1, {{"S", ""}});
+        c.subject = "CN=" + std::string(1021, 'a');
+        CHECK(find_fact(parse_certificate_inventory_blob(blob(stores, {c})), 1) != nullptr);
+    }
+    SECTION("64 stores accepted") {
+        std::string many;
+        for (int i = 0; i < 64; ++i)
+            many += store_rec("S" + std::to_string(i), "absent");
+        CHECK(parse_certificate_inventory_blob(blob(many, {})).nack == CertBlobNack::kNone);
+    }
+    SECTION("2,000 certificates in one store accepted") {
+        std::vector<Cert> certs;
+        for (int i = 1; i <= 2000; ++i)
+            certs.push_back(cert(i, {{"S", ""}}));
+        const auto p = parse_certificate_inventory_blob(blob(stores, certs));
+        CHECK_FALSE(p.any_over_cap);
+        CHECK(p.data.facts.size() == 2000);
+    }
+}
+
+TEST_CASE("cert parse: reason over the cap constrains that store, not the whole blob; `?` flags "
+          "and unknown fields are named",
+          "[certinv][parse]") {
+    const auto p = parse_certificate_inventory_blob(
+        blob(store_rec("A", "ok", std::string(300, 'a')) + store_rec("B", "ok"), {}));
+    CHECK(p.nack == CertBlobNack::kNone);
+    CHECK(find_store(p, "A")->reason == "parse_error");
+    CHECK(find_store(p, "B")->status == "ok");
+
+    Cert c = cert(1, {{"B", ""}});
+    c.flags = "?";
+    const auto q = parse_certificate_inventory_blob(blob(store_rec("B", "ok"), {c}));
+    REQUIRE(q.data.facts.size() == 1);
+    CHECK(q.data.facts[0].constrained_fields == "flags_unknown");
+}
+
+TEST_CASE("cert ingest: a hash-only claim that is not 64 lowercase hex is nacked and never "
+          "reaches the store",
+          "[certinv][pg]") {
+    CERT_SHARED(store, pool);
+    yuzu::MetricsRegistry m;
+    cert_ingest_metric::register_metrics(m);
+    ingest(store, "agent-1", full_report(blob(store_rec("S", "ok"), {cert(1, {{"S", ""}})})));
+    for (const std::string& claim :
+         {std::string(), std::string(63, 'a'), std::string(65, 'a'), std::string(64, 'A'),
+          std::string(64, 'g'), std::string("claimed-hash")})
+        CHECK(nacked(ingest(store, "agent-1", hash_only(claim), &m)));
+    CHECK(metric_count(m, "need_full", "bad_claim") == 6);
+    CHECK(metric_count(m, "need_full", "hash_mismatch") == 0); // never reached the store compare
+    CHECK(metric_count(m, "touched", "none") == 0);
 }

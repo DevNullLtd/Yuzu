@@ -87,8 +87,8 @@ AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
                               })
                             : nullptr});
     // The eighth store (slice-2 PR 2a-2a): fleet certificate inventory. delete_agent erases every
-    // table's rows AND writes the decommission tombstone in the same transaction, so a still-
-    // running agent's next report is acknowledged and dropped instead of repopulating the rows.
+    // table's rows in one transaction (erase only: the decommission tombstone that stops a still-
+    // running agent repopulating them is PR 2a-2c, so until then its next report re-creates them).
     targets_.push_back({"certificate_inventory",
                         stores.certificate_inventory
                             ? Fn([p = stores.certificate_inventory](std::string_view id) {
