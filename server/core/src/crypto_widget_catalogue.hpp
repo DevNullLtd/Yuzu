@@ -353,6 +353,11 @@ struct LayoutRequest {
 /// [ bucket=<b>] rows=<n> page=<first|continuation> total=<n>` (crypto.ca.certificates.view,
 /// success).
 [[nodiscard]] std::string audit_detail_certs(std::string_view cid, const CaCertPage& page);
+/// `[cid=<cid> ]inventory rows=<n> limit=<n> offset=<n> has_more=<true|false>`
+/// (crypto.ca.certificates.view, success, for the UNFILTERED offset-paged list: it has no
+/// window set, count or cursor to name, so it records what was served and which page).
+[[nodiscard]] std::string audit_detail_inventory(std::string_view cid, std::size_t rows, int limit,
+                                                 int offset, bool has_more);
 /// The failure-row twin of both: `[cid=<cid> ]ws=<window set> as_of=<epoch|db_now> <what>`
 /// where `what` is "store degraded", "capacity in use" or "access check unavailable".
 [[nodiscard]] std::string audit_detail_ca_degraded(std::string_view cid,

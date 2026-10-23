@@ -882,6 +882,12 @@ std::string audit_detail_certs(std::string_view cid, const CaCertPage& page) {
                        page.query.cursor.empty() ? "first" : "continuation", page.total);
 }
 
+std::string audit_detail_inventory(std::string_view cid, std::size_t rows, int limit, int offset,
+                                   bool has_more) {
+    return std::format("{}inventory rows={} limit={} offset={} has_more={}", cid_prefix(cid), rows,
+                       limit, offset, has_more);
+}
+
 std::string audit_detail_ca_degraded(std::string_view cid, std::optional<std::int64_t> as_of,
                                      CryptoReadCause cause) {
     std::string_view what;

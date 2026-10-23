@@ -378,6 +378,91 @@ void CaRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm
                     std::move(issue_code_signing_fn));
 }
 
+namespace {
+
+/// The A4 error body every `/api/v1/ca/issued` refusal shares (filtered and unfiltered).
+void issued_fail(httplib::Response& res, int status, std::string_view message,
+                 const std::string& cid, bool retryable) {
+    res.status = status;
+    res.set_content(retryable ? error_json_a4(status, message, cid, 5000, {})
+                              : error_json_a4(status, message, cid),
+                    kJson);
+}
+
+/// One `crypto.ca.certificates.view` row; a dropped write marks the response `Sec-Audit-Failed`
+/// and is returned so a served list can say `audit_persisted: false` (set-and-proceed).
+bool issued_audit(const CaRoutes::AuditFn& audit_fn, const httplib::Request& req,
+                  httplib::Response& res, const std::string& result, const std::string& target,
+                  const std::string& detail) {
+    const bool ok = audit_fn ? audit_fn(req, "crypto.ca.certificates.view", result, "Security",
+                                        target, detail)
+                             : false;
+    if (!ok)
+        res.set_header("Sec-Audit-Failed", "true");
+    return ok;
+}
+
+/// The standing check BOTH `/api/v1/ca/issued` lists share (ADR-0070 R2): rows of per-agent
+/// certificates (subject, SAN) are fleet-wide, so a caller whose view of the fleet is confined
+/// gets the withheld answer, never a narrowed list (`list_issued` has no scope parameter).
+/// Returns true when the read may proceed; otherwise the response is written. An unwired probe
+/// fails closed (503, no retry hint: a wiring fault lasts until a restart). `needs_api` is set by
+/// the filtered list, which also reads through the CryptoApi seam. Asked before any parameter is
+/// parsed, so the answer does not depend on them.
+[[nodiscard]] bool admit_issued_read(const CaRoutes::FilteredIssuedDeps& filtered,
+                                     const httplib::Request& req, httplib::Response& res,
+                                     const CaRoutes::AuditFn& audit_fn, const std::string& cid,
+                                     bool needs_api) {
+    namespace cw = crypto_widgets;
+    if ((needs_api && !filtered.api) || !filtered.confinement_fn) {
+        static std::once_flag logged;
+        std::call_once(logged, [] {
+            spdlog::error("ca routes: /api/v1/ca/issued confinement probe unwired - answering 503");
+        });
+        issued_fail(res, 503,
+                    needs_api ? "filtered certificate list unavailable"
+                              : "certificate list unavailable",
+                    cid, false);
+        return false;
+    }
+    switch (filtered.confinement_fn(req)) {
+    case cw::Access::kConfined:
+        (void)issued_audit(audit_fn, req, res, "denied", "", "withheld=confined; cid=" + cid);
+        issued_fail(res, 403, cw::kConfinedWithheldMessage, cid, false);
+        return false;
+    case cw::Access::kDegraded:
+        issued_fail(res, 503, "access check unavailable", cid, true);
+        return false;
+    case cw::Access::kAvailable:
+    case cw::Access::kRefused: // no Inventory grant at all is not a confined view
+        break;
+    }
+    return true;
+}
+
+/// The Settings panel lists every issued serial and subject (the same rows as the API
+/// inventory), so it is held to the same standing: a confined caller gets the withheld note
+/// instead of the list, and an unwired or degraded probe fails closed. Empty = may list.
+/// Quiet: no response and no audit row (the panel itself is not audited).
+[[nodiscard]] std::optional<std::string_view>
+issued_panel_withheld(const CaRoutes::FilteredIssuedDeps& filtered, const httplib::Request& req) {
+    namespace cw = crypto_widgets;
+    if (!filtered.confinement_fn)
+        return "Certificate inventory unavailable (access check not configured).";
+    switch (filtered.confinement_fn(req)) {
+    case cw::Access::kConfined:
+        return cw::kConfinedWithheldMessage;
+    case cw::Access::kDegraded:
+        return "Certificate inventory unavailable (access check failed).";
+    case cw::Access::kAvailable:
+    case cw::Access::kRefused:
+        break;
+    }
+    return std::nullopt;
+}
+
+} // namespace
+
 void CaRoutes::serve_filtered_issued(const FilteredIssuedDeps& filtered,
                                      const httplib::Request& req, httplib::Response& res,
                                      const AuditFn& audit_fn) {
@@ -386,43 +471,14 @@ void CaRoutes::serve_filtered_issued(const FilteredIssuedDeps& filtered,
     res.set_header("Cache-Control", "no-store, private");
     res.set_header("Vary", "Authorization, Cookie, X-Yuzu-Token");
     auto fail = [&](int status, std::string_view message, bool retryable) {
-        res.status = status;
-        res.set_content(retryable ? error_json_a4(status, message, cid, 5000, {})
-                                  : error_json_a4(status, message, cid),
-                        kJson);
+        issued_fail(res, status, message, cid, retryable);
     };
     auto audit = [&](const std::string& result, const std::string& target,
                      const std::string& detail) {
-        const bool ok = audit_fn ? audit_fn(req, "crypto.ca.certificates.view", result, "Security",
-                                            target, detail)
-                                 : false;
-        if (!ok)
-            res.set_header("Sec-Audit-Failed", "true");
-        return ok;
+        return issued_audit(audit_fn, req, res, result, target, detail);
     };
-    if (!filtered.api || !filtered.confinement_fn) {
-        static std::once_flag logged;
-        std::call_once(logged, [] {
-            spdlog::error("ca routes: filtered /api/v1/ca/issued unwired - answering 503");
-        });
-        // No retry hint (L3): a wiring fault lasts until a restart (ADR-0071's posture).
-        fail(503, "filtered certificate list unavailable", false);
+    if (!admit_issued_read(filtered, req, res, audit_fn, cid, /*needs_api=*/true))
         return;
-    }
-    // R2: a confined view never gets the rows behind a fleet-wide count. Asked before parsing,
-    // so the answer does not depend on the parameters.
-    switch (filtered.confinement_fn(req)) {
-    case cw::Access::kConfined:
-        (void)audit("denied", "", "withheld=confined; cid=" + cid);
-        fail(403, cw::kConfinedWithheldMessage, false);
-        return;
-    case cw::Access::kDegraded:
-        fail(503, "access check unavailable", true);
-        return;
-    case cw::Access::kAvailable:
-    case cw::Access::kRefused: // no Inventory grant at all is not a confined view
-        break;
-    }
     const auto q = cw::parse_cert_params(req.params);
     if (!q) {
         fail(400, q.error(), false);
@@ -598,10 +654,19 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                     serve_filtered_issued(filtered, req, res, audit_fn);
                     return;
                 }
+                // The inventory is fleet-wide and carries per-agent subject/SAN: the same
+                // confinement answer and the same audit verb as the filtered list. Asked
+                // before the store is touched or a parameter parsed.
+                const auto cid = make_correlation_id();
+                res.set_header("Cache-Control", "no-store, private");
+                res.set_header("Vary", "Authorization, Cookie, X-Yuzu-Token");
+                if (!admit_issued_read(filtered, req, res, audit_fn, cid, /*needs_api=*/false))
+                    return;
                 if (!ca_store || !ca_store->is_open()) {
+                    (void)issued_audit(audit_fn, req, res, "failure", "inventory",
+                                       "inventory store unavailable; cid=" + cid);
                     res.status = 503;
-                    res.set_content(error_json_a4(503, "CA not available", make_correlation_id()),
-                                    kJson);
+                    res.set_content(error_json_a4(503, "CA not available", cid), kJson);
                     return;
                 }
                 const auto limit_opt = clamp_int(req, "limit", 200, 1, 1000);
@@ -622,9 +687,10 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                 // so limit+1 (<=1001) is always in range.
                 auto records_or_err = ca_store->list_issued(limit + 1, offset);
                 if (!records_or_err) {
+                    (void)issued_audit(audit_fn, req, res, "failure", "inventory",
+                                       "inventory store unavailable; cid=" + cid);
                     res.status = 503;
-                    res.set_content(error_json_a4(503, "CA store unavailable — try again",
-                                                  make_correlation_id()),
+                    res.set_content(error_json_a4(503, "CA store unavailable — try again", cid),
                                     kJson);
                     return;
                 }
@@ -632,6 +698,12 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                 const bool has_more = static_cast<int>(records.size()) > limit;
                 if (has_more)
                     records.resize(static_cast<std::size_t>(limit));
+                // Set-and-proceed, as the filtered list: a dropped row marks the response
+                // (Sec-Audit-Failed, audit_persisted false), it does not withhold the page.
+                const bool persisted = issued_audit(
+                    audit_fn, req, res, "success", "inventory",
+                    crypto_widgets::audit_detail_inventory(cid, records.size(), limit, offset,
+                                                           has_more));
                 nlohmann::json items = nlohmann::json::array();
                 for (const auto& r : records) {
                     items.push_back({
@@ -661,6 +733,9 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                 nlohmann::json out = {{"items", std::move(items)},
                                       {"count", records.size()},
                                       {"meta", std::move(meta)}};
+                if (!persisted)
+                    out["audit_persisted"] = false;
+                res.set_header("X-Correlation-Id", cid);
                 res.set_content(out.dump(), kJson);
             });
 
@@ -1138,10 +1213,17 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
     // gates on Security:Read for RBAC parity with GET /ca/issued). Dark-theme
     // product UI; all agent-controlled fields are html_escaped in render_ca_fragment.
     sink.Get("/fragments/settings/ca",
-             [perm_fn, ca_store](const httplib::Request& req, httplib::Response& res) {
+             [perm_fn, ca_store, filtered = filtered_](const httplib::Request& req,
+                                                        httplib::Response& res) {
                  if (!perm_fn(req, res, "Security", "Read"))
                      return;
                  res.set_header("Cache-Control", "no-store");
+                 if (const auto withheld = issued_panel_withheld(filtered, req)) {
+                     res.set_content("<p class=\"feedback-error\">" +
+                                         html_escape(std::string(*withheld)) + "</p>",
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
                  res.set_content(render_ca(ca_store, wants_pki_view(req)),
                                  "text/html; charset=utf-8");
              });
@@ -1155,7 +1237,12 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
     // never touch the owner, so copying the (small, boot-immutable) list keeps it
     // that way and raises no question about CaRoutes outliving the sink.
     const auto csrf_trusted = csrf_trusted_origins_;
-    const auto read_probe = read_probe_;
+    // The wrappers append the panel (with its inventory) only when this says the caller may read
+    // it: Security:Read AND not confined (same standing as the API inventory).
+    const ReadProbeFn read_probe = [probe = read_probe_,
+                                    filtered = filtered_](const httplib::Request& req) {
+        return probe && probe(req) && !issued_panel_withheld(filtered, req);
+    };
     sink.Post("/api/settings/ca/revoke", [perm_fn, audit_fn, ca_store, revoke_core, csrf_trusted, read_probe](
                                              const httplib::Request& req, httplib::Response& res) {
         // H-1 (#1241): this revoke is authorized by the yuzu_session COOKIE alone

@@ -560,6 +560,15 @@ struct FakeAuth {
 };
 } // namespace
 
+TEST_CASE("crypto widgets: audit_detail_inventory - the unfiltered list's success row",
+          "[crypto][widgets]") {
+    namespace cw = yuzu::server::crypto_widgets;
+    CHECK(cw::audit_detail_inventory("c-1", 3, 200, 0, false) ==
+          "cid=c-1 inventory rows=3 limit=200 offset=0 has_more=false");
+    CHECK(cw::audit_detail_inventory("", 5, 5, 10, true) ==
+          "inventory rows=5 limit=5 offset=10 has_more=true");
+}
+
 TEST_CASE("crypto_access_for: a confined Inventory:Read holder - kConfined for fleet-wide-only, "
           "kAvailable for fleet-read",
           "[crypto][widgets][authz]") {

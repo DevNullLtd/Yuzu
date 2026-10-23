@@ -1441,8 +1441,8 @@ TEST_CASE("ca_routes: /ca/issued without a session is 401, filtered or not, with
     CHECK(h.audits.empty());
 }
 
-TEST_CASE("ca_routes: a confined Security:Read holder is withheld the filtered list; the "
-          "unfiltered list is unchanged",
+TEST_CASE("ca_routes: a confined Security:Read holder is withheld the filtered AND the unfiltered "
+          "list, each audited denied",
           "[ca_routes][pki][pg][crypto][security]") {
     Harness h;
     h.standing = yuzu::server::crypto_widgets::Access::kConfined;
@@ -1455,15 +1455,45 @@ TEST_CASE("ca_routes: a confined Security:Read holder is withheld the filtered l
     CHECK_FALSE(j["error"].contains("permission"));
     REQUIRE(h.audits.size() == 1);
     CHECK(h.audits[0].result == "denied");
-    // The unfiltered inventory answers exactly as before: no probe, no audit (pre-existing).
-    const int probes = h.standing_calls;
+    // The unfiltered inventory is the same fleet-wide per-agent data: same answer, same verb.
     auto plain = h.sink.Get("/api/v1/ca/issued");
     REQUIRE(plain);
-    CHECK(plain->status == 200);
-    CHECK(nlohmann::json::parse(plain->body)["count"] == 1);
-    CHECK_FALSE(nlohmann::json::parse(plain->body).contains("filter"));
-    CHECK(h.standing_calls == probes);
-    CHECK(h.audits.size() == 1);
+    CHECK(plain->status == 403);
+    const auto pj = nlohmann::json::parse(plain->body);
+    CHECK_FALSE(pj["error"].contains("permission"));
+    CHECK(plain->body.find("agent-C1") == std::string::npos);
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[1].action == "crypto.ca.certificates.view");
+    CHECK(h.audits[1].result == "denied");
+}
+
+TEST_CASE("ca_routes: an unconfined unfiltered /ca/issued is served and audited success; a "
+          "dropped audit row is reported, not fatal",
+          "[ca_routes][pki][pg][crypto][security]") {
+    Harness h;
+    h.wire();
+    REQUIRE(h.store->record_issued(sample_issued("C2")));
+    auto ok = h.sink.Get("/api/v1/ca/issued?limit=5");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(ok->get_header_value("Sec-Audit-Failed").empty());
+    CHECK_FALSE(nlohmann::json::parse(ok->body).contains("audit_persisted"));
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "crypto.ca.certificates.view");
+    CHECK(h.audits[0].result == "success");
+    CHECK_THAT(h.audits[0].detail,
+               Catch::Matchers::ContainsSubstring("inventory rows=1 limit=5 offset=0"));
+    CHECK_THAT(h.audits[0].detail, Catch::Matchers::ContainsSubstring("cid="));
+
+    // The filtered list's policy, mirrored: the page is served and the response is marked.
+    h.audit_succeeds = false;
+    auto marked = h.sink.Get("/api/v1/ca/issued");
+    REQUIRE(marked);
+    CHECK(marked->status == 200);
+    CHECK(marked->get_header_value("Sec-Audit-Failed") == "true");
+    const auto mj = nlohmann::json::parse(marked->body);
+    CHECK(mj["audit_persisted"] == false);
+    CHECK(mj["count"] == 1);
 }
 
 TEST_CASE("ca_routes: filtered /ca/issued fails closed when unwired or degraded",
@@ -1476,13 +1506,17 @@ TEST_CASE("ca_routes: filtered /ca/issued fails closed when unwired or degraded"
         CHECK(res->status == 503);
         // L3: a wiring fault lasts until a restart - no retry hint.
         CHECK(nlohmann::json::parse(res->body)["error"]["retry_after_ms"].is_null());
-        CHECK(h.sink.Get("/api/v1/ca/issued")->status == 200); // unfiltered unaffected
+        // The unfiltered inventory needs the same probe: it fails closed too, never open.
+        auto plain = h.sink.Get("/api/v1/ca/issued");
+        CHECK(plain->status == 503);
+        CHECK(nlohmann::json::parse(plain->body)["error"]["retry_after_ms"].is_null());
     }
     {
         Harness h;
         h.standing = yuzu::server::crypto_widgets::Access::kDegraded;
         h.wire();
         CHECK(h.sink.Get("/api/v1/ca/issued?kind=active")->status == 503);
+        CHECK(h.sink.Get("/api/v1/ca/issued")->status == 503);
     }
     {
         Harness h;
@@ -2017,4 +2051,209 @@ TEST_CASE("ca_routes: the CA fragment is no-store, and refuses a caller without 
     REQUIRE(denied);
     CHECK(denied->status == 403);
     check_no_inventory(denied->body);
+}
+
+// ── The Security:Read inventory is fleet-wide: confined callers are withheld (no Postgres) ────
+//
+// These register CaRoutes with NO CaStore. A confined or degraded caller must be answered before
+// the store is touched, so the answers below hold with none, and no `failure` row for an
+// unavailable store may appear beside the `denied` row.
+
+namespace {
+
+struct ProbeHarness {
+    test::TestRouteSink sink;
+    std::vector<AuditRow> audits;
+    yuzu::server::crypto_widgets::Access standing{yuzu::server::crypto_widgets::Access::kAvailable};
+    bool wire_probe{true};
+    bool audit_succeeds{true};
+    bool can_read{true};
+    int standing_calls{0};
+    int perm_calls{0};
+
+    void wire() {
+        CaRoutes routes;
+        CaRoutes::AuthFn auth = [](const httplib::Request&,
+                                   httplib::Response&) -> std::optional<auth::Session> {
+            return std::nullopt;
+        };
+        CaRoutes::PermFn perm = [this](const httplib::Request&, httplib::Response& res,
+                                       const std::string&, const std::string&) {
+            ++perm_calls;
+            if (!can_read) {
+                res.status = 403;
+                res.set_content(R"({"error":{"code":403,"message":"denied"}})", "application/json");
+                return false;
+            }
+            return true;
+        };
+        CaRoutes::AuditFn audit = [this](const httplib::Request&, const std::string& a,
+                                         const std::string& r, const std::string& tt,
+                                         const std::string& ti, const std::string& d) -> bool {
+            audits.push_back({a, r, tt, ti, d});
+            return audit_succeeds;
+        };
+        if (wire_probe)
+            routes.set_filtered_issued(CaRoutes::FilteredIssuedDeps{
+                .api = nullptr, .confinement_fn = [this](const httplib::Request&) {
+                    ++standing_calls;
+                    return standing;
+                }});
+        routes.set_read_probe([this](const httplib::Request&) { return can_read; });
+        routes.register_routes(
+            sink, auth, perm, audit, /*ca_store=*/nullptr,
+            []() -> std::optional<std::vector<std::uint8_t>> { return std::nullopt; },
+            []() -> std::optional<std::string> { return std::nullopt; },
+            [](const std::string&, const std::string&) { return CaRoutes::ImportOutcome::Ok; },
+            [](const std::string&, const std::string&, std::optional<int>,
+               const std::string&) -> std::expected<CodeSigningIssuance, std::string> {
+                return std::unexpected(std::string("unused"));
+            });
+    }
+};
+
+constexpr std::string_view kWithheld = yuzu::server::crypto_widgets::kConfinedWithheldMessage;
+
+} // namespace
+
+TEST_CASE("ca_routes: a confined caller is withheld the unfiltered /ca/issued before any parameter "
+          "or store is read, and the denial is audited",
+          "[ca_routes][pki][crypto][security]") {
+    ProbeHarness h;
+    h.standing = yuzu::server::crypto_widgets::Access::kConfined;
+    h.wire();
+    // The malformed limit would be a 400 if the parameters were read first.
+    for (const char* path : {"/api/v1/ca/issued", "/api/v1/ca/issued?limit=5&offset=2",
+                             "/api/v1/ca/issued?limit=abc"}) {
+        INFO(path);
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(res->get_header_value("Cache-Control") == "no-store, private");
+        const auto j = json::parse(res->body);
+        CHECK(j["error"]["message"] == std::string(kWithheld));
+        CHECK_FALSE(j["error"].contains("permission")); // none would admit this caller
+        CHECK(res->body.find("items") == std::string::npos);
+    }
+    REQUIRE(h.audits.size() == 3);
+    for (const auto& a : h.audits) {
+        CHECK(a.action == "crypto.ca.certificates.view");
+        CHECK(a.result == "denied");
+        CHECK(a.target_type == "Security");
+        CHECK_THAT(a.detail, Catch::Matchers::ContainsSubstring("withheld=confined"));
+    }
+}
+
+TEST_CASE("ca_routes: the unfiltered /ca/issued fails closed when the standing probe is degraded or "
+          "unwired, and asks Security:Read first",
+          "[ca_routes][pki][crypto][security]") {
+    {
+        ProbeHarness h;
+        h.standing = yuzu::server::crypto_widgets::Access::kDegraded;
+        h.wire();
+        auto res = h.sink.Get("/api/v1/ca/issued");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(json::parse(res->body)["error"]["retry_after_ms"] == 5000);
+        CHECK(h.audits.empty());
+    }
+    {
+        ProbeHarness h;
+        h.wire_probe = false;
+        h.wire();
+        auto res = h.sink.Get("/api/v1/ca/issued");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(json::parse(res->body)["error"]["retry_after_ms"].is_null());
+        CHECK(h.audits.empty());
+    }
+    {
+        ProbeHarness h;
+        h.can_read = false;
+        h.wire();
+        auto res = h.sink.Get("/api/v1/ca/issued");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.standing_calls == 0); // Security:Read first
+        CHECK(h.audits.empty());
+    }
+}
+
+TEST_CASE("ca_routes: an unconfined or grant-less caller passes the probe; an unreadable store is "
+          "audited failure",
+          "[ca_routes][pki][crypto][security]") {
+    using yuzu::server::crypto_widgets::Access;
+    for (const Access a : {Access::kAvailable, Access::kRefused}) {
+        ProbeHarness h;
+        h.standing = a;
+        h.wire();
+        auto res = h.sink.Get("/api/v1/ca/issued");
+        REQUIRE(res);
+        CHECK(res->status == 503); // no store wired here: past the probe, into the store check
+        CHECK(h.standing_calls == 1);
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].result == "failure");
+        CHECK(h.audits[0].action == "crypto.ca.certificates.view");
+    }
+}
+
+TEST_CASE("ca_routes: the Settings CA panel withholds the inventory from a confined caller",
+          "[ca_routes][pki][crypto][security]") {
+    using yuzu::server::crypto_widgets::Access;
+    for (const char* path : {"/fragments/settings/ca", "/fragments/settings/ca?view=pki"}) {
+        INFO(path);
+        {
+            ProbeHarness h;
+            h.standing = Access::kConfined;
+            h.wire();
+            auto res = h.sink.Get(path);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            CHECK(res->get_header_value("Cache-Control") == "no-store");
+            CHECK(res->body.find(std::string(kWithheld)) != std::string::npos);
+            CHECK(res->body.find("Certificate authority unavailable") == std::string::npos);
+        }
+        {
+            ProbeHarness h;
+            h.standing = Access::kAvailable;
+            h.wire();
+            auto res = h.sink.Get(path);
+            REQUIRE(res);
+            CHECK(res->body.find(std::string(kWithheld)) == std::string::npos);
+            CHECK(res->body.find("access check") == std::string::npos);
+        }
+        for (const bool unwired : {false, true}) {
+            ProbeHarness h;
+            h.wire_probe = !unwired;
+            h.standing = Access::kDegraded;
+            h.wire();
+            auto res = h.sink.Get(path);
+            REQUIRE(res);
+            CHECK(res->body.find("Certificate inventory unavailable (access check") !=
+                  std::string::npos);
+        }
+    }
+}
+
+TEST_CASE("ca_routes: a revoke wrapper appends the panel only for a caller who may list it",
+          "[ca_routes][pki][crypto][security]") {
+    using yuzu::server::crypto_widgets::Access;
+    // No store: the wrapper answers its 503 banner, plus the panel when the caller may read it.
+    auto body_for = [](Access standing, bool probe_wired) {
+        ProbeHarness h;
+        h.standing = standing;
+        h.wire_probe = probe_wired;
+        h.wire();
+        auto res = h.sink.dispatch("POST", "/api/settings/ca/revoke?serial_hex=DEAD", "",
+                                   "application/x-www-form-urlencoded", kSameOrigin);
+        REQUIRE(res);
+        return res->body;
+    };
+    const auto open = body_for(Access::kAvailable, true);
+    CHECK(open.find("Certificate authority unavailable.</span>") != std::string::npos);
+    for (const auto& body : {body_for(Access::kConfined, true), body_for(Access::kDegraded, true),
+                             body_for(Access::kAvailable, false)}) {
+        CHECK(body.find("Certificate authority unavailable.</span>") == std::string::npos);
+        CHECK(body.find("Certificate authority unavailable.</div>") != std::string::npos);
+    }
 }

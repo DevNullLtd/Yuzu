@@ -12,7 +12,9 @@
 ///   one `/crypto` Yuzu-issued count (ADR-0070 D13 condition 2, R2): the same rows, selected
 ///   by exactly the count's predicate through the CryptoApi seam (`set_filtered_issued`),
 ///   withheld from a confined caller and audited `crypto.ca.certificates.view`. Without one it
-///   answers exactly as before (unaudited, no confinement check - pre-existing).
+///   is the offset-paged INVENTORY, held to the same confinement check, withheld answer and audit
+///   verb (the rows are fleet-wide per-agent data, and `list_issued` has no scope parameter to
+///   narrow them by).
 /// - `POST /api/v1/ca/revoke` — `Security:Delete`. Revoke a serial; republishes
 ///   the CRL.
 /// - `POST /api/v1/ca/issue-code-signing` — `Security:Write`. Code-signing leaf
@@ -242,8 +244,10 @@ public:
     /// The filtered `GET /api/v1/ca/issued` (ADR-0070 R2-2): `api` reads the rows behind one
     /// Yuzu-issued count; `confinement_fn` answers the caller's standing for a fleet-wide-only
     /// figure (the SAME non-auditing probe the /crypto widgets use) - kConfined withholds the
-    /// list (403, no `.permission`), kDegraded fails closed (503). Either unset: a filtered
-    /// request answers 503 (the unfiltered list is unaffected). Set BEFORE `register_routes`.
+    /// list (403, no `.permission`), kDegraded fails closed (503). The probe guards BOTH the
+    /// filtered list and the unfiltered inventory, and the Settings CA panel's rows; `api` is
+    /// needed by the filtered list only. An unset probe fails every one of them closed (503, or
+    /// the "access check" note on the panel). Set BEFORE `register_routes`.
     struct FilteredIssuedDeps {
         std::shared_ptr<const CryptoApi> api;
         std::function<crypto_widgets::Access(const httplib::Request&)> confinement_fn;

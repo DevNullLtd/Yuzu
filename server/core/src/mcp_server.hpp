@@ -825,8 +825,8 @@ public:
 
     /// The ONE non-auditing /crypto availability callback (server.cpp builds it once and wires
     /// the SAME function into CryptoRoutes): `list_crypto_widgets`' availability, the R2
-    /// confinement withhold of `get_crypto_ca_stats`' twin answers and of `list_issued_certs`'
-    /// filtered form. It decides what is DRAWN or withheld, never a grant (every data tool keeps
+    /// confinement withhold of `get_crypto_ca_stats`' twin answers and of `list_issued_certs`
+    /// (both the filtered and the unfiltered form). It decides what is DRAWN or withheld, never a grant (every data tool keeps
     /// its own gate). Unset => those paths answer an internal error, never a guessed answer.
     using CryptoAccessFn = std::function<crypto_widgets::Access(
         const httplib::Request&, crypto_widgets::WidgetGate, const std::string& securable_type,
