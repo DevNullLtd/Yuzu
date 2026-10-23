@@ -3094,9 +3094,9 @@ Self-audited as `rbac.assignments.list`.
 
 #### `POST /api/v1/rbac/roles/{name}/assignments`
 
-Grant one of the 6 fleet-wide-assignable built-in RBAC roles (`Administrator`,
-`PlatformEngineer`, `Operator`, `ApiTokenManager`, `Viewer`, `Reviewer`) to a
-human user, fleet-wide. See "Fleet-Wide Role Assignment (Built-in Roles)" in
+Grant one of the 7 fleet-wide-assignable built-in RBAC roles (`Administrator`,
+`PlatformEngineer`, `Operator`, `ApiTokenManager`, `Viewer`, `Reviewer`,
+`ForensicsAnalyst`) to a human user, fleet-wide. See "Fleet-Wide Role Assignment (Built-in Roles)" in
 `docs/user-manual/rbac.md` for the full narrative (key constraints, examples,
 and why this is a separate surface from `POST /api/v1/rbac/check`'s
 `perm_fn`-gated siblings above).
@@ -3153,7 +3153,7 @@ is never misreported as "no active account."
 array or scalar), missing `principal_id`, a `principal_type`/`principal_id`
 field present with the wrong JSON type (degrades to "missing"/"invalid",
 never an uncaught exception), `principal_type` other than `"user"`, a
-malformed `principal_id`, `{name}` is not one of the 6 assignable roles
+malformed `principal_id`, `{name}` is not one of the 7 assignable roles
 (`ITServiceOwner` and a genuinely unknown/custom role name return the
 identical client-facing message — no role-catalog oracle; the specific
 reason is audited server-side only; use `POST
@@ -6715,17 +6715,31 @@ and MCP `aggregate_responses` share another (`response_aggregate_row_json`).
 derived from the capability catalogue) are served only to callers who hold `Forensics:Read` in
 addition to `Response:Read`. This applies to every route that reads stored responses: the legacy
 `GET /api/responses/{id}[/aggregate|/export]`, the v1 twins above, `GET
-/api/v1/executions/{id}/responses`, `GET /api/v1/executions/{id}/visualization`, and the
-`GET /api/v1/management-groups/agent-count-preview` count. To any other caller those rows are
-absent, not marked: there is no extra field, flag or error, and the row cap, the truncation flags,
-the aggregate counts and the agent counts are all computed over the rows the caller may read. With a
-management-group-scoped `Forensics:Read` grant (RBAC enforcement on) only the Forensics rows of the
-agents in that scope are served. With RBAC enforcement off, `Forensics:Read` is administrator-only,
-so a non-administrator session does not receive these rows. A served read that includes at least one
-such row also writes a `response.forensics.read` audit row (`detail=forensics_rows=<n>
-plugins=<names>`), fail-closed like the neighbouring `response.read` row (`503` +
-`Sec-Audit-Failed: true`, no data); aggregate and count reads write none. The filter is per plugin,
-because only the `plugin` name is stored with a row.
+/api/v1/executions/{id}/responses`, `GET /api/v1/executions/{id}/visualization`, `GET
+/api/v1/bundles/{id}` (a Forensics step stays `pending` with an empty output for a caller without a
+global grant, so that bundle never reports `complete=true` to that caller), and the `GET
+/api/v1/management-groups/agent-count-preview` count. To any other caller those rows are absent,
+not marked: there is no extra field or flag, and the row cap, the truncation flags, the aggregate
+counts and the agent counts are all computed over the rows the caller may read, so **an empty or
+short result does not imply that no data exists**. The one error is the unresolved case: if the
+server cannot determine whether the caller may read Forensics rows (an authorization or
+management-group store fault), the route answers a retryable A4 `503` (`retry_after_ms`, no
+`permission` field) instead of a result with those rows silently missing. `Forensics:Read` is a global grant, or, for an ordinary session or plain API token while RBAC
+enforcement is on, a grant scoped to management groups (only the Forensics rows of the agents in
+that scope are served). Service-scoped tokens, MCP-tier tokens and engine principals need a global
+grant and get nothing from a scoped one. With RBAC enforcement off, `Forensics:Read` is
+administrator-only, so a non-administrator session does not receive these rows. The built-in
+`ForensicsAnalyst` role is the delegable read-only holder (see `rbac.md`). A served read that
+includes at least one such row also writes a `response.forensics.read` audit row
+(`detail=forensics_rows=<n> plugins=<names> surface=<s>`, `surface` being `rest` for the v1 routes
+and `legacy` for the unversioned ones), fail-closed like the neighbouring `response.read` row
+(`503` + `Sec-Audit-Failed: true`, no data); aggregate and count reads write none. The filter is
+per plugin, because only the `plugin` name is stored with a row. The same filter is applied to the
+server's own consumers of these rows: policy check output (such a policy scores `unknown`), result
+set membership (a set sourced from such a command materialises empty) and the live output stream.
+The per-agent `error_detail` of a Forensics-tier command (execution routes, `include=agents`) is a
+short machine token (`scope:cause[:detail]`) or the fixed value `forensics_error`; status and exit
+code are unchanged.
 
 **Numeric query parameters are parsed strictly (#4644), on these routes AND the legacy
 `GET /api/responses/{id}[/aggregate|/export]` routes.** `status`, `since`, `until`, `limit` (and the
@@ -8175,7 +8189,7 @@ Pin (exempt from TTL expiry) or unpin a result set.
 
 ### Forensics
 
-The **per-agent app-usage** discovery surface (Wave 7 PR7.2, ADR-0016 §5). Data is derived on the agent from TAR's `usage_daily` fold via the read-only `app_usage` plugin and synced daily into `AppUsageStore`, projecting each executable's retained-window first/last-seen plus a trailing-30-day run-count/total-seconds window. `Forensics` is **Administrator-only by design** — deliberately absent from the seeded Viewer read-list.
+The **per-agent app-usage** discovery surface (Wave 7 PR7.2, ADR-0016 §5). Data is derived on the agent from TAR's `usage_daily` fold via the read-only `app_usage` plugin and synced daily into `AppUsageStore`, projecting each executable's retained-window first/last-seen plus a trailing-30-day run-count/total-seconds window. `Forensics` is **held by default only by Administrator and the read-only `ForensicsAnalyst` role** — deliberately absent from the seeded Viewer read-list.
 
 #### `GET /api/v1/forensics/agents/{agent_id}/app-usage`
 
@@ -10910,7 +10924,7 @@ Render the Users panel: one row per active account (name, source, account role).
 Render the Roles panel: one row per role in the catalogue (name, description, whether it is built in).
 
 - **Permission:** `UserManagement:Read`, the same securable and the same checked store read as `GET /api/v1/rbac/roles`.
-- **Response (200):** HTML fragment. A role store that does not answer is a red "could not be read" box with a Retry button and no table, still with status 200. An empty catalogue (which the store never produces: it seeds seven roles) is drawn as the same red box, never as "no roles".
+- **Response (200):** HTML fragment. A role store that does not answer is a red "could not be read" box with a Retry button and no table, still with status 200. An empty catalogue (which the store never produces: it seeds eight roles) is drawn as the same red box, never as "no roles".
 - **Response (403):** The caller lacks the permission; the panel shows a "not available to your account" note.
 - **Headers:** `Cache-Control: no-store`. No success audit row (the REST twin writes none).
 

@@ -219,7 +219,7 @@ The policy engine tracks compliance status per agent per policy. Each
 |---|---|
 | `compliant` | Check passed -- the endpoint is in the desired state |
 | `non_compliant` | Check failed -- the endpoint is not in the desired state |
-| `unknown` | Not yet evaluated, status invalidated, or the agent did not respond to a check within the grace window |
+| `unknown` | Not yet evaluated, status invalidated, the agent did not respond to a check within the grace window, or the check instruction runs a Forensics-tier plugin (see below) |
 | `fixing` | Fix instruction is currently running |
 | `error` | Check or fix instruction failed to execute, **or the policy is misconfigured** (e.g. an empty compliance expression — a policy that checks nothing is reported as `error`, never `compliant`) |
 
@@ -250,6 +250,18 @@ enabled policy due immediately (a freshly authored policy evaluates within
 Verdict semantics: a plugin failure / timeout / rejection → `error`; a
 non-responder after the grace window → `unknown`; a successful response that
 fails the CEL → `non_compliant`; one that satisfies it → `compliant`.
+
+**A check that runs a Forensics-tier plugin scores `unknown`.** The evaluator
+reads each check's stored response with every Forensics-tier plugin
+(`app_usage`, `browser_inventory`, `execution_artifacts`,
+`privacy_permissions`, `remote_access_audit`; the set is derived from the
+capability catalogue) excluded, because the verdict and the first bytes of the
+check output are shown to readers who do not hold `Forensics:Read`. Such a
+policy therefore shows `unknown` for every agent with an empty `check_result`,
+and never a verdict from, or a stored copy of, Forensics output. `unknown`
+there says nothing about the device. A Forensics-tier plugin is not a suitable
+policy check. The evaluator still dispatches the check instruction as it does
+any other; only reading its output is withheld.
 
 Implementation/lifecycle: the thread is `PolicyEvaluator`
 (`policy_evaluator.{hpp,cpp}`), wired in `server.cpp` against a hoisted shared

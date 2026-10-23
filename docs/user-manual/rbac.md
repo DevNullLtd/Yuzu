@@ -491,7 +491,7 @@ Settings uses, so the two stay equivalent.
   does; if that row cannot be saved the panel is still drawn and the response carries
   `Sec-Audit-Failed`. A grant table that cannot be read is a red message, never an empty table.
 - **Assign and remove a role.** On an administrator account the panel offers **Assign role** (a
-  username and one of the six fleet-wide roles; ITServiceOwner needs a management group and is not
+  username and one of the seven fleet-wide roles; ITServiceOwner needs a management group and is not
   offered; the account does not have to exist yet) and **Remove** on a grant. These call
   `POST` and `DELETE /api/v1/rbac/roles/{name}/assignments`, which need a durable Administrator
   and a fresh MFA check; the page only shows or hides the controls from your account role, and the
@@ -550,7 +550,7 @@ Settings uses, so the two stay equivalent.
 
 ## System Roles
 
-Seven roles are created automatically and cannot be deleted:
+Eight roles are created automatically and cannot be deleted:
 
 | Role | Permissions | Use case |
 |---|---|---|
@@ -562,6 +562,18 @@ Seven roles are created automatically and cannot be deleted:
 | **Viewer** | Read on 24 securable types (24 permissions) — an explicit allow-list in `rbac_store.cpp`'s seed, *not* “everything except” | Helpdesk staff, auditors, read-only dashboards |
 | **Reviewer** | Read and Attest on AccessReview (2 permissions) | Periodic access reviews (SOC 2 CC6.2) — the non-admin role that can attest or flag a grant |
 | **ForensicsAnalyst** | Read on Forensics, Response, Execution and Inventory (4 permissions). No Execute and no write of any kind | Read-only analysts of Forensics-tier response rows. Fleet-wide assignable only; cannot dispatch; not part of any other role |
+
+### The ForensicsAnalyst role
+
+`ForensicsAnalyst` is the delegable read tier for the stored rows of Forensics-tier plugins (`app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`), which only a caller holding `Forensics:Read` is served (see the `Forensics` and `Response` rows under "Securable Types"). Without it, the only built-in holder of `Forensics:Read` is `Administrator`, so there would be no way to give an analyst these rows short of administrator rights or writing the grants by hand in PostgreSQL.
+
+- **Read-only.** Exactly four permissions: `Forensics:Read`, `Response:Read`, `Execution:Read` and `Inventory:Read`. It holds no `Execute` and no write of any kind, so it cannot dispatch a command, and it is part of no other role.
+- **Fleet-wide assignment only.** Assign it with `POST /api/v1/rbac/roles/ForensicsAnalyst/assignments`, the MCP `assign_rbac_role` tool or the **Assign role** control on the Users and roles page (see "Fleet-Wide Role Assignment" below). Assigning it at management-group scope is not offered: the scoped assignment routes accept only `Operator` and `Viewer`.
+- **Not for engine principals.** It is a built-in (system) role, and the engine-principal assignment gate refuses a built-in role, so an engine principal cannot be given it.
+- **Inert while RBAC enforcement is off.** The legacy permission fallback is unchanged and `Forensics:Read` stays administrator-only until enforcement is on; a stored assignment is neither erased nor honoured in that state, and takes effect again when enforcement is switched back on. See "Enabling RBAC".
+- **Collection stays approval-gated.** The role lets its holder read what was collected; it does not let them collect. A user holding `Operator` plus `ForensicsAnalyst` passes the permission step of a Forensics-plugin dispatch, but the dispatch is still `AdminOrApproval`: a caller who is not an effective administrator needs an approval ticket.
+- **API tokens.** A token carries its creator's authority. A plain API token and an MCP-tier token (a read is permitted at every tier) created by a global `Forensics:Read` holder carry that global read. A service-scoped token never carries it, even when its creator holds the role. A `Forensics:Read` grant scoped to a management group can only be written by hand in PostgreSQL today (the scoped assignment routes accept only `Operator` and `Viewer`, and engine principals cannot hold a scoped assignment); it applies to ordinary sessions and plain API tokens, while service-scoped tokens, MCP-tier tokens and engine principals need a global `Forensics:Read` and get nothing from a scoped one.
+- **Existing databases gain it on the next start.** The role is created by the idempotent seed pass that runs at every server start, with no migration, and is assigned to nobody. If a role named `ForensicsAnalyst` that is not a built-in role already exists (it can only have been created by hand in PostgreSQL), it is kept as it is, the four grants are merged into it, and the server logs one warning naming the role at start-up. Because that role is not a built-in role, the engine-principal bar above does not apply to it, so review its assignments, or rename it and restart to adopt the built-in role.
 
 ## Securable Types
 
@@ -588,7 +600,7 @@ Seven roles are created automatically and cannot be deleted:
 | `GuaranteedState` | Guardian (Guaranteed State) policy rules, events, and status |
 | `Inventory` | Installed-software inventory synced from endpoints (ADR-0016) |
 | `EnginePrincipal` | Engine-principal inventory and fleet-wide grant-graph reads (list/get engine principals, list their assigned roles) — cut away from `Security` (#2376) so this narrower read is not gated by the same broad permission that also covers CA/quarantine/KEK operational reads. See "The authorization topology floor" below. |
-| `Forensics` | Forensic-artefact reads (Windows execution artefacts — ShimCache/AmCache/Prefetch; per-device application-usage projection; per-app privacy-permission grants; per-account SSH authorized-key fingerprints and sshd settings). Administrator-only by default (absent from the Viewer read-list). The stored results of these plugins are served only to a caller who holds `Forensics:Read` in addition to `Response:Read`; to any other reader of the response APIs those rows are absent. With RBAC enforcement off, `Forensics:Read` is administrator-only, so a non-administrator session does not see them either. Only the `plugin` name is stored with a response row, so the filter is per plugin: a plugin that mixed Forensics and ordinary actions would have all of its rows treated as Forensics-tier until the action name is stored too (no such plugin exists today). Every catalogue row on it is single-target (exactly one agent id, no fleet/scope fan-out) and `AdminOrApproval`-gated. Wave 7 PR7.2/PR7.3. |
+| `Forensics` | Forensic-artefact reads (Windows execution artefacts — ShimCache/AmCache/Prefetch; per-device application-usage projection; per-app privacy-permission grants; per-account SSH authorized-key fingerprints and sshd settings). Held by default by Administrator and by the read-only `ForensicsAnalyst` role (absent from the Viewer read-list). The stored results of these plugins are served only to a caller who holds `Forensics:Read` in addition to `Response:Read`; to any other reader of the response APIs those rows are absent. With RBAC enforcement off, `Forensics:Read` is administrator-only, so a non-administrator session does not see them either. Only the `plugin` name is stored with a response row, so the filter is per plugin: a plugin that mixed Forensics and ordinary actions would have all of its rows treated as Forensics-tier until the action name is stored too (no such plugin exists today). Every catalogue row on it is single-target (exactly one agent id, no fleet/scope fan-out) and `AdminOrApproval`-gated. Wave 7 PR7.2/PR7.3. |
 | `Decommission` | Device-level agent-erasure gate for `DELETE /api/v1/sle/agents/{id}` (ADR-0024 Decision 9, amended Wave 7 PR7.2). `Decommission:Delete` authorizes for the whole decommission cascade's blast radius (seven per-agent stores: five spanning `Inventory`, `GuaranteedState`, and `SoftwareLicensing`, a sixth `Forensics`-governed store, and the `endpoint_state` presence row read on `/hardware` and `/viz/fleet`) in one grant, replacing a hand-maintained per-store conjunction. |
 | `SoftwareLicensing` | Discovered software-licence facts synced from endpoints (ADR-0024) |
 | `AccessReview` | Periodic access-review campaigns and attestations (SOC 2 CC6.2). Seeded to Administrator and `Reviewer` only — deliberately NOT `AuditLog`, see "The authorization topology floor" above |
@@ -774,9 +786,15 @@ curl -s -b cookies.txt http://localhost:8080/api/v1/rbac/roles
       "description": "Read audit evidence and attest/flag access-review grants (SOC 2 CC6.2)",
       "is_system": true,
       "created_at": 1710849600
+    },
+    {
+      "name": "ForensicsAnalyst",
+      "description": "Read forensic-tier response rows (Forensics:Read) plus the ordinary response, execution and inventory reads needed to interpret them; read-only, cannot dispatch (#4990)",
+      "is_system": true,
+      "created_at": 1710849600
     }
   ],
-  "pagination": { "total": 7, "start": 0, "page_size": 50 },
+  "pagination": { "total": 8, "start": 0, "page_size": 50 },
   "meta": { "api_version": "v1" }
 }
 ```
@@ -810,7 +828,7 @@ curl -s -b cookies.txt \
 
 Custom roles can be created programmatically via `RbacStore::create_role()` and permissions assigned via `RbacStore::set_permission()`. REST API endpoints for role **creation** are planned but **not yet implemented** — there is no HTMX Settings UI fragment for this either (`settings_routes.cpp` has no RBAC role-CRUD registration). Currently, a genuinely NEW custom role can only be created directly against the shared PostgreSQL `rbac_store` schema (see the "Storage (ADR-0041)" callout above — one `psql` session, not a per-node file).
 
-**Assigning one of the 6 fleet-wide-assignable built-in roles to a human user is implemented — see "Fleet-Wide Role Assignment" below** (`ITServiceOwner`, the 7th built-in role, is assignable only at management-group scope — see "Scoped Role Assignments"). Only AUTHORING a brand-new custom role (and narrowing/widening a seeded system role's own permission set) remains planned.
+**Assigning one of the 7 fleet-wide-assignable built-in roles to a human user is implemented — see "Fleet-Wide Role Assignment" below** (`ITServiceOwner`, the 8th built-in role, is assignable only at management-group scope — see "Scoped Role Assignments"). Only AUTHORING a brand-new custom role (and narrowing/widening a seeded system role's own permission set) remains planned.
 
 **Planned endpoints (not yet available):**
 
@@ -822,7 +840,7 @@ Custom roles can be created programmatically via `RbacStore::create_role()` and 
 
 ### Fleet-Wide Role Assignment (Built-in Roles)
 
-An Administrator can grant or revoke one of the 6 non-`ITServiceOwner` built-in roles (`Administrator`, `PlatformEngineer`, `Operator`, `ApiTokenManager`, `Viewer`, `Reviewer`) to a human (`principal_type="user"`) user, fleet-wide, through a dedicated pair of routes — **not** the general RBAC-securable `perm_fn`/`require_permission` gate every other route in this document uses. Granting (and especially revoking) standing Administrator authority is a stronger security decision than an ordinary permission check, so the caller must hold a **durable** Administrator role themselves, re-read fresh from the store rather than trusted from a cached session role or a JIT (`POST /api/v1/elevate`) elevation — an elevated session does **not** satisfy this gate.
+An Administrator can grant or revoke one of the 7 non-`ITServiceOwner` built-in roles (`Administrator`, `PlatformEngineer`, `Operator`, `ApiTokenManager`, `Viewer`, `Reviewer`, `ForensicsAnalyst`) to a human (`principal_type="user"`) user, fleet-wide, through a dedicated pair of routes — **not** the general RBAC-securable `perm_fn`/`require_permission` gate every other route in this document uses. Granting (and especially revoking) standing Administrator authority is a stronger security decision than an ordinary permission check, so the caller must hold a **durable** Administrator role themselves, re-read fresh from the store rather than trusted from a cached session role or a JIT (`POST /api/v1/elevate`) elevation — an elevated session does **not** satisfy this gate.
 
 Changing the sign-in provider settings (`POST /api/settings/oidc`, and `PUT /api/config/{key}` for the `oidc_*` keys) needs the caller's own administrator role: a session that is administrator only through a temporary elevation is refused, because the provider decides who becomes an administrator at the next SSO login.
 
@@ -849,7 +867,7 @@ Key constraints:
 
 - **`principal_type` must be `"user"`.** Group-scoped fleet-wide assignment is not supported yet — `rbac_store.group_members` is written solely by IdP group-sync, so a group-held grant would make the IdP the admin-authority source, a decision not made by this surface.
 - **`ITServiceOwner` is explicitly rejected**, not silently mis-assigned. Its 92-permission grant is designed around the holder being CONFINED to devices tagged with their IT Service — but that confinement is enforced entirely by `ManagementGroupStore::get_visible_agents`, which reads only the group-scoped `management_group_roles` table, never `principal_roles` (this surface's only write target). A fleet-wide `ITServiceOwner` grant would resolve unconfined/global on every type-level permission check while showing the holder zero visible devices on any per-device list read — wrong both ways. Assign `ITServiceOwner` via the management-group role route instead (see "Scoped Role Assignments" below).
-- **Only the 6 named roles above are accepted** — enforced against a closed allow-list (`rbac_assignable_roles.hpp`), not "any role that happens to exist in the store". A pre-existing custom role (`is_system=false`, creatable only via direct SQL today — `RbacStore::create_role` has no route caller) is rejected exactly like an unknown role name. An unknown/custom role name and `ITServiceOwner` all return the identical client-facing rejection message — the specific reason is recorded in the audit log only, so a caller cannot enumerate the role catalog by diffing error text.
+- **Only the 7 named roles above are accepted** — enforced against a closed allow-list (`rbac_assignable_roles.hpp`), not "any role that happens to exist in the store". A pre-existing custom role (`is_system=false`, creatable only via direct SQL today — `RbacStore::create_role` has no route caller) is rejected exactly like an unknown role name. An unknown/custom role name and `ITServiceOwner` all return the identical client-facing rejection message — the specific reason is recorded in the audit log only, so a caller cannot enumerate the role catalog by diffing error text.
 - **A caller may not revoke the fleet's last remaining `Administrator` grant through this surface.** The store-level guard runs inside the same transaction as the delete, so two concurrent revokes cannot both succeed and leave zero administrators. It counts only `principal_type='user'` rows that ALSO name a currently-active `auth.users` account — a grant naming a nonexistent, deactivated, or (soft-)deleted username is never treated as a survivor.
   - **A principal reactivated while an unassign is in flight is caught (Doomgoose external review, PR #4985).** The guard first locks the candidate Administrator grant rows (`FOR UPDATE OF pr`) and deliberately does not lock the candidate set of `auth.users` rows, because that would serialize unassigns against unrelated logins and role changes. A grant whose account was deactivated at that moment is therefore excluded from that snapshot and could be reactivated by an independent transaction (for example an account reactivation) before the delete runs. After the delete, in the same transaction, and only when the removed grant was not already among the counted rows, the guard re-reads the deleted principal's own `auth.users` row with `FOR UPDATE`: a reactivation that has already committed is seen, one still in flight makes the guard wait and re-read it, and one that starts later blocks until this transaction finishes. If the reactivated principal is the fleet's only real Administrator, the removal is refused. This is closed for an existing account only. One case remains outside the guard: a pre-provisioned grant whose `auth.users` row is created concurrently (there is no row to lock), tracked at #4966. Deactivating a surviving Administrator is guarded separately, takes the same grant-row locks in the same order, and is described under "Last-Administrator guard for account deactivation and demotion" below. A lock wait is bounded by the database pool's lock timeout (10 seconds by default; the pool does not inject it when the DSN sets its own `options` or `PGOPTIONS` is set, and the wait is then bounded only if that setting, or the server or role default, sets a `lock_timeout`); on timeout nothing is deleted, the REST route answers `503`, and the MCP twin answers an internal error with a retry hint.
   - **This guard covers only THIS route's own unassign path.** Deactivating or deleting an account, and demoting a local `admin` account, are guarded by a separate rule, described under "Last-Administrator guard for account deactivation and demotion" below. Neither rule proves that anyone can sign in.
@@ -989,7 +1007,7 @@ Assign this role alongside any other roles. Because deny overrides allow, the us
 | `POST` | `/api/v1/rbac/roles` | Create a custom role | Planned |
 | `PUT` | `/api/v1/rbac/roles/{name}` | Update a role | Planned |
 | `DELETE` | `/api/v1/rbac/roles/{name}` | Delete a custom role | Planned |
-| `POST` | `/api/v1/rbac/roles/{name}/assignments` | Assign one of the 6 non-`ITServiceOwner` built-in roles to a human user, fleet-wide (A2) | Implemented |
+| `POST` | `/api/v1/rbac/roles/{name}/assignments` | Assign one of the 7 non-`ITServiceOwner` built-in roles to a human user, fleet-wide (A2) | Implemented |
 | `DELETE` | `/api/v1/rbac/roles/{name}/assignments/{principal_id}` | Unassign a fleet-wide role from a human user (A2) | Implemented |
 | `PUT` | `/api/v1/rbac/enforcement` | Enable or disable RBAC enforcement fleet-wide (A1) | Implemented |
 | `GET` | `/api/v1/rbac/roles/assignments` | Fleet-wide "who currently holds which role" — the complete grant table, gated `AccessReview:Read` (see the securable table below) | Implemented |
