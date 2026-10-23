@@ -58,10 +58,12 @@ constexpr std::size_t kLedgerBackfillCap = 0;
 const std::set<std::string> kExpectedTwinsBackfill{"discover_routes"};
 constexpr std::size_t kExpectedTwinsBackfillCap = 1;
 
-// Number of ledger domain files a healthy scan reads; a floor so a wrongly-pointed or truncated
-// directory cannot pass (test_api_parity_ledger_catalogue.cpp keeps the exact DOMAINS-derived
-// floor).
-constexpr std::size_t kMinLedgerFiles = 1;
+// Exact number of ledger domain files a healthy scan reads (one per DOMAINS entry in
+// check-api-parity.py, which also requires the set to match exactly). Equality, not a floor:
+// a wrongly-pointed, truncated or silently grown directory cannot pass. Bump it together with
+// DOMAINS and test_api_parity_ledger_catalogue.cpp's kLedgerFiles when a domain file is added
+// or removed.
+constexpr std::size_t kLedgerFiles = 24;
 
 struct LedgerTwins {
     std::set<std::string> names; // every string-valued mcp_twin
@@ -166,7 +168,11 @@ TEST_CASE("MCP twin completeness: every registry tool is a ledger mcp_twin",
     INFO("ledger dir: " << YUZU_API_PARITY_LEDGER_DIR);
     INFO("ledger read failures:" << join(ledger.failures));
     CHECK(ledger.failures.empty());
-    REQUIRE(ledger.files >= kMinLedgerFiles);
+    INFO("ledger files read: " << ledger.files << " (expected " << kLedgerFiles
+                               << "); if a domain file was added or removed, move kLedgerFiles "
+                                  "together with DOMAINS in check-api-parity.py and the same "
+                                  "constant in test_api_parity_ledger_catalogue.cpp");
+    REQUIRE(ledger.files == kLedgerFiles);
     REQUIRE_FALSE(ledger.names.empty());
 
     CHECK(kLedgerBackfill.size() == kLedgerBackfillCap); // shrink-only: a fix lowers the cap in the same change

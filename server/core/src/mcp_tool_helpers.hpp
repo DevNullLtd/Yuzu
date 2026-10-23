@@ -14,8 +14,9 @@
 //
 // The names answer, answer_unwired and dump_replace are reserved in yuzu::server::mcp: a domain
 // file that defines its own copy next to these gets an ambiguous-call error, so extend the
-// helper instead. answer_unwired answers a non-retryable kInternalError by design (the
-// retry-hint gate does not scan this header); a transient fault needs its own a4_error call.
+// helper instead. answer_unwired answers a non-retryable kInternalError by design (it carries
+// the retry-hint-exempt marker; scripts/ci/check-mcp-retry-hints.py scans this header whenever
+// it is new or changed); a transient fault needs its own a4_error call with a retry hint.
 
 #include "mcp_jsonrpc.hpp"       // kInternalError
 #include "mcp_tool_deps.hpp"     // ToolDeps::audit_fn

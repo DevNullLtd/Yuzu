@@ -299,6 +299,14 @@ std::vector<std::string> declared_record_names(const std::string& code, const st
     return names;
 }
 
+// Exact counts of the registry source files a healthy scan reads. Equality, not a floor: a
+// domain file that drops out of the glob (renamed away from the prefix) would otherwise leave
+// its records and includes unchecked while the scan still passes on the remaining files. Bump
+// kRegistryDomainFiles together with MIN_REGISTRY_FILES in scripts/ci/check-api-parity.py when
+// a mcp_tools_<domain>.cpp is added; bump kToolHeaderFiles when an mcp_tool*.hpp is added.
+constexpr std::size_t kRegistryDomainFiles = 3;
+constexpr std::size_t kToolHeaderFiles = 3;
+
 } // namespace
 
 TEST_CASE("MCP dispatch coverage: the stripper and the scan behave as documented",
@@ -415,7 +423,9 @@ TEST_CASE("MCP dispatch coverage: every mcp_tools_*.cpp record is registered and
                 problems.push_back(fname + ": no `" + def + "` definition");
         }
     }
-    CHECK(files >= 1);
+    INFO("mcp_tools_*.cpp files scanned: " << files << " (expected " << kRegistryDomainFiles
+                                           << "); bump kRegistryDomainFiles with the new file");
+    CHECK(files == kRegistryDomainFiles);
 
     // Set equality in both directions, and no name declared twice across files.
     std::set<std::string> declared_set(declared.begin(), declared.end());
@@ -527,7 +537,13 @@ TEST_CASE("MCP dispatch coverage: mcp_tools_*.cpp and mcp_tool*.hpp include no s
         for (const auto& path : *group)
             for (const auto& header : forbidden_includes_in(read_source(path)))
                 offences.push_back(path.filename().string() + ": #include \"" + header + "\"");
-    CHECK(files.cpp.size() >= 1);
+    INFO("mcp_tools_*.cpp files: " << files.cpp.size() << " (expected " << kRegistryDomainFiles
+                                   << "), mcp_tool*.hpp files: " << files.hpp.size()
+                                   << " (expected " << kToolHeaderFiles
+                                   << "); bump kRegistryDomainFiles / kToolHeaderFiles with the "
+                                      "new file");
+    CHECK(files.cpp.size() == kRegistryDomainFiles);
+    CHECK(files.hpp.size() == kToolHeaderFiles);
     INFO(join(offences));
     CHECK(offences.empty());
 }
