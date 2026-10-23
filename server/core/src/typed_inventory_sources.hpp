@@ -51,6 +51,21 @@ inline constexpr std::array<std::string_view, 6> kTypedInventorySources = {
     "certificate_inventory",
 };
 
+// Each name is a plain lowercase identifier: never empty, and only [a-z0-9_]. The
+// names are wire keys and SQL array elements, so a name outside that shape is a
+// review decision, not an edit.
+consteval bool typed_source_names_well_formed() {
+    for (const auto name : kTypedInventorySources) {
+        if (name.empty())
+            return false;
+        for (const char c : name)
+            if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'))
+                return false;
+    }
+    return true;
+}
+static_assert(typed_source_names_well_formed());
+
 [[nodiscard]] constexpr bool is_typed_inventory_source(std::string_view source) {
     return std::ranges::find(kTypedInventorySources, source) != kTypedInventorySources.end();
 }

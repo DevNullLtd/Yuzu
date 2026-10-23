@@ -17,6 +17,7 @@
 #include "test_route_sink.hpp"
 
 #include "inventory_store.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 
 #include "../test_helpers.hpp"
@@ -235,6 +236,19 @@ TEST_CASE("GET /api/inventory/:agent_id/:plugin: a typed source's stray generic 
     // As an older server's gateway path would have written it: device_ci's serial
     // belongs behind Inventory:Read in its own store, never in this generic read.
     h.store->upsert("agent-2", "device_ci", R"({"serial":"abc123"})", 200);
+    {
+        // The row really is there (upsert returns void): counted in SQL, since the
+        // store's own reads exclude typed sources.
+        auto lease = h.pool->acquire();
+        REQUIRE(lease);
+        auto seeded = yuzu::server::pg::exec_params(
+            lease.get(),
+            "SELECT 1 FROM inventory_store.inventory_data "
+            "WHERE agent_id = 'agent-2' AND plugin = 'device_ci'",
+            std::vector<std::string>{});
+        REQUIRE(seeded.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(seeded.get()) == 1);
+    }
 
     auto res = h.sink.Get("/api/inventory/agent-2/device_ci");
     REQUIRE(res);

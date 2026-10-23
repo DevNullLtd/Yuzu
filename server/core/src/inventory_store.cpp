@@ -1,5 +1,6 @@
 #include "inventory_store.hpp"
 
+#include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
@@ -132,20 +133,12 @@ std::int64_t affected_rows(const pg::PgResult& res) {
 
 // The typed-source read filter (ADR-0070 D12): every generic read binds this as a
 // `text[]` and excludes `plugin <> ALL(...)`, so a typed source's stray row is never
-// readable here whether or not the boot purge has reached it. Built from
-// kTypedInventorySources, the one list; the names are plain identifiers, so no
-// element needs array-literal quoting.
+// readable here whether or not the boot purge has reached it. Built once from
+// kTypedInventorySources, the one list, through pg::to_text_array, which quotes and
+// escapes every element.
 const std::string& typed_sources_param() {
-    static const std::string param = [] {
-        std::string out = "{";
-        for (const auto name : kTypedInventorySources) {
-            if (out.size() > 1)
-                out += ',';
-            out += name;
-        }
-        out += '}';
-        return out;
-    }();
+    static const std::string param = pg::to_text_array(
+        std::vector<std::string_view>(kTypedInventorySources.begin(), kTypedInventorySources.end()));
     return param;
 }
 

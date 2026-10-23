@@ -516,7 +516,7 @@ unlimited/no-expiry behaviour, or size them to the rollout window and the number
 
 **Who notices.** Only a caller that read one of those six source names from the generic store. Their data was never meant to be there, and the typed routes (for example, the software inventory and app-usage reads) are unchanged.
 
-**Deploy order.** Upgrade servers before agents, and do not roll a server back below this release while agents that send `certificate_inventory` are running. A server older than this release stores such a blob in the generic store, where it is readable until a server at this release or later is running. The boot purge then removes it.
+**Deploy order.** Upgrade servers before agents. A server older than this release, or one rolled back below it, keeps storing typed-source blobs that arrive through a gateway in the generic store and serving them under `Infrastructure:Read` or `Inventory:Read`, until a server at this release or later runs. Its read filter then hides them and its boot purge removes them. This matters most once agents send `certificate_inventory`, which no agent does yet.
 
 **No action on upgrade.** There is no schema change, and the boot purge still removes any stray typed rows.
 
