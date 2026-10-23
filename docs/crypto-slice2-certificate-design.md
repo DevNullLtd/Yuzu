@@ -271,7 +271,7 @@ has been opened, so a parent that cannot be read is `unreadable`, not `absent`. 
   the owed items under [Phasing and PR order](#phasing-and-pr-order)). The design does not edit
   the ADR.
 - A root on, under or containing a network mount is not opened. This is the `runtimes` guard
-  (`agents/shared/network_fstype.hpp`), with the same disclosed residuals.
+  (`agents/shared/network_fstype.hpp`), with the residuals disclosed in Decisions item 11.
 - Slice 2 adds no delete. Any later certificate mutation inherits today's rule: a delete removes
   the directory entry, which for a symlinked bundle entry is the link, never its target
   (`certificates_linux_store.hpp:331-336`, `:431`).
@@ -1932,17 +1932,16 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
     than OD-2's MCP set-and-proceed); the export's own row stays set-and-proceed for the library
     half. The code is kept and this design follows it.
 
-11. **The Linux walk's residual** (raised by 2a-2e's governance and measured by its chaos runs,
-    for the owner to accept or reject). Every root, path hop and entry is classified against the
-    start-of-run mount snapshot, by an allowlist of local filesystem types (overlay only when all
-    its layers are local), and by `statx(AT_NO_AUTOMOUNT|AT_STATX_DONT_SYNC)` mount id before it
-    is opened; on unnamed dead autofs, FUSE and sshfs mount points that statx did not block. What
-    remains: on kernels before 5.8 or under a seccomp filter denying statx, the fallback
-    `fstatat`/`openat` can block on an unnamed dead FUSE or autofs root or hop; with an unreadable
-    mount table, boundaries at path hops are not refused; a mount stacked after the snapshot over a
-    mount point the snapshot names as local is opened (its type is checked only afterwards); and
-    the action deadline cannot interrupt a syscall already blocked in the kernel. 2a-2e does not
-    merge before the owner accepts this or asks for a worker that can be abandoned.
+11. **The Linux walk's residual** (raised by 2a-2e's governance and measured by its chaos runs;
+    an owner decision: accept it as disclosed, or require further closure). Source: `sync_cancel.hpp`
+    header (2a-2e), copied verbatim. 2a-2e does not merge before the owner decides.
+
+    WHAT REMAINS (disclosed residual, as measured):
+    (1) With the mount table read in full and statx available (Linux 5.8 or later, not blocked by seccomp), an unnamed dead autofs or FUSE mount as root, path hop or entry is refused without blocking, and a late overmount over a named local mount is refused.
+    (2) On the FALLBACK path (kernel before 5.8, or a seccomp profile denying statx) there is no mount id and the stat is fstatat: entries, hops and roots on a silent FUSE mount, named or unnamed, can block in fstatat; an autofs hop can block in openat although an autofs root is refused; and a late overmount (a FUSE or autofs mount stacked after the snapshot over a named local mount) blocks in fstatat or openat before any fstatfs check can run.
+    (3) When the mount table cannot be read in full (mountinfo_unreadable) hop and root boundaries cannot be told from ordinary local mounts and are not refused: a dead autofs root or hop blocks in openat, and a dead FUSE root, hop or entry blocks in openat (statx path) or fstatat (fallback).
+    (4) Mount ids are reused after an unmount and st_dev is not comparable with mountinfo (btrfs subvolumes report a different device), so a mount is accepted by id AND by an fstatfs check of the opened directory against the local allowlist: a swapped mount that reuses an allowlisted id is accepted only if it is itself an allowlisted local filesystem.
+    (5) The 60 s action deadline and cooperative cancellation cannot interrupt a syscall already blocked in the kernel.
 
 ## How this could ship wrong
 
