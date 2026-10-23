@@ -723,14 +723,17 @@ void RbacStore::seed_defaults() {
         std::string_view name;
         std::string_view desc;
     };
-    const std::array<RoleSeed, 7> roles = {
+    const std::array<RoleSeed, 8> roles = {
         RoleSeed{"Administrator", "Full access to all operations"},
         {"PlatformEngineer", "Author and manage YAML instruction definitions, sets, and schemas"},
         {"Operator", "Execute and manage instructions, schedules, and tags"},
         {"ApiTokenManager", "Create, revoke, and manage API tokens for programmatic access"},
         {"ITServiceOwner", "Admin control over devices tagged with the same IT Service"},
         {"Viewer", "Read-only access to operational data"},
-        {"Reviewer", "Read audit evidence and attest/flag access-review grants (SOC 2 CC6.2)"}};
+        {"Reviewer", "Read audit evidence and attest/flag access-review grants (SOC 2 CC6.2)"},
+        {"ForensicsAnalyst",
+         "Read forensic-tier response rows (Forensics:Read) plus the ordinary response, execution "
+         "and inventory reads needed to interpret them; read-only, cannot dispatch (#4990)"}};
     for (const auto& r : roles)
         exec("INSERT INTO rbac_store.roles (name, description, is_system, created_at) "
              "VALUES ($1, $2, TRUE, $3::bigint) ON CONFLICT (name) DO NOTHING",
@@ -1024,6 +1027,19 @@ void RbacStore::seed_defaults() {
     // Reviewer.
     grant("Reviewer", "AccessReview", "Read");
     grant("Reviewer", "AccessReview", "Attest");
+
+    // ForensicsAnalyst (#4990): the delegable read tier for Forensics-class response rows.
+    // EXACTLY four read pairs, no Execute and no write of any kind: collecting forensic data
+    // stays on its own approval-gated dispatch path, this role only READS what was collected.
+    // Seed-only by design: a new role row plus these four grants reach an existing database
+    // through this idempotent pass (no migrations() step), nothing is auto-assigned to any
+    // principal, and it is deliberately NOT added to ITServiceOwner or any other role. It is
+    // is_system, so the engine-principal dangerous-class gate refuses it structurally. With
+    // RBAC off the role does nothing (the legacy branch of require_permission is unedited).
+    grant("ForensicsAnalyst", "Forensics", "Read");
+    grant("ForensicsAnalyst", "Response", "Read");
+    grant("ForensicsAnalyst", "Execution", "Read");
+    grant("ForensicsAnalyst", "Inventory", "Read");
 }
 
 bool RbacStore::load_enabled_flag() {

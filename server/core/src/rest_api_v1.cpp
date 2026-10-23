@@ -14,7 +14,7 @@
 #include "bundle_service.hpp"      // validate_bundle_steps / aggregate_to_json
 #include "engine_principal_store.hpp" // PR 4.2: engine role-assignment authoring surface
 #include "rbac_admin_predicate.hpp" // A2: is_rbac_administrator / is_self_target — global human role assignment gate
-#include "rbac_assignable_roles.hpp" // A2: kRbacAssignableRoles / is_rbac_assignable_role — closed 6-role set
+#include "rbac_assignable_roles.hpp" // A2: kRbacAssignableRoles / is_rbac_assignable_role — closed 7-role set
 #include "app_perf_compare.hpp" // app_perf_param_valid — shared cap + control-char/NUL re-floor
 #include "app_perf_daily_store.hpp" // AppPerfDailyStore::kRetentionDays -- the VERIFY compare window clamp
 #include "dex_read_model.hpp" // #4035: shared REST+MCP model structs + serializers (device score, ...)
@@ -6836,7 +6836,7 @@ void RestApiV1::register_routes(
     // ── A2: global human role assignment/unassignment ───────────────────
     // (.claude/plans/rbac-industry-leading-DELIVERY-PLAN.md §2 "A2 — Global
     // human role assignment/unassignment"). Lets an Administrator grant/
-    // revoke one of the 6 fleet-wide-assignable built-in RBAC roles to a human (principal_type=
+    // revoke one of the 7 fleet-wide-assignable built-in RBAC roles to a human (principal_type=
     // "user") principal, fleet-wide, through RbacStore::assign_role/
     // unassign_role — before this PR those methods had ZERO production
     // callers for a human principal anywhere in the codebase.

@@ -18,7 +18,7 @@
 /// existed, the route/tool handlers rejected ONLY `ITServiceOwner` and a
 /// genuinely-unknown role name — any OTHER existing role, including an
 /// `is_system=false` CUSTOM role, was silently accepted, contradicting the
-/// shipped docs' own claim of a closed 6-role set
+/// shipped docs' own claim of a closed 7-role set
 /// (`docs/user-manual/rbac.md` "Fleet-Wide Role Assignment"). `RbacStore::
 /// create_role` has zero production route callers today (a custom role can
 /// only exist via direct SQL against a live database), so this was not a
@@ -26,11 +26,18 @@
 /// promise, not merely happen to agree with it while nothing exercises the
 /// gap.
 ///
-/// THE RULE: a role name is assignable through A2 iff it is one of these six
-/// literals — EXACTLY the 7 seeded roles (`rbac_store.cpp`'s
+/// THE RULE: a role name is assignable through A2 iff it is one of these seven
+/// literals — EXACTLY the 8 seeded roles (`rbac_store.cpp`'s
 /// `seed_defaults()`) minus `ITServiceOwner`. Not "any existing role in the
 /// store", not "any `is_system` role" — a closed, hand-maintained list, so a
-/// future 8th seeded role does NOT become assignable here by default.
+/// future 9th seeded role does NOT become assignable here by default.
+///
+/// `ForensicsAnalyst` (#4990) is the read-only delegable tier for Forensics-class
+/// response rows (Forensics:Read, Response:Read, Execution:Read, Inventory:Read; no
+/// Execute, no write). It is fleet-wide assignable ONLY: management-group scoped
+/// assignment is deliberately not offered (the scoped route's own allow-list stays
+/// Operator/Viewer), and being `is_system` it is structurally refused for engine
+/// principals by `RbacStore::assign_role`.
 ///
 /// EXTEND this, never fork it — REST route validation
 /// (`rest_api_v1.cpp`) and `assign_rbac_role`'s MCP tool `role` input schema
@@ -53,9 +60,10 @@ namespace yuzu::server {
 
 inline constexpr std::string_view kRbacAssignableRoles[] = {
     "Administrator", "PlatformEngineer", "Operator", "ApiTokenManager", "Viewer", "Reviewer",
+    "ForensicsAnalyst",
 };
 
-/// True iff `role_name` is one of the six names above.
+/// True iff `role_name` is one of the seven names above.
 [[nodiscard]] inline bool is_rbac_assignable_role(std::string_view role_name) noexcept {
     for (auto r : kRbacAssignableRoles)
         if (r == role_name)
@@ -86,7 +94,7 @@ inline constexpr std::string_view kRbacAssignableRoles[] = {
                                                              std::string_view role_name_for_audit) {
     if (role_name == "ITServiceOwner")
         return "ITServiceOwner: requires group-scoped confinement, not supported fleet-wide";
-    return std::string(role_name_for_audit) + ": not one of the 6 fleet-wide-assignable roles";
+    return std::string(role_name_for_audit) + ": not one of the 7 fleet-wide-assignable roles";
 }
 
 } // namespace yuzu::server
