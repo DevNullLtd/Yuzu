@@ -39,17 +39,18 @@ _hspec.loader.exec_module(hook)
 PLANT = "import pathlib; pathlib.Path(__file__).with_name('EXECUTED').write_text('x')\n"
 
 
-_DIAG_TRACE = os.path.join(tempfile.gettempdir(), "yuzu_test_dd_trace_%d.json" % os.getpid())  # TEMPORARY DIAGNOSTIC
-
-
 def hermetic_env(**extra):
     """The environment for every git / hook subprocess here: no inherited GIT_*
     (a git-hook context sets GIT_DIR / GIT_INDEX_FILE), and no global or
     system config, so a developer's commit.gpgsign or core.hooksPath cannot
     break or leak into a test commit."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", **extra)
-    env["GIT_TRACE2_EVENT"] = _DIAG_TRACE  # TEMPORARY DIAGNOSTIC (PR #6377)
+    # No automatic maintenance: a commit in a repo above git's loose-object threshold (the fixture
+    # sits within a few objects of it) starts a detached `git repack`, which writes into .git while
+    # tearDown deletes it ("Directory not empty: .git", seen on a runner with git 2.55).
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_COUNT="2",
+               GIT_CONFIG_KEY_0="gc.auto", GIT_CONFIG_VALUE_0="0",
+               GIT_CONFIG_KEY_1="maintenance.auto", GIT_CONFIG_VALUE_1="false", **extra)
     return env
 
 
@@ -358,44 +359,7 @@ class SyntheticRepo(unittest.TestCase):
         git(self.repo, "update-ref", "refs/remotes/origin/dev", "HEAD")
 
     def tearDown(self):
-        # TEMPORARY DIAGNOSTIC (PR #6377): CI reported "Directory not empty: .git" from this cleanup.
-        # On that failure, say what is still in .git and which git processes are alive, then re-raise.
-        try:
-            self._tmp.cleanup()
-        except OSError as exc:
-            lines = [f"TEARDOWN-DIAG {self.id()}: {exc!r}"]
-            for cmd in (["git", "--version"],
-                        ["ps", "-eo", "pid,ppid,lstart,args", "--sort=start_time"],
-                        ["find", str(self.repo / ".git"), "-ls"],
-                        ["git", "config", "--show-origin", "--list"]):
-                try:
-                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=20,
-                                       cwd=ROOT, env=hermetic_env())
-                    out = r.stdout
-                    if cmd[0] == "ps":
-                        out = "\n".join(ln[:200] for ln in out.splitlines()
-                                         if " git " in ln or "/git" in ln or "yuzu_test_" in ln)
-                    lines.append(f"--- {' '.join(cmd)} (rc={r.returncode})\n{out.rstrip()}{r.stderr.rstrip()}")
-                except Exception as e2:  # diagnostics only
-                    lines.append(f"--- {' '.join(cmd)} failed: {e2!r}")
-            try:  # git's own trace: which command ran which, with start times
-                ev = []
-                with open(_DIAG_TRACE, encoding="utf-8", errors="replace") as fh:
-                    for ln in fh:
-                        try:
-                            j = json.loads(ln)
-                        except ValueError:
-                            continue
-                        if j.get("event") in ("start", "cmd_name", "child_start", "exit"):
-                            what = j.get("argv") or j.get("name") or j.get("hierarchy") or j.get("code")
-                            ev.append(f"{j.get('time','')[11:26]} sid={j.get('sid','')[-24:]} {j['event']} {str(what)[:140]}")
-                sus = [e for e in ev if re.search(r"maintenance|gc|repack|update-server-info|pack-objects|prune|commit-graph", e)]
-                lines.append("--- git trace2: %d events, %d maintenance-like (first 60)\n%s" % (len(ev), len(sus), "\n".join(sus[:60])))
-                lines.append("--- git trace2 (last 80 events)\n%s" % "\n".join(ev[-80:]))
-            except Exception as e3:
-                lines.append(f"--- trace unreadable: {e3!r}")
-            print("\n".join(lines), file=sys.stderr, flush=True)
-            raise
+        self._tmp.cleanup()
 
     def commit(self, msg="c"):
         git(self.repo, "add", "-A")
