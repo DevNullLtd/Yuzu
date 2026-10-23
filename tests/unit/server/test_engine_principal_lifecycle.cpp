@@ -814,6 +814,109 @@ TEST_CASE("Engine-principal REST: rotate reads overlap_secs strictly and rejects
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Degraded token-store reads on the credential mint and rotate routes.
+//
+// The degraded read is produced by holding every lease of the shared token
+// pool, so the store's bounded read gives up (a pool-lease timeout) while every
+// other store keeps working. No schema is touched, so the shared clone stays
+// clean. Each held-pool read waits one read timeout (1.5 s).
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+using TokenPoolLease = decltype(yuzu::test::detail::api_token_shared_bundle().pool->acquire());
+
+/// Takes every lease of the shared token pool; they return on destruction.
+std::vector<TokenPoolLease> hold_all_token_pool_leases() {
+    auto& pool = *yuzu::test::detail::api_token_shared_bundle().pool;
+    std::vector<TokenPoolLease> held;
+    for (std::size_t i = 0; i < pool.size(); ++i) {
+        held.push_back(pool.acquire());
+        REQUIRE(held.back());
+    }
+    return held;
+}
+} // namespace
+
+TEST_CASE("Engine-principal REST: mint fails closed with 503 when the active-credential guard "
+          "cannot read and a retry after recovery mints exactly one credential",
+          "[pg][rest][engine_principal][mint][degraded]") {
+    RestEngineHarness h;
+    auto cres = h.create("mint-degraded");
+    REQUIRE(cres);
+    REQUIRE(cres->status == 201);
+    auto pid = nlohmann::json::parse(cres->body)["data"]["principal_id"].get<std::string>();
+
+    {
+        auto held = hold_all_token_pool_leases();
+        auto res = h.mint(pid);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Retry-After") == "2");
+        CHECK(res->body.find("\"token\"") == std::string::npos);
+        REQUIRE(!h.audit_log.empty());
+        CHECK(h.audit_log.back().action == "engine_principal.credential.mint");
+        CHECK(h.audit_log.back().result == "failure");
+    }
+
+    // Nothing was minted while the read could not answer ...
+    CHECK(h.token_store->list_active_for_principal(pid).empty());
+    // ... and the retry now succeeds, creating the one credential.
+    auto retry = h.mint(pid);
+    REQUIRE(retry);
+    CHECK(retry->status == 201);
+    CHECK(h.token_store->list_active_for_principal(pid).size() == 1);
+    // A further mint is the ordinary 409, not a second secret.
+    auto again = h.mint(pid);
+    REQUIRE(again);
+    CHECK(again->status == 409);
+}
+
+TEST_CASE("Engine-principal REST: rotate withholds the secret with 503 and a partial audit when "
+          "the successor read-back cannot answer and a retry re-serves the same secret",
+          "[pg][rest][engine_principal][rotation][degraded]") {
+    RestEngineHarness h;
+    auto [pid, raw1] = h.create_and_mint("rotate-degraded");
+    (void)raw1;
+
+    std::vector<TokenPoolLease> held;
+    // Fires after the rotate commits and before the store caches the secret,
+    // so the successor exists when the route's own read-back runs dry.
+    h.token_store->test_hook_before_store_rotation_raw_ = [&held] {
+        held = hold_all_token_pool_leases();
+    };
+    auto res = h.rotate(pid);
+    h.token_store->test_hook_before_store_rotation_raw_ = nullptr;
+    held.clear();
+
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK(res->body.find("\"token\"") == std::string::npos);
+
+    // The audit row matches the database: a successor exists, so the outcome
+    // is partial and no reveal was recorded.
+    REQUIRE(!h.audit_log.empty());
+    CHECK(h.audit_log.back().action == "engine_principal.credential.rotate");
+    CHECK(h.audit_log.back().result == "partial");
+    for (const auto& row : h.audit_log)
+        CHECK(row.action != "engine_principal.credential.reveal");
+    CHECK(h.token_store->list_active_for_principal(pid).size() == 2);
+
+    // The same operator's retry inside the grace window re-serves the same
+    // successor with a usable token_id, and records its own reveal. This rests on
+    // the store caching the secret even though its own pending check could not
+    // read: that check fails open by contract (successor_rotation_still_pending).
+    auto retry = h.rotate(pid);
+    REQUIRE(retry);
+    REQUIRE(retry->status == 200);
+    auto data = nlohmann::json::parse(retry->body)["data"];
+    CHECK(!data["token"].get<std::string>().empty());
+    CHECK(!data["token_id"].get<std::string>().empty());
+    CHECK(h.audit_log.back().action == "engine_principal.credential.reveal");
+    CHECK(h.audit_log.back().result == "success");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // No-admin auditor query (§4.2).
 // ═══════════════════════════════════════════════════════════════════════════
 

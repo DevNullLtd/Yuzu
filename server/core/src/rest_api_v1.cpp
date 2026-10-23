@@ -1060,10 +1060,10 @@ const std::string& openapi_spec() {
       "delete": {"summary": "Revoke an engine principal (terminal) and its active credentials", "tags": ["Security"], "description": "Cross-store ordering invariant: credentials are revoked FIRST (ApiTokenStore::revoke_for_principal), the identity SECOND — never the reverse.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"superseded_by": {"type": "string"}}}}}}, "responses": {"200": {"description": "Revoked (idempotent — success even if already revoked); {revoked, credentials_revoked}"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No engine principal with that id"}, "503": {"description": "Engine-principal or credential store unavailable"}}}
     },
     "/engine-principals/{id}/credentials": {
-      "post": {"summary": "Mint the first credential for an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"ttl_days": {"type": "integer", "minimum": 1, "maximum": 90, "default": 90}}}}}}, "responses": {"201": {"description": "Minted; {token, token_id, expires_at} — token is the raw secret, shown once (Cache-Control: no-store)"}, "400": {"description": "ttl_days present but of the wrong type (string, float, boolean, null) or out of range (1-90), or a non-empty body that is not a JSON object (malformed, array, string, number, null); nothing is minted. An empty or whitespace-only body still mints the 90-day default"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No engine principal with that id"}, "409": {"description": "Engine principal is not active, or an active credential already exists — rotate instead of minting a second one"}, "503": {"description": "Store unavailable, or CSPRNG failure"}}}
+      "post": {"summary": "Mint the first credential for an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"ttl_days": {"type": "integer", "minimum": 1, "maximum": 90, "default": 90}}}}}}, "responses": {"201": {"description": "Minted; {token, token_id, expires_at} — token is the raw secret, shown once (Cache-Control: no-store)"}, "400": {"description": "ttl_days present but of the wrong type (string, float, boolean, null) or out of range (1-90), or a non-empty body that is not a JSON object (malformed, array, string, number, null); nothing is minted. An empty or whitespace-only body still mints the 90-day default"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No engine principal with that id"}, "409": {"description": "Engine principal is not active, or an active credential already exists — rotate instead of minting a second one"}, "503": {"description": "Store unavailable, CSPRNG failure, or the check for an existing active credential could not read the store (nothing is minted; Retry-After: 2)"}}}
     },
     "/engine-principals/{id}/credentials/rotate": {
-      "post": {"summary": "Overlap-pair rotation of an engine principal's credential (design §7)", "tags": ["Security"], "description": "Mints a successor credential alongside the still-valid predecessor for the overlap window. A retry within the grace window by the SAME operator re-serves the identical raw secret (idempotent); step-up is re-validated on every call, including a re-serve.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days. A non-empty body must be a JSON object and overlap_secs a JSON integer (400 otherwise)"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs outside the 24h-10y bounds, or more than 2 active credentials in an unrecognized shape"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, or no active credential to rotate (ambiguous with a transient store read failure — retry, or mint if genuinely absent)"}}}
+      "post": {"summary": "Overlap-pair rotation of an engine principal's credential (design §7)", "tags": ["Security"], "description": "Mints a successor credential alongside the still-valid predecessor for the overlap window. A retry within the grace window by the SAME operator re-serves the identical raw secret (idempotent); step-up is re-validated on every call, including a re-serve.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days. A non-empty body must be a JSON object and overlap_secs a JSON integer (400 otherwise)"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs outside the 24h-10y bounds, or more than 2 active credentials in an unrecognized shape"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, or no active credential to rotate (ambiguous with a transient store read failure — retry, or mint if genuinely absent). Also returned, with Retry-After: 2 and the secret withheld, when the rotation committed but the successor could not be read back; the same operator repeating the call within the grace window gets the same secret"}}}
     },
     "/engine-principals/{id}/credentials/confirm": {
       "post": {"summary": "Confirm receipt of a rotated credential's successor secret (design §7 maker-checker)", "tags": ["Security"], "description": "Pass the successor token_id the rotate response returned (pins the confirm to that exact rotation; a stale or mismatched id is rejected with no state change) AND the raw successor secret (proof of possession, #3015). Confirm revokes the predecessor only after the presented secret verifies against the stored hash.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["token_id", "secret"], "properties": {"token_id": {"type": "string", "pattern": "^[0-9a-f]{24}$", "minLength": 24, "maxLength": 24, "description": "Successor token_id returned by the rotate call (24 lowercase hex) — pins the exact rotation being confirmed"}, "secret": {"type": "string", "minLength": 1, "maxLength": 512, "description": "The raw successor secret the rotate call returned — proof of possession (#3015), verified constant-time against the stored hash; checked only after every other admission gate. Missing/empty is 400; wrong is 403"}}}}}}, "responses": {"200": {"description": "Confirmed; predecessor credential revoked"}, "400": {"description": "token_id or secret missing, empty, or not a string; more than two active credentials; or a non-engine active credential"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write, or the presented secret does not verify against the pending successor (#3015)"}, "409": {"description": "Replay or resolved-rotation conflict (do not blindly retry): token_id does not match the pending successor; the rotation was already confirmed or otherwise resolved by cutover/sweep/revoke; the sole active credential has unresolved rotation metadata; the grace window elapsed; or the rotation was initiated by a different operator"}, "503": {"description": "Retryable: store unavailable, advisory-lock contention, a confirm/revoke/clear persistence failure, or no in-flight rotation to confirm - the last covers zero active credentials (ambiguous with a transient read failure) and an unrecognized two-credential pair; rotate first if genuinely absent"}}}
@@ -5434,7 +5434,25 @@ void RestApiV1::register_routes(
             // rejects a >2-active shape it doesn't recognize). Reject BEFORE
             // create_token so a retry surfaces a clear, actionable 409 instead
             // of a second live credential.
-            if (!token_store->list_active_for_principal(principal_id).empty()) {
+            //
+            // The guard reads through the CHECKED twin: the plain accessor
+            // collapses a pool-lease timeout or query failure into an empty
+            // vector, which would read here as "no credential yet" and let a
+            // retry mint the second live secret this guard exists to prevent.
+            // A read that cannot answer fails closed (503), minting nothing.
+            auto active_before = token_store->list_active_for_principal_checked(principal_id);
+            if (!active_before) {
+                res.status = 503;
+                res.set_header("Retry-After", "2");
+                res.set_content(detail::a4_error(res, "could not confirm the principal has no "
+                                                      "active credential; retry"),
+                                "application/json");
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.credential.mint", "failure",
+                    "EnginePrincipal", principal_id, active_before.error());
+                return;
+            }
+            if (!active_before->empty()) {
                 res.status = 409;
                 res.set_content(
                     detail::a4_error(res, "engine principal already has an active credential; "
@@ -5599,6 +5617,60 @@ void RestApiV1::register_routes(
                     "EnginePrincipal", principal_id, result.error());
                 return;
             }
+            // rotate_engine_credential returns only the raw secret; look up
+            // the successor for its token_id + expires_at/overlap_expires_at
+            // — mirrors the MCP rotate_engine_credential twin's correlation
+            // logic (mcp_server.cpp) so a pure-REST caller can correlate the
+            // credential it just minted without a follow-up GET. Selected
+            // STRUCTURALLY (the row whose supersedes_token_id links back to
+            // the predecessor), NOT by newest created_at — created_at is
+            // second-resolution, so a same-second mint→rotate ties and the
+            // newest-scan could return the predecessor's id, which would
+            // break the #2384 confirm token_id pin.
+            //
+            // The read is the CHECKED twin, taken BEFORE the reveal audit.
+            // rotate_engine_credential above has already committed, so a
+            // successor and its live secret exist; if this read cannot answer
+            // (the plain accessor would return empty and this route would hand
+            // out the secret with token_id '' that confirm can never pin), fail
+            // CLOSED exactly like the human rotate route: 503, secret withheld,
+            // audit 'partial' (never 'failure', since a credential does exist) and
+            // no reveal row, since no secret left the server. The secret is not
+            // lost: the store cached it for the grace window (kRotationGraceSecs,
+            // 120 s), so the same operator's retry inside it re-serves the same
+            // successor (that retry gets its own reveal audit and its own
+            // step-up). After the window a retry is a 409 and the pair is
+            // resolved by revoke, as for a dropped reveal audit.
+            std::string successor_token_id;
+            int64_t successor_expires_at = 0;
+            int64_t successor_overlap_expires_at = 0;
+            auto active_after = token_store->list_active_for_principal_checked(principal_id);
+            if (!active_after) {
+                res.status = 503;
+                res.set_header("Retry-After", "2");
+                res.set_content(
+                    detail::a4_error(res, "rotation succeeded but the successor could not be "
+                                          "read back; the secret was withheld. Rotate again "
+                                          "within about two minutes to re-serve it"),
+                    "application/json");
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.credential.rotate", "partial",
+                    "EnginePrincipal", principal_id,
+                    "successor minted but its secret could not be read back for delivery: " +
+                        active_after.error());
+                return;
+            }
+            for (const auto& t : *active_after) {
+                // At most one active row links (the store clears
+                // supersedes_token_id at cutover, revoke-resolution, and
+                // sweep), so first match is THE successor.
+                if (!t.supersedes_token_id.empty()) {
+                    successor_token_id = t.token_id;
+                    successor_expires_at = t.expires_at;
+                    successor_overlap_expires_at = t.overlap_expires_at;
+                    break;
+                }
+            }
             // #2466/#2406: fail closed — the reveal IS this route's success audit
             // (see the comment above the route registration), so a dropped
             // reveal-audit would let the raw secret leave the server with no
@@ -5617,30 +5689,6 @@ void RestApiV1::register_routes(
                                           "successor secret"),
                     "application/json");
                 return;
-            }
-            // rotate_engine_credential returns only the raw secret; look up
-            // the successor for its token_id + expires_at/overlap_expires_at
-            // — mirrors the MCP rotate_engine_credential twin's correlation
-            // logic (mcp_server.cpp) so a pure-REST caller can correlate the
-            // credential it just minted without a follow-up GET. Selected
-            // STRUCTURALLY (the row whose supersedes_token_id links back to
-            // the predecessor), NOT by newest created_at — created_at is
-            // second-resolution, so a same-second mint→rotate ties and the
-            // newest-scan could return the predecessor's id, which would
-            // break the #2384 confirm token_id pin.
-            std::string successor_token_id;
-            int64_t successor_expires_at = 0;
-            int64_t successor_overlap_expires_at = 0;
-            for (const auto& t : token_store->list_active_for_principal(principal_id)) {
-                // At most one active row links (the store clears
-                // supersedes_token_id at cutover, revoke-resolution, and
-                // sweep), so first match is THE successor.
-                if (!t.supersedes_token_id.empty()) {
-                    successor_token_id = t.token_id;
-                    successor_expires_at = t.expires_at;
-                    successor_overlap_expires_at = t.overlap_expires_at;
-                    break;
-                }
             }
             // G5 (secret hygiene) — same no-store contract as the mint route.
             res.set_header("Cache-Control", "no-store, no-cache, must-revalidate");

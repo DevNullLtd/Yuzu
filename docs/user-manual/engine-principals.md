@@ -80,7 +80,12 @@ curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce
 
 The response carries the raw secret **exactly once**, under
 `Cache-Control: no-store` — copy it immediately into the consuming module's
-secret store. It cannot be retrieved again; only rotated or revoked.
+secret store. It cannot be retrieved again; only rotated or revoked. If the
+server cannot read the token store to check that the principal has no
+credential yet, it answers `503` with `Retry-After: 2` and mints nothing, so
+retrying after that `503` is safe. Mint does not take a lock between the check
+and the insert, so two mint requests in flight at the same moment can both pass
+the check. Send them one at a time.
 
 ### 3. Rotate the credential (overlap-pair model)
 
@@ -104,6 +109,12 @@ curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce
   or minting a second successor — safe to retry a dropped response. Every
   successful return, original or replay, is independently audited under
   `engine_principal.credential.reveal`.
+- If the rotation commits but the server then cannot read the new credential
+  back to build the response, it answers `503` with `Retry-After: 2` and
+  **withholds the secret**; the audit row is
+  `engine_principal.credential.rotate` with `result=partial`, with no reveal
+  row. Retry inside the same ~120-second grace window to receive the same
+  successor secret.
 - If the consuming module updates the secret and you never call `confirm`
   (next step), a **60-second background sweep** enforces predecessor
   auto-revoke on your behalf, with this SLA: **a predecessor is revoked
