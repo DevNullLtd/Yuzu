@@ -1584,6 +1584,50 @@ TEST_CASE("executions drawer: the Response:Read probe is the quiet one and a sco
     }
 }
 
+TEST_CASE("executions page detail: a degraded read leaves no response.forensics.read row for rows it did "
+          "not render",
+          "[pg][workflow][executions][detail][page][audit][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-T", "T def");
+    const auto eid = h.make_exec("def-T", "completed", 1, 1, 0);
+    h.agent_status(eid, "agent-A", "success");
+    // The primary (execution-id) read finds only a row whose plugin makes the read fail; the
+    // fallback (instruction-id) read then succeeds and returns legacy rows with no execution id,
+    // one of them Forensics-tier. A degraded read renders the degraded notice, not those rows.
+    h.store_response("def-other", "agent-B", "TOKEN-BOOM", eid, 1735689610, "boom_b5");
+    h.store_response("def-T", "agent-A", "TOKEN-FORENSICS-LEGACY", "", 1735689611,
+                     yuzu::server::test::kForensicsPlugin);
+    h.store_response("def-T", "agent-A", "TOKEN-ORDINARY-LEGACY", "", 1735689612,
+                     yuzu::server::test::kOrdinaryPlugin);
+    h.forensics.admin();
+
+    exec_sql(db.dsn(), "ALTER TABLE response_store.responses RENAME TO responses_real_b5");
+    exec_sql(db.dsn(),
+             "CREATE FUNCTION response_store.boom_b5(p text) RETURNS boolean LANGUAGE plpgsql "
+             "COST 100000 AS $$ BEGIN IF p = 'boom_b5' THEN RAISE EXCEPTION 'injected'; END IF; "
+             "RETURN true; END $$");
+    exec_sql(db.dsn(),
+             "CREATE VIEW response_store.responses AS SELECT * FROM "
+             "response_store.responses_real_b5 WHERE response_store.boom_b5(plugin)");
+    h.audit_calls.clear();
+    auto page = h.sink.Get("/fragments/executions/" + eid + "/detail?view=page");
+    exec_sql(db.dsn(), "DROP VIEW response_store.responses");
+    exec_sql(db.dsn(), "DROP FUNCTION response_store.boom_b5(text)");
+    exec_sql(db.dsn(), "ALTER TABLE response_store.responses_real_b5 RENAME TO responses");
+
+    REQUIRE(page);
+    REQUIRE(page->status == 200);
+    // The degraded notice is what rendered (the fault really happened) and no row text did.
+    CHECK(has(page->body, "Responses unavailable."));
+    CHECK_FALSE(has(page->body, "TOKEN-FORENSICS-LEGACY"));
+    CHECK_FALSE(has(page->body, "TOKEN-ORDINARY-LEGACY"));
+    // So nothing was served from the Forensics tier, and nothing is audited as such.
+    for (const auto& a : h.audit_calls)
+        CHECK(a.action != "response.forensics.read");
+}
+
 TEST_CASE("executions drawer: the confined-projection redaction is unchanged by the tier and the "
           "probe",
           "[pg][workflow][executions][detail][drawer][confinement][forensics]") {

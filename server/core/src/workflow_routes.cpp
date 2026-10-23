@@ -125,7 +125,10 @@ PageResponses collect_page_responses(ResponseStore* store, ResponseAccess access
             continue;
         ++out.total;
         if (out.rows.size() < operate_pages::kDeviceResponsesCap) {
-            out.forensics.note(r.plugin, forensics_plugins);
+            // A degraded read renders the degraded notice, never these rows, so they are not
+            // "served" and must not be counted for the response.forensics.read row.
+            if (!degraded)
+                out.forensics.note(r.plugin, forensics_plugins);
             out.rows.push_back({std::move(r.agent_id), std::move(r.output),
                                 std::move(r.error_detail), static_cast<int>(r.status), r.timestamp,
                                 r.received_at_ms});
