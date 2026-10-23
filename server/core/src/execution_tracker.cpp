@@ -2,11 +2,13 @@
 
 #include "command_delivery_finalization_owner.hpp" // #4982 round 5: ADR-0012 §3 shared cross-schema predicate
 #include "execution_event_bus.hpp"
+#include "forensics_error_detail.hpp"
 #include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "response_tier_filter.hpp" // ForensicsPluginSet
 #include "secure_random.hpp"
 
 #include <yuzu/audit_retention_rules.hpp>
@@ -22,6 +24,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <random>
+#include <string_view>
+#include <unordered_set>
 
 namespace yuzu::server {
 
@@ -173,6 +177,64 @@ const char* kSelectErrorDetailExpr =
 // Empty-string placeholder so `row_to_exec` can read column 14
 // unconditionally without branching on which column list was used.
 const char* kSelectErrorDetailEmpty = ", '' AS last_error_detail";
+
+// #4990: the executions, among `ids`, that ran at least one command of a Forensics-tier plugin.
+// The plugin is the command-id prefix recorded in `command_execution` (the same first-`-` split
+// the ingest stores in `responses.plugin`), folded to ASCII lowercase in SQL with COLLATE "C" so it
+// agrees with `ForensicsPluginSet`. A failed read returns nullopt; the caller then treats EVERY
+// candidate as Forensics (the safe reading: a bounded token or the placeholder is shown instead of
+// free text). `command_execution` has no `execution_id` index (a plain CREATE INDEX on an existing
+// table is barred by the store playbook), so this is a scan of at most 24h of mappings; it runs
+// only when a result actually carries a non-empty error text.
+std::optional<std::unordered_set<std::string>>
+forensics_executions_among(PGconn* conn, const ForensicsPluginSet& set,
+                           const std::vector<std::string>& ids) {
+    std::vector<std::string_view> idv(ids.begin(), ids.end());
+    std::vector<std::string_view> names(set.names().begin(), set.names().end());
+    pg::PgResult res = pg::exec_params(
+        conn,
+        "SELECT DISTINCT execution_id FROM execution_tracker.command_execution "
+        "WHERE execution_id = ANY($1::text[]) "
+        "AND lower(split_part(command_id, '-', 1) COLLATE \"C\") = ANY($2::text[])",
+        std::vector<std::string>{pg::to_text_array(idv), pg::to_text_array(names)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::nullopt;
+    std::unordered_set<std::string> out;
+    for (int i = 0; i < PQntuples(res.get()); ++i)
+        out.insert(col_str(res.get(), i, 0));
+    return out;
+}
+
+// Reduce the error text of every Forensics-tier execution among the given (execution id, text)
+// slots. `set == nullptr` (unwired harness) leaves the texts as stored.
+void scrub_error_texts(PGconn* conn, const ForensicsPluginSet* set,
+                       std::vector<std::pair<std::string, std::string*>> slots) {
+    if (!set)
+        return;
+    std::erase_if(slots, [](const auto& s) { return s.second->empty(); });
+    if (slots.empty())
+        return;
+    std::vector<std::string> ids;
+    ids.reserve(slots.size());
+    for (const auto& s : slots)
+        ids.push_back(s.first);
+    std::ranges::sort(ids);
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    const auto forensics = forensics_executions_among(conn, *set, ids);
+    if (!forensics)
+        spdlog::warn("ExecutionTracker: Forensics execution lookup failed; error text withheld "
+                     "for {} execution(s) (#4990)", ids.size());
+    for (auto& [exec_id, text] : slots)
+        if (!forensics || forensics->contains(exec_id))
+            *text = sanitize_forensics_error_detail(*text);
+}
+
+void scrub_executions(PGconn* conn, const ForensicsPluginSet* set, std::vector<Execution>& execs) {
+    std::vector<std::pair<std::string, std::string*>> slots;
+    for (auto& e : execs)
+        slots.emplace_back(e.id, &e.last_error_detail);
+    scrub_error_texts(conn, set, std::move(slots));
+}
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets search_path to the store schema for
@@ -704,6 +766,7 @@ ExecutionTracker::query_executions_checked(const ExecutionQuery& q,
     results.reserve(static_cast<std::size_t>(rows));
     for (int i = 0; i < rows; ++i)
         results.push_back(row_to_exec(res.get(), i));
+    scrub_executions(lease.get(), forensics_plugins_, results); // #4990
     return results;
 }
 
@@ -759,7 +822,10 @@ ExecutionTracker::get_execution_checked(const std::string& id) const {
     }
     if (PQntuples(res.get()) == 0)
         return std::optional<Execution>{std::nullopt};
-    return std::optional<Execution>{row_to_exec(res.get(), 0)};
+    std::vector<Execution> one;
+    one.push_back(row_to_exec(res.get(), 0));
+    scrub_executions(lease.get(), forensics_plugins_, one); // #4990
+    return std::optional<Execution>{std::move(one.front())};
 }
 
 ExecutionSummary ExecutionTracker::get_summary(const std::string& id) const {
@@ -829,6 +895,12 @@ ExecutionTracker::get_agent_statuses_checked(
         a.error_detail = col_str(res.get(), i, 6);
         a.plugin_result_status = to_i(col(res.get(), i, 7));
         results.push_back(std::move(a));
+    }
+    { // #4990
+        std::vector<std::pair<std::string, std::string*>> slots;
+        for (auto& a : results)
+            slots.emplace_back(execution_id, &a.error_detail);
+        scrub_error_texts(lease.get(), forensics_plugins_, std::move(slots));
     }
     return results;
 }
@@ -901,6 +973,13 @@ ExecutionTracker::get_agent_statuses_for_executions_checked(
         a.plugin_result_status = to_i(col(res.get(), i, 8));
         by_execution[col_str(res.get(), i, 0)].push_back(std::move(a));
     }
+    { // #4990
+        std::vector<std::pair<std::string, std::string*>> slots;
+        for (auto& [exec_id, list] : by_execution)
+            for (auto& a : list)
+                slots.emplace_back(exec_id, &a.error_detail);
+        scrub_error_texts(lease.get(), forensics_plugins_, std::move(slots));
+    }
     return by_execution;
 }
 
@@ -965,6 +1044,7 @@ ExecutionTracker::get_children_checked(const std::string& parent_id,
         result.children.reserve(static_cast<std::size_t>(take));
         for (int i = 0; i < take; ++i)
             result.children.push_back(row_to_exec(res.get(), i));
+        scrub_executions(c, forensics_plugins_, result.children); // #4990
         out = std::move(result);
         return true;
     });

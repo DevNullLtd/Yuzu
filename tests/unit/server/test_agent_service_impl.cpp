@@ -47,6 +47,7 @@
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
 #include "test_auth_db_pg_helper.hpp" // WS-6 6.2: enrollment state is PG-backed
+#include "test_forensics_tier_fixture.hpp" // #4990: the catalogue-derived Forensics plugin set
 #include "test_offload_target_store_pg_helper.hpp"
 #include "test_tracker_scope.hpp"
 #include "test_webhook_store_pg_helper.hpp"
@@ -183,6 +184,9 @@ struct GatewayResponseHarness {
         REQUIRE(audit->is_open());
         svc.set_response_store(&responses);
         svc.set_audit_store(audit.get());
+        // #4990: unwired fails closed (error_detail is sanitised for every plugin), so the
+        // ordinary-plugin cases below need the set wired like production.
+        svc.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
     }
 
     static apb::CommandResponse make_response(const std::string& command_id,

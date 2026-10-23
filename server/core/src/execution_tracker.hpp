@@ -44,6 +44,7 @@ class MetricsRegistry;
 namespace yuzu::server {
 
 class ExecutionEventBus;
+class ForensicsPluginSet; // #4990 (response_tier_filter.hpp)
 
 struct Execution {
     std::string id;
@@ -317,6 +318,16 @@ public:
     /// owned by the server; the tracker only borrows it. nullptr disables
     /// publishing — used by harnesses that don't exercise SSE.
     void set_event_bus(ExecutionEventBus* bus) { event_bus_ = bus; }
+
+    /// #4990: the Forensics plugin set. When wired, every read of a per-agent `error_detail` (and
+    /// of an execution's `last_error_detail`) for an execution that ran a Forensics-tier plugin
+    /// command is reduced to a bounded failure token (`forensics_error_detail.hpp`), so rows
+    /// written before the write-side sanitiser existed are covered too. The plugin is resolved
+    /// from the `command_execution` correlation (command id prefix), so an execution whose
+    /// mapping has aged out (24h) or was never recorded is not recognised. Borrowed; set before
+    /// the listener starts. Unset = reads are returned as stored (a test harness; production boot
+    /// refuses without the set and the write side fails closed).
+    void set_forensics_plugin_set(const ForensicsPluginSet* plugins) { forensics_plugins_ = plugins; }
 
     /// ADR-1007 — optional observability sink for the per-device
     /// concurrency-claim path (skip counts, force-releases). nullptr (the
@@ -1019,6 +1030,7 @@ private:
     bool poll_initialized_{false};
     /// Borrowed — owned by the server. nullptr = no SSE publishing.
     ExecutionEventBus* event_bus_{nullptr};
+    const ForensicsPluginSet* forensics_plugins_{nullptr}; // #4990, borrowed
     /// Borrowed — owned by the server. nullptr = no metrics (ADR-1007).
     yuzu::MetricsRegistry* metrics_{nullptr};
 };

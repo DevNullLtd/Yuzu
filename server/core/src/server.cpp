@@ -6472,6 +6472,7 @@ public:
             } else {
                 execution_tracker_->set_event_bus(execution_event_bus_.get());
                 execution_tracker_->set_metrics(&metrics_); // ADR-1007
+                execution_tracker_->set_forensics_plugin_set(forensics_plugins()); // #4990
                 // ADR-1007: pre-seed to 0 so absent-vs-zero is meaningful —
                 // a healthy fleet with zero concurrency collisions/anomalies
                 // must read as "wired, nothing happened" on a dashboard, not

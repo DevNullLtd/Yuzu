@@ -45,7 +45,8 @@
 #include "peer_ip.hpp"
 #include "plugin_result_audit.hpp"
 #include "response_store.hpp"
-#include "response_tier_filter.hpp" // #4990: ForensicsPluginSet::contains
+#include "forensics_error_detail.hpp" // #4990: sanitize_forensics_error_detail
+#include "response_tier_filter.hpp"  // #4990: ForensicsPluginSet::contains
 #include "result_parsing.hpp"
 #include "tag_store.hpp"
 #include "update_registry.hpp"
@@ -2265,6 +2266,12 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     s.plugin_result_status = static_cast<int>(resp.plugin_result_status());
     if (resp.has_error()) {
         s.error_detail = resp.error().message();
+        // #4990: this value is shown at the Execution:Read tier (drawer, execution status, event
+        // stream and outbox), below the Forensics tier of the plugin's own rows. A Forensics-tier
+        // plugin keeps only a bounded failure token; an unwired set cannot tell the plugins apart,
+        // so it sanitises every plugin's message.
+        if (!forensics_plugins_ || forensics_plugins_->contains(extract_plugin(command_id)))
+            s.error_detail = sanitize_forensics_error_detail(s.error_detail);
     }
     switch (resp.status()) {
     case pb::CommandResponse::RUNNING:
