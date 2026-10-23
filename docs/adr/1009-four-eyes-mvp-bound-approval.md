@@ -78,6 +78,15 @@ than an identifier for it (context: #4395); the approval read routes carry the s
 
 `consume_ticket` takes the origin the redeeming surface expects (`ApprovalOrigin`). A ticket
 whose recorded origin differs refuses, and `kUnspecified` and `kUnrecognised` always refuse.
+
+Bound and origin are one relation: `submit_bound` mints only for an origin that requires a bound
+request (`requires_bound_request`, today `kGuardianDeploy` alone) and refuses every other origin
+with the ordinary validation failure, while `submit()` refuses an origin that requires one. So a
+bound `kMcp`, `kInstruction` or `kSchedule` ticket cannot exist: the MCP recall compares only the
+tool and arguments it recalls, not a frozen request or digest, and the other two have no redeemer
+that does. A later producer that needs another bound origin changes `requires_bound_request` and
+its redeemer in the same change, which the dormant-code tripwire and this ADR's entry conditions
+make visible.
 PR2 adds `kGuardianDeploy` and reserves the `guardian.` definition-id prefix alongside `mcp.`, so
 no authored definition can impersonate a Guardian ticket. A second `consume_ticket` overload takes
 a caller-held transaction connection so consumption commits or rolls back with the caller's own

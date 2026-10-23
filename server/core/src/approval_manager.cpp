@@ -677,6 +677,14 @@ ApprovalManager::submit_impl(const std::string& definition_id, const std::string
         if (!names_concrete_surface(origin))
             return fail(SubmitFailure::kInvalidRequest,
                         "a bound approval must declare a concrete origin");
+        // Bound and origin are one relation, not two: a bound ticket is minted only for a
+        // surface that requires one (the same predicate `submit()` uses to refuse the
+        // unbound mint). Otherwise a bound kMcp ticket would be redeemable by a recall that
+        // never compares the frozen request, and a bound kSchedule or kInstruction ticket
+        // would be dead or would wait for a redeemer that has not been written.
+        if (!requires_bound_request(origin))
+            return fail(SubmitFailure::kInvalidRequest,
+                        "a bound approval can only be minted for an origin that requires one");
         if (bound->request_json.empty() || bound->request_json.size() > kMaxRequestJsonBytes)
             return fail(SubmitFailure::kInvalidRequest,
                         "request_json is required and at most " +

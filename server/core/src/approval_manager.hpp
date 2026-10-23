@@ -695,6 +695,9 @@ public:
     ///     holds the session should also test `Session::is_engine()` first). A
     ///     gated effect needs a human requester root (ADR-0033 section 7);
     ///   - `origin` names no concrete surface (kUnspecified / kUnrecognised);
+    ///   - `origin` is a concrete surface that does not require a bound request (anything
+    ///     but kGuardianDeploy today: `requires_bound_request(origin)` is false). Bound and
+    ///     origin are one relation; the surfaces' redeemers decide what they compare;
     ///   - `request_json` is empty, over `kMaxRequestJsonBytes`, nested deeper than
     ///     `kMaxRequestJsonDepth`, not a JSON object, or contains a NUL byte anywhere
     ///     (the JSON parser accepts a NUL after a complete value, but the column is bound

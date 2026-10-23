@@ -883,6 +883,17 @@ TEST_CASE("submit_bound: every validation bound, at the edge and one past it",
     SECTION("origin: kUnrecognised is refused for naming no surface") {
         refused_for(bound_request(), "concrete origin", ApprovalOrigin::kUnrecognised);
     }
+    SECTION("origin: a concrete surface that does not require a bound request is refused") {
+        for (const auto o :
+             {ApprovalOrigin::kMcp, ApprovalOrigin::kInstruction, ApprovalOrigin::kSchedule}) {
+            REQUIRE_FALSE(requires_bound_request(o));
+            refused_for(bound_request(), "requires one", o);
+        }
+    }
+    SECTION("origin: kGuardianDeploy, the only surface that requires one, is accepted") {
+        REQUIRE(requires_bound_request(ApprovalOrigin::kGuardianDeploy));
+        CHECK(submit(bound_request()).has_value());
+    }
 }
 
 TEST_CASE("submit_bound: a NUL byte in request_json or a control character in a root is "
