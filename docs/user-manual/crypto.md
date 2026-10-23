@@ -37,12 +37,26 @@ each widget then needs its own permission:
   unconfined `Inventory:Read` holders;
 - the **certificates behind a Yuzu-issued count** (the drill) need **`Security:Read`**, the same
   permission as `GET /api/v1/ca/issued` ([PKI](server-admin.md)), and are withheld from a
-  confined caller in the same way. A caller who can see a count but does not hold
+  confined caller too: the drill shows the note "Yuzu-issued certificate figures are not
+  available to this account ..." in place of the list. A caller who can see a count but does not hold
   `Security:Read` sees the count, and a click shows "the certificate list needs Security:Read"
   in the drill panel. The withholding covers the drill, both forms of
-  `GET /api/v1/ca/issued` / `list_issued_certs` (filtered and unfiltered) and the list in the
-  Settings certificate panel: the unfiltered inventory returns the same per-agent rows, so a
-  confined caller gets the same refusal there and sees a note in the panel instead of the list.
+  `GET /api/v1/ca/issued` / `list_issued_certs` (filtered and unfiltered) and the issued-certificate
+  list in the Settings certificate panel: the unfiltered inventory returns the same per-agent rows.
+  A confined caller gets `403` from the route and a permission-denied error from the tool, and the
+  Settings panel withholds only that list (a note in its place; the CA details, the root and CRL
+  downloads and the import form are still shown).
+
+  **Who counts as confined.** The test is the caller's `Inventory:Read` standing, not
+  `Security:Read`. A caller whose `Inventory:Read` is granted only for management groups is
+  confined. A caller holding `Security:Read` and **no** `Inventory:Read` grant at all is **not**
+  confined and is served the list: removing a scoped `Inventory:Read` grant does not confine a
+  caller, and granting a global `Inventory:Read` removes the confinement. With RBAC enforcement off
+  nothing changes. **Known gap:** if a store behind the access check (permissions, management
+  groups) cannot be read partway through, the check answers as for a caller with no grant, so the
+  list is served (it fails open) rather than refused with `503`; this applies to the drill and the
+  filtered list as well as the unfiltered list, and is tracked by an issue (issue number to be
+  added when filed). The success rows for such pages say `standing=refused`.
 
 A widget whose permission you do not hold is drawn as a card that says "not available to this
 account (`Inventory:Read` required)", not as an error.
@@ -569,7 +583,7 @@ Every read that serves data is written to the audit log (see [audit-log.md](audi
 | `crypto.libraries.devices` | A page of one family's devices is served (REST route and the drill). The MCP tool writes `mcp.list_crypto_library_devices`. |
 | `crypto.cbom.export` | A CBOM is exported (REST route). The MCP tool writes `mcp.export_crypto_cbom`. Same detail key set as the summary (`rows` is the number of families), plus ` serial=<urn:uuid:...> [ecosystem=<filter>] components=<n>` (the `ecosystem` key only when that filter was given) on the success row, tying the audit row to the exact document handed out. |
 | `crypto.ca.stats.view` | The Yuzu-issued counts are served (`GET /api/v1/crypto/ca/stats`, the dashboard, a single Yuzu-issued card, and the MCP tool `get_crypto_ca_stats` under the same verb). Target `Inventory` / `yuzu_ca`; detail `cid=.. ws=crypto_widget_windows_v1 as_of=<epoch>`, plus `widgets=<n>` on the dashboard row. A confined caller's refusal is a `denied` row with `withheld=confined`. |
-| `crypto.ca.certificates.view` | A page of Yuzu-issued certificates behind one count is served: `GET /api/v1/ca/issued` (filtered or not), the drill with every Load more page, and `list_issued_certs` (filtered or not), under the same verb. Target `Security` / `kind=<k>[ days=<n>][ week=<YYYY-Www>][ bucket=<b>]`; detail adds `as_of` (with `pinned` when the caller supplied it or the page continues a cursor), `rows`, `page=first` or `page=continuation`, and `total`. A confined caller's refusal is a `denied` row with `withheld=confined`. The unfiltered `GET /api/v1/ca/issued` and `list_issued_certs` write the same verb with target `Security` / `inventory` and detail `inventory rows=<n> limit=<n> offset=<n> has_more=<true|false>`, and a refused confined caller gets the same `denied` row. The Settings certificate panel is not audited. `issued_by` names who caused the issuance: `agent:<id>` for an enrolment, `operator:<username>` for a certificate an operator issued, or `system:default-certs` for the server's own bootstrap certificates, so the list can carry operator usernames (personal data) to every unconfined `Security:Read` holder, as the unfiltered list always has. |
+| `crypto.ca.certificates.view` | A page of Yuzu-issued certificates behind one count is served: `GET /api/v1/ca/issued` (filtered or not), the drill with every Load more page, and `list_issued_certs` (filtered or not), under the same verb. Target `Security` / `kind=<k>[ days=<n>][ week=<YYYY-Www>][ bucket=<b>]`; detail adds `as_of` (with `pinned` when the caller supplied it or the page continues a cursor), `rows`, `page=first` or `page=continuation`, and `total`. On the route and the tool a confined caller's refusal is a `denied` row with `withheld=confined` (target `filtered` or `inventory`), and an access check that could not be completed is a `failure` row; the drill and the Settings panel write **no** `denied` row for a confined caller and the drill writes none when its access check is unavailable (tracked by an issue (issue number to be added when filed)). The unfiltered `GET /api/v1/ca/issued` and `list_issued_certs` write the same verb with target `Security` / `inventory` and detail `inventory rows=<n> limit=<n> offset=<n> has_more=<true|false>`. On the route and the tool every success row, filtered or not, ends `standing=available` or `standing=refused` (no `Inventory:Read` grant at all, or a read failure inside the access check; both are served, see [Access](#access)). The Settings certificate panel is not audited. `issued_by` names who caused the issuance: `agent:<id>` for an enrolment, `operator:<username>` for a certificate an operator issued, or `system:default-certs` for the server's own bootstrap certificates, so the list can carry operator usernames (personal data) to every `Security:Read` holder whose view is not confined, including one with no `Inventory:Read` grant, as the unfiltered list always has. |
 | `crypto.dashboard.layout.update` | You save a layout (`PUT /api/v1/crypto/dashboard/layout`, the dashboard buttons, or `set_crypto_dashboard_layout`). An `attempted` row is written first and the layout is not changed if it cannot be; then `success` (with the new `version=`) or `failure` (with `outcome=conflict`, `corrupt`, `degraded`, `unknown` or `invalid`). Target `CryptoDashboard` / your user name; detail `widgets=<n>`, plus `expected_version=<n>` when sent. A service-scoped token's attempt is a `denied` row. |
 | `crypto.dashboard.layout.access_denied` | A service-scoped API token tried to read a layout (`GET /api/v1/crypto/dashboard/layout`); written as `denied`. |
 
@@ -649,8 +663,19 @@ an empty list, because an empty list would read as "no library installed".
   `Yuzu CA read degraded` or `crypto read capacity in use; retry`).
 - **A wiring fault** (the server built without the `/crypto` seam: `503 service unavailable` on
   the `/api/v1/crypto/*` data routes, `503 filtered certificate list unavailable` on a filtered
-  `GET /api/v1/ca/issued`) carries **no** `retry_after_ms`: it lasts until a restart with the
-  wiring fixed, the same posture as layouts unavailable since server start (ADR-0071).
+  `GET /api/v1/ca/issued`, `503 certificate list unavailable` on an unfiltered one) carries **no**
+  `retry_after_ms`: it lasts until a restart with the wiring fixed, the same posture as layouts
+  unavailable since server start (ADR-0071).
+- **`GET /api/v1/ca/issued` and `list_issued_certs`, told apart by the answer.**
+
+  | Answer | Cause | Audit row | Retry |
+  |---|---|---|---|
+  | `403` (MCP: permission denied), "Yuzu-issued certificate figures are not available to this account ..." | The caller's `Inventory:Read` is granted only for management groups (a confined view). Not a fault: retrying cannot change it. Ask for an unconfined account; granting a global `Inventory:Read` removes the confinement. | `denied`, `withheld=confined` | none |
+  | `403` with a `permission` field | The caller lacks `Security:Read` | written by the gate | none |
+  | `503` `access check unavailable` | A store behind the access check (permissions, management groups, tags) could not be read | `failure`, `access check unavailable` | `retry_after_ms: 5000` |
+  | `503` `CA store unavailable` or `CA not available` (REST and MCP) | The CA store is not open (`CA not available`) or `list_issued` failed (`CA store unavailable`; the server log carries a sampled warning with the database error) | `failure`, `inventory store unavailable` | REST `CA store unavailable`: `retry_after_ms: 5000`; otherwise none |
+  | `503` `certificate list unavailable` / `filtered certificate list unavailable` | The server was built without the access check (or the `/crypto` seam): a wiring fault | none | none, lasts until a restart |
+  | `200` with rows | Served. If the caller is confined only by a read failure inside the access check, or has no `Inventory:Read` grant, the success row says `standing=refused` | `success` | none |
 - **Layouts.** A layout read or save that fails answers `503` with `retry_after_ms` (`dashboard
   layout read degraded` / `dashboard layout save failed`), and `save outcome unknown — reload to
   check` when the connection dropped after a save was sent. A stale `expected_version`, or none

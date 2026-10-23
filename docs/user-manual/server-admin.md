@@ -848,8 +848,8 @@ What changes on **every** deployment, including single-server:
   that event has aged out of audit retention — 365 days by default — and you
   cannot establish the serial another way, you cannot tell whether it was lost:
   treat it as lost), then
-  page through `GET /api/v1/ca/issued` (follow `offset` until `has_more` is
-  false) or decode the CRL (`curl … /api/v1/ca/crl | openssl crl -inform DER
+  page through `GET /api/v1/ca/issued` with an unconfined account (follow `offset` until
+  `has_more` is false; a management-group-confined account is refused that list) or decode the CRL (`curl … /api/v1/ca/crl | openssl crl -inform DER
   -noout -text`). If the serial is still listed as revoked, nothing was lost. If
   it is missing, re-root
   the internal CA with the clean re-root in `docs/pki-architecture.md`
@@ -3117,8 +3117,13 @@ When the server runs its built-in CA, **Settings → Certificates and secrets**
 (or **Settings → Internal CA** on the Settings page) lists the newest 500
 issued certificates; for an older one, find its serial with
 `GET /api/v1/ca/issued?offset=` and revoke it with `POST /api/v1/ca/revoke`. A caller whose
-view of the fleet is confined (management-group confinement) sees a note in place of the list,
-in the panel and on that route alike. To revoke one (e.g. a decommissioned or compromised agent):
+view of the fleet is confined (management-group confinement) is refused that route with a `403`,
+and the panel shows a note in place of the issued-certificate list while keeping the CA details,
+the root and CRL downloads and the import form. A confined `Security:Delete` holder can still
+revoke a serial it already knows through `POST /api/v1/ca/revoke`, but cannot list serials: use
+an unconfined account, or read revoked serials from the CRL (`/api/v1/ca/crl`). The panel's
+reply to a revoke or an import is never blank for such a caller: it shows the same note. To
+revoke one (e.g. a decommissioned or compromised agent):
 
 1. Find the agent's row in the inventory (match on **Subject** = `agent_id` or
    the **Serial**).

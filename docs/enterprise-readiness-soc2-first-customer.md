@@ -372,6 +372,23 @@ until the plugin's own release action runs), and REST has no approval-ticket pat
 refusal, not a four-eyes control; activation of the
 four-eyes feature is a separate, postponed decision (epic #6060).
 
+**Addendum: who can list the issued certificates (CC6.1/CC6.3, 2026-10-23).** The issued-certificate
+inventory (`GET /api/v1/ca/issued`, filtered or not, MCP `list_issued_certs`, and the list in the
+Settings certificate panel) carries every enrolled agent's subject, SAN and issuing identity. Before
+this change any `Security:Read` holder was served it, a management-group-confined one included. It is
+now withheld from a confined caller, and every call is audited as `crypto.ca.certificates.view`.
+Who is served, stated plainly so a questionnaire answer is not rounded up: with RBAC enforcement off
+(the shipped default), every `Security:Read` session, unchanged; with RBAC on, a caller with a global
+`Inventory:Read` grant or an elevated (JIT) session; a `Security:Read` holder with **no** `Inventory:Read`
+grant at all (removing a scoped grant does not confine a caller); and **any caller whose access check
+hits a read failure partway through**, because that check answers as for a caller with no grant
+(it fails open). Refused: a caller whose `Inventory:Read` is granted only for management groups. The
+read-failure case also affects the filtered list and the `/crypto` drill, is narrower than the prior
+behaviour, and is tracked by an issue (issue number to be added when filed). Detective control: each
+success row ends `standing=available` or `standing=refused`; review the `refused` rows. The Settings
+panel and the `/crypto` drill write no row for a refused confined caller. Do not state that confined
+operators cannot read the certificate inventory without these qualifications.
+
 **Addendum: the last-Administrator guard for account lifecycle (CC6.1/CC6.2,
 #4966).** Deactivating, deleting or demoting the last active local administrator
 account is now refused on the Settings user delete and role change and on every SCIM

@@ -2437,7 +2437,7 @@ static const ToolDef kTools[] = {
     {"list_issued_certs",
      "List certificates issued by the internal CA (inventory: serial, subject, purpose, status, "
      "expiry, revocation). Mirrors GET /api/v1/ca/issued. Requires Security:Read. With any of "
-     "kind/days/week/bucket/as_of it lists exactly the certificates behind one "
+     "kind/days/week/bucket/as_of/cursor it lists exactly the certificates behind one "
      "get_crypto_ca_stats count (same predicate, valid through notAfter inclusive): the result "
      "adds filter (rule_id, criterion, as_of, total) and next_cursor (pass it back as cursor for "
      "the next page of the same snapshot; null on the last page - keyset paging, so a "
@@ -2448,7 +2448,11 @@ static const ToolDef kTools[] = {
      "database clock or more than 300 seconds after it is rejected), a caller whose view is "
      "confined is refused, a degraded store or busy reads are retryable, and the read is audited "
      "as crypto.ca.certificates.view. Without them it lists the inventory with offset paging, with "
-     "the same confinement refusal and the same audit.",
+     "the same confinement refusal and the same audit. A confined refusal (permission denied, "
+     "management-group confinement) is permanent for that caller: retrying cannot change it, use an "
+     "account whose Inventory:Read is not management-group-limited. An 'access check unavailable' "
+     "error is retryable (retry_after_ms 5000). A caller with no Inventory:Read grant at all is not "
+     "confined and is served.",
      R"j({"type":"object","properties":{)j"
      R"j("limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Max rows (at most 500, default 100, when filtering)"},)j"
      R"j("offset":{"type":"integer","minimum":0,"maximum":1000000,"description":"Pagination offset; unfiltered calls only, 0 when omitted. A filtered call refuses any offset, 0 included (it pages with cursor)"},)j"

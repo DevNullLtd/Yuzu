@@ -2,16 +2,22 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
-## Behaviour change: a confined operator is refused the unfiltered issued-certificate list
+## ⚠️ Breaking: a management-group-confined operator is refused the unfiltered issued-certificate list
 
-**What changed.** `GET /api/v1/ca/issued` without a filter parameter, the MCP tool `list_issued_certs` without filter arguments, and the list in the Settings certificate panel now apply the confinement check the filtered form already used. A caller whose view of the fleet is confined (management-group confinement) gets `403` (MCP: permission denied) with no permission named, and the panel shows a note in place of the list. If the check reports itself unavailable the answer is `503` with `retry_after_ms: 5000`. A read failure partway through the check reads as no Inventory grant and is not treated as confined. Both forms of the route and the tool are now audited `crypto.ca.certificates.view` with target `inventory`, set-and-proceed.
+**What changed.** `GET /api/v1/ca/issued` without a filter parameter, the MCP tool `list_issued_certs` without filter arguments, and the issued-certificate list in the Settings certificate panel now apply the confinement check the filtered form already used. A caller whose `Inventory:Read` is granted only for management groups (a confined view) gets `403` (MCP: permission denied) with no permission named. In the Settings panel only the issued-certificate list is withheld, with a note in its place; the CA details (trust mode, algorithm, validity, root fingerprint), the root, signing-request and CRL downloads and the import form are still shown, and a revoke or an import answers the panel with the same note instead of a blank body. If the check reports itself unavailable the answer is `503` with `retry_after_ms: 5000`. Both forms of the route and the tool are now audited `crypto.ca.certificates.view` (set-and-proceed).
 
 **Who is affected.** A confined operator or agentic worker that holds `Security:Read` (the seeded Viewer role does) and listed the CA inventory, and anyone who relied on that call being unaudited.
 
+**What did not change, stated plainly.**
+
+- **RBAC-off installs** (the shipped default) are unchanged: every `Security:Read` session is served.
+- A caller with global `Security:Read` and **no** `Inventory:Read` grant at all is **not** confined and is served the list. Removing a scoped `Inventory:Read` grant does **not** confine a caller; granting a global `Inventory:Read` removes the confinement.
+- **A read failure inside the access check fails open.** If a store behind the check (permissions, management groups) cannot be read partway through, the check answers as for a caller with no grant, so the list is served rather than refused. This applies to the unfiltered list, the filtered list and the drill on `/crypto`. It is narrower than before this change, when every confined caller was served, and it is tracked by an issue (issue number to be added when filed).
+
 **What to check.**
 
-- A confined caller that needs the inventory must be given an unconfined view, or use an unconfined account.
-- A SIEM rule or report that counts `crypto.ca.certificates.view` rows now sees one per inventory page as well as one per filtered page.
+- A confined caller that needs the inventory must use an account with an unconfined view (for example one holding a global `Inventory:Read`). A confined `Security:Delete` holder can still revoke a serial it already knows, but cannot list serials; revoked serials are in the CRL (`/api/v1/ca/crl`).
+- **SIEM volume.** A SIEM rule or report that counts `crypto.ca.certificates.view` rows now sees one `success` row per inventory page (two rows per MCP call, with `mcp.list_issued_certs`), `denied` rows for refusals, and `failure` rows when the access check or the store is unavailable (a polling client during an outage writes one per call). Every `success` row now ends `standing=available` or `standing=refused`; `refused` marks a page served to a caller with no `Inventory:Read` grant or after a read failure inside the check, and is the one to review.
 
 ## Behaviour change: the Windows agent installer passes the enrollment token by file
 
