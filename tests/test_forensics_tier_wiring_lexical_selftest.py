@@ -129,9 +129,31 @@ def main() -> int:
     for extra in ("std::string leak = resp.error().message();",
                   "notify(resp.error().message());",
                   "auto m =\n   resp.error()\n      .message();",
-                  "const auto& e = other.error().message();"):
+                  "const auto& e = other.error().message();",
+                  "auto m = p->error().message();",
+                  "auto m = (&resp)->error().message();"):
         expect("raw-failure-text-reads" in ids(g.agent_service_problems(asrc + "\n" + extra + "\n")),
                f"a new raw failure-text read was NOT detected: {extra!r}")
+    # g8p3-qe-3(b): the same text reached through a held reference, a pointer, or a dump.
+    for extra, want in (("const auto& e = resp.error();\n auto m = e.message();",
+                         "raw-failure-text-error-accessor"),
+                        ("const auto& e = resp.error();\n auto m = e.message();",
+                         "raw-failure-text-any-message-read"),
+                        ("const auto* e = &resp.error();\n auto m = e->message();",
+                         "raw-failure-text-any-message-read"),
+                        ("auto m = holder->message();", "raw-failure-text-any-message-read"),
+                        ("auto m = resp.error().message();", "raw-failure-text-error-accessor"),
+                        ("auto m = resp.ShortDebugString();", "raw-failure-text-dump"),
+                        ("auto m = resp.DebugString();", "raw-failure-text-dump"),
+                        ("auto m = resp.Utf8DebugString();", "raw-failure-text-dump"),
+                        ("auto m = resp.SerializeAsString();", "raw-failure-text-dump"),
+                        ("resp.SerializeToString(&out);", "raw-failure-text-dump"),
+                        ("auto m = resp.error().ShortDebugString();", "raw-failure-text-dump"),
+                        ("resp.mutable_error()->set_message(x);", "raw-failure-text-mutable-error")):
+        expect(want in ids(g.agent_service_problems(asrc + "\n" + extra + "\n")),
+               f"{want} was NOT raised for: {extra!r}")
+    expect(g.agent_service_problems(asrc + "\n// auto m = resp.DebugString(); e->message();\n") == [],
+           "a comment mentioning a dump or a message read is not one")
     stored = "err_detail = resp.error().message();"
     expect(asrc.count(stored) == 2, "selftest anchor moved: the two stored-row reads")
     expect("raw-failure-text-stored-row" in ids(g.agent_service_problems(asrc.replace(stored, "err_detail = {};", 1))),

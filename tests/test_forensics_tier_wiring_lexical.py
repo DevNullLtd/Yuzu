@@ -45,6 +45,12 @@ open a comment), whitespace is collapsed and removed around punctuation, so line
 re-indentation and comment text mentioning a token cannot satisfy or break a check. Patterns anchor
 on distinctive tokens, never line numbers.
 
+The raw-failure-text pins are lexical too: they count the spellings `X.error().message()`,
+`X->error().message()`, any `.message()` / `->message()`, `resp.error()` / `resp->error()` and forbid
+the whole-message dumps (`DebugString`, `SerializeAsString`, ...) and `mutable_error()`. A response
+renamed to something other than `resp` and then read only through a dump helper outside this file
+is not seen (review-enforced).
+
 Lexical only: it cannot see a relocation that keeps the tokens but changes control flow, or a
 statement that is present but sits in a branch that never runs (review-enforced). The companion
 tests/test_forensics_tier_wiring_lexical_selftest.py deletes each required statement in memory and
@@ -275,9 +281,18 @@ FORBIDDEN: list[tuple[str, str, str]] = [
 # cannot move it. The first row is the catch-all: ANY `.error().message()` read, whatever it is
 # assigned to; the other two say where today's reads are.
 EXACT_AGENT_SERVICE: list[tuple[str, str, int, str]] = [
-    ("raw-failure-text-reads", r"\.error\(\)\.message\(\)", 3,
+    ("raw-failure-text-reads", r"(?:\.|->)error\(\)(?:\.|->)message\(\)", 3,
      "the raw failure text of a command response is read at exactly three sites; a new read is a "
      "new sink the Forensics tier does not cover (route it through failure_text_for_sinks)"),
+    # The same text reached another way: through a pointer or a held reference (`const auto& e =
+    # resp.error(); e.message()`), so BOTH halves are pinned separately. Every `.message()` read in
+    # this file is today one of the three above, and so is every `resp.error()` accessor.
+    ("raw-failure-text-any-message-read", r"(?:\.|->)message\(\)", 3,
+     "a `.message()` read anywhere in this file (through a pointer, a held reference, any variable) "
+     "is a possible new sink of the raw failure text; there are exactly three today"),
+    ("raw-failure-text-error-accessor", r"\bresp(?:\.|->)error\(\)", 3,
+     "the response's error submessage is taken at exactly three sites; holding it in a reference "
+     "or passing it on is a new way to reach the raw failure text"),
     ("raw-failure-text-stored-row", r"err_detail=resp\.error\(\)\.message\(\);", 2,
      "the stored response row (Subscribe and gateway ingest) keeps the raw text; it is read only "
      "through the tier-filtered stored-response reads"),
@@ -293,6 +308,19 @@ EXACT_AGENT_SERVICE: list[tuple[str, str, int, str]] = [
 ]
 
 
+# Spellings that serialise or dump a whole message, including the error text, without ever calling
+# `.message()`. None occurs in agent_service_impl.cpp today; each must NOT occur.
+FORBIDDEN_AGENT_SERVICE: list[tuple[str, str, str]] = [
+    ("raw-failure-text-dump",
+     r"(?:Short|Utf8)?DebugString\(|SerializeAsString\(|SerializeToString\(|SerializePartial\w*\(|"
+     r"\bMessageToJson|\bTextFormat\b",
+     "a whole-message dump of a command response would carry the raw failure text; reduce it with "
+     "failure_text_for_sinks and log or store only that"),
+    ("raw-failure-text-mutable-error", r"(?:\.|->)mutable_error\(\)",
+     "mutable_error() hands out the error submessage; no ingest path needs it"),
+]
+
+
 def agent_service_problems(src: str) -> list[tuple[str, str]]:
     """(id, message) per violated exact count in agent_service_impl.cpp; [] when clean."""
     t = canonical(src)
@@ -301,6 +329,9 @@ def agent_service_problems(src: str) -> list[tuple[str, str]]:
         got = len(re.findall(pat, t, re.S))
         if got != want:
             out.append((rid, f"{rid}: expected exactly {want} occurrences, found {got}: {why}"))
+    for rid, pat, why in FORBIDDEN_AGENT_SERVICE:
+        if re.search(pat, t, re.S):
+            out.append((rid, f"{rid}: {why}"))
     return out
 
 
@@ -347,7 +378,8 @@ def main() -> int:
     if found or afound:
         return 1
     print(f"OK: {len(REQUIRED)} wiring statements, {len(COUNTED)} counted sites, "
-          f"{len(FORBIDDEN)} forbidden hatches, {len(EXACT_AGENT_SERVICE)} exact counts checked")
+          f"{len(FORBIDDEN)} forbidden hatches, {len(EXACT_AGENT_SERVICE)} exact counts, "
+          f"{len(FORBIDDEN_AGENT_SERVICE)} forbidden dumps checked")
     return 0
 
 
