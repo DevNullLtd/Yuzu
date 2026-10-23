@@ -1080,8 +1080,7 @@ flip, with a red-first test each:
     budget.
     **Operator route.** The server's automatic heartbeat re-push is a full push
     (`server.cpp`, `build_agent_push(..., /*full_sync=*/true, ...)`); the dashboard
-    Baseline Re-deploy (`GuardianRoutes::deploy_baseline`) bumps the generation and sends
-    `push_fn_("", true)`, fleet-wide; REST `POST /api/v1/guaranteed-state/push` and MCP
+    Baseline Re-deploy (`GuardianRoutes::deploy_baseline`) bumps the generation and sends `push_fn_("", true)` to the agents connected to the server that handles it; REST `POST /api/v1/guaranteed-state/push` and MCP
     `push_guardian_rules` DEFAULT to `full_sync=false` and take an optional `scope`
     that can target one agent. Both defaults still carry the agent's full OS/scope-filtered
     deployed rule set (`build_agent_push` only sets the flag), so the default is not
@@ -1096,7 +1095,7 @@ flip, with a red-first test each:
     only) and then filtered per agent by `build_agent_push` on the LIVE row (`enabled`,
     `os_target`, `scope_expr`). So DISABLING the rule, or narrowing its scope or OS target,
     flows with the next automatic re-push (a rule update bumps the policy generation), while
-    removing a MEMBER from the Baseline is staged until a Re-deploy, which is a full push to the agents connected to the server that handles it and needs `GuaranteedState:Push`. REST push refuses a service-scoped token
+    removing a MEMBER from the Baseline is staged until a Re-deploy, a full push that needs `GuaranteedState:Push` and goes to the agents connected to the server that handles it. REST push refuses a service-scoped token
     (`deny_fleet_wide_service_scoped`) and an interactive session must clear the MFA
     step-up check (`step_up_fn`, which skips API-token principals); MCP `push_guardian_rules`
     applies the same service-scoped refusal and its tier gate. The `scope` parameter is a scope
