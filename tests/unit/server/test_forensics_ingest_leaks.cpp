@@ -665,6 +665,10 @@ TEST_CASE("tracker error_detail: a failed Forensics lookup on the write path nev
         // The write itself did not fail: no "NOT recorded" line, and the terminal row is intact.
         CHECK(logs.text().find("NOT recorded") == std::string::npos);
         CHECK(logs.text().find("upsert failed") == std::string::npos);
+        // The failed lookup is still visible to an operator: its own warning (the write path
+        // logs under its own throttle key, and no other case here makes the write-path lookup
+        // fail, so this is the first line of the minute).
+        CHECK(logs.text().find("Forensics execution lookup failed") != std::string::npos);
         CHECK(stored_error_detail(pool, id) == kFreeText);
         const auto statuses = tracker.get_agent_statuses(id);
         REQUIRE(statuses.size() == 1);
@@ -707,6 +711,28 @@ TEST_CASE("tracker error_detail: a failed Forensics lookup on the write path nev
         fault.repair();
         CHECK(stored_error_detail(pool, id) == "forensics_error");
         CHECK(outbox_data(pool, id).find("forensics_error") != std::string::npos);
+    }
+    SECTION("CHARACTERISATION: a raw Forensics text written straight to the tracker is published "
+            "raw on that first write (the incoming text is trusted to be reduced already)") {
+        // The write path skips its lookup when the persisted text equals the incoming one,
+        // because the one production caller (AgentServiceImpl::notify_exec_tracker) reduces the
+        // text at ingest with failure_text_for_sinks, which the wiring gate pins. A caller that
+        // bypassed it would publish its raw text on this first write; the READ paths still
+        // reduce it, and a later replay is reduced by the sticky-terminal branch (case above).
+        tracker.set_forensics_plugin_set(&test::forensics_plugin_set());
+        const auto id = make(std::string{test::kForensicsPlugin} + "-0w5");
+        std::vector<std::string> frames;
+        const auto sub = exec_bus.subscribe(id, [&frames](const ExecutionEvent& e) {
+            frames.push_back(e.data);
+        });
+        tracker.update_agent_status(id, frame("failure", kFreeText));
+        exec_bus.unsubscribe(id, sub);
+        CHECK(outbox_data(pool, id).find("marker-4990") != std::string::npos);
+        CHECK(any_has(frames, "marker-4990"));
+        // The reads do reduce it.
+        const auto statuses = tracker.get_agent_statuses(id);
+        REQUIRE(statuses.size() == 1);
+        CHECK(statuses[0].error_detail == "forensics_error");
     }
     SECTION("an UNWIRED tracker never looks anything up: the replay publishes the stored text") {
         // Characterisation of the documented harness fail-open (production always wires the set;
