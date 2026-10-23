@@ -75,12 +75,12 @@ void write_step_up_challenge(const httplib::Request& req, httplib::Response& res
     // The approver gate's challenge speaks the same envelope as the generic gate: one verdict,
     // one renderer (`render_step_up_refusal`, which carries the local-vs-SSO challenge URL and
     // the correlation id) and one audit writer (`emit_step_up_refusal_effects`). Only the audit
-    // detail suffix is the approver gate's own. `user` goes through audit_token (CWE-117): the
-    // name is IdP- or operator-controlled.
+    // detail suffix is the approver gate's own. The subject is neutralised (CWE-117) by
+    // emit_step_up_refusal_effects for every step-up refusal.
     StepUpVerdict verdict;
     verdict.decision = StepUpDecision::kChallenge;
     verdict.is_oidc = is_oidc;
-    verdict.user = audit_token(session.username);
+    verdict.user = session.username;
     verdict.age_secs = age_secs;
     verdict.window_secs = window_secs;
     std::string suffix;
