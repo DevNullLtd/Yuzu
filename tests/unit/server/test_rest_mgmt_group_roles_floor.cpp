@@ -42,6 +42,7 @@
 
 #include <functional>
 #include <optional>
+#include <set>
 #include <string>
 
 using namespace yuzu::server;
@@ -277,6 +278,49 @@ TEST_CASE("POST /management-groups/{id}/roles: ForensicsAnalyst is refused at gr
                           R"({"principal_id":"someone","role_name":"Operator"})");
     REQUIRE(ok);
     CHECK(ok->status == 201);
+}
+
+// The group-scope allow-list is the ONLY thing keeping the dormant management-group-scoped
+// Forensics:Read branch of the permission resolver unreachable (#4990): nothing else can author a
+// group-scoped grant of a role that holds it. This case derives the answer from the real handler
+// and the real seeded role list, so widening the list fails here by name rather than passing
+// because a hand-copied list in a test moved with it.
+TEST_CASE("POST /management-groups/{id}/roles: the group-scope allow-list is exactly "
+          "{Operator, Viewer}; widening it makes the scoped Forensics:Read branch reachable "
+          "(re-review the resolver's scoped branch, #4990)",
+          "[pg][rest][mgmt_group][authz][security_scope][forensics_analyst]") {
+    GroupRolesHarness h;
+    ManagementGroup g;
+    g.name = "floor-test-allowlist";
+    g.membership_type = "static";
+    g.created_by = "tester";
+    auto grp = h.mgmt_bundle->create_group(g);
+    REQUIRE(grp.has_value());
+    const std::string gid = *grp;
+
+    // Every seeded role, plus names that are not roles at all.
+    std::set<std::string> names;
+    for (const auto& r : h.rbac.list_roles())
+        names.insert(r.name);
+    REQUIRE(names.contains("ForensicsAnalyst"));
+    REQUIRE(names.contains("Administrator"));
+    names.insert({"NoSuchRole", "operator", "VIEWER"});
+
+    std::set<std::string> accepted;
+    int n = 0;
+    for (const auto& role : names) {
+        INFO(role);
+        auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles",
+                               R"({"principal_id":"p)" + std::to_string(n++) +
+                                   R"(","role_name":")" + role + R"("})");
+        REQUIRE(res);
+        if (res->status == 201)
+            accepted.insert(role);
+        else
+            CHECK(res->status == 403);
+    }
+    CHECK(accepted == std::set<std::string>{"Operator", "Viewer"});
+    CHECK(h.mgmt_bundle->get_group_roles(gid).size() == 2);
 }
 
 TEST_CASE("POST /management-groups/{id}/roles: ITServiceOwner OF THIS GROUP is "

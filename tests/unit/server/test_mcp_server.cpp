@@ -26596,6 +26596,62 @@ TEST_CASE("MCP assign_management_group_role: role_name outside {Operator,Viewer}
     CHECK(store.get_group_roles(*created).empty());
 }
 
+// Companion of the REST allow-list case in test_rest_mgmt_group_roles_floor.cpp. The group-scope
+// allow-list is the only thing keeping the dormant management-group-scoped Forensics:Read branch of
+// the permission resolver unreachable (#4990). The role names come from the real seeded role list
+// and the answer from the real handler.
+TEST_CASE("MCP assign_management_group_role: the group-scope allow-list is exactly "
+          "{Operator, Viewer}; widening it makes the scoped Forensics:Read branch reachable "
+          "(re-review the resolver's scoped branch, #4990)",
+          "[mcp][pg][management_group][forensics_analyst]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Role Allowlist";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+
+    std::set<std::string> names;
+    for (const auto& r : rbac.list_roles())
+        names.insert(r.name);
+    REQUIRE(names.contains("ForensicsAnalyst"));
+    REQUIRE(names.contains("Administrator"));
+    names.insert({"NoSuchRole", "operator", "VIEWER"});
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.rbac_store_for_test = &rbac;
+    ts.start();
+    std::set<std::string> accepted;
+    int n = 0;
+    for (const auto& role : names) {
+        INFO(role);
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":14,)"
+            R"("params":{"name":"assign_management_group_role",)"
+            R"("arguments":{"group_id":")" +
+            *created + R"(","principal_id":"p)" + std::to_string(n++) + R"(","role_name":")" + role +
+            R"("}}})");
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        if (!body.contains("error")) {
+            accepted.insert(role);
+            continue;
+        }
+        // Everything else is refused for the role, with the allow-list's own message.
+        CHECK(body["error"]["message"] == "only Operator and Viewer roles can be delegated");
+    }
+    CHECK(accepted == std::set<std::string>{"Operator", "Viewer"});
+    CHECK(store.get_group_roles(*created).size() == 2);
+}
+
 TEST_CASE("MCP assign_management_group_role: RBAC denial (ManagementGroup:Write, no "
           "ITServiceOwner fallback) blocks the call",
           "[mcp][pg][management_group]") {
