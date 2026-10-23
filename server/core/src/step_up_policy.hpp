@@ -333,6 +333,8 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::pending("POST",  R"(/api/v1/license)"),
     step_up_detail::pending("DELETE",R"(/api/v1/license/([a-f0-9]+))"),
     step_up_detail::exempt("POST",  R"(/api/v1/dex/devices/([^/]+)/live)",                                        step_up_detail::kReadShaped),
+    step_up_detail::exempt("PUT",   R"(/api/v1/dex/score-policy)",                                                step_up_detail::kOperationalData),
+    step_up_detail::exempt("DELETE",R"(/api/v1/dex/score-policy)",                                                step_up_detail::kOperationalData),
     // result_set_routes.cpp
     step_up_detail::exempt("POST",  R"(/fragments/result-sets/(rs_[0-9a-f]+)/pin)",                               step_up_detail::kOperationalData),
     step_up_detail::exempt("POST",  R"(/fragments/result-sets/(rs_[0-9a-f]+)/unpin)",                             step_up_detail::kOperationalData),
