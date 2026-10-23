@@ -7104,7 +7104,7 @@ void RestApiV1::register_routes(
                 res.set_content(detail::a4_error(res, kUniformReject), "application/json");
                 return;
             }
-            // Defense-in-depth: role_name is one of the six allow-listed
+            // Defense-in-depth: role_name is one of the seven allow-listed
             // names, which are seeded unconditionally at construction
             // (seed_defaults()) — this should always resolve. Kept because
             // assign_role's INSERT carries no FK to `roles`, so an

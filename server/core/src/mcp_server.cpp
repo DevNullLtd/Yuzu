@@ -2342,6 +2342,12 @@ static const ToolDef kTools[] = {
      "EXCEPTION (Wave 7 PR7.2b): a Forensics-classified plugin.action pair requires EXACTLY ONE "
      "explicit, in-scope agent_id - not merely non-empty agent_ids, and scope is refused outright "
      "even when it would resolve to one device - a forensic read is per-device by nature. "
+     "READING THE RESULT: the collected rows of a Forensics-classified pair are returned by "
+     "query_responses, get_bundle_result and the REST response reads only to a caller who holds "
+     "Forensics:Read as well as Response:Read. Dispatch authority (administrator, or an approved "
+     "ticket) and read authority are separate: a caller without Forensics:Read gets an EMPTY "
+     "result that looks like a run still in flight, so confirm that grant before polling for such "
+     "a pair. "
      "DENIAL DISCRIMINATION (#3687): a dispatch-authorization denial is a JSON-RPC error whose "
      "error.data.reason is one of the six machine-readable values \"unclassified\", "
      "\"ambiguous\", \"anonymous_operator\", \"forbidden\", \"approval_required\", "
@@ -9926,8 +9932,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // hidden ones the LIMIT already truncated. Mirrors aggregate_responses'
                 // resolve-then-scope pattern; `distinct_agent_ids`/`_by_execution` picks
                 // the twin matching whichever id this call used.
-                // #4990: derived after the ManagementGroup:Write gate and the scope derivation above, before
-                // the store read (the resolver never writes a response).
+                // #4990: derived after the Response:Read gate (fleet_read_fn_) and the scope derivation
+                // above, before the store read (the resolver never writes a response).
                 const auto tier_resolved = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
                 if (!tier_resolved) { // Unknown: a retryable error, never a partial result (#4990)
                     mcp_audit("failure", "forensics tier unresolved");
@@ -11834,7 +11840,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         agent_scope = std::vector<std::string>(scope->begin(), scope->end());
                 }
 
-                // #4990: derived after the Response:Read gate (never writes a response), before the store read.
+                // #4990: derived after the ManagementGroup:Write gate and the scope derivation above (never
+                // writes a response), before the store read.
                 const auto tier_resolved = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
                 if (!tier_resolved) { // Unknown: a retryable error, never a partial result (#4990)
                     mcp_audit("failure", "forensics tier unresolved");
