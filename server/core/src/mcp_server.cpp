@@ -5,6 +5,7 @@
 #include "approver_assurance.hpp" // #6061: approve/reject are human-session acts (typed refusal)
 #include "approval_model.hpp" // #2146 A2-R4: shared approval-row JSON builder (REST v1 + MCP)
 #include "dispatch_denial_text.hpp" // shared describe_dispatch_denial (#6065 PR-Q; was an anonymous-namespace local here)
+#include "engine_no_admin_audit.hpp"      // the shared no-admin auditor (REST + MCP)
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
 #include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
 #include "mcp_approval_error.hpp" // shared approval-store failure body (#2786)
@@ -27963,33 +27964,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const bool include_revoked = *include_revoked_opt;
-                auto principals = engine_principal_store_->list_all(include_revoked);
-                // Design doc §4.2 named PR-4.3/4.4 deliverable: "no admin, ever" and
-                // "no all-permissions toggle" are enforced at the write path
-                // (RbacStore::validate_assignment) — a claim about code behavior an
-                // auditor cannot verify by reading a policy doc. This independently
-                // joins principal_type='engine' against resolved role/permission
-                // state and asserts zero violations, the same way an auditor-runnable
-                // proof should never just ask to trust the write-path guard.
-                //
-                // G2: mirrors the REST auditor (GET
-                // /api/v1/engine-principals/audit/no-admin, rest_api_v1.cpp) EXACTLY
-                // — same three checks (literal admin/Administrator role name, any
-                // is_system role via list_roles(), and the full securable x
-                // operation cross-product wildcard-grant bound) — rather than the
-                // narrower "Security/UserManagement securable" subset this tool
-                // previously checked. The two auditors must never diverge on what
-                // counts as a violation.
-                auto all_roles = rbac_store->list_roles();
+                // The shared auditor (engine_no_admin_audit.hpp, also behind the REST
+                // twin GET /api/v1/engine-principals/audit/no-admin): grant-table
+                // driven over CHECKED reads, so a degraded read can never certify
+                // ok:true. It is the only control over a wildcard custom role
+                // (maintainer ruling 2026-10-23, #2485).
                 auto all_securables = rbac_store->list_securable_types();
                 auto all_operations = rbac_store->list_operations();
-                // G3: same fail-closed posture as the REST twin — these are seeded
-                // RBAC reference tables that a live deployment never legitimately
-                // has zero rows in, so empty means resolution failed, not "no
-                // securables exist". A silently-zero full_grant_size would make
-                // the wildcard-grant check vacuously pass every principal, so
-                // report this run as unable to verify rather than certifying
-                // "clean":true over data we could not actually read.
+                // G3: these are seeded RBAC reference tables that a live deployment
+                // never legitimately has zero rows in, so empty means resolution
+                // failed, not "no securables exist". An empty grid would make the
+                // wildcard check vacuous, so report this run as unable to verify.
                 if (all_securables.empty() || all_operations.empty()) {
                     mcp_audit("failure", "rbac reference data unavailable — cannot verify");
                     (void)audit_fn(req, "engine_principal.audit.no_admin", "failure", "AuditLog",
@@ -28000,48 +27985,53 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                const std::size_t full_grant_size = all_securables.size() * all_operations.size();
-                JArr violations;
-                for (const auto& p : principals) {
-                    for (const auto& pr : rbac_store->get_principal_roles("engine", p.principal_id)) {
-                        if (pr.role_name == "admin" || pr.role_name == "Administrator") {
-                            violations.add(JObj()
-                                              .add("principal_id", p.principal_id)
-                                              .add("role", pr.role_name)
-                                              .add("reason", "admin_role"));
-                            continue;
-                        }
-                        auto it = std::find_if(
-                            all_roles.begin(), all_roles.end(),
-                            [&](const RbacRole& r) { return r.name == pr.role_name; });
-                        if (it != all_roles.end() && it->is_system) {
-                            violations.add(JObj()
-                                              .add("principal_id", p.principal_id)
-                                              .add("role", pr.role_name)
-                                              .add("reason", "system_role"));
-                        }
-                    }
-                    // "No all-permissions toggle" residual — same as the REST twin.
-                    auto effective = rbac_store->get_effective_permissions(p.principal_id);
-                    std::unordered_set<std::string> granted;
-                    for (const auto& perm : effective) {
-                        if (perm.effect == "allow")
-                            granted.insert(perm.securable_type + "\x1f" + perm.operation);
-                    }
-                    if (granted.size() >= full_grant_size) {
-                        violations.add(JObj()
-                                          .add("principal_id", p.principal_id)
-                                          .add("role", "")
-                                          .add("reason", "wildcard_grant"));
-                    }
+                const auto fail_closed = [&]() {
+                    mcp_audit("failure", std::string(engine_no_admin_audit::kFailureAuditDetail));
+                    (void)audit_fn(req, "engine_principal.audit.no_admin", "failure", "AuditLog",
+                                   "no-admin",
+                                   std::string(engine_no_admin_audit::kFailureAuditDetail));
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 std::string(engine_no_admin_audit::kUnavailableMessage),
+                                 "retry the request",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                };
+                auto inputs = engine_no_admin_audit::read_inputs(*rbac_store);
+                if (!inputs) {
+                    fail_closed();
+                    return;
                 }
-                // {ok, violations} — exact parity with the REST twin's response
-                // shape (GET /api/v1/engine-principals/audit/no-admin) so a
+                // include_revoked=false narrows the report to ACTIVE principals; that
+                // roster read is a checked read too. The default (true) audits every
+                // grant on record, so a revoked principal that still holds an admin
+                // grant is still flagged (parity with the REST twin).
+                std::optional<std::unordered_set<std::string>> active_only;
+                if (!include_revoked) {
+                    auto active = engine_principal_store_->list_all_checked(false);
+                    if (!active) {
+                        fail_closed();
+                        return;
+                    }
+                    active_only.emplace();
+                    for (const auto& p : *active)
+                        active_only->insert(p.principal_id);
+                }
+                const auto found = engine_no_admin_audit::evaluate(
+                    *inputs, all_securables, all_operations, active_only ? &*active_only : nullptr);
+                JArr violations;
+                for (const auto& v : found) {
+                    violations.add(JObj()
+                                       .add("principal_id", v.principal_id)
+                                       .add("role", v.role)
+                                       .add("reason", v.reason));
+                }
+                // {ok, violations} — the same response shape as the REST twin so a
                 // machine caller can treat the two transports identically.
                 JObj payload;
-                payload.add("ok", violations.size() == 0).raw("violations", violations.str());
+                payload.add("ok", found.empty()).raw("violations", violations.str());
                 (void)audit_fn(req, "engine_principal.audit.no_admin", "success", "AuditLog",
-                               "no-admin", "violations=" + std::to_string(violations.size()));
+                               "no-admin", engine_no_admin_audit::audit_detail(found));
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");

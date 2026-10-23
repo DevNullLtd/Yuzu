@@ -33,6 +33,7 @@
 #include "rbac_store.hpp"
 #include "rest_api_v1.hpp"
 #include "settings_routes.hpp"
+#include "test_principal_lock_gate.hpp" // SqlFault: a REAL table moved aside in the throwaway DB
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
@@ -1040,6 +1041,202 @@ TEST_CASE("Engine-principal REST: no-admin auditor fails CLOSED (503) when the "
             found_failure = true;
     }
     CHECK(found_failure);
+}
+
+namespace {
+
+/// Grant `role` every (securable, operation) pair of the CURRENT grid, as a custom (non-system)
+/// role. Returns the number of pairs granted.
+std::size_t grant_full_grid(RbacStore& store, const std::string& role) {
+    std::size_t n = 0;
+    for (const auto& s : store.list_securable_types())
+        for (const auto& o : store.list_operations()) {
+            REQUIRE(store.set_permission({role, s, o, "allow"}).has_value());
+            ++n;
+        }
+    return n;
+}
+
+bool has_audit(const std::vector<AuditCall>& log, const std::string& action,
+               const std::string& result) {
+    for (const auto& a : log)
+        if (a.action == action && a.result == result)
+            return true;
+    return false;
+}
+
+/// The three tables the shared auditor reads through CHECKED accessors, with the SQL that moves
+/// each one aside and back. (securable_types/operations are the fail-soft reference reads,
+/// covered by the empty-table case above.)
+struct AuditReadTable {
+    const char* label;
+    const char* apply;
+    const char* undo;
+};
+const AuditReadTable kAuditReadTables[] = {
+    {"principal_roles", "ALTER TABLE rbac_store.principal_roles RENAME TO principal_roles_gone",
+     "ALTER TABLE rbac_store.principal_roles_gone RENAME TO principal_roles"},
+    {"roles", "ALTER TABLE rbac_store.roles RENAME TO roles_gone",
+     "ALTER TABLE rbac_store.roles_gone RENAME TO roles"},
+    {"role_permissions", "ALTER TABLE rbac_store.role_permissions RENAME TO role_permissions_gone",
+     "ALTER TABLE rbac_store.role_permissions_gone RENAME TO role_permissions"},
+};
+
+} // namespace
+
+TEST_CASE("Engine-principal REST: no-admin auditor fails CLOSED (503, no ok:true, no success "
+          "audit row) when ANY checked read degrades",
+          "[pg][rest][engine_principal][no_admin][fail_closed][degraded]") {
+    // The auditor is the only control over a wildcard custom role (ruling 2026-10-23, #2485).
+    // A degraded read used to collapse to an empty vector and certify {"ok":true} over a
+    // deployment that DID hold a violation. Seed a real violation (a custom role covering the
+    // whole grid) so the unfixed route answers 200 here, then break each read in turn.
+    RestEngineHarness h;
+    REQUIRE(h.rbac_store->create_role({.name = "WildRole", .description = "d"}).has_value());
+    grant_full_grid(*h.rbac_store, "WildRole");
+    auto [principal_id, raw] = h.create_and_mint("audit-degraded");
+    (void)raw;
+    REQUIRE(h.rbac_store->assign_role({"engine", principal_id, "WildRole"}).has_value());
+
+    // Control: healthy, the violation is reported.
+    {
+        auto ok = h.no_admin_audit();
+        REQUIRE(ok);
+        REQUIRE(ok->status == 200);
+        REQUIRE(nlohmann::json::parse(ok->body)["data"]["violations"].size() == 1);
+    }
+
+    for (const auto& t : kAuditReadTables) {
+        INFO("read broken: " << t.label);
+        h.audit_log.clear();
+        yuzu::test::SqlFault fault(*h.rbac_pool, t.apply, t.undo);
+        fault.arm();
+
+        auto res = h.no_admin_audit();
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Retry-After") == "2");
+        CHECK(res->body.find("\"ok\":true") == std::string::npos);
+        CHECK(res->body.find("\"violations\"") == std::string::npos); // no partial list
+        CHECK(res->body.find("rbac resolution unavailable - cannot verify") != std::string::npos);
+        CHECK(has_audit(h.audit_log, "engine_principal.audit.no_admin", "failure"));
+        // The fixed detail only: never the store's own error text.
+        for (const auto& a : h.audit_log)
+            if (a.action == "engine_principal.audit.no_admin" && a.result == "failure")
+                CHECK(a.detail == "rbac_resolution_failed");
+        // A run that could not verify leaves NO evidence-shaped success row.
+        CHECK_FALSE(has_audit(h.audit_log, "engine_principal.audit.no_admin", "success"));
+
+        fault.repair();
+        auto healed = h.no_admin_audit();
+        REQUIRE(healed);
+        CHECK(healed->status == 200);
+    }
+}
+
+TEST_CASE("Engine-principal REST: no-admin auditor success row names the detected principals",
+          "[pg][rest][engine_principal][no_admin]") {
+    RestEngineHarness h;
+    REQUIRE(h.rbac_store->create_role({.name = "WildRole", .description = "d"}).has_value());
+    grant_full_grid(*h.rbac_store, "WildRole");
+    auto [principal_id, raw] = h.create_and_mint("audit-detail");
+    (void)raw;
+    REQUIRE(h.rbac_store->assign_role({"engine", principal_id, "WildRole"}).has_value());
+
+    auto res = h.no_admin_audit();
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    std::string detail;
+    for (const auto& a : h.audit_log)
+        if (a.action == "engine_principal.audit.no_admin" && a.result == "success")
+            detail = a.detail;
+    CHECK(detail == "violations=1 sample=" + principal_id + ":wildcard_grant");
+}
+
+// ── The wildcard ruling (maintainer, 2026-10-23, #2485): a custom role covering the whole grid
+// is PERMITTED at assignment and DETECTED afterwards. Administrator and built-ins stay refused.
+
+TEST_CASE("Engine-principal REST: a custom full-grid role is assignable and the auditor lists it "
+          "as wildcard_grant under its role NAME",
+          "[pg][rest][engine_principal][no_admin][wildcard]") {
+    RestEngineHarness h;
+    REQUIRE(h.rbac_store->create_role({.name = "WildRole", .description = "d"}).has_value());
+    grant_full_grid(*h.rbac_store, "WildRole");
+    auto [principal_id, raw] = h.create_and_mint("wildcard-named");
+    (void)raw;
+    REQUIRE(h.rbac_store->assign_role({"engine", principal_id, "WildRole"}).has_value());
+
+    auto res = h.no_admin_audit();
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["data"]["ok"].get<bool>() == false);
+    REQUIRE(body["data"]["violations"].size() == 1);
+    CHECK(body["data"]["violations"][0]["principal_id"].get<std::string>() == principal_id);
+    CHECK(body["data"]["violations"][0]["role"].get<std::string>() == "WildRole");
+    CHECK(body["data"]["violations"][0]["reason"].get<std::string>() == "wildcard_grant");
+}
+
+TEST_CASE("Engine-principal REST: a role edited to the full grid AFTER assignment is still "
+          "caught on the next run",
+          "[pg][rest][engine_principal][no_admin][wildcard]") {
+    RestEngineHarness h;
+    REQUIRE(h.rbac_store->create_role({.name = "LaterWild", .description = "d"}).has_value());
+    REQUIRE(h.rbac_store->set_permission({"LaterWild", "Inventory", "Read", "allow"}).has_value());
+    auto [principal_id, raw] = h.create_and_mint("wildcard-later");
+    (void)raw;
+    REQUIRE(h.rbac_store->assign_role({"engine", principal_id, "LaterWild"}).has_value());
+
+    {
+        auto before = h.no_admin_audit();
+        REQUIRE(before);
+        CHECK(nlohmann::json::parse(before->body)["data"]["ok"].get<bool>() == true);
+    }
+    grant_full_grid(*h.rbac_store, "LaterWild"); // edited after the assignment succeeded
+    auto after = h.no_admin_audit();
+    REQUIRE(after);
+    auto body = nlohmann::json::parse(after->body);
+    CHECK(body["data"]["ok"].get<bool>() == false);
+    REQUIRE(body["data"]["violations"].size() == 1);
+    CHECK(body["data"]["violations"][0]["role"].get<std::string>() == "LaterWild");
+}
+
+TEST_CASE("Engine-principal REST: a role granting every pair but one is not reported, and "
+          "Administrator plus built-in roles are still refused at assignment",
+          "[pg][rest][engine_principal][no_admin][wildcard]") {
+    RestEngineHarness h;
+    REQUIRE(h.rbac_store->create_role({.name = "AlmostAll", .description = "d"}).has_value());
+    const auto securables = h.rbac_store->list_securable_types();
+    const auto operations = h.rbac_store->list_operations();
+    REQUIRE(!securables.empty());
+    REQUIRE(!operations.empty());
+    bool skipped = false;
+    for (const auto& s : securables)
+        for (const auto& o : operations) {
+            if (!skipped) {
+                skipped = true; // withhold exactly one pair
+                continue;
+            }
+            REQUIRE(h.rbac_store->set_permission({"AlmostAll", s, o, "allow"}).has_value());
+        }
+    auto [principal_id, raw] = h.create_and_mint("almost-all");
+    (void)raw;
+    REQUIRE(h.rbac_store->assign_role({"engine", principal_id, "AlmostAll"}).has_value());
+
+    auto res = h.no_admin_audit();
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["data"]["ok"].get<bool>() == true); // the documented limit of the check
+
+    // The name-based and built-in bars are unchanged by the ruling.
+    CHECK_FALSE(h.rbac_store->assign_role({"engine", principal_id, "Administrator"}).has_value());
+    CHECK_FALSE(h.rbac_store->assign_role({"engine", principal_id, "admin"}).has_value());
+    for (const auto& role : h.rbac_store->list_roles()) {
+        if (!role.is_system)
+            continue;
+        INFO("built-in role " << role.name);
+        CHECK_FALSE(h.rbac_store->assign_role({"engine", principal_id, role.name}).has_value());
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

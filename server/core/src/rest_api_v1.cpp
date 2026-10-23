@@ -69,6 +69,7 @@
 #include "credential_change_owner.hpp" // #5342 — CredentialChangeRequest/Outcome (the one-transaction write)
 #include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric
 #include "admin_gate.hpp"
+#include "engine_no_admin_audit.hpp" // the shared no-admin auditor (REST + MCP)
 #include "web_utils.hpp"  // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "response_templates_engine.hpp"
 #include "software_catalog_rules.hpp" // kEcosystemFamilies: the published ecosystem vocabulary
@@ -5959,7 +5960,6 @@ void RestApiV1::register_routes(
                                     "EnginePrincipal"))
                 return;
 
-            auto all_roles = rbac_store->list_roles();
             auto all_securables = rbac_store->list_securable_types();
             auto all_operations = rbac_store->list_operations();
             // G3: list_securable_types()/list_operations() read the
@@ -5968,14 +5968,10 @@ void RestApiV1::register_routes(
             // deployment NEVER legitimately has zero rows in either. Coming
             // back empty therefore means resolution failed (closed
             // connection, corrupt table, etc.), not "there happen to be no
-            // securables" — and a silently-zero `full_grant_size` would make
-            // the wildcard-grant check below vacuously pass every principal.
-            // Fail CLOSED: report this run as unable to verify rather than
-            // certifying `"ok":true` over data we could not actually read.
-            // (list_roles()/get_principal_roles()/get_effective_permissions()
-            // returning empty is not distinguishable from "legitimately no
-            // rows" with the store's current API — same residual noted on
-            // the MCP twin, audit_engine_no_admin, in mcp_server.cpp.)
+            // securables" — and an empty grid would make the wildcard check
+            // vacuously pass every principal. Fail CLOSED: report this run as
+            // unable to verify rather than certifying `"ok":true` over data
+            // we could not actually read.
             if (all_securables.empty() || all_operations.empty()) {
                 res.status = 503;
                 res.set_content(
@@ -5986,56 +5982,41 @@ void RestApiV1::register_routes(
                     "no-admin", "rbac_resolution_failed");
                 return;
             }
-            const std::size_t full_grant_size = all_securables.size() * all_operations.size();
 
-            auto principals = eps->list_all();
-            JArr violations;
-            for (const auto& p : principals) {
-                auto roles = rbac_store->get_principal_roles("engine", p.principal_id);
-                for (const auto& pr : roles) {
-                    if (pr.role_name == "admin" || pr.role_name == "Administrator") {
-                        violations.add(JObj()
-                                          .add("principal_id", p.principal_id)
-                                          .add("role", pr.role_name)
-                                          .add("reason", "admin_role"));
-                        continue;
-                    }
-                    auto it = std::find_if(all_roles.begin(), all_roles.end(),
-                                           [&](const RbacRole& r) { return r.name == pr.role_name; });
-                    if (it != all_roles.end() && it->is_system) {
-                        violations.add(JObj()
-                                          .add("principal_id", p.principal_id)
-                                          .add("role", pr.role_name)
-                                          .add("reason", "system_role"));
-                    }
-                }
-                // "No all-permissions toggle" residual (rbac_store.cpp's
-                // assign_role comment): a custom, non-system role that
-                // happens to be granted a FULL cross-product of every known
-                // securable x operation is functionally admin-equivalent
-                // even though neither the literal-name nor is_system checks
-                // above would catch it.
-                if (full_grant_size > 0) {
-                    auto effective = rbac_store->get_effective_permissions(p.principal_id);
-                    std::unordered_set<std::string> granted;
-                    for (const auto& perm : effective) {
-                        if (perm.effect == "allow")
-                            granted.insert(perm.securable_type + "\x1f" + perm.operation);
-                    }
-                    if (granted.size() >= full_grant_size) {
-                        violations.add(JObj()
-                                          .add("principal_id", p.principal_id)
-                                          .add("role", "")
-                                          .add("reason", "wildcard_grant"));
-                    }
-                }
+            // The grants, roles and role permissions are CHECKED reads
+            // (engine_no_admin_audit.hpp, shared with the MCP twin): a read
+            // that cannot be answered must never read as "no violations".
+            // This auditor is the only control over a wildcard custom role
+            // (maintainer ruling 2026-10-23, #2485), so it fails closed: 503,
+            // no partial list, no `success` audit row.
+            auto inputs = engine_no_admin_audit::read_inputs(*rbac_store);
+            if (!inputs) {
+                res.status = 503;
+                res.set_header("Retry-After", "2");
+                res.set_content(
+                    detail::a4_error(res, std::string(engine_no_admin_audit::kUnavailableMessage),
+                                     detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                    "application/json");
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.audit.no_admin", "failure", "AuditLog",
+                    "no-admin", std::string(engine_no_admin_audit::kFailureAuditDetail));
+                return;
             }
 
-            const bool ok = violations.size() == 0;
+            const auto found = engine_no_admin_audit::evaluate(*inputs, all_securables, all_operations);
+            JArr violations;
+            for (const auto& v : found) {
+                violations.add(JObj()
+                                   .add("principal_id", v.principal_id)
+                                   .add("role", v.role)
+                                   .add("reason", v.reason));
+            }
+
+            const bool ok = found.empty();
             std::string data = JObj().add("ok", ok).raw("violations", violations.str()).str();
             (void)detail::emit_behavioral_audit(
                 audit_fn, req, res, "engine_principal.audit.no_admin", "success", "AuditLog",
-                "no-admin", "violations=" + std::to_string(violations.size()));
+                "no-admin", engine_no_admin_audit::audit_detail(found));
             res.set_content(ok_json(data), "application/json");
         });
 

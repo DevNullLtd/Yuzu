@@ -45,6 +45,7 @@
 #include "pg/pg_pool.hpp"
 #include "ca_store.hpp"
 #include "discover_routes.hpp"     // A2 discovery builders (Issue 17.1)
+#include "engine_principal_store.hpp"
 #include "event_bus.hpp"
 #include "execution_tracker.hpp"
 #include "instruction_definition_model.hpp" // #4029: shared row/detail/export builders
@@ -57,6 +58,7 @@
 #include "response_store.hpp"
 #include "rest_api_v1.hpp"      // M.9 PR-2b: cross-transport cursor walk (REST + MCP)
 #include "test_route_sink.hpp"  // M.9 PR-2b: in-process sink for that REST half
+#include "test_principal_lock_gate.hpp" // SqlFault: a REAL table moved aside in the throwaway DB
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
 #include "test_compliance_api_double.hpp" // ADR-0031 WS-A4: FnComplianceApi
@@ -1091,6 +1093,11 @@ struct McpTestServer {
     /// on the "engine credential store unavailable" path.
     yuzu::server::ApiTokenStore* engine_credential_store_for_test{nullptr};
 
+    /// Optionally wire an EnginePrincipalStore so audit_engine_no_admin (which refuses to run
+    /// without one) can be exercised against a real RbacStore. Default nullptr keeps every
+    /// pre-existing test on the "store unavailable" path.
+    yuzu::server::EnginePrincipalStore* engine_principal_store_for_test{nullptr};
+
     /// #2395 track D: optionally wire a stub KekOps so rotate_kek /
     /// rewrap_secrets / get_kek_status can be exercised end-to-end at the MCP
     /// surface — mirrors ca_store_for_test above. Default-constructed
@@ -1564,6 +1571,8 @@ private:
         // build_handler param — wire before the handlers are built.
         if (engine_credential_store_for_test)
             mcp.set_engine_credential_store(engine_credential_store_for_test);
+        if (engine_principal_store_for_test)
+            mcp.set_engine_principal_store(engine_principal_store_for_test);
 
         // #2395 track D: the KEK ops seam ALSO rides a setter (same pattern as
         // the engine-credential store above) — wire before the handlers are
@@ -3053,6 +3062,159 @@ TEST_CASE("MCP confirm_engine_rotation: token_id pin round-trip via tools/call",
         if (d.find("token_id=" + successor_token_id) != std::string::npos)
             audit_bound = true;
     CHECK(audit_bound);
+}
+
+// The MCP twin of the REST no-admin auditor shares ONE implementation with it
+// (engine_no_admin_audit.hpp). The auditor is the only control over a wildcard custom role
+// (maintainer ruling 2026-10-23, #2485), so a degraded read must never certify ok:true.
+TEST_CASE("MCP audit_engine_no_admin: fails CLOSED (error + retry hint, no ok:true, no success "
+          "audit row) when ANY checked read degrades",
+          "[mcp][pg][engine_principal][no_admin][fail_closed][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+    yuzu::server::EnginePrincipalStore eps{pool};
+    REQUIRE(eps.is_open());
+
+    // A real violation: a custom role granted the whole current grid, held by an engine id.
+    REQUIRE(rbac.create_role({.name = "WildRole", .description = "d"}).has_value());
+    for (const auto& s : rbac.list_securable_types())
+        for (const auto& o : rbac.list_operations())
+            REQUIRE(rbac.set_permission({"WildRole", s, o, "allow"}).has_value());
+    REQUIRE(eps.create("mcp wild", "alice", "audit test", "internal", "alice", "engine:mcp-wild")
+                .has_value());
+    REQUIRE(rbac.assign_role({"engine", "engine:mcp-wild", "WildRole"}).has_value());
+
+    McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
+    ts.engine_principal_store_for_test = &eps;
+    ts.start("readonly");
+    const std::string call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":71,)"
+        R"("params":{"name":"audit_engine_no_admin","arguments":{}}})";
+
+    // Control: healthy, the violation is reported by role name and the success row carries it.
+    {
+        auto ok = ts.call(call);
+        REQUIRE(ok);
+        auto j = nlohmann::json::parse(ok->body);
+        REQUIRE(j.contains("result"));
+        const auto payload =
+            nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+        REQUIRE(payload["violations"].size() == 1);
+        CHECK(payload["violations"][0]["role"] == "WildRole");
+        CHECK(payload["violations"][0]["reason"] == "wildcard_grant");
+        CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                         "engine_principal.audit.no_admin|success") == 1);
+    }
+
+    struct Broken {
+        const char* label;
+        const char* apply;
+        const char* undo;
+    };
+    const Broken tables[] = {
+        {"principal_roles",
+         "ALTER TABLE rbac_store.principal_roles RENAME TO principal_roles_gone",
+         "ALTER TABLE rbac_store.principal_roles_gone RENAME TO principal_roles"},
+        {"roles", "ALTER TABLE rbac_store.roles RENAME TO roles_gone",
+         "ALTER TABLE rbac_store.roles_gone RENAME TO roles"},
+        {"role_permissions",
+         "ALTER TABLE rbac_store.role_permissions RENAME TO role_permissions_gone",
+         "ALTER TABLE rbac_store.role_permissions_gone RENAME TO role_permissions"},
+    };
+    for (const auto& t : tables) {
+        INFO("read broken: " << t.label);
+        ts.audit_log.clear();
+        yuzu::test::SqlFault fault(pool, t.apply, t.undo);
+        fault.arm();
+
+        auto r = ts.call(call);
+        REQUIRE(r);
+        auto j = nlohmann::json::parse(r->body);
+        REQUIRE(j.contains("error"));
+        REQUIRE_FALSE(j.contains("result"));
+        CHECK(j["error"]["message"].get<std::string>() ==
+              "rbac resolution unavailable - cannot verify");
+        CHECK(j["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultRetryMs);
+        CHECK(r->body.find("violations") == std::string::npos); // no partial list
+        CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                         "engine_principal.audit.no_admin|failure") == 1);
+        CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                         "engine_principal.audit.no_admin|success") == 0);
+
+        fault.repair();
+    }
+}
+
+TEST_CASE("MCP audit_engine_no_admin: include_revoked=false fails closed when the active "
+          "roster read degrades, and narrows to active principals when healthy",
+          "[mcp][pg][engine_principal][no_admin][fail_closed][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+    yuzu::server::EnginePrincipalStore eps{pool};
+    REQUIRE(eps.is_open());
+
+    // Two engine principals that both hold an Administrator grant written straight into the
+    // table (assignment itself refuses it): one active, one revoked. The default audits both;
+    // include_revoked=false narrows the report to the active one.
+    REQUIRE(eps.create("live", "alice", "audit test", "internal", "alice", "engine:mcp-live")
+                .has_value());
+    REQUIRE(eps.create("gone", "alice", "audit test", "internal", "alice", "engine:mcp-gone")
+                .has_value());
+    REQUIRE(eps.revoke("engine:mcp-gone", "").has_value());
+    REQUIRE_FALSE(rbac.assign_role({"engine", "engine:mcp-live", "Administrator"}).has_value());
+    for (const char* id : {"engine:mcp-live", "engine:mcp-gone"}) {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto ins = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO rbac_store.principal_roles (principal_type, principal_id, role_name) "
+            "VALUES ('engine', $1, 'Administrator')",
+            std::vector<std::string>{id});
+        REQUIRE(ins.status() == PGRES_COMMAND_OK);
+    }
+
+    McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
+    ts.engine_principal_store_for_test = &eps;
+    ts.start("readonly");
+
+    auto all = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":72,)"
+                       R"("params":{"name":"audit_engine_no_admin","arguments":{}}})");
+    REQUIRE(all);
+    auto ja = nlohmann::json::parse(all->body);
+    REQUIRE(ja.contains("result"));
+    CHECK(nlohmann::json::parse(ja["result"]["content"][0]["text"].get<std::string>())["violations"]
+              .size() == 2);
+
+    const std::string active_only =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":73,)"
+        R"("params":{"name":"audit_engine_no_admin","arguments":{"include_revoked":false}}})";
+    auto narrowed = ts.call(active_only);
+    REQUIRE(narrowed);
+    auto jn = nlohmann::json::parse(narrowed->body);
+    REQUIRE(jn.contains("result"));
+    CHECK(nlohmann::json::parse(jn["result"]["content"][0]["text"].get<std::string>())["violations"]
+              .size() == 1); // engine:mcp-live only
+
+    yuzu::test::SqlFault fault(
+        pool, "ALTER TABLE engine_principal_store.engine_principals RENAME TO engine_principals_gone",
+        "ALTER TABLE engine_principal_store.engine_principals_gone RENAME TO engine_principals");
+    fault.arm();
+    auto broken = ts.call(active_only);
+    REQUIRE(broken);
+    auto jb = nlohmann::json::parse(broken->body);
+    REQUIRE(jb.contains("error"));
+    REQUIRE_FALSE(jb.contains("result"));
+    CHECK(jb["error"]["message"].get<std::string>() ==
+          "rbac resolution unavailable - cannot verify");
+    fault.repair();
 }
 
 // #3937: the engine-principal MUTATION twins fail closed (JSON-RPC 503 error, NOT
