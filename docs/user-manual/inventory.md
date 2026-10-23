@@ -1153,12 +1153,12 @@ points. It never lands in the generic inventory store, on either path.
 - **Wire format.** A version-1 pipe-delimited blob (`ver|`, `store|`, `cert|`, `loc|`,
   `san|`, `eku|`, `cdp|`, `der|`), every field framed with `\\`, `\|`, `\n` and `\r`
   escapes so store ids, DNs and paths round-trip byte for byte. The agent writer
-  (`certificates_inventory_blob.hpp`) defines the record and its 32 `cert|` fields; the
+  (`certificates_inventory_blob.hpp`) defines the record and its 33 `cert|` fields; the
   server parser follows it, and the order is documented in the header of
   `server/core/src/certificate_inventory_ingestion.hpp`. Digests are stored lower-case and
   serial, subject key id and authority key id upper-case, so filters compare
-  case-insensitively. A DER that does not hash to its certificate's SHA-256 is dropped and
-  the certificate marked `der_sha256_mismatch`. A
+  case-insensitively. A DER that does not hash to its certificate's SHA-256 is dropped, the
+  certificate marked `der_hash_mismatch` and the report counted under that reason. A
   field sent as `?` is unknown and stored NULL, which is not the same as an empty value.
   The stored hash is the SHA-256 of the received bytes, never the agent's claim.
 - **Per-store rules.** Every store reports one status. `ok` replaces the store's rows

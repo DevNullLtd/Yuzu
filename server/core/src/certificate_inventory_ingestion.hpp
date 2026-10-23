@@ -24,7 +24,7 @@
 ///
 ///   ver|<major>[.<minor>]
 ///   store|<store_id>|<scope>|<status>|<reason>|<cert_count or ?>     all stores first, sorted
-///   cert|<32 positional fields, below>                               then one group per store
+///   cert|<33 positional fields, below>                               then one group per store
 ///   loc|<sha256>|<store_id>|<path>
 ///   san|<sha256>|<type>|<value>
 ///   eku|<sha256>|<oid>
@@ -35,18 +35,17 @@
 /// The stores a group belongs to are the stores its `loc|` records name; a certificate in two
 /// stores repeats its `cert|` in each group (the facts are identical and the first wins; the
 /// locations add up). A self-signed certificate carries der_omitted=self_signed and no `der|`.
-/// `cert|` positional fields, in order (the 32 after the kind):
+/// `cert|` positional fields, in order (the 33 after the kind):
 ///
 ///   0 sha256, 1 sha1, 2 tbs_sha256, 3 version, 4 serial, 5 subject_dn, 6 issuer_dn,
 ///   7 subject_name_sha256, 8 issuer_name_sha256, 9 not_before, 10 not_after, 11 key_alg_oid,
 ///   12 rsa_modulus_bits, 13 ec_curve_oid, 14 ec_order_bits, 15 sig_alg_oid, 16 pss_hash_oid,
-///   17 pss_mgf1_hash_oid, 18 ski, 19 aki_key_id, 20 is_ca, 21 path_len, 22 key_usage,
-///   23 self_signed, 24 key_association, 25 key_provider, 26 key_exportable, 27 sans=<n>,
-///   28 ekus=<n>, 29 cdps=<n>, 30 der_omitted (empty|self_signed|oversize|budget|?),
-///   31 flags (comma-joined: serial_negative, sans_truncated, ekus_truncated,
+///   17 pss_mgf1_hash_oid, 18 spki_sha256, 19 ski, 20 aki_key_id, 21 is_ca, 22 path_len,
+///   23 key_usage, 24 self_signed, 25 key_association, 26 key_provider, 27 key_exportable,
+///   28 sans=<n>, 29 ekus=<n>, 30 cdps=<n>, 31 der_omitted (empty|self_signed|oversize|budget|?),
+///   32 flags (comma-joined: serial_negative, sans_truncated, ekus_truncated,
 ///   crl_dps_truncated, subject_dn_truncated, issuer_dn_truncated)
 ///
-/// `spki_sha256` is not on the wire (the writer does not send it); the column stays NULL.
 /// Fields 0-10 are mandatory; a record without the rest is an older agent's and the missing
 /// fields read UNKNOWN. A field sent as `?` is UNKNOWN (NULL); an empty text field is a real empty
 /// value; an empty integer, boolean or date field is not applicable and also stored NULL.
@@ -55,7 +54,7 @@
 /// marks this seam adds); `serial_negative` is also its own column.
 ///
 /// HEX CASE is normalised on ingest so filters compare case-insensitively: digests (sha256,
-/// sha1, tbs_sha256, the two name digests) are stored LOWERCASE; serial, ski and aki_key_id are
+/// sha1, tbs_sha256, the two name digests, spki_sha256) are stored LOWERCASE; serial, ski and aki_key_id are
 /// stored UPPERCASE.
 ///
 /// STORE REASONS are stored verbatim (sanitised, 256 bytes), never used as a metric label, so
@@ -129,6 +128,7 @@ struct CertBlobParse {
     bool any_parse_error{false}; ///< at least one record refused, or the report fell back
     bool any_over_cap{false};    ///< at least one refusal was a cap
     bool utf8_replaced{false};   ///< at least one field had invalid UTF-8 replaced
+    bool der_hash_mismatch{false}; ///< at least one DER did not hash to its certificate; dropped
     std::size_t refused_records{0};
 };
 
@@ -150,10 +150,11 @@ void ingest_certificate_inventory_report(CertificateInventoryStore& store,
 namespace cert_ingest_metric {
 inline constexpr std::string_view kName = "yuzu_server_cert_inventory_ingest_total";
 /// The closed (result, reason) set. Every increment is one of these pairs.
-inline constexpr std::array<std::pair<std::string_view, std::string_view>, 14> kPairs = {{
+inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> kPairs = {{
     {"stored", "none"},
     {"stored", "parse_error"},
     {"stored", "over_cap"},
+    {"stored", "der_hash_mismatch"},
     {"stored", "utf8_replaced"},
     {"touched", "none"},
     {"need_full", "cold"},
