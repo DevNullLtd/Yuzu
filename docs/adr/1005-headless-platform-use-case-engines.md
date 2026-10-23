@@ -876,8 +876,11 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        reads routes and tool names, so it cannot see a query-parameter variant
        or the `/swagger` page. This entry is the record that the gap is
        deliberate.
-     - **Acceptance.** No maintainer ruling is recorded yet. Until one is
-       recorded, this entry is a proposal and not an accepted exception.
+     - **Acceptance.** Accepted by the ADR owner (Dave Rae) on 2026-10-23, as
+       a session statement like the entries above and not a signed decision.
+       It has no revisit date. Issue #6359 carries the conditions for
+       revisiting it: an agentic worker shown to need guide text the default
+       document lacks, or the first release that ships the `/swagger` page.
 
 ## Interim rules (until the named follow-ups ship)
 
