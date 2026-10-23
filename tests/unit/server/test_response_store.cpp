@@ -3673,4 +3673,26 @@ TEST_CASE("ResponseStore tier: a filter with no plugin set wired refuses every r
     auto by_ids = store.query_by_ids(ids, f);
     REQUIRE(by_ids.has_value());
     CHECK(by_ids->empty());
+
+    // The remaining three reads of the 14, each with an unrestricted control on the same data.
+    auto gbi_all = store.get_by_instruction(kTierInstr, kAllRows);
+    REQUIRE(gbi_all.has_value());
+    CHECK(gbi_all->size() == 6);
+    auto gbi = store.get_by_instruction(kTierInstr, f);
+    REQUIRE(gbi.has_value());
+    CHECK(gbi->empty());
+
+    auto da_all = store.distinct_agent_ids_by_execution(kTierExec, kAllRows);
+    REQUIRE(da_all.has_value());
+    CHECK(da_all->size() == 3);
+    auto da = store.distinct_agent_ids_by_execution(kTierExec, f);
+    REQUIRE(da.has_value());
+    CHECK(da->empty());
+
+    auto lc_all = store.facet_line_count(kTierInstr, kAllRows, ctl);
+    REQUIRE(lc_all.has_value());
+    CHECK(*lc_all > 0);
+    auto lc = store.facet_line_count(kTierInstr, f, ctl);
+    REQUIRE(lc.has_value());
+    CHECK(*lc == 0);
 }

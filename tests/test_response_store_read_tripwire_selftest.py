@@ -6,8 +6,11 @@ mutated copies of the real header and source tree (held in memory, nothing on di
 asserts each mutation is caught: a new unlisted read, a read that lost its ResponseTierFilter, a
 defaulted filter, a stale list entry, a fifth internal-consumer site, a vanished site, a
 reintroduced marker, a parameter that only mentions the filter's name, and the literal-unrestricted
-spellings `exclude(set, std::nullopt)` and `for_fixed_plugin_poll(nullptr)`. It also pins the comment stripper against the string literal that would
-otherwise hide call sites from the scan. Stdlib only.
+spellings `exclude(set, std::nullopt)` and `for_fixed_plugin_poll(nullptr)`, including their wrapped
+forms (`VisibleSet(std::nullopt)`, `{std::nullopt}`, `std::optional<...>(std::nullopt)`, a
+`static_cast<...>(...)`, a C-style cast, extra parentheses, a null plugin set under a cast) and a
+same-file alias of the filter type. It also pins the comment stripper against the string literal that
+would otherwise hide call sites from the scan. Stdlib only.
 """
 from __future__ import annotations
 
@@ -142,6 +145,47 @@ def main() -> int:
            "exclude(set, std::optional<...>()) must fail")
     expect(any_mentions(idiom("auto f = ResponseTierFilter::exclude(*set, std::nullopt_t());"), "idiom.cpp"),
            "exclude(set, std::nullopt_t()) must fail")
+    for spelling in (
+            "authz::VisibleSet(std::nullopt)",
+            "authz::VisibleSet{std::nullopt}",
+            "{std::nullopt}",
+            "std::optional<std::unordered_set<std::string>>(std::nullopt)",
+            "std::optional<std::unordered_set<std::string>>{std::nullopt}",
+            "static_cast<authz::VisibleSet>(std::nullopt)",
+            "static_cast<std::optional<std::unordered_set<std::string>>>(std::nullopt)",
+            "static_cast<authz::VisibleSet>(authz::VisibleSet{})",
+            "(authz::VisibleSet)std::nullopt",
+            "(std::nullopt)",
+            "((std::nullopt))",
+            "static_cast<authz::VisibleSet>((std::nullopt))"):
+        expect(any_mentions(idiom(f"auto f = ResponseTierFilter::exclude(*set, {spelling});"), "idiom.cpp"),
+               f"exclude(set, {spelling}) must fail")
+    for fixed in ("static_cast<const ForensicsPluginSet*>(nullptr)",
+                  "(const ForensicsPluginSet*)nullptr",
+                  "static_cast<const yuzu::server::ForensicsPluginSet*>((nullptr))",
+                  "NULL", "0", "{}", "(nullptr)"):
+        expect(any_mentions(idiom(f"auto f = ResponseTierFilter::for_fixed_plugin_poll({fixed});"), "idiom.cpp"),
+               f"for_fixed_plugin_poll({fixed}) must fail")
+    # A same-file alias of the filter type is searched too.
+    expect(any_mentions(idiom("using RTF = ResponseTierFilter;\nauto f = RTF::exclude(*set, std::nullopt);"),
+                        "idiom.cpp"), "an alias (using) of the filter type must not hide exclude(set, nullopt)")
+    expect(any_mentions(idiom("using RTF = yuzu::server::ResponseTierFilter;\n"
+                              "auto f = RTF::exclude(*set, static_cast<authz::VisibleSet>(std::nullopt));"),
+                        "idiom.cpp"), "a qualified alias must not hide a wrapped nullopt")
+    expect(any_mentions(idiom("typedef ResponseTierFilter RTF;\nauto f = RTF::exclude(*set, {});"),
+                        "idiom.cpp"), "an alias (typedef) of the filter type must not hide exclude(set, {})")
+    expect(idiom("using RTF = ResponseTierFilter;\nauto f = RTF::exclude(*set, authz::deny_all());") == [],
+           "an alias with a real visibility argument is not flagged")
+    # Real (non-literal) arguments, with and without wrappers, are never flagged.
+    expect(idiom("auto f = ResponseTierFilter::exclude(*set, static_cast<authz::VisibleSet>(ids));") == [],
+           "a cast of a variable is not the unrestricted literal")
+    expect(idiom("auto f = ResponseTierFilter::exclude(*set, (fn)(req));") == [],
+           "a call through a parenthesised callable is not the unrestricted literal")
+    expect(idiom("auto f = ResponseTierFilter::exclude(*set, std::optional<std::unordered_set<std::string>>(ids));")
+           == [], "std::optional<...>(<variable>) is a real set, not the unrestricted literal")
+    expect(idiom("auto f = ResponseTierFilter::for_fixed_plugin_poll(static_cast<const ForensicsPluginSet*>"
+                 "(forensics_plugins()));") == [],
+           "a cast of the accessor is not the null literal")
     expect(idiom("auto f = ResponseTierFilter::exclude(*set, authz::VisibleSet{ids});") == [],
            "exclude(set, VisibleSet{<non-empty>}) is a real set, not the unrestricted literal")
     expect(any_mentions(idiom("auto f = ResponseTierFilter::for_fixed_plugin_poll(nullptr);"), "idiom.cpp"),

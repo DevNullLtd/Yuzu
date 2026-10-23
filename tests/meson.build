@@ -4056,7 +4056,9 @@ test('response store read tripwire selftest',
   _python3_test,
   args: [files('test_response_store_read_tripwire_selftest.py')],
   suite: 'docs',
-  timeout: 30,
+  # Runs the scan over a mutated copy of the whole server tree once per mutation. Memoised per file
+  # it takes a few seconds; the headroom is for a loaded shared CI box, not for the work.
+  timeout: 120,
 )
 
 # #4990: server.cpp must keep wiring the Forensics plugin set and the visibility resolver into every

@@ -38,14 +38,17 @@ CHECK 2b (the other unrestricted spellings). The factory is not the only way to 
 CHECK 3 (markers). `operator_surface_pending_wiring` (the removed transitional factory) and
   `TODO(#4990)` must not reappear anywhere under server/ or tests/unit/.
 
-GREP LIMIT: this is lexical. A renamed alias of the factory, a call through a function pointer or a
-  macro, or a read added to a class other than ResponseStore evades it; the type-level static_asserts
-  and the routed-concern review (Executions-history ladder row) are the compensating controls.
+GREP LIMIT: this is lexical. A same-file alias of the filter type is followed in CHECK 2b, and the
+  literal spellings are matched through casts and parentheses. A renamed alias of the factory, an
+  alias of the filter type declared in another file, a call through a function pointer or a macro,
+  or a read added to a class other than ResponseStore evades it; the type-level static_asserts and
+  the routed-concern review (Executions-history ladder row) are the compensating controls.
 
 Stdlib only, like the other tests/test_*.py gates. Exit 0 = pass; non-zero prints each failure.
 """
 from __future__ import annotations
 
+import functools
 import os
 import re
 import sys
@@ -113,8 +116,15 @@ _SRC_EXTS = (".cpp", ".hpp", ".h", ".cc")
 
 # --- CHECK 1: the public section of ResponseStore ---------------------------------------------
 
+_RAW_OPEN = re.compile(r'R"([^()\\\s]{0,16})\(')
+
+
+@functools.lru_cache(maxsize=None)
 def _strip_comments(text: str) -> str:
     """Drop // and /* */ comments, leaving string and character literals (and raw strings) intact.
+
+    Memoised per file text: the scans re-strip the whole tree once per check (and the selftest once
+    per mutation), and a mutation changes one file, so every other file is a cache hit.
 
     A regex strip is wrong here: a literal such as "/api/*" would open a block comment that eats
     real code up to some later `*/`, silently hiding call sites from the scan.
@@ -131,7 +141,7 @@ def _strip_comments(text: str) -> str:
             i = n if j < 0 else j + 2
             out.append(" ")
         elif c == "R" and text[i + 1:i + 2] == '"' and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
-            m = re.compile(r'R"([^()\\\s]{0,16})\(').match(text, i)
+            m = _RAW_OPEN.match(text, i)
             if m:
                 end = text.find(")" + m.group(1) + '"', m.end())
                 j = n if end < 0 else end + len(m.group(1)) + 2
@@ -316,21 +326,30 @@ def _first_arg(text: str, open_paren: int) -> str:
     return " ".join("".join(cur).split())
 
 
+@functools.lru_cache(maxsize=None)
+def _internal_sites_in_file(rel: str, text: str) -> tuple[str, ...]:
+    """Site keys in one file (memoised, like _unrestricted_in_file)."""
+    keys: list[str] = []
+    code = _strip_comments(text)
+    for m in re.finditer(r"unrestricted_internal_consumer\s*\(", code):
+        calls = [c for c in _CALL_RE.finditer(code, 0, m.start())]
+        if calls:
+            c = calls[-1]
+            key = f"{c.group(1)}({_first_arg(code, c.end() - 1)})"
+        else:
+            key = "<no preceding ResponseStore call>"
+        keys.append(f"{rel}:{key}")
+    return tuple(keys)
+
+
 def find_internal_consumer_sites(files: dict[str, str]) -> list[str]:
     """Site keys for every `unrestricted_internal_consumer()` call outside its definition header."""
-    keys = []
+    keys: list[str] = []
     for rel, text in files.items():
-        if rel.replace(os.sep, "/") == FILTER_HEADER.replace(os.sep, "/"):
+        rel = rel.replace(os.sep, "/")
+        if rel == FILTER_HEADER.replace(os.sep, "/"):
             continue
-        code = _strip_comments(text)
-        for m in re.finditer(r"unrestricted_internal_consumer\s*\(", code):
-            calls = [c for c in _CALL_RE.finditer(code, 0, m.start())]
-            if calls:
-                c = calls[-1]
-                key = f"{c.group(1)}({_first_arg(code, c.end() - 1)})"
-            else:
-                key = "<no preceding ResponseStore call>"
-            keys.append(f"{rel.replace(os.sep, '/')}:{key}")
+        keys.extend(_internal_sites_in_file(rel, text))
     return keys
 
 
@@ -354,16 +373,80 @@ def check_internal_sites(files: dict[str, str]) -> list[str]:
 
 
 # The literal spellings of "no restriction" for the second argument of exclude(): `std::nullopt`,
-# a value-initialised nullopt_t, a bare `{}`, a value-initialised VisibleSet or
-# `std::optional<...>` (braces or parentheses), and `VisibleSet{std::nullopt}`. A VARIABLE holding
-# a nullopt cannot be seen lexically (review-enforced, and `tier_filter_for` is the sanctioned
-# shape that derives it from the resolver).
+# a value-initialised nullopt_t, a bare `{}` or `{std::nullopt}`, a value-initialised VisibleSet or
+# `std::optional<...>` built from nothing or from `std::nullopt` (braces or parentheses), each
+# optionally wrapped in a `static_cast<...>(...)`, a C-style cast or redundant parentheses. A
+# VARIABLE holding a nullopt cannot be seen lexically (review-enforced, and `tier_filter_for` is the
+# sanctioned shape that derives it from the resolver).
 _EMPTY_INIT = r"(?:\{\s*\}|\(\s*\))"
+_NULLOPT_INIT = r"(?:\{\s*std::nullopt\s*\}|\(\s*std::nullopt\s*\))"
 _UNRESTRICTED_VISIBLE = re.compile(
     r"^(?:std::nullopt(?:_t\s*" + _EMPTY_INIT + r")?"
     r"|\{\s*\}"
-    r"|(?:\w+::)*VisibleSet\s*(?:" + _EMPTY_INIT + r"|\{\s*std::nullopt\s*\})"
-    r"|std::optional\s*<.*>\s*" + _EMPTY_INIT + r")$")
+    r"|\{\s*std::nullopt\s*\}"
+    r"|(?:\w+::)*VisibleSet\s*(?:" + _EMPTY_INIT + r"|" + _NULLOPT_INIT + r")"
+    r"|std::optional\s*<.*>\s*(?:" + _EMPTY_INIT + r"|" + _NULLOPT_INIT + r"))$")
+_NULL_PLUGIN_SET = re.compile(r"^(?:nullptr|NULL|0|\{\s*\})$")
+_C_CAST = re.compile(r"^\(\s*[\w:<>,\s*&]+\)\s*(?=[\w{(:])")
+
+
+def _balanced_end(s: str, i: int, open_c: str, close_c: str) -> int:
+    """Index just past the bracket matching s[i] == open_c, or -1."""
+    depth = 0
+    for j in range(i, len(s)):
+        if s[j] == open_c:
+            depth += 1
+        elif s[j] == close_c:
+            depth -= 1
+            if depth == 0:
+                return j + 1
+    return -1
+
+
+def _peel(arg: str) -> str:
+    """The argument text with redundant wrappers removed: outer parentheses, `static_cast<T>(x)`
+    and a C-style `(T)x`. What is left is matched against the literal spellings above, so peeling
+    can only reveal a literal, never invent one."""
+    a = " ".join(arg.split())
+    while True:
+        if a.startswith("(") and _balanced_end(a, 0, "(", ")") == len(a):
+            a = a[1:-1].strip()
+            continue
+        m = re.match(r"static_cast\s*<", a)
+        if m:
+            j = _balanced_end(a, m.end() - 1, "<", ">")
+            rest = a[j:].lstrip() if j > 0 else ""
+            if rest.startswith("(") and _balanced_end(rest, 0, "(", ")") == len(rest):
+                a = rest[1:-1].strip()
+                continue
+        m = _C_CAST.match(a)
+        if m:
+            a = a[m.end():].strip()
+            continue
+        return a
+
+
+def _is_unrestricted_visible(arg: str) -> bool:
+    return bool(_UNRESTRICTED_VISIBLE.match(_peel(arg)))
+
+
+def _is_null_plugin_set(arg: str) -> bool:
+    return bool(_NULL_PLUGIN_SET.match(_peel(arg)))
+
+
+# `using RTF = ResponseTierFilter;` / `typedef ResponseTierFilter RTF;` in the SAME file: the alias
+# is searched for as well. An alias declared in one file and used in another, or `using
+# ResponseTierFilter::exclude;` followed by a bare `exclude(...)`, is not seen (GREP LIMIT).
+_FILTER_TYPE = r"(?:\w+\s*::\s*)*ResponseTierFilter"
+_ALIAS_USING = re.compile(r"\busing\s+(\w+)\s*=\s*(?:const\s+)?" + _FILTER_TYPE + r"\s*;")
+_ALIAS_TYPEDEF = re.compile(r"\btypedef\s+" + _FILTER_TYPE + r"\s+(\w+)\s*;")
+
+
+def _filter_names(code: str) -> list[str]:
+    names = {"ResponseTierFilter"}
+    names.update(m.group(1) for m in _ALIAS_USING.finditer(code))
+    names.update(m.group(1) for m in _ALIAS_TYPEDEF.finditer(code))
+    return sorted(names)
 
 
 def _call_args(code: str, open_paren: int) -> list[str]:
@@ -375,22 +458,32 @@ def _call_args(code: str, open_paren: int) -> list[str]:
     return []
 
 
+@functools.lru_cache(maxsize=None)
+def _unrestricted_in_file(rel: str, text: str) -> tuple[str, ...]:
+    """The literal-unrestricted constructions in one file. Memoised: the selftest re-runs the scan
+    once per mutation over a tree in which only one file changed."""
+    found: list[str] = []
+    code = _strip_comments(text)
+    for name in _filter_names(code):
+        for m in re.finditer(r"\b" + re.escape(name) + r"\s*::\s*exclude\s*\(", code):
+            args = _call_args(code, m.end() - 1)
+            if len(args) >= 2 and _is_unrestricted_visible(args[1]):
+                found.append(f"{rel}: {name}::exclude(..., {' '.join(args[1].split())})")
+    for m in re.finditer(r"for_fixed_plugin_poll\s*\(", code):
+        args = _call_args(code, m.end() - 1)
+        if len(args) == 1 and _is_null_plugin_set(args[0]):
+            found.append(f"{rel}: for_fixed_plugin_poll({' '.join(args[0].split())})")
+    return tuple(found)
+
+
 def find_unrestricted_idioms(files: dict[str, str]) -> list[str]:
     """`file: <description>` for each literal-unrestricted filter construction in the given files."""
-    found = []
+    found: list[str] = []
     for rel, text in files.items():
         rel = rel.replace(os.sep, "/")
         if rel == FILTER_HEADER.replace(os.sep, "/"):
             continue
-        code = _strip_comments(text)
-        for m in re.finditer(r"ResponseTierFilter\s*::\s*exclude\s*\(", code):
-            args = _call_args(code, m.end() - 1)
-            if len(args) >= 2 and _UNRESTRICTED_VISIBLE.match(" ".join(args[1].split())):
-                found.append(f"{rel}: ResponseTierFilter::exclude(..., {' '.join(args[1].split())})")
-        for m in re.finditer(r"for_fixed_plugin_poll\s*\(", code):
-            args = _call_args(code, m.end() - 1)
-            if len(args) == 1 and re.match(r"^(?:nullptr|NULL|0|\{\s*\})$", args[0].strip()):
-                found.append(f"{rel}: for_fixed_plugin_poll({args[0].strip()})")
+        found.extend(_unrestricted_in_file(rel, text))
     return found
 
 
