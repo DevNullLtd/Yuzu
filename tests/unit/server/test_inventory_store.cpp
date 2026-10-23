@@ -137,6 +137,11 @@ TEST_CASE("InventoryStore degrades (not empty) on a broken pool", "[inventory]")
     auto g = store.get("a", "p");
     CHECK(!g.has_value());
     CHECK(g.error() == yuzu::server::InventoryReadError::kDegraded);
+    // A typed source name on a broken store is a degrade too, never "absent": the
+    // read filter must not turn a failure into a quiet 404 (chaos CH-3).
+    auto typed = store.get("a", "device_ci");
+    CHECK(!typed.has_value());
+    CHECK(typed.error() == yuzu::server::InventoryReadError::kDegraded);
     CHECK_FALSE(store.delete_agent("a"));       // ingest/delete: fail-soft, false, no crash
     CHECK_FALSE(store.delete_source("app_usage")); // same, keyed on plugin instead of agent
     store.upsert("a", "p", "{}", 1);            // fail-soft: does not throw
