@@ -349,30 +349,39 @@ struct Opened {
                 out.error = std::string{kTokKeyNotFound};
                 return out;
             }
-            for (std::size_t j = i; j < parts.size(); ++j) {
-                const bool last_j = j + 1 == parts.size();
-                Handle made = 0;
-                bool created_new = false;
-                // kAccessDelete: a walk that stops deletes what it made through this very handle.
-                const std::uint32_t create_access =
-                    (last_j ? leaf_access : (kKeyQueryValue | kKeyCreateSubKey)) | kAccessDelete;
-                const long crc = reg.create_sub(parent, parts[j], create_access, made, created_new);
-                if (crc != kErrorSuccess) {
-                    out.error = rc_token(crc, Missing::key);
-                    roll_back();
-                    return out;
+            // An exception on any path below (an allocation, a throwing seam) also rolls back before it leaves: the
+            // keys made so far are deleted by their own handles and the exception goes on. push_back cannot throw
+            // once the storage is reserved, so a key create_sub reported new is always in made_keys.
+            made_keys.reserve(parts.size() - i);
+            try {
+                for (std::size_t j = i; j < parts.size(); ++j) {
+                    const bool last_j = j + 1 == parts.size();
+                    Handle made = 0;
+                    bool created_new = false;
+                    // kAccessDelete: a walk that stops deletes what it made through this very handle.
+                    const std::uint32_t create_access =
+                        (last_j ? leaf_access : (kKeyQueryValue | kKeyCreateSubKey)) | kAccessDelete;
+                    const long crc = reg.create_sub(parent, parts[j], create_access, made, created_new);
+                    if (crc != kErrorSuccess) {
+                        out.error = rc_token(crc, Missing::key);
+                        roll_back();
+                        return out;
+                    }
+                    Owned made_owner{reg, made}; // closes on the early return below: opened-existing is never deleted
+                    if (!created_new) { // the walk saw it absent a moment ago
+                        out.error = std::string{kTokConcurrentChange};
+                        roll_back();
+                        return out;
+                    }
+                    made_keys.push_back(std::move(made_owner));
+                    ++out.created;
+                    parent = made_keys.back().get(); // the checked parent in `cur` stays open until the walk ends
                 }
-                Owned made_owner{reg, made}; // closes on the early return below: opened-existing is never deleted
-                if (!created_new) { // the walk saw it absent a moment ago
-                    out.error = std::string{kTokConcurrentChange};
-                    roll_back();
-                    return out;
-                }
-                made_keys.push_back(std::move(made_owner));
-                ++out.created;
-                parent = made_keys.back().get(); // the checked parent in `cur` stays open until the walk ends
+                return hand_over();
+            } catch (...) {
+                roll_back();
+                throw;
             }
-            return hand_over();
         }
         if (rc != kErrorSuccess) {
             out.error = rc_token(rc, Missing::key);
@@ -425,10 +434,14 @@ struct Opened {
 // ── single-action outcome ────────────────────────────────────────────────
 
 struct WriteOutcome {
-    std::string result = "refused"; ///< ok | refused (nothing mutated) | failed (a mutation was attempted)
-    std::string reason;             ///< "" or a token
-    std::string verify;             ///< ok | mismatch | ""
-    unsigned created = 0;           ///< keys this operation created and left behind (0 = nothing stranded)
+    /// ok | refused (nothing was mutated, or every key the walk created was removed again) |
+    /// failed (a mutation was attempted)
+    std::string result = "refused";
+    std::string reason; ///< "" or a token
+    std::string verify; ///< ok | mismatch | ""
+    /// Keys created and still present: on ok the keys the write made; after a walk that stopped,
+    /// only those it could not delete again.
+    unsigned created = 0;
     OldValue old;
     bool has_old = false;
     bool mutated = false;

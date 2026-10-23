@@ -215,7 +215,7 @@ The plugin is the producer of the `audit|` line the server parses (`server/core/
 |---|---|---|
 | 1 | `op` | `set_value`, `delete_value` or `delete_key` |
 | 2 | `hive` | `HKLM`, `HKCU`, `HKCR` or `HKU` |
-| 3 | `result` | `ok`, `refused` (nothing was mutated) or `failed` (a mutation was attempted) |
+| 3 | `result` | `ok`, `refused` (nothing was mutated, or every key the walk created was removed again) or `failed` (a mutation was attempted) |
 | 4 | `reason` | the error token (`access_denied`, `key_is_link`, `verify_mismatch`, `win32:<n>`, ...) or `-` |
 | 5 | `verify` | `ok`, `mismatch` or `-` (not read back) |
 | 6 | `key` | the key path, scrubbed, cut at 256 bytes with `~<total length>` |
@@ -226,7 +226,7 @@ The plugin is the producer of the `audit|` line the server parses (`server/core/
 | 11 | `counted_keys` | `delete_key`: the number of keys removed or refused (0 or 1), else `-` |
 | 12 | `counted_values` | `delete_key`: the values the key held, else `-` |
 | 13 | `capped` | `delete_key`: `1` when `counted_values` stopped at its cap of 10,000 nodes (the key plus up to 9,999 values), else `0`; `-` otherwise |
-| 14 | `created` | the keys this operation created and left behind: `0` when none (always `0` for the deletes); for a walk that stopped after it created keys, only those it could not delete again |
+| 14 | `created` | the keys this operation created and that are still present: on `ok` the keys the write made (`0` when it made none, always `0` for the deletes); after a walk that stopped, only those it could not delete again |
 | 15 | `sid` | always `-` in this version |
 | 16 | `old_state` | the value before the mutation: `absent`, `present` or `unreadable`; `-` when none was captured |
 | 17 | `old_type` | its type, or `-` |

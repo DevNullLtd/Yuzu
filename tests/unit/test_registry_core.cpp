@@ -14,6 +14,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <new>
 #include <optional>
 #include <set>
 #include <string>
@@ -988,6 +989,28 @@ TEST_CASE("registry core: a walk that does not hand its leaf over deletes the ke
         CHECK(o.created == 0);
         REQUIRE(reg.get("Top\\A", "Marker") != nullptr);
         CHECK(reg.method_calls("delete_key_by_handle") == 0);
+    }
+    SECTION("an exception after a create rolls back and goes on: the stranded key is removed") {
+        // mutant: no catch (...) { roll_back(); throw; } around the create loop and the hand-over
+        reg.before = [&](const std::string& ev) {
+            complete_link(ev);
+            if (ev == "create_sub:B") throw std::bad_alloc{};
+        };
+        CHECK_THROWS_AS(write("Top\\A\\B"), std::bad_alloc);
+        CHECK_FALSE(reg.exists("Decoy\\A"));
+        CHECK(reg.get("Decoy", "Marker")->data == dword(0xDEC0));
+        CHECK(reg.calls("set_value") == 0);
+    }
+    SECTION("an exception while the leaf's name is being tested also rolls back") {
+        // mutant: the try block ends before hand_over()
+        int names = 0;
+        reg.before = [&](const std::string& ev) {
+            if (ev == "final_name" && ++names == 2) throw std::bad_alloc{}; // the first is Top's, the second the leaf's
+        };
+        CHECK_THROWS_AS(write("Top\\A\\B"), std::bad_alloc);
+        CHECK_FALSE(reg.exists("Top\\A"));
+        CHECK(reg.exists("Top"));
+        CHECK(reg.calls("set_value") == 0);
     }
 }
 

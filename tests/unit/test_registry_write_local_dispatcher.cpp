@@ -7,7 +7,8 @@
  * key is a cross-JOB shared resource) and an RAII guard removes each scratch object. Cases that need
  * elevation WARN and skip, and a skip is NOT evidence: YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS=1 (the
  * kingsley evidence jobs) turns every skip into a FAIL -- see skip_or_fail(). Off Windows this TU pins
- * the planned-stub contract of the loaded plugin (the #else branch).
+ * the planned-stub contract of the loaded plugin and the ABI-containment catch of its execute() (the #else
+ * branch).
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -657,7 +658,10 @@ TEST_CASE("registry write: a non-ASCII key and value name reach the registry as 
 // the dispatcher rely on: the plugin version, the 9 descriptors with the Windows leg SUPPORTED rung 1
 // and the macOS / Linux legs PLANNED (naming the mechanism that will carry them), the read action's
 // honest sentinel with rc 0, and every mutator's rc 1 with the same sentinel -- a write that did not
-// happen is never a terminal SUCCESS (BR-03).
+// happen is never a terminal SUCCESS (BR-03). The last case includes registry_plugin.cpp (the guard macro
+// below drops its C plugin entry point and adds a throwing test-only action) to prove nothing thrown inside
+// execute() crosses the plugin boundary: the Windows leg's twin is execute_guarded in
+// test_registry_win_internals.cpp.
 // ═════════════════════════════════════════════════════════════════════════
 
 #include <yuzu/agent/plugin_loader.hpp>
@@ -668,12 +672,18 @@ TEST_CASE("registry write: a non-ASCII key and value name reach the registry as 
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <iterator>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string_view>
 #include <unordered_set>
 #include <vector>
+
+#define YUZU_REGISTRY_UNIT_TEST_INTERNALS_ONLY 1
+#include "../../agents/plugins/registry/src/registry_plugin.cpp"
+#undef YUZU_REGISTRY_UNIT_TEST_INTERNALS_ONLY
 
 namespace fs = std::filesystem;
 
@@ -729,6 +739,47 @@ std::vector<std::string> rows_of(const std::string& captured) {
         if (!line.empty()) out.push_back(line);
     }
     return out;
+}
+
+// A fake descriptor whose execute runs an injected body against a REAL yuzu::CommandContext (the
+// test_registry_win_internals.cpp shape), so RegistryPlugin::execute writes to the same capture LocalDispatcher
+// reads for the loaded plugin.
+std::function<int(yuzu::CommandContext&)> g_body;
+
+int fake_seam_execute(YuzuCommandContext* raw_ctx, const char* /*action*/, const YuzuParam* /*params*/,
+                      std::size_t /*param_count*/) {
+    yuzu::CommandContext ctx(raw_ctx);
+    return g_body(ctx);
+}
+
+const char* const kFakeActions[] = {"seam", nullptr};
+
+const YuzuPluginDescriptor kFakeDescriptor = {
+    /*abi_version=*/YUZU_PLUGIN_ABI_VERSION,
+    /*name=*/"registry_seam",
+    /*version=*/"1.0.0",
+    /*description=*/"test-only registry execute fixture",
+    /*actions=*/kFakeActions,
+    /*init=*/nullptr,
+    /*shutdown=*/nullptr,
+    /*execute=*/fake_seam_execute,
+    /*sdk_version=*/nullptr,
+};
+
+struct Executed {
+    int rc = 0;
+    std::vector<std::string> rows;
+};
+
+/// Runs RegistryPlugin::execute(`action`) with no params inside the fake context.
+Executed run_execute(std::string_view action) {
+    g_body = [action](yuzu::CommandContext& ctx) -> int {
+        RegistryPlugin plugin;
+        return plugin.execute(ctx, action, yuzu::Params{std::span<const YuzuParam>{}});
+    };
+    const auto result = yuzu::agent::LocalDispatcher{}.run(&kFakeDescriptor, "seam");
+    g_body = nullptr;
+    return {result.rc, rows_of(result.captured)};
 }
 
 } // namespace
@@ -790,6 +841,23 @@ TEST_CASE("registry plugin: off Windows a read answers the sentinel with rc 0 an
         const auto rows = rows_of(result.captured);
         REQUIRE(rows.size() == 1);
         CHECK(rows[0] == "error|unknown action: get_vaule");
+    }
+}
+
+TEST_CASE("registry plugin: an exception inside an off-Windows dispatch is contained as error|exception",
+          "[registry][actions]") {
+    SECTION("a dispatch that throws answers rc 1 and one error|exception line; nothing escapes") {
+        // mutant: the catch (...) in RegistryPlugin::execute deleted -- the exception reaches the host
+        const auto r = run_execute("__throw_std");
+        CHECK(r.rc == 1);
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.rows[0] == "error|exception");
+    }
+    SECTION("an ordinary unknown action still passes through unchanged") {
+        const auto r = run_execute("get_vaule");
+        CHECK(r.rc == 1);
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.rows[0] == "error|unknown action: get_vaule");
     }
 }
 

@@ -13,6 +13,9 @@
 #include <iterator>
 #include <string>
 #include <string_view>
+#if defined(YUZU_REGISTRY_UNIT_TEST_INTERNALS_ONLY)
+#include <stdexcept>
+#endif
 
 #include "registry_core.hpp"
 
@@ -76,6 +79,11 @@ public:
         // ONE try/catch(...) at the ABI seam, as execute_guarded is on the Windows leg: nothing thrown here (the
         // only throw sites are string allocations) crosses the plugin boundary.
         try {
+#if defined(YUZU_REGISTRY_UNIT_TEST_INTERNALS_ONLY)
+            // Test-only (the macro is defined by test_registry_write_local_dispatcher.cpp alone): a dispatch that
+            // throws, so the catch below is pinned. The real build has no such action.
+            if (action == "__throw_std") throw std::runtime_error("registry test: std::exception");
+#endif
             // Unknown actions are refused BEFORE the platform answer, so a misspelled one is never terminal SUCCESS.
             bool known = false;
             for (const char* const* a = actions(); *a != nullptr; ++a) {
@@ -111,4 +119,8 @@ public:
     }
 };
 
+// The guard macro is defined only by tests/unit/test_registry_write_local_dispatcher.cpp, which includes this file
+// to drive execute() directly; the test executable carries no C plugin entry point. The real build never defines it.
+#if !defined(YUZU_REGISTRY_UNIT_TEST_INTERNALS_ONLY)
 YUZU_PLUGIN_EXPORT(RegistryPlugin)
+#endif
