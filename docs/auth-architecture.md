@@ -944,8 +944,8 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   the sentinel already cleared (a prior reap, or a manual
   `revoke_elevation`/`revoke_user_elevations`, which clear to the same
   sentinel) emits nothing, so a manual step-down never ALSO produces a spurious
-  `expired` row. **The `role.elevation.expired` emission is itself best-effort
-  (never retried, so it can be lost)** (governance hardening round, UP-3): `elevated_until` is
+  `expired` row. **The `role.elevation.expired` emission is itself best-effort:
+  it is never retried, so it can be lost** (governance hardening round, UP-3). `elevated_until` is
   cleared to the sentinel BEFORE the audit call, so a store failure loses only
   the confirmatory `expired` row, never the reap itself (the session still
   correctly reverts to base role) — and the window's end remains
