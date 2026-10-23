@@ -229,37 +229,20 @@ TEST_CASE("TAR schema: effective network capture method is always polling today"
 
 // ── Per-source default-enabled (review R1) ──────────────────────────────────
 
-TEST_CASE("TAR schema: opt-in sources declare default_enabled=false",
-          "[tar][schema][default-off]") {
+TEST_CASE("TAR schema: every capture source ships default_enabled=true",
+          "[tar][schema][default-on]") {
     // default_enabled is the single source of truth the plugin's source_enabled(),
     // do_status(), apply_source_enabled_transition(), and run_retention() all
-    // read. The high-volume usage-class sources (module ~100× process volume,
-    // procperf per-app, netqual per-connection) are opt-in and must report
-    // disabled on a fresh agent; software is opt-in too (off by default — the
-    // cautious posture for a new capture source, #1620); everything else is
-    // always-on.
-    for (const auto* name : {"module", "procperf", "netqual", "arp", "dns", "software", "netconn",
-                             "mapdrive"}) {
-        INFO("opt-in source=" << name);
-        CHECK_FALSE(source_default_enabled(name));
-    }
-    // power/removable are default-ON by the Wave 6 operator ruling — the first
-    // capture sources to ship enabled. They belong in THIS list, not a separate
-    // assertion in the cursor-seam tests: the whole point of this case is that
-    // one file states the enable posture for every source, so a source added
-    // with the wrong default fails here rather than nowhere.
-    for (const auto* name : {"process", "tcp", "service", "user", "perf", "power", "removable"}) {
-        INFO("always-on source=" << name);
-        CHECK(source_default_enabled(name));
-    }
-    // An unknown source falls back to the always-on default.
-    CHECK(source_default_enabled("does_not_exist"));
-
-    // The field and the lookup must agree for every registered source.
+    // read. Registry-wide invariant: NO source may declare default_enabled=false
+    // — a source added with that default fails here rather than shipping off.
+    REQUIRE_FALSE(capture_sources().empty());
     for (const auto& src : capture_sources()) {
         INFO("source=" << src.name);
-        CHECK(source_default_enabled(src.name) == src.default_enabled);
+        CHECK(src.default_enabled);
+        CHECK(source_default_enabled(src.name));
     }
+    // An unknown source falls back to the default-on value.
+    CHECK(source_default_enabled("does_not_exist"));
 }
 
 TEST_CASE("TAR schema: software source is registered with three tiers + Windows support",
@@ -269,7 +252,6 @@ TEST_CASE("TAR schema: software source is registered with three tiers + Windows 
                            [](const CaptureSourceDef& s) { return s.name == "software"; });
     REQUIRE(it != sources.end());
     CHECK(it->dollar_name == "Software");
-    CHECK_FALSE(it->default_enabled); // opt-in (off by default) — cautious new-source posture (#1620)
 
     // live + daily + monthly, in that declaration order (so run_aggregation rolls
     // daily-from-live before monthly-from-daily within one tick).
@@ -416,7 +398,6 @@ TEST_CASE("TAR schema: netconn source is registered live-only with Windows wevta
                            [](const CaptureSourceDef& s) { return s.name == "netconn"; });
     REQUIRE(it != sources.end());
     CHECK(it->dollar_name == "NetConn");
-    CHECK_FALSE(it->default_enabled); // opt-in usage-class posture
 
     REQUIRE(it->granularities.size() == 1);
     CHECK(it->granularities[0].suffix == "live");
