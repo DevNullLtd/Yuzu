@@ -116,8 +116,9 @@ WHAT IT CHECKS
      gate that comes after an unconditional service-scope refusal (`if (deny_fleet_wide_
      service_scoped(...)) return;` or `deny_service_scoped_schedule_list`, directly in the
      handler body, the call being the whole condition and the branch returning) has kind
-     `refused`. Any further DISTINCT gate triple must also agree with the MCP side or the
-     row is a finding, and a further gate whose arguments cannot be read fails closed.
+     `refused`. Every further gate call (a repeat of the first call's triple aside) must also
+     agree with the MCP side or the row is a finding, and a further gate whose arguments
+     cannot be read fails closed. Further calls are counted by occurrence, not collapsed.
      MCP side: the tool's pair in mcp_server.cpp's kToolSecurityRows[], or for a registry
      tool the positional `"Securable", "Operation", ServiceScopeClass::x` triple of its
      ToolRecord. The confinement comparison: REST scoped/fleet == MCP `confined`; REST
@@ -131,7 +132,8 @@ WHAT IT CHECKS
      branch, or the function a registry record points at): a tool whose label is not
      `confined` but whose handler calls the fleet / list read mechanism, every call asking
      for the tool's own pair, compares as confined; the gate calls the handler makes
-     are the gates a further REST gate may match; and the refusal / confinement evidence above.
+     are the gates a further REST gate may match, one MCP call per REST call (a Counter of
+     triple -> number of calls); and the refusal / confinement evidence above.
      A route with no recognisable gate (auth_fn
      only, a helper closure, a member-function gate) fails CLOSED unless named in the
      size-pinned, shrink-only GATE_PARITY_NO_GATE_ALLOWED; a mismatch is an error unless
@@ -147,9 +149,12 @@ WHAT IT CHECKS
      row with a null twin on either side compares nothing. The MCP-side confinement read is
      whole-handler-body lexical: a fleet / list read call in an untaken branch or in a lambda
      the handler never invokes reads as confining, and the same holds for a refusal call that
-     unconditional_refusals accepts at the top level of the body. A further REST gate is
-     excused when the MCP handler makes the same (kind, securable, operation) call ANYWHERE in
-     its body, with no check that the call guards the data the REST gate guards. A row whose
+     unconditional_refusals accepts at the top level of the body. A further REST gate that
+     the tool's own label does not already agree with is matched one-to-one by a
+     same-(kind, securable, operation) call ANYWHERE in the MCP body (two such REST calls need
+     two MCP calls), with no check that the MCP call guards the data the REST gate guards.
+     Two REST gate calls in different branches of one handler still count twice: that is a
+     fail-closed finding to rule on, not a pairing the script can prove. A row whose
      route or tool cannot be found is an error, never a skip. The count of mcp_tools_*.cpp
      registry files must equal MIN_REGISTRY_FILES (its C++ twin is kRegistryDomainFiles in
      tests/unit/server/test_mcp_dispatch_coverage.cpp; a new mcp_tool*.hpp needs
@@ -184,6 +189,7 @@ USAGE
                                           # to lower a baseline
 """
 import argparse
+import collections
 import datetime
 import inspect
 import json
@@ -2042,10 +2048,12 @@ def handler_gate(span_text):
     """The gate of one REST handler span: (kind, securable, operation) for the FIRST gate call
     (as first_gate reads it), or (None, why) when there is none or it cannot be read. A plain gate
     that comes after an unconditional service-scope refusal (see unconditional_refusals) has kind
-    `refused`. When the handler holds further DISTINCT gates, the result is the 4-tuple (kind,
+    `refused`. When the handler holds further gate calls, the result is the 4-tuple (kind,
     securable, operation, extras), extras being the other (kind, securable, operation) triples in
-    text order; a further gate whose arguments cannot be read is the triple ("unparsed",
-    function_name, "?"), so a second gate is never silently dropped. `span_text` is
+    text order, ONE PER CALL (a repeated further call appears repeatedly, so check 6 can match it
+    one-to-one against the MCP side; a repeat of the first call's own triple is dropped); a
+    further gate whose arguments cannot be read is the triple ("unparsed", function_name, "?"),
+    so a second gate is never silently dropped. `span_text` is
     comment-blanked."""
     calls = all_gate_calls(span_text)
     if not calls:
@@ -2063,7 +2071,7 @@ def handler_gate(span_text):
     extras = []
     for c in calls[1:]:
         t = triple(c)
-        if t != first and t not in extras:
+        if t != first:
             extras.append(t)
     return first + (tuple(extras),) if extras else first
 
@@ -2183,10 +2191,11 @@ def mcp_handler_effect(body, pair):
 
 
 def mcp_handler_gates(body):
-    """The set of (kind, securable, operation) gate calls an MCP handler body (comment-blanked)
-    makes with literal arguments; a call whose arguments cannot be read is left out (it can only
-    fail to match, never excuse a REST gate)."""
-    return {(c[1], c[2], c[3]) for c in all_gate_calls(body) if c[1] is not None}
+    """A Counter of (kind, securable, operation) -> number of gate calls an MCP handler body
+    (comment-blanked) makes with literal arguments; a call whose arguments cannot be read is left
+    out (it can only fail to match, never excuse a REST gate). The count is what makes check 6's
+    matching one-to-one."""
+    return collections.Counter((c[1], c[2], c[3]) for c in all_gate_calls(body) if c[1] is not None)
 
 
 def extract_mcp_handlers(by_tool, registry, tools):
@@ -2196,9 +2205,9 @@ def extract_mcp_handlers(by_tool, registry, tools):
     such body is simply not derived (it keeps its label), never an error. effects is
     {tool: "confined"} for a tool whose ServiceScopeClass label is not `confined` but whose
     handler proves the confinement mechanism (mcp_handler_effect); gates is
-    {tool: mcp_handler_gates(body)}; proofs is {tool: frozenset of "refusal" (the body holds an
-    unconditional service-scope refusal call, see unconditional_refusals) and "confine" (the body
-    calls the confinement mechanism for the tool's own pair, whatever the label)}. A tool whose
+    {tool: mcp_handler_gates(body)}, a Counter per tool; proofs is {tool: frozenset of "refusal" (the
+    body holds an unconditional service-scope refusal call, see unconditional_refusals) and "confine"
+    (the body calls the confinement mechanism for the tool's own pair, whatever the label)}. A tool whose
     body cannot be derived is absent from all three maps, so it never yields a proof."""
     text = blank_cpp_comments(_read_mcp_server_cpp())
     effects, gates, proofs, reg_text = {}, {}, {}, {}
@@ -2245,8 +2254,8 @@ def extract_mcp_handlers(by_tool, registry, tools):
 # gates reads `<gate>; also <gate>, ...`. MCP kind is the tool's ServiceScopeClass (denied /
 # confined / global_safe), written `<label>+confined-by-handler` when the handler's own fleet
 # read proves it confines. The comparison is the securable, the operation, and the confinement
-# side (see _gate_agrees); every further REST gate must agree too or be matched by a gate call the
-# MCP handler makes.
+# side (see _gate_agrees); every further REST gate call must agree too or be matched, one-to-one, by a
+# gate call the MCP handler makes.
 GATE_PARITY_KNOWN_MISMATCHES_MAX = 6
 GATE_PARITY_KNOWN_MISMATCHES = {
     ("GET", "/api/v1/dex/perf/devices", "list_dex_perf_devices"): (
@@ -2332,7 +2341,7 @@ def _gate_desc(kind, securable, operation):
     return f"{kind}:{securable}:{operation}"
 
 
-def _gate_agrees(gate, mcp_class, mcp_pair, mcp_gates=frozenset(), mcp_proof=frozenset()):
+def _gate_agrees(gate, mcp_class, mcp_pair, mcp_gates=None, mcp_proof=frozenset()):
     """One REST gate triple against the MCP tool: same securable and operation, and the same
     side of the confinement line. `scoped` and `fleet` confine, so they need an MCP `confined`;
     `plain` confines nothing, so it needs `denied` or `global_safe`; `refused` (a plain gate behind
@@ -2341,19 +2350,24 @@ def _gate_agrees(gate, mcp_class, mcp_pair, mcp_gates=frozenset(), mcp_proof=fro
     unconditional refusal call, or a call to the confinement mechanism for the tool's own pair. A
     label alone never agrees with `refused`, and a tool whose handler body cannot be derived has
     no evidence, so it does not agree (it is listed in GATE_PARITY_KNOWN_MISMATCHES instead).
-    A triple the MCP handler itself gates on (`mcp_gates`, the exact (kind, securable, operation)
-    triples its body calls) also agrees: that is how a second gate is matched. An unreadable
-    triple never agrees."""
+    A triple the MCP handler itself gates on also agrees, ONE-TO-ONE: `mcp_gates` is a mutable
+    Counter of the exact (kind, securable, operation) triples its body calls, and a gate that
+    only that route matches (the label comparison above fails) consumes one count, so two REST
+    gate calls need two MCP calls. The label comparison is tried first and consumes nothing, so
+    a call is spent only when it is needed. An unreadable triple never agrees."""
     kind, securable, operation = gate
     if kind == "unparsed":
         return False
-    if gate in mcp_gates:
+    if (securable, operation) == mcp_pair:
+        if kind == "refused":
+            if mcp_class in ("denied", "confined") and bool(mcp_proof):
+                return True
+        elif (kind in _REST_CONFINING_KINDS) == (mcp_class == "confined"):
+            return True
+    if mcp_gates is not None and mcp_gates.get(gate, 0) > 0:
+        mcp_gates[gate] -= 1
         return True
-    if (securable, operation) != mcp_pair:
-        return False
-    if kind == "refused":
-        return mcp_class in ("denied", "confined") and bool(mcp_proof)
-    return (kind in _REST_CONFINING_KINDS) == (mcp_class == "confined")
+    return False
 
 
 def gate_parity_findings(ledger_rows, mcp_tools, rest_gates, mcp_security, mcp_effects=None, mcp_gates=None,
@@ -2372,7 +2386,9 @@ def gate_parity_findings(ledger_rows, mcp_tools, rest_gates, mcp_security, mcp_e
     allowlist entry pins the whole set. `mcp_effects` is {tool: "confined"} for a tool whose
     ServiceScopeClass label is not `confined` but whose handler PROVABLY calls the confinement
     mechanism (extract_mcp_handlers): that tool compares as confined and its description says so.
-    `mcp_gates` is {tool: set of (kind, securable, operation)} for the gate calls in that handler.
+    `mcp_gates` is {tool: Counter or set of (kind, securable, operation)} for the gate calls in
+    that handler (a set counts each triple once). It is copied per REST gate and consumed
+    one-to-one by the further REST gates the tool's label does not already agree with.
     `mcp_proofs` is {tool: frozenset of "refusal" / "confine"}, the evidence the handler body
     holds for a REST `refused` gate (extract_mcp_handlers); a tool absent from it has none."""
     mismatches, no_gates, errors = {}, {}, []
@@ -2405,10 +2421,10 @@ def gate_parity_findings(ledger_rows, mcp_tools, rest_gates, mcp_security, mcp_e
                 no_gates[key] = f"{owner}: {gate[1]}"
                 continue
             primary, extras = tuple(gate[:3]), (gate[3] if len(gate) > 3 else ())
-            tool_gates = mcp_gates.get(tool, frozenset())
             tool_proof = mcp_proofs.get(tool, frozenset())
             # The first gate is held to the label (or the proven effect); a handler's own gate
             # calls match only the further gates, never the first.
+            tool_gates = collections.Counter(mcp_gates.get(tool, ()))
             if (_gate_agrees(primary, mcp_class, (mcp[0], mcp[1]), mcp_proof=tool_proof)
                     and all(_gate_agrees(g, mcp_class, (mcp[0], mcp[1]), tool_gates, tool_proof)
                             for g in extras)):
@@ -3638,8 +3654,8 @@ def _selftest_body():
              ("plain", "Sec", "Read", (("fleet", "Other", "Write"),))),
             ("second-gate-kind-only", f'{gate}\nscoped_perm_fn(q, p, "Sec", "Read", id);',
              ("plain", "Sec", "Read", (("scoped", "Sec", "Read"),))),
-            ("two-extras-deduped", f'{gate}\nperm_fn(q, p, "A", "Read");\nperm_fn(q, p, "A", "Read");\nperm_fn(q, p, "B", "Read");',
-             ("plain", "Sec", "Read", (("plain", "A", "Read"), ("plain", "B", "Read")))),
+            ("two-extras-counted", f'{gate}\nperm_fn(q, p, "A", "Read");\nperm_fn(q, p, "A", "Read");\nperm_fn(q, p, "B", "Read");',
+             ("plain", "Sec", "Read", (("plain", "A", "Read"), ("plain", "A", "Read"), ("plain", "B", "Read")))),
             ("second-gate-unreadable", f"{gate}\nperm_fn(q, p, securable, op);",
              ("plain", "Sec", "Read", (("unparsed", "perm_fn", "?"),))),
             ("refused-first-then-plain-extra", f'if ({deny}) return;\n{gate}\nperm_fn(q, p, "A", "Read");',
@@ -3792,6 +3808,12 @@ def _selftest_body():
         "extra_bad": (("plain", *S, (("plain", "Zed", "Read"),)), (*S, "denied")),
         "extra_unread": (("plain", *S, (("unparsed", "perm_fn", "?"),)), (*S, "denied")),
         "extra_only_first_gate": (("plain", "Tee", "Read"), (*S, "denied")),
+        "extra_dup_one_call": (("plain", *S, (("plain", "Tee", "Read"), ("plain", "Tee", "Read"))), (*S, "denied")),
+        "extra_dup_two_calls": (("plain", *S, (("plain", "Tee", "Read"), ("plain", "Tee", "Read"))), (*S, "denied")),
+        "extra_dup_set": (("plain", *S, (("plain", "Tee", "Read"), ("plain", "Tee", "Read"))), (*S, "denied")),
+        "extra_dup_three_calls": (("plain", *S, (("plain", "Tee", "Read"), ("plain", "Tee", "Read"))), (*S, "denied")),
+        "extra_two_kinds_one_call_each": (("plain", *S, (("plain", "Tee", "Read"), ("fleet", "Tee", "Read"))), (*S, "denied")),
+        "extra_same_pair_label_free": (("plain", *S, (("plain", *S), ("plain", *S))), (*S, "denied")),
         "plain_denied": (("plain", *S), (*S, "denied")),
         "plain_global": (("plain", *S), (*S, "global_safe")),
         "fleet_denied": (("fleet", *S), (*S, "denied")),
@@ -3812,7 +3834,14 @@ def _selftest_body():
     rows_, tools_, rest_, sec_ = _fp(fp_cases)
     handler_gates = {"extra_ok": {("plain", "Tee", "Read")}, "extra_kind": {("plain", "Tee", "Read")},
                      "extra_bad": {("plain", "Tee", "Read")}, "extra_unread": {("unparsed", "perm_fn", "?")},
-                     "extra_only_first_gate": {("plain", "Tee", "Read")}}
+                     "extra_only_first_gate": {("plain", "Tee", "Read")},
+                     "extra_dup_one_call": collections.Counter({("plain", "Tee", "Read"): 1}),
+                     "extra_dup_two_calls": collections.Counter({("plain", "Tee", "Read"): 2}),
+                     "extra_dup_set": {("plain", "Tee", "Read")},
+                     "extra_dup_three_calls": collections.Counter({("plain", "Tee", "Read"): 3}),
+                     "extra_two_kinds_one_call_each": collections.Counter({("plain", "Tee", "Read"): 1,
+                                                                            ("fleet", "Tee", "Read"): 1}),
+                     "extra_same_pair_label_free": collections.Counter()}
     handler_effects = {"fleet_effect": "confined", "plain_effect": "confined", "refused_effect": "confined"}
     # The evidence the MCP handler body holds for a REST `refused` gate: a derived body with a
     # refusal call or a confinement call proves it; a derived body with neither (an empty set) and
@@ -3825,6 +3854,7 @@ def _selftest_body():
     m1, n1, e1 = gate_parity_findings(rows_, tools_, rest_, sec_, handler_effects, handler_gates, handler_proofs)
     check(not n1 and not e1, f"gate parity (further gates): no gap or error expected, got {n1} {e1}")
     check(set(t for _m, _p, t in m1) == {"extra_kind", "extra_bad", "extra_unread", "extra_only_first_gate",
+                                         "extra_dup_one_call", "extra_dup_set",
                                          "fleet_denied", "plain_effect", "refused_global",
                                          "refused_wrong_op", "refused_denied_noproof",
                                          "refused_confined_noproof", "refused_confined_noderive",
@@ -3841,6 +3871,18 @@ def _selftest_body():
           and ("GET", "/api/v1/refused_denied_noderive", "refused_denied_noderive") in m1,
           "gate parity (refused): a label alone never agrees, whether the handler body holds neither "
           "kind of evidence or could not be derived at all")
+    check(("GET", "/api/v1/extra_dup_two_calls", "extra_dup_two_calls") not in m1
+          and ("GET", "/api/v1/extra_dup_three_calls", "extra_dup_three_calls") not in m1
+          and ("GET", "/api/v1/extra_two_kinds_one_call_each", "extra_two_kinds_one_call_each") not in m1
+          and ("GET", "/api/v1/extra_same_pair_label_free", "extra_same_pair_label_free") not in m1,
+          "gate parity (one-to-one): as many MCP calls as REST calls agree, spare MCP calls are harmless, "
+          "different kinds each need their own call, and a further call the label already agrees with "
+          "needs no MCP call")
+    check(m1[("GET", "/api/v1/extra_dup_one_call", "extra_dup_one_call")]
+          == ("plain:Sec:Read; also plain:Tee:Read, plain:Tee:Read", "denied:Sec:Read")
+          and ("GET", "/api/v1/extra_dup_set", "extra_dup_set") in m1,
+          "gate parity (one-to-one): two REST gate calls with one triple are not excused by ONE MCP call "
+          "(a Counter of 1 or a plain set), and the description names both REST calls")
     check(m1[("GET", "/api/v1/extra_bad", "extra_bad")] == ("plain:Sec:Read; also plain:Zed:Read", "denied:Sec:Read"),
           f"gate parity (further gates): the description names every further gate, got {m1[('GET', '/api/v1/extra_bad', 'extra_bad')]}")
     check(m1[("GET", "/api/v1/extra_unread", "extra_unread")][0] == "plain:Sec:Read; also unparsed:perm_fn:?",
@@ -3879,6 +3921,7 @@ def _selftest_body():
             'if (tool_name == "t_ref_nested") {\n  if (flag) {\n    if (deny_fleet_wide_service_scoped(req, res)) return;\n  }\n}\n'
             'if (tool_name == "t_ref_noreturn") {\n  if (deny_fleet_wide_service_scoped(req, res)) { log(); }\n}\n'
             'if (tool_name == "t_bare") { noop(); }\n'
+            'if (tool_name == "t_dup") { perm_fn(req, res, "Tee", "Read"); if (x) perm_fn(req, res, "Tee", "Read"); }\n'
             '}\n', encoding="utf-8")
         (hreg / "mcp_tools_one.cpp").write_text(
             'namespace {\nvoid handle_reg_t(const ToolCallContext& ctx) {\n'
@@ -3892,7 +3935,7 @@ def _selftest_body():
             '};\n}\n', encoding="utf-8")
         h_by_tool = {t: ("Sec", "Read", "denied") for t in (
             "t_fleet", "t_list", "t_wrong", "t_mixed", "t_twice", "t_comment", "t_plain", "t_unread", "t_or",
-            "reg_t", "reg_n", "t_missing", "t_ref", "t_ref_nested", "t_ref_noreturn", "t_bare")}
+            "reg_t", "reg_n", "t_missing", "t_ref", "t_ref_nested", "t_ref_noreturn", "t_bare", "t_dup")}
         h_by_tool["t_conf"] = ("Sec", "Read", "confined")
         h_registry = {"reg_t": "mcp_tools_one.cpp", "reg_n": "mcp_tools_one.cpp"}
         with _patched(MCP_SERVER_CPP=hcpp, MCP_REGISTRY_DIR=hreg):
@@ -3901,9 +3944,12 @@ def _selftest_body():
               f"extract_mcp_handlers: only a proven fleet/list read of the tool's own pair gives the effect "
               f"(wrong pair, mixed pairs, a duplicated branch, a comment, a plain gate, unreadable arguments, a "
               f"label that is already confined and a disjunction branch do not), got {effs}")
-        check(gts.get("t_fleet") == {("fleet", "Sec", "Read")} and gts.get("t_plain") == {("plain", "Sec", "Read")}
-              and gts.get("t_mixed") == {("fleet", "Sec", "Read"), ("fleet", "Other", "Read")}
-              and gts.get("t_comment") == set() and gts.get("reg_n") == {("fleet", "Other", "Read")}
+        check(gts.get("t_fleet") == collections.Counter({("fleet", "Sec", "Read"): 1})
+              and gts.get("t_plain") == collections.Counter({("plain", "Sec", "Read"): 1})
+              and gts.get("t_mixed") == collections.Counter({("fleet", "Sec", "Read"): 1, ("fleet", "Other", "Read"): 1})
+              and gts.get("t_comment") == collections.Counter()
+              and gts.get("reg_n") == collections.Counter({("fleet", "Other", "Read"): 1})
+              and gts.get("t_dup") == collections.Counter({("plain", "Tee", "Read"): 2})
               and "t_twice" not in gts and "t_or" not in gts and "t_missing" not in gts,
               f"extract_mcp_handlers: the handler's gate calls are collected for a single body only, got {gts}")
         check(prfs.get("t_ref") == frozenset({"refusal"}) and prfs.get("t_fleet") == frozenset({"confine"})

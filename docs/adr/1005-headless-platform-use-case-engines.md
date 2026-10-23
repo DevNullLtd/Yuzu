@@ -874,7 +874,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      reads the management-group axis, MCP the service-scope axis), a row whose
      `rest_v1_twin` or `mcp_twin` is null compares nothing, and the checks read
      source text, so the first gate call in a handler is taken as its gate and
-     each further distinct gate must agree or be matched by a gate call the MCP
+     each further gate call must agree or be matched, one to one, by a gate call the MCP
      handler makes. `MIN_REGISTRY_FILES` rises from 1 to 3, the number of
      `mcp_tools_*.cpp` registry files, and must equal that count; the
      test-existence tripwire also requires the test file to be registered in
