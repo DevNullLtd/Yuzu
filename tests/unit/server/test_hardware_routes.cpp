@@ -1456,8 +1456,8 @@ TEST_CASE("result poll: a caller who lacks the Forensics read proof gets a permi
     CHECK(contains(own_device->body, "Waiting"));
 }
 
-TEST_CASE("result poll: an Unknown Forensics decision ends the poll with a retry notice, never a "
-          "timeout or rows",
+TEST_CASE("result poll: an Unknown Forensics decision ends a Forensics poll with a retry notice, never a "
+          "timeout or rows; an ordinary plugin's poll does not depend on it",
           "[pg][hardware][route][security][forensics]") {
     YUZU_REQUIRE_PG_DB_TPL(db, hw_responsestore_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1471,23 +1471,65 @@ TEST_CASE("result poll: an Unknown Forensics decision ends the poll with a retry
 
     for (const char* attempt : {"", "&n=40"}) {
         INFO(attempt);
-        for (const auto& url : {poll_url("agent-1", "browser_inventory-aaaa1111", "browser_inventory"),
-                                poll_url("agent-1", "hardware-bbbb2222", "hardware")}) {
-            auto res = h.sink.Get(url + attempt);
-            REQUIRE(res);
-            CHECK(res->status == 200);
-            CHECK(contains(res->body, "data-permission-unconfirmed"));
-            CHECK(contains(res->body, "could not be completed"));
-            CHECK_FALSE(contains(res->body, "Timed out"));
-            CHECK_FALSE(contains(res->body, "Waiting"));
-            CHECK_FALSE(contains(res->body, "hx-get"));
-            CHECK_FALSE(contains(res->body, "TOKEN-HW-"));
-        }
+        auto res = h.sink.Get(poll_url("agent-1", "browser_inventory-aaaa1111", "browser_inventory") +
+                              attempt);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "data-permission-unconfirmed"));
+        CHECK(contains(res->body, "could not be completed"));
+        CHECK_FALSE(contains(res->body, "Timed out"));
+        CHECK_FALSE(contains(res->body, "Waiting"));
+        CHECK_FALSE(contains(res->body, "hx-get"));
+        CHECK_FALSE(contains(res->body, "TOKEN-HW-"));
     }
     for (const auto& full : h.audit_full)
         CHECK(full.rfind("response.forensics.read|", 0) != 0);
-    for (const auto& full : h.audit_full)
-        CHECK(full.rfind("hardware.action.result|", 0) != 0); // nothing was rendered
+
+    // The ordinary plugin's reply does not depend on the Forensics decision: it renders, and the
+    // resolver is not even asked.
+    h.forensics.calls = 0;
+    auto ordinary = h.sink.Get(poll_url("agent-1", "hardware-bbbb2222", "hardware"));
+    REQUIRE(ordinary);
+    CHECK(contains(ordinary->body, "TOKEN-HW-ORDINARY"));
+    CHECK_FALSE(contains(ordinary->body, "data-permission-unconfirmed"));
+    CHECK(h.forensics.calls == 0);
+}
+
+TEST_CASE("result poll: the Forensics resolver runs once per poll of a Forensics plugin and never for any "
+          "other plugin",
+          "[pg][hardware][route][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, hw_responsestore_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    put_hw_response(rs, "hardware-bbbb2222", "agent-1", "hardware", "TOKEN-HW-ORDINARY");
+    // A Forensics-plugin row planted under an ordinary command id would be a stored row whose plugin
+    // is not its command id's plugin; the filter still excludes it for a caller without the tier.
+    put_hw_response(rs, "hardware-cccc3333", "agent-1", "browser_inventory", "TOKEN-HW-MISFILED");
+    HwHarness h(false, false, false, kContainmentUi, &rs);
+    h.forensics.viewer();
+
+    for (int i = 0; i < 5; ++i) {
+        auto res = h.sink.Get(poll_url("agent-1", "hardware-bbbb2222", "hardware"));
+        REQUIRE(res);
+        CHECK(contains(res->body, "TOKEN-HW-ORDINARY"));
+    }
+    CHECK(h.forensics.calls == 0);
+
+    // The exclusion is exact without a per-caller answer: even an admin's ordinary-plugin poll does
+    // not surface a Forensics-plugin row filed under that command id.
+    h.forensics.admin();
+    auto misfiled = h.sink.Get(poll_url("agent-1", "hardware-cccc3333", "hardware"));
+    REQUIRE(misfiled);
+    CHECK_FALSE(contains(misfiled->body, "TOKEN-HW-MISFILED"));
+    CHECK(h.forensics.calls == 0);
+
+    // A Forensics plugin asks the resolver exactly once per poll.
+    h.forensics.admin();
+    for (int i = 1; i <= 3; ++i) {
+        (void)h.sink.Get(poll_url("agent-1", "browser_inventory-aaaa1111", "browser_inventory"));
+        CHECK(h.forensics.calls == i);
+    }
 }
 
 namespace {

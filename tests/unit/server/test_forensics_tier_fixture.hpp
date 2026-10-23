@@ -47,6 +47,7 @@ inline constexpr const char* kOrdinaryPlugin = "shellexec";
 struct ForensicsCaller {
     authz::VisibleSet visible{std::nullopt};
     std::optional<ForensicsUnknown> unknown_why; ///< engaged = the resolver answers Unknown
+    int calls{0};                                ///< how many times a surface asked the resolver
 
     void admin() { set(std::nullopt); }
     void viewer() { set(authz::deny_all()); }
@@ -60,6 +61,7 @@ struct ForensicsCaller {
 
     [[nodiscard]] ForensicsVisibilityFn fn() {
         return [this](const httplib::Request&) -> ForensicsVisibility {
+            ++calls;
             if (unknown_why)
                 return std::unexpected(*unknown_why);
             return visible;

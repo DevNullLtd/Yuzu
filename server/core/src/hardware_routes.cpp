@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <iterator>
 #include <optional>
 #include <string>
@@ -908,8 +909,20 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         // Derived after the gates above (it never writes a response): the replies are read only
         // as far as the caller may read the plugin's tier.
+        // The visibility resolver (two authorization probes) runs only for a poll of a Forensics-tier
+        // plugin. The plugin here is derived from the server-minted command id and validated
+        // against the catalogue above (never taken from the client), and stored rows carry the
+        // plugin of their command id, so a poll of any other plugin can only ever meet its own
+        // plugin's rows: excluding the Forensics plugins outright is exact, needs no per-caller
+        // answer, and spares up to 40 resolver runs per action. An unwired plugin set keeps the
+        // fail-closed path through `tier_filter_for`.
+        const bool resolve_for_caller =
+            !deps_.forensics_plugins || deps_.forensics_plugins->contains(plugin);
         const auto tier_resolved =
-            tier_filter_for(req, deps_.forensics_visibility_fn, deps_.forensics_plugins);
+            resolve_for_caller
+                ? tier_filter_for(req, deps_.forensics_visibility_fn, deps_.forensics_plugins)
+                : std::expected<ResponseTierFilter, ForensicsUnknown>{
+                      ResponseTierFilter::exclude(*deps_.forensics_plugins, authz::deny_all())};
         if (!tier_resolved) {
             // Unknown: end the poll with a retry notice. Polling on would end in a false "timed
             // out" for a device that did answer, and the rows can never be shown from here.
