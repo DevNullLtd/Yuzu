@@ -56,6 +56,13 @@ namespace {
 
 constexpr const char* kMarker = "marker-4990-live-row";
 
+/// The ONE row a Forensics-tier plugin's output produces on the live "output" bus: a fixed
+/// constant that replaces the Console's "Waiting for results..." placeholder. It carries no plugin
+/// data and nothing the agent supplied. Pinned verbatim: the documentation quotes this text.
+constexpr std::string_view kForensicsLiveNotice =
+    "<tr id=\"empty-row\" hx-swap-oob=\"outerHTML\"><td colspan=\"99\" class=\"empty-state\">"
+    "Forensics output is not shown live. Open the execution results.</td></tr>";
+
 apb::CommandResponse running_frame(const std::string& command_id, const std::string& output) {
     apb::CommandResponse r;
     r.set_command_id(command_id);
@@ -88,6 +95,11 @@ struct LiveBusHarness {
                              [](const SseEvent& e) { return e.event_type == "output"; });
         return out;
     }
+    std::size_t notice_count() const {
+        return static_cast<std::size_t>(std::ranges::count_if(seen, [](const SseEvent& e) {
+            return e.event_type == "output" && e.data == kForensicsLiveNotice;
+        }));
+    }
     std::size_t marker_count() const {
         std::size_t n = 0;
         for (const auto& e : seen)
@@ -99,7 +111,7 @@ struct LiveBusHarness {
 
 } // namespace
 
-TEST_CASE("live output bus: a Forensics-tier plugin's rows are never published",
+TEST_CASE("live output bus: a Forensics-tier plugin's rows are never published, one fixed notice is",
           "[server][forensics_tier][security]") {
     LiveBusHarness h;
     h.svc.set_forensics_plugin_set(&test::forensics_plugin_set());
@@ -111,7 +123,7 @@ TEST_CASE("live output bus: a Forensics-tier plugin's rows are never published",
         REQUIRE(out.size() == 1);
         CHECK(out[0].data.find(kMarker) != std::string::npos);
     }
-    SECTION("every Forensics plugin, in any ASCII case, publishes nothing") {
+    SECTION("every Forensics plugin, in any ASCII case, publishes only the fixed notice") {
         for (const auto& plugin : test::forensics_plugin_set().names()) {
             h.svc.process_gateway_response("agent-1", running_frame(plugin + "-0001", kMarker));
             std::string upper = plugin;
@@ -120,16 +132,26 @@ TEST_CASE("live output bus: a Forensics-tier plugin's rows are never published",
                     c = static_cast<char>(c - 'a' + 'A');
             h.svc.process_gateway_response("agent-1", running_frame(upper + "-0002", kMarker));
         }
-        CHECK(h.output_events().empty());
+        // Two frames per plugin (lower and upper case): each produced exactly the notice, and
+        // no output event of any other shape.
+        const auto frames = test::forensics_plugin_set().names().size() * 2;
+        CHECK(h.output_events().size() == frames);
+        CHECK(h.notice_count() == frames);
         CHECK(h.marker_count() == 0);
     }
-    SECTION("a mixed batch: only the ordinary plugin's frame publishes") {
+    SECTION("a mixed batch: the ordinary plugin's row publishes beside the notice") {
         h.svc.process_gateway_response(
             "agent-1", running_frame(std::string{test::kForensicsPlugin} + "-0001", kMarker));
         h.svc.process_gateway_response(
             "agent-1", running_frame(std::string{test::kOrdinaryPlugin} + "-0002", kMarker));
-        CHECK(h.output_events().size() == 1);
+        CHECK(h.output_events().size() == 2);
+        CHECK(h.notice_count() == 1);
         CHECK(h.marker_count() == 1);
+    }
+    SECTION("a Forensics frame with no output publishes nothing, notice included") {
+        h.svc.process_gateway_response(
+            "agent-1", running_frame(std::string{test::kForensicsPlugin} + "-0003", ""));
+        CHECK(h.output_events().empty());
     }
 }
 
@@ -812,7 +834,7 @@ TEST_CASE("terminal failure text: an unwired plugin set sanitises every plugin i
 
 // The live output bus through the DIRECT Subscribe stream: the same helper the gateway path uses
 // (publish_output_rows), reached from the other ingest branch.
-TEST_CASE("live output bus: the direct Subscribe path publishes no Forensics-tier row either",
+TEST_CASE("live output bus: the direct Subscribe path publishes the fixed notice, never a Forensics row",
           "[pg][server][forensics_tier][security]") {
     const bool wired = GENERATE(true, false);
     INFO((wired ? "plugin set wired" : "plugin set unwired"));
@@ -830,12 +852,14 @@ TEST_CASE("live output bus: the direct Subscribe path publishes no Forensics-tie
                             running_frame(std::string{test::kForensicsPlugin} + "-0f2", kForensicRow),
                             running_frame("BROWSER_INVENTORY-0f3", kForensicRow)});
     h.bus.unsubscribe(sub);
-    std::size_t ordinary = 0, forensic = 0, output_events = 0;
+    std::size_t ordinary = 0, forensic = 0, output_events = 0, notices = 0;
     {
         std::lock_guard lock(mu);
         for (const auto& e : seen) {
             if (e.event_type == "output")
                 ++output_events;
+            if (e.event_type == "output" && e.data == kForensicsLiveNotice)
+                ++notices;
             if (e.data.find(kMarker) != std::string::npos)
                 ++ordinary;
             if (e.data.find(kForensicRow) != std::string::npos)
@@ -845,10 +869,13 @@ TEST_CASE("live output bus: the direct Subscribe path publishes no Forensics-tie
     CHECK(forensic == 0); // never published, in either case, wired or not
     if (wired) {
         CHECK(ordinary == 1); // control: the ordinary plugin's row reaches the bus
-        CHECK(output_events == 1);
+        // The ordinary row plus one fixed notice for each of the two Forensics frames.
+        CHECK(output_events == 3);
+        CHECK(notices == 2);
     } else {
         CHECK(ordinary == 0); // an unwired set publishes no output row at all
         CHECK(output_events == 0);
+        CHECK(notices == 0);
     }
 }
 
