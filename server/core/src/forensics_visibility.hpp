@@ -44,6 +44,13 @@ namespace yuzu::server {
 class AuthRoutes;
 class ManagementGroupStore;
 class RbacStore;
+} // namespace yuzu::server
+
+namespace yuzu {
+class MetricsRegistry;
+}
+
+namespace yuzu::server {
 
 /// Why the resolver could not answer. A CLOSED set: the names below are the `reason` label of
 /// `yuzu_server_forensics_tier_withheld_total` (seeded from `kForensicsUnknownReasons`).
@@ -75,13 +82,29 @@ using ForensicsVisibility = std::expected<authz::VisibleSet, ForensicsUnknown>;
 /// Per-request resolver wired once in `server.cpp` and passed to each surface.
 using ForensicsVisibilityFn = std::function<ForensicsVisibility(const httplib::Request&)>;
 
-/// The stores the production resolver reads. Borrowed; any null member makes the answer
-/// present-empty (never "unrestricted").
+/// The stores the production resolver reads. Borrowed; a null auth/RBAC/management-group member
+/// makes the answer Unknown (never "unrestricted"). `metrics` is optional: unset (a harness) the
+/// resolver counts nothing.
 struct ForensicsVisibilityDeps {
     AuthRoutes* auth_routes{nullptr};
     const RbacStore* rbac_store{nullptr};
     const ManagementGroupStore* mgmt_store{nullptr};
+    yuzu::MetricsRegistry* metrics{nullptr};
 };
+
+/// `yuzu_server_forensics_tier_withheld_total{reason}`: one increment per resolver call that
+/// answered Unknown, i.e. a read whose Forensics rows were withheld because the caller's authority
+/// could not be determined (the read was refused with a 503 or showed a notice). `reason` is the
+/// CLOSED set `kForensicsUnknownReasons` (`to_string`): `rbac_unavailable`, `scope_read_failed`,
+/// `unwired`. A definitive refusal (Denied) is correct behaviour and is never counted, so the
+/// series stays flat on a healthy server whatever the callers' roles. Operational, not
+/// `event="security"`.
+inline constexpr const char* kForensicsTierWithheldMetric =
+    "yuzu_server_forensics_tier_withheld_total";
+
+/// Describe the metric and pre-seed every closed-set reason to 0, so the family exists on a healthy
+/// server and `increase()` sees the first event. Called once at server start.
+void seed_forensics_tier_metrics(yuzu::MetricsRegistry& metrics);
 
 /// The production resolver. Order is load-bearing:
 ///   1. `AuthRoutes::probe_permission(req, scratch, "Forensics", "Read")` true => `nullopt`

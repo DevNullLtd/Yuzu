@@ -4406,3 +4406,53 @@ tests:
       - eval_time: 29m
         alertname: YuzuSameSiteGateInternalError
         exp_alerts: []
+
+  # -- Forensics-tier visibility unresolved (group yuzu-response-store, #4990) -----------------
+  #
+  # yuzu_server_forensics_tier_withheld_total{reason} counts reads refused (or shown a notice)
+  # because the caller's Forensics authority could not be determined. It is pre-seeded to 0 for
+  # every closed reason at boot and a definitive refusal never moves it, so a healthy server is
+  # flat. The rule needs the increase to hold for 10m (`for: 10m` over a [10m] window).
+
+  # CASE A -- a recurring failure (one more event every minute from minute 2) fires, labelled with
+  # instance and reason. RED if the rule lost the by (instance, reason) or the metric name.
+  - interval: 1m
+    name: forensics tier unresolved - a sustained failure fires with the reason label
+    input_series:
+      - series: 'yuzu_server_forensics_tier_withheld_total{job="yuzu",instance="s1",reason="scope_read_failed"}'
+        values: "0 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuForensicsTierUnresolved", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuForensicsTierUnresolved", alertstate="firing", instance="s1", reason="scope_read_failed", severity="warning"}'
+            value: 1
+
+  # CASE B -- a healthy server (every reason pre-seeded at 0, never moving) is quiet. RED if the
+  # rule ever fires on a flat series, for example by counting a definitive refusal.
+  - interval: 1m
+    name: forensics tier unresolved - pre-seeded zero series stay quiet
+    input_series:
+      - series: 'yuzu_server_forensics_tier_withheld_total{job="yuzu",instance="s1",reason="rbac_unavailable"}'
+        values: "0x40"
+      - series: 'yuzu_server_forensics_tier_withheld_total{job="yuzu",instance="s1",reason="scope_read_failed"}'
+        values: "0x40"
+      - series: 'yuzu_server_forensics_tier_withheld_total{job="yuzu",instance="s1",reason="unwired"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuForensicsTierUnresolved"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE C -- a single blip (one event at minute 2) is pending at most, never firing: the increase
+  # is true from minute 2 to minute 10, and at minute 8 a rule with a short `for:` would already be
+  # firing while this one (needing the full 10 minutes) is still only pending. RED if `for:` shrinks.
+  - interval: 1m
+    name: forensics tier unresolved - a single event does not page
+    input_series:
+      - series: 'yuzu_server_forensics_tier_withheld_total{job="yuzu",instance="s1",reason="rbac_unavailable"}'
+        values: "0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuForensicsTierUnresolved", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []

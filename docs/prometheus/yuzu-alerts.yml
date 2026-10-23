@@ -2225,6 +2225,35 @@ groups:
             consumers render a degrade banner / 503 rather than a false-empty.
             Usually PostgreSQL pool saturation; correlate with pool metrics.
 
+      # #4990: stored-response reads withhold Forensics-tier rows from a caller without
+      # Forensics:Read. When the caller's authority itself cannot be determined (the
+      # authorization read answered unavailable, the scoped-visibility lookup failed, or a
+      # dependency was never wired) the read is refused with a retryable 503 or shows a notice;
+      # it is NEVER served as a 200 with the Forensics rows silently missing. A definitive
+      # refusal is correct behaviour and is not counted, so the series is flat on a healthy
+      # server whatever the callers' roles. The series is pre-seeded to 0 for every reason at
+      # boot, so the first event is an increase. `for: 10m` over a 10m window: a single blip
+      # does not alert, a sustained or recurring failure does.
+      - alert: YuzuForensicsTierUnresolved
+        expr: |
+          sum by (instance, reason) (increase(yuzu_server_forensics_tier_withheld_total[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Forensics-tier reads are being refused because caller authority cannot be determined on {{ $labels.instance }} (reason={{ $labels.reason }})"
+          description: >-
+            Reads of stored responses could not determine whether the caller may see
+            Forensics-tier rows (reason={{ $labels.reason }}) for at least 10 minutes on
+            {{ $labels.instance }}. Those reads are refused with a retryable 503 (REST,
+            legacy and MCP) or show a notice (dashboard); no Forensics row is served and no
+            partial result is returned. rbac_unavailable: the authorization store answered
+            unavailable. scope_read_failed: the management-group scoped-visibility lookup
+            failed. unwired: a dependency of the resolver was never wired, which a running
+            server should not show. Usually PostgreSQL pool saturation or a store outage:
+            correlate with yuzu_server_rbac_read_degrade_total, the pool metrics and the
+            server log line "Forensics-tier visibility could not be resolved".
+
       - alert: YuzuResponseReapBacklog
         expr: |
           rate(yuzu_server_response_reap_passes_total{result="capped"}[1h]) > 0
@@ -3071,9 +3100,14 @@ groups:
             dex.signal.view, dex.perf.device.view, network.device.view, inventory.devices,
             inventory.device.ci, plus
             response.read on the v1 query, aggregate and export routes and on the
-            legacy get, aggregate and export routes) is returning 503 and withholding PII or response
+            legacy get, aggregate and export routes, plus response.forensics.read (written
+            only when the rows served include a Forensics-tier plugin's) on the v1
+            execution-scoped response, response get, export and visualization routes and on
+            the legacy get and export routes) is returning 503 and withholding PII or response
             data, so a ServiceNow / CMDB poll blackouts fleet-wide. Set-and-proceed reads, including
-            crypto.libraries.*, keep serving data and do not 503: their REST routes and dashboard
+            crypto.libraries.* and response.forensics.read on the dashboard results fragment, the
+            executions drawer, the hardware result poll and the MCP query_responses tool, keep
+            serving data and do not 503: their REST routes and dashboard
             fragments set the Sec-Audit-Failed header, their MCP tools set audit_persisted:false
             (the hardware CI tools list_hardware_ci and get_hardware_ci, which audit as
             inventory.devices and inventory.device.ci, fail closed instead: they withhold the

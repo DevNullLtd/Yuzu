@@ -2336,6 +2336,9 @@ public:
                                   "skipped_lock", "failed"})
             metrics_.counter("yuzu_server_response_reap_passes_total", {{"result", result}});
         seed_response_facet_metrics(metrics_);
+        // #4990: Forensics-tier reads withheld because the caller's authority could not be
+        // determined; the closed reason set is pre-seeded to 0 by the header that emits it.
+        yuzu::server::seed_forensics_tier_metrics(metrics_);
         // #4644/#4703 response-route observability: strict-parse rejections and cut
         // exports, closed label sets seeded by the same header the emit sites use.
         seed_response_metrics(metrics_);
@@ -16015,7 +16018,8 @@ private:
             return yuzu::server::resolve_forensics_visible(
                 {.auth_routes = auth_routes_.get(),
                  .rbac_store = rbac_store_.get(),
-                 .mgmt_store = mgmt_group_store_.get()},
+                 .mgmt_store = mgmt_group_store_.get(),
+                 .metrics = &metrics_},
                 req);
         };
         // #4035 review fix's bespoke `dex_visible_fn` resolver (a global-Read

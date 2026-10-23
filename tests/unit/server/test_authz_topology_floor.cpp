@@ -1106,6 +1106,7 @@ struct ForensicsVisRig {
         engine_pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = engine_db.dsn(), .size = 2});
         engines = std::make_unique<EnginePrincipalStore>(*engine_pool);
         REQUIRE(engines->is_open());
+        seed_forensics_tier_metrics(metrics); // as ServerImpl does at start: every reason at 0
         auth_mgr.set_metrics_registry(&metrics);
         ar = std::make_unique<AuthRoutes>(cfg, auth_mgr, &rbac, api_tokens.get(),
                                           /*audit_store=*/nullptr, &mgmt, /*tag_store=*/nullptr,
@@ -1128,7 +1129,12 @@ struct ForensicsVisRig {
     }
 
     ForensicsVisibilityDeps deps() {
-        return {.auth_routes = ar.get(), .rbac_store = &rbac, .mgmt_store = &mgmt};
+        return {.auth_routes = ar.get(), .rbac_store = &rbac, .mgmt_store = &mgmt, .metrics = &metrics};
+    }
+
+    // The withheld counter for `reason` (0 when the series was never created).
+    double withheld(const std::string& reason) {
+        return metrics.counter(kForensicsTierWithheldMetric, {{"reason", reason}}).value();
     }
 
     httplib::Request cookie_request(const std::string& username, auth::Role role) {
@@ -1147,6 +1153,33 @@ struct ForensicsVisRig {
 };
 
 } // namespace
+
+TEST_CASE("yuzu_server_forensics_tier_withheld_total: every closed reason is pre-seeded at 0, HELP is "
+          "7-bit ASCII",
+          "[auth_routes][authz_topology_floor][forensics][metrics]") {
+    yuzu::MetricsRegistry metrics;
+    seed_forensics_tier_metrics(metrics);
+    const std::string text = metrics.serialize();
+    for (const auto why : kForensicsUnknownReasons) {
+        const std::string series = std::string(kForensicsTierWithheldMetric) + "{reason=\"" +
+                                   std::string(to_string(why)) + "\"} 0";
+        INFO(series);
+        CHECK(text.find(series) != std::string::npos);
+    }
+    // Exactly the closed set: no free-form series.
+    std::size_t n = 0;
+    for (std::size_t pos = 0; (pos = text.find("yuzu_server_forensics_tier_withheld_total{", pos)) !=
+                              std::string::npos;
+         ++pos)
+        ++n;
+    CHECK(n == std::size(kForensicsUnknownReasons));
+    const auto help_at = text.find(std::string("# HELP ") + kForensicsTierWithheldMetric);
+    REQUIRE(help_at != std::string::npos);
+    const auto help_end = text.find('\n', help_at);
+    CHECK(std::all_of(text.begin() + static_cast<std::ptrdiff_t>(help_at),
+                      text.begin() + static_cast<std::ptrdiff_t>(help_end),
+                      [](char c) { return static_cast<unsigned char>(c) < 0x80; }));
+}
 
 TEST_CASE("forensics visibility: RBAC off - an ordinary user sees no Forensics row, an admin sees all",
           "[pg][auth_routes][authz_topology_floor][forensics]") {
@@ -1274,11 +1307,15 @@ TEST_CASE("forensics visibility: a degraded or unwired input is Unknown, a defin
         ForensicsVisibilityDeps d = rig.deps();
         d.mgmt_store = &bad_mgmt;
         CHECK(is_unknown(resolve_forensics_visible(d, scoped), ForensicsUnknown::ScopeReadFailed));
+        CHECK(rig.withheld("scope_read_failed") == 1.0);
+        CHECK(rig.withheld("rbac_unavailable") == 0.0);
+        CHECK(rig.withheld("unwired") == 0.0);
     }
     SECTION("management-group store not wired") {
         ForensicsVisibilityDeps d = rig.deps();
         d.mgmt_store = nullptr;
         CHECK(is_unknown(resolve_forensics_visible(d, scoped), ForensicsUnknown::Unwired));
+        CHECK(rig.withheld("unwired") == 1.0);
     }
     SECTION("rbac store not wired") {
         ForensicsVisibilityDeps d = rig.deps();
@@ -1291,9 +1328,13 @@ TEST_CASE("forensics visibility: a degraded or unwired input is Unknown, a defin
         auto admin = rig.cookie_request("admin3", auth::Role::admin);
         CHECK(is_unknown(resolve_forensics_visible(d, admin), ForensicsUnknown::Unwired));
     }
-    SECTION("an unauthenticated request is a definitive refusal") {
+    SECTION("an unauthenticated request is a definitive refusal, and a refusal is never counted") {
         httplib::Request anonymous;
         CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), anonymous)));
+        auto viewer = rig.cookie_request("viewer9", auth::Role::user);
+        CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), viewer)));
+        for (const auto why : kForensicsUnknownReasons)
+            CHECK(rig.withheld(std::string(to_string(why))) == 0.0);
     }
     SECTION("an unavailable authorization store reads Unknown for an ordinary session too") {
         // The RBAC store behind the gate is not open: the gate fails closed (403 for an ordinary
@@ -1306,7 +1347,8 @@ TEST_CASE("forensics visibility: a degraded or unwired input is Unknown, a defin
         AuthRoutes bad_ar(rig.cfg, rig.auth_mgr, &bad_rbac, rig.api_tokens.get(),
                           /*audit_store=*/nullptr, &rig.mgmt, /*tag_store=*/nullptr,
                           /*analytics_store=*/nullptr, rig.oidc_mu, rig.oidc_provider);
-        ForensicsVisibilityDeps d{.auth_routes = &bad_ar, .rbac_store = &bad_rbac, .mgmt_store = &rig.mgmt};
+        ForensicsVisibilityDeps d{.auth_routes = &bad_ar, .rbac_store = &bad_rbac, .mgmt_store = &rig.mgmt,
+                                  .metrics = &rig.metrics};
         CHECK(is_unknown(resolve_forensics_visible(d, scoped), ForensicsUnknown::ScopeReadFailed));
     }
     SECTION("an unavailable authorization store answers 503 to an engine principal: Unknown") {
@@ -1326,7 +1368,10 @@ TEST_CASE("forensics visibility: a degraded or unwired input is Unknown, a defin
                           /*audit_store=*/nullptr, &rig.mgmt, /*tag_store=*/nullptr,
                           /*analytics_store=*/nullptr, rig.oidc_mu, rig.oidc_provider);
         bad_ar.set_engine_principal_store(rig.engines.get());
-        ForensicsVisibilityDeps d{.auth_routes = &bad_ar, .rbac_store = &bad_rbac, .mgmt_store = &rig.mgmt};
+        ForensicsVisibilityDeps d{.auth_routes = &bad_ar, .rbac_store = &bad_rbac, .mgmt_store = &rig.mgmt,
+                                  .metrics = &rig.metrics};
         CHECK(is_unknown(resolve_forensics_visible(d, req), ForensicsUnknown::RbacUnavailable));
+        CHECK(rig.withheld("rbac_unavailable") == 1.0);
+        CHECK(rig.withheld("scope_read_failed") == 0.0);
     }
 }
