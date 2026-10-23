@@ -985,7 +985,8 @@ TEST_CASE("CertificateInventoryStore: a rejected blob writes nothing and is a TE
     CHECK_FALSE(nacked(ingest(store, "agent-1", full_report("garbage"), &m)));
     CHECK(metric_count(m, "rejected", "bad_header") == 1);
     // The generic per-source family is emitted too.
-    CHECK(generic_count(m, "rejected") == 2);
+    CHECK(generic_count(m, "dropped") == 2); // maps to the siblings' over-cap-blob outcome
+    CHECK(generic_count(m, "rejected") == -1); // `rejected` is reserved for >64 sources
 }
 
 // ── Decommission ─────────────────────────────────────────────────────────────
@@ -1038,9 +1039,9 @@ TEST_CASE("CertificateInventoryStore: an ingest racing delete_agent ends as one 
         std::atomic<bool> delete_done{false};
         std::atomic<bool> delete_done_at_hook_return{true};
         bool delete_ok = false;
-        std::thread deleter;
+        std::jthread deleter;
         store.set_test_hook_after_lock([&] {
-            deleter = std::thread([&] {
+            deleter = std::jthread([&] {
                 CertificateInventoryStore other{pool}; // a second connection
                 delete_ok = other.delete_agent("agent-1");
                 delete_done = true;
@@ -1063,12 +1064,12 @@ TEST_CASE("CertificateInventoryStore: an ingest racing delete_agent ends as one 
         std::atomic<bool> ingest_done{false};
         std::atomic<bool> deferred_ack_nacked{false};
         std::atomic<bool> ingest_done_at_hook_return{false};
-        std::thread reporter;
+        std::jthread reporter;
         CertificateInventoryStore other{pool};
         yuzu::MetricsRegistry m;
         cert_ingest_metric::register_metrics(m);
         store.set_test_hook_after_erase([&] {
-            reporter = std::thread([&] {
+            reporter = std::jthread([&] {
                 deferred_ack_nacked = nacked(ingest(other, "agent-1", full_report(b), &m));
                 ingest_done = true;
             });
@@ -1342,7 +1343,7 @@ TEST_CASE("CertificateInventoryStore: concurrent reports for one agent never par
 
     HeldAgentLock held(pool, "agent-1"); // another replica's report is mid-flight
     constexpr int kN = 12;               // more than the shared pool's size (4)
-    std::vector<std::thread> ts;
+    std::vector<std::jthread> ts;
     std::atomic<int> full_nacked{0}, hash_nacked{0};
     const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < kN; ++i)
@@ -1524,4 +1525,64 @@ TEST_CASE("cert ingest: a hash-only claim that is not 64 lowercase hex is nacked
     CHECK(metric_count(m, "need_full", "bad_claim") == 6);
     CHECK(metric_count(m, "need_full", "hash_mismatch") == 0); // never reached the store compare
     CHECK(metric_count(m, "touched", "none") == 0);
+}
+
+TEST_CASE("cert ingest: a transaction over its budget is a distinct counted outcome, rolled back, "
+          "and a scaled budget lets a large report finish",
+          "[certinv][pg]") {
+    CERT_SHARED(store, pool);
+    const auto b = blob(store_rec("S", "ok"), {cert(1, {{"S", ""}}), cert(2, {{"S", ""}})});
+    yuzu::MetricsRegistry m;
+    cert_ingest_metric::register_metrics(m);
+    store.set_test_ingest_budget([](std::size_t) { return std::chrono::steady_clock::duration::zero(); });
+    const auto ack = ingest(store, "agent-1", full_report(b), &m);
+    CHECK_FALSE(nacked(ack)); // terminal ack, not an endless need_full loop
+    CHECK(metric_count(m, "error", "budget_exceeded") == 1);
+    CHECK(metric_count(m, "error", "store_error") == 0);
+    CHECK(store.row_counts("agent-1")->agent_state == 0); // rolled back whole
+    // The default budget scales with the report and is generous for a legitimate one.
+    store.set_test_ingest_budget(nullptr);
+    CertificateInventoryStore fresh{pool};
+    CHECK_FALSE(nacked(ingest(fresh, "agent-1", full_report(b), &m)));
+    CHECK(fresh.row_counts("agent-1")->cert_fact == 2);
+}
+
+TEST_CASE("CertificateInventoryStore: a child-only change (SAN set) is never skipped as unchanged",
+          "[certinv][pg]") {
+    CERT_SHARED(store, pool);
+    Cert c = cert(1, {{"S", ""}});
+    c.sans = {{"dns", "a"}};
+    ingest(store, "agent-1", full_report(blob(store_rec("S", "ok"), {c})));
+    c.sans = {{"dns", "a"}, {"dns", "b"}}; // facts identical, only the SAN children differ
+    ingest(store, "agent-1", full_report(blob(store_rec("S", "ok"), {c})));
+    CHECK(scalar(pool, "SELECT string_agg(value, ',' ORDER BY ord) FROM certificate_inventory_store.cert_san") ==
+          "a,b");
+    c.sans = {{"dns", "b"}};
+    c.ekus = {"1.3.6.1.5.5.7.3.1"};
+    ingest(store, "agent-1", full_report(blob(store_rec("S", "ok"), {c})));
+    CHECK(scalar(pool, "SELECT string_agg(value, ',' ORDER BY ord) FROM certificate_inventory_store.cert_san") == "b");
+    CHECK(store.row_counts("agent-1")->cert_eku == 1);
+}
+
+TEST_CASE("cert path key: the dedupe key is md5(path), identical to the table's generated column",
+          "[certinv][pg]") {
+    CERT_SHARED(store, pool);
+    const std::string path = "/etc/ssl/certs/\xC3\xA9.pem";
+    ingest(store, "agent-1", full_report(blob(store_rec("S", "ok"), {cert(1, {{"S", path}})})));
+    CHECK(scalar(pool, "SELECT path_md5 FROM certificate_inventory_store.cert_location") ==
+          cert_path_key(path));
+    CHECK(cert_path_key("") == "d41d8cd98f00b204e9800998ecf8427e");
+}
+
+TEST_CASE("CertificateInventoryStore: delete_agent gives up on a held lock and is counted",
+          "[certinv][pg][decommission]") {
+    CERT_SHARED(store, pool);
+    yuzu::MetricsRegistry m;
+    store.set_metrics(&m);
+    ingest(store, "agent-1", full_report(blob(store_rec("S", "ok"), {cert(1, {{"S", ""}})})));
+    HeldAgentLock held(pool, "agent-1");
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK_FALSE(store.delete_agent("agent-1")); // lock_timeout, not an unbounded wait
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(9));
+    CHECK(m.serialize().find("yuzu_server_cert_inventory_delete_failed_total 1") != std::string::npos);
 }

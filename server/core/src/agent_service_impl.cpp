@@ -1140,11 +1140,13 @@ grpc::Status AgentServiceImpl::ReportInventory(grpc::ServerContext* context,
                                                 *response, &metrics_);
         } catch (const std::exception& ex) {
             response->add_need_full("certificate_inventory");
+            cert_ingest_metric::count_exception(&metrics_);
             spdlog::warn("ReportInventory: certificate_inventory ingest threw for agent {} — "
                          "nacked: {}",
                          agent_id, ex.what());
         } catch (...) {
             response->add_need_full("certificate_inventory");
+            cert_ingest_metric::count_exception(&metrics_);
             spdlog::warn("ReportInventory: certificate_inventory ingest threw unknown exception "
                          "for agent {} — nacked",
                          agent_id);

@@ -157,7 +157,7 @@ void ingest_certificate_inventory_report(CertificateInventoryStore& store,
 namespace cert_ingest_metric {
 inline constexpr std::string_view kName = "yuzu_server_cert_inventory_ingest_total";
 /// The closed (result, reason) set. Every increment is one of these pairs.
-inline constexpr std::array<std::pair<std::string_view, std::string_view>, 17> kPairs = {{
+inline constexpr auto kPairs = std::to_array<std::pair<std::string_view, std::string_view>>({
     {"stored", "none"},
     {"stored", "parse_error"},
     {"stored", "over_cap"},
@@ -175,9 +175,13 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 17> k
     {"deferred", "agent_busy"},
     {"error", "store_error"},
     {"error", "digest_error"},
-}};
+    {"error", "budget_exceeded"},
+    {"error", "exception"},
+});
 /// Register the HELP text and zero-seed every pair, so the series exist on an idle server.
 void register_metrics(::yuzu::MetricsRegistry& metrics);
+/// Count a seam exception caught at a call site (the call sites nack; this makes it visible).
+void count_exception(::yuzu::MetricsRegistry* metrics);
 } // namespace cert_ingest_metric
 
 } // namespace yuzu::server

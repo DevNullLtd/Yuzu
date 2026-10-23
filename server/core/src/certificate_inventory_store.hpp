@@ -51,6 +51,10 @@
 #include <string_view>
 #include <vector>
 
+namespace yuzu {
+class MetricsRegistry;
+}
+
 namespace yuzu::server::pg {
 class PgPool;
 struct PgMigration;
@@ -63,6 +67,10 @@ namespace yuzu::server {
 /// change the key, or a rolling upgrade would run two keys for one agent). Ingest (full and
 /// hash-skip), `delete_agent` and the future retention prune ALL use this one constant.
 inline constexpr std::string_view kCertInventoryAgentLockPrefix = "cert_inventory:";
+
+/// md5(path) as lowercase hex: the key `cert_location` uses for a path. The ingest de-duplicates
+/// on this, so the dedupe and the primary key can never disagree.
+[[nodiscard]] std::string cert_path_key(std::string_view path);
 
 /// The store's migration array (schema `certificate_inventory_store`), for the D13 schema lint.
 [[nodiscard]] const std::vector<pg::PgMigration>& certificate_inventory_migrations();
@@ -140,6 +148,7 @@ enum class CertIngestOutcome {
     kStored,         ///< full report applied
     kTouched,        ///< hash-skip matched; freshness advanced
     kNeedFull,       ///< cold cache or hash mismatch: the agent must resend in full
+    kBudgetExceeded, ///< the ingest transaction ran past its (row-scaled) time budget: rolled back
     kBusy,           ///< another report for this agent holds the lock: nothing written, retry
     kError,          ///< pool/SQL failure (transient)
 };
@@ -200,8 +209,18 @@ public:
         test_hook_after_erase_ = std::move(hook);
     }
 
+    /// Wire a metrics registry (the delete-failed counter). Set once at startup; null disables.
+    void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+
+    /// TEST SEAM. Replaces the row-scaled ingest transaction budget (rows -> duration).
+    void set_test_ingest_budget(std::function<std::chrono::steady_clock::duration(std::size_t)> f) {
+        ingest_budget_ = std::move(f);
+    }
+
 private:
     pg::PgPool& pool_;
+    yuzu::MetricsRegistry* metrics_{nullptr};
+    std::function<std::chrono::steady_clock::duration(std::size_t)> ingest_budget_;
     bool open_{false};
     std::function<void()> test_hook_after_lock_;
     std::function<void()> test_hook_after_erase_;

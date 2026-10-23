@@ -627,7 +627,7 @@ unlimited/no-expiry behaviour, or size them to the rollout window and the number
 The server now creates the Postgres schema `certificate_inventory_store` at boot (seven tables, no
 data until a certificate-collecting agent reports). The server's database role needs `CREATE` on the
 database, as for every other store; if the schema cannot be created the server refuses to start
-(fail-closed, ADR-0007) and `/readyz` shows `certificate_inventory_store` until it opens.
+(fail-closed, ADR-0007). `/readyz` includes `certificate_inventory_store` once the server is up, so a degraded store after boot shows there.
 
 `DELETE /api/v1/sle/agents/{id}` now fans out across **eight** stores: the response's `stores` map
 gains a `certificate_inventory` key and `deleted` reaches 8 when every store is configured. During a
