@@ -33,7 +33,12 @@ Required statements (each is one requirement id below):
     borrows it, the agent service gets the set before its listener starts, and MCP gets the set and
     the resolver before the web thread starts;
   * no wiring spells the unwired hatches (a null plugin set passed to a setter or a Deps field,
-    for_fixed_plugin_poll(nullptr)).
+    for_fixed_plugin_poll(nullptr));
+  * the raw failure text of a command response (`resp.error().message()`) is read at EXACTLY the
+    sites it is read today in agent_service_impl.cpp (a second file, checked by
+    agent_service_problems): the two that feed the stored response row, and the one inside
+    failure_text_for_sinks that reduces it for every other sink. A new read is a new sink of text
+    the tier does not cover, and it fails here until it is reviewed and counted.
 
 Robustness: comments are stripped with a literal-aware scanner (a string such as "/api/*" must not
 open a comment), whitespace is collapsed and removed around punctuation, so line wrapping,
@@ -55,6 +60,7 @@ import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SERVER_CPP = os.path.join("server", "core", "src", "server.cpp")
+AGENT_SERVICE_CPP = os.path.join("server", "core", "src", "agent_service_impl.cpp")
 TAG = "test_forensics_tier_wiring_lexical"
 HINT = (" (this gate pins the #4990 Forensics-tier wiring; if server.cpp was legitimately restructured "
         "or renamed, update tests/test_forensics_tier_wiring_lexical.py and its selftest)")
@@ -264,6 +270,33 @@ FORBIDDEN: list[tuple[str, str, str]] = [
 ]
 
 
+# Patterns over agent_service_impl.cpp whose occurrence count is pinned EXACTLY (a new read is as
+# much a defect as a deleted one). Every count is over canonical text, so wrapping and comments
+# cannot move it. The first row is the catch-all: ANY `.error().message()` read, whatever it is
+# assigned to; the other two say where today's reads are.
+EXACT_AGENT_SERVICE: list[tuple[str, str, int, str]] = [
+    ("raw-failure-text-reads", r"\.error\(\)\.message\(\)", 3,
+     "the raw failure text of a command response is read at exactly three sites; a new read is a "
+     "new sink the Forensics tier does not cover (route it through failure_text_for_sinks)"),
+    ("raw-failure-text-stored-row", r"err_detail=resp\.error\(\)\.message\(\);", 2,
+     "the stored response row (Subscribe and gateway ingest) keeps the raw text; it is read only "
+     "through the tier-filtered stored-response reads"),
+    ("raw-failure-text-helper", r"std::string text=resp\.error\(\)\.message\(\);", 1,
+     "failure_text_for_sinks is the one place the raw text is reduced for the other sinks"),
+]
+
+
+def agent_service_problems(src: str) -> list[tuple[str, str]]:
+    """(id, message) per violated exact count in agent_service_impl.cpp; [] when clean."""
+    t = canonical(src)
+    out: list[tuple[str, str]] = []
+    for rid, pat, want, why in EXACT_AGENT_SERVICE:
+        got = len(re.findall(pat, t, re.S))
+        if got != want:
+            out.append((rid, f"{rid}: expected exactly {want} occurrences, found {got}: {why}"))
+    return out
+
+
 def problems_canonical(t: str) -> list[tuple[str, str]]:
     """(id, message) per violated requirement over already-canonical text; [] when clean."""
     out: list[tuple[str, str]] = []
@@ -295,10 +328,19 @@ def main() -> int:
     found = problems(src)
     for _rid, msg in found:
         print(f"::error::{TAG}: {SERVER_CPP}: {msg}{HINT}", file=sys.stderr)
-    if found:
+    try:
+        with open(os.path.join(REPO_ROOT, AGENT_SERVICE_CPP), encoding="utf-8") as fh:
+            asrc = fh.read()
+    except OSError as e:
+        print(f"::error::{TAG}: cannot read {AGENT_SERVICE_CPP}: {e}", file=sys.stderr)
+        return 1
+    afound = agent_service_problems(asrc)
+    for _rid, msg in afound:
+        print(f"::error::{TAG}: {AGENT_SERVICE_CPP}: {msg}{HINT}", file=sys.stderr)
+    if found or afound:
         return 1
     print(f"OK: {len(REQUIRED)} wiring statements, {len(COUNTED)} counted sites, "
-          f"{len(FORBIDDEN)} forbidden hatches checked")
+          f"{len(FORBIDDEN)} forbidden hatches, {len(EXACT_AGENT_SERVICE)} exact counts checked")
     return 0
 
 

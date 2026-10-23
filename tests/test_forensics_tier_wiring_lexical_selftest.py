@@ -10,6 +10,8 @@ mutations of the real server/core/src/server.cpp (nothing on disk is touched):
   * for each forbidden hatch, append a spelling of it and require the gate to flag it;
   * move a registration-order setter after its register_routes call and require the gate to flag
     the order for REST v1, the dashboard and the workflow routes;
+  * the raw failure-text reads in agent_service_impl.cpp are pinned EXACTLY: appending one more
+    read, or deleting one of the stored-row reads or the helper's read, is named;
   * a comment that merely mentions a required token must not satisfy a requirement, and a string
     literal containing a comment opener must not hide a real statement.
 
@@ -119,11 +121,35 @@ def main() -> int:
     expect("agent-service-set" not in ids(g.problems(hidden)),
            "a string literal containing a comment opener must not hide a real statement")
 
+    # The raw failure-text reads in agent_service_impl.cpp: an EXACT count, so an addition is
+    # caught as well as a deletion.
+    with open(os.path.join(g.REPO_ROOT, g.AGENT_SERVICE_CPP), encoding="utf-8") as fh:
+        asrc = fh.read()
+    expect(g.agent_service_problems(asrc) == [], "the real agent_service_impl.cpp must pass the exact counts")
+    for extra in ("std::string leak = resp.error().message();",
+                  "notify(resp.error().message());",
+                  "auto m =\n   resp.error()\n      .message();",
+                  "const auto& e = other.error().message();"):
+        expect("raw-failure-text-reads" in ids(g.agent_service_problems(asrc + "\n" + extra + "\n")),
+               f"a new raw failure-text read was NOT detected: {extra!r}")
+    stored = "err_detail = resp.error().message();"
+    expect(asrc.count(stored) == 2, "selftest anchor moved: the two stored-row reads")
+    expect("raw-failure-text-stored-row" in ids(g.agent_service_problems(asrc.replace(stored, "err_detail = {};", 1))),
+           "deleting a stored-row raw read was NOT detected")
+    helper = "std::string text = resp.error().message();"
+    expect(asrc.count(helper) == 1, "selftest anchor moved: the helper's read")
+    expect("raw-failure-text-helper" in ids(g.agent_service_problems(asrc.replace(helper, "std::string text;", 1))),
+           "deleting the helper's raw read was NOT detected")
+    expect(g.agent_service_problems(asrc.replace(stored, "// " + stored, 1)) != [],
+           "a commented-out stored-row read must not count")
+    expect(g.agent_service_problems(asrc + "\n// resp.error().message() is only mentioned here\n") == [],
+           "a comment mentioning the accessor is not a read")
+
     if FAILURES:
         print(f"{len(FAILURES)} selftest failure(s)", file=sys.stderr)
         return 1
     print(f"OK: {len(g.REQUIRED)} deletions, {len(g.COUNTED)} counted, {len(g.FORBIDDEN)} hatches, "
-          f"{len(orders)} order and 2 comment/literal mutations all caught")
+          f"{len(orders)} order, 2 comment/literal and the exact raw-read mutations all caught")
     return 0
 
 
