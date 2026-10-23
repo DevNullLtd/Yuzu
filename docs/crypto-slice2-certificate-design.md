@@ -3,7 +3,7 @@
 **Status:** design, not built. This is the slice-2 design that ADR-0070 (PR #6125) requires
 before any slice-2 code is written ("Slice 2 is unblocked to design. Its design doc must cite this
 ADR and satisfy D4, D5, D6, D7 and D12"). It is a design, not an ADR. The owner's decisions for
-slice 2, and the points still open, are under [Decisions](#decisions). Where possible it states
+slice 2, all decided as of 2026-10-23, are under [Decisions](#decisions). Where possible it states
 outcomes and leaves mechanisms to the implementation PRs, which get their own governance.
 
 It supersedes the "Slice 2: certificate inventory" section of `docs/crypto-asset-design.md` where
@@ -74,25 +74,37 @@ server. ADR-0070 rules that out as a field (D4, and D13 condition 3: "no stored
 
 ## Phasing and PR order
 
-**Proposed.** Each PR is reachable on merge: it changes behaviour an operator, an agent or a test
-against the running server can observe. No PR ships half a feature that waits for a later one.
+**Decided (owner, 2026-10-23): small PRs, never stacked.** The owner ruled that slice 2 ships
+as small PRs, each branched from `dev` and raised only once the PR it needs has merged. That
+replaces the earlier single 2a-2 PR. Each PR still changes something an operator, an agent or a
+test against the running server can observe; the last column says what. Where that is a
+counter or a store rather than a read, the PR says so, and the next PR in the chain adds the read.
 
-| # | PR | Contents | Why it is reachable on its own |
-|---|---|---|---|
-| 2a-1 | Typed-source hygiene | One exported constant array of typed source names in `typed_inventory_sources.hpp`, **already including the reserved name `certificate_inventory`**, used by the predicate (and so the gateway skip), a batched purge and a new read-time filter on the generic `InventoryStore` reads. No certificate code. Amends the app-usage read-surface routed-concern row in the same change. | It closes today's accepted stray-row window for `app_usage` and `device_ci` (see [Typed set](#typed-set-purge-and-read-filter)). D12 forbids that window for certificates, so it must exist, with the certificate source name reserved, before any agent sends the source. |
-| 2a-2 | Certificate inventory, end to end | Agent action `certificates.list_inventory` and its parsers; daily-sync source `certificate_inventory`; `CertificateInventoryStore` and ingest seam; per-certificate read and raw-value summary, REST + MCP + `/crypto` fragment; the dedicated securable, its seeding and floor entry; decommission, `/readyz`, retention prune; the D10 lint and the schema lint. | The agent source cannot ship without the store (its rows would land nowhere, or in the generic store), and the store cannot ship without a read (it would be dormant). So this is one PR, reviewed commit by commit. |
-| 2a-3 | D13 certificate counts | The counts read (REST + MCP), the D13 condition-1 lint entries and the recompute test; the data the certificate widgets read (their UI is proposed in unmerged work). | Operators see the counts on `/crypto` and through MCP. |
-| 2a-4 | CBOM certificate half | Certificate, algorithm and public-key components in `GET /api/v1/crypto/cbom` and `export_crypto_cbom`, gated by the certificate securable. | Builds on the library-component CBOM (#6143, merged to `dev`). |
-| 2b-1 | Revocation sources and fetcher | `RevocationSourceStore`; registration REST + MCP; the admin-only predicate and the floor-header amendment; the fetcher and its egress checks; CRL verification and acceptance; the leader-gated refresh job; `crl_past_next_update` on the source read; metrics and alerts. | An administrator registers a source and sees its fetch status, held CRL, `thisUpdate`, `nextUpdate`, entry count and `crl_past_next_update`; the alerts fire. |
-| 2b-2 | Revocation statements | Read-time matching on the per-certificate read; the revoked windows in the counts read; the signature-verification job; the widgets' revoked data. | Certificates read "revoked on …", "on hold", "not listed on …" or "revocation not checked", with the cause. |
-| 2b-3 | Delta CRLs (optional, last) | Delta CRL use together with its base. | Until it lands, a delta CRL is verified and recorded but never used, and the source shows `delta_not_supported`. Nothing earlier depends on it. |
+| # | PR | Contents | What is observable on merge | Needs |
+|---|---|---|---|---|
+| 2a-1 | Typed-source read filter | One exported array of typed source names in `typed_inventory_sources.hpp`, **already including the reserved name `certificate_inventory`**, used by the predicate (and so the gateway skip), the boot purge and a new read-time filter on every generic `InventoryStore` read. No certificate code. Amends the app-usage read-surface routed-concern row in the same change. | It closes today's accepted stray-row window for `app_usage` and `device_ci` (see [Typed set](#typed-set-purge-and-read-filter)). D12 forbids that window for certificates, so it must exist, with the certificate source name reserved, before any agent sends the source. | — |
+| 2a-1b | Background typed-source purge | The boot purge becomes a bounded, batched background pass, classified in `background_jobs.hpp`, started at every boot and no longer awaited before serving. | Boot no longer waits on an unbounded delete; the pass's progress is counted. | 2a-1 |
+| 2a-2a | Certificate store and ingest | `CertificateInventoryStore` (schema `cert_inventory`) and the shared ingest seam on the direct and gateway paths: blob parse, hash-skip, per-store replace rules, the decommission tombstone and per-agent lock, decommission cascade membership, `/readyz` membership, `yuzu_server_cert_inventory_ingest_total`, and the schema lint. | A report from an agent (or a test) is stored, counted by result and reason, erased on decommission, and covered by `/readyz`. | 2a-1 |
+| 2a-2b | Certificate read surface | The `CertificateInventory` securable, its seeding and floor entry; the per-certificate read and the raw-value summary (REST + MCP + `/crypto` fragment) with every filter in [Parameters](#parameters-strict-or-free-text-the-same-on-both-twins); admission, truncation, audit (OD-2) and the D10 lint. | Operators read fleet certificates, including the [one-CA queries](#finding-one-cas-certificates). | 2a-2a |
+| 2a-2c | Decommission tombstones | The admin-only tombstone list and purge (REST + MCP, OD-4), `coverage.tombstoned_agents_registered`, and the cross-schema enrolment clear (`CertificateEnrolmentTombstoneOwner`) at every approval write. | An administrator lists and purges tombstones; approving a tombstoned agent clears it. | 2a-2b |
+| 2a-2d | Certificate retention prune | The [prune](#retention-and-the-prune), at store and location grain, with its metrics and its clock-guarded-retention register entry. | Stores unread for 30 days are pruned and counted. | 2a-2a |
+| 2a-2e | Agent collector: action, daily-sync source and Linux | `certificates.list_inventory` (no catalogue row, OD-1), the `certificate_inventory` daily-sync source and blob writer, and the Linux store reads. | A Linux agent reports its certificates daily. | 2a-2a (raise after it merges: deploy order is server first) |
+| 2a-2f | Agent collector: Windows | The Windows machine-store reads and the private-key metadata. | A Windows agent reports its certificates. | 2a-2e |
+| 2a-2g | Agent collector: macOS | The System keychain and SystemRoots reads. | A macOS agent reports its certificates. | 2a-2e |
+| 2a-3 | D13 certificate counts | The counts read (REST + MCP), the snapshot export, the D13 condition-1 lint entries and the recompute test; the data the certificate widgets read. | Operators see the counts on `/crypto` and through MCP. | 2a-2b |
+| 2a-4 | CBOM certificate half | Certificate, algorithm and public-key components in `GET /api/v1/crypto/cbom` and `export_crypto_cbom`, gated by the certificate securable. | The CBOM gains its certificate half. | 2a-2b |
+| 2b-1a | Revocation sources | `RevocationSourceStore`; registration REST + MCP; the admin-only predicate and the floor-header amendment; `/readyz` membership. | An administrator registers, lists and removes a CA and its CRL URLs. | — |
+| 2b-1b | CRL fetcher | The fetcher and its egress checks; CRL verification and acceptance; the leader-gated refresh job; `crl_past_next_update` on the source read; metrics and alerts. | A registered source shows its fetch status, held CRL, `thisUpdate`, `nextUpdate` and entry count; the alerts fire. | 2b-1a |
+| 2b-2 | Revocation statements | Read-time matching on the per-certificate read (`CertificateRevocationReader`); the revoked windows in the counts read; the signature-verification job; the widgets' revoked data. | Certificates read "revoked on …", "on hold", "not listed on …" or "revocation not checked", with the cause. | 2a-3, 2b-1b |
+| 2b-3 | Delta CRLs (optional, last) | Delta CRL use together with its base. | Until it lands, a delta CRL is verified and recorded but never used, and the source shows `delta_not_supported`. | 2b-2 |
 
-**Order.** 2a-1 → 2a-2 → 2a-3. 2a-3 uses one shared set of D13 window constants and edge
-predicates, written to ADR-0070's R5/R7/R10/R14. If the widgets work (proposed in unmerged work)
-lands such a set first, 2a-3 imports it; otherwise 2a-3 lands it. 2a-4 can follow 2a-2 at any time
-(the library-component CBOM, #6143, is merged). 2b-1 can
-start once 2a-2 is merged, because it reads no fleet rows. 2b-2 needs 2a-2 and 2b-1. 2b-3 is
-optional and comes last.
+**Order.** Each PR is raised once everything in its "Needs" column has merged. 2a-1, 2b-1a and
+this design amendment need nothing and can be raised together. 2a-3 imports the shared D13 window
+constants and edge predicates the widgets work landed in `crypto_widget_catalogue.hpp` (ADR-0070
+R5/R7/R10/R14). 2b-3 is optional and comes last.
+
+Where the rest of this design says "2a-2", it means the 2a-2a to 2a-2g chain, and the table above
+says which PR carries each item. "2b-1" likewise means 2b-1a and 2b-1b.
 
 **Deploy order** is server before agents, as for blob v2 of `installed_software`
 (`docs/adr/0016-agent-daily-sync-framework.md`, "Deploy order: server before agents"). Nothing
@@ -101,10 +113,10 @@ enforces that order, so the design does not rely on it:
   2a-1 or later never stores the blob in the generic store on the gateway path, and its read filter
   hides any stray row.
 - **The remaining window (disclosed):** a server older than 2a-1, including a server rolled back
-  below it, that receives the blob from a 2a-2 agent through a gateway stores it in the generic
+  below it, that receives the blob from a 2a-2e agent through a gateway stores it in the generic
   store, readable under `Infrastructure:Read` / `Inventory:Read`. The rows become unreadable as soon as the server is
   at 2a-1 or later, and the purge removes them. `upgrading.md` states this and says to upgrade
-  servers before agents and never roll a server back below 2a-1 while 2a-2 agents run.
+  servers before agents and never roll a server back below 2a-1 while 2a-2e agents run.
 
 **Owed documents, per PR** (beyond the obligations in
 [Still owed by every slice-2 PR](#still-owed-by-every-slice-2-pr)):
@@ -112,11 +124,15 @@ enforces that order, so the design does not rely on it:
 | PR | Documents |
 |---|---|
 | 2a-1 | `upgrading.md`: the `app_usage`/`device_ci` behaviour change (stray generic rows stop being readable), the deploy order, and the downgrade note above. The app-usage read-surface routed-concern row: its accepted mixed-version window becomes closed. A changelog fragment. |
-| 2a-2 | `crypto.md`, `rest-api.md`, `mcp.md`, `audit-log.md` (the new verbs, including `crypto.certificates.tombstones.view` and `crypto.certificates.tombstone_purge`), `rbac.md` and the SOC 2 access-control inventory (`CertificateInventory`), the generated plugin README, the OS capability matrix, and the DPIA screening record. The tombstone list and purge routes and their MCP tools. The A2/A1 RBAC-administration routed-concern row (`.claude/routed-concerns-access-control.md`), amended for the new `is_rbac_administrator()` call sites, as that row requires. |
+| 2a-2a | `rest-api.md`/`server-admin.md` for the ingest metric and `/readyz` membership; `inventory.md` for the new daily-sync source; the DPIA screening record (before 2a-2b merges). |
+| 2a-2b | `crypto.md`, `rest-api.md`, `mcp.md`, `audit-log.md` (the read verbs), `rbac.md` and the SOC 2 access-control inventory (`CertificateInventory`). |
+| 2a-2c | `crypto.md`, `rest-api.md`, `mcp.md`, `audit-log.md` (`crypto.certificates.tombstones.view`, `crypto.certificates.tombstone_purge`). The A2/A1 RBAC-administration routed-concern row (`.claude/routed-concerns-access-control.md`), amended for the new `is_rbac_administrator()` call sites, as that row requires. |
+| 2a-2d | `crypto.md` (retention) and the clock-guarded-retention adoption register. |
+| 2a-2e, 2a-2f, 2a-2g | The generated plugin README and the OS capability matrix, per OS. |
 | #6125 (owed request, not an edit) | Ask that D6's "never opens ... key blocks in PEM files" (`0070:630`) be worded as the exact property in [Linux link and file rules](#stores-read-per-os): key-block lines discarded unretained, never base64-decoded, buffer cleansed. Tracked until #6125 answers; this design does not edit the ADR. |
 | 2a-3 | `crypto.md`, `rest-api.md`, `mcp.md` and `audit-log.md` for the snapshot export (`GET /api/v1/crypto/certificates/snapshot`, `export_crypto_certificate_snapshot`, verb `crypto.certificates.snapshot`), including that paged reads make no cross-page consistency promise. `crypto.md` (each count's rule, window and boundary), the D10 lint's allow-list entries. |
 | 2a-4 | `crypto.md` and `rest-api.md`/`mcp.md` (the certificate half of the CBOM, its securable and its `halves_omitted` metadata). |
-| 2b-1 | `server-admin.md` and `security-hardening.md`: CRL egress, the address rules, and firewall guidance for the server's outbound CRL fetches. `rbac.md`, `audit-log.md` and the SOC 2 inventory (`RevocationSource`). The fetcher's security review record. |
+| 2b-1a, 2b-1b | `server-admin.md` and `security-hardening.md`: CRL egress, the address rules, and firewall guidance for the server's outbound CRL fetches. `rbac.md`, `audit-log.md` and the SOC 2 inventory (`RevocationSource`). The fetcher's security review record. |
 | 2b-2 | `crypto.md`: the revocation statements and their causes. |
 
 ## Collection on the agent
@@ -323,7 +339,7 @@ shows a way that opens no key.
 | Linux | `unknown`: there is no association to read without opening key files. | `unknown` | `unknown` |
 
 - The provider name is reported raw, not mapped to "hardware-backed". A mapping table would be a
-  Yuzu classification. Whether to add one is open decision 5 (see [Decisions](#decisions)).
+  Yuzu classification. The owner decided against one (decision 5, [Decisions](#decisions)).
 - Every response says that an associated key "may since have been deleted" (placement table).
 - The macOS identity query must be shown, in the implementing PR, to raise no keychain prompt and
   evaluate no key ACL when run as the agent daemon. If it cannot be shown, macOS reports `unknown`.
@@ -691,7 +707,7 @@ concern. The design states how a pruned store's rows are re-sent despite hash-sk
   prunes it. Both times are server receipt times. An offline device sends no reports, so its
   `status_at` stops and nothing of its is pruned: age alone still never prunes. D12 states the
   prune condition at store grain, so this location-grain reading is listed under
-  [Decisions](#decisions) (open decision 6) for confirmation.
+  [Decisions](#decisions) (decision 6), and the owner confirmed it.
 - **Mechanics:** a single-writer pass under `pg_advisory_xact_lock`, capped per pass (500 stores).
   For each agent it prunes, it also takes the same per-agent lock that ingest and decommission take
   (see [Ingest](#ingest)) and rechecks the prune predicate under it, so a fresh ingest that
@@ -912,8 +928,8 @@ typed output schema and per-error recovery metadata, with the values in
 
 | REST | MCP | Securable | Slice |
 |---|---|---|---|
-| `GET /api/v1/crypto/certificates` | `list_crypto_certificates` | `CertificateInventory:Read` | 2a-2 |
-| `GET /api/v1/crypto/certificates/summary` | `get_crypto_certificate_summary` | `CertificateInventory:Read` | 2a-2 |
+| `GET /api/v1/crypto/certificates` | `list_crypto_certificates` | `CertificateInventory:Read` | 2a-2b |
+| `GET /api/v1/crypto/certificates/summary` | `get_crypto_certificate_summary` | `CertificateInventory:Read` | 2a-2b |
 | `GET /api/v1/crypto/certificates/snapshot` | `export_crypto_certificate_snapshot` | `CertificateInventory:Read` | 2a-3 |
 | `GET /api/v1/crypto/certificates/counts` | `get_crypto_certificate_counts` | `CertificateInventory:Read` | 2a-3 (revoked windows 2b-2) |
 | `GET /api/v1/crypto/cbom` (certificate half) | `export_crypto_cbom` | per half: `Inventory:Read` / `CertificateInventory:Read` | 2a-4 |
@@ -923,9 +939,9 @@ typed output schema and per-error recovery metadata, with the values in
 | `PUT /api/v1/crypto/revocation-sources/{id}` | `update_revocation_source` | `RevocationSource:Write` | 2b-1 |
 | `DELETE /api/v1/crypto/revocation-sources/{id}` | `remove_revocation_source` (`destructiveHint: true`) | `RevocationSource:Write` | 2b-1 |
 | `POST /api/v1/crypto/revocation-sources/{id}/reset-high-water` | `reset_revocation_source_high_water` (`destructiveHint: true`) | `RevocationSource:Write` | 2b-1 |
-| `GET /api/v1/crypto/certificates/tombstones` | `list_certificate_tombstones` | administrator predicate + `CertificateInventory:Write` (OD-4) | 2a-2 |
-| `DELETE /api/v1/crypto/certificates/tombstones/{agent_id}` | `purge_certificate_tombstone` (`destructiveHint: true`) | administrator predicate + `CertificateInventory:Write` (OD-4) | 2a-2 |
-| `/fragments/crypto/certificates`, `/fragments/crypto/certificates/devices` | — (dashboard, twin of the REST reads) | `CertificateInventory:Read` | 2a-2 |
+| `GET /api/v1/crypto/certificates/tombstones` | `list_certificate_tombstones` | administrator predicate + `CertificateInventory:Write` (OD-4) | 2a-2c |
+| `DELETE /api/v1/crypto/certificates/tombstones/{agent_id}` | `purge_certificate_tombstone` (`destructiveHint: true`) | administrator predicate + `CertificateInventory:Write` (OD-4) | 2a-2c |
+| `/fragments/crypto/certificates`, `/fragments/crypto/certificates/devices` | — (dashboard, twin of the REST reads) | `CertificateInventory:Read` | 2a-2b |
 
 Every certificate and revocation-source REST and MCP description carries D10's sentence: "facts
 only; the only built-in checks are D13's named rules and windows, each shown with its criterion"
@@ -1211,7 +1227,7 @@ certificate (`sha256`), with `assetType: certificate`:
 **Left empty:** `classicalSecurityLevel`, `nistQuantumSecurityLevel` and `certificateState`
 (lifecycle state is derived against "now"). `revocationDate` is also left empty in 2a-4. Filling it
 from an R1 statement is a fact, but it would need D5's basis wording, which the field cannot carry.
-Whether to add it later is open decision 4 (see [Decisions](#decisions)). The exact field
+It is revisited after 2b-2 (decision 4, [Decisions](#decisions)). The exact field
 list is checked against `bom-1.7.schema.json` when 2a-4 is built (D7, `0070:694-695`).
 
 A caller holding `Inventory:Read` but not `CertificateInventory:Read` gets the library half, plus
@@ -1324,7 +1340,7 @@ review, as a new egress surface.
   Anything else is refused with cause `redirect_unregistered`.
 - **No credentials:** no `Authorization`, cookies, client certificate or proxy credentials, and no
   NTLM or Negotiate. Responses that ask for authentication fail with `auth_required`. No outbound
-  proxy is used in 2b-1 (open decision 3).
+  proxy is used in 2b-1b (decision 3).
 - **Bounds:** connect 5 s, read 10 s, whole fetch 30 s. Response body at most 32 MiB, read with a
   counting limit; a larger body stops the read and records cause `over_size_bound`.
   `Content-Encoding` other than `identity` is refused. Conditional GET (`If-Modified-Since`,
@@ -1478,12 +1494,12 @@ windows. The signature-check job also reads `cert_fact.der` and writes `cert_sig
 its prune reads `cert_fact`. Under ADR-0012 §3, all of that cross-schema SQL lives in one named
 query owner, as `RbacAdminAuthorityOwner` is for the RBAC/auth join (the access-control routed
 concerns). Proposed: `CertificateRevocationReader`, depending on both stores sharing one PgPool, as
-the RBAC precedent does (open decision 2).
+the RBAC precedent does (decision 2, decided as proposed).
 
 The tombstone clear crosses the other way, from the `auth` schema's enrolment writes into
 `cert_inventory`. Proposed: a second named owner, `CertificateEnrolmentTombstoneOwner`, holding the
 clear statement each approval write calls inside its own transaction, and the tombstone list's
-join against the agent registry. It carries the same one-PgPool assumption, which open decision 2
+join against the agent registry. It carries the same one-PgPool assumption, which decision 2
 also covers.
 
 ### Matching and statements
@@ -1623,11 +1639,11 @@ posture, and the data-processor obligations an engine takes on.
 - **Retention:** rows live while the device reports them, or until 30 days after a reporting
   device's store stops being read, when they are pruned. An offline device's rows are not pruned
   (see [Retention and the prune](#retention-and-the-prune)); decommission erases them.
-- **DPIA (Proposed).** The owner and the compliance-officer own the screening. It is recorded in
-  `docs/security-reviews/` (a dated screening record for machine-scope certificate data) before 2a-2
-  merges, and the 2a-2 PR links it. Whether it needs a full DPIA and a works-council consultation is
-  open decision 1. The data is not behavioural: it records what is installed, not what a person
-  did.
+- **DPIA (Decided, owner 2026-10-23, decision 1).** The owner and the compliance-officer own the
+  screening. It is recorded in `docs/security-reviews/` (a dated screening record for machine-scope
+  certificate data) before 2a-2b merges, and the 2a-2b PR links it. It is a screening, not a full
+  DPIA, and there is no works-council consultation: the data is not behavioural, since it records
+  what is installed, not what a person did.
 - **Decommission tombstones.** A tombstone holds an `agent_id` and a time. An `agent_id` is a
   pseudonymous device identifier, and it is personal data, because the audit log links it to a
   hostname and so, often, to a person. It is kept only to stop a decommissioned agent repopulating
@@ -1809,24 +1825,26 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
   are `Read` and `Write` only; removal is a `Write`. The fetcher always refuses loopback and the
   server's own bind addresses ([Registration](#registration)).
 
-Still open for the owner:
+**Decided by the owner, 2026-10-23** (the six decisions this design left open, each as proposed):
 
-1. **DPIA and works-council position for machine-scope certificate data.** Proposed: a recorded
-   DPIA screening, owned by the owner and the compliance-officer, with no works-council trigger
-   because the data is not behavioural ([Personal data](#personal-data)).
-2. **Cross-schema matching.** Proposed: two schemas with one named query owner on one PgPool. The
-   alternative is the revocation tables in the `cert_inventory` schema ([The store](#the-store)).
-3. **An outbound proxy for the CRL fetcher.** Proposed: none in 2b-1
-   ([The fetcher](#the-fetcher)).
-4. **CBOM `revocationDate`.** Proposed: left empty in 2a-4 and revisited after 2b-2
+1. **DPIA and works-council position for machine-scope certificate data.** A recorded DPIA
+   screening, owned by the owner and the compliance-officer, with no works-council trigger because
+   the data is not behavioural. The screening also records the tombstone's Art. 17 path and that
+   slice 2 builds no per-subject purge ([Personal data](#personal-data)).
+2. **Cross-schema matching.** Two schemas (`cert_inventory`, `revocation_source`) with one named
+   query owner each way (`CertificateRevocationReader`, `CertificateEnrolmentTombstoneOwner`), on
+   one PgPool, as the RBAC precedent does ([The store](#the-store)).
+3. **An outbound proxy for the CRL fetcher.** None in 2b-1b. `server-admin.md` states the
+   limitation: a site whose only route out is a proxy cannot fetch CRLs until a later change adds
+   one ([The fetcher](#the-fetcher)).
+4. **CBOM `revocationDate`.** Left empty in 2a-4, revisited after 2b-2
    ([CBOM certificate components](#cbom-certificate-components)).
-5. **Mapping `key_provider` to "hardware-backed".** Proposed: no mapping. The raw provider name
-   only ([Private-key metadata](#private-key-metadata)).
-6. **Retention of locations in a store that stays `constrained`.** Proposed: a location missing
-   from every report over 30 days of the store's own reports is treated as not observed at location
-   grain and pruned. D12 states its prune condition at store grain, so the owner confirms this
-   reading, or chooses to keep such rows under a per-store ceiling instead
-   ([Retention and the prune](#retention-and-the-prune)).
+5. **Mapping `key_provider` to "hardware-backed".** No mapping. The raw provider name only
+   ([Private-key metadata](#private-key-metadata)).
+6. **Retention of locations in a store that stays `constrained`.** A location missing from every
+   report the server received over 30 days is treated as not observed at location grain and pruned
+   by the same pass. The owner confirmed this reading of D12's store-grain condition over a
+   per-store ceiling ([Retention and the prune](#retention-and-the-prune)).
 
 ## How this could ship wrong
 
