@@ -34,10 +34,12 @@
 #include "test_analytics_pg_helper.hpp"
 #include "test_auth_db_pg_helper.hpp"
 #include "test_forensics_tier_fixture.hpp"
+#include "test_principal_lock_gate.hpp" // SqlFault
 #include "test_offload_target_store_pg_helper.hpp"
 #include "test_tracker_scope.hpp"
 #include "test_webhook_store_pg_helper.hpp"
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 #include <libpq-fe.h>
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
@@ -376,6 +378,53 @@ TEST_CASE("tracker error_detail: rows written before the sanitiser are reduced o
         REQUIRE(got->has_value());
         CHECK((*got)->last_error_detail == "forensics_error");
     }
+}
+
+TEST_CASE("tracker error_detail: a failed Forensics execution lookup withholds the text and logs at "
+          "most once",
+          "[pg][server][forensics_tier][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, forensics_leaks_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecutionTracker tracker{pool};
+    REQUIRE(tracker.is_open());
+    tracker.set_forensics_plugin_set(&test::forensics_plugin_set());
+
+    Execution e;
+    e.definition_id = "def-lookup-fault";
+    e.dispatched_by = "tester";
+    e.status = "running";
+    e.agents_targeted = 1;
+    const auto id = tracker.create_execution(e);
+    REQUIRE(id.has_value());
+    REQUIRE(tracker.record_command_execution(std::string{test::kOrdinaryPlugin} + "-0g", *id));
+    AgentExecStatus s;
+    s.agent_id = "agent-1";
+    s.status = "failure";
+    s.completed_at = 100;
+    s.error_detail = kFreeText;
+    tracker.update_agent_status(*id, s);
+    tracker.refresh_counts(*id);
+    REQUIRE(tracker.get_agent_statuses(*id)[0].error_detail == kFreeText); // control: healthy lookup
+
+    // The plugin lookup (command_execution) fails while the main read succeeds: an unknown
+    // execution is treated as Forensics-tier, so the text is withheld on EVERY read ...
+    yuzu::test::SqlFault fault(
+        pool, "ALTER TABLE execution_tracker.command_execution RENAME TO command_execution_gone",
+        "ALTER TABLE execution_tracker.command_execution_gone RENAME TO command_execution");
+    fault.arm();
+    yuzu::test::LogCapture logs{spdlog::level::warn};
+    for (int i = 0; i < 6; ++i)
+        CHECK(tracker.get_agent_statuses(*id)[0].error_detail == "forensics_error");
+    logs.stop();
+    fault.repair();
+    // ... and the warning (drawer polls repeat this read every few seconds) is throttled to one
+    // per minute, however many reads failed. At most, not exactly: the throttle is process-wide.
+    const auto text = logs.text();
+    std::size_t lines = 0;
+    for (std::size_t pos = text.find("Forensics execution lookup failed"); pos != std::string::npos;
+         pos = text.find("Forensics execution lookup failed", pos + 1))
+        ++lines;
+    CHECK(lines <= 1);
 }
 
 // -- A3: the failure text in the server's other derived sinks -------------------------------------

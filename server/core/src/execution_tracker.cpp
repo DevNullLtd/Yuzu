@@ -8,6 +8,7 @@
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "refusal_log_throttle.hpp"
 #include "response_tier_filter.hpp" // ForensicsPluginSet
 #include "secure_random.hpp"
 
@@ -221,9 +222,14 @@ void scrub_error_texts(PGconn* conn, const ForensicsPluginSet* set,
     std::ranges::sort(ids);
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
     const auto forensics = forensics_executions_among(conn, *set, ids);
-    if (!forensics)
-        spdlog::warn("ExecutionTracker: Forensics execution lookup failed; error text withheld "
-                     "for {} execution(s) (#4990)", ids.size());
+    if (!forensics) {
+        // The drawer repeats this read every few seconds, so the line is throttled (the text is
+        // withheld on every read regardless): at most one per minute.
+        static RefusalLogThrottle throttle;
+        if (throttle.should_warn("forensics_execution_lookup_failed"))
+            spdlog::warn("ExecutionTracker: Forensics execution lookup failed; error text withheld "
+                         "for {} execution(s) (#4990; at most one log per 60 s)", ids.size());
+    }
     for (auto& [exec_id, text] : slots)
         if (!forensics || forensics->contains(exec_id))
             *text = sanitize_forensics_error_detail(*text);
