@@ -217,11 +217,7 @@ const std::vector<pg::PgMigration>& build_migrations() {
          "  uri       TEXT NOT NULL,"
          "  PRIMARY KEY (agent_id, sha256, ord),"
          "  FOREIGN KEY (agent_id, sha256) REFERENCES cert_fact (agent_id, sha256)"
-         "    ON DELETE CASCADE);"
-         // Written by delete_agent in the same transaction as the erase. No age-based prune.
-         "CREATE TABLE decommission_tombstone ("
-         "  agent_id          TEXT PRIMARY KEY,"
-         "  decommissioned_at TIMESTAMPTZ NOT NULL);"},
+         "    ON DELETE CASCADE);"},
     };
     return kMigrations;
 }
@@ -366,18 +362,8 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
     const bool committed = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
         if (!tup_ok(pg::exec_params(c, kLockSql, std::vector<std::string>{id})))
             return false;
-        pg::PgResult tomb = pg::exec_params(
-            c, "SELECT 1 FROM cert_inventory.decommission_tombstone WHERE agent_id = $1",
-            std::vector<std::string>{id});
-        if (!tup_ok(tomb))
-            return false;
-        const bool tombstoned = PQntuples(tomb.get()) > 0;
-        if (test_hook_after_tombstone_check_)
-            test_hook_after_tombstone_check_();
-        if (tombstoned) {
-            result.outcome = CertIngestOutcome::kDecommissioned;
-            return true; // acknowledged, nothing written
-        }
+        if (test_hook_after_lock_)
+            test_hook_after_lock_();
 
         pg::PgResult tr = pg::exec_params(c, kTimeSql, std::vector<std::string>{id});
         if (!tup_ok(tr) || PQntuples(tr.get()) != 1)
@@ -590,18 +576,8 @@ CertIngestResult CertificateInventoryStore::ingest_touch(std::string_view agent_
     const bool committed = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
         if (!tup_ok(pg::exec_params(c, kLockSql, std::vector<std::string>{id})))
             return false;
-        pg::PgResult tomb = pg::exec_params(
-            c, "SELECT 1 FROM cert_inventory.decommission_tombstone WHERE agent_id = $1",
-            std::vector<std::string>{id});
-        if (!tup_ok(tomb))
-            return false;
-        const bool tombstoned = PQntuples(tomb.get()) > 0;
-        if (test_hook_after_tombstone_check_)
-            test_hook_after_tombstone_check_();
-        if (tombstoned) {
-            result.outcome = CertIngestOutcome::kDecommissioned;
-            return true;
-        }
+        if (test_hook_after_lock_)
+            test_hook_after_lock_();
         pg::PgResult st = pg::exec_params(
             c, "SELECT content_hash FROM cert_inventory.agent_state WHERE agent_id = $1",
             std::vector<std::string>{id});
@@ -654,20 +630,6 @@ CertIngestResult CertificateInventoryStore::ingest_touch(std::string_view agent_
     return result;
 }
 
-std::optional<bool> CertificateInventoryStore::is_tombstoned(std::string_view agent_id) {
-    if (!open_ || agent_id.empty())
-        return std::nullopt;
-    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
-    if (!lease)
-        return std::nullopt;
-    pg::PgResult r = pg::exec_params(
-        lease.get(), "SELECT 1 FROM cert_inventory.decommission_tombstone WHERE agent_id = $1",
-        std::vector<std::string>{std::string(agent_id)});
-    if (!tup_ok(r))
-        return std::nullopt;
-    return PQntuples(r.get()) > 0;
-}
-
 bool CertificateInventoryStore::delete_agent(std::string_view agent_id) {
     if (agent_id.empty()) {
         spdlog::warn("CertificateInventoryStore: delete_agent called with an empty agent_id — "
@@ -677,8 +639,9 @@ bool CertificateInventoryStore::delete_agent(std::string_view agent_id) {
     if (!open_)
         return false;
     const std::string id{agent_id};
-    // Erase and tombstone in ONE transaction under the same per-agent lock ingest takes: an
-    // in-flight ingest either commits first (and is erased here) or reads the tombstone after.
+    // Erase in ONE transaction under the same per-agent lock ingest takes: an in-flight ingest
+    // either commits first (and is erased here) or runs after the erase and re-creates its rows
+    // from its own report; either way the result is one whole state, never partial rows.
     const bool committed = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
         if (!tup_ok(pg::exec_params(c, kLockSql, std::vector<std::string>{id})))
             return false;
@@ -689,12 +652,9 @@ bool CertificateInventoryStore::delete_agent(std::string_view agent_id) {
             if (!cmd_ok(pg::exec_params(c, sql.c_str(), std::vector<std::string>{id})))
                 return false;
         }
-        return cmd_ok(pg::exec_params(
-            c,
-            "INSERT INTO cert_inventory.decommission_tombstone (agent_id, decommissioned_at) "
-            "VALUES ($1, clock_timestamp()) ON CONFLICT (agent_id) DO UPDATE SET "
-            "decommissioned_at = EXCLUDED.decommissioned_at",
-            std::vector<std::string>{id}));
+        if (test_hook_after_erase_)
+            test_hook_after_erase_();
+        return true;
     });
     if (!committed)
         spdlog::debug("CertificateInventoryStore: delete_agent did not commit for agent={} ({})",

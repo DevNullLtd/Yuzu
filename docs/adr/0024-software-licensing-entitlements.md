@@ -474,9 +474,7 @@ Decision numbers are stable, since other documents cite them.
     single scoped `Decommission:Delete`, see the Decision 9 update note.)*
     *(Update 2026-10-23, slice-2 PR 2a-2a: the cascade now covers **eight** stores.
     `CertificateInventoryStore` (schema `cert_inventory`, the fleet certificate inventory of
-    ADR-0070 D12) joined, and its `delete_agent` also writes a `decommission_tombstone` row in
-    the same transaction as the erase, so a still-running agent's later reports are
-    acknowledged and dropped rather than repopulating it. Its read securable,
+    ADR-0070 D12) joined, and its `delete_agent` erases its rows in one transaction. Its read securable,
     `CertificateInventory`, arrives in PR 2a-2b.)*
     There is **no row-level erasure API**, a stated gap. The cascade's
     production trigger is `DELETE /api/v1/sle/agents/{id}`, authorized by the scoped

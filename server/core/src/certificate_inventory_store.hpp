@@ -6,10 +6,10 @@
 /// `certificate_inventory` daily-sync source. Design:
 /// `docs/crypto-slice2-certificate-design.md`, "Server: store, ingest and lifecycle".
 ///
-/// SHAPE. Eight tables, every one leading its key with `agent_id` (decommission and
+/// SHAPE. Seven tables, every one leading its key with `agent_id` (decommission and
 /// confinement): `agent_state` (hash-skip state), `store_state` (one row per store per
 /// device: status, reason, `observed_at`, `status_at`), `cert_location` (where a
-/// certificate was seen), `decommission_tombstone`, `cert_fact` (one row per (device,
+/// certificate was seen), `cert_fact` (one row per (device,
 /// certificate): the X.509 facts), and the `cert_san` / `cert_eku` / `cert_cdp` children.
 /// A `cert_fact` row exists while at least one `cert_location` row references it; the
 /// ingest transaction deletes the orphans.
@@ -27,16 +27,12 @@
 ///
 /// PER-AGENT SERIALISATION. Ingest (full and hash-skip) and `delete_agent` take the SAME
 /// `pg_advisory_xact_lock(hashtextextended('cert_inventory:' || agent_id, 0))` first, so a
-/// decommission cannot commit between an ingest's tombstone read and its commit. The retention
+/// decommission cannot interleave with an ingest's transaction. The retention
 /// prune (PR 2a-2d) must take it too.
 ///
-/// DECOMMISSION. `delete_agent` erases every table's rows for the agent AND writes the
-/// `decommission_tombstone` in the same transaction. An ingest for a tombstoned agent writes
-/// nothing: it is acknowledged and counted (`reason=decommissioned`). The tombstone has no
-/// age-based prune (a decommissioned agent that is still running would repopulate). It is
-/// cleared ONLY by the enrolment write and the audited admin purge, both of which are PR 2a-2c;
-/// until that PR merges nothing in this build clears a tombstone, so an agent that is
-/// decommissioned and then re-enrolled stays discarded.
+/// DECOMMISSION. `delete_agent` erases every table's rows for the agent in one transaction
+/// under the per-agent lock. A still-running agent's next report re-creates its rows; keeping it
+/// out is the decommission tombstone, which is a separate, later change.
 ///
 /// FAILURE POSTURE (ADR-0012 §1). Ingest is fail-soft (a transient outage returns `kError`; the
 /// seam nacks and the agent resends next cycle). `delete_agent` returns true only when the
@@ -137,7 +133,6 @@ enum class CertIngestOutcome {
     kStored,         ///< full report applied
     kTouched,        ///< hash-skip matched; freshness advanced
     kNeedFull,       ///< cold cache or hash mismatch: the agent must resend in full
-    kDecommissioned, ///< tombstoned agent: acknowledged, nothing written
     kError,          ///< pool/SQL failure (transient)
 };
 
@@ -176,13 +171,7 @@ public:
     [[nodiscard]] CertIngestResult ingest_touch(std::string_view agent_id,
                                                 std::string_view claimed_hash);
 
-    /// True when `agent_id` is tombstoned; nullopt on a store/pool/query failure. A plain read,
-    /// used only by the seam to acknowledge an unparseable blob from a decommissioned agent. The
-    /// authoritative check is inside the ingest transaction.
-    [[nodiscard]] std::optional<bool> is_tombstoned(std::string_view agent_id);
-
-    /// Erase every table's rows for the agent and write the tombstone, in ONE transaction under
-    /// the per-agent lock. Empty id -> false without touching PG. True iff committed.
+    /// Erase every table's rows for the agent in ONE transaction under the per-agent lock. Empty id -> false without touching PG. True iff committed.
     [[nodiscard]] bool delete_agent(std::string_view agent_id);
 
     /// Row counts for one agent, for tests and diagnostics: {agent_state, store_state,
@@ -193,17 +182,21 @@ public:
     };
     [[nodiscard]] std::optional<RowCounts> row_counts(std::string_view agent_id);
 
-    /// TEST SEAM. Runs inside the ingest transaction after the tombstone read and before the
-    /// commit, so a test can start a concurrent `delete_agent` at exactly that point. Null in
-    /// production.
-    void set_test_hook_after_tombstone_check(std::function<void()> hook) {
-        test_hook_after_tombstone_check_ = std::move(hook);
+    /// TEST SEAMS. Run inside the transaction (null in production): `after_lock` right after an
+    /// ingest has taken the per-agent lock, `after_erase` in `delete_agent` after the deletes and
+    /// before the commit. They let a test start a racing call at exactly that point.
+    void set_test_hook_after_lock(std::function<void()> hook) {
+        test_hook_after_lock_ = std::move(hook);
+    }
+    void set_test_hook_after_erase(std::function<void()> hook) {
+        test_hook_after_erase_ = std::move(hook);
     }
 
 private:
     pg::PgPool& pool_;
     bool open_{false};
-    std::function<void()> test_hook_after_tombstone_check_;
+    std::function<void()> test_hook_after_lock_;
+    std::function<void()> test_hook_after_erase_;
 };
 
 } // namespace yuzu::server

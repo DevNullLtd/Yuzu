@@ -483,8 +483,6 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
     const auto* ci = find_store(result, "certificate_inventory");
     REQUIRE(ci != nullptr);
     CHECK(ci->outcome == DecommissionOutcome::Deleted); // the certificate store IS included
-    CHECK(certificate_inventory.is_tombstoned("agent-del") == std::optional<bool>{true});
-    CHECK(certificate_inventory.is_tombstoned("agent-bystander") == std::optional<bool>{false});
 
     // agent-del is gone from EVERY store.
     auto inv_del = inventory.get_agent_inventory("agent-del");
