@@ -299,6 +299,14 @@ std::vector<std::string> declared_record_names(const std::string& code, const st
     return names;
 }
 
+// Exact counts of the registry source files a healthy scan reads. Equality, not a floor: a
+// domain file that drops out of the glob (renamed away from the prefix) would otherwise leave
+// its records and includes unchecked while the scan still passes on the remaining files. Bump
+// kRegistryDomainFiles together with MIN_REGISTRY_FILES in scripts/ci/check-api-parity.py when
+// a mcp_tools_<domain>.cpp is added; bump kToolHeaderFiles when an mcp_tool*.hpp is added.
+constexpr std::size_t kRegistryDomainFiles = 3;
+constexpr std::size_t kToolHeaderFiles = 3;
+
 } // namespace
 
 TEST_CASE("MCP dispatch coverage: the stripper and the scan behave as documented",
@@ -415,7 +423,10 @@ TEST_CASE("MCP dispatch coverage: every mcp_tools_*.cpp record is registered and
                 problems.push_back(fname + ": no `" + def + "` definition");
         }
     }
-    CHECK(files >= 1);
+    INFO("mcp_tools_*.cpp files scanned: " << files << " (expected " << kRegistryDomainFiles
+                                           << "); bump kRegistryDomainFiles with the new file, together with "
+                                              "MIN_REGISTRY_FILES in scripts/ci/check-api-parity.py");
+    CHECK(files == kRegistryDomainFiles);
 
     // Set equality in both directions, and no name declared twice across files.
     std::set<std::string> declared_set(declared.begin(), declared.end());
@@ -460,39 +471,105 @@ TEST_CASE("MCP dispatch coverage: the include denylist for mcp_tools_*.cpp behav
         CHECK_FALSE(is_forbidden_tool_include(ok));
 }
 
-TEST_CASE("MCP dispatch coverage: mcp_tools_*.cpp includes no store, registry, server or auth header",
-          "[mcp][dispatch_coverage]") {
+namespace {
+
+// The direct #include names in `source` that the denylist forbids. Comments and raw strings
+// are stripped first, so a commented-out include is not an offence.
+std::vector<std::string> forbidden_includes_in(const std::string& source) {
     std::vector<std::string> offences;
-    std::size_t files = 0;
+    const std::string code = strip_comments_and_raw_strings(source);
+    std::istringstream lines(code);
+    std::string line;
+    while (std::getline(lines, line)) {
+        const std::size_t hash = line.find_first_not_of(" \t");
+        if (hash == std::string::npos || line[hash] != '#')
+            continue;
+        const std::size_t inc = line.find("include", hash + 1);
+        if (inc == std::string::npos)
+            continue;
+        const std::size_t open = line.find_first_of("<\"", inc + 7);
+        if (open == std::string::npos)
+            continue;
+        const std::size_t close = line.find(line[open] == '<' ? '>' : '"', open + 1);
+        if (close == std::string::npos)
+            continue;
+        const std::string header = line.substr(open + 1, close - open - 1);
+        if (is_forbidden_tool_include(header))
+            offences.push_back(header);
+    }
+    return offences;
+}
+
+// The files the include denylist polices: every registry domain file (mcp_tools_*.cpp) and
+// every registry seam / shared-helper header (mcp_tool*.hpp: mcp_tool_registry.hpp,
+// mcp_tool_deps.hpp, mcp_tool_helpers.hpp). The headers matter because a shared helper
+// header is included by every domain file, so a store header reached through one of them
+// would reach all of them, and the .cpp scan alone would never see it. Each header is
+// held to the same denylist as the .cpp files: mcp_tool_deps.hpp deliberately names
+// domain MODEL headers (hardware_list_model.hpp, inventory_routes.hpp,
+// quarantine_visible.hpp) for the provider closure types, but none of them is a store,
+// agent-registry, server or auth header, so it passes unchanged and the denylist is not
+// weakened for it.
+struct ToolScanFiles {
+    std::vector<fs::path> cpp;
+    std::vector<fs::path> hpp;
+};
+
+ToolScanFiles tool_scan_files() {
+    ToolScanFiles out;
     for (const auto& entry : fs::directory_iterator(fs::path(YUZU_SERVER_SRC_DIR))) {
         const std::string fname = entry.path().filename().string();
-        if (fname.rfind("mcp_tools_", 0) != 0 || entry.path().extension() != ".cpp")
-            continue;
-        ++files;
-        const std::string code = strip_comments_and_raw_strings(read_source(entry.path()));
-        std::istringstream lines(code);
-        std::string line;
-        while (std::getline(lines, line)) {
-            const std::size_t hash = line.find_first_not_of(" \t");
-            if (hash == std::string::npos || line[hash] != '#')
-                continue;
-            const std::size_t inc = line.find("include", hash + 1);
-            if (inc == std::string::npos)
-                continue;
-            const std::size_t open = line.find_first_of("<\"", inc + 7);
-            if (open == std::string::npos)
-                continue;
-            const std::size_t close = line.find(line[open] == '<' ? '>' : '"', open + 1);
-            if (close == std::string::npos)
-                continue;
-            const std::string header = line.substr(open + 1, close - open - 1);
-            if (is_forbidden_tool_include(header))
-                offences.push_back(fname + ": #include \"" + header + "\"");
-        }
+        if (fname.rfind("mcp_tools_", 0) == 0 && entry.path().extension() == ".cpp")
+            out.cpp.push_back(entry.path());
+        else if (fname.rfind("mcp_tool", 0) == 0 && entry.path().extension() == ".hpp")
+            out.hpp.push_back(entry.path());
     }
-    CHECK(files >= 1);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("MCP dispatch coverage: mcp_tools_*.cpp and mcp_tool*.hpp include no store, registry, "
+          "server or auth header",
+          "[mcp][dispatch_coverage]") {
+    std::vector<std::string> offences;
+    const ToolScanFiles files = tool_scan_files();
+    for (const auto* group : {&files.cpp, &files.hpp})
+        for (const auto& path : *group)
+            for (const auto& header : forbidden_includes_in(read_source(path)))
+                offences.push_back(path.filename().string() + ": #include \"" + header + "\"");
+    INFO("mcp_tools_*.cpp files: " << files.cpp.size() << " (expected " << kRegistryDomainFiles
+                                   << "), mcp_tool*.hpp files: " << files.hpp.size()
+                                   << " (expected " << kToolHeaderFiles
+                                   << "); bump kRegistryDomainFiles (together with MIN_REGISTRY_FILES in "
+                                      "scripts/ci/check-api-parity.py) for a new mcp_tools_<domain>.cpp, "
+                                      "or kToolHeaderFiles for a new mcp_tool*.hpp");
+    CHECK(files.cpp.size() == kRegistryDomainFiles);
+    CHECK(files.hpp.size() == kToolHeaderFiles);
     INFO(join(offences));
     CHECK(offences.empty());
+}
+
+TEST_CASE("MCP dispatch coverage: the include scan reaches the registry headers and the shared helper",
+          "[mcp][dispatch_coverage]") {
+    const ToolScanFiles files = tool_scan_files();
+    std::set<std::string> headers;
+    for (const auto& path : files.hpp)
+        headers.insert(path.filename().string());
+    // A header that drops out of the scan (renamed away from the mcp_tool prefix, or the
+    // glob narrowed) would silently exempt it from the denylist.
+    CHECK(headers.contains("mcp_tool_helpers.hpp"));
+    CHECK(headers.contains("mcp_tool_registry.hpp"));
+    CHECK(headers.contains("mcp_tool_deps.hpp"));
+
+    // The scan itself is not vacuous: a store header in a header-shaped source is an
+    // offence, a commented-out one is not, and an allowed one is not.
+    const std::string bad =
+        "#pragma once\n#include \"mcp_tool_registry.hpp\"\n#include \"quarantine_store.hpp\"\n"
+        "#include <pg/pg_pool.hpp>\n// #include \"auth_db.hpp\"\n";
+    CHECK(forbidden_includes_in(bad) ==
+          std::vector<std::string>{"quarantine_store.hpp", "pg/pg_pool.hpp"});
+    CHECK(forbidden_includes_in("#include \"rest_audit.hpp\"\n#include <nlohmann/json.hpp>\n").empty());
 }
 
 TEST_CASE("MCP dispatch coverage: the ctor feeds the validator from the merged catalogue, and the "

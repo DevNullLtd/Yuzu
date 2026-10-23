@@ -5501,6 +5501,139 @@ TEST_CASE("MCP Guardian: get_guardian_device_guards returns every guard's state 
     CHECK(ts.audit_log.back() == "guardian.device.view|success");
 }
 
+// The three cases below need no store: a FnGuardianApi double with a call
+// counter stands in for the seam, so they run without Postgres.
+TEST_CASE("MCP Guardian: get_guardian_device_guards denies an out-of-scope device before "
+          "the seam is read",
+          "[mcp][integration][guardian][twins]") {
+    McpTestServer ts;
+    int device_guards_calls = 0;
+    auto seam_api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+        yuzu::server::test::FnGuardianApi::ListRulesFn{},
+        yuzu::server::test::FnGuardianApi::GetRuleFn{},
+        yuzu::server::test::FnGuardianApi::StatusFn{},
+        yuzu::server::test::FnGuardianApi::AgentStatusFn{},
+        yuzu::server::test::FnGuardianApi::RuleStatusFn{},
+        [&device_guards_calls](const std::string&)
+            -> std::optional<std::vector<GuardianDeviceGuardRow>> {
+            ++device_guards_calls;
+            return std::vector<GuardianDeviceGuardRow>{};
+        });
+    ts.guardian_api_for_test = seam_api;
+    std::string securable_seen, operation_seen;
+    ts.scoped_perm_fn_for_test = [&](const httplib::Request&, httplib::Response& res,
+                                     const std::string& sec, const std::string& op,
+                                     const std::string& agent_id) -> bool {
+        securable_seen = sec;
+        operation_seen = op;
+        if (agent_id == "WS-9") {
+            res.status = 403;
+            res.set_content(R"({"error":"forbidden"})", "application/json");
+            return false;
+        }
+        return true;
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5469,"params":{"name":"get_guardian_device_guards",)"
+        R"("arguments":{"agent_id":"WS-9"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("\"result\"") == std::string::npos);
+    CHECK(securable_seen == "GuaranteedState");
+    CHECK(operation_seen == "Read");
+    CHECK(device_guards_calls == 0); // the gate answered before the seam was touched
+    for (const auto& a : ts.audit_log)
+        CHECK(a.rfind("guardian.device.view", 0) != 0); // no access row for a refused read
+}
+
+TEST_CASE("MCP Guardian: get_guardian_device_guards hands the requested agent_id to the "
+          "scope gate for a service-scoped session",
+          "[mcp][integration][guardian][twins][service_scope]") {
+    // get_guardian_device_guards is ServiceScopeClass::confined: C8 admits the
+    // session and the handler's own per-device gate is the mechanism. The gate
+    // must see the requested agent_id and run before the seam read.
+    McpTestServer ts;
+    ts.mock_token_scope_service = "printers";
+    std::vector<std::string> gate_agents;
+    int device_guards_calls = 0;
+    int calls_at_gate = -1;
+    GuardianDeviceGuardRow row;
+    row.rule_id = "r1";
+    row.name = "guard-one";
+    row.state = "compliant";
+    row.updated_at = "2026-06-20T10:00:00Z";
+    auto seam_api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+        yuzu::server::test::FnGuardianApi::ListRulesFn{},
+        yuzu::server::test::FnGuardianApi::GetRuleFn{},
+        yuzu::server::test::FnGuardianApi::StatusFn{},
+        yuzu::server::test::FnGuardianApi::AgentStatusFn{},
+        yuzu::server::test::FnGuardianApi::RuleStatusFn{},
+        [&device_guards_calls, row](const std::string&)
+            -> std::optional<std::vector<GuardianDeviceGuardRow>> {
+            ++device_guards_calls;
+            return std::vector<GuardianDeviceGuardRow>{row};
+        });
+    ts.guardian_api_for_test = seam_api;
+    std::string securable_seen, operation_seen;
+    ts.scoped_perm_fn_for_test = [&](const httplib::Request&, httplib::Response&,
+                                     const std::string& sec, const std::string& op,
+                                     const std::string& agent_id) -> bool {
+        securable_seen = sec;
+        operation_seen = op;
+        gate_agents.push_back(agent_id);
+        calls_at_gate = device_guards_calls;
+        return true;
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5470,"params":{"name":"get_guardian_device_guards",)"
+        R"("arguments":{"agent_id":"WS-1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    REQUIRE(gate_agents.size() == 1);
+    CHECK(gate_agents[0] == "WS-1");
+    CHECK(securable_seen == "GuaranteedState");
+    CHECK(operation_seen == "Read");
+    CHECK(calls_at_gate == 0); // gate ran before the seam read
+    CHECK(device_guards_calls == 1);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+}
+
+TEST_CASE("MCP Guardian: get_guardian_device_guards scope gate unwired -> fail closed",
+          "[mcp][integration][guardian][twins]") {
+    McpTestServer ts; // scoped_perm_fn_for_test left empty
+    int device_guards_calls = 0;
+    auto seam_api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+        yuzu::server::test::FnGuardianApi::ListRulesFn{},
+        yuzu::server::test::FnGuardianApi::GetRuleFn{},
+        yuzu::server::test::FnGuardianApi::StatusFn{},
+        yuzu::server::test::FnGuardianApi::AgentStatusFn{},
+        yuzu::server::test::FnGuardianApi::RuleStatusFn{},
+        [&device_guards_calls](const std::string&)
+            -> std::optional<std::vector<GuardianDeviceGuardRow>> {
+            ++device_guards_calls;
+            return std::vector<GuardianDeviceGuardRow>{};
+        });
+    ts.guardian_api_for_test = seam_api;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5471,"params":{"name":"get_guardian_device_guards",)"
+        R"("arguments":{"agent_id":"WS-1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(res->body.find("scope gate not configured") != std::string::npos);
+    CHECK(res->body.find("\"result\"") == std::string::npos);
+    CHECK(device_guards_calls == 0);
+}
+
 // ── Guardian rule CRUD + push + per-agent read twins (#2146 Batch B1) ──────
 // Each mirrors its REST v1 sibling exactly: create/get/update/delete via the
 // SAME GuaranteedStateStore rule CRUD REST uses; push via the SAME
@@ -9728,6 +9861,87 @@ TEST_CASE("MCP DEX: get_dex_observation returns the detail, audits dex.observati
         R"({"jsonrpc":"2.0","method":"tools/call","id":985,"params":{"name":"get_dex_observation","arguments":{"agent_id":"WS-1","event_id":"h2"}}})");
     REQUIRE(foreign);
     CHECK(foreign->body.find("-32602") != std::string::npos);
+}
+
+// The two cases below need no store, so they run without Postgres. With no
+// Guaranteed State store wired the handler's own "store unavailable" answer is
+// what a call would reach once past the scope gate, so a refusal that is still
+// the gate's own 403 proves the gate answered first.
+TEST_CASE("MCP DEX: get_dex_observation denies an out-of-scope device before the store "
+          "is consulted",
+          "[mcp][integration][dex]") {
+    McpTestServer ts; // no store wired: proves the gate short-circuits first
+    std::string securable_seen, operation_seen;
+    ts.scoped_perm_fn_for_test = [&](const httplib::Request&, httplib::Response& res,
+                                     const std::string& sec, const std::string& op,
+                                     const std::string& agent_id) -> bool {
+        securable_seen = sec;
+        operation_seen = op;
+        if (agent_id == "WS-9") {
+            res.status = 403;
+            res.set_content(R"({"error":"forbidden"})", "application/json");
+            return false;
+        }
+        return true;
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9732,"params":{"name":"get_dex_observation","arguments":{"agent_id":"WS-9","event_id":"h1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("Guaranteed State store unavailable") == std::string::npos);
+    CHECK(res->body.find("\"result\"") == std::string::npos);
+    CHECK(securable_seen == "GuaranteedState");
+    CHECK(operation_seen == "Read");
+}
+
+TEST_CASE("MCP DEX: get_dex_observation hands the requested agent_id to the scope gate "
+          "for a service-scoped session",
+          "[mcp][integration][dex][service_scope]") {
+    // get_dex_observation is ServiceScopeClass::confined: C8 admits the session
+    // and the handler's own per-device gate is the mechanism. The agent_id comes
+    // straight from the call arguments (the tool does not resolve it from the
+    // event_id), so "WS-1" is the known value the gate must receive.
+    McpTestServer ts;
+    ts.mock_token_scope_service = "printers";
+    std::vector<std::string> gate_agents;
+    std::string securable_seen, operation_seen;
+    ts.scoped_perm_fn_for_test = [&](const httplib::Request&, httplib::Response&,
+                                     const std::string& sec, const std::string& op,
+                                     const std::string& agent_id) -> bool {
+        securable_seen = sec;
+        operation_seen = op;
+        gate_agents.push_back(agent_id);
+        return true;
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9733,"params":{"name":"get_dex_observation","arguments":{"agent_id":"WS-1","event_id":"h1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    REQUIRE(gate_agents.size() == 1);
+    CHECK(gate_agents[0] == "WS-1");
+    CHECK(securable_seen == "GuaranteedState");
+    CHECK(operation_seen == "Read");
+    // Past the gate, the unwired store answers: the call reached the read path.
+    CHECK(res->body.find("Guaranteed State store unavailable") != std::string::npos);
+    CHECK(res->body.find("\"result\"") == std::string::npos);
+}
+
+TEST_CASE("MCP DEX: get_dex_observation scope gate unwired -> fail closed",
+          "[mcp][integration][dex]") {
+    McpTestServer ts; // scoped_perm_fn_for_test left empty, no store wired
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9734,"params":{"name":"get_dex_observation","arguments":{"agent_id":"WS-1","event_id":"h1"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("scope gate not configured") != std::string::npos);
+    // The gate check precedes the store check, so the unwired gate is what answers.
+    CHECK(res->body.find("Guaranteed State store unavailable") == std::string::npos);
+    CHECK(res->body.find("\"result\"") == std::string::npos);
 }
 
 TEST_CASE("MCP DEX: tools report unavailable when no Guaranteed State store is wired",
