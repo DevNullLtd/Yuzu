@@ -245,7 +245,7 @@ The contract the server relies on (it cannot recover from a violation):
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-22 · interactive user (elevated; username, SID and profile path anonymised) · leg-hash 8e63a482f476
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-23 · interactive user (elevated; username, SID and profile path anonymised) · leg-hash 8e63a482f476
 
 ```
 == action=get_value hive=HKLM key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" name=ProductName
