@@ -77,6 +77,7 @@ class AppPerfDailyStore;
 class DeviceInventoryStore;
 class SoftwareLicensingStore;
 class AppUsageStore;
+class CertificateInventoryStore;
 class UpdateRegistry;
 class ExecutionTracker;
 class FleetTopologyStore;
@@ -270,6 +271,11 @@ public:
     /// Typed per-agent last-used app-usage projection (Wave 7 PR7.2, ADR-0016
     /// §5) — receives the app_usage daily-sync source via ReportInventory.
     void set_app_usage_store(AppUsageStore* store) { app_usage_store_ = store; }
+    /// Typed fleet certificate inventory (slice-2 PR 2a-2a, ADR-0016 §5, ADR-0070 D12) —
+    /// receives the certificate_inventory daily-sync source via ReportInventory.
+    void set_certificate_inventory_store(CertificateInventoryStore* store) {
+        certificate_inventory_store_ = store;
+    }
     /// Guardian (Guaranteed State) store — receives drift/remediation events
     /// ingested from the agent `__guard__` side-channel on the Subscribe stream
     /// (contract G2/step 5). nullptr disables ingest — used by tests that don't
@@ -619,6 +625,7 @@ private:
     DeviceInventoryStore* device_inventory_store_{nullptr};
     SoftwareLicensingStore* software_licensing_store_{nullptr};
     AppUsageStore* app_usage_store_{nullptr};
+    CertificateInventoryStore* certificate_inventory_store_{nullptr};
     GuaranteedStateStore* guaranteed_state_store_{nullptr};
     BlastRadiusDetector* blast_radius_detector_{nullptr};
     DexAlertRouter* dex_alert_router_{nullptr};

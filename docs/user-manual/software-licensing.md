@@ -187,9 +187,9 @@ enabling the SLE sources — deny-override wins).
   custom properties, quarantine records or property schemas. A partial failure lists each
   store's outcome and can be re-issued; a failed audit write refuses the erase.
 - **Decommission cascade — live via `DELETE /api/v1/sle/agents/{id}`.** This release wires
-  the agent-decommission cascade to an audited REST route that clears the seven stores in
+  the agent-decommission cascade to an audited REST route that clears the eight stores in
   the cascade for a removed device (inventory, installed-software, device-CI, app-perf,
-  detected-licence, app-usage and presence rows). Because it erases well beyond licences, it is gated on a
+  detected-licence, app-usage, presence and fleet-certificate rows). Because it erases well beyond licences, it is gated on a
   single dedicated securable, **`Decommission:Delete`**, scoped to the device (ADR-0024 Decision 9,
   amended Wave 7 PR7.2; see [RBAC](rbac.md)). Administrator and ITServiceOwner hold it by default; a custom
   role that only holds the old per-store `Delete` grants is refused. It is

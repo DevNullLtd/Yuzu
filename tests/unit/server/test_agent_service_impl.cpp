@@ -35,6 +35,7 @@
 #include "agent_registry.hpp"
 #include "app_usage_store.hpp"
 #include "audit_store.hpp"
+#include "certificate_inventory_store.hpp"
 #include "enrollment_token_rejection.hpp"
 #include "event_bus.hpp"
 #include "execution_tracker.hpp"
@@ -2388,6 +2389,134 @@ TEST_CASE("ProxyInventory: app_usage is NOT double-stored into the generic Inven
     auto custom_row = inv.get("agent-gw-usage-mixed", "custom_source");
     REQUIRE(custom_row.has_value());
     CHECK(custom_row->has_value()); // generic source still works
+}
+
+namespace {
+// Pre-migrated template for the certificate_inventory composition tests (slice-2 PR 2a-2a): the
+// generic InventoryStore (the gateway must NOT double-store into it) and the typed store.
+yuzu::test::PgTestTemplate cert_inventory_composition_tpl{
+    "agent_svc_cert_inventory", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        yuzu::server::InventoryStore inv_store{pool};
+        yuzu::server::CertificateInventoryStore cert_store{pool};
+        if (!inv_store.is_open() || !cert_store.is_open())
+            throw std::runtime_error(
+                "agent_svc_cert_inventory template: a store failed to migrate");
+    }};
+
+// A minimal valid `certificate_inventory` blob: one ok store and one certificate in it.
+std::string make_cert_inventory_blob() {
+    const std::string sha(64, 'a');
+    return "ver|1\n"
+           "store|LocalMachine\\\\Root|machine|ok||1\n"
+           "cert|" + sha + "|" + std::string(40, 'b') + "|" + std::string(64, 'c') +
+           "|3|0A1B|CN=x|CN=y|" + std::string(64, 'd') + "|" + std::string(64, 'e') +
+           "|2020-01-01T00:00:00Z|2030-01-01T00:00:00Z\n"
+           "loc|" + sha + "|LocalMachine\\\\Root|\n";
+}
+
+bool cert_inventory_nacked(const apb::InventoryAck& ack) {
+    return std::find(ack.need_full().begin(), ack.need_full().end(), "certificate_inventory") !=
+           ack.need_full().end();
+}
+} // namespace
+
+TEST_CASE("ReportInventory (direct): certificate_inventory is stored, then a decommissioned "
+          "agent's replay writes nothing",
+          "[pg][agent_service][certinv]") {
+    using yuzu::server::CertificateInventoryStore;
+    YUZU_REQUIRE_PG_DB_TPL(db, cert_inventory_composition_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    GatewayResponseHarness h(pool);
+    CertificateInventoryStore certs{pool};
+    REQUIRE(certs.is_open());
+    h.svc.set_certificate_inventory_store(&certs);
+
+    auto raw = mint_enrollment_token(h.auth_mgr, "t1", /*max_uses=*/1, std::chrono::hours(1));
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id("agent-direct-cert");
+    req.mutable_info()->set_hostname("host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+    req.set_enrollment_token(raw);
+    apb::RegisterResponse resp;
+    REQUIRE(h.svc.Register(/*context=*/nullptr, &req, &resp).ok());
+    REQUIRE(resp.accepted());
+
+    apb::InventoryReport rpt;
+    rpt.set_session_id(resp.session_id());
+    (*rpt.mutable_content_hashes())["certificate_inventory"] = "claimed-hash";
+    (*rpt.mutable_plugin_data())["certificate_inventory"] = make_cert_inventory_blob();
+    apb::InventoryAck ack;
+    REQUIRE(h.svc.ReportInventory(/*context=*/nullptr, &rpt, &ack).ok());
+    CHECK_FALSE(cert_inventory_nacked(ack));
+    REQUIRE(certs.row_counts("agent-direct-cert").has_value());
+    CHECK(certs.row_counts("agent-direct-cert")->cert_fact == 1);
+    CHECK(certs.row_counts("agent-direct-cert")->cert_location == 1);
+
+    // Decommission, then replay the same full report: acknowledged, zero rows.
+    REQUIRE(certs.delete_agent("agent-direct-cert"));
+    apb::InventoryAck ack2;
+    REQUIRE(h.svc.ReportInventory(/*context=*/nullptr, &rpt, &ack2).ok());
+    CHECK_FALSE(cert_inventory_nacked(ack2));
+    const auto rc = certs.row_counts("agent-direct-cert");
+    REQUIRE(rc.has_value());
+    CHECK(rc->agent_state + rc->store_state + rc->cert_location + rc->cert_fact + rc->cert_san +
+              rc->cert_eku + rc->cert_cdp ==
+          0);
+}
+
+TEST_CASE("ProxyInventory (gateway): certificate_inventory reaches the typed store, never the "
+          "generic one, and a decommissioned agent's replay writes nothing",
+          "[pg][agent_service][gateway][inventory][certinv]") {
+    using yuzu::server::CertificateInventoryStore;
+    using yuzu::server::InventoryStore;
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    YUZU_REQUIRE_PG_DB_TPL(db, cert_inventory_composition_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+    InventoryStore inv{pool};
+    REQUIRE(inv.is_open());
+    gateway_svc.set_inventory_store(&inv);
+    CertificateInventoryStore certs{pool};
+    REQUIRE(certs.is_open());
+    gateway_svc.set_certificate_inventory_store(&certs);
+
+    auto reg = make_gw_register(h.auth_mgr, "agent-gw-cert", /*csr_pem=*/"");
+    apb::RegisterResponse rresp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &reg, &rresp).ok());
+    REQUIRE(rresp.accepted());
+
+    apb::InventoryReport rpt;
+    rpt.set_session_id(rresp.session_id());
+    (*rpt.mutable_content_hashes())["certificate_inventory"] = "claimed-hash";
+    (*rpt.mutable_plugin_data())["certificate_inventory"] = make_cert_inventory_blob(); // typed
+    (*rpt.mutable_plugin_data())["custom_source"] = "{\"k\":1}";                      // generic
+    apb::InventoryAck ack;
+    REQUIRE(gateway_svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack).ok());
+    CHECK_FALSE(cert_inventory_nacked(ack));
+
+    REQUIRE(certs.row_counts("agent-gw-cert").has_value());
+    CHECK(certs.row_counts("agent-gw-cert")->cert_fact == 1);
+    CHECK_FALSE(generic_row_exists(pool, "agent-gw-cert", "certificate_inventory"));
+    auto custom_row = inv.get("agent-gw-cert", "custom_source");
+    REQUIRE(custom_row.has_value());
+    CHECK(custom_row->has_value()); // generic sources still work
+
+    REQUIRE(certs.delete_agent("agent-gw-cert"));
+    apb::InventoryAck ack2;
+    REQUIRE(gateway_svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack2).ok());
+    CHECK_FALSE(cert_inventory_nacked(ack2));
+    const auto rc = certs.row_counts("agent-gw-cert");
+    REQUIRE(rc.has_value());
+    CHECK(rc->agent_state + rc->store_state + rc->cert_location + rc->cert_fact + rc->cert_san +
+              rc->cert_eku + rc->cert_cdp ==
+          0);
+    CHECK_FALSE(generic_row_exists(pool, "agent-gw-cert", "certificate_inventory"));
 }
 
 TEST_CASE("ProxyInventory: over-cap source maps are rejected before generic writes",

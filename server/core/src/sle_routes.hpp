@@ -28,7 +28,7 @@
 ///     (ADR-0024 Decision 9, amended Wave 7 PR7.2; Decision 11): ONE SCOPED
 ///     securable, `Decommission:Delete` — a device-level erasure grant that
 ///     authorizes for the cascade's WHOLE blast radius, not the individual
-///     securables that govern each store's READ. It erases SEVEN per-agent stores:
+///     securables that govern each store's READ. It erases EIGHT per-agent stores:
 ///     the original five — `InventoryStore`, `SoftwareInventoryStore`,
 ///     `DeviceInventoryStore` (ADR-0016, read-gated by `Inventory`),
 ///     `AppPerfDailyStore` (DEX behavioural PII, read-gated by `GuaranteedState`),
@@ -36,7 +36,10 @@
 ///     `AppUsageStore` (Wave 7 PR7.2, read-gated by `Forensics`) and
 ///     `OfflineEndpointStore` (#5682: the `endpoint_state` presence row: hostname,
 ///     os, agent version, arch; read on `/hardware` under `Inventory` and on
-///     `/viz/fleet` under `Response`). This was originally a
+///     `/viz/fleet` under `Response`) — plus `CertificateInventoryStore` (slice-2 PR 2a-2a:
+///     the fleet certificate inventory, whose read securable `CertificateInventory` arrives in
+///     PR 2a-2b; erasing it also writes the decommission tombstone that stops a still-running
+///     agent repopulating it). This was originally a
 ///     hand-maintained conjunction over the per-store securables (rejected as of
 ///     Decision 9's reversal — see the ADR): it stopped scaling once a fourth
 ///     securable (`Forensics`, via `AppUsageStore`) was set to join the cascade, per

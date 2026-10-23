@@ -1138,6 +1138,56 @@ seconds, first/last-seen, and a distinct-user count over a 30-day sliding window
   heavy toolchain churn are the plausible case. There is currently no
   operator-facing alert for this state.
 
+## Certificate inventory (`certificate_inventory`) - server side
+
+A further daily-sync source, **`certificate_inventory`**, is received by the server
+(ADR-0070 D12; the agent collector and the read surface ship in later changes, so on
+its own this change stores reports and exposes nothing). It is persisted in the typed
+Postgres schema **`cert_inventory`**: one row per (device, certificate) with its X.509
+facts, the places it was seen (store and path), and its SANs, EKUs and CRL distribution
+points. It never lands in the generic inventory store, on either path.
+
+- **Wire format.** A version-1 pipe-delimited blob (`ver|`, `store|`, `cert|`, `loc|`,
+  `san|`, `eku|`, `cdp|`, `der|`), every field framed with `\\`, `\|`, `\n` and `\r`
+  escapes so store ids, DNs and paths round-trip byte for byte. The field order is
+  fixed in the header of `server/core/src/certificate_inventory_ingestion.hpp`. A
+  field sent as `?` is unknown and stored NULL, which is not the same as an empty value.
+  The stored hash is the SHA-256 of the received bytes, never the agent's claim.
+- **Per-store rules.** Every store reports one status. `ok` replaces the store's rows
+  with exactly those reported. `absent` removes them. `constrained` upserts what was
+  reported and keeps the rest, because a partial read cannot prove a removal.
+  `unreadable` leaves the rows alone. A store the device used to report and omits is
+  marked `not_observed` from the first omission, with its rows kept. Each store has its
+  own `observed_at` (last report in which it read `ok` or `absent`) and `status_at`
+  (last report that carried it), both server receipt time.
+- **Hash-skip.** A report byte-identical to the last full one is answered by hash only.
+  The server advances `observed_at` for `ok`/`absent` stores only, and the location
+  `last_seen` only for the locations that last full report carried, so kept, unreported
+  locations still age. A cold cache or a changed hash is answered `need_full`.
+- **Refusals, never truncation.** A record over a cap (64 stores, 10,000 distinct
+  certificates, 2,000 certificates per store, 64 SANs of 256 bytes, 32 EKUs, 8 CRL
+  distribution points of 512 bytes, 1,024-byte DNs, 16 KiB DER and 1 MiB of DER per
+  blob, 3 MiB per blob) is refused. A refused or malformed record makes the store it
+  belongs to read `constrained` with reason `parse_error`, keeps that store's rows, and
+  the blob is still acknowledged. A record that cannot be tied to a store constrains the
+  whole report. An unparseable header or an unknown major version nacks the blob.
+  Invalid UTF-8 is replaced with U+FFFD and the field is named in the certificate's
+  `constrained_fields`.
+- **Decommission.** Erasing a device (`DELETE /api/v1/sle/agents/{id}`) removes its
+  certificate rows and records a tombstone in the same transaction. A report from a
+  tombstoned device is acknowledged, writes nothing and is counted
+  (`reason="decommissioned"`), so a still-running agent cannot bring its rows back.
+  The tombstone has no age-based removal. This release has no way to clear one; the
+  audited purge and the enrolment clear arrive with the tombstone routes, so a device
+  that is decommissioned and then re-enrolled stays discarded until then.
+- **Observability.** `yuzu_server_cert_inventory_ingest_total{result,reason}` (see
+  [Metrics](metrics.md)). The store (`certificate_inventory_store`) is a `/readyz` and
+  `/healthz` component: the server refuses to start if its schema cannot be created,
+  and a store that failed to open would otherwise acknowledge the blob with no rows.
+- **Deploy order.** Upgrade servers before agents. `certificate_inventory` is in the
+  typed set from the typed-source read filter change, so even a gateway-proxied blob
+  reaching a server without this store is not stored in the generic store.
+
 ## See also
 
 - `docs/adr/0016-agent-daily-sync-framework.md` — the design and rationale.
