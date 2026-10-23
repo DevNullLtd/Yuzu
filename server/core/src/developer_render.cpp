@@ -114,7 +114,9 @@ std::string render_api_panel(std::size_t operation_count) {
          "&lt;token&gt;</span>. Create tokens under API Tokens in Settings.</p>"
          "<div class=\"btns\" style=\"padding-top:12px\"><a class=\"btn primary\" "
          "href=\"/api/v1/openapi.json\" target=\"_blank\" rel=\"noopener\">Open OpenAPI "
-         "document</a></div>";
+         "document</a>"
+         "<a class=\"btn\" href=\"/swagger\" target=\"_blank\" rel=\"noopener\">Open API "
+         "reference</a></div>";
     return h;
 }
 
