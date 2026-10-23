@@ -793,7 +793,15 @@ std::optional<Execution> ExecutionTracker::get_execution(const std::string& id) 
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
         return std::nullopt;
-    return exec_by_id_at(lease.get(), id);
+    // #4990: the same error-text scrub as the _checked readers; this accessor carries
+    // `last_error_detail` too, so it must not be the one tracker read that returns it as stored.
+    auto exec = exec_by_id_at(lease.get(), id);
+    if (!exec)
+        return std::nullopt;
+    std::vector<Execution> one;
+    one.push_back(std::move(*exec));
+    scrub_executions(lease.get(), forensics_plugins_, one);
+    return std::optional<Execution>{std::move(one.front())};
 }
 
 std::expected<std::optional<Execution>, std::string>

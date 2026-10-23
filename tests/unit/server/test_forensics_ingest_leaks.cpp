@@ -321,6 +321,21 @@ TEST_CASE("tracker error_detail: rows written before the sanitiser are reduced o
         CHECK(batch.at(token)[0].error_detail == kToken);
         CHECK(batch.at(ordinary)[0].error_detail == kFreeText);
     }
+    SECTION("get_execution (the unchecked accessor) reduces the execution-level text too") {
+        const auto f = tracker.get_execution(forensic);
+        REQUIRE(f.has_value());
+        CHECK(f->last_error_detail == "forensics_error");
+        const auto u = tracker.get_execution(upper);
+        REQUIRE(u.has_value());
+        CHECK(u->last_error_detail == "forensics_error");
+        const auto t = tracker.get_execution(token);
+        REQUIRE(t.has_value());
+        CHECK(t->last_error_detail == kToken);
+        const auto o = tracker.get_execution(ordinary);
+        REQUIRE(o.has_value());
+        CHECK(o->last_error_detail == kFreeText);
+        CHECK_FALSE(tracker.get_execution("exec-does-not-exist").has_value());
+    }
     SECTION("the execution-level last_error_detail on list and get") {
         std::map<std::string, std::string> by_id;
         ExecutionQuery q;
