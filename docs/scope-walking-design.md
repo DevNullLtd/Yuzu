@@ -163,14 +163,14 @@ rs_01HXYZ resolved to 2,798 devices (3 dropped: 2 offline > 24h, 1 decommissione
 
 ## 5. Materialisation vs. lazy evaluation
 
-The default is **materialisation at create time** — the device IDs are written to `result_set_members` and never re-derived from the source query unless the operator triggers live re-eval. Trade-offs:
+The default is **materialisation at create time** — the device IDs are written to `result_set_members` and never re-derived from the source query. An operator can run a live re-eval, which creates a new sibling set and leaves the original unchanged (only `tar_query` and `instruction_result` sets can be re-run). Trade-offs:
 
 | Approach | Pros | Cons | Decision |
 |---|---|---|---|
 | **Materialise** | Stable, reproducible, audit-friendly, fast resolve | Membership goes stale as estate mutates | Default — operators *want* a stable target during IR |
-| **Lazy** | Always fresh | Re-evaluates a possibly-expensive query on every action; results shift mid-chain | Available via `?live=true` query param on resolve |
+| **Lazy** | Always fresh | Re-evaluates a possibly-expensive query on every action; results shift mid-chain | Not implemented. No route takes a `live` parameter; the only refresh is `POST /api/v1/result-sets/{id}/re-eval` |
 
-The dashboard surfaces the materialisation timestamp (`Created 09:42 UTC, 17m ago — Re-eval`) on every result-set chip so the operator knows what they are aiming at. Live re-eval is a one-click action that produces a *new* result set ID; the original stays put.
+The dashboard surfaces the materialisation timestamp on the result-set detail, so the operator knows what they are aiming at. Live re-eval is a one-click **Re-evaluate** button, shown only for the source kinds that can be re-run, that produces a *new* result set ID; the original stays put.
 
 ## 6. REST API
 
@@ -178,7 +178,7 @@ Base path: `/api/v1/result-sets`. All routes require an authenticated session an
 
 | Method | Path | Body | Returns | Notes |
 |---|---|---|---|---|
-| `POST` | `/api/v1/result-sets` | `{name?, source_kind, source_payload, device_ids[]}` | `201` and the full set record | Direct create — operator passes pre-computed members. Used by dashboard for "I have a CSV" import. |
+| `POST` | `/api/v1/result-sets` | `{name?, source_kind, source_payload, device_ids[], parent_id?}` | `201` and the full set record | Direct create — operator passes pre-computed members; an optional `parent_id` parents the new set onto an owned set. Used by dashboard for "I have a CSV" import. |
 | `POST` | `/api/v1/result-sets/from-inventory-query` | `{name?, combine?, conditions[], parent_id?}` | `201` and the full set record | Server runs the inventory query inside `parent_id`'s scope (or `__all__`) and persists the result. Reads the Postgres-backed generic `InventoryStore` (ADR-0037); returns **503** on a store degrade rather than persisting a result set built from a silent-empty read. |
 | `POST` | `/api/v1/result-sets/from-tar-query` | `{name?, sql, parent_id?}` | `202` and the full set record (`status` shows progress) | Dispatches the SQL to TAR agents in `parent_id`'s scope; the device-ID set is the union of agents that returned ≥1 row (default) or all agents that responded (`include_empty=true`). |
 | `POST` | `/api/v1/result-sets/from-instruction-result` | `{name?, instruction_id, params, matcher, parent_id?}` | `202` and the full set record (`status` shows progress) | Runs the instruction in `parent_id`'s scope; the device set is filtered by `matcher`. Mirrors the Chrome hash-check step. |

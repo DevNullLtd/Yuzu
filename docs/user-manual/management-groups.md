@@ -137,14 +137,14 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/management-groups \
   -H "Content-Type: application/json" \
   -d '{
     "name": "All Windows Endpoints",
-    "description": "Auto-populated with all Windows agents",
+    "description": "Windows endpoints (members added by hand)",
     "parent_id": "mg_all_devices",
     "membership_type": "dynamic",
     "scope_expression": "ostype == \"Windows\""
   }'
 ```
 
-The `scope_expression` uses the same syntax as the scope engine. Common operators:
+The `scope_expression` is stored with the group and written back by reads. Yuzu does **not** evaluate it to fill a group created this way: the new group has no members until you add them with `POST /api/v1/management-groups/{id}/members`. The expression is written in scope engine syntax, shown here for reference. Examples of that syntax:
 
 | Expression | Matches |
 |---|---|
@@ -252,6 +252,8 @@ Returns `200 OK`:
 }
 ```
 
+Switching to `dynamic` stores the expression but does not compute members. The existing members stay as they are and nothing adds or removes members from the expression afterwards.
+
 ### Delete a Group
 
 ```bash
@@ -320,7 +322,7 @@ Returns `200 OK`:
 }
 ```
 
-Only removes static membership records. Dynamic membership entries (added by scope expression evaluation) are not removed by this endpoint.
+Only removes static membership records. Dynamic membership entries (the root group's enrollment members and the one-time snapshot of a `Service: {name}` group) are not removed by this endpoint.
 
 ## Role Delegation
 

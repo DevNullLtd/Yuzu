@@ -6956,6 +6956,8 @@ Each group opens with a one-sentence summary and a **Guide** button. The guide s
 
 The page loads `/api/v1/openapi.json?guides=true` with your own session, so it shows exactly what that route returns. It takes the same `Infrastructure:Read` gate; an operator without it gets a `403`. An unauthenticated visitor is redirected by the server's pre-routing session check to the sign-in landing page, `/home` (`/swagger` is not a screen the landing page can return to, so the redirect carries no `next` key). It has no sidebar entry, and a successful load writes no audit row.
 
+**When the page cannot load.** The permission check runs before the page is sent, so an operator without `Infrastructure:Read` never sees the page shell: the browser tab shows the raw `403` JSON error body from the server. Once the page is open, a failed fetch of the document replaces the loading text with a message that names the HTTP status, plus the correlation id when the server sent one (from the error body, or from the `X-Correlation-Id` header when the body is not JSON), and a **Retry** button that fetches again. A `401` adds a note that the session may have ended, and a `403` adds a note naming the `Infrastructure:Read` permission. The fetch is abandoned after 30 seconds and the page then reports that the description took too long to load, again with **Retry**.
+
 Operations the running server does not serve, because the store behind them is not wired in (the License Management, Device Tokens and Software Deployment groups today), are marked **unavailable** and say so at the top of their detail view. Operations whose success response has only a prose description are marked **untyped**.
 
 ---

@@ -214,6 +214,19 @@ admin caller may revoke any token, not just one they created — see
 `docs/user-manual/rest-api.md` "`DELETE /api/v1/tokens/{token_id}`") works
 on it, then rotate again once you're down to one active credential.
 
+**Recovering when the successor secret was lost.** If the rotate response was
+lost and the ~120-second re-serve window has passed, the secret cannot be shown
+again and `confirm` cannot be used (it needs the raw secret). The way out is an
+administrator call, and nothing else will do it: sign in as a user who holds the
+`admin` role (the same MFA step-up as other token revokes applies), read
+`GET /api/v1/engine-principals/{id}`, and pick the entry in `active_credentials`
+with `last_used_at` of `0` and `overlap_expires_at` of `0` (the successor; the
+predecessor carries the non-zero `overlap_expires_at`). Then call
+`DELETE /api/v1/tokens/{token_id}` with that `token_id`. A user who does not hold
+the admin role gets `404` for a token it does not own. Rotate again afterwards.
+Until then the predecessor keeps working, and the sweep will not retire it
+because the successor was never used.
+
 If you replay a `confirm` **after it already succeeded** — a dropped `200`, a
 double-submit, or a client racing the auto-revoke sweep — you get a *terminal*
 `409` (`rotation already confirmed` / `no rotation in flight ... already the

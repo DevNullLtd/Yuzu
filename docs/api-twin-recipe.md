@@ -211,8 +211,10 @@ and by the `/swagger` page as well as by people:
   then the path (without the `/api/v1` base) in PascalCase, with each path parameter written as
   `By` plus its name. `GET /hardware/{id}` is `getHardwareById`, `POST /hardware/{id}/sync` is
   `postHardwareByIdSync`, `DELETE /upload-grants/{grant_id}` is `deleteUploadGrantsByGrantId`. A
-  new operation follows the same rule. No test checks uniqueness today, so check a new id against
-  the others by searching for it.
+  new operation follows the same rule. Two tests in `tests/unit/server/test_openapi_spec_completeness.cpp`
+  check uniqueness: `openapi_spec_json(): every operation has a unique, well-formed operationId`
+  (which also checks presence and shape) and `openapi documents: every operation has a unique
+  operationId in both forms`.
 - **Group guides.** Prose for a group lives in the guide of the matching top-level `tags` entry
   under `x-yuzu-guide`, not inside an operation. `GET /api/v1/openapi.json` leaves the guides out
   and `?guides=true` includes them; the MCP resource `yuzu://openapi` and the discover tools serve
