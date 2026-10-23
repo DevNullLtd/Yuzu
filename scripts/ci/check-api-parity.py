@@ -2250,8 +2250,8 @@ def extract_mcp_handlers(by_tool, registry, tools):
 # KNOWN_MISMATCHES: (METHOD, canonical REST path, tool) -> (REST gate, MCP gate, reason), where a
 # gate reads `<kind>:<Securable>:<Operation>`. REST kind is plain (perm_fn / require_permission),
 # refused (plain behind an unconditional service-scope refusal), scoped (scoped_perm_fn) or fleet
-# (fleet_read_fn / list_read_fn, the admit-then-filter reads); a REST gate with further distinct
-# gates reads `<gate>; also <gate>, ...`. MCP kind is the tool's ServiceScopeClass (denied /
+# (fleet_read_fn / list_read_fn, the admit-then-filter reads); a REST gate with further gate
+# calls (one per call) reads `<gate>; also <gate>, ...`. MCP kind is the tool's ServiceScopeClass (denied /
 # confined / global_safe), written `<label>+confined-by-handler` when the handler's own fleet
 # read proves it confines. The comparison is the securable, the operation, and the confinement
 # side (see _gate_agrees); every further REST gate call must agree too or be matched, one-to-one, by a
@@ -2381,7 +2381,7 @@ def gate_parity_findings(ledger_rows, mcp_tools, rest_gates, mcp_security, mcp_e
     path, tool).
 
     A REST gate is (kind, securable, operation), optionally with a fourth item: the other
-    DISTINCT gate triples the handler holds. The first is compared; every other one must also
+    gate triples the handler holds, one per call. The first is compared; every other one must also
     agree with the MCP side or the row is a finding, and its description names them all, so an
     allowlist entry pins the whole set. `mcp_effects` is {tool: "confined"} for a tool whose
     ServiceScopeClass label is not `confined` but whose handler PROVABLY calls the confinement
@@ -3883,6 +3883,16 @@ def _selftest_body():
           and ("GET", "/api/v1/extra_dup_set", "extra_dup_set") in m1,
           "gate parity (one-to-one): two REST gate calls with one triple are not excused by ONE MCP call "
           "(a Counter of 1 or a plain set), and the description names both REST calls")
+    # Consumption is per ROW: two rows twinned to one tool each get a fresh copy of its MCP call
+    # counts, so one MCP call excuses one REST call in EACH row, never across rows.
+    two_rows = {("GET", "/fragments/r1"): _gp_row("t_two", path="/api/v1/r1"),
+                ("GET", "/fragments/r2"): _gp_row("t_two", path="/api/v1/r2")}
+    two_rest = {("GET", "/api/v1/r1"): [("a.cpp", ("plain", *S, (("plain", "Tee", "Read"),)))],
+                ("GET", "/api/v1/r2"): [("a.cpp", ("plain", *S, (("plain", "Tee", "Read"),)))]}
+    mt, nt, et = gate_parity_findings(two_rows, {"t_two"}, two_rest, {"t_two": (*S, "denied")}, {},
+                                      {"t_two": collections.Counter({("plain", "Tee", "Read"): 1})}, {})
+    check(not mt and not nt and not et,
+          f"gate parity (one-to-one): the MCP call counts are copied per row, not shared across rows, got {mt} {nt} {et}")
     check(m1[("GET", "/api/v1/extra_bad", "extra_bad")] == ("plain:Sec:Read; also plain:Zed:Read", "denied:Sec:Read"),
           f"gate parity (further gates): the description names every further gate, got {m1[('GET', '/api/v1/extra_bad', 'extra_bad')]}")
     check(m1[("GET", "/api/v1/extra_unread", "extra_unread")][0] == "plain:Sec:Read; also unparsed:perm_fn:?",
