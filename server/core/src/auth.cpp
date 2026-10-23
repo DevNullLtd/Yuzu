@@ -609,7 +609,10 @@ bool AuthManager::wipe_user_sessions_durable(const std::string& username) {
 }
 
 bool AuthManager::persist_new_session(const std::string& raw_token,
-                                      const yuzu::server::SessionWriteParams& params) {
+                                      const yuzu::server::SessionWriteParams& params,
+                                      bool* future_dated) {
+    if (future_dated)
+        *future_dated = false;
     // The cached Session's non-time fields come straight from params; its
     // adjudication deadlines are derived from the AUTHORED times (DB clock for a
     // durable store; this host's wall clock for the legacy path) so the cache
@@ -637,13 +640,47 @@ bool AuthManager::persist_new_session(const std::string& raw_token,
             return false; // fail closed — login not honored (ADR-0007)
         }
         const auto& a = *r;
+        if (params.local_mfa.verified_ms > 0 && a.mfa_verified_ms == 0) {
+            // The carried verification instant was later than the DB clock at the write
+            // (it stepped back between the verification and now): the store kept NO proof and
+            // NO binding. Never a clamped age-zero proof, so the mint is refused: delete the
+            // row just written (this token only; it was never released) and cache nothing.
+            if (metrics_)
+                metrics_->counter("yuzu_auth_mfa_verification_future_dated_total").increment();
+            spdlog::warn("AuthManager: refusing session for '{}': the carried MFA verification "
+                         "instant is later than the database clock",
+                         ::yuzu::log_key_token(s.username));
+            if (auto del = session_store_->invalidate(p.token_hash); !del) {
+                // The token is never released, so a row that survives holds no usable
+                // credential; surface it all the same.
+                spdlog::error("AuthManager: could not delete the refused session row ({})",
+                              del.error().message);
+                note_session_store_degrade("invalidate");
+            }
+            if (future_dated)
+                *future_dated = true;
+            return false;
+        }
         derive_session_deadlines(s, a.created_at_ms, a.expires_at_ms, a.last_activity_ms,
                                  a.mfa_verified_ms, a.elevated_until_ms, a.elevation_issued_ms,
                                  a.db_now_ms);
     } else {
-        // Legacy no-store path: this host's wall clock IS the authority.
+        // Legacy no-store path: this host's wall clock IS the authority. The same rule as
+        // the store's SQL: a carried instant later than `now` is refused, never clamped.
         const std::int64_t now_ms = wall_now_ms();
-        const std::int64_t mfa_ms = params.mfa_verified_now ? now_ms : params.mfa_verified_ms_abs;
+        if (params.local_mfa.verified_ms > now_ms) {
+            if (metrics_)
+                metrics_->counter("yuzu_auth_mfa_verification_future_dated_total").increment();
+            spdlog::warn("AuthManager: refusing session for '{}': the carried MFA verification "
+                         "instant is later than the clock",
+                         ::yuzu::log_key_token(s.username));
+            if (future_dated)
+                *future_dated = true;
+            return false;
+        }
+        const std::int64_t mfa_ms = params.local_mfa.verified_ms > 0 ? params.local_mfa.verified_ms
+                                    : params.mfa_verified_now        ? now_ms
+                                                                     : params.mfa_verified_ms_abs;
         derive_session_deadlines(s, now_ms, now_ms + params.session_lifetime_ms, now_ms, mfa_ms,
                                  /*elevated_until*/ 0, /*elevation_issued*/ 0, now_ms);
     }
@@ -907,7 +944,8 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
 
 bool AuthManager::post_mint_role_recheck(const std::string& username, Role minted_role,
                                          const std::optional<std::string>& expected_hash_hex,
-                                         std::string_view context) {
+                                         std::optional<std::int64_t> expected_factor_gen,
+                                         std::string_view context, MintDenial* why) {
     // #4107 check-then-mint gap (external adversarial review, fjarvis, PR
     // #4076): recheck_role_after_credential_check's row-locked read closes
     // the SAME-process/cross-replica divergence race for the read itself,
@@ -973,17 +1011,37 @@ bool AuthManager::post_mint_role_recheck(const std::string& username, Role minte
     // which is what makes the revoke-on-divergence half of this function
     // (not just the read half above) cross-replica-correct too.
     //
+    // #6079 factor generation. The same locked read also returns the account's
+    // `mfa_factor_gen`, which a database trigger advances on EVERY change of
+    // `mfa_enrolled_at` (clear, re-enrol, soft delete, whichever binary writes it) and
+    // which every such writer changes under this same row lock. A BOUND proof carries the
+    // generation its verifier read under that lock; a difference here means the factor
+    // the proof was earned with has since been replaced, so the mint is revoked and
+    // denied like a role change. The three cases above apply unchanged (a clear that
+    // takes the lock after this read is covered by the gates' own generation equality).
+    // Only the comparison runs under the lock: the revoke follows after it releases.
+    //
     // Returns true (nothing to do) in cfg-file mode - `users_` IS the
     // truth there, nothing to diverge from.
     if (!auth_db_)
         return true;
-    enum class Divergence { kNone, kRole, kCredential };
+    const auto deny = [&](MintDenial cause, const char* reason) {
+        if (why)
+            *why = cause;
+        if (metrics_) {
+            metrics_->counter("yuzu_auth_role_recheck_post_mint_denied_total", {{"reason", reason}})
+                .increment();
+        }
+    };
+    enum class Divergence { kNone, kRole, kCredential, kFactor };
     Divergence divergence = Divergence::kNone;
     Role db_role_seen = minted_role;
+    std::int64_t db_factor_gen_seen = 0;
     auto post = auth_db_->recheck_role_locked(
-        username, [&](Role db_role, const std::string& db_hash) {
+        username, [&](Role db_role, const std::string& db_hash, std::int64_t db_factor_gen) {
             // Under the row lock: compare only — no I/O, no mutex.
             db_role_seen = db_role;
+            db_factor_gen_seen = db_factor_gen;
             if (db_role != minted_role) {
                 divergence = Divergence::kRole;
                 return;
@@ -994,8 +1052,13 @@ bool AuthManager::post_mint_role_recheck(const std::string& username, Role minte
             // empty anchor never equals a stored hash, so it DENIES — fail
             // closed). Two server-held hashes, but constant_time_compare keeps
             // the idiom uniform.
-            if (expected_hash_hex && !constant_time_compare(db_hash, *expected_hash_hex))
+            if (expected_hash_hex && !constant_time_compare(db_hash, *expected_hash_hex)) {
                 divergence = Divergence::kCredential;
+                return;
+            }
+            // #6079: a bound proof's generation must still be the account's.
+            if (expected_factor_gen && db_factor_gen != *expected_factor_gen)
+                divergence = Divergence::kFactor;
         });
     if (!post) {
         const bool removed = yuzu::server::AuthDBError::UserNotFound == post.error();
@@ -1003,9 +1066,7 @@ bool AuthManager::post_mint_role_recheck(const std::string& username, Role minte
                     context, username, removed ? "found the account no longer active"
                                                 : "hit a store error (failing closed)");
         auto revoke = invalidate_user_sessions(username);
-        if (metrics_) {
-            metrics_->counter("yuzu_auth_role_recheck_post_mint_denied_total").increment();
-        }
+        deny(MintDenial::kRecheckUnavailable, removed ? "removed" : "store");
         (void)revoke; // best-effort revoke; the mint is already denied to the caller either way
         return false;
     }
@@ -1014,9 +1075,7 @@ bool AuthManager::post_mint_role_recheck(const std::string& username, Role minte
                     "the mint (concurrent role-change race) - revoking the session just minted",
                     context, username, role_to_string(minted_role), role_to_string(db_role_seen));
         auto revoke = invalidate_user_sessions(username);
-        if (metrics_) {
-            metrics_->counter("yuzu_auth_role_recheck_post_mint_denied_total").increment();
-        }
+        deny(MintDenial::kRoleChanged, "role");
         (void)revoke;
         return false;
     }
@@ -1026,13 +1085,121 @@ bool AuthManager::post_mint_role_recheck(const std::string& username, Role minte
                      "the session just minted",
                      context, username);
         auto revoke = invalidate_user_sessions(username);
-        if (metrics_) {
-            metrics_->counter("yuzu_auth_role_recheck_post_mint_denied_total").increment();
-        }
+        deny(MintDenial::kCredentialChanged, "credential");
+        (void)revoke;
+        return false;
+    }
+    if (divergence == Divergence::kFactor) {
+        spdlog::warn("{}: post-mint re-check for '{}' found the MFA factor changed after the "
+                     "second factor was verified (generation {} -> {}) - revoking the session "
+                     "just minted",
+                     context, username, *expected_factor_gen, db_factor_gen_seen);
+        auto revoke = invalidate_user_sessions(username);
+        deny(MintDenial::kFactorChanged, "factor");
         (void)revoke;
         return false;
     }
     return true;
+}
+
+AuthManager::StampRecheck AuthManager::post_stamp_factor_recheck(const std::string& username,
+                                                                 const std::string& token_hash,
+                                                                 std::int64_t stamped_gen) {
+    // The stamp half of the post-mint pattern (#6079). The stamp (SessionStore::mark_mfa)
+    // has COMMITTED, so this session's row is visible to every later statement; the read
+    // below is `AuthDB::recheck_role_locked`, `SELECT ... FOR UPDATE` on the account's
+    // `auth.users` row, and every factor writer (enrol, clear, soft delete) takes that same
+    // row lock for its whole transaction. For a factor change W exactly one of:
+    //   (1) W committed before this FOR UPDATE ran -> the read sees the new generation ->
+    //       the stamp is cleared;
+    //   (2) W holds the row lock -> this read WAITS for W's commit, then sees the new
+    //       generation -> cleared (a plain read would have seen the old one);
+    //   (3) W has not taken the lock yet -> the read admits, and W's generation bump lands
+    //       after the stamp, so the stored (old) generation no longer equals the account's:
+    //       a binding gate refuses the proof by equality. Nothing relies on the cleanup
+    //       below succeeding.
+    // Comparison only under the lock (no I/O, no mutex); the cleanup runs AFTER it releases,
+    // so no AuthDB row lock is ever held across a SessionStore write (the cross-store
+    // nesting docs/auth-architecture.md section 3 rejects). A wait is bounded by
+    // recheck_role_locked's transaction-scoped lock_timeout; a timeout is a store error and
+    // fails closed (the stamp is cleared and not reported as stamped).
+    if (!auth_db_ || !session_store_)
+        return StampRecheck::kHolds; // nothing to compare against / no durable stamp to clear
+    std::int64_t db_gen = 0;
+    auto post = auth_db_->recheck_role_locked(
+        username, [&](Role, const std::string&, std::int64_t factor_gen) { db_gen = factor_gen; });
+    const bool unverifiable = !post;
+    const bool changed = post && db_gen != stamped_gen;
+    if (!unverifiable && !changed)
+        return StampRecheck::kHolds;
+
+    if (unverifiable)
+        spdlog::warn("post_stamp_factor_recheck: could not read the factor generation for '{}' "
+                     "- clearing the proof just stamped (failing closed)",
+                     ::yuzu::log_key_token(username));
+    else
+        spdlog::warn("post_stamp_factor_recheck: the MFA factor for '{}' changed after the "
+                     "second factor was verified (generation {} -> {}) - clearing the proof "
+                     "just stamped",
+                     ::yuzu::log_key_token(username), stamped_gen, db_gen);
+    if (metrics_)
+        metrics_
+            ->counter("yuzu_auth_mfa_stamp_denied_total",
+                      {{"reason", unverifiable ? "unverifiable" : "factor_changed"}})
+            .increment();
+    // Cleanup, after the lock. A failure is logged and counted; the row stays bound to the
+    // OLD generation (refused by equality) and this replica's cache is dropped regardless.
+    auto cleared = session_store_->clear_mfa_proof(token_hash);
+    if (!cleared) {
+        spdlog::error("post_stamp_factor_recheck: clearing the stamped proof failed ({}) - the "
+                      "stored proof stays bound to the previous factor generation, which a "
+                      "binding gate refuses",
+                      cleared.error().message);
+        note_session_store_degrade("clear_mfa_proof");
+        drop_cached_mfa_proof(token_hash);
+    } else if (cleared->has_value()) {
+        const auto& a = cleared->value();
+        std::unique_lock lock(mu_);
+        if (auto it = sessions_.find(token_hash); it != sessions_.end())
+            (void)derive_session_deadlines(it->second, a.created_at_ms, a.expires_at_ms,
+                                           a.last_activity_ms, a.mfa_verified_ms,
+                                           a.elevated_until_ms, a.elevation_issued_ms, a.db_now_ms);
+    } else {
+        drop_cached_mfa_proof(token_hash);
+    }
+    return unverifiable ? StampRecheck::kUnverifiable : StampRecheck::kFactorChanged;
+}
+
+void AuthManager::drop_cached_mfa_proof(const std::string& key) {
+    std::unique_lock lock(mu_);
+    if (auto it = sessions_.find(key); it != sessions_.end()) {
+        it->second.steady_mfa_verified = {};
+        it->second.mfa_verified_at = tp_from_ms(0);
+    }
+}
+
+std::optional<std::string> AuthManager::session_username_for_key(const std::string& key) const {
+    {
+        std::shared_lock lock(mu_);
+        if (auto it = sessions_.find(key); it != sessions_.end())
+            return it->second.username;
+    }
+    if (!session_store_)
+        return std::nullopt;
+    auto found = session_store_->find(key);
+    if (!found || !found->has_value())
+        return std::nullopt;
+    return found->value().row.username;
+}
+
+std::optional<AuthManager::LiveMfaState>
+AuthManager::read_live_mfa_state(const std::string& username) const {
+    if (!auth_db_)
+        return std::nullopt;
+    auto st = auth_db_->mfa_status(username);
+    if (!st)
+        return std::nullopt;
+    return LiveMfaState{st->enrolled, st->factor_gen, st->db_now_ms};
 }
 
 std::optional<std::string> AuthManager::authenticate(const std::string& username,
@@ -1117,7 +1284,8 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     if (!persist_new_session(token, params))
         return std::nullopt; // durable-write failure → login not honored (ADR-0007)
     // #4107 check-then-mint gap: see post_mint_role_recheck's own doc.
-    if (!post_mint_role_recheck(username, entry->role, entry->hash_hex, "Auth failed"))
+    if (!post_mint_role_recheck(username, entry->role, entry->hash_hex, std::nullopt,
+                                "Auth failed"))
         return std::nullopt;
 
     spdlog::info("User '{}' authenticated (role={})", username, params.role);
@@ -1200,19 +1368,63 @@ AuthManager::verify_password(const std::string& username, const std::string& pas
 }
 
 std::string AuthManager::create_local_session(const std::string& username, Role role,
+                                              const std::string& expected_hash_hex) {
+    return mint_local_session(username, role, nullptr, expected_hash_hex);
+}
+
+std::string AuthManager::create_local_session(const std::string& username, Role role,
+                                              const std::string& expected_hash_hex,
+                                              const yuzu::server::LocalMfaProof& proof,
+                                              MintDenial* denial) {
+    return mint_local_session(username, role, &proof, expected_hash_hex, denial);
+}
+
+std::string AuthManager::create_local_session(const std::string& username, Role role,
                                               bool mfa_verified,
                                               const std::string& expected_hash_hex) {
-    return mint_local_session(username, role, mfa_verified, expected_hash_hex);
+    if (!mfa_verified)
+        return mint_local_session(username, role, nullptr, expected_hash_hex);
+    // Transitional: an UNBOUND proof at the database clock (see the declaration).
+    // The instant comes from the clock that will judge it: the database's when a session
+    // store writes it, this host's wall clock on the legacy no-store path.
+    const auto live = read_live_mfa_state(username);
+    const yuzu::server::LocalMfaProof proof{0, (live && session_store_) ? live->db_now_ms
+                                                                        : wall_now_ms()};
+    return mint_local_session(username, role, &proof, expected_hash_hex);
 }
 
 std::string AuthManager::create_local_session_for_test(const std::string& username, Role role,
                                                        bool mfa_verified) {
-    return mint_local_session(username, role, mfa_verified, std::nullopt);
+    if (!mfa_verified)
+        return mint_local_session(username, role, nullptr, std::nullopt);
+    // Bind the proof to the live identity when an AuthDB knows the user (the shape a
+    // production verifier produces); an un-enrolled user, any error, or no AuthDB leaves it
+    // unbound. A read error never fails the mint: existing call sites must not change.
+    const auto live = read_live_mfa_state(username);
+    yuzu::server::LocalMfaProof proof{0,
+                                      (live && session_store_) ? live->db_now_ms : wall_now_ms()};
+    if (live && live->enrolled && live->factor_gen > 0)
+        proof.factor_gen = live->factor_gen;
+    return mint_local_session(username, role, &proof, std::nullopt);
 }
 
 std::string AuthManager::mint_local_session(const std::string& username, Role role,
-                                            bool mfa_verified,
-                                            const std::optional<std::string>& expected_hash_hex) {
+                                            const yuzu::server::LocalMfaProof* proof,
+                                            const std::optional<std::string>& expected_hash_hex,
+                                            MintDenial* denial) {
+    if (denial)
+        *denial = MintDenial::kNone;
+    // A proof is {generation >= 0, instant > 0}. A binding without an instant (or a
+    // negative value) is a caller bug: refuse rather than mint a session whose binding
+    // means nothing.
+    if (proof && (proof->verified_ms <= 0 || proof->factor_gen < 0)) {
+        spdlog::error("create_local_session: invalid MFA proof for '{}' (instant {} generation {})"
+                      " - refusing to mint",
+                      ::yuzu::log_key_token(username), proof->verified_ms, proof->factor_gen);
+        if (denial)
+            *denial = MintDenial::kPersistFailed;
+        return {};
+    }
     auto token = generate_session_token();
     yuzu::server::SessionWriteParams params;
     params.username = username;
@@ -1221,12 +1433,22 @@ std::string AuthManager::mint_local_session(const std::string& username, Role ro
     params.auth_source = "local";
     params.session_lifetime_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(kSessionDuration).count();
-    params.mfa_verified_now = mfa_verified; // local step-up → stamp now() in the store
-    if (!persist_new_session(token, params)) {
-        // Durable-write failure (store configured but unreachable) → no session.
-        // An empty token degrades to "not authenticated" at the caller's cookie
-        // set / next validate (fail-safe), never a false success (ADR-0007).
+    if (proof)
+        params.local_mfa = *proof; // carried verification instant + factor generation
+    bool future_dated = false;
+    if (!persist_new_session(token, params, &future_dated)) {
+        // Durable-write failure (store configured but unreachable) or a refused
+        // future-dated proof → no session. An empty token degrades to "not authenticated"
+        // at the caller's cookie set / next validate (fail-safe), never a false success
+        // (ADR-0007).
+        if (future_dated) {
+            if (denial)
+                *denial = MintDenial::kVerificationFutureDated;
+            return {};
+        }
         spdlog::error("create_local_session: durable persist failed for '{}'", username);
+        if (denial)
+            *denial = MintDenial::kPersistFailed;
         return {};
     }
     // #4107 check-then-mint gap: see post_mint_role_recheck's own doc. This
@@ -1241,8 +1463,14 @@ std::string AuthManager::mint_local_session(const std::string& username, Role ro
     // session, degrades to "not authenticated" at the caller's cookie set.
     // #5342 Gate 7: the same re-read also requires the stored hash to still be
     // the one the caller verified (`expected_hash_hex`), so the window covers
-    // a credential change exactly as it covers a role change.
-    if (!post_mint_role_recheck(username, role, expected_hash_hex, "create_local_session"))
+    // a credential change exactly as it covers a role change. #6079: and, for a
+    // BOUND proof, the account's factor generation to still be the one the
+    // verifier read, so the window covers a factor replacement too.
+    std::optional<std::int64_t> expected_gen;
+    if (proof && proof->factor_gen > 0)
+        expected_gen = proof->factor_gen;
+    if (!post_mint_role_recheck(username, role, expected_hash_hex, expected_gen,
+                                "create_local_session", denial))
         return {};
     // Stamp last_login_at on every successful login, not just the
     // MFA-verified TOTP path. The MFA-verified TOTP path already does
@@ -1254,34 +1482,107 @@ std::string AuthManager::mint_local_session(const std::string& username, Role ro
     if (auth_db_) {
         auth_db_->touch_last_login(username);
     }
-    spdlog::info("Local session created for '{}' (mfa_verified={})", username, mfa_verified);
+    spdlog::info("Local session created for '{}' (mfa_verified={})", username, proof != nullptr);
     return token;
+}
+
+AuthManager::MfaStampOutcome
+AuthManager::stamp_session_mfa_proof(const std::string& token,
+                                     const yuzu::server::LocalMfaProof& proof) {
+    if (token.size() > auth::kMaxSessionTokenLength)
+        return MfaStampOutcome::kNoSession;
+    if (proof.verified_ms <= 0 || proof.factor_gen < 0)
+        return MfaStampOutcome::kInvalidProof;
+    if (session_store_) {
+        const std::string key = hash_token(token);
+        // Durable write FIRST (bumps the generation → every replica's cache drops the
+        // stale copy on its next refresh); the store writes the CARRIED instant and
+        // generation (never its own now()) and RETURNs every time field, so the cache
+        // re-derives exactly.
+        auto r = session_store_->mark_mfa(key, proof);
+        if (!r) {
+            spdlog::error("mark_session_mfa_verified: durable write failed ({})",
+                          r.error().message);
+            note_session_store_degrade("mark_mfa");
+            return MfaStampOutcome::kStoreError;
+        }
+        if (!r->has_value())
+            return MfaStampOutcome::kNoSession; // no such durable session
+        const auto& a = r->value();
+        if (a.mfa_verified_ms == 0) {
+            // The carried instant was later than the DB clock at the write: the store kept
+            // NO proof and NO binding. A refusal the caller sees, never a clamped proof.
+            if (metrics_)
+                metrics_->counter("yuzu_auth_mfa_verification_future_dated_total").increment();
+            spdlog::warn("mark_session_mfa_verified: the carried MFA verification instant is "
+                         "later than the database clock - no proof stored");
+            drop_cached_mfa_proof(key);
+            return MfaStampOutcome::kFutureDated;
+        }
+        if (proof.factor_gen > 0 && auth_db_) {
+            // S1: the factor may have been replaced between the verification and now.
+            const auto username = session_username_for_key(key);
+            StampRecheck verdict = StampRecheck::kUnverifiable;
+            if (username) {
+                verdict = post_stamp_factor_recheck(*username, key, proof.factor_gen);
+            } else {
+                // Cannot name the account to compare against: fail closed.
+                spdlog::warn("mark_session_mfa_verified: cannot resolve the session's account "
+                             "for the factor recheck - clearing the proof just stamped");
+                if (auto cleared = session_store_->clear_mfa_proof(key); !cleared)
+                    note_session_store_degrade("clear_mfa_proof");
+                drop_cached_mfa_proof(key);
+            }
+            if (verdict == StampRecheck::kFactorChanged)
+                return MfaStampOutcome::kFactorChanged;
+            if (verdict == StampRecheck::kUnverifiable)
+                return MfaStampOutcome::kStoreError;
+        }
+        std::unique_lock lock(mu_);
+        if (auto it = sessions_.find(key); it != sessions_.end())
+            (void)derive_session_deadlines(it->second, a.created_at_ms, a.expires_at_ms,
+                                           a.last_activity_ms, a.mfa_verified_ms,
+                                           a.elevated_until_ms, a.elevation_issued_ms, a.db_now_ms);
+        return MfaStampOutcome::kStamped;
+    }
+    // Legacy no-store path: this host's clock is the authority, the same rule as the
+    // store's SQL (an instant later than `now` is refused). There is no durable binding to
+    // recheck here.
+    const std::int64_t wall = wall_now_ms();
+    if (proof.verified_ms > wall)
+        return MfaStampOutcome::kFutureDated;
+    std::unique_lock lock(mu_);
+    auto it = sessions_.find(token);
+    if (it == sessions_.end())
+        return MfaStampOutcome::kNoSession;
+    it->second.mfa_verified_at = tp_from_ms(proof.verified_ms);
+    it->second.steady_mfa_verified =
+        std::chrono::steady_clock::now() - std::chrono::milliseconds(wall - proof.verified_ms);
+    return MfaStampOutcome::kStamped;
+}
+
+bool AuthManager::mark_session_mfa_verified(const std::string& token,
+                                            const yuzu::server::LocalMfaProof& proof) {
+    return stamp_session_mfa_proof(token, proof) == MfaStampOutcome::kStamped;
 }
 
 bool AuthManager::mark_session_mfa_verified(const std::string& token) {
     if (token.size() > auth::kMaxSessionTokenLength)
         return false;
     if (session_store_) {
-        const std::string key = hash_token(token);
-        // Durable write FIRST (bumps the generation → every replica's cache drops
-        // the stale copy on its next refresh); the store authors mfa_verified =
-        // now() and RETURNs every time field, so the cache re-derives exactly.
-        auto r = session_store_->mark_mfa(key);
-        if (!r) {
-            spdlog::error("mark_session_mfa_verified: durable write failed ({})",
-                          r.error().message);
-            note_session_store_degrade("mark_mfa");
+        // Transitional: an UNBOUND proof at the database clock, read from the session row
+        // itself (the same DB clock the write is judged against, never the replica's).
+        auto found = session_store_->find(hash_token(token));
+        if (!found) {
+            spdlog::error("mark_session_mfa_verified: durable lookup failed ({})",
+                          found.error().message);
+            note_session_store_degrade("validate");
             return false;
         }
-        if (!r->has_value())
+        if (!found->has_value())
             return false; // no such durable session
-        const auto& a = r->value();
-        std::unique_lock lock(mu_);
-        if (auto it = sessions_.find(key); it != sessions_.end())
-            derive_session_deadlines(it->second, a.created_at_ms, a.expires_at_ms,
-                                     a.last_activity_ms, a.mfa_verified_ms, a.elevated_until_ms,
-                                     a.elevation_issued_ms, a.db_now_ms);
-        return true;
+        return stamp_session_mfa_proof(token, {0, found->value().db_now_ms}) ==
+               MfaStampOutcome::kStamped;
     }
     std::unique_lock lock(mu_);
     auto it = sessions_.find(token);
@@ -1753,7 +2054,17 @@ DurableMfaProof AuthManager::read_durable_mfa_proof(const std::string& token,
     const auto& f = found->value();
     if (f.row.username != expected_username)
         return {DurableMfaProof::Source::kAbsent, 0, 0};
-    return {DurableMfaProof::Source::kRow, f.row.mfa_verified_ms, f.db_now_ms};
+    // The stored generation is only trustworthy while the rebind guard is observed to be in
+    // force (find() re-validates it behind a memo). Once it is not, a legacy writer could have
+    // carried a binding the guard would have cleared: unavailable, never a bound proof.
+    if (!session_store_->rebind_guard_ok()) {
+        spdlog::warn("read_durable_mfa_proof: the session store's rebind guard is not in force - "
+                     "failing closed");
+        note_session_store_degrade("rebind_guard");
+        return {DurableMfaProof::Source::kUnavailable, 0, 0};
+    }
+    return {DurableMfaProof::Source::kRow, f.row.mfa_verified_ms, f.db_now_ms,
+            f.row.mfa_factor_gen};
 }
 
 std::optional<Session> AuthManager::validate_session_durable(const std::string& token,

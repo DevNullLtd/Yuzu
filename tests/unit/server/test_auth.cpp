@@ -10,6 +10,8 @@
 #include <yuzu/server/auth_db.hpp>
 
 #include "rbac_store.hpp"
+#include "session_store.hpp"
+#include "totp.hpp"
 #include "test_auth_db_pg_helper.hpp"
 #include "../test_log_capture.hpp"
 
@@ -2260,4 +2262,341 @@ TEST_CASE("save and reload config preserves users", "[auth][config]") {
     }
 
     fs::remove(tmp);
+}
+
+// ── #6079: factor-bound MFA proofs, S1 rechecks ──────────────────────────────────────────────────
+//
+// The AuthManager side of the factor-generation binding: the proof a verifier produced
+// ({factor generation, DB instant}) is stored as given, the post-mint recheck refuses a mint whose
+// factor has since been replaced, and the post-stamp recheck clears a stamp whose factor has since
+// been replaced. Store-only cases (no AuthDB) live in test_auth_session_store.cpp.
+
+namespace {
+
+struct BindingFixture {
+    yuzu::test::AuthDbPg db;
+    yuzu::server::SessionStore store{db.pool()};
+    yuzu::MetricsRegistry metrics;
+    AuthManager mgr;
+
+    BindingFixture() {
+        REQUIRE(store.is_open());
+        mgr.set_auth_db(db.get());
+        mgr.set_session_store(&store);
+        mgr.set_metrics_registry(&metrics);
+    }
+    ~BindingFixture() { mgr.set_session_store(nullptr); }
+
+    void add_user(const std::string& name, Role role = Role::admin) {
+        REQUIRE(mgr.upsert_user(name, "password1234", role));
+    }
+    void enroll(const std::string& user) {
+        auto init = db->mfa_init_enrollment(user, "Yuzu", std::nullopt);
+        REQUIRE(init.has_value());
+        auto bytes = yuzu::server::mfa::base32_decode(init->secret_base32);
+        REQUIRE(bytes.has_value());
+        const std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+        const auto code = yuzu::server::mfa::generate(
+            raw, yuzu::server::mfa::current_counter(std::chrono::system_clock::now()));
+        REQUIRE(db->mfa_verify_enrollment(user, code, std::nullopt).has_value());
+    }
+    /// Replace the factor: clear and enrol afresh. The generation moves by two.
+    void rotate(const std::string& user) {
+        REQUIRE(db->mfa_disable(user).has_value());
+        enroll(user);
+    }
+    yuzu::server::AuthDB::MfaStatus status(const std::string& user) {
+        auto st = db->mfa_status(user);
+        REQUIRE(st.has_value());
+        return *st;
+    }
+    std::string anchor(const std::string& user) {
+        auto vc = mgr.verify_password(user, "password1234");
+        REQUIRE(vc.has_value());
+        return vc->hash_hex;
+    }
+    yuzu::server::SessionRow row(const std::string& token) {
+        auto found = store.find(AuthManager::sha256_hex(token));
+        REQUIRE(found.has_value());
+        REQUIRE(found->has_value());
+        return found->value().row;
+    }
+    std::int64_t session_count(const std::string& user) {
+        auto lease = db.pool().acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(
+            lease.get(), "SELECT count(*) FROM session_store.sessions WHERE username = $1",
+            std::vector<std::string>{user});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        return std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10);
+    }
+    double counter(const std::string& name, const yuzu::Labels& labels = {}) {
+        return labels.empty() ? metrics.counter(name).value()
+                              : metrics.counter(name, labels).value();
+    }
+};
+
+} // namespace
+
+TEST_CASE_METHOD(BindingFixture,
+                 "create_local_session_for_test binds the proof to the live factor identity",
+                 "[pg][auth][session][mfa_binding]") {
+    add_user("alice");
+    enroll("alice");
+    add_user("bob", Role::user); // never enrolled
+
+    const auto alice = status("alice");
+    REQUIRE(alice.enrolled);
+    REQUIRE(alice.factor_gen > 0);
+    auto at = mgr.create_local_session_for_test("alice", Role::admin, /*mfa_verified=*/true);
+    REQUIRE_FALSE(at.empty());
+    const auto arow = row(at);
+    CHECK(arow.mfa_factor_gen == alice.factor_gen);
+    CHECK(arow.mfa_verified_ms >= alice.enrolled_at_ms); // enrol-then-approve keeps passing
+    CHECK(arow.mfa_verified_ms <= status("alice").db_now_ms);
+    const auto durable = mgr.read_durable_mfa_proof(at, "alice");
+    REQUIRE(durable.source == DurableMfaProof::Source::kRow);
+    CHECK(durable.mfa_factor_gen == alice.factor_gen);
+
+    // An un-enrolled user holds an UNBOUND proof at the database clock.
+    auto bt = mgr.create_local_session_for_test("bob", Role::user, true);
+    REQUIRE_FALSE(bt.empty());
+    const auto brow = row(bt);
+    CHECK(brow.mfa_factor_gen == 0);
+    CHECK(brow.mfa_verified_ms > 0);
+
+    // mfa_verified == false carries nothing.
+    auto none = mgr.create_local_session_for_test("alice", Role::admin, false);
+    REQUIRE_FALSE(none.empty());
+    CHECK(row(none).mfa_verified_ms == 0);
+    CHECK(row(none).mfa_factor_gen == 0);
+
+    // A test that enrols AFTER minting holds an unbound proof by design.
+    auto early = mgr.create_local_session_for_test("bob", Role::user, true);
+    enroll("bob");
+    CHECK(row(early).mfa_factor_gen == 0);
+}
+
+TEST_CASE_METHOD(BindingFixture, "the transitional overloads keep enrol-then-approve working",
+                 "[pg][auth][session][mfa_binding]") {
+    add_user("alice");
+    enroll("alice"); // the enrolment instant
+    const auto enrolled = status("alice");
+
+    // Old create (mfa_verified = true): an UNBOUND proof at the DB clock read just before the
+    // write, so it is never earlier than the enrolment that preceded it.
+    auto t1 = mgr.create_local_session("alice", Role::admin, true, anchor("alice"));
+    REQUIRE_FALSE(t1.empty());
+    const auto r1 = row(t1);
+    CHECK(r1.mfa_factor_gen == 0);
+    CHECK(r1.mfa_verified_ms >= enrolled.enrolled_at_ms);
+    CHECK(r1.mfa_verified_ms <= status("alice").db_now_ms);
+
+    // Old stamp: unbound, at the DB clock, also not earlier than the enrolment.
+    auto t2 = mgr.create_local_session("alice", Role::admin, false, anchor("alice"));
+    REQUIRE_FALSE(t2.empty());
+    CHECK(row(t2).mfa_verified_ms == 0);
+    REQUIRE(mgr.mark_session_mfa_verified(t2));
+    const auto r2 = row(t2);
+    CHECK(r2.mfa_factor_gen == 0);
+    CHECK(r2.mfa_verified_ms >= enrolled.enrolled_at_ms);
+    CHECK(r2.mfa_bind_seq == 2);
+}
+
+TEST_CASE_METHOD(BindingFixture,
+                 "post-mint recheck refuses a mint whose factor was replaced "
+                 "after it was verified",
+                 "[pg][auth][session][mfa_binding]") {
+    add_user("alice");
+    enroll("alice");
+    const auto hash = anchor("alice");
+    const std::int64_t g = status("alice").factor_gen;
+    const std::int64_t verified = status("alice").db_now_ms - 1'000;
+
+    // Control: the verified generation is still the account's: the mint stands, bound.
+    AuthManager::MintDenial why = AuthManager::MintDenial::kPersistFailed;
+    auto ok = mgr.create_local_session("alice", Role::admin, hash, {g, verified}, &why);
+    REQUIRE_FALSE(ok.empty());
+    CHECK(why == AuthManager::MintDenial::kNone);
+    CHECK(row(ok).mfa_factor_gen == g);
+    CHECK(row(ok).mfa_verified_ms == verified);
+
+    // The factor is replaced (clear + re-enrol) after the verification and before the mint
+    // completes: denied, no token, nothing left behind, counted by cause.
+    rotate("alice");
+    REQUIRE(status("alice").factor_gen == g + 2);
+    why = AuthManager::MintDenial::kNone;
+    auto denied = mgr.create_local_session("alice", Role::admin, hash, {g, verified}, &why);
+    CHECK(denied.empty());
+    CHECK(why == AuthManager::MintDenial::kFactorChanged);
+    CHECK(session_count("alice") ==
+          0); // the recheck revokes the account's sessions, as for a role change
+    CHECK(counter("yuzu_auth_role_recheck_post_mint_denied_total", {{"reason", "factor"}}) == 1.0);
+
+    // A proof for the CURRENT generation mints again; an UNBOUND proof is never rechecked.
+    const std::int64_t g2 = status("alice").factor_gen;
+    CHECK_FALSE(mgr.create_local_session("alice", Role::admin, hash, {g2, verified}).empty());
+    CHECK_FALSE(mgr.create_local_session("alice", Role::admin, hash, {0, verified}).empty());
+}
+
+TEST_CASE_METHOD(BindingFixture,
+                 "post-mint recheck still denies a role change and a credential "
+                 "change, and labels them",
+                 "[pg][auth][session][mfa_binding]") {
+    add_user("alice", Role::user);
+    enroll("alice");
+    const auto hash = anchor("alice");
+    const std::int64_t g = status("alice").factor_gen;
+    const std::int64_t verified = status("alice").db_now_ms - 1'000;
+
+    // A stale role (admin claimed, user stored).
+    AuthManager::MintDenial why = AuthManager::MintDenial::kNone;
+    CHECK(mgr.create_local_session("alice", Role::admin, hash, {g, verified}, &why).empty());
+    CHECK(why == AuthManager::MintDenial::kRoleChanged);
+    CHECK(counter("yuzu_auth_role_recheck_post_mint_denied_total", {{"reason", "role"}}) == 1.0);
+
+    // A stale credential anchor.
+    why = AuthManager::MintDenial::kNone;
+    CHECK(mgr.create_local_session("alice", Role::user, "not-the-stored-hash", {g, verified}, &why)
+              .empty());
+    CHECK(why == AuthManager::MintDenial::kCredentialChanged);
+    CHECK(counter("yuzu_auth_role_recheck_post_mint_denied_total", {{"reason", "credential"}}) ==
+          1.0);
+}
+
+TEST_CASE_METHOD(BindingFixture, "post-stamp recheck clears a stamp whose factor was replaced",
+                 "[pg][auth][session][mfa_binding]") {
+    add_user("alice");
+    enroll("alice");
+    const std::int64_t g = status("alice").factor_gen;
+    const std::int64_t verified = status("alice").db_now_ms - 1'000;
+
+    // Control: the verified generation is current: the stamp stands and is bound.
+    auto good = mgr.create_local_session_for_test("alice", Role::admin, false);
+    REQUIRE_FALSE(good.empty());
+    CHECK(mgr.stamp_session_mfa_proof(good, {g, verified}) ==
+          AuthManager::MfaStampOutcome::kStamped);
+    CHECK(row(good).mfa_factor_gen == g);
+    CHECK(row(good).mfa_verified_ms == verified);
+    auto live = mgr.validate_session(good);
+    REQUIRE(live.has_value());
+    CHECK(live->steady_mfa_verified.time_since_epoch().count() != 0);
+
+    // The factor is replaced after the verification: the stamp is refused and cleared, the
+    // session itself survives, and this replica's cache holds no proof.
+    auto token = mgr.create_local_session_for_test("alice", Role::admin, false);
+    REQUIRE_FALSE(token.empty());
+    rotate("alice");
+    CHECK(mgr.stamp_session_mfa_proof(token, {g, verified}) ==
+          AuthManager::MfaStampOutcome::kFactorChanged);
+    CHECK_FALSE(mgr.mark_session_mfa_verified(token, {g, verified}));
+    const auto r = row(token);
+    CHECK(r.mfa_verified_ms == 0);
+    CHECK(r.mfa_factor_gen == 0);
+    auto s = mgr.validate_session(token);
+    REQUIRE(s.has_value());
+    CHECK(s->steady_mfa_verified.time_since_epoch().count() == 0);
+    CHECK(counter("yuzu_auth_mfa_stamp_denied_total", {{"reason", "factor_changed"}}) == 2.0);
+
+    // An unbound stamp is not rechecked (there is no generation to compare).
+    CHECK(mgr.stamp_session_mfa_proof(token, {0, verified}) ==
+          AuthManager::MfaStampOutcome::kStamped);
+}
+
+TEST_CASE_METHOD(BindingFixture,
+                 "a stamp whose cleanup fails leaves a proof bound to the OLD generation",
+                 "[pg][auth][session][mfa_binding]") {
+    add_user("alice");
+    enroll("alice");
+    const std::int64_t g = status("alice").factor_gen;
+    const std::int64_t verified = status("alice").db_now_ms - 1'000;
+    auto token = mgr.create_local_session_for_test("alice", Role::admin, false);
+    REQUIRE_FALSE(token.empty());
+    // Prime the generation view: the first validate on a fresh manager refreshes it and drops
+    // the whole cache, which would hide whether the stamp path dropped its own entry.
+    REQUIRE(mgr.validate_session(token).has_value());
+
+    // Make ONLY the cleanup (an update that zeroes an existing proof) fail.
+    {
+        auto lease = db.pool().acquire();
+        REQUIRE(lease);
+        for (const char* sql :
+             {"CREATE FUNCTION session_store.yuzu_test_refuse_clear() RETURNS trigger LANGUAGE "
+              "plpgsql AS $$ BEGIN IF NEW.mfa_verified_ms = 0 AND OLD.mfa_verified_ms <> 0 THEN "
+              "RAISE EXCEPTION 'clear refused'; END IF; RETURN NEW; END $$",
+              "CREATE TRIGGER yuzu_test_refuse_clear BEFORE UPDATE ON session_store.sessions FOR "
+              "EACH ROW EXECUTE FUNCTION session_store.yuzu_test_refuse_clear()"}) {
+            auto res = yuzu::server::pg::exec_params(lease.get(), sql, std::vector<std::string>{});
+            INFO(PQresultErrorMessage(res.get()));
+            REQUIRE(res.status() == PGRES_COMMAND_OK);
+        }
+    }
+    rotate("alice");
+    CHECK(mgr.stamp_session_mfa_proof(token, {g, verified}) ==
+          AuthManager::MfaStampOutcome::kFactorChanged);
+
+    // The stored proof is still there, but bound to the generation the account no longer has:
+    // exactly what a binding gate refuses by equality. It is never an admissible proof.
+    const auto durable = mgr.read_durable_mfa_proof(token, "alice");
+    REQUIRE(durable.source == DurableMfaProof::Source::kRow);
+    CHECK(durable.mfa_verified_ms == verified);
+    CHECK(durable.mfa_factor_gen == g);
+    CHECK(durable.mfa_factor_gen != status("alice").factor_gen);
+    // And this replica's cache was dropped regardless of the failed clear.
+    auto s = mgr.validate_session(token);
+    REQUIRE(s.has_value());
+    CHECK(s->steady_mfa_verified.time_since_epoch().count() == 0);
+}
+
+TEST_CASE_METHOD(BindingFixture,
+                 "post-stamp recheck fails closed when the generation cannot be read",
+                 "[pg][auth][session][mfa_binding]") {
+    add_user("alice");
+    enroll("alice");
+    const std::int64_t g = status("alice").factor_gen;
+    const std::int64_t verified = status("alice").db_now_ms - 1'000;
+    auto token = mgr.create_local_session_for_test("alice", Role::admin, false);
+    REQUIRE_FALSE(token.empty());
+
+    // Hold the account's row lock from a separate connection: the recheck's bounded
+    // lock_timeout fires, which is a store error, not a verdict.
+    yuzu::server::pg::PgConn holder{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(holder.get()) == CONNECTION_OK);
+    REQUIRE(
+        yuzu::server::pg::exec_params(holder.get(), "BEGIN", std::vector<std::string>{}).status() ==
+        PGRES_COMMAND_OK);
+    REQUIRE(yuzu::server::pg::exec_params(holder.get(),
+                                          "SELECT 1 FROM auth.users WHERE username = $1 FOR UPDATE",
+                                          std::vector<std::string>{"alice"})
+                .status() == PGRES_TUPLES_OK);
+
+    const auto outcome = mgr.stamp_session_mfa_proof(token, {g, verified});
+    yuzu::server::pg::exec_params(holder.get(), "ROLLBACK", std::vector<std::string>{});
+
+    CHECK(outcome == AuthManager::MfaStampOutcome::kStoreError);
+    CHECK(row(token).mfa_verified_ms == 0); // cleared: nothing admitted on an unverifiable stamp
+    CHECK(row(token).mfa_factor_gen == 0);
+    CHECK(counter("yuzu_auth_mfa_stamp_denied_total", {{"reason", "unverifiable"}}) == 1.0);
+}
+
+TEST_CASE_METHOD(BindingFixture,
+                 "a future-dated carried proof is refused with an AuthDB attached too",
+                 "[pg][auth][session][mfa_binding]") {
+    add_user("alice");
+    enroll("alice");
+    const std::int64_t g = status("alice").factor_gen;
+    const std::int64_t future = status("alice").db_now_ms + 60'000;
+    const auto hash = anchor("alice");
+
+    AuthManager::MintDenial why = AuthManager::MintDenial::kNone;
+    CHECK(mgr.create_local_session("alice", Role::admin, hash, {g, future}, &why).empty());
+    CHECK(why == AuthManager::MintDenial::kVerificationFutureDated);
+    CHECK(session_count("alice") == 0);
+
+    auto token = mgr.create_local_session("alice", Role::admin, hash);
+    REQUIRE_FALSE(token.empty());
+    CHECK(mgr.stamp_session_mfa_proof(token, {g, future}) ==
+          AuthManager::MfaStampOutcome::kFutureDated);
+    CHECK(row(token).mfa_verified_ms == 0);
+    CHECK(counter("yuzu_auth_mfa_verification_future_dated_total") == 2.0);
 }

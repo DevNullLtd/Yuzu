@@ -791,3 +791,287 @@ TEST_CASE("Gates: a restored (engine_token source, human kind) session takes the
         CHECK(ar.make_audit_event(sreq, "test.action", "success").principal_class == "engine");
     }
 }
+
+
+// ── #6079: carried, factor-bound MFA proofs through AuthManager ────────────────────────────────
+//
+// AuthManager hands the store the verifier's {factor generation, DB instant} unchanged, refuses an
+// instant later than the DB clock (never clamps it), and keeps the pre-binding overloads working as
+// UNBOUND proofs. The AuthDB-dependent rechecks (S1) are in test_auth.cpp.
+
+namespace {
+
+using yuzu::server::LocalMfaProof;
+using yuzu::server::auth::DurableMfaProof;
+
+std::int64_t pg_now_ms(PgPool& pool) {
+    auto lease = pool.acquire();
+    auto r = yuzu::server::pg::exec_params(
+        lease.get(), "SELECT (extract(epoch from now())*1000)::bigint", std::vector<std::string>{});
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    return std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10);
+}
+
+void exec_sql(PgPool& pool, const std::string& sql) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto r = yuzu::server::pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+}
+
+std::int64_t count_sessions(PgPool& pool, const std::string& user) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto r = yuzu::server::pg::exec_params(
+        lease.get(), "SELECT count(*) FROM session_store.sessions WHERE username = $1",
+        std::vector<std::string>{user});
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    return std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10);
+}
+
+yuzu::server::SessionRow durable_row(SessionStore& store, const std::string& token) {
+    auto found = store.find(AuthManager::sha256_hex(token));
+    REQUIRE(found.has_value());
+    REQUIRE(found->has_value());
+    return found->value().row;
+}
+
+double counter_value(yuzu::MetricsRegistry& m, const std::string& name,
+                     const yuzu::Labels& labels = {}) {
+    return labels.empty() ? m.counter(name).value() : m.counter(name, labels).value();
+}
+
+} // namespace
+
+TEST_CASE("AuthManager+SessionStore: create_local_session stores the carried proof exactly",
+          "[auth][session_store][pg][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    auto mgr = make_mgr(store);
+
+    // A verification that began 20 s ago on the DATABASE clock.
+    const std::int64_t verified = pg_now_ms(pool) - 20'000;
+    auto token = mgr->create_local_session("alice", Role::admin, "", LocalMfaProof{7, verified});
+    REQUIRE_FALSE(token.empty());
+
+    // The row holds the carried instant and generation, not the write's own now().
+    const auto row = durable_row(store, token);
+    CHECK(row.mfa_verified_ms == verified);
+    CHECK(row.mfa_factor_gen == 7);
+    CHECK(row.mfa_bind_seq == 1);
+
+    // The cached proof ages from the verification, so it is already ~20 s old.
+    auto s = mgr->validate_session(token);
+    REQUIRE(s.has_value());
+    const auto age = std::chrono::steady_clock::now() - s->steady_mfa_verified;
+    CHECK(age >= std::chrono::seconds(19));
+    CHECK(age < std::chrono::seconds(60));
+
+    // The authoritative read hands the gates the generation with the instants.
+    const auto durable = mgr->read_durable_mfa_proof(token, "alice");
+    REQUIRE(durable.source == DurableMfaProof::Source::kRow);
+    CHECK(durable.mfa_verified_ms == verified);
+    CHECK(durable.mfa_factor_gen == 7);
+    CHECK(durable.db_now_ms >= verified);
+
+    // No-proof overload: a session with no proof and no binding.
+    auto bare = mgr->create_local_session("bob", Role::user, "");
+    REQUIRE_FALSE(bare.empty());
+    const auto bare_row = durable_row(store, bare);
+    CHECK(bare_row.mfa_verified_ms == 0);
+    CHECK(bare_row.mfa_factor_gen == 0);
+}
+
+TEST_CASE("AuthManager+SessionStore: a future-dated proof refuses the mint and leaves nothing",
+          "[auth][session_store][pg][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    auto mgr = make_mgr(store);
+    mgr->set_metrics_registry(&metrics);
+
+    // The DB clock "stepped back": the carried instant is a minute ahead of it.
+    AuthManager::MintDenial why = AuthManager::MintDenial::kNone;
+    auto token = mgr->create_local_session("alice", Role::admin, "",
+                                           LocalMfaProof{7, pg_now_ms(pool) + 60'000}, &why);
+    CHECK(token.empty());
+    CHECK(why == AuthManager::MintDenial::kVerificationFutureDated);
+    // Refused, not clamped to an age-zero proof: the row written for it is gone.
+    CHECK(count_sessions(pool, "alice") == 0);
+    CHECK(counter_value(metrics, "yuzu_auth_mfa_verification_future_dated_total") == 1.0);
+
+    // Control: the same call with a past instant mints, so the refusal was the instant.
+    why = AuthManager::MintDenial::kPersistFailed;
+    auto ok = mgr->create_local_session("alice", Role::admin, "",
+                                        LocalMfaProof{7, pg_now_ms(pool) - 1'000}, &why);
+    CHECK_FALSE(ok.empty());
+    CHECK(why == AuthManager::MintDenial::kNone);
+    CHECK(count_sessions(pool, "alice") == 1);
+}
+
+TEST_CASE("AuthManager+SessionStore: a malformed proof mints and stamps nothing",
+          "[auth][session_store][pg][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    auto mgr = make_mgr(store);
+
+    // A binding without an instant, a zero proof and a negative generation are caller bugs.
+    for (const LocalMfaProof bad :
+         {LocalMfaProof{3, 0}, LocalMfaProof{0, 0}, LocalMfaProof{-1, 5}}) {
+        CHECK(mgr->create_local_session("alice", Role::admin, "", bad).empty());
+    }
+    CHECK(count_sessions(pool, "alice") == 0);
+
+    auto token = mgr->create_local_session("alice", Role::admin, "");
+    REQUIRE_FALSE(token.empty());
+    for (const LocalMfaProof bad :
+         {LocalMfaProof{3, 0}, LocalMfaProof{0, 0}, LocalMfaProof{-1, 5}}) {
+        CHECK(mgr->stamp_session_mfa_proof(token, bad) ==
+              AuthManager::MfaStampOutcome::kInvalidProof);
+        CHECK_FALSE(mgr->mark_session_mfa_verified(token, bad));
+    }
+    CHECK(durable_row(store, token).mfa_verified_ms == 0);
+}
+
+TEST_CASE("AuthManager+SessionStore: stamping a carried proof stores it; a future one stores none",
+          "[auth][session_store][pg][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    auto mgr = make_mgr(store);
+    mgr->set_metrics_registry(&metrics);
+
+    auto token = mgr->create_local_session("alice", Role::admin, "");
+    REQUIRE_FALSE(token.empty());
+    const auto g0 = store.read_generation();
+    REQUIRE(g0.has_value());
+
+    // Bound stamp: stored as given, sequence advanced, write generation bumped.
+    const std::int64_t verified = pg_now_ms(pool) - 5'000;
+    CHECK(mgr->stamp_session_mfa_proof(token, {9, verified}) ==
+          AuthManager::MfaStampOutcome::kStamped);
+    auto row = durable_row(store, token);
+    CHECK(row.mfa_verified_ms == verified);
+    CHECK(row.mfa_factor_gen == 9);
+    CHECK(row.mfa_bind_seq == 2); // create wrote 1, the stamp advanced it
+    const auto g1 = store.read_generation();
+    REQUIRE(g1.has_value());
+    CHECK(*g1 > *g0);
+    auto cached = mgr->validate_session(token);
+    REQUIRE(cached.has_value());
+    CHECK(cached->steady_mfa_verified.time_since_epoch().count() != 0);
+
+    // A later stamp with an instant ahead of the DB clock: refused, and the previous proof
+    // is NOT kept as if it were current (the store wrote no proof and no binding).
+    const auto refused = mgr->stamp_session_mfa_proof(token, {9, pg_now_ms(pool) + 60'000});
+    CHECK(refused == AuthManager::MfaStampOutcome::kFutureDated);
+    CHECK_FALSE(mgr->mark_session_mfa_verified(token, {9, pg_now_ms(pool) + 60'000}));
+    row = durable_row(store, token);
+    CHECK(row.mfa_verified_ms == 0);
+    CHECK(row.mfa_factor_gen == 0);
+    auto after = mgr->validate_session(token);
+    REQUIRE(after.has_value());
+    CHECK(after->steady_mfa_verified.time_since_epoch().count() == 0);
+    CHECK(counter_value(metrics, "yuzu_auth_mfa_verification_future_dated_total") == 2.0);
+
+    // No such session.
+    CHECK(mgr->stamp_session_mfa_proof("no-such-session-token", {9, verified}) ==
+          AuthManager::MfaStampOutcome::kNoSession);
+}
+
+TEST_CASE(
+    "AuthManager+SessionStore: the pre-binding overloads write an UNBOUND proof at the DB clock",
+    "[auth][session_store][pg][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    auto mgr = make_mgr(store);
+
+    // mfa_verified == false: no proof at all.
+    auto plain = mgr->create_local_session("alice", Role::admin, /*mfa_verified=*/false, "");
+    REQUIRE_FALSE(plain.empty());
+    CHECK(durable_row(store, plain).mfa_verified_ms == 0);
+
+    // mfa_verified == true: a proof, never bound, never later than the DB clock.
+    const auto before = pg_now_ms(pool);
+    auto stamped = mgr->create_local_session("alice", Role::admin, /*mfa_verified=*/true, "");
+    REQUIRE_FALSE(stamped.empty());
+    const auto row = durable_row(store, stamped);
+    CHECK(row.mfa_verified_ms >= before - 1'000); // no AuthDB: the replica clock, same host
+    CHECK(row.mfa_verified_ms <= pg_now_ms(pool));
+    CHECK(row.mfa_factor_gen == 0);
+
+    // The old stamp: an unbound proof at the DB clock read from the session row.
+    REQUIRE(mgr->mark_session_mfa_verified(plain));
+    const auto marked = durable_row(store, plain);
+    CHECK(marked.mfa_verified_ms > 0);
+    CHECK(marked.mfa_verified_ms <= pg_now_ms(pool));
+    CHECK(marked.mfa_factor_gen == 0);
+    CHECK(marked.mfa_bind_seq == 2);
+    CHECK_FALSE(mgr->mark_session_mfa_verified("no-such-session-token"));
+}
+
+TEST_CASE(
+    "AuthManager+SessionStore: read_durable_mfa_proof is unavailable once the rebind guard is gone",
+    "[auth][session_store][pg][mfa_binding]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    auto mgr = make_mgr(store);
+
+    auto token = mgr->create_local_session("alice", Role::admin, "",
+                                           LocalMfaProof{4, pg_now_ms(pool) - 1'000});
+    REQUIRE_FALSE(token.empty());
+    CHECK(mgr->read_durable_mfa_proof(token, "alice").source == DurableMfaProof::Source::kRow);
+
+    // The binding cannot be trusted once the guard is observed to be off: unavailable, not a
+    // bound proof and not "no proof" (both would be a wrong answer).
+    store.set_binding_validation_memo_for_test(std::chrono::milliseconds{0});
+    exec_sql(pool, "ALTER TABLE session_store.sessions DISABLE TRIGGER sessions_mfa_rebind_guard");
+    const auto durable = mgr->read_durable_mfa_proof(token, "alice");
+    CHECK(durable.source == DurableMfaProof::Source::kUnavailable);
+    CHECK(durable.mfa_factor_gen == 0);
+    CHECK_FALSE(store.rebind_guard_ok());
+}
+
+TEST_CASE("AuthManager legacy path: a carried proof is stored, a future one refused",
+          "[auth][session][mfa_binding]") {
+    AuthManager mgr; // no stores: this host's clock is the authority
+    const auto wall = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::system_clock::now().time_since_epoch())
+                          .count();
+
+    auto token = mgr.create_local_session("alice", Role::user, "", LocalMfaProof{3, wall - 30'000});
+    REQUIRE_FALSE(token.empty());
+    auto s = mgr.validate_session(token);
+    REQUIRE(s.has_value());
+    const auto age = std::chrono::steady_clock::now() - s->steady_mfa_verified;
+    CHECK(age >= std::chrono::seconds(29));
+    CHECK(age < std::chrono::seconds(60));
+
+    AuthManager::MintDenial why = AuthManager::MintDenial::kNone;
+    CHECK(mgr.create_local_session("bob", Role::user, "", LocalMfaProof{3, wall + 3'600'000}, &why)
+              .empty());
+    CHECK(why == AuthManager::MintDenial::kVerificationFutureDated);
+
+    auto bare = mgr.create_local_session("carol", Role::user, "");
+    REQUIRE_FALSE(bare.empty());
+    CHECK(mgr.stamp_session_mfa_proof(bare, {3, wall + 3'600'000}) ==
+          AuthManager::MfaStampOutcome::kFutureDated);
+    CHECK(mgr.stamp_session_mfa_proof(bare, {3, wall - 10'000}) ==
+          AuthManager::MfaStampOutcome::kStamped);
+    auto stamped = mgr.validate_session(bare);
+    REQUIRE(stamped.has_value());
+    CHECK(stamped->steady_mfa_verified.time_since_epoch().count() != 0);
+}
