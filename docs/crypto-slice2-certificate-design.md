@@ -1924,6 +1924,16 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
     than OD-2's MCP set-and-proceed); the export's own row stays set-and-proceed for the library
     half. The code is kept and this design follows it.
 
+11. **The Linux walk's unnamed-mount residual** (raised by 2a-2e's governance, for the owner to
+    accept or reject). Every path hop and directory entry is classified against the start-of-run
+    mount snapshot and by `statx(AT_NO_AUTOMOUNT|AT_STATX_DONT_SYNC)` mount id before it is opened,
+    so no automount is triggered and nothing on a named network, autofs or non-local FUSE mount is
+    opened or read. What remains: a dead FUSE or network mount that the snapshot does not name
+    (mounted after it, or an unreadable mount table) can still block that one `statx` on the
+    entry that is its mount point, and the action deadline cannot interrupt it; kernels before 5.8
+    detect such boundaries by `st_dev` only. 2a-2e does not merge before the owner accepts this or
+    asks for a worker that can be abandoned.
+
 ## How this could ship wrong
 
 1. **A failed or kept store reads as current.** Kept rows shown without their store status, or a
