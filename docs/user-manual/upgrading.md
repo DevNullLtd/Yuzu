@@ -2,6 +2,12 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: engine credential mint, rotate and the no-admin auditor fail closed on a degraded read
+
+**What changed.** The engine credential routes `POST /api/v1/engine-principals/{id}/credentials` and `.../credentials/rotate`, and the MCP tools `mint_engine_credential` and `rotate_engine_credential`, now read the token store through checked reads. If the check for an existing credential cannot be answered, nothing is minted and the caller gets `503` (REST, `Retry-After: 2`) or a retryable error (MCP, `retry_after_ms`). If a mint or rotation commits but the new credential cannot be read back, the secret is withheld and the audit row is `partial`; retry a rotation within about two minutes against the same replica to receive the same secret, or recover as described in [Engine Principals](engine-principals.md#3-rotate-the-credential-overlap-pair-model). The no-admin auditor (`GET /api/v1/engine-principals/audit/no-admin`, `audit_engine_no_admin`) answers `503` / a retryable error instead of `ok:true` when a read it needs fails.
+
+**No action on upgrade.** There is no schema change. A client that treated a `200` with an empty `token_id` as success will now see the `503`, and should retry as described above.
+
 ## Behaviour change: the Windows agent installer passes the enrollment token by file
 
 **What changed.** The Windows agent installer no longer puts the enrollment token on the

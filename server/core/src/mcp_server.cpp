@@ -2501,7 +2501,9 @@ static const ToolDef kTools[] = {
     // docs/auth-engine-principals-design.md). An engine principal is the
     // durable identity behind an autonomous use-case-engine module —
     // hard-locked to MCP tier readonly (§8), never grantable the admin/
-    // wildcard role (§4.2 "no admin, ever"), and structurally barred from
+    // Administrator role names or a built-in role (§4.2; a custom full-grid
+    // role is permitted and detected afterwards, design Decision 15), and
+    // structurally barred from
     // acting as caller of its OWN lifecycle surface (§9). Mutating tools
     // require Security:Write — supervised MCP tier, approval-gated,
     // same posture as every other destructive MCP op.
@@ -2515,7 +2517,8 @@ static const ToolDef kTools[] = {
     {"create_engine_principal",
      "Create a new engine principal — the durable identity behind an autonomous use-case-engine "
      "module. Engine credentials minted against it are hard-locked to MCP tier readonly and can "
-     "never be granted the admin/wildcard role (no admin, ever). owner_username is the named "
+     "never be granted the admin/Administrator role or a built-in role (a custom wildcard role is "
+     "not refused; audit_engine_no_admin detects it afterwards). owner_username is the named "
      "responsible human and is FK-validated against the user store before the row is written. "
      "Mirrors POST /api/v1/engine-principals. Approval-gated — requires Security:Write (supervised "
      "MCP tier; maker-checker approval like every other privileged MCP op). Additive: creates a "
@@ -2789,22 +2792,21 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"transferred":{"type":"boolean"},"principal_id":{"type":"string"},"new_owner":{"type":"string"}},"required":["transferred","principal_id","new_owner"]})j"},
 
     {"audit_engine_no_admin",
-     "Auditor-runnable check (design doc §4.2) that 'no admin, ever' holds for every engine "
-     "principal and that reports any all-permissions role, which assignment does not refuse. Joins "
-     "principal_type=engine against each principal's resolved role assignments AND effective "
-     "permissions and reports any row that would violate those constraints: the literal admin/"
-     "Administrator role name, any role flagged is_system, or a granted securable x operation "
-     "set whose size reaches the full cross-product (functionally admin-equivalent even under a "
-     "custom non-system role name). ok:true with an empty violations[] is the positive "
-     "evidence; a non-empty violations[] (ok:false) holds rows. Reason admin_role or system_role "
+     "Auditor-runnable check (design doc §4.2) of the 'no admin' rule for every engine principal; "
+     "run it after assign_engine_role and periodically. Reads every engine: grant with each role's "
+     "permissions and reports admin_role (the admin/Administrator names), system_role (an "
+     "is_system role) and wildcard_grant (a role, or the union of a principal's roles, allowing "
+     "every securable x operation pair of the grid at run time). Assignment permits a custom "
+     "wildcard role, so this detective check is the only control over it: ok:true means no role "
+     "covers the whole grid at the moment of the run (a role granting all but one pair is not "
+     "reported), it is point-in-time, and nothing schedules it. Reason admin_role or system_role "
      "means the assignment check was bypassed (data corruption, direct DB write, or a code "
-     "regression) and is a security incident; reason wildcard_grant is an all-permissions "
-     "custom role that assignment does not refuse, so review whether it is intended. A "
-     "503/internal-error result (rather than ok:true) means the RBAC "
-     "reference data needed to compute the wildcard bound could not be resolved — treat as "
-     "'unable to verify', never as 'clean'. Mirrors GET "
-     "/api/v1/engine-principals/audit/no-admin exactly, including its {ok, violations} response "
-     "shape. Requires AuditLog:Read.",
+     "regression) and is a security incident; wildcard_grant means review whether the grant is "
+     "intended. FAILS CLOSED: if any read cannot be answered it returns a retryable internal "
+     "error (retry_after_ms) with no partial violations[], never ok:true - treat that as "
+     "'unable to verify', not 'clean'. Same checks and {ok, violations} shape as GET "
+     "/api/v1/engine-principals/audit/no-admin; include_revoked is MCP-only. Requires "
+     "AuditLog:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("include_revoked":{"type":"boolean","default":true,"description":"false restricts the audit to lifecycle_state=active principals only"})j"
      R"j(}})j",
@@ -26964,16 +26966,18 @@ McpServer::HandlerFn McpServer::build_handler(
                     // a dropped reveal-audit would let the raw secret leave the server
                     // with no audit-chain row. The one-time secret is WITHHELD (never
                     // built into the response below). Parity with the REST twin (#2466)
-                    // + the plugin-config MCP precedent; within the overlap window a
-                    // re-rotate re-serves the same successor once the audit persists.
+                    // + the plugin-config MCP precedent; within the grace window (about two
+                    // minutes, same operator, same replica) a re-rotate re-serves the same
+                    // successor once the audit persists.
                     mcp_audit("error", "audit_persist_failed");
                     res.set_content(
                         a4_error(503,
                                  "the credential was rotated but its reveal audit record could not "
                                  "be persisted; the one-time secret was withheld. Rotate again "
-                                 "within the overlap window to re-serve the same audited successor "
+                                 "within about two minutes to re-serve the same audited successor "
                                  "secret",
-                                 "rotate again within the overlap window; do not retry immediately",
+                                 "rotate again within the grace window (about two minutes, same "
+                                 "operator and server replica); do not retry immediately",
                                  /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
                         "application/json");
                     return;

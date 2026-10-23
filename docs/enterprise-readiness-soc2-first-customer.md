@@ -249,18 +249,30 @@ service-scoped tokens only; human sessions, engine principals and MCP tiers are
 unchanged. Evidence for this entry is the governance ledger for #3526.
 
 **Addendum — machine-identity resource-bounding (CC6.6, PR 4.4).** Engine
-principals (ADR-1005 class) are already least-privilege by construction —
-default-deny RBAC resolution, barred from the admin and built-in roles at assignment, with a
-no-admin audit route that reports any wildcard grant afterwards (see the
-`engine_principal_store.*` row in `CLAUDE.md`) — and
+principals (ADR-1005 class) resolve authority from default-deny RBAC, and
+assignment refuses the `admin` / `Administrator` role names and the built-in
+roles. A custom role is not blocked, including one that covers every
+permission (maintainer ruling 2026-10-23, #2485): that case is detected
+afterwards by the no-admin audit route, which is a pull-only, point-in-time
+check. `ok:true` means no role held by an engine principal covers the whole
+permission grid at the time of the run; a role granting all but one pair is not
+reported, and nothing schedules or alerts on the check. The cadence is the
+operator's, and the `engine_principal.audit.no_admin` run rows (which name up to
+ten detected principals) are the evidence the control operated. A machine-identity
+access review must therefore include the engine grants and a no-admin run. The
+route and its MCP twin fail closed when a read cannot be answered, so a degraded
+store is never reported as clean. Risk register: a custom wildcard role on a
+machine identity is detected, not prevented, with pull-only detection. See the
+engine-principal routed-concern row in `.claude/routed-concerns-access-control.md`.
 PR 4.4 adds the complementary resource-bounding control: a per-principal
 in-flight concurrency cap and request-rate cap enforced at the server's
 single pre-routing chokepoint, so a compromised or malfunctioning engine
 principal cannot exhaust server capacity via unbounded concurrent or
-high-rate requests. Credit this pairing (least-privilege identity +
-bounded-resource machine credential) as a CC6.6 control for any privileged/
-machine-identity access review. See `docs/user-manual/engine-principals.md`
-"Per-principal quota cap" for the operator-facing reference.
+high-rate requests. Credit this pairing (RBAC-bounded identity with a detective
+check, plus a bounded-resource machine credential) as a CC6.6 control for any
+privileged/machine-identity access review. See
+`docs/user-manual/engine-principals.md` "Per-principal quota cap" for the
+operator-facing reference.
 
 **Addendum — engine-credential rotation confirm pinning (CC6.1/CC6.3, #2384).**
 The overlap-pair rotation's maker-checker confirm step is pinned to the exact

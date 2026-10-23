@@ -3749,12 +3749,17 @@ walkthrough.
   capability. Design record: `docs/security-reviews/human-token-rotation-2026-08-10.md`
   "Open risks" (#2961, marked resolved).
 - **No-admin auditor** — `GET /api/v1/engine-principals/audit/no-admin` /
-  MCP `audit_engine_no_admin` — independently resolves every engine
-  principal's actual roles + effective permissions against the live RBAC
-  reference tables and reports any violation (literal admin/system-role
-  grant, or a full securable × operation wildcard grant). Fails closed
-  (`503`, "cannot verify") rather than reporting a false `ok:true` if RBAC
-  reference data can't be resolved.
+  MCP `audit_engine_no_admin` — one shared implementation
+  (`engine_no_admin_audit.hpp`) over CHECKED reads of the grant table, the roles
+  and the role permissions. It is the DETECTIVE control for a wildcard custom
+  role, which assignment deliberately permits (maintainer ruling 2026-10-23,
+  #2485). It reports a detected `admin_role`, `system_role` or `wildcard_grant`
+  (a role, or the union of a principal's roles, allowing every securable ×
+  operation pair of the grid at run time; a role granting all but one pair is
+  not reported). Point-in-time and pull-only: no schedule, no alert. Fails
+  closed (`503` / retryable MCP error, a `failure` audit row, no `success` row,
+  no partial list) when any read cannot be answered, so a degraded read never
+  reads as `ok:true`.
 - **Audit-persist posture (#2466/#2406 + #3937, ADR-1005 "mutations fail closed
   on audit failure"):** every *mutating* engine-principal REST route fails closed
   — `503` + `Sec-Audit-Failed: true` — if its audit row cannot persist, so a

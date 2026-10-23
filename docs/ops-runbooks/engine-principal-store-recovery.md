@@ -274,6 +274,25 @@ admin surface for `max_entries_` today (it is a fixed constant,
 `kAuthCacheMaxEntries`), so raising it requires a code change and a new
 release, not a live toggle.
 
+## A rotation left with a successor nobody holds (`result=partial`)
+
+A rotate that committed but could not deliver the successor secret (the read-back
+failed, or the reveal could not be audited) answers `503`, withholds the secret
+and writes `engine_principal.credential.rotate` with `result=partial`. That audit
+row is the operator signal; no metric or alert covers it today. The same
+operator can retry within the grace window (about two minutes, in the memory of
+the same server replica) to receive the same secret. After a restart, on a
+different replica, or once the window ends, the retry is `409` and the pair is
+stuck with a successor whose secret nobody has.
+
+Recover by revoking the **successor** (`GET /api/v1/tokens` lists the principal's
+credentials; the successor is the active one whose `supersedes_token_id` is set
+and whose `overlap_expires_at` is `0`), then rotate again. Alternatively rotate
+from the sole remaining credential. Do **not** revoke only the predecessor: that
+leaves the principal holding one credential whose secret no one has. A `partial`
+row on `engine_principal.credential.mint` means the credential exists but its
+secret was never shown; rotate it (a second mint is `409`).
+
 ## Cross-references
 
 - Store contract, three-state `get_for_auth`, and construction posture:
