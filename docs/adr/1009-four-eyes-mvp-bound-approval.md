@@ -296,10 +296,16 @@ conditions (security-guardian `sec-1`, with the architect's five conditions):
 ### PR3 entry conditions
 
 Open findings that become conditions on the PR that first wires a producer or redeemer (#6063).
-The consume-time recheck is in PR2 (`up-2`, `g8-sg-1`). Every read a consume makes before its
+The consume-time recheck is in PR2 (`up-2`, `g8-sg-1`, `g10-redeem-does-not-recheck-bound-origin`),
+and so is a liveness test on the wall clock rather than the transaction-start `now()`, so a
+caller-held transaction cannot redeem a ticket after its lifetime ended (`sg-6`; proof
+`consume_ticket(PGconn*): a transaction begun before expiry whose consume happens after it is
+refused as expired and the ticket is not spent`). Every read a consume makes before its
 consuming statement runs the origin and submitter checks, and, for a row that is approved and not yet consumed, the integrity
 checks (reviewer is not the submitter or an excluded root, an approved ticket names a reviewer,
-excluded roots readable, request matches its digest); a pending, rejected, expired or already
+excluded roots readable, request matches its digest, and an origin that requires a bound request
+has one: an empty request with an empty digest on such a row is refused, not read as a legacy
+row); a pending, rejected, expired or already
 consumed row keeps reading as the ordinary refusal it is. The consuming statement is pinned to the
 row VERSION of the last row examined, which is two values: `xmin` (the transaction that wrote the
 version) and `ctid` (its tuple position). An update of the row by ANOTHER transaction between the
@@ -341,10 +347,6 @@ keep them green and extend them to the new surface. Test names are the case titl
   locked, or MUST fire after the caller's transaction ends. Proof: `consume_ticket(PGconn*): with
   the pool exhausted the denial observer completes in bounded time and its audit row survives the
   caller's rollback`, in `test_approval_manager_bound.cpp`.
-- **Held-path expiry** (`sg-6`): MUST use `clock_timestamp()` or a bounded transaction age, not the
-  transaction-start `now()`. Proof: `consume_ticket(PGconn*): a transaction begun before expiry
-  whose consume happens after it is refused as expired and the ticket is not spent`, in
-  `test_approval_manager_bound.cpp`.
 - **Lost commit acknowledgement** (`up-9`): a retry that finds the ticket consumed by the same
   caller, in the transaction identity the redeemer recorded, MUST reconcile from the redeemer's
   own record as idempotent success, never as "already used". The failure class is not new to

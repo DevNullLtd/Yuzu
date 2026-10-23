@@ -81,6 +81,8 @@ std::string redact_id(const std::string& id) {
 // scheduled run is now a guarded STATE transition (retire_schedule_tickets), not a clock
 // comparison, so no reader needs the two clocks to agree.
 constexpr const char* kDbNowEpochSql = "EXTRACT(EPOCH FROM now())::bigint";
+// The same database clock, read at the moment the statement executes (see ticket_live_sql).
+constexpr const char* kDbWallEpochSql = "EXTRACT(EPOCH FROM clock_timestamp())::bigint";
 
 // THE ticket-liveness predicate, as a SQL boolean over `reviewed_at`. ONE definition,
 // used by the consume CAS, its diagnostic read, submit()'s approved-ticket sweep and
@@ -98,8 +100,16 @@ constexpr const char* kDbNowEpochSql = "EXTRACT(EPOCH FROM now())::bigint";
 // adjudication"), so a wrong cutoff is recoverable by resubmitting. What remains is the
 // database's own clock, the shared authority every replica already trusts for sessions.
 // Literals are interpolated from the constants (integers, no caller text).
-std::string ticket_live_sql() {
-    const std::string now = kDbNowEpochSql;
+//
+// `wall_clock` reads `clock_timestamp()` instead of `now()`. `now()` is the START of the
+// transaction, so on the held-connection consume path (a caller's long transaction) it is
+// frozen at BEGIN: a transaction begun before the ticket's TTL ran out would still see it
+// live after (an over-grant), and one begun before `reviewed_at` was stamped would see the
+// ticket as dated in the future and misreport it as expired (#6062 sg-6). The consume
+// CAS and its diagnostic read therefore ask for the wall clock; the sweep and
+// `ticket_is_live()` keep `now()`, where the statement IS the transaction.
+std::string ticket_live_sql(bool wall_clock = false) {
+    const std::string now = wall_clock ? kDbWallEpochSql : kDbNowEpochSql;
     return "(reviewed_at >= (" + now + " - " + std::to_string(kApprovalTicketTtlSeconds) +
            ") AND reviewed_at <= (" + now + " + " +
            std::to_string(kApprovalReviewedAtSlackSeconds) + "))";
@@ -450,6 +460,12 @@ std::optional<IntegrityFault> approval_integrity_fault(const Approval& a) {
         return IntegrityFault{"reviewer is the submitter"};
     if (reviewer_is_excluded(a.reviewed_by, a.excluded_roots))
         return IntegrityFault{"reviewer is an excluded root"};
+    // A row of an origin whose mint always freezes a request but which has none: submit_bound
+    // cannot have produced it (an unbound submit() refuses such an origin), so it was set by
+    // hand, an old build or a restore, and an empty request with an empty digest would
+    // otherwise pass as a "legacy" row (#6062 g10-redeem-does-not-recheck-bound-origin).
+    if (requires_bound_request(a.origin) && a.request_json.empty())
+        return IntegrityFault{"bound origin without a frozen request"};
     return request_binding_fault(a.request_json, a.request_digest, /*require_readable=*/false);
 }
 
@@ -1559,7 +1575,8 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
     const std::string consume_sql =
         std::string("UPDATE approval_manager.approvals SET consumed_at = ") + kDbNowEpochSql +
         ", consumed_by = $1 "
-        "WHERE id = $2 AND status = 'approved' AND consumed_at = 0 AND " + ticket_live_sql() +
+        "WHERE id = $2 AND status = 'approved' AND consumed_at = 0 AND " +
+        ticket_live_sql(/*wall_clock=*/true) +
         " AND reviewed_by = $3 AND request_json = $4 AND request_digest = $5"
         " AND excluded_roots = $6 AND origin = $7 AND submitted_by = $8 AND status = $9"
         " AND xmin::text = $10 AND ctid::text = $11"
@@ -1597,7 +1614,7 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
     // The pinned columns ride the same read, so a pin mismatch can be named (column NAMES
     // only, never values) at no extra round trip.
     const std::string why_sql =
-        "SELECT status, consumed_at, NOT " + ticket_live_sql() +
+        "SELECT status, consumed_at, NOT " + ticket_live_sql(/*wall_clock=*/true) +
         ", reviewed_by, request_json, request_digest, excluded_roots, origin, submitted_by, xmin::text, ctid::text"
         " FROM approval_manager.approvals WHERE id = $1";
     pg::PgResult why =

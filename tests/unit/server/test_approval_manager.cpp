@@ -1309,8 +1309,17 @@ TEST_CASE("ApprovalManager: every stamp and expiry cutoff is authored in-SQL fro
         INFO("banned clock API: " << banned);
         CHECK(std::none_of(banned.begin(), banned.end(),
                            [](unsigned char ch) { return std::isupper(ch) != 0; }));
+        // The one exemption (#6062 sg-6): the DATABASE's wall clock, read once, in
+        // kDbWallEpochSql, for the consume liveness test on a caller-held transaction, where
+        // `now()` is the transaction start. It is the same clock, not a per-replica one.
+        if (banned == "clock_timestamp")
+            continue;
         CHECK_FALSE(tripwire_matches(lc, banned));
     }
+    CHECK(count_occurrences(lc, "clock_timestamp") == 1);
+    const auto db_wall_def = statement_from(code, "constexpr const char* kDbWallEpochSql");
+    REQUIRE_FALSE(db_wall_def.empty());
+    CHECK(db_wall_def.find("clock_timestamp()") != std::string::npos);
     // The one database clock: SQL `now()` (any case) appears only in kDbNowEpochSql's own
     // definition.
     CHECK(count_occurrences(lc, "now()") == 1);
@@ -1355,8 +1364,13 @@ TEST_CASE("ApprovalManager: every stamp and expiry cutoff is authored in-SQL fro
         CHECK(code.substr(from, at - from).find("SET LOCAL statement_timeout = '300s';") !=
               std::string::npos);
     }
-    CHECK(consume.find("ticket_live_sql()") != std::string::npos);
-    CHECK(why.find("ticket_live_sql()") != std::string::npos);   // consume's expiry diagnostic
+    // The consume CAS and its diagnostic read test liveness on the wall clock (#6062 sg-6):
+    // both pass `true` to the shared predicate, so they cannot drift apart or back to `now()`.
+    for (const auto* stmt : {&consume, &why}) {
+        const auto at = stmt->find("ticket_live_sql(");
+        REQUIRE(at != std::string::npos);
+        CHECK(stmt->substr(at, 40).find("true") != std::string::npos);
+    }
     CHECK(is_live.find("ticket_live_sql()") != std::string::npos); // ticket_is_live()
     CHECK(db_now.find("kDbNowEpochSql") != std::string::npos);   // the pending-sweep cutoff
     CHECK(sweep_pending.find("db_now") != std::string::npos);

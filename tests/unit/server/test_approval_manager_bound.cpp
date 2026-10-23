@@ -624,6 +624,44 @@ TEST_CASE("consume_ticket(PGconn*): a ticket past its lifetime is refused as exp
     CHECK(mgr.get(id)->consumed_at == 0);
 }
 
+TEST_CASE("consume_ticket(PGconn*): a transaction begun before expiry whose consume happens "
+          "after it is refused as expired and the ticket is not spent",
+          "[pg][approval_manager][bound][6062]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    const auto id = approved_ticket(mgr, ApprovalOrigin::kMcp);
+    // Live for about one more second of database time.
+    REQUIRE(run_sql(bundle.pool(),
+                    "UPDATE approval_manager.approvals SET reviewed_at = "
+                    "extract(epoch from now())::bigint - " +
+                        std::to_string(kApprovalTicketTtlSeconds) + " + 1 WHERE id = $1",
+                    {id})
+                .status() == PGRES_COMMAND_OK);
+
+    in_txn(bundle.pool(), /*commit=*/true, [&](PGconn* conn) {
+        // Pin the transaction start, then prove the premise: by the transaction's own now()
+        // the ticket is still inside its lifetime. Without this the test would pass for any
+        // clock (a false green if the ticket had simply already expired).
+        auto before = pg::exec_params(
+            conn,
+            ("SELECT extract(epoch from now())::bigint <= reviewed_at + " +
+             std::to_string(kApprovalTicketTtlSeconds) +
+             " FROM approval_manager.approvals WHERE id = $1")
+                .c_str(),
+            std::vector<std::string>{id});
+        REQUIRE(before.status() == PGRES_TUPLES_OK);
+        REQUIRE(std::string(PQgetvalue(before.get(), 0, 0)) == "t");
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(2300));
+
+        auto r = mgr.consume_ticket(conn, id, "alice", ApprovalOrigin::kMcp, {});
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == ConsumeFailure::kExpired);
+        CHECK(r.error().message == kTicketExpiredMessage);
+    });
+    CHECK(mgr.get(id)->consumed_at == 0);
+}
+
 // -- submit_bound: the frozen request, digest and excluded roots -------------------
 
 namespace {
@@ -1214,6 +1252,22 @@ TEST_CASE("consume: a request_json that no longer hashes to request_digest refus
                     .status() == PGRES_COMMAND_OK);
         check_refused_on_both_overloads(bundle, id);
     }
+}
+
+TEST_CASE("consume: a bound-origin ticket with no frozen request refuses, even with an empty "
+          "digest",
+          "[pg][approval_manager][bound][6062]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    // Request AND digest both cleared: the request/digest pair is internally consistent, so
+    // only the origin says a request should be there.
+    const auto id = approved_bound(mgr);
+    REQUIRE(run_sql(bundle.pool(),
+                    "UPDATE approval_manager.approvals SET request_json = '', "
+                    "request_digest = '' WHERE id = $1",
+                    {id})
+                .status() == PGRES_COMMAND_OK);
+    check_refused_on_both_overloads(bundle, id);
 }
 
 TEST_CASE("consume: a legacy row (no request, no digest, no roots) is not re-checked into "
