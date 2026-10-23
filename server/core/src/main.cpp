@@ -371,8 +371,9 @@ int main(int argc, char* argv[]) {
     app.add_option("--csrf-trusted-origin", cfg.csrf_trusted_origins,
                    "External origin the dashboard is served on, for the CSRF same-site check "
                    "(repeatable; a single value may be comma-separated). Set this when a reverse "
-                   "proxy rewrites Host, otherwise every CSRF-gated dashboard action is refused "
-                   "with 403 because the browser's Origin cannot match the proxied Host. Forms: "
+                   "proxy rewrites Host, otherwise every cookie-session write is refused with "
+                   "403 because the browser's Origin cannot match the proxied Host. Environment "
+                   "variable: YUZU_CSRF_TRUSTED_ORIGIN. Forms: "
                    "'https://yuzu.example' (matched on scheme AND host) or a bare 'yuzu.example' "
                    "(host only). Wildcards are NOT supported. No forwarded header is consulted.")
         // Comma-splitting is done ONCE, in normalise_trusted_origins (web_utils.hpp),
@@ -485,7 +486,10 @@ int main(int argc, char* argv[]) {
     app.add_option("--log-max-files", log_max_files, "Max rotated log files (default: 5)")
         ->default_val(5)
         ->envname("YUZU_LOG_MAX_FILES");
-    app.add_option("--rate-limit", rate_limit, "Max API requests/second per IP (default: 100)")
+    app.add_option("--rate-limit", rate_limit,
+                   "Max API requests/second per IP (default: 100). Also the per-source budget "
+                   "for /health and /api/health requests that carry a credential; values "
+                   "below 1 are treated as 1")
         ->default_val(100)
         ->envname("YUZU_RATE_LIMIT");
     app.add_option("--login-rate-limit", login_rate_limit,
@@ -538,7 +542,10 @@ int main(int argc, char* argv[]) {
         ->envname("YUZU_MFA_ENFORCEMENT");
     app.add_option("--mfa-step-up-window-secs", cfg.mfa_step_up_window_secs,
                    "Seconds after a TOTP proof that high-risk endpoints accept the session as "
-                   "stepped-up (default: 300)")
+                   "stepped-up (default: 300). A value <= 0 disables the stale-proof "
+                   "requirement on the 36 central step-up routes: a stale or absent proof is "
+                   "neither refused nor recorded, SAML sessions pass, and the auth store is not "
+                   "read; engine denials and unwired-store refusals still apply and are recorded")
         ->default_val(300)
         ->envname("YUZU_MFA_STEP_UP_WINDOW_SECS");
     app.add_option("--mfa-login-pending-secs", cfg.mfa_login_pending_secs,
@@ -1109,6 +1116,12 @@ int main(int argc, char* argv[]) {
         spdlog::info("CSRF same-site gate: accepting {} operator-declared external origin(s) "
                      "in addition to the request Host — {}",
                      accepted, joined);
+    } else {
+        spdlog::info("CSRF same-site gate: cookie-session writes require a same-site Origin or "
+                     "Referer matching the request Host; no --csrf-trusted-origin value "
+                     "accepted. Behind a reverse proxy that rewrites Host, declare the public "
+                     "origin with --csrf-trusted-origin or dashboard writes will be refused "
+                     "with 403.");
     }
     // A config whose entries were ALL rejected previously logged nothing — boot
     // output byte-identical to not passing the flag, followed by every proxied
@@ -1205,23 +1218,27 @@ int main(int argc, char* argv[]) {
                      "absolute 8h session lifetime applies.");
     }
     // PR2 governance Gate 2 sec-M6: the step-up gate honours
-    // window_secs <= 0 as an "escape hatch" that lets every request
-    // through without re-prompting. The helper itself doesn't log on
-    // every skip (too noisy), so we surface it once at startup so the
-    // operator sees the disabled state in journald and an auditor
-    // reading the boot log can spot a misconfigured deployment. The JIT
+    // window_secs <= 0 as an "escape hatch" that stops a stale or absent
+    // MFA proof from being refused or re-prompted. It does not admit
+    // everything: the unwired-auth-store 503 (apply_step_up_chokepoint) and
+    // the engine-principal denial (decide_step_up) both run BEFORE the
+    // hatch, so they still apply and are still recorded. The helper itself
+    // doesn't log on every skip (too noisy), so we surface it once at
+    // startup so the operator sees the disabled state in journald and an
+    // auditor reading the boot log can spot a misconfigured deployment. The JIT
     // elevation handlers are the exception: AuthRoutes substitutes a 300 s window
     // for them when this flag is <= 0 (auth_routes.cpp, kElevationStepUpWindow),
     // so they keep prompting and keep emitting their audit rows.
     if (cfg.mfa_step_up_window_secs <= 0) {
         spdlog::warn(
-            "--mfa-step-up-window-secs={} disables the MFA step-up gate on every high-risk "
-            "REST + Settings endpoint except the JIT-elevation endpoints (POST /api/v1/elevate "
-            "and the elevation-eligibility routes), which still require an MFA-enrolled "
-            "caller's proof (local TOTP or IdP `amr`) to be no older than 300s. The "
-            "disabled endpoints will NOT re-prompt for MFA proof and emit no SOC 2 CC6.6 "
-            "`mfa.step_up.required` evidence rows. Set to a positive value (default 300) "
-            "to re-enable.",
+            "--mfa-step-up-window-secs={} disables the stale-proof requirement on the 36 central "
+            "step-up routes (REST, dashboard and Settings routes; the three JIT-elevation routes "
+            "keep their own 300 s window). On the 36 routes a stale or absent proof is neither refused nor "
+            "recorded (no SOC 2 CC6.6 `mfa.step_up.required` evidence row), they will NOT "
+            "re-prompt for MFA proof, SAML sessions pass, and the auth store is not read. "
+            "Engine-principal denials and unwired-auth-store refusals still apply on those "
+            "routes and are still recorded. Set to a positive value (default 300) to restore "
+            "the requirement.",
             cfg.mfa_step_up_window_secs);
     }
 

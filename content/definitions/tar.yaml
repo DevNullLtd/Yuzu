@@ -604,11 +604,15 @@ spec:
           share paths (identity/usage-class telemetry under the works-council
           posture; enabling is audited). Windows + Linux (macOS planned); inbound
           needs local-admin / Server-Operator on Windows and Samba on Linux and
-          degrades to empty otherwise. NOTE: the one-time HISTORICAL backfill (all
-          PREVIOUSLY mapped drives, from the registry / fstab / event logs) is
-          seeded at agent init, so it materializes on the first agent restart
-          AFTER you enable this. See software_enabled for disable semantics (same
-          opt-in posture; disabling leaves existing rows queryable).
+          degrades to empty otherwise. NOTE: the HISTORICAL backfill (all
+          PREVIOUSLY mapped drives, from the registry / fstab / event logs) runs
+          its first pass at agent init, so it materializes on the first agent
+          restart AFTER you enable this; any profile whose hive could not be read
+          on that first pass (including a logged-out profile the offline
+          hive-file guard refuses) is retried individually, bounded at 7 attempts
+          per profile 24 hours apart, until it resolves or is abandoned. See
+          software_enabled for disable semantics (same opt-in posture; disabling
+          leaves existing rows queryable).
           Requires agent v0.12.0+; older agents silently ignore. Valid:
           "true" | "false".
         validation:

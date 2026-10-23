@@ -37,8 +37,9 @@ struct WriteGate {
     std::function<std::optional<auth::Session>(const httplib::Request&)> resolve_session;
     std::vector<std::string> trusted_origins;
 
-    /// Call AFTER the permission gate so an unauthorised caller keeps its 403. Returns true
-    /// when the write was refused (403 written and a `csrf.denied` row attempted).
+    /// Defence in depth behind the central pre-routing gate (same_site_write_gate.hpp), which
+    /// answers a cookie-session write first. Call it before any state is read or changed.
+    /// Returns true when the write was refused (403 written and a `csrf.denied` row attempted).
     template <class AuditFn>
     [[nodiscard]] bool refuse_cross_site(const AuditFn& audit_fn, const httplib::Request& req,
                                          httplib::Response& res,

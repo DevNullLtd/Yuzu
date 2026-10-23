@@ -38,6 +38,7 @@ the Windows event log shows one of these, and they mean different things:
 | `[PG] Refusing to start: cannot reach PostgreSQL substrate: …` | Postgres down, wrong DSN, network/auth failure | [Substrate down](#postgres-substrate-unreachable) |
 | `[PG] Refusing to start: auth store (AuthDB) migration/open failed` | Database reachable, `auth` schema could not be created/opened | [Migration failure](#auth-schema-migration-failure) |
 | `SecretCodec::init() failed for the auth store bootstrap — …` or `[PG] Refusing to start: SecretCodec::init() failed — …` | The secrets seam could not initialise — usually a missing or unreadable KEK | [KEK problems](#kek-missing-or-unreadable) |
+| `SecretCodec::init() failed` … `kek_orphaned: stored secret blobs reference KEK version(s) […] absent from kek_meta` | A stored secret blob (for example one account's TOTP secret) names a key-encryption-key version that is not registered in `secrets.kek_meta` | [Stored secret names an unregistered KEK version](#stored-secret-names-an-unregistered-kek-version) |
 | `[auth] Refusing to start: the 'engine:' namespace …` | An `engine:`-prefixed principal collides with the reserved namespace | `docs/ops-runbooks/engine-principal-store-recovery.md` |
 
 If the shipped systemd unit is in use it retries `StartLimitBurst=3` times
@@ -632,11 +633,16 @@ does not talk to the running process.
 
 ### Fallback: direct SQL
 
-Only when no `yuzu-server` binary is available on the host. **Writes no audit
-row** — record it manually.
+Use it in two cases: no `yuzu-server` binary is available on the host, or
+`--mfa-reset` fails with `kek_orphaned` because the stored secret's header names a
+key version that is not registered and that header is corrupt (see
+[Stored secret names an unregistered KEK version](#stored-secret-names-an-unregistered-kek-version),
+where a restore of the paired backup comes first when the version once existed).
+**Writes no audit row**, so record it manually.
 
 ```bash
-psql "$YUZU_POSTGRES_DSN" <<'SQL'
+psql -v ON_ERROR_STOP=1 "$YUZU_POSTGRES_DSN" <<'SQL'
+BEGIN;
 UPDATE auth.users
    SET mfa_totp_secret  = NULL,
        mfa_enrolled_at  = NULL,
@@ -644,11 +650,103 @@ UPDATE auth.users
        mfa_last_counter = 0
  WHERE username = 'alice';
 DELETE FROM auth.mfa_recovery_codes WHERE username = 'alice';
+COMMIT;
 SQL
 ```
 
+The two statements run in one transaction on purpose, as `--mfa-reset` does
+(`AuthDB::mfa_disable`): an interruption between them must never leave the secret
+cleared with the old recovery codes still valid. `ON_ERROR_STOP` makes `psql` stop
+and exit non-zero if a statement fails, so a failed `UPDATE` cannot turn the
+`COMMIT` into a silent rollback with exit status 0.
+
 Clearing the secret needs no KEK (you are writing NULL, not reading
 ciphertext), so this works even when the KEK is unavailable.
+
+### Stored secret names an unregistered KEK version
+
+A stored secret blob carries its key-encryption-key (KEK) version in its header: a
+one-byte format marker, then the version as a four-byte big-endian number. If that
+version is not registered in the `secrets.kek_meta` table, the secret cannot be
+read, and the usual recovery is closed:
+
+- The step-up gated routes answer `503` for that account, as for any unreadable
+  secret. While the secret stays unreadable the account's password sign-in also
+  answers `503` (measured for a truncated blob; expected for any unreadable
+  secret), so the user cannot sign in at all until it is recovered.
+- `yuzu-server --mfa-reset <username>` fails with exit status 1 and
+  `SecretCodec::init() failed for the auth store bootstrap` naming `kek_orphaned`,
+  because the secrets seam refuses to initialise while any stored blob names an
+  unregistered key version. It never gets as far as clearing the account.
+- A server restart refuses to start for the same reason. A server that is already
+  running keeps serving until it is restarted, so fix this before any restart.
+
+**The boot check covers every secret column, not only TOTP.** It scans each
+registered secret column for blob headers that name a version absent from
+`kek_meta`: `auth.users.mfa_totp_secret`, `webhook_store.webhooks.secret`,
+`plugin_config_store.secrets.sealed_value`,
+`offload_target_store.offload_targets.auth_credential` and
+`runtime_config_store.runtime_config_secrets.sealed_value`
+(`scan_orphaned_versions` in `pg/secret_codec.cpp`, run for every registered
+column). The refusal line names the version number or numbers (`v<N>`), not the
+table or the account. Each store has its own codec and its own scan, and the
+refusal line names the store (for example `webhook_store SecretCodec::init()
+failed`; the auth store's own line carries no store name). The SQL in this
+runbook clears MFA enrolment only: clearing an account's TOTP secret therefore
+fixes an orphan only if that orphan lives in `auth.users`, and an orphan in any
+other store is recovered by restoring the paired `kek_meta` and keys backup, not
+by SQL here (the server otherwise keeps refusing with the same line).
+
+**Identify the affected accounts first (read-only).** The query below reads the
+same four header bytes the boot check reads and lists the accounts whose TOTP blob
+names a version that is not in `kek_meta`. It changes nothing.
+
+```sql
+SELECT username, blob_kek_version
+  FROM (SELECT username,
+               ('x' || encode(substring(mfa_totp_secret from 2 for 4), 'hex'))
+                 ::bit(32)::bigint AS blob_kek_version
+          FROM auth.users
+         WHERE mfa_totp_secret IS NOT NULL
+           AND length(mfa_totp_secret) >= 5) AS blobs
+ WHERE blob_kek_version NOT IN (SELECT kek_version FROM secrets.kek_meta)
+ ORDER BY username;
+
+-- For comparison: the registered versions (retired ones count as registered).
+SELECT kek_version, created_at, retired_at FROM secrets.kek_meta ORDER BY kek_version;
+```
+
+The `length(...) >= 5` filter mirrors the boot check, which skips a blob too short to
+have a four-byte version. A zero-row result for `auth.users` while the server still
+refuses to start means the orphan is in one of the other columns. To check one,
+repeat the first query with that table and column, for example
+`webhook_store.webhooks` and `secret`.
+
+**Choose the remedy by the version number the log names.** Versions are small
+integers: the first is `1` and each KEK rotation adds one.
+
+- **The version legitimately existed** (a small number that a real rotation could
+  have produced, for example one missing from the middle of the `kek_meta` list or
+  one above its highest entry): a registration row was deleted, or the database was restored against a
+  mismatched `kek_meta`. This is the first-choice case, and the server's own
+  message prescribes the fix: restore `kek_meta` **and** the keys directory from the
+  paired backup (see [Backup, the KEK pairing rule](#backup--the-kek-pairing-rule)
+  and [KEK permanently lost](#kek-permanently-lost)). It recovers every affected
+  account and every other store at once without discarding enrolments, and it is the
+  remedy for an orphan outside `auth.users`, where this runbook offers no clearing
+  statement. Do not clear secrets that a correct restore would have kept.
+- **The blob header is corrupt** (a version number that cannot be real, such as
+  `2880154539`, which is what a damaged or garbage blob header decodes to): the
+  secret is not recoverable by any backup of the keys. The
+  [direct SQL fallback](#fallback-direct-sql) is the remedy, because writing NULL
+  needs no key. Run it only for the accounts the identification query listed with
+  such a version, not for accounts whose blob is intact. Keep the existing warnings:
+  it writes no audit row, so record it by hand. The account can re-enrol afterwards.
+
+If the identification query lists more than one account, or the missing version is
+one in use by many blobs, the cause is probably a `kek_meta` and keys-directory pair
+that no longer match, which points to the restore rather than to clearing accounts
+one by one.
 
 ## Break-glass arm (IdP outage under `--auth-mode=sso-only`)
 
@@ -741,6 +839,229 @@ sudo systemctl restart yuzu-server
 
 # 3. Restore enforcement and restart.
 ```
+
+## Step-up returns 503 while the authentication store is unavailable
+
+The 36 routes that need a fresh MFA step-up (token, session, engine-principal,
+RBAC and Guardian writes, password reset and the others listed in the
+[REST API reference](../user-manual/rest-api.md#step-up-envelope-on-high-risk-endpoints))
+check the caller's MFA state before the route runs. Other mutating routes and all
+MCP tools are not step-up gated in this release, so this incident does not close
+them. A gated route answers **`503`** and does not run in three cases:
+
+- the server has **no wired authentication store** (reason
+  `auth_store_unwired`). This is a defensive state (a boot-wiring fault, or a
+  build that wires no store), not a field condition you should see after a
+  normal boot. It answers `503` for any caller that reaches the check, a token
+  caller included, and even when the step-up window is disabled;
+- the store is wired but **cannot be read, or an enrolled account's stored second
+  factor cannot be decrypted** (reason `mfa_status_unavailable`). This answers
+  `503` to **local (password) sessions only**, since those are the only sessions
+  whose enrollment is read from the store. API-token and MCP-token callers pass
+  before any store read, OIDC sessions are judged on the identity provider's
+  assertion, SAML sessions get their `403`, and engine principals get `403`;
+- the check itself **threw an unexpected exception**, or could not fingerprint the session
+  (reason `chokepoint_exception` for both). An exception can arise for any caller class; a
+  fingerprint failure is reached only after the decision has passed, so an engine principal or a
+  SAML session still gets its `403`. This is a fault in the server rather than in the store: the
+  server log (sampled, one line in 100) holds the exception text for a thrown exception, or
+  `could not fingerprint the session for <route label>` for a fingerprint failure, and the
+  window lever below is not a fix for either.
+
+```json
+{"error": {"code": 503, "message": "authentication store is temporarily unavailable", ...},
+ "meta": {"api_version": "v1", "mfa_step_up_required": true}}
+```
+
+There is no `challenge_url`: this is a server-side outage, not a request to
+re-prove, so entering a TOTP code cannot clear it. The envelope's `meta` still
+carries `mfa_step_up_required: true`, so a client must treat a `503` as "retry
+shortly" and prompt for a code only on a `401`. Each refusal writes an
+`mfa.step_up.required` audit row, best effort (every refusal has `result=error`;
+the `reason=` token in `detail` tells them apart: a missing store is
+`reason=auth_store_unwired`, an unreadable enrollment
+`reason=mfa_status_unavailable`, an unexpected failure inside the check itself
+`reason=chokepoint_exception` (also written when the session could not be fingerprinted); the `detail` also carries `cid=<id>`, equal to the
+response's `X-Correlation-Id` header, and `stage=pre_authz`), and
+`yuzu_auth_mfa_step_up_gate_total{outcome="unavailable"}` counts the 503s. If the
+audit store is down too, the rows are lost and the counter is the only record. A
+read failure the store does not classify as unavailable is answered `401` instead,
+with the same `mfa_status_unavailable` reason and a remediation that says the
+authentication store is unavailable; it is counted as `refused`, not
+`unavailable`, so the alert below does not see it. A `503` is never a pass: the
+gated route stays closed until the cause is fixed.
+
+**The alert is slow by design.** `YuzuStepUpGateUnavailable` fires when the
+`unavailable` outcome counts at least **3** refusals in a 10-minute window for one
+instance and surface, held for 5 minutes. Expect it **no earlier than about 5
+minutes after the third `503`**, plus scrape and evaluation delay, and it clears
+up to 10 minutes after the last `503`. One or two stray `503`s never fire it, so a
+quiet alert does not prove the check is healthy: on a low-traffic instance, read
+the counter and the audit rows directly. The threshold is per (job, instance,
+surface), so a few `503`s on each of many replicas (or spread across both
+surfaces) may never reach 3 on any one series and not fire at all; during a
+suspected outage, sum the counter across replicas yourself.
+
+### When Postgres is stalled rather than down
+
+A database that accepts connections but answers slowly or not at all (a frozen
+host, a saturated disk, a paused container) behaves differently from one that
+refuses connections. The measurements below come from one test rig: the database
+container was paused for 30 seconds (the longer run is noted where it matters),
+so the transport kept acknowledging packets while the database process answered
+nothing. No gated request was admitted during any stall. Each figure below is
+marked as measured or as derived from the code, because the two are not equally
+firm.
+
+- **Gated requests that already hold a database connection wait until the stall
+  ends** (measured). The statement timeout does not cut them short, so they can
+  stay open for the whole stall. That holds while the transport still
+  acknowledges packets, as with a paused or hung database process. Over a dead
+  network path the 10 second `tcp_user_timeout` on the pool's connections bounds
+  the wait instead (`pg_pool.hpp`, derived from the code, not measured).
+- **New requests fail with `503`** in about 1.6 to 10.3 seconds (measured over
+  three runs: most failed within about 1.6 seconds, a second group took about 10.3
+  seconds). The slower group is the requests that had to open a fresh connection
+  and waited out the pool's 10 second connect timeout (`connect_timeout_s`,
+  `pg_pool.hpp`).
+- **After about 30 seconds of a long stall, cookie sessions begin to answer `401`
+  `unauthorized` before the step-up check runs**, instead of `503`. The 30 second
+  figure is derived from the code, not measured: the session validation cache is
+  trusted for 30 seconds after the last successful refresh
+  (`kSessionGenStaleServeBoundMs`, `auth.cpp`), after which a session has to be
+  re-read from the database. It was seen only in a longer run (70 second stall),
+  where the first `401` arrived after the first request had itself been held for
+  60 seconds, so that run does not pin the onset. A `401` is still a refusal (the
+  route does not run), but the status class changes from `503` to `401`. A client
+  or monitor that reads every `401` as "re-authenticate" will misread the outage;
+  check the database first.
+- **Engine principals get `401` too** (measured). An engine token is resolved by
+  the same pre-routing authentication as a session, so while the database cannot
+  answer it is not resolved and the request is refused `401` `unauthorized`: no
+  step-up envelope, no per-principal quota check and no step-up audit row. The
+  `403` `engine_principal_denied` answer needs the credential to resolve first; the
+  denial itself never reads the MFA store.
+- **The server recovers without a restart** (one measurement: about 3 seconds
+  after the database answered again, a gated request reached the step-up check
+  and got its normal `401` challenge instead of `503`, and `/readyz` returned
+  `200`). The wait is the pool's connect circuit breaker, whose
+  window is capped at 5 seconds with jitter (`connect_backoff_cap`, `pg_pool.hpp`),
+  so a slower recovery within that cap is expected.
+- **The step-up refusal audit rows for requests during the stall are lost**
+  (measured), as the audit store is the same database.
+
+**What the counters record.** `yuzu_auth_mfa_step_up_gate_total` and
+`yuzu_server_audit_emit_failed_total` count what happened, with two limits.
+First, the gate counter records only refusals the step-up check itself decides.
+A refusal decided before the gate is not counted there: the `401`
+`unauthorized` that cookie sessions get once the session cache lapses, and an
+engine credential that does not resolve during the outage, never reach the check.
+Second, `yuzu_server_audit_emit_failed_total` is exposed with the type `counter`
+(its `# TYPE` line comes from the metric's description, `server.cpp`), but the
+server refreshes its value by a sweep every 15 seconds (the fleet health
+recomputation thread in `server.cpp`), so it lags a burst by up to that long.
+See the alert note above for the gate counter's own alert.
+
+**An audit-only outage looks different.** If the audit store fails while the
+authentication store is healthy, no step-up refusal is `unavailable`: the audit
+write is best effort and never changes the refusal, so the refusals keep their
+normal answer (for example a `401` challenge, counted `refused`) and `YuzuStepUpGateUnavailable` does not fire. The alert that
+covers it is `YuzuAuditPersistFailures` (`docs/prometheus/yuzu-alerts.yml`), which
+fires on `increase(yuzu_server_audit_emit_failed_total[5m]) > 0` held for 2
+minutes, so allow for the 15 second refresh plus that hold. In that outage the
+refusal rows are lost and the counters are the only record.
+
+**Probes during a stall.** `/livez` and `/login` stay fast (milliseconds,
+measured). `/readyz` does not flip at once. It answers from the latest result of
+a background reachability probe, not from a live query: the probe runs every 2
+seconds, each query has a 2 second deadline, and the replica reports not ready
+after 2 consecutive failures (`pg_reachability_rules.hpp`), so it flips within
+about 10 seconds. In the measurements `/readyz` kept answering `200` for the first
+9 seconds of the stall and `503` after. If no probe succeeds for 15 seconds the
+verdict reads stale, which is also not ready, whatever the failure count says.
+`/health` can wait on the database: it resolves a session only when the request
+carries a credential header (`Cookie`, `Authorization` or `X-Yuzu-Token`;
+`resolve_session_fn` in `health_routes.cpp`), and a session lookup that the
+in-memory cache cannot answer is a database read, which during a stall can wait
+for the pool's 10 second connect timeout when it has to open a connection
+(derived from the code; not measured on this path). That figure is not an upper
+bound: a request that already holds a database connection waits until the stall
+ends (see the first bullet of the list above; measured there for gated requests,
+not on this path). A request with no credential header resolves no session.
+`/livez` does no session or database work. Point **liveness** probes at `/livez`
+and **readiness** probes at `/readyz`, not at `/health`: a liveness probe that
+waits on the database during a stall can fail repeatedly and restart a server
+that would have recovered by itself; the restart then makes the incident longer.
+
+### Precondition: Postgres must be reachable
+
+Everything below assumes the server is running, which means it reached Postgres at
+boot (the server refuses to start otherwise; see
+[Postgres substrate unreachable](#postgres-substrate-unreachable)). If the server
+is down, this section does not apply: use the boot procedures above.
+
+### Work through the cause, not the route
+
+1. Is Postgres reachable from the server now? See
+   [Postgres substrate unreachable](#postgres-substrate-unreachable). Logins
+   fail at the same time, so this is usually the same incident.
+2. Did the KEK resolve? A non-zero `secret_decrypt_failures_total` for the
+   `auth` store means enrolled accounts cannot be read; see
+   [KEK missing or unreadable](#kek-missing-or-unreadable).
+3. Check `yuzu_auth_secret_unavailable_total{route="mfa_stepup"}` against the
+   other `route` values: if only `mfa_stepup` moves, look at the one account
+   named in the audit rows' `detail`.
+
+### Single account: prefer `--mfa-reset`
+
+If one account's second factor is the problem (a corrupt or undecryptable
+secret), reset that account with
+[`yuzu-server --mfa-reset <username>`](#the---mfa-reset-cli-audited). It is
+audited (`mfa.reset.breakglass`), needs the Postgres DSN and the keys directory,
+and does not touch any other account or the rest of the fleet's step-up
+protection. The account can re-enrol afterwards. Prefer it over the window
+lever below. If `--mfa-reset` fails with `kek_orphaned`, the stored secret names
+a key version that is not registered: see
+[Stored secret names an unregistered KEK version](#stored-secret-names-an-unregistered-kek-version),
+which makes restoring the paired `kek_meta` and keys backup the first choice and
+keeps the [direct SQL fallback](#fallback-direct-sql) for a corrupt blob header.
+
+### Last resort: disable the proof requirement fleet-wide
+
+`--mfa-step-up-window-secs 0` (or less) makes the check pass without reading the
+enrollment, so a gated route runs again for a local session. It is a deliberate
+security reduction for **every** gated route and every account (see
+[Locked out by MFA enforcement misconfiguration](#locked-out-by-mfa-enforcement-misconfiguration)
+for the other recovery lever), so use it only when you cannot restore the
+authentication store or reset the affected account. Know its limits:
+
+- **It does not help the `auth_store_unwired` reason.** The null-store check
+  runs before the window is consulted, so a server with no wired store answers
+  `503` at any window value. That is a defensive state (a boot-wiring fault or
+  a build that wires no store); restart the server with the store configured. The window lever only helps the
+  `mfa_status_unavailable` case, and then only for the routes the check guards.
+- **It is per process.** Set it on every replica that is failing, by restarting
+  each with the flag; a replica you did not restart keeps refusing. The same holds
+  for the revert: restore the window (default `300`) and restart **each** replica
+  once the store is back. A replica left at `0` is a silent hole in step-up
+  protection for as long as it runs.
+- **The JIT-elevation routes ignore it.** They substitute a 300 s window, so
+  elevation still asks for a fresh proof and still fails if the store cannot be
+  read.
+- **SAML sessions pass too.** The window check precedes the SAML denial, so while
+  the window is `0` or less a SAML session reaches all 36 routes instead of
+  getting its `403`.
+- **Step-up evidence thins out.** While the window is `0` or less, no stale proof
+  is refused, so none is recorded as a `mfa.step_up.required` row (passes never
+  write one); the SAML refusal and the store read are skipped as well. Engine
+  denials and unwired-store refusals still apply and are still recorded. Write the start and end times of the
+  window into your incident record; the audit log cannot reconstruct them.
+- **The reminder is slow too.** `YuzuStepUpWindowDisabled` fires after the gauge
+  has read `0` or less for 10 minutes, so a short-lived window passes without an
+  alert.
+
+The server logs a startup `WARN` while the flag is in force. Restore the window and
+restart once the store is back.
 
 ## What you cannot recover from
 

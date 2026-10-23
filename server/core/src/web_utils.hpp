@@ -493,9 +493,28 @@ normalise_trusted_origins(std::span<const std::string> raw) {
 /// caller that forgets it gets exactly the pre-#2537 behaviour — same-host only,
 /// which refuses a proxied browser POST. Forgetting degrades to fail-closed, it
 /// never opens a hole.
+///
+/// `listener_is_tls` says whether the listener that received the request
+/// terminates TLS itself. The Host header carries no scheme, so the scheme of the
+/// listener is the only trustworthy statement of what the public scheme is, and
+/// it has to come from the caller. It defaults to false, which is the legacy loose
+/// comparison, so every per-route defence-in-depth caller is unchanged; the
+/// pre-routing gate passes the web listener's real state.
+///   - true: the same-host branch requires the source (Origin, else Referer) to
+///     carry `https://` (case-insensitive); any other scheme, or none, is not
+///     same-host and can only match a trusted-origin entry. Ports are canonicalised
+///     scheme-aware: `:443` is stripped from both sides and `:80` is NOT, so
+///     Origin `https://h:80` never equals Host `h:443`.
+///   - false: the legacy loose compare, plus declared-scheme pinning: when the
+///     source scheme is `http://` and `trusted_origins` holds an `https://` entry
+///     for the same host[:port], the operator has declared https as the public
+///     scheme, so the plain-http source is not same-host. Residual: a TLS-terminating
+///     proxy in front of a plain listener WITHOUT such a declared entry still has
+///     an `http://` Origin for the same host and port treated as same-site.
 inline bool origin_is_same_site(std::string_view host, std::string_view origin,
                                 std::string_view referer,
-                                std::span<const std::string> trusted_origins = {}) {
+                                std::span<const std::string> trusted_origins = {},
+                                bool listener_is_tls = false) {
     auto strip_default_port = [](std::string h) -> std::string {
         auto colon = h.rfind(':');
         if (colon == std::string::npos)
@@ -522,8 +541,9 @@ inline bool origin_is_same_site(std::string_view host, std::string_view origin,
             return std::nullopt; // userinfo → malformed, fail closed
         return url;
     };
-    // Scheme of the request origin, lowercased, "" when absent. Only consulted
-    // for allowlist entries that themselves carry a scheme.
+    // Scheme of the request origin, lowercased, "" when absent. Consulted by the
+    // TLS-listener same-host rule, the declared-scheme pin, and allowlist entries
+    // that themselves carry a scheme.
     auto extract_scheme = [](std::string_view url) -> std::string {
         const auto sep = url.find("://");
         if (sep == std::string_view::npos)
@@ -539,12 +559,58 @@ inline bool origin_is_same_site(std::string_view host, std::string_view origin,
     auto extracted = extract_host(std::string(source));
     if (!extracted)
         return false; // userinfo → fail closed, before any allowlist consideration
-    // Same-host: the LOOSE strip on both sides, byte-for-byte the pre-#2537
-    // behaviour. The Host header carries no scheme, so there is no default to be
-    // aware of here, and tightening it would change a path this issue never
-    // touched.
-    if (strip_default_port(*extracted) == strip_default_port(std::string(host)))
-        return true;
+    const std::string source_scheme = extract_scheme(source);
+    if (listener_is_tls) {
+        // The listener terminates TLS, so a same-host claim must itself be https. The
+        // port rule is scheme-aware (RFC 6454): only `:443` is the default here, on
+        // both sides, so `https://h:80` is a different origin from Host `h:443`.
+        // A malformed authority with more than one port-like suffix (`h:80:443`) is never
+        // same-host: the single default-port strip below would otherwise equate it with
+        // `h:80`.
+        const auto one_port_at_most = [](std::string_view a) {
+            if (!a.empty() && a.front() == '[') {
+                const auto close = a.find(']');
+                if (close == std::string_view::npos)
+                    return false;
+                a.remove_prefix(close + 1);
+                return a.empty() || (a.front() == ':' && a.find(':', 1) == std::string_view::npos);
+            }
+            return a.find(':') == a.rfind(':');
+        };
+        if (source_scheme == "https://" && one_port_at_most(*extracted) &&
+            one_port_at_most(host) &&
+            strip_scheme_default_port(*extracted, "https://") ==
+                strip_scheme_default_port(std::string(host), "https://"))
+            return true;
+    } else if (strip_default_port(*extracted) == strip_default_port(std::string(host))) {
+        // Plain listener: the LOOSE strip on both sides, byte-for-byte the pre-#2537
+        // behaviour, because the Host header carries no scheme. The one tightening is
+        // declared-scheme pinning: an operator who declared `https://h` as a trusted
+        // origin has said https is the public scheme for h, so an `http://` source
+        // for that host[:port] is refused. The source host is canonicalised under
+        // both schemes' default so `http://h:443` cannot slip past an `https://h`
+        // entry; the entry itself was canonicalised by `normalise_trusted_origins`.
+        bool pinned_to_https = false;
+        if (source_scheme == "http://") {
+            std::string lowered = *extracted;
+            for (auto& c : lowered)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            const std::string as_http = strip_scheme_default_port(lowered, "http://");
+            const std::string as_https = strip_scheme_default_port(lowered, "https://");
+            constexpr std::string_view kHttps = "https://";
+            for (const auto& entry : trusted_origins) {
+                if (entry.size() > kHttps.size() && entry.compare(0, kHttps.size(), kHttps) == 0) {
+                    const std::string_view hp = std::string_view(entry).substr(kHttps.size());
+                    if (hp == as_http || hp == as_https) {
+                        pinned_to_https = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!pinned_to_https)
+            return true;
+    }
 
     // Allowlist. Compare lowercased, since a config value's case is the
     // operator's typing and a silent no-match there is an opaque 403.
@@ -552,7 +618,7 @@ inline bool origin_is_same_site(std::string_view host, std::string_view origin,
     // `normalise_trusted_origins` canonicalised the entries — so `https://h:80`
     // and `https://h` stay distinct on both sides rather than collapsing into
     // one over-broad entry (#2641 review).
-    const std::string want_scheme = extract_scheme(source);
+    const std::string& want_scheme = source_scheme;
     std::string want = strip_scheme_default_port(std::move(*extracted), want_scheme);
     for (auto& c : want)
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -562,6 +628,12 @@ inline bool origin_is_same_site(std::string_view host, std::string_view origin,
     // elsewhere, especially now that five call sites supply the span. An empty
     // `want` means a host-less source, which is never a same-site claim.
     if (want.empty() || want.front() == ':')
+        return false;
+    // `null` is the reserved serialisation of an opaque origin (sandboxed iframe,
+    // cross-origin redirect, `file://`). `normalise_trusted_origins` drops a bare
+    // `null` entry, but the gate's safety must not rest on that: refuse it here
+    // even if a raw, un-normalised `null` entry reached the span.
+    if (want == "null")
         return false;
     for (const auto& entry : trusted_origins) {
         if (const auto sep = entry.find("://"); sep != std::string::npos) {
@@ -587,12 +659,13 @@ inline bool origin_is_same_site(std::string_view host, std::string_view origin,
 /// be refused.
 [[nodiscard]] inline bool browser_write_is_cross_site(
     std::string_view auth_source, std::string_view host, std::string_view origin,
-    std::string_view referer, std::span<const std::string> trusted_origins = {}) {
+    std::string_view referer, std::span<const std::string> trusted_origins = {},
+    bool listener_is_tls = false) {
     if (auth_source == "api_token" || auth_source == "mcp_token" || auth_source == "engine_token")
         return false;
     if (origin.empty() && referer.empty())
         return true;
-    return !origin_is_same_site(host, origin, referer, trusted_origins);
+    return !origin_is_same_site(host, origin, referer, trusted_origins, listener_is_tls);
 }
 
 /// The MCP transport body-cap decision for the server's pre-routing handler
@@ -771,7 +844,7 @@ template <typename Req>
 /// `oversize = !unmeasurable && content_length > cap`, so the BROAD rule
 /// suppressed the size check: `Transfer-Encoding: identity` plus a
 /// `Content-Length` of 8 MiB was admitted on every class whose
-/// `requires_measurable` is false — 24 of 25, including the rate-limit-exempt
+/// `requires_measurable` is false, 24 of 25, including the
 /// health probes — because httplib honours an exact `chunked` and NOTHING
 /// else, falling through to `Content-Length` and reading every byte. The gate
 /// discarded a length httplib was about to act on. Verified on a raw socket

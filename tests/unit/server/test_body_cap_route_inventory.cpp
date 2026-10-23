@@ -16,6 +16,10 @@
  * author never looked at. Only a comparison against the ACTUAL REGISTERED
  * ROUTE TABLE — this file — can catch that.
  *
+ * The scan helpers (`discover_mutating_routes`, `read_all_cpp_files`, `probe_path`, the memoisation
+ * described under CACHING) live in route_inventory_scan.hpp, shared with
+ * test_step_up_route_inventory.cpp; the description below is of what that scan does.
+ *
  * MECHANISM — no hand-copied route list. A hand-copied list goes stale
  * exactly like the thing it's testing. This test opens every `*.cpp` AND
  * `*.inc` file under `server/core/src` (recursively, via
@@ -111,6 +115,7 @@
 #include "body_cap_policy.hpp"
 #include "route_registration_scan.hpp"
 #include "source_scan.hpp"
+#include "route_inventory_scan.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -125,10 +130,6 @@
 #include <string_view>
 #include <utility>
 #include <vector>
-
-#ifndef YUZU_SERVER_SRC_DIR
-#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build (meson.project_source_root() / 'server' / 'core' / 'src') — see the server_test_exe cpp_args block."
-#endif
 
 using yuzu::server::resolve_body_cap;
 namespace route_scan = yuzu::test::route_scan;
@@ -273,6 +274,7 @@ std::vector<RegisteredRoute> discover_mutating_routes() {
     }();
     return cached;
 }
+using namespace yuzu::server::test::route_scan;
 
 /// `{method, EXACT raw registered path text (as it appears in source —
 /// regex patterns included verbatim), why the 4 MiB catch-all default is

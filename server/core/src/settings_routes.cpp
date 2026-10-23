@@ -28,6 +28,7 @@
 #include "integrations_render.hpp" // MCP + Gateway panel markup and the MCP form parser
 #include "json_extract.hpp" // #2557: shared extract_json_string (was an anonymous-namespace copy)
 #include "mcp_policy.hpp"
+#include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log (enrol-confirm stamp log)
 #include "oidc_writer_gate.hpp" // writer priority for the OIDC lock (#5692 UP-13)
 #include "rbac_admin_predicate.hpp" // is_self_target — shared #397/#403 self-target comparison
 #include "rbac_store.hpp"       // access-review read-model direct-grant reads
@@ -37,6 +38,7 @@
 #include "plugin_signing_helpers.hpp"
 #include "rest_a4_envelope.hpp"      // #4028 — detail::error_json_a4 for the settings read-twins
 #include "audited_write.hpp"          // detail::audit_attempted — audit-first settings.mcp
+#include "auth_routes.hpp"           // AuthRoutes::extract_session_cookie (enrol-confirm proof stamp)
 #include "rest_a4_envelope_http.hpp" // #4028 — detail::a4_error/ensure_correlation_id
 #include "rest_audit.hpp"            // #4028 — detail::emit_behavioral_audit (fail-closed REST reads)
 #include "settings_model.hpp"        // #4028 — shared REST/fragment read-twin builders
@@ -140,9 +142,14 @@ std::string url_encode(const std::string& s) {
 
 // A refused MFA step-up on an htmx form: `step_up_fn_` has already written the refusal (a 401/403/503
 // A4 envelope). htmx swaps no 4xx/5xx body, so without a toast the button looks dead. Show the
-// envelope's own `error.message` (never its `remediation`, which for a SAML session points back at
-// a sign-in that cannot help); fall back to a fixed message if the body is not an envelope.
+// envelope's own `error.message` (never its `remediation`, which names API-caller steps such as a
+// token or a POST route, not something the form can do); fall back to a fixed message if the body is not an envelope.
+// An in-handler refusal (require_mfa_step_up) already toasts on an htmx request via
+// render_step_up_refusal; Response::set_header appends to a multimap, so a second HX-Trigger here
+// would put two lines on the wire. Do nothing when one is already set.
 void toast_step_up_refusal(httplib::Response& res) {
+    if (res.has_header("HX-Trigger"))
+        return;
     std::string message = "MFA step-up required";
     try {
         const auto body = nlohmann::json::parse(res.body, nullptr, false);
@@ -4423,8 +4430,9 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
-        // Same-site gate (audited_write.hpp rule 1), after the permission gate and before any
-        // state is read or changed.
+        // Same-site gate (audited_write.hpp rule 1): defence in depth behind the central
+        // pre-routing gate, which already answered any cookie-session write before this handler
+        // ran. This copy sits after the permission gate and before any state is read or changed.
         if (refuse_cross_site(req, res, *session, "/api/settings/users/{username}"))
             return;
         // PR2 — MFA step-up gate. Deleting a user destroys a principal;
@@ -5732,6 +5740,10 @@ void SettingsRoutes::register_routes(
         }
         return out;
     };
+    // Cookie-session writes require a same-site Origin or Referer; the pre-routing gate
+    // (same_site_write_gate.hpp) decides that, after authentication, before this handler runs.
+    // This copy is defence in depth and serves the TestRouteSink tests, which bypass
+    // pre-routing. It is not a substitute for the central gate.
     auto origin_safe = [this, sanitise](const httplib::Request& req, httplib::Response& res,
                                         const std::string& action_for_audit) -> bool {
         auto host = req.get_header_value("Host");
@@ -6089,9 +6101,9 @@ void SettingsRoutes::register_routes(
     sink.Post("/api/settings/mcp", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
-        // Same-site gate for a cookie-authorised write: unlike origin_safe above, a header-less
-        // cookie request is refused (browsers always send an Origin on a write); token callers
-        // are exempt.
+        // Same-site check for a cookie-authorised write: a cookie request without a same-site
+        // Origin or Referer is refused here too (the pre-routing gate decides it first, so this
+        // copy is defence in depth); token callers are exempt.
         const auto session = auth_fn_(req, res);
         if (!session)
             return;
@@ -6645,9 +6657,9 @@ void SettingsRoutes::register_routes(
     // are a different origin, which is what Origin/Referer catches.
     //
     // We require Origin (or Referer as fallback) to carry the
-    // same host as the request's Host header; absence means a non-
-    // browser caller (curl, automation) which is explicitly allowed
-    // because programmatic admin clients post without an Origin header.
+    // same host as the request's Host header. Cookie-session writes require a
+    // same-site Origin or Referer; the pre-routing gate (same_site_write_gate.hpp)
+    // decides that first, and this copy is defence in depth.
     // Mismatched host → 403, audited as csrf.denied for SIEM correlation.
     //
     // Hardenings from the re-review round of the Hermes fixes:
@@ -6662,14 +6674,13 @@ void SettingsRoutes::register_routes(
     //    validate URL shape, so anything containing `@`, `?`, or `#`
     //    is treated as a fail-closed mismatch.
     //
-    // Scoping note (Gate 4 SHOULD S2 — known follow-up): origin_safe is
-    // wired into the 4 mutating MFA POSTs and the 4 auto-approve writes
-    // only. 11 sibling state-changing Settings POSTs (/api/settings/users/*,
-    // plugin-signing, OIDC, cert, enrollment-tokens, tls) remain CSRF-unprotected
-    // pending a follow-up PR that wraps every admin HTMX mutation. The
-    // asymmetric defence is documented in CHANGELOG and is NOT a
-    // regression introduced by this PR — those sites were unprotected
-    // before PR1 too.
+    // Scoping note: cookie-session writes require a same-site Origin or
+    // Referer, enforced centrally in the pre-routing stage after
+    // authentication (same_site_write_gate.hpp). origin_safe is wired into
+    // the routes that carry a per-route copy, as defence in depth; its
+    // audit rows (result=error, sanitised header bytes) are written only
+    // for a request the central gate admitted, or by a TestRouteSink test
+    // that bypasses pre-routing.
 
     sink.Get("/fragments/settings/mfa", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))
@@ -6837,7 +6848,65 @@ void SettingsRoutes::register_routes(
                                       "text/html; charset=utf-8");
                       return;
                   }
-                  audit_fn_(req, "mfa.enroll.verified", "ok", "User", session->username, "");
+                  // Enrolment has just committed, and the code that committed it IS a fresh proof
+                  // of the factor: stamp the CURRENT cookie session's step-up proof (the same
+                  // `mark_session_mfa_verified` as POST /login/mfa/stepup, so the DB-clock
+                  // authoring and every replica's cache refresh are that primitive's), so the
+                  // operator can regenerate recovery codes or disable MFA from this very session
+                  // without a separate step-up. Only a local cookie session is stamped, and only
+                  // when the cookie resolves to the SAME user the form was verified for: a bearer
+                  // credential, an OIDC/SAML session or a mismatched cookie never earns it. A
+                  // failed stamp does not undo the enrolment (the codes below are shown once), and
+                  // neither does a throw from the stamp: the stamp block is wrapped, so the stamp
+                  // can never drop the codes reveal or the audit rows below. Those two audit_fn_
+                  // calls and the render follow it unguarded, exactly like every other handler in
+                  // this file (a throw there is not caught here). The Settings
+                  // panel cannot prompt for a step-up, so an operator who is not stamped signs in
+                  // again to earn a proof. Never reached on a failed or rejected verification (all
+                  // return above).
+                  // The audit row below says only `not_stamped`; this line says why. Sampled (1 in
+                  // kStampThrewLogEvery, the first always) so a failing auth store cannot become a log storm.
+                  // `what()` is text an exception chose, so it is sanitised. Guarded: a formatter
+                  // or logger throw must not escape the catch and drop the codes reveal.
+                  const auto note_stamp_threw = [](const char* what) noexcept {
+                      try {
+                          static std::atomic<uint64_t> stamp_threw_hits{0};
+                          if (stamp_threw_hits.fetch_add(1, std::memory_order_relaxed) %
+                                  kStampThrewLogEvery != 0)
+                              return;
+                          if (what)
+                              spdlog::warn("enrol-confirm: step-up proof stamp threw; recording "
+                                           "not_stamped ({})",
+                                           onbehalf::sanitize_for_log(what));
+                          else
+                              spdlog::warn("enrol-confirm: step-up proof stamp threw; recording "
+                                           "not_stamped");
+                      } catch (...) { // NOLINT(bugprone-empty-catch)
+                      }
+                  };
+                  bool proof_stamped = false;
+                  try {
+                      if (auth_mgr_ && session->auth_source == "local") {
+                          const auto cookie_token = AuthRoutes::extract_session_cookie(req);
+                          if (!cookie_token.empty()) {
+                              const auto cookie_session = auth_mgr_->validate_session(cookie_token);
+                              if (cookie_session && cookie_session->auth_source == "local" &&
+                                  cookie_session->username == session->username) {
+                                  if (stamp_fault_hook_) // test seam, empty in production
+                                      stamp_fault_hook_();
+                                  proof_stamped = auth_mgr_->mark_session_mfa_verified(cookie_token);
+                              }
+                          }
+                      }
+                  } catch (const std::exception& ex) {
+                      proof_stamped = false;
+                      note_stamp_threw(ex.what());
+                  } catch (...) {
+                      proof_stamped = false;
+                      note_stamp_threw(nullptr);
+                  }
+                  audit_fn_(req, "mfa.enroll.verified", "ok", "User", session->username,
+                            proof_stamped ? "step_up_proof=stamped" : "step_up_proof=not_stamped");
                   audit_fn_(req, "mfa.recovery_codes.generated", "ok", "User",
                             session->username, "10 codes issued");
                   set_no_store(res);
@@ -6855,6 +6924,14 @@ void SettingsRoutes::register_routes(
                   auto session = auth_fn_(req, res);
                   if (!session || session->username.empty()) {
                       res.status = 401;
+                      return;
+                  }
+                  // MFA step-up gate. Minting a fresh recovery-code set hands the caller a
+                  // credential that satisfies the step-up challenge itself, and disabling MFA removes
+                  // the factor the gate checks; both need a fresh proof first. Before any mutation.
+                  if (step_up_fn_ &&
+                      !step_up_fn_(req, res, *session, "POST /api/settings/mfa/recovery-codes")) {
+                      toast_step_up_refusal(res);
                       return;
                   }
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
@@ -6890,6 +6967,13 @@ void SettingsRoutes::register_routes(
                   auto session = auth_fn_(req, res);
                   if (!session || session->username.empty()) {
                       res.status = 401;
+                      return;
+                  }
+                  // MFA step-up gate (see recovery-codes above): stripping the factor the gate
+                  // checks needs a fresh proof. Before the enforcement guard and any mutation.
+                  if (step_up_fn_ &&
+                      !step_up_fn_(req, res, *session, "POST /api/settings/mfa/disable")) {
+                      toast_step_up_refusal(res);
                       return;
                   }
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
