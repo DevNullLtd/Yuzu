@@ -8,7 +8,6 @@
 #include "dex_score_policy_writer.hpp"
 #include "rest_api_v1.hpp"
 
-#include "../test_helpers.hpp"
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -156,7 +155,7 @@ std::string etag_of(const std::string& rev) { return "\"" + rev + "\""; }
 
 } // namespace
 
-TEST_CASE("score-policy routes: unwired, all three answer 503 with an A4 body",
+TEST_CASE("score-policy routes: with no writer wired all three answer 503 with an A4 body",
           "[server][routes][dex][score_policy]") {
     Harness h(/*wire_writer=*/false);
     for (const char* method : {"GET", "PUT", "DELETE"}) {
@@ -368,7 +367,7 @@ TEST_CASE("score-policy routes: PUT happy path answers 200 with the new revision
     CHECK(h.stored == body);
 }
 
-TEST_CASE("score-policy routes: a dry run's ETag is the current revision, not the would-be one",
+TEST_CASE("score-policy routes: a dry run's ETag is the current revision and not the would-be one",
           "[server][routes][dex][score_policy]") {
     Harness h;
     h.stored = doc_with_excellent(90.0);

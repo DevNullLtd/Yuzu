@@ -851,6 +851,26 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `get.api-inventory-param-param`, `get.api-agents`,
        `get.fragments-network-overview`, `get.api-tags`).
 
+   - **2026-10-23 - DEX customer score policy (`GET`, `PUT` and `DELETE
+     /api/v1/dex/score-policy`, #6086).** REST-only, no MCP twin: a "no" on
+     Decision 1's both-surfaces requirement, recorded rather than fixed in the
+     same change because the REST routes and the one write function behind
+     them ship first and the MCP twins follow over that function.
+     - **No MCP twin - tracked follow-up, not a permanent exception.** The
+       three twins are tracked as **#6087**; **revisit by 2027-01-31**. Until
+       they land, this row stands as the open exception for these routes, and
+       it retires when the twins merge (this entry is then amended to say so).
+       It is recorded here only: `scripts/ci/api-parity/*.json` does not track
+       a new `/api/v1` route that has no twin, so no ledger row is added.
+     - **The exception relaxes no control.** The routes are in
+       `openapi_spec()` and `GET /api/v1/routes` (A2/A3 hold for the REST
+       half), every error is the A4 envelope, `PUT` and `DELETE` need
+       `Infrastructure:Write` and an `If-Match` precondition, are audit-first
+       and fail closed on audit (`dex.score_policy.update`, `.reset`,
+       `.validate`), and a service-scoped token is refused at the gate.
+     - Wire reference: `docs/user-manual/rest-api.md`, "GET / PUT / DELETE
+       /api/v1/dex/score-policy"; audit rows: `docs/user-manual/audit-log.md`.
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.

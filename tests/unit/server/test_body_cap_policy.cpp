@@ -398,8 +398,8 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
 // rest-api.md carried the identical stale claim (both fixed together). A
 // regression on the upload_session opt-in would have shipped with this
 // test green.
-TEST_CASE("resolve_body_cap: requires_measurable is ON for /mcp/, upload_session, and "
-         "hardware, OFF for every other named class",
+TEST_CASE("resolve_body_cap: requires_measurable is ON for /mcp/ and upload_session and "
+         "hardware and dex_score_policy and OFF for every other named class",
          "[body_cap]") {
     CHECK(resolve_body_cap("POST", "/mcp/v1/").requires_measurable);
     CHECK(resolve_body_cap("GET", "/mcp/v1/").requires_measurable);
@@ -408,6 +408,8 @@ TEST_CASE("resolve_body_cap: requires_measurable is ON for /mcp/, upload_session
     CHECK(resolve_body_cap("POST", "/api/v1/hardware/agent-1/sync").requires_measurable);
     CHECK(resolve_body_cap("POST", "/api/v1/hardware/sync").requires_measurable);
     CHECK(resolve_body_cap("GET", "/api/v1/hardware").requires_measurable);
+    CHECK(resolve_body_cap("PUT", "/api/v1/dex/score-policy").requires_measurable);
+    CHECK(resolve_body_cap("GET", "/api/v1/dex/score-policy").requires_measurable);
 
     // Public REST (bundles), SCIM, certificate import (REST + dashboard),
     // product-pack/workflow authoring, OTA upload, and plugin-config all

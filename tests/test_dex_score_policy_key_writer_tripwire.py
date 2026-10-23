@@ -21,7 +21,10 @@ Three checks over server/core/src/*.{cpp,hpp}, comments removed:
      (a) `rest_api_v1_->set_dex_score_policy_writer(` is one active line and comes BEFORE
      `rest_api_v1_->register_routes(` (the deps are captured by value there, so a later call
      compiles, keeps every injected-deps rig green and leaves the three routes answering 503);
-     (b) the provider is constructed under `if (runtime_config_store_ && runtime_config_store_->is_open())`
+     (b) the setter sits under exactly `if (dex_score_policy_provider_) {` (the nearest `if (`
+     above it), so the routes answer 503 exactly where there is no provider, that is no open
+     runtime config store, and not wherever some other store is absent;
+     (c) the provider is constructed under `if (runtime_config_store_ && runtime_config_store_->is_open())`
      in the scope that declares `dex_api`, ahead of the `if (guaranteed_state_store_) {` block
      (it depends only on the runtime config store, so nested inside that block the routes answer
      503 wherever the signals store is absent).
@@ -93,6 +96,10 @@ def wiring_problems(text):
     if setter[0] > register[0]:
         out.append("set_dex_score_policy_writer must be called BEFORE register_routes: the deps are "
                    "captured by value there, so a later call leaves all three routes answering 503")
+    guard = next((ln for ln in reversed(lines[:setter[0]]) if ln.startswith("if (")), "")
+    if guard != "if (dex_score_policy_provider_) {":
+        out.append("the writer deps must be set under exactly `if (dex_score_policy_provider_) {`; "
+                   "any other guard changes where the three routes answer 503")
     if lines[provider[0] - 1] != "if (runtime_config_store_ && runtime_config_store_->is_open())":
         out.append("the provider must be guarded by exactly `if (runtime_config_store_ && "
                    "runtime_config_store_->is_open())`; any other guard changes when the routes are 503")
@@ -111,7 +118,9 @@ std::shared_ptr<yuzu::server::DexApi> dex_api;
 if (guaranteed_state_store_) {
     dex_api = make_local_dex_api();
 }
-rest_api_v1_->set_dex_score_policy_writer({});
+if (dex_score_policy_provider_) {
+    rest_api_v1_->set_dex_score_policy_writer({});
+}
 rest_api_v1_->register_routes(*web_server_);
 """
 
@@ -126,11 +135,17 @@ def self_test():
     assert literal_count('x = "dex_score_policy"; // "dex_score_policy"') == 1
     assert literal_count("/* \"dex_score_policy\" */") == 0
     assert wiring_problems(GOOD_WIRING) == [], "the reference wiring must pass"
-    setter, register = ("rest_api_v1_->set_dex_score_policy_writer({});\n",
-                        "rest_api_v1_->register_routes(*web_server_);\n")
+    setter = "if (dex_score_policy_provider_) {\n    rest_api_v1_->set_dex_score_policy_writer({});\n}\n"
+    register = "rest_api_v1_->register_routes(*web_server_);\n"
+    assert setter + register in GOOD_WIRING
     late = GOOD_WIRING.replace(setter + register, register + setter)
     assert any("BEFORE register_routes" in p for p in wiring_problems(late)), "late setter"
-    assert wiring_problems(GOOD_WIRING.replace(setter, "// " + setter)), "commented-out setter"
+    assert wiring_problems(GOOD_WIRING.replace("rest_api_v1_->set_dex_score_policy_writer",
+                                               "// rest_api_v1_->set_dex_score_policy_writer")), \
+        "commented-out setter"
+    swapped = GOOD_WIRING.replace("if (dex_score_policy_provider_) {", "if (guaranteed_state_store_) {")
+    assert any("if (dex_score_policy_provider_) {" in p for p in wiring_problems(swapped)), \
+        "swapped setter guard"
     nested = """\
 std::shared_ptr<yuzu::server::DexApi> dex_api;
 if (guaranteed_state_store_) {

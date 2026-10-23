@@ -18744,16 +18744,6 @@ private:
         // (PreflightRoutes, DeploymentRoutes, TarTreeRoutes, and McpServer's/
         // TarTreeRoutes' `set_all_devices_fn`), unrelated to DeviceRoutes itself.
         auto device_api = make_local_device_api(registry_, tag_store_.get());
-        // ADR-0031 WS-A4 (fifth family): the DEX signals API seam — ONE
-        // instance backing the GuaranteedStateStore-backed GET /api/v1/dex/*
-        // signal/experience reads, wired with the SAME `dex_fleet_fn` closure
-        // (defined above) the DEX fragments/REST/MCP already share, so the
-        // fleet denominator can never diverge between the seam and the
-        // fragments. Passed to RestApiV1::register_routes below.
-        // Gated on store presence so `!dex_api` in the REST handlers is the
-        // exact readiness signal the old `if (!guaranteed_state_store)` 503
-        // guard used: store present → wired; store absent → nullptr → 503
-        // (byte-identical). Mirrors verify_api's "null → 503" contract.
         // The customer score policy is one stored document read through a
         // bounded-refresh provider, so every instance converges within
         // kDexPolicyRefreshMs. It depends only on the runtime config store, so it exists
@@ -18767,6 +18757,16 @@ private:
                                std::chrono::steady_clock::now().time_since_epoch())
                         .count();
                 });
+        // ADR-0031 WS-A4 (fifth family): the DEX signals API seam — ONE
+        // instance backing the GuaranteedStateStore-backed GET /api/v1/dex/*
+        // signal/experience reads, wired with the SAME `dex_fleet_fn` closure
+        // (defined above) the DEX fragments/REST/MCP already share, so the
+        // fleet denominator can never diverge between the seam and the
+        // fragments. Passed to RestApiV1::register_routes below.
+        // Gated on store presence so `!dex_api` in the REST handlers is the
+        // exact readiness signal the old `if (!guaranteed_state_store)` 503
+        // guard used: store present → wired; store absent → nullptr → 503
+        // (byte-identical). Mirrors verify_api's "null → 503" contract.
         std::shared_ptr<yuzu::server::DexApi> dex_api;
         if (guaranteed_state_store_) {
             yuzu::server::DexScorePolicyFn dex_policy_fn;
@@ -21145,9 +21145,10 @@ private:
         // engine class and the session correlator. MUST run BEFORE register_routes().
         rest_api_v1_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());
         // #6086: GET/PUT/DELETE /api/v1/dex/score-policy. The reader and the two conditional
-        // writes borrow runtime_config_store_ by reference, which is reset only after
-        // web_server_->stop() (the same ordering the provider's reader relies on). Without an
-        // open store the three routes answer 503. MUST run BEFORE register_routes().
+        // writes borrow runtime_config_store_ by reference. stop() waits for and joins the
+        // listener thread(s) before it resets the store, so no handler is running when the
+        // reference dies (the same ordering the provider's reader relies on). Without an open
+        // store the three routes answer 503. MUST run BEFORE register_routes().
         if (dex_score_policy_provider_) {
             auto policy_writes = dex_score_policy_store_writer(*runtime_config_store_);
             rest_api_v1_->set_dex_score_policy_writer(

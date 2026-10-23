@@ -7,11 +7,10 @@
  */
 #include "dex_score_policy_writer.hpp"
 
-#include "../test_helpers.hpp"
-
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <functional>
 #include <future>
 #include <memory>
@@ -172,7 +171,7 @@ struct World {
 
 // ── parsers ─────────────────────────────────────────────────────────────────
 
-TEST_CASE("parse_if_match: accepts one strong revision, refuses everything else",
+TEST_CASE("parse_if_match: accepts one strong revision and refuses everything else",
           "[dex][score_policy_writer]") {
     const std::string hex = "0123456789abcdef";
     CHECK(parse_if_match("\"" + hex + "\"").value() == hex);
@@ -191,7 +190,7 @@ TEST_CASE("parse_if_match: accepts one strong revision, refuses everything else"
     CHECK_FALSE(parse_if_match(std::string(65, 'a')));
 }
 
-TEST_CASE("parse_dry_run: absent is false, true and false only", "[dex][score_policy_writer]") {
+TEST_CASE("parse_dry_run: absent is false and only true or false are accepted", "[dex][score_policy_writer]") {
     CHECK(parse_dry_run(std::nullopt).value() == false);
     CHECK(parse_dry_run(std::string("true")).value() == true);
     CHECK(parse_dry_run(std::string("false")).value() == false);
@@ -281,6 +280,24 @@ TEST_CASE("writer: a malformed If-Match is 400 and is recorded neutralised",
     CHECK(w.cas_calls == 0);
 }
 
+TEST_CASE("writer: an untrusted token is capped at 128 bytes and a split character is replaced",
+          "[dex][score_policy_writer]") {
+    using dex_score_policy_writer_detail::cap_token;
+    CHECK(cap_token(std::string(300, 'a')).size() == 128);
+    CHECK(cap_token(std::string(128, 'a')).size() == 128);
+
+    // 127 ASCII bytes then a two-byte character: the cap cuts the character in half. The denied
+    // row must still be written, with the stray lead byte replaced, not lost to a throwing dump.
+    World w;
+    const std::string raw = std::string(127, 'a') + "\xC3\xA9" + "tail";
+    const auto r = w.put(raw, doc_with_excellent(95.0));
+    CHECK(r.status == St::IfMatchMalformed);
+    REQUIRE(w.rows.size() == 1);
+    CHECK(w.rows[0].result == "denied");
+    CHECK(w.rows[0].detail["if_match"].get<std::string>() ==
+          std::string(127, 'a') + "\xEF\xBF\xBD");
+}
+
 TEST_CASE("writer: a stale If-Match is 409 naming the stored revision; nothing is written",
           "[dex][score_policy_writer]") {
     World w;
@@ -315,6 +332,9 @@ TEST_CASE("writer: version 2 is refused with the reader's own wording",
     const auto r = w.put("default", R"({"version":2})");
     CHECK(r.status == St::Invalid);
     CHECK(r.message == "unsupported_version at version: 2 above the supported 1");
+    // The refusal says what to do: a rolling upgrade can leave a newer document stored.
+    CHECK(r.remediation.find("version 1") != std::string::npos);
+    CHECK(r.remediation.find("leave the stored document alone") != std::string::npos);
 }
 
 TEST_CASE("writer: an oversized body is refused at document before it is parsed",
@@ -353,7 +373,7 @@ TEST_CASE("writer: a read failure is 503 with no audit row and no store write",
 
 // ── dry run ─────────────────────────────────────────────────────────────────
 
-TEST_CASE("writer: dry_run validates, checks the precondition and stores nothing",
+TEST_CASE("writer: dry_run validates and checks the precondition and stores nothing",
           "[dex][score_policy_writer]") {
     World w;
     const std::string body = doc_with_excellent(95.0);
@@ -402,7 +422,7 @@ TEST_CASE("writer: a dry run whose validate row is refused is 503 and stores not
 
 // ── PUT ─────────────────────────────────────────────────────────────────────
 
-TEST_CASE("writer: PUT against a never-written policy creates it and installs it",
+TEST_CASE("writer: PUT against a never-written policy creates it and the provider serves it",
           "[dex][score_policy_writer]") {
     World w;
     const std::string body = doc_with_excellent(95.0);
@@ -429,7 +449,7 @@ TEST_CASE("writer: PUT against a never-written policy creates it and installs it
     CHECK(cur->revision == rev);
 }
 
-TEST_CASE("writer: PUT stores the canonical form of the document, not the body as sent",
+TEST_CASE("writer: PUT stores the canonical form of the document and not the body as sent",
           "[dex][score_policy_writer]") {
     World w;
     // Whitespace, a reordered key, an integer edge and a partial document (the rest of the
@@ -449,7 +469,7 @@ TEST_CASE("writer: PUT stores the canonical form of the document, not the body a
     REQUIRE(w.rows.size() == 2);
     CHECK(w.rows[0].detail["revision"] == rev);
     CHECK(w.rows[1].detail["revision"] == rev);
-    // A following GET serves the revision of the stored text; the installed policy agrees.
+    // A following GET serves the revision of the stored text; the provider serves the same one.
     CHECK(dex_policy_in_force_from_stored(w.stored).revision == rev);
     REQUIRE(w.provider->current());
     CHECK(w.provider->current()->revision == rev);
@@ -496,6 +516,93 @@ TEST_CASE("writer: the attempted row carries the whole proposal before the store
     }
 }
 
+// The whole document rides only on the attempted, success and validate rows; every other row
+// (denied, failure, no_change) carries the size of the canonical text instead.
+TEST_CASE("writer: only attempted and success and validate rows carry the document",
+          "[dex][score_policy_writer]") {
+    World w;
+    // Not the canonical text, so the byte count is shown to be the canonical size.
+    const std::string sent =
+        "{ \"version\" : 1,\n  \"tiers\" : { \"edges\" : { \"excellent\" : 95 } } }";
+    const std::string canonical = doc_with_excellent(95.0);
+    REQUIRE(sent.size() != canonical.size());
+    auto full = [](const Row& r) {
+        INFO("result=" << r.result);
+        CHECK(r.detail.contains("document"));
+        CHECK_FALSE(r.detail.contains("document_bytes"));
+    };
+    auto lean = [](const Row& r, const json& bytes) {
+        INFO("result=" << r.result);
+        CHECK_FALSE(r.detail.contains("document"));
+        REQUIRE(r.detail.contains("document_bytes"));
+        CHECK(r.detail["document_bytes"] == bytes);
+        // the revisions and the reason stay on every row
+        CHECK(r.detail.contains("if_match"));
+        CHECK(r.detail.contains("prior_revision"));
+        CHECK(r.detail.contains("revision"));
+    };
+    SECTION("a real write: attempted and success") {
+        REQUIRE(w.put("default", sent).status == St::Ok);
+        REQUIRE(w.rows.size() == 2);
+        full(w.rows[0]);
+        full(w.rows[1]);
+        CHECK(w.rows[1].detail["document"] == json::parse(canonical));
+    }
+    SECTION("a dry run: validate") {
+        REQUIRE(w.put("default", sent, std::string("true")).status == St::Ok);
+        REQUIRE(w.rows.size() == 1);
+        full(w.rows[0]);
+    }
+    SECTION("a stale precondition: denied") {
+        w.stored = doc_with_excellent(90.0);
+        REQUIRE(w.put("default", sent).status == St::Stale);
+        REQUIRE(w.rows.size() == 1);
+        lean(w.rows[0], canonical.size());
+        CHECK(w.rows[0].detail["reason"] == "stale");
+    }
+    SECTION("a refusal before the document is read: denied, no byte count") {
+        REQUIRE(w.put(std::nullopt, sent).status == St::IfMatchMissing);
+        REQUIRE(w.rows.size() == 1);
+        lean(w.rows[0], nullptr);
+    }
+    SECTION("an invalid document: denied, no byte count") {
+        REQUIRE(w.put("default", R"({"version":2})").status == St::Invalid);
+        REQUIRE(w.rows.size() == 1);
+        lean(w.rows[0], nullptr);
+    }
+    SECTION("a lost compare-and-set race: attempted then failure") {
+        auto d = w.deps();
+        d.compare_and_set = [](const std::optional<std::string>&, const std::string&,
+                               const std::string&) -> std::expected<bool, std::string> {
+            return false;
+        };
+        DexScorePolicyWriteRequest rq;
+        rq.if_match = "default";
+        rq.body = sent;
+        REQUIRE(apply_dex_score_policy(rq, d).status == St::Stale);
+        REQUIRE(w.rows.size() == 2);
+        full(w.rows[0]);
+        lean(w.rows[1], canonical.size());
+        CHECK(w.rows[1].detail["reason"] == "stale");
+    }
+    SECTION("an unknown outcome: attempted then failure") {
+        w.store_error = kPrefixedError;
+        w.after_apply = [&] { w.stored = doc_with_excellent(80.0); };
+        REQUIRE(w.put("default", sent).status == St::OutcomeUnknown);
+        REQUIRE(w.rows.size() == 2);
+        full(w.rows[0]);
+        lean(w.rows[1], canonical.size());
+        CHECK(w.rows[1].detail["reason"] == "outcome_unknown");
+    }
+    SECTION("DELETE of a policy that was never written: attempted then no_change") {
+        REQUIRE(w.del("default").status == St::Ok);
+        REQUIRE(w.rows.size() == 2);
+        full(w.rows[0]);
+        CHECK(w.rows[0].detail["document"].is_null());
+        lean(w.rows[1], nullptr);
+    }
+}
+
 TEST_CASE("writer: PUT over a present-but-empty row compares against the empty text",
           "[dex][score_policy_writer]") {
     World w;
@@ -519,7 +626,7 @@ TEST_CASE("writer: PUT replaces a stored policy when If-Match is its revision",
     CHECK(w.stored == body);
 }
 
-TEST_CASE("writer: the attempted row is refused: 503, no store call",
+TEST_CASE("writer: the attempted row is refused with 503 and no store call",
           "[dex][score_policy_writer]") {
     World w;
     w.refuse_results = {"attempted"};
@@ -576,7 +683,12 @@ TEST_CASE("writer: a second writer in this process gets WriterBusy", "[dex][scor
     rq1.body = body;
     std::optional<DexScorePolicyWriteResult> first;
     std::thread t([&] { first = apply_dex_score_policy(rq1, d1); });
-    entered.wait();
+    // Bounded: a first write that never reaches its commit fails the case instead of hanging it.
+    if (entered.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
+        release_p.set_value();
+        t.join();
+        FAIL("the first write never reached its commit");
+    }
     const auto second = w.put("default", doc_with_excellent(96.0));
     release_p.set_value();
     t.join();
@@ -653,17 +765,24 @@ TEST_CASE("writer: a store error with the intended text observed afterwards is a
           "[dex][score_policy_writer]") {
     World w;
     w.store_error = kPrefixedError; // applied, then the connection was lost
-    const std::string body = doc_with_excellent(95.0);
-    const auto r = w.put("default", body);
+    // The body as sent is not the canonical text (whitespace, an integer edge, a partial
+    // document): the re-read finds the canonical text stored, and that is the intended state.
+    const std::string sent =
+        "{ \"version\" : 1,\n  \"tiers\" : { \"edges\" : { \"excellent\" : 95 } } }";
+    const std::string canonical = doc_with_excellent(95.0);
+    REQUIRE(sent != canonical);
+    const auto r = w.put("default", sent);
     REQUIRE(r.status == St::Ok);
-    CHECK(r.in_force.revision == dex_score_policy_revision(body));
+    CHECK(w.stored == canonical);
+    CHECK(r.in_force.revision == dex_score_policy_revision(canonical));
     CHECK(r.previous_revision == "default");
     REQUIRE(w.rows.size() == 2);
     CHECK(w.rows[1].result == "success");
     CHECK(w.rows[1].detail["outcome"] == "observed_after_store_error");
+    CHECK(w.rows[1].detail["revision"] == dex_score_policy_revision(canonical));
 }
 
-TEST_CASE("writer: applied then overwritten before the re-read: outcome unknown, naming what "
+TEST_CASE("writer: applied then overwritten before the re-read is outcome unknown naming what "
           "is stored",
           "[dex][score_policy_writer]") {
     World w;

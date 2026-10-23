@@ -39,6 +39,11 @@
  * Failure of the later audit rows (success, failure, no_change) never changes the answer: the
  * store state they describe already exists, and the handler's Sec-Audit-Failed header carries
  * the signal.
+ *
+ * Audit row size. The whole canonical document (up to ~97 KB) rides only on the rows that
+ * record a proposal or an applied change: `attempted`, `success` and `validate`. Every other
+ * row (denied, failure, no_change) carries `document_bytes`, the size of the canonical text,
+ * instead, so a refused or failed request cannot multiply the document in the audit store.
  */
 
 #include "dex_score_policy_json.hpp"
@@ -231,6 +236,7 @@ struct AuditDetail {
     nlohmann::json prior_revision = nullptr;
     nlohmann::json revision = nullptr;
     nlohmann::json document = nullptr;
+    nlohmann::json document_bytes = nullptr; ///< size of the canonical text, when there is one
     nlohmann::json dry_run = nullptr;
     std::string reason;
     std::string field;
@@ -238,20 +244,28 @@ struct AuditDetail {
     std::string observed_revision;
     std::string reread_error;
 
-    [[nodiscard]] std::string dump() const {
-        nlohmann::json j{{"if_match", if_match},
-                         {"prior_revision", prior_revision},
-                         {"revision", revision},
-                         {"document", document}};
+    /// `with_document`: the whole canonical document (attempted, success, validate rows);
+    /// otherwise only its byte count (denied, failure, no_change rows).
+    [[nodiscard]] std::string dump(bool with_document) const {
+        nlohmann::json j = nlohmann::json::object();
+        j["if_match"] = if_match;
+        j["prior_revision"] = prior_revision;
+        j["revision"] = revision;
+        if (with_document)
+            j["document"] = document;
+        else
+            j["document_bytes"] = document_bytes;
         if (!dry_run.is_null())
             j["dry_run"] = dry_run;
-        for (const auto& [k, v] : {std::pair<const char*, const std::string&>{"reason", reason},
-                                   {"field", field},
-                                   {"outcome", outcome},
-                                   {"observed_revision", observed_revision},
-                                   {"reread_error", reread_error}})
-            if (!v.empty())
-                j[k] = v;
+        auto put = [&j](const char* key, const std::string& value) {
+            if (!value.empty())
+                j[key] = value;
+        };
+        put("reason", reason);
+        put("field", field);
+        put("outcome", outcome);
+        put("observed_revision", observed_revision);
+        put("reread_error", reread_error);
         return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
     }
 };
@@ -279,7 +293,8 @@ apply_dex_score_policy(const DexScorePolicyWriteRequest& rq, const DexScorePolic
         if (!d.audit)
             return true; // audit-off deployment: not a persist failure
         try {
-            return d.audit(v, result, det.dump());
+            // The proposal and the applied change carry the document; the rest its size.
+            return d.audit(v, result, det.dump(result == "attempted" || result == "success"));
         } catch (...) {
             return false;
         }
@@ -366,12 +381,20 @@ apply_dex_score_policy(const DexScorePolicyWriteRequest& rq, const DexScorePolic
             return refuse(Status::Invalid, "request body nests too deeply", "invalid", base,
                           "document");
         const auto v = dex_score_policy_validate_text(rq.body);
-        if (!v)
+        if (!v) {
+            std::string fix(dex_score_policy_projection_remediation(v.error().field));
+            if (fix.empty() && v.error().field == "version")
+                fix = "this server reads version " + std::to_string(kDexScorePolicyVersion) +
+                      " documents; leave the stored document alone (a newer server reads it) or "
+                      "send a version " +
+                      std::to_string(kDexScorePolicyVersion) + " document";
             return refuse(Status::Invalid, v.error().message, "invalid", base, v.error().field,
-                          std::string(dex_score_policy_projection_remediation(v.error().field)));
+                          std::move(fix));
+        }
         canonical = dex_score_policy_canonical(*v);
         base.revision = dex_score_policy_revision(canonical);
         base.document = dex_score_policy_to_json(*v);
+        base.document_bytes = canonical.size();
     } else {
         base.revision = std::string(kDexScorePolicyDefaultRevision);
     }
@@ -479,7 +502,9 @@ apply_dex_score_policy(const DexScorePolicyWriteRequest& rq, const DexScorePolic
     const auto re = safe_read();
     out.status = Status::OutcomeUnknown;
     out.retry_after_ms = kDexScorePolicyRetryMs;
-    out.remediation = "GET /api/v1/dex/score-policy and compare its revision";
+    out.remediation = "GET /api/v1/dex/score-policy and compare its revision: the If-Match you sent "
+                      "means the write did not apply, any other means review the policy before "
+                      "changing it again";
     if (re) {
         const bool intended = put ? (re->has_value() && **re == canonical) : !re->has_value();
         if (intended) {

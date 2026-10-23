@@ -552,8 +552,9 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // leaves framing headroom over that, so a legitimate document is never refused here and
     // an unauthenticated flood is held 12x under the 4 MiB catch-all. ANY method: GET and
     // DELETE are bodyless siblings sharing the class. requires_measurable = true: the
-    // permission and same-site gates run in the handler, after httplib buffers the body, so
-    // an unmeasurable (chunked) body must be refused here (the hardware row's reasoning).
+    // permission gate runs in the handler, after httplib buffers the body (a cookie session's
+    // same-site gate runs earlier, pre-routing), so an unmeasurable (chunked) body must be
+    // refused here (the hardware row's reasoning).
     {kBodyCapAnyMethod, "/api/v1/dex/score-policy", 320u * 1024, true, "dex_score_policy"},
     // /api/v1/crypto — the /crypto REST v1 subtree. The only body-bearing route is
     // PUT /api/v1/crypto/dashboard/layout {"widgets":[ids]}: at most 64 catalogue ids of at most

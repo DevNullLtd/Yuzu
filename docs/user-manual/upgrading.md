@@ -89,7 +89,7 @@ spent or expired.
 
 **How to fix.** Pass an explicit `0` for `max_uses` and/or `ttl_hours` to keep the old
 unlimited/no-expiry behaviour, or size them to the rollout window and the number of machines.
-## Behaviour change: the DEX score policy document carries a version (#6085)
+## Behaviour change: the DEX score policy document carries a version (#6085, #6086)
 
 **What changed.** The canonical text of the `dex_score_policy` document now includes `"version": 1`, and `version` is a recognised key. A document without the field reads as version 1. A server that meets a version above the one it supports scores under the shipped defaults, reports `fault: unsupported_version at version: N above the supported 1` on every Apps response, and logs it once. It never applies part of a document, and the revision stays the hash of the stored text. `PUT /api/v1/dex/score-policy` writes the document from this release. A build that predates the score policy reader ignores it. A development build that has the reader but predates this change refuses a `version` key as an unknown key and serves the shipped defaults with a fault for any document that carries it.
 
