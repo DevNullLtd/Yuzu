@@ -474,7 +474,10 @@ Expected response:
 > "You submitted this — another reviewer must approve" instead of buttons on
 > your own requests. If you have been following along as a single admin,
 > create a second operator account now and use it for the approve/reject
-> steps below.
+> steps below. The approver must be a different human account, and (since
+> #6079) it needs an enrolled MFA factor and a fresh proof, and with RBAC
+> enforcement off (the default) it must hold the `admin` role; see
+> [Who can approve](user-manual/instructions.md#who-can-approve).
 
 **1. Submit the action.**
 

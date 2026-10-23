@@ -197,8 +197,8 @@ principal and not an engine principal. The existing rule that the reviewer canno
     [Instructions](instructions.md#who-can-approve).
   - **A non-admin cannot enrol itself** under `--mfa-enforcement=optional` or `admin-only` (login enrols only the
     accounts the mode protects, and the Settings enrolment routes are administrator-only). The seeded `Operator`
-    role holds `Approval:Approve`, so after the upgrade every such approver is refused `mfa_not_enrolled` until an
-    administrator enrols them, either with a temporary enrolment sign-in window or by promoting each account to
+    role holds `Approval:Approve`, so with RBAC enforcement on, every such approver is refused `mfa_not_enrolled`
+    after the upgrade until an administrator enrols them, either with a temporary enrolment sign-in window or by promoting each account to
     administrator just long enough to enrol and then demoting it; see
     [Enrolling a non-admin approver](../ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver),
     including the identity-proofing step (under the window, whoever signs in first with the password enrols the
@@ -206,7 +206,10 @@ principal and not an engine principal. The existing rule that the reviewer canno
     enrolled, authorised approver exists who is not the submitter of each request you expect to be decided: until
     then nothing can be approved. A seeded administrator that has never enrolled is in the same position. Self-service
     enrolment for non-admins is a planned follow-up, as is ending an account's existing sessions when its MFA is
-    disabled or reset (`--mfa-reset`); neither is part of this change.
+    disabled in Settings; neither is part of this change. `yuzu-server --mfa-reset` does end the account's
+    sessions. **With RBAC enforcement off (the shipped default),** the legacy gate requires the `admin` role for
+    approving, so a non-admin is refused `403` "admin role required" before the MFA check and enrolling a non-admin
+    approver achieves nothing until RBAC enforcement is turned on.
   - **An unreadable MFA store, or an unreadable stored session proof,** answers `503` with `retry_after_ms` and increments
     `yuzu_auth_secret_unavailable_total{route="approval"}`; nothing is decided.
 - **A same-site `Origin` (or `Referer`) is now required.** A browser or script `POST` to
@@ -216,9 +219,10 @@ principal and not an engine principal. The existing rule that the reviewer canno
   TLS-terminating or Host-rewriting reverse proxy must declare the public address with `--csrf-trusted-origin`, as
   for the sibling cookie-write routes described further down this page (for example the hardware-sync and
   `PUT /api/config/{key}` notes) and in [Server Administration](server-admin.md), or the dashboard's Approve and Reject buttons are refused. Token callers
-  are not subject to this check (they are refused as non-interactive sessions instead). The dashboard dialog shows
-  every `403` as "You do not have permission to decide approvals", so a missing `Origin` looks like a permission
-  problem there; see "Who can approve" in `instructions.md` for the causes.
+  are not subject to this check (they are refused as non-interactive sessions instead). The dashboard dialog shows an
+  `approver_assurance_required` refusal as its own remediation text, but shows any other `403` (a missing `Origin`,
+  or a missing `Approval:Approve`) as "You do not have permission to decide approvals", so a missing `Origin` looks
+  like a permission problem there; see "Who can approve" in `instructions.md` for the causes.
 - **A degraded session read fails closed.** The route answers `503` and the request stays pending; it no
   longer records the reviewer `unknown` (#4128).
 - **The attempt is audited first.** If the audit row cannot be written, approve and reject return `503`
@@ -233,7 +237,7 @@ principal and not an engine principal. The existing rule that the reviewer canno
 fail. A supervised-tier agentic worker still requests approval and recalls with the `approval_id`, but a
 person must approve in the dashboard or over REST on a signed-in session. SAML-only approvers must sign
 in with a local account or OIDC. Also affected: **every approver whose account has no enrolled MFA factor** (by default all
-non-admin approvers under `optional` or `admin-only`) and every OIDC approver whose provider does not assert an MFA
+non-admin approvers under `optional` or `admin-only`, once RBAC enforcement is on) and every OIDC approver whose provider does not assert an MFA
 `amr`; both are refused until fixed. Scripts that approve with a session cookie must complete the step-up
 (`POST /login/mfa/stepup`) when they receive `401` with `meta.mfa_step_up_required`.
 

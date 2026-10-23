@@ -619,8 +619,9 @@ is behind login, so the dashboard path is unreachable.
 ### The `--mfa-reset` CLI (audited)
 
 `yuzu-server --mfa-reset <username>` clears the user's MFA enrolment and exits
-**without starting the server**. It writes an audit row
-(`mfa.reset.breakglass`, principal = the OS account that ran it).
+**without starting the server**. It also ends the account's sessions, and it
+writes an audit row (`mfa.reset.breakglass`, principal = the OS account that ran
+it).
 
 **It needs the Postgres DSN and the keys directory.** This changed with the
 Postgres migration and is the most common reason the command fails today:
@@ -673,6 +674,19 @@ access* as equivalent to MFA-reset authority over every account:
 writable *before* clearing any MFA, and refuses to proceed if it is not — the
 whole point is to replace the unaudited SQL path. A `{"status":"ok",…}` line
 with exit code 0 means an audit row persisted.
+
+**It ends the account's sessions.** After clearing the factor the one-shot
+deletes the account's durable sessions (`SessionStore::invalidate_user`), which
+bumps the session generation so every replica drops its cached copy on its next
+refresh; the account is signed out everywhere. The number of sessions deleted is
+recorded as `sessions_ended=<n>` at the end of the audit row's `detail`
+(`... (os_identity=<account>, sessions_ended=<n>)`); the command's stdout line is
+unchanged. If ending the sessions fails, the factor is already cleared: the
+command exits non-zero with `error: MFA cleared but the account's sessions were
+not ended` and writes no audit row. Treat that as an incomplete reset. Run
+`DELETE /api/v1/sessions?username=<name>` yourself and record both the reset and
+the manual session deletion in your change-management system. Disabling MFA from Settings does **not** end sessions;
+only this CLI does.
 
 **Detective control.** Because the CLI exits without serving, it emits no
 Prometheus metric — the audit row is the only signal. Alert on
@@ -804,10 +818,15 @@ Approving or rejecting an approval request requires the approver's own account t
 → Security and sign-in → Two-factor sign-in, but a **non-admin cannot enrol itself** in the default modes:
 the Settings enrolment routes are administrator-only, and sign-in enrols an account only when
 `--mfa-enforcement` protects it (`optional` protects nobody; `admin-only` protects administrators). The
-seeded `Operator` role holds `Approval:Approve`, so on a fresh `optional` deployment the non-admin
-approvers are exactly the accounts that cannot enrol. The seeded administrator is also un-enrolled under
+seeded `Operator` role holds `Approval:Approve`, so on a fresh `optional` deployment with RBAC enforcement on
+the non-admin approvers are exactly the accounts that cannot enrol. The seeded administrator is also un-enrolled under
 `optional`, so a deployment that has not enrolled anyone has no approver at all. An administrator cannot
 enrol another user's account on its behalf: Settings enrolment always enrols the signed-in account.
+
+**This section applies only with RBAC enforcement on.** With RBAC enforcement off (the shipped default) the legacy
+permission gate requires the `admin` role for `Approval:Approve`, so a non-admin is refused `403`
+"admin role required" before the MFA check is reached, and enrolling a non-admin by path A or path B changes
+nothing about that refusal. Turn RBAC enforcement on (and confirm the approver holds `Approval:Approve`) first.
 
 There are two ways to enrol a non-admin, and neither is self-service:
 
@@ -860,8 +879,8 @@ break-glass account signs in locally): there, restart in `--auth-mode=standard` 
 first, reset the passwords, and only then restart with `required` in step 2, which adds a restart. Between that
 first restart and the reset, the old passwords work again, so keep the interval short. The reset also signs the account
 out everywhere and discards an unfinished enrolment. Ask the approver to be ready to sign in as soon as the window
-opens, and to change the password afterwards (Settings → User Management → **Change password**; once enrolled,
-that step needs a fresh code).
+opens, and to change the password afterwards (a non-admin cannot open Settings: use **Access → Users and roles → Your
+account → Change password**, or `POST /api/v1/users/me/password`; once enrolled, that step needs a fresh code).
 
 **2. Open the window.**
 

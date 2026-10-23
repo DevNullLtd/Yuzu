@@ -749,15 +749,22 @@ Consequences, each deliberate:
 - **A non-admin approver cannot enrol itself.** Local MFA enrolment fires at sign-in only when
   `--mfa-enforcement` protects the account (`optional` protects nobody, `admin-only` protects
   administrators), and the Settings enrolment routes are administrator-only. The seeded `Operator` role
-  holds `Approval:Approve`, so under `optional` or `admin-only` a non-admin approver is refused
-  `mfa_not_enrolled` until an administrator runs an enrolment sign-in window or promotes the account
+  holds `Approval:Approve`, so with RBAC enforcement on and `--mfa-enforcement` at `optional` or
+  `admin-only` a non-admin approver is refused `mfa_not_enrolled` until an administrator runs an enrolment sign-in window or promotes the account
   to administrator long enough to enrol and then demotes it
   (`docs/ops-runbooks/auth-db-recovery.md`, "Enrolling a non-admin approver"). Self-service enrolment
-  for non-admins is a named follow-up.
-- **Not yet done.** Disabling MFA on an account (Settings, `mfa_disable`) or `--mfa-reset` does not end
-  that account's existing sessions; the proof-versus-enrolment comparison above is what stops an older
-  proof being reused after a re-enrolment, and session invalidation on disable or reset is a named
-  follow-up. The check is an admission boundary: a clearance committed before the read is honoured, one
+  for non-admins is a named follow-up. With RBAC enforcement off (the shipped default) the legacy gate
+  in `AuthRoutes::require_permission` requires the `admin` role for `Approval:Approve`, so a non-admin
+  is refused `403` "admin role required" before the MFA gate, and the enrolment paths achieve nothing
+  until enforcement is turned on.
+- **Session ending on reset, not on disable.** `yuzu-server --mfa-reset` deletes the account's durable
+  sessions in the same one-shot (`SessionStore::invalidate_user`, which bumps the generation so every
+  replica drops its cached copy), and exits non-zero if that fails; the audit row records
+  `sessions_ended`. Disabling MFA from Settings (`mfa_disable`) does not end sessions, so there the
+  proof-versus-enrolment comparison above is what stops an older proof being reused after a
+  re-enrolment; that comparison assumes the database primary clock does not step backward (ADR-2002
+  section 4 treats database clock integrity as a monitored security dependency), and ending sessions
+  on a Settings disable is a named follow-up. The check is an admission boundary: a clearance committed before the read is honoured, one
   committed after it is seen from the next request, and the two session resolves on the route are not
   atomic.
 - **Mixed versions and rollback.** The enrolled-factor requirement is in force only while every replica

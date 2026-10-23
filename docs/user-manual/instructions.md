@@ -645,13 +645,16 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
   A non-admin approver cannot enrol itself in the default modes. Local enrolment happens at sign-in only
   for accounts that `--mfa-enforcement` protects (`optional` protects nobody; `admin-only` protects
   administrators), and the enrolment routes in Settings are administrator-only. A non-admin who holds
-  `Approval:Approve` (the seeded `Operator` role does) is therefore refused `mfa_not_enrolled` until an
-  administrator enrols them (by a temporary enrolment sign-in window, or by promoting the account to
+  `Approval:Approve` (the seeded `Operator` role does) is therefore, with RBAC enforcement on, refused
+  `mfa_not_enrolled` until an administrator enrols them (by a temporary enrolment sign-in window, or by promoting the account to
   administrator just long enough to enrol and then demoting it); see "Enrolling a non-admin approver" in the
   [recovery runbook](../ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver), which also
   lists each path's consequences. Make sure at least one enrolled, authorised approver exists
   who is not the submitter of each request, or nothing can be decided. Break-glass accounts are enrolled
-  by validation and get no exemption. Self-service enrolment for non-admins is a planned follow-up.
+  by validation and get no exemption. With RBAC enforcement off (the shipped default) the legacy gate requires
+  the `admin` role for approving, so a non-admin is refused `403` "admin role required" before the MFA check and
+  enrolling them achieves nothing until RBAC enforcement is turned on. Self-service enrolment for non-admins is
+  a planned follow-up.
 - **A human principal.** An engine principal is never admitted.
 - **Not the submitter.** Unchanged: the reviewer cannot be the person who submitted the request
   (HTTP 400, audited as denied).
