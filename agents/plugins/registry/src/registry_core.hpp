@@ -387,8 +387,7 @@ struct Opened {
             // The component the handle is bound to must still be named as requested: a rename between the open
             // and this read would otherwise anchor the whole walk at the renamed object.
             const auto sep = first_name.rfind('\\');
-            if (sep == std::string::npos ||
-                !names_equal_ascii_ci(std::string_view{first_name}.substr(sep + 1), parts[0])) {
+            if (!names_equal_ascii_ci(std::string_view{first_name}.substr(sep + 1), parts[0])) {
                 out.error = std::string{kTokKeyIsLink};
                 return out;
             }

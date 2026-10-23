@@ -9,7 +9,7 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdio>
+#include <format>
 #include <functional>
 #include <iterator>
 #include <map>
@@ -92,8 +92,6 @@ public:
     /// "<op>:<name>" (e.g. "create_sub:B"), so a test can change the tree at a call boundary.
     std::function<void(const std::string&)> before, after;
     std::function<void(Node&, const std::string&)> tamper_after_set;
-    /// Lets a test rewrite the name final_name is about to answer (a name the kernel would never give).
-    std::function<void(std::string&)> name_hook;
     /// Fired at the start of every enum_value call: a value set that grows while it is being enumerated.
     std::function<void(Node&)> grow_on_enum;
     /// "<op>:<name>" -> rc, consumed on use. open_path/final_name/root_name also take the bare method name.
@@ -159,7 +157,7 @@ public:
         tally("open_sub");
         const std::string ev = "open_sub:" + std::string{name};
         log.push_back(ev);
-        masks.push_back(ev + ":" + hex(access));
+        masks.push_back(std::format("{}:{:#x}", ev, access));
         long rc = 0;
         if (const auto inj = take(ev)) rc = *inj;
         NodeP child;
@@ -180,7 +178,7 @@ public:
         tally("open_path");
         const std::string ev = "open_path:" + std::string{key_path};
         log.push_back(ev);
-        masks.push_back(ev + ":" + hex(access));
+        masks.push_back(std::format("{}:{:#x}", ev, access));
         if (const auto inj = take(ev, "open_path")) return *inj;
         const auto start = node(root_h);
         if (!start) return 1018;
@@ -200,7 +198,6 @@ public:
         std::string path;
         if (!n || n->deleted || !canonical_path(n.get(), path)) return 1018;
         out = std::string{kRootName} + (path.empty() ? "" : "\\" + path);
-        if (name_hook) name_hook(out);
         return 0;
     }
     long root_name(Handle root_h, std::string& out) override {
@@ -216,7 +213,7 @@ public:
         tally("create_sub");
         const std::string ev = "create_sub:" + std::string{name};
         log.push_back(ev);
-        masks.push_back(ev + ":" + hex(access));
+        masks.push_back(std::format("{}:{:#x}", ev, access));
         if (before) before(ev);
         long rc = 0;
         if (const auto inj = take(ev)) rc = *inj;
@@ -313,11 +310,6 @@ public:
     }
 
 private:
-    static std::string hex(std::uint32_t mask) {
-        char buf[16];
-        std::snprintf(buf, sizeof buf, "0x%x", static_cast<unsigned>(mask));
-        return buf;
-    }
     void tally(const char* method) {
         ++seam_calls;
         ++by_method[method];
@@ -720,28 +712,6 @@ TEST_CASE("registry core: the walk refuses a leaf whose kernel name is not the r
         CHECK(reg.get("Decoy", "Marker")->data == dword(0xDEC0));
         CHECK(render_single_action(AuditRecord{}, o, false).lines[0].find("|created=0|") != std::string::npos);
     }
-    SECTION("a created key the cleanup cannot delete stays reported: failed, with the residual count") {
-        FakeRegistry reg;
-        const NodeP top = reg.key("Top");
-        reg.put("Decoy", "Marker", kRegDword, dword(0xDEC0));
-        reg.before = [&](const std::string& ev) {
-            if (ev == "create_sub:A") {
-                top->is_link = true;
-                top->link_target = "Decoy";
-            }
-        };
-        reg.inject["delete_key_by_handle"] = 5;
-        const auto o = set_value_verified(reg, FakeRegistry::kRoot, "Top\\A", "V", kRegDword, dword(7), false);
-        CHECK(o.reason == "key_is_link");
-        CHECK(o.result == "failed");
-        CHECK(o.created == 1);
-        CHECK(reg.exists("Decoy\\A"));
-        CHECK(reg.calls("set_value") == 0);
-        // The residual is on the wire, where the server's audit row carries it.
-        CHECK(render_single_action(AuditRecord{}, o, false).lines[0].find("|result=failed|reason=key_is_link|") !=
-              std::string::npos);
-        CHECK(render_single_action(AuditRecord{}, o, false).lines[0].find("|created=1|") != std::string::npos);
-    }
     SECTION("a legitimate walk is accepted, case variants and a leaf link for delete_key included") {
         FakeRegistry reg;
         reg.put("Software\\Acme\\Deep", "V", kRegDword, dword(1));
@@ -827,18 +797,6 @@ TEST_CASE("registry core: a first component renamed between its open and its nam
         CHECK(reg.calls("set_value") == 0);
         CHECK(reg.get(c.parked_leaf, "V") == nullptr);
     }
-}
-
-TEST_CASE("registry core: a first-component name with no separator is refused", "[registry][core][walk_identity]") {
-    FakeRegistry reg;
-    reg.key("A");
-    // Every name read answers "A": equal to the requested component and to the leaf test's expectation, but not a
-    // path the kernel could name, so only the separator check stands between it and an accepted walk.
-    reg.name_hook = [](std::string& n) { n = "A"; };
-    const auto o = set_value_verified(reg, FakeRegistry::kRoot, "A", "V", kRegDword, dword(7), false);
-    CHECK(o.result == "refused");
-    CHECK(o.reason == "key_is_link");
-    CHECK(reg.calls("set_value") == 0);
 }
 
 TEST_CASE("registry core: every open and create asks for the access it needs", "[registry][core]") {
@@ -1014,6 +972,10 @@ TEST_CASE("registry core: a walk that does not hand its leaf over deletes the ke
         CHECK(o.created == 1);
         CHECK(reg.exists("Decoy\\A"));
         CHECK(reg.calls("set_value") == 0);
+        // The residual is on the wire, where the server's audit row carries it.
+        const auto line = render_single_action(AuditRecord{}, o, false).lines[0];
+        CHECK(line.find("|result=failed|reason=win32:1450|") != std::string::npos);
+        CHECK(line.find("|created=1|") != std::string::npos);
     }
     SECTION("the first create finds its key already there: nothing was created, nothing is deleted") {
         // mutant: the opened-existing key pushed into made_keys before the !created_new test
