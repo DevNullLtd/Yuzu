@@ -369,7 +369,7 @@ public:
     ///                per-reveal audit + step-up re-validation that gates a
     ///                replay happen at the ROUTE layer, not here. Once the
     ///                grace window lapses (or the cache entry is gone),
-    ///                rejected — the caller resolves the stuck pair by
+    ///                rejected; the caller resolves the stuck pair by
     ///                revoking the SUCCESSOR credential (the surviving
     ///                predecessor then becomes a standalone credential via
     ///                resolve_rotation_pair_after_revoke) and rotating
