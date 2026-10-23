@@ -205,3 +205,40 @@ TEST_CASE("response_visible_set: nullopt means the whole fleet and an engine nev
         CHECK(no_store->empty());
     }
 }
+
+// ── Degraded stores ─────────────────────────────────────────────────────────────────────────────
+// An absent RBAC store counts as enforcement in effect (fail closed), so no resolver may return the
+// fleet: every one narrows to deny or empty, for a human and an engine alike, never to nullopt.
+TEST_CASE("every resolver narrows to deny or empty on an absent RBAC store (#6204)",
+          "[pg][6204][engine][visibility][degraded]") {
+    VisRig r;
+    for (const char* who : {"alice", kEngine}) {
+        INFO("principal: " << who);
+        CHECK_FALSE(vis::dispatch_permission(nullptr, who, "Execution", authz::Operation::Execute));
+        CHECK_FALSE(vis::response_agent_in_scope(nullptr, &r.mgmt, who, "agent-1"));
+        CHECK(vis::visible_agents_json(fleet(), nullptr, &r.mgmt, who).empty());
+        auto infra = vis::infrastructure_visible_set(nullptr, &r.mgmt, who);
+        REQUIRE(infra.has_value());
+        CHECK(infra->empty());
+        auto resp = vis::response_visible_set(nullptr, &r.mgmt, who);
+        REQUIRE(resp.has_value());
+        CHECK(resp->empty());
+    }
+}
+
+// The engine rule leans on the stores refusing what would give an engine a confined view: scoped
+// engine role assignments and engine group members. The resolvers have no engine arm for a confined
+// engine, so if either refusal is ever relaxed this case must fail and point here.
+TEST_CASE("an engine cannot be given a confined view: scoped assignment and group membership are "
+          "refused (#6204)",
+          "[pg][6204][engine][visibility]") {
+    VisRig r;
+    auto scoped = r.mgmt.assign_role({r.group, "engine", kEngine, "ExecRunner6204"});
+    REQUIRE_FALSE(scoped.has_value());
+    CHECK(scoped.error().find("engine") != std::string::npos);
+
+    REQUIRE(r.rbac.create_group({"G6204rbac", "", "local", "", 0}).has_value());
+    auto member = r.rbac.add_group_member("G6204rbac", kEngine);
+    REQUIRE_FALSE(member.has_value());
+    CHECK(member.error().find("engine:") != std::string::npos);
+}
