@@ -2,6 +2,7 @@
 
 #include "agent_registry.hpp"
 #include "bundled_content.hpp"
+#include "content_etag.hpp"
 #include "http_route_sink.hpp"
 #include "instruction_param_schema.hpp" // canonicalise_param_schema: the enforced shape, published as input_schema
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
@@ -86,21 +87,6 @@ const PluginDocsIndex& plugin_docs_index() {
         return out;
     }();
     return idx;
-}
-
-// FNV-1a 64-bit content hash -> a strong ETag, same idiom as
-// guardian_schema_registry.cpp's content_etag (not shared directly — that
-// helper is TU-local to a different file and the two catalogs have no other
-// coupling reason to share a translation unit).
-std::string content_etag(const std::string& body) {
-    std::uint64_t h = 1469598103934665603ull;
-    for (unsigned char c : body) {
-        h ^= c;
-        h *= 1099511628211ull;
-    }
-    char buf[19];
-    int n = std::snprintf(buf, sizeof(buf), "\"%016llx\"", static_cast<unsigned long long>(h));
-    return std::string(buf, static_cast<std::size_t>(n));
 }
 
 DiscoveryDoc build_discovery_doc(json body) {

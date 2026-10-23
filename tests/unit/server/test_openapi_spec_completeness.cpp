@@ -38,6 +38,7 @@
  * `nullptr`, i.e. unconditionally).
  */
 
+#include "content_etag.hpp"
 #include "crypto_library_model.hpp"
 #include "device_token_store.hpp"
 #include "license_store.hpp"
@@ -45,6 +46,7 @@
 #include "rest_api_v1.hpp"
 #include "software_catalog_rules.hpp" // kEcosystemFamilies: the published ecosystem vocabulary
 #include "software_deployment_store.hpp"
+#include "pg/pg_pool.hpp" // an unparseable-conninfo pool backs the unopened stand-in stores
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -714,16 +716,20 @@ TEST_CASE("openapi_spec_json(): every ecosystem parameter and the pipe-list are 
     CHECK(&yuzu::server::openapi_spec_json() == &yuzu::server::openapi_spec_json());
     // openapi_spec_json() is the lean copy openapi_strip_guides() builds once and trims with
     // shrink_to_fit(), so its capacity must sit within a small slack of its size. This pins that
-    // derivation, NOT the expansion's reserve: the expansion's string is the guides-included one
-    // and is pinned separately by the expand_ecosystem_tokens test below.
+    // derivation.
     CHECK(yuzu::server::openapi_spec_json().capacity() - raw.size() < 4096);
+    // The guides-included document is the expansion's own string, served as built, so its capacity
+    // pins the reserve of the very expand_ecosystem_tokens() that builds the document (the
+    // function the test below exercises on a synthetic template).
+    const auto& built = yuzu::server::openapi_spec_with_guides_json();
+    CHECK(built.capacity() - built.size() < 64);
 }
 
-TEST_CASE("expand_ecosystem_tokens(): the output is allocated once, at its final size",
+TEST_CASE("expand_ecosystem_tokens(): the output is allocated once at its final size",
           "[openapi][software][ecosystem]") {
-    // The same body as the TU-local copy that expands the spec in rest_api_v1.cpp (which is not
-    // reachable from a test): reserve(peak) on an empty string, then in-place replaces. A grown
-    // table that made the replaces reallocate would show as a capacity well above the size.
+    // The function rest_api_v1.cpp builds the spec with (it uses this one through a
+    // using-declaration, not a copy): reserve(peak) on an empty string, then in-place replaces. A
+    // grown table that made the replaces reallocate would show as a capacity well above the size.
     // The template is long enough that reserve() is not satisfied by the small-string buffer.
     const std::string tmpl = std::string(200, 'x') + R"( "@@ECOSYSTEM_ENUM@@" "@@ECOSYSTEM_ENUM_OR_EMPTY@@" )" +
                              "@@ECOSYSTEM_LIST@@ " + std::string(200, 'y');
@@ -810,18 +816,26 @@ RestApiV1::AuditFn ok_audit_fn() {
               const std::string&, const std::string&, const std::string&) { return true; };
 }
 
+/// Three stores that never opened: real objects built over a pool whose connection string does
+/// not parse, so nothing connects (`PgPool::valid()` is false and every acquire returns an empty
+/// lease). `register_routes` only tests these pointers for non-null and captures them for the
+/// handlers, so an unopened store stands in for a PG-backed one without any cast.
+struct UnopenedStores {
+    yuzu::server::pg::PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 1}};
+    SoftwareDeploymentStore sw{pool};
+    DeviceTokenStore dt{pool};
+    LicenseStore lic{pool};
+};
+
 /// The routes `register_routes` registers when every store is null except the three whose routes
-/// are documented as unavailable, which are `wired` or null as asked. A "wired" store is storage
-/// the registration only tests for non-null and captures by pointer: no handler runs and nothing
-/// is dereferenced, so the address of suitably aligned bytes stands in for a PG-backed store.
+/// are documented as unavailable, which are `wired` or null as asked.
 std::set<std::pair<std::string, std::string>> registered_routes(bool wire_unavailable_stores) {
-    alignas(SoftwareDeploymentStore) static unsigned char sw_bytes[sizeof(SoftwareDeploymentStore)];
-    alignas(DeviceTokenStore) static unsigned char dt_bytes[sizeof(DeviceTokenStore)];
-    alignas(LicenseStore) static unsigned char lic_bytes[sizeof(LicenseStore)];
-    auto* sw = wire_unavailable_stores ? reinterpret_cast<SoftwareDeploymentStore*>(sw_bytes)
-                                       : nullptr;
-    auto* dt = wire_unavailable_stores ? reinterpret_cast<DeviceTokenStore*>(dt_bytes) : nullptr;
-    auto* lic = wire_unavailable_stores ? reinterpret_cast<LicenseStore*>(lic_bytes) : nullptr;
+    std::optional<UnopenedStores> stores;
+    if (wire_unavailable_stores)
+        stores.emplace();
+    auto* sw = stores ? &stores->sw : nullptr;
+    auto* dt = stores ? &stores->dt : nullptr;
+    auto* lic = stores ? &stores->lic : nullptr;
 
     RestApiV1 api;
     yuzu::server::test::TestRouteSink sink;
@@ -845,7 +859,7 @@ std::set<std::pair<std::string, std::string>> registered_routes(bool wire_unavai
 
 } // namespace
 
-TEST_CASE("openapi_spec_json(): every operation has a unique, well-formed operationId",
+TEST_CASE("openapi_spec_json(): every operation has a unique and well-formed operationId",
           "[openapi][structure]") {
     const json spec = json::parse(yuzu::server::openapi_spec_json());
     const auto ops = all_operations(spec);
@@ -973,12 +987,95 @@ TEST_CASE("GET /api/v1/openapi.json: gated on Infrastructure:Read for every form
     }
 }
 
-TEST_CASE("openapi_strip_guides(): removes the guides, keeps everything else",
+TEST_CASE("GET /api/v1/openapi.json: a strong ETag per form and 304 on a matching If-None-Match",
+          "[openapi][etag]") {
+    RestApiV1 api;
+    yuzu::server::test::TestRouteSink sink;
+    bool admit = true;
+    RestApiV1::PermFn perm_fn = [&](const httplib::Request&, httplib::Response& res,
+                                    const std::string&, const std::string&) {
+        if (admit)
+            return true;
+        res.status = 403;
+        res.set_content(R"({"error":{"code":403,"message":"denied"}})", "application/json");
+        return false;
+    };
+    api.register_routes(sink, admin_auth_fn(), perm_fn, ok_audit_fn(),
+                        /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr,
+                        /*token_store=*/nullptr, /*quarantine_store=*/nullptr,
+                        /*response_store=*/nullptr, /*instruction_store=*/nullptr,
+                        /*execution_tracker=*/nullptr, /*schedule_engine=*/nullptr,
+                        /*approval_manager=*/nullptr, /*tag_store=*/nullptr,
+                        /*audit_store=*/nullptr);
+
+    const std::string lean_path = "/api/v1/openapi.json";
+    const std::string full_path = "/api/v1/openapi.json?guides=true";
+
+    auto lean = sink.Get(lean_path);
+    auto full = sink.Get(full_path);
+    REQUIRE(lean);
+    REQUIRE(full);
+    REQUIRE(lean->status == 200);
+    REQUIRE(full->status == 200);
+
+    // A strong (not W/) quoted validator, derived from the exact bytes served, no-cache so every
+    // use revalidates through the gate.
+    const std::string lean_etag = lean->get_header_value("ETag");
+    const std::string full_etag = full->get_header_value("ETag");
+    CHECK(lean_etag.size() > 2);
+    CHECK(lean_etag.front() == '"');
+    CHECK(lean_etag.back() == '"');
+    CHECK(lean_etag == yuzu::server::content_etag(lean->body));
+    CHECK(full_etag == yuzu::server::content_etag(full->body));
+    CHECK(lean_etag == yuzu::server::openapi_spec_etag());
+    CHECK(full_etag == yuzu::server::openapi_spec_with_guides_etag());
+    CHECK(lean->get_header_value("Cache-Control") == "no-cache");
+    CHECK(full->get_header_value("Cache-Control") == "no-cache");
+    // The two forms are different bytes, so they must not share a validator.
+    CHECK(lean_etag != full_etag);
+
+    SECTION("a matching If-None-Match is 304 with no body, for the form it names") {
+        auto hit = sink.Get(lean_path, {{"If-None-Match", lean_etag}});
+        REQUIRE(hit);
+        CHECK(hit->status == 304);
+        CHECK(hit->body.empty());
+        CHECK(hit->get_header_value("ETag") == lean_etag);
+        CHECK(hit->get_header_value("Cache-Control") == "no-cache");
+
+        auto full_hit = sink.Get(full_path, {{"If-None-Match", full_etag}});
+        REQUIRE(full_hit);
+        CHECK(full_hit->status == 304);
+        CHECK(full_hit->body.empty());
+    }
+
+    SECTION("another form's validator, or a stale one, is a full 200") {
+        auto crossed = sink.Get(lean_path, {{"If-None-Match", full_etag}});
+        REQUIRE(crossed);
+        CHECK(crossed->status == 200);
+        CHECK(crossed->body == lean->body);
+
+        auto stale = sink.Get(full_path, {{"If-None-Match", "\"0000000000000000\""}});
+        REQUIRE(stale);
+        CHECK(stale->status == 200);
+        CHECK(stale->body == full->body);
+    }
+
+    SECTION("the permission gate runs before the validator is looked at") {
+        admit = false;
+        auto denied = sink.Get(lean_path, {{"If-None-Match", lean_etag}});
+        REQUIRE(denied);
+        CHECK(denied->status == 403);
+        CHECK(denied->get_header_value("ETag").empty());
+        CHECK(denied->body.find("\"openapi\"") == std::string::npos);
+    }
+}
+
+TEST_CASE("openapi_strip_guides(): removes the guides and keeps everything else",
           "[openapi][guides]") {
     const std::string full = yuzu::server::openapi_spec_with_guides_json();
-    bool fell_back = true;
-    const std::string lean = yuzu::server::openapi_strip_guides(full, &fell_back);
-    CHECK_FALSE(fell_back);
+    const auto stripped = yuzu::server::openapi_strip_guides(full);
+    CHECK_FALSE(stripped.fell_back);
+    const std::string& lean = stripped.json;
 
     json full_doc = json::parse(full);
     const json lean_doc = json::parse(lean);
@@ -996,8 +1093,6 @@ TEST_CASE("openapi_strip_guides(): removes the guides, keeps everything else",
     CHECK(lean.size() < full.size());
     // The accessor serves exactly this derivation.
     CHECK(lean == yuzu::server::openapi_spec_json());
-    // A null out-parameter is allowed.
-    CHECK(yuzu::server::openapi_strip_guides(full) == lean);
 }
 
 TEST_CASE("openapi_strip_guides(): input it cannot use is returned unchanged and reported",
@@ -1006,9 +1101,9 @@ TEST_CASE("openapi_strip_guides(): input it cannot use is returned unchanged and
                                     std::string(R"({"openapi":"3.0.3","paths":{}})"),
                                     std::string(R"({"tags":"not-an-array"})")}) {
         INFO("input: " << input);
-        bool fell_back = false;
-        CHECK(yuzu::server::openapi_strip_guides(input, &fell_back) == input);
-        CHECK(fell_back);
+        const auto stripped = yuzu::server::openapi_strip_guides(input);
+        CHECK(stripped.json == input);
+        CHECK(stripped.fell_back);
     }
 }
 
@@ -1039,8 +1134,13 @@ struct SpinGate {
 
 } // namespace
 
-TEST_CASE("openapi_spec_json(): concurrent callers all get the same string",
+TEST_CASE("openapi_spec_json(): callers on many threads all get the same object",
           "[openapi][guides][concurrency]") {
+    // What this asserts: every thread is handed the one stable string, never a per-call copy.
+    // What it does NOT assert: the first-call initialisation race. Earlier cases in this binary
+    // have already initialised the function-local static, so no thread here runs the initialiser;
+    // that race is covered by the language guarantee for a function-local static (initialised
+    // exactly once, concurrent first callers block until it finishes), not by this test.
     constexpr int kThreads = 8;
     std::vector<const std::string*> seen(kThreads, nullptr);
     {

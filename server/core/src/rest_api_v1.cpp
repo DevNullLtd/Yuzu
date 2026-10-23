@@ -1,5 +1,6 @@
 #include "rest_api_v1.hpp"
 
+#include "content_etag.hpp" // content_etag: strong ETag of the OpenAPI document forms
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
 #include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
 #include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
@@ -671,41 +672,11 @@ private:
 static_assert(kMaxFacetValueBytes == 2048,
               "update the preview route text, the MCP tool text and the docs");
 
-/// Expands the ecosystem placeholders in the spec template with values generated from
-/// kEcosystemFamilies. A missing token is not an error here; the openapi completeness test guards.
-/// One allocation, sized to the largest the string reaches (the final size, or the template's
-/// when every substitution shrinks it): reserve() runs on an empty string (no capacity doubling),
-/// so the append and the in-place replaces below never reallocate for any well-formed table.
-std::string expand_ecosystem_tokens(std::string_view tmpl) {
-    const std::string items = software_catalog::ecosystem_json_enum_items();
-    const std::pair<std::string_view, std::string> subs[] = {
-        {"\"@@ECOSYSTEM_ENUM@@\"", items},
-        {"\"@@ECOSYSTEM_ENUM_OR_EMPTY@@\"", "\"\", " + items},
-        {"@@ECOSYSTEM_LIST@@", software_catalog::ecosystem_pipe_list()},
-    };
-    // Same token order and counts as the replace loop below, so `peak` is the largest size the
-    // in-place replaces reach (a table whose substitutions mix growing and shrinking ones peaks
-    // mid-way).
-    std::size_t size = tmpl.size();
-    std::size_t peak = size;
-    for (const auto& [tok, val] : subs) {
-        for (std::size_t pos = tmpl.find(tok); pos != std::string_view::npos;
-             pos = tmpl.find(tok, pos + tok.size())) {
-            size = size - tok.size() + val.size();
-            peak = std::max(peak, size);
-        }
-    }
-    std::string out;
-    out.reserve(peak);
-    out.append(tmpl);
-    for (const auto& [tok, val] : subs) {
-        for (std::size_t pos = 0; (pos = out.find(tok, pos)) != std::string::npos;
-             pos += val.size()) {
-            out.replace(pos, tok.size(), val);
-        }
-    }
-    return out;
-}
+// The ecosystem placeholders in the spec template are expanded by software_catalog's own
+// expand_ecosystem_tokens (the one the MCP catalogue build uses), so the expansion the tests pin
+// is the one that builds the document. The using-declaration keeps the unqualified call spelling
+// that openapi_spec() below and the literal-chain lexers anchor on.
+using software_catalog::expand_ecosystem_tokens;
 
 const std::string& openapi_spec() {
     // The OpenAPI template is one literal chain expanded once, on first use. The tokens and the
@@ -2058,7 +2029,7 @@ const std::string& openapi_spec() {
       "post": {"operationId": "postElevateRevoke", "summary": "Step an active JIT elevation down early", "tags": ["Authentication"], "description": "Cookie session only; no MFA step-up (reduces privilege). Always 200; whether a window was active is recorded in the role.elevation.revoked audit detail.", "responses": {"200": {"description": "{status: ok}", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AuthElevationRevoked"}}}}, "401": {"description": "Not authenticated"}}}
     },
     "/openapi.json": {
-      "get": {"operationId": "getOpenapiJson", "summary": "OpenAPI 3.0 specification", "tags": ["Documentation"], "description": "Requires Infrastructure:Read (#2057 — was unauthenticated; the top-level security schemes apply, no per-route override). Matches the MCP yuzu://openapi resource's gate. By default the document omits the per-group guides (the x-yuzu-guide extension on the top-level tags), which are written for people reading the /swagger page; pass guides=true to include them. The MCP resource yuzu://openapi and the discover tools always serve the default form.", "parameters": [{"name": "guides", "in": "query", "schema": {"type": "string"}, "description": "Exactly true or 1 (case-sensitive) adds the x-yuzu-guide text of every group to the document. Any other value gives the default form, and a repeated parameter uses its first value. The guided form is returned as written in the source and the default form is re-serialised, so key order and whitespace differ."}], "responses": {"200": {"description": "OpenAPI 3.0 JSON spec", "content": {"application/json": {"schema": {"type": "object", "additionalProperties": true, "description": "The OpenAPI 3.0 document for this API, served bare (no data/meta wrapper)."}}}}, "401": {"description": "Not authenticated"}, "403": {"description": "Missing Infrastructure:Read"}}}
+      "get": {"operationId": "getOpenapiJson", "summary": "OpenAPI 3.0 specification", "tags": ["Documentation"], "description": "Requires Infrastructure:Read (#2057 — was unauthenticated; the top-level security schemes apply, no per-route override). Matches the MCP yuzu://openapi resource's gate. By default the document omits the per-group guides (the x-yuzu-guide extension on the top-level tags), which are written for people reading the /swagger page; pass guides=true to include them. The MCP resource yuzu://openapi and the discover tools always serve the default form. Each form carries its own strong ETag and Cache-Control: no-cache; send the ETag back in If-None-Match to get a 304 with no body when the document has not changed (the permission check still runs first).", "parameters": [{"name": "guides", "in": "query", "schema": {"type": "string"}, "description": "Exactly true or 1 (case-sensitive) adds the x-yuzu-guide text of every group to the document. Any other value gives the default form, and a repeated parameter uses its first value. The guided form is returned as written in the source and the default form is re-serialised, so key order and whitespace differ."}], "responses": {"200": {"description": "OpenAPI 3.0 JSON spec", "content": {"application/json": {"schema": {"type": "object", "additionalProperties": true, "description": "The OpenAPI 3.0 document for this API, served bare (no data/meta wrapper)."}}}}, "304": {"description": "Not modified: If-None-Match matched the ETag of the form requested; no body"}, "401": {"description": "Not authenticated"}, "403": {"description": "Missing Infrastructure:Read"}}}
     },)json"
         // Split: keep each raw-string literal under MSVC's 16,380-byte C2026 cap
         // (adjacent literals concatenate; emitted OpenAPI JSON is byte-identical).
@@ -2717,21 +2688,16 @@ bool is_safe_install_command(std::string_view s) {
 // TU-local). openapi_spec_json() is not a plain forwarder: it derives, once per process, the
 // default form of the document (the full literal minus the per-group guides) and serves that
 // one stable string; openapi_spec_with_guides_json() below forwards to the literal as written.
-std::string openapi_strip_guides(const std::string& full, bool* fell_back) {
-    if (fell_back)
-        *fell_back = false;
+OpenApiStripResult openapi_strip_guides(const std::string& full) {
     auto doc = nlohmann::json::parse(full, nullptr, /*allow_exceptions=*/false);
-    if (doc.is_discarded() || !doc.contains("tags") || !doc["tags"].is_array()) {
-        if (fell_back)
-            *fell_back = true;
-        return full; // unparseable or no tags: serve the document as written
-    }
+    if (doc.is_discarded() || !doc.contains("tags") || !doc["tags"].is_array())
+        return {full, /*fell_back=*/true}; // unparseable or no tags: serve the document as written
     for (auto& tag : doc["tags"])
         if (tag.is_object())
             tag.erase("x-yuzu-guide");
     std::string out = doc.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
     out.shrink_to_fit(); // sized exactly: one stable string for the process lifetime
-    return out;
+    return {std::move(out), /*fell_back=*/false};
 }
 
 const std::string& openapi_spec_json() {
@@ -2740,18 +2706,29 @@ const std::string& openapi_spec_json() {
     // yuzu://openapi or discover/routes should not pay tokens for them. The tag names and
     // one-line descriptions stay. A function-local static: initialised once, thread-safely.
     static const std::string lean = [] {
-        bool fell_back = false;
-        auto out = openapi_strip_guides(openapi_spec(), &fell_back);
-        if (fell_back)
+        auto stripped = openapi_strip_guides(openapi_spec());
+        if (stripped.fell_back)
             spdlog::error("openapi: the compiled-in document could not be parsed or has no tags; "
                           "serving it with the guides included");
-        return out;
+        return std::move(stripped.json);
     }();
     return lean;
 }
 
 const std::string& openapi_spec_with_guides_json() {
     return openapi_spec();
+}
+
+// One ETag per form, hashed once from the exact bytes served, so a body that changes between
+// builds changes its ETag with no manual bump.
+const std::string& openapi_spec_etag() {
+    static const std::string etag = content_etag(openapi_spec_json());
+    return etag;
+}
+
+const std::string& openapi_spec_with_guides_etag() {
+    static const std::string etag = content_etag(openapi_spec_with_guides_json());
+    return etag;
 }
 
 namespace detail {
@@ -3917,8 +3894,18 @@ void RestApiV1::register_routes(
         if (!perm_fn(req, res, "Infrastructure", "Read"))
             return;
         const auto guides = req.get_param_value("guides");
-        res.set_content(guides == "true" || guides == "1" ? openapi_spec_with_guides_json()
-                                                          : openapi_spec_json(),
+        const bool with_guides = guides == "true" || guides == "1";
+        const std::string& etag = with_guides ? openapi_spec_with_guides_etag() : openapi_spec_etag();
+        // The document is large and compressing it is not free, so let a client revalidate with
+        // If-None-Match instead of refetching. `no-cache` (not `max-age`) so every use goes back
+        // through the Infrastructure:Read gate above, which has already run by this line.
+        res.set_header("ETag", etag);
+        res.set_header("Cache-Control", "no-cache");
+        if (req.get_header_value("If-None-Match") == etag) {
+            res.status = 304;
+            return;
+        }
+        res.set_content(with_guides ? openapi_spec_with_guides_json() : openapi_spec_json(),
                         "application/json");
     });
 
