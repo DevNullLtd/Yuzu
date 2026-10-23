@@ -24,7 +24,7 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
-#include <thread>
+#include <vector>
 
 using namespace yuzu::server;
 using yuzu::server::auth::AuthManager;
@@ -145,7 +145,7 @@ TEST_CASE_METHOD(LockoutFixture, "malformed username is rejected", "[pg][auth][l
 }
 
 TEST_CASE_METHOD(LockoutFixture, "expired window unlocks and grants a fresh budget",
-                 "[pg][auth][lockout][slow]") {
+                 "[pg][auth][lockout]") {
     const int threshold = 2;
     // Lock with a 1-second window.
     db->record_failed_login("alice", threshold, 1);
@@ -153,13 +153,26 @@ TEST_CASE_METHOD(LockoutFixture, "expired window unlocks and grants a fresh budg
     REQUIRE(locked.has_value());
     REQUIRE(locked->locked);
 
-    // Wait out the window. SQLite datetime('now','+1 seconds') has calendar-
-    // second granularity, so the real required wait is up to ~2 s depending on
-    // where in the second the lock landed; the `yuzu-local-windows` runner adds
-    // Defender-induced I/O serialisation on top (flake #473). Sleep 3.5 s (3.5×
-    // the window) for a comfortable margin. Tagged `[slow]` so quick runs can
-    // exclude it with `~[slow]`.
-    std::this_thread::sleep_for(std::chrono::milliseconds(3500));
+    // Lapse the window by rewinding the stored deadline in SQL. locked_until is
+    // authored and compared with Postgres now() (auth_db.cpp record_failed_login /
+    // lockout_status), so the test cannot shift it from the C++ side; rewinding the
+    // row leaves the PG clock as the only author of the comparison and avoids
+    // sleeping out the window. No production change.
+    {
+        auto lease = db.pool().acquire();
+        REQUIRE(lease);
+        // The WHERE clause is the authored-width check the old 3.5 s sleep gave for free:
+        // the 1 s window must still be open (> now()) and no wider than 3 s, so a window
+        // authored in the wrong unit (minutes, hours) matches no row and fails here.
+        auto res = yuzu::server::pg::exec_params(
+            lease.get(),
+            "UPDATE auth.users SET locked_until = now() - interval '1 second' "
+            "WHERE username = 'alice' AND locked_until > now() "
+            "AND locked_until <= now() + interval '3 seconds' RETURNING 1",
+            std::vector<std::string>{});
+        REQUIRE(res.ok());
+        REQUIRE(PQntuples(res.get()) == 1);
+    }
 
     // The lock auto-expires — no background job needed.
     auto st = db->lockout_status("alice");
