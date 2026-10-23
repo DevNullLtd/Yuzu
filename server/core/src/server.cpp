@@ -16998,6 +16998,9 @@ private:
         // use the quiet admin probe, as the Users page does: a non-administrator's page view
         // must not write an auth.admin_required row per panel. Mutating routes keep the loud
         // require_admin bound above. Wired before the listener starts.
+        // mfa.disable audits after ending the actor's own session (#6079), so it needs the
+        // session-bound writer, not the request-resolving one.
+        settings_routes_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());
         settings_routes_->set_read_admin_fn(
             [this](const httplib::Request& req, httplib::Response& res) {
                 return auth_routes_->probe_admin(req, res);

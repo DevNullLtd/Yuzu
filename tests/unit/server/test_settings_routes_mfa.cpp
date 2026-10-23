@@ -445,6 +445,20 @@ TEST_CASE("POST /api/settings/mfa/disable ends EVERY session of the account, the
     REQUIRE(h.auth_mgr.validate_session(other).has_value());
     REQUIRE(h.auth_mgr.validate_session(bobs).has_value());
 
+    // The row is written after the actor's own session is deleted, so it must go through the
+    // session-bound writer: record what that writer is handed.
+    std::string bound_user, bound_role, bound_action, bound_result;
+    h.routes.set_audit_as_session_fn(
+        [&](const httplib::Request&, const auth::Session& s, const std::string& role,
+            const std::string& action, const std::string& result, const std::string&,
+            const std::string&, const std::string&) {
+            bound_user = s.username;
+            bound_role = role;
+            bound_action = action;
+            bound_result = result;
+            return true;
+        });
+
     auto res = h.sink.dispatch("POST", "/api/settings/mfa/disable", {},
                                "application/x-www-form-urlencoded",
                                {{"Host", "yuzu.example"},
@@ -452,10 +466,14 @@ TEST_CASE("POST /api/settings/mfa/disable ends EVERY session of the account, the
                                 {"Cookie", "yuzu_session=" + mine}});
     REQUIRE(res);
     CHECK(res->status == 200);
+    CHECK(bound_user == "admin");
+    CHECK(bound_role == "admin");
+    CHECK(bound_action == "mfa.disabled");
+    CHECK(bound_result == "ok");
     CHECK(res->get_header_value("HX-Redirect") == "/home");
     CHECK(res->get_header_value("Set-Cookie").find("Max-Age=0") != std::string::npos);
-    CHECK(h.has_audit("mfa.disabled", "ok", "admin"));
-    CHECK(h.audit_detail("mfa.disabled").find("sessions_ended=2") != std::string::npos);
+    // Written through the session-bound writer, not the request-resolving one.
+    CHECK_FALSE(h.has_audit("mfa.disabled"));
 
     // Durable view: both sessions of the account are gone, an unrelated user's row survives.
     CHECK_FALSE(sessions.find(auth::AuthManager::sha256_hex(mine)).value().has_value());
@@ -500,11 +518,73 @@ TEST_CASE("POST /api/settings/mfa/disable reports a failed session delete and au
     REQUIRE(res);
     CHECK(res->get_header_value("HX-Redirect").empty());
     CHECK(res->body.find("sessions could not be ended") != std::string::npos);
+    CHECK(res->body.find("Try again") == std::string::npos);
     CHECK(h.has_audit("mfa.disabled", "partial", "admin"));
     CHECK(h.audit_detail("mfa.disabled").find("sessions_ended=failed") != std::string::npos);
     auto status = h.auth_db->mfa_status("admin");
     REQUIRE(status.has_value());
     CHECK_FALSE(status->enrolled);
+}
+
+TEST_CASE("POST /api/settings/mfa/disable cancelling an unfinished enrolment keeps the sessions "
+          "(#6079)",
+          "[pg][mfa][routes][settings]") {
+    MfaSettingsHarness h;
+    yuzu::server::SessionStore sessions{h.auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    h.auth_mgr.set_session_store(&sessions);
+    // A provisional secret that was never verified: no usable factor exists.
+    REQUIRE(h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt).has_value());
+    const auto mine = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    REQUIRE_FALSE(mine.empty());
+
+    auto res = h.sink.dispatch("POST", "/api/settings/mfa/disable", {},
+                               "application/x-www-form-urlencoded",
+                               {{"Host", "yuzu.example"},
+                                {"Origin", "http://yuzu.example"},
+                                {"Cookie", "yuzu_session=" + mine}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("HX-Redirect").empty());
+    CHECK(h.has_audit("mfa.disabled", "ok", "admin"));
+    CHECK(h.audit_detail("mfa.disabled") == "no verified factor to clear");
+    CHECK(sessions.find(auth::AuthManager::sha256_hex(mine)).value().has_value());
+    CHECK(h.auth_mgr.validate_session(mine).has_value());
+}
+
+TEST_CASE("POST /api/settings/mfa/disable still ends the sessions when the clear fails "
+          "(#6079)",
+          "[pg][mfa][routes][settings]") {
+    MfaSettingsHarness h;
+    yuzu::server::SessionStore sessions{h.auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    h.auth_mgr.set_session_store(&sessions);
+    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    auto bytes = mfa::base32_decode(init->secret_base32);
+    REQUIRE(bytes.has_value());
+    std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+    auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
+    const auto mine = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    REQUIRE_FALSE(mine.empty());
+
+    // The clear may commit with its acknowledgement lost: an enrolled account's sessions end
+    // even though the call reports failure. Break the users table so mfa_disable errors.
+    yuzu::test::SqlFault fault(h.auth_db.pool(), "ALTER TABLE auth.users RENAME TO users_gone",
+                               "ALTER TABLE auth.users_gone RENAME TO users");
+    fault.arm();
+    auto res = h.sink.dispatch("POST", "/api/settings/mfa/disable", {},
+                               "application/x-www-form-urlencoded",
+                               {{"Host", "yuzu.example"},
+                                {"Origin", "http://yuzu.example"},
+                                {"Cookie", "yuzu_session=" + mine}});
+    fault.repair();
+    REQUIRE(res);
+    CHECK(h.has_audit("mfa.disabled", "error", "admin"));
+    CHECK(h.audit_detail("mfa.disabled") == "disable failed (sessions_ended=1)");
+    CHECK(res->get_header_value("HX-Redirect") == "/home");
+    CHECK_FALSE(sessions.find(auth::AuthManager::sha256_hex(mine)).value().has_value());
 }
 
 TEST_CASE("POST /api/settings/mfa/disable is blocked for self under enforcement (PR3 invariant)",

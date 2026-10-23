@@ -6926,13 +6926,55 @@ void SettingsRoutes::register_routes(
                           "text/html; charset=utf-8");
                       return;
                   }
+                  // A status read that fails counts as enrolled: the fail-safe is to end sessions.
+                  const auto before = db->mfa_status(session->username);
+                  const bool had_factor = !before || before->enrolled;
+                  // The row is written AFTER the actor's own session is deleted, so it is
+                  // attributed to the session already resolved, not re-resolved from the cookie.
+                  const auto audit = [&](const char* result, const std::string& detail) {
+                      if (audit_as_session_fn_)
+                          audit_as_session_fn_(req, *session,
+                                               auth::role_to_string(auth::effective_role(*session)),
+                                               "mfa.disabled", result, "User", session->username,
+                                               detail);
+                      else
+                          audit_fn_(req, "mfa.disabled", result, "User", session->username, detail);
+                  };
+                  // Same exit as logout: drop the cookie and send the browser to the landing page.
+                  const auto sign_out = [&] {
+                      res.set_header("Set-Cookie",
+                                     "yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+                      res.set_header("HX-Redirect", "/home");
+                      res.set_content("", "text/plain");
+                  };
                   auto r = db->mfa_disable(session->username);
                   if (!r) {
-                      audit_fn_(req, "mfa.disabled", "error", "User", session->username,
-                                "disable failed");
+                      // The clear may have committed with its acknowledgement lost, so a factor
+                      // that was enrolled still has its sessions ended (#6079).
+                      if (had_factor) {
+                          const auto ended = auth_mgr_->invalidate_user_sessions(session->username);
+                          audit("error",
+                                "disable failed (sessions_ended=" +
+                                    (ended.db_persisted ? std::to_string(ended.count)
+                                                        : std::string("failed")) +
+                                    ")");
+                          if (ended.db_persisted) {
+                              sign_out();
+                              return;
+                          }
+                      } else {
+                          audit("error", "disable failed");
+                      }
                       res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                           "Could not disable MFA"),
                                       "text/html; charset=utf-8");
+                      return;
+                  }
+                  // Cancelling an enrolment that never completed clears no usable factor, so no
+                  // proof can predate one: nothing to end.
+                  if (!had_factor) {
+                      audit("ok", "no verified factor to clear");
+                      res.set_content(render_mfa_fragment(*session), "text/html; charset=utf-8");
                       return;
                   }
                   // End EVERY session of the account, the caller's included (#6079): any of them
@@ -6940,23 +6982,17 @@ void SettingsRoutes::register_routes(
                   // again; a kept session would be a surviving proof we could not tell apart.
                   const auto ended = auth_mgr_->invalidate_user_sessions(session->username);
                   if (!ended.db_persisted) {
-                      audit_fn_(req, "mfa.disabled", "partial", "User", session->username,
-                                "sessions_ended=failed");
+                      audit("partial", "sessions_ended=failed");
                       res.set_content(
                           render_mfa_fragment(
                               *session, {}, {}, {}, {},
                               "MFA was disabled, but the account's sessions could not be ended. "
-                              "Try again; if this persists, ask an administrator to end them."),
+                              "Ask an administrator to end them."),
                           "text/html; charset=utf-8");
                       return;
                   }
-                  audit_fn_(req, "mfa.disabled", "ok", "User", session->username,
-                            std::format("sessions_ended={}", ended.count));
-                  // Same exit as logout: drop the cookie and send the browser to the landing page.
-                  res.set_header("Set-Cookie",
-                                 "yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
-                  res.set_header("HX-Redirect", "/home");
-                  res.set_content("", "text/plain");
+                  audit("ok", std::format("sessions_ended={}", ended.count));
+                  sign_out();
               });
 }
 
