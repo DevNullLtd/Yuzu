@@ -1458,11 +1458,12 @@ TEST_CASE("#5547 live (prefer_spark=false): boot debt is not cleared by an unrel
           "only by a clean full_sync",
           "[spark][guardian][reconcile][boot][5513][5547]") {
     // Ruling 22 (d): an unrelated delta must not clear boot_unresolved_. The boot re-arm failure
-    // latches the boot application; begin_delta_application() inherits that latch, so the delta's
-    // application is not clean and the flag, and the reported generation 0, stay. A full_sync at
-    // the next generation is the authoritative repair. Mutations: begin_delta_application not
-    // inheriting the latch (the delta clears the flag and reports kGen5513 + 1); the discharge
-    // deleted (the full_sync never clears it).
+    // is recorded against r1 (tagged boot-origin; the application-wide latch is only the
+    // allocation-failure fallback), and the omitting empty delta carries that record, so the
+    // delta's application is not clean and the flag, and the reported generation 0, stay. A
+    // full_sync at the next generation is the authoritative repair (it carries no per-rule
+    // outcome). Mutation: the carry of sync_failed_ids in begin_delta_application deleted (the
+    // delta clears the flag and reports kGen5513 + 1).
     BootRig5513 r;
     r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
 
