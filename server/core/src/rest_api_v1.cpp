@@ -2136,7 +2136,9 @@ std::atomic<int>& live_poll_interval_ms() {
 //   6. (admin) target == the configured break-glass account → 403
 //      `break_glass_target` (the sealed escape hatch is re-keyed out of band
 //      only — an IdP compromise must not be able to invalidate it).
-//   7. MFA step-up (step_up_fn; skips an un-enrolled user).
+//   7. MFA step-up (step_up_fn; skips an un-enrolled user). The central step-up check
+//      (step_up_gate.hpp) evaluates the same decision before the handler runs, i.e. ahead of
+//      steps 2-6; this in-handler call repeats it from that verdict and stays in the ladder.
 //   8. Body + length policy (password_policy.hpp) → 400, NOT audited.
 //   9. (self) The current password through AuthRoutes'
 //      verify_password_with_lockout (the SAME striped-lock / lockout / sso-only
@@ -15470,8 +15472,11 @@ void RestApiV1::register_routes(
         // the session up front means a single map lookup and avoids the
         // re-resolve race that the prior order opened up. (The
         // token/session handlers run perm_fn before auth_fn; both
-        // orderings are safe because step_up_fn always runs last, after
+        // orderings are safe because step_up_fn always runs after
         // auth_fn has populated `session` — PR #1199 review LOW.)
+        // The central step-up check (step_up_gate.hpp) evaluates the same
+        // decision before this handler runs; step_up_fn below repeats it
+        // from that verdict within the request.
         auto session = auth_fn(req, res);
         if (!session)
             return;

@@ -533,13 +533,16 @@ it was read from:
 
 **Named PR-4.2/4.3 sweep deliverable.** Six sites compare `auth_source`
 today (`mfa_step_up.cpp`, `auth_routes.cpp`, `auth_db.cpp` storage-only).
-One is instructive: `mfa_step_up.cpp`'s bearer-token step-up exemption
-checks for `api_token`/`mcp_token` and falls through to a `mfa_status()`
-lookup for anything else — `engine_token` hits that fallthrough today by
-accident of the default branch, which happens to be the *correct* posture
-(an engine session has no MFA-enrolled user to step up, so it fails closed
-via `UserNotFound`, consistent with §9's structural denial). The design
-requires this to stop being accidental: PR 4.2 (introducing the value) or
+One was instructive: the bearer-token step-up exemption checked for
+`api_token`/`mcp_token` and fell through to a `mfa_status()` lookup for
+anything else - `engine_token` hit that fallthrough by accident of the
+default branch (the lookup of `engine:<slug>` was rejected as
+`InvalidUsername`, which surfaced as a misleading `401`). **Superseded:**
+the step-up decision now denies an engine principal explicitly, ahead of
+any store read, with `403` and `reason=engine_principal_denied`, on every
+step-up-gated route (`decide_step_up`, verdict `kEngineDenied`; see
+`docs/auth-architecture.md` "MFA step-up chokepoint"). The design
+required this to stop being accidental: PR 4.2 (introducing the value) or
 4.3 (building on it) must sweep all six `auth_source` comparison sites and
 record, per site, that its default-branch behavior for `engine_token` is
 the intended one — not merely that it happens not to crash.
@@ -705,10 +708,14 @@ mutations.
   means no engine session can hold `UserManagement:*`/`Security:*` grants
   on principal-lifecycle routes, and the engine-principal lifecycle surface
   itself (create/rotate/revoke/transfer-owner) requires a **human admin
-  session + MFA step-up** (same posture as the existing 11 step-up
-  surfaces). One defensive addition: those routes deny any engine-classed
+  session + MFA step-up** (same posture as the other step-up surfaces,
+  which are now enforced by the central step-up check on 36 routes). One
+  defensive addition: those routes deny any engine-classed
   session outright (fail-closed belt to the structural braces), audited as
-  `denied` — keyed on the session's **principal kind** (the persisted
+  `denied` in the route handler. On a route the central check enforces, the
+  engine denial is made there first and is audited as `mfa.step_up.required`
+  (`result=error`, `reason=engine_principal_denied`) instead of the handler
+  row. The handler denial is keyed on the session's **principal kind** (the persisted
   discriminator, §6), with `auth_source="engine_token"` as a second belt,
   so a future second engine authentication path cannot silently bypass a
   string-keyed deny.
