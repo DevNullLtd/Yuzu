@@ -465,7 +465,9 @@ der|<sha256>|<base64>
   fields as unknown.
 - **Unknown versus empty.** A field an older agent's record does not have reads as NULL (unknown)
   on the server. A field the agent could not determine is sent as the literal `?` and also stored
-  NULL. An empty field is a real empty value: for example, an empty SAN list is sent as no `san|`
+  NULL. **As built in 2a-2a:** a `?` in `is_ca`, `path_len` or `self_signed` is stored NULL and adds an
+  `unknown:<field>` token to `constrained_fields`; a `?` in the `flags` field adds `flags_unknown`;
+  an empty field stays not-applicable NULL, with no token. An empty field is a real empty value: for example, an empty SAN list is sent as no `san|`
   records together with `cert|...|sans=0`. A count of zero is an explicit 0; it never means "not
   collected".
 - **Store status.** Every store the allowlist names gets exactly one `store|` record:
@@ -534,8 +536,9 @@ the per-user identifier for per-user rows. Every count is of distinct (device, S
 carries the server-receipt `last_seen`. Each store has its own `observed_at` (ADR-0070 D12,
 `0070:977-1038`).
 
-**Proposed:** `CertificateInventoryStore`, schema `certificate_inventory_store`. All `*_at` and `*_seen`
-columns are `TIMESTAMPTZ` set from `now()` in SQL. Certificate validity columns are `TIMESTAMPTZ`
+**Proposed (as built in 2a-2a):** `CertificateInventoryStore`, schema `certificate_inventory_store`, with seven tables in 2a-2a (the
+`decommission_tombstone` row below arrives in 2a-2c). All `*_at` and `*_seen`
+columns are `TIMESTAMPTZ` set from the database clock in SQL (`now()`, or for a report's own time T the plain `clock_timestamp()`). Certificate validity columns are `TIMESTAMPTZ`
 from the certificate. Postgres covers 4713 BC to 294276 AD, so pre-1970 and year-9999 dates fit
 unclamped.
 
@@ -543,7 +546,7 @@ unclamped.
 |---|---|---|
 | `agent_state` | `agent_id` | `content_hash`, `blob_version`, `first_seen`, `last_seen` (receipt of any report, full or skip), `last_full_at` (receipt of the last full report) |
 | `store_state` | (`agent_id`, `store_id`, `user_ref`) | `scope`, `status`, `reason`, `observed_at` (receipt of the last report in which the store read `ok` or `absent`), `status_at` (receipt of the last report that carried this store), `cert_count` |
-| `cert_location` | (`agent_id`, `store_id`, `user_ref`, `path`, `sha256`) | `first_seen`, `last_seen`, `full_report_at` (the `last_full_at` of the full report that last carried it) |
+| `cert_location` | (`agent_id`, `store_id`, `user_ref`, `path_md5`, `sha256`); `path_md5` is a generated column, `md5(path)`, and the full `path` is stored beside it (as built in 2a-2a; keeps the key short for long paths) | `first_seen`, `last_seen`, `full_report_at` (the `last_full_at` of the full report that last carried it) |
 | `decommission_tombstone` | `agent_id` | `decommissioned_at` |
 | `cert_fact` | (`agent_id`, `sha256`) | every field in the field table, `der` (nullable), `server_parsed` (bool), `constrained_fields` |
 | `cert_san` | (`agent_id`, `sha256`, `ord`) | `san_type`, `value` |
@@ -569,8 +572,18 @@ in this store's migration array.
 
 **Proposed:** one shared ingest seam, `certificate_inventory_ingestion.cpp`, for the direct
 `ReportInventory` and gateway `ProxyInventory` paths (ADR-0016 §5). It runs in one transaction per
-report, holding a per-agent row lock on `agent_state`, so concurrent replaces for one agent
-serialise as the software store's do. Per store:
+report. **As built in 2a-2a:** the transaction takes a per-agent lock with
+`pg_try_advisory_xact_lock`, so it never queues behind another report for the same agent. A report
+that finds the agent busy is **deferred**, not stored: it is counted `result="deferred"`,
+`reason="agent_busy"`; a full report is answered `need_full` (the agent resends), and a hash-only
+report is not nacked (the agent retries the hash next cycle). `delete_agent` is an operator action
+and takes the same lock by waiting, under a bounded `lock_timeout`. The report time T is the plain
+database `clock_timestamp()` read once at the top of the transaction (no `GREATEST`, no strictly
+monotonic T): the `ok`-store sweep removes the locations whose `full_report_at IS DISTINCT FROM`
+this report's T, so a location this report re-stamped survives and everything else in that store goes.
+The fact upsert skips an unchanged fact (`IS DISTINCT FROM` guard) and rewrites a fact's SAN, EKU and
+CDP children only when the fact changed or is new; the intent is that children never go stale
+relative to their fact (a child digest is being added to prove it). Per store:
 
 | Status in this report | What happens to that store's rows | `observed_at` |
 |---|---|---|
@@ -585,10 +598,9 @@ been decommissioned: the check runs inside the ingest transaction, against a dec
 that `delete_agent` writes in the same transaction as the erase (or an equivalent registry check;
 the PR chooses). A report from such an agent is acknowledged, writes no row, and is counted
 (`reason=decommissioned`).
-- **No race.** Ingest and `delete_agent` both take the same per-agent lock first, for example
-  `pg_advisory_xact_lock` on a hash of the agent id, so a decommission cannot commit between the
+- **No race.** Ingest (`pg_try_advisory_xact_lock`, deferring when busy) and `delete_agent` (the same lock, waited for under a bounded `lock_timeout`) both take the same per-agent lock first, on a hash of the agent id, so a decommission cannot commit between the
   ingest's tombstone read and its commit.
-- **What decommission does today (verified).** The decommission cascade erases seven data stores
+- **What decommission does today (verified).** The decommission cascade erases seven data stores before 2a-2a and **eight as built in 2a-2a** (the certificate inventory is the eighth, `agent_decommission.cpp`)
   and no auth store (`server.cpp:10019-10029`, `agent_decommission.hpp:117-125`); the only
   `pending_agents` delete is pending-only (`auth_db.cpp:2765`). So an approved agent's enrolment
   record survives decommission. If that agent is still running, it re-registers through the
@@ -640,7 +652,19 @@ the PR chooses). A report from such an agent is acknowledged, writes no row, and
 UTF-8 is validated at the seam. Invalid bytes are replaced, with `sanitize_utf8`
 (`sdk/include/yuzu/string_utils.hpp:32`), and the field is marked. A record over a cap is refused,
 never truncated silently. Refusals are counted on
-`yuzu_server_cert_inventory_ingest_total{result,reason}`, with the reason label from a closed set that includes `parse_error`.
+`yuzu_server_cert_inventory_ingest_total{result,reason}`. **As built in 2a-2a** the closed
+(result, reason) set is: `stored` {`none`, `parse_error`, `over_cap`, `der_hash_mismatch`,
+`utf8_replaced`}; `touched` {`none`}; `need_full` {`cold`, `hash_mismatch`, `bad_claim`};
+`rejected` {`blob_too_large`, `unknown_version`, `bad_header`, `over_cap`, `too_many_sources`};
+`deferred` {`agent_busy`}; `error` {`store_error`, `digest_error`}; every pair is zero-seeded. Each
+outcome is also counted on the generic `yuzu_inventory_ingest_total{source="certificate_inventory",outcome}`
+and timed on `yuzu_inventory_ingest_duration_seconds{source="certificate_inventory",phase}`.
+A hash-only claim that is not exactly 64 lowercase hex characters is answered `need_full` with
+`reason=bad_claim` without reaching the store (it could never match, and no claim may equal the
+stored empty-hash "pruned" sentinel). A hash-only store error is **not** a `need_full` (it would turn
+a transient fault into a 3 MiB upload); a full-report store error is. Refusals are terminal on
+the FIRST sighting: ack, counted `rejected`, nothing stored and no `need_full`, including an unknown
+major version, so the agent never loops on bytes the server will always refuse.
 
 ### Typed set, purge and read filter
 
@@ -753,7 +777,7 @@ concern. The design states how a pruned store's rows are re-sent despite hash-sk
 
 | Pass | Class (`background_jobs.hpp:84-88`) | Why |
 |---|---|---|
-| `cert_inventory_store.run_retention_prune` | `ReplicaSafe` | Advisory-lock single-writer retention, the `execution_tracker.reap_command_execution_mappings` precedent (`background_jobs.hpp:118-119`). |
+| `cert_inventory_store.run_retention_prune` | `ReplicaSafe` | Named as in `background_jobs.hpp` (piggybacks `preflight_runner_thread_`). Clock-guarded advisory-lock single-writer retention, the `execution_tracker.reap_command_execution_mappings` precedent (`background_jobs.hpp:118-119`). |
 | `revocation_source.refresh` (2b-1) | `FencedLeaderOnly` | Network egress that would otherwise run once per replica. The dispatch site is wrapped in `leader_gate_permits` (`leader_gate.hpp`) and carries `YUZU_ASSERT_BACKGROUND_JOB`, as the header requires (`background_jobs.hpp:27-32`). `ca.publish_crl` is the nearest precedent (`:212`). |
 | `revocation_source.verify_certificate_signatures` (2b-2) | `ReplicaSafe` | An idempotent upsert of a pure function of (certificate DER, registered key). It reads both schemas, so it runs through the named cross-schema query owner (see [The store](#the-store)). |
 | `inventory_store.purge_typed_sources` (2a-1b) | `ReplicaSafe` | The batched purge of typed-source rows from the generic store: an idempotent bounded delete. |
@@ -1605,7 +1629,7 @@ caps (64 sources × 8 URLs). Closed label sets are pre-seeded to 0.
 | `yuzu_server_crl_refresh_last_run_timestamp_seconds` | gauge, set at the end of every refresh tick | none | the leader |
 | `yuzu_server_crl_sources` | gauge | none | every replica (a store count) |
 | `yuzu_server_crl_refresh_leader` | gauge, 1 on the replica running the refresh, else 0 | none | every replica |
-| `yuzu_server_cert_inventory_ingest_total` | counter | `result`, `reason` | every replica |
+| `yuzu_server_cert_inventory_ingest_total` | counter | `result`, `reason` (closed set, see [Ingest](#ingest); as built in 2a-2a, plus the generic `yuzu_inventory_ingest_total` / `yuzu_inventory_ingest_duration_seconds` with `source=certificate_inventory`) | every replica |
 | `yuzu_server_cert_inventory_claim_mismatch_total` | counter | none | every replica |
 | `yuzu_server_cert_inventory_pruned_total`, `..._prune_capped_total` | counter | `grain` | every replica |
 | `yuzu_fleet_cert_store_status` | gauge, fleet rollup | `os`, `status` | every replica; absent-not-zero |
