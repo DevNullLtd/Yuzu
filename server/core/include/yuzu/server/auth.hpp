@@ -986,6 +986,13 @@ public:
     /// unrelated locks.
     [[nodiscard]] RevokeResult invalidate_user_sessions(const std::string& username);
 
+    /// As `invalidate_user_sessions`, but keeps the session whose raw token is
+    /// `keep_token` (empty keeps none). Used when the user disables a factor from
+    /// Settings (#6079): their other sessions may hold a proof made under the factor
+    /// just cleared. Same durable-first ordering and `db_persisted` contract.
+    [[nodiscard]] RevokeResult invalidate_other_user_sessions(const std::string& username,
+                                                              const std::string& keep_token);
+
     /// List all configured users (password hashes omitted from caller view).
     std::vector<UserEntry> list_users() const;
 

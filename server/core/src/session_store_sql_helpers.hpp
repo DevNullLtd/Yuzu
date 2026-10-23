@@ -83,4 +83,29 @@ inline std::optional<int> invalidate_user_in_txn(PGconn* c, const std::string& u
     return count;
 }
 
+/// Delete every durable session of `username` EXCEPT `keep_token_hash`, and bump the
+/// write-generation, IN THE CALLER'S TXN (#6079: disabling a factor from Settings ends the
+/// account's OTHER sessions and keeps the one the user is acting from). An empty
+/// `keep_token_hash` keeps nothing back. Returns the number deleted, or nullopt (with `err`
+/// set) on a statement failure. Always bumps, even on a 0-row delete.
+inline std::optional<int> invalidate_user_except_in_txn(PGconn* c, const std::string& username,
+                                                        const std::string& keep_token_hash,
+                                                        std::string& err) {
+    pg::PgResult r = pg::exec_params(
+        c,
+        "DELETE FROM session_store.sessions WHERE username=$1 AND token_hash<>$2 "
+        "RETURNING token_hash",
+        std::vector<std::string>{username, keep_token_hash});
+    if (r.status() != PGRES_TUPLES_OK) {
+        err = std::string("session delete-others failed: ") + PQerrorMessage(c);
+        return std::nullopt;
+    }
+    const int count = PQntuples(r.get());
+    if (!bump_generation_in_txn(c)) {
+        err = std::string("session write-generation bump failed: ") + PQerrorMessage(c);
+        return std::nullopt;
+    }
+    return count;
+}
+
 } // namespace yuzu::server::session_sql

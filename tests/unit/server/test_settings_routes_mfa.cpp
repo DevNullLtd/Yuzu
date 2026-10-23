@@ -408,6 +408,57 @@ TEST_CASE("POST /api/settings/mfa/disable clears state + emits mfa.disabled",
     CHECK(status->recovery_codes_remaining == 0);
 }
 
+TEST_CASE("POST /api/settings/mfa/disable ends the account's OTHER sessions and keeps the caller's "
+          "(#6079)",
+          "[pg][mfa][routes][settings]") {
+    MfaSettingsHarness h;
+    yuzu::server::SessionStore sessions{h.auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    h.auth_mgr.set_session_store(&sessions);
+
+    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    auto bytes = mfa::base32_decode(init->secret_base32);
+    REQUIRE(bytes.has_value());
+    std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+    auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
+
+    {
+        auto salt = auth::AuthManager::random_bytes(16);
+        REQUIRE(h.auth_db
+                    ->upsert_user("bob",
+                                  auth::AuthManager::pbkdf2_sha256("bobpassword12", salt, 100'000),
+                                  auth::AuthManager::bytes_to_hex(salt), auth::Role::user)
+                    .has_value());
+    }
+    const auto mine = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    const auto other = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    const auto bobs = h.auth_mgr.create_local_session_for_test("bob", auth::Role::user, false);
+    REQUIRE_FALSE(mine.empty());
+    REQUIRE_FALSE(other.empty());
+    REQUIRE_FALSE(bobs.empty());
+
+    auto res = h.sink.dispatch("POST", "/api/settings/mfa/disable", {},
+                               "application/x-www-form-urlencoded",
+                               {{"Host", "yuzu.example"},
+                                {"Origin", "http://yuzu.example"},
+                                {"Cookie", "yuzu_session=" + mine}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.has_audit("mfa.disabled", "ok", "admin"));
+    CHECK(h.audit_detail("mfa.disabled").find("other_sessions_ended=1") != std::string::npos);
+
+    // Durable view: the caller's row and an unrelated user's row survive, the other
+    // session of the same account is gone.
+    CHECK(sessions.find(auth::AuthManager::sha256_hex(mine)).value().has_value());
+    CHECK(sessions.find(auth::AuthManager::sha256_hex(bobs)).value().has_value());
+    CHECK_FALSE(sessions.find(auth::AuthManager::sha256_hex(other)).value().has_value());
+    CHECK(h.auth_mgr.validate_session(mine).has_value());
+    CHECK_FALSE(h.auth_mgr.validate_session(other).has_value());
+    CHECK(h.auth_mgr.validate_session(bobs).has_value());
+}
+
 TEST_CASE("POST /api/settings/mfa/disable is blocked for self under enforcement (PR3 invariant)",
           "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;

@@ -1894,6 +1894,34 @@ AuthManager::invalidate_user_sessions(const std::string& username) {
     return RevokeResult{before - sessions_.size(), db_persisted};
 }
 
+AuthManager::RevokeResult
+AuthManager::invalidate_other_user_sessions(const std::string& username,
+                                            const std::string& keep_token) {
+    // Same ordering as invalidate_user_sessions: durable delete OUTSIDE mu_ first, then
+    // the in-memory erase. The cache key is the token hash when a store is attached.
+    const std::string keep_key =
+        keep_token.empty() ? std::string{} : (session_store_ ? hash_token(keep_token) : keep_token);
+    bool db_persisted = true;
+    std::size_t db_count = 0;
+    if (session_store_) {
+        if (auto r = session_store_->invalidate_user_except(username, keep_key)) {
+            db_count = static_cast<std::size_t>(*r);
+        } else {
+            db_persisted = false;
+            spdlog::error("invalidate_other_user_sessions: durable delete failed ({})",
+                          r.error().message);
+            note_session_store_degrade("invalidate_user_except");
+        }
+    }
+    std::unique_lock lock(mu_);
+    const auto before = sessions_.size();
+    std::erase_if(sessions_, [&](const auto& pair) {
+        return pair.second.username == username && pair.first != keep_key;
+    });
+    const auto local = before - sessions_.size();
+    return RevokeResult{session_store_ && db_persisted ? db_count : local, db_persisted};
+}
+
 // ── User management ─────────────────────────────────────────────────────────
 
 bool AuthManager::has_users() const {

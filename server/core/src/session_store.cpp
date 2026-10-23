@@ -272,6 +272,26 @@ SessionStore::invalidate_user(const std::string& username) {
     return count;
 }
 
+std::expected<int, SessionStore::Error>
+SessionStore::invalidate_user_except(const std::string& username,
+                                     const std::string& keep_token_hash) {
+    if (!open_)
+        return std::unexpected(Error{"session store not open"});
+    int count = 0;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        const auto deleted =
+            session_sql::invalidate_user_except_in_txn(c, username, keep_token_hash, err);
+        if (!deleted)
+            return false;
+        count = *deleted;
+        return true;
+    });
+    if (!ok)
+        return std::unexpected(Error{err.empty() ? "invalidate_user_except failed" : err});
+    return count;
+}
+
 std::expected<std::optional<AuthoredTimes>, SessionStore::Error>
 SessionStore::set_elevation(const std::string& token_hash, std::int64_t elevation_duration_ms) {
     if (!open_)
