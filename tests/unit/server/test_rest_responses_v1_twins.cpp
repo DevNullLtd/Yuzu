@@ -832,6 +832,26 @@ TEST_CASE("v1 response row reads: response.forensics.read is written only when F
             CHECK(res->body.find("ordinary-") == std::string::npos);
             CHECK(forensics_audits(h).size() == 1);
         }
+
+        // g8-ch-6, CHARACTERISED (not endorsed): the neighbouring success row is written BEFORE
+        // the verb row, so a refused attempt has already left its own `response.read` row behind,
+        // and every client retry adds another. The audit trail over-reports access (a row for
+        // data that was withheld); it never under-reports it. Pinned so a change in the order
+        // (the row count per refused attempt) is a decision, not a surprise.
+        const auto neighbour_rows = [&] {
+            return std::ranges::count_if(h.audit_log, [](const AuditRecord& a) {
+                return a.action != "response.forensics.read";
+            });
+        };
+        CHECK(neighbour_rows() == 1);
+        {
+            auto retry = h.sink.Get(path);
+            REQUIRE(retry);
+            CHECK(retry->status == 503);
+        }
+        CHECK(neighbour_rows() == 2);
+        CHECK(forensics_audits(h).size() == 2);
+        h.audit_fail_action.clear();
     }
 }
 
