@@ -6,7 +6,8 @@
 only in a dashboard.
 
 tests/unit/server/test_result_set_matcher.cpp keeps its own copy of the schema (the server test
-binary has no YAML loader); this file ties that copy to the definition that actually ships.
+binary has no YAML loader); the same column names, types and row_kind values are pinned in both
+places.
 
 Runnable standalone: `python3 tests/test_filesystem_definition.py` (how meson runs it; a bare
 pytest-style file with no runner would execute zero assertions and always exit 0).
@@ -38,10 +39,13 @@ class FindByHashDefinition(unittest.TestCase):
         # 0.3.0 -> 0.4.0 changed the declared columns (matches_found is a row kind, not a column).
         self.assertEqual(_find_by_hash()["metadata"]["version"], "0.4.0")
 
-    def test_three_string_columns_in_wire_order(self):
+    def test_three_columns_in_wire_order(self):
+        # A column matcher takes a row as a data row only when its field count equals this width,
+        # so the match row (`match|path|size`) is the one three-field row kind; size is the byte
+        # count, as in file_hash.
         columns = _find_by_hash()["spec"]["result"]["columns"]
         self.assertEqual([c["name"] for c in columns], ["row_kind", "path", "size"])
-        self.assertEqual([c["type"] for c in columns], ["string", "string", "string"])
+        self.assertEqual([c["type"] for c in columns], ["string", "string", "int64"])
 
     def test_row_kind_values_are_the_three_wire_row_kinds(self):
         row_kind = _find_by_hash()["spec"]["result"]["columns"][0]

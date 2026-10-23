@@ -153,9 +153,10 @@ bool json_column_match(std::string_view output, const std::string& column, const
 // names (stored in the matcher at admission by bind_declared_columns). Rows are split to the
 // DECLARED width (`split_fields(plugin, line, width)`), so the index is the declared column
 // position, not the dashboard cell position: for a key/value plugin the dashboard still shows key
-// + remainder under the declared headers (a pre-existing display gap tracked separately). A line
-// whose width differs (status|not_found, not_available|<reason>, a malformed row) or that equals
-// the header is not a data row.
+// + remainder under the declared headers (a pre-existing display gap tracked separately). A row
+// is a data row only when its field count equals the declared width: a line of any other width
+// (status|not_found, not_available|<reason>, a longer trailer, a malformed row) or that equals
+// the header is skipped.
 bool declared_column_match(std::string_view output, const std::string& column, const std::string& op,
                            const nlohmann::json& matcher) {
     std::vector<std::string> declared;

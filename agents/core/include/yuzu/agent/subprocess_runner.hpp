@@ -498,7 +498,9 @@ YUZU_EXPORT SubprocessResult run_bounded_subprocess(const std::vector<std::strin
  * run_bounded_subprocess polls subprocess_cancel_requested() each iteration
  * of its wait loop; once true it kills and reaps the child (same bounded
  * path as a deadline) and returns promptly with timed_out=true,
- * termination_reason=cancelled.
+ * termination_reason=cancelled. Its one non-subprocess reader is the filesystem
+ * plugin's find_by_hash walk (filesystem_find_by_hash.hpp), which polls it per
+ * entry and per hashed chunk.
  *
  * Backed by a file-local std::atomic<bool> in subprocess_runner.cpp -- a
  * single flag shared by every in-flight run in the process, not a

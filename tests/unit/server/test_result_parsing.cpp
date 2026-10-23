@@ -116,27 +116,38 @@ TEST_CASE("filesystem find_by_hash rows: a path ending in a backslash is folded 
     CHECK(split_fields("an_all_pipes_plugin", "match|foo\\|3").size() == 2);
 }
 
-TEST_CASE("split_fields to a declared width cuts a key/value plugin at the declared column count "
-          "(#5624)",
+TEST_CASE("split_fields to a declared width splits a key/value plugin on every pipe, so the "
+          "caller's width check is strict (#5624)",
           "[result_parsing]") {
     // A key/value plugin's DEFINITION may declare more columns than the fixed key + remainder
-    // schema (find_by_hash: row_kind, path, size). The matcher splits to that declared width.
+    // schema (find_by_hash: row_kind, path, size). The matcher splits on every unescaped pipe and
+    // compares the cell count with the declared width: a row is a data row only at exactly that.
     using V = std::vector<std::string>;
     CHECK(split_fields("filesystem", "match|/etc/hosts|413", 3) == V{"match", "/etc/hosts", "413"});
 
-    // The last cell is the unescaped remainder, so a truncated row's counters stay in one cell.
-    CHECK(split_fields("filesystem", "truncated|none|visited=1|hashed=2|skipped_unreadable=0", 3) ==
-          V{"truncated", "none", "visited=1|hashed=2|skipped_unreadable=0"});
+    // The verbatim 9-field trailer is NOT a width-3 row: nine cells, so the width check rejects it.
+    CHECK(split_fields("filesystem",
+                       "truncated|none|visited=1|hashed=2|skipped_unreadable=0|skipped_symlink=0|"
+                       "skipped_not_regular=0|skipped_oversize=0|skipped_network_mount=0",
+                       3) ==
+          V{"truncated", "none", "visited=1", "hashed=2", "skipped_unreadable=0",
+            "skipped_symlink=0", "skipped_not_regular=0", "skipped_oversize=0",
+            "skipped_network_mount=0"});
 
-    // A short row is not padded: the caller's width check rejects it.
+    // A short row is not padded: two cells, rejected by the same width check.
     CHECK(split_fields("filesystem", "matches_found|1", 3) == V{"matches_found", "1"});
+
+    // list_dir's wire row has four fields against its three declared columns: not a data row.
+    CHECK(split_fields("filesystem", "entry|foo.txt|file|12", 3) ==
+          V{"entry", "foo.txt", "file", "12"});
 
     // An escaped pipe inside a field does not consume a cut.
     CHECK(split_fields("filesystem", "match|a\\|b|3", 3) == V{"match", "a|b", "3"});
 
-    // Width 0 or 1 is no cut at all: the whole unescaped line is one cell.
-    CHECK(split_fields("filesystem", "match|a\\|b|3", 1) == V{"match|a|b|3"});
-    CHECK(split_fields("filesystem", "match|a\\|b|3", 0) == V{"match|a|b|3"});
+    // Widths 0 and 1 are no special case: the same all-pipes split, so no row can satisfy them
+    // except a pipe-free one.
+    CHECK(split_fields("filesystem", "match|a\\|b|3", 1) == V{"match", "a|b", "3"});
+    CHECK(split_fields("filesystem", "match|a\\|b|3", 0) == V{"match", "a|b", "3"});
 }
 
 TEST_CASE("split_fields to a declared width of 2, or for a non-key/value plugin, is the "

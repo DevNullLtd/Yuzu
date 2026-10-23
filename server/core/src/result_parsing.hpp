@@ -151,6 +151,22 @@ inline std::string unescape_pipes(const std::string& s) {
     return out;
 }
 
+/// Split on EVERY unescaped '|' (the default shape for plugins without a fixed key/value schema).
+inline std::vector<std::string> split_all_pipes(const std::string& line) {
+    std::vector<std::string> parts;
+    size_t pos = 0;
+    while (pos <= line.size()) {
+        auto p = find_unescaped_pipe(line, pos);
+        if (p == std::string::npos) {
+            parts.push_back(unescape_pipes(line.substr(pos)));
+            break;
+        }
+        parts.push_back(unescape_pipes(line.substr(pos, p - pos)));
+        pos = p + 1;
+    }
+    return parts;
+}
+
 /// Split a pipe-delimited output line into fields according to the plugin schema.
 /// The first column ("Agent") is NOT included — the caller prepends the agent name.
 inline std::vector<std::string> split_fields(const std::string& plugin,
@@ -180,43 +196,23 @@ inline std::vector<std::string> split_fields(const std::string& plugin,
         return {unescape_pipes(line), ""};
     }
     // Default: split on all pipes
-    std::vector<std::string> parts;
-    size_t pos = 0;
-    while (pos <= line.size()) {
-        auto p = find_unescaped_pipe(line, pos);
-        if (p == std::string::npos) {
-            parts.push_back(unescape_pipes(line.substr(pos)));
-            break;
-        }
-        parts.push_back(unescape_pipes(line.substr(pos, p - pos)));
-        pos = p + 1;
-    }
-    return parts;
+    return split_all_pipes(line);
 }
 
-/// Split a line to a definition's DECLARED column width (the result-set matcher's reader).
-/// A key/value plugin's fixed schema is key + remainder, but its content DEFINITION may declare
-/// more columns (find_by_hash: row_kind, path, size). For such a plugin this cuts at the first
-/// `declared_width - 1` unescaped pipes; the last cell is the unescaped remainder. A short row is
-/// NOT padded (it returns fewer cells, so the caller's width check rejects it); a width of 0 or 1
-/// returns the whole unescaped line as one cell. Width 2 and every non-key/value plugin
-/// (vuln_scan and the kSchemas plugins included) delegate to the 2-argument overload, so their
-/// behaviour is unchanged. The dashboard / SSE / facets readers keep the 2-argument form.
+/// Split a line to a definition's DECLARED column width (the result-set matcher's reader). A
+/// key/value plugin's fixed schema is key + remainder, but its content DEFINITION may declare more
+/// columns (find_by_hash: row_kind, path, size). Width 2 deliberately mirrors the dashboard's key +
+/// remainder, and a non-key/value plugin (vuln_scan and the kSchemas plugins included) keeps its
+/// own schema: both delegate to the 2-argument overload. For a key/value plugin at any OTHER width
+/// the line is split on every unescaped pipe, so the caller's `cells.size() != declared.size()`
+/// check is the whole rule: a row is a data row only when its field count equals the declared
+/// width (a longer row such as a 9-field trailer, or a shorter one such as `matches_found|0`, is
+/// not one).
 inline std::vector<std::string> split_fields(const std::string& plugin, const std::string& line,
                                              std::size_t declared_width) {
     if (declared_width == 2 || columns_for_plugin(plugin).size() != 3) // not the key/value schema
         return split_fields(plugin, line);
-    std::vector<std::string> parts;
-    size_t pos = 0;
-    while (parts.size() + 1 < declared_width) {
-        auto p = find_unescaped_pipe(line, pos);
-        if (p == std::string::npos)
-            break;
-        parts.push_back(unescape_pipes(line.substr(pos, p - pos)));
-        pos = p + 1;
-    }
-    parts.push_back(unescape_pipes(line.substr(pos)));
-    return parts;
+    return split_all_pipes(line);
 }
 
 // -- Output line iteration ----------------------------------------------------

@@ -149,13 +149,8 @@ inline bool running_as_root() {
 
 /// A junction (NTFS mount point) at `link` -> `target`. `link` must not exist yet.
 inline bool create_junction(const fs::path& link, const fs::path& target) {
-    if (!CreateDirectoryW(link.c_str(), nullptr))
-        return false;
-    const HANDLE raw =
-        CreateFileW(link.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
-                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-    if (raw == INVALID_HANDLE_VALUE)
-        return false;
+    // Every allocating (throwing) step comes BEFORE the handle is opened: nothing between
+    // CreateFileW and CloseHandle can throw, so the raw HANDLE below cannot leak.
     // Hand-built IO_REPARSE_TAG_MOUNT_POINT buffer: REPARSE_DATA_BUFFER is WDK-only. The
     // substitute name is the NT form of the absolute target (the \??\ prefix), the print name the
     // plain absolute path.
@@ -183,6 +178,14 @@ inline bool create_junction(const fs::path& link, const fs::path& target) {
     std::memcpy(buf.data() + kFixedHeaderSize + kMountFieldsSize, substitute.c_str(), sub_bytes);
     std::memcpy(buf.data() + kFixedHeaderSize + kMountFieldsSize + sub_bytes, print_name.c_str(),
                 print_bytes);
+
+    if (!CreateDirectoryW(link.c_str(), nullptr))
+        return false;
+    const HANDLE raw =
+        CreateFileW(link.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (raw == INVALID_HANDLE_VALUE)
+        return false;
     DWORD returned = 0;
     const bool ok =
         DeviceIoControl(raw, FSCTL_SET_REPARSE_POINT, buf.data(), static_cast<DWORD>(buf.size()),

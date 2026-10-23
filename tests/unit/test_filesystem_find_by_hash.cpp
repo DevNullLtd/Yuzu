@@ -315,6 +315,7 @@ TEST_CASE("find_by_hash budget: the first bound to trip is sticky and cancel out
     CHECK(b.check());
     CHECK(b.consume(60));
     CHECK(c.hashed_bytes == 60);
+    CHECK(b.remaining() == 40);
     CHECK_FALSE(b.consume(41)); // 60 + 41 > 100
     CHECK(b.stop() == fbh::StopReason::byte_cap);
     CHECK(c.hashed_bytes == 60); // the refused chunk is not counted
@@ -385,6 +386,30 @@ TEST_CASE("find_by_hash depth: max_depth matches the old slash-count meaning and
 }
 
 // -- Symlinks, special files, unreadable --------------------------------------------------------
+
+TEST_CASE("find_by_hash hasher verdicts: a symlink or non-regular file found at open time is counted "
+          "and does not constrain",
+          "[find_by_hash]") {
+    // The TOCTOU swap the descriptor-based hashers exist for: the walk's lstat said "regular file",
+    // the open found a link (or a FIFO). The walk must count each under its own counter.
+    Tree t;
+    t.write("swapped_to_link");
+    t.write("swapped_to_fifo");
+    Probe probe;
+    auto env = fake_env(probe);
+    env.hash_entry = [](const fs::directory_entry& e, fbh::HashBudget&, const fbh::WalkLimits&) {
+        return fbh::HashOutcome{e.path().filename() == "swapped_to_link"
+                                    ? fbh::HashKind::symlink
+                                    : fbh::HashKind::not_regular,
+                                {}, 0};
+    };
+    const auto w = walk(t, 3, {}, env);
+    CHECK(w.out.c.skipped_symlink == 1);
+    CHECK(w.out.c.skipped_not_regular == 1);
+    CHECK(w.out.matches == 0);
+    CHECK(w.out.trailer_needed());
+    CHECK_FALSE(w.out.constrained());
+}
 
 #ifndef _WIN32
 
@@ -569,6 +594,102 @@ TEST_CASE("find_by_hash can_enter_posix: a listable directory, and nothing else"
     }
 }
 
+TEST_CASE("find_by_hash is_pseudo_fs_magic: the Linux control filesystems, never a data filesystem",
+          "[find_by_hash]") {
+    for (const std::uint64_t magic :
+         {0x9fa0ULL, 0x62656572ULL, 0x64626720ULL, 0x74726163ULL, 0x73636673ULL, 0x62656570ULL,
+          0xcafe4a11ULL, 0x27e0ebULL, 0x63677270ULL, 0x1cd1ULL, 0xde5e81e4ULL, 0x6165676cULL,
+          0x6e736673ULL, 0x42494e4dULL, 0x19800202ULL}) {
+        INFO("f_type " << std::hex << magic);
+        CHECK(fbh::is_pseudo_fs_magic(magic));
+    }
+    // ext4, tmpfs, xfs, btrfs, overlayfs, nfs, fuse, and "unknown": all ordinary file storage.
+    for (const std::uint64_t magic : {0xef53ULL, 0x01021994ULL, 0x58465342ULL, 0x9123683eULL,
+                                      0x794c7630ULL, 0x6969ULL, 0x65735546ULL, 0ULL}) {
+        INFO("f_type " << std::hex << magic);
+        CHECK_FALSE(fbh::is_pseudo_fs_magic(magic));
+    }
+}
+
+#ifdef __linux__
+TEST_CASE("find_by_hash pseudo-filesystems: /proc is refused as a directory, so none of its files "
+          "is ever opened",
+          "[find_by_hash]") {
+    std::error_code ec;
+    if (!fs::is_directory("/proc/sys", ec))
+        SKIP("/proc is not mounted");
+    // Classified on the directory BEFORE the iterator names a child: a /proc/kmsg open (which drains
+    // the kernel log with CAP_SYSLOG) cannot happen, because nothing under /proc is ever listed.
+    CHECK_FALSE(fbh::can_enter_posix("/proc"));
+    CHECK_FALSE(fbh::can_enter_posix("/proc/sys"));
+    if (fs::is_directory("/sys/kernel", ec))
+        CHECK_FALSE(fbh::can_enter_posix("/sys/kernel"));
+
+    Probe probe;
+    auto env = fake_env(probe); // records every hash_entry call: none may happen
+    env.can_enter = fbh::can_enter_posix;
+    const auto out = fbh::walk_find_by_hash("/proc", kTarget, 5, {}, env, [](const std::string&) {});
+    CHECK(out.c.visited == 0);
+    CHECK(out.c.skipped_unreadable == 1);
+    CHECK(probe.hashed.empty());
+    CHECK(out.constrained());
+}
+#endif
+
+namespace {
+/// Open descriptors of this process, counted through the OS's own listing (the count includes the
+/// listing's own descriptor, identically before and after, so a difference is a leak). 0 = the
+/// listing is unavailable.
+std::size_t open_fd_count() {
+#if defined(__APPLE__)
+    const char* dir = "/dev/fd";
+#else
+    const char* dir = "/proc/self/fd";
+#endif
+    std::error_code ec;
+    std::size_t n = 0;
+    for (fs::directory_iterator it{dir, ec}, end; !ec && it != end; it.increment(ec))
+        ++n;
+    return ec ? 0 : n;
+}
+} // namespace
+
+TEST_CASE("find_by_hash descriptors: no walk, refusal or mid-file stop leaves a descriptor open",
+          "[find_by_hash]") {
+    const std::size_t before = open_fd_count();
+    if (before == 0)
+        SKIP("this host cannot list its open descriptors");
+    {
+        Tree t;
+        const auto big = t.write("big.bin", std::string(3 * fbh::kHashChunk + 17, 'q'));
+        t.write("ok.txt", "plain");
+        t.write("huge.bin", "12345");
+        fs::create_symlink(t.root / "ok.txt", t.root / "link.txt");
+        fs::create_directory_symlink(t.root, t.root / "loop");
+        REQUIRE(::mkfifo((t.root / "pipe").c_str(), 0600) == 0);
+        if (!running_as_root()) {
+            const auto locked = t.write("locked.txt", "secret");
+            REQUIRE(::chmod(locked.c_str(), 0) == 0);
+        }
+        fbh::WalkLimits oversize;
+        oversize.max_file_bytes = 4; // huge.bin (5 bytes) and big.bin are oversize
+        (void)walk(t, 3, oversize, real_env(), kTarget);
+        (void)walk(t, 3, {}, real_env(), yuzu::shared::sha256_hex("plain"));
+        // A bound that trips MID-FILE (cancel on the third chunk), and one before the first: the
+        // open descriptor must still be closed.
+        int checks = 0;
+        CHECK(hash_run(big, {}, [&checks] { return ++checks > 2; }).outcome.kind ==
+              fbh::HashKind::stopped);
+        CHECK(hash_run(big, {}, [] { return true; }).outcome.kind == fbh::HashKind::stopped);
+        // The refusals: a link and a pipe through the real open.
+        CHECK(hash_direct(t.root / "link.txt").kind == fbh::HashKind::symlink);
+        CHECK(hash_direct(t.root / "pipe").kind == fbh::HashKind::not_regular);
+        if (!running_as_root())
+            ::chmod((t.root / "locked.txt").c_str(), 0600);
+    }
+    CHECK(open_fd_count() == before);
+}
+
 #endif // !_WIN32
 
 #ifdef _WIN32
@@ -601,18 +722,21 @@ TEST_CASE("find_by_hash junctions: a junction is counted and never entered or ha
     CHECK_FALSE(w.out.constrained()); // a by-design exclusion alone does not constrain
 }
 
-TEST_CASE("find_by_hash reparse points: the real Windows hasher reports a file reparse point",
+TEST_CASE("find_by_hash reparse points: a non-link, non-data tag is counted unreadable, never read",
           "[find_by_hash]") {
+    // IO_REPARSE_TAG_AF_UNIX is not a name surrogate (not a link) and not a data-serving filter
+    // (WOF, Dedup), so the hasher refuses it as unreadable instead of reading it or calling it a
+    // symlink. std::filesystem does not classify the tag, so the walk lists the file as an
+    // ordinary one and the hasher decides.
     Tree t;
     const auto p = t.write("tagged.bin", "x");
     REQUIRE(make_file_reparse_point(p));
-    CHECK(hash_direct(p).kind == fbh::HashKind::symlink);
-    // Through the walk the file is never read through: whether std::filesystem lists the tagged
-    // file as a regular file (the hasher then reports the reparse point) or as something else, it
-    // is counted as skipped and its content is not matched.
+    CHECK(hash_direct(p).kind == fbh::HashKind::unreadable);
     const auto w = walk(t, 3, {}, real_env(), yuzu::shared::sha256_hex("x"));
     CHECK(w.out.matches == 0);
-    CHECK(w.out.c.skipped_symlink + w.out.c.skipped_not_regular == 1);
+    CHECK(w.out.c.skipped_unreadable == 1);
+    CHECK(w.out.c.skipped_symlink == 0);
+    CHECK(w.out.constrained()); // unreadable, unlike a by-design link, constrains the result
 }
 
 TEST_CASE("find_by_hash win_root_drive_refused: only a fixed disk or a nonexistent drive proceeds",
@@ -653,20 +777,33 @@ TEST_CASE("find_by_hash real hasher: digest equals the in-memory SHA-256 across 
     CHECK(w.out.c.hashed_bytes == content.size());
 }
 
-TEST_CASE("find_by_hash real hasher: the byte cap stops a large file mid-stream",
+TEST_CASE("find_by_hash real hasher: a file larger than the remaining byte budget is refused "
+          "before a byte is read",
           "[find_by_hash]") {
     // The real per-OS hasher (hash_entry_win on Windows, hash_entry_posix elsewhere), not a fake:
-    // without the per-chunk budget.consume() a large file would be read to the end however small
-    // the cap.
+    // a file that can never fit is skipped up front (oversize), so it cannot end the walk
+    // part-way through. The per-chunk byte cap itself (a file that grows after it is sized) is
+    // pinned on the streaming reader below.
     Tree t;
     const auto p = t.write("big.bin", std::string(3 * fbh::kHashChunk + 17, 'q'));
     fbh::WalkLimits lim;
     lim.max_bytes_hashed = 2 * fbh::kHashChunk;
     const auto got = hash_run(p, lim);
+    CHECK(got.outcome.kind == fbh::HashKind::oversize);
+    CHECK(got.stop == fbh::StopReason::none);
+    CHECK(got.counters.hashed_bytes == 0);
+}
+
+TEST_CASE("find_by_hash real hasher: a bound that trips mid-file stops after the admitted chunks",
+          "[find_by_hash]") {
+    Tree t;
+    const auto p = t.write("big.bin", std::string(3 * fbh::kHashChunk + 17, 'q'));
+    int checks = 0;
+    // The budget polls cancel once per chunk: it flips on the third, so two chunks are admitted.
+    const auto got = hash_run(p, {}, [&checks] { return ++checks > 2; });
     CHECK(got.outcome.kind == fbh::HashKind::stopped);
-    CHECK(got.stop == fbh::StopReason::byte_cap);
-    CHECK(got.counters.hashed_bytes ==
-          2 * fbh::kHashChunk); // two chunks admitted, the third refused
+    CHECK(got.stop == fbh::StopReason::cancelled);
+    CHECK(got.counters.hashed_bytes == 2 * fbh::kHashChunk);
 }
 
 TEST_CASE("find_by_hash real hasher: a cancelled budget stops a large file before it hashes a byte",
@@ -702,6 +839,25 @@ TEST_CASE("find_by_hash oversize: a file over max_file_bytes is counted but does
     CHECK(w.out.c.skipped_oversize == 1);
     CHECK(w.out.matches == 1);
     CHECK(w.out.trailer_needed());
+    CHECK_FALSE(w.out.constrained());
+}
+
+TEST_CASE("find_by_hash byte budget: a file larger than the remaining budget is skipped, not a "
+          "walk-ender",
+          "[find_by_hash]") {
+    // The "no silent miss" oracle for the byte cap: one big file must not end the scan before a
+    // later needle. The 5-byte file can never fit the 4-byte budget, whatever order the directory
+    // lists the two files in.
+    Tree t;
+    t.write("big.bin", "12345");
+    t.write("needle.bin", "1234");
+    fbh::WalkLimits lim;
+    lim.max_bytes_hashed = 4;
+    const auto w = walk(t, 3, lim, real_env(), yuzu::shared::sha256_hex("1234"));
+    CHECK(w.out.c.skipped_oversize == 1);
+    CHECK(w.out.stop == fbh::StopReason::none); // counted and skipped, not a byte_cap stop
+    CHECK(w.out.matches == 1);
+    CHECK(w.out.c.hashed_bytes == 4);
     CHECK_FALSE(w.out.constrained());
 }
 
@@ -770,7 +926,37 @@ TEST_CASE("find_by_hash is_under_mount: path-boundary matching", "[find_by_hash]
     CHECK_FALSE(fbh::is_under_mount("/mnt/nfs", {}));
 }
 
+TEST_CASE("find_by_hash add_data_volume_aliases: both macOS spellings of a mount are refused",
+          "[find_by_hash]") {
+    // getmntinfo lists a mount the system creates as /System/Volumes/Data/<path>; the operator
+    // types /<path>, and a firmlink is not a symlink, so only a second spelling catches it.
+    std::vector<std::string> home{"/System/Volumes/Data/home"};
+    fbh::add_data_volume_aliases(home);
+    CHECK(fbh::is_under_mount("/home/x", home));
+    CHECK(fbh::is_under_mount("/System/Volumes/Data/home/x", home));
+    CHECK_FALSE(fbh::is_under_mount("/homes", home));
+
+    std::vector<std::string> users{"/Users/shared"};
+    fbh::add_data_volume_aliases(users);
+    CHECK(fbh::is_under_mount("/System/Volumes/Data/Users/shared/x", users));
+    CHECK(fbh::is_under_mount("/Users/shared", users));
+
+    // "/" and the Data volume's own root gain no alias (an alias of "/" would cover the volume).
+    std::vector<std::string> roots{"/", "/System/Volumes/Data"};
+    fbh::add_data_volume_aliases(roots);
+    CHECK(roots.size() == 2);
+}
+
 #ifndef _WIN32
+TEST_CASE("find_by_hash root_lexically_under_mount: a relative root is judged by its absolute "
+          "spelling",
+          "[find_by_hash]") {
+    const std::vector<std::string> rel{(fs::current_path() / "yuzu_test_rel_mount").string()};
+    CHECK(fbh::root_lexically_under_mount("yuzu_test_rel_mount", rel));
+    CHECK(fbh::root_lexically_under_mount("./yuzu_test_rel_mount/sub", rel));
+    CHECK_FALSE(fbh::root_lexically_under_mount("yuzu_test_rel_mounted", rel));
+}
+
 TEST_CASE("find_by_hash root_lexically_under_mount: aliases of a mount point are refused",
           "[find_by_hash]") {
     const std::vector<std::string> nfs{"/mnt/nfs"};
@@ -872,6 +1058,10 @@ TEST_CASE("find_by_hash constrained_reason: the provenance names the first appli
     CHECK(fbh::constrained_reason(o) == "filesystem:deadline");
     o.stop = fbh::StopReason::max_results;
     CHECK(fbh::constrained_reason(o) == "filesystem:max_results");
+    o.stop = fbh::StopReason::file_cap;
+    CHECK(fbh::constrained_reason(o) == "filesystem:file_cap");
+    o.stop = fbh::StopReason::byte_cap;
+    CHECK(fbh::constrained_reason(o) == "filesystem:byte_cap");
 }
 
 // -- Streaming hasher (POSIX) -------------------------------------------------------------------
@@ -947,3 +1137,26 @@ TEST_CASE("find_by_hash hash_stream: digest, byte cap and read errors", "[find_b
 }
 
 #endif // !_WIN32
+
+TEST_CASE("find_by_hash walk: a directory that vanishes before it is entered is counted and ends "
+          "the walk cleanly",
+          "[find_by_hash]") {
+    // can_enter says yes, then the directory is gone: the descend fails with ENOENT, which the
+    // loop-bottom increment error must count (it used to be silent).
+    Tree t;
+    t.write("only/f.txt");
+    t.write("z.txt");
+    Probe probe;
+    auto env = fake_env(probe);
+    env.can_enter = [&](const fs::path& p) {
+        probe.entered.push_back(p);
+        if (p.filename() == "only") {
+            std::error_code ec;
+            fs::remove_all(p, ec);
+        }
+        return true;
+    };
+    const auto w = walk(t, 3, {}, env);
+    CHECK(w.out.c.skipped_unreadable == 1);
+    CHECK(w.out.constrained());
+}

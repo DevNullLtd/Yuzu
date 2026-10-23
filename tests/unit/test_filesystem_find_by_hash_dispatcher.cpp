@@ -103,7 +103,9 @@ TEST_CASE("filesystem find_by_hash: the target digest is matched case-insensitiv
     for (auto& c : upper)
         c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     const auto result = find_by_hash(*plugin, t.root.string(), upper);
-    CHECK(captured_rows(result.captured).back() == "matches_found|1");
+    const auto rows = captured_rows(result.captured);
+    REQUIRE(!rows.empty());
+    CHECK(rows.back() == "matches_found|1");
 }
 
 TEST_CASE("filesystem find_by_hash: no match is a bare count",
@@ -132,7 +134,9 @@ TEST_CASE(
     CHECK(captured_rows(shallow.captured) == std::vector<std::string>{"matches_found|0"});
     CHECK(shallow.result_status == YUZU_RESULT_STATUS_UNDECLARED);
     const auto deeper = find_by_hash(*plugin, t.root.string(), digest, "2");
-    CHECK(captured_rows(deeper.captured).back() == "matches_found|1");
+    const auto deeper_rows = captured_rows(deeper.captured);
+    REQUIRE(!deeper_rows.empty());
+    CHECK(deeper_rows.back() == "matches_found|1");
 }
 
 TEST_CASE("filesystem find_by_hash: empty files are hashed",

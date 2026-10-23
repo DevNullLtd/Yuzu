@@ -37,10 +37,10 @@
 //   "declared_columns":[names in output order], "plugin":"<name>"
 // (written at admission by bind_declared_columns), C's index is its position in that list, each
 // output line is split to the DECLARED width with `split_fields(plugin, line, width)`, and a line
-// is skipped unless its width equals the list's and it is not the header row. The index is the
-// declared column position, not the dashboard cell position: for a key/value plugin the dashboard
-// still shows key + remainder under the declared headers (a pre-existing display gap tracked
-// separately). Wrong-typed keys match nobody; a caller may not supply either key.
+// is skipped unless its field count equals the list's exactly and it is not the header row. The
+// index is the declared column position, not the dashboard cell position: for a key/value plugin
+// the dashboard still shows key + remainder under the declared headers (a pre-existing display
+// gap tracked separately). Wrong-typed keys match nobody; a caller may not supply either key.
 //
 // `op` ∈ {eq, in, contains, exists}. A non-SUCCESS response NEVER qualifies,
 // regardless of matcher — a plugin that errored is not evidence of a hit.

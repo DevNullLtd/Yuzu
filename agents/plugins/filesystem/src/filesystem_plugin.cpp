@@ -106,6 +106,7 @@
 #ifdef __APPLE__
 #include <sys/mount.h> // getmntinfo_r_np
 #include <sys/param.h>
+#include <sys/resource.h> // getiopolicy_np / setiopolicy_np
 #endif
 #endif
 
@@ -355,22 +356,22 @@ std::string compute_hash_unix(const std::string& path, std::string_view algorith
 #if defined(_WIN32)
 
 std::vector<std::string> find_by_hash_network_mounts(const std::string& directory) {
-    const fs::path raw = fs::path(directory).lexically_normal();
-    const std::string spelled = raw.string();
-    // A relative root lands on the drive of the agent's working directory; fs::absolute resolves
-    // that lexically (GetFullPathNameW) and never touches the target. If it cannot, refuse.
+    // The root as the pre-validation guard will judge it (absolute, lexically normalised: a
+    // relative root lands on the drive of the agent's working directory; fs::absolute resolves
+    // that lexically via GetFullPathNameW and never touches the target). If it cannot, refuse.
+    // The refusal's "mount" is this same spelling, so root_lexically_under_mount matches it.
     std::error_code ec;
-    const fs::path judged = raw.has_root_name() ? raw : fs::absolute(raw, ec);
+    const fs::path judged = yuzu::filesystem::find_by_hash::lexical_root(directory, ec);
     const std::string where = judged.string();
     // A UNC root IS the mount. A drive letter is judged by its drive type: anything but a fixed
     // disk (a mapped network drive, removable, optical, RAM disk, unknown) is refused; a
     // nonexistent drive falls through to the normal "directory is not accessible" error.
     if (ec || where.starts_with("\\\\") || where.starts_with("//"))
-        return {spelled};
+        return {where};
     if (judged.has_root_name()) {
         const std::wstring root = judged.root_name().wstring() + L"\\";
         if (yuzu::filesystem::find_by_hash::win_root_drive_refused(GetDriveTypeW(root.c_str())))
-            return {spelled};
+            return {where};
     }
     return {};
 }
@@ -378,16 +379,20 @@ std::vector<std::string> find_by_hash_network_mounts(const std::string& director
 #elif defined(__linux__)
 
 std::vector<std::string> find_by_hash_network_mounts(const std::string&) {
-    // /proc/self/mountinfo reports st_size 0, so the reader streams to the cap (16 MiB covers the
-    // fs.mount-max ceiling). When it cannot be read the walk runs unguarded and says so once.
+    // /proc/self/mountinfo reports st_size 0, so the reader streams to the cap. The 16 MiB cap is
+    // a bound (the remote_access_audit / runtimes precedent), not a claim to cover every possible
+    // table: fs.mount-max can allow far more mounts than that. When the table cannot be read in
+    // full the walk runs unguarded and says why, once.
     constexpr std::size_t kMountinfoCap = 16 * 1024 * 1024;
     const auto table = yuzu::shared::read_file_no_follow("/proc/self/mountinfo", kMountinfoCap);
     if (!table.ok()) {
         static std::once_flag warned;
         std::call_once(warned, [&] {
-            spdlog::warn("filesystem find_by_hash: /proc/self/mountinfo unreadable (errno {}); "
-                         "the network-mount guard is off",
-                         table.err);
+            spdlog::warn("filesystem find_by_hash: /proc/self/mountinfo unreadable ({}); the "
+                         "network-mount guard is off",
+                         table.error == yuzu::shared::ReadError::oversized
+                             ? std::string{"larger than the 16 MiB read bound"}
+                             : std::format("errno {}", table.err));
         });
         return {};
     }
@@ -408,8 +413,39 @@ std::vector<std::string> find_by_hash_network_mounts(const std::string&) {
         if (yuzu::shared::is_network_mount_fstype(table.get()[i].f_fstypename))
             out.emplace_back(table.get()[i].f_mntonname);
     }
+    // A mount the system creates is listed as /System/Volumes/Data/<path> (autofs /home): refuse
+    // the plain spelling too.
+    yuzu::filesystem::find_by_hash::add_data_volume_aliases(out);
     return out;
 }
+
+// Dataless (iCloud / File Provider) files and directories must not be materialised by a walk: the
+// download runs inside a read the deadline cannot interrupt. The policy is per THREAD and this
+// runs on a shared pool thread, so it is read, switched OFF for the walk and restored on every
+// exit path. With it off a dataless file or directory fails its open with EDEADLK, which the walk
+// already counts as unreadable (CONSTRAINED), and a dataless directory is refused by the
+// directory open before the iterator names its children.
+class DatalessMaterializationOff {
+public:
+    DatalessMaterializationOff() {
+        previous_ = ::getiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD);
+        if (previous_ < 0)
+            previous_ = IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT;
+        changed_ = ::setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD,
+                                    IOPOL_MATERIALIZE_DATALESS_FILES_OFF) == 0;
+    }
+    ~DatalessMaterializationOff() {
+        if (changed_)
+            ::setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD,
+                             previous_);
+    }
+    DatalessMaterializationOff(const DatalessMaterializationOff&) = delete;
+    DatalessMaterializationOff& operator=(const DatalessMaterializationOff&) = delete;
+
+private:
+    int previous_ = IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT;
+    bool changed_ = false;
+};
 
 #else
 
@@ -2370,6 +2406,9 @@ private:
         std::transform(target.begin(), target.end(), target.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
+#ifdef __APPLE__
+        const DatalessMaterializationOff dataless_off; // restored when the walk returns
+#endif
         fbh::WalkEnv env;
         env.cancelled = [] {
             return yuzu::agent::subprocess_cancel_requested();

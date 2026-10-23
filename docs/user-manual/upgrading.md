@@ -2,6 +2,12 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: `device.filesystem.find_by_hash` is bounded and reports what it skipped (#5624)
+
+**What changed.** The agent hashes in-process and stops at the first of 20 seconds, 50,000 entries visited, 4 GiB hashed or 100 matches. The limits are fixed; scan a large tree one subdirectory at a time. When anything was skipped or the search stopped early, a `truncated|<reason>|visited=N|...` row precedes `matches_found|N`. Any symlink counts, so most scans have one; scripts must not read it as a match. The result is `CONSTRAINED`/`PARTIAL` when a limit was hit, an entry was unreadable, or a network mount, UNC share or non-fixed Windows drive was skipped. Symlinks are no longer followed, so a symlink to the target file is not reported; empty files are now hashed. Agents and server may upgrade in either order.
+
+**Stored definition.** Upgrades keep definition 0.3.0. Results stay correct, but a column matcher on `row_kind` is accepted and matches nothing. Check `GET /api/v1/instructions/device.filesystem.find_by_hash` for `"version":"0.4.0"`. To adopt it, replace the definition after every agent is upgraded ([Replacing a stored parameter schema](instructions.md#replacing-a-stored-parameter-schema); edit `result_schema`, not `parameter_schema`). A replaced bundled definition never receives later corrections.
+
 ## Behaviour change: the Windows agent installer passes the enrollment token by file
 
 **What changed.** The Windows agent installer no longer puts the enrollment token on the

@@ -386,39 +386,78 @@ TEST_CASE("matcher: declared columns leave tar and json matching unchanged",
 
 // ── declared columns wider than a key/value plugin's key + remainder schema (#5624) ──
 // find_by_hash declares row_kind/path/size on the key/value `filesystem` plugin. The matcher
-// splits each row to the DECLARED width, so a three-column definition can match a row.
+// splits each row on every unescaped pipe and takes it as a data row only when its field count
+// equals the declared width, so the 9-field `truncated|...` trailer and the 2-field
+// `matches_found|N` summary are never data rows.
 // kFindByHashSchema is a literal copy (this binary has no YAML loader); the shipped definition is
 // pinned to the same names, types and row_kind values by tests/test_filesystem_definition.py.
 namespace {
 const char* kFindByHashSchema =
     R"([{"name":"row_kind","type":"string"},{"name":"path","type":"string"},)"
-    R"({"name":"size","type":"string"}])";
+    R"({"name":"size","type":"int64"}])";
 
-const char* kFindByHashOutput = "match|/etc/hosts|413\n"
-                                "truncated|deadline|visited=5|hashed=9|skipped_unreadable=1\n"
-                                "matches_found|1";
+// The verbatim trailer filesystem_find_by_hash.hpp writes (nine fields).
+const char* kTrailer = "truncated|deadline|visited=5|hashed=9|skipped_unreadable=1|skipped_symlink=0|"
+                       "skipped_not_regular=0|skipped_oversize=0|skipped_network_mount=0";
+
+const char* kHitOutput = "match|/etc/hosts|413\n"
+                         "truncated|deadline|visited=5|hashed=9|skipped_unreadable=1|"
+                         "skipped_symlink=0|skipped_not_regular=0|skipped_oversize=0|"
+                         "skipped_network_mount=0\n"
+                         "matches_found|1";
+
+// A device with no hit that skipped one entry: only the trailer and the zero count.
+const char* kZeroHitOutput = "truncated|none|visited=5|hashed=0|skipped_unreadable=0|"
+                             "skipped_symlink=1|skipped_not_regular=0|skipped_oversize=0|"
+                             "skipped_network_mount=0\n"
+                             "matches_found|0";
 
 bool find_by_hash_matches(const std::string& column, const std::string& op,
-                          const std::string& value = {}) {
+                          const std::string& value = {}, const char* output = kHitOutput) {
     nlohmann::json m{{"column", column}, {"op", op}};
     if (!value.empty())
         m["value"] = value;
     bind_declared_columns(m, kFindByHashSchema, "filesystem");
-    return response_matches(m.dump(), kOk, kFindByHashOutput);
+    return response_matches(m.dump(), kOk, output);
 }
 } // namespace
 
-TEST_CASE("matcher: a three-column definition over a key/value plugin matches by declared position",
+TEST_CASE("matcher: a three-column definition over a key/value plugin matches match rows by "
+          "declared position",
           "[result_set][matcher]") {
+    CHECK(find_by_hash_matches("row_kind", "eq", "match"));
     CHECK(find_by_hash_matches("path", "contains", "/etc/hosts"));
+    CHECK(find_by_hash_matches("path", "exists"));
     CHECK(find_by_hash_matches("size", "eq", "413"));
-    CHECK(find_by_hash_matches("row_kind", "eq", "truncated"));
-    // The truncated row's third cell is the whole remainder.
-    CHECK(find_by_hash_matches("size", "contains", "skipped_unreadable=1"));
-    // matches_found|N is a two-cell summary, not a data row.
-    CHECK_FALSE(find_by_hash_matches("row_kind", "eq", "matches_found"));
     CHECK_FALSE(find_by_hash_matches("path", "contains", "/etc/passwd"));
     CHECK_FALSE(find_by_hash_matches("size", "eq", "414"));
+}
+
+TEST_CASE("matcher: the trailer and the matches_found summary are not data rows (strict width)",
+          "[result_set][matcher]") {
+    // Neither row has three fields, so neither can satisfy a column matcher.
+    CHECK_FALSE(find_by_hash_matches("row_kind", "eq", "truncated"));
+    CHECK_FALSE(find_by_hash_matches("row_kind", "eq", "matches_found"));
+    CHECK_FALSE(find_by_hash_matches("size", "contains", "skipped_unreadable=1"));
+
+    // A zero-hit device that skipped an entry is NOT selected by an `exists` matcher: the trailer
+    // must not read as a match row.
+    CHECK_FALSE(find_by_hash_matches("path", "exists", {}, kZeroHitOutput));
+    CHECK_FALSE(find_by_hash_matches("size", "exists", {}, kZeroHitOutput));
+    CHECK_FALSE(find_by_hash_matches("row_kind", "exists", {}, kZeroHitOutput));
+    CHECK_FALSE(find_by_hash_matches("path", "contains", "none", kZeroHitOutput));
+    CHECK_FALSE(find_by_hash_matches("row_kind", "eq", "match", kTrailer));
+}
+
+TEST_CASE("matcher: list_dir's four-field wire row is not a row of its three declared columns",
+          "[result_set][matcher]") {
+    nlohmann::json m{{"column", "entry_name"}, {"op", "eq"}, {"value", "entry"}};
+    bind_declared_columns(m,
+                          R"([{"name":"entry_name","type":"string"},)"
+                          R"({"name":"entry_type","type":"string"},)"
+                          R"({"name":"entry_size","type":"int64"}])",
+                          "filesystem");
+    CHECK_FALSE(response_matches(m.dump(), kOk, "entry|foo.txt|file|12"));
 }
 
 TEST_CASE("matcher: a two-column definition over a key/value plugin is unchanged",

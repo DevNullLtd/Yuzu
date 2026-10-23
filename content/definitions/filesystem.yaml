@@ -764,22 +764,33 @@ metadata:
     verification. Walks the directory recursively up to the specified
     depth limit and returns matching file paths and sizes. The walk is
     bounded: it stops after 20 seconds, 50,000 directory entries visited or
-    4 GiB hashed, and after 100 matches. A symlink is never followed (the
-    whole path on macOS and Linux 5.6 or later, the final component only on
-    older Linux kernels and on Windows), a file that is not a regular file is
-    never opened, a file over 10 GB is skipped, and a subtree on a network
-    mount is skipped before anything under it is read (on Windows a root on
-    any non-fixed drive, or a UNC root, is refused the same way). When
-    anything was skipped or the walk stopped early, one trailing row
-    truncated|reason|visited=N|hashed=N|skipped_unreadable=N|skipped_symlink=N|
-    skipped_not_regular=N|skipped_oversize=N|skipped_network_mount=N says
-    what was not examined (reason is deadline, file_cap, byte_cap, cancelled,
-    max_results, or none when only individual entries were skipped); a clean
-    run writes no such row. The result is reported as constrained and partial
-    when a bound tripped, an entry could not be read, or a network mount was
-    skipped. Only the shutdown signal cancels a running search; there is no
-    per-command cancel. A path whose last character is a backslash is
-    reported with a forward slash in its place.
+    4 GiB hashed, and after 100 matches (a search ordinarily ends within 20
+    seconds; a single blocked read or directory listing is not interrupted).
+    A file larger than the remaining byte budget is skipped. Below the
+    search root a symlink is never followed (the whole path on macOS and
+    Linux 5.6 or later, the final component only on older Linux kernels and
+    on Windows), a file that is not a regular file is never opened, a file
+    over 10 GB is skipped, pseudo-filesystems such as /proc and /sys are
+    never entered, and a subtree on a network mount is skipped before
+    anything under it is read. On Windows the root drive is judged (a root
+    on any non-fixed drive, or a UNC root, is refused) and a mounted folder
+    below it is a reparse point, skipped as a junction; compressed and
+    deduplicated files are hashed, while cloud placeholders and other
+    reparse points are counted unreadable. When anything was skipped or the
+    walk stopped early, one trailing row
+    truncated|reason|visited=N|hashed=N|skipped_unreadable=N|skipped_symlink=N|skipped_not_regular=N|skipped_oversize=N|skipped_network_mount=N
+    says what was not examined (reason is deadline, file_cap, byte_cap,
+    cancelled or max_results; none means no bound tripped and the counters
+    say what was skipped); a clean run writes no such row. The result is
+    reported as constrained and partial when a bound tripped, an entry
+    could not be read, or a network mount was skipped, but only the status
+    number is stored on the server: the truncated row is the operator-visible
+    signal, and matches_found|0 beside one means not found in the part
+    examined. Only match rows are data rows to a column matcher. Only the
+    shutdown signal cancels a running search; there is no per-command
+    cancel. A path whose last character is a backslash is reported with a
+    forward slash in its place. An agent older than this release still runs
+    the unbounded, symlink-following walk.
   tags: [filesystem, security, ioc, compliance, hash]
 
 spec:
@@ -827,18 +838,18 @@ spec:
     columns:
       - name: row_kind
         type: string
-        description: 'Row shape discriminator (the wire row''s leading tag). Values: match (one per file whose SHA-256 equals the target), truncated (at most one, only when something was skipped or the walk stopped early), matches_found (exactly one, always last).'
+        description: 'Row shape discriminator (the wire row''s leading tag). Values: match (one per file whose SHA-256 equals the target), truncated (at most one, only when something was skipped or the walk stopped early), matches_found (exactly one, always last). Only match rows are data rows to column matchers; truncated and matches_found rows have a different field count and never match.'
         values: [match, truncated, matches_found]
         example: match
         platforms: [windows, linux, darwin]
       - name: path
         type: string
-        description: 'match rows: full path of a file whose SHA-256 matches the target hash. truncated rows: why the walk stopped early (deadline, file_cap, byte_cap, cancelled, max_results) or none when it ran to the end and only individual entries were skipped. matches_found rows: the total number of matching files.'
+        description: 'match rows: full path of a file whose SHA-256 matches the target hash. (A truncated row carries its stop reason in this position -- deadline, file_cap, byte_cap, cancelled, max_results, or none when no bound tripped -- and a matches_found row the count; neither is a data row to a column matcher.)'
         example: "C:\\Windows\\System32\\drivers\\etc\\hosts"
         platforms: [windows, linux, darwin]
       - name: size
-        type: string
-        description: 'match rows: the matching file''s size in bytes (path and size are the second and third fields). truncated rows: the REMAINDER of the row as one string, visited=N|hashed=N|skipped_unreadable=N|skipped_symlink=N|skipped_not_regular=N|skipped_oversize=N|skipped_network_mount=N (counts of entries not examined; pipe-unescaped). matches_found|N is a two-field summary row with no size field; column matchers do not treat it as a data row.'
+        type: int64
+        description: 'match rows: the matching file''s size in bytes. (A truncated row carries its counters here and in the fields after it, visited=N|hashed=N|skipped_unreadable=N|skipped_symlink=N|skipped_not_regular=N|skipped_oversize=N|skipped_network_mount=N, and matches_found|N is a two-field summary; neither is a data row to a column matcher.)'
         example: "1405"
         platforms: [windows, linux, darwin]
 

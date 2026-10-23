@@ -15,14 +15,18 @@
 //                   cold spinning disk.
 //   * bytes hashed  kMaxBytesHashed 4 GiB -- about 20 s of pure-C++ SHA-256 (~200 MB/s) on the one
 //                   shared command worker; it also bounds page-cache churn.
-//   * matches       kMaxResults 100 (unchanged).
-// The three bounds are coupled, not independent: whichever trips first ends the walk.
+//   * matches       kMaxResults 100.
+// The three bounds are coupled, not independent: whichever trips first ends the walk. The deadline
+// is polled between system calls, so a search ordinarily ends within 20 seconds; a single blocked
+// read or directory listing is not interrupted (#4875). A file larger than the remaining byte
+// budget is skipped and counted (skipped_oversize), so one big file cannot end the walk.
 //
-// An entry is NEVER followed through a symlink (whole path on macOS and Linux >= 5.6, leaf only on
-// older Linux kernels and on Windows), a non-regular file is never opened, and the network-mount
-// check runs on a path BEFORE any call that touches it. Anything the walk could not examine, or
-// stopped short of, is counted and reported by ONE trailing `truncated|...` row; a run that
-// skipped nothing writes exactly the rows it always wrote.
+// An entry below the search root is NEVER followed through a symlink (whole path on macOS and
+// Linux >= 5.6, leaf only on older Linux kernels and on Windows), a non-regular file is never
+// opened, and the network-mount check runs on a path BEFORE any call that touches it. On Linux a
+// directory on a pseudo-filesystem (/proc, /sys, ...) is never entered. Anything the walk could not
+// examine, or stopped short of, is counted and reported by ONE trailing `truncated|...` row; a run
+// that skipped nothing writes exactly the rows it always wrote.
 
 #include "filesystem_acl_parsers.hpp" // yuzu::filesystem::acl::row_field (shared row-field escaping)
 
@@ -38,6 +42,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -55,12 +60,15 @@
 #include <yuzu/agent/confined_fs.hpp> // confined_fs::WinHandle, the shared HANDLE owner
 #pragma comment(lib, "bcrypt.lib")
 #else
+#include <spdlog/spdlog.h>
+
 #include <cerrno>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #ifdef __linux__
 #include <sys/syscall.h>
+#include <sys/vfs.h> // fstatfs
 // openat2 (Linux 5.6) is syscall 437 on x86, arm, arm64 and riscv. An old linux-libc-dev only lacks
 // the SYS_ macro, not the kernel the agent runs on, so the whole-path no-follow must not depend on
 // the build host's headers. Architectures with their own numbering (alpha, mips, ia64) are left
@@ -158,7 +166,8 @@ struct WalkOutcome {
 }
 
 /// `truncated|<stop token or none>|visited=N|hashed=N|skipped_unreadable=N|skipped_symlink=N|
-/// skipped_not_regular=N|skipped_oversize=N|skipped_network_mount=N` (one line).
+/// skipped_not_regular=N|skipped_oversize=N|skipped_network_mount=N` (one line). `none` means no
+/// bound tripped; the counters say what was skipped.
 [[nodiscard]] inline std::string format_trailer(const WalkOutcome& o) {
     return std::format("truncated|{}|visited={}|hashed={}|skipped_unreadable={}|skipped_symlink={}|"
                        "skipped_not_regular={}|skipped_oversize={}|skipped_network_mount={}",
@@ -173,6 +182,17 @@ struct WalkOutcome {
 /// onto the field separator as `\|`.
 [[nodiscard]] inline std::string format_match_row(std::string_view path, std::uintmax_t size) {
     return std::format("match|{}|{}", acl::row_field(path), size);
+}
+
+/// The path as UTF-8 bytes for a match row. On Windows path::string() is the ANSI code page and
+/// throws for a name it cannot hold; u8string() cannot, and is byte-identical for ASCII names.
+[[nodiscard]] inline std::string path_utf8(const fs::path& p) {
+#ifdef _WIN32
+    const auto u8 = p.u8string();
+    return std::string{reinterpret_cast<const char*>(u8.data()), u8.size()};
+#else
+    return p.string();
+#endif
 }
 
 // -- Network mounts -----------------------------------------------------------------------------
@@ -201,12 +221,43 @@ struct WalkOutcome {
     return false;
 }
 
-/// The pre-validation refusal: the raw `directory` parameter, lexically normalised (so "/mnt/nfs/",
-/// "/mnt//nfs", "/mnt/./nfs" and "/mnt/x/../nfs" all name the mount), under a network mount. It
-/// runs before validate_path's exists/canonical, which would otherwise block on a dead hard mount.
+/// macOS firmlinked volume: a mount the system creates is listed as `/System/Volumes/Data/<path>`
+/// and is the same object as `/<path>`; a firmlink is not a symlink, so a prefix compare cannot tell
+/// the spellings apart (docs/darwin-compat.md).
+inline constexpr std::string_view kDataVolume = "/System/Volumes/Data";
+
+/// Adds the other spelling of every mount (stripped / Data-volume form; never "/") so a root
+/// matches under either. Pure: no stat, no realpath.
+inline void add_data_volume_aliases(std::vector<std::string>& mounts) {
+    std::vector<std::string> aliases;
+    for (const std::string_view m : mounts) {
+        if (m.size() <= kDataVolume.size() && m.starts_with(kDataVolume))
+            continue; // the Data volume's own root: no alias
+        if (m.starts_with(kDataVolume) && m[kDataVolume.size()] == '/')
+            aliases.emplace_back(m.substr(kDataVolume.size()));
+        else if (m.size() > 1 && m.front() == '/')
+            aliases.push_back(std::string{kDataVolume} + std::string{m});
+    }
+    mounts.insert(mounts.end(), aliases.begin(), aliases.end());
+}
+
+/// The root as the pre-validation guard judges it: absolute (a lexical join with the working
+/// directory; touches nothing) and lexically normalised, so "/mnt/nfs/", "/mnt//nfs",
+/// "/mnt/./nfs", "/mnt/x/../nfs" and a relative spelling all name the mount. On failure `ec` is set
+/// and the normalised spelling as given is returned.
+[[nodiscard]] inline fs::path lexical_root(std::string_view raw_root, std::error_code& ec) {
+    const fs::path raw{std::string{raw_root}};
+    const fs::path absolute = fs::absolute(raw, ec);
+    return (ec ? raw : absolute).lexically_normal();
+}
+
+/// The pre-validation refusal: the raw `directory` parameter, lexically resolved (see
+/// lexical_root), under a network mount. It runs before validate_path's exists/canonical, which
+/// would otherwise block on a dead hard mount.
 [[nodiscard]] inline bool root_lexically_under_mount(std::string_view raw_root,
                                                      const std::vector<std::string>& mounts) {
-    return is_under_mount(fs::path(std::string{raw_root}).lexically_normal().string(), mounts);
+    std::error_code ec;
+    return is_under_mount(lexical_root(raw_root, ec).string(), mounts);
 }
 
 // -- Budget -------------------------------------------------------------------------------------
@@ -248,6 +299,12 @@ public:
         }
         counters_.hashed_bytes += n;
         return true;
+    }
+
+    /// Bytes still admissible under the cap: a hasher skips a file larger than this instead of
+    /// letting it end the whole walk part-way through.
+    [[nodiscard]] std::uint64_t remaining() const noexcept {
+        return limits_.max_bytes_hashed - counters_.hashed_bytes;
     }
 
     [[nodiscard]] StopReason stop() const noexcept { return stop_; }
@@ -335,8 +392,10 @@ WalkOutcome walk_find_by_hash(const std::string& root, std::string_view target_l
         const fs::directory_entry& entry = *it;
         const fs::path& path = entry.path();
 
-        // A mount point under a walked directory is refused BEFORE lstat can block on it.
-        if (is_under_mount(path.string(), env.network_mounts)) {
+        // A mount point under a walked directory is refused BEFORE lstat can block on it. With no
+        // mount list there is nothing to compare, so the path is not even converted to a string
+        // (on MSVC path::string() can throw for a name the ANSI code page cannot hold).
+        if (!env.network_mounts.empty() && is_under_mount(path.string(), env.network_mounts)) {
             ++c.skipped_network_mount;
             it.disable_recursion_pending();
         } else if (const fs::file_status st = entry.symlink_status(ec); ec) {
@@ -385,7 +444,7 @@ WalkOutcome walk_find_by_hash(const std::string& root, std::string_view target_l
                 break;
             }
             if (h.kind == HashKind::hashed && h.hex == target_lower) {
-                emit(format_match_row(path.string(), h.size));
+                emit(format_match_row(path_utf8(path), h.size));
                 if (++out.matches >= limits.max_results) {
                     // Stopping at the cap is only honest if nothing is left to look at: look one
                     // entry ahead, so exactly `max_results` matches in a fully walked tree is
@@ -422,6 +481,14 @@ inline std::atomic<bool>& openat2_unavailable() {
     return unavailable;
 }
 
+/// Remember that openat2 cannot be used, and say so once: from here on the open is leaf-only
+/// no-follow (a disclosed residual), which an operator debugging a symlink question needs to know.
+inline void latch_openat2_unavailable() {
+    if (!openat2_unavailable().exchange(true, std::memory_order_relaxed))
+        spdlog::debug("filesystem find_by_hash: openat2 is unavailable; the no-follow open is "
+                      "leaf-only from here on");
+}
+
 /// open(2) that refuses a symlink in ANY path component where the OS offers that as one call:
 /// macOS O_NOFOLLOW_ANY; Linux >= 5.6 openat2(RESOLVE_NO_SYMLINKS). Elsewhere (and on a kernel
 /// without openat2) only the leaf is no-follow, so a directory swapped for a link between
@@ -439,15 +506,31 @@ inline int open_no_follow_any(const char* path, int flags) {
         } how{};
         constexpr std::uint64_t kResolveNoSymlinks = 0x04;
         how.flags = static_cast<std::uint64_t>(flags | O_NOFOLLOW);
+#ifdef O_LARGEFILE
+        // glibc adds O_LARGEFILE to open() only; the raw syscall must ask, or a file over 2 GiB is
+        // EOVERFLOW on a 32-bit build.
+        how.flags |= static_cast<std::uint64_t>(O_LARGEFILE);
+#endif
         how.resolve = kResolveNoSymlinks;
         const long fd = ::syscall(SYS_openat2, AT_FDCWD, path, &how, sizeof(how));
         if (fd >= 0)
             return static_cast<int>(fd);
-        // ENOSYS: kernel < 5.6. EPERM: a seccomp profile that does not know the syscall.
-        // EINVAL / E2BIG: the how struct is not understood. Anything else is a real open error.
-        if (errno != ENOSYS && errno != EPERM && errno != EINVAL && errno != E2BIG)
+        // ENOSYS: kernel < 5.6. EINVAL / E2BIG: the how struct is not understood. These say the
+        // SYSCALL is unusable. Anything else is a real open error.
+        if (errno == EPERM) {
+            // EPERM is ambiguous: a seccomp profile that does not know the syscall, or the FILE's
+            // own refusal (/proc/kmsg without CAP_SYSLOG, a FUSE file). openat2 differs from open
+            // only by RESOLVE_NO_SYMLINKS, whose refusal is ELOOP, so the plain open tells them
+            // apart: latch only if it succeeds. A failure is the file's own and keeps its errno.
+            const int plain = ::open(path, flags | O_NOFOLLOW);
+            if (plain < 0)
+                return -1;
+            latch_openat2_unavailable();
+            return plain;
+        }
+        if (errno != ENOSYS && errno != EINVAL && errno != E2BIG)
             return -1;
-        openat2_unavailable().store(true, std::memory_order_relaxed);
+        latch_openat2_unavailable();
     }
     return ::open(path, flags | O_NOFOLLOW);
 #else
@@ -485,15 +568,57 @@ template <class ReadChunk>
     return {HashKind::hashed, sha.hex_digest(), size};
 }
 
+/// statfs f_type of a Linux pseudo-filesystem whose "files" are not data: reading one has side
+/// effects (/proc/kmsg drains the kernel log), is endless (/proc/<pid>/pagemap) or is a control
+/// surface (sysfs, debugfs, cgroups, ...). The values are linux/magic.h's ABI-stable constants as
+/// plain numbers (no kernel header needed; the system_hardening plugin does the same).
+[[nodiscard]] constexpr bool is_pseudo_fs_magic(std::uint64_t f_type) noexcept {
+    switch (f_type) {
+    case 0x9fa0:     // PROC_SUPER_MAGIC
+    case 0x62656572: // SYSFS_MAGIC
+    case 0x64626720: // DEBUGFS_MAGIC
+    case 0x74726163: // TRACEFS_MAGIC
+    case 0x73636673: // SECURITYFS_MAGIC
+    case 0x62656570: // CONFIGFS_MAGIC
+    case 0xcafe4a11: // BPF_FS_MAGIC
+    case 0x27e0eb:   // CGROUP_SUPER_MAGIC
+    case 0x63677270: // CGROUP2_SUPER_MAGIC
+    case 0x1cd1:     // DEVPTS_SUPER_MAGIC
+    case 0xde5e81e4: // EFIVARFS_MAGIC
+    case 0x6165676c: // PSTOREFS_MAGIC
+    case 0x6e736673: // NSFS_MAGIC
+    case 0x42494e4d: // BINFMTFS_MAGIC
+    case 0x19800202: // MQUEUE_MAGIC
+        return true;
+    default:
+        return false;
+    }
+}
+
 /// Can `dir` be listed? access() answers the permission bits; the no-follow directory open answers
 /// everything else the directory iterator will meet -- a macOS TCC or SIP refusal is EPERM, which
 /// skip_permission_denied does not swallow and which would end the whole walk at that directory.
+/// On Linux a directory on a pseudo-filesystem is refused too (see is_pseudo_fs_magic): the check
+/// is on the DIRECTORY, on the descriptor just opened, so it precedes the iterator naming a single
+/// child and no file under it is ever opened. A filesystem that cannot be classified is refused
+/// (fail-closed); either way the directory is counted unreadable, never silently skipped.
 [[nodiscard]] inline bool can_enter_posix(const fs::path& dir) {
     if (::access(dir.c_str(), R_OK | X_OK) != 0)
         return false;
     const yuzu::agent::ScopedFd fd{
         detail::open_no_follow_any(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
-    return static_cast<bool>(fd);
+    if (!fd)
+        return false;
+#ifdef __linux__
+    struct statfs info{};
+    if (::fstatfs(fd.get(), &info) != 0)
+        return false;
+    // f_type is signed on some ABIs: widen from its unsigned twin so 0xcafe4a11 does not sign-extend.
+    using Raw = std::make_unsigned_t<decltype(info.f_type)>;
+    if (is_pseudo_fs_magic(static_cast<std::uint64_t>(static_cast<Raw>(info.f_type))))
+        return false;
+#endif
+    return true;
 }
 
 /// Hash one directory entry on POSIX: a whole-path no-follow open, fstat on THAT descriptor (the
@@ -513,7 +638,7 @@ template <class ReadChunk>
     if (!S_ISREG(st.st_mode))
         return {HashKind::not_regular, {}, 0};
     const auto size = static_cast<std::uintmax_t>(st.st_size);
-    if (size > limits.max_file_bytes)
+    if (size > limits.max_file_bytes || size > budget.remaining())
         return {HashKind::oversize, {}, 0};
     return hash_stream(
         [&](unsigned char* buf, std::size_t len) -> long long {
@@ -535,6 +660,11 @@ template <class ReadChunk>
 
 namespace detail {
 
+/// IO_REPARSE_TAG_WOF (CompactOS / Windows Overlay Filter) and IO_REPARSE_TAG_DEDUP: reparse points
+/// whose filter serves the file's real data, so the file is hashed (through a reopened handle).
+inline constexpr DWORD kReparseTagWof = 0x80000017;
+inline constexpr DWORD kReparseTagDedup = 0x80000013;
+
 /// BCrypt SHA-256 context with scope-exit cleanup on every path. Kept beside the hasher rather than
 /// folded onto a shared helper: compute_hash_win (file_hash) drives BCrypt by hand and is outside
 /// this change, so unifying the two is a file_hash refactor of its own.
@@ -553,7 +683,11 @@ struct BcryptSha256 {
         if (BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&object_length),
                               sizeof(object_length), &got, 0) != 0)
             return;
-        object.resize(object_length);
+        try {
+            object.resize(object_length);
+        } catch (...) {
+            return; // ok stays false and the destructor closes `alg` (a throwing ctor would not)
+        }
         ok = BCryptCreateHash(alg, &hash, object.data(), object_length, nullptr, 0, 0) == 0;
     }
     BcryptSha256(const BcryptSha256&) = delete;
@@ -585,27 +719,47 @@ struct BcryptSha256 {
 } // namespace detail
 
 /// Hash one directory entry on Windows: open the entry itself (FILE_FLAG_OPEN_REPARSE_POINT -- a
-/// reparse point is opened as itself, never its target), classify on the handle, stream through
-/// BCrypt SHA-256 under `budget`. The no-follow is LEAF-ONLY: an ancestor directory swapped for a
-/// junction after enumeration is a disclosed residual.
+/// reparse point is opened as itself, never its target) and classify on that handle BEFORE any
+/// read: a cloud placeholder or offline file is counted unreadable (a read would recall it over
+/// the network, which the deadline cannot interrupt); a name-surrogate reparse point (symlink,
+/// junction) is a link; a WOF or Dedup file is hashed through a handle reopened WITHOUT the reparse
+/// flag, so the filter serves real data; any other tag is counted unreadable. Nothing is ever read
+/// through the reparse-point handle itself. The no-follow is LEAF-ONLY: an ancestor directory
+/// swapped for a junction after enumeration is a disclosed residual.
 [[nodiscard]] inline HashOutcome hash_entry_win(const fs::directory_entry& entry,
                                                 HashBudget& budget, const WalkLimits& limits) {
-    const yuzu::agent::confined_fs::WinHandle file{CreateFileW(
-        entry.path().c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr)};
+    constexpr DWORD kShare = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    yuzu::agent::confined_fs::WinHandle file{
+        CreateFileW(entry.path().c_str(), GENERIC_READ, kShare, nullptr, OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr)};
     if (!file.valid())
         return {HashKind::unreadable, {}, 0};
     BY_HANDLE_FILE_INFORMATION info{};
     if (!GetFileInformationByHandle(file.get(), &info))
         return {HashKind::unreadable, {}, 0};
-    if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
-        return {HashKind::symlink, {}, 0};
+    if (info.dwFileAttributes & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS |
+                                 FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_OFFLINE))
+        return {HashKind::unreadable, {}, 0};
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+        FILE_ATTRIBUTE_TAG_INFO tag{};
+        if (!GetFileInformationByHandleEx(file.get(), FileAttributeTagInfo, &tag, sizeof(tag)))
+            return {HashKind::unreadable, {}, 0};
+        if (IsReparseTagNameSurrogate(tag.ReparseTag))
+            return {HashKind::symlink, {}, 0};
+        if (tag.ReparseTag != detail::kReparseTagWof && tag.ReparseTag != detail::kReparseTagDedup)
+            return {HashKind::unreadable, {}, 0};
+        yuzu::agent::confined_fs::WinHandle data{
+            ReOpenFile(file.get(), GENERIC_READ, kShare, FILE_FLAG_SEQUENTIAL_SCAN)};
+        if (!data.valid() || !GetFileInformationByHandle(data.get(), &info))
+            return {HashKind::unreadable, {}, 0};
+        file = std::move(data);
+    }
     if ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
         GetFileType(file.get()) != FILE_TYPE_DISK)
         return {HashKind::not_regular, {}, 0};
     const std::uintmax_t size =
         (static_cast<std::uintmax_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
-    if (size > limits.max_file_bytes)
+    if (size > limits.max_file_bytes || size > budget.remaining())
         return {HashKind::oversize, {}, 0};
 
     detail::BcryptSha256 sha;

@@ -127,6 +127,10 @@ definition is never sent a target: it names no agent plugin, so if selected it i
 dispatch chokepoint denies it. A server.* row that the risk table classes destructive is skipped in
 a targeted run for the same reason, as is testing.chargen.start (it streams until stopped; start and
 stop it by hand through the dashboard or REST with agent_ids).
+
+Directory-shaped parameters (find_by_hash, search_dir) get a per-run directory the runner seeds on
+its own host, so they assume the agent shares the runner host's filesystem: a remote agent, or one
+under a private /tmp (systemd PrivateTmp), reports `directory is not accessible` for those rows.
 """
 
 from __future__ import annotations
