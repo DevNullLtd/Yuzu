@@ -86,9 +86,9 @@ counter or a store rather than a read, the PR says so, and the next PR in the ch
 | 2a-1b | Background typed-source purge | The boot purge becomes a bounded, batched background pass, classified in `background_jobs.hpp`, started at every boot and no longer awaited before serving. | Boot no longer waits on an unbounded delete; the pass's progress is counted. | 2a-1 |
 | 2a-2a | Certificate store and ingest | `CertificateInventoryStore` (schema `cert_inventory`) and the shared ingest seam on the direct and gateway paths: blob parse, hash-skip, per-store replace rules, the per-agent lock, decommission cascade membership (erase only; no tombstone), `/readyz` membership, `yuzu_server_cert_inventory_ingest_total`, and the schema lint. | A report from an agent (or a test) is stored, counted by result and reason, erased on decommission, and covered by `/readyz`. | 2a-1 |
 | 2a-2b | Certificate read surface | The `CertificateInventory` securable, its seeding and floor entry; the per-certificate read and the raw-value summary (REST + MCP + `/crypto` fragment) with every filter in [Parameters](#parameters-strict-or-free-text-the-same-on-both-twins); admission, truncation, audit (OD-2), the D10 lint, and the `cert_inventory.fleet_store_status` gauge job. | Operators read fleet certificates, including the [one-CA queries](#finding-one-cas-certificates). | 2a-2a |
-| 2a-2c | Decommission tombstones | The decommission tombstone itself (written by `delete_agent`, checked by ingest), the admin-only tombstone list and purge (REST + MCP, OD-4), `coverage.tombstoned_agents_registered`, and the cross-schema enrolment clear (`CertificateEnrolmentTombstoneOwner`) at every approval write. | An administrator lists and purges tombstones; approving a tombstoned agent clears it. | 2a-2b |
+| 2a-2c | Decommission tombstones | The decommission tombstone itself (written by `delete_agent`, checked by ingest), the admin-only tombstone list and purge (REST + MCP, OD-4), `coverage.tombstoned_agents_registered`, and the cross-schema enrolment clear (`CertificateEnrolmentTombstoneOwner`) at every approval write. | An administrator lists and purges tombstones; approving a tombstoned agent clears it. | 2a-2b, and the DPIA screening |
 | 2a-2d | Certificate retention prune | The [prune](#retention-and-the-prune), at store and location grain, with its metrics and its clock-guarded-retention register entry. | Stores unread for 30 days are pruned and counted. | 2a-2a |
-| 2a-2e | Agent collector: action, daily-sync source and Linux | `certificates.list_inventory` (no catalogue row, OD-1), the `certificate_inventory` daily-sync source and blob writer, and the Linux store reads. | A Linux agent reports its certificates daily. | 2a-2b, 2a-2c, 2a-2d, and the DPIA screening |
+| 2a-2e | Agent collector: action, daily-sync source and Linux | `certificates.list_inventory` (no catalogue row, OD-1), the `certificate_inventory` daily-sync source and blob writer, and the Linux store reads. | A Linux agent reports its certificates daily. | 2a-2b, 2a-2c, 2a-2d |
 | 2a-2f | Agent collector: Windows | The Windows machine-store reads and the private-key metadata. | A Windows agent reports its certificates. | 2a-2e |
 | 2a-2g | Agent collector: macOS | The System keychain and SystemRoots reads. | A macOS agent reports its certificates. | 2a-2e |
 | 2a-3 | D13 certificate counts | The counts read (REST + MCP), the snapshot export, the D13 condition-1 lint entries and the recompute test; the data the certificate widgets read. | Operators see the counts on `/crypto` and through MCP. | 2a-2b |
@@ -104,7 +104,8 @@ constants and edge predicates the widgets work landed in `crypto_widget_catalogu
 R5/R7/R10/R14). 2b-3 is optional and comes last. Agents are the last link of the server chain:
 2a-2e waits for the read surface, the tombstone and the prune, so no device reports certificate
 data before it can be read, erased and retained as this design states. The DPIA screening is
-recorded before 2a-2e merges, the first PR that processes real certificate data. No PR writes
+recorded before 2a-2c merges: the tombstone is the first stored personal data (an `agent_id`), and
+2a-2e, the first PR that processes real certificate data, comes after it. No PR writes
 durable state whose only remover arrives in a later PR.
 
 Where the rest of this design says "2a-2", it means the 2a-2a to 2a-2g chain, and the table above
@@ -132,8 +133,8 @@ enforces that order, so the design does not rely on it:
 | 2a-2a | `rest-api.md`/`server-admin.md` for the ingest metric and `/readyz` membership; `inventory.md` for the new daily-sync source. |
 | 2a-2b | `crypto.md`, `rest-api.md`, `mcp.md`, `audit-log.md` (the read verbs), `rbac.md` and the SOC 2 access-control inventory (`CertificateInventory`). |
 | 2a-2c | `crypto.md`, `rest-api.md`, `mcp.md`, `audit-log.md` (`crypto.certificates.tombstones.view`, `crypto.certificates.tombstone_purge`). The A2/A1 RBAC-administration routed-concern row (`.claude/routed-concerns-access-control.md`), amended for the new `is_rbac_administrator()` call sites, as that row requires. |
-| 2a-2d | `crypto.md` (retention) and the clock-guarded-retention adoption register. |
-| 2a-2e, 2a-2f, 2a-2g | The generated plugin README and the OS capability matrix, per OS. 2a-2e also links the DPIA screening record, which must exist before it merges. |
+| 2a-2d | `crypto.md` (retention) and the clock-guarded-retention adoption register, with a separate decision for the location grain, whose cutoff compares two stored receipt times (`status_at`, `last_seen`) rather than the pass's own `now()`. |
+| 2a-2e, 2a-2f, 2a-2g | The generated plugin README and the OS capability matrix, per OS. 2a-2c links the DPIA screening record, which must exist before it merges. |
 | #6125 (owed request, not an edit) | Ask that D6's "never opens ... key blocks in PEM files" (`0070:630`) be worded as the exact property in [Linux link and file rules](#stores-read-per-os): key-block lines discarded unretained, never base64-decoded, buffer cleansed. Tracked until #6125 answers; this design does not edit the ADR. |
 | 2a-3 | `crypto.md`, `rest-api.md`, `mcp.md` and `audit-log.md` for the snapshot export (`GET /api/v1/crypto/certificates/snapshot`, `export_crypto_certificate_snapshot`, verb `crypto.certificates.snapshot`), including that paged reads make no cross-page consistency promise. `crypto.md` (each count's rule, window and boundary), the D10 lint's allow-list entries. |
 | 2a-4 | `crypto.md` and `rest-api.md`/`mcp.md` (the certificate half of the CBOM, its securable and its `halves_omitted` metadata). |
@@ -1647,9 +1648,13 @@ posture, and the data-processor obligations an engine takes on.
   (see [Retention and the prune](#retention-and-the-prune)); decommission erases them.
 - **DPIA (Decided, owner 2026-10-23, decision 1).** The owner and the compliance-officer own the
   screening. It is recorded in `docs/security-reviews/` (a dated screening record for machine-scope
-  certificate data) before 2a-2b merges, and the 2a-2b PR links it. It is a screening, not a full
-  DPIA, and there is no works-council consultation: the data is not behavioural, since it records
-  what is installed, not what a person did.
+  certificate data) before 2a-2c merges, and the 2a-2c PR links it: the tombstone is the first
+  personal data slice 2 stores, and certificate data follows in 2a-2e. It is a screening, not a
+  full DPIA, and there is no works-council consultation: the data is not behavioural, since it
+  records what is installed, not what a person did. It records two accepted residuals: a
+  tombstone kept indefinitely for an agent approved before decommission (erased only by the
+  audited purge), and the rows of a device that stays offline, which are never pruned because
+  age alone never prunes (Art. 5(1)(e): the bound runs from the device's own reports).
 - **Decommission tombstones.** A tombstone holds an `agent_id` and a time. An `agent_id` is a
   pseudonymous device identifier, and it is personal data, because the audit log links it to a
   hostname and so, often, to a person. It is kept only to stop a decommissioned agent repopulating
@@ -1821,7 +1826,7 @@ Decided by the owner on 2026-10-19:
   unchanged (the Administrator loop grants every operation, `rbac_store.cpp:780-782`); no floor
   entry is needed, the floor covering `Read` only; the access-review export lists any custom grant.
   The purge mutates server-side tombstone rows only, never a device, so D6's read-only-by-
-  construction rule for collection is unaffected. The new predicate call site means 2a-2 amends
+  construction rule for collection is unaffected. The new predicate call site means 2a-2c amends
   the A2/A1 access-control routed-concern row ([Ingest](#ingest)).
 
 - **R-gen (senior review ruling, #6159 Gate 8): no dataset generation.** D13 condition 2's

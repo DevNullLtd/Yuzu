@@ -999,8 +999,9 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
     grow without bound. A location inside such a store counts as not observed once it has been
     missing from every report the server received from that device over the stated bound
     (server receipt times on both sides), and the same pass prunes it. An offline device sends
-    no reports, so nothing of it is pruned: age alone still never prunes. Recorded in the
-    slice-2 design's Decisions (decision 6).
+    no reports, so nothing of it is pruned: age alone still never prunes. Ruled by the owner
+    (liamsomerville) on 2026-10-23 and recorded as decision 6 in the Decisions section of
+    `docs/crypto-slice2-certificate-design.md`, whose governance ledger is under `governance.d/`.
 - A capped or timed-out capture is reported `constrained`, and the report is never an
   empty success.
 - An empty blob is never sent for a failed or constrained capture (the ADR-0016
@@ -1456,6 +1457,10 @@ carries once that PR merges. Before the merge, the PR is the proposal.
   certificates), and D13's ruling also amends D6 so they may use a `CaStore` count
   method. The rulings are recorded here as rulings, not requests. They are also
   recorded in PR #6125's description, and are ratified by the approving review.
+- R15 is the owner's 2026-10-23 amendment of D12's bounded-retention rule (location grain inside a
+  `constrained` store), made after this ADR was accepted. It is ratified by the approving review
+  of the PR that adds it (approver not the author), which records it alongside the slice-2
+  design's decision 6.
 - The approval grants those five rulings as written. Approvers are asked to state each
   ruling in the review, so that the record shows each one, but the statements are a
   request, not a separate acceptance gate. On merge, the "ruling requested" notes in those
