@@ -130,9 +130,12 @@ Recommended order for a fresh install:
 > create-group form, and `503` from `group-from-results` — since that
 > failure is orthogonal to agent visibility. Separately, when the server cannot determine
 > whether the caller may read Forensics-tier rows (#4990), `group-from-results` creates nothing and
-> answers `200` with a visible "could not be completed. Nothing was created. Retry shortly."
-> message in the form (`200` so the page can show it); the store-degraded case above still answers
-> `503`.
+> answers `200`; the operator sees a constant error toast ("The permission check for this action
+> could not be completed. Nothing was created. Retry shortly."), delivered in an `HX-Trigger`
+> `showToast` header because the create-group form swaps no response body into the page (the body
+> repeats the text only for a caller that is not htmx). The store-degraded case above answers `503`
+> with its own error toast ("Agent count unavailable. The response store could not be read. Nothing
+> was created. Retry shortly.") on the same channel, and also creates nothing.
 >
 > **Admission on these three routes is unchanged (#1712 follow-up, tracked for
 > ADR-0017 PR-B).** Each route still gates on its own flat

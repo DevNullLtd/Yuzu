@@ -61,7 +61,7 @@ filtering and pagination.
 `app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions` and
 `remote_access_audit` are absent, with no marker, for any other caller, and counts and truncation
 flags cover only the rows that caller may read, so an empty result does not prove that no data
-exists. See "Forensics-tier rows" in the REST API guide. The dashboard's create-group-from-results action reads facets through the same tier; when the server cannot determine the caller's authority it creates nothing and shows a visible "could not be completed. Nothing was created. Retry shortly." message in the form (HTTP `200`, so the page can show it), while its store-degraded case still answers `503`.
+exists. See "Forensics-tier rows" in the REST API guide. The dashboard's create-group-from-results action reads facets through the same tier; when the server cannot determine the caller's authority it creates nothing, answers HTTP `200`, and shows an error toast ("The permission check for this action could not be completed. Nothing was created. Retry shortly.") through an `HX-Trigger` `showToast` header, because the create-group form swaps no response body into the page; its store-degraded case answers `503` with its own error toast on the same channel and also creates nothing. The action writes `group.create_from_results` but no `response.forensics.read` row, even when the matching agents come from Forensics-tier rows (a documented residual; see the audit log guide).
 
 **Path parameters:**
 
