@@ -242,7 +242,8 @@ constexpr std::string_view kExpectedPathClasses[] = {
 // expression under -fsanitize=undefined. GCC 15 cannot constant-evaluate the
 // UBSan pointer checks, so a `const BodyCapEntry*` best-match inside it breaks
 // every UBSan leg that compiles `crypto_routes.cpp`'s `static_assert`. This
-// TU is built in those legs too, so a regression fails here, not in the nightly.
+// TU is built in those legs too, so the guard also covers constexpr use
+// outside `crypto_routes.cpp`.
 static_assert(resolve_body_cap("PUT", "/api/v1/crypto/dashboard/layout").max_body_bytes > 0);
 static_assert(resolve_body_cap("GET", "/no/such/route").path_class == std::string_view{"default"});
 

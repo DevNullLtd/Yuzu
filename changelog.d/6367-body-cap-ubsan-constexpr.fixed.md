@@ -1,1 +1,1 @@
-- `resolve_body_cap` tracks its best match by index instead of pointer, so `crypto_routes.cpp`'s `static_assert(resolve_body_cap(...))` is a constant expression under GCC 15 `-fsanitize=undefined` again and the ASan+UBSan nightly builds the server (#6367).
+- **ASan+UBSan builds can compile the server again.** `resolve_body_cap` now tracks its best match by index rather than by pointer, so `crypto_routes.cpp`'s `static_assert(resolve_body_cap(...))` is a constant expression under GCC 15 `-fsanitize=undefined` (#6367).

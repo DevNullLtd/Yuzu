@@ -595,10 +595,11 @@ struct BodyCapMatch {
 [[nodiscard]] constexpr BodyCapMatch resolve_body_cap(std::string_view method,
                                                       std::string_view path) noexcept {
     // Best match is tracked as an INDEX, not a `const BodyCapEntry*` (#6367).
-    // GCC 15 with -fsanitize=undefined cannot constant-evaluate a pointer
-    // null/compare check, so a pointer here makes `static_assert(
-    // resolve_body_cap(...))` (crypto_routes.cpp) a non-constant expression
-    // in every UBSan leg. Do not revert this to a pointer.
+    // GCC 15 with -fsanitize=undefined cannot constant-evaluate UBSan's pointer
+    // checks (null, nonnull-attribute, pointer-compare; the nightly disables
+    // only `null`, #5492) on a `const BodyCapEntry*`, so a pointer here makes
+    // `static_assert(resolve_body_cap(...))` (crypto_routes.cpp) a non-constant
+    // expression in every UBSan leg. Do not revert this to a pointer.
     constexpr std::size_t kNone = static_cast<std::size_t>(-1);
     std::size_t best = kNone;
     for (std::size_t i = 0; i < std::size(kBodyCapTable); ++i) {
