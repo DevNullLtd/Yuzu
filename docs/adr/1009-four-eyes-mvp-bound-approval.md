@@ -462,8 +462,10 @@ keep them green and extend them to the new surface. Test names are the case titl
   that signature (or add an origin check to the runner in the same change that adds a schedule id
   to the bound mint), and any later producer of bound tickets inherits the same rule. Proof:
   `submit_bound: a bound mint cannot name a schedule`, in `test_approval_manager_bound.cpp`
-  (a `static_assert` that the schedule-id call shape does not compile, plus a mint that stores an
-  empty schedule id).
+  (`static_assert`s that pin the whole `submit_bound` signature and that the old schedule-id call
+  shape does not compile, plus a mint that stores an empty schedule id), and
+  `ScheduleRunner: a bound ticket is never selected or fired`, in `test_schedule_runner.cpp`
+  (an approved bound ticket for the schedule's creator, definition and scope does not fire).
 
 ## Honest residuals and not in the MVP
 

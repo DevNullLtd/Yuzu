@@ -612,6 +612,40 @@ TEST_CASE("ScheduleRunner: approving the ticket fires the held occurrence exactl
     CHECK(h.approvals.query({.status = "pending"}).size() == 1);
 }
 
+// #6062 (pm3): a bound ticket is never schedule-fired. The runner matches approved tickets on
+// (schedule_id, definition, scope) with no origin check, so the barrier is that a bound ticket is
+// minted with an empty schedule id (submit_bound has no schedule-id parameter) and no schedule's id
+// is empty. This is the behavioural half of that argument: an approved bound ticket for the
+// schedule's creator, definition and scope is not selected, nothing fires, and the runner raises
+// its own ask instead.
+TEST_CASE("ScheduleRunner: a bound ticket is never selected or fired (#6062)",
+          "[schedule][runner][approval][pg][6062]") {
+    Harness h;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+
+    auto bound = h.approvals.submit_bound("test.def", "admin", "", ApprovalOrigin::kGuardianDeploy,
+                                          BoundRequest{R"({"k":1})", {}});
+    REQUIRE(bound.has_value());
+    REQUIRE(h.approvals.approve(*bound, "boss", "ok").has_value());
+    const auto row = h.approvals.get(*bound);
+    REQUIRE(row.has_value());
+    REQUIRE(row->schedule_id.empty());
+
+    h.runner.tick();
+
+    CHECK(h.enqueues.empty()); // nothing fired under the bound approval
+    CHECK(h.get(id).execution_count == 0);
+    CHECK(h.get(id).next_execution_at == 1); // occurrence held, not advanced
+    auto pending = h.approvals.query({.status = "pending"});
+    REQUIRE(pending.size() == 1); // the runner raised its own ask
+    CHECK(pending[0].id != *bound);
+    CHECK(pending[0].schedule_id == id);
+    auto after = h.approvals.get(*bound);
+    REQUIRE(after.has_value());
+    CHECK(after->status == "approved");
+    CHECK(after->consumed_at == 0); // untouched, not retired by the runner
+}
+
 // #6061 (governance SG-2): the runner retires a ticket via retire_schedule_tickets (before #6096,
 // by advancing the schedule), never by consume_ticket(), so it did not see the 7-day lifetime
 // consume enforces: an approved ticket older than the TTL fired unattended as the schedule's

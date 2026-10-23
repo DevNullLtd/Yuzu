@@ -31,6 +31,8 @@
 #include <functional>
 #include <chrono>
 #include <stdexcept>
+#include <type_traits>
+#include <expected>
 #include <thread>
 #include <string>
 #include <vector>
@@ -770,6 +772,15 @@ TEST_CASE("submit_bound: a bound mint cannot name a schedule",
                   "submit_bound must not accept a schedule id");
     static_assert(CallableWithoutScheduleId<ApprovalManager>,
                   "control: the schedule-less shape is callable");
+    // The two concepts above only see one call shape. This pins the whole signature, so a
+    // schedule id added anywhere (a trailing defaulted parameter, an overload, a template)
+    // fails the build: an overload set or a template makes `&submit_bound` ill-formed.
+    static_assert(
+        std::is_same_v<decltype(&ApprovalManager::submit_bound),
+                       std::expected<std::string, SubmitError> (ApprovalManager::*)(
+                           const std::string&, const std::string&, const std::string&,
+                           ApprovalOrigin, const BoundRequest&, std::string, std::string)>,
+        "submit_bound's signature is pinned: a bound mint must not be able to name a schedule");
 
     yuzu::test::ApprovalManagerPg bundle;
     ApprovalManager& mgr = *bundle;

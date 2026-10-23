@@ -686,7 +686,7 @@ public:
     /// definition, scope) with no origin check and fires the schedule's own definition,
     /// so a bound ticket carrying a schedule id could be fired without its frozen
     /// request, digest or excluded roots ever being compared. The row is written with
-    /// an empty `schedule_id`, and no signature of this function can say otherwise.
+    /// an empty `schedule_id`, and the signature offers no way to supply one.
     ///
     /// Refused with a TYPED error (`SubmitFailure`), nothing written, when:
     ///   - the submitter is an engine principal (`engine:` is a reserved namespace
