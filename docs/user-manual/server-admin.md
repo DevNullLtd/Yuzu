@@ -3007,7 +3007,8 @@ result set by supplying `device_ids` directly. Checked against this repository's
 grants (`RbacStore::seed_defaults`), of the 8 seeded built-in roles only **Administrator** and
 **ITServiceOwner** hold `Infrastructure:Read` — **Viewer, Operator, PlatformEngineer,
 ApiTokenManager, Reviewer, and ForensicsAnalyst do not** (`ForensicsAnalyst` was added later, so
-it is not a role that could have created result sets with `device_ids` before this release). A principal holding one of those five roles who could
+it is not a role that could have created result sets with `device_ids` before this release). A principal holding one of the five roles that existed at that release
+(Viewer, Operator, PlatformEngineer, ApiTokenManager, Reviewer) who could
 previously create a result set with `device_ids` (the RBAC-enabled default before this release
 carried no permission check on this field at all) will now receive a new `403` on all three
 surfaces. This is a genuine, confirmed regression path, not a hypothetical one. A caller who omits

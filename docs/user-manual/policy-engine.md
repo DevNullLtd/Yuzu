@@ -260,8 +260,9 @@ check output are shown to readers who do not hold `Forensics:Read`. Such a
 policy therefore shows `unknown` for every agent with an empty `check_result`,
 and never a verdict from, or a stored copy of, Forensics output. `unknown`
 there says nothing about the device. A Forensics-tier plugin is not a suitable
-policy check. The evaluator still dispatches the check instruction as it does
-any other; only reading its output is withheld.
+policy check. A separate follow-up tracks the dispatch-side authorisation of
+policy checks. A `check_result` stored by an evaluation before the upgrade
+stays until the policy is next evaluated.
 
 Implementation/lifecycle: the thread is `PolicyEvaluator`
 (`policy_evaluator.{hpp,cpp}`), wired in `server.cpp` against a hoisted shared
