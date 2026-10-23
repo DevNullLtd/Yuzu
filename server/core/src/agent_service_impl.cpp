@@ -2322,24 +2322,13 @@ void AgentServiceImpl::publish_output_rows(const std::string& agent_id, const st
     if (raw_output.empty())
         return;
     // #4990: the "output" stream is shared by every dashboard session, with no per-subscriber
-    // read tier. A Forensics-tier plugin's rows are therefore never published to it; they are
-    // served only by the tier-filtered stored-response reads. An unwired set publishes nothing
-    // (without it a Forensics row cannot be told apart from an ordinary one, and a notice for
-    // every plugin would be wrong).
-    //
-    // For a Forensics plugin the Console is told so by ONE fixed notice row in place of its
-    // "Waiting for results..." placeholder (the placeholder keeps the id `empty-row`, so a
-    // second notice replaces the first instead of adding a row, and rows already shown are
-    // untouched). The text is a constant: no plugin data, nothing the agent supplied.
-    if (!forensics_plugins_)
+    // read tier. A Forensics-tier plugin's frame therefore publishes NOTHING to it: no row, and no
+    // notice either (a notice would be an event the stream's subscribers could see even though
+    // they hold no Forensics read). Its rows are served only by the tier-filtered stored-response
+    // reads. An unwired set publishes nothing for the same reason: without it a Forensics row
+    // cannot be told apart from an ordinary one.
+    if (!forensics_plugins_ || forensics_plugins_->contains(plugin))
         return;
-    if (forensics_plugins_->contains(plugin)) {
-        bus_.publish("output",
-                     "<tr id=\"empty-row\" hx-swap-oob=\"outerHTML\"><td colspan=\"99\" "
-                     "class=\"empty-state\">Forensics output is not shown live. Open the "
-                     "execution results.</td></tr>");
-        return;
-    }
     auto agent_name = registry_.display_name(agent_id);
     auto& col_names = yuzu::server::columns_for_plugin(plugin);
     auto lines = yuzu::server::split_output_lines(raw_output);
