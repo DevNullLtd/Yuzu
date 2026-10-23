@@ -118,6 +118,9 @@ elif host_machine.system() == 'windows'
   agent_test_native_deps += cxx.find_library('oleaut32')
   # test_msi_packages_actions.cpp's live per-user cross-check calls MsiEnumProductsExW directly.
   agent_test_native_deps += cxx.find_library('msi')
+  # test_app_usage_local_dispatcher.cpp's foreign-owner case calls SetNamedSecurityInfoW and
+  # AdjustTokenPrivileges directly, as tar_test_deps' Windows block does for its DACL cases.
+  agent_test_native_deps += cxx.find_library('advapi32')
 endif
 
 # ── Test fixture: FROZEN ABI3-layout plugin (PLAN-03 — real backward-compat) ──
@@ -1216,7 +1219,11 @@ if host_machine.system() == 'windows'
   tar_test_deps += cxx.find_library('iphlpapi')
   tar_test_deps += cxx.find_library('tdh') # tar_proc_etw.cpp / tar_module_etw.cpp ETW decode
   tar_test_deps += cxx.find_library('wintrust') # tar_module_etw.cpp WinVerifyTrust
-  tar_test_deps += cxx.find_library('crypt32')  # tar_module_etw.cpp CryptQueryObject
+  tar_test_deps += cxx.find_library('crypt32')  # tar_module_etw.cpp CertGetNameStringW (signer from the WinVerifyTrust chain)
+  # advapi32, declared deliberately: tar_db.cpp's owner-only DACL
+  # (ConvertStringSecurityDescriptorToSecurityDescriptorW, SetSecurityInfo, GetSecurityInfo) and
+  # the test_tar_store.cpp DACL readback/owner calls.
+  tar_test_deps += cxx.find_library('advapi32')
   tar_test_deps += cxx.find_library('version')  # tar_proc_perf.cpp GetFileVersionInfoW
   tar_test_deps += cxx.find_library('wevtapi')  # tar_netconn_win.cpp EvtQuery/EvtRender
   tar_test_deps += cxx.find_library('ws2_32')   # winsock2 symbols the iphlpapi/netioapi headers in tar_netqual_boot.cpp pull in
