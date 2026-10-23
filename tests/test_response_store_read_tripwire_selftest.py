@@ -174,6 +174,38 @@ def main() -> int:
             "decltype(vis)()"):
         expect(any_mentions(idiom(f"auto f = ResponseTierFilter::exclude(*set, {spelling});"), "idiom.cpp"),
                f"exclude(set, {spelling}) must fail")
+    # g8p3-qe-3(a): whitespace around `::`, a line splice, a bare nullopt after a using-declaration
+    # in the same file, and an alias of an alias.
+    for spelling in ("std :: nullopt", "std:: nullopt", "std ::nullopt", ":: std :: nullopt",
+                     "std :: optional<std::unordered_set<std::string>>{}",
+                     "authz :: VisibleSet{}", "static_cast<authz::VisibleSet>(std :: nullopt)"):
+        expect(any_mentions(idiom(f"auto f = ResponseTierFilter::exclude(*set, {spelling});"), "idiom.cpp"),
+               f"exclude(set, {spelling}) must fail")
+    expect(any_mentions(idiom("auto f = ResponseTierFilter::exclude(*set, std::nullo\\\npt);"), "idiom.cpp"),
+           "a backslash-newline splice inside std::nullopt must not hide it")
+    expect(any_mentions(idiom("auto f = ResponseTierFilter::exclude(*set, std::nul\\\r\nlopt);"), "idiom.cpp"),
+           "a CRLF line splice inside std::nullopt must not hide it")
+    for using, spelling in (("using std::nullopt;", "nullopt"),
+                            ("using ::std::nullopt;", "nullopt"),
+                            ("using namespace std;", "nullopt"),
+                            ("using std::nullopt_t;", "nullopt_t()"),
+                            ("using std::optional;", "optional<std::unordered_set<std::string>>{}"),
+                            ("using namespace std;", "authz::VisibleSet{nullopt}")):
+        expect(any_mentions(idiom(f"{using}\nauto f = ResponseTierFilter::exclude(*set, {spelling});"),
+                            "idiom.cpp"),
+               f"after '{using}', exclude(set, {spelling}) must fail")
+    expect(idiom("auto f = ResponseTierFilter::exclude(*set, nullopt);") == [],
+           "a bare nullopt WITHOUT a using-declaration is some other symbol, not flagged")
+    expect(idiom("using std::nullopt;\nauto f = ResponseTierFilter::exclude(*set, nullopt_like);") == [],
+           "a using-declaration does not turn an unrelated name into the literal")
+    expect(any_mentions(idiom("using A = ResponseTierFilter;\nusing B = A;\n"
+                              "auto f = B::exclude(*set, std::nullopt);"), "idiom.cpp"),
+           "an alias of an alias of the filter type must not hide exclude(set, nullopt)")
+    expect(any_mentions(idiom("using A = yuzu::server::ResponseTierFilter;\ntypedef A B;\nusing C = const B;\n"
+                              "auto f = C::exclude(*set, {});"), "idiom.cpp"),
+           "a chain of using/typedef aliases must not hide exclude(set, {})")
+    expect(idiom("using A = ResponseTierFilter;\nusing B = Other;\nauto f = B::exclude(*set, std::nullopt);") == [],
+           "an alias of an unrelated type is not the filter")
     for fixed in ("static_cast<const ForensicsPluginSet*>(nullptr)",
                   "(const ForensicsPluginSet*)nullptr",
                   "static_cast<const yuzu::server::ForensicsPluginSet*>((nullptr))",

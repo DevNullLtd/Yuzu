@@ -38,11 +38,16 @@ CHECK 2b (the other unrestricted spellings). The factory is not the only way to 
 CHECK 3 (markers). `operator_surface_pending_wiring` (the removed transitional factory) and
   `TODO(#4990)` must not reappear anywhere under server/ or tests/unit/.
 
-GREP LIMIT: this is lexical. A same-file alias of the filter type is followed in CHECK 2b, and the
-  literal spellings are matched through casts and parentheses. A renamed alias of the factory, an
-  alias of the filter type declared in another file, a call through a function pointer or a macro,
-  or a read added to a class other than ResponseStore evades it; the type-level static_asserts and
-  the routed-concern review (Executions-history ladder row) are the compensating controls.
+GREP LIMIT: this is lexical. A same-file alias of the filter type (and an alias of an alias) is
+  followed in CHECK 2b, line splices are joined, whitespace around `::` is closed, a bare `nullopt`
+  or `optional<...>` is read as `std::` when the same file has a `using std::nullopt;`,
+  `using std::optional;` or `using namespace std;`, and the literal spellings are matched through
+  casts and parentheses. A renamed alias of the factory, an alias of the filter type declared in
+  another file, a call through a function pointer, a parenthesised `(ResponseTierFilter::exclude)(...)`,
+  a macro, or a nullopt produced by `std::exchange`, a ternary or comma expression, a lambda or
+  `std::decay_t<decltype(v)>{}`, or a read added to a class other than ResponseStore evades it; the
+  type-level static_asserts and the routed-concern review (Executions-history ladder row) are the
+  compensating controls.
 
 Stdlib only, like the other tests/test_*.py gates. Exit 0 = pass; non-zero prints each failure.
 """
@@ -409,11 +414,17 @@ def _balanced_end(s: str, i: int, open_c: str, close_c: str) -> int:
     return -1
 
 
+def _close_scope_ws(a: str) -> str:
+    """`std :: nullopt` and `std:: nullopt` are the same token sequence as `std::nullopt` to the
+    compiler; close the whitespace around every `::` so the literal matcher sees one spelling."""
+    return re.sub(r"\s*::\s*", "::", a)
+
+
 def _peel(arg: str) -> str:
     """The argument text with redundant wrappers removed: outer parentheses, `static_cast<T>(x)`,
     `std::move(x)` and a C-style `(T)x`. What is left is matched against the literal spellings above, so peeling
     can only reveal a literal, never invent one."""
-    a = " ".join(arg.split())
+    a = _close_scope_ws(" ".join(arg.split()))
     while True:
         if a.startswith("(") and _balanced_end(a, 0, "(", ")") == len(a):
             a = a[1:-1].strip()
@@ -446,19 +457,41 @@ def _is_null_plugin_set(arg: str) -> bool:
     return bool(_NULL_PLUGIN_SET.match(_peel(arg)))
 
 
-# `using RTF = ResponseTierFilter;` / `typedef ResponseTierFilter RTF;` in the SAME file: the alias
-# is searched for as well. An alias declared in one file and used in another, or `using
-# ResponseTierFilter::exclude;` followed by a bare `exclude(...)`, is not seen (GREP LIMIT).
+# `using RTF = ResponseTierFilter;` / `typedef ResponseTierFilter RTF;` in the SAME file (and an
+# alias of such an alias): the alias is searched for as well. An alias declared in one file and
+# used in another, or `using ResponseTierFilter::exclude;` followed by a bare `exclude(...)`, is
+# not seen (GREP LIMIT).
 _FILTER_TYPE = r"(?:\w+\s*::\s*)*ResponseTierFilter"
 _ALIAS_USING = re.compile(r"\busing\s+(\w+)\s*=\s*(?:const\s+)?" + _FILTER_TYPE + r"\s*;")
 _ALIAS_TYPEDEF = re.compile(r"\btypedef\s+" + _FILTER_TYPE + r"\s+(\w+)\s*;")
 
 
 def _filter_names(code: str) -> list[str]:
+    """The filter type's name and every same-file alias of it, including an alias of an alias
+    (`using B = A;` where `A` itself aliases the type): iterated to a fixed point."""
     names = {"ResponseTierFilter"}
-    names.update(m.group(1) for m in _ALIAS_USING.finditer(code))
-    names.update(m.group(1) for m in _ALIAS_TYPEDEF.finditer(code))
-    return sorted(names)
+    while True:
+        before = len(names)
+        alt = "|".join(re.escape(n) for n in sorted(names))
+        ty = r"(?:\w+\s*::\s*)*(?:" + alt + r")"
+        for m in re.finditer(r"\busing\s+(\w+)\s*=\s*(?:const\s+)?" + ty + r"\s*;", code):
+            names.add(m.group(1))
+        for m in re.finditer(r"\btypedef\s+" + ty + r"\s+(\w+)\s*;", code):
+            names.add(m.group(1))
+        if len(names) == before:
+            return sorted(names)
+
+
+# `using std::nullopt;` / `using std::optional;` / `using namespace std;` in a file lets the same
+# file spell the literal without the `std::` qualifier. When one is present the argument text is
+# re-qualified before it is matched.
+_USING_NULLOPT = re.compile(r"\busing\s+(?:(?:::)?std\s*::\s*(?:nullopt(?:_t)?|optional)|namespace\s+(?:::)?std)\s*;")
+
+
+def _requalify_std(arg: str) -> str:
+    arg = re.sub(r"(?<![\w:])nullopt_t\b", "std::nullopt_t", arg)
+    arg = re.sub(r"(?<![\w:])nullopt\b", "std::nullopt", arg)
+    return re.sub(r"(?<![\w:])optional\s*<", "std::optional<", arg)
 
 
 def _call_args(code: str, open_paren: int) -> list[str]:
@@ -475,11 +508,16 @@ def _unrestricted_in_file(rel: str, text: str) -> tuple[str, ...]:
     """The literal-unrestricted constructions in one file. Memoised: the selftest re-runs the scan
     once per mutation over a tree in which only one file changed."""
     found: list[str] = []
-    code = _strip_comments(text)
+    # Translation phase 2 first: a backslash-newline splice joins a token split across lines.
+    code = _strip_comments(re.sub(r"\\\r?\n", "", text))
+    bare_std = bool(_USING_NULLOPT.search(code))
     for name in _filter_names(code):
         for m in re.finditer(r"\b" + re.escape(name) + r"\s*::\s*exclude\s*\(", code):
             args = _call_args(code, m.end() - 1)
-            if len(args) >= 2 and _is_unrestricted_visible(args[1]):
+            if len(args) < 2:
+                continue
+            arg = _requalify_std(args[1]) if bare_std else args[1]
+            if _is_unrestricted_visible(arg):
                 found.append(f"{rel}: {name}::exclude(..., {' '.join(args[1].split())})")
     for m in re.finditer(r"for_fixed_plugin_poll\s*\(", code):
         args = _call_args(code, m.end() - 1)
