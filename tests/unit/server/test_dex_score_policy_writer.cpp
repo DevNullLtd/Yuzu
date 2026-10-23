@@ -35,6 +35,16 @@ std::string doc_with_excellent(double e) {
 
 const std::string kPrefixedError = std::string(kDbErrorPrefix) + "database write failed";
 
+// The recovery hint of every unknown-outcome 503, pinned whole: the OpenAPI text and the
+// rest-api.md runbook repeat it.
+const std::string kUnknownRemediation =
+    "GET /api/v1/dex/score-policy and compare its revision: if it is the If-Match revision you "
+    "sent, the write did not apply; if it is any other revision, review the policy before "
+    "changing it again";
+
+// The lost-race 409: it names no revision (the store was not re-read).
+const std::string kLostRaceMessage = "the stored policy changed while this write was being made";
+
 struct Row {
     std::string verb, result;
     json detail;
@@ -311,6 +321,7 @@ TEST_CASE("writer: a stale If-Match is 409 naming the stored revision; nothing i
     CHECK(w.rows[0].result == "denied");
     CHECK(w.rows[0].detail["reason"] == "stale");
     CHECK(w.rows[0].detail["prior_revision"] == observed);
+    CHECK_FALSE(w.rows[0].detail.contains("dry_run")); // a real update, not a dry run
     CHECK(w.cas_calls == 0);
 }
 
@@ -335,6 +346,20 @@ TEST_CASE("writer: version 2 is refused with the reader's own wording",
     // The refusal says what to do: a rolling upgrade can leave a newer document stored.
     CHECK(r.remediation.find("version 1") != std::string::npos);
     CHECK(r.remediation.find("leave the stored document alone") != std::string::npos);
+}
+
+TEST_CASE("writer: a malformed version keeps its own message and no newer-server advice",
+          "[dex][score_policy_writer]") {
+    World w;
+    for (const char* body : {R"({"version":0})", R"({"version":"x"})", R"({"version":1.5})"}) {
+        CAPTURE(body);
+        const auto r = w.put("default", body);
+        CHECK(r.status == St::Invalid);
+        CHECK(r.message == "unparseable at version: must be an integer of at least 1");
+        CHECK(r.remediation.find("newer server") == std::string::npos);
+        CHECK(r.remediation.find("leave the stored document alone") == std::string::npos);
+    }
+    CHECK(w.cas_calls == 0);
 }
 
 TEST_CASE("writer: an oversized body is refused at document before it is parsed",
@@ -380,9 +405,19 @@ TEST_CASE("writer: dry_run validates and checks the precondition and stores noth
     SECTION("no If-Match is 428") {
         CHECK(w.put(std::nullopt, body, std::string("true")).status == St::IfMatchMissing);
     }
-    SECTION("a stale If-Match is 409") {
+    SECTION("a stale If-Match is 409, recorded as a refused dry run") {
         w.stored = doc_with_excellent(90.0);
         CHECK(w.put("default", body, std::string("true")).status == St::Stale);
+        REQUIRE(w.rows.size() == 1);
+        CHECK(w.rows[0].result == "denied");
+        CHECK(w.rows[0].detail["reason"] == "stale");
+        CHECK(w.rows[0].detail["dry_run"] == true);
+    }
+    SECTION("an invalid document is 400, recorded as a refused dry run") {
+        CHECK(w.put("default", R"({"version":2})", std::string("true")).status == St::Invalid);
+        REQUIRE(w.rows.size() == 1);
+        CHECK(w.rows[0].result == "denied");
+        CHECK(w.rows[0].detail["dry_run"] == true);
     }
     SECTION("a valid dry run") {
         const auto r = w.put("default", body, std::string("true"));
@@ -658,6 +693,8 @@ TEST_CASE("writer: a compare-and-set that reports stale is 409 with a failure ro
     rq.body = body;
     const auto r = apply_dex_score_policy(rq, d);
     CHECK(r.status == St::Stale);
+    CHECK(r.message == kLostRaceMessage);
+    CHECK(r.remediation.find("GET") != std::string::npos);
     REQUIRE(w.rows.size() == 2);
     CHECK(w.rows[1].result == "failure");
     CHECK(w.rows[1].detail["reason"] == "stale");
@@ -749,6 +786,30 @@ TEST_CASE("writer: DELETE removes the exact stored text", "[dex][score_policy_wr
     CHECK(w.provider->current()->source == "default");
 }
 
+TEST_CASE("writer: a compare-and-remove that reports stale is 409 with a failure row",
+          "[dex][score_policy_writer]") {
+    World w;
+    w.stored = doc_with_excellent(90.0);
+    const std::string prior = dex_score_policy_revision(*w.stored);
+    auto d = w.deps();
+    d.compare_and_remove = [&](const std::string&) -> std::expected<bool, std::string> {
+        return false; // another writer got in between the read and the removal
+    };
+    DexScorePolicyWriteRequest rq;
+    rq.op = Op::Reset;
+    rq.if_match = prior;
+    const auto r = apply_dex_score_policy(rq, d);
+    CHECK(r.status == St::Stale);
+    CHECK(dex_score_policy_http_status(r.status) == 409);
+    CHECK(r.message == kLostRaceMessage);
+    CHECK(r.previous_revision == prior);
+    REQUIRE(w.rows.size() == 2);
+    CHECK(w.rows[0].result == "attempted");
+    CHECK(w.rows[1].verb == "dex.score_policy.reset");
+    CHECK(w.rows[1].result == "failure");
+    CHECK(w.rows[1].detail["reason"] == "stale");
+}
+
 TEST_CASE("writer: DELETE with a stale If-Match is 409", "[dex][score_policy_writer]") {
     World w;
     w.stored = doc_with_excellent(90.0);
@@ -795,7 +856,7 @@ TEST_CASE("writer: applied then overwritten before the re-read is outcome unknow
     CHECK(r.retry_after_ms == 2000);
     CHECK(r.message.find(observed) != std::string::npos);
     CHECK(r.message.find("not changed") == std::string::npos);
-    CHECK(r.remediation.find("GET") != std::string::npos);
+    CHECK(r.remediation == kUnknownRemediation);
     REQUIRE(w.rows.size() == 2);
     CHECK(w.rows[1].result == "failure");
     CHECK(w.rows[1].detail["reason"] == "outcome_unknown");
@@ -836,7 +897,7 @@ TEST_CASE("writer: when the re-read fails the outcome is unknown and says so",
     const auto r = apply_dex_score_policy(rq, d);
     REQUIRE(r.status == St::OutcomeUnknown);
     CHECK(r.message.find("could not be re-read") != std::string::npos);
-    CHECK(r.remediation.find("GET") != std::string::npos);
+    CHECK(r.remediation == kUnknownRemediation);
     REQUIRE(w.rows.size() == 2);
     CHECK(w.rows[1].detail["reason"] == "outcome_unknown");
     CHECK(w.rows[1].detail["reread_error"] == "store_down_again");

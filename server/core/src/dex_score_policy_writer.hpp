@@ -40,10 +40,12 @@
  * store state they describe already exists, and the handler's Sec-Audit-Failed header carries
  * the signal.
  *
- * Audit row size. The whole canonical document (up to ~97 KB) rides only on the rows that
- * record a proposal or an applied change: `attempted`, `success` and `validate`. Every other
- * row (denied, failure, no_change) carries `document_bytes`, the size of the canonical text,
- * instead, so a refused or failed request cannot multiply the document in the audit store.
+ * Audit row size. The whole canonical document (about 130 KB at the override limit, at most
+ * about 185 KB when image keys and names need escaping, always under the 256 KiB cap) rides
+ * only on the rows that record a proposal or an applied change: `attempted`, `success` and
+ * `validate`. Every other row (denied, failure, no_change) carries `document_bytes`, the size
+ * of the canonical text, instead, so a refused or failed request cannot multiply the document
+ * in the audit store.
  */
 
 #include "dex_score_policy_json.hpp"
@@ -371,6 +373,10 @@ apply_dex_score_policy(const DexScorePolicyWriteRequest& rq, const DexScorePolic
             return refuse(Status::Invalid, dr.error(), "dry_run_invalid", base, "dry_run");
         }
         dry = *dr;
+        // Set now, so a REFUSED dry run (invalid document, stale If-Match) is told apart from a
+        // refused real update in the `denied` row.
+        if (dry)
+            base.dry_run = true;
     }
 
     // 3. PUT body: the reader's own validation.
@@ -383,7 +389,9 @@ apply_dex_score_policy(const DexScorePolicyWriteRequest& rq, const DexScorePolic
         const auto v = dex_score_policy_validate_text(rq.body);
         if (!v) {
             std::string fix(dex_score_policy_projection_remediation(v.error().field));
-            if (fix.empty() && v.error().field == "version")
+            // Only a version ABOVE the supported one is a newer server's document: a malformed
+            // version is reported at the same field but is simply wrong.
+            if (fix.empty() && v.error().message.starts_with("unsupported_version"))
                 fix = "this server reads version " + std::to_string(kDexScorePolicyVersion) +
                       " documents; leave the stored document alone (a newer server reads it) or "
                       "send a version " +
@@ -418,7 +426,6 @@ apply_dex_score_policy(const DexScorePolicyWriteRequest& rq, const DexScorePolic
 
     // 5. Dry run: validated, current, nothing stored.
     if (put && dry) {
-        base.dry_run = true;
         if (!emit(kDexScorePolicyValidateVerb, "success", base))
             return audit_unavailable();
         out.status = Status::Ok;
@@ -502,9 +509,9 @@ apply_dex_score_policy(const DexScorePolicyWriteRequest& rq, const DexScorePolic
     const auto re = safe_read();
     out.status = Status::OutcomeUnknown;
     out.retry_after_ms = kDexScorePolicyRetryMs;
-    out.remediation = "GET /api/v1/dex/score-policy and compare its revision: the If-Match you sent "
-                      "means the write did not apply, any other means review the policy before "
-                      "changing it again";
+    out.remediation = "GET /api/v1/dex/score-policy and compare its revision: if it is the "
+                      "If-Match revision you sent, the write did not apply; if it is any other "
+                      "revision, review the policy before changing it again";
     if (re) {
         const bool intended = put ? (re->has_value() && **re == canonical) : !re->has_value();
         if (intended) {

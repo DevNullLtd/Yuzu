@@ -534,7 +534,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      unchanged).** The list/record/per-device routes are REST-only, no MCP twin, and absent from
      route discovery only in the sense that no `get_hardware_ci`/
      `list_hardware`/equivalent MCP tool exists yet — the REST routes
-     themselves ARE in `openapi_spec()` and `GET /api/v1/routes` (A2/A3
+     themselves ARE in `openapi_spec()` and `GET /api/v1/discover/routes` (A2/A3
      hold for the REST half). A "no" on Decision 1/4's both-surfaces
      requirement for the MCP half.
      - **No MCP twin — tracked follow-up, not a permanent exception.** An
@@ -860,14 +860,17 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        three twins are tracked as **#6087**; **revisit by 2027-01-31**. Until
        they land, this row stands as the open exception for these routes, and
        it retires when the twins merge (this entry is then amended to say so).
-       It is recorded here only: `scripts/ci/api-parity/*.json` does not track
-       a new `/api/v1` route that has no twin, so no ledger row is added.
+       No ledger row is added: the parity ledger admits an `exception:` row
+       for a `/api/v1` route (check 1b, as for the password routes) but does
+       not require one; this one is recorded here and tracked by #6087.
      - **The exception relaxes no control.** The routes are in
-       `openapi_spec()` and `GET /api/v1/routes` (A2/A3 hold for the REST
-       half), every error is the A4 envelope, `PUT` and `DELETE` need
-       `Infrastructure:Write` and an `If-Match` precondition, are audit-first
-       and fail closed on audit (`dex.score_policy.update`, `.reset`,
-       `.validate`), and a service-scoped token is refused at the gate.
+       `openapi_spec()` and `GET /api/v1/discover/routes` (A2/A3 hold for the
+       REST half), errors from the route use the A4 envelope, `PUT` and
+       `DELETE` need `Infrastructure:Write` and an `If-Match` precondition,
+       are audit-first and fail closed on audit (`dex.score_policy.update`,
+       `.reset`, `.validate`), and a service-scoped token is refused at the
+       gate. The MCP-token posture of these routes is carried on #6087; this
+       entry does not fence MCP tokens.
      - Wire reference: `docs/user-manual/rest-api.md`, "GET / PUT / DELETE
        /api/v1/dex/score-policy"; audit rows: `docs/user-manual/audit-log.md`.
 

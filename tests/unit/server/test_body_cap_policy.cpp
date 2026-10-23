@@ -319,7 +319,7 @@ TEST_CASE("resolve_body_cap: same prefix, different method -> different entry",
 
 TEST_CASE("resolve_body_cap: longest matching prefix wins over the catch-all default",
           "[body_cap]") {
-    // "/scim/v2/" (64 KiB, method-specific) and "" (the catch-all default,
+    // "/scim/v2/" (64 KiB, any method) and "" (the catch-all default,
     // ANY method, 4 MiB) BOTH match "/scim/v2/Users" for POST — the longer,
     // more specific entry must win.
     const auto got = resolve_body_cap("POST", "/scim/v2/Users");
@@ -367,13 +367,13 @@ TEST_CASE("kBodyCapTable: the path_class label set is exactly the documented, fi
 TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // Independent of the label-set check above: a new row using an EXISTING
     // label (e.g. a second SCIM method already covered) would pass that
-    // check while still silently growing the table. 28 = mcp(1) +
+    // check while still silently growing the table. 35 = mcp(1) +
     // bundles(1) + ota_upload(1) + json_to_csv_export(1) + nvd_match(1) +
     // ca_import_chain(1) + ca_issue_code_signing(1: gap-matrix #10) +
     // ca_revoke(1) +
     // kek_ops(1: one prefix entry covers both rotate and rewrap) +
-    // ca_import_chain_dashboard(1) + plugin_trust_bundle(1) + scim(3:
-    // POST/PUT/PATCH) + saml_acs(1) + response_templates(2: POST/PUT) +
+    // ca_import_chain_dashboard(1) + plugin_trust_bundle(1) + scim(1:
+    // one any-method row) + saml_acs(1) + response_templates(2: POST/PUT) +
     // tar_dashboard_sql(1) + tar_result_set_sql(1) +
     // guardian_rule_authoring(2: POST create + PUT update) +
     // workflow_yaml(1) + product_pack_yaml(1) + instruction_import(1) +

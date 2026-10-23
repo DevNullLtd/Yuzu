@@ -181,8 +181,8 @@ def main():
         print("\n".join(problems))
         return 1
     print(f"OK: the score policy key is written only in {WRITER_FILE}: {', '.join(writer_calls)}; "
-          f"{SERVER_FILE} wires the writer deps before register_routes and the provider outside the "
-          "signals-store block")
+          f"{SERVER_FILE} wires the writer deps before register_routes, only under "
+          "`if (dex_score_policy_provider_)`, and the provider outside the signals-store block")
     return 0
 
 
