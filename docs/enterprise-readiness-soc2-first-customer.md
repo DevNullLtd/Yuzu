@@ -406,11 +406,11 @@ and 300 when that is `0` or negative, independent of `--mfa-enforcement`, so nei
 **Residual risks:** (a) an OIDC "fresh proof" means the provider asserted MFA on a recently issued
 token, not that a second factor was presented again at approval time, and any single MFA-method
 `amr` value the gate accepts counts; real re-authentication (`auth_time` with `max_age`) is a planned
-follow-up; (b) disabling MFA on an account in Settings does not end that account's existing sessions
-(`--mfa-reset` does, and records `sessions_ended` in its audit row); the comparison of the proof with
-the current enrolment stops an older proof being reused after re-enrolment, assumes the database
+follow-up; (b) `--mfa-reset` ends the account's sessions (and records `sessions_ended` in its audit row) and
+disabling MFA in Settings ends the account's other sessions; the comparison of the proof with the
+current enrolment stops an older proof being reused after re-enrolment and assumes the database
 primary clock does not step backward (ADR-2002 section 4 treats that clock as a monitored security
-dependency), and session ending on a Settings disable is a planned follow-up; (c) a non-admin
+dependency); (c) a non-admin
 cannot enrol itself under `--mfa-enforcement=optional` or `admin-only` (this refuses the approver
 `mfa_not_enrolled` only with RBAC enforcement on; with enforcement off, the shipped default, a non-admin
 is refused `403` "admin role required" before the MFA gate, so enrolment achieves nothing until

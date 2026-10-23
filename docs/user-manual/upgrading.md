@@ -205,9 +205,9 @@ principal and not an engine principal. The existing rule that the reviewer canno
     factor) and each path's consequences. Plan this **before** upgrading, and make sure at least one
     enrolled, authorised approver exists who is not the submitter of each request you expect to be decided: until
     then nothing can be approved. A seeded administrator that has never enrolled is in the same position. Self-service
-    enrolment for non-admins is a planned follow-up, as is ending an account's existing sessions when its MFA is
-    disabled in Settings; neither is part of this change. `yuzu-server --mfa-reset` does end the account's
-    sessions. **With RBAC enforcement off (the shipped default),** the legacy gate requires the `admin` role for
+    enrolment for non-admins is a planned follow-up and is not part of this change. `yuzu-server --mfa-reset`
+    ends the account's sessions, and disabling MFA in Settings ends the account's other sessions and keeps the
+    one you are using. **With RBAC enforcement off (the shipped default),** the legacy gate requires the `admin` role for
     approving, so a non-admin is refused `403` "admin role required" before the MFA check and enrolling a non-admin
     approver achieves nothing until RBAC enforcement is turned on.
   - **An unreadable MFA store, or an unreadable stored session proof,** answers `503` with `retry_after_ms` and increments

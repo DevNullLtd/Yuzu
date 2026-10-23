@@ -757,14 +757,15 @@ Consequences, each deliberate:
   in `AuthRoutes::require_permission` requires the `admin` role for `Approval:Approve`, so a non-admin
   is refused `403` "admin role required" before the MFA gate, and the enrolment paths achieve nothing
   until enforcement is turned on.
-- **Session ending on reset, not on disable.** `yuzu-server --mfa-reset` deletes the account's durable
+- **Session ending on every factor clear.** `yuzu-server --mfa-reset` deletes the account's durable
   sessions in the same one-shot (`SessionStore::invalidate_user`, which bumps the generation so every
   replica drops its cached copy), and exits non-zero if that fails; the audit row records
-  `sessions_ended`. Disabling MFA from Settings (`mfa_disable`) does not end sessions, so there the
-  proof-versus-enrolment comparison above is what stops an older proof being reused after a
-  re-enrolment; that comparison assumes the database primary clock does not step backward (ADR-2002
-  section 4 treats database clock integrity as a monitored security dependency), and ending sessions
-  on a Settings disable is a named follow-up. The check is an admission boundary: a clearance committed before the read is honoured, one
+  `sessions_ended` either way. Disabling MFA from Settings (`mfa_disable`) deletes the account's OTHER
+  sessions (`SessionStore::invalidate_user_except`, same generation bump) and keeps the one making the
+  request; the audit row records `other_sessions_ended`. These are the only two production callers of
+  `mfa_disable`. The proof-versus-enrolment comparison above remains the second line: it assumes the
+  database primary clock does not step backward (ADR-2002 section 4 treats database clock integrity as
+  a monitored security dependency). The check is an admission boundary: a clearance committed before the read is honoured, one
   committed after it is seen from the next request, and the two session resolves on the route are not
   atomic.
 - **Mixed versions and rollback.** The enrolled-factor requirement is in force only while every replica
