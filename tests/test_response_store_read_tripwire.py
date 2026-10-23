@@ -353,8 +353,17 @@ def check_internal_sites(files: dict[str, str]) -> list[str]:
     return errors
 
 
+# The literal spellings of "no restriction" for the second argument of exclude(): `std::nullopt`,
+# a value-initialised nullopt_t, a bare `{}`, a value-initialised VisibleSet or
+# `std::optional<...>` (braces or parentheses), and `VisibleSet{std::nullopt}`. A VARIABLE holding
+# a nullopt cannot be seen lexically (review-enforced, and `tier_filter_for` is the sanctioned
+# shape that derives it from the resolver).
+_EMPTY_INIT = r"(?:\{\s*\}|\(\s*\))"
 _UNRESTRICTED_VISIBLE = re.compile(
-    r"^(?:std::nullopt(?:_t\s*\{\s*\})?|\{\s*\}|(?:\w+::)*VisibleSet\s*\{\s*\})$")
+    r"^(?:std::nullopt(?:_t\s*" + _EMPTY_INIT + r")?"
+    r"|\{\s*\}"
+    r"|(?:\w+::)*VisibleSet\s*(?:" + _EMPTY_INIT + r"|\{\s*std::nullopt\s*\})"
+    r"|std::optional\s*<.*>\s*" + _EMPTY_INIT + r")$")
 
 
 def _call_args(code: str, open_paren: int) -> list[str]:

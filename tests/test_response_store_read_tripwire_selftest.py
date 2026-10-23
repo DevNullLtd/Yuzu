@@ -129,6 +129,21 @@ def main() -> int:
            "exclude(set, authz::VisibleSet{}) must fail")
     expect(any_mentions(idiom("auto f = ResponseTierFilter::exclude(*set, {});"), "idiom.cpp"),
            "exclude(set, {}) must fail")
+    expect(any_mentions(idiom("auto f = ResponseTierFilter::exclude(*set, authz::VisibleSet());"), "idiom.cpp"),
+           "exclude(set, authz::VisibleSet()) must fail")
+    expect(any_mentions(idiom("auto f = ResponseTierFilter::exclude(*set, authz::VisibleSet{std::nullopt});"),
+                        "idiom.cpp"),
+           "exclude(set, authz::VisibleSet{std::nullopt}) must fail")
+    expect(any_mentions(idiom("auto f = ResponseTierFilter::exclude(*set, "
+                              "std::optional<std::unordered_set<std::string>>{});"), "idiom.cpp"),
+           "exclude(set, std::optional<...>{}) must fail")
+    expect(any_mentions(idiom("auto f = ResponseTierFilter::exclude(*set, "
+                              "std::optional<std::unordered_set<std::string>>());"), "idiom.cpp"),
+           "exclude(set, std::optional<...>()) must fail")
+    expect(any_mentions(idiom("auto f = ResponseTierFilter::exclude(*set, std::nullopt_t());"), "idiom.cpp"),
+           "exclude(set, std::nullopt_t()) must fail")
+    expect(idiom("auto f = ResponseTierFilter::exclude(*set, authz::VisibleSet{ids});") == [],
+           "exclude(set, VisibleSet{<non-empty>}) is a real set, not the unrestricted literal")
     expect(any_mentions(idiom("auto f = ResponseTierFilter::for_fixed_plugin_poll(nullptr);"), "idiom.cpp"),
            "for_fixed_plugin_poll(nullptr) must fail")
     expect(idiom("auto f = ResponseTierFilter::exclude(*set, authz::deny_all());") == [],
