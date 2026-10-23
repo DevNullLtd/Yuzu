@@ -267,7 +267,13 @@ payload carry; the stored response row keeps the plugin's own message and is rea
 the tracker publishes is built from the error text persisted on the row, which can be older than the write (a terminal row
 is sticky), so that text is reduced again for a Forensics execution before it reaches the outbox or the bus
 (`ExecutionTracker`'s agent-status upsert in `execution_tracker.cpp`); within the same 24 hour correlation limit a late
-`running` frame therefore cannot republish a pre-upgrade raw value. An unwired tracker (a test harness only; production
+`running` frame therefore cannot republish a pre-upgrade raw value. The lookup that decides whether the execution is a
+Forensics one runs on the write path only when the persisted text differs from the incoming text and is not already a
+bounded token, and it runs under a SAVEPOINT: if the lookup fails, the text is reduced to the fixed value
+`forensics_error`, and the status write, the outbox row and the bus event still commit (an agent's status is never lost to a
+failed lookup). The write path trusts that the incoming text was already reduced at ingest
+(`notify_exec_tracker` calls `AgentServiceImpl::failure_text_for_sinks`; `tests/test_forensics_tier_wiring_lexical.py`
+pins that call), which is why an ordinary frame, whose persisted text equals the incoming text, costs no lookup. An unwired tracker (a test harness only; production
 boot refuses an unwired plugin set) publishes the text as stored. The durable event outbox (24 hours; other replicas re-publish its rows onto their own stream) is
 not reduced on read, so text written by a replica that predates the change can reach another
 replica's stream until it expires. The live `output` event stream publishes nothing for a
