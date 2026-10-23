@@ -126,7 +126,7 @@ function matchChain(el, parts, i) {
 class El {
   constructor(tag) {
     this.tag = tag; this.attrs = {}; this.classes = new Set(); this.children = []; this.parent = null;
-    this.listeners = {}; this.style = {}; this._text = ''; this.innerHTML = ''; this.rect = { left: 0, width: 0 };
+    this.listeners = {}; this.style = {}; this._text = ''; this._html = ''; this.rect = { left: 0, width: 0 };
     this.disabled = false; this.value = ''; this.captured = [];
     this.classList = { add: (c) => this.classes.add(c), remove: (c) => this.classes.delete(c),
                        contains: (c) => this.classes.has(c),
@@ -135,7 +135,9 @@ class El {
   get className() { return [...this.classes].join(' '); }
   set className(v) { this.classes = new Set(String(v).split(/\s+/).filter(Boolean)); }
   get textContent() { return this._text; }
-  set textContent(v) { this._text = String(v); this.children = []; }
+  set textContent(v) { this._text = String(v); this._html = ''; this.children = []; }
+  get innerHTML() { return this._html; }
+  set innerHTML(v) { this._html = String(v); this._text = ''; this.children = []; }
   setAttribute(k, v) { if (k === 'class') this.className = v; else this.attrs[k] = String(v); }
   getAttribute(k) { if (k === 'class') return this.classes.size ? this.className : null;
                     return k in this.attrs ? this.attrs[k] : null; }
@@ -180,6 +182,7 @@ function build(o) {
   ctx.run.attrs['data-selected-url'] = '/fragments/tar/timeline/selected?id=agent-1';
   ctx.moment = mk('div', 'tl-moment');
   ctx.selected = mk('div', 'tl-selected');
+  ctx.prompt = new El('p'); ctx.prompt.classes.add('tl-empty'); ctx.selected.appendChild(ctx.prompt);
   const fetchStub = (url, opts) => new Promise((resolve, reject) => ctx.fetches.push({ url, opts, signal: opts.signal, resolve, reject }));
   const env = { document: doc, fetch: fetchStub, AbortController: AC,
     location: { origin: 'https://yuzu.test', pathname: '/tar/timeline', search: '?id=agent-1&stale=1',
@@ -287,6 +290,45 @@ const key = (ctx, k, init) => fire(ctx.t.body, 'keydown', Object.assign({ key: k
     eq(urls(c).slice(6), [MOM + '180'], 'a block with no item id requests the moment panel only');
     key(c, 'ArrowLeft');
     eq(urls(c).slice(7), [MOM + '179'], 'and clears the selection');
+  }
+
+  // ---- no selection puts the shell's prompt back: on a count-block click and on a rebind
+  {
+    const c = build(); const t = show(c);
+    fire(t.buttons[0], 'click', {});                   // p1 at 130
+    ok200(c.fetches[2], '<b>p1 at 130</b>'); await flush();
+    eq([c.selected.innerHTML, c.selected.children.length], ['<b>p1 at 130</b>', 0], 'a selected response replaces the prompt');
+    fire(t.buttons[2], 'click', {});                   // a count block: no item id
+    eq([c.selected.children[0] === c.prompt, c.selected.children.length, c.selected.innerHTML], [true, 1, ''],
+       'a click with no item puts the prompt node back');
+    key(c, 'ArrowRight');
+    eq(urls(c).slice(3), [MOM + '180', MOM + '181'], 'and no selected panel is requested any more');
+    fire(t.buttons[1], 'click', {});                   // p2 at 170, selected request in flight
+    fire(t.buttons[2], 'click', {});
+    eq([c.fetches[6].signal.aborted, c.selected.children[0] === c.prompt], [true, true], 'an in-flight selected request is aborted and the prompt is back');
+    ok200(c.fetches[6], '<i>late</i>'); await flush();
+    eq([c.selected.children[0] === c.prompt, c.selected.innerHTML], [true, ''], 'its late answer writes nothing');
+    fire(t.buttons[0], 'click', {});                   // p1 again
+    ok200(c.fetches[c.fetches.length - 1], '<b>p1 again</b>'); await flush();
+    eq(c.selected.innerHTML, '<b>p1 again</b>', 'the second selection lands');
+    show(c, { from: 1000, to: 1050, ts: 1010 });
+    eq([c.selected.children[0] === c.prompt, c.selected.innerHTML], [true, ''], 'a rebind clears the previous instance\'s selection');
+  }
+
+  // ---- the run slot swapped for markup with no timeline unbinds, playback included
+  {
+    const c = build(); show(c); fire(c.play, 'click', {}); c.tick();
+    const before = urls(c).length;
+    const gone = new El('div'); c.run.children = []; c.run.appendChild(gone);
+    fire(c.body, 'htmx:afterSettle', { target: gone });
+    eq([c.play.attrs['aria-pressed'], c.intervals.size, c.play.disabled, c.speed.disabled], ['false', 0, true, true],
+       'a run with no timeline stops playback and disables the controls');
+    eq(c.fetches[0].signal.aborted, true, 'and aborts the pending panel request');
+    c.tick(5000);
+    fire(c.body, 'htmx:afterSettle', { target: gone });
+    eq(urls(c).length, before, 'no panel request is made for the removed window');
+    show(c, { from: 1000, to: 1050, ts: 1010 });
+    eq([urls(c).slice(before), c.play.disabled], [[MOM + '1010'], false], 'a later instance binds normally');
   }
 
   // ---- pointer scrubbing
@@ -437,6 +479,7 @@ const key = (ctx, k, init) => fire(ctx.t.body, 'keydown', Object.assign({ key: k
       'nav link': (c) => { const a = new El('a'); a.attrs['data-ts'] = '120'; c.moment.appendChild(a); fire(a, 'click', {}); },
       'pointer scrub': (c) => fire(c.t.body, 'pointerdown', { clientX: 780, pointerId: 1 }),
       'range input': (c) => { const r = c.t.root.querySelector('.tl-scrub'); r.value = '120'; fire(r, 'input', {}); },
+      'linked item': (c) => { const a = new El('a'); a.attrs['data-ref'] = 'p2'; a.attrs['data-ts'] = '150'; c.selected.appendChild(a); fire(a, 'click', {}); },
     };
     for (const [name, act] of Object.entries(manual)) {
       const c = build(); show(c); fire(c.play, 'click', {}); c.tick();
@@ -446,6 +489,15 @@ const key = (ctx, k, init) => fire(ctx.t.body, 'keydown', Object.assign({ key: k
     const c = build(); show(c); fire(c.play, 'click', {});
     key(c, 'ArrowRight');
     eq(urls(c).length, 2, 'a manual key while playing is one request, not a playback request as well');
+  }
+  {
+    const c = build(); show(c); fire(c.speed, 'click', {}); fire(c.play, 'click', {}); c.tick();   // 10x: 152.5
+    const a = new El('a'); a.attrs['data-ref'] = 'p2'; a.attrs['data-ts'] = '152'; c.selected.appendChild(a);
+    const e = fire(a, 'click', {});
+    eq([e.defaultPrevented, c.play.attrs['aria-pressed'], c.intervals.size], [true, 'false', 0], 'a linked-item click stops playback');
+    eq(urls(c).slice(1), [MOM + '152', SEL + 'p2&at=152', SEL + 'p2&at=152'],
+       'the stop time is flushed once with the new selection, then the explicit request carries the same URL');
+    eq(c.fetches.slice(2).map((f) => f.signal.aborted), [true, false], 'and the explicit selected request supersedes the flushed one');
   }
 
   // ---- playback: failure, hidden, unbind

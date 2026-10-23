@@ -114,6 +114,7 @@
     var doc = env.document;
     var run, clockEl, playBtn, speedBtn, noteEl, copyBtn;
     var copyIdle = '';      // the copy button's own label, restored when the moment moves
+    var selectedIdle = null; // the Selected panel's own prompt node, restored when nothing is selected
     var moment = { el: null, ctl: null };
     var selected = { el: null, ctl: null };
     var st = null;          // the bound run instance, or null
@@ -127,6 +128,15 @@
         slot.ctl = null;
       }
       if (slot.el) slot.el.classList.remove('busy');
+    }
+
+    // No item selected: stop any selected request and put the server's own prompt back.
+    function clearSelection() {
+      abortSlot(selected);
+      if (selected.el && selectedIdle) {
+        selected.el.textContent = '';
+        selected.el.appendChild(selectedIdle);
+      }
     }
 
     function fail(slot, ctl, msg) {
@@ -235,7 +245,7 @@
     function unbind() {
       stopPlayback(false);
       abortSlot(moment);
-      abortSlot(selected);
+      clearSelection();
       st = null;
       scrubbing = false;
       setPlayAvailability(false, '');
@@ -251,7 +261,8 @@
     function bind() {
       if (!run) return;
       var root = run.querySelector('.tl');
-      if (!root || root.getAttribute('data-tl-bound')) return;
+      if (!root) { if (st) unbind(); return; } // the instance was replaced by markup with no timeline
+      if (root.getAttribute('data-tl-bound')) return;
       unbind();
       root.setAttribute('data-tl-bound', '1');
       var body = root.querySelector('.tl-body'), ph = root.querySelector('.tl-ph');
@@ -322,7 +333,7 @@
       if (!isFinite(ts)) return;
       st.ref = b.getAttribute('data-ref') || null;
       markOn(st.ref);
-      if (st.ref === null) abortSlot(selected);
+      if (st.ref === null) clearSelection();
       manualCommit(ts);
     }
 
@@ -339,6 +350,7 @@
       if (!run) return;
       moment.el = doc.getElementById('tl-moment');
       selected.el = doc.getElementById('tl-selected');
+      selectedIdle = selected.el ? selected.el.children[0] || null : null;
       clockEl = doc.getElementById('tl-clock');
       playBtn = doc.getElementById('tl-play');
       speedBtn = doc.getElementById('tl-speed');
@@ -380,6 +392,7 @@
         e.preventDefault();
         st.ref = a.getAttribute('data-ref');
         markOn(st.ref);
+        stopPlayback(true); // a selection change is a manual action: the line stops, the panels catch up
         request(selected, tl.selectedUrl(run.getAttribute('data-selected-url') || '', st.ref, st.t));
       });
       if (copyBtn) copyBtn.addEventListener('click', onCopy);
