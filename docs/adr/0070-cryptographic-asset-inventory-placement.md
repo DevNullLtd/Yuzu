@@ -1465,7 +1465,7 @@ silent, and one correction to a statement in this ADR's narrative.
 - **Both forms of `GET /api/v1/ca/issued` (and MCP `list_issued_certs`), and the issued-certificate
   list in the Settings certificate panel, are confined.** R2 said the CA routes "gate on
   `Security:Read`" and the narrative above (the sentence beginning "`/api/v1/ca/issued` is not
-  confined today (pre-existing)") treated the unfiltered list as out of scope. The unfiltered list
+  confined today (pre-existing)") recorded the unfiltered list as an unconfined gap. The unfiltered list
   returns the same per-agent rows (subject, SAN, issuing identity) the filtered list does, and
   `list_issued` has no scope parameter to narrow them by, so it is held to the same standing: a
   confined caller is withheld (403, no permission named; MCP permission denied), never served a
@@ -1484,6 +1484,10 @@ availability callback the `/crypto` widgets use, kFleetWideOnly class). It resol
 | kDegraded (the check answered 503: a store behind it could not be read) | 503, `retry_after_ms` 5000; audited `failure` |
 | kAvailable (admitted, with no exec-visibility set: a global grant, or RBAC enforcement off) | served; success row ends `standing=available` |
 | kRefused (the check admitted nobody and did not answer 503) | **served**; success row ends `standing=refused` |
+
+The table is the behaviour of the REST and MCP lists. The Settings panel answers kConfined and
+kDegraded with a note in place of the inventory (kDegraded: "Certificate inventory unavailable
+(access check failed)") and a normal page, not a 403 or 503, and writes no audit row (#6384).
 
 R2 says a confined caller is one with "a present exec-visibility set" and is silent on a failed
 read. kRefused covers two causes the answer cannot tell apart:
