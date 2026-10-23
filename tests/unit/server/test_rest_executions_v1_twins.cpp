@@ -102,6 +102,8 @@ struct ExecV1Harness {
     std::vector<AuditRecord> audit_log;
     // #4990: the caller's Forensics visibility (admin by default; the tier cases flip it).
     yuzu::server::test::ForensicsCaller forensics;
+    // #4990: an audit verb whose row does NOT persist (every other row does).
+    std::string audit_fail_action;
 
     RestApiV1 api;
 
@@ -150,7 +152,7 @@ struct ExecV1Harness {
                                const std::string& tt, const std::string& ti,
                                const std::string& d) -> bool {
             audit_log.push_back({a, r, tt, ti, d});
-            return true;
+            return a != audit_fail_action;
         };
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
@@ -549,6 +551,84 @@ TEST_CASE("GET /api/v1/executions/:id/responses: Forensics rows follow the calle
     h.forensics.viewer();
     h.fleet_read_scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}};
     CHECK(outputs() == Outputs{"ordinary-A"});
+}
+
+// #4990: the `response.forensics.read` audit row on the execution-scoped read.
+TEST_CASE("GET /api/v1/executions/:id/responses: response.forensics.read is written only when "
+          "Forensics rows are served",
+          "[pg][rest][executions][v1][responses][audit][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    auto exec_id = h.make_exec_with_agents("def-resp-faud");
+
+    auto put = [&](const std::string& agent, const std::string& plugin, const std::string& out,
+                   int64_t ts) {
+        StoredResponse r;
+        r.instruction_id = "def-resp-faud";
+        r.agent_id = agent;
+        r.timestamp = ts;
+        r.status = 0;
+        r.output = out;
+        r.plugin = plugin;
+        r.execution_id = exec_id;
+        h.response_store->store(r);
+    };
+    using yuzu::server::test::kForensicsPlugin;
+    using yuzu::server::test::kOrdinaryPlugin;
+    put("agent-A", kForensicsPlugin, "forensics-A", 1735689610);
+    put("agent-B", kForensicsPlugin, "forensics-B", 1735689611);
+    put("agent-A", kOrdinaryPlugin, "ordinary-A", 1735689612);
+
+    auto verb_rows = [&] {
+        std::vector<AuditRecord> out;
+        for (const auto& a : h.audit_log)
+            if (a.action == "response.forensics.read")
+                out.push_back(a);
+        return out;
+    };
+    const std::string path = "/api/v1/executions/" + exec_id + "/responses";
+
+    h.forensics.viewer();
+    {
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(verb_rows().empty());
+    }
+    h.forensics.admin();
+    h.audit_log.clear();
+    {
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto rows = verb_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].result == "success");
+        CHECK(rows[0].target_type == "Execution");
+        CHECK(rows[0].target_id == exec_id);
+        CHECK(rows[0].detail == "forensics_rows=2 plugins=browser_inventory");
+    }
+    h.forensics.scoped({"agent-B"});
+    h.audit_log.clear();
+    {
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        const auto rows = verb_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory");
+    }
+    h.forensics.admin();
+    h.audit_log.clear();
+    h.audit_fail_action = "response.forensics.read";
+    {
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(res->body.find("forensics-") == std::string::npos);
+        CHECK(res->body.find("ordinary-") == std::string::npos);
+    }
 }
 
 // #4030 Gate 8 fix (happy-path, Gate 4, HIGH/I3): `offset` over this

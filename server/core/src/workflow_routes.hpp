@@ -58,6 +58,13 @@ public:
     using AuditFn = std::function<void(const httplib::Request&, const std::string& action,
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
+    /// The persist-reporting twin of AuditFn (true == durably written, or audit off), for the one
+    /// row a route needs to know the fate of (#4990 `response.forensics.read`).
+    using PersistAuditFn = std::function<bool(const httplib::Request&, const std::string& action,
+                                              const std::string& result,
+                                              const std::string& target_type,
+                                              const std::string& target_id,
+                                              const std::string& detail)>;
     using EmitEventFn = std::function<void(const std::string& event_type,
                                            const httplib::Request& req)>;
 
@@ -164,6 +171,10 @@ public:
         /// file keep using `perm_fn` above unchanged.
         FleetReadFn fleet_read_fn;
         AuditFn audit_fn;
+        /// #4990: persist-reporting sink for the drawer's `response.forensics.read` row (set-and-
+        /// proceed: a failed persist sets `Sec-Audit-Failed` and the drawer still renders). Unwired
+        /// is audit-off, the established `AuditFn` contract (`rest_audit.hpp`): no row is written.
+        PersistAuditFn persist_audit_fn;
         /// `--csrf-trusted-origin` allowlist (#2537) for the same-site gate on the dashboard's
         /// `POST /api/instructions/{id}/execute`. Empty = same-host only.
         std::vector<std::string> csrf_trusted_origins;

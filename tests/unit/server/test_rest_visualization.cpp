@@ -79,6 +79,8 @@ struct VizHarness {
     std::vector<AuditRecord> audit_log;
     // #4990: the caller's Forensics visibility (admin by default; the tier case flips it).
     yuzu::server::test::ForensicsCaller forensics;
+    // #4990: an audit verb whose row does NOT persist (every other row does).
+    std::string audit_fail_action;
 
     RestApiV1 api;
 
@@ -132,7 +134,7 @@ struct VizHarness {
                                const std::string& tt, const std::string& ti,
                                const std::string& d) -> bool {
             audit_log.push_back({a, r, tt, ti, d});
-            return true;
+            return a != audit_fail_action;
         };
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
@@ -399,6 +401,58 @@ TEST_CASE("REST visualization: Forensics rows are charted only for a caller with
         const auto [got, total] = charted();
         CHECK(got == std::map<std::string, double>{{"ordinary-one", 1}, {"secret-forensics", 1}});
         CHECK(total == 2);
+    }
+}
+
+TEST_CASE("REST visualization: response.forensics.read is written only when Forensics rows feed "
+          "the chart",
+          "[pg][rest][visualization][audit][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    VizHarness h(pool);
+    auto spec = R"({"type":"pie","processor":"single_series","labelField":1,
+                    "title":"Top procs"})";
+    auto def_id = h.make_def(spec, "procfetch");
+    h.push_response("cmd-faud", "agent-1", "1|ordinary-one|/x|d", "procfetch");
+    h.push_response("cmd-faud", "agent-2", "1|secret-forensics|/x|d",
+                    yuzu::server::test::kForensicsPlugin);
+    const std::string path = "/api/v1/executions/cmd-faud/visualization?definition_id=" + def_id;
+    auto verb_rows = [&] {
+        std::vector<AuditRecord> out;
+        for (const auto& a : h.audit_log)
+            if (a.action == "response.forensics.read")
+                out.push_back(a);
+        return out;
+    };
+
+    h.forensics.viewer();
+    {
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(verb_rows().empty());
+    }
+    h.forensics.admin();
+    h.audit_log.clear();
+    {
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto rows = verb_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].result == "success");
+        CHECK(rows[0].target_id == "cmd-faud");
+        CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory");
+    }
+    h.audit_log.clear();
+    h.audit_fail_action = "response.forensics.read";
+    {
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(res->body.find("secret-forensics") == std::string::npos);
+        CHECK(res->body.find("ordinary-one") == std::string::npos);
     }
 }
 

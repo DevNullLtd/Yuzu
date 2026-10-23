@@ -33,6 +33,7 @@
 #include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
 #include "response_query_model.hpp" // #2146 A2-R2: shared instruction/command-ID-keyed
                                      // response query/aggregate/export row builders
+#include "forensics_read_audit.hpp" // #4990: response.forensics.read (separately countable usage-class read)
 #include "response_export_metrics.hpp"
 #include "response_query_params.hpp" // #4644/#4703: strict numeric params + export byte cap
 #include "execution_statistics_model.hpp" // #2146 Batch B3: shared execution/fleet statistics builders
@@ -356,6 +357,26 @@ static bool deny_mcp_token_session(
             "application/json");
         return true;
     }
+    return false;
+}
+
+/// #4990: the fail-closed REST step for the `response.forensics.read` row. Writes it only when the
+/// rows about to be served include a Forensics-tier plugin's (nothing to audit is a pass); on a
+/// persist failure answers the same 503 + `Sec-Audit-Failed` as the neighbouring `response.read`
+/// step and returns false, and the route must return before building any body.
+[[nodiscard]] static bool audit_forensics_or_refuse(const RestApiV1::AuditFn& audit_fn,
+                                                    const httplib::Request& req,
+                                                    httplib::Response& res,
+                                                    const ForensicsServed& served,
+                                                    const std::string& target_id) {
+    if (emit_forensics_read_audit(audit_fn, req, res, served, target_id))
+        return true;
+    res.status = 503;
+    res.set_content(detail::a4_error(res,
+                                     "audit subsystem unavailable; refusing to serve response "
+                                     "data without durable evidence",
+                                     {.retry_after_ms = 5000, .remediation = "retry the request"}),
+                    "application/json");
     return false;
 }
 
@@ -10744,6 +10765,11 @@ void RestApiV1::register_routes(
                     "application/json");
                 return;
             }
+            if (!audit_forensics_or_refuse(audit_fn, req, res,
+                                           summarize_forensics_served(*responses_opt,
+                                                                      forensics_plugins),
+                                           execution_id))
+                return;
 
             JArr arr;
             for (const auto& r : *responses_opt)
@@ -11101,6 +11127,10 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
+            if (!audit_forensics_or_refuse(audit_fn, req, res,
+                                           summarize_forensics_served(results, forensics_plugins),
+                                           instruction_id))
+                return;
 
             // Truncation signal: `cut.row_cap` = more matching rows existed beyond `limit`
             // (exact: the store fetches limit+1 candidates); `cut.byte_cap` = rows within
@@ -11267,6 +11297,10 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
+            if (!audit_forensics_or_refuse(audit_fn, req, res,
+                                           summarize_forensics_served(results, forensics_plugins),
+                                           instruction_id))
+                return;
 
             // happy-path/enterprise-readiness governance finding: this route
             // never signalled a cap-hit, unlike MCP query_responses (this
@@ -12122,6 +12156,12 @@ void RestApiV1::register_routes(
                 }
                 final_json += "}";
             }
+            // #4990: the chart is built from the served rows, so a chart over Forensics-tier rows
+            // is the same usage-class read; fail closed before the body is sent.
+            if (!audit_forensics_or_refuse(audit_fn, req, res,
+                                           summarize_forensics_served(responses, forensics_plugins),
+                                           execution_id))
+                return;
             res.set_content(ok_json(final_json), "application/json");
             // #1634 (governance Gate 4 consistency-auditor finding): a scope-drop
             // is a security-relevant event — emit the SAME paired denied+success

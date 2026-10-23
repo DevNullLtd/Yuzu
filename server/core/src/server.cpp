@@ -20126,6 +20126,7 @@ private:
         // used only by the executions-drawer detail route.
         wf_deps.fleet_read_fn = fleet_read_fn;
         wf_deps.audit_fn = audit_fn;
+        wf_deps.persist_audit_fn = audit_fn; // #4990: the drawer's response.forensics.read row
         wf_deps.emit_fn = [this](const std::string& event_type, const httplib::Request& req) {
             emit_event(event_type, req);
         };

@@ -27482,6 +27482,104 @@ TEST_CASE("MCP query_responses: an unwired Forensics resolver or plugin set fail
     CHECK(response_outputs(query_responses_result(ts, R"({"execution_id":"exec-unw"})")).empty());
 }
 
+TEST_CASE("MCP query_responses: response.forensics.read is written only when Forensics rows are "
+          "served, and a persist failure shows as audit_persisted:false",
+          "[pg][mcp][integration][response][audit][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    seed_mcp_tier(store, "exec-faud", "instr-faud");
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    // The recorded verb rows as (result, target_type, target_id, detail).
+    auto verb_rows = [&] {
+        std::vector<std::array<std::string, 4>> out;
+        for (std::size_t i = 0; i < ts.audit_log.size(); ++i)
+            if (ts.audit_log[i].rfind("response.forensics.read|", 0) == 0)
+                out.push_back({ts.audit_log[i].substr(std::string("response.forensics.read|").size()),
+                               ts.audit_target_types[i], ts.audit_target_ids[i],
+                               ts.audit_details[i]});
+        return out;
+    };
+    using Row = std::array<std::string, 4>;
+
+    for (const char* args : {R"({"execution_id":"exec-faud"})", R"({"instruction_id":"instr-faud"})"}) {
+        INFO(args);
+        const std::string key = std::string(args).find("execution_id") != std::string::npos
+                                    ? "exec-faud"
+                                    : "instr-faud";
+
+        ts.forensics_for_test.viewer();
+        ts.audit_log.clear();
+        ts.audit_details.clear();
+        ts.audit_target_ids.clear();
+        ts.audit_target_types.clear();
+        CHECK_FALSE(query_responses_result(ts, args).contains("audit_persisted"));
+        CHECK(verb_rows().empty());
+
+        ts.forensics_for_test.admin();
+        ts.audit_log.clear();
+        ts.audit_details.clear();
+        ts.audit_target_ids.clear();
+        ts.audit_target_types.clear();
+        {
+            const auto result = query_responses_result(ts, args);
+            CHECK_FALSE(result.contains("audit_persisted"));
+            const auto rows = verb_rows();
+            REQUIRE(rows.size() == 1);
+            CHECK(rows[0] == Row{"success", "Execution", key,
+                                 "forensics_rows=2 plugins=browser_inventory"});
+        }
+
+        ts.forensics_for_test.scoped({"agent-B"});
+        ts.audit_log.clear();
+        ts.audit_details.clear();
+        ts.audit_target_ids.clear();
+        ts.audit_target_types.clear();
+        (void)query_responses_result(ts, args);
+        {
+            const auto rows = verb_rows();
+            REQUIRE(rows.size() == 1);
+            CHECK(rows[0][3] == "forensics_rows=1 plugins=browser_inventory");
+        }
+
+        // The verb row alone does not persist: the data is still served, the gap is surfaced.
+        ts.forensics_for_test.admin();
+        ts.audit_log.clear();
+        ts.audit_details.clear();
+        ts.audit_target_ids.clear();
+        ts.audit_target_types.clear();
+        ts.audit_succeeds_for_action_ = [](const std::string& action) {
+            return action != "response.forensics.read";
+        };
+        {
+            const auto result = query_responses_result(ts, args);
+            REQUIRE(result.contains("audit_persisted"));
+            CHECK(result["audit_persisted"] == false);
+            CHECK(result["structuredContent"]["audit_persisted"] == false);
+            CHECK(response_outputs(result).size() == 4);
+            CHECK(verb_rows().size() == 1);
+        }
+        ts.audit_succeeds_for_action_ = nullptr;
+    }
+
+    SECTION("a caller served only ordinary rows writes no verb row") {
+        store_tier_row(store, "exec-ord", "instr-ord", "agent-A", kOrdinaryPlugin, "ordinary-only", 700);
+        ts.forensics_for_test.admin();
+        ts.audit_log.clear();
+        ts.audit_details.clear();
+        ts.audit_target_ids.clear();
+        ts.audit_target_types.clear();
+        CHECK(response_outputs(query_responses_result(ts, R"({"execution_id":"exec-ord"})")) ==
+              TierOutputs{"ordinary-only"});
+        CHECK(verb_rows().empty());
+    }
+}
+
 TEST_CASE("MCP aggregate_responses: totals are computed from the permitted rows only",
           "[pg][mcp][integration][response][aggregate][security][forensics]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

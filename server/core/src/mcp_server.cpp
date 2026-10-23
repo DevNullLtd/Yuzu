@@ -73,6 +73,7 @@
 #include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
 #include "auth_routes.hpp"      // detail::sanitize_detail_value — audit-string sanitiser
 #include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)
+#include "forensics_read_audit.hpp"     // #4990: response.forensics.read
 #include "rest_audit.hpp"               // detail::try_persist_audit (behavioural-audit kernel, #1647)
 #include "web_utils.hpp"                // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "bundle_orchestrator.hpp"      // live-query bundle (ADR-0011): dispatch + collate
@@ -9978,7 +9979,16 @@ McpServer::HandlerFn McpServer::build_handler(
                                                         key);
                 // #1550 HIGH-2: observe the audit bool — a dropped evidence row on this
                 // SOC 2 read surface is surfaced to the caller via audit_persisted:false.
-                const bool audit_ok = mcp_audit("success", key) && denied_ok;
+                bool audit_ok = mcp_audit("success", key) && denied_ok;
+                // #4990: a read that served Forensics-tier rows leaves its own separately
+                // countable row (set-and-proceed here: a drop shows as audit_persisted:false).
+                if (const auto served = summarize_forensics_served(responses, forensics_plugins_);
+                    served.any()) {
+                    const bool forensics_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, kForensicsReadVerb, "success", "Execution", key,
+                        served.detail());
+                    audit_ok = audit_ok && forensics_ok;
+                }
                 // poll_hint was computed above, before the response-store
                 // query (UP-1). Emit the count only when in-flight-ness was
                 // actually checked — an instruction_id-only call (nullopt)

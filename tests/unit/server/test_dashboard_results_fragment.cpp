@@ -40,6 +40,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstddef>
+#include <format>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -83,12 +84,25 @@ struct FragmentResultsHarness {
     // #4990: the caller's Forensics visibility (admin by default so the cases that are not about
     // the tier keep their meaning). Declared before `routes`: the resolver borrows it.
     yuzu::server::test::ForensicsCaller forensics;
+    // #4990: every row the persist-reporting audit sink received, and the one verb (if any) whose
+    // row does NOT persist. Declared before `routes`: the sink borrows them.
+    struct AuditRow {
+        std::string action, result, target_type, target_id, detail;
+    };
+    std::vector<AuditRow> persisted_audits;
+    std::string persist_fail_action;
     DashboardRoutes routes;
     yuzu::server::test::TestRouteSink sink;
 
     explicit FragmentResultsHarness(ResponseStore* response_store,
                                     InstructionStore* instruction_store = nullptr) {
         yuzu::server::test::wire_forensics(routes, forensics);
+        routes.set_persist_audit_fn([this](const httplib::Request&, const std::string& a,
+                                           const std::string& r, const std::string& tt,
+                                           const std::string& ti, const std::string& d) {
+            persisted_audits.push_back({a, r, tt, ti, d});
+            return a != persist_fail_action;
+        });
         auto auth_fn = [](const httplib::Request&,
                           httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
@@ -1049,6 +1063,83 @@ TEST_CASE("/fragments/results: Forensics rows follow the caller's Forensics visi
         auto ok = h.get(url + "&f_category=TOKEN-ORDINARY-A");
         REQUIRE(ok);
         CHECK(contains(ok->body, "TOKEN-ORDINARY-A"));
+    }
+}
+
+TEST_CASE("/fragments/results: response.forensics.read is written only when the rendered page shows "
+          "Forensics rows, and a persist failure never blanks the page",
+          "[pg][server][dashboard][fragment][audit][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-faud";
+    // Sorted by agent, one line per row, 10 lines per page (the floor): agent-01 (Forensics) is on
+    // page 1, agent-11..agent-13 (ordinary) are alone on page 2.
+    put_tier_row(rs, command_id, "agent-01", yuzu::server::test::kForensicsPlugin, "TOKEN-FORENSICS-A");
+    for (int i = 2; i <= 13; ++i)
+        put_tier_row(rs, command_id, std::format("agent-{:02d}", i),
+                     yuzu::server::test::kOrdinaryPlugin, std::format("TOKEN-ORDINARY-{:02d}", i));
+
+    FragmentResultsHarness h(&rs);
+    h.routes.set_fleet_read_fn(admit_all);
+    const std::string url = "/fragments/results?command_id=" + command_id +
+                            "&plugin=vuln_scan&sort=agent&dir=asc";
+    auto verb_rows = [&] {
+        std::vector<FragmentResultsHarness::AuditRow> out;
+        for (const auto& a : h.persisted_audits)
+            if (a.action == "response.forensics.read")
+                out.push_back(a);
+        return out;
+    };
+
+    SECTION("a caller without Forensics:Read leaves no verb row") {
+        h.forensics.viewer();
+        auto res = h.get(url);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(verb_rows().empty());
+    }
+    SECTION("a global grant leaves exactly one row counting the stored rows the page shows") {
+        h.forensics.admin();
+        auto res = h.get(url);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto rows = verb_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].result == "success");
+        CHECK(rows[0].target_type == "Execution");
+        CHECK(rows[0].target_id == command_id);
+        CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory");
+    }
+    SECTION("only a page that shows a Forensics row counts it, though Forensics rows exist elsewhere") {
+        h.forensics.admin();
+        auto page = [&](int n) {
+            auto res = h.get(url + "&per_page=10&page=" + std::to_string(n));
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            return res;
+        };
+        auto second = page(2);
+        CHECK(contains(second->body, "TOKEN-ORDINARY-13"));
+        CHECK_FALSE(contains(second->body, "TOKEN-FORENSICS"));
+        CHECK(verb_rows().empty());
+        auto first = page(1);
+        CHECK(contains(first->body, "TOKEN-FORENSICS-A"));
+        const auto rows = verb_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory");
+    }
+    SECTION("a persist failure sets Sec-Audit-Failed and still renders the page") {
+        h.forensics.admin();
+        h.persist_fail_action = "response.forensics.read";
+        auto res = h.get(url);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(contains(res->body, "TOKEN-FORENSICS-A"));
+        CHECK(contains(res->body, "TOKEN-ORDINARY-02"));
+        CHECK(verb_rows().size() == 1);
     }
 }
 

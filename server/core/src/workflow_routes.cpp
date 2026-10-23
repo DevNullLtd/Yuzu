@@ -6,6 +6,7 @@
 #include "dispatch_destructive_gate.hpp" // BR-001: evaluate_destructive_targeting / requires_explicit_targets
 #include "dispatch_target_shape.hpp" // check_targeting_shape — the omitted-vs-supplied rule (#2500)
 #include "event_bus.hpp"
+#include "forensics_read_audit.hpp" // #4990: response.forensics.read
 #include "executions_page_render.hpp" // Operate O1: view=page renderers
 #include "workflows_page_render.hpp" // Operate WF-A: workflows + schedules page renderers
 #include "execution_event_bus.hpp"
@@ -71,10 +72,13 @@ struct PageResponses {
     std::vector<operate_pages::DeviceResponse> rows;
     std::size_t total{0};
     operate_pages::ResponsesState state{operate_pages::ResponsesState::kOk};
+    ForensicsServed forensics; // #4990: the Forensics-tier rows among `rows` (the served ones)
 };
 
 PageResponses collect_page_responses(ResponseStore* store, bool may_read_responses,
-                                     const ResponseTierFilter& tier, const Execution& exec,
+                                     const ResponseTierFilter& tier,
+                                     const ForensicsPluginSet* forensics_plugins,
+                                     const Execution& exec,
                                      const std::vector<AgentExecStatus>& visible_agents,
                                      const authz::VisibleSet& scope) {
     PageResponses out;
@@ -112,10 +116,12 @@ PageResponses collect_page_responses(ResponseStore* store, bool may_read_respons
         if (scope && !authz::in_scope(scope, r.agent_id))
             continue;
         ++out.total;
-        if (out.rows.size() < operate_pages::kDeviceResponsesCap)
+        if (out.rows.size() < operate_pages::kDeviceResponsesCap) {
+            out.forensics.note(r.plugin, forensics_plugins);
             out.rows.push_back({std::move(r.agent_id), std::move(r.output),
                                 std::move(r.error_detail), static_cast<int>(r.status), r.timestamp,
                                 r.received_at_ms});
+        }
     }
     return out;
 }
@@ -212,6 +218,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // #1712 / #3290 Phase 2 — see WorkflowRoutes::FleetReadFn's doc comment.
     auto fleet_read_fn = std::move(deps.fleet_read_fn);
     auto audit_fn = std::move(deps.audit_fn);
+    auto persist_audit_fn = std::move(deps.persist_audit_fn); // #4990
     auto probe_perm_fn = std::move(deps.probe_perm_fn);
     auto emit_fn = std::move(deps.emit_fn);
     auto scope_fn = std::move(deps.scope_fn);
@@ -646,8 +653,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // to exact `execution_id` correlation transparently).
     sink.Get(
         R"(/fragments/executions/([A-Za-z0-9_-]{1,128})/detail)",
-        [auth_fn, fleet_read_fn, audit_fn, probe_perm_fn, execution_tracker, instruction_store,
-         response_store, forensics_plugins, forensics_visibility_fn](
+        [auth_fn, fleet_read_fn, audit_fn, persist_audit_fn, probe_perm_fn, execution_tracker,
+         instruction_store, response_store, forensics_plugins, forensics_visibility_fn](
             const httplib::Request& req, httplib::Response& res) {
             // #1712 / #3290 Phase 2 — migrated onto require_fleet_read
             // (fleet_read_fn), mirroring query_installed_software / the REST
@@ -689,6 +696,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             const auto tier = may_read_responses
                                   ? tier_filter_for(req, forensics_visibility_fn, forensics_plugins)
                                   : ResponseTierFilter::refuse_unwired();
+            // #4990: the drawer's `response.forensics.read` row, written only when the rendered
+            // responses include a Forensics-tier plugin's. Set-and-proceed: a failed persist sets
+            // `Sec-Audit-Failed` and the drawer still renders. Both render branches call it.
+            auto emit_drawer_forensics_audit = [&](const ForensicsServed& served,
+                                                   const httplib::Request& r,
+                                                   httplib::Response& out,
+                                                   const std::string& id) {
+                if (!served.any())
+                    return;
+                (void)emit_forensics_read_audit(persist_audit_fn, r, out, served, id);
+            };
             if (!execution_tracker) {
                 res.status = 503;
                 res.set_content("<div class=\"empty-state\">Tracker not available</div>",
@@ -843,14 +861,15 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 for (const auto& a : agents)
                     devs.rows.push_back({a.agent_id, a.status, a.error_detail, a.exit_code,
                                          a.dispatched_at, a.completed_at});
-                auto pr = collect_page_responses(response_store, may_read_responses, tier, exec, agents,
-                                                 gate.scope);
+                auto pr = collect_page_responses(response_store, may_read_responses, tier,
+                                                 forensics_plugins, exec, agents, gate.scope);
                 devs.responses = std::move(pr.rows);
                 devs.responses_total = pr.total;
                 devs.responses_state = pr.state;
                 res.set_content(operate_pages::render_exec_selected(view) +
                                     operate_pages::render_exec_devices(devs),
                                 "text/html; charset=utf-8");
+                emit_drawer_forensics_audit(pr.forensics, req, res, exec.id);
                 // Same forensic-read audit row as the drawer below: one per selection.
                 audit_fn(req, "execution.detail.view", "success", "Execution", exec.id, "");
                 return;
@@ -1117,6 +1136,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             html += "</tbody></table></div>";
 
             // -- Responses (collapsed) ---------------------------------------
+            ForensicsServed inline_forensics; // #4990: filled when Forensics-tier rows are rendered
             html += "<div class=\"per-agent-responses-wrap\">";
             if (!may_read_responses) {
                 // #4990: no rows, no count, and no store read.
@@ -1182,6 +1202,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     filtered.swap(visible);
                 }
 
+                // #4990: every row of `filtered` is rendered below.
+                if (!store_degraded)
+                    inline_forensics = summarize_forensics_served(filtered, forensics_plugins);
                 html += std::format("<details class=\"per-agent-responses\">"
                                     "<summary>Show responses ({})</summary>",
                                     filtered.size());
@@ -1257,6 +1280,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
             html += "</div>"; // exec-detail-grid
             res.set_content(html, "text/html; charset=utf-8");
+            emit_drawer_forensics_audit(inline_forensics, req, res, exec.id);
 
             // sec-M2: emit audit on the forensic-data read so SOC 2 can
             // answer "who viewed execution X's per-agent error data and

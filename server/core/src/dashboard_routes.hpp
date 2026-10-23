@@ -39,6 +39,7 @@ class TagStore;
 class InstructionStore;
 class HttpRouteSink; // http_route_sink.hpp — the in-process-testable seam (#438)
 struct FacetFilter;
+struct ForensicsServed; // forensics_read_audit.hpp - #4990
 struct TarRetentionPausedScan; // tar_tree_routes.hpp — #4027 REST+MCP twin shape
 
 namespace detail {
@@ -359,6 +360,9 @@ private:
     /// nullopt so the existing DashboardResultsColumnsTestAccess friend
     /// seam (test_dashboard_results_columns.cpp) keeps testing the
     /// unfiltered path unchanged.
+    /// @p served - #4990: when non-null, filled with the Forensics-tier rows the rendered PAGE
+    /// shows (the stored rows behind the page's lines, not the whole filtered set), so the route can
+    /// write the `response.forensics.read` row. Null = the caller discards it (the test seam).
     std::string render_results(const std::string& command_id, const ResponseTierFilter& tier,
                                const std::string& plugin,
                                const std::string& sort_col, const std::string& sort_dir,
@@ -368,7 +372,8 @@ private:
                                const std::string& definition_id = {},
                                const std::string& template_id = {},
                                const std::vector<std::string>& visible_columns = {},
-                               const authz::VisibleSet& scope = std::nullopt);
+                               const authz::VisibleSet& scope = std::nullopt,
+                               ForensicsServed* served = nullptr);
 
     /// Render filter controls for a plugin schema. When @p definition_id is
     /// non-empty it's emitted as a hidden form input so subsequent

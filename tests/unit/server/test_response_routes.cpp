@@ -1672,3 +1672,107 @@ TEST_CASE("GET /api/responses/:id/export: rows and the truncation flag come from
         CHECK(res->body.find("forensics-") == std::string::npos);
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #4990: the `response.forensics.read` audit row on the legacy row-returning reads. Asserted on the
+// RECORDED audit rows (never on a mock having been called), over a real store, with an ordinary
+// control row in every case.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+std::vector<AuditRow> forensics_audits(const PgHarness& h) {
+    std::vector<AuditRow> out;
+    for (const auto& a : h.audits)
+        if (a.action == "response.forensics.read")
+            out.push_back(a);
+    return out;
+}
+
+struct LegacyRowRoute {
+    const char* name;
+    const char* suffix; // after /api/responses/<id>
+};
+constexpr LegacyRowRoute kLegacyRowRoutes[] = {
+    {"get", ""}, {"export json", "/export"}, {"export csv", "/export?format=csv"}};
+} // namespace
+
+TEST_CASE("legacy row reads: response.forensics.read is written only when Forensics rows are served",
+          "[server][routes][response_routes][rest][pg][audit][security][forensics]") {
+    PgHarness h;
+    seed_tier_rows(h, "instr-faud");
+
+    for (const auto& route : kLegacyRowRoutes) {
+        INFO(route.name);
+        const std::string path = std::string("/api/responses/instr-faud") + route.suffix;
+
+        SECTION(std::string(route.name) + ": a caller without Forensics:Read leaves no verb row") {
+            h.forensics.viewer();
+            auto res = h.sink.Get(path);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            CHECK(forensics_audits(h).empty());
+        }
+        SECTION(std::string(route.name) + ": a global grant leaves exactly one row with the count") {
+            h.forensics.admin();
+            auto res = h.sink.Get(path);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            const auto rows = forensics_audits(h);
+            REQUIRE(rows.size() == 1);
+            CHECK(rows[0].result == "success");
+            CHECK(rows[0].target_type == "Execution");
+            CHECK(rows[0].target_id == "instr-faud");
+            CHECK(rows[0].detail == "forensics_rows=2 plugins=browser_inventory");
+        }
+        SECTION(std::string(route.name) + ": a scoped grant counts only the rows it was served") {
+            h.forensics.scoped({"agent-A"});
+            auto res = h.sink.Get(path);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            const auto rows = forensics_audits(h);
+            REQUIRE(rows.size() == 1);
+            CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory");
+        }
+        SECTION(std::string(route.name) + ": a scoped grant that matches no Forensics row writes none") {
+            h.forensics.scoped({"agent-C"});
+            auto res = h.sink.Get(path);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            CHECK(forensics_audits(h).empty());
+        }
+        SECTION(std::string(route.name) + ": a persist failure is a 503 and serves no data") {
+            h.forensics.admin();
+            h.audit_succeeds = false;
+            h.audit_fail_after = 1; // the response.read row persists, the verb row does not
+            auto res = h.sink.Get(path);
+            REQUIRE(res);
+            CHECK(res->status == 503);
+            CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+            CHECK(res->body.find("forensics-") == std::string::npos);
+            CHECK(res->body.find("ordinary-") == std::string::npos);
+            CHECK(forensics_audits(h).size() == 1); // attempted once, not retried
+        }
+    }
+}
+
+TEST_CASE("legacy row reads: a result of ordinary rows only writes no verb row, and aggregate never does",
+          "[server][routes][response_routes][rest][pg][audit][security][forensics]") {
+    PgHarness h;
+    h.seed("instr-faud-ord", "agent-A", 1, kOrdinaryPlugin, "ordinary-A");
+    h.forensics.admin();
+    for (const auto& route : kLegacyRowRoutes) {
+        INFO(route.name);
+        auto res = h.sink.Get(std::string("/api/responses/instr-faud-ord") + route.suffix);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+    CHECK(forensics_audits(h).empty());
+
+    PgHarness agg;
+    seed_tier_rows(agg, "instr-faud-agg");
+    agg.forensics.admin();
+    auto res = agg.sink.Get("/api/responses/instr-faud-agg/aggregate?group_by=agent_id");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(forensics_audits(agg).empty());
+}

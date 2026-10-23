@@ -6,6 +6,7 @@
 #include "scope_attribute_guard.hpp" // E-1: unknown-attribute refusal for expression sends
 #include "mcp_input_bounds.hpp"    // kExecInstrScopeMaxLen
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500), kReasonDestructiveUntargeted
+#include "forensics_read_audit.hpp" // #4990: response.forensics.read
 #include "rest_audit.hpp" // detail::try_persist_audit (E-1: audit-before-dispatch)
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, make_correlation_id (#4027 REST twin)
 #include "tar_tree_routes.hpp" // TarRetentionPausedScan/TarPausedSourceRow/tar_retention_paused_json (#4027)
@@ -415,10 +416,15 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 // #4990: derived after the Response:Read gate (never writes a response); the
                 // filter narrows the rows, facets and counts below to what the caller may read.
                 const auto tier = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                ForensicsServed served;
                 auto html = render_results(command_id, tier, plugin, sort_col, sort_dir,
                                            page, per_page, filters, text_query,
                                            definition_id, template_id,
-                                           visible_columns, gate.scope);
+                                           visible_columns, gate.scope, &served);
+                // #4990: a page that shows Forensics-tier rows leaves its own separately countable
+                // row. Set-and-proceed like the neighbouring dashboard fragments: a persist failure
+                // shows as `Sec-Audit-Failed` and never blanks the operator's view.
+                (void)emit_forensics_read_audit(persist_audit_fn_, req, res, served, command_id);
                 res.set_content(html, "text/html; charset=utf-8");
             });
 
@@ -2350,7 +2356,8 @@ std::string DashboardRoutes::render_results(
     const std::string& definition_id,
     const std::string& template_id,
     const std::vector<std::string>& visible_columns,
-    const authz::VisibleSet& scope) {
+    const authz::VisibleSet& scope,
+    ForensicsServed* served) {
 
     if (!response_store_) {
         return "<tbody id=\"results-tbody\"><tr><td class=\"empty-state\">"
@@ -2461,6 +2468,7 @@ std::string DashboardRoutes::render_results(
     struct ResultLine {
         std::string agent_name;
         std::vector<std::string> fields; // excludes Agent column
+        std::size_t response_idx{0};     // index into `responses` (#4990: the row behind the line)
     };
     std::vector<ResultLine> all_lines;
     all_lines.reserve(responses.size() * 4);
@@ -2472,7 +2480,8 @@ std::string DashboardRoutes::render_results(
     for (const auto& f : filters)
         filter_stored_values.push_back(facet_filter_stored_form(f.value));
 
-    for (const auto& resp : responses) {
+    for (std::size_t resp_idx = 0; resp_idx < responses.size(); ++resp_idx) {
+        const auto& resp = responses[resp_idx];
         auto agent_name = registry_ ? registry_->display_name(resp.agent_id)
                                      : resp.agent_id;
         auto lines = split_output_lines(resp.output);
@@ -2502,6 +2511,7 @@ std::string DashboardRoutes::render_results(
             ResultLine rl;
             rl.agent_name = agent_name;
             rl.fields = std::move(fields);
+            rl.response_idx = resp_idx;
             all_lines.push_back(std::move(rl));
         }
     }
@@ -2532,6 +2542,15 @@ std::string DashboardRoutes::render_results(
     if (page > total_pages) page = static_cast<int>(total_pages);
     int64_t start = static_cast<int64_t>(page - 1) * per_page;
     int64_t end = std::min(start + per_page, total_lines);
+
+    // #4990: the stored rows behind the lines this page shows (a degraded read serves none).
+    if (served && !store_degraded) {
+        std::set<std::size_t> shown;
+        for (int64_t i = start; i < end; ++i)
+            shown.insert(all_lines[i].response_idx);
+        for (const auto idx : shown)
+            served->note(responses[idx].plugin, forensics_plugins_);
+    }
 
     // Phase 5: render HTML
 

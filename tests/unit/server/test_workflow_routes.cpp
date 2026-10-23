@@ -254,6 +254,8 @@ struct ExecHarness {
         std::string action, result, target_type, target_id, detail;
     };
     std::vector<AuditCall> audit_calls;
+    /// #4990: the one audit verb whose row does NOT persist through `persist_audit_fn`.
+    std::string persist_fail_action;
     /// #2500 targeting-widening regression net. `dispatch_calls` is the
     /// load-bearing one: a refusal that still dispatched would be no fix at
     /// all, and the pre-#2500 bug was precisely a 200-with-dispatch. The
@@ -510,6 +512,15 @@ struct ExecHarness {
         // else: leave genuinely default-constructed (empty std::function) --
         // production's own unwired-misconfiguration contract (#3565).
         wf_deps.audit_fn = audit_fn;
+        // #4990: the persist-reporting twin the drawer's response.forensics.read row goes through.
+        wf_deps.persist_audit_fn = [this](const httplib::Request&, const std::string& action,
+                                          const std::string& result,
+                                          const std::string& target_type,
+                                          const std::string& target_id,
+                                          const std::string& detail) -> bool {
+            audit_calls.push_back({action, result, target_type, target_id, detail});
+            return action != persist_fail_action;
+        };
         wf_deps.emit_fn = emit_fn;
         wf_deps.scope_fn = scope_fn;
         wf_deps.execution_tracker = tracker.get();
@@ -1326,6 +1337,84 @@ TEST_CASE("executions page detail: Forensics rows follow the caller's Forensics 
     REQUIRE(admin);
     CHECK(has(admin->body, "TOKEN-FORENSICS-A"));
     CHECK(has(admin->body, "Show responses (4)"));
+}
+
+TEST_CASE("executions drawer and page detail: response.forensics.read is written only when Forensics "
+          "rows are rendered, and a persist failure never blanks the view",
+          "[pg][workflow][executions][detail][drawer][page][audit][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    const auto eid = seed_tier_exec(h);
+
+    auto verb_rows = [&] {
+        std::vector<ExecHarness::AuditCall> out;
+        for (const auto& a : h.audit_calls)
+            if (a.action == "response.forensics.read")
+                out.push_back(a);
+        return out;
+    };
+
+    for (const char* suffix : {"", "?view=page"}) {
+        INFO(suffix);
+        const auto url = "/fragments/executions/" + eid + "/detail" + suffix;
+        h.persist_fail_action.clear();
+
+        h.forensics.viewer();
+        h.audit_calls.clear();
+        {
+            auto res = h.sink.Get(url);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            CHECK(verb_rows().empty());
+        }
+
+        h.forensics.admin();
+        h.audit_calls.clear();
+        {
+            auto res = h.sink.Get(url);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            const auto rows = verb_rows();
+            REQUIRE(rows.size() == 1);
+            CHECK(rows[0].result == "success");
+            CHECK(rows[0].target_type == "Execution");
+            CHECK(rows[0].target_id == eid);
+            CHECK(rows[0].detail == "forensics_rows=2 plugins=browser_inventory");
+        }
+
+        h.forensics.scoped({"agent-B"});
+        h.audit_calls.clear();
+        {
+            auto res = h.sink.Get(url);
+            REQUIRE(res);
+            const auto rows = verb_rows();
+            REQUIRE(rows.size() == 1);
+            CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory");
+        }
+
+        // The drawer proceeds on a persist failure and says so in the header.
+        h.forensics.admin();
+        h.audit_calls.clear();
+        h.persist_fail_action = "response.forensics.read";
+        {
+            auto res = h.sink.Get(url);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+            CHECK(has(res->body, "TOKEN-FORENSICS-A"));
+            CHECK(verb_rows().size() == 1);
+        }
+    }
+
+    SECTION("without Response:Read nothing is rendered, so nothing is audited") {
+        h.probe_response_read = false;
+        h.forensics.admin();
+        h.audit_calls.clear();
+        auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
+        REQUIRE(res);
+        CHECK(verb_rows().empty());
+    }
 }
 
 TEST_CASE("executions drawer: without Response:Read the responses section carries no rows and no "

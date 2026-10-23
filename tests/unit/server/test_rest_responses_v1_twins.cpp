@@ -77,6 +77,8 @@ struct RespV1Harness {
     // #4990: the caller's Forensics visibility (admin by default so tests that are not about the
     // tier keep their meaning; the tier cases below flip it).
     yuzu::server::test::ForensicsCaller forensics;
+    // #4990: an audit verb whose row does NOT persist (every other row follows audit_persist).
+    std::string audit_fail_action;
 
     yuzu::MetricsRegistry metrics; // #4644/#4703 counters, seeded like production
 
@@ -122,7 +124,7 @@ struct RespV1Harness {
                                const std::string& tt, const std::string& ti,
                                const std::string& d) -> bool {
             audit_log.push_back({a, r, tt, ti, d});
-            return audit_persist;
+            return audit_persist && a != audit_fail_action;
         };
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
@@ -721,6 +723,109 @@ TEST_CASE("GET /api/v1/responses/:id/export: management-group scope filters anot
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body["data"].size() == 1);
     CHECK(body["data"][0]["agent_id"] == "agent-A");
+}
+
+// ── #4990: the `response.forensics.read` audit row ──────────────────────
+//
+// Asserted on the RECORDED audit rows over a real store, with an ordinary control row.
+
+namespace {
+std::vector<AuditRecord> forensics_audits(const RespV1Harness& h) {
+    std::vector<AuditRecord> out;
+    for (const auto& a : h.audit_log)
+        if (a.action == "response.forensics.read")
+            out.push_back(a);
+    return out;
+}
+
+constexpr const char* kV1RowRoutes[] = {"/api/v1/responses/instr-faud",
+                                        "/api/v1/responses/instr-faud/export",
+                                        "/api/v1/responses/instr-faud/export?format=csv"};
+} // namespace
+
+TEST_CASE("v1 response row reads: response.forensics.read is written only when Forensics rows are "
+          "served",
+          "[pg][rest][responses][v1][audit][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+    seed_tier(h, "instr-faud");
+
+    for (const std::string path : kV1RowRoutes) {
+        INFO(path);
+        h.audit_log.clear();
+        h.audit_fail_action.clear();
+
+        h.forensics.viewer();
+        {
+            auto res = h.sink.Get(path);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            CHECK(forensics_audits(h).empty());
+        }
+
+        h.forensics.admin();
+        h.audit_log.clear();
+        {
+            auto res = h.sink.Get(path);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            const auto rows = forensics_audits(h);
+            REQUIRE(rows.size() == 1);
+            CHECK(rows[0].result == "success");
+            CHECK(rows[0].target_type == "Execution");
+            CHECK(rows[0].target_id == "instr-faud");
+            CHECK(rows[0].detail == "forensics_rows=2 plugins=browser_inventory");
+        }
+
+        h.forensics.scoped({"agent-A"});
+        h.audit_log.clear();
+        {
+            auto res = h.sink.Get(path);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            const auto rows = forensics_audits(h);
+            REQUIRE(rows.size() == 1);
+            CHECK(rows[0].detail == "forensics_rows=1 plugins=browser_inventory");
+        }
+
+        // The verb row alone does not persist: fail closed, no data, the header says why.
+        h.forensics.admin();
+        h.audit_log.clear();
+        h.audit_fail_action = "response.forensics.read";
+        {
+            auto res = h.sink.Get(path);
+            REQUIRE(res);
+            CHECK(res->status == 503);
+            CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+            CHECK(res->body.find("forensics-") == std::string::npos);
+            CHECK(res->body.find("ordinary-") == std::string::npos);
+            CHECK(forensics_audits(h).size() == 1);
+        }
+    }
+}
+
+TEST_CASE("v1 response row reads: a caller served only ordinary rows writes no verb row, and "
+          "aggregate never does",
+          "[pg][rest][responses][v1][audit][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+    h.forensics.admin();
+    put(h, "instr-faud-ord", "agent-A", kOrdinaryPlugin, "ordinary-A", 100);
+    for (const char* path : {"/api/v1/responses/instr-faud-ord",
+                             "/api/v1/responses/instr-faud-ord/export"}) {
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+    CHECK(forensics_audits(h).empty());
+
+    seed_tier(h, "instr-faud-agg");
+    auto res = h.sink.Get("/api/v1/responses/instr-faud-agg/aggregate?group_by=agent_id");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(forensics_audits(h).empty());
 }
 
 // ── #4644: strict numeric query parameters ─────────────────────────────────
