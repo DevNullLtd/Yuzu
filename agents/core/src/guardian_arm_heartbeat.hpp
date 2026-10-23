@@ -50,18 +50,28 @@ struct GuardianArmStats {
     /// probe - see that accessor's own doc comment) and its
     /// contribution here is cleared - every OTHER non-Committed status (Failed,
     /// CongestionExpired, Withdrawn, Stopped) still only ever increments this
-    /// field within one application, exactly as before. It ALSO still resets to 0
-    /// whenever decide_retry() returns Reapply on a generation that previously
-    /// failed, which begins a FRESH application via begin_application() - that
-    /// Reapply path is driven by the existing ~25s full_sync retry cadence and
-    /// predates PR-5d. A HELD WEDGE is the exception (#5459): while a wedge is
-    /// outstanding decide_retry() Suppresses the identical retry, so the application
-    /// is NOT replaced and this field holds steady while the wedge is held. The
-    /// safety valve (kWedgeSuppressMaxDecisions) forces a Reapply that may dip it
-    /// within one application, but the dip is normally not visible at the heartbeat
-    /// cadence (the drain runs before the sample); it falls when the claim pops or
-    /// the recovery scan clears the wedge, or when the hold ends by a full push that
-    /// omits or re-keys the wedged rule and the new application has no other failure.
+    /// field within one application, exactly as before. It ALSO resets to 0 whenever
+    /// decide_retry() returns Reapply on a generation that previously failed and the push
+    /// that follows is a FULL sync (or names every rule that failed): that begins a FRESH
+    /// application via begin_full_application(), which carries no per-rule outcome, and the
+    /// Reapply path is driven by the existing ~25s full_sync retry cadence. #5547: a DELTA
+    /// push (begin_delta_application()) no longer resets it for a rule the delta does not
+    /// name. Those rules' unresolved outcomes (a pending receipt, a retained wedge, a drained
+    /// failure) are carried into the new application, so this field keeps counting them
+    /// across omitting deltas until a full sync (or a push naming the rule) ends the entry.
+    /// That includes an entry that no longer reflects the rule's true state, for example a
+    /// wedge that was adopted or settled before the agent had retained it (the flip gate's
+    /// AC-15 shape): it is counted as a failure and carried until a full sync or a push
+    /// naming the rule removes it, so the gauge can read a sustained 1 for a rule that has
+    /// since armed. Synchronous failures (sync_failed_ids) and the application-wide latch
+    /// are NOT counted here, as before. A HELD WEDGE is also stable within one application
+    /// (#5459): while a wedge is outstanding decide_retry() Suppresses the identical retry,
+    /// so the application is NOT replaced and this field holds steady while the wedge is
+    /// held. The safety valve (kWedgeSuppressMaxDecisions) forces a Reapply that may dip it
+    /// within one application, but the dip is normally not visible at the heartbeat cadence
+    /// (the drain runs before the sample); it falls when the claim pops or the recovery scan
+    /// clears the wedge, or when the hold ends by a full push that omits or re-keys the
+    /// wedged rule and the new application has no other failure.
     /// Recovery is scoped to THIS application's
     /// own bookkeeping only (see Application::failed_receipts' own doc comment) - a durable,
     /// cross-application "last known outcome for every currently-desired rule"
@@ -78,7 +88,8 @@ struct GuardianArmStats {
 /// SparkDisabled), or the ledger has no current application yet. THIS explicit
 /// four-way gate is load-
 /// bearing (Check A, KICKOFF-v2): GuardianEngine::apply_rules() calls
-/// GuardianArmAckLedger::begin_application() UNCONDITIONALLY, regardless of
+/// GuardianArmAckLedger::begin_full_application()/begin_delta_application()
+/// UNCONDITIONALLY, regardless of
 /// prefer_spark_, so "is there a current application" alone cannot distinguish
 /// "spark dormant" from "spark live, currently clean" - a legacy (non-spark) agent
 /// has a live, empty Application on every push. Gating on `current_ != nullptr`

@@ -233,9 +233,12 @@ public:
     /// these are orthogonal to any single rule's own arm outcome, so they
     /// cannot be expressed as a receipt. A no-op if there is no current
     /// application.
-    /// Also called by the boot caller, GuardianEngine::note_boot_rearm_failure_locked() (#5513).
-    /// noexcept: that caller is itself noexcept, so this must never throw (the body is a
-    /// pointer test and a bool store).
+    /// Also called by GuardianEngine::note_boot_rearm_failure_locked() (#5513) as the FALLBACK
+    /// when note_sync_failure() (which records the boot failure against its rule, #5547)
+    /// itself throws, and by apply_rules()'s unwind guard (#5547). noexcept: those callers are
+    /// noexcept or run during unwinding, so this must never throw (the body is a pointer test
+    /// and a bool store). A latch is inherited by every later application (inherited_latch)
+    /// and discharged only by a full sync that completes cleanly.
     void latch_failure() noexcept;
 
     /// Expected to be called with the caller's own engine lock held, matching
@@ -490,10 +493,12 @@ private:
         /// receipt_recovery_status() (rung 9c PR-5e's atomic accessor - see below)
         /// that the runtime has since adopted it (rung 9c PR-5d's own concern 1)
         /// and clear its contribution to resolved_failed -
-        /// scoped to THIS application's own bookkeeping only: begin_*_application()/
-        /// retire() replace `current_` wholesale (see the file header), so a
-        /// receipt whose application was superseded before recovering is simply
-        /// gone, same as every other per-application field here. This is NOT the
+        /// scoped to THIS application's own bookkeeping, except that
+        /// begin_delta_application() (#5547) carries the entry of a rule the delta does
+        /// not name into the next application. begin_full_application() and retire()
+        /// replace `current_` without carrying it, so a receipt whose application was
+        /// superseded by a full sync before recovering is simply gone, same as every
+        /// other per-application field here. This is NOT the
         /// durable, cross-application "last known outcome for every currently-
         /// desired rule" gauge - deliberately unbuilt (rung 9c PR-5e, #4221's own
         /// "Explicit narrowing": docs/spark-stage2-guardian-consumer-design.md's

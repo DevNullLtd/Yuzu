@@ -1037,8 +1037,9 @@ std::expected<void, std::string> GuardianEngine::start_local() {
     // sentinel returns Reapply before that check). If the record itself cannot be made
     // (allocation failure) it falls back to the application-wide latch.
     // Contract: if this begin_*_application() throws there is no boot application, so the late
-    // variant is invisible (late receipts are dropped by add_pending) and the latch is a
-    // no-op; the synchronous variants are still covered.
+    // variant is invisible (late receipts are dropped by add_pending) and recording a
+    // synchronous failure is a no-op (its rule identity is lost); the synchronous flag
+    // boot_unresolved_ is still set by the synchronous variants.
     //
     // Production order, and what the test fixture now covers: agent.cpp calls
     // wire_spark_engine() BEFORE start_local(), so a real boot CAN re-arm via Spark here and
