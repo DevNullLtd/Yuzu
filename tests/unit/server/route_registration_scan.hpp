@@ -71,7 +71,8 @@ inline std::size_t receiver_start(std::string_view text, std::size_t at, bool wi
 }
 
 // A plain "..." literal starting at text[j]: escapes are kept verbatim and a backslash escapes
-// any byte except a line break. On success `end` is one past the closing quote.
+// any byte except a line break (CR or LF), whatever the standard library: the former pattern's
+// `.` was library-defined on exactly that byte. On success `end` is one past the closing quote.
 inline bool plain_literal(std::string_view text, std::size_t j, std::string& out, std::size_t& end) {
     if (j >= text.size() || text[j] != '"')
         return false;
