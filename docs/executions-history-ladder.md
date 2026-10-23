@@ -206,12 +206,32 @@ seam is the `ResponseStore` read API: every public read takes a `const ResponseT
 required parameter with no default (`response_tier_filter.hpp`), and the filter is pushed into the
 SQL beside the agent scope, before `ORDER BY`/`LIMIT`/`GROUP BY`, so the cap flags, counts, facet
 options and aggregates are computed over the rows the caller may read. A filtered row is simply
-absent: there is no marker, field or error. The plugin set comes from the capability catalogue
+absent: there is no marker or field, so an empty result no longer implies that no data exists. The
+one error is an unresolved decision: when the caller's authority cannot be determined the REST routes
+answer a retryable `503` (`retry_after_ms`), MCP a retryable `kInternalError`, and an HTML surface a
+notice, and
+`yuzu_server_forensics_tier_withheld_total{reason}` counts it (see `docs/observability-conventions.md`).
+The plugin set comes from the capability catalogue
 (`forensics_plugin_set.hpp`), never a hand-kept list, and boot refuses an empty set. Only `plugin` is
 stored with a row, so the filter is per plugin; a plugin that mixed tiers would be excluded wholesale
 until `action` is stored too. The exact set of read methods and the exact set of call sites that opt
-out through `unrestricted_internal_consumer()` (the dispatch-correlation and evaluation consumers of
-their own commands, none an operator surface) are frozen by `tests/test_response_store_read_tripwire.py`.
+out through `unrestricted_internal_consumer()` are frozen by
+`tests/test_response_store_read_tripwire.py`: four sites, all reads of a command the server
+dispatched itself from a fixed non-Forensics plugin (the pre-flight check collation, the quarantine
+containment poll, the `tar.fleet_snapshot` topology poll and the deployment collect), none an
+operator surface. The server-side consumers that used to read the store unfiltered now apply the tier
+through a real filter: the policy evaluator excludes the Forensics plugins outright (such a check
+scores `unknown`), the result-set materialiser does the same (a set sourced from such a command
+materialises empty for every creator), and bundle collation applies the caller's own decision
+(approval to dispatch a step does not imply reading its output; a step the caller may not read stays
+`pending` with an empty output). `tests/test_forensics_tier_wiring_lexical.py` pins that `server.cpp`
+wires the plugin set and the resolver into each of these.
+
+**Not covered by this tier.** The policy evaluator still dispatches a Forensics-tier plugin as a
+system caller if a policy check instruction names one (only its output is withheld); tightening who
+may cause that dispatch is separate follow-up work. Bundle collation does not write a
+`response.forensics.read` row. Failure text stored before the sanitiser is reduced on read only
+while the execution's command correlation (24 hours) is still held.
 
 **The executions drawer.** `GET /fragments/executions/{id}/detail` (both render branches: the
 drawer and `?view=page`) gates on `Execution:Read`, a lower tier than the `Response:Read` the stored
@@ -220,11 +240,17 @@ it the section is a notice naming the permission, with no rows, no count and no 
 with it the Forensics filter applies. The `Execution:Read` gate scope keeps driving the
 confined-projection redaction and the row scope filter, so the effective row scope is the meet of
 the two, and this change only narrows: confined-execution admission still grants visibility only and
-never bypasses redaction. The execution event bus and the status routes carry status and exit code,
-not output, and are unchanged.
+never bypasses redaction. The execution event bus, the event outbox and the status routes carry
+status, exit code and a failure text (`error_detail`). For a command of a Forensics-tier plugin that
+text is reduced, when it is stored and again when the tracker reads it, to a bounded machine token
+(`^[a-z0-9_]{1,32}(:[a-z0-9_.-]{1,48}){1,3}$`, at most 96 bytes) or to the fixed `forensics_error`
+(`forensics_error_detail.hpp`); status and exit code are unchanged, and other plugins' text is not
+touched. The event outbox replay (24 hours) is not reduced on read, so text written by a replica
+that predates the change can be replayed until it expires. The live `output` event stream publishes no
+Forensics-tier row.
 
 **Audit.** A read that serves at least one Forensics-tier row writes one `response.forensics.read`
-row (`forensics_rows=<n> plugins=<names>`), on the row-returning surfaces only; see
+row (`forensics_rows=<n> plugins=<names> surface=<s>`), on the row-returning surfaces only; see
 `docs/user-manual/audit-log.md`. The drawer's row, and the row written by the Hardware Actions-lens result poll, are
 set-and-proceed (`Sec-Audit-Failed` on a failed persist).
 

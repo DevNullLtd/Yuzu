@@ -2245,9 +2245,10 @@ groups:
           description: >-
             Reads of stored responses could not determine whether the caller may see
             Forensics-tier rows (reason={{ $labels.reason }}) for at least 10 minutes on
-            {{ $labels.instance }}. Those reads are refused with a retryable 503 (REST,
-            legacy and MCP) or show a notice (dashboard); no Forensics row is served and no
-            partial result is returned. rbac_unavailable: the authorization store answered
+            {{ $labels.instance }}. Those reads are refused with a retryable error (a 503 on the
+            REST and legacy routes, a JSON-RPC internal error carrying retry_after_ms on MCP)
+            or show a notice (dashboard); no Forensics row is served and no partial result is
+            returned. rbac_unavailable: the authorization store answered
             unavailable. scope_read_failed: the management-group scoped-visibility lookup
             failed. unwired: a dependency of the resolver was never wired, which a running
             server should not show. Usually PostgreSQL pool saturation or a store outage:
