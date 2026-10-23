@@ -1184,7 +1184,14 @@ ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
         payload["status"] = persisted_status;
         payload["exit_code"] = to_i64(col(res.get(), 0, 1));
         payload["completed_at"] = to_i64(col(res.get(), 0, 2));
-        const std::string returned_error = col_str(res.get(), 0, 3);
+        std::string returned_error = col_str(res.get(), 0, 3);
+        // #4990: the PERSISTED text can be older than this write (a terminal row is sticky, so a
+        // later frame returns what an earlier writer stored). Reduce it exactly as the read paths
+        // do before it reaches the durable outbox or the bus. A value that already has the bounded
+        // shape needs no lookup (the reduction is idempotent).
+        if (!returned_error.empty() &&
+            sanitize_forensics_error_detail(returned_error) != returned_error)
+            scrub_error_texts(conn, forensics_plugins_, {{execution_id, &returned_error}});
         if (!returned_error.empty())
             payload["error_detail"] = returned_error;
         const int64_t returned_plugin_status = to_i64(col(res.get(), 0, 4));

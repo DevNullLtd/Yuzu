@@ -186,6 +186,44 @@ std::string outbox_data(yuzu::server::pg::PgPool& pool, const std::string& execu
     return PQgetisnull(res.get(), 0, 0) ? std::string{} : std::string{PQgetvalue(res.get(), 0, 0)};
 }
 
+/// The outbox payloads appended AFTER `after_event_id` for one execution, and the high-water mark
+/// to pass next time. Separates what a step wrote from the rows that were already there.
+std::string outbox_data_after(yuzu::server::pg::PgPool& pool, const std::string& execution_id,
+                              long long after_event_id) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT string_agg(data, E'\\n') FROM execution_tracker.event_outbox "
+        "WHERE execution_id = $1 AND event_id > $2::bigint",
+        std::vector<std::string>{execution_id, std::to_string(after_event_id)});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    return PQgetisnull(res.get(), 0, 0) ? std::string{} : std::string{PQgetvalue(res.get(), 0, 0)};
+}
+
+std::string stored_error_detail(yuzu::server::pg::PgPool& pool, const std::string& execution_id) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT error_detail FROM execution_tracker.agent_exec_status WHERE execution_id = $1",
+        std::vector<std::string>{execution_id});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(res.get()) == 1);
+    return PQgetvalue(res.get(), 0, 0);
+}
+
+long long outbox_high_water(yuzu::server::pg::PgPool& pool, const std::string& execution_id) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT COALESCE(max(event_id), 0) FROM execution_tracker.event_outbox WHERE execution_id = $1",
+        std::vector<std::string>{execution_id});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    return std::stoll(PQgetvalue(res.get(), 0, 0));
+}
+
 } // namespace
 
 TEST_CASE("forensics_error_detail: the bounded token shape", "[server][forensics_tier]") {
@@ -273,6 +311,109 @@ TEST_CASE("tracker error_detail: an unwired plugin set sanitises every plugin's 
     const auto statuses = ts.tracker->get_agent_statuses(exec_id);
     REQUIRE(statuses.size() == 1);
     CHECK(statuses[0].error_detail == "forensics_error");
+}
+
+TEST_CASE("tracker error_detail: a later RUNNING frame never republishes a stored free-text value",
+          "[pg][server][forensics_tier][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, forensics_leaks_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    LiveBusHarness h;
+    h.svc.set_forensics_plugin_set(&test::forensics_plugin_set());
+    ExecutionEventBus exec_bus;
+    yuzu::test::TrackerScope ts{h.svc, pool, &exec_bus};
+    ts.tracker->set_forensics_plugin_set(&test::forensics_plugin_set());
+
+    // A terminal row holding RAW text, written straight to the tracker the way a row from before
+    // the write-side sanitiser exists (an older binary or replica). A later RUNNING frame for the
+    // same (execution, agent) leaves that terminal row as it is, and the transition event built
+    // from the persisted row is published on the bus and appended to the durable outbox.
+    const auto seed_raw_terminal = [&](const std::string& command_id) {
+        const auto exec_id = ts.make_exec();
+        h.svc.record_execution_id(command_id, exec_id);
+        AgentExecStatus s;
+        s.agent_id = "agent-1";
+        s.status = "failure";
+        s.completed_at = 100;
+        s.exit_code = 3;
+        s.error_detail = kFreeText;
+        ts.tracker->update_agent_status(exec_id, s);
+        return exec_id;
+    };
+    const auto any_frame_has = [](const std::vector<std::string>& frames, std::string_view needle) {
+        return std::ranges::any_of(frames, [&](const std::string& f) {
+            return f.find(needle) != std::string::npos;
+        });
+    };
+    const auto replay = [&](const std::string& command_id, const std::string& exec_id,
+                            std::vector<std::string>& frames) {
+        const auto sub = exec_bus.subscribe(exec_id, [&frames](const ExecutionEvent& e) {
+            frames.push_back(e.data);
+        });
+        h.svc.process_gateway_response("agent-1", running_frame(command_id, ""));
+        exec_bus.unsubscribe(exec_id, sub);
+    };
+
+    SECTION("a Forensics plugin: neither the bus frame nor the outbox row carries the stored text") {
+        const std::string cmd = std::string{test::kForensicsPlugin} + "-0r1";
+        const auto exec_id = seed_raw_terminal(cmd);
+        const auto seeded = outbox_high_water(pool, exec_id);
+        // Precondition: the stored column really is raw (the reads scrub, so look at the SQL).
+        REQUIRE(stored_error_detail(pool, exec_id).find("marker-4990") != std::string::npos);
+        std::vector<std::string> frames;
+        replay(cmd, exec_id, frames);
+        REQUIRE_FALSE(frames.empty());
+        for (const auto& f : frames)
+            CHECK(f.find("marker-4990") == std::string::npos);
+        const auto added = outbox_data_after(pool, exec_id, seeded);
+        REQUIRE_FALSE(added.empty());
+        CHECK(added.find("marker-4990") == std::string::npos);
+        // The published value is the bounded placeholder, and the row itself is untouched.
+        CHECK(any_frame_has(frames, "forensics_error"));
+        const auto statuses = ts.tracker->get_agent_statuses(exec_id);
+        REQUIRE(statuses.size() == 1);
+        CHECK(statuses[0].status == "failure");
+        CHECK(statuses[0].exit_code == 3);
+    }
+    SECTION("a token-shaped stored value is published as stored") {
+        const auto exec_id = ts.make_exec();
+        const std::string cmd = std::string{test::kForensicsPlugin} + "-0r2";
+        h.svc.record_execution_id(cmd, exec_id);
+        AgentExecStatus s;
+        s.agent_id = "agent-1";
+        s.status = "failure";
+        s.completed_at = 100;
+        s.error_detail = kToken;
+        ts.tracker->update_agent_status(exec_id, s);
+        std::vector<std::string> frames;
+        replay(cmd, exec_id, frames);
+        REQUIRE_FALSE(frames.empty());
+        CHECK(any_frame_has(frames, kToken));
+    }
+    SECTION("healing control: a duplicate terminal frame replaces the stored text, then stays clean") {
+        const std::string cmd = std::string{test::kForensicsPlugin} + "-0r3";
+        const auto exec_id = seed_raw_terminal(cmd);
+        h.svc.process_gateway_response("agent-1", failure_frame(cmd, kFreeText));
+        const auto seeded = outbox_high_water(pool, exec_id);
+        std::vector<std::string> frames;
+        replay(cmd, exec_id, frames);
+        const auto statuses = ts.tracker->get_agent_statuses(exec_id);
+        REQUIRE(statuses.size() == 1);
+        CHECK(statuses[0].error_detail == "forensics_error");
+        REQUIRE_FALSE(frames.empty());
+        for (const auto& f : frames)
+            CHECK(f.find("marker-4990") == std::string::npos);
+        CHECK(outbox_data_after(pool, exec_id, seeded).find("marker-4990") == std::string::npos);
+    }
+    SECTION("ordinary plugin control: the stored text is published unchanged") {
+        const std::string cmd = std::string{test::kOrdinaryPlugin} + "-0r4";
+        const auto exec_id = seed_raw_terminal(cmd);
+        const auto seeded = outbox_high_water(pool, exec_id);
+        std::vector<std::string> frames;
+        replay(cmd, exec_id, frames);
+        REQUIRE_FALSE(frames.empty());
+        CHECK(any_frame_has(frames, "marker-4990"));
+        CHECK(outbox_data_after(pool, exec_id, seeded).find("marker-4990") != std::string::npos);
+    }
 }
 
 TEST_CASE("tracker error_detail: rows written before the sanitiser are reduced on every read",
