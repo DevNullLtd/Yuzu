@@ -56,9 +56,10 @@ struct GuardianArmStats {
     /// application via begin_full_application(), which carries no per-rule outcome, and the
     /// Reapply path is driven by the existing ~25s full_sync retry cadence. #5547: a DELTA
     /// push (begin_delta_application()) no longer resets it for a rule the delta does not
-    /// name. Those rules' unresolved outcomes (a pending receipt, a retained wedge, a drained
-    /// failure) are carried into the new application, so this field keeps counting them
-    /// across omitting deltas until a full sync (or a push naming the rule) ends the entry.
+    /// name. Those rules' unresolved outcomes are carried into the new application: a retained
+    /// wedge and a drained failure keep counting in this field across omitting deltas until a
+    /// full sync (or a push naming the rule) ends the entry, while a carried pending receipt
+    /// counts in `pending` instead, not here.
     /// That includes an entry that no longer reflects the rule's true state, for example a
     /// wedge that was adopted or settled before the agent had retained it (the flip gate's
     /// AC-15 shape): it is counted as a failure and carried until a full sync or a push

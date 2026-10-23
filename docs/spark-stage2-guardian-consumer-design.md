@@ -834,8 +834,8 @@ push only while the agent reports a generation behind the server's. The REST and
 pushes do not bump the generation (`server.cpp`, the comments in the push lambda that read,
 never bump, the generation), so a delta applied at the generation the agent already holds
 is not followed by an automatic full push: the hold lasts until a full push or a later
-generation (baseline deploy does bump it and sends a fleet-wide full push, which repairs the hold;
-deleting a deployed Baseline does too, but withdraws every Guard that no other deployed
+generation (baseline deploy does bump it and sends a fleet-wide full push, which retries the hold, except that a wedged rule stays held until
+its hung call returns; deleting a deployed Baseline does too, but withdraws every Guard that no other deployed
 Baseline delivers, so it is not a repair; `guardian_routes.cpp`). The suppress budget restarts on every replacement (flip gate AC-11 (4); as before #5547).
 The unattributed legacy debt (the application-wide latch from a full push's rule-key
 sweep, key delete or teardown failure, or a put_rule failure) is carried as
