@@ -127,5 +127,18 @@ else
   echo "FAIL - audit detail lacks sessions_ended=1 (detail=$detail)"; fail=$((fail+1))
 fi
 
+# A failed session delete is loud and non-zero, but the audit row is still written.
+sess_sql "ALTER TABLE session_store.sessions RENAME TO sessions_yuzu_test_hidden;"
+set +e
+"$BIN" --config "$TMP/yuzu-server.cfg" --data-dir "$TMP" --ca-dir "$TMP" --postgres-dsn "$CHILD_DSN" --mfa-reset admin >/dev/null 2>&1
+got=$?
+set -e
+detail="$(sess_sql "SELECT detail FROM audit_store.audit_events WHERE action='mfa.reset.breakglass' ORDER BY id DESC LIMIT 1;" 2>&1 || true)"
+if [ "$got" = "1" ] && printf '%s' "$detail" | grep -qF 'sessions_ended=failed'; then
+  echo "ok   - failed session delete exits 1 and still audits sessions_ended=failed"; pass=$((pass+1))
+else
+  echo "FAIL - failed session delete (exit=$got want=1; detail=$detail)"; fail=$((fail+1))
+fi
+
 echo "---- $pass passed, $fail failed ----"
 [ "$fail" -eq 0 ]

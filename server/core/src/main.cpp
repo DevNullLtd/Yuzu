@@ -1918,6 +1918,7 @@ int main(int argc, char* argv[]) {
         // its next refresh. A failure here is loud and non-zero: the factor is already
         // cleared, so the operator must end the sessions by hand.
         int sessions_ended = 0;
+        bool sessions_end_failed = false;
         {
             yuzu::server::SessionStore sessions(*auth_pg_pool);
             auto ended = sessions.is_open() ? sessions.invalidate_user(mfa_reset_user)
@@ -1929,9 +1930,10 @@ int main(int argc, char* argv[]) {
                               "and record the reset.",
                               mfa_reset_user, ended.error().message);
                 std::cerr << "error: MFA cleared but the account's sessions were not ended\n";
-                return EXIT_FAILURE;
+                sessions_end_failed = true;
+            } else {
+                sessions_ended = *ended;
             }
-            sessions_ended = *ended;
         }
         // Attribute the break-glass to the KERNEL-AUTHORITATIVE OS identity, not
         // getenv("USER") — the env var is inherited from the parent and trivially
@@ -1950,7 +1952,7 @@ int main(int argc, char* argv[]) {
         ev.result = "success";
         ev.detail = std::format("MFA enrollment cleared via --mfa-reset CLI (os_identity={}, "
                                 "sessions_ended={})",
-                                os_user, sessions_ended);
+                                os_user, sessions_end_failed ? "failed" : std::to_string(sessions_ended));
         if (!audit->log(ev)) {
             // The pre-check passed but the write failed (e.g. disk filled mid-op).
             // MFA is already cleared; fail loudly and non-zero so automation and
@@ -1962,6 +1964,10 @@ int main(int argc, char* argv[]) {
                          "manually\n";
             return EXIT_FAILURE;
         }
+        // The audit row is written either way; a failed session delete still exits non-zero
+        // so automation and the operator end the sessions by hand.
+        if (sessions_end_failed)
+            return EXIT_FAILURE;
         spdlog::info("Break-glass: MFA cleared for '{}'. The user can now sign in with their "
                      "password alone; under MFA enforcement they will be walked through "
                      "enrollment at next login.",

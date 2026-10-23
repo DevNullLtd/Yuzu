@@ -683,10 +683,11 @@ recorded as `sessions_ended=<n>` at the end of the audit row's `detail`
 (`... (os_identity=<account>, sessions_ended=<n>)`); the command's stdout line is
 unchanged. If ending the sessions fails, the factor is already cleared: the
 command exits non-zero with `error: MFA cleared but the account's sessions were
-not ended` and writes no audit row. Treat that as an incomplete reset. Run
-`DELETE /api/v1/sessions?username=<name>` yourself and record both the reset and
-the manual session deletion in your change-management system. Disabling MFA from Settings does **not** end sessions;
-only this CLI does.
+not ended`. The audit row is still written, with `sessions_ended=failed`. Treat
+that as an incomplete reset. Run `DELETE /api/v1/sessions?username=<name>`
+yourself and record the manual session deletion in your change-management
+system. Disabling MFA from Settings does **not** end sessions; only this CLI
+does.
 
 **Detective control.** Because the CLI exits without serving, it emits no
 Prometheus metric — the audit row is the only signal. Alert on
