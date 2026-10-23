@@ -431,7 +431,13 @@ def end_to_end_checks() -> list[tuple[str, object, object]]:
             rc_nofile, _ = go(b0, "0" * 40)
         finally:
             globals()["REPO_ROOT"] = saved_root
+    # The real tree's helper headers (comments included, because the scan reads them) must come up
+    # clean; a header comment that spells out a flagged guard would otherwise only fail in CI.
+    real_findings = []
+    for hdr in sorted((saved_root / src_dir).glob("mcp_tool*.hpp")):
+        real_findings += [(hdr.name, v, st) for v, st in scan_block(hdr.name, hdr.read_text(encoding="utf-8"))]
     return [
+        ("e2e: the checked-in mcp_tool*.hpp headers scan clean", real_findings, []),
         ("e2e: a new header with an unhinted guarded error fails", rc_bad, 1),
         ("e2e: the failure names the header", "mcp_tool_x.hpp" in out_bad, True),
         ("e2e: a new clean header passes", rc_clean, 0),
