@@ -1314,10 +1314,10 @@ flip, with a red-first test each:
     delta names is covered by the new application and is not carried; a full_sync carries no
     per-rule outcome (it re-arms its named rules and detaches the rest).
     What this does and does not do:
-    (1) It holds the generation. A carried pending arm, wedge or drained failure also stays
-    counted in `arm_failed` (Spark path only); a carried synchronous failure (`sync_failed_ids`)
-    and the application-wide latch hold the generation but are not counted there
-    (`arm_stats()` reads `resolved_failed` only). It does not re-attempt the omitted
+    (1) It holds the generation. A carried pending arm stays counted in `arm_pending`, and a
+    carried wedge or drained failure in `arm_failed` (Spark path only); a carried synchronous
+    failure (`sync_failed_ids`) and the application-wide latch hold the generation but are
+    counted in neither (`arm_stats()` reads `pending.size()` and `resolved_failed` only). It does not re-attempt the omitted
     rule (a repeat of the delta processes only the rules it names). A carried failure forces
     a Reapply before the wedge loop, so a co-held genuine wedge is not Suppressed (the same as
     any ordinary failure, AC-12).
@@ -1327,8 +1327,10 @@ flip, with a red-first test each:
     push lambda around "do not bump the generation" and "Read (never bump)"), so a delta applied
     at the generation the agent already holds is not followed by an automatic full_sync, and the
     hold lasts until an operator sends a full_sync or the generation moves. Baseline deploy and
-    delete DO bump it and push a fleet-wide full_sync (`guardian_routes.cpp`, the
-    `bump_policy_generation()` calls followed by `push_fn_("", true)`). A delta-only hold is
+    delete of a DEPLOYED Baseline DO bump it and push a fleet-wide full_sync (`guardian_routes.cpp`,
+    the `bump_policy_generation()` calls followed by `push_fn_("", true)`); a deploy repairs the
+    hold, but a delete is not a repair: it withdraws every Guard no other deployed Baseline
+    delivers, so the hold on such a rule ends because the rule is no longer pushed. A delta-only hold is
     therefore not self-repairing, and its visibility is limited: on the Spark path an arm
     failure or wedge shows in `arm_failed`, but a carried synchronous failure is not counted
     there and `prefer_spark_=false` emits no arm pair, so the signals at the default are the

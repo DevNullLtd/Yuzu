@@ -823,18 +823,20 @@ acknowledge while the omitted wedged claim had no owning application).
 delta does not name: pending receipts, retained wedges, drained failures
 (`failed_ids`) and synchronous failures (`sync_failed_ids`), each with its boot-origin tag.
 A rule the delta names is not carried, and a full push carries none of them. What the
-carry guarantees and what it does not: it holds the generation; a carried pending arm, wedge
-or drained failure also stays counted in `arm_failed` (Spark path only), whereas a carried
-synchronous failure and the application-wide latch hold the generation without being counted
-there (`arm_stats()` reads `resolved_failed` only), and `prefer_spark_=false` emits no arm
+carry guarantees and what it does not: it holds the generation; a carried pending arm stays
+counted in `arm_pending`, and a carried wedge or drained failure in `arm_failed` (Spark path
+only), whereas a carried synchronous failure and the application-wide latch hold the
+generation without being counted in either (`arm_stats()` reads `pending.size()` and
+`resolved_failed` only), and `prefer_spark_=false` emits no arm
 pair; it does not re-attempt the omitted rule, because a repeat of the delta
 processes only the rules it names, and the server's heartbeat reconcile re-pushes a full
 push only while the agent reports a generation behind the server's. The REST and MCP
 pushes do not bump the generation (`server.cpp`, the comments in the push lambda that read,
 never bump, the generation), so a delta applied at the generation the agent already holds
 is not followed by an automatic full push: the hold lasts until a full push or a later
-generation (baseline deploy and delete do bump it and send a fleet-wide full push,
-`guardian_routes.cpp`). The suppress budget restarts on every replacement (flip gate AC-11 (4); as before #5547).
+generation (baseline deploy does bump it and sends a fleet-wide full push, which repairs the hold;
+deleting a deployed Baseline does too, but withdraws every Guard that no other deployed
+Baseline delivers, so it is not a repair; `guardian_routes.cpp`). The suppress budget restarts on every replacement (flip gate AC-11 (4); as before #5547).
 The unattributed legacy debt (the application-wide latch from a full push's rule-key
 sweep, key delete or teardown failure, or a put_rule failure) is carried as
 `inherited_latch` and discharged only at the tail of a full push whose synchronous phases
@@ -1129,7 +1131,8 @@ design is mentioned it is named as the earlier design.
   have made every held push pay a full teardown). **Suppression may include
   compensation; acknowledgment never does.**
 - **Acknowledgment is the conservative branch only.** `can_advance()` is `current_ &&
-  pending.empty() && !latched_failure && resolved_failed == 0`. An outstanding wedge, a
+  pending.empty() && !latched_failure && !inherited_latch && resolved_failed == 0 &&
+  sync_failed_ids.empty()` (`guardian_arm_ack.cpp`). An outstanding wedge, a
   compensation-pending wedge and every ordinary failure keep `resolved_failed > 0`,
   so the generation stays held until a genuine recovery (the recovery drain
   decrements it for an adopted late success) or a fresh successful application

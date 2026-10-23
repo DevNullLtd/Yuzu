@@ -1570,13 +1570,17 @@ static const ToolDef kTools[] = {
      "dispatch (this is by design — a push is an action, not a state to converge on; a "
      "concurrent/replayed push simply re-delivers the same-or-newer generation, which "
      "agents accept idempotently on THEIR side, but the tool call itself is not safe to "
-     "retry blindly assuming no-op). Fleet-wide; requires the distinct GuaranteedState:Push "
+     "retry blindly assuming no-op). With full_sync=false the agent merges the pushed rules "
+     "and does not retry a still-unresolved rule the push omits (it holds its policy "
+     "generation instead); only a full push or a push naming the rule does, and this tool "
+     "does not bump the policy generation, so a delta at the generation an agent already "
+     "holds is not followed by an automatic full push. Fleet-wide; requires the distinct GuaranteedState:Push "
      "verb (not Write), denied outright to a service-scoped API token. REST's twin applies "
      "an MFA step-up check; MCP applies none for a cookie-session caller (architecture-wide "
      "gap, not specific to this tool - tracked in #4309).",
      R"j({"type":"object","properties":{)j"
      R"j("scope":{"type":"string","maxLength":2048,"default":"","description":"Scope DSL expression selecting target agents; empty = fleet-wide"},)j"
-     R"j("full_sync":{"type":"boolean","default":false,"description":"Force a full re-sync of the enabled rule set to in-scope agents rather than an incremental push"})j"
+     R"j("full_sync":{"type":"boolean","default":false,"description":"Force a full re-sync of the enabled rule set to in-scope agents. When false the push is a merge that does not retry a still-unresolved rule it omits"})j"
      R"j(}})j",
      R"j({"type":"object","properties":{"queued":{"const":true},"rules":{"type":"integer"},"agents":{"type":"integer"},"scope":{"type":"string"},"full_sync":{"type":"boolean"}},"required":["queued","rules","agents","scope","full_sync"]})j"},
 

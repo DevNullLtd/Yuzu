@@ -2640,7 +2640,7 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): a carried failed id or sync fai
 }
 
 TEST_CASE("GuardianArmAckLedger::begin_delta_application(): the suppress budget restarts at "
-          "zero on replacement (Ruling 22 (c)) (#5547)",
+          "zero on replacement (AC-11 (4)) (#5547)",
           "[spark][ack][5547]") {
     Rig5459 f;
     auto w = f.wedge("r1", "/a");
