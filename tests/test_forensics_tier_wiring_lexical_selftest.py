@@ -140,6 +140,13 @@ def main() -> int:
     expect(asrc.count(helper) == 1, "selftest anchor moved: the helper's read")
     expect("raw-failure-text-helper" in ids(g.agent_service_problems(asrc.replace(helper, "std::string text;", 1))),
            "deleting the helper's raw read was NOT detected")
+    sinks = "s.error_detail = failure_text_for_sinks(command_id, resp);"
+    expect(asrc.count(sinks) == 1, "selftest anchor moved: the tracker status text reduction")
+    expect("tracker-status-text-reduced" in ids(g.agent_service_problems(
+               asrc.replace(sinks, "s.error_detail = resp.error().message();", 1))),
+           "replacing the tracker status text reduction was NOT detected")
+    expect("tracker-status-text-reduced" in ids(g.agent_service_problems(asrc.replace(sinks, "// " + sinks, 1))),
+           "a commented-out tracker status text reduction must not count")
     expect(g.agent_service_problems(asrc.replace(stored, "// " + stored, 1)) != [],
            "a commented-out stored-row read must not count")
     expect(g.agent_service_problems(asrc + "\n// resp.error().message() is only mentioned here\n") == [],

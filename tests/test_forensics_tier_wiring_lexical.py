@@ -283,6 +283,13 @@ EXACT_AGENT_SERVICE: list[tuple[str, str, int, str]] = [
      "through the tier-filtered stored-response reads"),
     ("raw-failure-text-helper", r"std::string text=resp\.error\(\)\.message\(\);", 1,
      "failure_text_for_sinks is the one place the raw text is reduced for the other sinks"),
+    # The tracker write path skips its Forensics lookup when the persisted text equals the incoming
+    # one, because the incoming text was already reduced here. Dropping this call would let a raw
+    # Forensics failure text through the status upsert unreduced.
+    ("tracker-status-text-reduced", r"\bs\.error_detail=failure_text_for_sinks\(", 1,
+     "notify_exec_tracker must reduce the status text with failure_text_for_sinks: the tracker "
+     "write path relies on the incoming text already being reduced (it skips the lookup when the "
+     "persisted text equals it)"),
 ]
 
 

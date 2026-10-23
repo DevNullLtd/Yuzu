@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <grpcpp/grpcpp.h>
@@ -583,15 +584,160 @@ TEST_CASE("tracker error_detail: a failed Forensics execution lookup withholds t
     // ... and the warning (drawer polls repeat this read every few seconds) is throttled to one
     // per minute, however many reads failed. EXACTLY one: at least one (the line is emitted at
     // all, the alert runbook and the operator both grep it) and at most one (the throttle holds
-    // across the six reads). The throttle is a function-local static, so this holds only while
-    // this is the one test in the binary that makes the lookup fail; a second such test must
-    // compare against the count it started with instead of 1.
+    // across the six reads). The throttle is a function-local static keyed by caller, so this
+    // holds only while this is the one test in the binary that makes the READ-path lookup fail
+    // (the write path logs under its own key); a second such test must compare against the count
+    // it started with instead of 1.
     const auto text = logs.text();
     std::size_t lines = 0;
     for (std::size_t pos = text.find("Forensics execution lookup failed"); pos != std::string::npos;
          pos = text.find("Forensics execution lookup failed", pos + 1))
         ++lines;
     CHECK(lines == 1);
+}
+
+// The write path (#4990 H-1). `upsert_agent_status_once` shares ONE transaction between the
+// agent_exec_status upsert and the durable event_outbox append. A Forensics-lookup statement that
+// fails INSIDE that transaction would abort it, and the agent's terminal status would be lost
+// (agents do not re-send). So the lookup is not issued in the ordinary case (the incoming text was
+// already reduced at ingest), and in the one case that needs it (the persisted text differs from
+// the incoming one) it runs under a SAVEPOINT. Every read below goes through raw SQL, because the
+// tracker's own reads would run the same (faulted) lookup.
+//
+// The write path has its own warning throttle key, so these cases do not consume the one the read
+// path case above asserts on (exactly one line), whatever order the cases run in.
+TEST_CASE("tracker error_detail: a failed Forensics lookup on the write path never costs the "
+          "agent's status",
+          "[pg][server][forensics_tier][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, forensics_leaks_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecutionTracker tracker{pool};
+    REQUIRE(tracker.is_open());
+    ExecutionEventBus exec_bus;
+    tracker.set_event_bus(&exec_bus);
+
+    const auto make = [&](const std::string& command_id) {
+        Execution e;
+        e.definition_id = "def-write-fault";
+        e.dispatched_by = "tester";
+        e.status = "running";
+        e.agents_targeted = 1;
+        const auto id = tracker.create_execution(e);
+        REQUIRE(id.has_value());
+        REQUIRE(tracker.record_command_execution(command_id, *id));
+        return *id;
+    };
+    const auto frame = [](const char* status, const char* error_detail) {
+        AgentExecStatus s;
+        s.agent_id = "agent-1";
+        s.status = status;
+        s.completed_at = (std::string_view{status} == "running") ? 0 : 100;
+        s.exit_code = (std::string_view{status} == "running") ? 0 : 3;
+        s.error_detail = error_detail;
+        return s;
+    };
+    const auto lookup_fault = [&] {
+        return yuzu::test::SqlFault(
+            pool,
+            "ALTER TABLE execution_tracker.command_execution RENAME TO command_execution_gone",
+            "ALTER TABLE execution_tracker.command_execution_gone RENAME TO command_execution");
+    };
+    const auto any_has = [](const std::vector<std::string>& frames, std::string_view needle) {
+        return std::ranges::any_of(frames, [&](const std::string& f) {
+            return f.find(needle) != std::string::npos;
+        });
+    };
+
+    SECTION("a replayed RUNNING frame after a RAW terminal row: recorded, text reduced, nothing lost") {
+        tracker.set_forensics_plugin_set(&test::forensics_plugin_set());
+        const auto id = make(std::string{test::kForensicsPlugin} + "-0w1");
+        tracker.update_agent_status(id, frame("failure", kFreeText)); // a raw row from an older writer
+        const auto seeded = outbox_high_water(pool, id);
+        REQUIRE(stored_error_detail(pool, id) == kFreeText);
+
+        auto fault = lookup_fault();
+        fault.arm();
+        std::vector<std::string> frames;
+        const auto sub = exec_bus.subscribe(id, [&frames](const ExecutionEvent& e) {
+            frames.push_back(e.data);
+        });
+        yuzu::test::LogCapture logs{spdlog::level::warn};
+        tracker.update_agent_status(id, frame("running", ""));
+        logs.stop();
+        exec_bus.unsubscribe(id, sub);
+        fault.repair();
+
+        // The transition event WAS appended and published, with the fail-closed bounded value.
+        const auto added = outbox_data_after(pool, id, seeded);
+        REQUIRE_FALSE(added.empty());
+        CHECK(added.find("marker-4990") == std::string::npos);
+        CHECK(added.find("forensics_error") != std::string::npos);
+        REQUIRE_FALSE(frames.empty());
+        CHECK_FALSE(any_has(frames, "marker-4990"));
+        CHECK(any_has(frames, "forensics_error"));
+        // The write itself did not fail: no "NOT recorded" line, and the terminal row is intact.
+        CHECK(logs.text().find("NOT recorded") == std::string::npos);
+        CHECK(logs.text().find("upsert failed") == std::string::npos);
+        CHECK(stored_error_detail(pool, id) == kFreeText);
+        const auto statuses = tracker.get_agent_statuses(id);
+        REQUIRE(statuses.size() == 1);
+        CHECK(statuses[0].status == "failure");
+        CHECK(statuses[0].exit_code == 3);
+        // The transaction was usable afterwards: the same replay on a healthy lookup still works.
+        const auto after_fault = outbox_high_water(pool, id);
+        tracker.update_agent_status(id, frame("running", ""));
+        CHECK(outbox_high_water(pool, id) > after_fault);
+    }
+    SECTION("an ordinary plugin's free-text failure frame: recorded in full, no lookup is issued") {
+        tracker.set_forensics_plugin_set(&test::forensics_plugin_set());
+        const auto id = make(std::string{test::kOrdinaryPlugin} + "-0w2");
+        auto fault = lookup_fault();
+        fault.arm(); // any lookup on this path would fail, abort the transaction and lose the row
+        std::vector<std::string> frames;
+        const auto sub = exec_bus.subscribe(id, [&frames](const ExecutionEvent& e) {
+            frames.push_back(e.data);
+        });
+        yuzu::test::LogCapture logs{spdlog::level::warn};
+        tracker.update_agent_status(id, frame("failure", kFreeText));
+        logs.stop();
+        exec_bus.unsubscribe(id, sub);
+        fault.repair();
+
+        CHECK(logs.text().find("NOT recorded") == std::string::npos);
+        CHECK(logs.text().find("Forensics execution lookup failed") == std::string::npos);
+        CHECK(stored_error_detail(pool, id) == kFreeText);
+        CHECK(outbox_data(pool, id).find("marker-4990-error") != std::string::npos);
+        REQUIRE_FALSE(frames.empty());
+        CHECK(any_has(frames, "marker-4990-error"));
+    }
+    SECTION("a Forensics plugin's reduced failure frame: recorded as the bounded value, no lookup") {
+        tracker.set_forensics_plugin_set(&test::forensics_plugin_set());
+        const auto id = make(std::string{test::kForensicsPlugin} + "-0w3");
+        auto fault = lookup_fault();
+        fault.arm();
+        // Ingest reduces a Forensics plugin's text before the tracker sees it.
+        tracker.update_agent_status(id, frame("failure", "forensics_error"));
+        fault.repair();
+        CHECK(stored_error_detail(pool, id) == "forensics_error");
+        CHECK(outbox_data(pool, id).find("forensics_error") != std::string::npos);
+    }
+    SECTION("an UNWIRED tracker never looks anything up: the replay publishes the stored text") {
+        // Characterisation of the documented harness fail-open (production always wires the set;
+        // ingest itself sanitises every plugin's text when its own set is unwired).
+        const auto id = make(std::string{test::kForensicsPlugin} + "-0w4");
+        tracker.update_agent_status(id, frame("failure", kFreeText));
+        const auto seeded = outbox_high_water(pool, id);
+        auto fault = lookup_fault();
+        fault.arm();
+        yuzu::test::LogCapture logs{spdlog::level::warn};
+        tracker.update_agent_status(id, frame("running", ""));
+        logs.stop();
+        fault.repair();
+        CHECK(logs.text().find("NOT recorded") == std::string::npos);
+        const auto added = outbox_data_after(pool, id, seeded);
+        REQUIRE_FALSE(added.empty());
+        CHECK(added.find("marker-4990") != std::string::npos);
+    }
 }
 
 // -- A3: the failure text in the server's other derived sinks -------------------------------------

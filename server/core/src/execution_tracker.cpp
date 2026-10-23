@@ -207,14 +207,18 @@ forensics_executions_among(PGconn* conn, const ForensicsPluginSet& set,
 }
 
 // Reduce the error text of every Forensics-tier execution among the given (execution id, text)
-// slots. `set == nullptr` (unwired harness) leaves the texts as stored.
-void scrub_error_texts(PGconn* conn, const ForensicsPluginSet* set,
-                       std::vector<std::pair<std::string, std::string*>> slots) {
+// slots. `set == nullptr` (unwired harness) leaves the texts as stored. Returns false only when
+// the Forensics lookup itself failed (every non-empty slot was then reduced, the fail-closed
+// reading); true otherwise, including when there was nothing to look up. `throttle_key` names the
+// caller's own warning throttle (the read paths and the write path each get one line a minute).
+bool scrub_error_texts(PGconn* conn, const ForensicsPluginSet* set,
+                       std::vector<std::pair<std::string, std::string*>> slots,
+                       const char* throttle_key = "forensics_execution_lookup_failed") {
     if (!set)
-        return;
+        return true;
     std::erase_if(slots, [](const auto& s) { return s.second->empty(); });
     if (slots.empty())
-        return;
+        return true;
     std::vector<std::string> ids;
     ids.reserve(slots.size());
     for (const auto& s : slots)
@@ -226,13 +230,46 @@ void scrub_error_texts(PGconn* conn, const ForensicsPluginSet* set,
         // The drawer repeats this read every few seconds, so the line is throttled (the text is
         // withheld on every read regardless): at most one per minute.
         static RefusalLogThrottle throttle;
-        if (throttle.should_warn("forensics_execution_lookup_failed"))
+        if (throttle.should_warn(throttle_key))
             spdlog::warn("ExecutionTracker: Forensics execution lookup failed; error text withheld "
                          "for {} execution(s) (#4990; at most one log per 60 s)", ids.size());
     }
     for (auto& [exec_id, text] : slots)
         if (!forensics || forensics->contains(exec_id))
             *text = sanitize_forensics_error_detail(*text);
+    return forensics.has_value();
+}
+
+// The same reduction for the one caller that runs INSIDE an open write transaction (the agent
+// status upsert). A failed statement aborts a PostgreSQL transaction, and the upsert and the
+// durable outbox append share one, so a lookup error there would lose the agent's terminal status
+// (agents do not re-send). The lookup therefore runs under a SAVEPOINT that is rolled back on
+// failure: the transaction stays usable and the text is reduced to its bounded form (the same
+// fail-closed reading as the read paths) while the status write, the outbox row and the bus event
+// still commit. If the SAVEPOINT itself cannot be created the lookup is not attempted and the text
+// is reduced the same way. One sanitiser path: this calls `scrub_error_texts`.
+void scrub_error_texts_in_txn(PGconn* conn, const ForensicsPluginSet* set,
+                              std::vector<std::pair<std::string, std::string*>> slots) {
+    if (!set)
+        return;
+    pg::PgResult sp = pg::exec_params(conn, "SAVEPOINT forensics_lookup", std::vector<std::string>{});
+    if (sp.status() != PGRES_COMMAND_OK) {
+        static RefusalLogThrottle throttle;
+        if (throttle.should_warn("forensics_execution_savepoint_failed_in_write_txn"))
+            spdlog::warn("ExecutionTracker: could not open a savepoint for the Forensics execution "
+                         "lookup; error text withheld (#4990; at most one log per 60 s)");
+        for (auto& [exec_id, text] : slots)
+            *text = sanitize_forensics_error_detail(*text);
+        return;
+    }
+    const bool lookup_ok = scrub_error_texts(conn, set, std::move(slots),
+                                             "forensics_execution_lookup_failed_in_write_txn");
+    pg::PgResult fin = pg::exec_params(
+        conn, lookup_ok ? "RELEASE SAVEPOINT forensics_lookup" : "ROLLBACK TO SAVEPOINT forensics_lookup",
+        std::vector<std::string>{});
+    if (fin.status() != PGRES_COMMAND_OK)
+        spdlog::warn("ExecutionTracker: closing the Forensics lookup savepoint failed: {}",
+                     PQerrorMessage(conn));
 }
 
 void scrub_executions(PGconn* conn, const ForensicsPluginSet* set, std::vector<Execution>& execs) {
@@ -1186,12 +1223,18 @@ ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
         payload["completed_at"] = to_i64(col(res.get(), 0, 2));
         std::string returned_error = col_str(res.get(), 0, 3);
         // #4990: the PERSISTED text can be older than this write (a terminal row is sticky, so a
-        // later frame returns what an earlier writer stored). Reduce it exactly as the read paths
-        // do before it reaches the durable outbox or the bus. A value that already has the bounded
-        // shape needs no lookup (the reduction is idempotent).
-        if (!returned_error.empty() &&
+        // later frame returns what an earlier writer stored). The incoming text was already reduced
+        // at ingest (`AgentServiceImpl::failure_text_for_sinks`), so a persisted value equal to it
+        // needs no lookup: that is every ordinary frame, and it keeps this write transaction free
+        // of the Forensics scan. Only a persisted value that DIFFERS from the incoming one (the
+        // sticky-terminal case, or a row from an older writer) is reduced here, as the read paths
+        // do, before it reaches the durable outbox or the bus; a value that already has the bounded
+        // shape needs no lookup either (the reduction is idempotent). The lookup runs under a
+        // SAVEPOINT so a failure of it can never abort this transaction (see
+        // `scrub_error_texts_in_txn`).
+        if (!returned_error.empty() && returned_error != s.error_detail &&
             sanitize_forensics_error_detail(returned_error) != returned_error)
-            scrub_error_texts(conn, forensics_plugins_, {{execution_id, &returned_error}});
+            scrub_error_texts_in_txn(conn, forensics_plugins_, {{execution_id, &returned_error}});
         if (!returned_error.empty())
             payload["error_detail"] = returned_error;
         const int64_t returned_plugin_status = to_i64(col(res.get(), 0, 4));
