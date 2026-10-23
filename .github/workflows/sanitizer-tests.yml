@@ -147,11 +147,10 @@ jobs:
           # Sanity-check the install above landed meson/gcc-15 on PATH and
           # libsystemd is discoverable (the Linux Guardian systemd service
           # guard links sd-bus at configure time). Fail loudly otherwise.
+          #
           # `libtoolize`, not `libtool`: Ubuntu's `libtool` package ships only
-          # libtoolize; the `libtool` script itself is in `libtool-bin`, which
-          # nothing here installs or needs (vcpkg's libpq autotools build runs
-          # libtoolize/autoreconf). Asserting `libtool` failed this step on
-          # every Big Tam runner before any build started.
+          # `libtoolize`; the `libtool` script itself is in `libtool-bin`, which
+          # nothing here installs.
           for tool in meson ninja gcc-15 g++-15 ccache python3 bison flex autoconf automake libtoolize; do
               if ! command -v "$tool" >/dev/null; then
                   echo "::error::$tool not on PATH on yuzu-bigtam-linux runner"
@@ -323,10 +322,8 @@ jobs:
       - name: Assert toolchain available
         run: |
           # `libtoolize`, not `libtool`: Ubuntu's `libtool` package ships only
-          # libtoolize; the `libtool` script itself is in `libtool-bin`, which
-          # nothing here installs or needs (vcpkg's libpq autotools build runs
-          # libtoolize/autoreconf). Asserting `libtool` failed this step on
-          # every Big Tam runner before any build started.
+          # `libtoolize`; the `libtool` script itself is in `libtool-bin`, which
+          # nothing here installs.
           for tool in meson ninja gcc-15 g++-15 ccache python3 bison flex autoconf automake libtoolize; do
               if ! command -v "$tool" >/dev/null; then
                   echo "::error::$tool not on PATH on yuzu-bigtam-linux runner"
