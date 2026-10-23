@@ -24,6 +24,10 @@ automation pipeline; engine credentials are hard-locked to MCP tier
 `readonly` and structurally barred from the admin role, which is the wrong
 shape for anything that needs to execute or approve on a human's behalf.
 
+An engine credential has no authority while RBAC is off: it is refused, or sees no agents, until RBAC
+is enabled and a role is granted to it. See
+[Upgrading](upgrading.md#behaviour-change-engine-principals-are-default-deny-when-rbac-is-off).
+
 ## Before you start
 
 Every mutating operation on this surface requires:

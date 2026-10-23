@@ -283,3 +283,18 @@ TEST_CASE("an absent management-group store narrows to empty unless the caller h
         CHECK(vis::response_agent_in_scope(&r.rbac, nullptr, kEngine, "agent-1"));
     }
 }
+
+// The header makes its own enforcement read and ManagementGroupStore::get_visible_agents consults its
+// probe again. Force the probe to disagree with the header (RBAC on for the header, off for the
+// store, the shape a toggle between the two reads would produce): an engine must still get an empty
+// view, because the store refuses the `engine:` prefix in its legacy-open branch.
+TEST_CASE("an engine stays empty when the store's probe disagrees with the header's read (#6204)",
+          "[pg][6204][engine][visibility]") {
+    VisRig r;
+    r.mgmt.set_rbac_enabled_probe([]() { return false; });
+    REQUIRE(rbac_enforcement_in_effect(&r.rbac)); // the header will read "enforced"
+    CHECK(vis::visible_agents_json(fleet(), &r.rbac, &r.mgmt, kEngine).empty());
+    auto infra = vis::infrastructure_visible_set(&r.rbac, &r.mgmt, kEngine);
+    REQUIRE(infra.has_value());
+    CHECK(infra->empty());
+}

@@ -7,14 +7,15 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 **What changed.** An engine principal's only authority is an explicit RBAC grant. With RBAC off, the
 legacy-open fallback that admits every authenticated human no longer applies to an engine
 credential: `GET /api/v1/upload-grants` answers it `403` (`503` when the RBAC store is
-unavailable), and the shared per-agent visibility and dispatch-permission checks return no agents
-or refuse it instead of treating it as legacy-open.
+unavailable), and the shared per-agent list reads, device visibility, scheduled arming and
+dispatch-permission checks return no agents or refuse it instead of treating it as legacy-open.
 
 **Who is affected.** Only deployments whose engine credentials ran with RBAC disabled (the default)
 and relied on that fallback. Human sessions are unchanged.
 
 **What to do.** Enable RBAC and assign the engine principal the grants it needs (for example
-`UploadGrant:Read` to list upload grants). See [Role-Based Access Control](rbac.md).
+`UploadGrant:Read` to list upload grants). Enabling RBAC applies to every operator, so assign the
+human roles first and follow the prerequisites in [Role-Based Access Control](rbac.md).
 
 ## Behaviour change: the Windows agent installer passes the enrollment token by file
 
