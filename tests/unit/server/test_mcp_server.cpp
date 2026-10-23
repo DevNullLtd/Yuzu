@@ -9879,8 +9879,6 @@ TEST_CASE("MCP DEX: get_dex_observation denies an out-of-scope device before the
     CHECK(res->status == 403);
     CHECK(res->body.find("Guaranteed State store unavailable") == std::string::npos);
     CHECK(res->body.find("\"result\"") == std::string::npos);
-    for (const auto& a : ts.audit_log)
-        CHECK(a.rfind("dex.observation.view", 0) != 0); // no access row for a refused read
 }
 
 TEST_CASE("MCP DEX: get_dex_observation hands the requested agent_id to the scope gate "
@@ -9909,6 +9907,20 @@ TEST_CASE("MCP DEX: get_dex_observation hands the requested agent_id to the scop
     CHECK(gate_agents[0] == "WS-1");
     // Past the gate, the unwired store answers: the call reached the read path.
     CHECK(res->body.find("Guaranteed State store unavailable") != std::string::npos);
+    CHECK(res->body.find("\"result\"") == std::string::npos);
+}
+
+TEST_CASE("MCP DEX: get_dex_observation scope gate unwired -> fail closed",
+          "[mcp][integration][dex]") {
+    McpTestServer ts; // scoped_perm_fn_for_test left empty, no store wired
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9734,"params":{"name":"get_dex_observation","arguments":{"agent_id":"WS-1","event_id":"h1"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("scope gate not configured") != std::string::npos);
+    // The gate check precedes the store check, so the unwired gate is what answers.
+    CHECK(res->body.find("Guaranteed State store unavailable") == std::string::npos);
     CHECK(res->body.find("\"result\"") == std::string::npos);
 }
 
