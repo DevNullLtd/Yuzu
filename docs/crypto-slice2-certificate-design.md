@@ -1014,8 +1014,8 @@ comment: they resolve an administrator-registered host, the only outbound reach 
 | `update_revocation_source` | Replace a CRL source's keys and URLs | false | true | true | true | Idempotent: a full replace. A body equal to the current configuration changes nothing and does not bump `config_version`. Destructive because dropping a key or URL deletes its held CRLs. |
 | `remove_revocation_source` | Remove a CRL source | false | true | true | false | Idempotent: a repeat has no further effect and answers 404 `not_found`. The high-water marks survive. |
 | `reset_revocation_source_high_water` | Reset a CA's CRL anti-rollback marks | false | true | false | false | **Not** idempotent: each call sets a new `reset_at` and deletes the CA's held CRLs again, so a repeat after a CRL was accepted discards it. |
-| `list_certificate_tombstones` | List decommission tombstones | true | false | true | false | A read (admin-only). |
-| `purge_certificate_tombstone` | Purge one decommission tombstone | false | true | true | false | Idempotent: a repeat answers 404 `not_found`. |
+| `list_certificate_tombstones` | List decommission tombstones | false | false | true | false | A read (admin-only), gated on the `CertificateInventory:Write` pair (OD-4), so `readOnlyHint` follows the pair's operation as the annotation-coherence rule requires. |
+| `purge_certificate_tombstone` | Purge one decommission tombstone | false | true | true | false | Idempotent: a repeat answers 404 on REST and `invalid_params` (-32602, not retryable) on MCP, which has no not-found code. |
 
 **Error semantics, every tool** (A4 envelope on REST and in MCP `error.data`, including local
 errors such as non-object arguments, an unwired gate or a parse error):
