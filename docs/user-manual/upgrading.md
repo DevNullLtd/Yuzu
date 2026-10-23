@@ -12,7 +12,7 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 - **RBAC-off installs** (the shipped default) are unchanged: every `Security:Read` session is served.
 - A caller with global `Security:Read` and **no** `Inventory:Read` grant at all is **not** confined and is served the list. Removing a scoped `Inventory:Read` grant does **not** confine a caller; granting a global `Inventory:Read` removes the confinement.
-- **A read failure inside the access check fails open.** If a store behind the check (permissions, management groups) cannot be read partway through, the check answers as for a caller with no grant, so the list is served rather than refused. This applies to the unfiltered list, the filtered list and the drill on `/crypto`. It is narrower than before this change, when every confined caller was served, and it is tracked by an issue (issue number to be added when filed).
+- **A read failure inside the access check fails open.** If a store behind the check (permissions, management groups) cannot be read partway through, the check answers as for a caller with no grant, so the list is served rather than refused. This applies to the unfiltered list, the filtered list and the drill on `/crypto`. It is narrower than before this change, when every confined caller was served, and it is tracked by #6382.
 
 **What to check.**
 

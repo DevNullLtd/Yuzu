@@ -19775,7 +19775,7 @@ TEST_CASE("MCP CA: list_issued_certs reads limit/offset as 64 bits, saturates, a
 }
 
 TEST_CASE("MCP CA: list_issued_certs unfiltered writes a success audit row; a dropped row is "
-          "reported, not fatal",
+          "reported and not fatal",
           "[mcp][integration][pki][security][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
@@ -19817,7 +19817,7 @@ TEST_CASE("MCP CA: list_issued_certs unfiltered writes a success audit row; a dr
 }
 
 TEST_CASE("MCP CA: KNOWN RESIDUAL - kRefused serves the unfiltered list and the success row says "
-          "standing=refused (tracked by the to-be-filed issue)",
+          "standing=refused (tracked by #6382)",
           "[mcp][integration][pki][security][pg]") {
     // The REST twin's pin in test_ca_routes.cpp: kRefused (no Inventory grant, or a read failure
     // partway through the access check, which the answer cannot tell apart) is SERVED. A future
@@ -40223,8 +40223,8 @@ TEST_CASE("MCP list_issued_certs filtered: a confined Security:Read holder is wi
     CHECK(ts.audit_target_ids.front() == "filtered");
 }
 
-TEST_CASE("MCP list_issued_certs unfiltered: a confined Security:Read holder is withheld, audited "
-          "denied, and no store is read",
+TEST_CASE("MCP list_issued_certs unfiltered: a confined Security:Read holder is withheld and audited "
+          "denied and no store is read",
           "[mcp][crypto][widgets][ca][security]") {
     // ca_store_for_test stays null: a confined caller must be answered before the store is
     // touched, so no `failure` row for an unavailable store may appear either.

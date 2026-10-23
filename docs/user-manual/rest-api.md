@@ -2354,7 +2354,7 @@ carries `standing=refused`, the same token as the no-grant case, because the ans
 them apart). The same holds for the filtered list below and the `/crypto` drill; the drill's
 success rows carry no standing token, so only this route and the MCP tool mark such pages. It is
 narrower than the behaviour before this change, when every confined caller was served
-unconditionally. It is tracked by an issue (issue number to be added when filed). Review
+unconditionally. It is tracked by #6382. Review
 `standing=refused` success rows, remembering that the audit row can be missing during the same
 outage (correlate with `yuzu_server_audit_emit_failed_total`) and that no alert fires on this
 path.

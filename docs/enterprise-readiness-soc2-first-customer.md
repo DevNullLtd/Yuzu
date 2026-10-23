@@ -384,7 +384,7 @@ grant at all (removing a scoped grant does not confine a caller); and **any call
 hits a read failure partway through**, because that check answers as for a caller with no grant
 (it fails open). Refused: a caller whose `Inventory:Read` is granted only for management groups. The
 read-failure case also affects the filtered list and the `/crypto` drill, is narrower than the prior
-behaviour, and is tracked by an issue (issue number to be added when filed). Detective control, with
+behaviour, and is tracked by #6382. Detective control, with
 its limits: on the route and the MCP tool each success row ends `standing=available` or
 `standing=refused`; review the `refused` rows. `refused` cannot separate a by-design caller with no
 `Inventory:Read` grant from a read failure inside the check, the drill's success rows carry no

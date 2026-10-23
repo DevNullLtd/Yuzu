@@ -569,7 +569,7 @@ TEST_CASE("crypto widgets: audit_detail_inventory - the unfiltered list's succes
           "inventory rows=5 limit=5 offset=10 has_more=true");
 }
 
-TEST_CASE("crypto widgets: audit_detail_with_standing - one token per standing, never a false "
+TEST_CASE("crypto widgets: audit_detail_with_standing - one token per standing and never a false "
           "refused",
           "[crypto][widgets]") {
     namespace cw = yuzu::server::crypto_widgets;

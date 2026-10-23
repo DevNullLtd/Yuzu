@@ -1446,7 +1446,7 @@ TEST_CASE("ca_routes: /ca/issued without a session is 401, filtered or not, with
 }
 
 TEST_CASE("ca_routes: a confined Security:Read holder is withheld the filtered AND the unfiltered "
-          "list, each audited denied",
+          "list - each audited denied",
           "[ca_routes][pki][pg][crypto][security]") {
     Harness h;
     h.standing = yuzu::server::crypto_widgets::Access::kConfined;
@@ -1476,7 +1476,7 @@ TEST_CASE("ca_routes: a confined Security:Read holder is withheld the filtered A
 }
 
 TEST_CASE("ca_routes: an unconfined unfiltered /ca/issued is served and audited success; a "
-          "dropped audit row is reported, not fatal",
+          "dropped audit row is reported and not fatal",
           "[ca_routes][pki][pg][crypto][security]") {
     Harness h;
     h.wire();
@@ -2080,7 +2080,7 @@ TEST_CASE("ca_routes: revoke wrapper without Security:Read confirms the revoke a
     }
 }
 
-TEST_CASE("ca_routes: import wrapper without Security:Read confirms the import, never the inventory",
+TEST_CASE("ca_routes: import wrapper without Security:Read confirms the import and never the inventory",
           "[ca_routes][pki][subordinate][security][pg]") {
     for (const char* view : {"", "&view=pki"}) {
         Harness h;
@@ -2234,7 +2234,7 @@ constexpr std::string_view kWithheld = yuzu::server::crypto_widgets::kConfinedWi
 } // namespace
 
 TEST_CASE("ca_routes: a confined caller is withheld the unfiltered /ca/issued before any parameter "
-          "or store is read, and the denial is audited",
+          "or store is read and the denial is audited",
           "[ca_routes][pki][crypto][security]") {
     ProbeHarness h;
     h.standing = yuzu::server::crypto_widgets::Access::kConfined;
@@ -2268,7 +2268,7 @@ TEST_CASE("ca_routes: a confined caller is withheld the unfiltered /ca/issued be
 }
 
 TEST_CASE("ca_routes: the unfiltered /ca/issued fails closed when the standing probe is degraded or "
-          "unwired, and asks Security:Read first",
+          "unwired and asks Security:Read first",
           "[ca_routes][pki][crypto][security]") {
     {
         ProbeHarness h;
@@ -2328,7 +2328,7 @@ TEST_CASE("ca_routes: an unconfined or grant-less caller passes the probe; an un
     }
 }
 
-TEST_CASE("ca_routes: a revoke wrapper never answers an empty body, whoever the caller",
+TEST_CASE("ca_routes: a revoke wrapper never answers an empty body whoever the caller",
           "[ca_routes][pki][crypto][security]") {
     using yuzu::server::crypto_widgets::Access;
     // No store: the wrapper answers its 503 banner plus the panel (here the store-unavailable
@@ -2378,7 +2378,7 @@ void check_inventory_withheld_panel_intact(const std::string& body) {
 
 } // namespace
 
-TEST_CASE("ca_routes: the Settings CA panel withholds ONLY the inventory from a confined, degraded "
+TEST_CASE("ca_routes: the Settings CA panel withholds ONLY the inventory from a confined or degraded "
           "or unwired caller",
           "[ca_routes][pki][crypto][security][pg]") {
     using yuzu::server::crypto_widgets::Access;
@@ -2429,8 +2429,8 @@ TEST_CASE("ca_routes: the Settings CA panel withholds ONLY the inventory from a 
     }
 }
 
-TEST_CASE("ca_routes: a confined caller's revoke wrapper answers the panel without the inventory, "
-          "never an empty body",
+TEST_CASE("ca_routes: a confined caller's revoke wrapper answers the panel without the inventory "
+          "and never an empty body",
           "[ca_routes][pki][crypto][security][pg]") {
     for (const char* view : {"", "&view=pki"}) {
         INFO("view=" << view);
@@ -2479,7 +2479,7 @@ TEST_CASE("ca_routes: a confined caller's revoke wrapper answers the panel witho
 }
 
 TEST_CASE("ca_routes: a confined caller's import-chain wrapper answers the panel without the "
-          "inventory, never an empty body",
+          "inventory and never an empty body",
           "[ca_routes][pki][subordinate][crypto][security][pg]") {
     for (const char* view : {"", "&view=pki"}) {
         INFO("view=" << view);
@@ -2548,8 +2548,8 @@ TEST_CASE("ca_routes: a degraded or unwired caller's wrappers confirm success wi
     }
 }
 
-TEST_CASE("ca_routes: a wrapper caller without Security:Read gets a confirmation and a plain note, "
-          "never an empty body",
+TEST_CASE("ca_routes: a wrapper caller without Security:Read gets a confirmation and a plain note "
+          "and never an empty body",
           "[ca_routes][pki][security][pg]") {
     Harness h;
     REQUIRE(h.store->set_root(sample_root()));
@@ -2577,7 +2577,7 @@ TEST_CASE("ca_routes: a wrapper caller without Security:Read gets a confirmation
 // ── Standing, audit shape and serving order (Postgres) ──────────────────────────────────────
 
 TEST_CASE("ca_routes: KNOWN RESIDUAL - kRefused serves the unfiltered list and the success row "
-          "says standing=refused (tracked by the to-be-filed issue)",
+          "says standing=refused (tracked by #6382)",
           "[ca_routes][pki][crypto][security][pg]") {
     // kRefused = the access check admitted nobody and did not answer 503: no Inventory grant at
     // all, OR a read failure partway through the check (the answer cannot tell them apart). The
