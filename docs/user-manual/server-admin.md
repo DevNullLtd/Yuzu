@@ -2561,7 +2561,7 @@ MFA CLI flags: `--mfa-enforcement` (default `optional`; `admin-only`/`required` 
 
 ### v0.10.0 — API token revocation is owner-scoped
 
-Starting with v0.10.0, non-admin users can no longer revoke API tokens they do not own. A caller holding the `ApiToken:Delete` permission may revoke only tokens whose `principal_id` matches the session's username; the global `admin` role is the sole bypass. Prior releases allowed any holder of `ApiToken:Delete` to revoke any token, which was an IDOR (tracked in GitHub issue #222).
+Starting with v0.10.0, non-admin users can no longer revoke API tokens they do not own. A caller holding the `ApiToken:Delete` permission may revoke only tokens whose `principal_id` matches the session's username; the global `admin` role, or a session with an active just-in-time admin elevation, is the only bypass. Prior releases allowed any holder of `ApiToken:Delete` to revoke any token, which was an IDOR (tracked in GitHub issue #222).
 
 **If your deployment uses a non-admin service account to rotate tokens for other principals** — for example, a shared `ops` role that recycles service-account tokens on a schedule — those rotations will begin receiving `HTTP 404 token not found` after upgrade. To restore the behavior, either:
 

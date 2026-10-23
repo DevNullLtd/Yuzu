@@ -1111,9 +1111,9 @@ Revoke an API token. The token becomes immediately unusable.
 
 **Permission:** `ApiToken:Delete`
 
-**Ownership constraint:** A caller with `ApiToken:Delete` may only revoke tokens they created. The global `admin` role is the sole bypass and may revoke any token. Attempting to revoke another user's token returns `404 token not found` — identical to the response for a token that does not exist — so the endpoint cannot be used as an enumeration oracle by a non-owner with `ApiToken:Delete`. Denied attempts are recorded in the audit log with `action=api_token.revoke`, `result=denied`, and `detail=owner=<real owner>` so forensics can distinguish a probe from a legitimate self-revoke.
+**Ownership constraint:** A caller with `ApiToken:Delete` may only revoke tokens they created. The global `admin` role, or a session with an active just-in-time admin elevation, is the only bypass and may revoke any token. Attempting to revoke another user's token returns `404 token not found` — identical to the response for a token that does not exist — so the endpoint cannot be used as an enumeration oracle by a non-owner with `ApiToken:Delete`. Denied attempts are recorded in the audit log with `action=api_token.revoke`, `result=denied`, and `detail=owner=<real owner>` so forensics can distinguish a probe from a legitimate self-revoke.
 
-The same ownership constraint applies to the HTMX dashboard path `DELETE /api/settings/api-tokens/{token_id}`.
+The same ownership constraint applies to the HTMX dashboard path `DELETE /api/settings/api-tokens/{token_id}`. The same bypass applies there: the global `admin` role or a just-in-time-elevated session may revoke any token.
 
 **Response:**
 
