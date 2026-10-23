@@ -993,6 +993,14 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
     prune follows the clock-guarded-retention concern. The design doc also states how a
     pruned store's rows are re-sent despite the daily sync skipping unchanged content.
     Until pruned, kept rows are shown as last observed at their `observed_at`.
+  - **R15 — location grain inside a `constrained` store (owner, 2026-10-23; amends the
+    bounded-retention rule above).** A store whose reads keep succeeding only partly reports
+    `constrained`, so its kept locations would never reach the store-grain condition and would
+    grow without bound. A location inside such a store counts as not observed once it has been
+    missing from every report the server received from that device over the stated bound
+    (server receipt times on both sides), and the same pass prunes it. An offline device sends
+    no reports, so nothing of it is pruned: age alone still never prunes. Recorded in the
+    slice-2 design's Decisions (decision 6).
 - A capped or timed-out capture is reported `constrained`, and the report is never an
   empty success.
 - An empty blob is never sent for a failed or constrained capture (the ADR-0016

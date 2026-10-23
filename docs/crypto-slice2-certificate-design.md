@@ -84,16 +84,16 @@ counter or a store rather than a read, the PR says so, and the next PR in the ch
 |---|---|---|---|---|
 | 2a-1 | Typed-source read filter | One exported array of typed source names in `typed_inventory_sources.hpp`, **already including the reserved name `certificate_inventory`**, used by the predicate (and so the gateway skip), the boot purge and a new read-time filter on every generic `InventoryStore` read. No certificate code. Amends the app-usage read-surface routed-concern row in the same change. | It closes today's accepted stray-row window for `app_usage` and `device_ci` (see [Typed set](#typed-set-purge-and-read-filter)). D12 forbids that window for certificates, so it must exist, with the certificate source name reserved, before any agent sends the source. | — |
 | 2a-1b | Background typed-source purge | The boot purge becomes a bounded, batched background pass, classified in `background_jobs.hpp`, started at every boot and no longer awaited before serving. | Boot no longer waits on an unbounded delete; the pass's progress is counted. | 2a-1 |
-| 2a-2a | Certificate store and ingest | `CertificateInventoryStore` (schema `cert_inventory`) and the shared ingest seam on the direct and gateway paths: blob parse, hash-skip, per-store replace rules, the decommission tombstone and per-agent lock, decommission cascade membership, `/readyz` membership, `yuzu_server_cert_inventory_ingest_total`, and the schema lint. | A report from an agent (or a test) is stored, counted by result and reason, erased on decommission, and covered by `/readyz`. | 2a-1 |
-| 2a-2b | Certificate read surface | The `CertificateInventory` securable, its seeding and floor entry; the per-certificate read and the raw-value summary (REST + MCP + `/crypto` fragment) with every filter in [Parameters](#parameters-strict-or-free-text-the-same-on-both-twins); admission, truncation, audit (OD-2) and the D10 lint. | Operators read fleet certificates, including the [one-CA queries](#finding-one-cas-certificates). | 2a-2a |
-| 2a-2c | Decommission tombstones | The admin-only tombstone list and purge (REST + MCP, OD-4), `coverage.tombstoned_agents_registered`, and the cross-schema enrolment clear (`CertificateEnrolmentTombstoneOwner`) at every approval write. | An administrator lists and purges tombstones; approving a tombstoned agent clears it. | 2a-2b |
+| 2a-2a | Certificate store and ingest | `CertificateInventoryStore` (schema `cert_inventory`) and the shared ingest seam on the direct and gateway paths: blob parse, hash-skip, per-store replace rules, the per-agent lock, decommission cascade membership (erase only; no tombstone), `/readyz` membership, `yuzu_server_cert_inventory_ingest_total`, and the schema lint. | A report from an agent (or a test) is stored, counted by result and reason, erased on decommission, and covered by `/readyz`. | 2a-1 |
+| 2a-2b | Certificate read surface | The `CertificateInventory` securable, its seeding and floor entry; the per-certificate read and the raw-value summary (REST + MCP + `/crypto` fragment) with every filter in [Parameters](#parameters-strict-or-free-text-the-same-on-both-twins); admission, truncation, audit (OD-2), the D10 lint, and the `cert_inventory.fleet_store_status` gauge job. | Operators read fleet certificates, including the [one-CA queries](#finding-one-cas-certificates). | 2a-2a |
+| 2a-2c | Decommission tombstones | The decommission tombstone itself (written by `delete_agent`, checked by ingest), the admin-only tombstone list and purge (REST + MCP, OD-4), `coverage.tombstoned_agents_registered`, and the cross-schema enrolment clear (`CertificateEnrolmentTombstoneOwner`) at every approval write. | An administrator lists and purges tombstones; approving a tombstoned agent clears it. | 2a-2b |
 | 2a-2d | Certificate retention prune | The [prune](#retention-and-the-prune), at store and location grain, with its metrics and its clock-guarded-retention register entry. | Stores unread for 30 days are pruned and counted. | 2a-2a |
-| 2a-2e | Agent collector: action, daily-sync source and Linux | `certificates.list_inventory` (no catalogue row, OD-1), the `certificate_inventory` daily-sync source and blob writer, and the Linux store reads. | A Linux agent reports its certificates daily. | 2a-2a (raise after it merges: deploy order is server first) |
+| 2a-2e | Agent collector: action, daily-sync source and Linux | `certificates.list_inventory` (no catalogue row, OD-1), the `certificate_inventory` daily-sync source and blob writer, and the Linux store reads. | A Linux agent reports its certificates daily. | 2a-2b, 2a-2c, 2a-2d, and the DPIA screening |
 | 2a-2f | Agent collector: Windows | The Windows machine-store reads and the private-key metadata. | A Windows agent reports its certificates. | 2a-2e |
 | 2a-2g | Agent collector: macOS | The System keychain and SystemRoots reads. | A macOS agent reports its certificates. | 2a-2e |
 | 2a-3 | D13 certificate counts | The counts read (REST + MCP), the snapshot export, the D13 condition-1 lint entries and the recompute test; the data the certificate widgets read. | Operators see the counts on `/crypto` and through MCP. | 2a-2b |
 | 2a-4 | CBOM certificate half | Certificate, algorithm and public-key components in `GET /api/v1/crypto/cbom` and `export_crypto_cbom`, gated by the certificate securable. | The CBOM gains its certificate half. | 2a-2b |
-| 2b-1a | Revocation sources | `RevocationSourceStore`; registration REST + MCP; the admin-only predicate and the floor-header amendment; `/readyz` membership. | An administrator registers, lists and removes a CA and its CRL URLs. | — |
+| 2b-1a | Revocation sources | `RevocationSourceStore`; registration REST + MCP, with the registration-time address checks and the resolved address-class display; the admin-only predicate and the floor-header amendment; `/readyz` membership. | An administrator registers, lists and removes a CA and its CRL URLs. | — |
 | 2b-1b | CRL fetcher | The fetcher and its egress checks; CRL verification and acceptance; the leader-gated refresh job; `crl_past_next_update` on the source read; metrics and alerts. | A registered source shows its fetch status, held CRL, `thisUpdate`, `nextUpdate` and entry count; the alerts fire. | 2b-1a |
 | 2b-2 | Revocation statements | Read-time matching on the per-certificate read (`CertificateRevocationReader`); the revoked windows in the counts read; the signature-verification job; the widgets' revoked data. | Certificates read "revoked on …", "on hold", "not listed on …" or "revocation not checked", with the cause. | 2a-3, 2b-1b |
 | 2b-3 | Delta CRLs (optional, last) | Delta CRL use together with its base. | Until it lands, a delta CRL is verified and recorded but never used, and the source shows `delta_not_supported`. | 2b-2 |
@@ -101,7 +101,11 @@ counter or a store rather than a read, the PR says so, and the next PR in the ch
 **Order.** Each PR is raised once everything in its "Needs" column has merged. 2a-1, 2b-1a and
 this design amendment need nothing and can be raised together. 2a-3 imports the shared D13 window
 constants and edge predicates the widgets work landed in `crypto_widget_catalogue.hpp` (ADR-0070
-R5/R7/R10/R14). 2b-3 is optional and comes last.
+R5/R7/R10/R14). 2b-3 is optional and comes last. Agents are the last link of the server chain:
+2a-2e waits for the read surface, the tombstone and the prune, so no device reports certificate
+data before it can be read, erased and retained as this design states. The DPIA screening is
+recorded before 2a-2e merges, the first PR that processes real certificate data. No PR writes
+durable state whose only remover arrives in a later PR.
 
 Where the rest of this design says "2a-2", it means the 2a-2a to 2a-2g chain, and the table above
 says which PR carries each item. "2b-1" likewise means 2b-1a and 2b-1b.
@@ -124,15 +128,16 @@ enforces that order, so the design does not rely on it:
 | PR | Documents |
 |---|---|
 | 2a-1 | `upgrading.md`: the `app_usage`/`device_ci` behaviour change (stray generic rows stop being readable), the deploy order, and the downgrade note above. The app-usage read-surface routed-concern row: its accepted mixed-version window becomes closed. A changelog fragment. |
-| 2a-2a | `rest-api.md`/`server-admin.md` for the ingest metric and `/readyz` membership; `inventory.md` for the new daily-sync source; the DPIA screening record (before 2a-2b merges). |
+| 2a-1b | The purge metric where inventory metrics are documented, and `upgrading.md` (boot no longer waits on the purge). |
+| 2a-2a | `rest-api.md`/`server-admin.md` for the ingest metric and `/readyz` membership; `inventory.md` for the new daily-sync source. |
 | 2a-2b | `crypto.md`, `rest-api.md`, `mcp.md`, `audit-log.md` (the read verbs), `rbac.md` and the SOC 2 access-control inventory (`CertificateInventory`). |
 | 2a-2c | `crypto.md`, `rest-api.md`, `mcp.md`, `audit-log.md` (`crypto.certificates.tombstones.view`, `crypto.certificates.tombstone_purge`). The A2/A1 RBAC-administration routed-concern row (`.claude/routed-concerns-access-control.md`), amended for the new `is_rbac_administrator()` call sites, as that row requires. |
 | 2a-2d | `crypto.md` (retention) and the clock-guarded-retention adoption register. |
-| 2a-2e, 2a-2f, 2a-2g | The generated plugin README and the OS capability matrix, per OS. |
+| 2a-2e, 2a-2f, 2a-2g | The generated plugin README and the OS capability matrix, per OS. 2a-2e also links the DPIA screening record, which must exist before it merges. |
 | #6125 (owed request, not an edit) | Ask that D6's "never opens ... key blocks in PEM files" (`0070:630`) be worded as the exact property in [Linux link and file rules](#stores-read-per-os): key-block lines discarded unretained, never base64-decoded, buffer cleansed. Tracked until #6125 answers; this design does not edit the ADR. |
 | 2a-3 | `crypto.md`, `rest-api.md`, `mcp.md` and `audit-log.md` for the snapshot export (`GET /api/v1/crypto/certificates/snapshot`, `export_crypto_certificate_snapshot`, verb `crypto.certificates.snapshot`), including that paged reads make no cross-page consistency promise. `crypto.md` (each count's rule, window and boundary), the D10 lint's allow-list entries. |
 | 2a-4 | `crypto.md` and `rest-api.md`/`mcp.md` (the certificate half of the CBOM, its securable and its `halves_omitted` metadata). |
-| 2b-1a, 2b-1b | `server-admin.md` and `security-hardening.md`: CRL egress, the address rules, and firewall guidance for the server's outbound CRL fetches. `rbac.md`, `audit-log.md` and the SOC 2 inventory (`RevocationSource`). The fetcher's security review record. |
+| 2b-1a, 2b-1b | The A2/A1 RBAC-administration routed-concern row (`.claude/routed-concerns-access-control.md`), amended for 2b-1a's new `is_rbac_administrator()`-style call sites. `server-admin.md` and `security-hardening.md`: CRL egress, the address rules, and firewall guidance for the server's outbound CRL fetches. `rbac.md`, `audit-log.md` and the SOC 2 inventory (`RevocationSource`). The fetcher's security review record. |
 | 2b-2 | `crypto.md`: the revocation statements and their causes. |
 
 ## Collection on the agent
@@ -185,7 +190,7 @@ compile-time assertion or a test checks the list against the catalogue's `ReadOn
   rows". With no catalogue row, the check is instead: the sync source's action list is exactly
   `{"list_inventory"}` (a compile-time assertion), and a plugin test asserts that `list_inventory`
   reaches no write, delete or key-opening call. That is stricter than D6's wording (the action
-  cannot be dispatched at all), and the 2a-2 PR records it as such.
+  cannot be dispatched at all), and the 2a-2e PR records it as such.
 - **One parser on every OS.** Every leg gets each certificate's DER and parses it with the plugin's
   libcrypto parser. `certificates_x509.hpp:325` already has `parse_der_cert`, which refuses a
   buffer it did not wholly consume. Today the Windows build does not link OpenSSL
@@ -225,7 +230,7 @@ skips stores whose provider is not a built-in system provider (reason `third_par
 records why loading them is acceptable.
 
 The Linux root list is drawn from the Debian, RHEL, SUSE and Arch trust-store layouts as documented
-by those distributions; none has been checked on a host yet, so 2a-2 verifies each layout (in
+by those distributions; none has been checked on a host yet, so 2a-2e verifies each layout (in
 particular that no RHEL or Arch host reads `constrained` permanently from a link into an unlisted
 directory) before merge. It is a
 fixed list, not a crawl. A root that does not exist reads `absent` only after its parent directory
@@ -550,7 +555,7 @@ response presents one entry per (device, certificate), with its locations as a l
 requires (`0070:1013-1016`).
 
 **Schema lint (Decided, ADR-0070 D13 "Mechanical checks", `0070:1324-1325`):** no column is named
-after a D13 rule id or window field, or `days_remaining`. 2a-2 adds the lint over every migration
+after a D13 rule id or window field, or `days_remaining`. 2a-2a adds the lint over every migration
 in this store's migration array.
 
 ### Ingest
@@ -568,7 +573,7 @@ serialise as the software store's do. Per store:
 | `unreadable` | Untouched. | Unchanged |
 | missing from the report (stored, not reported) | Untouched; status becomes `not_observed` from this first omission (D12, `0070:989-991`). | Unchanged |
 
-**No rows for a decommissioned agent (Proposed).** Ingest writes nothing for an agent that has
+**No rows for a decommissioned agent (Proposed; ships in 2a-2c, with the clear below, so no tombstone is ever written before something can clear it).** Ingest writes nothing for an agent that has
 been decommissioned: the check runs inside the ingest transaction, against a decommission tombstone
 that `delete_agent` writes in the same transaction as the erase (or an equivalent registry check;
 the PR chooses). A report from such an agent is acknowledged, writes no row, and is counted
@@ -652,7 +657,7 @@ What exists today:
   one list.
 - The array includes `certificate_inventory` from 2a-1, before the source or its store exists. Its
   only effects then are the gateway skip and the read filter, which is what closes the window for
-  servers at 2a-1 or later (see [Phasing](#phasing-and-pr-order)). 2a-2 adds the seam behind it.
+  servers at 2a-1 or later (see [Phasing](#phasing-and-pr-order)). 2a-2a adds the seam behind it.
 - `InventoryStore::get`, `query`, `list_tables` and `count` exclude every typed source in SQL
   (`plugin <> ALL($1)`).
 - **The purge starts at boot but no longer blocks it (PR 2a-1b).** 2a-1 keeps the existing
@@ -737,7 +742,7 @@ concern. The design states how a pruned store's rows are re-sent despite hash-sk
 | `revocation_source.refresh` (2b-1) | `FencedLeaderOnly` | Network egress that would otherwise run once per replica. The dispatch site is wrapped in `leader_gate_permits` (`leader_gate.hpp`) and carries `YUZU_ASSERT_BACKGROUND_JOB`, as the header requires (`background_jobs.hpp:27-32`). `ca.publish_crl` is the nearest precedent (`:212`). |
 | `revocation_source.verify_certificate_signatures` (2b-2) | `ReplicaSafe` | An idempotent upsert of a pure function of (certificate DER, registered key). It reads both schemas, so it runs through the named cross-schema query owner (see [The store](#the-store)). |
 | `inventory_store.purge_typed_sources` (2a-1b) | `ReplicaSafe` | The batched purge of typed-source rows from the generic store: an idempotent bounded delete. |
-| `cert_inventory.fleet_store_status` (2a-2) | `ReplicaSafe` | A read-only fleet gauge sweep, like the existing inventory-freshness gauge (`background_jobs.hpp:209`). |
+| `cert_inventory.fleet_store_status` (2a-2b) | `ReplicaSafe` | A read-only fleet gauge sweep, like the existing inventory-freshness gauge (`background_jobs.hpp:209`). |
 
 A replica that loses leadership clears the gauges only the refresh job sets
 (`yuzu_server_crl_scopes_past_next_update`, `yuzu_server_crl_url_last_success_age_seconds`), so a
@@ -796,7 +801,7 @@ denied certificate half says it was denied, never "no certificates".
 
 **Proposed:**
 - `CryptoRoutes` today calls `fleet_read_fn(req, res, "Inventory", "Read")` (`crypto_routes.cpp:165`)
-  and hard-codes "Inventory:Read is required" (`:117-119`). 2a-2 makes both a per-surface parameter
+  and hard-codes "Inventory:Read is required" (`:117-119`). 2a-2b makes both a per-surface parameter
   and passes `CertificateInventory` for every certificate surface. Slice 1's surfaces keep passing
   `Inventory`.
 - Confinement is ADR-0017 admit-then-filter: the gate's visible-device set becomes a SQL
@@ -849,7 +854,7 @@ fleet-wide or confined scope. A degraded read is a 503 with a retry hint, never 
   it never enters an audit row. Every other untrusted value that does goes through `log_token`
   (`common/include/yuzu/log_token.hpp:85`).
 - The postures above need `docs/api-twin-recipe.md` §4 reconciled with `audit-log.md`
-  (#6122 item 8). 2a-2 records this design's split there, so findings have one written basis, and
+  (#6122 item 8). 2a-2b records this design's split there, so findings have one written basis, and
   adds every verb above to the `audit-log.md` catalogue.
 
 ### Admission
@@ -1050,7 +1055,7 @@ per-certificate read. The snapshot accepts them too, because it takes the same f
   filtering by a key returns every certificate over it, and that is the point.
 - **Indexes.** `cert_fact (spki_sha256)` and `(aki_key_id)` are added to the
   [store's index list](#store-and-schema). The two substring filters scan the caller's visible
-  `cert_fact` rows under the read's statement timeout. That cost is unmeasured. 2a-2 measures it at
+  `cert_fact` rows under the read's statement timeout. That cost is unmeasured. 2a-2b measures it at
   the target scale and adds a `pg_trgm` index only if the measured p95 needs one.
 - **Out of scope here.** Detecting a weak key from the key itself (a tiny EC private key, shared or
   close RSA primes) needs more than these filters. It is a separate proposal.
@@ -1260,8 +1265,9 @@ A caller holding `Inventory:Read` but not `CertificateInventory:Read` gets the l
   `RevocationSource` route and tool therefore gates on an administrator predicate in the
   `is_rbac_administrator` style (`rbac_admin_predicate.hpp`), extended rather than forked, in
   addition to the securable. Under RBAC off, `Write` is already admin-only (`auth_routes.cpp:944`)
-  and `Read` gets a floor entry under a fifth inclusion class added to the header's test (after
-  the fourth that `CertificateInventory` adds)
+  and `Read` gets a floor entry under its own inclusion class added to the header's test
+  (alongside the one `CertificateInventory` adds; whichever of 2b-1a and 2a-2b merges first adds
+  its class first)
   (`authz_topology_floor.hpp:54-63`): "the read discloses operator-registered egress targets, which
   map internal network topology". The reason the grant is refused: the fetch-status field
   (`last_failure_cause`) would otherwise make the fetcher a blind request-forgery and port-scan
@@ -1299,7 +1305,7 @@ A caller holding `Inventory:Read` but not `CertificateInventory:Read` gets the l
   `CertificateInventory:Write` is among them, and this design maps removal, reset and purge to
   `Write`, not `Delete`. Left as is, a supervised MCP token held by an administrator would
   register, update, remove, reset and purge with no ticket. So **2b-1 adds
-  `RevocationSource:Write`, and 2a-2 adds `CertificateInventory:Write`, to `requires_approval`'s
+  `RevocationSource:Write`, and 2a-2c adds `CertificateInventory:Write`, to `requires_approval`'s
   supervised list.** The REST mirror needs no second list: `AuthRoutes` already applies the same
   predicate to an MCP token on every non-MCP transport (`auth_routes.cpp:1017`, `:1156`), so the
   one edit covers both. Each PR adds a test that a supervised MCP token gets `approval_required`
@@ -1690,7 +1696,12 @@ gates them on `Inventory:Read`, with the confined-caller note, and they are neve
 
 ## Tests and chaos
 
-**Decided (ADR-0070 D12 "Chaos", `0070:1057-1067`):** the slice-2 PR runs CH-1..CH-6 before merge.
+**Decided (ADR-0070 D12 "Chaos", `0070:1057-1067`):** CH-1..CH-6 run before slice 2 is complete,
+each in the PR that first makes it runnable: CH-1's store-ingest half in 2a-2a and its Windows
+half in 2a-2f; CH-2's caps in 2a-2e and its fragment and audit half in 2a-2b; CH-3 on each OS in
+2a-2e, 2a-2f and 2a-2g, and its registered-URL half in 2b-1b; CH-4's offline and prune half in
+2a-2d, its paging half in 2a-2b and its CBOM half in 2a-4; CH-5's storage half in 2a-2a and its
+count half in 2a-3; CH-6 in 2b-1b, with its statement cases in 2b-2 and its delta case in 2b-3.
 Each is defined by the property it must prove.
 
 ### Unit and integration tests (Proposed)
