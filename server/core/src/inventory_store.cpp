@@ -586,8 +586,11 @@ InventoryStore::drain_typed_sources(int batch_rows, const std::function<bool()>&
         if (should_stop && should_stop())
             return total;
         const auto n = purge_typed_sources_batch(kTypedInventorySources, batch_rows);
-        if (!n)
+        if (!n) {
+            if (metrics_)
+                metrics_->counter("yuzu_inventory_typed_purge_failures_total").increment();
             return std::nullopt;
+        }
         if (*n == 0)
             return total;
         total += *n;

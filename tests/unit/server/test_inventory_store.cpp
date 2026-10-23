@@ -144,7 +144,12 @@ TEST_CASE("InventoryStore degrades (not empty) on a broken pool", "[inventory]")
     CHECK(typed.error() == yuzu::server::InventoryReadError::kDegraded);
     CHECK_FALSE(store.delete_agent("a"));       // ingest/delete: fail-soft, false, no crash
     CHECK(!store.purge_typed_sources_batch(yuzu::server::kTypedInventorySources, 10));
+    // CH-2: a failing pass reports failure, never throws, and counts the failure.
+    yuzu::MetricsRegistry purge_metrics;
+    store.set_metrics(&purge_metrics);
     CHECK(!store.drain_typed_sources(10).has_value());
+    CHECK(purge_metrics.counter("yuzu_inventory_typed_purge_failures_total").value() == 1.0);
+    CHECK(purge_metrics.counter("yuzu_inventory_typed_purge_rows_total").value() == 0.0);
     store.upsert("a", "p", "{}", 1);            // fail-soft: does not throw
 }
 
@@ -346,6 +351,13 @@ TEST_CASE("InventoryStore purge_typed_sources_batch deletes only typed rows, bou
         CHECK(raw_row_count(pool, "app_usage") == 0);
         CHECK(raw_row_count(pool, "hardware_info") == 1);
     }
+    SECTION("drain_typed_sources counts purged rows and no failure") {
+        yuzu::MetricsRegistry m;
+        store.set_metrics(&m);
+        REQUIRE(store.drain_typed_sources(2).has_value());
+        CHECK(m.counter("yuzu_inventory_typed_purge_rows_total").value() == 6.0);
+        CHECK(m.counter("yuzu_inventory_typed_purge_failures_total").value() == 0.0);
+    }
     SECTION("drain_typed_sources stops between batches when asked") {
         auto n = store.drain_typed_sources(2, [] { return true; });
         REQUIRE(n.has_value());
@@ -401,11 +413,15 @@ TEST_CASE("InventoryStore reads never return a typed source's stray row (ADR-007
         CHECK(rows->front().plugin == "hardware_info");
         CHECK_FALSE(truncated);
     }
-    SECTION("delete_source removes every typed source's rows and leaves the generic row") {
-        for (const auto typed : yuzu::server::kTypedInventorySources) {
-            CHECK(store.delete_source(typed));
+    SECTION("the purge removes every typed source's rows and leaves the generic row") {
+        // arch-A2: covers every kTypedInventorySources member, seeded above.
+        for (const auto typed : yuzu::server::kTypedInventorySources)
+            REQUIRE(raw_row_count(pool, std::string(typed)) == 1);
+        auto n = store.drain_typed_sources(2);
+        REQUIRE(n.has_value());
+        CHECK(*n == static_cast<std::int64_t>(yuzu::server::kTypedInventorySources.size()));
+        for (const auto typed : yuzu::server::kTypedInventorySources)
             CHECK(raw_row_count(pool, std::string(typed)) == 0);
-        }
         CHECK(raw_row_count(pool, "hardware_info") == 1);
     }
     SECTION("delete_agent erases typed stray rows too, not just the visible ones") {

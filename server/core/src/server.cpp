@@ -7765,6 +7765,7 @@ public:
                 // row remains, then stops for this boot. A failure is logged and
                 // non-fatal (never sets startup_failed_). It is a delete with no clock
                 // cutoff, so the clock-guarded-retention apparatus does not apply.
+                // Readiness is not gated on it either (nothing waits on this thread).
                 // Iterates kTypedInventorySources, the one list the gateway skip and
                 // the read filter also use; never a second hand-written list here.
                 typed_purge_thread_ = std::thread([this]() {
