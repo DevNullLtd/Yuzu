@@ -432,8 +432,8 @@ blob ingests and the blob is **acked**, so the agent neither resends it forever 
 stored status stays `constrained`/`parse_error`, and every hash-skip replay of the same bytes keeps
 it visibly `constrained` until the agent sends a blob that parses. A record that cannot be tied to
 a store is refused and counted, and the whole report's stores read `constrained`/`parse_error`. An
-unparseable header (the `ver|` line or a `store|` header record) still nacks the blob, as an
-unknown major version does (see "Version" below).
+unparseable header (the `ver|` line or a `store|` header record) is refused as a whole, as an
+unknown major version is (see "Version" below).
 
 ```
 ver|1
@@ -456,8 +456,12 @@ der|<sha256>|<base64>
   The same inventory therefore always produces the same bytes (hash-skip holds), and a store past
   the cut keeps its server-side rows (ingest treats `constrained` as keep-unreported, see
   [Ingest](#ingest)) instead of ageing to `not_observed`.
-- **Version.** `ver|1` is the first line. The server refuses an unknown major version with a nack,
-  so the agent keeps its last good report and does not loop. It parses a newer minor version's extra
+- **Version.** `ver|1` is the first line. The server refuses an unknown major version, an
+  unparseable header, an over-cap report and an oversized blob with a terminal acknowledgement:
+  nothing is stored, the refusal is counted (`result="rejected"`), and no `need_full` is sent, so
+  the agent does not loop on a report the server will always refuse (governance on 2a-2a measured
+  about 96 full reports a day under a nack). The agent's next changed or weekly full report is
+  parsed once the server understands it. It parses a newer minor version's extra
   fields as unknown.
 - **Unknown versus empty.** A field an older agent's record does not have reads as NULL (unknown)
   on the server. A field the agent could not determine is sent as the literal `?` and also stored
