@@ -940,7 +940,7 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   *after* the window has lapsed. `elevated_until` is cleared to the sentinel on
   that first observing call, so on a single server replica emission is exact (the
   clear is rechecked under the exclusive session lock); with several replicas a rare
-  duplicate is possible (effectively-once, ADR-2002) — a request that finds
+  duplicate is possible (effectively-once, ADR-2002). A request that finds
   the sentinel already cleared (a prior reap, or a manual
   `revoke_elevation`/`revoke_user_elevations`, which clear to the same
   sentinel) emits nothing, so a manual step-down never ALSO produces a spurious
