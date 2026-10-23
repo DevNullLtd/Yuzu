@@ -7080,7 +7080,7 @@ void RestApiV1::register_routes(
             const std::string kUniformReject =
                 "role '" + role_name + "' cannot be assigned to a human principal fleet-wide";
 
-            // Closed allow-list (rbac_assignable_roles.hpp —
+            // Closed allow-list (rbac_assignable_roles.hpp;
             // adversarial-review PR1/A2 finding: docs claimed a closed
             // 6-role set but the code previously accepted ANY existing
             // role, including a pre-existing is_system=false custom role).

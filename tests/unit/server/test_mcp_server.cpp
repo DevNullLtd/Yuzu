@@ -15924,6 +15924,8 @@ TEST_CASE("MCP execute_instruction: a caller holding only ForensicsAnalyst is re
     INFO("analyst recall body: " << ana.recall_body);
     CHECK(ana.mint_code == yuzu::server::mcp::kApprovalRequired);
     CHECK(ana.recall_status == 403);
+    // The body is this fixture's mock permission gate's 403 shape (production answers through
+    // AuthRoutes::require_permission); the evidence is the status, no dispatch and the spent ticket.
     CHECK(ana.recall_body == R"({"error":"forbidden"})");
     CHECK_FALSE(ana.dispatched);
     CHECK(ana.consumed_at != 0);

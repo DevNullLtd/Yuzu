@@ -698,9 +698,10 @@ private:
     /// are read below the Forensics tier of the plugin's own rows, so a Forensics-tier plugin keeps
     /// only a bounded failure token (`sanitize_forensics_error_detail`); an unwired plugin set
     /// cannot tell the plugins apart and sanitises every plugin's message. Any other plugin keeps
-    /// its full text. Empty when the frame carries no error. Each ingest path calls this ONCE per
-    /// response and feeds the one value to every sink; a new sink of the failure text takes it
-    /// from there, never from `resp.error().message()` directly.
+    /// its full text. Empty when the frame carries no error. Each ingest branch computes it once
+    /// per terminal response and feeds that value to the notification, the analytics event and the
+    /// webhook / offload payload; `notify_exec_tracker` applies this same function for the tracker.
+    /// A new sink of the failure text takes it from here, never from `resp.error().message()`.
     [[nodiscard]] std::string failure_text_for_sinks(const std::string& command_id,
                                                      const pb::CommandResponse& resp) const;
 
