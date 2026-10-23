@@ -3749,7 +3749,7 @@ walkthrough.
   capability. Design record: `docs/security-reviews/human-token-rotation-2026-08-10.md`
   "Open risks" (#2961, marked resolved).
 - **No-admin auditor** — `GET /api/v1/engine-principals/audit/no-admin` /
-  MCP `audit_engine_no_admin` — one shared implementation
+  MCP `audit_engine_no_admin`: one shared implementation
   (`engine_no_admin_audit.hpp`) over CHECKED reads of the grant table, the roles
   and the role permissions. It is the DETECTIVE control for a wildcard custom
   role, which assignment deliberately permits (maintainer ruling 2026-10-23,

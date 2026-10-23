@@ -308,8 +308,8 @@ until real data says otherwise.)
 - **Named PR-4.3/4.4 deliverable — auditor-runnable check, not just a
   write-path claim.** The name and built-in-role bars are enforced at the write
   path, which is a claim about code behavior an auditor cannot verify by
-  reading a policy doc. A query or report — reading every `engine:` grant
-  against resolved role permissions and listing admin/system/wildcard grants —
+  reading a policy doc. A query or report, reading every `engine:` grant
+  against resolved role permissions and listing admin/system/wildcard grants,
   must exist as an independent check, the same way the sampled-auth-log
   export independently evidences auth-surface behavior rather than asking
   an auditor to trust the login code. Since design doc decision log #15 it is also the ONLY
