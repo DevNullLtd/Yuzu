@@ -3122,7 +3122,9 @@ and the panel shows a note in place of the issued-certificate list while keeping
 the root and CRL downloads and the import form. A confined `Security:Delete` holder can still
 revoke a serial it already knows through `POST /api/v1/ca/revoke`, but cannot list serials: use
 an unconfined account, or read revoked serials from the CRL (`/api/v1/ca/crl`). The panel's
-reply to a revoke or an import is never blank for such a caller: it shows the same note. To
+reply to a revoke or an import is never blank for such a caller: it shows the panel with a note
+where the list would be, plus a confirmation banner after a success (a caller without
+`Security:Read` gets a plain note instead). To
 revoke one (e.g. a decommissioned or compromised agent):
 
 1. Find the agent's row in the inventory (match on **Subject** = `agent_id` or
@@ -5119,8 +5121,8 @@ session, which only the surface that received the request has (ADR-0010,
 design review "arch-7") — so an auditor correlating the audit log should
 expect the pair, not treat it as a double-count. `rewrap`/`rewrap_secrets`
 similarly audits `kek.rewrap` with `rows_rewrapped=<n>`; `GET
-/status`/`get_kek_status` is read-only and is not audited (matches the
-internal-CA read routes).
+/status`/`get_kek_status` is read-only and is not audited (as the CA metadata routes
+`/api/v1/ca/root` and `/api/v1/ca/crl` are not; `GET /api/v1/ca/issued` is audited).
 
 Decrypt failures are counted per store and failure class as
 `yuzu_server_secret_decrypt_failures_total{store, failure_class}` (classes:

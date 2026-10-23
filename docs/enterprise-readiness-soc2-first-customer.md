@@ -376,7 +376,7 @@ four-eyes feature is a separate, postponed decision (epic #6060).
 inventory (`GET /api/v1/ca/issued`, filtered or not, MCP `list_issued_certs`, and the list in the
 Settings certificate panel) carries every enrolled agent's subject, SAN and issuing identity. Before
 this change any `Security:Read` holder was served it, a management-group-confined one included. It is
-now withheld from a confined caller, and every call is audited as `crypto.ca.certificates.view`.
+now withheld from a confined caller, and every API and MCP call is audited as `crypto.ca.certificates.view`.
 Who is served, stated plainly so a questionnaire answer is not rounded up: with RBAC enforcement off
 (the shipped default), every `Security:Read` session, unchanged; with RBAC on, a caller with a global
 `Inventory:Read` grant or an elevated (JIT) session; a `Security:Read` holder with **no** `Inventory:Read`
@@ -384,8 +384,12 @@ grant at all (removing a scoped grant does not confine a caller); and **any call
 hits a read failure partway through**, because that check answers as for a caller with no grant
 (it fails open). Refused: a caller whose `Inventory:Read` is granted only for management groups. The
 read-failure case also affects the filtered list and the `/crypto` drill, is narrower than the prior
-behaviour, and is tracked by an issue (issue number to be added when filed). Detective control: each
-success row ends `standing=available` or `standing=refused`; review the `refused` rows. The Settings
+behaviour, and is tracked by an issue (issue number to be added when filed). Detective control, with
+its limits: on the route and the MCP tool each success row ends `standing=available` or
+`standing=refused`; review the `refused` rows. `refused` cannot separate a by-design caller with no
+`Inventory:Read` grant from a read failure inside the check, the drill's success rows carry no
+standing token, the audit row can be missing during the same outage (correlate with
+`yuzu_server_audit_emit_failed_total`), and no alert fires on the fails-open path. The Settings
 panel and the `/crypto` drill write no row for a refused confined caller. Do not state that confined
 operators cannot read the certificate inventory without these qualifications.
 

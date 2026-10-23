@@ -2347,14 +2347,17 @@ confined and is served the list (`standing=refused` in the success row): removin
 removes the confinement. With RBAC enforcement off nothing changes: every `Security:Read` session is
 served, as before.
 
-**Known gap: a read failure inside the access check fails open.** If a store behind the check
+**A read failure inside the access check fails open.** If a store behind the check
 (permissions, management groups) cannot be read partway through, the check answers as for a
 caller with no grant, so the list is **served** rather than refused with `503` (the success row
 carries `standing=refused`, the same token as the no-grant case, because the answer cannot tell
-them apart). The same holds for the filtered list below and the `/crypto` drill. It is narrower
-than the behaviour before this change, when every confined caller was served unconditionally, and
-it is tracked by an issue (issue number to be added when filed). Treat `standing=refused` success
-rows as the ones to review.
+them apart). The same holds for the filtered list below and the `/crypto` drill; the drill's
+success rows carry no standing token, so only this route and the MCP tool mark such pages. It is
+narrower than the behaviour before this change, when every confined caller was served
+unconditionally. It is tracked by an issue (issue number to be added when filed). Review
+`standing=refused` success rows, remembering that the audit row can be missing during the same
+outage (correlate with `yuzu_server_audit_emit_failed_total`) and that no alert fires on this
+path.
 
 `meta.has_more` is `true` when more rows exist beyond the current page; when it is,
 `meta.next_offset` carries the `offset` to pass for the next page. Iterate until
