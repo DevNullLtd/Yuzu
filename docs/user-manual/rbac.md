@@ -128,7 +128,11 @@ Recommended order for a fresh install:
 > existing rendering instead — a disabled "unavailable" dropdown on the
 > filter bar, "agent count unavailable (store degraded)" on the
 > create-group form, and `503` from `group-from-results` — since that
-> failure is orthogonal to agent visibility.
+> failure is orthogonal to agent visibility. Separately, when the server cannot determine
+> whether the caller may read Forensics-tier rows (#4990), `group-from-results` creates nothing and
+> answers `200` with a visible "could not be completed. Nothing was created. Retry shortly."
+> message in the form (`200` so the page can show it); the store-degraded case above still answers
+> `503`.
 >
 > **Admission on these three routes is unchanged (#1712 follow-up, tracked for
 > ADR-0017 PR-B).** Each route still gates on its own flat

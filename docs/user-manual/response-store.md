@@ -61,7 +61,7 @@ filtering and pagination.
 `app_usage`, `browser_inventory`, `execution_artifacts`, `privacy_permissions` and
 `remote_access_audit` are absent, with no marker, for any other caller, and counts and truncation
 flags cover only the rows that caller may read, so an empty result does not prove that no data
-exists. See "Forensics-tier rows" in the REST API guide.
+exists. See "Forensics-tier rows" in the REST API guide. The dashboard's create-group-from-results action reads facets through the same tier; when the server cannot determine the caller's authority it creates nothing and shows a visible "could not be completed. Nothing was created. Retry shortly." message in the form (HTTP `200`, so the page can show it), while its store-degraded case still answers `503`.
 
 **Path parameters:**
 
