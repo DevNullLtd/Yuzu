@@ -25,11 +25,11 @@
  *     set_X(member_.get())` call (the setter-call regex captures the member
  *     name from its `.get()` argument, so no separate list of members needs
  *     maintaining); and
- *   - every `member_ = std::make_unique<...>` construction.
+ *   - every `member_ = std::make_unique<...>` or `std::make_shared<...>` construction.
  * For each setter call at line L wiring member M, the rule is: some
  * construction of M exists, and the EARLIEST such construction is on a line
  * strictly before L. Every member matched by the setter regex has exactly
- * one `std::make_unique` site today (verified at the time this test was
+ * one `std::make_unique` or `std::make_shared` site today (verified at the time this test was
  * written) -- "earliest" is the chosen semantic for the day a member ever
  * gains a second construction site (e.g. a reconfigure/rebuild path).
  *
@@ -197,11 +197,11 @@ std::vector<SetterCall> extract_setter_calls(const std::string& text) {
     return out;
 }
 
-/// `member_ = std::make_unique<...>`. Returns every construction line per
-/// member (a member with more than one site keeps every line; the rule
+/// `member_ = std::make_unique<...>` or `std::make_shared<...>`. Returns every construction
+/// line per member (a member with more than one site keeps every line; the rule
 /// checked below uses the earliest).
 std::map<std::string, std::vector<int>> extract_constructions(const std::string& text) {
-    static const std::regex re(R"regex(\b(\w+_)\s*=\s*std::make_unique<)regex");
+    static const std::regex re(R"regex(\b(\w+_)\s*=\s*std::make_(?:unique|shared)<)regex");
     std::map<std::string, std::vector<int>> out;
     for (auto it = std::sregex_iterator(text.begin(), text.end(), re); it != std::sregex_iterator();
          ++it) {

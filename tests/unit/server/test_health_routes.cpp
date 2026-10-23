@@ -15,8 +15,10 @@
 ///     deny_service_scoped_fn at all — reachable with no session, matching
 ///     the pre-routing exemption that (deliberately) lives in server.cpp,
 ///     not this module.
-///   - /health, /api/health call ONLY resolve_session_fn (non-blocking) —
-///     always 200, response SHAPE differs by session presence.
+///   - /health, /api/health call ONLY resolve_session_fn (non-blocking), and only
+///     when the request carries a Cookie, Authorization or X-Yuzu-Token header;
+///     always 200, response SHAPE differs by session presence. A request with no
+///     credential header makes ZERO resolve_session_fn calls.
 ///   - /fragments/health/summary calls deny_service_scoped_fn THEN auth_fn
 ///     (blocking) — one of the two routes in this cluster that gate on a session
 ///     (with /fragments/dashboard/health).
@@ -53,11 +55,13 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <string>
 #include <utility>
@@ -105,6 +109,7 @@ struct Harness {
     std::string session_username{"alice"};
     bool auth_fn_called{false};
     bool resolve_session_fn_called{false};
+    int resolve_session_calls{0};
 
     bool deny_scoped{false};
     bool deny_scoped_fn_called{false};
@@ -146,6 +151,7 @@ struct Harness {
         deps.resolve_session_fn =
             [this](const httplib::Request&) -> std::optional<auth::Session> {
             resolve_session_fn_called = true;
+            ++resolve_session_calls;
             if (!session_present)
                 return std::nullopt;
             auth::Session s;
@@ -207,6 +213,7 @@ struct Harness {
     void reset_gate_tracking() {
         auth_fn_called = false;
         resolve_session_fn_called = false;
+        resolve_session_calls = 0;
         deny_scoped_fn_called = false;
     }
 };
@@ -698,8 +705,8 @@ TEST_CASE("health_routes: GET /health and GET /api/health are BOTH reachable "
         auto r = h.sink.Get(path);
         REQUIRE(r);
         CHECK(r->status == 200);
-        CHECK(h.resolve_session_fn_called); // non-blocking resolve DOES run
-        CHECK_FALSE(h.auth_fn_called);       // but the blocking gate never does
+        CHECK(h.resolve_session_calls == 0); // no credential header: no session lookup
+        CHECK_FALSE(h.auth_fn_called);       // and the blocking gate never runs
         CHECK_FALSE(h.deny_scoped_fn_called);
         auto body = json::parse(r->body);
         CHECK(body.contains("status"));
@@ -719,7 +726,7 @@ TEST_CASE("health_routes: GET /health with a session gets the heavier "
     Harness h;
     h.wire(); // session_present defaults true
 
-    auto r = h.sink.Get("/health");
+    auto r = h.sink.Get("/health", {{"Cookie", "yuzu_session=abc"}});
     REQUIRE(r);
     CHECK(r->status == 200);
     CHECK(h.resolve_session_fn_called);
@@ -731,6 +738,77 @@ TEST_CASE("health_routes: GET /health with a session gets the heavier "
     CHECK(body["agents"]["pending"].is_null());
     CHECK(body.contains("executions"));
     CHECK(body.contains("system"));
+}
+
+TEST_CASE("health_routes: /health and /api/health resolve a session only for a request that "
+          "carries a credential header",
+          "[server][routes][health_routes]") {
+    Harness h;
+    h.wire(); // a session WOULD resolve, so any skipped call is the guard's doing
+
+    for (const std::string& path : {std::string("/health"), std::string("/api/health")}) {
+        INFO("path: " << path);
+
+        // No credential at all: zero resolve_session_fn calls, unauthenticated body.
+        h.reset_gate_tracking();
+        auto bare = h.sink.Get(path);
+        REQUIRE(bare);
+        CHECK(bare->status == 200);
+        CHECK(h.resolve_session_calls == 0);
+        auto bare_body = json::parse(bare->body);
+        CHECK_FALSE(bare_body["agents"].contains("pending"));
+        CHECK_FALSE(bare_body.contains("executions"));
+        CHECK_FALSE(bare_body.contains("system"));
+
+        // Headers that are not credentials do not count.
+        h.reset_gate_tracking();
+        auto other = h.sink.Get(path, {{"Accept", "application/json"}, {"User-Agent", "probe"}});
+        REQUIRE(other);
+        CHECK(h.resolve_session_calls == 0);
+
+        // Each credential source resolve_session reads still resolves, exactly once, and
+        // gets the authenticated body.
+        const std::vector<std::pair<std::string, std::string>> credentials{
+            {"Cookie", "yuzu_session=abc"},
+            {"Authorization", "Bearer abc"},
+            {"X-Yuzu-Token", "abc"}};
+        for (const auto& [name, value] : credentials) {
+            INFO("header: " << name);
+            h.reset_gate_tracking();
+            auto r = h.sink.Get(path, {{name, value}});
+            REQUIRE(r);
+            CHECK(r->status == 200);
+            CHECK(h.resolve_session_calls == 1);
+            auto body = json::parse(r->body);
+            CHECK(body["agents"].contains("pending"));
+            CHECK(body.contains("executions"));
+            CHECK(body.contains("system"));
+        }
+
+        // A credential that does not resolve still yields the unauthenticated body.
+        h.session_present = false;
+        h.reset_gate_tracking();
+        auto stale = h.sink.Get(path, {{"Cookie", "yuzu_session=stale"}});
+        REQUIRE(stale);
+        CHECK(h.resolve_session_calls == 1);
+        CHECK_FALSE(json::parse(stale->body).contains("system"));
+        h.session_present = true;
+    }
+}
+
+TEST_CASE("health_routes: request_carries_credential matches the three sources resolve_session reads",
+          "[server][routes][health_routes]") {
+    httplib::Request none;
+    CHECK_FALSE(health::request_carries_credential(none));
+    for (const char* name : {"Cookie", "Authorization", "X-Yuzu-Token"}) {
+        INFO("header: " << name);
+        httplib::Request r;
+        r.set_header(name, "x");
+        CHECK(health::request_carries_credential(r));
+    }
+    httplib::Request unrelated;
+    unrelated.set_header("Accept", "*/*");
+    CHECK_FALSE(health::request_carries_credential(unrelated));
 }
 
 TEST_CASE("health_routes: /health and /api/health status flips to 'degraded' "
@@ -839,6 +917,177 @@ TEST_CASE("health_routes: /fragments/health/summary renders the WARN strip "
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Source-text pin helpers. `strip_comments` drops `//` and `/* */` comments from C++ source
+// (string, character and raw-string literals are kept verbatim, so a literal that merely
+// contains `//` is not truncated) so a pin cannot be satisfied by commented-out code. It
+// understands: ordinary strings with escapes; raw strings with an optional encoding prefix
+// (`R"`, `u8R"`, `uR"`, `UR"`, `LR"`); character literals with an optional encoding prefix
+// (`'x'`, `L'x'`, `u'x'`, `U'x'`, `u8'x'`); digit separators (`1'000`), which are not
+// character literals; and a `//` comment continued onto the next line by a trailing
+// backslash. It is a lexer for the shapes this repo uses, not a full preprocessor; the
+// self-test case below states exactly which shapes are covered.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace {
+
+bool is_ident_char(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+}
+
+// The identifier run that ends just before index `i` (empty when in[i-1] is not an
+// identifier character).
+std::string ident_run_before(const std::string& in, std::size_t i) {
+    std::size_t k = i;
+    while (k > 0 && is_ident_char(in[k - 1]))
+        --k;
+    return in.substr(k, i - k);
+}
+
+// True when the run is empty or is exactly an encoding prefix, i.e. a following `R"` or `'`
+// opens a literal rather than continuing an identifier or a number.
+bool opens_literal(const std::string& run) {
+    return run.empty() || run == "u8" || run == "u" || run == "U" || run == "L";
+}
+
+std::string strip_comments(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    std::size_t i = 0;
+    while (i < in.size()) {
+        const char c = in[i];
+        if (c == '/' && i + 1 < in.size() && in[i + 1] == '/') {
+            // Line comment; a trailing backslash (optionally before a CR) continues it.
+            while (i < in.size()) {
+                if (in[i] == '\n') {
+                    const bool continued = (i >= 1 && in[i - 1] == '\\') ||
+                                           (i >= 2 && in[i - 1] == '\r' && in[i - 2] == '\\');
+                    if (!continued)
+                        break;
+                }
+                ++i;
+            }
+        } else if (c == '/' && i + 1 < in.size() && in[i + 1] == '*') {
+            const auto end = in.find("*/", i + 2);
+            i = end == std::string::npos ? in.size() : end + 2;
+            out.push_back(' ');
+        } else if (c == 'R' && i + 1 < in.size() && in[i + 1] == '"' &&
+                   opens_literal(ident_run_before(in, i))) {
+            // Raw string: R"delim( ... )delim" (any encoding prefix is already in `out`).
+            const auto open = in.find('(', i + 2);
+            if (open == std::string::npos) {
+                out.append(in, i, std::string::npos);
+                break;
+            }
+            const std::string close = ")" + in.substr(i + 2, open - (i + 2)) + "\"";
+            const auto end = in.find(close, open + 1);
+            const auto stop = end == std::string::npos ? in.size() : end + close.size();
+            out.append(in, i, stop - i);
+            i = stop;
+        } else if (c == '"' || (c == '\'' && opens_literal(ident_run_before(in, i)))) {
+            // Ordinary string or character literal. A `'` inside an identifier or number
+            // (`1'000`) is a digit separator, not a literal.
+            std::size_t j = i + 1;
+            while (j < in.size() && in[j] != c) {
+                if (in[j] == '\\')
+                    ++j;
+                ++j;
+            }
+            const auto stop = std::min(j + 1, in.size());
+            out.append(in, i, stop - i);
+            i = stop;
+        } else {
+            out.push_back(c);
+            ++i;
+        }
+    }
+    return out;
+}
+
+std::string squeeze_ws(std::string s) {
+    std::erase_if(s, [](unsigned char c) { return std::isspace(c) != 0; });
+    return s;
+}
+
+std::string read_server_src(const char* file) {
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / file);
+    REQUIRE(in.is_open());
+    return std::string{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+} // namespace
+
+TEST_CASE("health_routes: the source-text pin lexer strips comments and keeps literals",
+          "[server][routes][health_routes]") {
+    const auto check = [](const std::string& in, const std::string& want) {
+        INFO("input: " << in);
+        CHECK(strip_comments(in) == want);
+    };
+
+    SECTION("a line comment is dropped, the newline stays") {
+        check("a; // c\nb;\n", "a; \nb;\n");
+    }
+    SECTION("// inside an ordinary string is kept; the real comment after it is dropped") {
+        check("x = \"a // b\"; // c\n", "x = \"a // b\"; \n");
+    }
+    SECTION("an escaped quote does not end a string early") {
+        check("x = \"a\\\" // b\"; // c\n", "x = \"a\\\" // b\"; \n");
+    }
+    SECTION("a block comment becomes one space; /* */ inside a string is kept") {
+        check("s = \"/* x */\" /* real */ y;", "s = \"/* x */\"   y;");
+        check("/* a // b */ c", "  c");
+    }
+    SECTION("a raw string holding quotes and // is kept whole") {
+        // Both an odd and an even number of quotes: with an odd number, reading the raw
+        // string as an ordinary one would leave a quote open and swallow the real comment
+        // boundary, so the output would differ.
+        check("auto s = R\"x(he said \"hi\" // not)x\"; // c\nint y;",
+              "auto s = R\"x(he said \"hi\" // not)x\"; \nint y;");
+        check("auto s = R\"x(a \" // not)x\"; // c\nint y;",
+              "auto s = R\"x(a \" // not)x\"; \nint y;");
+    }
+    SECTION("an encoding-prefixed raw string is a raw string") {
+        for (const char* prefix : {"u8R", "uR", "UR", "LR"}) {
+            // One quote inside: only a correct raw-string read keeps the quotes balanced.
+            const std::string in =
+                std::string("auto s = ") + prefix + "\"(a \" // z)\"; // c\nint y;";
+            const std::string want =
+                std::string("auto s = ") + prefix + "\"(a \" // z)\"; \nint y;";
+            check(in, want);
+        }
+    }
+    SECTION("an identifier ending in R is not a raw string prefix") {
+        // `fooR"` is the identifier `fooR` followed by an ordinary string; the quote inside
+        // the ordinary string's escape must not be read as a raw delimiter.
+        check("fooR\"a\\\"b\" // c\n", "fooR\"a\\\"b\" \n");
+    }
+    SECTION("digit separators are not character literals") {
+        check("int n = 1'000'000; // c\n", "int n = 1'000'000; \n");
+        check("int h = 0xFF'FF; // c\n", "int h = 0xFF'FF; \n");
+    }
+    SECTION("a character literal holding a quote does not open a string") {
+        check("char q = '\"'; // c\n", "char q = '\"'; \n");
+    }
+    SECTION("an encoding-prefixed character literal holding a quote is a literal") {
+        for (const char* prefix : {"L", "u", "U", "u8"}) {
+            const std::string in = std::string("auto q = ") + prefix + "'\"'; // c\nint y;";
+            const std::string want = std::string("auto q = ") + prefix + "'\"'; \nint y;";
+            check(in, want);
+        }
+    }
+    SECTION("a // comment continued by a trailing backslash swallows the next line") {
+        check("a // c \\\n still comment\nb\n", "a \nb\n");
+        check("a // c \\\r\n still comment\r\nb\n", "a \nb\n");
+        // A backslash that is not the last character on the line does not continue it.
+        check("a // c \\ x\nb\n", "a \nb\n");
+    }
+    SECTION("an unterminated block comment drops the rest of the input") {
+        check("a /* never closed", "a  ");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Wiring tripwire: every case above proves register_health_routes' OWN
 // handlers are correct, but nothing above reads server.cpp — a future edit
 // that drops the production `register_health_routes(...)` call at
@@ -852,23 +1101,21 @@ TEST_CASE("health_routes: /fragments/health/summary renders the WARN strip "
 TEST_CASE("health_routes: wiring -- server.cpp still calls "
           "register_health_routes and wires the plaintext probe listener",
           "[server][routes][health_routes]") {
-#ifndef YUZU_SERVER_SRC_DIR
-#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
-#endif
-    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
-    REQUIRE(in.is_open());
-    const std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-    CHECK(src.find("register_health_routes(") != std::string::npos);
+    const std::string src = read_server_src("server.cpp");
+
+    // Comments are dropped first so a needle that only survives inside a comment, such as a
+    // call that was commented out, cannot satisfy the pin. The lexer has its own self-test
+    // below.
+    const std::string code = strip_comments(src);
+    CHECK(code.find("register_health_routes(") != std::string::npos);
 
     // Compare with all whitespace removed so a clang-format re-wrap of a call site
     // can neither redden nor greenwash the tripwire.
-    const auto squeeze = [](std::string s) {
-        std::erase_if(s, [](unsigned char c) { return std::isspace(c) != 0; });
-        return s;
-    };
-    const auto flat = squeeze(src);
+    const auto squeeze = [](std::string s) { return squeeze_ws(std::move(s)); };
+    const auto flat = squeeze(code);
     const auto occurrences = [&](const std::string& needle) {
-        const auto n = squeeze(needle);
+        // A needle that spells an inline argument-name comment is compared as code too.
+        const auto n = squeeze(strip_comments(needle));
         std::size_t count = 0;
         for (auto pos = flat.find(n); pos != std::string::npos; pos = flat.find(n, pos + 1))
             ++count;
@@ -892,6 +1139,28 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
     // One closed probe set shared by the main pre-routing chokepoint.
     expect("if (yuzu::server::health::is_probe_path(req.path)) {", 1,
            "main pre-routing exempts probes through the one shared predicate");
+    // The /health + /api/health per-source budget is checked inside the probe branch, once,
+    // on the `--rate-limit` limiter, before the body cap; the general 429 body has one
+    // definition (write_rate_limited_response), not a second literal in server.cpp.
+    // The refusal must actually end the request: a call whose result is ignored, or whose
+    // `return` was dropped, would still compile and still charge the bucket.
+    expect("if (!yuzu::server::health::admit_probe_request(api_rate_limiter_, req, res)) "
+           "return httplib::Server::HandlerResponse::Handled;",
+           1, "the pre-routing probe branch applies the /health rate limit and returns Handled");
+    // The whole probe branch, contiguous: budget (refusal ends the request), then the body cap
+    // (refusal ends the request), then the exempt-from-the-rest return. Being one contiguous
+    // needle that must occur exactly once, it also fixes the order branch < budget < cap, so
+    // no separate position comparison is needed.
+    expect("if (yuzu::server::health::is_probe_path(req.path)) { "
+           "if (!yuzu::server::health::admit_probe_request(api_rate_limiter_, req, res)) "
+           "return httplib::Server::HandlerResponse::Handled; "
+           "if (enforce_pre_auth_body_cap()) "
+           "return httplib::Server::HandlerResponse::Handled; "
+           "return httplib::Server::HandlerResponse::Unhandled; }",
+           1, "the probe branch is: budget, then body cap, then Unhandled");
+    expect("rate limit exceeded", 0, "the 429 body lives only in write_rate_limited_response");
+    expect("write_rate_limited_response(res);", 1,
+           "the general limiter site uses the shared 429 writer");
     // The sink the probes register on must exist before register_health_routes is handed it:
     // deleting the construction leaves a null sink, which silently registers nothing.
     expect("redirect_sink_ = std::make_unique<HttplibRouteSink>(*redirect_server_)", 1,
@@ -990,6 +1259,208 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
     // stop() must stop the redirect listener, or its thread never returns and every shutdown
     // burns the whole 15 s bound before the force-exit.
     expect("redirect_server_->stop();", 1, "stop() stops the redirect listener");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Credential-source pin. `health::request_carries_credential` decides which /health and
+// /api/health requests resolve a session and are charged against the per-source budget; it
+// must name exactly the headers `AuthRoutes::resolve_session` reads. The behavioural case
+// above checks that the three known names count; it cannot notice a FOURTH header being
+// added to resolve_session. This case reads both sources as text (comments stripped by the
+// lexer pinned above) and compares the header names they read.
+//
+// Known limits of this pin:
+//  - It sees only header reads written directly in the bodies of resolve_session and
+//    extract_session_cookie. A header read made through a new helper function or macro is
+//    not seen, and the mirror comment inside resolve_session is the remaining guard. The
+//    req-argument check below narrows this (a new helper taking `req` fails the pin) but
+//    cannot close it (a helper reached through a captured or stored request is not seen).
+//  - A `//` comment ending with a backslash plus trailing whitespace is not treated as a
+//    line continuation by strip_comments.
+//  - function_body does not skip raw string literals when it counts braces.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace {
+
+// Body (outer braces excluded) of the one function in comment-stripped `code` whose
+// definition contains `signature`; nullopt when it is absent, ambiguous or unbalanced.
+// String and character literals are skipped while counting braces; raw strings are not
+// handled, which is fine for the small bodies this is pointed at.
+std::optional<std::string> function_body(const std::string& code, const std::string& signature) {
+    const auto at = code.find(signature);
+    if (at == std::string::npos || code.find(signature, at + 1) != std::string::npos)
+        return std::nullopt;
+    const auto open = code.find('{', at + signature.size());
+    if (open == std::string::npos)
+        return std::nullopt;
+    int depth = 0;
+    for (std::size_t i = open; i < code.size(); ++i) {
+        const char c = code[i];
+        if (c == '"' || (c == '\'' && opens_literal(ident_run_before(code, i)))) {
+            std::size_t j = i + 1;
+            while (j < code.size() && code[j] != c) {
+                if (code[j] == '\\')
+                    ++j;
+                ++j;
+            }
+            i = j;
+        } else if (c == '{') {
+            ++depth;
+        } else if (c == '}' && --depth == 0) {
+            return code.substr(open + 1, i - open - 1);
+        }
+    }
+    return std::nullopt;
+}
+
+// Lower-cased header names a function body reads through `get_header_value*(` or
+// `has_header(`. A call whose argument is not a string literal, or any direct use of the
+// header map, is reported as a marker no expected set contains, so it fails loudly.
+std::set<std::string> header_names_read(const std::string& body) {
+    std::set<std::string> names;
+    const auto lower = [](std::string v) {
+        std::transform(v.begin(), v.end(), v.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        return v;
+    };
+    for (const std::string call : {"get_header_value", "has_header"}) {
+        for (auto pos = body.find(call); pos != std::string::npos; pos = body.find(call, pos + 1)) {
+            // Skip the rest of an identifier such as get_header_value_count, then whitespace.
+            auto k = pos + call.size();
+            while (k < body.size() && is_ident_char(body[k]))
+                ++k;
+            while (k < body.size() && std::isspace(static_cast<unsigned char>(body[k])) != 0)
+                ++k;
+            if (k >= body.size() || body[k] != '(') {
+                names.insert("<unrecognised use of " + call + ">");
+                continue;
+            }
+            ++k;
+            while (k < body.size() && std::isspace(static_cast<unsigned char>(body[k])) != 0)
+                ++k;
+            const auto close = k < body.size() && body[k] == '"' ? body.find('"', k + 1)
+                                                                 : std::string::npos;
+            if (close == std::string::npos)
+                names.insert("<non-literal argument to " + call + ">");
+            else
+                names.insert(lower(body.substr(k + 1, close - k - 1)));
+        }
+    }
+    for (const char* raw : {".headers", "get_header_map"}) {
+        if (body.find(raw) != std::string::npos)
+            names.insert(std::string("<direct use of ") + raw + ">");
+    }
+    return names;
+}
+
+// Names of the functions a body passes the request `req` to as an argument: for each use of
+// the identifier `req` that is not a member access (`req.`), the identifier before the
+// nearest unmatched '(' to its left. A use with no enclosing call is reported as
+// "<not a call argument>" so it fails loudly.
+std::set<std::string> req_argument_callees(const std::string& body) {
+    std::set<std::string> callees;
+    for (auto pos = body.find("req"); pos != std::string::npos; pos = body.find("req", pos + 1)) {
+        const bool starts_ident = pos == 0 || !is_ident_char(body[pos - 1]);
+        const auto end = pos + 3;
+        if (!starts_ident || (end < body.size() && is_ident_char(body[end])))
+            continue;
+        auto after = end;
+        while (after < body.size() && std::isspace(static_cast<unsigned char>(body[after])) != 0)
+            ++after;
+        if (after < body.size() && body[after] == '.')
+            continue; // member access: header_names_read covers the header reads
+        int depth = 0;
+        std::size_t open = std::string::npos;
+        for (std::size_t i = pos; i > 0; --i) {
+            const char c = body[i - 1];
+            if (c == ')') {
+                ++depth;
+            } else if (c == '(' && depth-- == 0) {
+                open = i - 1;
+                break;
+            }
+        }
+        if (open == std::string::npos) {
+            callees.insert("<not a call argument>");
+            continue;
+        }
+        auto name_end = open;
+        while (name_end > 0 && std::isspace(static_cast<unsigned char>(body[name_end - 1])) != 0)
+            --name_end;
+        auto name_begin = name_end;
+        while (name_begin > 0 && is_ident_char(body[name_begin - 1]))
+            --name_begin;
+        callees.insert(body.substr(name_begin, name_end - name_begin));
+    }
+    return callees;
+}
+
+std::string join_names(const std::set<std::string>& names) {
+    std::string out;
+    for (const auto& n : names)
+        out += (out.empty() ? "" : ", ") + n;
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("health_routes: resolve_session and request_carries_credential read the same credential "
+          "headers",
+          "[server][routes][health_routes]") {
+    const std::set<std::string> expected{"cookie", "authorization", "x-yuzu-token"};
+    const std::string how_to_fix =
+        "Update BOTH AuthRoutes::resolve_session (auth_routes.cpp) and "
+        "health::request_carries_credential (health_routes.hpp), then this test's expected set.";
+
+    const auto auth_code = strip_comments(read_server_src("auth_routes.cpp"));
+    // The credential walk lives in `resolve_session_unbound`; `resolve_session` wraps it with the
+    // per-request principal binding (pinned below).
+    const auto resolve = function_body(
+        auth_code, "AuthRoutes::resolve_session_unbound(const httplib::Request& req)");
+    REQUIRE(resolve.has_value()); // signature moved or renamed: re-point this pin
+    const auto wrapper = function_body(
+        auth_code, "AuthRoutes::resolve_session(const httplib::Request& req)");
+    REQUIRE(wrapper.has_value());
+    const auto cookie_fn = function_body(
+        auth_code, "AuthRoutes::extract_session_cookie(const httplib::Request& req)");
+    REQUIRE(cookie_fn.has_value());
+    const auto health_code = strip_comments(read_server_src("health_routes.hpp"));
+    const auto probe_fn = function_body(
+        health_code, "request_carries_credential(const httplib::Request& req)");
+    REQUIRE(probe_fn.has_value());
+
+    // resolve_session reads the cookie only through extract_session_cookie, which itself
+    // must read nothing but the Cookie header.
+    CHECK(resolve->find("extract_session_cookie(") != std::string::npos);
+    const auto cookie_reads = header_names_read(*cookie_fn);
+    INFO("extract_session_cookie reads: " << join_names(cookie_reads) << ". " << how_to_fix);
+    CHECK(cookie_reads == std::set<std::string>{"cookie"});
+
+    auto resolve_reads = header_names_read(*resolve);
+    resolve_reads.insert("cookie"); // via extract_session_cookie, checked above
+    INFO("resolve_session reads: " << join_names(resolve_reads) << ". " << how_to_fix);
+    CHECK(resolve_reads == expected);
+
+    // A helper that takes the request could read a header this pin cannot see. The only
+    // functions resolve_session may hand `req` to: extract_session_cookie (checked above) and
+    // audit_log_for_principal (builds an audit row; reads User-Agent and, through
+    // extract_session_cookie, the session cookie, and no other credential header).
+    const std::set<std::string> req_callees_allowed{"extract_session_cookie",
+                                                    "audit_log_for_principal"};
+    const auto req_callees = req_argument_callees(*resolve);
+    INFO("resolve_session passes req to: " << join_names(req_callees) << ". " << how_to_fix);
+    for (const auto& callee : req_callees)
+        CHECK(req_callees_allowed.count(callee) == 1);
+
+    const auto probe_reads = header_names_read(*probe_fn);
+    INFO("request_carries_credential names: " << join_names(probe_reads) << ". " << how_to_fix);
+    CHECK(probe_reads == expected);
+
+    // The wrapper reads no credential itself: it walks via `resolve_session_unbound` and applies
+    // the per-request binding to whatever that returns, so no path of the walk can skip it.
+    CHECK(header_names_read(*wrapper).empty());
+    const std::set<std::string> wrapper_callees{"resolve_session_unbound",
+                                                "step_up_binding_admits"};
+    CHECK(req_argument_callees(*wrapper) == wrapper_callees);
 }
 
 // ---------------------------------------------------------------------------
@@ -1127,10 +1598,15 @@ TEST_CASE("health_routes: /fragments/dashboard/health without a session writes 4
 
 TEST_CASE("health_routes: /fragments/dashboard/health renders real rows, executions row only when unscoped",
           "[server][routes][health_routes][home]") {
+    // Every section sends the credential a real panel request carries (the in-process health
+    // document only includes `executions` for a request that resolves a session), so an
+    // omission below is the panel's own gate decision and not an artefact of a bare request.
+    const std::unordered_map<std::string, std::string> kPanelCredential{
+        {"Cookie", "yuzu_session=abc"}};
     SECTION("unbound fleet gate omits the executions row") {
         Harness h;
         h.wire();
-        auto r = h.sink.dispatch("GET", "/fragments/dashboard/health");
+        auto r = h.sink.Get("/fragments/dashboard/health", kPanelCredential);
         REQUIRE(r);
         CHECK(r->status == 200);
         CHECK(r->body.find("id=\"dash-health\"") != std::string::npos);
@@ -1142,7 +1618,7 @@ TEST_CASE("health_routes: /fragments/dashboard/health renders real rows, executi
         Harness h;
         h.fleet_wired = true;
         h.wire();
-        auto r = h.sink.dispatch("GET", "/fragments/dashboard/health");
+        auto r = h.sink.Get("/fragments/dashboard/health", kPanelCredential);
         REQUIRE(r);
         CHECK(r->body.find("Executions running") != std::string::npos);
         REQUIRE(h.fleet_calls.size() == 1);
@@ -1153,8 +1629,9 @@ TEST_CASE("health_routes: /fragments/dashboard/health renders real rows, executi
         h.fleet_wired = true;
         h.fleet_scoped = true;
         h.wire();
-        auto r = h.sink.dispatch("GET", "/fragments/dashboard/health");
+        auto r = h.sink.Get("/fragments/dashboard/health", kPanelCredential);
         REQUIRE(r);
+        REQUIRE(h.fleet_calls.size() == 1); // the gate was consulted and its scope decided
         CHECK(r->body.find("Executions running") == std::string::npos);
         CHECK(r->body.find("Agents connected to this server") != std::string::npos);
     }
@@ -1163,8 +1640,9 @@ TEST_CASE("health_routes: /fragments/dashboard/health renders real rows, executi
         h.fleet_wired = true;
         h.fleet_admit = false;
         h.wire();
-        auto r = h.sink.dispatch("GET", "/fragments/dashboard/health");
+        auto r = h.sink.Get("/fragments/dashboard/health", kPanelCredential);
         REQUIRE(r);
+        REQUIRE(h.fleet_calls.size() == 1); // the gate was consulted and refused
         CHECK(r->body.find("Executions running") == std::string::npos);
     }
 }
@@ -1174,7 +1652,9 @@ TEST_CASE("health_routes: /fragments/dashboard/health never renders system, tls 
     Harness h;
     h.fleet_wired = true;
     h.wire();
-    auto r = h.sink.dispatch("GET", "/fragments/dashboard/health");
+    // With a credential the in-process health document does carry those fields, so their
+    // absence from the panel is the panel's own filtering.
+    auto r = h.sink.Get("/fragments/dashboard/health", {{"Cookie", "yuzu_session=abc"}});
     REQUIRE(r);
     for (const char* banned : {"cpu_percent", "rss", "tls", "pending", "command_queue_depth"})
         CHECK(r->body.find(banned) == std::string::npos);
@@ -1192,8 +1672,10 @@ TEST_CASE("health_routes: /fragments/dashboard/health agrees with /api/health on
         Harness h;
         h.pg_probe = probe;
         h.wire();
-        auto doc = h.sink.dispatch("GET", "/api/health");
-        auto panel = h.sink.dispatch("GET", "/fragments/dashboard/health");
+        const std::unordered_map<std::string, std::string> credential{
+            {"Cookie", "yuzu_session=abc"}};
+        auto doc = h.sink.Get("/api/health", credential);
+        auto panel = h.sink.Get("/fragments/dashboard/health", credential);
         REQUIRE(doc);
         REQUIRE(panel);
         const std::string status = json::parse(doc->body)["status"].get<std::string>();
@@ -1201,6 +1683,173 @@ TEST_CASE("health_routes: /fragments/dashboard/health agrees with /api/health on
         const bool degraded_pill = panel->body.find(">Degraded<") != std::string::npos;
         CHECK(healthy_pill == (status == "healthy"));
         CHECK(degraded_pill == (status != "healthy"));
+    }
+}
+
+// ── The per-source rate limit on /health and /api/health ───────────────────
+//
+// Timing note: RateLimiter refills continuously (`rate` tokens per second) and has no
+// injectable clock. Every test below that expects a refusal uses a limiter built with a rate
+// of 1, so a refusal can only turn into an admission if the thread is descheduled for more
+// than a full second between two adjacent calls; a larger rate would shrink that margin to
+// `1/rate` seconds.
+
+namespace {
+httplib::Request probe_request(const char* path, const char* addr = "10.0.0.7",
+                               bool credential = true) {
+    httplib::Request r;
+    r.method = "GET";
+    r.path = path;
+    r.remote_addr = addr;
+    if (credential)
+        r.set_header("Cookie", "yuzu_session=probe");
+    return r;
+}
+} // namespace
+
+TEST_CASE("health_routes: a credentialed request over the budget on /health is refused with the "
+          "standard 429",
+          "[server][routes][health_routes][ratelimit]") {
+    RateLimiter limiter(1);
+    for (const char* path : {"/health", "/api/health"}) {
+        INFO("path: " << path);
+        const auto addr = std::string("10.1.0.") + (path[1] == 'h' ? "1" : "2");
+        int admitted = 0;
+        httplib::Response last;
+        for (int i = 0; i < 8; ++i) {
+            httplib::Response res;
+            if (health::admit_probe_request(limiter, probe_request(path, addr.c_str()), res))
+                ++admitted;
+            else
+                last = std::move(res);
+        }
+        CHECK(admitted == 1);
+        // The refusal is the exact response the general limiter sends.
+        CHECK(last.status == 429);
+        CHECK(last.get_header_value("Content-Type").find("application/json") !=
+              std::string::npos);
+        CHECK(last.get_header_value("Retry-After") == "1");
+        const auto body = json::parse(last.body);
+        CHECK(body["error"]["code"] == 429);
+        CHECK(body["error"]["message"] == "rate limit exceeded");
+        CHECK(body["meta"]["api_version"] == "v1");
+        // The full A4 envelope: the body's correlation_id is the X-Correlation-Id header.
+        const auto cid = last.get_header_value("X-Correlation-Id");
+        CHECK_FALSE(cid.empty());
+        REQUIRE(body["error"].contains("correlation_id"));
+        CHECK(body["error"]["correlation_id"] == cid);
+        REQUIRE(body["error"].contains("retry_after_ms"));
+        CHECK(body["error"]["retry_after_ms"] == 1000);
+    }
+}
+
+TEST_CASE("health_routes: write_rate_limited_response keeps a correlation id an earlier gate set",
+          "[server][routes][health_routes][ratelimit]") {
+    httplib::Response res;
+    res.set_header("X-Correlation-Id", "req-upstream-1");
+    write_rate_limited_response(res);
+    CHECK(res.status == 429);
+    CHECK(res.get_header_value("X-Correlation-Id") == "req-upstream-1");
+    CHECK(json::parse(res.body)["error"]["correlation_id"] == "req-upstream-1");
+
+    // Two refusals that mint their own ids do not share one.
+    httplib::Response a;
+    httplib::Response b;
+    write_rate_limited_response(a);
+    write_rate_limited_response(b);
+    CHECK(a.get_header_value("X-Correlation-Id") != b.get_header_value("X-Correlation-Id"));
+}
+
+TEST_CASE("health_routes: a request with no credential header is never charged against the "
+          "probe budget",
+          "[server][routes][health_routes][ratelimit]") {
+    RateLimiter limiter(1);
+    for (const char* path : {"/health", "/api/health"}) {
+        INFO("path: " << path);
+        for (int i = 0; i < 1000; ++i) {
+            httplib::Response res;
+            REQUIRE(health::admit_probe_request(
+                limiter, probe_request(path, "10.3.0.1", /*credential=*/false), res));
+            REQUIRE(res.status == -1); // untouched: no 429, nothing written
+        }
+    }
+    // No bucket was created for the source either: a credential-less caller costs no state.
+    CHECK(limiter.bucket_count() == 0);
+
+    // The same source with a credential IS charged, and its credential-less polling stays
+    // unaffected once that bucket is spent.
+    httplib::Response first;
+    CHECK(health::admit_probe_request(limiter, probe_request("/health", "10.3.0.1"), first));
+    httplib::Response second;
+    CHECK_FALSE(health::admit_probe_request(limiter, probe_request("/health", "10.3.0.1"), second));
+    CHECK(limiter.bucket_count() == 1);
+    httplib::Response bare;
+    CHECK(health::admit_probe_request(
+        limiter, probe_request("/health", "10.3.0.1", /*credential=*/false), bare));
+}
+
+TEST_CASE("health_routes: each credential source counts as a credential for the probe budget",
+          "[server][routes][health_routes][ratelimit]") {
+    for (const char* name : {"Cookie", "Authorization", "X-Yuzu-Token"}) {
+        INFO("header: " << name);
+        RateLimiter limiter(1);
+        auto req = probe_request("/health", "10.3.1.1", /*credential=*/false);
+        req.set_header(name, "x");
+        httplib::Response first;
+        CHECK(health::admit_probe_request(limiter, req, first));
+        httplib::Response second;
+        CHECK_FALSE(health::admit_probe_request(limiter, req, second));
+        CHECK(second.status == 429);
+    }
+}
+
+TEST_CASE("health_routes: /livez and /readyz are never charged against the probe budget",
+          "[server][routes][health_routes][ratelimit]") {
+    RateLimiter limiter(1);
+    for (int i = 0; i < 50; ++i) {
+        for (const char* path : {"/livez", "/readyz"}) {
+            httplib::Response res;
+            CHECK(health::admit_probe_request(limiter, probe_request(path), res));
+            CHECK(res.status == -1); // untouched
+        }
+    }
+    CHECK(limiter.bucket_count() == 0);
+}
+
+TEST_CASE("health_routes: the probe budget is a bucket of its own, per source",
+          "[server][routes][health_routes][ratelimit]") {
+    RateLimiter limiter(1);
+    // Drain one source's probe bucket.
+    httplib::Response drain;
+    REQUIRE(health::admit_probe_request(limiter, probe_request("/health", "10.2.0.1"), drain));
+    httplib::Response refused;
+    CHECK_FALSE(health::admit_probe_request(limiter, probe_request("/health", "10.2.0.1"), refused));
+    // /health and /api/health share the one probe bucket for a source.
+    httplib::Response alias;
+    CHECK_FALSE(
+        health::admit_probe_request(limiter, probe_request("/api/health", "10.2.0.1"), alias));
+    // The same source's ordinary API budget is untouched by it.
+    CHECK(limiter.allow("10.2.0.1"));
+    // Another source is unaffected.
+    httplib::Response other;
+    CHECK(health::admit_probe_request(limiter, probe_request("/health", "10.2.0.2"), other));
+    // Draining a source's API bucket does not refuse its probe.
+    REQUIRE(limiter.allow("10.2.0.3"));
+    CHECK_FALSE(limiter.allow("10.2.0.3"));
+    httplib::Response probe;
+    CHECK(health::admit_probe_request(limiter, probe_request("/health", "10.2.0.3"), probe));
+}
+
+TEST_CASE("health_routes: a normal credentialed probe cadence is never limited at the default "
+          "--rate-limit",
+          "[server][routes][health_routes][ratelimit]") {
+    // The limiter is built from the default `--rate-limit` (100/s per source). A fleet of load
+    // balancers behind one NAT address probing every second is tens of requests per second.
+    RateLimiter limiter(Config{}.rate_limit);
+    CHECK(Config{}.rate_limit == 100);
+    for (int i = 0; i < 60; ++i) {
+        httplib::Response res;
+        CHECK(health::admit_probe_request(limiter, probe_request("/health", "192.0.2.10"), res));
     }
 }
 
@@ -1287,7 +1936,7 @@ TEST_CASE("health_routes: plaintext /health never resolves a session - even with
     }
 
     // The main sink on the same harness still shows the authenticated-only fields.
-    auto main_r = h.sink.Get("/health");
+    auto main_r = h.sink.Get("/health", {{"Cookie", "yuzu_session=abc"}});
     REQUIRE(main_r);
     auto main_body = json::parse(main_r->body);
     CHECK(main_body.contains("executions"));

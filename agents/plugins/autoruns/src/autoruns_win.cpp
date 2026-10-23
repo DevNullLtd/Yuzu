@@ -146,17 +146,6 @@ std::optional<std::string> win_machine_env_var(std::string_view name) {
     return yuzu::win::from_wide(buf.c_str(), static_cast<int>(len2));
 }
 
-std::string_view hive_status_token(yuzu::win::HiveAccessStatus st) {
-    switch (st) {
-    case yuzu::win::HiveAccessStatus::ok:                return "ok";
-    case yuzu::win::HiveAccessStatus::not_found:         return "not_found";
-    case yuzu::win::HiveAccessStatus::privilege_missing: return "privilege_missing";
-    case yuzu::win::HiveAccessStatus::mount_failed:      return "mount_failed";
-    case yuzu::win::HiveAccessStatus::file_refused:      return "file_refused";
-    }
-    return "not_found";
-}
-
 /// True when `status` (an LSTATUS from RegOpenKeyExW) reflects a
 /// genuinely-absent key -- several of this leg's keys are legitimately
 /// absent on a given host (RunOnceEx unused, no per-app IFEO override
@@ -1321,12 +1310,13 @@ int collect_windows(yuzu::CommandContext& ctx, std::string_view filter) {
                     &report);
 
                 for (const auto& line : yuzu::profiles::render_hive_access_lines(
-                         status, report.unload_failed, report.mount_name, profile.sid))
+                         status, report.unload_failed, report.mount_name, profile.sid,
+                         report.refusal))
                     ctx.write_output(line); // unload_failed warnings surfaced, never dropped
 
                 if (status != yuzu::win::HiveAccessStatus::ok) {
                     const std::string token =
-                        profile.sid + ":" + std::string{hive_status_token(status)};
+                        profile.sid + ":" + yuzu::profiles::hive_access_token(status, report.refusal);
                     if (want(filter, SourceId::win_run_hku)) note_constraint(run_hku, token);
                     if (want(filter, SourceId::win_runonce_hku))
                         note_constraint(runonce_hku, token);

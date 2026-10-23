@@ -36440,6 +36440,88 @@ TEST_CASE("MCP async result-set producers: an unwired caller_fn is an audited "
     CHECK_FALSE(dispatched); // THE assertion: nothing was ever dispatched
 }
 
+TEST_CASE("MCP create_result_set_from_instruction_result: a column matcher is bound to the "
+          "declared columns and caller-supplied server-authored keys are refused",
+          "[pg][mcp][integration][result-sets]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore instr(instr_pool);
+    REQUIRE(instr.is_open());
+    std::string instruction_id;
+    {
+        yuzu::server::InstructionDefinition def;
+        def.name = "Certificates list";
+        def.version = "1.0";
+        def.plugin = "certificates";
+        def.action = "list";
+        def.type = "question";
+        def.description = "test";
+        def.result_schema =
+            R"([{"name":"subject","type":"string"},{"name":"issuer","type":"string"}])";
+        def.enabled = true;
+        auto created = instr.create_definition(def);
+        REQUIRE(created.has_value());
+        instruction_id = *created;
+    }
+    int dispatches = 0;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&,
+                        const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        ++dispatches;
+        return {.sent = 1, .command_id = "cmd-bind-" + std::to_string(dispatches)};
+    };
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.instruction_store_for_test = &instr;
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto call = [&](const std::string& matcher) {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_instruction_result","arguments":{"instruction_id":")" +
+            instruction_id + R"(","matcher":)" + matcher + "}}}");
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    auto stored_matchers = [&] {
+        std::vector<nlohmann::json> out;
+        auto rows = rs_bundle.get()->list_by_owner_checked("test-user", "", 50);
+        REQUIRE(rows.has_value());
+        for (const auto& r : rows->sets)
+            out.push_back(nlohmann::json::parse(r.matcher));
+        return out;
+    };
+
+    auto body = call(R"({"column":"issuer","op":"contains","value":"eMudhra"})");
+    REQUIRE_FALSE(body.contains("error"));
+    auto m = stored_matchers();
+    REQUIRE(m.size() == 1);
+    CHECK(m[0]["declared_columns"] == nlohmann::json::array({"subject", "issuer"}));
+    CHECK(m[0]["plugin"] == "certificates");
+
+    body = call(R"({"column":"nope","op":"exists"})");
+    REQUIRE_FALSE(body.contains("error"));
+    m = stored_matchers();
+    REQUIRE(m.size() == 2);
+    int unbound = 0;
+    for (const auto& x : m)
+        if (!x.contains("declared_columns") && !x.contains("plugin"))
+            ++unbound;
+    CHECK(unbound == 1);
+
+    const int before = dispatches;
+    for (const auto& bad : {R"({"column":"issuer","op":"exists","declared_columns":["issuer"]})",
+                            R"({"column":"issuer","op":"exists","plugin":"x"})"}) {
+        body = call(bad);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+    }
+    CHECK(dispatches == before);
+}
+
 TEST_CASE("MCP result-sets: the 3 async producers derive the caller's confined exec_visible "
           "and thread it into dispatch_fn — the #1788 chokepoint, not a looser provider",
           "[mcp][integration][result-sets][scope]") {

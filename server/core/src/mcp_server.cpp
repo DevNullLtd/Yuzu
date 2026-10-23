@@ -14782,9 +14782,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (args.contains("params") && args["params"].is_object())
                     for (auto& [k, v] : args["params"].items())
                         params[k] = v.is_string() ? v.get<std::string>() : v.dump();
-                std::string matcher = (args.contains("matcher") && args["matcher"].is_object())
-                                          ? args["matcher"].dump()
-                                          : std::string();
+                std::string matcher;
+                if (args.contains("matcher") && args["matcher"].is_object()) {
+                    auto bound = args["matcher"];
+                    yuzu::server::rs_matcher::bind_declared_columns(bound, def.result_schema,
+                                                                    def.plugin);
+                    matcher = bound.dump();
+                }
                 // source_payload — design §3.2 instruction_result shape.
                 nlohmann::json payload;
                 payload["instruction_id"] = instruction_id;

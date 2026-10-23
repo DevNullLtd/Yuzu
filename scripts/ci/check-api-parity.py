@@ -39,7 +39,10 @@ WHAT IT CHECKS
      scripts/ci/api-parity/<domain>.json ledger file, keyed by (method,
      canonical path - see `canonicalize()`).
   1b. A ledger row keyed on a route that is not a registered fragment/
-     legacy route is either status "retire" (stale), OR - the ONE other
+     legacy route is either status "retire" (the route is gone, OR it is still
+     registered but no twin will be built and a tracking issue named in the
+     ADR-1005 entry owns its removal; this check does NOT require absence),
+     OR - the ONE other
      legal shape (#5342) - a registered `/api/v1/*` route ledgered with an
      `exception:` status: a REST v1 capability that deliberately has NO MCP
      twin (ADR-1005 requires one by default, so the reviewed reason is
@@ -370,7 +373,8 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # #5955: the maintainer accepted the UI-only fragment rows of the Dashboard, Integrations webhooks,
 # General and Access pages (PRs #5859, #5872, #5873, #5880) on 2026-10-15 as TEMPORARY exceptions,
 # not a general waiver (a new UI-only capability needs its own ruling); those 13 rows now carry
-# `exception:#5955 revisit:...`. Rows with exactly one machine twin are no longer plain `twinned`:
+# `exception:#5955 revisit:...`
+# (10 more were recorded by the ADR-1005 2026-10-22 entry, 23 in all). Rows with exactly one machine twin are no longer plain `twinned`:
 # they carry `twinned-rest-only` / `twinned-mcp-only` (or, for the deliberate #520 no-MCP
 # decisions, `exception:#520 revisit:...`), which count untwinned. 11 rows were reclassified that
 # way, so 216 -> 227, with no change in capability; a 12th (settings developer plugins) is
@@ -390,14 +394,19 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # /crypto (crypto.json): the dashboard and widget fragments compose several /api/v1/crypto reads,
 # but `composed-of:` can name only ledger capability ids and /api/v1 routes are not ledger rows,
 # so each row stays `twinned` against its primary v1 read + MCP tool; the count does not move.
-BASELINE_UNTWINNED = 225
+#
+# 225 -> 214 (ledger reconcile, ADR-1005 2026-10-22 entry): 11 stale rows flipped to `twinned` (both twins
+# already existed). The other 76 reclassified rows (exception, retire, composed-of) stay untwinned by design,
+# so only the flips move this number; they left the generic placeholder (see BASELINE_GENERIC_PLANNED).
+BASELINE_UNTWINNED = 214
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
 # issue. Bidirectional like BASELINE_UNTWINNED: lower it in the same change that removes rows.
+# 174 -> 87 (ledger reconcile, ADR-1005 2026-10-22 entry): 87 rows moved to twinned, exception, retire or composed-of.
 GENERIC_PLANNED_STATUS = "planned:#2146"
 GENERIC_PLANNED_ISSUE = 2146
-BASELINE_GENERIC_PLANNED = 174
+BASELINE_GENERIC_PLANNED = 87
 
 # A revisit date outside this window is a typo (9999-12-31), a shape error. A date at or before
 # today + REVISIT_WARN_DAYS only produces ONE aggregated warning, never a failure.
@@ -446,6 +455,56 @@ STRICT_EXCEPTION_PINS = {
     # #6061: approve/reject is a human-session act, MCP approve_request/reject_request permanently refuse (ADR-1005 exception entry).
     "post.api-approvals-param-approve": (6061, "2027-01-18"),
     "post.api-approvals-param-reject": (6061, "2027-01-18"),
+    # #5955: further temporary owner-accepted UI-only rows, recorded by the ADR-1005 2026-10-22 entry (it extends the 2026-10-15 waiver, including two POST rows).
+    "get.api-chargen-status": (5955, "2026-11-30"),
+    "get.api-help-autocomplete": (5955, "2026-11-30"),
+    "get.api-help-palette": (5955, "2026-11-30"),
+    "get.api-procfetch-status": (5955, "2026-11-30"),
+    "get.fragments-device-live": (5955, "2026-11-30"),
+    "get.fragments-dex-device-perf-result": (5955, "2026-11-30"),
+    "get.fragments-dex-device-procperf-result": (5955, "2026-11-30"),
+    "get.fragments-results-filter-bar": (5955, "2026-11-30"),
+    "post.api-export-json-to-csv": (5955, "2026-11-30"),
+    "post.fragments-instructions-yaml-preview": (5955, "2026-11-30"),
+    # #4099: NVD routes grandfathered by ADR-1005 (surface 2; the re-home is tracked by #4099, Phase 7, not started); ADR-1005 2026-10-22 entry.
+    "get.api-nvd-status": (4099, "2027-03-31"),
+    "post.api-nvd-match": (4099, "2027-03-31"),
+    "post.api-nvd-sync": (4099, "2027-03-31"),
+    # #6325: legacy admin-plane rows whose REST v1 twin is deferred to the 2027-Q1 re-home (no MCP twin is built); ADR-1005 2026-10-22 entry, which dates the four fragment rows itself.
+    "delete.api-settings-auto-approve-param": (6325, "2027-03-31"),
+    "delete.api-settings-enrollment-tokens-param": (6325, "2027-03-31"),
+    "delete.api-settings-pending-agents-param": (6325, "2027-03-31"),
+    "delete.api-settings-updates-param-param-param": (6325, "2027-03-31"),
+    "get.fragments-settings-dex-alerts": (6325, "2027-03-31"),
+    "get.fragments-settings-mfa": (6325, "2027-03-31"),
+    "get.fragments-settings-tokens": (6325, "2027-03-31"),
+    "get.fragments-settings-updates": (6325, "2027-03-31"),
+    "post.api-settings-auto-approve": (6325, "2027-03-31"),
+    "post.api-settings-auto-approve-mode": (6325, "2027-03-31"),
+    "post.api-settings-auto-approve-param-toggle": (6325, "2027-03-31"),
+    "post.api-settings-cert-paste": (6325, "2027-03-31"),
+    "post.api-settings-dex-alerts-blast": (6325, "2027-03-31"),
+    "post.api-settings-dex-alerts-cohort-export": (6325, "2027-03-31"),
+    "post.api-settings-dex-alerts-routing": (6325, "2027-03-31"),
+    "post.api-settings-enrollment-tokens": (6325, "2027-03-31"),
+    "post.api-settings-enrollment-tokens-batch": (6325, "2027-03-31"),
+    "post.api-settings-mcp": (6325, "2027-03-31"),
+    "post.api-settings-mfa-disable": (6325, "2027-03-31"),
+    "post.api-settings-mfa-init": (6325, "2027-03-31"),
+    "post.api-settings-mfa-recovery-codes": (6325, "2027-03-31"),
+    "post.api-settings-mfa-verify": (6325, "2027-03-31"),
+    "post.api-settings-oidc": (6325, "2027-03-31"),
+    "post.api-settings-oidc-test": (6325, "2027-03-31"),
+    "post.api-settings-pending-agents-bulk-approve": (6325, "2027-03-31"),
+    "post.api-settings-pending-agents-bulk-deny": (6325, "2027-03-31"),
+    "post.api-settings-pending-agents-param-approve": (6325, "2027-03-31"),
+    "post.api-settings-pending-agents-param-deny": (6325, "2027-03-31"),
+    "post.api-settings-plugin-signing-clear": (6325, "2027-03-31"),
+    "post.api-settings-plugin-signing-require": (6325, "2027-03-31"),
+    "post.api-settings-plugin-signing-upload": (6325, "2027-03-31"),
+    "post.api-settings-updates-param-param-param-rollout": (6325, "2027-03-31"),
+    "post.api-settings-updates-upload": (6325, "2027-03-31"),
+    "post.api-settings-users": (6325, "2027-03-31"),
 }
 
 # `exception:` rows must read `exception:#<issue> revisit:<YYYY-MM-DD> <reason>`. The rows named

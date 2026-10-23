@@ -439,6 +439,14 @@ struct AnnounceResult {
     /// the in-memory registry), never merely logged as a desync. Mutually
     /// exclusive with `matched` (a violation never also matches).
     bool cluster_affinity_violation{false};
+    /// #5683: true iff the fallback INSERT was refused because ANOTHER agent's
+    /// row already holds `session_id` (the unique index). Like
+    /// `cluster_affinity_violation` this is a fail-closed refusal the caller
+    /// must not publish anywhere, never a benign `matched == false` desync.
+    /// Both flags can be true only in a delete race (the affinity read saw a
+    /// row that the fallback insert then found gone); callers act on
+    /// `cluster_affinity_violation` FIRST, and both arms unpublish.
+    bool session_held_by_other_agent{false};
 };
 
 /// Outcome of `reclaim_tombstoned_session`; a degraded store is the error channel.
@@ -719,9 +727,11 @@ public:
     /// SAME id also lands here, because the guard needs `session_id IS NULL`);
     /// `held_by_other_agent` iff another agent's row already carries
     /// `session_id` (a forged or colliding id). For either refusal the caller
-    /// MUST NOT install anything. The cross-agent guard is a same-statement
-    /// NOT EXISTS and is best-effort: `session_id` has no UNIQUE index, so two
-    /// concurrent reclaims of one unheld id under READ COMMITTED can both win.
+    /// MUST NOT install anything. The same-statement NOT EXISTS is only the fast
+    /// path; two concurrent reclaims of one unheld id are arbitrated by the
+    /// UNIQUE partial index `ux_agent_routes_session_id` (migration v5, #5683):
+    /// the loser's write fails 23505 on that index and is reported as
+    /// `held_by_other_agent`.
     ///
     /// Deliberately does NOT mint a fresh `connection_epoch` (unlike
     /// `register_fresh`): this is not a new connection racing for the row,
@@ -778,19 +788,18 @@ public:
     /// bytes are dropped before the query (returned as absent; the caller
     /// counts them malformed) and duplicate ids are collapsed, so a repeat can
     /// never come back twice. The rest are read in ceil(n/1024) statements
-    /// (`session_id = ANY($1)`, served by `agent_routes_session_id_idx`, each
+    /// (`session_id = ANY($1)`, served by `ux_agent_routes_session_id`, each
     /// `ORDER BY agent_id`) on ONE lease: `kHotReadTimeout` (500 ms) bounds
     /// only the lease ACQUISITION, each statement is bounded by the pool's
     /// `statement_timeout`, and there is no aggregate deadline.
     /// `RoutableRoute::route.session_id` is the matched id and
     /// `route.agent_id` the owning agent; `routable` is computed IN-SQL on the
     /// DB clock exactly as in `lookup_routes`. A session with no row is simply
-    /// absent. **`session_id` is NOT unique** (`register_fresh` guards only
-    /// the caller's own row and `reclaim_tombstoned_session`'s cross-agent
-    /// guard is best-effort), so one id can legitimately come back on SEVERAL
-    /// rows — the CALLER must treat more than one row per id as ambiguous and
-    /// refuse to resolve it; this method deliberately returns every match
-    /// rather than picking one. Use `lookup_route(agent_id)` (PK, unambiguous)
+    /// absent. Since migration v5 (#5683) a non-NULL `session_id` is UNIQUE, so
+    /// at most one row per id comes back; the method still returns every match
+    /// rather than picking one, and the CALLER keeps its more-than-one-row
+    /// ambiguity refusal as defense in depth (only a hand-dropped index can let
+    /// a duplicate exist after v5). Use `lookup_route(agent_id)` (PK, unambiguous)
     /// whenever the agent_id is already known.
     [[nodiscard]] std::expected<std::vector<RoutableRoute>, GatewayRouteStoreError>
     lookup_by_sessions(std::span<const std::string> session_ids);
@@ -867,16 +876,30 @@ public:
     [[nodiscard]] std::expected<ReapRoutesResult, GatewayRouteStoreError>
     reap_stale_routes();
 
-    /// The schema migrations for this store (version 4: v1 the `agent_routes`
+    /// The schema migrations for this store (version 5: v1 the `agent_routes`
     /// table, v2 the `route_meta` reaper-anchor table, v3 the nullable
     /// `stream_home_id` column — SLICE #4324, v4 the nullable
-    /// `home_cluster_id` column — #4669). Exposed for tests and the migration
-    /// ladder.
+    /// `home_cluster_id` column — #4669, v5 the UNIQUE partial index on
+    /// `session_id` with a one-time dedup — #5683). Exposed for tests and the
+    /// migration ladder.
     static const std::vector<pg::PgMigration>& migrations();
+
+    /// Name of the UNIQUE partial index migration v5 (#5683) creates; the 23505
+    /// remap in the three writers matches this constraint name EXACTLY. Keep in
+    /// sync with the CREATE UNIQUE INDEX in migration v5 (a unit test pins the
+    /// two). An index recreated under another name silently breaks the remap.
+    static constexpr std::string_view kSessionUniqueIndexName = "ux_agent_routes_session_id";
+
+    /// Rows migration v5 tombstoned in THIS construction because they shared a
+    /// session id (#5683); 0 when v5 did not run here or found no duplicate.
+    [[nodiscard]] std::int64_t boot_session_dedup_rows() const noexcept {
+        return boot_session_dedup_rows_;
+    }
 
 private:
     pg::PgPool& pool_;
     bool open_{false};
+    std::int64_t boot_session_dedup_rows_{0};
 };
 
 } // namespace yuzu::server
