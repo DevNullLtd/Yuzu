@@ -164,6 +164,9 @@ std::string crl_panel(const Crl& c) {
 std::string issued_panel(const Model& m) {
     std::string h = "<section class=\"panel\" id=\"issued-panel\"><div class=\"hd\"><h2>Issued "
                     "certificates</h2></div>";
+    if (!m.inventory_note.empty())
+        return h + "<div class=\"pb\"><span class=\"feedback-error\">" + esc(m.inventory_note) +
+               "</span></div></section>";
     if (m.inventory_error)
         return h + "<div class=\"pb\"><span class=\"feedback-error\">Certificate inventory "
                    "unavailable (store error).</span></div></section>";

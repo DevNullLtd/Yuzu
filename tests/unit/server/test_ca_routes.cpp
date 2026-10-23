@@ -25,6 +25,10 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <expected>
 #include <memory>
 #include <set>
@@ -1455,6 +1459,10 @@ TEST_CASE("ca_routes: a confined Security:Read holder is withheld the filtered A
     CHECK_FALSE(j["error"].contains("permission"));
     REQUIRE(h.audits.size() == 1);
     CHECK(h.audits[0].result == "denied");
+    // The denied row names the list with its own target, in the one shared detail shape.
+    CHECK(h.audits[0].target_id == "filtered");
+    CHECK_THAT(h.audits[0].detail, Catch::Matchers::ContainsSubstring("ws="));
+    CHECK_THAT(h.audits[0].detail, Catch::Matchers::ContainsSubstring("withheld=confined"));
     // The unfiltered inventory is the same fleet-wide per-agent data: same answer, same verb.
     auto plain = h.sink.Get("/api/v1/ca/issued");
     REQUIRE(plain);
@@ -1517,6 +1525,12 @@ TEST_CASE("ca_routes: filtered /ca/issued fails closed when unwired or degraded"
         h.wire();
         CHECK(h.sink.Get("/api/v1/ca/issued?kind=active")->status == 503);
         CHECK(h.sink.Get("/api/v1/ca/issued")->status == 503);
+        // Both forms audit the access-check failure, each under its own target.
+        REQUIRE(h.audits.size() == 2);
+        CHECK(h.audits[0].result == "failure");
+        CHECK(h.audits[0].target_id == "filtered");
+        CHECK(h.audits[1].result == "failure");
+        CHECK(h.audits[1].target_id == "inventory");
     }
     {
         Harness h;
@@ -2067,7 +2081,8 @@ struct ProbeHarness {
     yuzu::server::crypto_widgets::Access standing{yuzu::server::crypto_widgets::Access::kAvailable};
     bool wire_probe{true};
     bool audit_succeeds{true};
-    bool can_read{true};
+    bool can_read{true};   // perm_fn (every securable)
+    bool probe_read{true}; // the quiet Security:Read probe the wrappers ask
     int standing_calls{0};
     int perm_calls{0};
 
@@ -2099,7 +2114,7 @@ struct ProbeHarness {
                     ++standing_calls;
                     return standing;
                 }});
-        routes.set_read_probe([this](const httplib::Request&) { return can_read; });
+        routes.set_read_probe([this](const httplib::Request&) { return probe_read; });
         routes.register_routes(
             sink, auth, perm, audit, /*ca_store=*/nullptr,
             []() -> std::optional<std::vector<std::uint8_t>> { return std::nullopt; },
@@ -2140,7 +2155,13 @@ TEST_CASE("ca_routes: a confined caller is withheld the unfiltered /ca/issued be
         CHECK(a.action == "crypto.ca.certificates.view");
         CHECK(a.result == "denied");
         CHECK(a.target_type == "Security");
+        // One detail shape across surfaces (audit_detail_ca_withheld, as crypto.ca.stats.view
+        // writes it) and a target, so a refused unfiltered call is distinguishable from a
+        // refused filtered one.
+        CHECK(a.target_id == "inventory");
         CHECK_THAT(a.detail, Catch::Matchers::ContainsSubstring("withheld=confined"));
+        CHECK_THAT(a.detail, Catch::Matchers::ContainsSubstring("cid="));
+        CHECK_THAT(a.detail, Catch::Matchers::ContainsSubstring("ws="));
     }
 }
 
@@ -2155,7 +2176,15 @@ TEST_CASE("ca_routes: the unfiltered /ca/issued fails closed when the standing p
         REQUIRE(res);
         CHECK(res->status == 503);
         CHECK(json::parse(res->body)["error"]["retry_after_ms"] == 5000);
-        CHECK(h.audits.empty());
+        // The access check could not be completed: audited failure, as crypto.ca.stats.view does
+        // (a gate that cannot answer is evidence an auditor needs), naming the access check.
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].action == "crypto.ca.certificates.view");
+        CHECK(h.audits[0].result == "failure");
+        CHECK(h.audits[0].target_id == "inventory");
+        CHECK_THAT(h.audits[0].detail,
+                   Catch::Matchers::ContainsSubstring("access check unavailable"));
+        CHECK_THAT(h.audits[0].detail, Catch::Matchers::ContainsSubstring("cid="));
     }
     {
         ProbeHarness h;
@@ -2197,63 +2226,295 @@ TEST_CASE("ca_routes: an unconfined or grant-less caller passes the probe; an un
     }
 }
 
-TEST_CASE("ca_routes: the Settings CA panel withholds the inventory from a confined caller",
+TEST_CASE("ca_routes: a revoke wrapper never answers an empty body, whoever the caller",
           "[ca_routes][pki][crypto][security]") {
     using yuzu::server::crypto_widgets::Access;
-    for (const char* path : {"/fragments/settings/ca", "/fragments/settings/ca?view=pki"}) {
-        INFO(path);
-        {
-            ProbeHarness h;
-            h.standing = Access::kConfined;
-            h.wire();
-            auto res = h.sink.Get(path);
-            REQUIRE(res);
-            CHECK(res->status == 200);
-            CHECK(res->get_header_value("Cache-Control") == "no-store");
-            CHECK(res->body.find(std::string(kWithheld)) != std::string::npos);
-            CHECK(res->body.find("Certificate authority unavailable") == std::string::npos);
-        }
-        {
-            ProbeHarness h;
-            h.standing = Access::kAvailable;
-            h.wire();
-            auto res = h.sink.Get(path);
-            REQUIRE(res);
-            CHECK(res->body.find(std::string(kWithheld)) == std::string::npos);
-            CHECK(res->body.find("access check") == std::string::npos);
-        }
-        for (const bool unwired : {false, true}) {
-            ProbeHarness h;
-            h.wire_probe = !unwired;
-            h.standing = Access::kDegraded;
-            h.wire();
-            auto res = h.sink.Get(path);
-            REQUIRE(res);
-            CHECK(res->body.find("Certificate inventory unavailable (access check") !=
-                  std::string::npos);
-        }
-    }
-}
-
-TEST_CASE("ca_routes: a revoke wrapper appends the panel only for a caller who may list it",
-          "[ca_routes][pki][crypto][security]") {
-    using yuzu::server::crypto_widgets::Access;
-    // No store: the wrapper answers its 503 banner, plus the panel when the caller may read it.
-    auto body_for = [](Access standing, bool probe_wired) {
+    // No store: the wrapper answers its 503 banner plus the panel (here the store-unavailable
+    // note); a caller without Security:Read gets a plain note instead of the panel.
+    auto body_for = [](Access standing, bool probe_wired, bool can_read) {
         ProbeHarness h;
         h.standing = standing;
         h.wire_probe = probe_wired;
+        h.probe_read = can_read;
         h.wire();
         auto res = h.sink.dispatch("POST", "/api/settings/ca/revoke?serial_hex=DEAD", "",
                                    "application/x-www-form-urlencoded", kSameOrigin);
         REQUIRE(res);
         return res->body;
     };
-    const auto open = body_for(Access::kAvailable, true);
-    CHECK(open.find("Certificate authority unavailable.</span>") != std::string::npos);
-    for (const auto& body : {body_for(Access::kConfined, true), body_for(Access::kDegraded, true),
-                             body_for(Access::kAvailable, false)}) {
-        CHECK(body.find("Certificate authority unavailable.</span>") == std::string::npos);
+    for (const auto& body : {body_for(Access::kAvailable, true, true),
+                             body_for(Access::kConfined, true, true),
+                             body_for(Access::kDegraded, true, true),
+                             body_for(Access::kAvailable, false, true)}) {
         CHECK(body.find("Certificate authority unavailable.</div>") != std::string::npos);
+        CHECK(body.find("Certificate authority unavailable.</span>") != std::string::npos);
     }
+    const auto no_read = body_for(Access::kAvailable, true, false);
+    CHECK(no_read.find("Certificate authority unavailable.</div>") != std::string::npos);
+    CHECK(no_read.find("not shown to this account") != std::string::npos);
+}
+
+// ── The panel and its wrappers withhold ONLY the inventory (Postgres) ─────────────────────────
+//
+// A confined, degraded or unwired caller keeps the CA metadata, the root / CSR / CRL links and
+// the import form; the issued-certificate inventory (and its per-row revoke forms) is replaced by
+// a note. After a successful revoke or import the wrapper answers a NON-EMPTY body: htmx swaps
+// the body into #ca-section, so an empty 200 would blank the panel with no confirmation.
+
+namespace {
+
+void check_inventory_withheld_panel_intact(const std::string& body) {
+    CHECK(body.find("agent-DEAD") == std::string::npos);
+    CHECK(body.find("agent-BEEF") == std::string::npos);
+    CHECK(body.find("DEAD</") == std::string::npos);
+    CHECK(body.find("<table") == std::string::npos);
+    CHECK(body.find("/api/settings/ca/revoke") == std::string::npos); // no per-row forms
+    CHECK(body.find("AB:CD:EF") != std::string::npos);                // the root fingerprint
+    CHECK(body.find("/api/v1/ca/root") != std::string::npos);         // the root download
+    CHECK(body.find("/api/settings/ca/import-chain") != std::string::npos); // the import form
+}
+
+} // namespace
+
+TEST_CASE("ca_routes: the Settings CA panel withholds ONLY the inventory from a confined, degraded "
+          "or unwired caller",
+          "[ca_routes][pki][crypto][security][pg]") {
+    using yuzu::server::crypto_widgets::Access;
+    struct Case {
+        Access standing;
+        bool wire_filtered;
+        std::string note;
+    };
+    const std::vector<Case> cases = {
+        {Access::kConfined, true, std::string(kWithheld)},
+        {Access::kDegraded, true, "Certificate inventory unavailable (access check failed)."},
+        {Access::kAvailable, false,
+         "Certificate inventory unavailable (access check not configured)."}};
+    for (const char* path : {"/fragments/settings/ca", "/fragments/settings/ca?view=pki"}) {
+        for (const auto& c : cases) {
+            INFO(path << " / " << c.note);
+            Harness h;
+            REQUIRE(h.store->set_root(sample_root()));
+            REQUIRE(h.store->record_issued(sample_issued("DEAD")));
+            h.standing = c.standing;
+            h.wire_filtered = c.wire_filtered;
+            h.wire();
+            auto res = h.sink.Get(path);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            CHECK(res->get_header_value("Cache-Control") == "no-store");
+            CHECK(res->body.find(c.note) != std::string::npos);
+            check_inventory_withheld_panel_intact(res->body);
+        }
+        // An unconfined caller still gets the inventory.
+        Harness h;
+        REQUIRE(h.store->set_root(sample_root()));
+        REQUIRE(h.store->record_issued(sample_issued("DEAD")));
+        h.wire();
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->body.find("agent-DEAD") != std::string::npos);
+        CHECK(res->body.find(std::string(kWithheld)) == std::string::npos);
+    }
+}
+
+TEST_CASE("ca_routes: a confined caller's revoke wrapper answers the panel without the inventory, "
+          "never an empty body",
+          "[ca_routes][pki][crypto][security][pg]") {
+    for (const char* view : {"", "&view=pki"}) {
+        INFO("view=" << view);
+        Harness h;
+        REQUIRE(h.store->set_root(sample_root()));
+        REQUIRE(h.store->record_issued(sample_issued("DEAD")));
+        REQUIRE(h.store->record_issued(sample_issued("BEEF")));
+        h.standing = yuzu::server::crypto_widgets::Access::kConfined;
+        h.wire();
+        const std::string v = view;
+        auto post = [&](const std::string& query) {
+            return h.sink.dispatch("POST", "/api/settings/ca/revoke?" + query + v, "",
+                                   "application/x-www-form-urlencoded", kSameOrigin);
+        };
+
+        // Success: the revoke happened, and the operator sees the panel with the note.
+        auto ok = post("serial_hex=DEAD&reason=test");
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+        CHECK(h.store->is_revoked("DEAD"));
+        CHECK_FALSE(ok->body.empty());
+        CHECK(ok->body.find(std::string(kWithheld)) != std::string::npos);
+        check_inventory_withheld_panel_intact(ok->body);
+
+        // 400 / 404 error paths keep the panel too.
+        auto bad = post("serial_hex=zz");
+        REQUIRE(bad);
+        CHECK(bad->status == 400);
+        CHECK(bad->body.find("Invalid certificate serial.") != std::string::npos);
+        CHECK(bad->body.find(std::string(kWithheld)) != std::string::npos);
+        check_inventory_withheld_panel_intact(bad->body);
+
+        auto gone = post("serial_hex=DEAD"); // already revoked
+        REQUIRE(gone);
+        CHECK(gone->status == 404);
+        CHECK(gone->body.find(std::string(kWithheld)) != std::string::npos);
+        check_inventory_withheld_panel_intact(gone->body);
+    }
+}
+
+TEST_CASE("ca_routes: a confined caller's import-chain wrapper answers the panel without the "
+          "inventory, never an empty body",
+          "[ca_routes][pki][subordinate][crypto][security][pg]") {
+    for (const char* view : {"", "&view=pki"}) {
+        INFO("view=" << view);
+        Harness h;
+        REQUIRE(h.store->set_root(sample_root()));
+        REQUIRE(h.store->record_issued(sample_issued("DEAD")));
+        h.standing = yuzu::server::crypto_widgets::Access::kConfined;
+        h.import_outcome = CaRoutes::ImportOutcome::Ok;
+        h.wire();
+        auto ok = h.sink.dispatch(
+            "POST", std::string("/api/settings/ca/import-chain?intermediate_pem=INT&chain_pem=PAR") + view,
+            "", "application/x-www-form-urlencoded", kSameOrigin);
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+        CHECK(h.import_calls == 1);
+        CHECK_FALSE(ok->body.empty());
+        CHECK(ok->body.find(std::string(kWithheld)) != std::string::npos);
+        check_inventory_withheld_panel_intact(ok->body);
+    }
+}
+
+TEST_CASE("ca_routes: a wrapper caller without Security:Read gets a plain note, never an empty body",
+          "[ca_routes][pki][security][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    REQUIRE(h.store->record_issued(sample_issued("DEAD")));
+    h.deny_ops = {"Read"};
+    h.wire();
+    auto ok = h.sink.dispatch("POST", "/api/settings/ca/revoke?serial_hex=DEAD", "",
+                              "application/x-www-form-urlencoded", kSameOrigin);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(h.store->is_revoked("DEAD"));
+    CHECK(ok->body.find("not shown to this account") != std::string::npos);
+    check_no_inventory(ok->body);
+    h.import_outcome = CaRoutes::ImportOutcome::Ok;
+    auto imp = h.sink.dispatch("POST",
+                               "/api/settings/ca/import-chain?intermediate_pem=INT&chain_pem=PAR", "",
+                               "application/x-www-form-urlencoded", kSameOrigin);
+    REQUIRE(imp);
+    CHECK(imp->body.find("not shown to this account") != std::string::npos);
+    check_no_inventory(imp->body);
+}
+
+// ── Standing, audit shape and serving order (Postgres) ──────────────────────────────────────
+
+TEST_CASE("ca_routes: KNOWN RESIDUAL - kRefused serves the unfiltered list, and the success row "
+          "says standing=refused (tracked by the to-be-filed issue)",
+          "[ca_routes][pki][crypto][security][pg]") {
+    // kRefused = the access check admitted nobody and did not answer 503: no Inventory grant at
+    // all, OR a read failure partway through the check (the answer cannot tell them apart). The
+    // list is SERVED to both. This test pins that so a future tri-state fix (a read failure
+    // answering 503) flips it DELIBERATELY, in the same change that updates the docs, rather
+    // than by accident. When that lands, the read-failure half of this case must become 503.
+    using yuzu::server::crypto_widgets::Access;
+    Harness h;
+    h.standing = Access::kRefused;
+    h.wire();
+    REQUIRE(h.store->record_issued(sample_issued("C3")));
+    auto res = h.sink.Get("/api/v1/ca/issued");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const auto j = json::parse(res->body);
+    CHECK(j["count"] == 1);
+    CHECK(j["items"][0]["subject"] == "agent-C3");
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "success");
+    CHECK_THAT(h.audits[0].detail, Catch::Matchers::ContainsSubstring("standing=refused"));
+
+    // The unrestricted standing is told apart in the same row.
+    h.standing = Access::kAvailable;
+    auto avail = h.sink.Get("/api/v1/ca/issued");
+    REQUIRE(avail);
+    CHECK(avail->status == 200);
+    REQUIRE(h.audits.size() == 2);
+    CHECK_THAT(h.audits[1].detail, Catch::Matchers::ContainsSubstring("standing=available"));
+}
+
+TEST_CASE("ca_routes: a subject carrying bytes that are not UTF-8 is served, and the success row "
+          "is written only for a page that was served",
+          "[ca_routes][pki][security][pg]") {
+    // CaStore sanitises free text at the write boundary, so a stored subject cannot reach the
+    // read path as invalid UTF-8; the handler also serialises with the replacing dumper before
+    // it writes the row, so even a value that did would be served, not a bare 500 behind a
+    // success row.
+    Harness h;
+    h.wire();
+    auto rec = sample_issued("C4");
+    rec.subject = std::string("agent-C4-\xC3\x28");
+    REQUIRE(h.store->record_issued(rec));
+    auto res = h.sink.Get("/api/v1/ca/issued");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const auto j = json::parse(res->body);
+    CHECK(j["count"] == 1);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "success");
+}
+
+// ── Wiring order tripwire (source text; no Postgres) ──────────────────────────────────────────
+
+namespace {
+
+// Repo-relative file lookup: $MESON_SOURCE_ROOT, then CWD, then a bounded walk-up from CWD (the
+// same order test_crypto_library_model.cpp uses).
+std::filesystem::path find_repo_file_for_ca(const std::string& relative) {
+    namespace fs = std::filesystem;
+    std::vector<fs::path> candidates;
+    if (auto* root = std::getenv("MESON_SOURCE_ROOT"))
+        candidates.emplace_back(fs::path{root} / relative);
+    candidates.emplace_back(fs::path{relative});
+    std::error_code ec;
+    fs::path dir = fs::current_path(ec);
+    for (int i = 0; !ec && i < 8 && !dir.empty(); ++i) {
+        candidates.emplace_back(dir / relative);
+        fs::path parent = dir.parent_path();
+        if (parent == dir)
+            break;
+        dir = parent;
+    }
+    for (const auto& c : candidates) {
+        std::error_code e2;
+        if (fs::exists(c, e2) && !e2)
+            return fs::absolute(c, e2);
+    }
+    return {};
+}
+
+} // namespace
+
+TEST_CASE("ca_routes: server.cpp wires the confinement probe and the read probe BEFORE "
+          "register_routes",
+          "[ca_routes][pki][security]") {
+    // register_routes copies the probe into every handler capture, so a probe wired after it
+    // never reaches them: the unfiltered list would then answer 503 to EVERYONE and every
+    // revoke / import panel would withhold its inventory. Every other test injects its own
+    // probe, so none of them can see the production order. This reads the source, and fails
+    // loudly (never skips) when it cannot find it.
+    const auto path = find_repo_file_for_ca("server/core/src/server.cpp");
+    REQUIRE_FALSE(path.empty());
+    std::ifstream in(path);
+    REQUIRE(in);
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const std::string src = ss.str();
+    const auto filtered = src.find("ca_routes_->set_filtered_issued(");
+    const auto probe = src.find("ca_routes_->set_read_probe(");
+    const auto reg = src.find("ca_routes_->register_routes(");
+    REQUIRE(filtered != std::string::npos);
+    REQUIRE(probe != std::string::npos);
+    REQUIRE(reg != std::string::npos);
+    CHECK(filtered < reg);
+    CHECK(probe < reg);
+    // Exactly one registration site, so the ordering above is about THE site.
+    CHECK(src.find("ca_routes_->register_routes(", reg + 1) == std::string::npos);
 }

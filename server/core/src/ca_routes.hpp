@@ -107,6 +107,15 @@ namespace yuzu::server {
 /// (ADR-1005 Decision 4) and are shared exactly once.
 [[nodiscard]] nlohmann::json crl_figures_json(CaStore& ca_store);
 
+/// Log a failed `CaStore::list_issued` on the unfiltered inventory reads (REST `GET
+/// /api/v1/ca/issued`, MCP `list_issued_certs`) at warn, WITH the store's error text: the
+/// handlers answer a fixed 503 message and the `failure` audit row carries a fixed detail, so
+/// without this the libpq error is nowhere. Sampled like CaStore's own degrade warns (the first
+/// of an episode, then at most one a minute, and every 100th), so a polling client against a
+/// degraded store does not write a line per request. `surface` is "rest" or "mcp". The text
+/// carries no caller input.
+void log_issued_list_failure(std::string_view surface, const std::string& error);
+
 /// Prefix on `IssueCodeSigningFn`'s `unexpected()` when the failure is a
 /// caller-attributable business refusal — no CA root to issue from — rather
 /// than a genuine crypto/store failure. The REST handler maps this to 409 +
@@ -255,9 +264,11 @@ public:
     void set_filtered_issued(FilteredIssuedDeps d) { filtered_ = std::move(d); }
     /// Whether the caller holds `Security:Read`, decided without writing a response or a denial
     /// row (`AuthRoutes::has_permission`). The dashboard revoke / import wrappers use it to
-    /// decide whether to append the CA panel to their reply: they are gated on Delete / Write,
-    /// which do not imply Read. Set BEFORE `register_routes`. Leaving it unset fails closed
-    /// (the wrappers return only their banner text).
+    /// decide whether to answer with the CA panel: they are gated on Delete / Write, which do not
+    /// imply Read. A caller without Read gets a plain note in its place (never an empty body). A
+    /// Read holder who is confined (or whose access check is degraded or unwired) gets the panel
+    /// with ONLY its issued-certificate inventory withheld. Set BEFORE `register_routes`. Leaving
+    /// it unset fails closed (the plain note).
     using ReadProbeFn = std::function<bool(const httplib::Request&)>;
     void set_read_probe(ReadProbeFn probe) { read_probe_ = std::move(probe); }
 

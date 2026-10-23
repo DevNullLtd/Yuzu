@@ -203,10 +203,11 @@ struct MergedLayout {
 
 // ── Availability (drawing only, never a grant) ───────────────────────────────
 
-/// A caller's standing for one gate: kAvailable; kRefused (the check answered 403: no grant,
-/// or a read failure partway through the check, which the answer cannot tell apart);
-/// kConfined (a kFleetWideOnly widget and the caller's view is confined); kDegraded (the
-/// check answered 503: it could not be completed because a store behind it could not be read).
+/// A caller's standing for one gate: kAvailable; kRefused (not admitted for any cause other than a
+/// 503: no grant, or a read failure partway through the check, which the answer cannot tell
+/// apart; the issued-certificate LIST serves this standing); kConfined (a
+/// kFleetWideOnly widget and the caller's view is confined); kDegraded (the check answered 503:
+/// it could not be completed because a store behind it could not be read).
 enum class Access { kAvailable, kRefused, kConfined, kDegraded };
 [[nodiscard]] std::string_view access_name(Access a);
 
@@ -359,6 +360,12 @@ struct LayoutRequest {
 /// window set, count or cursor to name, so it records what was served and which page).
 [[nodiscard]] std::string audit_detail_inventory(std::string_view cid, std::size_t rows, int limit,
                                                  int offset, bool has_more);
+/// `<detail> standing=<available|refused>`: the success rows of the issued-certificate list name
+/// the standing they were served under. `refused` (no Inventory grant, or a read failure inside
+/// the access check, which the answer cannot tell apart) is served by design; the token lets an
+/// auditor tell those pages from the confined-view-checked ones. Only the two standings a list
+/// is ever served under are expected; any other renders as `refused`.
+[[nodiscard]] std::string audit_detail_with_standing(std::string detail, Access standing);
 /// The failure-row twin of both: `[cid=<cid> ]ws=<window set> as_of=<epoch|db_now> <what>`
 /// where `what` is "store degraded", "capacity in use" or "access check unavailable".
 [[nodiscard]] std::string audit_detail_ca_degraded(std::string_view cid,

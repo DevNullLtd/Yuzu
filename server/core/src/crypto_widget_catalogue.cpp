@@ -888,6 +888,11 @@ std::string audit_detail_inventory(std::string_view cid, std::size_t rows, int l
                        limit, offset, has_more);
 }
 
+std::string audit_detail_with_standing(std::string detail, Access standing) {
+    detail += standing == Access::kAvailable ? " standing=available" : " standing=refused";
+    return detail;
+}
+
 std::string audit_detail_ca_degraded(std::string_view cid, std::optional<std::int64_t> as_of,
                                      CryptoReadCause cause) {
     std::string_view what;

@@ -3,8 +3,8 @@
 /// @file crypto_access.hpp
 /// The ONE /crypto availability composition (ADR-0070 R2; fix-spec B1), extracted from
 /// `ServerImpl::crypto_access` so it is unit-testable (M4). server.cpp instantiates it with its
-/// `AuthRoutes` and hands the result to CryptoRoutes, the filtered GET /api/v1/ca/issued and the
-/// MCP server, so the REST widget list, the dashboard and list_crypto_widgets cannot draw
+/// `AuthRoutes` and hands the result to CryptoRoutes, both forms of GET /api/v1/ca/issued, the
+/// Settings CA panel's inventory and the MCP server, so the REST widget list, the dashboard and list_crypto_widgets cannot draw
 /// different answers. Drawing only - never a grant: every data route keeps its own gate.
 ///
 /// `Auth` is `AuthRoutes` in production; a test passes a fake with the same two members:

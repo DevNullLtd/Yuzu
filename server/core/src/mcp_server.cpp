@@ -22125,6 +22125,20 @@ McpServer::HandlerFn McpServer::build_handler(
                 namespace cw = crypto_widgets;
                 const bool filtered_form = cw::has_cert_filter_args(args);
                 if (!crypto_access_fn_ || (filtered_form && !crypto_api_)) {
+                    // Which dependency is missing, once: a wiring fault lasts until a restart.
+                    static std::once_flag access_unwired_logged, api_unwired_logged;
+                    if (!crypto_access_fn_)
+                        std::call_once(access_unwired_logged, [] {
+                            spdlog::error("mcp: list_issued_certs confinement probe "
+                                          "(crypto_access_fn_) is unwired - answering an internal "
+                                          "error");
+                        });
+                    else
+                        std::call_once(api_unwired_logged, [] {
+                            spdlog::error("mcp: filtered list_issued_certs CryptoApi "
+                                          "(crypto_api_) is unwired - answering an internal "
+                                          "error");
+                        });
                     res.set_content(error_response(id, kInternalError,
                                                    filtered_form ? "filtered certificate list unavailable"
                                                                  : "certificate list unavailable"),
@@ -22132,19 +22146,30 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const auto standing = crypto_access_fn_(req, cw::WidgetGate::kFleetWideOnly, "Inventory", "Read");
-                if (standing == cw::Access::kConfined) {
-                    (void)audit_fn(req, "crypto.ca.certificates.view", "denied", "Security", "",
-                                   "withheld=confined");
+                // The row target names the list on rows written before its arguments are read.
+                const std::string list_target = filtered_form ? "filtered" : "inventory";
+                // Exhaustive, no default: a new enumerator must be decided here, not served.
+                switch (standing) {
+                case cw::Access::kConfined:
+                    (void)audit_fn(req, "crypto.ca.certificates.view", "denied", "Security",
+                                   list_target, cw::audit_detail_ca_withheld(""));
                     mcp_audit("denied", "withheld=confined");
                     res.set_content(a4_error(kPermissionDenied, cw::kConfinedWithheldMessage), "application/json"); // retry-hint-exempt: authorization outcome, retrying cannot change it
                     return;
-                }
-                if (standing == cw::Access::kDegraded) {
+                case cw::Access::kDegraded:
+                    (void)audit_fn(req, "crypto.ca.certificates.view", "failure", "Security",
+                                   list_target,
+                                   cw::audit_detail_ca_degraded("", std::nullopt,
+                                                                CryptoReadCause::kAccessCheck));
+                    mcp_audit("failure", "access check unavailable");
                     res.set_content(a4_error(kInternalError, "access check unavailable",
                                              "retry the request",
                                              /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
+                case cw::Access::kAvailable:
+                case cw::Access::kRefused: // no Inventory grant at all is not a confined view
+                    break;
                 }
                 // ADR-0070 R2-2: any filter argument lists the certificates behind one
                 // get_crypto_ca_stats count, through the CryptoApi seam (the REST twin's
@@ -22183,9 +22208,11 @@ McpServer::HandlerFn McpServer::build_handler(
                                         "application/json");
                         return;
                     }
+                    const std::string certs_detail = cw::audit_detail_with_standing(
+                        cw::audit_detail_certs("", *read), standing);
                     const bool audit_ok = audit_fn(req, "crypto.ca.certificates.view", "success",
-                                                   "Security", target, cw::audit_detail_certs("", *read));
-                    mcp_audit("success", cw::audit_detail_certs("", *read));
+                                                   "Security", target, certs_detail);
+                    mcp_audit("success", certs_detail);
                     nlohmann::json payload = {{"items", cw::ca_items_json(*read)},
                                               {"count", read->rows.size()},
                                               {"limit", read->query.limit},
@@ -22230,6 +22257,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // precise has_more so an agentic client can paginate deterministically.
                 auto records_or_err = ca_store->list_issued(limit + 1, offset);
                 if (!records_or_err) {
+                    log_issued_list_failure("mcp", records_or_err.error());
                     (void)audit_fn(req, "crypto.ca.certificates.view", "failure", "Security",
                                    "inventory", "inventory store unavailable");
                     mcp_audit("failure", "inventory store unavailable");
@@ -22241,12 +22269,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 const bool has_more = static_cast<int>(records.size()) > limit;
                 if (has_more)
                     records.resize(static_cast<std::size_t>(limit));
-                // Set-and-proceed, as the filtered form and the REST twin: a dropped audit row
-                // is reported on the payload, it does not withhold the page.
-                const std::string inventory_detail =
-                    cw::audit_detail_inventory("", records.size(), limit, offset, has_more);
-                const bool audit_ok = audit_fn(req, "crypto.ca.certificates.view", "success",
-                                               "Security", "inventory", inventory_detail);
+                // The payload is built and serialised BEFORE the success row is written, so a
+                // throw cannot leave a row claiming a page that was never served; the safe
+                // dumper (replace) keeps bytes that are not UTF-8 from becoming a bare error.
                 nlohmann::json items = nlohmann::json::array();
                 for (const auto& r : records) {
                     items.push_back({{"serial_hex", r.serial_hex},
@@ -22272,11 +22297,21 @@ McpServer::HandlerFn McpServer::build_handler(
                     payload["next_offset"] = offset + limit;
                 // Same figures as GET /api/v1/ca/issued meta (one shared builder).
                 payload.update(crl_figures_json(*ca_store));
-                if (!audit_ok)
+                std::string payload_text = crypto_library::dump_safe(payload);
+                // Set-and-proceed, as the filtered form and the REST twin: a dropped audit row
+                // is reported on the payload, it does not withhold the page.
+                const std::string inventory_detail = cw::audit_detail_with_standing(
+                    cw::audit_detail_inventory("", records.size(), limit, offset, has_more),
+                    standing);
+                const bool audit_ok = audit_fn(req, "crypto.ca.certificates.view", "success",
+                                               "Security", "inventory", inventory_detail);
+                if (!audit_ok) {
                     payload["audit_persisted"] = false;
+                    payload_text = crypto_library::dump_safe(payload);
+                }
                 mcp_audit("success", inventory_detail);
                 res.set_content(
-                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    success_response(id, tool_result(payload_text, kObjectOutputSchema)),
                     "application/json");
                 return;
             }
