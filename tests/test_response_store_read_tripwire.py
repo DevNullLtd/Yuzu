@@ -18,10 +18,22 @@ CHECK 1 (exact set of reads). The public section of server/core/src/response_sto
 
 CHECK 2 (internal-consumer allowlist). `ResponseTierFilter::unrestricted_internal_consumer()` is the
   one call that reads every row regardless of the Forensics tier. Its call sites under server/
-  (outside response_tier_filter.hpp, where it is defined) must equal a FROZEN list of seven sites,
+  (outside response_tier_filter.hpp, where it is defined) must equal a FROZEN list of four sites,
   each keyed by file + the ResponseStore method called + that call's first argument, so the key
-  survives reformatting and a comment edit but not a new site. An eighth site fails until it is
-  reviewed and added here. The frozen list below carries the human label of each site.
+  survives reformatting and a comment edit but not a new site. A fifth site fails until it is
+  reviewed and added here. The frozen list below carries the human label of each site and WHY it
+  passes the principled definition of "internal": the read-back of a command the server dispatches
+  itself from a FIXED server-side plugin set none of which is Forensics-tier (a unit test pins that
+  set against the catalogue), or a read whose bytes reach no principal lacking the dispatcher's
+  authority. The policy evaluator, bundle collate and result-set materialiser were three more sites
+  that failed that definition and now read through a real tier filter.
+
+CHECK 2b (the other unrestricted spellings). The factory is not the only way to build a filter that
+  excludes nothing: `ResponseTierFilter::exclude(<set>, std::nullopt)` is the same thing spelled
+  as "a global Forensics:Read", and `for_fixed_plugin_poll(nullptr)` was once the same thing for an
+  unwired surface. Neither may appear in non-test code under server/: a caller that really holds a
+  global grant gets `nullopt` from the resolver at run time and passes a variable (see
+  `tier_filter_for`), never a literal. Tests live outside server/ and may spell either.
 
 CHECK 3 (markers). `operator_surface_pending_wiring` (the removed transitional factory) and
   `TODO(#4990)` must not reappear anywhere under server/ or tests/unit/.
@@ -76,22 +88,22 @@ NOT_READS = frozenset({
     "reap_expired",          # retention sweep
 })
 
-# The internal-consumer call sites: "file:method(first-arg)" -> human label (file:function).
+# The internal-consumer call sites: "file:method(first-arg)" -> human label (file:function) and the
+# reason it is internal. Each plugin set below is fixed in server code; test_forensics_ingest_leaks.cpp
+# asserts none of those plugins is in the Forensics set.
 INTERNAL_CONSUMER_SITES = {
-    "server/core/src/policy_evaluator.cpp:query_by_execution(f.execution_id)":
-        "policy_evaluator.cpp: PolicyEvaluator::collect_ready (compliance verdicts)",
-    "server/core/src/bundle_orchestrator.cpp:query_by_execution(correlation_id)":
-        "bundle_orchestrator.cpp: BundleOrchestrator::collate",
     "server/core/src/preflight_eval.cpp:query_by_execution(check_execution_id(run_id, key))":
-        "preflight_eval.cpp: pre-flight check collation",
+        "preflight_eval.cpp: pre-flight check collation (kPreflightChecks: a fixed non-Forensics "
+        "plugin list; the grid is scored server-side, never returned as rows)",
     "server/core/src/quarantine_containment_reconciler.cpp:query(pending_command_id)":
-        "quarantine_containment_reconciler.cpp: in-flight quarantine command poll",
+        "quarantine_containment_reconciler.cpp: in-flight quarantine command poll (the closed "
+        "protective set, plugin `quarantine`; polls its own dispatch)",
     "server/core/src/server.cpp:query(command_id)":
-        "server.cpp: tar.fleet_snapshot topology poll",
-    "server/core/src/server.cpp:query_by_execution(p.source_execution_id)":
-        "server.cpp: result-set materialiser",
+        "server.cpp: tar.fleet_snapshot topology poll (fixed plugin `tar`; parsed into the "
+        "topology graph, never returned as rows)",
     "server/core/src/server.cpp:query_by_execution(execution_id)":
-        "server.cpp: deployment collect",
+        "server.cpp: deployment collect (fixed plugin `content_dist`; scored, cohort "
+        "re-authorized every tick)",
 }
 
 FORBIDDEN_MARKERS = ("operator_surface_pending_wiring", "TODO(#4990)")
@@ -235,6 +247,18 @@ def parse_public_methods(header_text: str, cls: str = "ResponseStore"):
     return methods
 
 
+_TIER_PARAM_RE = re.compile(r"^const\s+(?:\w+::)*ResponseTierFilter\s*&\s*\w*$")
+
+
+def _is_tier_filter_param(param: str) -> bool:
+    """True iff `param` is a `const ResponseTierFilter&` parameter (a default value ignored here).
+
+    A substring test (`"ResponseTierFilter" in p`) also accepted `int ResponseTierFilterCount` or a
+    by-value filter; the type must be exactly a const lvalue reference to it.
+    """
+    return bool(_TIER_PARAM_RE.match(param.split("=", 1)[0].strip()))
+
+
 def check_store_reads(header_text: str) -> list[str]:
     errors = []
     try:
@@ -246,7 +270,7 @@ def check_store_reads(header_text: str) -> list[str]:
     if overlap:
         errors.append(f"frozen lists overlap: {sorted(overlap)}")
     for name, params in methods:
-        takes = [p for p in params if "ResponseTierFilter" in p]
+        takes = [p for p in params if _is_tier_filter_param(p)]
         if name in READS:
             if not takes:
                 errors.append(f"read method {name}() does not take a ResponseTierFilter")
@@ -329,6 +353,44 @@ def check_internal_sites(files: dict[str, str]) -> list[str]:
     return errors
 
 
+_UNRESTRICTED_VISIBLE = re.compile(
+    r"^(?:std::nullopt(?:_t\s*\{\s*\})?|\{\s*\}|(?:\w+::)*VisibleSet\s*\{\s*\})$")
+
+
+def _call_args(code: str, open_paren: int) -> list[str]:
+    depth = 0
+    for j in range(open_paren, len(code)):
+        depth += {"(": 1, ")": -1}.get(code[j], 0)
+        if depth == 0:
+            return _split_params(code[open_paren + 1:j])
+    return []
+
+
+def find_unrestricted_idioms(files: dict[str, str]) -> list[str]:
+    """`file: <description>` for each literal-unrestricted filter construction in the given files."""
+    found = []
+    for rel, text in files.items():
+        rel = rel.replace(os.sep, "/")
+        if rel == FILTER_HEADER.replace(os.sep, "/"):
+            continue
+        code = _strip_comments(text)
+        for m in re.finditer(r"ResponseTierFilter\s*::\s*exclude\s*\(", code):
+            args = _call_args(code, m.end() - 1)
+            if len(args) >= 2 and _UNRESTRICTED_VISIBLE.match(" ".join(args[1].split())):
+                found.append(f"{rel}: ResponseTierFilter::exclude(..., {' '.join(args[1].split())})")
+        for m in re.finditer(r"for_fixed_plugin_poll\s*\(", code):
+            args = _call_args(code, m.end() - 1)
+            if len(args) == 1 and re.match(r"^(?:nullptr|NULL|0|\{\s*\})$", args[0].strip()):
+                found.append(f"{rel}: for_fixed_plugin_poll({args[0].strip()})")
+    return found
+
+
+def check_unrestricted_idioms(files: dict[str, str]) -> list[str]:
+    return [f"{f}: spells an unrestricted tier filter as a literal; resolve the caller's visibility "
+            f"and pass it (tier_filter_for), or use a reviewed internal-consumer site"
+            for f in find_unrestricted_idioms(files)]
+
+
 def check_forbidden_markers(files: dict[str, str]) -> list[str]:
     errors = []
     for rel, text in files.items():
@@ -361,6 +423,7 @@ def main() -> int:
         return 1
     errors = check_store_reads(header)
     errors += check_internal_sites(server)
+    errors += check_unrestricted_idioms(server)
     errors += check_forbidden_markers({**server, **tests})
     for e in errors:
         print(f"FAIL: {e}", file=sys.stderr)

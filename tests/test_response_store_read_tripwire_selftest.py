@@ -4,8 +4,9 @@
 A tripwire that has never been seen to fail proves nothing. This runs the tripwire's checks against
 mutated copies of the real header and source tree (held in memory, nothing on disk is touched) and
 asserts each mutation is caught: a new unlisted read, a read that lost its ResponseTierFilter, a
-defaulted filter, a stale list entry, an eighth internal-consumer site, a vanished site, a
-reintroduced marker. It also pins the comment stripper against the string literal that would
+defaulted filter, a stale list entry, a fifth internal-consumer site, a vanished site, a
+reintroduced marker, a parameter that only mentions the filter's name, and the literal-unrestricted
+spellings `exclude(set, std::nullopt)` and `for_fixed_plugin_poll(nullptr)`. It also pins the comment stripper against the string literal that would
 otherwise hide call sites from the scan. Stdlib only.
 """
 from __future__ import annotations
@@ -48,6 +49,8 @@ def main() -> int:
     expect(t.check_store_reads(header) == [], "real header must pass CHECK 1")
     expect(t.check_internal_sites(server) == [], "real tree must pass CHECK 2")
     expect(t.check_forbidden_markers(server) == [], "real tree must pass CHECK 3")
+    expect(t.check_unrestricted_idioms(server) == [], "real tree must pass CHECK 2b")
+    expect(len(t.INTERNAL_CONSUMER_SITES) == 4, "the frozen internal-consumer list is four sites")
 
     # CHECK 1 mutations.
     errs = t.check_store_reads(with_extra_public(
@@ -76,6 +79,19 @@ def main() -> int:
     expect(any_mentions(t.check_store_reads(removed), "reap_expired"),
            "a stale frozen-list entry must fail")
 
+    # A parameter that merely mentions the filter's name is not the filter.
+    lookalike = header.replace(
+        "query_by_ids(const std::vector<int64_t>& response_ids, const ResponseTierFilter& tier) const;",
+        "query_by_ids(const std::vector<int64_t>& response_ids, int ResponseTierFilterCount) const;", 1)
+    expect(lookalike != header, "selftest anchor moved: query_by_ids declaration (lookalike)")
+    expect(any_mentions(t.check_store_reads(lookalike), "query_by_ids"),
+           "a parameter that only names the filter type must fail")
+    byvalue = header.replace(
+        "query_by_ids(const std::vector<int64_t>& response_ids, const ResponseTierFilter& tier) const;",
+        "query_by_ids(const std::vector<int64_t>& response_ids, ResponseTierFilter tier) const;", 1)
+    expect(any_mentions(t.check_store_reads(byvalue), "query_by_ids"),
+           "a by-value filter parameter must fail")
+
     # A comment mentioning a method is not a method.
     commented = with_extra_public(header, "// bogus_read(const std::string& id) const;")
     expect(t.check_store_reads(commented) == [], "a commented-out declaration must not count")
@@ -91,6 +107,38 @@ def main() -> int:
     fewer = {k: v for k, v in server.items() if not k.endswith("preflight_eval.cpp")}
     expect(any_mentions(t.check_internal_sites(fewer), "preflight_eval.cpp"),
            "a vanished internal-consumer site must fail")
+
+    # The three sites that were fixed must not come back.
+    for name in ("policy_evaluator.cpp", "bundle_orchestrator.cpp"):
+        again = dict(server)
+        again[f"server/core/src/{name}"] = (
+            "auto rows = d_.response_store->query_by_execution(f.execution_id,\n"
+            "    ResponseTierFilter::unrestricted_internal_consumer());\n")
+        expect(any_mentions(t.check_internal_sites(again), name),
+               f"re-adding an internal-consumer call to {name} must fail")
+
+    # CHECK 2b: the literal-unrestricted spellings.
+    def idiom(text: str) -> list[str]:
+        d = dict(server)
+        d["server/core/src/idiom.cpp"] = text
+        return t.check_unrestricted_idioms(d)
+
+    expect(any_mentions(idiom("auto f = ResponseTierFilter::exclude(*set, std::nullopt);"), "idiom.cpp"),
+           "exclude(set, std::nullopt) must fail")
+    expect(any_mentions(idiom("auto f = ResponseTierFilter::exclude(*set, authz::VisibleSet{});"), "idiom.cpp"),
+           "exclude(set, authz::VisibleSet{}) must fail")
+    expect(any_mentions(idiom("auto f = ResponseTierFilter::exclude(*set, {});"), "idiom.cpp"),
+           "exclude(set, {}) must fail")
+    expect(any_mentions(idiom("auto f = ResponseTierFilter::for_fixed_plugin_poll(nullptr);"), "idiom.cpp"),
+           "for_fixed_plugin_poll(nullptr) must fail")
+    expect(idiom("auto f = ResponseTierFilter::exclude(*set, authz::deny_all());") == [],
+           "exclude(set, deny_all()) is the sanctioned spelling")
+    expect(idiom("auto f = ResponseTierFilter::exclude(*set, fn ? fn(req) : authz::deny_all());") == [],
+           "exclude(set, <variable expression>) is the tier_filter_for shape")
+    expect(idiom("auto f = ResponseTierFilter::for_fixed_plugin_poll(forensics_plugins());") == [],
+           "for_fixed_plugin_poll(<accessor>) is allowed")
+    expect(idiom("// ResponseTierFilter::exclude(*set, std::nullopt)\n") == [],
+           "a comment is not a construction")
 
     # The definition header is not a call site, and a comment is not a call.
     only_comment = dict(server)
