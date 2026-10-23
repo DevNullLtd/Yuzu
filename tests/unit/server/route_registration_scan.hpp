@@ -236,32 +236,19 @@ inline std::vector<StepUpCall> find_step_up_calls(std::string_view text) {
             j += token.size();
             return true;
         };
-        if (!eat("("))
-            continue;
-        skip();
-        if (!eat("req") || (j < text.size() && is_word(text[j])))
+        const auto tok = [&](std::string_view token) {
+            skip();
+            return eat(token);
+        };
+        if (!eat("(") || !tok("req") || (j < text.size() && is_word(text[j])))
             continue;
         StepUpCall call{at, false, {}};
         std::size_t end = 0;
-        skip();
-        if (eat(",")) {
+        if (tok(",") && tok("res") && tok(",") && tok("*session") && tok(",")) {
             skip();
-            if (eat("res")) {
-                skip();
-                if (eat(",")) {
-                    skip();
-                    if (eat("*session")) {
-                        skip();
-                        if (eat(",")) {
-                            skip();
-                            if (detail::plain_literal(text, j, call.label, end)) {
-                                j = end;
-                                skip();
-                                call.readable = eat(")");
-                            }
-                        }
-                    }
-                }
+            if (detail::plain_literal(text, j, call.label, end)) {
+                j = end;
+                call.readable = tok(")");
             }
         }
         if (!call.readable)
