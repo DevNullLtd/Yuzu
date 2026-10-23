@@ -366,6 +366,21 @@ std::vector<std::string> load_redaction_patterns(yuzu::tar::TarDatabase& db) {
 // sites below are unchanged.
 using yuzu::tar::source_enabled;
 
+// §3.8 mapped-drive backfill retry (related issue #5291) — same unqualified-lookup convenience as
+// source_enabled above, for the bare calls in retry_pending_mapdrive_backfill() below.
+using yuzu::tar::apply_outcomes;
+using yuzu::tar::commit_first_pass;
+using yuzu::tar::initial_pending;
+using yuzu::tar::kMapDriveBackfillMaxAttempts;
+using yuzu::tar::kMapDriveBackfillRetryIntervalS;
+using yuzu::tar::MapDriveHistory;
+using yuzu::tar::MapDriveEvent;
+using yuzu::tar::PendingState;
+using yuzu::tar::format_pending_state;
+using yuzu::tar::parse_pending_state;
+using yuzu::tar::retry_due;
+using yuzu::tar::retry_sids;
+
 // Process stabilization exclusion patterns (issue #59). Empty = no exclusions.
 std::vector<std::string> load_stabilization_exclusions(yuzu::tar::TarDatabase& db) {
     auto stored = db.get_config("process_stabilization_exclusions");
@@ -886,6 +901,10 @@ public:
         if (source_enabled(*db_, "mapdrive")) {
             if (!db_->get_config("mapdrive_backfill_done", "").empty()) {
                 spdlog::info("TAR: mapdrive historical backfill already done — skipped");
+                // §3.8 bounded per-profile retry (related issue #5291): the first pass already
+                // ran -- give its pending list a chance before this tick's own work. Cheap when
+                // nothing is due (phase A's own short lock-and-check).
+                retry_pending_mapdrive_backfill();
             } else {
                 // enumerate_mapdrive_history touches the registry / offline hives /
                 // subprocesses and does substantial allocation; a std::bad_alloc (or
@@ -893,7 +912,7 @@ public:
                 // out of init(). Catch here; a throw is NOT the same as "no history"
                 // — enumerated_ok gates the done-key so a throw leaves it unset and
                 // the next restart retries (only a clean empty result records done).
-                std::vector<yuzu::tar::MapDriveHistoryRow> hist;
+                MapDriveHistory hist;
                 bool enumerated_ok = false;
                 try {
                     hist = yuzu::tar::enumerate_mapdrive_history();
@@ -907,10 +926,10 @@ public:
                                  "will retry on restart");
                 }
                 const auto snap = next_snapshot_id();
-                std::vector<yuzu::tar::MapDriveEvent> typed;
-                typed.reserve(hist.size());
-                for (auto& h : hist) {
-                    yuzu::tar::MapDriveEvent ev;
+                std::vector<MapDriveEvent> typed;
+                typed.reserve(hist.rows.size());
+                for (auto& h : hist.rows) {
+                    MapDriveEvent ev;
                     ev.ts = h.ts;
                     ev.snapshot_id = snap;
                     ev.action = "historical";
@@ -926,12 +945,58 @@ public:
                 if (!enumerated_ok) {
                     // Enumeration threw (already logged) — leave the key unset so the
                     // next restart retries rather than permanently skipping history.
-                } else if (typed.empty()) {
-                    spdlog::info("TAR: no historical mapped drives found to backfill");
-                    db_->set_config("mapdrive_backfill_done", std::to_string(now_epoch_seconds()));
-                } else if (db_->insert_mapdrive_events(typed)) {
-                    db_->set_config("mapdrive_backfill_done", std::to_string(now_epoch_seconds()));
-                    spdlog::info("TAR: backfilled {} historical mapped-drive rows", typed.size());
+                } else if (typed.empty() ||
+                           // skip_known_historical: a restart after the commit below failed
+                           // re-walks every profile, and the rows the failed pass already wrote
+                           // must not be written a second time (the retry path's own insert).
+                           db_->insert_mapdrive_events(typed, std::nullopt,
+                                                       /*skip_known_historical=*/true)) {
+                    // §3.8 bounded per-profile retry (related issue #5291): every profile this
+                    // pass could not fully resolve (not_found, privilege_missing, mount_failed, a
+                    // refused hive file, a failed inner read, or a cap-cut walk) starts at attempt
+                    // 1/kMapDriveBackfillMaxAttempts -- the first pass itself is attempt 1 -- and
+                    // a profile it did not try at all (a mount before it timed out, or no mount
+                    // was possible) starts at 0.
+                    PendingState pending{now_epoch_seconds(), initial_pending(hist.profiles)};
+                    if (typed.empty() && pending.profiles.empty()) {
+                        spdlog::info("TAR: no historical mapped drives found to backfill");
+                    } else if (typed.empty()) {
+                        spdlog::info("TAR: no historical mapped drives recovered this pass; {} "
+                                     "profile(s) are pending a retry",
+                                     pending.profiles.size());
+                    } else {
+                        spdlog::info("TAR: backfilled up to {} historical mapped-drive rows "
+                                     "(rows already recorded are skipped)",
+                                     typed.size());
+                    }
+                    for (const auto& p : pending.profiles) {
+                        if (p.attempts == 0) {
+                            spdlog::info("TAR mapdrive backfill: profile {} not yet tried, pending "
+                                         "(0/{} attempts)",
+                                         p.sid, kMapDriveBackfillMaxAttempts);
+                        } else {
+                            spdlog::info("TAR mapdrive backfill: profile {} attempt {}/{} pending",
+                                         p.sid, p.attempts, kMapDriveBackfillMaxAttempts);
+                        }
+                    }
+                    if (!commit_first_pass(
+                            [&](std::string_view k, std::string_view v) {
+                                return db_->set_config(std::string{k}, std::string{v});
+                            },
+                            pending.profiles.empty() ? std::string{} : format_pending_state(pending),
+                            std::to_string(now_epoch_seconds()))) {
+                        spdlog::error("TAR: mapdrive historical backfill commit failed — "
+                                      "backfill left undone, retried on restart");
+                    }
+                    if (!hist.complete) {
+                        // Pre-existing one-shot contract: the first pass's own ProfileList walk
+                        // was itself cut short. Logged, not retried separately here -- a
+                        // profile this missed is simply never in `pending` either, so it is
+                        // never picked up again until the NEXT full restart's first pass.
+                        // Tracked as a follow-up (plan risk, not fixed in this change).
+                        spdlog::warn("TAR: mapdrive historical backfill's profile list walk was "
+                                     "incomplete this pass");
+                    }
                 } else {
                     // Leave the key unset so the next restart retries.
                     spdlog::warn("TAR: mapdrive historical backfill insert failed (continuing; "
@@ -2543,11 +2608,145 @@ private:
         return 0;
     }
 
+    // §3.8 bounded per-profile retry for the mapped-drive HISTORICAL backfill (related issue
+    // #5291). The first pass (init()) can leave a profile unread; this retries each one
+    // individually, kMapDriveBackfillRetryIntervalS apart, up to kMapDriveBackfillMaxAttempts
+    // attempts in total (first pass included), until it resolves or is abandoned.
+    //
+    // Three phases, mirroring do_collect_software's enumeration-outside-the-lock split (gov
+    // UP-6): PHASE A claims the slot under collect_mu_ (so a concurrent tick reads not-due and a
+    // crash mid-retry costs a day, never an attempt); PHASE B enumerates UNLOCKED (hive I/O, via
+    // with_user_hive/ScopedOfflineHiveLock, never runs under the shared lock); PHASE C commits
+    // under collect_mu_ again, taken a second time, never nested. Called from two sites, both
+    // BEFORE they take their own collect_mu_ lock_guard: init()'s already-done branch and
+    // do_collect_slow below — never from collect_slow_impl or fleet_snapshot, so a snapshot
+    // dispatch never carries hive I/O.
+    void retry_pending_mapdrive_backfill() {
+        constexpr int kMax = kMapDriveBackfillMaxAttempts;
+        const auto now = now_epoch_seconds();
+
+        // PHASE A: claim. A concurrent tick that reads `mapdrive_backfill_pending` after this
+        // write sees `now` and skips (not due); a crash or throw before PHASE C's commit leaves
+        // the SID list unchanged, so the cost of this claim going nowhere is one day, never an
+        // acquisition attempt.
+        PendingState state;
+        std::string claimed_pending; // the exact value this claim persisted; re-checked in PHASE C
+        {
+            std::lock_guard lock(collect_mu_);
+            if (!source_enabled(*db_, "mapdrive"))
+                return;
+            state = parse_pending_state(db_->get_config("mapdrive_backfill_pending", ""), kMax);
+            if (state.profiles.empty() ||
+                !retry_due(now, state.last_ts, kMapDriveBackfillRetryIntervalS))
+                return;
+            state.last_ts = now;
+            claimed_pending = format_pending_state(state);
+            if (!db_->set_config("mapdrive_backfill_pending", claimed_pending))
+                return; // claim write failed; the next due tick tries again
+        }
+
+        // PHASE B: enumerate unlocked. retry_sids excludes any already-exhausted entry (review
+        // P5); an empty result still falls through to PHASE C so a hand-edited/clamped exhausted
+        // entry is abandoned even when nothing was walked.
+        const auto sids = retry_sids(state, kMax);
+        MapDriveHistory hist; // default {rows={}, profiles={}, complete=true} when sids is empty
+        if (!sids.empty()) {
+            try {
+                hist = yuzu::tar::enumerate_mapdrive_history_for_profiles(sids);
+            } catch (const std::exception& e) {
+                spdlog::warn("TAR: mapdrive backfill retry enumeration threw ({}) — will retry "
+                             "at the next due tick",
+                             e.what());
+                return; // the claimed state stands unchanged; costs a day, not an attempt
+            } catch (...) {
+                spdlog::warn("TAR: mapdrive backfill retry enumeration threw — will retry at "
+                             "the next due tick");
+                return;
+            }
+        }
+
+        const auto snap = next_snapshot_id();
+        std::vector<MapDriveEvent> typed;
+        typed.reserve(hist.rows.size());
+        for (auto& h : hist.rows) {
+            MapDriveEvent ev;
+            ev.ts = h.ts;
+            ev.snapshot_id = snap;
+            ev.action = "historical";
+            ev.direction = h.entry.direction;
+            ev.local_mount = h.entry.local_mount;
+            ev.remote_path = h.entry.remote_path;
+            ev.remote_host = h.entry.remote_host;
+            ev.username = h.entry.username;
+            ev.provider = h.entry.provider;
+            ev.origin = "historical";
+            typed.push_back(std::move(ev));
+        }
+
+        // PHASE C: commit. Re-check source_enabled: a plain disable that is STILL in effect here
+        // raced the enumeration above, so this result is stale -- drop it and leave the claimed
+        // state exactly as PHASE A left it (the next enable's first pass starts fresh).
+        std::lock_guard lock(collect_mu_);
+        if (!source_enabled(*db_, "mapdrive")) {
+            spdlog::info("TAR: mapdrive backfill retry result dropped — source disabled mid-retry");
+            return;
+        }
+        // A disable+purge+re-enable fully inside PHASE B's unlocked window defeats the check
+        // above: `mapdrive` reads enabled again by the time we get here, but do_purge_source
+        // also clears this exact key (adversarial review: a stale commit otherwise resurrects
+        // rows the purge just deleted). Nothing else writes `mapdrive_backfill_pending` except
+        // this function's own two phases and the first pass's commit_first_pass, so a value that
+        // no longer matches what PHASE A itself persisted means something else touched it in
+        // between -- drop the stale result rather than overwrite that newer state.
+        if (db_->get_config("mapdrive_backfill_pending", "") != claimed_pending) {
+            spdlog::info("TAR: mapdrive backfill retry result dropped — claim superseded "
+                         "mid-retry (reconfigured or purged)");
+            return;
+        }
+        // skip_known_historical=true: the NOT EXISTS insert makes a repeated attempt over the
+        // same identity idempotent, so a retry that re-observes an already-recorded mapping never
+        // duplicates it.
+        if (!db_->insert_mapdrive_events(typed, std::nullopt, /*skip_known_historical=*/true)) {
+            spdlog::warn("TAR: mapdrive backfill retry insert failed — will retry at the next "
+                         "due tick");
+            return; // claimed state untouched; the retry is idempotent next time
+        }
+        // Runs even when sids was empty, so an exhausted-but-still-persisted entry (a clamped or
+        // hand-edited attempt count) is abandoned here rather than retried forever.
+        const auto r = apply_outcomes(state, hist.profiles, hist.complete, kMax);
+        for (const auto& f : r.failed) {
+            spdlog::info("TAR mapdrive backfill: profile {} attempt {}/{} {}", f.sid, f.attempts,
+                         kMax, f.token);
+        }
+        for (const auto& a : r.abandoned) {
+            spdlog::warn("TAR mapdrive backfill: profile {} abandoned after {} attempts ({})",
+                         a.sid, kMax, a.token);
+        }
+        for (const auto& ret : r.retained) {
+            spdlog::info("TAR mapdrive backfill: profile {} retained ({})", ret.sid, ret.cause);
+        }
+        for (const auto& sid : r.vanished) {
+            spdlog::info("TAR mapdrive backfill: profile {} is no longer in the profile list; "
+                         "dropped from the pending set",
+                         sid);
+        }
+        if (!db_->set_config("mapdrive_backfill_pending", r.next.profiles.empty()
+                                                               ? std::string{}
+                                                               : format_pending_state(r.next)))
+            spdlog::warn("TAR: mapdrive backfill retry committed its rows but failed to persist "
+                         "the updated pending state — the stale claim stands, costing one extra "
+                         "retry interval (quality-engineer)");
+    }
+
     int do_collect_slow(yuzu::CommandContext& ctx) {
         {
             yuzu::PluginContext pctx{plugin_ctx_};
             reconcile_db_health_publish(pctx);
         }
+        // §3.8 bounded mapdrive-backfill retry (related issue #5291): above collect_mu_, same as
+        // init()'s call site, so hive I/O never runs under the shared lock. Cheap when nothing is
+        // due (phase A's own short lock-and-check) — see retry_pending_mapdrive_backfill's banner.
+        retry_pending_mapdrive_backfill();
         std::lock_guard lock(collect_mu_);
         return collect_slow_impl(ctx);
     }
@@ -3417,6 +3616,22 @@ private:
         auto res = db_->purge_source(source);
         if (!res) {
             ctx.write_output(std::format("error|{}", res.error()));
+            return 1;
+        }
+        // The per-profile mapdrive backfill retry (§3.8, related issue #5291) persists its own
+        // pending list in a key this purge does not otherwise touch -- left alone, a still-
+        // pending profile's next retry can re-enumerate and re-insert exactly the rows this
+        // purge just deleted (adversarial review). Never clear mapdrive_backfill_done here: that
+        // would re-run the full first pass and resurrect everything, not just the pending subset.
+        // This write's own failure must not report a silent success: the warehouse rows are
+        // already gone (checked above), so a retry only re-attempts this one idempotent write,
+        // never a second deletion -- but reporting "purged" while the pending list still names
+        // the deleted rows reopens the exact resurrection this fix exists to close (governance,
+        // unhappy-path).
+        if (source == "mapdrive" && !db_->set_config("mapdrive_backfill_pending", "")) {
+            ctx.write_output(
+                "error|purge removed the rows but failed to clear the pending backfill retry "
+                "list; retry the purge (the deletion itself is idempotent and will not repeat)");
             return 1;
         }
         ctx.write_output(
