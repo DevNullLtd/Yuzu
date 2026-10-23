@@ -904,6 +904,7 @@ FULL_FILE_ROWS = {
     "raw-string splice desync", "splice through a form feed",
     "u8 char desync at the top of the lambda", "#define Handled Unhandled",
     "registration receiver swapped to another server", "registration inside a runtime if block",
+    "second pre_request handler registration (the stage is wired)",
 }
 FULL_FILE_POSITIVES = {
     "macro that names nothing the lambda uses", "digit separators at the top of the lambda",

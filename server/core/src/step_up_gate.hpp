@@ -25,9 +25,9 @@
 /// answered ahead of the handler's own authorization and its own cross-site copy.
 /// It reads neither Origin nor Referer: for a cookie session the server-wide
 /// same-site gate (same_site_write_gate.hpp, pre-routing) has already answered a
-/// cross-site or header-less write by then. The
-/// audit rows it writes carry `stage=pre_authz` (last) so they can be told apart, and `cid=<id>`,
-/// the same value as the response's `X-Correlation-Id`.
+/// cross-site or header-less write by then. The audit rows it writes carry
+/// `stage=pre_authz` (last) so they can be told apart, and `cid=<id>`, the same
+/// value as the response's `X-Correlation-Id`.
 /// The decision is made per request and never cached across requests; the only
 /// state is a one-request thread-local stash (see `detail::StepUpPassStash`) that
 /// lets the still-present in-handler `StepUpFn` skip a second store read and binds

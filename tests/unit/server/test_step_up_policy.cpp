@@ -69,6 +69,20 @@ TEST_CASE("step-up policy: the gated set is exactly the 36 routes with an in-han
     CHECK(count_class(StepUpClass::kStrong) == 0);
 }
 
+TEST_CASE("step-up policy: the table's total and per-class row counts are pinned",
+          "[stepup][policy]") {
+    // Executable pins for the table counts (232 mutating REST routes: 36 required, 3 own-gate,
+    // 120 exempt, 73 pending). A row added or reclassified without these numbers moving
+    // together fails here.
+    CHECK(kStepUpPolicyCount == 232);
+    CHECK(count_class(StepUpClass::kExempt) == 120);
+    CHECK(count_class(StepUpClass::kPendingRuling) == 73);
+    CHECK(count_class(StepUpClass::kRequired) + count_class(StepUpClass::kOwnGate) +
+              count_class(StepUpClass::kStrong) + count_class(StepUpClass::kExempt) +
+              count_class(StepUpClass::kPendingRuling) ==
+          kStepUpPolicyCount);
+}
+
 TEST_CASE("step-up policy: kOwnGate is the three elevation routes", "[stepup][policy]") {
     const auto* a = step_up_policy_for("POST", R"(/api/v1/users/([^/]+)/elevation-eligibility)");
     const auto* b = step_up_policy_for("POST", R"(/api/v1/users/elevation-eligibility)");
