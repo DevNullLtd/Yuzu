@@ -25,7 +25,13 @@ Required statements (each is one requirement id below):
   * the withheld-read counter family is pre-seeded (seed_forensics_tier_metrics);
   * the drawer's Response:Read probe is the QUIET draw-time fleet-read probe, and the drawer's
     audit row is persisted through a real audit sink;
+  * the dashboard results fragment's audit sink (set_persist_audit_fn) is wired before its
+    registration: an unwired sink reads as "audit off", so a dropped setter silently loses the
+    response.forensics.read rows;
   * setters that take effect only at registration run BEFORE the matching register_routes call;
+  * lifetime orderings (ORDER_ANCHORS): the plugin-set member is declared before every member that
+    borrows it, the agent service gets the set before its listener starts, and MCP gets the set and
+    the resolver before the web thread starts;
   * no wiring spells the unwired hatches (a null plugin set passed to a setter or a Deps field,
     for_fixed_plugin_poll(nullptr)).
 
@@ -157,6 +163,10 @@ REQUIRED: list[tuple[str, str, str]] = [
     ("dashboard-fn",
      r"(?P<k>dashboard_routes_->set_forensics_visibility_fn\(" + _VF + r"\);).*?dashboard_routes_->register_routes\(",
      "the dashboard routes must receive the visibility resolver before registration"),
+    ("dashboard-persist-audit",
+     r"(?P<k>dashboard_routes_->set_persist_audit_fn\(audit_fn\);).*?dashboard_routes_->register_routes\(",
+     "the dashboard results fragment's response.forensics.read row must be persisted through a real "
+     "audit sink (an unwired sink reads as audit-off, not as a failure)"),
     ("workflow-set",
      r"(?P<k>wf_deps\.forensics_plugins=" + _FP + r";).*?workflow_routes_->register_routes\(",
      "the workflow routes (executions drawer, bundle paths) must receive the plugin set"),
@@ -197,6 +207,44 @@ REQUIRED: list[tuple[str, str, str]] = [
      r"(?P<k>result_set_members\(\*response_store_," + _FP + r",p\))",
      "the result-set materialiser must read through result_set_members with the plugin set"),
 ]
+
+# Lifetime orderings. Each row's key statement must appear BEFORE its anchor in the file; the
+# selftest moves the key statement after the anchor and requires the row to be named.
+#   * the plugin-set member is declared before every member that borrows `forensics_plugins()`, so
+#     reverse-order destruction keeps the borrowed pointer valid until the borrowers are gone;
+#   * the agent service receives the set before its gRPC listener starts (the first ingest runs on
+#     a listener thread), and MCP receives it before the web thread starts.
+# Anchors are the canonical (comment-free, punctuation-tight) spelling of the declaration or call.
+_SET_MEMBER = r"(?P<k>std::optional<yuzu::server::ForensicsPluginSet>forensics_plugin_set_;)"
+ORDER_ANCHORS: dict[str, str] = {
+    "member-before-agent-service": "detail::AgentServiceImpl agent_service_;",
+    "member-before-response-store": "std::unique_ptr<ResponseStore>response_store_;",
+    "member-before-execution-tracker": "std::unique_ptr<ExecutionTracker>execution_tracker_;",
+    "member-before-policy-evaluator": "std::unique_ptr<PolicyEvaluator>policy_evaluator_;",
+    "member-before-rest-api": "std::unique_ptr<RestApiV1>rest_api_v1_;",
+    "member-before-mcp-server": "std::unique_ptr<mcp::McpServer>mcp_server_;",
+    "member-before-hardware-routes": "std::unique_ptr<HardwareRoutes>hardware_routes_;",
+    "member-before-dashboard-routes": "std::unique_ptr<DashboardRoutes>dashboard_routes_;",
+    "member-before-workflow-routes": "std::unique_ptr<WorkflowRoutes>workflow_routes_;",
+    "agent-service-set-before-listener": "agent_server_=builder.BuildAndStart();",
+    "mcp-set-before-web-thread": "web_thread_=std::thread(",
+    "mcp-fn-before-web-thread": "web_thread_=std::thread(",
+}
+for _rid, _anchor in ORDER_ANCHORS.items():
+    if _rid.startswith("member-before-"):
+        _pat = _SET_MEMBER + r".*?" + re.escape(_anchor)
+        _why = ("the plugin-set member must be declared before the member that borrows it, so it is "
+                "destroyed after it")
+    elif _rid == "agent-service-set-before-listener":
+        _pat = (r"(?P<k>agent_service_\.set_forensics_plugin_set\(" + _FP + r"\);).*?" + re.escape(_anchor))
+        _why = "the agent service must receive the plugin set before its gRPC listener starts"
+    elif _rid == "mcp-set-before-web-thread":
+        _pat = (r"(?P<k>mcp_server_->set_forensics_plugin_set\(" + _FP + r"\);).*?" + re.escape(_anchor))
+        _why = "MCP must receive the plugin set before the web thread starts serving"
+    else:
+        _pat = (r"(?P<k>mcp_server_->set_forensics_visibility_fn\(" + _VF + r"\);).*?" + re.escape(_anchor))
+        _why = "MCP must receive the visibility resolver before the web thread starts serving"
+    REQUIRED.append((_rid, _pat, _why))
 
 # Patterns whose occurrence COUNT is pinned (a deleted site must not hide behind the others).
 COUNTED: list[tuple[str, str, int, str]] = [

@@ -48,7 +48,7 @@ def main() -> int:
     t = g.canonical(raw)
 
     expect(g.problems_canonical(t) == [], "the real server.cpp must pass the gate")
-    expect(len(g.REQUIRED) >= 28, "the required-statement list must not shrink silently")
+    expect(len(g.REQUIRED) >= 41, "the required-statement list must not shrink silently")
 
     # Delete each required statement's key text.
     for rid, pat, _why in g.REQUIRED:
@@ -83,12 +83,16 @@ def main() -> int:
     expect({r for r, _, _ in g.FORBIDDEN} == set(hatches), "every forbidden hatch has a selftest spelling")
 
     # Registration-order: move the setter text after its register_routes call.
-    for rid, reg in (("rest-set", "rest_api_v1_->register_routes("),
-                     ("rest-fn", "rest_api_v1_->register_routes("),
-                     ("dashboard-set", "dashboard_routes_->register_routes("),
-                     ("dashboard-fn", "dashboard_routes_->register_routes("),
-                     ("workflow-set", "workflow_routes_->register_routes("),
-                     ("workflow-fn", "workflow_routes_->register_routes(")):
+    orders = [("rest-set", "rest_api_v1_->register_routes("),
+              ("rest-fn", "rest_api_v1_->register_routes("),
+              ("dashboard-set", "dashboard_routes_->register_routes("),
+              ("dashboard-fn", "dashboard_routes_->register_routes("),
+              ("dashboard-persist-audit", "dashboard_routes_->register_routes("),
+              ("workflow-set", "workflow_routes_->register_routes("),
+              ("workflow-fn", "workflow_routes_->register_routes(")]
+    # Lifetime orderings: the key statement moved after its anchor (a declaration or a call).
+    orders += list(g.ORDER_ANCHORS.items())
+    for rid, reg in orders:
         pat = next(p for r, p, _ in g.REQUIRED if r == rid)
         m = re.search(pat, t, re.S)
         a, b = m.span("k")
@@ -119,7 +123,7 @@ def main() -> int:
         print(f"{len(FAILURES)} selftest failure(s)", file=sys.stderr)
         return 1
     print(f"OK: {len(g.REQUIRED)} deletions, {len(g.COUNTED)} counted, {len(g.FORBIDDEN)} hatches, "
-          f"6 order and 2 comment/literal mutations all caught")
+          f"{len(orders)} order and 2 comment/literal mutations all caught")
     return 0
 
 
