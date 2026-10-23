@@ -85,6 +85,48 @@ constexpr std::array<CommandCapability, 3> kMixedRows{{
     },
 }};
 
+// A plugin with rows on BOTH the Forensics securable and another one: the per-plugin response tier
+// would withhold the ordinary row's output too.
+constexpr std::array<CommandCapability, 2> kMixedTierPlugin{{
+    {
+        .plugin = "mixed",
+        .action = "forensic_read",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Forensics",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::High,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::AdminOrApproval,
+    },
+    {
+        .plugin = "Mixed",
+        .action = "ordinary_read",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Infrastructure",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Low,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
+    },
+}};
+
+// A Forensics plugin whose name contains '-': the stored plugin is the text before the first '-'.
+constexpr std::array<CommandCapability, 1> kDashedForensicsPlugin{{
+    {
+        .plugin = "dashed-plugin",
+        .action = "read",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Forensics",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::High,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::AdminOrApproval,
+    },
+}};
+
 } // namespace
 
 TEST_CASE("response tier filter: the types cannot be default-constructed",
@@ -137,6 +179,44 @@ TEST_CASE("ResponseTierFilter::unrestricted_internal_consumer restricts nothing"
     const auto f = ResponseTierFilter::unrestricted_internal_consumer();
     CHECK_FALSE(f.restricts());
     CHECK(f.excluded_plugins().empty());
+}
+
+TEST_CASE("the real catalogue is sound for a per-plugin response tier",
+          "[server][responses][security][forensics]") {
+    const CommandCapabilityRegistry registry{YUZU_ALL_CAPABILITY_FRAGMENTS};
+    CHECK_FALSE(forensics_catalogue_defect(registry).has_value());
+    // The two properties the defect check pins, asserted directly on the production catalogue so a
+    // failure names the plugin: no '-' in a Forensics plugin name, and every row of a Forensics
+    // plugin is on the Forensics securable.
+    const auto names = registry.plugins_on_securable(kForensicsSecurable);
+    REQUIRE_FALSE(names.empty());
+    registry.for_each_row([&](const CommandCapability& cap) {
+        const auto lower = ascii_lower(cap.plugin);
+        if (std::ranges::find(names, lower) == names.end())
+            return;
+        INFO("plugin " << lower << " action " << cap.action);
+        CHECK(cap.securable == kForensicsSecurable);
+        CHECK(lower.find('-') == std::string::npos);
+    });
+}
+
+TEST_CASE("an unsound catalogue is refused, not tolerated",
+          "[server][responses][security][forensics]") {
+    SECTION("a plugin with rows on the Forensics securable and another one") {
+        const CommandCapabilityRegistry registry{std::span<const CommandCapability>(kMixedTierPlugin)};
+        const auto defect = forensics_catalogue_defect(registry);
+        REQUIRE(defect.has_value());
+        CHECK(defect->find("mixed") != std::string::npos);
+        CHECK_FALSE(derive_forensics_plugin_set(registry).has_value());
+    }
+    SECTION("a Forensics plugin whose name contains a dash") {
+        const CommandCapabilityRegistry registry{
+            std::span<const CommandCapability>(kDashedForensicsPlugin)};
+        const auto defect = forensics_catalogue_defect(registry);
+        REQUIRE(defect.has_value());
+        CHECK(defect->find("dashed-plugin") != std::string::npos);
+        CHECK_FALSE(derive_forensics_plugin_set(registry).has_value());
+    }
 }
 
 TEST_CASE("the Forensics plugin set is derived from the catalogue, not a hand-kept list",
