@@ -38,6 +38,7 @@
 
 #include "../test_helpers.hpp"
 
+#include <algorithm>
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
@@ -1488,6 +1489,21 @@ TEST_CASE("Engine-principal REST: a stuck rotation pair is recovered by revoking
         REQUIRE(!predecessor_id.empty());
     }
 
+    // The per-credential route is owner-or-admin: a non-admin caller who does not own the
+    // engine credential is refused with the same 404 as an unknown id, and the successor stays
+    // active (the recovery is not reachable by anyone who merely holds ApiToken:Delete).
+    h.session_role = auth::Role::user;
+    {
+        auto refused = h.sink.dispatch("DELETE", "/api/v1/tokens/" + successor_id, "");
+        REQUIRE(refused);
+        CHECK(refused->status == 404);
+        CHECK(refused->body.find("token not found") != std::string::npos);
+        const auto active = h.token_store->list_active_for_principal(pid);
+        CHECK(active.size() == 2);
+        CHECK(std::any_of(active.begin(), active.end(),
+                          [&](const auto& t) { return t.token_id == successor_id; }));
+    }
+
     // Recovery step 2: revoke the successor as an effective administrator.
     h.session_role = auth::Role::admin;
     auto del = h.sink.dispatch("DELETE", "/api/v1/tokens/" + successor_id, "");
@@ -1504,6 +1520,17 @@ TEST_CASE("Engine-principal REST: a stuck rotation pair is recovered by revoking
         CHECK(active[0].rotation_group.empty());
         CHECK(active[0].supersedes_token_id.empty());
         CHECK(active[0].overlap_expires_at == 0);
+    }
+
+    // The maintenance sweep must not touch the survivor either: it is a standalone credential
+    // with no rotation stamp, so a sweep run well past any overlap window leaves it active.
+    {
+        const auto swept = h.token_store->sweep_expired_rotations(now_epoch() + 3 * 86400);
+        CHECK(swept.outcome == ApiTokenStore::SweepOutcome::Ok);
+        CHECK(swept.revoked.empty());
+        const auto active = h.token_store->list_active_for_principal(pid);
+        REQUIRE(active.size() == 1);
+        CHECK(active[0].token_id == predecessor_id);
     }
 
     // Recovery step 3: rotating from the sole credential succeeds with a fresh secret.
