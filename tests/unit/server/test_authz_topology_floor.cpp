@@ -1289,6 +1289,73 @@ TEST_CASE("forensics visibility: an engine principal without a grant sees nothin
     CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), req)));
 }
 
+TEST_CASE("forensics visibility: RBAC on - a ForensicsAnalyst holder is global, a Viewer is still nothing "
+          "(#4990)",
+          "[pg][auth_routes][authz_topology_floor][forensics][forensics_analyst]") {
+    ForensicsVisRig rig;
+    rig.rbac.set_rbac_enabled(true);
+
+    auto analyst = rig.cookie_request("ana1", auth::Role::user);
+    REQUIRE(rig.rbac.assign_role({"user", "ana1", "ForensicsAnalyst"}).has_value());
+    CHECK(rig.rbac.check_permission("ana1", "Forensics", "Read"));
+    CHECK(is_global(resolve_forensics_visible(rig.deps(), analyst)));
+
+    // The sibling read roles are unchanged: Viewer and Operator hold no Forensics grant.
+    auto viewer = rig.cookie_request("viewer9", auth::Role::user);
+    REQUIRE(rig.rbac.assign_role({"user", "viewer9", "Viewer"}).has_value());
+    CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), viewer)));
+    auto op = rig.cookie_request("op9", auth::Role::user);
+    REQUIRE(rig.rbac.assign_role({"user", "op9", "Operator"}).has_value());
+    CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), op)));
+
+    // Operator + ForensicsAnalyst combine to a global Forensics read.
+    REQUIRE(rig.rbac.assign_role({"user", "op9", "ForensicsAnalyst"}).has_value());
+    CHECK(is_global(resolve_forensics_visible(rig.deps(), op)));
+
+    // The grant is revocable: unassigning returns the holder to nothing.
+    REQUIRE(rig.rbac.unassign_role("user", "ana1", "ForensicsAnalyst").has_value());
+    CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), analyst)));
+}
+
+TEST_CASE("forensics visibility: RBAC off - an assigned ForensicsAnalyst grant does nothing, the floor stands "
+          "(#4990)",
+          "[pg][auth_routes][authz_topology_floor][forensics][forensics_analyst]") {
+    ForensicsVisRig rig;
+    rig.rbac.set_rbac_enabled(true);
+    auto analyst = rig.cookie_request("ana2", auth::Role::user);
+    REQUIRE(rig.rbac.assign_role({"user", "ana2", "ForensicsAnalyst"}).has_value());
+    REQUIRE(is_global(resolve_forensics_visible(rig.deps(), analyst))); // sanity: honoured while enforced
+
+    // Enforcement off: the legacy fallback plus the topology floor decide, and the floor keeps
+    // Forensics:Read administrator-only. The stored grant is inert, not honoured and not erased.
+    rig.rbac.set_rbac_enabled(false);
+    CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), analyst)));
+    CHECK(rig.rbac.get_principal_roles("user", "ana2").size() == 1);
+
+    // Back on, the same grant works again.
+    rig.rbac.set_rbac_enabled(true);
+    CHECK(is_global(resolve_forensics_visible(rig.deps(), analyst)));
+}
+
+TEST_CASE("forensics visibility: a service-scoped token minted by a ForensicsAnalyst holder carries nothing "
+          "(#4990)",
+          "[pg][auth_routes][authz_topology_floor][forensics][forensics_analyst][service_scope]") {
+    ForensicsVisRig rig;
+    rig.rbac.set_rbac_enabled(true);
+    REQUIRE(rig.auth_mgr.upsert_user("ana3", "password1234", auth::Role::user));
+    REQUIRE(rig.rbac.assign_role({"user", "ana3", "ForensicsAnalyst"}).has_value());
+
+    auto plain = rig.api_tokens->create_token("plain", "ana3", forensics_vis_now() + 3600);
+    REQUIRE(plain.has_value());
+    auto plain_req = rig.bearer_request(*plain);
+    CHECK(is_global(resolve_forensics_visible(rig.deps(), plain_req))); // a plain token is the user
+
+    auto svc = rig.api_tokens->create_token("svc", "ana3", forensics_vis_now() + 3600, "billing");
+    REQUIRE(svc.has_value());
+    auto svc_req = rig.bearer_request(*svc);
+    CHECK(is_present_empty(resolve_forensics_visible(rig.deps(), svc_req)));
+}
+
 TEST_CASE("forensics visibility: a degraded or unwired input is Unknown, a definitive refusal is Denied, neither is ever global",
           "[pg][auth_routes][authz_topology_floor][forensics]") {
     ForensicsVisRig rig;
