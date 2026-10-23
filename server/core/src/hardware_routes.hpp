@@ -185,7 +185,19 @@ std::string render_hardware_actions_lens(const std::string& agent_id, const std:
 /// `device_routes.cpp`'s live-info result idiom: Pending polls again via
 /// `hx-trigger="load delay:700ms"`; a terminal state renders once and stops.
 struct HwActionResultView {
-    enum class Phase { Pending, Rendered, RenderedEmpty, Failed, TimedOut } phase{Phase::Pending};
+    /// `NeedsForensicsRead` / `PermissionUnconfirmed` (#4990) end the poll with a notice: the caller
+    /// cannot read this Forensics-tier plugin's reply for this device (a permission, not a timeout),
+    /// or the permission check itself could not be completed (try again). Appended last: the phase
+    /// number is part of the `hardware.action.result` audit detail.
+    enum class Phase {
+        Pending,
+        Rendered,
+        RenderedEmpty,
+        Failed,
+        TimedOut,
+        NeedsForensicsRead,
+        PermissionUnconfirmed
+    } phase{Phase::Pending};
     std::string output;
     std::string error_detail;
     int attempt{1};

@@ -1372,13 +1372,15 @@ TEST_CASE("result poll: a Forensics-plugin reply is rendered only for a caller w
 
     HwHarness h(false, false, false, kContainmentUi, &rs);
 
-    SECTION("a caller without Forensics:Read gets the pending view, never the output") {
+    SECTION("a caller without Forensics:Read gets a permission notice, never the output") {
         h.forensics.viewer();
         auto res = h.sink.Get(poll_url("agent-1", "browser_inventory-aaaa1111", "browser_inventory"));
         REQUIRE(res);
         CHECK(res->status == 200);
         CHECK_FALSE(contains(res->body, "TOKEN-HW-FORENSICS"));
-        CHECK(contains(res->body, "Waiting for the device to respond"));
+        CHECK(contains(res->body, "data-forensics-read-required"));
+        CHECK(contains(res->body, "Forensics:Read"));
+        CHECK_FALSE(contains(res->body, "Waiting for the device to respond"));
     }
     SECTION("a global Forensics:Read gets the output") {
         h.forensics.admin();
@@ -1391,6 +1393,7 @@ TEST_CASE("result poll: a Forensics-plugin reply is rendered only for a caller w
         auto denied = h.sink.Get(poll_url("agent-1", "browser_inventory-aaaa1111", "browser_inventory"));
         REQUIRE(denied);
         CHECK_FALSE(contains(denied->body, "TOKEN-HW-FORENSICS"));
+        CHECK(contains(denied->body, "data-forensics-read-required"));
         h.forensics.scoped({"agent-1"});
         auto ok = h.sink.Get(poll_url("agent-1", "browser_inventory-aaaa1111", "browser_inventory"));
         REQUIRE(ok);
@@ -1404,6 +1407,87 @@ TEST_CASE("result poll: a Forensics-plugin reply is rendered only for a caller w
             CHECK(contains(res->body, "TOKEN-HW-ORDINARY"));
         }
     }
+}
+
+TEST_CASE("result poll: a caller who lacks the Forensics read proof gets a permission notice on the first "
+          "poll and on every later one, never a false timeout",
+          "[hardware][route][security][forensics]") {
+    // No response store is needed: the notice is decided before any read.
+    HwHarness h;
+    const auto url = poll_url("agent-1", "browser_inventory-aaaa1111", "browser_inventory");
+    h.forensics.viewer();
+
+    for (const char* attempt : {"", "&n=1", "&n=2", "&n=39", "&n=40", "&n=50"}) {
+        INFO(attempt);
+        auto res = h.sink.Get(url + attempt);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "data-forensics-read-required"));
+        CHECK(contains(res->body, "Forensics:Read"));
+        // The poll ends here: not pending (no further hx-get), and never the timeout text.
+        CHECK_FALSE(contains(res->body, "Timed out"));
+        CHECK_FALSE(contains(res->body, "Waiting"));
+        CHECK_FALSE(contains(res->body, "hx-get"));
+    }
+    // Control: an ordinary plugin's poll is untouched for the same caller (pending, then a timeout
+    // only at the 40th attempt, as before).
+    auto ordinary = h.sink.Get(poll_url("agent-1", "hardware-abc123", "hardware"));
+    REQUIRE(ordinary);
+    CHECK(contains(ordinary->body, "Waiting"));
+    CHECK_FALSE(contains(ordinary->body, "data-forensics-read-required"));
+    auto timeout = h.sink.Get(poll_url("agent-1", "hardware-abc123", "hardware") + "&n=40");
+    REQUIRE(timeout);
+    CHECK(contains(timeout->body, "Timed out"));
+
+    // A holder is polled normally (pending until a reply lands), a scoped holder only for its own
+    // device.
+    h.forensics.admin();
+    auto holder = h.sink.Get(url);
+    REQUIRE(holder);
+    CHECK(contains(holder->body, "Waiting"));
+    CHECK_FALSE(contains(holder->body, "data-forensics-read-required"));
+    h.forensics.scoped({"agent-other"});
+    auto other_device = h.sink.Get(url);
+    REQUIRE(other_device);
+    CHECK(contains(other_device->body, "data-forensics-read-required"));
+    h.forensics.scoped({"agent-1"});
+    auto own_device = h.sink.Get(url);
+    REQUIRE(own_device);
+    CHECK(contains(own_device->body, "Waiting"));
+}
+
+TEST_CASE("result poll: an Unknown Forensics decision ends the poll with a retry notice, never a "
+          "timeout or rows",
+          "[pg][hardware][route][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, hw_responsestore_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    put_hw_response(rs, "browser_inventory-aaaa1111", "agent-1", "browser_inventory",
+                    "TOKEN-HW-FORENSICS");
+    put_hw_response(rs, "hardware-bbbb2222", "agent-1", "hardware", "TOKEN-HW-ORDINARY");
+    HwHarness h(false, false, false, kContainmentUi, &rs);
+    h.forensics.unknown();
+
+    for (const char* attempt : {"", "&n=40"}) {
+        INFO(attempt);
+        for (const auto& url : {poll_url("agent-1", "browser_inventory-aaaa1111", "browser_inventory"),
+                                poll_url("agent-1", "hardware-bbbb2222", "hardware")}) {
+            auto res = h.sink.Get(url + attempt);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            CHECK(contains(res->body, "data-permission-unconfirmed"));
+            CHECK(contains(res->body, "could not be completed"));
+            CHECK_FALSE(contains(res->body, "Timed out"));
+            CHECK_FALSE(contains(res->body, "Waiting"));
+            CHECK_FALSE(contains(res->body, "hx-get"));
+            CHECK_FALSE(contains(res->body, "TOKEN-HW-"));
+        }
+    }
+    for (const auto& full : h.audit_full)
+        CHECK(full.rfind("response.forensics.read|", 0) != 0);
+    for (const auto& full : h.audit_full)
+        CHECK(full.rfind("hardware.action.result|", 0) != 0); // nothing was rendered
 }
 
 namespace {

@@ -372,6 +372,17 @@ std::string render_hardware_action_result(const std::string& plugin, const std::
         case HwActionResultView::Phase::TimedOut:
             h += "<span class=\"gp-mute\">Timed out waiting for a response.</span>";
             break;
+        case HwActionResultView::Phase::NeedsForensicsRead:
+            // A permission notice, not a timeout: polling ends here and no reply is shown.
+            h += "<div class=\"gp-placeholder\" data-forensics-read-required=\"true\">"
+                 "Showing this result needs the <b>Forensics:Read</b> permission for this "
+                 "device.</div>";
+            break;
+        case HwActionResultView::Phase::PermissionUnconfirmed:
+            h += "<div class=\"gp-placeholder\" data-permission-unconfirmed=\"true\">"
+                 "The permission check for this result could not be completed. Try again "
+                 "shortly.</div>";
+            break;
     }
     h += "</div>";
     return h;

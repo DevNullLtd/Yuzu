@@ -911,13 +911,28 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const auto tier_resolved =
             tier_filter_for(req, deps_.forensics_visibility_fn, deps_.forensics_plugins);
         if (!tier_resolved) {
-            // Unknown: stop polling with a retry notice. Polling on would end in a false "timed
+            // Unknown: end the poll with a retry notice. Polling on would end in a false "timed
             // out" for a device that did answer, and the rows can never be shown from here.
-            send_html(res, "<div class=\"gp-placeholder\">The permission check for this result "
-                           "could not be completed. Retry shortly.</div>");
+            HwActionResultView notice;
+            notice.attempt = attempt;
+            notice.phase = HwActionResultView::Phase::PermissionUnconfirmed;
+            send_html(res, render_hardware_action_result(plugin, "", notice));
             return;
         }
         const ResponseTierFilter& tier = *tier_resolved;
+        // A Forensics-tier plugin's reply this caller may not read for this device: say so on the
+        // first poll (and on any later one, so a grant revoked mid-poll ends the same way) instead
+        // of polling to a false "timed out" for a device that did answer. The dispatch gate is
+        // AdminOrApproval and the read gate is Forensics:Read, which can differ (RBAC enforced, a
+        // legacy-admin role without the RBAC grant); no row ever reaches the page either way.
+        if (deps_.forensics_plugins && deps_.forensics_plugins->contains(plugin) &&
+            !tier.admits(plugin, id)) {
+            HwActionResultView notice;
+            notice.attempt = attempt;
+            notice.phase = HwActionResultView::Phase::NeedsForensicsRead;
+            send_html(res, render_hardware_action_result(plugin, "", notice));
+            return;
+        }
         const auto rows = deps_.responses_fn(command_id, tier, id);
         const DexAgentResponse* with_output = nullptr;
         const DexAgentResponse* terminal = nullptr;
