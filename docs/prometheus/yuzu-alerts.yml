@@ -3103,11 +3103,13 @@ groups:
             response.read on the v1 query, aggregate and export routes and on the
             legacy get, aggregate and export routes, plus response.forensics.read (written
             only when the rows served include a Forensics-tier plugin's) on the v1
-            execution-scoped response, response get, export and visualization routes and on
-            the legacy get and export routes) is returning 503 and withholding PII or response
+            execution-scoped response, response get, export and visualization routes, on
+            bundle collation (GET /api/v1/bundles/{id}) and on the legacy get and export
+            routes) is returning 503 and withholding PII or response
             data, so a ServiceNow / CMDB poll blackouts fleet-wide. Set-and-proceed reads, including
             crypto.libraries.* and response.forensics.read on the dashboard results fragment, the
-            executions drawer, the hardware result poll and the MCP query_responses tool, keep
+            executions drawer, the hardware result poll, the MCP query_responses tool and
+            the MCP get_bundle_result tool, keep
             serving data and do not 503: their REST routes and dashboard
             fragments set the Sec-Audit-Failed header, their MCP tools set audit_persisted:false
             (the hardware CI tools list_hardware_ci and get_hardware_ci, which audit as
