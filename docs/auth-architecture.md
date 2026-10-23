@@ -844,8 +844,8 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   routes are behind `require_admin`; the generic route uses the same predicate: `authz::admin_gate_verdict` (`admin_gate.hpp`) refuses a
   service-scoped token and an MCP-tier token whatever the creator's role, and otherwise
   requires the EFFECTIVE role to be `admin`. That role is the account's legacy
-  `Session::role`, or a live JIT elevation, never an RBAC grant: an RBAC Administrator grant alone does not count,
-  and an engine principal is refused. Any administrator account session passes,
+  `Session::role`, or a live JIT elevation, never an RBAC grant: an RBAC Administrator
+  grant alone does not count, and an engine principal is refused. Any administrator account session passes,
   including an administrator API token that is not MCP-tier. Unlike the `oidc_*` rule
   above, an active JIT elevation is admitted, as it is on those Settings routes. `Infrastructure:Write` alone
   does not suffice. The refusal precedes the store-open check and the body parse and is
