@@ -348,6 +348,11 @@ gate.
     `guardian_observations` rows (the per-application and per-version top-N membership) that is
     **not yet confined per-caller**. It publishes only distinct-device COUNTs, never an `agent_id`.
     The per-caller SQL slice is the same work item, tracked as #5090.
+- **CA issued-certificate reads** (`GET /api/v1/ca/issued` both forms, MCP `list_issued_certs`, the
+  Settings certificate panel's inventory): see the ADR-0070 Update (2026-10-23). These are the
+  exception to the "Out of scope" paragraph below, which lists CA routes as global-gated. The
+  failed-read arm of the standing probe is a recorded exception to INV-1 and INV-5 (a read failure
+  inside the check serves the list instead of answering 503), tracked by #6382.
 
 ### Out of scope (global by design)
 

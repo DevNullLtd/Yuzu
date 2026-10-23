@@ -1454,3 +1454,72 @@ carries once that PR merges. Before the merge, the PR is the proposal.
   decisions record rulings granted by that approval.
 - A reviewer who disagrees with any one of them blocks on it specifically, so that it can
   be split out rather than accepted silently.
+
+## Update (2026-10-23) - `GET /api/v1/ca/issued` and the panel inventory are confined; the actual gate
+
+This Update does not change R2's text above. It records what the code now does where R2 is
+silent, and one correction to a statement in this ADR's narrative.
+
+### What changed
+
+- **Both forms of `GET /api/v1/ca/issued` (and MCP `list_issued_certs`), and the issued-certificate
+  list in the Settings certificate panel, are confined.** R2 said the CA routes "gate on
+  `Security:Read`" and the narrative above (the sentence beginning "`/api/v1/ca/issued` is not
+  confined today (pre-existing)") treated the unfiltered list as out of scope. The unfiltered list
+  returns the same per-agent rows (subject, SAN, issuing identity) the filtered list does, and
+  `list_issued` has no scope parameter to narrow them by, so it is held to the same standing: a
+  confined caller is withheld (403, no permission named; MCP permission denied), never served a
+  narrowed list. The panel withholds only the inventory (CA details, downloads and the import form
+  stay), and a revoke or import answers a non-empty body. Both forms are audited
+  `crypto.ca.certificates.view` (`denied`, `failure`, `success`).
+
+### The actual gate
+
+The gate is `Security:Read` **plus** a standing probe on `Inventory:Read` (the same non-auditing
+availability callback the `/crypto` widgets use, kFleetWideOnly class). It resolves to:
+
+| Standing | Answer |
+|---|---|
+| kConfined (a present exec-visibility set from a management-group-scoped `Inventory:Read` grant) | withheld: 403 / permission denied; audited `denied` |
+| kDegraded (the check answered 503: a store behind it could not be read) | 503, `retry_after_ms` 5000; audited `failure` |
+| kAvailable (admitted, with no exec-visibility set: a global grant, or RBAC enforcement off) | served; success row ends `standing=available` |
+| kRefused (the check admitted nobody and did not answer 503) | **served**; success row ends `standing=refused` |
+
+R2 says a confined caller is one with "a present exec-visibility set" and is silent on a failed
+read. kRefused covers two causes the answer cannot tell apart:
+
+1. **No `Inventory:Read` grant at all.** Served on purpose: `Security:Read` already admitted the
+   caller, and R2 reads confinement as a property of a scoped grant ("unconfined `Inventory:Read`
+   holders"). Consequence to state plainly: removing a group-scoped `Inventory:Read` grant, or
+   adding a deny, does **not** confine a caller; granting a global `Inventory:Read` removes the
+   confinement. Whether a `Security:Read` holder without `Inventory:Read` should see this list at
+   all is a policy question this Update does not settle (#6383).
+2. **A read failure partway through the access check** (the permission-groups or visible-set read
+   errors, and `authorize_list_read` returns DenyAll). This is served too, i.e. the check **fails
+   open**. That is an **exception to ADR-0017 INV-1** ("any error is deny") **and INV-5** (a partial
+   failure 503s the whole read). It was previously unrecorded, and R2 does not say it; code
+   comments cite R2 only for the confinement withholding. It also affects the filtered list and the `/crypto` drill
+   (`ca_drill_gate`) and `authz_gates.cpp`'s documented 2c weakening. It is strictly narrower than
+   the behaviour before the unfiltered list was confined (every confined caller was served), is
+   pinned by tests that name it ("KNOWN RESIDUAL"), and is tracked by #6382 (a tri-state
+   `read_failed` result from `authorize_list_read` so the answer becomes 503). The no-grant arm and
+   the failed-read arm are indistinguishable at the probe today, so that fix changes the
+   failed-read arm only; the no-grant arm stays served until #6383 decides it.
+   When the tri-state fix lands, supersede this paragraph by a further dated Update (do not delete
+   it, so the history of the exception stays on record) and update the code comments.
+
+Detective control until then: on `GET /api/v1/ca/issued` and `list_issued_certs`, every success
+row carries `standing=available|refused`; review the `refused` rows, knowing that `refused` cannot
+separate a by-design no-grant caller from a read failure, that the audit row can be missing during
+the same outage, and that no alert fires on this path. The `/crypto` drill's success rows carry no
+standing token, so a drill page served on a failed read is not marked. The drill and the Settings
+panel write no `denied` row for a confined caller (a separate gap, tracked with the drill's
+missing `failure` row on a degraded gate: #6384).
+
+### Record
+
+`docs/user-manual/crypto.md` said of the unfiltered list that it "still returns every Yuzu-issued
+certificate to any `Security:Read` holder, a confined one included (owner decision; the same
+rows, without the dashboard's windows)". That sentence entered with commit 95486afc2, whose
+message lists two owner decisions (layout saves; keyset drill paging) and not this one, and no ADR
+records it. On 2026-10-23 the maintainer, Dave Rae, authorised reversing that statement: the unfiltered list is confined, as recorded in "What changed". He also ruled that a caller the standing check refuses without a 503 (kRefused) is served and the behaviour disclosed, with the failed-read exception tracked in #6382 and the no-grant question in #6383, and he approved this Update. He reports that the author of this ADR approved it offline before it was committed; that approval is not recorded elsewhere in the repository.
