@@ -352,7 +352,7 @@ struct Opened {
             // An exception on any path below (an allocation, a throwing seam) also rolls back before it leaves: the
             // keys made so far are deleted by their own handles and the exception goes on. push_back cannot throw
             // once the storage is reserved, so a key create_sub reported new is always in made_keys.
-            made_keys.reserve(parts.size() - i);
+            made_keys.reserve(parts.size() - i); // (no test can fail this: the fake has no allocation seam)
             try {
                 for (std::size_t j = i; j < parts.size(); ++j) {
                     const bool last_j = j + 1 == parts.size();
