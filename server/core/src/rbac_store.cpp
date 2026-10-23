@@ -1504,6 +1504,19 @@ bool RbacStore::generation_view_stale_locked() const {
                                                    kRbacStaleServeBoundMs);
 }
 
+void RbacStore::age_refresh_state_for_test(std::chrono::milliseconds elapsed) {
+    const std::int64_t ms = elapsed.count();
+    {
+        std::lock_guard lock(cache_mtx_);
+        refresh_started_ms_ -= ms;
+        last_successful_refresh_ms_ -= ms;
+    }
+    {
+        std::lock_guard lock(breaker_mtx_);
+        breaker_last_probe_started_ms_ -= ms;
+    }
+}
+
 bool RbacStore::rbac_enabled_view_degraded() const {
     std::lock_guard lock(cache_mtx_);
     return generation_view_stale_locked();
