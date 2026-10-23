@@ -302,7 +302,7 @@ struct ModuleRow {
 /// PRIVACY — only `remote_bucket` (a coarse destination CLASS: loopback /
 /// private / public / unknown — see remote_bucket() in tar_netqual.hpp) leaves
 /// the connection's destination on the row; the raw remote address / hostname is
-/// NOT stored in this tier. Collection is gated by its own opt-in toggle and a
+/// NOT stored in this tier. Collection is gated by its own toggle and a
 /// per-tick top-N cap (collector slice).
 struct NetQualRow {
     int64_t ts{0};
@@ -333,7 +333,7 @@ struct NetQualRow {
 /// current-loss verdict from their ratio (see NetQualRow above — the
 /// device-aggregate live signal was empirically disproven). Host-wide, no
 /// per-connection or per-process attribution, no addresses: nothing usage-class
-/// on the row, but it ships under netqual's opt-in toggle regardless.
+/// on the row, but it ships under netqual's own toggle regardless.
 struct NetQualBootRow {
     int64_t ts{0};              // t_live: when TAR started observing this boot
     int64_t snapshot_id{0};
@@ -439,6 +439,13 @@ public:
      * Open (or create) the TAR database at the given path.
      * Creates tables if they don't exist. Sets WAL mode, busy_timeout,
      * and secure_delete pragmas.
+     *
+     * On failure the error text says WHY and, where there is one, the remedy: the directory
+     * cannot be created, SQLite cannot open the file, a corrupt tar.db could not be moved aside
+     * (#559, refused rather than trusted), a schema transaction wedged, or -- on Windows only --
+     * a planted tar.db (refused) or a planted -wal, -shm or -journal that could not be replaced
+     * (foreign owner or extra hard link). The plugin ABI carries only an error CODE, so the
+     * caller must log this text.
      */
     static std::expected<TarDatabase, std::string> open(const std::filesystem::path& path);
 

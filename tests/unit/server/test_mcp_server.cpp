@@ -14900,7 +14900,9 @@ TEST_CASE("MCP Agentic demo: get_fleet_posture_fast reports real data_age_second
     auto miss_sc = nlohmann::json::parse(miss->body)["result"]["structuredContent"];
     CHECK(miss_sc["data_age_seconds"].get<int>() == 0); // fresh miss
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    // Age the cached payload's generated_at 2000 ms into the past (inside the 30 s TTL, so
+    // it is still a hit) instead of sleeping for the age to advance.
+    ts.mcp.age_posture_cache_for_test(std::chrono::milliseconds(2000));
 
     auto hit = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":305,"params":{"name":"get_fleet_posture_fast","arguments":{"ttl_seconds":30}}})");

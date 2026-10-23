@@ -870,6 +870,14 @@ public:
     /// no caller in `server/core/src/**` references it.
     void expire_trusted_gateway_for_test(std::chrono::seconds offset);
 
+    /// Test hook: age the live-presence cache by one full `kPresenceCacheTtl`, so the next
+    /// `live_presence()` call sees a cache at least a TTL old and re-reads through the
+    /// presence reader instead of serving the cached copy — through the same `>=
+    /// kPresenceCacheTtl` comparison production uses, without sleeping. Works on a
+    /// never-fetched cache too (it is already stale). Production code MUST NOT call this
+    /// — no caller in `server/core/src/**` references it.
+    void expire_presence_cache_for_test();
+
     /// W1.5 / #823: install the device-token store so `register_agent`
     /// revokes any device tokens bound to a previous incarnation of the
     /// same agent_id whenever a re-registration is detected. Optional —
