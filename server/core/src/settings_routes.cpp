@@ -33,6 +33,7 @@
 #include "sso_boot_guard.hpp" // oidc_config_complete + publish_oidc_provider_gauges (#4160)
 #include "rbac_admin_predicate.hpp" // is_self_target — shared #397/#403 self-target comparison
 #include "rbac_store.hpp"       // access-review read-model direct-grant reads
+#include "session_store.hpp" // LocalMfaProof: the enrolment's verified {generation, instant} (#6079)
 #include "tag_store.hpp" // F2a PR3: TagStore::validate_key for the cohort export key
 #include "mfa_qr.hpp"
 #include "password_policy.hpp" // #5342 — the ONE local password length policy
@@ -6933,7 +6934,7 @@ void SettingsRoutes::register_routes(
                   }
                   // Enrolment has just committed, and the code that committed it IS a fresh proof
                   // of the factor: stamp the CURRENT cookie session's step-up proof (the same
-                  // `mark_session_mfa_verified` as POST /login/mfa/stepup, so the DB-clock
+                  // `stamp_session_mfa_proof` as POST /login/mfa/stepup, so the DB-clock
                   // authoring and every replica's cache refresh are that primitive's), so the
                   // operator can regenerate recovery codes or disable MFA from this very session
                   // without a separate step-up. Only a local cookie session is stamped, and only
@@ -6967,7 +6968,14 @@ void SettingsRoutes::register_routes(
                       } catch (...) { // NOLINT(bugprone-empty-catch)
                       }
                   };
+                  // #6079: the stamp carries the enrolment's own proof, the generation its UPDATE
+                  // produced and the database instant its loading statement captured before the
+                  // TOTP check (so it precedes `mfa_enrolled_at`), never the stamp's now(). The
+                  // stamp refuses a future-dated instant and, after it commits, clears itself if
+                  // the factor generation moved since (`factor_changed`); the enrolment and the
+                  // codes below stand either way.
                   bool proof_stamped = false;
+                  const char* not_stamped_why = "";
                   try {
                       if (auth_mgr_ && session->auth_source == "local") {
                           const auto cookie_token = AuthRoutes::extract_session_cookie(req);
@@ -6977,19 +6985,31 @@ void SettingsRoutes::register_routes(
                                   cookie_session->username == session->username) {
                                   if (stamp_fault_hook_) // test seam, empty in production
                                       stamp_fault_hook_();
-                                  proof_stamped = auth_mgr_->mark_session_mfa_verified(cookie_token);
+                                  using Outcome = auth::AuthManager::MfaStampOutcome;
+                                  const auto outcome = auth_mgr_->stamp_session_mfa_proof(
+                                      cookie_token,
+                                      LocalMfaProof{codes_res->factor_gen, codes_res->verified_ms});
+                                  proof_stamped = outcome == Outcome::kStamped;
+                                  if (outcome == Outcome::kFactorChanged)
+                                      not_stamped_why = ";factor_changed";
+                                  else if (outcome == Outcome::kFutureDated)
+                                      not_stamped_why = ";verification_future_dated";
                               }
                           }
                       }
                   } catch (const std::exception& ex) {
                       proof_stamped = false;
+                      not_stamped_why = "";
                       note_stamp_threw(ex.what());
                   } catch (...) {
                       proof_stamped = false;
+                      not_stamped_why = "";
                       note_stamp_threw(nullptr);
                   }
                   audit_fn_(req, "mfa.enroll.verified", "ok", "User", session->username,
-                            proof_stamped ? "step_up_proof=stamped" : "step_up_proof=not_stamped");
+                            proof_stamped
+                                ? std::string("step_up_proof=stamped")
+                                : std::string("step_up_proof=not_stamped") + not_stamped_why);
                   audit_fn_(req, "mfa.recovery_codes.generated", "ok", "User",
                             session->username, "10 codes issued");
                   set_no_store(res);

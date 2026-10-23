@@ -35,6 +35,7 @@
 #include "saml_principal.hpp"  // saml_principal_id / is_valid_saml_component — ADR-2001 PR4a
 #include "saml_scim_link.hpp"  // link_saml_login_to_scim — ADR-2001 PR4a login-site orchestration
 #include "service_scope_policy.hpp" // authz::service_scope_global_safe — #2298 PR 3 default-deny table
+#include "session_store.hpp" // LocalMfaProof: the verified {generation, instant} a mint or stamp carries (#6079)
 #include "web_utils.hpp" // audit_token — CWE-117 neutralisation for the audit-failure warn
 
 #include <yuzu/version.hpp> // kVersionString — the version on the landing page's slim bar
@@ -71,6 +72,31 @@ constexpr std::size_t kMaxJustificationLength = 1024;
     default:
         return "query_error";
     }
+}
+
+// The audit `cause=` token for a refused local-session mint (#6079). `kNone` with an empty token
+// and `kPersistFailed` are the two the pre-binding code already reported as one "undifferentiated"
+// cause; the rest name what the mint's own recheck or write found, so the evidence says whether
+// the account changed under the login or the verification instant was unusable.
+[[nodiscard]] const char* mint_denial_cause(auth::AuthManager::MintDenial d) noexcept {
+    using D = auth::AuthManager::MintDenial;
+    switch (d) {
+    case D::kPersistFailed:
+        return "persist_failed";
+    case D::kVerificationFutureDated:
+        return "verification_future_dated";
+    case D::kRoleChanged:
+        return "role_changed";
+    case D::kCredentialChanged:
+        return "credential_changed";
+    case D::kFactorChanged:
+        return "factor_changed";
+    case D::kRecheckUnavailable:
+        return "recheck_unavailable";
+    case D::kNone:
+        break;
+    }
+    return "undifferentiated";
 }
 
 // Max stored length of a single sanitised detail value (e.g. an OIDC
@@ -246,6 +272,17 @@ std::string AuthRoutes::extract_session_cookie(const httplib::Request& req) {
     pos += prefix.size();
     auto end = cookie.find(';', pos);
     return cookie.substr(pos, end == std::string::npos ? end : end - pos);
+}
+
+auth::DurableMfaProof AuthRoutes::durable_mfa_proof_for(const httplib::Request& req,
+                                                        const auth::Session& session) const {
+    // Only a local cookie session has a stored proof; every other principal class is "no such
+    // session" here, so a bearer or federated caller never reaches the session store. The cookie
+    // is the one `resolve_session_unbound` validated for a local session (a bearer credential
+    // resolves to an API-token session, never a local one).
+    if (session.auth_source != "local")
+        return auth::DurableMfaProof{.source = auth::DurableMfaProof::Source::kAbsent};
+    return auth_mgr_.read_durable_mfa_proof(extract_session_cookie(req), session.username);
 }
 
 std::string AuthRoutes::session_correlator(const httplib::Request& req) {
@@ -2915,6 +2952,10 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         bool matched = false;
         bool used_recovery = false;
         bool store_unavailable = false;
+        // #6079: what the verifier proved, carried unchanged to the mint below: the factor
+        // generation read under the users row lock and the database instant its loading
+        // statement captured before any cryptographic check (never the mint's own now()).
+        LocalMfaProof proof{};
         // Strict shape gate (Gate 4 consistency N2 + unhappy UP-14/UP-20):
         //   - TOTP: exactly 6 ASCII digits
         //   - Recovery: any other shape goes through normalisation +
@@ -2935,6 +2976,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             auto r = db->mfa_verify_login_code(entry.username, code);
             if (r) {
                 matched = r->ok;
+                if (matched)
+                    proof = {r->factor_gen, r->verified_ms};
             } else if (is_store_unavailable(r.error())) {
                 // ★ SECURITY (architect BLOCK): a decrypt/store failure must
                 // NEVER be treated as "wrong code" — that would silently
@@ -2952,6 +2995,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             if (r && r->ok) {
                 matched = true;
                 used_recovery = true;
+                proof = {r->factor_gen, r->verified_ms};
             } else if (!r && is_store_unavailable(r.error())) {
                 store_unavailable = true; // outage → 503, never a burned attempt
             }
@@ -3050,20 +3094,26 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // Mint the real session marked as MFA-verified.
         // #5342 Gate 7 (B4): the step-1 credential anchor — a password reset
         // or change committed since the pending /login denies this mint.
-        auto token =
-            auth_mgr_.create_local_session(entry.username, entry.role, true, entry.hash_hex);
+        if (mfa_verify_barrier_for_test_) // test seam, empty in production
+            mfa_verify_barrier_for_test_("/login/mfa", proof);
+        auth::AuthManager::MintDenial denial = auth::AuthManager::MintDenial::kNone;
+        auto token = auth_mgr_.create_local_session(entry.username, entry.role, entry.hash_hex,
+                                                    proof, &denial);
         if (token.empty()) {
             // #4107 Gate 8 finding (security-guardian) - see the plain-
             // password-login call site's identical comment above (also
             // covers why the audit reason below doesn't assert
-            // post_mint_recheck=true - cpp-expert Gate 8).
+            // post_mint_recheck=true - cpp-expert Gate 8). #6079: the cause is the mint's own
+            // (a factor, role or credential change, an unusable verification instant); the
+            // client still sees the same uniform 401.
             res.status = 401;
             res.set_content(kFailureBody(res), "application/json");
-            audit_log_for_principal(req, "auth.login", "failure", entry.username,
-                                    auth::role_to_string(entry.role), "User", entry.username,
-                                    "reason=session_mint_failed;cause=undifferentiated;method=" +
-                                        std::string(used_recovery ? "password+recovery"
-                                                                   : "password+totp"));
+            audit_log_for_principal(
+                req, "auth.login", "failure", entry.username, auth::role_to_string(entry.role),
+                "User", entry.username,
+                std::string("reason=session_mint_failed;cause=") + mint_denial_cause(denial) +
+                    ";method=" +
+                    std::string(used_recovery ? "password+recovery" : "password+totp"));
             emit_event("auth.login", req,
                        {{"source_ip", req.remote_addr},
                         {"username", entry.username},
@@ -3175,6 +3225,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
 
         std::vector<std::string> recovery_codes;
+        LocalMfaProof proof{}; // #6079: the enrolment's generation and pre-crypto database instant
         bool verified = false;
         bool store_unavailable = false;
         bool already_enrolled = false;
@@ -3189,6 +3240,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             auto r = db->mfa_verify_enrollment(entry.username, code, entry.hash_hex);
             if (r) {
                 recovery_codes = std::move(r->recovery_codes);
+                proof = {r->factor_gen, r->verified_ms};
                 verified = true;
             } else if (r.error() == AuthDBError::CredentialChanged) {
                 credential_changed = true;
@@ -3363,8 +3415,11 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // the one-time reveal.
         // #5342 Gate 7 (B4): the step-1 credential anchor — a password reset
         // or change committed since the pending /login denies this mint.
-        auto token =
-            auth_mgr_.create_local_session(entry.username, entry.role, true, entry.hash_hex);
+        if (mfa_verify_barrier_for_test_) // test seam, empty in production
+            mfa_verify_barrier_for_test_("/login/mfa/enroll", proof);
+        auth::AuthManager::MintDenial denial = auth::AuthManager::MintDenial::kNone;
+        auto token = auth_mgr_.create_local_session(entry.username, entry.role, entry.hash_hex,
+                                                    proof, &denial);
         if (token.empty()) {
             // #4107 Gate 8 finding (security-guardian) - see the plain-
             // password-login call site's identical comment. Enrollment
@@ -3378,8 +3433,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             res.set_content(kFailureBody(res), "application/json");
             audit_log_for_principal(req, "auth.login", "failure", entry.username,
                                     auth::role_to_string(entry.role), "User", entry.username,
-                                    "reason=session_mint_failed;cause=undifferentiated;"
-                                    "method=password+totp-enroll");
+                                    std::string("reason=session_mint_failed;cause=") +
+                                        mint_denial_cause(denial) + ";method=password+totp-enroll");
             emit_event("auth.login", req,
                        {{"source_ip", req.remote_addr}, {"username", entry.username}}, {},
                        Severity::kWarn);
@@ -3517,10 +3572,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         bool matched = false;
         bool used_recovery = false;
         bool store_unavailable = false;
+        LocalMfaProof proof{}; // #6079: the verifier's generation and pre-crypto database instant
         if (is_totp) {
             auto r = db->mfa_verify_login_code(session->username, code);
             if (r) {
                 matched = r->ok;
+                if (matched)
+                    proof = {r->factor_gen, r->verified_ms};
             } else if (is_store_unavailable(r.error())) {
                 // ★ SECURITY (architect BLOCK): never collapse a decrypt/
                 // store failure into "wrong code" — no session mutation
@@ -3533,6 +3591,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             if (r && r->ok) {
                 matched = true;
                 used_recovery = true;
+                proof = {r->factor_gen, r->verified_ms};
             } else if (!r && is_store_unavailable(r.error())) {
                 store_unavailable = true; // outage → 503, never a burned attempt
             }
@@ -3586,15 +3645,38 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // session (which would break in-flight HTMX requests from the
         // same browser tab).
         auto token = extract_session_cookie(req);
-        if (!auth_mgr_.mark_session_mfa_verified(token)) {
-            // Defensive — require_auth succeeded so the token resolves to
-            // a session; if mark_session_mfa_verified can't find it, the
-            // session was concurrently invalidated. Fail closed.
+        if (mfa_verify_barrier_for_test_) // test seam, empty in production
+            mfa_verify_barrier_for_test_("/login/mfa/stepup", proof);
+        // #6079: the stamp stores the verifier's own generation and instant. Anything but
+        // kStamped admits nothing (the clear, where one was needed, is the primitive's): the
+        // session keeps whatever proof it had, the answer is the uniform 401, and the audit
+        // detail says why. kNoSession keeps the pre-binding wording.
+        const auto stamp = auth_mgr_.stamp_session_mfa_proof(token, proof);
+        if (stamp != auth::AuthManager::MfaStampOutcome::kStamped) {
+            using O = auth::AuthManager::MfaStampOutcome;
+            const char* why = "session vanished during step-up";
+            switch (stamp) {
+            case O::kFutureDated:
+                why = "verification_future_dated";
+                break;
+            case O::kFactorChanged:
+                why = "factor_changed_during_step_up";
+                break;
+            case O::kStoreError:
+                why = "step_up_proof_store_error";
+                break;
+            case O::kInvalidProof:
+                why = "step_up_proof_invalid";
+                break;
+            case O::kNoSession:
+            case O::kStamped:
+                break;
+            }
             res.status = 401;
             res.set_content(kFailureBody(res), "application/json");
             audit_log_for_principal(req, "mfa.step_up.failed", "error", session->username,
-                                    auth::role_to_string(session->role), "User",
-                                    session->username, "session vanished during step-up");
+                                    auth::role_to_string(session->role), "User", session->username,
+                                    why);
             return;
         }
         res.set_content(R"({"status":"ok"})", "application/json");

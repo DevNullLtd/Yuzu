@@ -30,7 +30,9 @@
 #include "audit_store.hpp"
 #include "credential_change_owner.hpp"
 #include "session_store.hpp"
+#include "mfa_factor_state.hpp" // judge_local_mfa_binding: is the stored proof bound (#6079)
 #include "step_up_gate.hpp"
+#include "test_approver_route_fixture.hpp" // the real approval routes behind the real approver gate
 #include "management_group_store.hpp"
 #include "oidc_provider.hpp"
 #include "runtime_config_store.hpp"
@@ -1439,4 +1441,231 @@ TEST_CASE("Referer fallback also evaluated when Origin is absent",
     REQUIRE(bad);
     CHECK(bad->status == 403);
     CHECK(h2.has_audit("csrf.denied"));
+}
+
+// ---------------------------------------------------------------------------
+// #6079: the Settings enrol-confirm stamps a proof BOUND to the enrolment, and the approver gate
+// judges survivors of a factor replacement by that binding.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// The stored-proof read the production approver closure takes (cookie token, principal-checked).
+yuzu::test::ApproverRouteFixture::DurableFn durable_from_cookie(MfaSettingsHarness& h) {
+    return [&h](const httplib::Request& req, const auth::Session& s) {
+        return h.auth_mgr.read_durable_mfa_proof(AuthRoutes::extract_session_cookie(req),
+                                                 s.username);
+    };
+}
+
+/// Enrols `admin` straight through AuthDB (no route, no session touched).
+void enrol_admin_directly(MfaSettingsHarness& h) {
+    const auto code = begin_admin_enrolment(h);
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
+}
+
+/// Clears `admin`'s factor and enrols a new one, WITHOUT ending any session (the survivors of a
+/// factor replacement: R1 of the design, and what a partial hygiene delete leaves behind).
+void replace_factor_keeping_sessions(MfaSettingsHarness& h) {
+    REQUIRE(h.auth_db->mfa_disable_report("admin", std::nullopt).has_value());
+    enrol_admin_directly(h);
+}
+
+std::string audit_details(const yuzu::test::ApproverRouteFixture& fx) {
+    std::string all;
+    for (const auto& a : fx.audits)
+        all += a.action + "|" + a.result + "|" + a.detail + "\n";
+    return all;
+}
+
+} // namespace
+
+TEST_CASE("POST /api/settings/mfa/verify stamps the enrolment's generation and its pre-UPDATE "
+          "instant (#6079 T5)",
+          "[pg][mfa][routes][settings][stepup][binding]") {
+    MfaSettingsHarness h;
+    SessionStore sessions{h.auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    h.auth_mgr.set_session_store(&sessions);
+    struct Detach {
+        auth::AuthManager& m;
+        ~Detach() { m.set_session_store(nullptr); }
+    } detach{h.auth_mgr};
+
+    const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, false);
+    REQUIRE_FALSE(token.empty());
+    // Waits between the enrolment and the stamp, so the stamp's own now() is strictly later than
+    // the enrolment: only a CARRIED instant can still precede mfa_enrolled_at.
+    h.routes.set_stamp_fault_hook_for_test(
+        [] { std::this_thread::sleep_for(std::chrono::milliseconds(5)); });
+    yuzu::test::ScopeExit clear_hook{[&h] { h.routes.set_stamp_fault_hook_for_test(nullptr); }};
+
+    const auto code = begin_admin_enrolment(h);
+    auto res = post_verify_with_cookie(h, code, token);
+    REQUIRE(res);
+    CHECK(res->body.find("Store these recovery codes now") != std::string::npos);
+    CHECK(h.audit_detail("mfa.enroll.verified") == "step_up_proof=stamped");
+
+    const auto st = h.auth_db->mfa_status("admin");
+    REQUIRE(st.has_value());
+    REQUIRE(st->enrolled);
+    auto found = sessions.find(auth::AuthManager::sha256_hex(token));
+    REQUIRE(found.has_value());
+    REQUIRE(found->has_value());
+    const auto& row = (*found)->row;
+    CHECK(row.mfa_factor_gen == st->factor_gen);
+    CHECK(row.mfa_factor_gen > 0);
+    CHECK(row.mfa_verified_ms > 0);
+    CHECK(row.mfa_verified_ms <= st->enrolled_at_ms); // captured before the enrolling UPDATE
+    const auto durable = h.auth_mgr.read_durable_mfa_proof(token, "admin");
+    CHECK(judge_local_mfa_binding(durable, st->factor_gen, st->binding_enforced).kind ==
+          LocalMfaBinding::kBound);
+}
+
+TEST_CASE(
+    "POST /api/settings/mfa/verify: a factor replaced before the stamp lands clears the stamp "
+    "but keeps the enrolment and the codes (#6079 T5)",
+    "[pg][mfa][routes][settings][stepup][binding]") {
+    MfaSettingsHarness h;
+    SessionStore sessions{h.auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    h.auth_mgr.set_session_store(&sessions);
+    struct Detach {
+        auth::AuthManager& m;
+        ~Detach() { m.set_session_store(nullptr); }
+    } detach{h.auth_mgr};
+
+    const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, false);
+    REQUIRE_FALSE(token.empty());
+    // The hook must NOT delete the session (the stamp would match zero rows and the recheck
+    // would never run); it replaces the factor, moving the generation by two.
+    h.routes.set_stamp_fault_hook_for_test([&h] { replace_factor_keeping_sessions(h); });
+    yuzu::test::ScopeExit clear_hook{[&h] { h.routes.set_stamp_fault_hook_for_test(nullptr); }};
+
+    const auto code = begin_admin_enrolment(h);
+    auto res = post_verify_with_cookie(h, code, token);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("Store these recovery codes now") != std::string::npos);
+    CHECK(h.audit_detail("mfa.enroll.verified") == "step_up_proof=not_stamped;factor_changed");
+
+    const auto st = h.auth_db->mfa_status("admin");
+    REQUIRE(st.has_value());
+    const auto durable = h.auth_mgr.read_durable_mfa_proof(token, "admin");
+    CHECK(durable.mfa_verified_ms == 0);
+    CHECK(durable.mfa_factor_gen == 0);
+    CHECK(judge_local_mfa_binding(durable, st->factor_gen, st->binding_enforced).kind !=
+          LocalMfaBinding::kBound);
+}
+
+TEST_CASE("enrol via Settings then approve at once passes the real approver gate (#6079 T18)",
+          "[pg][mfa][routes][settings][stepup][binding][approval_routes]") {
+    MfaSettingsHarness h;
+    SessionStore sessions{h.auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    h.auth_mgr.set_session_store(&sessions);
+    struct Detach {
+        auth::AuthManager& m;
+        ~Detach() { m.set_session_store(nullptr); }
+    } detach{h.auth_mgr};
+    yuzu::test::ApproverRouteFixture fx(h.auth_mgr, *h.auth_db.get(), durable_from_cookie(h));
+
+    const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, false);
+    REQUIRE_FALSE(token.empty());
+    const auto code = begin_admin_enrolment(h);
+    auto res = post_verify_with_cookie(h, code, token);
+    REQUIRE(res);
+    REQUIRE(h.audit_detail("mfa.enroll.verified") == "step_up_proof=stamped");
+
+    const auto approve_ticket = fx.submit();
+    auto approved = fx.decide("approve", approve_ticket, token);
+    REQUIRE(approved);
+    CHECK(approved->status == 200);
+    CHECK(fx.status_of(approve_ticket) == "approved");
+    const auto reject_ticket = fx.submit();
+    auto rejected = fx.decide("reject", reject_ticket, token);
+    REQUIRE(rejected);
+    CHECK(rejected->status == 200);
+    CHECK(fx.status_of(reject_ticket) == "rejected");
+}
+
+TEST_CASE("a session that survived a factor replacement cannot decide an approval until it "
+          "re-proves under the new factor (#6079 T4: R1, R2, R8)",
+          "[pg][mfa][routes][settings][binding][approval_routes]") {
+    MfaSettingsHarness h;
+    SessionStore sessions{h.auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    h.auth_mgr.set_session_store(&sessions);
+    struct Detach {
+        auth::AuthManager& m;
+        ~Detach() { m.set_session_store(nullptr); }
+    } detach{h.auth_mgr};
+    yuzu::test::ApproverRouteFixture fx(h.auth_mgr, *h.auth_db.get(), durable_from_cookie(h));
+
+    enrol_admin_directly(h);
+    // Minted AFTER the enrolment with an MFA proof: bound to F1 (the live identity).
+    const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, true);
+    REQUIRE_FALSE(token.empty());
+    {
+        // Control: the F1 session decides while F1 is current.
+        const auto ticket = fx.submit();
+        auto ok = fx.decide("approve", ticket, token);
+        REQUIRE(ok);
+        REQUIRE(ok->status == 200);
+    }
+
+    SECTION("R1: the factor is cleared and re-enrolled, no session deleted") {
+        replace_factor_keeping_sessions(h);
+    }
+    SECTION("R2 + R8: the hygiene delete fails after the clear, then a second disable finds "
+            "nothing to clear") {
+        yuzu::test::SqlFault fault(h.auth_db.pool(),
+                                   "ALTER TABLE session_store.sessions RENAME TO sessions_gone",
+                                   "ALTER TABLE session_store.sessions_gone RENAME TO sessions");
+        fault.arm();
+        auto partial = h.sink.dispatch("POST", "/api/settings/mfa/disable", {},
+                                       "application/x-www-form-urlencoded",
+                                       {{"Host", "yuzu.example"},
+                                        {"Origin", "http://yuzu.example"},
+                                        {"Cookie", "yuzu_session=" + token}});
+        fault.repair();
+        REQUIRE(partial);
+        REQUIRE(h.has_audit("mfa.disabled", "partial", "admin"));
+        REQUIRE_FALSE(h.auth_db->mfa_status("admin")->enrolled);
+        // R8: the second disable has no verified factor left to clear and keeps the sessions.
+        auto second = post_same_origin(h.sink, "/api/settings/mfa/disable");
+        REQUIRE(second);
+        REQUIRE(h.auth_db->mfa_status("admin").has_value());
+        enrol_admin_directly(h);
+    }
+
+    const auto st = h.auth_db->mfa_status("admin");
+    REQUIRE(st.has_value());
+    REQUIRE(st->enrolled);
+
+    // The survivor is signed in and holds a proof, but for the factor that no longer exists.
+    const auto approve_ticket = fx.submit();
+    auto approve = fx.decide("approve", approve_ticket, token);
+    REQUIRE(approve);
+    CHECK(approve->status == 401);
+    CHECK(fx.status_of(approve_ticket) == "pending");
+    const auto reject_ticket = fx.submit();
+    auto reject = fx.decide("reject", reject_ticket, token);
+    REQUIRE(reject);
+    CHECK(reject->status == 401);
+    CHECK(fx.status_of(reject_ticket) == "pending");
+    CHECK(audit_details(fx).find("proof_factor_mismatch") != std::string::npos);
+
+    // Re-proving under F2 (the step-up route's stamp, carrying F2's generation and an instant
+    // the database has already reached) restores both decisions.
+    REQUIRE(
+        h.auth_mgr.mark_session_mfa_verified(token, LocalMfaProof{st->factor_gen, st->db_now_ms}));
+    auto approve2 = fx.decide("approve", approve_ticket, token);
+    REQUIRE(approve2);
+    CHECK(approve2->status == 200);
+    CHECK(fx.status_of(approve_ticket) == "approved");
+    auto reject2 = fx.decide("reject", reject_ticket, token);
+    REQUIRE(reject2);
+    CHECK(reject2->status == 200);
+    CHECK(fx.status_of(reject_ticket) == "rejected");
 }

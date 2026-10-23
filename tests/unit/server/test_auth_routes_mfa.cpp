@@ -31,8 +31,10 @@
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
 #include "credential_change_owner.hpp"
+#include "mfa_factor_state.hpp" // judge_local_mfa_binding: is the stored proof bound (#6079)
 #include "session_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "test_approver_route_fixture.hpp" // the real approval routes behind the real approver gate
 #include "test_route_sink.hpp"
 #include "../../../server/core/src/totp.hpp"
 #include "test_auth_db_pg_helper.hpp"
@@ -102,6 +104,10 @@ struct AuthRoutesHarness {
     // #4966: the last-Administrator guard AuthManager::remove_user/update_role now require (fail
     // closed without it), built on the same pool: the production composition.
     std::unique_ptr<yuzu::server::RbacStore> rbac_guard;
+    // The durable session store on the same pool: the production shape, and what the #6079 proof
+    // binding needs (the carried generation and instant are stored and read back through it).
+    // Declared before auth_mgr, which borrows it.
+    std::unique_ptr<SessionStore> sessions;
     // Declared AFTER auth_db and rbac_guard on purpose: it borrows both, so it must be destroyed
     // first (members are destroyed in reverse order of declaration).
     auth::AuthManager auth_mgr{};
@@ -163,6 +169,9 @@ struct AuthRoutesHarness {
         rbac_guard = std::make_unique<yuzu::server::RbacStore>(auth_db.pool());
         REQUIRE(rbac_guard->is_open());
         auth_mgr.set_rbac_store(rbac_guard.get());
+        sessions = std::make_unique<SessionStore>(auth_db.pool());
+        REQUIRE(sessions->is_open());
+        auth_mgr.set_session_store(sessions.get());
         // A second active admin: cases that demote/remove an admin test the write path, not the
         // last-Administrator refusal (that has its own cases).
         REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", auth::Role::admin).has_value());
@@ -1850,4 +1859,410 @@ TEST_CASE("POST /login/mfa: an old-password login challenge cannot complete afte
                              "application/x-www-form-urlencoded");
     REQUIRE(fresh);
     CHECK(fresh->status == 202);
+}
+
+// ---------------------------------------------------------------------------
+// #6079: the verified {generation, instant} reaches the session unchanged.
+//
+// `set_mfa_verify_barrier_for_test` fires between the verifier's return and the mint or
+// stamp it feeds. The barrier records what the verifier produced and then waits a few
+// milliseconds, so the write's own now() is strictly later than the recorded instant and
+// "the stored instant equals the recorded one" can only hold if the route CARRIED it.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct SeenProof {
+    std::string route;
+    LocalMfaProof proof;
+};
+
+/// Installs the recording barrier. `rotate` (optional) runs after the record, still before the
+/// mint or stamp, to change the factor in that span.
+void record_proofs(AuthRoutesHarness& h, std::vector<SeenProof>& seen,
+                   std::function<void()> rotate = {}) {
+    h.auth_routes->set_mfa_verify_barrier_for_test(
+        [&seen, rotate = std::move(rotate)](std::string_view route, const LocalMfaProof& p) {
+            seen.push_back({std::string(route), p});
+            if (rotate) {
+                rotate();
+            } else {
+                // Makes the write's now() strictly later than the recorded instant.
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        });
+}
+
+std::string pending_token_of(const httplib::Response& r) {
+    return nlohmann::json::parse(r.body).at("mfa_pending_token").get<std::string>();
+}
+
+/// The raw session token out of a `Set-Cookie: yuzu_session=<token>; ...` header.
+std::string cookie_token_of(const httplib::Response& r) {
+    const auto hdr = r.get_header_value("Set-Cookie");
+    const std::string prefix = "yuzu_session=";
+    const auto at = hdr.find(prefix);
+    REQUIRE(at != std::string::npos);
+    const auto end = hdr.find(';', at);
+    return hdr.substr(at + prefix.size(),
+                      (end == std::string::npos ? hdr.size() : end) - at - prefix.size());
+}
+
+SessionRow stored_row(AuthRoutesHarness& h, const std::string& token) {
+    auto found = h.sessions->find(auth::AuthManager::sha256_hex(token));
+    REQUIRE(found.has_value());
+    REQUIRE(found->has_value());
+    return (*found)->row;
+}
+
+/// Replace `user`'s factor: clear and re-enrol, so the generation moves by two.
+void rotate_factor(AuthRoutesHarness& h, const std::string& user) {
+    REQUIRE(h.auth_db->mfa_disable(user).has_value());
+    (void)h.enroll_mfa(user);
+}
+
+/// Password step of the two-step login; returns the pending token.
+std::string login_pending(AuthRoutesHarness& h, const std::string& user, const std::string& pw) {
+    auto step1 = h.sink.Post("/login", form({{"username", user}, {"password", pw}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step1);
+    REQUIRE(step1->status == 202);
+    return pending_token_of(*step1);
+}
+
+/// What a binding gate decides for the session `token` of `user`, against the live factor.
+LocalMfaBinding binding_of(AuthRoutesHarness& h, const std::string& token,
+                           const std::string& user) {
+    const auto st = h.auth_db->mfa_status(user);
+    REQUIRE(st.has_value());
+    const auto durable = h.auth_mgr.read_durable_mfa_proof(token, user);
+    return judge_local_mfa_binding(durable, st->factor_gen, st->binding_enforced).kind;
+}
+
+/// The shared plumbing assertions: one barrier record on `route`, a live generation, and the
+/// stored session carrying EXACTLY the recorded proof (so not the write's own now()).
+void check_plumbing(AuthRoutesHarness& h, const std::vector<SeenProof>& seen,
+                    std::string_view route, const std::string& token, const std::string& user) {
+    REQUIRE(seen.size() == 1);
+    CHECK(seen[0].route == route);
+    const auto& proof = seen[0].proof;
+    const auto st = h.auth_db->mfa_status(user);
+    REQUIRE(st.has_value());
+    REQUIRE(st->enrolled);
+    CHECK(proof.factor_gen > 0);
+    CHECK(proof.verified_ms > 0);
+    CHECK(proof.factor_gen == st->factor_gen); // the verified generation IS the live one
+    const auto row = stored_row(h, token);
+    CHECK(row.mfa_verified_ms == proof.verified_ms);
+    CHECK(row.mfa_factor_gen == proof.factor_gen);
+    // The barrier waited, so a stored now() would be later than the recorded instant.
+    CHECK(proof.verified_ms < st->db_now_ms);
+    CHECK(binding_of(h, token, user) == LocalMfaBinding::kBound);
+}
+
+} // namespace
+
+TEST_CASE("POST /login/mfa TOTP stores the verifier's generation and instant, not the mint's now() "
+          "(#6079 T5)",
+          "[pg][mfa][routes][auth_routes][binding]") {
+    AuthRoutesHarness h;
+    auto secret = h.enroll_mfa("admin");
+    std::vector<SeenProof> seen;
+    record_proofs(h, seen);
+    const auto pending = login_pending(h, "admin", "adminpassword1");
+    auto res = h.sink.Post("/login/mfa",
+                           form({{"mfa_pending_token", pending}, {"code", h.totp_at(secret)}}),
+                           "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    check_plumbing(h, seen, "/login/mfa", cookie_token_of(*res), "admin");
+    CHECK(seen[0].proof.verified_ms < stored_row(h, cookie_token_of(*res)).created_at_ms);
+}
+
+TEST_CASE("POST /login/mfa recovery code stores the verifier's generation and instant (#6079 T5)",
+          "[pg][mfa][routes][auth_routes][binding]") {
+    AuthRoutesHarness h;
+    (void)h.enroll_mfa("admin");
+    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin", std::nullopt);
+    REQUIRE(codes.has_value());
+    std::vector<SeenProof> seen;
+    record_proofs(h, seen);
+    const auto pending = login_pending(h, "admin", "adminpassword1");
+    auto res =
+        h.sink.Post("/login/mfa", form({{"mfa_pending_token", pending}, {"code", codes->front()}}),
+                    "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    check_plumbing(h, seen, "/login/mfa", cookie_token_of(*res), "admin");
+    CHECK(seen[0].proof.verified_ms < stored_row(h, cookie_token_of(*res)).created_at_ms);
+}
+
+TEST_CASE("POST /login/mfa/enroll stores the enrolment's generation and a pre-UPDATE instant "
+          "(#6079 T5)",
+          "[pg][mfa][enroll][routes][auth_routes][binding]") {
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    std::vector<SeenProof> seen;
+    record_proofs(h, seen);
+    auto step1 =
+        h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                    "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    const auto body = nlohmann::json::parse(step1->body);
+    auto res =
+        h.sink.Post("/login/mfa/enroll",
+                    form({{"mfa_pending_token", body.at("mfa_pending_token").get<std::string>()},
+                          {"code", h.totp_at(body.at("secret_base32").get<std::string>(), 0)}}),
+                    "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    check_plumbing(h, seen, "/login/mfa/enroll", cookie_token_of(*res), "alice");
+    // The instant was captured by the statement that LOADED the provisional secret, before the
+    // TOTP check and the enrolling UPDATE, so it precedes the enrolment instant (a timestamp
+    // comparison would have called this proof stale; the generation decides).
+    const auto st = h.auth_db->mfa_status("alice");
+    REQUIRE(st.has_value());
+    CHECK(seen[0].proof.verified_ms <= st->enrolled_at_ms);
+}
+
+TEST_CASE("POST /login/mfa/stepup stores the verifier's generation and instant (#6079 T5, T8)",
+          "[pg][mfa][stepup][routes][binding]") {
+    AuthRoutesHarness h;
+    auto secret = h.enroll_mfa("admin");
+    const auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
+    const std::string token = cookie.substr(std::string("yuzu_session=").size());
+
+    // A recovery code re-proves without waiting out the TOTP replay window.
+    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin", std::nullopt);
+    REQUIRE(codes.has_value());
+    std::vector<SeenProof> seen;
+    record_proofs(h, seen);
+    auto res = h.sink.dispatch("POST", "/login/mfa/stepup", form({{"code", codes->front()}}),
+                               "application/x-www-form-urlencoded", {{"Cookie", cookie}});
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    check_plumbing(h, seen, "/login/mfa/stepup", token, "admin");
+    CHECK(h.count_audits("mfa.step_up.passed", "admin") >= 1);
+}
+
+TEST_CASE("POST /login/mfa/stepup by TOTP stores the verifier's generation and instant "
+          "(#6079 T5)",
+          "[pg][mfa][stepup][routes][binding]") {
+    AuthRoutesHarness h;
+    auto secret = h.enroll_mfa("admin");
+    const auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
+    const std::string token = cookie.substr(std::string("yuzu_session=").size());
+    // The login consumed the current TOTP counter, so replace the factor (the session survives,
+    // now holding a proof for the OLD generation): the new secret's counters are unspent.
+    REQUIRE(h.auth_db->mfa_disable("admin").has_value());
+    const auto new_secret = h.enroll_mfa("admin");
+    REQUIRE(binding_of(h, token, "admin") == LocalMfaBinding::kMismatch);
+
+    std::vector<SeenProof> seen;
+    record_proofs(h, seen);
+    auto res =
+        h.sink.dispatch("POST", "/login/mfa/stepup", form({{"code", h.totp_at(new_secret, 1)}}),
+                        "application/x-www-form-urlencoded", {{"Cookie", cookie}});
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    check_plumbing(h, seen, "/login/mfa/stepup", token, "admin");
+}
+
+// A factor replaced between the verification and the session write must not leave an admissible
+// proof. Login routes: the mint is DENIED (no cookie); step-up: the stamp is CLEARED.
+TEST_CASE("a factor replaced between verification and mint denies the mint on every login route "
+          "(#6079 T5)",
+          "[pg][mfa][routes][auth_routes][binding]") {
+    AuthRoutesHarness h;
+    SECTION("/login/mfa TOTP") {
+        auto secret = h.enroll_mfa("admin");
+        std::vector<SeenProof> seen;
+        record_proofs(h, seen, [&h] { rotate_factor(h, "admin"); });
+        const auto pending = login_pending(h, "admin", "adminpassword1");
+        auto res = h.sink.Post("/login/mfa",
+                               form({{"mfa_pending_token", pending}, {"code", h.totp_at(secret)}}),
+                               "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        CHECK(res->get_header_value("Set-Cookie").empty());
+        REQUIRE(seen.size() == 1);
+        CHECK(seen[0].proof.factor_gen < h.auth_db->mfa_status("admin")->factor_gen);
+        // The code was genuinely consumed, so its true row stands; the login row is an honest
+        // failure.
+        CHECK(h.count_audits("mfa.login.verified", "admin") >= 1);
+        AuditQuery q;
+        q.action = "auth.login";
+        q.principal = "admin";
+        const auto rows = h.audit_store->query(q);
+        REQUIRE(rows.has_value());
+        bool saw_factor_cause = false;
+        for (const auto& row : *rows) {
+            CHECK(row.result != "ok");
+            saw_factor_cause =
+                saw_factor_cause ||
+                row.detail.find("session_mint_failed;cause=factor_changed") != std::string::npos;
+        }
+        CHECK(saw_factor_cause);
+    }
+    SECTION("/login/mfa recovery code") {
+        (void)h.enroll_mfa("admin");
+        auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin", std::nullopt);
+        REQUIRE(codes.has_value());
+        std::vector<SeenProof> seen;
+        record_proofs(h, seen, [&h] { rotate_factor(h, "admin"); });
+        const auto pending = login_pending(h, "admin", "adminpassword1");
+        auto res = h.sink.Post("/login/mfa",
+                               form({{"mfa_pending_token", pending}, {"code", codes->front()}}),
+                               "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        CHECK(res->get_header_value("Set-Cookie").empty());
+        CHECK(h.count_audits("mfa.recovery_code.used", "admin") == 1);
+        CHECK(h.count_audits("auth.login", "admin") >= 1);
+    }
+    SECTION("/login/mfa/enroll") {
+        h.cfg.mfa_enforcement = "required";
+        auto step1 =
+            h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                        "application/x-www-form-urlencoded");
+        REQUIRE(step1->status == 202);
+        const auto body = nlohmann::json::parse(step1->body);
+        std::vector<SeenProof> seen;
+        record_proofs(h, seen, [&h] { rotate_factor(h, "alice"); });
+        auto res = h.sink.Post(
+            "/login/mfa/enroll",
+            form({{"mfa_pending_token", body.at("mfa_pending_token").get<std::string>()},
+                  {"code", h.totp_at(body.at("secret_base32").get<std::string>(), 0)}}),
+            "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        CHECK(res->get_header_value("Set-Cookie").empty());
+        // The one-time codes are withheld with the session.
+        CHECK(res->body.find("recovery_codes") == std::string::npos);
+        CHECK(h.count_audits("mfa.enroll.verified", "alice") >= 1);
+    }
+}
+
+TEST_CASE("a factor replaced between step-up verification and the stamp clears the stamp "
+          "(#6079 T5)",
+          "[pg][mfa][stepup][routes][binding]") {
+    AuthRoutesHarness h;
+    auto secret = h.enroll_mfa("admin");
+    const auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
+    const std::string token = cookie.substr(std::string("yuzu_session=").size());
+    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin", std::nullopt);
+    REQUIRE(codes.has_value());
+
+    // The hook must NOT delete the session: a vanished row would never reach the recheck.
+    std::vector<SeenProof> seen;
+    record_proofs(h, seen, [&h] { rotate_factor(h, "admin"); });
+    auto res = h.sink.dispatch("POST", "/login/mfa/stepup", form({{"code", codes->front()}}),
+                               "application/x-www-form-urlencoded", {{"Cookie", cookie}});
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(res->body.find("MFA step-up failed") != std::string::npos);
+    REQUIRE(seen.size() == 1);
+    CHECK(h.count_audits("mfa.step_up.passed", "admin") == 0);
+    AuditQuery q;
+    q.action = "mfa.step_up.failed";
+    q.principal = "admin";
+    const auto rows = h.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    bool saw = false;
+    for (const auto& row : *rows)
+        saw = saw || row.detail == "factor_changed_during_step_up";
+    CHECK(saw);
+
+    // The stamp is gone (or, were the clear to fail, bound to the OLD generation): never a
+    // proof the new factor's gates accept.
+    const auto durable = h.auth_mgr.read_durable_mfa_proof(token, "admin");
+    CHECK(durable.mfa_verified_ms == 0);
+    CHECK(durable.mfa_factor_gen == 0);
+    CHECK(binding_of(h, token, "admin") != LocalMfaBinding::kBound);
+}
+
+// `durable_mfa_proof_for` is the one place a gate turns a request into a stored-proof read.
+TEST_CASE("AuthRoutes::durable_mfa_proof_for reads the request's own local session only "
+          "(#6079)",
+          "[pg][mfa][routes][auth_routes][binding]") {
+    AuthRoutesHarness h;
+    auto secret = h.enroll_mfa("admin");
+    const auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
+    const std::string token = cookie.substr(std::string("yuzu_session=").size());
+
+    httplib::Request req;
+    req.set_header("Cookie", cookie);
+    const auto session = h.auth_mgr.validate_session(token);
+    REQUIRE(session.has_value());
+
+    SECTION("a local cookie session answers its stored, bound proof") {
+        const auto durable = h.auth_routes->durable_mfa_proof_for(req, *session);
+        CHECK(durable.source == auth::DurableMfaProof::Source::kRow);
+        CHECK(durable.mfa_verified_ms > 0);
+        CHECK(durable.mfa_factor_gen == h.auth_db->mfa_status("admin")->factor_gen);
+    }
+    SECTION("a bearer, OIDC or SAML session never reaches the store") {
+        for (const char* source : {"api_token", "mcp_token", "oidc", "saml"}) {
+            auto other = *session;
+            other.auth_source = source;
+            CHECK(h.auth_routes->durable_mfa_proof_for(req, other).source ==
+                  auth::DurableMfaProof::Source::kAbsent);
+        }
+    }
+    SECTION("a cookie that is another principal's, or missing, is kAbsent") {
+        auto other = *session;
+        other.username = "alice";
+        CHECK(h.auth_routes->durable_mfa_proof_for(req, other).source ==
+              auth::DurableMfaProof::Source::kAbsent);
+        httplib::Request bare;
+        CHECK(h.auth_routes->durable_mfa_proof_for(bare, *session).source ==
+              auth::DurableMfaProof::Source::kAbsent);
+    }
+}
+
+// Enrol then approve at once, through the real enrolment route and the real approval route:
+// the proof's instant precedes mfa_enrolled_at (it was captured before the enrolling UPDATE),
+// which the generation-bound approver gate admits by equality. This is the route-level proof for
+// the /login/mfa/enroll path; the Settings path is the sibling case in test_settings_routes_mfa.cpp
+// and the hand-stamped one is test_approval_routes.cpp's I14.
+TEST_CASE("enrol via /login/mfa/enroll then approve at once passes the real approver gate "
+          "(#6079 T18)",
+          "[pg][mfa][enroll][routes][auth_routes][binding][approval_routes]") {
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    yuzu::test::ApproverRouteFixture fx(h.auth_mgr, *h.auth_db.get(),
+                                        [&h](const httplib::Request& req, const auth::Session& s) {
+                                            return h.auth_routes->durable_mfa_proof_for(req, s);
+                                        });
+
+    std::vector<SeenProof> seen;
+    record_proofs(h, seen);
+    auto step1 =
+        h.sink.Post("/login", form({{"username", "admin"}, {"password", "adminpassword1"}}),
+                    "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    const auto body = nlohmann::json::parse(step1->body);
+    auto enrol =
+        h.sink.Post("/login/mfa/enroll",
+                    form({{"mfa_pending_token", body.at("mfa_pending_token").get<std::string>()},
+                          {"code", h.totp_at(body.at("secret_base32").get<std::string>(), 0)}}),
+                    "application/x-www-form-urlencoded");
+    REQUIRE(enrol);
+    REQUIRE(enrol->status == 200);
+    const auto token = cookie_token_of(*enrol);
+    REQUIRE(seen.size() == 1);
+    const auto st = h.auth_db->mfa_status("admin");
+    REQUIRE(st.has_value());
+    REQUIRE(seen[0].proof.verified_ms <= st->enrolled_at_ms); // the case the timestamp rule refused
+
+    const auto approve_ticket = fx.submit();
+    auto approved = fx.decide("approve", approve_ticket, token);
+    REQUIRE(approved);
+    CHECK(approved->status == 200);
+    CHECK(fx.status_of(approve_ticket) == "approved");
+    const auto reject_ticket = fx.submit();
+    auto rejected = fx.decide("reject", reject_ticket, token);
+    REQUIRE(rejected);
+    CHECK(rejected->status == 200);
+    CHECK(fx.status_of(reject_ticket) == "rejected");
 }
