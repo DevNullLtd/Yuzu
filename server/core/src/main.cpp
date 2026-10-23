@@ -534,8 +534,9 @@ int main(int argc, char* argv[]) {
     // MFA / TOTP — SOC 2 CC6.6. See docs/auth-mfa-design.md.
     app.add_option("--mfa-enforcement", cfg.mfa_enforcement,
                    "MFA enforcement (default: optional). \"optional\" = login never requires "
-                   "it; only an administrator can enrol, from Settings (a non-admin needs "
-                   "an enrolment sign-in window). \"admin-only\" = admins must "
+                   "it; only an administrator can enrol, from Settings, so a non-admin cannot "
+                   "enrol itself (see the runbook \"Enrolling a non-admin approver\"). "
+                   "\"admin-only\" = admins must "
                    "enrol before login completes. \"required\" = every role must enrol. "
                    "Under admin-only/required an un-enrolled login is redirected through "
                    "TOTP enrollment (POST /login/mfa/enroll) before a session is minted.")

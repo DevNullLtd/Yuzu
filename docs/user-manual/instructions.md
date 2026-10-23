@@ -678,7 +678,7 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
   account and a single sign-on identity, or two single sign-on identities, is two different names to the
   server, so that person can submit a request under one identity and approve it under the other (each
   identity still needs its own enrolled MFA factor and fresh proof). This behaviour predates #6079 and was
-  left out of its scope by the owner; resolving every identity to one person is a planned
+  left out of its scope by the Yuzu project maintainer; resolving every identity to one person is a planned
   follow-up. Until then, do not rely on the reviewer check as proof that two different humans were involved
   where users can hold more than one identity.
 - **Not a SAML session.** MFA step-up is not available for SAML sessions (#4935), so a user who

@@ -213,10 +213,9 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
     // 450 s old in elapsed time passes a 300 s window. A kRow closes that: age = db_now -
     // mfa_verified in ONE SELECT on the database clock, which a paused VM cannot stretch. The
     // cached monotonic check is kept as well (a stricter, never a looser, second condition),
-    // so both clocks must agree the proof is in the window. `mfa_proof_age` also computes a
-    // wall-clock figure (`wall_stale`, from the replica's system_clock) for the generic
-    // gate's suspend backstop; this gate never reads it, so no replica wall clock is
-    // decisional here. An SSO session's durable instant is the IdP `iat` clamped to this
+    // so both clocks must agree the proof is in the window. The decision never consults the
+    // replica's raw system_clock: `mfa_proof_age` still reads it to set `wall_stale`, which
+    // this arm ignores. An SSO session's durable instant is the IdP `iat` clamped to this
     // replica's clock at login, so a replica running ahead of the database can store a proof
     // the database reads as future-dated. A future-dated durable instant is refused here; for
     // a freshly minted or loaded session the same condition has already left no cached proof

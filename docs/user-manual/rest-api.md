@@ -11797,7 +11797,7 @@ finish checking (`400 parameter_schema could not be checked`). Updating a defini
 > remediation, the result-set producers, MCP `execute_instruction` and `POST /api/command` do not
 > validate against the stored schema yet.
 
-**Errors:** 404 (definition not found), 400 (invalid body, or invalid `params`), 202 (approval required -- execution queued, not yet dispatched), 403 (workflow blocked by approval-gated instruction and caller lacks execute-bypass permission), 500 (stored parameter schema invalid), 503 (no agents reached or store unavailable).
+**Errors:** 404 (definition not found), 400 (invalid body, or invalid `params`), 202 (approval required -- the ticket is held pending and nothing runs until it is approved), 403 (workflow blocked by approval-gated instruction and caller lacks execute-bypass permission), 500 (stored parameter schema invalid), 503 (no agents reached or store unavailable).
 
 ---
 

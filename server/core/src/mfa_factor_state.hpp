@@ -37,7 +37,8 @@ enum class MfaFactorState : std::uint8_t {
     kSamlUnsupported,   ///< SAML carries no MFA attestation in this release (#4935)
     kNotInteractive,    ///< any other auth_source (bearer, engine, unknown)
     kStoreUnavailable,  ///< the enrolment read failed (outage, undecryptable secret, or an
-                        ///< enrolled row with no usable factor generation)
+                        ///< enrolled row with no usable factor generation), or the durable
+                        ///< proof read failed
     kAccountUnavailable, ///< local session whose account is deactivated, deleted or malformed
 };
 
@@ -168,7 +169,7 @@ struct StepUpAdmission {
 struct ApproverMfaOutcome {
     enum class Kind : std::uint8_t {
         kRefuse = 0,       ///< no usable second factor; nothing was written to the response
-        kStoreUnavailable, ///< the enrolment read failed; nothing was written to the response
+        kStoreUnavailable, ///< the enrolment or durable-proof read failed; nothing was written
         kChallengeWritten, ///< the proof is stale, unbound, or bound to another factor
                            ///< generation; a 401 was written
         kProofClockSkew,   ///< an SSO proof dated after the database clock; nothing was written
