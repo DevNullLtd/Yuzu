@@ -45,6 +45,7 @@
 #include "peer_ip.hpp"
 #include "plugin_result_audit.hpp"
 #include "response_store.hpp"
+#include "response_tier_filter.hpp" // #4990: ForensicsPluginSet::contains
 #include "result_parsing.hpp"
 #include "tag_store.hpp"
 #include "update_registry.hpp"
@@ -2300,6 +2301,12 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
 void AgentServiceImpl::publish_output_rows(const std::string& agent_id, const std::string& plugin,
                                            const std::string& raw_output) {
     if (raw_output.empty())
+        return;
+    // #4990: the "output" stream is shared by every dashboard session, with no per-subscriber
+    // read tier. A Forensics-tier plugin's rows are therefore never published to it; they are
+    // served only by the tier-filtered stored-response reads. An unwired set publishes nothing
+    // (without it a Forensics row cannot be told apart from an ordinary one).
+    if (!forensics_plugins_ || forensics_plugins_->contains(plugin))
         return;
     auto agent_name = registry_.display_name(agent_id);
     auto& col_names = yuzu::server::columns_for_plugin(plugin);

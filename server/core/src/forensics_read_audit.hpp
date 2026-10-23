@@ -20,7 +20,6 @@
 #include <httplib.h>
 
 #include <algorithm>
-#include <cctype>
 #include <cstddef>
 #include <set>
 #include <string>
@@ -48,10 +47,8 @@ struct ForensicsServed {
     void note(std::string_view plugin, const ForensicsPluginSet* set) {
         if (!set)
             return;
-        std::string lower(plugin);
-        for (auto& c : lower)
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        if (!std::ranges::binary_search(set->names(), lower))
+        std::string lower = ascii_lower(plugin);
+        if (!set->contains(lower))
             return;
         ++rows;
         plugins.insert(std::move(lower));

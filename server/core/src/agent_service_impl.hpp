@@ -64,6 +64,7 @@ inline void seed_register_invalid_agent_id_series(yuzu::MetricsRegistry& metrics
 
 // Forward declarations to avoid pulling in full store headers
 class ResponseStore;
+class ForensicsPluginSet; // #4990 (response_tier_filter.hpp)
 class TagStore;
 class AnalyticsEventStore;
 class AuditStore;
@@ -195,6 +196,13 @@ public:
     /// false; only safe with per-agent client certs (see Config doc).
     void set_nat_trust_mtls_identity(bool enabled) { nat_trust_mtls_identity_ = enabled; }
     void set_response_store(ResponseStore* store) { response_store_ = store; }
+    /// #4990: the Forensics plugin set. The live `/events` `output` stream is shared by every
+    /// dashboard session, so rows of a Forensics-tier plugin are never published to it. Borrowed;
+    /// set before the listener starts. Unset (nullptr) FAILS CLOSED: no output row is published,
+    /// because without the set a Forensics row cannot be told apart from an ordinary one.
+    void set_forensics_plugin_set(const ForensicsPluginSet* plugins) {
+        forensics_plugins_ = plugins;
+    }
     void set_tag_store(TagStore* store) { tag_store_ = store; }
     void set_analytics_store(std::weak_ptr<AnalyticsEventStore> store) {
         analytics_store_ = std::move(store);
@@ -599,6 +607,7 @@ private:
     grpc::Status require_positive_ota_identity(grpc::ServerContext* context, std::string_view rpc,
                                                const std::string& claimed_agent_id);
     ResponseStore* response_store_{nullptr};
+    const ForensicsPluginSet* forensics_plugins_{nullptr}; // #4990, borrowed
     TagStore* tag_store_{nullptr};
     std::weak_ptr<AnalyticsEventStore> analytics_store_;
     AuditStore* audit_store_{nullptr};

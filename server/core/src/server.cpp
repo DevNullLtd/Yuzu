@@ -6347,6 +6347,8 @@ public:
         // Wire up store pointers for AgentServiceImpl
         if (response_store_)
             agent_service_.set_response_store(response_store_.get());
+        // #4990: the live "output" bus publishes no Forensics-tier row (unset fails closed).
+        agent_service_.set_forensics_plugin_set(forensics_plugins());
         if (tag_store_)
             agent_service_.set_tag_store(tag_store_.get());
         if (analytics_store_)

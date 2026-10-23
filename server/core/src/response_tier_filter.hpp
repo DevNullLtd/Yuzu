@@ -19,7 +19,6 @@
 /// capability catalogue in `forensics_plugin_set.hpp`, never hand-kept.
 
 #include <algorithm>
-#include <cctype>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -29,6 +28,18 @@
 #include "authz_model.hpp"
 
 namespace yuzu::server {
+
+/// ASCII lowercase of a plugin name. The ONE fold the Forensics tier uses in C++ (set
+/// construction, membership checks, audit summaries); the SQL predicate folds with
+/// `lower(plugin COLLATE "C")`, which is ASCII-only by construction, so the two always agree
+/// regardless of the database locale.
+[[nodiscard]] inline std::string ascii_lower(std::string_view s) {
+    std::string out(s);
+    for (auto& c : out)
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
+    return out;
+}
 
 /// The plugins whose stored rows are Forensics-tier: lowercase, sorted, unique, NON-EMPTY.
 /// The only ways to obtain one are `from_names` (which refuses an empty set) and the catalogue
@@ -42,8 +53,7 @@ public:
     /// is left: the caller must treat that as a refusal (boot refuses), never as "no Forensics plugins".
     [[nodiscard]] static std::optional<ForensicsPluginSet> from_names(std::vector<std::string> names) {
         for (auto& n : names)
-            for (auto& c : n)
-                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            n = ascii_lower(n);
         std::erase_if(names, [](const std::string& n) { return n.empty(); });
         std::ranges::sort(names);
         names.erase(std::unique(names.begin(), names.end()), names.end());
@@ -53,6 +63,11 @@ public:
     }
 
     [[nodiscard]] const std::vector<std::string>& names() const noexcept { return names_; }
+
+    /// True when `plugin` (any ASCII case) is a Forensics-tier plugin.
+    [[nodiscard]] bool contains(std::string_view plugin) const {
+        return std::ranges::binary_search(names_, ascii_lower(plugin));
+    }
 
 private:
     explicit ForensicsPluginSet(std::vector<std::string> names) : names_(std::move(names)) {}
