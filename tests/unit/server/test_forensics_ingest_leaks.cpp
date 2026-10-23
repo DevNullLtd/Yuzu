@@ -581,13 +581,17 @@ TEST_CASE("tracker error_detail: a failed Forensics execution lookup withholds t
     logs.stop();
     fault.repair();
     // ... and the warning (drawer polls repeat this read every few seconds) is throttled to one
-    // per minute, however many reads failed. At most, not exactly: the throttle is process-wide.
+    // per minute, however many reads failed. EXACTLY one: at least one (the line is emitted at
+    // all, the alert runbook and the operator both grep it) and at most one (the throttle holds
+    // across the six reads). The throttle is a function-local static, so this holds only while
+    // this is the one test in the binary that makes the lookup fail; a second such test must
+    // compare against the count it started with instead of 1.
     const auto text = logs.text();
     std::size_t lines = 0;
     for (std::size_t pos = text.find("Forensics execution lookup failed"); pos != std::string::npos;
          pos = text.find("Forensics execution lookup failed", pos + 1))
         ++lines;
-    CHECK(lines <= 1);
+    CHECK(lines == 1);
 }
 
 // -- A3: the failure text in the server's other derived sinks -------------------------------------
