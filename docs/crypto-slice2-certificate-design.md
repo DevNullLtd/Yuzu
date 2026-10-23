@@ -1924,15 +1924,17 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
     than OD-2's MCP set-and-proceed); the export's own row stays set-and-proceed for the library
     half. The code is kept and this design follows it.
 
-11. **The Linux walk's unnamed-mount residual** (raised by 2a-2e's governance, for the owner to
-    accept or reject). Every path hop and directory entry is classified against the start-of-run
-    mount snapshot and by `statx(AT_NO_AUTOMOUNT|AT_STATX_DONT_SYNC)` mount id before it is opened,
-    so no automount is triggered and nothing on a named network, autofs or non-local FUSE mount is
-    opened or read. What remains: a dead FUSE or network mount that the snapshot does not name
-    (mounted after it, or an unreadable mount table) can still block that one `statx` on the
-    entry that is its mount point, and the action deadline cannot interrupt it; kernels before 5.8
-    detect such boundaries by `st_dev` only. 2a-2e does not merge before the owner accepts this or
-    asks for a worker that can be abandoned.
+11. **The Linux walk's residual** (raised by 2a-2e's governance and measured by its chaos runs,
+    for the owner to accept or reject). Every root, path hop and entry is classified against the
+    start-of-run mount snapshot, by an allowlist of local filesystem types (overlay only when all
+    its layers are local), and by `statx(AT_NO_AUTOMOUNT|AT_STATX_DONT_SYNC)` mount id before it
+    is opened; on unnamed dead autofs, FUSE and sshfs mount points that statx did not block. What
+    remains: on kernels before 5.8 or under a seccomp filter denying statx, the fallback
+    `fstatat`/`openat` can block on an unnamed dead FUSE or autofs root or hop; with an unreadable
+    mount table, boundaries at path hops are not refused; a mount stacked after the snapshot over a
+    mount point the snapshot names as local is opened (its type is checked only afterwards); and
+    the action deadline cannot interrupt a syscall already blocked in the kernel. 2a-2e does not
+    merge before the owner accepts this or asks for a worker that can be abandoned.
 
 ## How this could ship wrong
 
