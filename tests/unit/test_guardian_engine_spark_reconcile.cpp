@@ -1575,6 +1575,91 @@ TEST_CASE("#5547: a push naming a rule id twice is rejected with no state change
     CHECK(r.engine->rule_count() == rules_before);
 }
 
+namespace {
+
+/// C3 body. An allocation failure after begin_*_application() has published the new ack
+/// application unwinds out of apply_rules() (dispatch() has no try around it). `full_sync`
+/// selects the push shape. The meaningful assertions are that the heartbeat tick, which acknowledges
+/// any application whose pending set is empty and that holds no failure, does NOT acknowledge the
+/// generation of the application the unwind left behind, and that the ledger holds a latched
+/// failure. (An empty unlatched application already returns Reapply from decide_retry, so a
+/// "next identical push is a Reapply" assertion would pass without the guard.)
+void run_unwind_after_publication_5547(bool full_sync) {
+    BootRig5513 r;
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+    r.construct(true, true);
+    r.wire();
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.tick_until([&] { return r.engine->spark_armed_rule_count() == 1; }));
+    r.quiesce();
+    REQUIRE(r.engine->policy_generation() == kGen5513);
+    REQUIRE_FALSE(r.engine->ack_latched_for_test());
+
+    r.engine->set_apply_post_drain_hook_for_test([] { throw std::bad_alloc{}; });
+    CHECK_THROWS_AS(r.push({make_service_rule("r1")}, kGen5513 + 1, full_sync), std::bad_alloc);
+    r.engine->set_apply_post_drain_hook_for_test(nullptr);
+
+    CHECK(r.engine->ack_latched_for_test());
+    r.tick_n(5); // a published, empty, unlatched application would be acknowledged here
+    CHECK(r.engine->policy_generation() == kGen5513);
+    CHECK(r.engine->ack_latched_for_test());
+
+    // An authoritative full_sync repairs it and the generation then advances.
+    r.push_ok({make_service_rule("r1")}, kGen5513 + 1);
+    REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen5513 + 1; }));
+    CHECK_FALSE(r.engine->ack_latched_for_test());
+}
+
+} // namespace
+
+TEST_CASE("#5547 unwind guard: a throw after the ack application is published latches it, so the "
+          "tick never acknowledges the generation (full_sync)",
+          "[spark][guardian][reconcile][5547][unwind]") {
+    // Mutations: the guard's fn never assigned; the guard never armed (committed left true); the
+    // guard disarmed immediately after arming.
+    run_unwind_after_publication_5547(/*full_sync=*/true);
+}
+
+TEST_CASE("#5547 unwind guard: a throw after the ack application is published latches it, so the "
+          "tick never acknowledges the generation (delta)",
+          "[spark][guardian][reconcile][5547][unwind]") {
+    run_unwind_after_publication_5547(/*full_sync=*/false);
+}
+
+TEST_CASE("#5547 unwind guard: a throw between the guard's assignment and the application's "
+          "publication is a clean abort that leaves the open application untouched and the guard "
+          "disarmed",
+          "[spark][guardian][reconcile][5547][unwind]") {
+    // Plan F7. The hook fires after fn is assigned (step 2) and before begin_*_application()
+    // (step 3). The push returns std::unexpected and never escapes dispatch(), and the
+    // application that is still current (clean here) must not be latched: a guard armed at the
+    // fn assignment would fire during this return. Mutation: `committed = false` moved to
+    // immediately after the fn assignment.
+    BootRig5513 r;
+    r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
+    r.construct(false, false);
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE_FALSE(r.engine->ack_latched_for_test());
+    const auto failures_before = r.engine->arm_failure_count();
+    const auto rules_before = r.engine->rule_count();
+
+    for (const bool full_sync : {true, false}) {
+        r.engine->set_apply_pre_begin_hook_for_test([] { throw std::bad_alloc{}; });
+        const auto reply = r.push({make_file_rule("r1")}, kGen5513 + 1, full_sync);
+        r.engine->set_apply_pre_begin_hook_for_test(nullptr);
+        CHECK(reply.exit_code != 0);
+        CHECK_FALSE(r.engine->ack_latched_for_test());
+        CHECK(r.engine->policy_generation() == kGen5513);
+        CHECK(r.engine->arm_failure_count() == failures_before);
+        CHECK(r.engine->rule_count() == rules_before);
+    }
+
+    // Nothing was published, so the next clean push applies and advances normally.
+    r.push_ok({make_file_rule("r1")}, kGen5513 + 1);
+    CHECK(r.engine->policy_generation() == kGen5513 + 1);
+    CHECK_FALSE(r.engine->ack_latched_for_test());
+}
+
 TEST_CASE("#5513 dormant (prefer_spark=true): a boot arm that drains as a failure reports 0, and "
           "only the tick clears it once the catch-up arm commits",
           "[spark][guardian][reconcile][boot][5513][dormant]") {

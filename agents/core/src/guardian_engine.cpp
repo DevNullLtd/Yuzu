@@ -1974,6 +1974,11 @@ std::size_t GuardianEngine::ack_failed_receipt_count_for_test() const {
     return ack_ledger_->failed_receipt_count_for_test();
 }
 
+bool GuardianEngine::ack_latched_for_test() const {
+    std::lock_guard lock(mtx_);
+    return ack_ledger_->latched_failure_for_test();
+}
+
 std::uint32_t GuardianEngine::boot_catchup_failures_for_test() const {
     std::lock_guard lock(mtx_);
     return boot_catchup_failures_;
@@ -2234,13 +2239,34 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // does NOT name (pending receipts, retained wedges, drained failures, synchronous failures),
     // so omitting a rule cannot drop its retry obligation. Both build the new application in
     // full before publishing it, so a throw here leaves the open one exactly as it was.
+    //
+    // #5547 unwind guard. begin_*_application() PUBLISHES the new application, and what follows
+    // it (the persist, the full_sync sweep's id and key containers, the rule loop) is not all
+    // firewalled: dispatch() has no try around apply_rules(), so an allocation failure there
+    // unwinds with a published application that holds no pending receipt and no failure, which a
+    // later tick can acknowledge as fully applied. This guard latches the application if the
+    // function unwinds before the normal tail disarms it. ORDER IS LOAD-BEARING: (1) the id set
+    // above is built, (2) fn is assigned (a std::function assignment can allocate, so it sits
+    // INSIDE the pre-publication try where a throw is still a clean abort), (3)
+    // begin_*_application() publishes, (4) the guard is armed in the very next statement (a bool
+    // store). Declared after the lock_guard so it fires with mtx_ held. latch_failure() is
+    // noexcept and GuardianRollback never propagates, so firing it during unwinding is safe; a
+    // second latch (the put_rule early return latches too) is idempotent. Whatever escapes
+    // dispatch() still escapes: the guard only ensures that nothing can inherit an
+    // acknowledgeable empty application.
+    GuardianRollback incomplete_application;
+    incomplete_application.committed = true; // inactive until step (4)
     try {
+        incomplete_application.fn = [this] { ack_ledger_->latch_failure(); }; // (2)
+        if (apply_pre_begin_hook_for_test_)
+            apply_pre_begin_hook_for_test_();
         if (push.full_sync())
             ack_ledger_->begin_full_application(push.policy_generation(), content_id,
                                                 /*applied=*/0);
         else
             ack_ledger_->begin_delta_application(push.policy_generation(), content_id,
                                                  /*applied=*/0, push_ids);
+        incomplete_application.committed = false; // (4) armed: the application is published
     } catch (const std::exception& e) {
         ack_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
         return std::unexpected(std::string("failed to begin ack application: ") + e.what());
@@ -2589,6 +2615,11 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     if (unattributed_failures > 0)
         ack_ledger_->latch_failure();
     ack_ledger_->set_applied(applied);
+    // #5547: the rule loop finished and every failure it saw is recorded in the application (the
+    // per-rule records and the tail latch above), so the application is complete: disarm the
+    // unwind guard declared where it was published. Anything that unwinds from here on (the
+    // generation persist, the log line) no longer leaves an incomplete application behind.
+    incomplete_application.committed = true;
     // #5547 (Ruling 22 (b)): a full_sync whose synchronous phases ALL succeeded is the
     // authoritative repair of the unattributed debt earlier applications handed down
     // (inherited_latch), so it is discharged here. ORDER IS LOAD-BEARING: after set_applied() and

@@ -804,6 +804,21 @@ public:
         apply_post_drain_hook_for_test_ = std::move(hook);
     }
 
+    /// TEST-ONLY (#5547): fires inside apply_rules, with mtx_ HELD, inside the pre-publication
+    /// try, after the unwind guard's callback is assigned and immediately before the ack
+    /// application is begun. A hook that throws is therefore a clean pre-publication abort (the
+    /// push returns std::unexpected, the open application is untouched and the guard stays
+    /// disarmed). Same CONTRACT as set_apply_post_drain_hook_for_test. No production caller.
+    void set_apply_pre_begin_hook_for_test(std::function<void()> hook) {
+        std::lock_guard lock(mtx_);
+        apply_pre_begin_hook_for_test_ = std::move(hook);
+    }
+
+    /// TEST-ONLY (#5547): whether the CURRENT ack application holds an application-wide latched
+    /// failure (this application's own, not the inherited debt). Defined out-of-line like
+    /// ack_pending_count_for_test(); takes mtx_. No production caller.
+    [[nodiscard]] bool ack_latched_for_test() const;
+
     /// TEST-ONLY (#4045): fires inside stop(), mtx_ HELD, at the START of each stop() stage
     /// ("journal_flush_1", "worker_join", "ledger", "journal_flush_2"), after the stage's start
     /// is read from the persister's clock and before its body runs: a test advances an injected
@@ -1364,6 +1379,8 @@ private:
     /// TEST-ONLY (#4045): see set_apply_post_drain_hook_for_test / set_seed_read_hook_for_test.
     /// mtx_-guarded; null = no-op.
     std::function<void()> apply_post_drain_hook_for_test_;
+    /// TEST-ONLY (#5547): see set_apply_pre_begin_hook_for_test. mtx_-guarded; null = no-op.
+    std::function<void()> apply_pre_begin_hook_for_test_;
     std::function<void(const char*)> stop_stage_hook_for_test_;
     /// #5604: the budget stop() lowers kv_ to. Atomic because the seam may be set from a test
     /// thread while stop() reads it before taking mtx_. Production never writes it.
