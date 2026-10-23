@@ -1586,3 +1586,16 @@ TEST_CASE("CertificateInventoryStore: delete_agent gives up on a held lock and i
     CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(9));
     CHECK(m.serialize().find("yuzu_server_cert_inventory_delete_failed_total 1") != std::string::npos);
 }
+
+TEST_CASE("cert ingest: an exception at a call site follows the leg rule (full resends, hash-only "
+          "does not), and is counted",
+          "[certinv][parse]") {
+    yuzu::MetricsRegistry m;
+    cert_ingest_metric::register_metrics(m);
+    agentpb::InventoryAck full_ack, hash_ack;
+    cert_ingest_metric::handle_exception(full_report("ver|1\n"), full_ack, &m);
+    cert_ingest_metric::handle_exception(hash_only(std::string(64, 'a')), hash_ack, &m);
+    CHECK(nacked(full_ack));
+    CHECK_FALSE(nacked(hash_ack));
+    CHECK(metric_count(m, "error", "exception") == 2);
+}

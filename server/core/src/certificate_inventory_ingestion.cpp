@@ -855,6 +855,13 @@ void cert_ingest_metric::count_exception(::yuzu::MetricsRegistry* metrics) {
         .increment();
 }
 
+void cert_ingest_metric::handle_exception(const pb::InventoryReport& report, pb::InventoryAck& ack,
+                                          ::yuzu::MetricsRegistry* metrics) {
+    count_exception(metrics);
+    if (report.plugin_data().find(kSource) != report.plugin_data().end())
+        ack.add_need_full(kSource);
+}
+
 void ingest_certificate_inventory_report(CertificateInventoryStore& store,
                                          const std::string& agent_id, const pb::InventoryReport& report,
                                          pb::InventoryAck& ack, ::yuzu::MetricsRegistry* metrics) {

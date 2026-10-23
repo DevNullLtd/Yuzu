@@ -182,6 +182,12 @@ inline constexpr auto kPairs = std::to_array<std::pair<std::string_view, std::st
 void register_metrics(::yuzu::MetricsRegistry& metrics);
 /// Count a seam exception caught at a call site (the call sites nack; this makes it visible).
 void count_exception(::yuzu::MetricsRegistry* metrics);
+/// The single exception policy for the call sites (direct and gateway): count it
+/// (error/exception) and, ONLY for a full-payload report, ask for a resend. A hash-only report
+/// is acknowledged clean and the agent retries next interval (a hash-only error never costs a
+/// multi-MiB upload).
+void handle_exception(const ::yuzu::agent::v1::InventoryReport& report,
+                      ::yuzu::agent::v1::InventoryAck& ack, ::yuzu::MetricsRegistry* metrics);
 } // namespace cert_ingest_metric
 
 } // namespace yuzu::server
