@@ -29,6 +29,7 @@
 
 #include "../test_helpers.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -838,9 +839,11 @@ TEST_CASE("v1 response row reads: response.forensics.read is written only when F
         // and every client retry adds another. The audit trail over-reports access (a row for
         // data that was withheld); it never under-reports it. Pinned so a change in the order
         // (the row count per refused attempt) is a decision, not a surprise.
+        // The NAMED neighbouring row (`response.read`, result `success`), not "any other row":
+        // replacing it with a differently named row would otherwise go unnoticed.
         const auto neighbour_rows = [&] {
             return std::ranges::count_if(h.audit_log, [](const AuditRecord& a) {
-                return a.action != "response.forensics.read";
+                return a.action == "response.read" && a.result == "success";
             });
         };
         CHECK(neighbour_rows() == 1);
