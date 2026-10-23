@@ -110,10 +110,12 @@ namespace yuzu::server {
 /// Log a failed `CaStore::list_issued` on the unfiltered inventory reads (REST `GET
 /// /api/v1/ca/issued`, MCP `list_issued_certs`) at warn, WITH the store's error text: the
 /// handlers answer a fixed 503 message and the `failure` audit row carries a fixed detail, so
-/// without this the libpq error is nowhere. Sampled like CaStore's own degrade warns (the first
-/// of an episode, then at most one a minute, and every 100th), so a polling client against a
-/// degraded store does not write a line per request. `surface` is "rest" or "mcp". The text
-/// carries no caller input.
+/// without this the libpq error is nowhere. Sampled like CaStore's own degrade warns: the first
+/// failure of an episode (the first ever, or after a quiet gap over 60 s), then every 100th.
+/// The gap is measured from the previous failure, not the previous line, so a client retrying
+/// more often than once a minute gets one line and then one per 100 failures. The state is
+/// shared by REST and MCP, so `surface` ("rest" or "mcp") names the surface that happened to
+/// log, not every surface that failed. The text carries no caller input.
 void log_issued_list_failure(std::string_view surface, const std::string& error);
 
 /// Prefix on `IssueCodeSigningFn`'s `unexpected()` when the failure is a

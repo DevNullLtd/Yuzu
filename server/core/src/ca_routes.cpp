@@ -54,8 +54,11 @@ nlohmann::json crl_figures_json(CaStore& ca_store) {
 }
 
 void log_issued_list_failure(std::string_view surface, const std::string& error) {
-    // The CaStore DegradeSampler shape: first of an episode, then at most one a minute, and
-    // every 100th. File-local state; the counter is a plain occurrence count.
+    // The CaStore DegradeSampler shape: the first failure of an episode (the first ever, or
+    // after a quiet gap over 60 s), then every 100th. `last_ts` is refreshed on EVERY failure,
+    // so a client retrying more often than once a minute logs one line, then one per 100
+    // failures. File-local state, shared by REST and MCP; the counter is a plain occurrence
+    // count.
     static std::atomic<std::uint64_t> count{0};
     static std::atomic<std::int64_t> last_ts{0};
     const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
@@ -402,9 +405,13 @@ std::string render_ca(CaStore* ca_store, bool pki_view,
 /// Surface a non-2xx wrapper outcome. htmx 2 drops every 4xx/5xx body, so without this the
 /// operator sees nothing. `message` is always a code-authored constant. `ensure_ascii` keeps
 /// the header value 7-bit.
-void set_error_toast(httplib::Response& res, const std::string& message) {
-    const nlohmann::json toast = {{"showToast", {{"message", message}, {"level", "error"}}}};
+void set_toast(httplib::Response& res, const std::string& message, const char* level) {
+    const nlohmann::json toast = {{"showToast", {{"message", message}, {"level", level}}}};
     res.set_header("HX-Trigger", toast.dump(-1, ' ', true));
+}
+
+void set_error_toast(httplib::Response& res, const std::string& message) {
+    set_toast(res, message, "error");
 }
 
 } // namespace
@@ -536,6 +543,22 @@ std::string wrapper_panel_body(CaStore* ca_store, bool pki_view, const PanelAcce
     return render_ca(ca_store, pki_view, access.inventory_note);
 }
 
+/// The success reply of a wrapper (revoke / import-chain). An unconfined caller sees the result
+/// in the re-rendered inventory (the Revoked pill, the Trust mode badge), byte-identical to
+/// before. A caller whose inventory is withheld has nothing in the panel that shows the
+/// mutation, so the reply carries an explicit confirmation (banner + success toast) that does
+/// not depend on the inventory. `prefix` is any code-authored banner that goes first.
+std::string wrapper_success_body(httplib::Response& res, CaStore* ca_store, bool pki_view,
+                                 const PanelAccess& access, std::string_view confirmation,
+                                 std::string prefix = {}) {
+    if (access.may_view && access.inventory_note) {
+        set_toast(res, std::string(confirmation), "success");
+        prefix += "<div class=\"alert alert-success\" style=\"margin-bottom:0.75rem\">" +
+                  html_escape(std::string(confirmation)) + "</div>";
+    }
+    return prefix + wrapper_panel_body(ca_store, pki_view, access);
+}
+
 } // namespace
 
 void CaRoutes::serve_filtered_issued(const FilteredIssuedDeps& filtered,
@@ -609,6 +632,9 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
         spdlog::error("CA routes: no confinement probe wired before register_routes "
                       "(set_filtered_issued): GET /api/v1/ca/issued answers 503 and the Settings "
                       "CA panel withholds its inventory for every caller");
+    if (!filtered_.api)
+        spdlog::error("CA routes: no CryptoApi wired before register_routes "
+                      "(set_filtered_issued): the filtered GET /api/v1/ca/issued answers 503");
 
     // Shared revoke core (REST + dashboard wrapper) over an ALREADY-normalised
     // serial: revoke → audit → republish CRL → audit. Returns -1 unknown/already-
@@ -779,8 +805,9 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                     (void)issued_audit(audit_fn, req, res, "failure", "inventory",
                                        "inventory store unavailable; cid=" + cid);
                     res.status = 503;
-                    res.set_content(error_json_a4(503, "CA store unavailable — try again", cid, 5000, {}),
-                                    kJson);
+                    res.set_content(
+                        error_json_a4(503, "CA store unavailable — try again", cid, 5000, {}),
+                        kJson);
                     return;
                 }
                 auto records = std::move(*records_or_err);
@@ -1346,8 +1373,9 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
             a.inventory_note = issued_panel_withheld(filtered, req);
         return a;
     };
-    sink.Post("/api/settings/ca/revoke", [perm_fn, audit_fn, ca_store, revoke_core, csrf_trusted, panel_access](
-                                             const httplib::Request& req, httplib::Response& res) {
+    sink.Post("/api/settings/ca/revoke",
+              [perm_fn, audit_fn, ca_store, revoke_core, csrf_trusted, panel_access](
+                  const httplib::Request& req, httplib::Response& res) {
         // H-1 (#1241): this revoke is authorized by the yuzu_session COOKIE alone
         // (a forged revoke = fleet-wide lockout DoS), so it carries a CSRF gate.
         //
@@ -1402,7 +1430,8 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
             res.status = status;
             set_error_toast(res, msg);
             res.set_content("<div class=\"alert alert-error\" style=\"margin-bottom:0.75rem\">" +
-                                html_escape(msg) + "</div>" + wrapper_panel_body(ca_store, pki_view, access),
+                                html_escape(msg) + "</div>" +
+                                wrapper_panel_body(ca_store, pki_view, access),
                             "text/html; charset=utf-8");
         };
         if (!ca_store || !ca_store->is_open()) {
@@ -1433,7 +1462,10 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
         }
         if (!rv.audit_ok)
             res.set_header("Sec-Audit-Failed", "true");
-        res.set_content(wrapper_panel_body(ca_store, pki_view, access), "text/html; charset=utf-8");
+        res.set_content(wrapper_success_body(res, ca_store, pki_view, access,
+                                             "Certificate revoked. The issued-certificate "
+                                             "inventory is not shown (see the note below)."),
+                        "text/html; charset=utf-8");
     });
 
     // ── POST /api/settings/ca/import-chain ── dashboard subordinate import (PR6).
@@ -1444,8 +1476,8 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
     // the new Trust mode badge shows. The submitted PEMs are NEVER echoed back
     // into the fragment, so this wrapper adds no HTML-injection surface.
     sink.Post("/api/settings/ca/import-chain",
-              [perm_fn, audit_fn, ca_store, import_chain_fn, publish_crl_fn, csrf_trusted, panel_access](
-                  const httplib::Request& req, httplib::Response& res) {
+              [perm_fn, audit_fn, ca_store, import_chain_fn, publish_crl_fn, csrf_trusted,
+               panel_access](const httplib::Request& req, httplib::Response& res) {
                   const std::string origin = req.get_header_value("Origin");
                   const std::string referer = req.get_header_value("Referer");
                   const bool same_site =
@@ -1475,7 +1507,8 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                       set_error_toast(res, msg);
                       res.set_content(
                           "<div class=\"alert alert-error\" style=\"margin-bottom:0.75rem\">" +
-                              html_escape(msg) + "</div>" + wrapper_panel_body(ca_store, pki_view, access),
+                              html_escape(msg) + "</div>" +
+                              wrapper_panel_body(ca_store, pki_view, access),
                           "text/html; charset=utf-8");
                   };
                   if (!ca_store || !ca_store->is_open() || !import_chain_fn) {
@@ -1570,8 +1603,13 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                       body += "<div class=\"alert alert-warning\" style=\"margin-bottom:0.75rem\">"
                               "Subordinated, but the CRL could not be republished — external CRL "
                               "consumers will not see the new issuer until the next publish.</div>";
-                  body += wrapper_panel_body(ca_store, pki_view, access);
-                  res.set_content(body, "text/html; charset=utf-8");
+                  res.set_content(wrapper_success_body(
+                                      res, ca_store, pki_view, access,
+                                      "Signed chain imported: this CA is now subordinate to the "
+                                      "imported enterprise root. The issued-certificate inventory "
+                                      "is not shown (see the note below).",
+                                      std::move(body)),
+                                  "text/html; charset=utf-8");
               });
 }
 

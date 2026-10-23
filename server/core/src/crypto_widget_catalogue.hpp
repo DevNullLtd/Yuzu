@@ -297,7 +297,8 @@ inline constexpr std::array<RevokedBucket, 3> kRevokedBuckets{
 parse_cert_params(const crypto_library::Params& p);
 
 /// True when any filter key (kind, days, week, bucket, as_of, cursor) is present: GET
-/// /api/v1/ca/issued then answers the filtered list; without one it answers exactly as before.
+/// /api/v1/ca/issued then answers the filtered list; without one it answers the unfiltered,
+/// offset-paged inventory (which is confinement-gated and audited too).
 [[nodiscard]] bool has_cert_filter_params(const crypto_library::Params& p);
 [[nodiscard]] bool has_cert_filter_args(const nlohmann::json& args);
 
@@ -364,7 +365,8 @@ struct LayoutRequest {
 /// the standing they were served under. `refused` (no Inventory grant, or a read failure inside
 /// the access check, which the answer cannot tell apart) is served by design; the token lets an
 /// auditor tell those pages from the confined-view-checked ones. Only the two standings a list
-/// is ever served under are expected; any other renders as `refused`.
+/// is ever served under are expected; kConfined and kDegraded are answered before any success
+/// row and, if one ever reaches here, render as `standing=unexpected` (never as `refused`).
 [[nodiscard]] std::string audit_detail_with_standing(std::string detail, Access standing);
 /// The failure-row twin of both: `[cid=<cid> ]ws=<window set> as_of=<epoch|db_now> <what>`
 /// where `what` is "store degraded", "capacity in use" or "access check unavailable".

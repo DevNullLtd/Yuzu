@@ -22265,7 +22265,12 @@ McpServer::HandlerFn McpServer::build_handler(
                     (void)audit_fn(req, "crypto.ca.certificates.view", "failure", "Security",
                                    "inventory", "inventory store unavailable");
                     mcp_audit("failure", "inventory store unavailable");
-                    res.set_content(error_response(id, kInternalError, "CA store unavailable"),
+                    // Retryable, as the REST twin's 503 and the degraded access-check branch
+                    // above; the `!is_open()` "CA not available" branch has no hint (it lasts
+                    // until a restart).
+                    res.set_content(a4_error(kInternalError, "CA store unavailable",
+                                             "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }

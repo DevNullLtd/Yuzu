@@ -356,7 +356,8 @@ void KekRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, AuditFn aud
     // ── GET /api/v1/secrets/kek/status ── Security:Read. ──────────────────────
     // Read-only; not audited (the CA metadata routes, /ca/root and /ca/crl, don't
     // audit either; GET /ca/issued does, as crypto.ca.certificates.view).
-    // `oldest_in_use` is null when no secret rows exist at all (nothing to rewrap, trivially "complete"). #2530 B2/C1:
+    // `oldest_in_use` is null when no secret rows exist at all (nothing to rewrap, trivially
+    // "complete"). #2530 B2/C1:
     // `live_versions`/`lock_held`/`lock_holder_pid` are diagnostic snapshots
     // taken lock-free — see the KekOpResult doc comment — and this route
     // still deliberately never takes the `secrets_kek_op` lock itself; the

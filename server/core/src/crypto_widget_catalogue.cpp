@@ -889,7 +889,22 @@ std::string audit_detail_inventory(std::string_view cid, std::size_t rows, int l
 }
 
 std::string audit_detail_with_standing(std::string detail, Access standing) {
-    detail += standing == Access::kAvailable ? " standing=available" : " standing=refused";
+    // Exhaustive, no default: a new enumerator must be decided here. kConfined and kDegraded
+    // never reach a success row (the handlers answer them first); if a caller ever passed one,
+    // the row says so under a token distinct from the two real standings, never a false
+    // `refused`.
+    switch (standing) {
+    case Access::kAvailable:
+        detail += " standing=available";
+        break;
+    case Access::kRefused:
+        detail += " standing=refused";
+        break;
+    case Access::kConfined:
+    case Access::kDegraded:
+        detail += " standing=unexpected";
+        break;
+    }
     return detail;
 }
 
