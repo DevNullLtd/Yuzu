@@ -900,12 +900,11 @@ void PolicyEvaluator::collect_ready() {
         // reads as "no terminal response yet", the same as a genuinely slow
         // agent — verdict_for() below already treats an unmatched target as
         // "unknown", never a fabricated compliant/drifted verdict.
-        // #4990: the check instruction's plugin is chosen by whoever authored the instruction
-        // definition and is dispatched as a system caller, and the verdict and the first bytes of
-        // its output (`make_check_result`) are served by the compliance routes and MCP to readers
-        // below the Forensics tier. So this read EXCLUDES the Forensics plugins outright
-        // (`deny_all()`): a Forensics check yields no row and scores `unknown`, never a verdict
-        // from, or a stored copy of, Forensics output.
+        // #4990: the verdict and the first bytes of a check's output (`make_check_result`) are
+        // served by the compliance routes and MCP to readers below the Forensics tier. So this
+        // read EXCLUDES the Forensics plugins outright (`deny_all()`): a Forensics check yields no
+        // row and scores `unknown`, never a verdict from, or a stored copy of, Forensics output.
+        // A separate follow-up tracks the dispatch-side authorisation of policy checks.
         const auto tier = d_.forensics_plugins
                               ? ResponseTierFilter::exclude(*d_.forensics_plugins, authz::deny_all())
                               : ResponseTierFilter::refuse_unwired();

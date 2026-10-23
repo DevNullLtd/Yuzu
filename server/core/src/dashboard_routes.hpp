@@ -350,7 +350,7 @@ private:
     /// the listed plugin column names are rendered (the "Agent" pseudo-
     /// column is always shown). @p template_id is propagated through pager
     /// / sort URLs so that switching pages doesn't drop the chosen template.
-    /// @p tier — #4990: what the caller may read with respect to the Forensics tier
+    /// @p tier: #4990, what the caller may read with respect to the Forensics tier
     /// (`tier_filter_for`, derived by the route after its gate). Required, no default: every
     /// store read below (rows, counts, byte-cap cuts, facets) is computed over the permitted set.
     /// @p scope — #1712 / #3290 Phase 2: the fleet-read gate's composed

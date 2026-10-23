@@ -7076,7 +7076,7 @@ void RestApiV1::register_routes(
             const std::string kUniformReject =
                 "role '" + role_name + "' cannot be assigned to a human principal fleet-wide";
 
-            // Closed six-name allow-list (rbac_assignable_roles.hpp —
+            // Closed allow-list (rbac_assignable_roles.hpp —
             // adversarial-review PR1/A2 finding: docs claimed a closed
             // 6-role set but the code previously accepted ANY existing
             // role, including a pre-existing is_system=false custom role).
@@ -7111,7 +7111,7 @@ void RestApiV1::register_routes(
             if (!rbac_store->get_role(role_name)) {
                 // Doomgoose external review, PR #4985 IMPORTANT finding #3:
                 // reclassified from 400 to 503 — `role_name` has ALREADY
-                // passed the closed six-name allow-list above, so the
+                // passed the closed allow-list above, so the
                 // caller's input was never wrong; a missing row here is a
                 // tampered/hand-edited store (see the comment above), a
                 // store-integrity fault, never a client-facing rejection.

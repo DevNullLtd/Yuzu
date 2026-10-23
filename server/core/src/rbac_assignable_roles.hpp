@@ -11,14 +11,14 @@
 /// its MCP twins `assign_rbac_role`/`unassign_rbac_role` (mcp_server.cpp).
 ///
 /// WHY THIS EXISTS (adversarial-review finding, PR1/A2 "Should fix" #1): of
-/// the 7 seeded roles, `ITServiceOwner` is excluded from this fleet-wide
+/// the seeded roles, `ITServiceOwner` is excluded from this fleet-wide
 /// surface — see `rbac_admin_predicate.hpp` / the A2 route's own doc comment
 /// for the full reasoning (its 92-permission grant is designed around
 /// group-scoped confinement this surface does not carry). Before this file
 /// existed, the route/tool handlers rejected ONLY `ITServiceOwner` and a
 /// genuinely-unknown role name — any OTHER existing role, including an
 /// `is_system=false` CUSTOM role, was silently accepted, contradicting the
-/// shipped docs' own claim of a closed 7-role set
+/// shipped docs' own claim of a closed role set
 /// (`docs/user-manual/rbac.md` "Fleet-Wide Role Assignment"). `RbacStore::
 /// create_role` has zero production route callers today (a custom role can
 /// only exist via direct SQL against a live database), so this was not a

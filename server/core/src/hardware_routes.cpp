@@ -874,8 +874,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
         const std::string command_id = req.has_param("command_id") ? req.get_param_value("command_id") : "";
         // The client `plugin` parameter is a caption only (#4990). The plugin the poll reads for
-        // is DERIVED from the command id (server-minted ids are `<plugin>-<hex>`), so a client
-        // cannot point the read at another plugin's command by supplying a matching prefix.
+        // is DERIVED from the command id (server-minted ids are `<plugin>-<hex>`), never taken
+        // from the client.
         const std::string caption_plugin = req.has_param("plugin") ? req.get_param_value("plugin") : "";
         if (id.empty()) { res.status = 400; send_html(res, "bad request"); return; }
         if (!id_is_audit_safe(id)) {

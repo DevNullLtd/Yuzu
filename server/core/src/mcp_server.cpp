@@ -25824,7 +25824,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // both return the SAME client-facing message.
                 const std::string kUniformReject =
                     "role '" + role_name + "' cannot be assigned to a human principal fleet-wide";
-                // Closed six-name allow-list (rbac_assignable_roles.hpp) —
+                // Closed allow-list (rbac_assignable_roles.hpp) —
                 // see the REST route's own comment for the full reasoning
                 // (adversarial-review PR1/A2 finding). Covers BOTH the
                 // ITServiceOwner named exclusion (delivery plan §2) AND a
@@ -25843,7 +25843,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // Doomgoose external review, PR #4985 IMPORTANT finding
                     // #3: reclassified from kInvalidParams to kInternalError
                     // (503-analog, retryable) — role_name has ALREADY passed
-                    // the closed six-name allow-list above, so the caller's
+                    // the closed allow-list above, so the caller's
                     // input was never wrong; a missing row here is a
                     // store-integrity fault, matching the REST route's own
                     // fix.
