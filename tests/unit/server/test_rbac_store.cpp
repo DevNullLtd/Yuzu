@@ -13,6 +13,10 @@
  */
 
 #include "management_group_store.hpp"
+#include "agent_registry.hpp"      // detail::classify_and_authorize_dispatch (#4990 gate case)
+#include "capability_fragments.hpp"  // YUZU_ALL_CAPABILITY_FRAGMENTS
+#include "command_capability.hpp"
+#include "dispatch_caller.hpp"
 #include "mcp_server_testonly.hpp" // rbac_ops/securables_for_test (#2383 mirror binding)
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -24,6 +28,7 @@
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include <libpq-fe.h>
 #include <yuzu/metrics.hpp>
 
@@ -539,6 +544,201 @@ TEST_CASE("RbacStore: seed data — Operator/PlatformEngineer/Viewer have Produc
 }
 
 // ── RBAC toggle ──────────────────────────────────────────────────────────────
+
+// ── ForensicsAnalyst (#4990): the delegable read tier for Forensics-class rows ──────────────
+
+namespace {
+// The role's grant set as a sorted "Securable:Operation/effect" list, every effect included, so an
+// extra or a non-allow row cannot hide behind a membership probe.
+std::vector<std::string> grant_pairs(const RbacStore& store, const std::string& role) {
+    std::vector<std::string> out;
+    for (const auto& p : store.get_role_permissions(role))
+        out.push_back(p.securable_type + ":" + p.operation + "/" + p.effect);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+} // namespace
+
+TEST_CASE("RbacStore: seed data - ForensicsAnalyst is a system role holding exactly four read pairs",
+          "[rbac_store][pg][forensics_analyst]") {
+    RBAC_STORE(store);
+    auto role = store.get_role("ForensicsAnalyst");
+    REQUIRE(role.has_value());
+    CHECK(role->is_system);
+    // The set is asserted whole: no Execute, no Write, no Delete, nothing outside the four.
+    CHECK(grant_pairs(store, "ForensicsAnalyst") ==
+          std::vector<std::string>{"Execution:Read/allow", "Forensics:Read/allow",
+                                   "Inventory:Read/allow", "Response:Read/allow"});
+    CHECK(role_denies(store, "ForensicsAnalyst", "Execution", "Execute"));
+    CHECK(role_denies(store, "ForensicsAnalyst", "Response", "Write"));
+    CHECK(role_denies(store, "ForensicsAnalyst", "Forensics", "Write"));
+    CHECK(role_denies(store, "ForensicsAnalyst", "Infrastructure", "Read"));
+    CHECK(role_denies(store, "ForensicsAnalyst", "AuditLog", "Read"));
+    // A system role is not deletable.
+    CHECK_FALSE(store.delete_role("ForensicsAnalyst").has_value());
+}
+
+TEST_CASE("RbacStore: ForensicsAnalyst is seed-only - assigned to nobody and part of no other role",
+          "[rbac_store][pg][forensics_analyst]") {
+    RBAC_STORE(store);
+    CHECK(store.get_role_members("ForensicsAnalyst").empty());
+    // Nothing else gained the Forensics read: ITServiceOwner (a broad grant) and the sibling
+    // roles must not hold it; only Administrator does, as before.
+    for (const char* other : {"ITServiceOwner", "Operator", "Viewer", "PlatformEngineer",
+                              "ApiTokenManager", "Reviewer"}) {
+        INFO(other);
+        CHECK(role_denies(store, other, "Forensics", "Read"));
+    }
+    CHECK(role_grants(store, "Administrator", "Forensics", "Read"));
+    // Nobody is auto-assigned: no principal holds it on a fresh database.
+    const auto all = store.list_all_principal_roles_checked();
+    REQUIRE(all.has_value());
+    for (const auto& pr : *all)
+        CHECK(pr.role_name != "ForensicsAnalyst");
+}
+
+TEST_CASE("RbacStore: ForensicsAnalyst seeding is idempotent across restarts",
+          "[rbac_store][pg][forensics_analyst]") {
+    RBAC_STORE(store);
+    const auto before_role = store.get_role("ForensicsAnalyst");
+    REQUIRE(before_role.has_value());
+    const auto before_grants = grant_pairs(store, "ForensicsAnalyst");
+    const auto role_count = store.list_roles().size();
+
+    // Two further constructions against the same pool each run the real seed pass again.
+    for (int i = 0; i < 2; ++i) {
+        RbacStore reopened{rbac_pool_fx_};
+        REQUIRE(reopened.is_open());
+    }
+    const auto after_role = store.get_role("ForensicsAnalyst");
+    REQUIRE(after_role.has_value());
+    CHECK(after_role->description == before_role->description);
+    CHECK(after_role->created_at == before_role->created_at);
+    CHECK(grant_pairs(store, "ForensicsAnalyst") == before_grants);
+    CHECK(store.list_roles().size() == role_count);
+}
+
+TEST_CASE("RbacStore: a user holding only ForensicsAnalyst reads Forensics-tier rows but cannot dispatch",
+          "[rbac_store][pg][forensics_analyst]") {
+    RBAC_STORE(store);
+    REQUIRE(store.assign_role({"user", "ana", "ForensicsAnalyst"}).has_value());
+    REQUIRE(store.assign_role({"user", "vic", "Viewer"}).has_value());
+
+    CHECK(store.check_permission("ana", "Forensics", "Read"));
+    CHECK(store.check_permission("ana", "Response", "Read"));
+    CHECK(store.check_permission("ana", "Execution", "Read"));
+    CHECK(store.check_permission("ana", "Inventory", "Read"));
+    CHECK_FALSE(store.check_permission("ana", "Execution", "Execute"));
+    CHECK_FALSE(store.check_permission("ana", "Execution", "Write"));
+    CHECK_FALSE(store.check_permission("ana", "Infrastructure", "Read"));
+    CHECK_FALSE(store.check_permission("ana", "Infrastructure", "Execute"));
+    // A Viewer still cannot read the Forensics tier.
+    CHECK_FALSE(store.check_permission("vic", "Forensics", "Read"));
+    CHECK(store.check_permission("vic", "Response", "Read"));
+
+    // Operator + ForensicsAnalyst: the combined holder gains the Forensics READ and keeps
+    // Operator's Execution:Execute (the existing, approval-gated dispatch path).
+    REQUIRE(store.assign_role({"user", "oli", "Operator"}).has_value());
+    REQUIRE(store.assign_role({"user", "oli", "ForensicsAnalyst"}).has_value());
+    CHECK(store.check_permission("oli", "Forensics", "Read"));
+    CHECK(store.check_permission("oli", "Execution", "Execute"));
+    // No Forensics write or execute appears from the combination.
+    CHECK_FALSE(store.check_permission("oli", "Forensics", "Execute"));
+    CHECK_FALSE(store.check_permission("oli", "Forensics", "Write"));
+}
+
+TEST_CASE("RbacStore: an engine principal cannot be granted ForensicsAnalyst (system role)",
+          "[rbac_store][pg][forensics_analyst]") {
+    RBAC_STORE(store);
+    auto r = store.assign_role({"engine", "engine:nvd", "ForensicsAnalyst"});
+    REQUIRE_FALSE(r.has_value());
+    CHECK_THAT(r.error(), Catch::Matchers::ContainsSubstring("built-in system role"));
+    CHECK(store.get_principal_roles("engine", "engine:nvd").empty());
+}
+
+TEST_CASE("RbacStore: a pre-existing custom role named ForensicsAnalyst is merged into, not replaced",
+          "[rbac_store][pg][forensics_analyst]") {
+    RBAC_STORE(store);
+    // Reproduce the upgrade state: a database that already carries an operator-authored
+    // (SQL-created) role of this name and never had the seeded one.
+    {
+        auto lease = rbac_pool_fx_.acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "DELETE FROM rbac_store.roles WHERE name = 'ForensicsAnalyst'",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    }
+    REQUIRE_FALSE(store.get_role("ForensicsAnalyst").has_value());
+    REQUIRE(store.create_role({"ForensicsAnalyst", "site-authored", false, 0}).has_value());
+    REQUIRE(store.set_permission({"ForensicsAnalyst", "Tag", "Read", "allow"}).has_value());
+
+    // The next boot runs the real seed pass.
+    RbacStore reopened{rbac_pool_fx_};
+    REQUIRE(reopened.is_open());
+
+    auto role = reopened.get_role("ForensicsAnalyst");
+    REQUIRE(role.has_value());
+    // Observed behaviour: the role row is untouched (ON CONFLICT DO NOTHING) so it stays a
+    // NON-system role with its own description, and the four seeded pairs are merged into
+    // whatever grants it already had. Nothing is removed.
+    CHECK_FALSE(role->is_system);
+    CHECK(role->description == "site-authored");
+    CHECK(grant_pairs(reopened, "ForensicsAnalyst") ==
+          std::vector<std::string>{"Execution:Read/allow", "Forensics:Read/allow",
+                                   "Inventory:Read/allow", "Response:Read/allow", "Tag:Read/allow"});
+    // Consequence worth knowing: because the row is not is_system, the engine-principal
+    // built-in bar does not apply to this collided role (the structural refusal only holds
+    // for the seeded row). Characterised here so a future change to it is deliberate.
+    CHECK(reopened.assign_role({"engine", "engine:nvd", "ForensicsAnalyst"}).has_value());
+}
+
+// Item (6) of the #4990 role design: the dispatch gate is unchanged. Holding Operator +
+// ForensicsAnalyst lets a caller PASS the RBAC step of a Forensics-class plugin dispatch (it now
+// holds Forensics:Read) but the approval dimension still applies: not an effective admin and no
+// approval provenance is ApprovalRequired, with a real ticket it is admitted. An Operator alone is
+// still Forbidden at the RBAC step. The decision function is the production chokepoint, over the
+// real composed catalogue and the real store's check_permission.
+TEST_CASE("RbacStore: Operator + ForensicsAnalyst gets only approval-gated Forensics collection",
+          "[rbac_store][pg][forensics_analyst][dispatch]") {
+    RBAC_STORE(store);
+    REQUIRE(store.assign_role({"user", "oli", "Operator"}).has_value());
+    REQUIRE(store.assign_role({"user", "oli", "ForensicsAnalyst"}).has_value());
+    REQUIRE(store.assign_role({"user", "opo", "Operator"}).has_value());
+    REQUIRE(store.assign_role({"user", "ana", "ForensicsAnalyst"}).has_value());
+
+    static const CommandCapabilityRegistry registry{YUZU_ALL_CAPABILITY_FRAGMENTS};
+    const auto has_permission = [&](std::string_view principal, std::string_view securable,
+                                    authz::Operation op) {
+        return store.check_permission(std::string(principal), std::string(securable),
+                                      std::string(authz::to_string(op)));
+    };
+    const auto verdict = [&](const char* user, ApprovalProvenance prov) {
+        DispatchCaller caller{.principal = user, .principal_role = "user"};
+        caller.principal_is_admin = false;
+        caller.approval_provenance = prov;
+        return detail::classify_and_authorize_dispatch(registry, caller, "browser_inventory",
+                                                       "profiles", has_permission);
+    };
+
+    // Operator + ForensicsAnalyst: RBAC passes, the approval gate is what stops it.
+    auto oli = verdict("oli", ApprovalProvenance::None);
+    REQUIRE_FALSE(oli.has_value());
+    CHECK(oli.error().reason == detail::DispatchDenialReason::ApprovalRequired);
+    CHECK(verdict("oli", ApprovalProvenance::Ticket).has_value());
+
+    // Operator alone: still refused at the RBAC step, even holding an approval ticket.
+    auto opo = verdict("opo", ApprovalProvenance::Ticket);
+    REQUIRE_FALSE(opo.has_value());
+    CHECK(opo.error().reason == detail::DispatchDenialReason::Forbidden);
+
+    // ForensicsAnalyst alone: passes RBAC for the Forensics read but holds no Execute, and the
+    // gate still demands an approval; nothing about the role dispatches anything by itself.
+    auto ana = verdict("ana", ApprovalProvenance::None);
+    REQUIRE_FALSE(ana.has_value());
+    CHECK(ana.error().reason == detail::DispatchDenialReason::ApprovalRequired);
+    CHECK_FALSE(store.check_permission("ana", "Execution", "Execute"));
+}
 
 TEST_CASE("RbacStore: RBAC disabled by default", "[rbac_store][pg]") {
     RBAC_STORE(store);
