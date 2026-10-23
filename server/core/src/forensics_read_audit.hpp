@@ -21,14 +21,15 @@
 /// (CWE-117). `surface` is the CLOSED `ForensicsSurface` set: the transport that served the rows, so
 /// an auditor can tell a dashboard view from an API read of the same rows without parsing paths.
 
-#include <httplib.h>
-
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <set>
 #include <string>
 #include <string_view>
+#include <utility>
+
+#include <httplib.h>
 
 #include "bundle_service.hpp" // BundleAggregate: the bundle collation's served steps
 #include "response_tier_filter.hpp"

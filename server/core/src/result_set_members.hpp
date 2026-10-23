@@ -23,7 +23,8 @@
 
 namespace yuzu::server {
 
-/// The agent ids that satisfy `pending`'s matcher, in first-response order; `std::nullopt` when the
+/// The agent ids that satisfy `pending`'s matcher, in order of first appearance in the store's read
+/// (which is newest row first, `timestamp DESC`, not first-response order); `std::nullopt` when the
 /// store read degraded (the caller skips this pending set for this tick rather than materialise a
 /// false-empty membership, ADR-0039).
 [[nodiscard]] inline std::optional<std::vector<std::string>>

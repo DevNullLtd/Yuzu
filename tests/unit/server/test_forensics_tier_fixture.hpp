@@ -30,7 +30,7 @@
 
 namespace yuzu::server::test {
 
-/// The Forensics plugin set derived from the composed catalogue (aborts the test run if empty).
+/// The Forensics plugin set derived from the composed catalogue (throws if empty, which Catch2 reports as a failed test).
 inline const ForensicsPluginSet& forensics_plugin_set() {
     static const CommandCapabilityRegistry registry{YUZU_ALL_CAPABILITY_FRAGMENTS};
     static const std::optional<ForensicsPluginSet> set = derive_forensics_plugin_set(registry);

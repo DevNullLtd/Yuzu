@@ -377,7 +377,11 @@ static bool deny_mcp_token_session(
     res.set_content(detail::a4_error(res,
                                      "audit subsystem unavailable; refusing to serve response "
                                      "data without durable evidence",
-                                     {.retry_after_ms = 5000, .remediation = "retry the request"}),
+                                     {.retry_after_ms = 5000,
+                                      .remediation = "retry the request",
+                                      .permission = {},
+                                      .approval_id = {},
+                                      .status_url = {}}),
                     "application/json");
     return false;
 }

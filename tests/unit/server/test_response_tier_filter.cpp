@@ -435,6 +435,31 @@ TEST_CASE("ResponseTierFilter::admits answers as the SQL predicate does",
     CHECK_FALSE(ResponseTierFilter::refuse_unwired().admits("shellexec", "agent-a"));
 }
 
+// A larger exempt set than the case above, so the binary search over the sorted agent ids is
+// exercised on every side of its midpoints: members, non-members between and beyond them, and ids
+// that are a prefix of a member.
+TEST_CASE("ResponseTierFilter::admits searches a multi-agent exempt set by exact id",
+          "[server][responses][security][forensics]") {
+    const auto set = make_set({"app_usage"});
+    const std::vector<std::string> members{"agent-b", "agent-d", "agent-f", "agent-h", "agent-j",
+                                           "agent-l", "agent-n"};
+    const auto f = ResponseTierFilter::exclude(
+        set, authz::VisibleSet{std::unordered_set<std::string>(members.begin(), members.end())});
+    for (const auto& m : members) {
+        INFO(m);
+        CHECK(f.admits("app_usage", m));
+    }
+    for (const char* non_member : {"agent-a", "agent-c", "agent-e", "agent-g", "agent-i", "agent-k",
+                                   "agent-m", "agent-o", "agent-", "agent-bb", "agent", "", "zzz"}) {
+        INFO(non_member);
+        CHECK_FALSE(f.admits("app_usage", non_member));
+    }
+    CHECK(f.admits("shellexec", "agent-a")); // not a Forensics plugin: no agent test at all
+}
+
+// The retry hint the Unknown refusal advertises is the one shared transient-fault floor.
+static_assert(kForensicsUnknownRetryMs == mcp::kMcpStoreFaultRetryMs);
+
 TEST_CASE("response.forensics.read detail: rows, plugins and a closed surface token",
           "[server][responses][security][forensics][audit]") {
     const auto set = make_set({"app_usage", "execution_artifacts"});

@@ -36,6 +36,7 @@
 #include <httplib.h>
 
 #include "authz_model.hpp"
+#include "mcp_retry.hpp" // mcp::kMcpStoreFaultRetryMs: the one transient-fault retry floor
 #include "response_tier_filter.hpp"
 #include "rest_a4_envelope_http.hpp"
 
@@ -146,7 +147,7 @@ tier_filter_for(const httplib::Request& req, const ForensicsVisibilityFn& fn,
 
 /// `retry_after_ms` a REST/MCP refusal advertises: the generic transient-fault floor
 /// (`mcp::kMcpStoreFaultRetryMs`, also what the sibling store-degrade 503s answer).
-inline constexpr std::int64_t kForensicsUnknownRetryMs = 5000;
+inline constexpr std::int64_t kForensicsUnknownRetryMs = mcp::kMcpStoreFaultRetryMs;
 
 /// The machine-surface refusal for an Unknown answer: a retryable A4 503. No `.permission` field
 /// (a grant would not fix an outage) and no content of the read. The route must return afterwards.

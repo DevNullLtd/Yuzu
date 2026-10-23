@@ -55,7 +55,7 @@ public:
 
     /// True when `plugin` (any ASCII case) is a Forensics-tier plugin.
     [[nodiscard]] bool contains(std::string_view plugin) const {
-        return std::ranges::binary_search(names_, ascii_lower(plugin));
+        return std::binary_search(names_.begin(), names_.end(), ascii_lower(plugin));
     }
 
 private:
@@ -84,9 +84,13 @@ public:
         return f;
     }
 
-    /// A server-internal consumer that is not an operator read surface (dispatch correlation,
-    /// compliance evaluation, deployment collection). Every call site is reviewed and named in the
-    /// PR; do not use it to silence a filter on anything an operator can reach.
+    /// A server-internal consumer that is not an operator read surface: it reads back a command the
+    /// server dispatched itself from a fixed, non-Forensics plugin set. The four live callers are
+    /// the tar fleet snapshot poll, the deployment collect, the pre-flight check collation and the
+    /// quarantine containment reconciler; they are frozen by
+    /// tests/test_response_store_read_tripwire.py. The policy evaluator, the bundle collate and the
+    /// result-set materialiser read through a real filter instead. Do not use this to silence a
+    /// filter on anything an operator can reach.
     [[nodiscard]] static ResponseTierFilter unrestricted_internal_consumer() {
         return ResponseTierFilter{Key{}};
     }
@@ -120,9 +124,10 @@ public:
             return false;
         if (excluded_.empty())
             return true; // unrestricted: a global Forensics:Read, or an internal consumer
-        if (!std::ranges::binary_search(excluded_, ascii_lower(plugin)))
+        if (!std::binary_search(excluded_.begin(), excluded_.end(), ascii_lower(plugin)))
             return true; // not a Forensics-tier plugin
-        return std::ranges::binary_search(exempt_agents_, std::string(agent_id));
+        return std::binary_search(exempt_agents_.begin(), exempt_agents_.end(), agent_id,
+                                  [](std::string_view a, std::string_view b) { return a < b; });
     }
 
     // -- Accessors for response_store.cpp (the SQL builder); not a policy surface. -----------------

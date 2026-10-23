@@ -38,7 +38,7 @@ struct DexAgentResponse {
     std::string error_detail;
     /// The plugin that wrote the row (`StoredResponse::plugin`). Filled only by a producer whose
     /// consumer audits Forensics-tier reads (#4990: the hardware result poll); empty elsewhere.
-    std::string plugin;
+    std::string plugin{};
 };
 
 /// A4: dispatch a plugin command to specific agents (same 5-param shape as
