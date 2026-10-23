@@ -1620,6 +1620,7 @@ if build_server
       'unit/server/test_software_catalog_rollup.cpp',
       'unit/server/test_tar_process_tree.cpp',
       'unit/server/test_tar_timeline_render.cpp', # TAR timeline: pure renderer, goldens, CSS pin
+      'unit/server/test_tar_timeline_page.cpp', # TAR timeline page: shell pins, flag default, escaping, script pins
       'unit/server/test_tar_tree_routes.cpp',
       'unit/server/test_dex_perf_model.cpp',
       # #1845 registry tripwire: pins detail::dex_perf_os_collects to the tar plugin's
@@ -3209,6 +3210,16 @@ test('shell bell script behaviour',
 test('tokens page rotate behaviour',
   _python3_test,
   args: [files('test_access_tokens_rotate_behaviour.py')],
+  suite: ['server', 'docs'],
+  timeout: 60,
+)
+
+# TAR timeline page script: runs server/core/static/yuzu-tar-timeline.js under node (pure helpers as
+# tables; the DOM shell against a fake DOM, a recording fetch and a fake clock, never a sleep).
+# Skips (77) without node.
+test('tar timeline script behaviour',
+  _python3_test,
+  args: [files('test_tar_timeline_script_behaviour.py')],
   suite: ['server', 'docs'],
   timeout: 60,
 )

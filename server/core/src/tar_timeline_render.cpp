@@ -546,8 +546,8 @@ struct MomentRow {
 
 std::string moment_nav(const char* label, std::int64_t ts, const TarTimelineLinks& links) {
     if (links.moment && ts > 0)
-        return std::string("<a class=\"btn sm\" href=\"") + esc(links.moment(ts)) + "\">" + label +
-               "</a>";
+        return std::string("<a class=\"btn sm\" href=\"") + esc(links.moment(ts)) + "\" data-ts=\"" +
+               num(ts) + "\">" + label + "</a>";
     return std::string("<button type=\"button\" class=\"btn sm\" disabled>") + label + "</button>";
 }
 
@@ -967,7 +967,9 @@ std::string render_timeline_lanes(const TarTimelineModel& m) {
     h += "</div></div><div class=\"tl-grid\">";
     for (const auto& t : ticks)
         h += "<i style=\"left:" + fix3(tar_timeline_pct(m, t.ts)) + "%\"></i>";
-    h += "</div><div class=\"tl-body\">";
+    // The window is read by the page script as numbers, never recomputed from the markup.
+    h += "</div><div class=\"tl-body\" data-from=\"" + num(m.window_from_ts) + "\" data-to=\"" +
+         num(m.window_to_ts) + "\">";
     if (m.groups.empty())
         h += "<div class=\"tl-empty\">No lanes in this read.</div>";
 
@@ -1014,7 +1016,7 @@ std::string render_timeline_lanes(const TarTimelineModel& m) {
         const std::int64_t moment = tar_timeline_resolve_moment(m);
         const double f = tar_timeline_pct(m, moment) / 100.0;
         h += "<div class=\"tl-fut\" style=\"" + plot_left(f, " + 1px") + "\"></div>";
-        h += "<div class=\"tl-ph\" style=\"" + plot_left(f) + "\"><b" +
+        h += "<div class=\"tl-ph\" data-ts=\"" + num(moment) + "\" style=\"" + plot_left(f) + "\"><b" +
              (f > 0.9 ? " class=\"e\"" : (f < 0.05 ? " class=\"s\"" : "")) + ">" + esc(iso(moment)) +
              "</b></div>";
     }
@@ -1211,7 +1213,8 @@ std::string render_timeline_selected(const TarTimelineModel& m, const std::strin
             if (!other.item)
                 continue; // engine data, not a failure: an id outside this read is dropped
             const std::string& lbl = !other.item->label.empty() ? other.item->label : other.item->id;
-            lk += "<a class=\"btn sm\" href=\"" + esc(links.selected(other.item->id, t)) + "\">" +
+            lk += "<a class=\"btn sm\" href=\"" + esc(links.selected(other.item->id, t)) +
+                  "\" data-ref=\"" + esc(other.item->id) + "\" data-ts=\"" + num(t) + "\">" +
                   esc(lbl) + "</a>";
         }
         if (!lk.empty())

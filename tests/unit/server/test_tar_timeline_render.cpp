@@ -1102,7 +1102,8 @@ TEST_CASE("tar timeline golden: moment exact", "[tar][timeline][golden]") {
     contains(html, "and 2 more");
     contains(html, "2026-10-20T09:30:00Z");
     // previous / next render as links only when the builder is set
-    contains(html, "<a class=\"btn sm\" href=\"/tar/moment?t=" + std::to_string(W0 + 600) + "\">Previous event</a>");
+    contains(html, "<a class=\"btn sm\" href=\"/tar/moment?t=" + std::to_string(W0 + 600) +
+                        "\" data-ts=\"" + std::to_string(W0 + 600) + "\">Previous event</a>");
     contains(html, "Next event</a>");
     const auto bare = render_timeline_moment(m, W0 + 1800, TarTimelineLinks{});
     contains(bare, "<button type=\"button\" class=\"btn sm\" disabled>Previous event</button>");
@@ -1853,4 +1854,54 @@ TEST_CASE("tar timeline css: one .tl- block, tokens only, no text on a filled hi
     CHECK(rules > 100);
     // the two time chips sit on the surface with an --hl border
     CHECK(count_of(block, "background: var(--surface); color: var(--ink); border: 1px solid var(--hl);") == 2);
+}
+
+// ═══ the markup the page script reads ═════════════════════════════════════════════════
+
+TEST_CASE("tar timeline page contract: the window, the moment and the links are numbers in the markup",
+          "[tar][timeline]") {
+    const auto m = base();
+    const auto lanes = render_timeline_lanes(m);
+    contains(lanes, "<div class=\"tl-body\" data-from=\"" + std::to_string(m.window_from_ts) + "\" data-to=\"" +
+                        std::to_string(m.window_to_ts) + "\">");
+    contains(lanes, "<div class=\"tl-ph\" data-ts=\"" + std::to_string(tar_timeline_resolve_moment(m)) + "\" style=");
+    CHECK(count_of(lanes, "data-from=") == 1);
+    CHECK(count_of(lanes, "class=\"tl-ph\"") == 1);
+
+    // A window outside the drawable range keeps the attributes on the body (the script rejects
+    // it by value) but has no playhead, which is the script's own bind signal.
+    auto bad = base();
+    bad.window_to_ts = bad.window_from_ts;
+    const auto none = render_timeline_lanes(bad);
+    contains(none, "data-from=\"" + std::to_string(bad.window_from_ts) + "\" data-to=\"" +
+                       std::to_string(bad.window_to_ts) + "\"");
+    lacks(none, "class=\"tl-ph\"");
+
+    // Moment panel: Previous / Next carry the adjacent times; a missing side is a disabled button.
+    const std::int64_t t = W0 + 1800;
+    const auto adj = tar_timeline_adjacent_events(m, t);
+    REQUIRE(adj.prev > 0);
+    REQUIRE(adj.next > 0);
+    const auto moment = render_timeline_moment(m, t, links_full());
+    contains(moment, "data-ts=\"" + std::to_string(adj.prev) + "\">Previous event</a>");
+    contains(moment, "data-ts=\"" + std::to_string(adj.next) + "\">Next event</a>");
+    const auto edge = render_timeline_moment(m, W0, links_full()); // nothing earlier than the window start
+    contains(edge, "disabled>Previous event</button>");
+    CHECK(count_of(edge, "data-ts=") == 1);
+    const auto bare = render_timeline_moment(m, t, TarTimelineLinks{});
+    lacks(bare, "data-ts=");
+
+    // Selected panel: each linked-item anchor names the item and the moment it was rendered at.
+    const auto sel = render_timeline_selected(m, "P2", W0 + 3300, links_full());
+    contains(sel, "data-ref=\"P1\" data-ts=\"" + std::to_string(W0 + 3300) + "\">proc-a.exe 4120</a>");
+    CHECK(count_of(sel, "data-ref=") == 1); // "gone-id" is not in the read: dropped
+    lacks(render_timeline_selected(m, "P2", W0 + 3300, TarTimelineLinks{}), "data-ref=");
+
+    // A hostile linked id is escaped in the attribute as well as in the href.
+    auto h = base();
+    h.groups[0].lanes[0].items[0].id = "a\"><x>";
+    h.groups[0].lanes[1].items[0].linked_ids = {"a\"><x>"};
+    const auto hs = render_timeline_selected(h, "P2", W0 + 3300, links_full());
+    contains(hs, "data-ref=\"" + escaped("a\"><x>") + "\"");
+    lacks(hs, "<x>");
 }

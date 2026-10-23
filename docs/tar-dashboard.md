@@ -337,6 +337,50 @@ so nothing is operator-visible.
 The data that fills the model (the read, its permissions, audit and the API twins) is
 separate work; this section records the contract it must meet.
 
+### 5.8 Timeline page (hidden until the timeline fragments land)
+
+`GET /tar/timeline?id=<agent_id>[&at=<epoch seconds>]` is the page that hosts the 5.7
+renderers, with `static/yuzu-tar-timeline.js` beside it. Both routes are registered only
+when `kTarTimelineUi` (`tar_timeline_page_ui.hpp`, copied into `page::Deps::tar_timeline_ui`)
+is true. It ships false: the paths do not exist, nothing links to them, and nothing is
+operator-visible. A signed-out request is redirected to sign in; a missing `id` is a 400.
+
+- **What the shell holds.** The page (`tar_timeline_page_ui.cpp`, shell `active_key`
+  "tar") carries no CSS or script of its own beyond the `yuzu.css` rules and the one
+  script. Slots: `#tl-run` (an htmx load of `/fragments/tar/timeline/run?id=<id>[&at=<n>]`,
+  with `data-moment-url` and `data-selected-url` naming the other two fragments),
+  `#tl-moment`, `#tl-selected`, the UTC clock, Play and Speed, and Copy link to this
+  moment. The id is percent-encoded then HTML-escaped; `at` is used only when it is
+  digits.
+- **What the fragments must carry.** The script reads numbers, never guesses them:
+  `.tl-body[data-from][data-to]` (the window), `.tl-ph[data-ts]` (the resolved moment,
+  emitted only for a valid window, which is the script's bind signal), moment-panel
+  Previous/Next anchors `a[data-ts]`, block buttons `button[data-ts][data-ref]`, and the
+  selected panel's linked-item anchors `a[data-ref][data-ts]`. The renderers emit all of
+  these. The run fragment is expected to poll its own result with `hx-target="this"` (as
+  the process tree does); a failed load or poll anywhere inside `#tl-run` is reported
+  in the run slot with the HTTP status.
+- **What the script does.** It binds once per run instance (a repeated or unrelated
+  settle changes nothing; a new instance rebinds from its own moment). An invalid window,
+  or one without a playhead, gets no controls and no requests. Drag, click and the
+  arrow, Page, Home and End keys move the moment line (UTC). Every committed time
+  change requests the moment panel and, while an item is selected, the selected panel at
+  the same time; the newest request per panel wins and a superseded one is aborted. The
+  panels show whatever the server returns, including offline, not-readable and capped
+  states; a non-2xx is "Could not load this panel (HTTP n)." and an unreachable server
+  "Could not reach the server.".
+- **Playback.** Play/Pause and a 1x / 10x / 60x speed move the moment line through the
+  window already loaded; they do not show live data. Each step advances the line by
+  speed times elapsed time, clamped to the window. It stops at the window end (no loop),
+  on Pause, on any manual move, on a failed panel request, when the tab is hidden and
+  when the run instance is replaced. Panel requests during playback are throttled to one
+  a second (the newest time wins); stopping on Pause, the window end or a hidden tab
+  commits the exact stop time once so the panels agree with the line. Play is disabled
+  with a note when the window is a day or longer or not valid.
+
+The fragments themselves, their permissions and audit are separate work; this section
+records the contract they must meet.
+
 ---
 
 <details><summary>Original seed-based design (superseded — kept for history)</summary>
