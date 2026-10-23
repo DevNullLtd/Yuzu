@@ -1149,8 +1149,13 @@ points. It never lands in the generic inventory store, on either path.
 
 - **Wire format.** A version-1 pipe-delimited blob (`ver|`, `store|`, `cert|`, `loc|`,
   `san|`, `eku|`, `cdp|`, `der|`), every field framed with `\\`, `\|`, `\n` and `\r`
-  escapes so store ids, DNs and paths round-trip byte for byte. The field order is
-  fixed in the header of `server/core/src/certificate_inventory_ingestion.hpp`. A
+  escapes so store ids, DNs and paths round-trip byte for byte. The agent writer
+  (`certificates_inventory_blob.hpp`) defines the record and its 32 `cert|` fields; the
+  server parser follows it, and the order is documented in the header of
+  `server/core/src/certificate_inventory_ingestion.hpp`. Digests are stored lower-case and
+  serial, subject key id and authority key id upper-case, so filters compare
+  case-insensitively. A DER that does not hash to its certificate's SHA-256 is dropped and
+  the certificate marked `der_sha256_mismatch`. A
   field sent as `?` is unknown and stored NULL, which is not the same as an empty value.
   The stored hash is the SHA-256 of the received bytes, never the agent's claim.
 - **Per-store rules.** Every store reports one status. `ok` replaces the store's rows
@@ -1173,13 +1178,9 @@ points. It never lands in the generic inventory store, on either path.
   whole report. An unparseable header or an unknown major version nacks the blob.
   Invalid UTF-8 is replaced with U+FFFD and the field is named in the certificate's
   `constrained_fields`.
-- **Decommission.** Erasing a device (`DELETE /api/v1/sle/agents/{id}`) removes its
-  certificate rows and records a tombstone in the same transaction. A report from a
-  tombstoned device is acknowledged, writes nothing and is counted
-  (`reason="decommissioned"`), so a still-running agent cannot bring its rows back.
-  The tombstone has no age-based removal. This release has no way to clear one; the
-  audited purge and the enrolment clear arrive with the tombstone routes, so a device
-  that is decommissioned and then re-enrolled stays discarded until then.
+- **Erasure.** Erasing a device (`DELETE /api/v1/sle/agents/{id}`) removes its
+  certificate rows in one transaction. Erasure does not unenrol the device, so a
+  still-running agent re-creates its rows on its next report.
 - **Observability.** `yuzu_server_cert_inventory_ingest_total{result,reason}` (see
   [Metrics](metrics.md)). The store (`certificate_inventory_store`) is a `/readyz` and
   `/healthz` component: the server refuses to start if its schema cannot be created,

@@ -200,6 +200,26 @@ bool is_rfc3339_utc_seconds(std::string_view s) {
     return d <= dim;
 }
 
+// A store reason: empty, or comma-joined tokens of [A-Za-z0-9_:.-], each at most 64 bytes
+// (`open_failed:13`, `permission_denied`, `row_cap`, ...).
+bool valid_reason(std::string_view r) {
+    if (r.empty())
+        return true;
+    std::size_t len = 0;
+    for (char c : r) {
+        if (c == ',') {
+            if (len == 0)
+                return false;
+            len = 0;
+            continue;
+        }
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (!(std::isalnum(u) || c == '_' || c == ':' || c == '.' || c == '-') || ++len > 64)
+            return false;
+    }
+    return len > 0;
+}
+
 // ── The parser ──────────────────────────────────────────────────────────────
 
 struct Group {
@@ -398,9 +418,20 @@ private:
             out_.nack = CertBlobNack::kOverCap;
             return false;
         }
-        store_index_.emplace(s.store_id, out_.data.stores.size());
-        declared_.emplace(s.store_id, declared);
+        // The reason is a comma-joined list of tokens stored verbatim (never a metric label), so
+        // the writer can add tokens without a lockstep server change. Anything outside the
+        // token charset is a parse error on this store, and the reason is not stored.
+        const bool reason_ok = valid_reason(s.reason);
+        if (!reason_ok)
+            s.reason.clear();
+        const std::string id = s.store_id;
+        store_index_.emplace(id, out_.data.stores.size());
+        declared_.emplace(id, declared);
         out_.data.stores.push_back(std::move(s));
+        if (!reason_ok) {
+            ++out_.refused_records;
+            mark_store(id);
+        }
         return true;
     }
 
@@ -542,37 +573,42 @@ private:
         g_.sha = lower(field(0));
         c.sha256 = g_.sha;
         bool ok = hexf(1, 40, c.sha1) && hexf(2, 64, c.tbs_sha256) && integer(3, c.version) &&
-                  hexf(4, 0, c.serial, true) && text(5, kCertMaxDnBytes, "subject_dn", c.subject_dn) &&
+                  hexf(4, 0, c.serial, true) &&
+                  text(5, kCertMaxDnBytes, "subject_dn", c.subject_dn) &&
                   text(6, kCertMaxDnBytes, "issuer_dn", c.issuer_dn) &&
                   hexf(7, 64, c.subject_name_sha256) && hexf(8, 64, c.issuer_name_sha256) &&
                   date(9, c.not_before) && date(10, c.not_after) && oid(11, c.key_alg_oid) &&
                   integer(12, c.rsa_modulus_bits) && oid(13, c.ec_curve_oid) &&
                   integer(14, c.ec_order_bits) && oid(15, c.sig_alg_oid) &&
                   oid(16, c.pss_hash_oid) && oid(17, c.pss_mgf1_hash_oid) &&
-                  hexf(18, 64, c.spki_sha256) && hexf(19, 0, c.ski) && hexf(20, 0, c.aki_key_id) &&
-                  boolean(21, c.is_ca) && integer(22, c.path_len) &&
-                  text(23, 256, "key_usage", c.key_usage) && boolean(24, c.self_signed) &&
-                  boolean(25, c.serial_negative) && text(26, 32, "key_association", c.key_association) &&
-                  text(27, 256, "key_provider", c.key_provider) &&
-                  text(28, 32, "key_exportable", c.key_exportable) &&
-                  text(29, 32, "der_omitted", c.der_omitted) && count(31, "sans", g_.want_sans) &&
-                  count(32, "ekus", g_.want_ekus) && count(33, "cdps", g_.want_cdps);
+                  hexf(18, 0, c.ski, true) && hexf(19, 0, c.aki_key_id, true) &&
+                  boolean(20, c.is_ca) && integer(21, c.path_len) &&
+                  text(22, 256, "key_usage", c.key_usage) && boolean(23, c.self_signed) &&
+                  text(24, 32, "key_association", c.key_association) &&
+                  text(25, 256, "key_provider", c.key_provider) &&
+                  text(26, 32, "key_exportable", c.key_exportable) &&
+                  count(27, "sans", g_.want_sans) && count(28, "ekus", g_.want_ekus) &&
+                  count(29, "cdps", g_.want_cdps) && text(30, 32, "der_omitted", c.der_omitted);
         if (ok && c.key_association && *c.key_association != "present" &&
             *c.key_association != "none" && *c.key_association != "unknown")
             ok = false;
         if (ok && c.der_omitted && !c.der_omitted->empty() && *c.der_omitted != "self_signed" &&
             *c.der_omitted != "oversize" && *c.der_omitted != "budget")
             ok = false;
-        // The agent's own constrained-field tokens, merged with the ones this parse added.
-        if (ok && has(30) && field(30) != "?" && !field(30).empty()) {
+        // flags: the agent's comma-joined tokens. They are kept verbatim in constrained_fields,
+        // merged with the tokens this parse added; serial_negative is also a column.
+        if (ok && has(31) && field(31) != "?" && !field(31).empty()) {
             std::string s;
-            if (!clean(field(30), 512, s, "constrained_fields", false))
+            if (!clean(field(31), 512, s, "flags", false))
                 ok = false;
             else {
+                c.serial_negative = (("," + s + ",").find(",serial_negative,") != std::string::npos);
                 if (!g_.fact.constrained_fields.empty())
                     s += "," + g_.fact.constrained_fields;
                 g_.fact.constrained_fields = std::move(s);
             }
+        } else if (ok && has(31)) {
+            c.serial_negative = false;
         }
         if (!ok) {
             g_.bad = true;
@@ -656,10 +692,10 @@ private:
             g_.over_cap = true;
             return;
         }
-        // The row identity is the SHA-256 of the whole DER: a DER that does not hash to it is a
-        // defective record, never silently stored under the wrong identity.
+        // The row identity is the SHA-256 of the whole DER: a DER that does not hash to it is
+        // dropped (and the certificate marked), never stored under the wrong identity.
         if (sha256_hex(*der) != g_.sha) {
-            g_.bad = true;
+            add_token("der_sha256_mismatch"); // keep the certificate, never store this DER
             return;
         }
         der_total_ += der->size();
@@ -779,9 +815,7 @@ std::string certificate_inventory_raw_hash(std::string_view blob) { return sha25
 void cert_ingest_metric::register_metrics(::yuzu::MetricsRegistry& metrics) {
     metrics.describe(std::string(kName),
                      "Certificate-inventory daily-sync ingest outcomes by result (stored, touched, "
-                     "need_full, nacked, discarded, error) and a closed reason set; discarded/"
-                     "decommissioned is a report acknowledged and dropped for a decommissioned "
-                     "device",
+                     "need_full, nacked, error) and a closed reason set",
                      "counter");
     for (const auto& [result, reason] : kPairs)
         metrics.counter(std::string(kName),
@@ -799,12 +833,7 @@ void ingest_certificate_inventory_report(CertificateInventoryStore& store,
                 .increment();
     };
     const auto need_full = [&] { ack.add_need_full(kSource); };
-    // A nack never loops a decommissioned agent: acknowledge and drop instead.
     const auto nack = [&](std::string_view reason) {
-        if (store.is_tombstoned(agent_id) == std::optional<bool>{true}) {
-            emit("discarded", "decommissioned");
-            return;
-        }
         need_full();
         emit("nacked", reason);
     };
@@ -830,9 +859,6 @@ void ingest_certificate_inventory_report(CertificateInventoryStore& store,
             return;
         case CertIngestOutcome::kTouched:
             emit("touched", "none");
-            return;
-        case CertIngestOutcome::kDecommissioned:
-            emit("discarded", "decommissioned");
             return;
         case CertIngestOutcome::kNeedFull:
             need_full();

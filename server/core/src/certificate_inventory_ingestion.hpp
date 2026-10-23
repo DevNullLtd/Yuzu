@@ -12,39 +12,56 @@
 /// the blob with its own stateful escape-aware splitter, recomputes the raw-byte hash and only
 /// then touches the store. A record over a cap is REFUSED, never truncated.
 ///
-/// BLOB GRAMMAR (version 1). Records are LF-separated lines, fields `|`-separated. Every field is
-/// framed the same way and fully reversibly: `\\` is a backslash, `\|` a pipe, `\n` and `\r` LF
-/// and CR; any other escape, or a trailing unpaired `\`, is a parse error. The scanner walks
-/// left to right consuming each `\` with the byte after it (it is NOT `find_unescaped_pipe`,
-/// which misreads `\\|`). Records:
+/// BLOB GRAMMAR (version 1). THE WRITER IS THE CANONICAL CONTRACT: the agent's
+/// `agents/plugins/certificates/src/certificates_inventory_blob.hpp` (`render_blob`, pinned
+/// byte-for-byte by its golden test; this seam's `test_certificate_inventory.cpp` parses a
+/// golden of the same shape). This parser follows it; change the writer first.
+///
+/// Records are LF-separated lines, fields `|`-separated. Every field is framed the same way and
+/// fully reversibly: `\\` is a backslash, `\|` a pipe, `\n` and `\r` LF and CR; any other escape,
+/// or a trailing unpaired `\`, is a parse error. The scanner walks left to right consuming each
+/// `\` with the byte after it (it is NOT `find_unescaped_pipe`, which misreads `\\|`). Records:
 ///
 ///   ver|<major>[.<minor>]
-///   store|<store_id>|<scope>|<status>|<reason>|<cert_count or ?>
-///   cert|<34 positional fields, below>
+///   store|<store_id>|<scope>|<status>|<reason>|<cert_count or ?>     all stores first, sorted
+///   cert|<32 positional fields, below>                               then one group per store
 ///   loc|<sha256>|<store_id>|<path>
 ///   san|<sha256>|<type>|<value>
 ///   eku|<sha256>|<oid>
 ///   cdp|<sha256>|<uri>
-///   der|<sha256>|<base64>
+///   der|<sha256>|<base64>                 once, in the first group that carries the certificate
 ///
 /// A certificate GROUP is a `cert|` and the `loc|`/`san|`/`eku|`/`cdp|`/`der|` records after it.
 /// The stores a group belongs to are the stores its `loc|` records name; a certificate in two
-/// stores is emitted as two groups (the facts are identical and the first wins; the locations
-/// add up). `cert|` positional fields, in order (the design leaves the tail as `...`, so this
-/// list IS the contract the collector PR must write):
+/// stores repeats its `cert|` in each group (the facts are identical and the first wins; the
+/// locations add up). A self-signed certificate carries der_omitted=self_signed and no `der|`.
+/// `cert|` positional fields, in order (the 32 after the kind):
 ///
 ///   0 sha256, 1 sha1, 2 tbs_sha256, 3 version, 4 serial, 5 subject_dn, 6 issuer_dn,
 ///   7 subject_name_sha256, 8 issuer_name_sha256, 9 not_before, 10 not_after, 11 key_alg_oid,
 ///   12 rsa_modulus_bits, 13 ec_curve_oid, 14 ec_order_bits, 15 sig_alg_oid, 16 pss_hash_oid,
-///   17 pss_mgf1_hash_oid, 18 spki_sha256, 19 ski, 20 aki_key_id, 21 is_ca, 22 path_len,
-///   23 key_usage, 24 self_signed, 25 serial_negative, 26 key_association, 27 key_provider,
-///   28 key_exportable, 29 der_omitted, 30 constrained_fields (comma-joined tokens),
-///   31 sans=<n>, 32 ekus=<n>, 33 cdps=<n>
+///   17 pss_mgf1_hash_oid, 18 ski, 19 aki_key_id, 20 is_ca, 21 path_len, 22 key_usage,
+///   23 self_signed, 24 key_association, 25 key_provider, 26 key_exportable, 27 sans=<n>,
+///   28 ekus=<n>, 29 cdps=<n>, 30 der_omitted (empty|self_signed|oversize|budget|?),
+///   31 flags (comma-joined: serial_negative, sans_truncated, ekus_truncated,
+///   crl_dps_truncated, subject_dn_truncated, issuer_dn_truncated)
 ///
+/// `spki_sha256` is not on the wire (the writer does not send it); the column stays NULL.
 /// Fields 0-10 are mandatory; a record without the rest is an older agent's and the missing
 /// fields read UNKNOWN. A field sent as `?` is UNKNOWN (NULL); an empty text field is a real empty
-/// value; an empty integer, boolean or date field is not applicable and also stored NULL. The
-/// three counts, when present, must equal the records that follow.
+/// value; an empty integer, boolean or date field is not applicable and also stored NULL.
+/// Booleans are `1`/`0`. The three counts, when present, must equal the records that follow.
+/// `flags` is kept verbatim in `cert_fact.constrained_fields` (with any `utf8_replaced:<field>`
+/// marks this seam adds); `serial_negative` is also its own column.
+///
+/// HEX CASE is normalised on ingest so filters compare case-insensitively: digests (sha256,
+/// sha1, tbs_sha256, the two name digests) are stored LOWERCASE; serial, ski and aki_key_id are
+/// stored UPPERCASE.
+///
+/// STORE REASONS are stored verbatim (sanitised, 256 bytes), never used as a metric label, so
+/// the tokens the writer emits (`not_collected`, `cert_malformed`, `mountinfo_unreadable`,
+/// `permission_denied`, `deadline`, `row_cap`, `byte_cap`, `open_failed:<errno>`, ...) need no
+/// server-side registry.
 ///
 /// PARSE ERRORS. A record-level error (a bad field, a count mismatch, a wrong hash, an over-cap
 /// record) refuses only that record; the stores the group's `loc|` records name read
@@ -59,9 +76,8 @@
 /// RAW-BYTE HASH. The stored hash is the SHA-256 of the received blob bytes, recomputed here;
 /// the agent's claim is only compared on the hash-only leg.
 ///
-/// DECOMMISSION. The store's per-agent lock and tombstone make a decommissioned agent's report
-/// acknowledged, written nowhere, and counted (`reason=decommissioned`); this seam never nacks
-/// a tombstoned agent (that would loop).
+/// DECOMMISSION. The store's `delete_agent` erases the device's rows under the same per-agent
+/// lock this seam's ingest takes, so a racing report and erase end as one whole state.
 ///
 /// METRIC. `yuzu_server_cert_inventory_ingest_total{result,reason}`; the (result, reason) pairs
 /// are the closed set in `cert_ingest_metric::kPairs`.
@@ -134,13 +150,12 @@ void ingest_certificate_inventory_report(CertificateInventoryStore& store,
 namespace cert_ingest_metric {
 inline constexpr std::string_view kName = "yuzu_server_cert_inventory_ingest_total";
 /// The closed (result, reason) set. Every increment is one of these pairs.
-inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> kPairs = {{
+inline constexpr std::array<std::pair<std::string_view, std::string_view>, 14> kPairs = {{
     {"stored", "none"},
     {"stored", "parse_error"},
     {"stored", "over_cap"},
     {"stored", "utf8_replaced"},
     {"touched", "none"},
-    {"discarded", "decommissioned"},
     {"need_full", "cold"},
     {"need_full", "hash_mismatch"},
     {"nacked", "blob_too_large"},

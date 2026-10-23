@@ -2421,8 +2421,8 @@ bool cert_inventory_nacked(const apb::InventoryAck& ack) {
 }
 } // namespace
 
-TEST_CASE("ReportInventory (direct): certificate_inventory is stored, then a decommissioned "
-          "agent's replay writes nothing",
+TEST_CASE("ReportInventory (direct): certificate_inventory is stored, then erased by "
+          "delete_agent",
           "[pg][agent_service][certinv]") {
     using yuzu::server::CertificateInventoryStore;
     YUZU_REQUIRE_PG_DB_TPL(db, cert_inventory_composition_tpl);
@@ -2455,11 +2455,8 @@ TEST_CASE("ReportInventory (direct): certificate_inventory is stored, then a dec
     CHECK(certs.row_counts("agent-direct-cert")->cert_fact == 1);
     CHECK(certs.row_counts("agent-direct-cert")->cert_location == 1);
 
-    // Decommission, then replay the same full report: acknowledged, zero rows.
+    // Erase the device: every certificate row goes.
     REQUIRE(certs.delete_agent("agent-direct-cert"));
-    apb::InventoryAck ack2;
-    REQUIRE(h.svc.ReportInventory(/*context=*/nullptr, &rpt, &ack2).ok());
-    CHECK_FALSE(cert_inventory_nacked(ack2));
     const auto rc = certs.row_counts("agent-direct-cert");
     REQUIRE(rc.has_value());
     CHECK(rc->agent_state + rc->store_state + rc->cert_location + rc->cert_fact + rc->cert_san +
@@ -2468,7 +2465,7 @@ TEST_CASE("ReportInventory (direct): certificate_inventory is stored, then a dec
 }
 
 TEST_CASE("ProxyInventory (gateway): certificate_inventory reaches the typed store, never the "
-          "generic one, and a decommissioned agent's replay writes nothing",
+          "generic one, and delete_agent erases it",
           "[pg][agent_service][gateway][inventory][certinv]") {
     using yuzu::server::CertificateInventoryStore;
     using yuzu::server::InventoryStore;
@@ -2508,9 +2505,6 @@ TEST_CASE("ProxyInventory (gateway): certificate_inventory reaches the typed sto
     CHECK(custom_row->has_value()); // generic sources still work
 
     REQUIRE(certs.delete_agent("agent-gw-cert"));
-    apb::InventoryAck ack2;
-    REQUIRE(gateway_svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack2).ok());
-    CHECK_FALSE(cert_inventory_nacked(ack2));
     const auto rc = certs.row_counts("agent-gw-cert");
     REQUIRE(rc.has_value());
     CHECK(rc->agent_state + rc->store_state + rc->cert_location + rc->cert_fact + rc->cert_san +

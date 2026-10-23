@@ -1,8 +1,7 @@
 // CertificateInventoryStore + certificate_inventory ingest seam tests (slice-2 PR 2a-2a):
 // the blob parse (escape grammar, versions, unknown vs empty, caps, UTF-8, record-level and
 // whole-report parse errors), every per-store replace rule, hash-skip and need_full, the
-// decommission tombstone and per-agent lock (including the delete-between-tombstone-read-and-
-// commit interleaving), the cascade registration, the metric's closed set, and the D13 schema
+// per-agent lock (an ingest racing delete_agent, in both orders), the cascade registration, the metric's closed set, and the D13 schema
 // lint over this store's migration array.
 //
 // The direct and gateway wiring (ReportInventory / ProxyInventory) is covered in
@@ -98,6 +97,7 @@ struct Cert {
     std::optional<std::string> sha_override;
     std::optional<std::string> sans_field;
     std::string tail_ext; // raw text appended as an extra (unknown) field
+    std::string der_omitted, flags;
 };
 
 std::string sha_of(const Cert& c) { return c.sha_override.value_or(hexn(c.id)); }
@@ -117,29 +117,27 @@ std::string cert_group(const Cert& c) {
         hexn(800 + c.id),
         c.not_before,
         c.not_after,
-        "1.2.840.113549.1.1.1",
-        "2048",
-        "",
-        "",
-        "1.2.840.113549.1.1.11",
-        "",
-        "",
-        hexn(500 + c.id),
-        "aabb",
-        "ccdd",
-        "1",
-        "0",
-        "digitalSignature,keyEncipherment",
-        "0",
-        "0",
-        "none",
-        "",
-        "unknown",
-        "",
-        "",
+        "1.2.840.113549.1.1.1", // key_alg_oid
+        "2048",                 // rsa_modulus_bits
+        "",                     // ec_curve_oid
+        "",                     // ec_order_bits
+        "1.2.840.113549.1.1.11", // sig_alg_oid
+        "",                     // pss_hash_oid
+        "",                     // pss_mgf1_hash_oid
+        "AABB",                 // ski
+        "CCDD",                 // aki_key_id
+        "1",                    // is_ca
+        "0",                    // path_len
+        "Digital Signature, Key Encipherment",
+        "0",       // self_signed
+        "none",    // key_association
+        "",        // key_provider
+        "unknown", // key_exportable
         c.sans_field.value_or("sans=" + std::to_string(c.sans.size())),
         "ekus=" + std::to_string(c.ekus.size()),
         "cdps=" + std::to_string(c.cdps.size()),
+        c.der_omitted, // der_omitted
+        c.flags,       // flags
     };
     if (!c.tail_ext.empty())
         f.push_back(c.tail_ext);
@@ -238,8 +236,7 @@ void cert_reset() {
     auto lease = cert_shared().pool->acquire();
     REQUIRE(lease);
     auto t = pg::exec_params(lease.get(),
-                             "TRUNCATE cert_inventory.agent_state, "
-                             "cert_inventory.decommission_tombstone CASCADE",
+                             "TRUNCATE cert_inventory.agent_state CASCADE",
                              std::vector<std::string>{});
     REQUIRE(t.status() == PGRES_COMMAND_OK);
 }
@@ -511,11 +508,12 @@ TEST_CASE("cert parse: DER is kept only when it hashes to the row identity", "[c
         REQUIRE(p.data.facts.size() == 1);
         CHECK(*p.data.facts[0].der_base64 == "YWJj");
     }
-    SECTION("mismatching is refused") {
+    SECTION("mismatching: the certificate is kept, the DER is not, and it is marked") {
         c.sha_override = hexn(77);
         const auto p = parse_certificate_inventory_blob(blob(stores, {c}));
-        CHECK(p.data.facts.empty());
-        CHECK(find_store(p, "S")->reason == "parse_error");
+        REQUIRE(p.data.facts.size() == 1);
+        CHECK_FALSE(p.data.facts[0].der_base64.has_value());
+        CHECK(p.data.facts[0].constrained_fields == "der_sha256_mismatch");
     }
     SECTION("not base64 is refused") {
         c.der_b64 = "!!!!";
@@ -646,7 +644,6 @@ TEST_CASE("cert metric: every (result, reason) pair is seeded and the set is clo
         CHECK(text.find(std::string("reason=\"") + std::string(pr.second) + "\"") !=
               std::string::npos);
     }
-    CHECK(seen.contains({"discarded", "decommissioned"}));
     CHECK(seen.contains({"stored", "parse_error"}));
     CHECK(text.find("yuzu_server_cert_inventory_ingest_total") != std::string::npos);
 }
@@ -662,7 +659,7 @@ TEST_CASE("CertificateInventoryStore: opens and migrates on a fresh database",
     CHECK(store.is_open());
     CHECK(scalar(pool,
                  "SELECT count(*) FROM information_schema.tables WHERE table_schema = "
-                 "'cert_inventory'") == "8");
+                 "'cert_inventory'") == "7");
 }
 
 TEST_CASE("CertificateInventoryStore: a report round-trips facts, children and locations",
@@ -925,7 +922,7 @@ TEST_CASE("CertificateInventoryStore: a nacked blob writes nothing", "[certinv][
 
 // ── Decommission ─────────────────────────────────────────────────────────────
 
-TEST_CASE("CertificateInventoryStore: delete_agent erases every table and writes the tombstone",
+TEST_CASE("CertificateInventoryStore: delete_agent erases every table for the agent only",
           "[certinv][pg][decommission]") {
     CERT_SHARED(store, pool);
     Cert c = cert(1, {{"S", "p"}});
@@ -936,80 +933,83 @@ TEST_CASE("CertificateInventoryStore: delete_agent erases every table and writes
     ingest(store, "bystander", full_report(blob(store_rec("S", "ok"), {cert(2, {{"S", ""}})})));
     REQUIRE(store.row_counts("agent-1")->cert_fact == 1);
 
-    CHECK(store.is_tombstoned("agent-1") == std::optional<bool>{false});
     REQUIRE(store.delete_agent("agent-1"));
     const auto rc = store.row_counts("agent-1");
     REQUIRE(rc.has_value());
     CHECK(rc->agent_state + rc->store_state + rc->cert_location + rc->cert_fact + rc->cert_san +
               rc->cert_eku + rc->cert_cdp ==
           0);
-    CHECK(store.is_tombstoned("agent-1") == std::optional<bool>{true});
     CHECK(store.row_counts("bystander")->cert_fact == 1); // a neighbour is untouched
-    CHECK(store.is_tombstoned("bystander") == std::optional<bool>{false});
     CHECK_FALSE(store.delete_agent("")); // refuses the empty id
 }
 
-TEST_CASE("CertificateInventoryStore: a decommissioned agent's replay writes nothing, on both "
-          "legs, and is acknowledged and counted",
-          "[certinv][pg][decommission]") {
-    CERT_SHARED(store, pool);
-    const auto b = blob(store_rec("S", "ok"), {cert(1, {{"S", ""}})});
-    ingest(store, "agent-1", full_report(b));
-    REQUIRE(store.delete_agent("agent-1"));
-
-    yuzu::MetricsRegistry m;
-    cert_ingest_metric::register_metrics(m);
-    // Full replay of the last report.
-    const auto full = ingest(store, "agent-1", full_report(b), &m);
-    CHECK_FALSE(nacked(full)); // acknowledged: a nack would loop the agent
-    // Hash-skip replay.
-    const auto skip = ingest(store, "agent-1", hash_only(raw_hash(b)), &m);
-    CHECK_FALSE(nacked(skip));
-    // An unparseable blob from the same agent is also acknowledged, not nacked.
-    const auto bad = ingest(store, "agent-1", full_report("not a blob"), &m);
-    CHECK_FALSE(nacked(bad));
-
-    const auto rc = store.row_counts("agent-1");
-    CHECK(rc->agent_state + rc->store_state + rc->cert_location + rc->cert_fact + rc->cert_san +
-              rc->cert_eku + rc->cert_cdp ==
-          0);
-    CHECK(m.serialize().find("reason=\"decommissioned\"") != std::string::npos);
+namespace {
+// Every table's row count for the agent, as one comparable tuple.
+std::vector<std::int64_t> shape(CertificateInventoryStore& s, const std::string& a) {
+    const auto r = s.row_counts(a);
+    REQUIRE(r.has_value());
+    return {r->agent_state, r->store_state, r->cert_location, r->cert_fact,
+            r->cert_san,    r->cert_eku,    r->cert_cdp};
 }
+} // namespace
 
-TEST_CASE("CertificateInventoryStore: delete_agent landing between an ingest's tombstone read and "
-          "its commit ends with zero rows",
+TEST_CASE("CertificateInventoryStore: an ingest racing delete_agent ends as one whole state, "
+          "whichever wins",
           "[certinv][pg][decommission]") {
     CERT_SHARED(store, pool);
-    const auto b = blob(store_rec("S", "ok"), {cert(1, {{"S", ""}})});
+    Cert c = cert(1, {{"S", ""}});
+    c.sans = {{"dns", "a"}};
+    const auto b = blob(store_rec("S", "ok"), {c});
+    // The state a single uncontended report leaves behind.
+    ingest(store, "reference", full_report(b));
+    const auto whole = shape(store, "reference");
+    REQUIRE(whole[3] == 1);
 
-    std::atomic<bool> delete_done{false};
-    std::atomic<bool> delete_done_at_hook_return{true};
-    bool delete_ok = false;
-    std::thread deleter;
-    // Fires inside the ingest transaction, after the tombstone read (absent) and before the
-    // commit. A second store instance is a second connection; its delete_agent must queue on the
-    // per-agent lock the ingest already holds.
-    store.set_test_hook_after_tombstone_check([&] {
-        deleter = std::thread([&] {
-            CertificateInventoryStore other{pool};
-            delete_ok = other.delete_agent("agent-1");
-            delete_done = true;
+    SECTION("delete_agent starts while the ingest holds the lock: the ingest commits first, the "
+            "erase then wins wholly") {
+        std::atomic<bool> delete_done{false};
+        std::atomic<bool> delete_done_at_hook_return{true};
+        bool delete_ok = false;
+        std::thread deleter;
+        store.set_test_hook_after_lock([&] {
+            deleter = std::thread([&] {
+                CertificateInventoryStore other{pool}; // a second connection
+                delete_ok = other.delete_agent("agent-1");
+                delete_done = true;
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(400));
+            delete_done_at_hook_return = delete_done.load();
         });
-        std::this_thread::sleep_for(std::chrono::milliseconds(400));
-        delete_done_at_hook_return = delete_done.load();
-    });
-    const auto ack = ingest(store, "agent-1", full_report(b));
-    store.set_test_hook_after_tombstone_check(nullptr);
-    deleter.join();
+        const auto ack = ingest(store, "agent-1", full_report(b));
+        store.set_test_hook_after_lock(nullptr);
+        deleter.join();
+        CHECK_FALSE(nacked(ack));
+        CHECK(delete_ok);
+        CHECK_FALSE(delete_done_at_hook_return.load()); // the erase waited for the ingest's lock
+        CHECK(shape(store, "agent-1") == std::vector<std::int64_t>(7, 0));
+    }
 
-    CHECK_FALSE(nacked(ack));
-    CHECK(delete_ok);
-    CHECK_FALSE(delete_done_at_hook_return.load()); // the delete waited for the ingest's lock
-    const auto rc = store.row_counts("agent-1");
-    CHECK(rc->agent_state + rc->store_state + rc->cert_location + rc->cert_fact + rc->cert_san +
-              rc->cert_eku + rc->cert_cdp ==
-          0);
-    CHECK(store.is_tombstoned("agent-1") == std::optional<bool>{true});
+    SECTION("an ingest starts while delete_agent holds the lock: the erase commits first, the "
+            "report then wins wholly") {
+        ingest(store, "agent-1", full_report(b)); // something to erase
+        std::atomic<bool> ingest_done{false};
+        std::atomic<bool> ingest_done_at_hook_return{true};
+        std::thread reporter;
+        CertificateInventoryStore other{pool};
+        store.set_test_hook_after_erase([&] {
+            reporter = std::thread([&] {
+                (void)ingest(other, "agent-1", full_report(b));
+                ingest_done = true;
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(400));
+            ingest_done_at_hook_return = ingest_done.load();
+        });
+        REQUIRE(store.delete_agent("agent-1"));
+        store.set_test_hook_after_erase(nullptr);
+        reporter.join();
+        CHECK_FALSE(ingest_done_at_hook_return.load()); // the report waited for the erase's lock
+        CHECK(shape(store, "agent-1") == whole);        // no partial rows
+    }
 }
 
 TEST_CASE("decommission cascade: the certificate inventory store is registered and erased",
@@ -1023,5 +1023,198 @@ TEST_CASE("decommission cascade: the certificate inventory store is registered a
     REQUIRE(it != result.stores.end());
     CHECK(it->outcome == DecommissionOutcome::Deleted);
     CHECK(store.row_counts("agent-1")->cert_fact == 0);
-    CHECK(store.is_tombstoned("agent-1") == std::optional<bool>{true});
+}
+
+// ── The agent's golden blob (canonical writer contract) ──────────────────────
+
+// `expected` is copied BYTE-FOR-BYTE from the writer's own golden ("inventory blob: GOLDEN bytes",
+// tests/unit/test_certificates_inventory.cpp at feat/cert-inventory-agent-linux fc0544c6d, the
+// 32-field cert| record). Its DER-carrying certificate uses a placeholder sha256 that is not the
+// SHA-256 of its DER, so this seam keeps the certificate but drops the DER and marks it
+// `der_sha256_mismatch` (the row identity is the SHA-256 of the DER; it is never stored under a
+// different one).
+TEST_CASE("cert parse: the agent writer's golden blob lands every field where it belongs",
+          "[certinv][parse][golden]") {
+    const std::string sha1c = std::string(60, 'a') + "0001";
+    const std::string sha2 = std::string(60, 'a') + "0002";
+    const std::string expected =
+        "ver|1\n"
+        "store|/etc/pki/tls/certs|machine|absent||0\n"
+        "store|/etc/pki/trust/anchors|machine|unreadable|permission_denied|0\n"
+        "store|/etc/ssl/certs|machine|ok||2\n"
+        "cert|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0001|"
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0001|"
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc0001|"
+        "3|0123|CN=Acme\\\\, Inc.,O=Yuzu|CN=Root\\\\\\\\CA|"
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|"
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee|"
+        "2024-01-01T00:00:00Z|9999-12-31T23:59:59Z|1.2.840.113549.1.1.1|2048|||"
+        "1.2.840.113549.1.1.11|||AABB|CCDD|1||Digital Signature, Key Encipherment|0|?|?|?|"
+        "sans=2|ekus=1|cdps=1||sans_truncated\n"
+        "loc|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0001|/etc/ssl/certs|"
+        "/etc/ssl/certs/a\\|x.pem\n"
+        "loc|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0001|/etc/ssl/certs|"
+        "/etc/ssl/certs/b.pem\n"
+        "san|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0001|dns|a.example\n"
+        "san|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0001|upn|alice@corp.example\n"
+        "eku|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0001|1.3.6.1.5.5.7.3.1\n"
+        "cdp|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0001|http://crl.example/a.crl\n"
+        "der|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0001|MAMCAQU=\n"
+        "cert|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0002|"
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0002|"
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc0002|"
+        "3|0123|CN=Beta\\\\, Inc.,O=Yuzu|CN=Root\\\\\\\\CA|"
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|"
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee|"
+        "2024-01-01T00:00:00Z|9999-12-31T23:59:59Z|1.2.840.113549.1.1.1|2048|||"
+        "1.2.840.113549.1.1.11|||AABB|CCDD|?||Digital Signature, Key Encipherment|1|?|?|?|"
+        "sans=0|ekus=0|cdps=0|self_signed|\n"
+        "loc|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0002|/etc/ssl/certs|"
+        "/etc/ssl/certs/c.pem\n";
+
+    const auto p = parse_certificate_inventory_blob(expected);
+    REQUIRE(p.nack == CertBlobNack::kNone);
+    CHECK_FALSE(p.any_parse_error);
+    CHECK(p.data.blob_version == "1");
+
+    REQUIRE(p.data.stores.size() == 3);
+    CHECK(find_store(p, "/etc/pki/tls/certs")->status == "absent");
+    CHECK(find_store(p, "/etc/pki/trust/anchors")->status == "unreadable");
+    CHECK(find_store(p, "/etc/pki/trust/anchors")->reason == "permission_denied");
+    CHECK(find_store(p, "/etc/ssl/certs")->status == "ok");
+    CHECK(find_store(p, "/etc/ssl/certs")->scope == "machine");
+
+    REQUIRE(p.data.facts.size() == 2);
+    const CertFactRow* a = nullptr;
+    const CertFactRow* b = nullptr;
+    for (const auto& f : p.data.facts)
+        (f.sha256 == sha1c ? a : b) = &f;
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+
+    CHECK(*a->sha1 == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0001");
+    CHECK(*a->tbs_sha256 == std::string(60, 'c') + "0001");
+    CHECK(*a->version == 3);
+    CHECK(*a->serial == "0123");
+    CHECK(*a->subject_dn == "CN=Acme\\, Inc.,O=Yuzu");
+    CHECK(*a->issuer_dn == "CN=Root\\\\CA");
+    CHECK(*a->subject_name_sha256 == std::string(64, 'd'));
+    CHECK(*a->issuer_name_sha256 == std::string(64, 'e'));
+    CHECK(*a->not_before == "2024-01-01T00:00:00Z");
+    CHECK(*a->not_after == "9999-12-31T23:59:59Z");
+    CHECK(*a->key_alg_oid == "1.2.840.113549.1.1.1");
+    CHECK(*a->rsa_modulus_bits == 2048);
+    CHECK_FALSE(a->ec_curve_oid.has_value());   // empty = not applicable
+    CHECK_FALSE(a->ec_order_bits.has_value());
+    CHECK(*a->sig_alg_oid == "1.2.840.113549.1.1.11");
+    CHECK_FALSE(a->pss_hash_oid.has_value());
+    CHECK_FALSE(a->pss_mgf1_hash_oid.has_value());
+    CHECK_FALSE(a->spki_sha256.has_value()); // not on the wire
+    CHECK(*a->ski == "AABB");
+    CHECK(*a->aki_key_id == "CCDD");
+    CHECK(*a->is_ca == true);
+    CHECK_FALSE(a->path_len.has_value());
+    CHECK(*a->key_usage == "Digital Signature, Key Encipherment");
+    CHECK(*a->self_signed == false);
+    CHECK_FALSE(a->key_association.has_value()); // ? = unknown
+    CHECK_FALSE(a->key_provider.has_value());
+    CHECK_FALSE(a->key_exportable.has_value());
+    CHECK(*a->der_omitted == "");
+    CHECK_FALSE(a->der_base64.has_value()); // placeholder sha: DER dropped, not stored
+    CHECK(a->constrained_fields == "sans_truncated,der_sha256_mismatch");
+    CHECK(*a->serial_negative == false);
+    REQUIRE(a->sans.size() == 2);
+    CHECK(a->sans[0].type == "dns");
+    CHECK(a->sans[0].value == "a.example");
+    CHECK(a->sans[1].type == "upn");
+    CHECK(a->sans[1].value == "alice@corp.example");
+    REQUIRE(a->ekus.size() == 1);
+    CHECK(a->ekus[0] == "1.3.6.1.5.5.7.3.1");
+    REQUIRE(a->cdps.size() == 1);
+    CHECK(a->cdps[0] == "http://crl.example/a.crl");
+
+    CHECK(*b->subject_dn == "CN=Beta\\, Inc.,O=Yuzu");
+    CHECK_FALSE(b->is_ca.has_value()); // ? = unknown
+    CHECK(*b->self_signed == true);
+    CHECK(*b->der_omitted == "self_signed");
+    CHECK_FALSE(b->der_base64.has_value());
+    CHECK(b->sans.empty());
+    CHECK(b->constrained_fields.empty());
+
+    REQUIRE(p.data.locations.size() == 3);
+    std::set<std::string> paths;
+    for (const auto& l : p.data.locations) {
+        CHECK(l.store_id == "/etc/ssl/certs");
+        paths.insert(l.sha256 == sha1c ? l.path : "c:" + l.path);
+    }
+    CHECK(paths == std::set<std::string>{"/etc/ssl/certs/a|x.pem", "/etc/ssl/certs/b.pem",
+                                         "c:/etc/ssl/certs/c.pem"});
+}
+
+TEST_CASE("cert parse: hex case is normalised and writer tokens are accepted",
+          "[certinv][parse]") {
+    Cert c = cert(1, {{"S", ""}});
+    c.flags = "serial_negative,issuer_dn_truncated";
+    std::string g = cert_group(c);
+    // Digests arrive upper-case, serial/ski/aki lower-case: stored lower / UPPER.
+    const auto up = [&](const std::string& from) {
+        std::string t = from;
+        for (auto& ch : t)
+            ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        return t;
+    };
+    g.replace(g.find(std::string(40, 'a')), 40, up(std::string(40, 'a')));
+    g.replace(g.find("|0A1B|"), 6, "|0a1b|");
+    g.replace(g.find("|AABB|"), 6, "|aabb|");
+    g.replace(g.find("|CCDD|"), 6, "|ccdd|");
+    const auto p = parse_certificate_inventory_blob(
+        "ver|1\n" + store_rec("S", "constrained", "mountinfo_unreadable,row_cap") +
+        store_rec("T", "unreadable", "not_collected") + store_rec("U", "constrained", "cert_malformed") + g);
+    REQUIRE(p.data.facts.size() == 1);
+    const auto& f = p.data.facts[0];
+    CHECK(*f.sha1 == std::string(40, 'a'));
+    CHECK(*f.serial == "0A1B");
+    CHECK(*f.ski == "AABB");
+    CHECK(*f.aki_key_id == "CCDD");
+    CHECK(*f.serial_negative == true);
+    CHECK(f.constrained_fields == "serial_negative,issuer_dn_truncated");
+    CHECK(find_store(p, "T")->reason == "not_collected");
+    CHECK(find_store(p, "S")->reason == "mountinfo_unreadable,row_cap");
+}
+
+TEST_CASE("cert parse: store reasons are stored verbatim; a reason outside the token charset is a "
+          "parse error",
+          "[certinv][parse]") {
+    const auto p = parse_certificate_inventory_blob(
+        blob(store_rec("A", "unreadable", "keychain_not_readable") +
+                 store_rec("B", "unreadable", "open_failed:13,timeout") +
+                 store_rec("C", "constrained", "cert_unconvertible,link_outside_roots") +
+                 store_rec("D", "unreadable", "busy") + store_rec("E", "constrained", "row_cap"),
+             {}));
+    REQUIRE(p.nack == CertBlobNack::kNone);
+    CHECK_FALSE(p.any_parse_error);
+    CHECK(find_store(p, "A")->reason == "keychain_not_readable");
+    CHECK(find_store(p, "B")->reason == "open_failed:13,timeout");
+    CHECK(find_store(p, "C")->reason == "cert_unconvertible,link_outside_roots");
+
+    const auto bad = parse_certificate_inventory_blob(
+        blob(store_rec("A", "ok", "has space") + store_rec("B", "constrained", "x,,y") +
+                 store_rec("C", "unreadable", "not;a;token"),
+             {}));
+    CHECK(bad.any_parse_error);
+    CHECK(find_store(bad, "A")->status == "constrained");
+    CHECK(find_store(bad, "A")->reason == "parse_error");
+    CHECK(find_store(bad, "B")->reason == "parse_error");
+    CHECK(find_store(bad, "C")->status == "unreadable"); // the specific status stays
+    CHECK(find_store(bad, "C")->reason.empty());
+}
+
+TEST_CASE("CertificateInventoryStore: a location with an empty path (a keychain has no per-cert "
+          "path) round-trips",
+          "[certinv][pg]") {
+    CERT_SHARED(store, pool);
+    ingest(store, "agent-1",
+           full_report(blob(store_rec("/Library/Keychains/System.keychain", "ok", "", "1"),
+                            {cert(1, {{"/Library/Keychains/System.keychain", ""}})})));
+    CHECK(scalar(pool, "SELECT count(*) FROM cert_inventory.cert_location WHERE path = ''") == "1");
 }

@@ -38,8 +38,7 @@
 ///     os, agent version, arch; read on `/hardware` under `Inventory` and on
 ///     `/viz/fleet` under `Response`) — plus `CertificateInventoryStore` (slice-2 PR 2a-2a:
 ///     the fleet certificate inventory, whose read securable `CertificateInventory` arrives in
-///     PR 2a-2b; erasing it also writes the decommission tombstone that stops a still-running
-///     agent repopulating it). This was originally a
+///     PR 2a-2b). This was originally a
 ///     hand-maintained conjunction over the per-store securables (rejected as of
 ///     Decision 9's reversal — see the ADR): it stopped scaling once a fourth
 ///     securable (`Forensics`, via `AppUsageStore`) was set to join the cascade, per
