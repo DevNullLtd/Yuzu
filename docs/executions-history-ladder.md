@@ -207,7 +207,10 @@ required parameter with no default (`response_tier_filter.hpp`), and the filter 
 SQL beside the agent scope, before `ORDER BY`/`LIMIT`/`GROUP BY`, so the cap flags, counts, facet
 options and aggregates are computed over the rows the caller may read. A filtered row is simply
 absent: there is no marker or field, so an empty result no longer implies that no data exists. The
-one error is an unresolved decision: when the caller's authority cannot be determined the REST routes
+one error is an unresolved decision: when the caller's authority cannot be determined (one disclosed exception: a degrade of
+only the global permission read for an ordinary session is answered `403` and classifies as Denied, a `200` with the
+Forensics rows absent; `yuzu_server_rbac_read_degrade_total` and the `YuzuRbacReadDegraded` alert are the signal, see
+`docs/authz-model.md`) the REST routes
 answer a retryable `503` (`retry_after_ms`), MCP a retryable `kInternalError`, and an HTML surface a
 notice, and
 `yuzu_server_forensics_tier_withheld_total{reason}` counts it (see `docs/observability-conventions.md`).
@@ -229,15 +232,17 @@ materialises empty for every creator), and bundle collation applies the caller's
 `tests/test_forensics_tier_wiring_lexical.py` pins that `server.cpp`
 wires the plugin set and the resolver into each of these.
 
-**Not covered by this tier.** A separate follow-up tracks the dispatch-side authorisation of policy
+**Not covered by this tier.** A separate follow-up (#6065) tracks the dispatch-side authorization of policy
 checks. Failure text stored before the sanitiser is reduced on read only
 while the execution's command correlation (24 hours) is still held (`ExecutionTracker::get_execution()`
 applies the same reduction as its siblings; a failed correlation lookup reduces the text rather than
 showing it, with one warning per 60 seconds). The same bounded token is what the failure
 notification, the analytics event and the webhook and offload payload carry for a Forensics-tier
 command; rows written to those sinks before the upgrade keep their original text and are not
-rewritten. A `check_result` stored by a policy before the upgrade stays until that policy is next
-evaluated. A user holding only `ForensicsAnalyst` cannot dispatch: the `Execution:Execute` gate of
+rewritten, and they have no age limit: `agent_exec_status` has no retention sweep, notification rows
+have no reaper and no delete endpoint, analytics buffer rows are never reaped, and webhook and
+offload delivery rows go only when their webhook or target is deleted. A `check_result` stored by a
+policy before the upgrade stays until that (policy, agent) pair is next written by an evaluation; for a disabled policy, a decommissioned agent or an agent no longer in the policy's scope it is never overwritten, and it has no age limit. Deleting the policy removes it (see the Policy Engine guide). The owner has accepted this residual (#4990). A user holding only `ForensicsAnalyst` cannot dispatch: the `Execution:Execute` gate of
 `POST /api/command` refuses, and on the MCP `execute_instruction` tool at the supervised tier the
 approval step runs before the tool's own permission check (an ordering that already applied to any
 caller lacking that permission).
@@ -257,10 +262,17 @@ text is reduced, when it is stored and again when the tracker reads it, to a bou
 touched. The same value, computed once at ingest on both the Subscribe and the gateway path
 (`AgentServiceImpl::failure_text_for_sinks`), is what the failure notification (listed at
 `Infrastructure:Read`), the analytics event `error_message` and the webhook and offload `error`
-payload carry; the stored response row keeps the plugin's own message and is read through the tier. The durable event outbox (24 hours; other replicas re-publish its rows onto their own stream) is
+payload carry; the stored response row keeps the plugin's own message and is read through the tier. The transition event
+the tracker publishes is built from the error text persisted on the row, which can be older than the write (a terminal row
+is sticky), so that text is reduced again for a Forensics execution before it reaches the outbox or the bus
+(`ExecutionTracker`'s agent-status upsert in `execution_tracker.cpp`); within the same 24 hour correlation limit a late
+`running` frame therefore cannot republish a pre-upgrade raw value. An unwired tracker (a test harness only; production
+boot refuses an unwired plugin set) publishes the text as stored. The durable event outbox (24 hours; other replicas re-publish its rows onto their own stream) is
 not reduced on read, so text written by a replica that predates the change can reach another
 replica's stream until it expires. The live `output` event stream publishes no
-Forensics-tier row.
+Forensics-tier row; for a Forensics-tier action it carries one constant notice row in place of the Console's
+"Waiting for results..." placeholder ("Forensics output is not shown live. Open the execution results."), and
+nothing at all when the plugin set is unwired or the frame carries no output.
 
 **Audit.** A read that serves at least one Forensics-tier row writes one `response.forensics.read`
 row (`forensics_rows=<n> plugins=<names> surface=<s>`), on the row-returning surfaces only; see
