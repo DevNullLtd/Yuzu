@@ -2788,16 +2788,18 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"transferred":{"type":"boolean"},"principal_id":{"type":"string"},"new_owner":{"type":"string"}},"required":["transferred","principal_id","new_owner"]})j"},
 
     {"audit_engine_no_admin",
-     "Auditor-runnable proof (design doc §4.2) that 'no admin, ever' and 'no all-permissions "
-     "toggle' hold for every engine principal — not just a write-path claim. Joins "
+     "Auditor-runnable check (design doc §4.2) that 'no admin, ever' holds for every engine "
+     "principal and that reports any all-permissions role, which assignment does not refuse. Joins "
      "principal_type=engine against each principal's resolved role assignments AND effective "
      "permissions and reports any row that would violate those constraints: the literal admin/"
      "Administrator role name, any role flagged is_system, or a granted securable x operation "
      "set whose size reaches the full cross-product (functionally admin-equivalent even under a "
      "custom non-system role name). ok:true with an empty violations[] is the positive "
-     "evidence; a non-empty violations[] (ok:false) indicates the write-path guard was bypassed "
-     "(data corruption, direct DB write, or a code regression) and should be treated as a "
-     "security incident. A 503/internal-error result (rather than ok:true) means the RBAC "
+     "evidence; a non-empty violations[] (ok:false) holds rows. Reason admin_role or system_role "
+     "means the assignment check was bypassed (data corruption, direct DB write, or a code "
+     "regression) and is a security incident; reason wildcard_grant is an all-permissions "
+     "custom role that assignment does not refuse, so review whether it is intended. A "
+     "503/internal-error result (rather than ok:true) means the RBAC "
      "reference data needed to compute the wildcard bound could not be resolved — treat as "
      "'unable to verify', never as 'clean'. Mirrors GET "
      "/api/v1/engine-principals/audit/no-admin exactly, including its {ok, violations} response "

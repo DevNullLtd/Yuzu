@@ -4,9 +4,9 @@ Engine principals are the durable identities behind autonomous use-case-engine
 modules (ADR-1005 item 2b) — a third principal class alongside human users and
 human-created API tokens. Each engine principal has a named responsible human
 owner, a grant justification captured at creation, and a required
-`internal`/`external` classification, and it can never be granted the
-admin/wildcard role: least privilege is enforced structurally, not merely
-asserted by policy.
+`internal`/`external` classification, and it cannot be granted the admin
+role or any other built-in role. A custom role that grants every permission is
+not refused when it is assigned; the no-admin audit reports it afterwards.
 
 This page is an operator walkthrough. Full API reference:
 [REST API — Engine Principals](rest-api.md#engine-principals);

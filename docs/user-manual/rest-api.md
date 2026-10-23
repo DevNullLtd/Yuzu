@@ -1534,7 +1534,7 @@ Auditor-runnable, independent proof that "no admin, ever" and "no all-permission
 }
 ```
 
-An empty `violations` array with `ok:true` is the positive evidence. A non-empty `violations` array (each entry carrying `principal_id`, `role`, and `reason` — `admin_role` / `system_role` / `wildcard_grant`) indicates the write-path guard was bypassed (data corruption, direct DB write, or a code regression) and should be treated as a security incident.
+An empty `violations` array with `ok:true` is the positive evidence. A non-empty `violations` array (each entry carrying `principal_id`, `role`, and `reason` — `admin_role` / `system_role` / `wildcard_grant`) means one of two things. A row with reason `admin_role` or `system_role` means the assignment check was bypassed (data corruption, direct DB write, or a code regression), and should be treated as a security incident. A row with reason `wildcard_grant` is a custom role that grants every securable and operation, which assignment does not refuse: review whether that grant is intended.
 
 **Error (503):** `rbac reference data unavailable — cannot verify` — the RBAC reference tables (`securable_types`/`operations`) could not be resolved, so the wildcard-grant bound cannot be computed. This is a fail-**closed** result: treat it as "unable to verify," never as "clean."
 
@@ -2812,9 +2812,12 @@ assignment is rejected pending the Phase-5 `authorize_list_read` extension
 (design §4.3).
 
 **Structural constraint (design §4.2, "no admin, ever"):** an engine principal
-can never hold the `admin`/`Administrator` role, any other built-in system
-role, or a wildcard role. `POST .../roles` **rejects** such a request outright
-(`400`) — it is never silently narrowed to something safer.
+cannot hold the `admin`/`Administrator` role or any other built-in system
+role. `POST .../roles` **rejects** such a request outright (`400`) — it is never
+silently narrowed to something safer. A custom role that grants every securable
+and operation is **not** refused at assignment;
+`GET /api/v1/engine-principals/audit/no-admin` reports it afterwards as
+`wildcard_grant`.
 
 #### `GET /api/v1/engine-principals/{id}/roles`
 
