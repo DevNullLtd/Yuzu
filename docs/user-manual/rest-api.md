@@ -1012,6 +1012,12 @@ none is. Such a value is not indexed in newly stored responses, so when the arra
 `agent_count` can be 0 or an undercount. The array names keys only, never the values. `agent_count`
 and every status code are unchanged, including the `503` when the response store is degraded.
 
+**Forensics-tier rows (#4990).** Rows written by a Forensics-tier plugin are counted only for a caller who also
+holds `Forensics:Read` (see "Forensics-tier rows" under Command/Instruction Responses). For any other caller they are
+absent from the count with no marker, so a low or zero `agent_count` does not prove that no matching data exists. If
+the caller's Forensics authority cannot be determined the route answers a retryable `503` with `retry_after_ms`
+instead of a partial count. The route writes no audit row of its own.
+
 ---
 
 ### API Tokens
@@ -5001,7 +5007,7 @@ the check instruction runs a Forensics-tier plugin (`app_usage`, `browser_invent
 `execution_artifacts`, `privacy_permissions`, `remote_access_audit`), the agent's `status` is
 `unknown` and `check_result` is empty, because the evaluator does not read or store that plugin's
 output. `unknown` there says nothing about the device. A `check_result` stored by an evaluation
-before the upgrade remains until the policy is next evaluated. See "Forensics-tier rows" in the
+before the upgrade stays until that (policy, agent) pair is next written by an evaluation; for a disabled policy, a decommissioned agent or an agent no longer in the policy's scope it is never overwritten, and it has no age limit. Deleting the policy removes it (see the Policy Engine guide). The owner has accepted this residual (#4990). See "Forensics-tier rows" in the
 Command/Instruction Responses section.
 
 ---
@@ -6732,7 +6738,10 @@ counts and the agent counts are all computed over the rows the caller may read, 
 short result does not imply that no data exists**. The one error is the unresolved case: if the
 server cannot determine whether the caller may read Forensics rows (an authorization or
 management-group store fault), the route answers a retryable A4 `503` (`retry_after_ms`, no
-`permission` field) instead of a result with those rows silently missing. `Forensics:Read` is a global grant, or, for an ordinary session or plain API token while RBAC
+`permission` field) instead of a result with those rows silently missing. One case is not covered by that
+rule: if only the global permission read degrades for an ordinary session, the session is answered as not holding
+the global grant, so the result is a `200` with the Forensics rows absent and no `503`;
+`yuzu_server_rbac_read_degrade_total` (alert `YuzuRbacReadDegraded`) is the signal for that case. `Forensics:Read` is a global grant, or, for an ordinary session or plain API token while RBAC
 enforcement is on, a grant scoped to management groups (only the Forensics rows of the agents in
 that scope are served). Service-scoped tokens, MCP-tier tokens and engine principals need a global
 grant and get nothing from a scoped one. With RBAC enforcement off, `Forensics:Read` is
@@ -6741,7 +6750,10 @@ administrator-only, so a non-administrator session does not receive these rows. 
 includes at least one such row also writes a `response.forensics.read` audit row
 (`detail=forensics_rows=<n> plugins=<names> surface=<s>`, `surface` being `rest` for the v1 routes
 and `legacy` for the unversioned ones), fail-closed like the neighbouring `response.read` row
-(`503` + `Sec-Audit-Failed: true`, no data); aggregate and count reads write none. A caller using
+(`503` + `Sec-Audit-Failed: true`, no data); aggregate, facet-option and count reads write none. For an export the
+`forensics_rows` count is taken before the byte cap trims the file, so it can exceed the rows the file holds. When the
+`response.forensics.read` row cannot persist and the route answers `503`, the attempt has already left its
+neighbouring success row (`response.read` or `execution.detail.fetch`, written first), and a retry leaves a second one. A caller using
 an API token, an MCP token or an engine principal that does not hold a global `Forensics:Read`
 also leaves one `auth.permission_required` denied audit row per read attempt (an interactive
 browser sign-in does not), so expect denial rows from automation that polls stored responses.
@@ -6751,7 +6763,9 @@ information under their own securables, and their stored rows stay under `Respon
 server's own consumers of these rows: policy check output (such a policy scores `unknown`), result
 set membership (a set sourced from such a command materialises empty) and the live output stream,
 which publishes no row of a Forensics-tier plugin on `GET /events`, `GET /sse/executions/{id}` or
-`GET /api/v1/events`. The per-agent `error_detail` of a Forensics-tier command (execution routes,
+`GET /api/v1/events`. (The dashboard Console's live results table shows one constant notice row in place of
+"Waiting for results..." for such an action: "Forensics output is not shown live. Open the execution results."
+Nothing is published when the plugin set is unwired or the frame carries no output.) The per-agent `error_detail` of a Forensics-tier command (execution routes,
 `include=agents`) is a short machine token (`scope:cause[:detail]`) or the fixed value
 `forensics_error`; status and exit code are unchanged. The failure notification, the analytics
 event and the webhook and offload payload carry the same reduced text. Rows written to those
@@ -12220,7 +12234,7 @@ backport-aware matching (M1b/OVAL) lands.
 
 #### `GET /events`
 
-Server-Sent Events stream for real-time dashboard updates. Events include agent connections/disconnections, command responses, and system notifications. Live output events never carry a row written by a Forensics-tier plugin (see "Forensics-tier rows" under Command/Instruction Responses).
+Server-Sent Events stream for real-time dashboard updates. Events include agent connections/disconnections, command responses, and system notifications. Live output events never carry a row written by a Forensics-tier plugin (see "Forensics-tier rows" under Command/Instruction Responses); for such an action the Console's output stream carries one constant notice row, "Forensics output is not shown live. Open the execution results.", in place of its "Waiting for results..." placeholder.
 
 **Example (curl):**
 
