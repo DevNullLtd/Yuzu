@@ -385,6 +385,15 @@ std::string render_exec_devices(const ExecDevicesView& v) {
                "permission.</div></details></div>";
         return out;
     }
+    if (v.responses_state == ResponsesState::kPermissionUnconfirmed) {
+        // Same shape as above: no count and no rows, and a different sentence.
+        out += "<details class=\"resp\"><summary>Responses</summary>"
+               "<div class=\"empty-state\" data-responses-permission-unconfirmed=\"true\">"
+               "<b>Responses unavailable.</b> The permission check for this view could not be "
+               "completed. This is <b>not</b> &ldquo;no responses&rdquo;; try again "
+               "shortly.</div></details></div>";
+        return out;
+    }
     out += "<details class=\"resp\"><summary>Show responses (" +
            std::to_string(v.responses_total) + ")</summary>";
     if (v.responses_state == ResponsesState::kUnavailable) {

@@ -192,10 +192,18 @@ struct ExecHarness {
 
     bool perm_grant{true};
     /// #4990: the executions drawer serves its responses section only to a caller who also holds
-    /// Response:Read (`probe_response_read`, the render-time probe) and then only the rows the
-    /// Forensics filter permits (`forensics`). Both default permissive so every pre-existing case
-    /// keeps its meaning; the tier cases flip them. Every OTHER probe answers true.
-    bool probe_response_read{true};
+    /// Response:Read, decided by the QUIET fleet-read probe (`response_probe`, the render-time
+    /// probe: a 503 on its scratch response is "could not be checked", distinct from a refusal),
+    /// and then only the rows the Forensics filter permits (`forensics`). Both default permissive
+    /// so every pre-existing case keeps its meaning; the tier cases flip them. `probe_perm_fn` (the
+    /// LOUD probe that writes a denial row per refused cookie session) answers true for everything
+    /// and records every call in `loud_probe_log`, so a test can prove the drawer never uses it for
+    /// Response:Read.
+    enum class ResponseProbe { kAdmit, kDeny, kUnavailable };
+    ResponseProbe response_probe{ResponseProbe::kAdmit};
+    yuzu::server::authz::VisibleSet response_probe_scope{std::nullopt}; ///< Response:Read scope
+    int response_probe_calls{0};
+    std::vector<std::string> loud_probe_log;
     yuzu::server::test::ForensicsCaller forensics;
     /// #1712 / #3290 Phase 2 — the executions-drawer detail route's fake
     /// twin of require_fleet_read. Defaults to admit-unfiltered (nullopt
@@ -540,7 +548,26 @@ struct ExecHarness {
         wf_deps.forensics_visibility_fn = forensics.fn();
         wf_deps.probe_perm_fn = [this](const httplib::Request&, const std::string& type,
                                        const std::string& op) {
-            return (type == "Response" && op == "Read") ? probe_response_read : true;
+            loud_probe_log.push_back(type + ":" + op);
+            return true;
+        };
+        wf_deps.response_probe_fn = [this](const httplib::Request&, httplib::Response& res,
+                                           const std::string& type, const std::string& op)
+            -> yuzu::server::authz::FleetReadGate {
+            ++response_probe_calls;
+            CHECK(type == "Response");
+            CHECK(op == "Read");
+            switch (response_probe) {
+            case ResponseProbe::kAdmit:
+                return {true, response_probe_scope};
+            case ResponseProbe::kUnavailable:
+                res.status = 503;
+                return {false, yuzu::server::authz::deny_all()};
+            case ResponseProbe::kDeny:
+                break;
+            }
+            res.status = 403;
+            return {false, yuzu::server::authz::deny_all()};
         };
         // CDX-FV-03: nullptr unless opted in, so /api/workflows/* keeps its 503
         // path for every pre-existing test.
@@ -1408,7 +1435,7 @@ TEST_CASE("executions drawer and page detail: response.forensics.read is written
     }
 
     SECTION("without Response:Read nothing is rendered, so nothing is audited") {
-        h.probe_response_read = false;
+        h.response_probe = ExecHarness::ResponseProbe::kDeny;
         h.forensics.admin();
         h.audit_calls.clear();
         auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
@@ -1425,7 +1452,7 @@ TEST_CASE("executions drawer: without Response:Read the responses section carrie
     ExecHarness h(pool);
     const auto eid = seed_tier_exec(h);
     h.agent_status(eid, "agent-A", "success");
-    h.probe_response_read = false;
+    h.response_probe = ExecHarness::ResponseProbe::kDeny;
     h.forensics.admin(); // even a global Forensics:Read does not lift the Response:Read requirement
 
     for (const char* suffix : {"", "?view=page"}) {
@@ -1452,6 +1479,108 @@ TEST_CASE("executions drawer: without Response:Read the responses section carrie
     for (const auto* r : {res.get(), page.get()}) {
         CHECK(has(r->body, "Response:Read"));
         CHECK_FALSE(has(r->body, "Responses unavailable"));
+    }
+}
+
+TEST_CASE("executions drawer: an unconfirmed Response:Read check says so, with no rows, no count and no "
+          "store read, in both renderings",
+          "[pg][workflow][executions][detail][drawer][page][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    const auto eid = seed_tier_exec(h);
+    h.agent_status(eid, "agent-A", "success");
+    h.forensics.admin();
+    h.response_probe = ExecHarness::ResponseProbe::kUnavailable;
+
+    // The response table is made unreadable: a store read would show the store-degraded banner.
+    exec_sql(db.dsn(), "ALTER TABLE response_store.responses RENAME TO responses_hidden_unconf");
+    auto drawer = h.sink.Get("/fragments/executions/" + eid + "/detail");
+    auto page = h.sink.Get("/fragments/executions/" + eid + "/detail?view=page");
+    exec_sql(db.dsn(), "ALTER TABLE response_store.responses_hidden_unconf RENAME TO responses");
+    REQUIRE(drawer);
+    REQUIRE(page);
+    for (const auto* r : {drawer.get(), page.get()}) {
+        REQUIRE(r->status == 200);
+        // The right sentence: the check could not be completed, try again.
+        CHECK(has(r->body, "data-responses-permission-unconfirmed"));
+        CHECK(has(r->body, "permission check for this view could not be completed"));
+        CHECK(has(r->body, "try again"));
+        // Neither the refusal sentence nor the store-failure sentence, no count, no rows.
+        CHECK_FALSE(has(r->body, "requires the"));
+        CHECK_FALSE(has(r->body, "response store could not be read"));
+        CHECK_FALSE(has(r->body, "Show responses"));
+        CHECK_FALSE(has(r->body, "No responses recorded"));
+        CHECK_FALSE(has(r->body, "TOKEN-"));
+        // The rest of the drawer is the Execution:Read view and is unchanged.
+        CHECK(has(r->body, "agent-A"));
+    }
+    // Nothing was rendered, so nothing is audited as a Forensics read.
+    for (const auto& a : h.audit_calls)
+        CHECK(a.action != "response.forensics.read");
+}
+
+TEST_CASE("executions drawer: an Unknown Forensics decision shows the same unconfirmed notice, never rows",
+          "[pg][workflow][executions][detail][drawer][page][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    const auto eid = seed_tier_exec(h);
+    h.forensics.unknown();
+
+    exec_sql(db.dsn(), "ALTER TABLE response_store.responses RENAME TO responses_hidden_unk");
+    auto drawer = h.sink.Get("/fragments/executions/" + eid + "/detail");
+    auto page = h.sink.Get("/fragments/executions/" + eid + "/detail?view=page");
+    exec_sql(db.dsn(), "ALTER TABLE response_store.responses_hidden_unk RENAME TO responses");
+    REQUIRE(drawer);
+    REQUIRE(page);
+    for (const auto* r : {drawer.get(), page.get()}) {
+        REQUIRE(r->status == 200);
+        CHECK(has(r->body, "data-responses-permission-unconfirmed"));
+        CHECK_FALSE(has(r->body, "response store could not be read")); // not read at all
+        CHECK_FALSE(has(r->body, "Show responses"));
+        CHECK_FALSE(has(r->body, "TOKEN-"));
+    }
+    for (const auto& a : h.audit_calls)
+        CHECK(a.action != "response.forensics.read");
+}
+
+TEST_CASE("executions drawer: the Response:Read probe is the quiet one and a scoped holder is admitted over "
+          "the meet of both scopes",
+          "[pg][workflow][executions][detail][drawer][page][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    const auto eid = seed_tier_exec(h);
+    h.forensics.admin();
+
+    // Never the loud probe for Response:Read: it writes one denial row per refused cookie session.
+    for (const char* suffix : {"", "?view=page"}) {
+        h.loud_probe_log.clear();
+        h.response_probe_calls = 0;
+        auto res = h.sink.Get("/fragments/executions/" + eid + "/detail" + suffix);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        CHECK(h.response_probe_calls == 1); // one quiet probe per render
+        for (const auto& call : h.loud_probe_log)
+            CHECK(call != "Response:Read");
+    }
+
+    // A caller whose Response:Read is scoped (never a global grant) still gets the section, over the
+    // meet of the Execution:Read scope {A,C} and the Response:Read scope {C,B} = {C}.
+    h.response_probe_scope =
+        yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-C", "agent-B"}};
+    h.fleet_read_scope =
+        yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-A", "agent-C"}};
+    for (const char* suffix : {"", "?view=page"}) {
+        INFO(suffix);
+        auto res = h.sink.Get("/fragments/executions/" + eid + "/detail" + suffix);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        CHECK(has(res->body, "TOKEN-ORDINARY-C"));
+        CHECK_FALSE(has(res->body, "TOKEN-ORDINARY-A")); // outside the Response:Read scope
+        CHECK_FALSE(has(res->body, "TOKEN-FORENSICS-B")); // outside the Execution:Read scope
+        CHECK_FALSE(has(res->body, "TOKEN-FORENSICS-A"));
     }
 }
 

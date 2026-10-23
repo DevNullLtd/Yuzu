@@ -20130,6 +20130,9 @@ private:
         // McpServer's query_installed_software and DashboardRoutes above;
         // used only by the executions-drawer detail route.
         wf_deps.fleet_read_fn = fleet_read_fn;
+        // #4990: the drawer's Response:Read probe is the QUIET fleet-read probe (no denial row for
+        // a cookie session, a 503 told apart from a refusal), never the loud `perm_fn`.
+        wf_deps.response_probe_fn = draw_fleet_read_fn;
         wf_deps.audit_fn = audit_fn;
         wf_deps.persist_audit_fn = audit_fn; // #4990: the drawer's response.forensics.read row
         wf_deps.emit_fn = [this](const std::string& event_type, const httplib::Request& req) {

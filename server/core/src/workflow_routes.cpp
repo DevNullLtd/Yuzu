@@ -75,26 +75,28 @@ struct PageResponses {
     ForensicsServed forensics; // #4990: the Forensics-tier rows among `rows` (the served ones)
 };
 
-PageResponses collect_page_responses(ResponseStore* store, bool may_read_responses,
-                                     bool tier_unknown, const ResponseTierFilter& tier,
+/// What the drawer may show of the responses section (#4990): see `Deps::response_probe_fn`.
+enum class ResponseAccess { kGranted, kDenied, kUnknown };
+
+PageResponses collect_page_responses(ResponseStore* store, ResponseAccess access,
+                                     const ResponseTierFilter& tier,
                                      const ForensicsPluginSet* forensics_plugins,
                                      const Execution& exec,
                                      const std::vector<AgentExecStatus>& visible_agents,
                                      const authz::VisibleSet& scope) {
     PageResponses out;
-    // #4990: no Response:Read => no store read, no rows and no count (the section says why).
-    if (!may_read_responses) {
+    // #4990: no Response:Read, or an unconfirmed check => no store read, no rows and no count (the
+    // section says which).
+    if (access == ResponseAccess::kDenied) {
         out.state = operate_pages::ResponsesState::kNeedsResponseRead;
+        return out;
+    }
+    if (access == ResponseAccess::kUnknown) {
+        out.state = operate_pages::ResponsesState::kPermissionUnconfirmed;
         return out;
     }
     if (!store || !store->is_open()) {
         out.state = operate_pages::ResponsesState::kUnavailable;
-        return out;
-    }
-    // #4990: the Forensics-tier decision could not be made: no store read, and the section says
-    // so (the degraded notice), never "no responses".
-    if (tier_unknown) {
-        out.state = operate_pages::ResponsesState::kDegraded;
         return out;
     }
     ResponseQuery rq;
@@ -223,6 +225,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     auto perm_fn = std::move(deps.perm_fn);
     // #1712 / #3290 Phase 2 — see WorkflowRoutes::FleetReadFn's doc comment.
     auto fleet_read_fn = std::move(deps.fleet_read_fn);
+    auto response_probe_fn = std::move(deps.response_probe_fn); // #4990: quiet Response:Read probe
     auto audit_fn = std::move(deps.audit_fn);
     auto persist_audit_fn = std::move(deps.persist_audit_fn); // #4990
     auto probe_perm_fn = std::move(deps.probe_perm_fn);
@@ -659,8 +662,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // to exact `execution_id` correlation transparently).
     sink.Get(
         R"(/fragments/executions/([A-Za-z0-9_-]{1,128})/detail)",
-        [auth_fn, fleet_read_fn, audit_fn, persist_audit_fn, probe_perm_fn, execution_tracker,
-         instruction_store, response_store, forensics_plugins, forensics_visibility_fn](
+        [auth_fn, fleet_read_fn, response_probe_fn, audit_fn, persist_audit_fn, probe_perm_fn,
+         execution_tracker, instruction_store, response_store, forensics_plugins,
+         forensics_visibility_fn](
             const httplib::Request& req, httplib::Response& res) {
             // #1712 / #3290 Phase 2 — migrated onto require_fleet_read
             // (fleet_read_fn), mirroring query_installed_software / the REST
@@ -693,22 +697,37 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 return;
             // #4990: the gate above is Execution:Read, a lower tier than the Response:Read the
             // stored output needs. The responses section is therefore served only to a caller who
-            // also holds Response:Read (the quiet probe never writes a response; an unwired probe
-            // is "not proven" = no responses section), and then only the rows the Forensics
-            // filter permits. The Execution:Read gate.scope keeps driving the confined-projection
-            // redaction and the row scope filter below, so the effective row scope is the meet.
-            const bool may_read_responses = probe_perm_fn && probe_perm_fn(req, "Response", "Read");
+            // also holds Response:Read, decided by a QUIET probe (`Deps::response_probe_fn`: no
+            // denial row for a cookie session, a 503 told apart from a refusal), and then only the
+            // rows the Forensics filter permits. The Execution:Read gate.scope keeps driving the
+            // confined-projection redaction and the row scope filter below, met with the
+            // Response:Read scope, so the effective row scope is the meet. An unwired probe is
+            // "not proven" = no responses section.
+            ResponseAccess response_access = ResponseAccess::kDenied;
+            authz::VisibleSet response_scope; // nullopt = Response:Read is unconfined
+            if (response_probe_fn) {
+                httplib::Response probe_res; // scratch: the probe's own 401/403/503 body
+                const auto response_gate = response_probe_fn(req, probe_res, "Response", "Read");
+                if (response_gate.admitted) {
+                    response_access = ResponseAccess::kGranted;
+                    response_scope = response_gate.scope;
+                } else if (probe_res.status == 503) {
+                    response_access = ResponseAccess::kUnknown;
+                }
+            }
             // Not derived when the section is withheld: nothing below reads the store then. An
-            // Unknown answer reads nothing either and renders the degraded notice (not "no
-            // responses"), so the filter below is only ever used for a resolved answer.
+            // Unknown Forensics answer reads nothing either and renders the unconfirmed notice (not
+            // "no responses"), so the filter below is only ever used for a resolved answer.
             const auto tier_resolved =
-                may_read_responses
+                response_access == ResponseAccess::kGranted
                     ? tier_filter_for(req, forensics_visibility_fn, forensics_plugins)
                     : std::expected<ResponseTierFilter, ForensicsUnknown>{
                           ResponseTierFilter::refuse_unwired()};
-            const bool tier_unknown = !tier_resolved;
+            if (response_access == ResponseAccess::kGranted && !tier_resolved)
+                response_access = ResponseAccess::kUnknown;
             const ResponseTierFilter tier =
                 tier_resolved ? *tier_resolved : ResponseTierFilter::refuse_unwired();
+            const authz::VisibleSet row_scope = authz::meet(gate.scope, response_scope);
             // #4990: the drawer's `response.forensics.read` row, written only when the rendered
             // responses include a Forensics-tier plugin's. Set-and-proceed: a failed persist sets
             // `Sec-Audit-Failed` and the drawer still renders. Both render branches call it.
@@ -874,8 +893,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 for (const auto& a : agents)
                     devs.rows.push_back({a.agent_id, a.status, a.error_detail, a.exit_code,
                                          a.dispatched_at, a.completed_at});
-                auto pr = collect_page_responses(response_store, may_read_responses, tier_unknown,
-                                                 tier, forensics_plugins, exec, agents, gate.scope);
+                auto pr = collect_page_responses(response_store, response_access, tier,
+                                                 forensics_plugins, exec, agents, row_scope);
                 devs.responses = std::move(pr.rows);
                 devs.responses_total = pr.total;
                 devs.responses_state = pr.state;
@@ -1151,17 +1170,19 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // -- Responses (collapsed) ---------------------------------------
             ForensicsServed inline_forensics; // #4990: filled when Forensics-tier rows are rendered
             html += "<div class=\"per-agent-responses-wrap\">";
-            if (!may_read_responses) {
+            if (response_access == ResponseAccess::kDenied) {
                 // #4990: no rows, no count, and no store read.
                 html += "<details class=\"per-agent-responses\"><summary>Responses</summary>"
                         "<div class=\"empty-state\">Viewing responses requires the "
                         "<b>Response:Read</b> permission.</div></details>";
-            } else if (response_store && response_store->is_open() && tier_unknown) {
-                // #4990: Unknown tier decision: no store read, a degraded notice (not "no responses").
+            } else if (response_access == ResponseAccess::kUnknown) {
+                // #4990: the permission check could not be completed: no rows, no count, no store
+                // read, and a sentence that is neither a refusal nor "no responses".
                 html += "<details class=\"per-agent-responses\"><summary>Responses</summary>"
-                        "<div class=\"empty-state result-degrade-banner\">"
+                        "<div class=\"empty-state result-degrade-banner\" "
+                        "data-responses-permission-unconfirmed=\"true\">"
                         "<b>Responses unavailable.</b> The permission check for this view could "
-                        "not be completed. This is <b>not</b> \"no responses\" &mdash; retry "
+                        "not be completed. This is <b>not</b> \"no responses\" &mdash; try again "
                         "shortly.</div></details>";
             } else if (response_store && response_store->is_open()) {
                 ResponseQuery rq;
@@ -1212,11 +1233,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 // filter covers both fetch paths. nullopt (TOP) ⇒ unfiltered
                 // — byte-identical to the pre-#1712 path for that caller
                 // class.
-                if (gate.scope) {
+                if (row_scope) {
                     std::vector<StoredResponse> visible;
                     visible.reserve(filtered.size());
                     for (auto& r : filtered) {
-                        if (authz::in_scope(gate.scope, r.agent_id))
+                        if (authz::in_scope(row_scope, r.agent_id))
                             visible.push_back(std::move(r));
                     }
                     filtered.swap(visible);

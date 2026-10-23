@@ -113,7 +113,10 @@ struct DeviceResponse {
 
 /// `kNeedsResponseRead` (#4990): the caller holds Execution:Read but not Response:Read, so the
 /// section names the permission and carries no rows and no count.
-enum class ResponsesState { kOk, kDegraded, kUnavailable, kNeedsResponseRead };
+/// `kPermissionUnconfirmed` (#4990): the permission check itself could not be completed (an
+/// unavailable authorization read), so the section says to try again, with no rows and no count;
+/// it must not be worded as a refusal, nor as a store failure.
+enum class ResponsesState { kOk, kDegraded, kUnavailable, kNeedsResponseRead, kPermissionUnconfirmed };
 
 /// Page-view caps: the per-device table and the collapsed responses list stay bounded no
 /// matter how many devices a run targets (every refresh re-sends the fragment). The agent

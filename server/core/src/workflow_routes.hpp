@@ -170,6 +170,17 @@ public:
         /// GET /api/workflow-executions/{id}; the remaining routes in this
         /// file keep using `perm_fn` above unchanged.
         FleetReadFn fleet_read_fn;
+        /// #4990: the executions drawer's render-time probe for `Response:Read`, in the shape of
+        /// `fleet_read_fn` but QUIET: server.cpp wires the draw-time `probe_fleet_read` (no
+        /// `auth.permission_required` / `auth.fleet_read_required` denial row for an interactive
+        /// cookie session, which a drawer that refreshes every few seconds would otherwise fill the
+        /// audit log with). It never gates anything (the drawer is gated by `fleet_read_fn` on
+        /// Execution:Read); it decides whether the responses section is drawn: admitted => drawn,
+        /// over the probe's scope met with the Execution:Read scope; a 503 on its scratch response =>
+        /// the permission check could not be completed (a "try again" notice, never the
+        /// "requires Response:Read" text); anything else => the caller lacks Response:Read. Unwired
+        /// = nothing proven = the section is not drawn. Do not wire `perm_fn` here: that gate is loud.
+        FleetReadFn response_probe_fn;
         AuditFn audit_fn;
         /// #4990: persist-reporting sink for the drawer's `response.forensics.read` row (set-and-
         /// proceed: a failed persist sets `Sec-Audit-Failed` and the drawer still renders). Unwired
