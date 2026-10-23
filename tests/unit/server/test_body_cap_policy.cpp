@@ -465,7 +465,9 @@ TEST_CASE("resolve_body_cap: requires_measurable is ON for /mcp/ and upload_sess
 // `enforce_pre_auth_body_cap` is invoked inside server.cpp's probe branch
 // (the shape mirrored here) and again after the on-behalf-of guard and rate
 // limiter for every other route. The second call site is not modelled: those
-// two guards are out of this fixture's scope.
+// two guards are out of this fixture's scope. The probe-branch call in server.cpp is
+// pinned by the source-text wiring case in test_health_routes.cpp; the non-probe call
+// site is pinned by neither file.
 #ifndef YUZU_TSAN_BUILD
 
 namespace {
@@ -752,7 +754,7 @@ TEST_CASE("Pre-routing body cap: a non-chunked Transfer-Encoding does NOT suppre
     //
     // So while the size check was gated on `!unmeasurable`, one header
     // suppressed the cap on all 24 classes that do not set
-    // requires_measurable — including the rate-limit-exempt probe paths —
+    // requires_measurable, including the probe paths,
     // while httplib went on to read the declared body in full. Production now
     // gates the size check on `content_length_is_authoritative` instead, which
     // asks httplib rather than re-deciding the header.

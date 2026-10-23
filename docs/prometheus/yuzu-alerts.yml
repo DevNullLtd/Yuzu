@@ -5021,6 +5021,61 @@ groups:
             is `no_store`/`pool_acquire_timeout`/`query_error`, never a bad-input
             case). Usually PostgreSQL pool saturation / failover — correlate
             with the pool metrics.
+      # MFA step-up chokepoint (docs/auth-architecture.md "MFA step-up
+      # chokepoint"). `unavailable` is a 503 on a step-up route: the auth store
+      # could not be read, an enrolled account's second factor could not be
+      # decrypted, the server has no usable auth store, or the check itself threw
+      # or could not fingerprint the session (chokepoint_exception). The counter is
+      # zero-seeded over its closed label set, so increase() is meaningful from the
+      # first scrape. The >= 3 debounce
+      # keeps one stray 503 (a single failed read, one request that raced a
+      # restart) from paging; it also means the first two refusals of an outage
+      # never alert. The rule only sees REFUSED-as-503: a read failure that the
+      # store does not classify as unavailable answers 401 and is counted as
+      # `refused`, which no alert here covers.
+      - alert: YuzuStepUpGateUnavailable
+        expr: |
+          sum by (job, instance, surface) (increase(yuzu_auth_mfa_step_up_gate_total{outcome="unavailable"}[10m])) >= 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MFA step-up check answering 503 on {{ $labels.instance }} ({{ $labels.surface }} surface)"
+          description: >-
+            The central MFA step-up check refused at least three requests in
+            ten minutes with 503 because it could not establish the caller's MFA
+            state (auth store unreadable, stored second factor undecryptable,
+            no usable auth store, or an unexpected exception inside the check).
+            The gated routes stay closed until the cause is fixed; re-entering a
+            TOTP code does not help. Each refusal has a best-effort
+            `mfa.step_up.required` audit row (lost when the audit store is also
+            down) whose `reason=` token in `detail` names the cause. Usually
+            PostgreSQL or KEK trouble: correlate with
+            yuzu_auth_session_store_degrade_total and
+            yuzu_server_secret_decrypt_failures_total, and see
+            docs/ops-runbooks/auth-db-recovery.md "Step-up returns 503".
+      # The window gauge is the configured --mfa-step-up-window-secs. 0 or less
+      # is the documented recovery lever (it disables the stale-proof requirement
+      # on every step-up route except JIT elevation, and also lets SAML sessions
+      # through and skips the store read; engine denials and the unwired-store 503
+      # still apply); it must not be left on.
+      - alert: YuzuStepUpWindowDisabled
+        expr: |
+          yuzu_auth_mfa_step_up_window_seconds <= 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MFA step-up stale-proof requirement is disabled (--mfa-step-up-window-secs <= 0)"
+          description: >-
+            The server was started with --mfa-step-up-window-secs 0 (or less),
+            so the stale-proof requirement is disabled on every step-up route
+            except the JIT-elevation routes: no stale proof is refused (so none
+            is recorded), and SAML sessions and the authentication-store read
+            are skipped too, while engine denials and unwired-store refusals
+            still apply and are recorded. This is a recovery lever, not a
+            steady state: restore the window (default 300) and restart once
+            the reason it was set is resolved.
 
   - name: yuzu-ota
     # Agent OTA pull bounds (#913 per-peer admission, #911 deadlines, #416

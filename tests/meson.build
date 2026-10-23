@@ -1358,6 +1358,13 @@ if build_server
       'unit/server/test_settings_routes_mfa.cpp',
       'unit/server/test_totp.cpp',
       'unit/server/test_mfa_step_up.cpp',
+      'unit/server/test_step_up_policy.cpp', # MFA step-up policy table self-checks (pure, no PG)
+      'unit/server/test_mcp_step_up_policy.cpp', # MCP step-up policy table vs the real MCP tool catalogue (L2; pure, no PG)
+      'unit/server/test_step_up_route_inventory.cpp', # step-up policy table vs the registered routes: L1 compiled TestRouteSink registrations, L3 lexical source scan (no PG)
+      'unit/server/test_route_inventory.cpp', # HttplibRouteSink records registrations in RouteInventory (bare httplib::Server, no listen)
+      'unit/server/test_step_up_wiring.cpp', # step-up chokepoint wired into the pre-request handler, over a real httplib::Server (no PG)
+      'unit/server/test_step_up_null_store.cpp', # the two unwired-auth-store 503 sites (server.cpp step_up_fn, auth_routes elevation_step_up); [stepup][null_store] pure + [pg] route cases
+      'unit/server/test_step_up_gate.cpp',   # step-up decide/render split + request chokepoint; [stepup][gate] pure, [pg][mfa][stepup] equivalence matrix
       'unit/server/test_mfa_qr.cpp',
       'unit/server/test_mfa_store.cpp',
       'unit/server/test_auth_lockout.cpp',
@@ -2206,6 +2213,11 @@ if build_server
   # any time measurement (case-count only, its own comment says so), and D's
   # 16.58s isn't on the same measured baseline as C's unmeasured population,
   # so this ordering is a reasonable placement, not a claimed comparison.
+  # Shard D also holds six step-up route-inventory cases (test_step_up_route_inventory.cpp) that
+  # carry [body_cap] only as a PLACEMENT tag: each scans the whole route-source tree (~10 s on
+  # Linux, cached per process), which does not belong in the heavier shard B. Tagging them
+  # [body_cap] moves them with no change to either filter, so flake-retry.py's verbatim non-pg
+  # spec pin and this partition are untouched; the file's header comment names them.
   test('server unit tests shard D', server_test_exe,
        args: ['[body_cap]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]', '--durations=yes'],
        suite: ['server', 'server-nonpg'], timeout: 600, priority: 48)
@@ -3719,6 +3731,17 @@ endif
 test('log handoff wiring lexical gate (#4666 PR-2 W3a)',
   _python3_test,
   args: [files('test_log_handoff_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# #5291 / PR #6311: static lexical gate over TAR's Windows-only bounded hive-mount call site --
+# the module must be pinned before the first mount and the walk must stop mounting after a timeout
+# (a detached mount thread, abandoned or not, keeps running plugin code with nothing joining it).
+# Source text only, so Python, no build needed.
+test('TAR mapdrive hive-mount pin wiring lexical gate (#5291)',
+  _python3_test,
+  args: [files('test_tar_mapdrive_pin_lexical.py')],
   suite: 'agent',
   timeout: 30,
 )
