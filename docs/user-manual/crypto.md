@@ -693,7 +693,9 @@ an empty list, because an empty list would read as "no library installed".
   from a caller whose list is withheld answers the panel with a confirmation banner, because the
   list cannot show the result. A caller without `Security:Read` who reaches a revoke or import
   (those need `Security:Delete` / `Security:Write`) gets the plain note "The certificate
-  authority panel is not shown to this account."
+  authority panel is not shown to this account." in place of the panel; after a success a
+  confirmation banner and a success toast ("Certificate revoked." or "Signed chain imported
+  ...") acknowledge the change, and after a failure the usual error banner and toast.
 - **Layouts.** A layout read or save that fails answers `503` with `retry_after_ms` (`dashboard
   layout read degraded` / `dashboard layout save failed`), and `save outcome unknown — reload to
   check` when the connection dropped after a save was sent. A stale `expected_version`, or none

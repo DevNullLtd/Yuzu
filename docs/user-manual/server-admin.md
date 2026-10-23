@@ -3124,7 +3124,8 @@ revoke a serial it already knows through `POST /api/v1/ca/revoke`, but cannot li
 an unconfined account, or read revoked serials from the CRL (`/api/v1/ca/crl`). The panel's
 reply to a revoke or an import is never blank for such a caller: it shows the panel with a note
 where the list would be, plus a confirmation banner after a success (a caller without
-`Security:Read` gets a plain note instead). To
+`Security:Read` gets the plain note instead of the panel, with the same confirmation banner and
+success toast after a success). To
 revoke one (e.g. a decommissioned or compromised agent):
 
 1. Find the agent's row in the inventory (match on **Subject** = `agent_id` or
