@@ -357,13 +357,17 @@ carries the role's name. Only `admin_role` and `system_role` mean the
 assignment check was bypassed; a `wildcard_grant` is permitted by design and is
 reported for review (the Tokens page words the two differently).
 
-The MCP tool also takes `include_revoked` (default `true`, MCP only). With
-`false` it skips principals the engine-principal roster lists as **revoked**,
-but never drops a grant whose principal has no roster row at all: such a grant
-is reported as `orphan_grant` (a stale or out-of-band grant that a walk over the
-roster would hide). The success audit row records `scope=active` for a narrowed
-run and `scope=all` otherwise, so a narrowed `violations=0` is not mistaken for
-a full-population result.
+The MCP tool also takes `include_revoked` (default `true`, MCP only). `false`
+is a different report, not a subset of the default run. It skips principals the
+engine-principal roster lists as **revoked**, and it also reports
+`orphan_grant` for every `engine:` grant whose principal has no roster row at
+all (a stale or out-of-band grant that a walk over the roster would hide). The
+default run and the REST route never report `orphan_grant`, so a grant of a
+harmless role to a principal with no roster row is `ok:true` there and a
+finding on the narrowed run. Use the default run for the full-population
+answer. The success audit row records `scope=active` for a narrowed run and
+`scope=all` otherwise, so a narrowed `violations=0` is not mistaken for a
+full-population result.
 
 **What assignment refuses, and what it does not.** Assigning a role to an engine
 principal refuses the `admin` and `Administrator` role names and every built-in

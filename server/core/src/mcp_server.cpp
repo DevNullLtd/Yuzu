@@ -2809,15 +2809,17 @@ static const ToolDef kTools[] = {
      "reported), it is point-in-time, and nothing schedules it. Reason admin_role or system_role "
      "means the assignment check was bypassed (data corruption, direct DB write, or a code "
      "regression) and is a security incident; wildcard_grant means review whether the grant is "
-     "intended (permitted by design). With include_revoked=false only principals the roster "
-     "lists as revoked are skipped; a grant whose principal has no roster row is reported as "
-     "orphan_grant, never dropped. FAILS CLOSED: if any read cannot be answered it returns a retryable internal "
+     "intended (permitted by design). include_revoked=false (MCP only) skips principals the "
+     "roster lists as revoked AND additionally reports orphan_grant for any engine: grant whose "
+     "principal has no roster row, which the default run and the REST twin never report; it is "
+     "not a subset of the default run, so use the default for the full-population answer. "
+     "FAILS CLOSED: if any read cannot be answered it returns a retryable internal "
      "error (retry_after_ms) with no partial violations[], never ok:true - treat that as "
      "'unable to verify', not 'clean'. Same checks and {ok, violations} shape as GET "
      "/api/v1/engine-principals/audit/no-admin; include_revoked is MCP-only. Requires "
      "AuditLog:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("include_revoked":{"type":"boolean","default":true,"description":"false skips principals the roster lists as revoked (a grant with no roster row is still reported as orphan_grant)"})j"
+     R"j("include_revoked":{"type":"boolean","default":true,"description":"false skips principals the roster lists as revoked and also reports orphan_grant for a grant with no roster row (the default run does not); not a subset of the default run"})j"
      R"j(}})j",
      R"j({"type":"object","properties":{"ok":{"type":"boolean"},"violations":{"type":"array","items":{"type":"object","properties":{"principal_id":{"type":"string"},"role":{"type":"string"},"reason":{"type":"string"}},"required":["principal_id","reason"]}}},"required":["ok","violations"]})j"},
 
