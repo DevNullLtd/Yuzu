@@ -1096,8 +1096,7 @@ flip, with a red-first test each:
     only) and then filtered per agent by `build_agent_push` on the LIVE row (`enabled`,
     `os_target`, `scope_expr`). So DISABLING the rule, or narrowing its scope or OS target,
     flows with the next automatic re-push (a rule update bumps the policy generation), while
-    removing a MEMBER from the Baseline is staged until a Re-deploy, a full push to the agents connected to that server
-    that needs `GuaranteedState:Push`. REST push refuses a service-scoped token
+    removing a MEMBER from the Baseline is staged until a Re-deploy, which is a full push to the agents connected to the server that handles it and needs `GuaranteedState:Push`. REST push refuses a service-scoped token
     (`deny_fleet_wide_service_scoped`) and an interactive session must clear the MFA
     step-up check (`step_up_fn`, which skips API-token principals); MCP `push_guardian_rules`
     applies the same service-scoped refusal and its tier gate. The `scope` parameter is a scope
@@ -1327,7 +1326,7 @@ flip, with a red-first test each:
     push lambda around "do not bump the generation" and "Read (never bump)"), so a delta applied
     at the generation the agent already holds is not followed by an automatic full_sync, and the
     hold lasts until an operator sends a full_sync or the generation moves. Baseline deploy and
-    delete of a DEPLOYED Baseline DO bump it and push a full_sync to the agents connected to that server (`guardian_routes.cpp`,
+    delete of a DEPLOYED Baseline DO bump it and push a full_sync to the agents connected to the server that handles it (`guardian_routes.cpp`,
     the `bump_policy_generation()` calls followed by `push_fn_("", true)`); a deploy retries the hold (a wedged rule stays held until its hung call returns, or another exit in AC-1 applies: a full push that drops it, an edit that changes its watch target, or an agent restart, each with the conditions stated in AC-1), but a delete is not a repair: it withdraws every Guard no other deployed Baseline
     delivers, so the hold on such a rule ends because the rule is no longer pushed. A delta-only hold is
     therefore not self-repairing, and its visibility is limited: on the Spark path an arm
@@ -3055,7 +3054,7 @@ at engine level. That run is a flip-gate line, not a merge gate for #3972.
   host and the agent log is the only per-host evidence, so an operator who cannot identify the
   affected hosts is left with the same push over a wider scope, at the cost below. Avoid the
   fleet-wide route (a
-  Baseline deploy issues a fleet-wide `full_sync`, `guardian_routes.cpp`): a `full_sync` reaches
+  Baseline deploy issues a `full_sync` to every agent connected to the server that handles it, `guardian_routes.cpp`): a `full_sync` reaches
   every in-scope agent: before #4415 it tore down and re-armed every rule there (R5.7 (g)(1);
   its cost is the #3990 blackout, `docs/spark-rebuild-baselines/3990-fullsync-blackout-run.md`,
   measured before #4415); since #4415 a rule that is healthy and unchanged is skipped (AC-18)
