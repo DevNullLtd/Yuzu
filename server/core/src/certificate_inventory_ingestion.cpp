@@ -581,14 +581,14 @@ private:
                   integer(12, c.rsa_modulus_bits) && oid(13, c.ec_curve_oid) &&
                   integer(14, c.ec_order_bits) && oid(15, c.sig_alg_oid) &&
                   oid(16, c.pss_hash_oid) && oid(17, c.pss_mgf1_hash_oid) &&
-                  hexf(18, 0, c.ski, true) && hexf(19, 0, c.aki_key_id, true) &&
-                  boolean(20, c.is_ca) && integer(21, c.path_len) &&
-                  text(22, 256, "key_usage", c.key_usage) && boolean(23, c.self_signed) &&
-                  text(24, 32, "key_association", c.key_association) &&
-                  text(25, 256, "key_provider", c.key_provider) &&
-                  text(26, 32, "key_exportable", c.key_exportable) &&
-                  count(27, "sans", g_.want_sans) && count(28, "ekus", g_.want_ekus) &&
-                  count(29, "cdps", g_.want_cdps) && text(30, 32, "der_omitted", c.der_omitted);
+                  hexf(18, 64, c.spki_sha256) && hexf(19, 0, c.ski, true) &&
+                  hexf(20, 0, c.aki_key_id, true) && boolean(21, c.is_ca) &&
+                  integer(22, c.path_len) && text(23, 256, "key_usage", c.key_usage) &&
+                  boolean(24, c.self_signed) && text(25, 32, "key_association", c.key_association) &&
+                  text(26, 256, "key_provider", c.key_provider) &&
+                  text(27, 32, "key_exportable", c.key_exportable) &&
+                  count(28, "sans", g_.want_sans) && count(29, "ekus", g_.want_ekus) &&
+                  count(30, "cdps", g_.want_cdps) && text(31, 32, "der_omitted", c.der_omitted);
         if (ok && c.key_association && *c.key_association != "present" &&
             *c.key_association != "none" && *c.key_association != "unknown")
             ok = false;
@@ -597,9 +597,9 @@ private:
             ok = false;
         // flags: the agent's comma-joined tokens. They are kept verbatim in constrained_fields,
         // merged with the tokens this parse added; serial_negative is also a column.
-        if (ok && has(31) && field(31) != "?" && !field(31).empty()) {
+        if (ok && has(32) && field(32) != "?" && !field(32).empty()) {
             std::string s;
-            if (!clean(field(31), 512, s, "flags", false))
+            if (!clean(field(32), 512, s, "flags", false))
                 ok = false;
             else {
                 c.serial_negative = (("," + s + ",").find(",serial_negative,") != std::string::npos);
@@ -607,7 +607,7 @@ private:
                     s += "," + g_.fact.constrained_fields;
                 g_.fact.constrained_fields = std::move(s);
             }
-        } else if (ok && has(31)) {
+        } else if (ok && has(32)) {
             c.serial_negative = false;
         }
         if (!ok) {
@@ -695,7 +695,8 @@ private:
         // The row identity is the SHA-256 of the whole DER: a DER that does not hash to it is
         // dropped (and the certificate marked), never stored under the wrong identity.
         if (sha256_hex(*der) != g_.sha) {
-            add_token("der_sha256_mismatch"); // keep the certificate, never store this DER
+            add_token("der_hash_mismatch"); // keep the certificate, never store this DER
+            out_.der_hash_mismatch = true;
             return;
         }
         der_total_ += der->size();
@@ -915,6 +916,8 @@ void ingest_certificate_inventory_report(CertificateInventoryStore& store,
         stored_reason = "over_cap";
     else if (parsed.any_parse_error)
         stored_reason = "parse_error";
+    else if (parsed.der_hash_mismatch)
+        stored_reason = "der_hash_mismatch";
     else if (parsed.utf8_replaced)
         stored_reason = "utf8_replaced";
     if (parsed.any_parse_error)

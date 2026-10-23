@@ -124,6 +124,7 @@ std::string cert_group(const Cert& c) {
         "1.2.840.113549.1.1.11", // sig_alg_oid
         "",                     // pss_hash_oid
         "",                     // pss_mgf1_hash_oid
+        hexn(500 + c.id),       // spki_sha256
         "AABB",                 // ski
         "CCDD",                 // aki_key_id
         "1",                    // is_ca
@@ -508,12 +509,13 @@ TEST_CASE("cert parse: DER is kept only when it hashes to the row identity", "[c
         REQUIRE(p.data.facts.size() == 1);
         CHECK(*p.data.facts[0].der_base64 == "YWJj");
     }
-    SECTION("mismatching: the certificate is kept, the DER is not, and it is marked") {
+    SECTION("mismatching: the certificate is kept, the DER is not, it is marked and counted") {
         c.sha_override = hexn(77);
         const auto p = parse_certificate_inventory_blob(blob(stores, {c}));
         REQUIRE(p.data.facts.size() == 1);
         CHECK_FALSE(p.data.facts[0].der_base64.has_value());
-        CHECK(p.data.facts[0].constrained_fields == "der_sha256_mismatch");
+        CHECK(p.data.facts[0].constrained_fields == "der_hash_mismatch");
+        CHECK(p.der_hash_mismatch);
     }
     SECTION("not base64 is refused") {
         c.der_b64 = "!!!!";
@@ -1028,48 +1030,48 @@ TEST_CASE("decommission cascade: the certificate inventory store is registered a
 // ── The agent's golden blob (canonical writer contract) ──────────────────────
 
 // `expected` is copied BYTE-FOR-BYTE from the writer's own golden ("inventory blob: GOLDEN bytes",
-// tests/unit/test_certificates_inventory.cpp at feat/cert-inventory-agent-linux fc0544c6d, the
-// 32-field cert| record). Its DER-carrying certificate uses a placeholder sha256 that is not the
-// SHA-256 of its DER, so this seam keeps the certificate but drops the DER and marks it
-// `der_sha256_mismatch` (the row identity is the SHA-256 of the DER; it is never stored under a
-// different one).
+// tests/unit/test_certificates_inventory.cpp at feat/cert-inventory-agent-linux 89a735644, the
+// 33-field cert| record with spki_sha256). The DER-carrying certificate's sha256 is the SHA-256
+// of its shipped DER, so the DER is kept.
 TEST_CASE("cert parse: the agent writer's golden blob lands every field where it belongs",
           "[certinv][parse][golden]") {
-    const std::string sha1c = std::string(60, 'a') + "0001";
-    const std::string sha2 = std::string(60, 'a') + "0002";
+    const std::string sha1c = "417c7763c4e320a6b747b3cb0c6d22f93741b29a32b48594b8eb4c144fe6d729";
+    const std::string sha2 = "eceda61045db145d209debf0d245e44b5b1cc52e3c04266aa2a486fdb6a2b285";
     const std::string expected =
         "ver|1\n"
         "store|/etc/pki/tls/certs|machine|absent||0\n"
         "store|/etc/pki/trust/anchors|machine|unreadable|permission_denied|0\n"
         "store|/etc/ssl/certs|machine|ok||2\n"
-        "cert|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0001|"
+        "cert|417c7763c4e320a6b747b3cb0c6d22f93741b29a32b48594b8eb4c144fe6d729|"
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0001|"
         "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc0001|"
         "3|0123|CN=Acme\\\\, Inc.,O=Yuzu|CN=Root\\\\\\\\CA|"
         "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|"
         "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee|"
         "2024-01-01T00:00:00Z|9999-12-31T23:59:59Z|1.2.840.113549.1.1.1|2048|||"
-        "1.2.840.113549.1.1.11|||AABB|CCDD|1||Digital Signature, Key Encipherment|0|?|?|?|"
+        "1.2.840.113549.1.1.11|||"
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0001|AABB|CCDD|1||Digital Signature, Key Encipherment|0|?|?|?|"
         "sans=2|ekus=1|cdps=1||sans_truncated\n"
-        "loc|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0001|/etc/ssl/certs|"
+        "loc|417c7763c4e320a6b747b3cb0c6d22f93741b29a32b48594b8eb4c144fe6d729|/etc/ssl/certs|"
         "/etc/ssl/certs/a\\|x.pem\n"
-        "loc|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0001|/etc/ssl/certs|"
+        "loc|417c7763c4e320a6b747b3cb0c6d22f93741b29a32b48594b8eb4c144fe6d729|/etc/ssl/certs|"
         "/etc/ssl/certs/b.pem\n"
-        "san|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0001|dns|a.example\n"
-        "san|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0001|upn|alice@corp.example\n"
-        "eku|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0001|1.3.6.1.5.5.7.3.1\n"
-        "cdp|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0001|http://crl.example/a.crl\n"
-        "der|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0001|MAMCAQU=\n"
-        "cert|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0002|"
+        "san|417c7763c4e320a6b747b3cb0c6d22f93741b29a32b48594b8eb4c144fe6d729|dns|a.example\n"
+        "san|417c7763c4e320a6b747b3cb0c6d22f93741b29a32b48594b8eb4c144fe6d729|upn|alice@corp.example\n"
+        "eku|417c7763c4e320a6b747b3cb0c6d22f93741b29a32b48594b8eb4c144fe6d729|1.3.6.1.5.5.7.3.1\n"
+        "cdp|417c7763c4e320a6b747b3cb0c6d22f93741b29a32b48594b8eb4c144fe6d729|http://crl.example/a.crl\n"
+        "der|417c7763c4e320a6b747b3cb0c6d22f93741b29a32b48594b8eb4c144fe6d729|MAMCAQU=\n"
+        "cert|eceda61045db145d209debf0d245e44b5b1cc52e3c04266aa2a486fdb6a2b285|"
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0002|"
         "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc0002|"
         "3|0123|CN=Beta\\\\, Inc.,O=Yuzu|CN=Root\\\\\\\\CA|"
         "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|"
         "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee|"
         "2024-01-01T00:00:00Z|9999-12-31T23:59:59Z|1.2.840.113549.1.1.1|2048|||"
-        "1.2.840.113549.1.1.11|||AABB|CCDD|?||Digital Signature, Key Encipherment|1|?|?|?|"
+        "1.2.840.113549.1.1.11|||"
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0002|AABB|CCDD|?||Digital Signature, Key Encipherment|1|?|?|?|"
         "sans=0|ekus=0|cdps=0|self_signed|\n"
-        "loc|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0002|/etc/ssl/certs|"
+        "loc|eceda61045db145d209debf0d245e44b5b1cc52e3c04266aa2a486fdb6a2b285|/etc/ssl/certs|"
         "/etc/ssl/certs/c.pem\n";
 
     const auto p = parse_certificate_inventory_blob(expected);
@@ -1109,7 +1111,8 @@ TEST_CASE("cert parse: the agent writer's golden blob lands every field where it
     CHECK(*a->sig_alg_oid == "1.2.840.113549.1.1.11");
     CHECK_FALSE(a->pss_hash_oid.has_value());
     CHECK_FALSE(a->pss_mgf1_hash_oid.has_value());
-    CHECK_FALSE(a->spki_sha256.has_value()); // not on the wire
+    CHECK(*a->spki_sha256 == std::string(60, 'f') + "0001");
+    CHECK(*b->spki_sha256 == std::string(60, 'f') + "0002");
     CHECK(*a->ski == "AABB");
     CHECK(*a->aki_key_id == "CCDD");
     CHECK(*a->is_ca == true);
@@ -1120,8 +1123,8 @@ TEST_CASE("cert parse: the agent writer's golden blob lands every field where it
     CHECK_FALSE(a->key_provider.has_value());
     CHECK_FALSE(a->key_exportable.has_value());
     CHECK(*a->der_omitted == "");
-    CHECK_FALSE(a->der_base64.has_value()); // placeholder sha: DER dropped, not stored
-    CHECK(a->constrained_fields == "sans_truncated,der_sha256_mismatch");
+    CHECK(*a->der_base64 == "MAMCAQU=");
+    CHECK(a->constrained_fields == "sans_truncated");
     CHECK(*a->serial_negative == false);
     REQUIRE(a->sans.size() == 2);
     CHECK(a->sans[0].type == "dns");
@@ -1217,4 +1220,21 @@ TEST_CASE("CertificateInventoryStore: a location with an empty path (a keychain 
            full_report(blob(store_rec("/Library/Keychains/System.keychain", "ok", "", "1"),
                             {cert(1, {{"/Library/Keychains/System.keychain", ""}})})));
     CHECK(scalar(pool, "SELECT count(*) FROM cert_inventory.cert_location WHERE path = ''") == "1");
+}
+
+TEST_CASE("cert ingest: a DER that does not hash to its certificate is dropped and COUNTED",
+          "[certinv][pg]") {
+    CERT_SHARED(store, pool);
+    Cert c = cert(1, {{"S", ""}});
+    c.sha_override = hexn(77);
+    c.der_b64 = "YWJj";
+    yuzu::MetricsRegistry m;
+    cert_ingest_metric::register_metrics(m);
+    ingest(store, "agent-1", full_report(blob(store_rec("S", "ok"), {c})), &m);
+    CHECK(store.row_counts("agent-1")->cert_fact == 1);
+    CHECK(scalar(pool, "SELECT der IS NULL FROM cert_inventory.cert_fact") == "t");
+    CHECK(scalar(pool, "SELECT constrained_fields FROM cert_inventory.cert_fact") ==
+          "der_hash_mismatch");
+    CHECK(m.serialize().find("result=\"stored\",reason=\"der_hash_mismatch\"} 1") !=
+          std::string::npos);
 }
