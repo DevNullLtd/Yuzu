@@ -739,6 +739,25 @@ void RbacStore::seed_defaults() {
              "VALUES ($1, $2, TRUE, $3::bigint) ON CONFLICT (name) DO NOTHING",
              {std::string(r.name), std::string(r.desc), std::to_string(now)});
 
+    // #4990: the seed above is ON CONFLICT DO NOTHING, so an operator-authored role that already
+    // carries the name "ForensicsAnalyst" is kept as it is and the four seeded read grants are
+    // merged into it. Seed semantics are deliberately unchanged; this only makes the situation
+    // visible at boot. A non-system role is outside the structural bar that keeps engine
+    // principals off the seeded role, so an engine principal could be assigned it.
+    {
+        pg::PgResult fa = pg::exec_params(
+            c, "SELECT is_system FROM rbac_store.roles WHERE name = 'ForensicsAnalyst'",
+            std::vector<std::string>{});
+        if (fa.status() == PGRES_TUPLES_OK && PQntuples(fa.get()) == 1 &&
+            !to_bool(PQgetvalue(fa.get(), 0, 0))) {
+            spdlog::warn(
+                "RbacStore: an existing non-system role named ForensicsAnalyst was found; the "
+                "built-in Forensics read grants were merged into it and its definition was left "
+                "unchanged. Engine principals could be assigned this role. Rename or remove it "
+                "and restart to adopt the built-in role.");
+        }
+    }
+
     // fable (Gate 4, #2703): skip a triple an operator explicitly revoked via
     // remove_permission() — revoked_seed_defaults is bookkeeping-only (never
     // read by any authorization decision), so this is the ONLY place its

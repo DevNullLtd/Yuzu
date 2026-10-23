@@ -26,6 +26,7 @@
 
 #include "test_auth_db_pg_helper.hpp" // RBAC_STORE_WITH_AUTH — the last-admin guard's auth.users JOIN
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
@@ -674,8 +675,12 @@ TEST_CASE("RbacStore: an existing database without the role gains it, with its f
     REQUIRE(store.get_role_permissions("ForensicsAnalyst").empty());
 
     // The existing-database path: the same constructor the server runs on every boot, no migration.
+    // The seeded system role is the ordinary case, so the collision WARN must not fire.
+    yuzu::test::LogCapture capture(spdlog::level::warn);
     RbacStore reopened{rbac_pool_fx_};
     REQUIRE(reopened.is_open());
+    capture.stop();
+    CHECK_THAT(capture.text(), !Catch::Matchers::ContainsSubstring("non-system role named"));
 
     auto role = reopened.get_role("ForensicsAnalyst");
     REQUIRE(role.has_value());
@@ -706,9 +711,15 @@ TEST_CASE("RbacStore: a pre-existing custom role named ForensicsAnalyst is merge
     REQUIRE(store.create_role({"ForensicsAnalyst", "site-authored", false, 0}).has_value());
     REQUIRE(store.set_permission({"ForensicsAnalyst", "Tag", "Read", "allow"}).has_value());
 
-    // The next boot runs the real seed pass.
+    // The next boot runs the real seed pass. It logs one WARN naming the role (the seed itself
+    // is unchanged); captured here so the boot visibility is pinned.
+    yuzu::test::LogCapture capture(spdlog::level::warn);
     RbacStore reopened{rbac_pool_fx_};
     REQUIRE(reopened.is_open());
+    capture.stop();
+    const std::string logs = capture.text();
+    CHECK_THAT(logs, Catch::Matchers::ContainsSubstring("non-system role named ForensicsAnalyst"));
+    CHECK_THAT(logs, Catch::Matchers::ContainsSubstring("Engine principals could be assigned"));
 
     auto role = reopened.get_role("ForensicsAnalyst");
     REQUIRE(role.has_value());
