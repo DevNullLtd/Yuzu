@@ -30,10 +30,10 @@
  *
  * The file corpus and the extracted route list are each memoised behind a function-local
  * `static const` (the registration pass this replaced cost 24 s on macOS debug, and more on MSVC
- * debug where it was not measured; see tests/meson.build's shard-D note), computed once per test PROCESS and shared by
- * every test case and translation unit that includes this header. Both assume every call passes
- * the same `YUZU_SERVER_SRC_DIR`, which is true today: do not call them with a different
- * directory without splitting the cache key.
+ * debug where it was not measured; see tests/meson.build's shard-D note), computed once per test
+ * PROCESS and shared by every test case and translation unit that includes this header. Both
+ * assume every call passes the same `YUZU_SERVER_SRC_DIR`, which is true today: do not call them
+ * with a different directory without splitting the cache key.
  *
  * Keep the C++ regular-expression library out of this file: test_store_wiring_order.cpp fails if
  * its short name appears here in any case, comments included.
