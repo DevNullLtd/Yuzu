@@ -1012,7 +1012,12 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
     receipt time), and the device's last receipt time is not in the future. An offline device is
     never pruned, and a location seen within the bound never is. Accepted residual: a forward step
     of the database clock in force when the device next reports shortens the bound by that step.
-    The prune PR does not merge until the owner rules on this.
+    The prune PR does not merge until the owner rules on this. Points for the ruling, raised by
+    the prune PR's governance: (i) a device that returns after more than the bound offline can
+    lose its kept locations after one report; (ii) a location in a `constrained` store that went
+    unreported for longer than the bound is pruned on the next report that reads the store
+    `unreadable`; (iii) the forward-clock residual above; (iv) the rule covers machine-scope
+    stores only (per-user stores are not collected in slice 2).
   - **R17 — the agents-before-servers window for `certificate_inventory` (PROPOSED, awaiting the
     owner's ruling; not in force).** D12 says stray certificate rows must never be readable and the
     mixed-version window is not acceptable for this source. A server older than the typed-source
