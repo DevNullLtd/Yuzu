@@ -28163,10 +28163,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         fail_closed();
                         return;
                     }
-                    scope.emplace();
-                    for (const auto& p : *roster)
-                        (p.lifecycle_state == "active" ? scope->active : scope->revoked)
-                            .insert(p.principal_id);
+                    // Only lifecycle_state == "revoked" narrows a principal out; any other
+                    // state is audited normally (make_active_scope).
+                    scope = engine_no_admin_audit::make_active_scope(*roster);
                 }
                 const auto found = engine_no_admin_audit::evaluate(
                     *inputs, all_securables, all_operations, scope ? &*scope : nullptr);

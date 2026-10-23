@@ -10,6 +10,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <set>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -191,8 +192,8 @@ TEST_CASE("no-admin audit: the active scope skips a REVOKED principal but never 
 TEST_CASE("no-admin audit: a principal listed as neither active nor revoked is an orphan, not "
           "silently narrowed away",
           "[engine_principal][no_admin][pure]") {
-    // The race the narrowing must survive: the roster was read AFTER the grants, so a principal
-    // created in between has a grant and no roster row.
+    // A grant with no roster row at all (principal_roles has no foreign key to the roster): the
+    // narrowing must report it, never drop it.
     auto in = inputs_with({{"engine", "engine:newborn", "admin"}}, {}, {});
     audit::ActiveScope scope; // empty roster
     const auto v = audit::evaluate(in, kSecurables, kOperations, &scope);
@@ -200,6 +201,38 @@ TEST_CASE("no-admin audit: a principal listed as neither active nor revoked is a
     CHECK(v[0].reason == "admin_role");
     CHECK(v[1].reason == "orphan_grant");
     CHECK(v[1].role.empty());
+}
+
+TEST_CASE("no-admin audit: only the exact state 'revoked' narrows a principal out of the scope",
+          "[engine_principal][no_admin][pure]") {
+    struct Row {
+        std::string principal_id;
+        std::string lifecycle_state;
+    };
+    const std::vector<Row> roster{{"engine:live", "active"},
+                                  {"engine:gone", "revoked"},
+                                  {"engine:odd", "suspended"},
+                                  {"engine:blank", ""},
+                                  {"engine:caps", "Revoked"}};
+    const auto scope = audit::make_active_scope(roster);
+    CHECK(scope.revoked == std::unordered_set<std::string>{"engine:gone"});
+    CHECK(scope.active.size() == 4);
+
+    auto in = inputs_with({{"engine", "engine:live", "admin"},
+                           {"engine", "engine:gone", "admin"},
+                           {"engine", "engine:odd", "admin"},
+                           {"engine", "engine:blank", "admin"},
+                           {"engine", "engine:caps", "admin"}},
+                          {}, {});
+    const auto v = audit::evaluate(in, kSecurables, kOperations, &scope);
+    std::set<std::string> flagged;
+    for (const auto& x : v) {
+        flagged.insert(x.principal_id);
+        // They are on the roster, so none of them is an orphan.
+        CHECK(x.reason != "orphan_grant");
+    }
+    // A state the code does not know is audited, not silently skipped.
+    CHECK(flagged == std::set<std::string>{"engine:live", "engine:odd", "engine:blank", "engine:caps"});
 }
 
 TEST_CASE("no-admin audit: the success detail carries a bounded, neutralised sample",

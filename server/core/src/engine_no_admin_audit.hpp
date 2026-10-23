@@ -84,13 +84,30 @@ struct Violation {
 /// MCP `include_revoked=false`: the roster read that scopes the report. A
 /// principal in `revoked` is narrowed out (that is what the flag asks for). A
 /// principal in NEITHER set holds a grant with no roster row at all (a shadow
-/// or orphan row, or one created after the grants were read): it is never
-/// dropped, it is evaluated normally AND reported as `orphan_grant`, because a
-/// roster-walk that silently omits it is the clause-3 regression.
+/// or out-of-band row: principal_roles.principal_id has no foreign key to the
+/// roster): it is never dropped, it is evaluated normally AND reported as
+/// `orphan_grant`, because a roster-walk that silently omits it is the clause-3
+/// regression. The grants are read BEFORE the roster (read_inputs, then the
+/// roster read), so a principal created between the two reads has no grant in
+/// this run: that gap cannot make an orphan, and a read in the other order
+/// could.
 struct ActiveScope {
     std::unordered_set<std::string> active;
     std::unordered_set<std::string> revoked;
 };
+
+/// Build the scope from roster rows (anything with `principal_id` and
+/// `lifecycle_state`). ONLY a state of exactly "revoked" narrows a principal
+/// out; any other state, including one this code does not know, is evaluated
+/// normally. The narrowing flag exists to skip revoked principals, so an
+/// unexpected state must never be a reason to stop auditing a grant.
+template <class Roster>
+[[nodiscard]] ActiveScope make_active_scope(const Roster& roster) {
+    ActiveScope scope;
+    for (const auto& p : roster)
+        (p.lifecycle_state == "revoked" ? scope.revoked : scope.active).insert(p.principal_id);
+    return scope;
+}
 
 /// The checked reads, taken as vectors so `evaluate` stays pure.
 struct Inputs {
