@@ -242,3 +242,27 @@ TEST_CASE("an engine cannot be given a confined view: scoped assignment and grou
     REQUIRE_FALSE(member.has_value());
     CHECK(member.error().find("engine:") != std::string::npos);
 }
+
+// An absent management-group store with enforcement on: nothing to resolve a confined view against,
+// so a caller without a global grant gets deny or empty, never the fleet. A global grant still wins.
+TEST_CASE("an absent management-group store narrows to empty unless the caller has a global grant "
+          "(#6204)",
+          "[pg][6204][engine][visibility][degraded]") {
+    VisRig r;
+    for (const char* who : {"alice", kEngine}) {
+        INFO("principal: " << who);
+        CHECK(vis::visible_agents_json(fleet(), &r.rbac, nullptr, who).empty());
+        auto infra = vis::infrastructure_visible_set(&r.rbac, nullptr, who);
+        REQUIRE(infra.has_value());
+        CHECK(infra->empty());
+        auto resp = vis::response_visible_set(&r.rbac, nullptr, who);
+        REQUIRE(resp.has_value());
+        CHECK(resp->empty());
+        CHECK_FALSE(vis::response_agent_in_scope(&r.rbac, nullptr, who, "agent-1"));
+    }
+    SECTION("a global Infrastructure:Read grant still sees the fleet") {
+        r.grant_engine("InfraReader6204");
+        CHECK(ids(vis::visible_agents_json(fleet(), &r.rbac, nullptr, kEngine)).size() == 3);
+        CHECK_FALSE(vis::infrastructure_visible_set(&r.rbac, nullptr, kEngine).has_value());
+    }
+}

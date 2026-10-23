@@ -65,11 +65,14 @@ namespace yuzu::server::visibility {
         return nlohmann::json::array();
     // #1498: restrict whenever enforcement is in effect (a missing/load-failed store counts); only a
     // loaded-and-explicitly-disabled store returns the full fleet to a human.
-    if (mgmt != nullptr && enforced) {
+    if (enforced) {
         // A global Infrastructure:Read grant sees the whole fleet even under RBAC-on.
         const bool global_read = rbac != nullptr && rbac->is_open() &&
                                  rbac->check_permission(username, "Infrastructure", "Read");
         if (!global_read) {
+            // No management-group store to resolve against: fail closed, never the fleet.
+            if (mgmt == nullptr)
+                return nlohmann::json::array();
             // ADR-0042: a degraded store (nullopt) -> empty visible set (fail closed).
             auto visible = mgmt->get_visible_agents(username);
             std::set<std::string> visible_set;
@@ -93,10 +96,13 @@ infrastructure_visible_set(const RbacStore* rbac, const ManagementGroupStore* mg
     const bool enforced = rbac_enforcement_in_effect(rbac);
     if (!enforced && authz::is_engine_principal_name(username))
         return std::set<std::string>{};
-    if (mgmt != nullptr && enforced) {
+    if (enforced) {
         const bool global_read = rbac != nullptr && rbac->is_open() &&
                                  rbac->check_permission(username, "Infrastructure", "Read");
         if (!global_read) {
+            // No management-group store to resolve against: fail closed, never the fleet.
+            if (mgmt == nullptr)
+                return std::set<std::string>{};
             // ADR-0042: nullopt from the store means DEGRADED -> an EMPTY confined set (sees
             // nothing), NOT nullopt here (which would mean "sees the whole fleet").
             auto v = mgmt->get_visible_agents(username);
