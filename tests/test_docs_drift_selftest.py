@@ -354,7 +354,28 @@ class SyntheticRepo(unittest.TestCase):
         git(self.repo, "update-ref", "refs/remotes/origin/dev", "HEAD")
 
     def tearDown(self):
-        self._tmp.cleanup()
+        # TEMPORARY DIAGNOSTIC (PR #6377): CI reported "Directory not empty: .git" from this cleanup.
+        # On that failure, say what is still in .git and which git processes are alive, then re-raise.
+        try:
+            self._tmp.cleanup()
+        except OSError as exc:
+            lines = [f"TEARDOWN-DIAG {self.id()}: {exc!r}"]
+            for cmd in (["git", "--version"],
+                        ["ps", "-eo", "pid,ppid,lstart,args", "--sort=start_time"],
+                        ["find", str(self.repo / ".git"), "-ls"],
+                        ["git", "config", "--show-origin", "--list"]):
+                try:
+                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=20,
+                                       cwd=ROOT, env=hermetic_env())
+                    out = r.stdout
+                    if cmd[0] == "ps":
+                        out = "\n".join(ln[:200] for ln in out.splitlines()
+                                         if " git " in ln or "/git" in ln or "yuzu_test_" in ln)
+                    lines.append(f"--- {' '.join(cmd)} (rc={r.returncode})\n{out.rstrip()}{r.stderr.rstrip()}")
+                except Exception as e2:  # diagnostics only
+                    lines.append(f"--- {' '.join(cmd)} failed: {e2!r}")
+            print("\n".join(lines), file=sys.stderr, flush=True)
+            raise
 
     def commit(self, msg="c"):
         git(self.repo, "add", "-A")
