@@ -20,10 +20,10 @@
 // follows the same pure/impure split. Only the I/O (WNet / NetApi / registry
 // hive loads / subprocess / getfsstat / file reads) is #ifdef-guarded.
 //
-// PII: mapped-drive rows expose usernames + share paths. Per the works-council
-// posture the source is opt-in (default_enabled=false); rows are NOT run through
-// redact_cmdline (cmdline-only; it would mangle UNC paths) — opt-in + audit is
-// the protection, exactly as dns_live does for visited domains.
+// Mapped-drive rows expose usernames + share paths. The source is on by default
+// (default_enabled=true); rows are NOT run through redact_cmdline (cmdline-only;
+// it would mangle UNC paths) — audit is the control, exactly as dns_live does
+// for visited domains.
 
 #include "bounded_wait.hpp" // yuzu::shared::bounded_call_ex — ../../shared include dir
 #include "tar_capture_status.hpp" // classify_subprocess_capture, IncompleteCaptureError, would_exceed_cap
@@ -386,6 +386,20 @@ std::string word_after(const std::string& line, const std::string& marker) {
     }
     return buf;
 }
+
+// Windows inbound-logon history query (wevtutil qe Security ... /c:N /f:text):
+// the event count and the runner's output cap must agree, or a normal Security
+// log truncates the capture and the whole backfill is thrown away as incomplete.
+// Defined here, outside the _WIN32 leg, so the pin below compiles on every host.
+// Measured live on kingsley 2026-10-22 (31,362-record Security log): one /f:text
+// 4624 rendering averages 2.62 KB, so 500 events = 1.3 MB. The 8 KiB per-event
+// figure is an assumed worst case (~3x the measured average), not a measurement.
+constexpr unsigned kWinInboundLogonEventCount = 500;
+constexpr std::size_t kWinRenderedLogonEventMaxBytes = 8u * 1024;
+constexpr std::size_t kWinInboundLogonOutputCap = 8u * 1024 * 1024;
+static_assert(kWinInboundLogonEventCount * kWinRenderedLogonEventMaxBytes <=
+                  kWinInboundLogonOutputCap,
+              "wevtutil /c count must fit the runner output cap");
 
 } // namespace
 
@@ -1362,9 +1376,10 @@ std::vector<MapDriveEntry> enumerate_mapdrive() {
 static std::vector<MapDriveHistoryRow> enumerate_mapdrive_history_inbound() {
     // Inbound history: Security event log 4624 (successful logon), filtered to
     // logon_type=3 (network) by the parser. Query 4624 ONLY — 4634 (logoff) is
-    // not parsed, so including it would waste up to half the newest-first /c:5000
+    // not parsed, so including it would waste up to half the newest-first event
     // budget on events we discard, halving the effective backfill depth. Bounded
-    // read; constant query (no interpolation). Empty on access denial.
+    // read; constant query (the only formatted part is the compile-time event
+    // count). Empty on access denial.
     //
     // The \" quotes the old shell string wrapped around the XPath were
     // SHELL-level protection (so the space-and-bracket-laden filter survived
@@ -1377,12 +1392,21 @@ static std::vector<MapDriveHistoryRow> enumerate_mapdrive_history_inbound() {
                                      "qe",
                                      "Security",
                                      "/q:*[System[(EventID=4624)]]",
-                                     "/c:5000",
+                                     std::format("/c:{}", kWinInboundLogonEventCount),
                                      "/f:text",
                                      "/rd:true"};
     auto run = yuzu::agent::run_bounded_subprocess(
         argv, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(15),
-                                             .output_cap_bytes = 8u * 1024 * 1024});
+                                             .output_cap_bytes = kWinInboundLogonOutputCap});
+    // Count/cap relation, measured live on kingsley 2026-10-22 (31,362-record
+    // Security log): /c:5000 rendered 13.1 MB, over the 8 MiB cap, so the former
+    // call tripped output_truncated and recorded no row on the measured host;
+    // /c:500 stays inside the cap (rendered size at the constants above);
+    // wevtutil alone ~0.3 s to a file, the runner's capture adds
+    // build-dependent time (~4 s per fresh data dir in a Debug build on one host,
+    // Release not measured). kWinInboundLogonEventCount is pinned against the
+    // cap by the static_assert beside the constants.
+    //
     // zero_exit_required=true is ASSUMED from documented wevtutil behaviour
     // (`wevtutil qe` exits 0 on a successful query including zero matching
     // events, non-zero on a channel/query error), NOT independently verified

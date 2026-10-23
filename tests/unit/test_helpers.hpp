@@ -139,7 +139,7 @@ struct TempDir {
 };
 
 /// RAII guard for a per-test SQLite database file. Cleans up the base
-/// `.db` plus the `-wal` and `-shm` companion files on destruction. Declare
+/// `.db` plus the `-wal`, `-shm` and `-journal` companion files on destruction. Declare
 /// this as the FIRST member of any test harness that opens SQLite so the
 /// destructor fires even if downstream construction throws — partial-
 /// construction leak pattern documented in `feedback_governance_run.md`
@@ -173,6 +173,8 @@ struct TempDbFile {
         std::filesystem::remove(path, ec);
         std::filesystem::remove(std::filesystem::path(path.string() + "-wal"), ec);
         std::filesystem::remove(std::filesystem::path(path.string() + "-shm"), ec);
+        // The Windows TarDatabase::open pre-creates an empty -journal beside the database.
+        std::filesystem::remove(std::filesystem::path(path.string() + "-journal"), ec);
     }
 
     TempDbFile(const TempDbFile&) = delete;
