@@ -960,7 +960,7 @@ TEST_CASE("result-set materialiser: membership is never derived from a Forensics
 
 // -- A6: the SQL fold is ASCII-only, like the C++ one --------------------------------------------
 
-TEST_CASE("response tier SQL folds the plugin name as ASCII, whatever the database locale",
+TEST_CASE("response tier SQL folds the plugin name as ASCII (observable on a locale-aware database)",
           "[pg][server][forensics_tier][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, leaks_responsestore_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -973,6 +973,22 @@ TEST_CASE("response tier SQL folds the plugin name as ASCII, whatever the databa
     REQUIRE_FALSE(test::forensics_plugin_set().contains(lookalike));
     put_source_row(store, "exec-fold", "agent-1", "BROWSER_INVENTORY", "upper-ascii");
     put_source_row(store, "exec-fold", "agent-2", lookalike, "lookalike");
+    //
+    // WHAT THIS CAN OBSERVE: only a database whose lower() is locale-aware. On a cluster created
+    // with the C/POSIX locale a plain lower() already leaves U+0130 alone, so this case passes
+    // whether or not the production SQL pins the fold with COLLATE "C"; it still checks the
+    // result, but it cannot tell the two apart there. The INFO line records which kind of
+    // database ran it.
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto probe = yuzu::server::pg::exec_params(
+            lease.get(), "SELECT lower($1::text) = 'browser_inventory'",
+            std::vector<std::string>{"BROWSER_\xC4\xB0NVENTORY"});
+        REQUIRE(probe.status() == PGRES_TUPLES_OK);
+        INFO("database lower() folds U+0130 to i (locale-aware, this case discriminates): "
+             << PQgetvalue(probe.get(), 0, 0));
+    }
     put_source_row(store, "exec-fold", "agent-3", test::kOrdinaryPlugin, "ordinary");
 
     const auto non_holder = ResponseTierFilter::exclude(test::forensics_plugin_set(),

@@ -1598,6 +1598,14 @@ TEST_CASE("executions page detail: a degraded read leaves no response.forensics.
     // The primary (execution-id) read finds only a row whose plugin makes the read fail; the
     // fallback (instruction-id) read then succeeds and returns legacy rows with no execution id,
     // one of them Forensics-tier. A degraded read renders the degraded notice, not those rows.
+    //
+    // PLANNER-DEPENDENT: the injected fault is a function in the view's WHERE clause that raises
+    // for one plugin value. It fires only if the planner evaluates that function on the boom row
+    // (COST 100000 asks for it to run after the cheaper predicates, and the boom row is the one
+    // row the primary read selects). A planner that evaluated it on no row, or on the legacy rows
+    // too, would change what this exercises. The "Responses unavailable." check below is the guard:
+    // it fails if the fault did not happen, so such a change shows up as a red test, never a
+    // silent pass.
     h.store_response("def-other", "agent-B", "TOKEN-BOOM", eid, 1735689610, "boom_b5");
     h.store_response("def-T", "agent-A", "TOKEN-FORENSICS-LEGACY", "", 1735689611,
                      yuzu::server::test::kForensicsPlugin);
