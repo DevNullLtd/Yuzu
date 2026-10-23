@@ -3929,8 +3929,9 @@ test('access users production wiring lexical gate',
   timeout: 30,
 )
 
-# 2a-1b: the typed-source purge thread must start in run(), never the ServerImpl constructor
-# (a later constructor throw would std::terminate on the joinable thread). Source-text only.
+# 2a-1b: the typed-source purge thread must start inside run()'s own body, after the
+# startup_failed_ recheck that follows start_web_server() -- not in the ServerImpl constructor
+# and not inside start_web_server(). Source-text only; carries move-mutation self-tests.
 test('typed-source purge wiring lexical gate (2a-1b)',
   _python3_test,
   args: [files('test_typed_purge_wiring_lexical.py')],

@@ -7771,9 +7771,10 @@ public:
                 // row unreadable (ADR-0070 D12); the purge is hygiene that reclaims
                 // the space. It runs in the BACKGROUND, bounded and batched, and is
                 // never awaited before serving, so boot no longer blocks on an
-                // unbounded DELETE per source. The thread is started in run(), NOT
-                // here: ~16 store constructions follow and a throw would destroy a
-                // joinable std::thread (std::terminate) -- see the start site and
+                // unbounded DELETE per source. The thread is started in run()'s own
+                // body after the startup_failed_ recheck, NOT here: ~16 store
+                // constructions follow and a throw would destroy a joinable
+                // std::thread (std::terminate) -- see the start site and
                 // tests/test_typed_purge_wiring_lexical.py.
             }
         }
@@ -8967,6 +8968,51 @@ public:
                          "stopping the already-started agent/management gRPC listeners.");
             stop();
             return;
+        }
+
+        // Typed-source purge (inventory_store.purge_typed_sources, 2a-1b): one-shot
+        // background hygiene pass over the generic InventoryStore. Started here, in run()'s
+        // OWN body after the startup_failed_ recheck that follows start_web_server(), so a
+        // server that refused to start (constructor failure, SCIM / cipher-pin / step-up
+        // aborts inside start_web_server()) never runs it and a constructor throw never
+        // leaves a joinable std::thread (std::terminate). Never awaited, not part of
+        // readiness. Not std::jthread: stop_requested_ is declared after the thread member,
+        // so an implicit join at member destruction would outlive it.
+        // The start holds lifecycle_mu_, the mutex stop() holds for its whole teardown:
+        // signal handlers are installed before run(), so a watcher-thread stop() can finish
+        // (join is a no-op, inventory_store_ reset, teardown_complete_ set) before this
+        // line; launching then would leave a thread that is never joined and reads a reset
+        // pointer. Under the lock either stop() has not begun (it will join this thread) or
+        // it has finished (skip). stop() never needs this thread to take lifecycle_mu_, so
+        // the join cannot deadlock.
+        // A delete of rows that must not exist, with no clock cutoff: clock-guarded-retention
+        // parts 1-4, 6 and 7 are n/a (recorded in docs/clock-guarded-retention.md); the
+        // per-batch bound is part 5 (the per-pass total is not bounded).
+        {
+            std::lock_guard<std::mutex> life(lifecycle_mu_);
+            if (!teardown_complete_ && !stop_requested_.load(std::memory_order_acquire) &&
+                inventory_store_ && inventory_store_->is_open()) {
+                typed_purge_thread_ = std::thread([this]() {
+                    YUZU_ASSERT_BACKGROUND_JOB("inventory_store.purge_typed_sources"); // WS-10 ReplicaSafe
+                    const auto r = inventory_store_->drain_typed_sources(
+                        InventoryStore::TypedPurgeOptions{},
+                        [this] { return stop_requested_.load(std::memory_order_acquire); });
+                    using St = InventoryStore::TypedPurgeStatus;
+                    if (r.status == St::kFailed)
+                        spdlog::warn("[PG] Typed-source purge failed after removing {} row(s): {} "
+                                     "(non-fatal hygiene sweep; stray rows stay unreadable)",
+                                     r.rows, r.cause);
+                    else if (r.status == St::kStopped)
+                        spdlog::info("[PG] Typed-source purge stopped by shutdown after {} row(s)",
+                                     r.rows);
+                    else if (r.rows > 0)
+                        spdlog::info("[PG] Typed-source purge finished: {} stray row(s) removed "
+                                     "from the generic inventory store",
+                                     r.rows);
+                    else
+                        spdlog::debug("[PG] Typed-source purge finished: no stray rows");
+                });
+            }
         }
 
         // Start certificate hot-reload watcher
@@ -17817,38 +17863,6 @@ private:
             // matching line for the full rationale.
             spdlog::info("Schedule runner thread stopped");
         });
-
-        // Typed-source purge (inventory_store.purge_typed_sources, 2a-1b): one-shot
-        // background hygiene pass over the generic InventoryStore, started HERE (after the
-        // post-start_web_server startup_failed_ recheck) so a server that refused to start
-        // never runs it and a constructor throw never leaves a joinable thread. Never awaited
-        // and not part of readiness. Not std::jthread: stop_requested_ is declared after the
-        // thread member, so an implicit join at member destruction would outlive it.
-        // A delete of rows that must not exist, with no clock cutoff: clock-guarded-retention
-        // parts 1-4, 6 and 7 are n/a (recorded in docs/clock-guarded-retention.md); the
-        // bounded batch is part 5.
-        if (inventory_store_ && inventory_store_->is_open()) {
-            typed_purge_thread_ = std::thread([this]() {
-                YUZU_ASSERT_BACKGROUND_JOB("inventory_store.purge_typed_sources"); // WS-10 ReplicaSafe
-                const auto r = inventory_store_->drain_typed_sources(
-                    InventoryStore::TypedPurgeOptions{},
-                    [this] { return stop_requested_.load(std::memory_order_acquire); });
-                using St = InventoryStore::TypedPurgeStatus;
-                if (r.status == St::kFailed)
-                    spdlog::warn("[PG] Typed-source purge failed after removing {} row(s): {} "
-                                 "(non-fatal hygiene sweep; stray rows stay unreadable)",
-                                 r.rows, r.cause);
-                else if (r.status == St::kStopped)
-                    spdlog::info("[PG] Typed-source purge stopped by shutdown after {} row(s)",
-                                 r.rows);
-                else if (r.rows > 0)
-                    spdlog::info("[PG] Typed-source purge finished: {} stray row(s) removed "
-                                 "from the generic inventory store",
-                                 r.rows);
-                else
-                    spdlog::debug("[PG] Typed-source purge finished: no stray rows");
-            });
-        }
 
         // Result-set maintenance thread (capability §30) — materialises pending
         // result sets once their producing execution reaches a terminal state,

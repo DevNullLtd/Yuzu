@@ -948,7 +948,7 @@ ingest is failing. Four further series sharpen the picture:
   flat counter after the first minutes is normal.
 - `yuzu_inventory_typed_purge_failures_total` (counter) — background purge passes that gave up after a failed
   batch (closed store, pool timeout, SQL error, 20 s statement timeout) and its retries with backoff
-  at smaller batch sizes. The pass is not retried until the next boot;
+  at smaller batch sizes. The pass is not retried until the next boot; **a restart re-runs it**, which is the remediation once the database is healthy;
   stray rows stay unreadable meanwhile. Any non-zero value after a boot is worth a look at the
   Postgres pool, not a page. Readiness does not depend on the pass.
 - `yuzu_inventory_query_truncated_total` (counter) — generic-store reads that hit their

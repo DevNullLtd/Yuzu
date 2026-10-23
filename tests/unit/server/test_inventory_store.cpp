@@ -379,6 +379,89 @@ TEST_CASE("InventoryStore purge_typed_sources_batch deletes only typed rows, bou
     }
 }
 
+TEST_CASE("InventoryStore drain_typed_sources retries, halves, rescans once and never calls a "
+          "peer-locked backlog completed",
+          "[pg][inventory]") {
+    INVENTORY_SHARED(store, pool);
+    using St = InventoryStore::TypedPurgeStatus;
+    for (int i = 0; i < 6; ++i)
+        store.upsert("agent-" + std::to_string(i), "app_usage", R"({"n":1})", 1000);
+    InventoryStore::TypedPurgeOptions opt;
+    opt.pause = opt.backoff = std::chrono::milliseconds{0};
+
+    SECTION("a failing batch halves down to the floor, succeeds, and the pass completes") {
+        opt.batch_rows = 64;
+        opt.min_batch_rows = 8;
+        opt.max_attempts = 3;
+        std::vector<int> sizes;
+        opt.test_fail_batch = [&](int n) {
+            sizes.push_back(n);
+            return sizes.size() <= 3; // fail the first three attempts
+        };
+        const auto r = store.drain_typed_sources(opt);
+        REQUIRE(sizes.size() >= 4);
+        CHECK(sizes[0] == 64);
+        CHECK(sizes[1] == 32);
+        CHECK(sizes[2] == 16);
+        CHECK(sizes[3] == 8);
+        CHECK(r.status == St::kCompleted);
+        CHECK(r.rows == 6);
+    }
+    SECTION("attempts are bounded: always-failing gives up after max_attempts retries") {
+        opt.batch_rows = 64;
+        opt.min_batch_rows = 20;
+        opt.max_attempts = 2;
+        std::vector<int> sizes;
+        opt.test_fail_batch = [&](int n) {
+            sizes.push_back(n);
+            return true;
+        };
+        yuzu::MetricsRegistry m;
+        store.set_metrics(&m);
+        const auto r = store.drain_typed_sources(opt);
+        CHECK(r.status == St::kFailed);
+        CHECK(sizes == std::vector<int>{64, 32, 20}); // halving stops at the floor
+        CHECK(r.cause.find("injected batch failure") != std::string::npos);
+        CHECK(r.rows == 0);
+        CHECK(raw_row_count(pool, "app_usage") == 6);
+        CHECK(m.counter("yuzu_inventory_typed_purge_failures_total").value() == 1.0);
+    }
+    SECTION("the from-the-start rescan runs exactly once") {
+        opt.batch_rows = 10; // one batch takes all six; then cursor-zero, rescan-zero
+        int calls = 0;
+        opt.test_fail_batch = [&](int) {
+            ++calls;
+            return false;
+        };
+        const auto r = store.drain_typed_sources(opt);
+        CHECK(r.status == St::kCompleted);
+        CHECK(r.rows == 6);
+        CHECK(calls == 3);
+    }
+    SECTION("rows locked by a peer end the pass as failed, never completed; unlocking drains") {
+        auto peer = pool.acquire();
+        REQUIRE(peer);
+        pg::PgResult begin{PQexec(peer.get(), "BEGIN")};
+        REQUIRE(begin.status() == PGRES_COMMAND_OK);
+        pg::PgResult lock{PQexec(peer.get(),
+                                 "SELECT 1 FROM inventory_store.inventory_data "
+                                 "WHERE plugin = 'app_usage' FOR UPDATE")};
+        REQUIRE(lock.status() == PGRES_TUPLES_OK);
+
+        opt.max_attempts = 1;
+        const auto blocked = store.drain_typed_sources(opt);
+        CHECK(blocked.status == St::kFailed);
+        CHECK(blocked.cause.find("locked") != std::string::npos);
+        CHECK(blocked.rows == 0);
+        CHECK(raw_row_count(pool, "app_usage") == 6);
+
+        pg::PgResult rb{PQexec(peer.get(), "ROLLBACK")};
+        const auto freed = store.drain_typed_sources(opt);
+        CHECK(freed.status == St::kCompleted);
+        CHECK(freed.rows == 6);
+    }
+}
+
 TEST_CASE("InventoryStore reads never return a typed source's stray row (ADR-0070 D12)",
           "[pg][inventory]") {
     INVENTORY_SHARED(store, pool);

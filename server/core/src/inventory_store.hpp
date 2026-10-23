@@ -201,6 +201,9 @@ public:
         int max_attempts{4};      ///< retries after a failed batch before giving up
         std::chrono::milliseconds pause{100};   ///< between batches (interruptible)
         std::chrono::milliseconds backoff{500}; ///< x failure count, interruptible
+        /// TEST ONLY: called with the batch size after the lease is held; true makes that
+        /// batch fail as a statement error would.
+        std::function<bool(int)> test_fail_batch;
     };
 
     /// Delete at most `max_rows` stray rows of `kTypedInventorySources` (across ALL
@@ -212,7 +215,8 @@ public:
 
     /// The background pass (ADR-0070 D12 hygiene -- the read filter and the gateway
     /// skip are the controls; this reclaims space): keyset batches in primary-key
-    /// order until none remain. A failed batch is retried with backoff at half the
+    /// order until none remain. A failed batch (or one that found every remaining
+    /// typed row locked by a peer, which is never reported as completion) is retried with backoff at half the
     /// size (down to the floor) before the pass gives up; `should_stop` is polled
     /// between batches and during every pause. Counts
     /// `yuzu_inventory_typed_purge_rows_total` per batch and
@@ -228,9 +232,11 @@ private:
     struct PurgeBatch {
         std::int64_t deleted{0};
         std::string last_agent, last_plugin; ///< last key deleted; empty when none
+        bool more_locked{false}; ///< typed rows remain after the cursor that this batch skipped
     };
-    [[nodiscard]] std::optional<PurgeBatch> purge_batch(int max_rows, const std::string& after_agent,
-                                                        const std::string& after_plugin);
+    [[nodiscard]] std::optional<PurgeBatch>
+    purge_batch(int max_rows, const std::string& after_agent, const std::string& after_plugin,
+                const TypedPurgeOptions* hook, std::string* err);
 
     pg::PgPool& pool_;
     bool open_{false};
