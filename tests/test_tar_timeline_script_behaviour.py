@@ -17,13 +17,18 @@ Rules under test:
   - every panel request carries HX-Request; a 401 or a redirect ends the session once: playback
     stops, both panels are aborted, nothing else is written and /login is assigned once;
   - a held key moves the line on every repeat but requests at most once a second (one immediate,
-    one trailing with the newest time, none at all at the window edge); a request in flight is
-    never answered with another one from the timer;
+    one trailing with the newest time, none at all at the window edge, none when it comes back to
+    the time already shown); a request in flight is never answered with another one from the
+    timer, unless it has gone unanswered for ten seconds;
+  - a click (block, Previous / Next) is one deliberate choice: it requests at once, even inside
+    the second after another commit, and a click that changes nothing requests nothing, unless
+    a panel failed and a repeat click retries it;
   - playback moves the line by speed x elapsed time, commits at most once a second and only once
     the previous answer is in, and stops at the window end, on Pause, on any manual move, on a
     failed panel, when the tab is hidden and when the instance is replaced;
-  - a scrub that cannot capture the pointer, is cancelled or loses its button never sticks, and
-    Play cannot start during one; a modified or middle click on a link is left to the browser.
+  - a scrub that cannot capture the pointer, is cancelled or loses its button or its capture
+    never sticks, and Play cannot start during one; a modified or middle click on a link is left
+    to the browser.
 
 Skips (77) when `node` is not on PATH. Stdlib only.
 """
@@ -201,7 +206,7 @@ function build(o) {
   const env = { document: doc, fetch: fetchStub, AbortController: AC,
     location: { origin: 'https://yuzu.test', pathname: '/tar/timeline', search: '?id=agent-1&stale=1',
                 assign: (u) => ctx.assigned.push(u) },
-    navigator: { clipboard: { writeText: (t) => { ctx.clip.push(t); return o && o.clipFail ? Promise.reject(new Error('no')) : Promise.resolve(); } } },
+    navigator: o && o.noClip ? {} : { clipboard: { writeText: (t) => { ctx.clip.push(t); return o && o.clipFail ? Promise.reject(new Error('no')) : Promise.resolve(); } } },
     now: () => ctx.clockNow,
     setInterval: (f, ms) => { const h = ctx.nextH++; ctx.intervals.set(h, { f, ms }); return h; },
     clearInterval: (h) => { ctx.intervals.delete(h); } };
@@ -262,6 +267,7 @@ const tap = (ctx, el, init) => { ctx.clockNow += 1000; return fire(el, 'click', 
     eq([rg.getAttribute('aria-label'), rg.getAttribute('aria-valuetext')], ['Time, in seconds', '1970-01-01T00:02:30Z'],
        'the range is named and reads the moment as a time');
     eq([c.play.disabled, c.speed.disabled, c.note.textContent], [false, false, ''], 'playback is available');
+    eq(c.speed.getAttribute('aria-label'), null, 'the speed button is named by its text, not an aria-label that would hide it');
     fire(c.body, 'htmx:afterSettle', { target: t.body });
     eq([urls(c).length, t.root.querySelectorAll('.tl-scrub').length], [1, 1], 'a repeated settle is a no-op');
     key(c, 'ArrowRight');
@@ -350,6 +356,67 @@ const tap = (ctx, el, init) => { ctx.clockNow += 1000; return fire(el, 'click', 
     eq(urls(c).slice(7), [MOM + '179'], 'and clears the selection');
   }
 
+  // ---- a click is one deliberate choice: immediate, even inside the second after another commit
+  {
+    const c = build(); const t = show(c);
+    fire(t.body, 'pointerdown', { clientX: 780, pointerId: 1 });
+    fire(t.body, 'pointermove', { clientX: 1280, buttons: 1 });
+    fire(t.body, 'pointerup', {});                    // the release commits 200
+    c.clockNow += 100;
+    fire(t.buttons[0], 'click', {});
+    eq(urls(c).slice(2), [MOM + '130', SEL + 'p1&at=130'], 'a block click 100 ms after a scrub release requests both panels at once');
+    eq([t.buttons[0].classes.has('on'), c.intervals.size], [true, 0], 'the highlight and the panels agree, and nothing is owed to the timer');
+    const a = new El('a'); a.attrs['data-ts'] = '120'; c.moment.appendChild(a);
+    c.clockNow += 100;
+    ok(fire(a, 'click', {}).defaultPrevented, 'Previous / Next is ours');
+    eq(urls(c).slice(4), [MOM + '120', SEL + 'p1&at=120'], 'and so is its refresh, 100 ms after that: both panels, at once');
+    eq(c.intervals.size, 0, 'again with nothing owed to the timer');
+  }
+
+  // ---- a click that changes nothing requests nothing: a held Enter on a button repeats the click
+  {
+    const c = build(); const t = show(c, { blocks: [{ ref: 'p1', ts: 130 }, { ref: 'p2', ts: 130 }, { ref: null, ts: 180 }] });
+    tap(c, t.buttons[0], {});
+    const n = urls(c).length;
+    eq(n, 3, 'the first click on a block requests both panels');
+    for (let i = 0; i < 20; i++) fire(t.buttons[0], 'click', {});
+    eq(urls(c).length, n, 'twenty more clicks on the same block request nothing');
+    const a = new El('a'); a.attrs['data-ts'] = '130'; c.moment.appendChild(a);
+    ok(fire(a, 'click', {}).defaultPrevented, 'a Previous / Next link to the time already shown is still ours');
+    eq(urls(c).length, n, 'and requests nothing');
+    fire(t.buttons[1], 'click', {});
+    eq(urls(c).slice(n), [MOM + '130', SEL + 'p2&at=130'], 'the same time with another item is a change: both panels');
+    keyRaw(c, 'ArrowRight');                          // inside the second: the line moves, the commit is owed
+    eq(c.intervals.size, 1, 'the key owes a commit');
+    fire(t.buttons[1], 'click', {});
+    eq([t.chip.textContent, urls(c).length], ['1970-01-01T00:02:10Z', n + 2], 'a click back on the block shown moves the line back and requests nothing');
+    c.tick();
+    eq([c.intervals.size, urls(c).length], [0, n + 2], 'and the commit the key had owed is dropped');
+    tap(c, t.buttons[2], {});
+    eq(urls(c).slice(n + 2), [MOM + '180'], 'a block with no item is a change when the item or time differs');
+    for (let i = 0; i < 5; i++) fire(t.buttons[2], 'click', {});
+    eq(urls(c).length, n + 3, 'and then asks for nothing more');
+  }
+
+  // ---- a failed panel is asked again by a repeat click, but a held Enter does not repeat the retry
+  {
+    const c = build(); const t = show(c);
+    tap(c, t.buttons[0], {});                          // p1 at 130
+    status(c.fetches[2], 500); await flush();          // the selected panel failed
+    eq(c.selected.getAttribute('role'), 'alert', 'the selected panel failed');
+    const m = c.fetches.length;
+    fire(t.buttons[0], 'click', {});
+    eq(urls(c).slice(m), [MOM + '130', SEL + 'p1&at=130'], 'a repeat click on the item whose panel failed asks again');
+    for (let i = 0; i < 20; i++) fire(t.buttons[0], 'click', {});
+    eq(urls(c).length, m + 2, 'and twenty more while that retry is out ask for nothing');
+    const d = build(); show(d);
+    status(d.fetches[0], 500); await flush();          // the moment panel failed
+    const k = d.fetches.length;
+    const a = new El('a'); a.attrs['data-ts'] = '150'; d.moment.appendChild(a);
+    fire(a, 'click', {});
+    eq(urls(d).slice(k), [MOM + '150'], 'a failed moment panel is asked again by a click on the time shown');
+  }
+
   // ---- no selection puts the shell's prompt back: on a count-block click and on a rebind
   {
     const c = build(); const t = show(c);
@@ -421,6 +488,10 @@ const tap = (ctx, el, init) => { ctx.clockNow += 1000; return fire(el, 'click', 
     fire(t.body, 'pointerdown', { clientX: 100, pointerId: 7, button: 2 });
     fire(t.body, 'pointerdown', { clientX: 780, pointerId: 7, button: 2 });
     eq(t.root.classes.has('scrubbing'), false, 'a press with another button is not a scrub');
+    const caps = t.body.captured.length, before = urls(c).length;
+    fire(t.body, 'pointerdown', { clientX: 780, pointerId: 7, button: 1 });
+    eq([t.root.classes.has('scrubbing'), t.body.captured.length, urls(c).length], [false, caps, before],
+       'a middle-button press is not a scrub, captures nothing and requests nothing');
   }
 
   // ---- a scrub never sticks and never races Play
@@ -461,6 +532,20 @@ const tap = (ctx, el, init) => { ctx.clockNow += 1000; return fire(el, 'click', 
     fire(t.body, 'pointerup', {});
     fire(c.play, 'click', {});
     eq(c.play.attrs['aria-pressed'], 'true', 'and works once the scrub is over');
+  }
+  {
+    const c = build(); const t = show(c);
+    fire(t.body, 'pointerdown', { clientX: 780, pointerId: 1 });
+    fire(t.body, 'pointermove', { clientX: 1280, buttons: 1 });
+    fire(t.body, 'lostpointercapture', {});          // the capture went and no pointerup came
+    eq([t.root.classes.has('scrubbing'), urls(c)[1]], [false, MOM + '200'], 'losing the pointer capture with no pointerup ends the scrub and commits where the line was');
+    fire(t.body, 'pointermove', { clientX: 300, buttons: 1 });
+    eq(t.chip.textContent, '1970-01-01T00:03:20Z', 'and the drag is over');
+    const n = urls(c).length;
+    fire(t.body, 'pointerdown', { clientX: 780, pointerId: 1 });
+    fire(t.body, 'pointerup', {});
+    fire(t.body, 'lostpointercapture', {});          // the browser's own release after a normal pointerup
+    eq(urls(c).length, n + 1, 'after a normal release the capture going adds no second request');
   }
 
   // ---- failures
@@ -566,6 +651,9 @@ const tap = (ctx, el, init) => { ctx.clockNow += 1000; return fire(el, 'click', 
     const d = build({ clipFail: true }); show(d);
     fire(d.copy, 'click', {}); await flush();
     eq(d.copy.textContent, 'Could not copy', 'copy failure is said');
+    const e = build({ noClip: true }); show(e);
+    fire(e.copy, 'click', {}); await flush();
+    eq([e.copy.textContent, e.clip], ['Could not copy', []], 'a browser with no clipboard is told so, not thrown at');
   }
 
   // ---- playback availability
@@ -595,6 +683,7 @@ const tap = (ctx, el, init) => { ctx.clockNow += 1000; return fire(el, 'click', 
     eq(urls(c)[4], MOM + '163', 'and carries the latest t (153 + 4 ticks of 2.5 s)');
     fire(c.speed, 'click', {}); eq(c.speed.textContent, 'Speed 60x', '10x to 60x');
     fire(c.speed, 'click', {}); eq(c.speed.textContent, 'Speed 1x', '60x back to 1x');
+    eq(c.speed.getAttribute('aria-label'), null, 'and the speed button still has no aria-label');
   }
 
   // ---- playback never answers an unanswered request with another one
@@ -607,6 +696,32 @@ const tap = (ctx, el, init) => { ctx.clockNow += 1000; return fire(el, 'click', 
     await settle(c);                               // positive control: the answer lands
     c.tick();
     eq(urls(c).slice(1), [MOM + '152'], 'the next tick after the answer commits the latest time');
+  }
+
+  // ---- ... unless that request never settles: it is given up on after ten seconds
+  {
+    const c = build(); show(c);                    // the bind request never settles
+    fire(c.play, 'click', {});
+    for (let i = 0; i < 39; i++) c.tick();         // 9.75 s of playback
+    eq([c.fetches.length, c.fetches[0].signal.aborted], [1, false], 'inside the bound the stalled request is still waited for');
+    c.tick();                                      // 10 s
+    eq([urls(c).slice(1), c.fetches[0].signal.aborted, c.intervals.size], [[MOM + '160'], true, 1],
+       'past the bound it is abandoned and the newest time asked for, and playback goes on');
+    c.fetches[0].reject(new Error('aborted')); await flush();
+    eq([c.moment.textContent, c.moment.getAttribute('role'), c.moment.classes.has('busy')], ['', null, true],
+       'the abandoned request says nothing when it dies, and the new one still holds the slot');
+    ok200(c.fetches[1], '<b>fresh</b>'); await flush();
+    eq([c.moment.innerHTML, c.moment.classes.has('busy')], ['<b>fresh</b>', false], 'the new request lands');
+  }
+  {
+    const d = build(); show(d);
+    d.clockNow += 1000; keyRaw(d, 'ArrowRight');   // immediate, and never answered
+    d.clockNow += 100; keyRaw(d, 'ArrowRight');    // owed
+    for (let i = 0; i < 39; i++) d.tick();
+    eq([d.fetches.length, d.fetches[1].signal.aborted, d.intervals.size], [2, false, 1], 'an owed commit still waits for an answer inside the bound');
+    d.tick();
+    eq([urls(d).slice(2), d.fetches[1].signal.aborted, d.intervals.size], [[MOM + '152'], true, 0],
+       'past it the owed commit is made over the stalled request, and the timer goes');
   }
 
   // ---- playback with an item selected: both panels are requested together at each second
@@ -700,6 +815,24 @@ const tap = (ctx, el, init) => { ctx.clockNow += 1000; return fire(el, 'click', 
     for (let i = 0; i < 30; i++) ok(keyRaw(c, 'End').defaultPrevented, 'a held End is still our key');
     for (let i = 0; i < 30; i++) keyRaw(c, 'ArrowRight');
     eq([urls(c).length, c.intervals.size], [base, 0], 'a held key at the window edge requests nothing and leaves no timer');
+  }
+  {
+    const c = build(); show(c);
+    keyRaw(c, 'ArrowRight');                         // inside the second: out ...
+    eq(c.intervals.size, 1, 'the key owes a commit');
+    keyRaw(c, 'ArrowLeft');                          // ... and back to the committed time
+    c.tick();
+    eq([c.intervals.size, urls(c).length], [0, 1], 'a key back at the committed time owes nothing: the timer goes, no request');
+    c.tick(5000);
+    eq(urls(c).length, 1, 'and none follows');
+  }
+  {
+    const c = build(); show(c, { ts: 100 });          // the line sits exactly at the window start
+    fire(c.play, 'click', {});
+    eq(c.play.attrs['aria-pressed'], 'true', 'playing from the window start');
+    const e = keyRaw(c, 'Home');                      // resolves to the time already shown
+    eq([e.defaultPrevented, c.play.attrs['aria-pressed'], c.intervals.size, urls(c).length], [true, 'false', 0, 1],
+       'a key that resolves to the time already shown still stops playback, and requests nothing');
   }
   {
     const c = build(); show(c); await settle(c);

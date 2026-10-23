@@ -18,11 +18,17 @@
  * window already shown; it stops on any manual move, a failed panel request, a hidden tab, the
  * window end, or an unbind.
  *
- * Request rate: a key, nav link or block click moves the line at once, but commits straight away
- * only when the last commit is a second old; inside that second it marks a commit owed and the
- * ONE interval (shared with playback) makes it, with the newest time, once the second is up. The
- * interval never commits while the moment request is still in flight (a slow fragment is not
- * answered with an abort per tick) and is cleared when playback is off and nothing is owed.
+ * Request rate: only a held key (and playback) is throttled. A key moves the line at once, but
+ * commits straight away only when the last commit is a second old; inside that second it marks a
+ * commit owed and the ONE interval (shared with playback) makes it, with the newest time, once
+ * the second is up. A block click, Previous / Next, a linked item, a scrub release and Play
+ * restart commit at once, so the line, the highlight and the panels agree (the newest request
+ * wins and aborts the older). A click that changes nothing (the time and item already shown)
+ * requests nothing, so a held Enter on a focused button cannot repeat a request; a panel that
+ * failed is the exception, and a repeat click asks it again. The interval never commits while
+ * the moment request is still in flight (a slow fragment is not answered with an abort per tick)
+ * unless that request has gone unanswered for STALE_MS: it is then abandoned and the owed commit
+ * made. The interval is cleared when playback is off and nothing is owed.
  * A 401 or a redirect from a panel request means the session ended: one path stops everything
  * and goes to /login once.
  *
@@ -36,6 +42,7 @@
   var SPEEDS = [1, 10, 60];
   var TICK_MS = 250;       // playback timer period
   var THROTTLE_MS = 1000;  // at most one playback commit a second
+  var STALE_MS = 10 * THROTTLE_MS; // a moment request unanswered this long no longer holds back the next commit
   var MAX_DT_MS = 1000;    // a stalled timer never makes the line jump
   var MAX_ISO_TS = 253402300799; // 9999-12-31T23:59:59Z
 
@@ -126,8 +133,8 @@
     var run, clockEl, playBtn, speedBtn, noteEl, copyBtn;
     var copyIdle = '';      // the copy button's own label, restored when the moment moves
     var selectedIdle = null; // the Selected panel's own prompt node, restored when nothing is selected
-    var moment = { el: null, ctl: null };
-    var selected = { el: null, ctl: null };
+    var moment = { el: null, ctl: null, at: 0 };   // at: when the request in ctl started
+    var selected = { el: null, ctl: null, at: 0 };
     var st = null;          // the bound run instance, or null
     var speed = 1;
     var playing = false, timer = null, lastTick = 0, lastCommit = -Infinity;
@@ -178,6 +185,7 @@
       if (slot.ctl) slot.ctl.abort();
       var ctl = new env.AbortController();
       slot.ctl = ctl;
+      slot.at = env.now();
       slot.el.classList.add('busy');
       // HX-Request makes the server answer a signed-out request with 401, not a redirect to a page.
       env.fetch(url, { credentials: 'same-origin', headers: { Accept: 'text/html', 'HX-Request': 'true' }, signal: ctl.signal })
@@ -246,10 +254,11 @@
       timer = null;
     }
 
-    // A time change the operator made: playback yields to it and the line moves now. The panels
-    // follow at once when the last commit is a second old; otherwise the commit is owed and the
-    // timer makes it with the newest time (a held key repeats far faster than a second).
-    function manualCommit(t) {
+    // A key press: playback yields to it and the line moves now. The panels follow at once when
+    // the last commit is a second old; otherwise the commit is owed and the timer makes it with
+    // the newest time (a held key repeats far faster than a second). This is the only throttled
+    // manual path: a click is one deliberate choice and goes through choose().
+    function keyCommit(t) {
       stopPlayback(false);
       if (tl.throttleDue(lastCommit, env.now())) { commit(t); return; }
       setT(t);
@@ -279,9 +288,14 @@
         setT(r.t);
         if (r.done) { stopPlayback(true); return; }
       }
-      // Commit when owed, a second after the last one, and only once the previous answer is in.
+      // A key that came back to the committed time owes nothing.
+      if (pending && Math.floor(st.t) === st.committed) pending = false;
+      // Commit when owed, a second after the last one, and once the previous answer is in; an
+      // answer missing for STALE_MS is given up on (commit aborts it), so a hung request cannot
+      // freeze the panels while the line moves on.
       var owed = pending || (playing && Math.floor(st.t) !== st.committed);
-      if (owed && !scrubbing && !moment.ctl && tl.throttleDue(lastCommit, n)) commit(st.t);
+      var waiting = moment.ctl !== null && n - moment.at < STALE_MS;
+      if (owed && !scrubbing && !waiting && tl.throttleDue(lastCommit, n)) commit(st.t);
       releaseTimer();
     }
 
@@ -391,16 +405,32 @@
     // Only a plain left click is ours; a modified or middle click keeps the browser's own meaning of a link.
     function plainClick(e) { return e.button === 0 && !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey; }
 
+    // A panel that answered with a failure and has no request out: asking again is how it recovers.
+    function failedIdle(slot) {
+      return !slot.ctl && slot.el !== null && slot.el.getAttribute('role') === 'alert';
+    }
+
+    // One deliberate choice (a block, Previous / Next): the line, the highlight and both panels
+    // move together, now. A choice that changes nothing asks for nothing (a held Enter repeats the
+    // click), unless a panel failed and is idle: a repeat click retries it.
+    function choose(ts, ref) {
+      stopPlayback(false);
+      var same = ref === st.ref && Math.floor(ts) === st.committed && !failedIdle(moment) && !failedIdle(selected);
+      if (ref !== st.ref) {
+        st.ref = ref;
+        markOn(ref);
+        if (ref === null) clearSelection();
+      }
+      if (same) setT(ts); else commit(ts);
+    }
+
     function onClick(e) {
       if (!st) return;
       var b = e.target.closest('button[data-ts]');
       if (!b) return;
       var ts = tl.epochAttr(b.getAttribute('data-ts'));
       if (isNaN(ts)) return;
-      st.ref = b.getAttribute('data-ref') || null;
-      markOn(st.ref);
-      if (st.ref === null) clearSelection();
-      manualCommit(ts);
+      choose(ts, b.getAttribute('data-ref') || null);
     }
 
     function onCopy() {
@@ -427,6 +457,9 @@
       run.addEventListener('pointerdown', onPointerDown);
       run.addEventListener('pointermove', onPointerMove);
       run.addEventListener('pointerup', onPointerEnd);
+      // The browser drops the capture when the pointer goes away or the body leaves the document,
+      // even if pointerup never arrives; after a normal pointerup this is a no-op.
+      run.addEventListener('lostpointercapture', onPointerEnd);
       run.addEventListener('pointercancel', onPointerCancel);
       run.addEventListener('click', onClick);
       run.addEventListener('input', function (e) {
@@ -442,8 +475,10 @@
         var n = tl.keyStep(e.key, st.t, st.from, st.to);
         if (n === null) return;
         e.preventDefault();
-        if (n === st.t) return; // already there (a held key at the window edge): nothing to request
-        manualCommit(n);
+        // Already there (a held key at the window edge): nothing to request, but a key is still a
+        // manual move and playback yields to it.
+        if (n === st.t) { stopPlayback(false); return; }
+        keyCommit(n);
       });
       if (moment.el) moment.el.addEventListener('click', function (e) {
         var a = e.target.closest('a[data-ts]');
@@ -451,7 +486,7 @@
         var ts = tl.epochAttr(a.getAttribute('data-ts'));
         if (isNaN(ts)) return;
         e.preventDefault();
-        manualCommit(ts);
+        choose(ts, st.ref);
       });
       if (selected.el) selected.el.addEventListener('click', function (e) {
         var a = e.target.closest('a[data-ref]');

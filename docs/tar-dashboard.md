@@ -358,9 +358,13 @@ operator-visible. A signed-out request is redirected to sign in; a missing `id` 
   Previous/Next anchors `a[data-ts]`, block buttons `button[data-ts]` (with a `data-ref`
   when the block is one item), and the selected panel's linked-item anchors
   `a[data-ref][data-ts]`. Every number is plain digits (at most 15): `0x10`, `1e3` or a
-  missing `data-ts` makes the window invalid. The renderers emit all of these. The run fragment is expected to poll its own result with `hx-target="this"` (as
-  the process tree does); a failed load or poll anywhere inside `#tl-run` is reported
-  in the run slot with the HTTP status.
+  missing `data-ts` makes the window invalid. The renderers emit all of these.
+  The run fragment is expected to poll its own result with `hx-target="this"` (as the
+  process tree does). A load inside `#tl-run` that is refused, never reaches the server
+  or times out ends the run view with a note ("Could not load the record (HTTP n)." or
+  "Could not reach the server."): the poll does not retry, so the page needs a reload.
+  The run slot's own 401 is handled by htmx, not by the script: a signed-out `HX-Request`
+  gets 401 with `HX-Redirect: /home`, which htmx follows.
 - **What the script does.** It binds once per run instance (a repeated or unrelated
   settle changes nothing; a new instance rebinds from its own moment). An invalid window,
   or one without a playhead, gets no controls and no requests. Drag, click and the
@@ -372,20 +376,23 @@ operator-visible. A signed-out request is redirected to sign in; a missing `id` 
   "Could not reach the server." (failures are announced as alerts, a landed panel is not).
   Every panel request sends `HX-Request: true`, so the server answers a signed-out one with
   401; a 401 or a redirected answer ends the session once: playback stops, both panel
-  requests are aborted and the browser goes to `/login`. A load inside `#tl-run` that is
-  refused, never reaches the server or times out is reported in the run slot.
+  requests are aborted and the browser goes to `/login`.
 - **Playback.** Play/Pause and a 1x / 10x / 60x speed move the moment line through the
   window already loaded; they do not show live data. Each step advances the line by
   speed times elapsed time, clamped to the window; a stalled timer (a throttled or
   suspended tab) counts at most one second of elapsed time per step, so the line never
-  leaps. It stops at the window end (no loop),
-  on Pause, on any manual move, on a failed panel request, when the tab is hidden and
-  when the run instance is replaced. Panel requests, during playback and for a held key
-  alike, are limited to one a second (the newest time wins) and wait for the previous
-  answer; stopping on Pause, the window end or a hidden tab commits the exact stop time
-  once so the panels agree with the line. A click on a linked item in the Selected panel
-  stops playback; Play at the window end restarts from the window start. Play is disabled
-  with a note when the window is a day or longer or not valid.
+  leaps. It stops at the window end (no loop), on Pause, on any manual move, on a failed
+  panel request, when the tab is hidden and when the run instance is replaced.
+  Repeated time changes (playback and a held key) are limited to one panel refresh a
+  second, the newest time wins, and the timer waits for the previous answer; an answer
+  still missing after ten seconds is abandoned and a fresh request made. A click on a
+  block, on Previous / Next or on a linked item, a scrub release, Play restart and the
+  first move after a quiet second refresh the panels at once. A click on what is already
+  shown (the same time and item) asks for nothing, unless its panel failed, in which case
+  it asks again. Stopping on Pause, the window end or a hidden tab commits the exact stop
+  time once so the panels agree with the line. A click on a linked item in the Selected
+  panel stops playback; Play at the window end restarts from the window start. Play is
+  disabled with a note when the window is a day or longer or not valid.
 
 The fragments themselves, their permissions and audit are separate work. What the page
 assumes of them:
