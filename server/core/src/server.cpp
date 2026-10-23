@@ -124,6 +124,8 @@
 #include "software_inventory_store.hpp"
 #include "software_licensing_store.hpp"
 #include "app_usage_store.hpp"
+#include "certificate_inventory_ingestion.hpp"
+#include "certificate_inventory_store.hpp"
 #include "app_usage_routes.hpp"
 #include "product_registry_store.hpp"
 #include "sle_routes.hpp"
@@ -2029,6 +2031,7 @@ public:
                           "Inventory-report ingest outcomes by source and outcome "
                           "(stored/touched/need_full/error/dropped/rejected/rejected_depth)",
                           "counter");
+        cert_ingest_metric::register_metrics(metrics_); // slice-2 PR 2a-2a
         metrics_.describe("yuzu_inventory_ingest_duration_seconds",
                           "Time to apply one inventory source's report - the pooled-connection + "
                           "transaction hold time per ingest, by source and phase "
@@ -7923,6 +7926,26 @@ public:
                     gateway_service_->set_app_usage_store(app_usage_store_.get());
             }
         }
+        // Typed fleet certificate inventory — born-on-Postgres (slice-2 PR 2a-2a, ADR-0070 D12,
+        // ADR-0016 §5, schema `cert_inventory`). Independent of the stores above (its own schema,
+        // its own fail-closed). Wires BOTH server entry points (direct ReportInventory + gateway
+        // ProxyInventory) to the certificate_inventory ingest seam. A store that failed to open
+        // would make ingest acknowledge nothing and (from 2a-2b) every certificate read answer
+        // 503, so the server refuses to start (ADR-0007/0008) and /readyz covers it.
+        if (pg_pool_ && !startup_failed_) {
+            certificate_inventory_store_ = std::make_unique<CertificateInventoryStore>(*pg_pool_);
+            if (!certificate_inventory_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: certificate_inventory store migration/open "
+                              "failed (database reachable but the cert_inventory schema could not "
+                              "be created/opened)");
+                startup_failed_ = true;
+            } else {
+                agent_service_.set_certificate_inventory_store(certificate_inventory_store_.get());
+                if (gateway_service_)
+                    gateway_service_->set_certificate_inventory_store(
+                        certificate_inventory_store_.get());
+            }
+        }
 
         // ProductRegistryStore — SLE canonical product identities + match links
         // (ADR-0024 Decision 4). Sibling of the licensing store: its own schema, its
@@ -10250,6 +10273,7 @@ public:
             .software_licensing = software_licensing_store_.get(),
             .app_usage = app_usage_store_.get(),
             .offline_endpoint = offline_endpoint_store_.get(),
+            .certificate_inventory = certificate_inventory_store_.get(),
         }};
         return cascade.decommission(agent_id);
     }
@@ -10945,6 +10969,11 @@ public:
         if (gateway_service_)
             gateway_service_->set_app_usage_store(nullptr);
         app_usage_store_.reset();
+        // Fleet certificate inventory (slice-2 PR 2a-2a): same discipline.
+        agent_service_.set_certificate_inventory_store(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_certificate_inventory_store(nullptr);
+        certificate_inventory_store_.reset();
         // SLE ProductRegistryStore: the /api/v1/sle/* route closures capture `this`
         // and dereference this store only at request time; the gRPC + HTTP drains
         // above have quiesced every handler, so drop it BEFORE the pool (ADR-0012
@@ -16580,6 +16609,7 @@ private:
                              .plugin_config_store = plugin_config_store_.get(),
                              .enablement_store = enablement_store_.get(),
                              .app_usage_store = app_usage_store_.get(),
+                             .certificate_inventory_store = certificate_inventory_store_.get(),
                              .product_registry_store = product_registry_store_.get(),
                              .product_pack_store = product_pack_store_.get(),
                              .scim_store = scim_store_.get(),
@@ -23472,6 +23502,7 @@ private:
     // Per-agent last-used app-usage store (Wave 7 PR7.2, ADR-0016 §5). Declared
     // after pg_pool_ so it destructs before the pool.
     std::unique_ptr<AppUsageStore> app_usage_store_;
+    std::unique_ptr<CertificateInventoryStore> certificate_inventory_store_;
     // SLE canonical product registry (ADR-0024 Decision 4). Declared after pg_pool_
     // so it destructs before the pool; the /api/v1/sle/* routes read it (the UCE
     // module's evaluator writes it, out-of-server).

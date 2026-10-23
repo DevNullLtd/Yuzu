@@ -40,6 +40,8 @@
 #include "software_licensing_store.hpp"
 #include "app_usage_ingestion.hpp"
 #include "app_usage_store.hpp"
+#include "certificate_inventory_ingestion.hpp"
+#include "certificate_inventory_store.hpp"
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
 #include "offload_target_store.hpp"
@@ -1127,6 +1129,24 @@ grpc::Status AgentServiceImpl::ReportInventory(grpc::ServerContext* context,
             response->add_need_full("app_usage");
             spdlog::warn("ReportInventory: app_usage ingest threw unknown exception for agent {} "
                          "— nacked",
+                         agent_id);
+        }
+    }
+    // Typed fleet certificate inventory (slice-2 PR 2a-2a) via its shared seam. A throw nacks, so
+    // the agent resends in full rather than going hash-only over nothing persisted.
+    if (certificate_inventory_store_ && certificate_inventory_store_->is_open()) {
+        try {
+            ingest_certificate_inventory_report(*certificate_inventory_store_, agent_id, *request,
+                                                *response, &metrics_);
+        } catch (const std::exception& ex) {
+            response->add_need_full("certificate_inventory");
+            spdlog::warn("ReportInventory: certificate_inventory ingest threw for agent {} — "
+                         "nacked: {}",
+                         agent_id, ex.what());
+        } catch (...) {
+            response->add_need_full("certificate_inventory");
+            spdlog::warn("ReportInventory: certificate_inventory ingest threw unknown exception "
+                         "for agent {} — nacked",
                          agent_id);
         }
     }

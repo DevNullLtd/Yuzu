@@ -35,6 +35,8 @@
 #include "software_licensing_store.hpp"
 #include "app_usage_ingestion.hpp"
 #include "app_usage_store.hpp"
+#include "certificate_inventory_ingestion.hpp"
+#include "certificate_inventory_store.hpp"
 #include "peer_ip.hpp"
 
 #include <yuzu/log_token.hpp>
@@ -1947,6 +1949,24 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* con
             response->add_need_full("app_usage");
             spdlog::warn("[gateway] ProxyInventory: app_usage ingest threw (unknown) for "
                          "agent={} — nacked",
+                         agent_id);
+        }
+    }
+    // Typed fleet certificate inventory via its shared seam (slice-2 PR 2a-2a) — byte-identical
+    // to the direct ReportInventory path; the generic loop above skips the source.
+    if (certificate_inventory_store_ && certificate_inventory_store_->is_open()) {
+        try {
+            ingest_certificate_inventory_report(*certificate_inventory_store_, agent_id, *request,
+                                                *response, metrics_);
+        } catch (const std::exception& ex) {
+            response->add_need_full("certificate_inventory");
+            spdlog::warn("[gateway] ProxyInventory: certificate_inventory ingest threw for "
+                         "agent={} — nacked: {}",
+                         agent_id, ex.what());
+        } catch (...) {
+            response->add_need_full("certificate_inventory");
+            spdlog::warn("[gateway] ProxyInventory: certificate_inventory ingest threw (unknown) "
+                         "for agent={} — nacked",
                          agent_id);
         }
     }
