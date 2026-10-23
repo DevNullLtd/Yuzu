@@ -13,7 +13,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
+#include <fstream>
+#include <future>
+#include <iterator>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -23,6 +28,28 @@
 using namespace std::chrono_literals;
 using yuzu::server::pg::PgPool;
 using yuzu::server::pg::PgResult;
+
+namespace yuzu::server::pg {
+
+// Friend seam (pg_pool.hpp) for the "does not wait on the pool lock" case: takes the
+// lease-path mutex so the test can hold it while another thread reads the breaker.
+struct PgPoolTestAccess {
+    static std::unique_lock<std::mutex> lock(const PgPool& pool) {
+        return std::unique_lock<std::mutex>{pool.mu_};
+    }
+    // Runs the pool's single breaker-deadline write (the helper both the arm and the clear sites
+    // go through) under the lock it requires, so a test can drive the clear without a live
+    // database.
+    static void set_connect_blocked_until(PgPool& pool,
+                                          std::chrono::steady_clock::time_point t) {
+        std::lock_guard lk{pool.mu_};
+        pool.set_connect_blocked_until_locked(t);
+    }
+};
+
+} // namespace yuzu::server::pg
+
+using yuzu::server::pg::PgPoolTestAccess;
 
 namespace {
 
@@ -243,6 +270,175 @@ TEST_CASE("PgPool failed construction", "[pg][pool]") {
         CHECK(pool.open() == 0);
         CHECK(pool.in_use() == 0);
     }
+}
+
+TEST_CASE("PgPool connect_breaker_open follows the breaker: closed, open, expired, re-armed",
+          "[pool][breaker]") {
+    // No Postgres needed: an unconnectable Unix-socket directory fails every connect at once.
+    // A window of 600-800 ms (base == cap, 75-100% jitter) is long enough to read the open
+    // state right after the failure and short enough to wait out.
+    PgPool pool{{.conninfo = unconnectable_conninfo(),
+                 .size = 2,
+                 .connect_backoff_base = 800ms,
+                 .connect_backoff_cap = 800ms}};
+    REQUIRE(pool.valid());
+
+    // The open reading is only asserted when the test thread was not stalled: the window is
+    // 600-800 ms, and a scheduler stall between the arming failure and the read (a loaded
+    // shared runner) would let it expire legitimately. `t0` is taken BEFORE the failing
+    // acquire, so the true time since arming is never more than `t_read - t0`; when that is
+    // under kOpenReadBudget (well inside the 600 ms minimum) the breaker must still read open.
+    // Otherwise the single assertion is skipped with a note, never failed. No sleep is added.
+    auto check_open_after_failed_acquire = [&pool, kOpenReadBudget = 400ms] {
+        const auto t0 = std::chrono::steady_clock::now();
+        CHECK_FALSE(static_cast<bool>(pool.acquire())); // a failed connect arms the breaker
+        const bool open = pool.connect_breaker_open();
+        const auto elapsed = std::chrono::steady_clock::now() - t0;
+        if (elapsed < kOpenReadBudget) {
+            CHECK(open);
+        } else {
+            WARN("breaker-open assertion skipped: "
+                 << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
+                 << " ms elapsed between the failed connect and the read");
+        }
+    };
+
+    CHECK_FALSE(pool.connect_breaker_open()); // closed before any connect attempt
+
+    check_open_after_failed_acquire();
+
+    // Expiry needs no write: the same stored deadline reads closed once the clock passes it.
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (pool.connect_breaker_open() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(10ms);
+    CHECK_FALSE(pool.connect_breaker_open());
+
+    // A new failed connect after expiry arms it again.
+    check_open_after_failed_acquire();
+}
+
+TEST_CASE("PgPool connect_breaker_open closes at once when the breaker is cleared",
+          "[pool][breaker]") {
+    // The clear site (a connection that succeeds) writes through the same helper as the arm site,
+    // which pairs the stored deadline with the lock-free mirror `connect_breaker_open()` reads. A
+    // clear that updated only the deadline would leave the breaker reading open until it expired.
+    PgPool pool{{.conninfo = unconnectable_conninfo(),
+                 .size = 2,
+                 .connect_backoff_base = 30000ms,
+                 .connect_backoff_cap = 30000ms}};
+    REQUIRE(pool.valid());
+
+    CHECK_FALSE(static_cast<bool>(pool.acquire())); // a failed connect arms a 22-30 s window
+    REQUIRE(pool.connect_breaker_open());
+
+    PgPoolTestAccess::set_connect_blocked_until(pool, {}); // what a successful connect does
+    CHECK_FALSE(pool.connect_breaker_open());
+
+    // The same helper re-arms it: a future deadline reads open, the cleared value reads closed.
+    PgPoolTestAccess::set_connect_blocked_until(pool,
+                                                std::chrono::steady_clock::now() + 30s);
+    CHECK(pool.connect_breaker_open());
+    PgPoolTestAccess::set_connect_blocked_until(pool, {});
+    CHECK_FALSE(pool.connect_breaker_open());
+}
+
+// The case above drives the helper through a friend seam, so it cannot see a clear site that stops
+// calling the helper. This floor scans pg_pool.cpp (comments stripped): the breaker deadline is
+// assigned in exactly one place, inside `set_connect_blocked_until_locked`, together with the
+// store to the lock-free mirror `connect_breaker_open()` reads. A direct assignment at the arm or
+// clear site would update the deadline and leave the mirror stale. It is a source-text floor: it
+// fails if a second assignment appears, not if the helper is made ineffective.
+TEST_CASE("PgPool assigns the breaker deadline only inside its single writer helper",
+          "[pool][breaker][lexical]") {
+    std::ifstream in(std::string(YUZU_SERVER_SRC_DIR) + "/pg/pg_pool.cpp", std::ios::binary);
+    REQUIRE(in.good());
+    const std::string raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+
+    // Strip `//` comments line by line (the file has no `//` inside a string literal that matters
+    // here; a stray one only hides text, which makes the counts smaller and the checks fail loud).
+    std::string src;
+    for (std::size_t at = 0; at < raw.size();) {
+        auto end = raw.find('\n', at);
+        if (end == std::string::npos)
+            end = raw.size();
+        const auto line = raw.substr(at, end - at);
+        src += line.substr(0, line.find("//"));
+        src += '\n';
+        at = end + 1;
+    }
+
+    const auto is_ident = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+    };
+    // Offsets of `name` used as the target of a plain assignment (`name =`, not `name ==`), as a
+    // whole identifier (so `connect_blocked_until_rep_` does not match `connect_blocked_until_`).
+    const auto assignments = [&](std::string_view name) {
+        std::vector<std::size_t> hits;
+        for (auto at = src.find(name); at != std::string::npos; at = src.find(name, at + 1)) {
+            if (at > 0 && is_ident(src[at - 1]))
+                continue;
+            auto next = at + name.size();
+            if (next < src.size() && is_ident(src[next]))
+                continue;
+            while (next < src.size() && (src[next] == ' ' || src[next] == '\t'))
+                ++next;
+            if (next < src.size() && src[next] == '=' &&
+                (next + 1 >= src.size() || src[next + 1] != '='))
+                hits.push_back(at);
+        }
+        return hits;
+    };
+
+    const auto helper_at = src.find("void PgPool::set_connect_blocked_until_locked(");
+    REQUIRE(helper_at != std::string::npos);
+    const auto helper_end = src.find("\n}", helper_at);
+    REQUIRE(helper_end != std::string::npos);
+
+    const auto deadline = assignments("connect_blocked_until_");
+    REQUIRE(deadline.size() == 1);
+    CHECK(deadline[0] > helper_at);
+    CHECK(deadline[0] < helper_end);
+
+    // The mirror is stored from the same helper and nowhere else.
+    constexpr std::string_view kMirrorStore = "connect_blocked_until_rep_.store(";
+    std::size_t stores = 0;
+    std::size_t store_at = 0;
+    for (auto at = src.find(kMirrorStore); at != std::string::npos;
+         at = src.find(kMirrorStore, at + 1)) {
+        ++stores;
+        store_at = at;
+    }
+    REQUIRE(stores == 1);
+    CHECK(store_at > helper_at);
+    CHECK(store_at < helper_end);
+}
+
+TEST_CASE("PgPool connect_breaker_open does not wait on the pool lock", "[pool][breaker]") {
+    PgPool pool{{.conninfo = unconnectable_conninfo(),
+                 .size = 2,
+                 .connect_backoff_base = 5000ms,
+                 .connect_backoff_cap = 5000ms}};
+    REQUIRE(pool.valid());
+
+    // Read once while the lock is unheld: closed.
+    CHECK_FALSE(pool.connect_breaker_open());
+
+    auto read_under_held_lock = [&pool](bool expect_open) {
+        // Hold the lease-path mutex, as a busy lease path would, and read from another thread.
+        auto lk = PgPoolTestAccess::lock(pool);
+        auto fut = std::async(std::launch::async, [&pool] { return pool.connect_breaker_open(); });
+        const auto status = fut.wait_for(2s);
+        const bool prompt = status == std::future_status::ready;
+        // Release before any assertion can unwind: the future's destructor joins the reader.
+        lk.unlock();
+        REQUIRE(prompt);
+        CHECK(fut.get() == expect_open);
+    };
+
+    read_under_held_lock(false);
+
+    CHECK_FALSE(static_cast<bool>(pool.acquire())); // arm (5 s window, outlives this test)
+    read_under_held_lock(true);
 }
 
 TEST_CASE("PgPool logs a connect failure's libpq text on one line",

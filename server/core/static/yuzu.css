@@ -1201,3 +1201,13 @@ td .sub { display: block; overflow: hidden; text-overflow: ellipsis; color: var(
 .tl-ph b.e { left: auto; right: 3px; transform: none; }
 .tl-kmk b { left: 6px; }
 .tl-kmk b.r { left: auto; right: 6px; }
+
+/* -- Timeline page interaction states: yuzu-tar-timeline.js toggles these; tokens only -- */
+.tl-body:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.tl-body { touch-action: pan-y; }
+.tl.scrubbing .tl-body { cursor: grabbing; }
+.tl.scrubbing .tl-b, .tl.scrubbing .tl-t, .tl.scrubbing .tl-c, .tl.scrubbing .tl-k, .tl.scrubbing .tl-d { pointer-events: none; }
+.tl-det.busy { opacity: .6; }
+.tl-det > .tl-empty { padding: 12px 16px; margin: 0; }
+.tl-ctl .btn.play[aria-pressed="true"] { border-color: var(--hl); background: color-mix(in srgb, var(--hl) 22%, transparent); }
+/* -- end Timeline page interaction states -- */
