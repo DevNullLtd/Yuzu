@@ -14,9 +14,14 @@
 //
 // The names answer, answer_unwired and dump_replace are reserved in yuzu::server::mcp: a domain
 // file that defines its own copy next to these gets an ambiguous-call error, so extend the
-// helper instead. answer_unwired answers a non-retryable kInternalError by design (it carries
-// the retry-hint-exempt marker; scripts/ci/check-mcp-retry-hints.py scans this header whenever
-// it is new or changed); a transient fault needs its own a4_error call with a retry hint.
+// helper instead. answer_unwired answers a non-retryable kInternalError by design and has no
+// retry hint. scripts/ci/check-mcp-retry-hints.py scans this header whenever it is new or
+// changed, but only for the guard shape `auto x = call(); if (!x) { ... a4_error(...) ... }`
+// with no retry_after_ms in the code of the guard body (a tripwire, not a proof). It flags
+// nothing today: answer_unwired has no such guard, so it needs no marker, and the line comment
+// inside it exempts nothing. A new helper that adds that guard shape with a retryable error
+// must pass retry_after_ms, or carry `// retry-hint-exempt: <reason>` inside the guard body;
+// a transient fault needs its own a4_error call with a retry hint.
 
 #include "mcp_jsonrpc.hpp"       // kInternalError
 #include "mcp_tool_deps.hpp"     // ToolDeps::audit_fn
@@ -67,7 +72,7 @@ inline void answer_unwired(const ToolCallContext& ctx, std::string_view message,
         yuzu::server::detail::try_persist_audit(ctx.deps->audit_fn, ctx.req, domain.verb, "failure",
                                                 domain.target_type, domain.target_id, detail);
     const bool generic_ok = ctx.audit("failure", detail);
-    // retry-hint-exempt: an unwired provider is a deployment misconfiguration, not a transient fault
+    // No retry hint (-1): an unwired provider is a deployment misconfiguration, not a transient fault.
     answer(ctx, ctx.a4_error(kInternalError, message, {}, -1, {}, domain_ok && generic_ok));
 }
 
