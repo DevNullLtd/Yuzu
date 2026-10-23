@@ -238,6 +238,14 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "default",
 };
 
+// Regression guard (#6367): `resolve_body_cap` must stay usable in a constant
+// expression under -fsanitize=undefined. GCC 15 cannot constant-evaluate the
+// UBSan pointer checks, so a `const BodyCapEntry*` best-match inside it breaks
+// every UBSan leg that compiles `crypto_routes.cpp`'s `static_assert`. This
+// TU is built in those legs too, so a regression fails here, not in the nightly.
+static_assert(resolve_body_cap("PUT", "/api/v1/crypto/dashboard/layout").max_body_bytes > 0);
+static_assert(resolve_body_cap("GET", "/no/such/route").path_class == std::string_view{"default"});
+
 } // namespace
 
 // ── 1. Every table entry resolves to its own cap ─────────────────────────
