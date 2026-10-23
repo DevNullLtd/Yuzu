@@ -695,9 +695,10 @@ TEST_CASE("procperf render: app drill links + escape + the soft empty state",
     CHECK(html.find("/fragments/dex/app?name=") != std::string::npos); // cross-link
     CHECK(html.find("names only") != std::string::npos);
 
-    // The SOFT truthful empty state: off-by-default OR no rollup yet — both said.
+    // The SOFT truthful empty state: disabled on the device OR no rollup yet — both said.
     auto empty = render_dex_procperf_panel({}, "7d");
-    CHECK(empty.find("off by default") != std::string::npos);
+    CHECK(empty.find("on by default") != std::string::npos);
+    CHECK(empty.find("usage-class") == std::string::npos); // the removed opt-in rationale
     CHECK(empty.find("no hourly rollup has completed yet") != std::string::npos);
 }
 

@@ -49,7 +49,7 @@ if host_machine.system() == 'windows'
   tar_deps += cxx.find_library('tdh')      # ETW event decoding (tar_proc_etw, tar_module_etw)
   tar_deps += cxx.find_library('dnsapi')   # DnsQuery_W / DnsRecordListFree (tar_dns_collector)
   tar_deps += cxx.find_library('wintrust') # WinVerifyTrust — image signing (tar_module_etw)
-  tar_deps += cxx.find_library('crypt32')  # CryptQueryObject — signer extraction (tar_module_etw)
+  tar_deps += cxx.find_library('crypt32')  # CertGetNameStringW — signer name from the WinVerifyTrust chain (tar_module_etw)
   tar_deps += cxx.find_library('version')  # GetFileVersionInfoW / VerQueryValueW (tar_proc_perf)
   tar_deps += cxx.find_library('wevtapi')  # EvtQuery / EvtNext / EvtRender (tar_netconn_win)
   tar_deps += cxx.find_library('mpr')      # WNetOpenEnumW / WNetGetUserW — outbound mapped drives (tar_mapdrive_collector)

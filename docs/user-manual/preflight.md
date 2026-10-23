@@ -148,8 +148,8 @@ per-machine pairs"* click, so opening that view is a deliberate, separately-audi
 action.
 
 **Prerequisite:** Verify reads the retained per-device performance history, which only
-exists if **per-application performance collection is enabled** on the devices (it is
-opt-in and off by default). Without it, every Verify comparison returns *insufficient*
+exists if **per-application performance collection** (`procperf_enabled`, on by default)
+has not been disabled on the devices. Without it, every Verify comparison returns *insufficient*
 with no data — pick the cohort accordingly. Even with collection on, a just-upgraded
 candidate version only appears once the upgraded machines have reported it (the next
 daily report after the upgrade), so running Verify immediately after a deploy may show

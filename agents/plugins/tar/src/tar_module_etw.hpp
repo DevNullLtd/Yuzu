@@ -69,8 +69,9 @@ struct ModuleSignVerdict {
 };
 
 /// Verifier callback: full image path → verdict. The real Windows verifier
-/// (WinVerifyTrust + CryptQueryObject, in the .cpp) is wired at drain; tests
-/// inject a fake. A null verifier yields {kUnknown, ""} (never fabricates signed).
+/// (WinVerifyTrust on an open handle, signer from its provider chain, in the .cpp)
+/// is wired at drain; tests inject a fake. A null verifier yields {kUnknown, ""}
+/// (never fabricates signed).
 using ModuleVerifier = std::function<ModuleSignVerdict(const std::string& full_path)>;
 
 /// Bounded cache of signing verdicts keyed by (path, last-write-time), so the
@@ -99,6 +100,32 @@ private:
     std::unordered_map<std::string, Entry> entries_;
     std::size_t cap_;
 };
+
+#ifdef _WIN32
+// Windows shell seams (defined in the .cpp; declared so the Windows-only tests drive the real
+// functions the drain calls). Windows types stay out of this header: a HANDLE is a void*.
+struct ImageHandleCloser {
+    void operator()(void* h) const noexcept; ///< CloseHandle; null is a no-op
+};
+/// An open image file; empty = no handle.
+using ImageHandle = std::unique_ptr<void, ImageHandleCloser>;
+
+/// Opens the IMAGE event's NT path as delivered (`\Device\HarddiskVolumeN\...`) ONCE, through
+/// NtCreateFile with OBJ_DONT_REPARSE: a symbolic link or junction anywhere in the path
+/// (including one planted after the event) fails the open instead of being followed. Callers
+/// classify with image_path_is_local FIRST. Empty on ANY failure: open error, a name-surrogate
+/// reparse point at the leaf, an over-long path, or a build that rejects OBJ_DONT_REPARSE.
+/// Filter-handled tags (WOF/CompactOS, dedup, cloud files) are ordinary images, NOT refused.
+/// Nothing is ever reopened by name.
+[[nodiscard]] ImageHandle open_local_image_no_reparse(const std::string& nt_path);
+
+/// Last-write time of the OPEN image (the SigningCache key), unix seconds; 0 on failure.
+[[nodiscard]] std::int64_t image_mtime_unix(void* image) noexcept;
+
+/// WinVerifyTrust on the OPEN handle (WINTRUST_FILE_INFO::hFile); `nt_path` only fills the
+/// required path field. The signer is the leaf of the provider chain's first signer.
+[[nodiscard]] ModuleSignVerdict verify_image_signature_win(void* image, const std::string& nt_path);
+#endif // _WIN32
 
 /// Owns a real-time ETW session on Microsoft-Windows-Kernel-Process (IMAGE
 /// keyword) and decodes image load/unload into a ModuleEventRing on a dedicated

@@ -1883,13 +1883,14 @@ std::string render_dex_app_fragment(const GuaranteedStateStore* store,
     // already the same canonicalized key at the agent (dex_signal_catalog.cpp),
     // so this is an exact-key join, never a display-name/fuzzy match. Shown
     // regardless of crash history — a quiet app can still have perf history.
+    // macOS has no procperf collector yet — "where a collector exists" avoids
+    // implying one.
     h += "<div class=\"gp-note\">" +
          drill_link("/fragments/dex/perf/app",
                     "app=" + url_encode(process_name) + "&window=" + window,
                     "Performance by version &rarr;") +
-         " &mdash; same process image, retained daily summaries. Per-app sampling is "
-         "opt-in where available.</div>"; // macOS has no procperf collector (or toggle)
-                                           // yet — "where available" avoids implying one
+         " &mdash; same process image, retained daily summaries. Per-app sampling "
+         "(procperf_enabled) is on by default where a collector exists.</div>";
     if (s.signals == 0)
         return h + placeholder("No crashes", "No crashes or hangs recorded for this application.");
 

@@ -10239,7 +10239,7 @@ The one device list behind every Performance drill: worst devices by a metric (d
 
 ### Application performance over time
 
-Per-application CPU / working-set **by version, over the retained window**, across the fleet or one management group — reading the retained Postgres aggregate (B1 per-device daily / B2 fleet rollup), not the live federated device drill. Per-app sampling is opt-in (`procperf_enabled`, off by default); a device contributes only after its first completed UTC midnight. The aggregate surfaces gate `GuaranteedState:Read` and are **not** audited (cohort posture); the per-device drill is behavioural PII and is audited fail-closed (see below). The same shared transform backs these endpoints, the `get_dex_app_perf` / `get_dex_group_app_perf` MCP tools, and the dashboard so the numbers cannot disagree.
+Per-application CPU / working-set **by version, over the retained window**, across the fleet or one management group — reading the retained Postgres aggregate (B1 per-device daily / B2 fleet rollup), not the live federated device drill. Per-app sampling (`procperf_enabled`) is on by default; a device contributes only after its first completed UTC midnight. The aggregate surfaces gate `GuaranteedState:Read` and are **not** audited (cohort posture); the per-device drill is behavioural PII and is audited fail-closed (see below). The same shared transform backs these endpoints, the `get_dex_app_perf` / `get_dex_group_app_perf` MCP tools, and the dashboard so the numbers cannot disagree.
 
 > **Percentile + suppression semantics (all three trend endpoints).** Each `points[]` entry's `cpu_p50`/`cpu_p95`/`ws_p50`/`ws_p95` is either `null` (absent — empty population, **not** zero) or `{value, lower_bound}`. `lower_bound: true` means the percentile fell in the open top histogram bucket, so `value` is a **floor** — render it as "≥ value", never an exact quantile. `hist_stale: true` means the row was stamped under a superseded histogram scheme, so percentiles are withheld (the exact mean/max still stand). **Cohort floor:** `kDexCohortFloor` is **one** device (maintainer ruling, 2026-10-14; previously 10): a `(version, day)` point is published with its stats whenever at least one device contributed, so only a point no device contributed to is suppressed (stats withheld, `device_count` only). A single-device point is therefore published — as a fleet-wide aggregate by application and version with no `agent_id`, behind `GuaranteedState:Read`; the per-device drill remains the audited path. This applies to **both** the fleet and the group endpoints.
 
@@ -12507,7 +12507,7 @@ Dispatch a single-device `tar.configure` with `<source>_enabled=true`. Per-sourc
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `device_id` | string | Yes | The agent ID. Must be in the operator's visible-agent set; otherwise rejected with 404 (same body as not-connected). |
-| `source` | string | Yes | One of `process`, `tcp`, `service`, `user`. Other values rejected with 400 to prevent forged form submissions. The retention-paused list covers the always-on four; opt-in sources (`arp`, `dns`, `procperf`, `netqual`, `module`) are enabled/disabled via the **Capture sources** frame (below), not this route. |
+| `source` | string | Yes | One of `process`, `tcp`, `service`, `user`. Other values rejected with 400 to prevent forged form submissions. The retention-paused list covers the four listed sources; the other sources (`arp`, `dns`, `procperf`, `netqual`, `module`) are enabled/disabled via the **Capture sources** frame (below), not this route. |
 
 **Response:**
 - 200 OK with empty body and an `HX-Trigger` toast on success.
@@ -12524,7 +12524,7 @@ Dispatch a single-device `tar.purge_source` that **permanently drops every wareh
 
 **Confirmation:** the dashboard requires the operator to type the device hostname before this POST fires (a native `prompt()`, CSP-safe). The confirmation is **client-side** — scripted callers that POST directly are still gated by the permission, the per-device visibility check, and the agent-side paused-guard.
 
-**Paused-guard (authoritative, agent-side):** the agent refuses the purge (`source_not_paused`) unless the source currently reports disabled. This closes the scan→purge TOCTOU (a source re-enabled between the operator's scan and the purge is not dropped). The server does **not** enforce a `SOURCE_NOT_PAUSED` check — the retention-paused list is an ephemeral live scan with no persisted paused-state.
+**Paused-guard (authoritative, agent-side):** the agent refuses the purge (`source_not_paused`) unless the source currently reports disabled, and refuses (`config_unreadable`) when the enable flag cannot be read so it cannot confirm that; nothing is purged in either case. This closes the scan→purge TOCTOU (a source re-enabled between the operator's scan and the purge is not dropped). The server does **not** enforce a `SOURCE_NOT_PAUSED` check — the retention-paused list is an ephemeral live scan with no persisted paused-state.
 
 **Request body (form-encoded):**
 
@@ -12559,7 +12559,7 @@ The **agentic-first (A1) structured surface** for the same destructive purge —
 | `source` | string | Yes | One of `process`, `tcp`, `service`, `user`. Others → 400. |
 
 **Responses:**
-- **202 Accepted** — `{"data":{"command_id","device_id","source","agents_reached"},"meta":{"api_version":"v1"}}`. Async: the agent computes `rows_deleted` (and the agent-side `source_not_paused` refusal if the source was re-enabled) into the command's **response record** — poll it by `command_id`; it is not in the 202 body. `X-Correlation-Id` header on every response.
+- **202 Accepted** — `{"data":{"command_id","device_id","source","agents_reached"},"meta":{"api_version":"v1"}}`. Async: the agent computes `rows_deleted` (and the agent-side `source_not_paused` refusal if the source was re-enabled, or `config_unreadable` if the enable flag could not be read) into the command's **response record** — poll it by `command_id`; it is not in the 202 body. `X-Correlation-Id` header on every response.
 - **400** — invalid JSON / missing `device_id`/`source` / source not in the allowlist (A4 error envelope).
 - **403 / 404** — permission denied or device out of scope (scoped gate; A4 envelope).
 - **404** — dispatch reached zero agents (device offline).
