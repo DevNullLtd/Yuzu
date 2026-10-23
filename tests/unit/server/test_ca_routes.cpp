@@ -2116,6 +2116,38 @@ TEST_CASE("ca_routes: import wrapper without Security:Read confirms the import a
     }
 }
 
+TEST_CASE("ca_routes: import wrapper without Security:Read still warns about a stale CRL "
+          "and confirms the import without the inventory",
+          "[ca_routes][pki][subordinate][security][pg]") {
+    // The Read-holding version of this check is in the import-chain wrapper test above: a CRL
+    // republish failure after a successful import prepends a warning. A caller without
+    // Security:Read must get the same warning and the confirmation, and still no inventory.
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    REQUIRE(h.store->record_issued(sample_issued("DEAD")));
+    h.deny_ops = {"Read"};
+    h.wire();
+    h.import_outcome = CaRoutes::ImportOutcome::Ok;
+    h.crl_succeeds = false;
+
+    auto res = h.sink.dispatch(
+        "POST", "/api/settings/ca/import-chain?intermediate_pem=INT&chain_pem=PAR", "",
+        "application/x-www-form-urlencoded", kSameOrigin);
+    REQUIRE(res);
+    CHECK(res->status == 200); // the import stands
+    CHECK(h.import_calls == 1);
+    const auto warn = res->body.find("CRL could not be republished");
+    const auto confirm = res->body.find("Signed chain imported");
+    REQUIRE(warn != std::string::npos);
+    REQUIRE(confirm != std::string::npos);
+    CHECK(res->body.find("alert-warning") < res->body.find("alert-success")); // prefix goes first
+    CHECK(res->body.find("not shown to this account") != std::string::npos);
+    CHECK(res->body.find("see the note below") == std::string::npos);
+    check_no_inventory(res->body);
+    CHECK_THAT(res->get_header_value("HX-Trigger"),
+               Catch::Matchers::ContainsSubstring("\"level\":\"success\""));
+}
+
 TEST_CASE("ca_routes: wrappers with a Read-holding caller still return the panel; no-store set",
           "[ca_routes][pki][security][pg]") {
     Harness h;

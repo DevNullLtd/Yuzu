@@ -455,7 +455,8 @@ bool issued_audit(const CaRoutes::AuditFn& audit_fn, const httplib::Request& req
 /// withheld answer, never a narrowed list (`list_issued` has no scope parameter). Returns the
 /// standing the read may proceed under (kAvailable, or kRefused: the check admitted nobody, no
 /// Inventory grant or a read failure partway through it, which the answer cannot tell apart; the
-/// list is served and its success row names the standing); nullopt = the response is written. An
+/// list is served and its success row names the standing; see the ADR-0070 Update (2026-10-23),
+/// the read-failure arm is tracked by #6382); nullopt = the response is written. An
 /// unwired probe fails closed (503, no retry hint: a wiring fault lasts until a restart).
 /// `needs_api` is set by the filtered list, which also reads through the CryptoApi seam. Asked
 /// before any parameter is parsed, so the answer does not depend on them. `target` names the
@@ -1370,7 +1371,8 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
     const auto csrf_trusted = csrf_trusted_origins_;
     // The wrappers answer with the panel for a Security:Read holder, its inventory withheld
     // (note in place, the rest of the panel intact) unless the caller is also unconfined: the
-    // same standing as the API inventory. A caller without Security:Read gets a plain note.
+    // same standing as the API inventory. A caller without Security:Read gets a plain note in
+    // place of the panel (plus, after a success, the confirmation banner and toast).
     // Never an empty body: htmx swaps it into #ca-section and would blank the panel.
     const auto panel_access = [probe = read_probe_,
                                filtered = filtered_](const httplib::Request& req) -> PanelAccess {
