@@ -119,9 +119,9 @@ static std::string render_forensics_unknown_results() {
     return "<tbody id=\"results-tbody\"><tr><td colspan=\"99\" "
            "class=\"empty-state result-degrade-banner\" data-forensics-tier-unknown=\"true\">"
            "<b>Results unavailable.</b> The permission check for this view could not be "
-           "completed. This is <b>not</b> \"no results\" &mdash; retry shortly.</td></tr></tbody>"
+           "completed. This is <b>not</b> \"no results\"; retry shortly.</td></tr></tbody>"
            "<div id=\"result-summary\" hx-swap-oob=\"true\">"
-           "<span class=\"result-degrade-banner\">permission check incomplete &mdash; count "
+           "<span class=\"result-degrade-banner\">permission check incomplete; count "
            "unavailable</span></div>";
 }
 
@@ -496,7 +496,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                     res.set_content(
                         "<div id=\"filter-bar\" class=\"filter-bar result-degrade-banner\">"
                         "<b>Filters unavailable.</b> The permission check for this view could "
-                        "not be completed. This is <b>not</b> \"no filters\" &mdash; retry "
+                        "not be completed. This is <b>not</b> \"no filters\"; retry "
                         "shortly.</div>",
                         "text/html; charset=utf-8");
                     return;

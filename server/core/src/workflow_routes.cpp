@@ -1186,7 +1186,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                         "<div class=\"empty-state result-degrade-banner\" "
                         "data-responses-permission-unconfirmed=\"true\">"
                         "<b>Responses unavailable.</b> The permission check for this view could "
-                        "not be completed. This is <b>not</b> \"no responses\" &mdash; try again "
+                        "not be completed. This is <b>not</b> \"no responses\"; try again "
                         "shortly.</div></details>";
             } else if (response_store && response_store->is_open()) {
                 ResponseQuery rq;
