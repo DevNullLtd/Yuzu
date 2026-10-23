@@ -28,24 +28,36 @@
 ///   POST /api/approvals/:id/approve      (perm_fn Approval:Approve + approver assurance)
 ///   POST /api/approvals/:id/reject       (perm_fn Approval:Approve + approver assurance)
 ///
-/// APPROVER ASSURANCE (#6061, four-eyes MVP PR1) -- approve/reject, in this
-/// order, each step failing closed BEFORE anything is mutated:
+/// APPROVER ASSURANCE (#6061, four-eyes MVP PR1) -- approve/reject. Both routes
+/// are kRequired rows in the central step-up table, so the central check runs
+/// in the pre-request stage, before the handler (and after the server-wide
+/// same-site gate, which answers a cross-site cookie write first): a stale or
+/// absent proof is a 401, a SAML session a 403, and an engine principal a 403
+/// (`engine_principal_denied`, audited as `mfa.step_up.required`); the handler
+/// never runs for any of them. API-token and MCP-token sessions pass that check
+/// and are refused by step 3. The handler's own steps below then run in this
+/// order, each failing closed BEFORE anything is mutated:
 ///   1. `perm_fn` (Approval:Approve) -- the RBAC gate, unchanged.
 ///   2. The session is re-resolved; an unresolvable one is a 503 A4 envelope
 ///      (#4128). It used to become reviewer "unknown", which can never equal a
 ///      real `submitted_by` and so defeated the separation-of-duties check.
 ///   2b. SAME-SITE GATE (`WriteGate`, #6061 SG-1): a cookie-authorised POST
 ///      must name this site in Origin/Referer (403, `csrf.denied` row, before
-///      anything else is touched). Token callers are exempt from it and are
-///      refused by the class check instead.
+///      anything else in the handler is touched). This is defence in depth: in
+///      production the server-wide pre-routing gate answers a cross-site cookie
+///      write first, before the central step-up check. Token callers are
+///      exempt from it and are refused by the class check instead.
 ///   3. Class check (`approver_assurance.hpp`): interactive local/OIDC/SAML
 ///      cookie session, `principal_kind == "human"`, not an engine principal.
-///      A bearer or engine caller gets a 403 A4 envelope whose message is
-///      `approver_assurance_required:<reason>`.
-///   4. `deps.step_up_fn` -- fresh MFA, the same `require_mfa_step_up` closure
-///      the other step-up-gated routes use (it writes its own 401). An UNWIRED
-///      `step_up_fn` is a 503, not a skip: this is the one place a null closure
-///      must not read as "no step-up required".
+///      A bearer caller gets a 403 A4 envelope whose message is
+///      `approver_assurance_required:<reason>`. (Over REST an engine principal
+///      is already refused by the central check; the `engine_principal` reason
+///      is reachable on the MCP surface.)
+///   4. `deps.step_up_fn` -- the same closure the other step-up-gated routes
+///      use. It consumes the central check's pass for this request (it
+///      evaluates afresh, and writes its own 401, only if no pass was armed).
+///      An UNWIRED `step_up_fn` is a 503, not a skip: this is the one place a
+///      null closure must not read as "no step-up required".
 ///   5. AUDIT BEFORE MUTATE (#5823): an `attempted` row is written first; if it
 ///      does not persist the response is a 503 (`Sec-Audit-Failed: true`) and
 ///      the ticket is left pending. The post-decision `success` / `denied` row
@@ -62,9 +74,11 @@
 /// AUDIT ASYMMETRY (also preserved verbatim): GET /api/approvals and GET
 /// .../pending/count are both pure reads and unaudited. The store-
 /// unavailable 503 on all three gated-past routes is unaudited (it returns
-/// before `deps.audit_fn` is ever reached), as are the unresolvable-session
-/// 503 and the assurance / step-up refusals (the latter writes its own
-/// `mfa.step_up.required` row). Past those, approve/reject write an
+/// before `deps.audit_fn` is ever reached), as is the unresolvable-session
+/// 503. The same-site refusal writes its own `csrf.denied` row, an assurance
+/// refusal writes a best-effort `"denied"` row (detail
+/// `approver_assurance:<reason>`), and a step-up refusal writes its own
+/// `mfa.step_up.required` row. Past those, approve/reject write an
 /// `"attempted"` row BEFORE the store call (fail closed, see above) and then
 /// audit BOTH outcomes — a denied review (e.g. the store's
 /// self-approval segregation-of-duties block) is audited as `"denied"`

@@ -518,3 +518,43 @@ TEST_CASE("entitlement_certs_outcome: every cert parsing cleanly is a genuine su
     CHECK(o2.ok);
     CHECK(o2.rows == 0);
 }
+
+// ── per_user_hives_outcome (pure decision seam, related issue #5291) ───────
+
+TEST_CASE("per_user_hives_outcome: precedence is privilege_missing > hive_file_refused > "
+          "hive_unload_failed > profile_list_truncated > ok, rows carried on every branch",
+          "[licensing][per_user_hives]") {
+    // Every flag set at once: privilege_missing wins.
+    auto pm = per_user_hives_outcome(/*privilege_missing=*/true, /*file_refused=*/true,
+                                     /*unload_failed=*/true, /*truncated=*/true, /*rows=*/3);
+    CHECK_FALSE(pm.ok);
+    CHECK(pm.surface == "per_user_hives");
+    CHECK(pm.rows == 3);
+    CHECK(pm.error == "privilege_missing");
+
+    auto fr = per_user_hives_outcome(false, true, true, true, 4);
+    CHECK_FALSE(fr.ok);
+    CHECK(fr.rows == 4);
+    CHECK(fr.error == "hive_file_refused");
+
+    auto uf = per_user_hives_outcome(false, false, true, true, 5);
+    CHECK_FALSE(uf.ok);
+    CHECK(uf.rows == 5);
+    CHECK(uf.error == "hive_unload_failed");
+
+    auto tr = per_user_hives_outcome(false, false, false, true, 6);
+    CHECK_FALSE(tr.ok);
+    CHECK(tr.rows == 6);
+    CHECK(tr.error == "profile_list_truncated");
+
+    auto ok = per_user_hives_outcome(false, false, false, false, 7);
+    CHECK(ok.ok);
+    CHECK(ok.rows == 7);
+    CHECK(ok.error.empty());
+}
+
+TEST_CASE("render_probe_status_line of a refused per_user_hives surface",
+          "[licensing][per_user_hives]") {
+    CHECK(render_probe_status_line({"per_user_hives", false, 2, "hive_file_refused"}) ==
+          "probe_status|per_user_hives|error|hive_file_refused");
+}
