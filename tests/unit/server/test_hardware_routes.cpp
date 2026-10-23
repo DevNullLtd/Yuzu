@@ -110,6 +110,9 @@ struct HwHarness {
     // #4990: the caller's Forensics visibility for the Actions-lens result poll (admin by default).
     yuzu::server::test::ForensicsCaller forensics;
 
+    // When non-empty, `audit_should_fail` fails ONLY this audit action (the row is still recorded).
+    std::string audit_fail_only;
+
     std::vector<std::string> audits;        // "action|result"
     std::vector<std::string> audit_full;    // "action|result|target_type|target_id"
     std::vector<std::string> audit_details; // detail strings, parallel to `audits`
@@ -196,7 +199,7 @@ struct HwHarness {
             audits.push_back(a + "|" + r);
             audit_full.push_back(a + "|" + r + "|" + tt + "|" + tid);
             audit_details.push_back(detail);
-            return !audit_should_fail;
+            return !(audit_should_fail && (audit_fail_only.empty() || audit_fail_only == a));
         };
         HardwareRoutes::DexScoreFn dex_fn = [this](const std::string& id) {
             ++dex_calls;
@@ -254,7 +257,7 @@ struct HwHarness {
             q.agent_id = agent_id;
             for (const auto& r : response_store->query(command_id, tier, q)
                                      .value_or(std::vector<StoredResponse>{}))
-                out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                out.push_back({r.agent_id, r.status, r.output, r.error_detail, r.plugin});
             return out;
         };
         deps.actions_fn = [this](const std::string&) -> std::optional<std::vector<HwPluginActions>> {
@@ -1400,6 +1403,129 @@ TEST_CASE("result poll: a Forensics-plugin reply is rendered only for a caller w
             REQUIRE(res);
             CHECK(contains(res->body, "TOKEN-HW-ORDINARY"));
         }
+    }
+}
+
+namespace {
+// The recorded `response.forensics.read` rows: "action|result|type|id" + the parallel detail.
+struct ForensicsAuditRows {
+    int count{0};
+    std::string full;
+    std::string detail;
+};
+ForensicsAuditRows forensics_audit_rows(const HwHarness& h) {
+    ForensicsAuditRows out;
+    for (std::size_t i = 0; i < h.audit_full.size(); ++i) {
+        if (h.audit_full[i].rfind("response.forensics.read|", 0) != 0)
+            continue;
+        ++out.count;
+        out.full = h.audit_full[i];
+        out.detail = h.audit_details[i];
+    }
+    return out;
+}
+} // namespace
+
+TEST_CASE("result poll: response.forensics.read is recorded only when a Forensics-tier reply is "
+          "rendered",
+          "[pg][hardware][route][security][forensics][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, hw_responsestore_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    put_hw_response(rs, "browser_inventory-aaaa1111", "agent-1", "browser_inventory",
+                    "TOKEN-HW-FORENSICS");
+    // The ordinary control row: a plugin outside the tier, same device.
+    put_hw_response(rs, "hardware-bbbb2222", "agent-1", "hardware", "TOKEN-HW-ORDINARY");
+    // A Forensics-tier plugin's FAILED reply: the error text is rendered too.
+    StoredResponse failed;
+    failed.instruction_id = "browser_inventory-ffff6666";
+    failed.agent_id = "agent-1";
+    failed.status = 2;
+    failed.plugin = "browser_inventory";
+    failed.error_detail = "TOKEN-HW-FORENSICS-ERR";
+    rs.store(failed);
+
+    HwHarness h(false, false, false, kContainmentUi, &rs);
+    const auto forensics_url = poll_url("agent-1", "browser_inventory-aaaa1111", "browser_inventory");
+
+    SECTION("a caller served nothing (no Forensics:Read) leaves no verb row") {
+        h.forensics.viewer();
+        auto res = h.sink.Get(forensics_url);
+        REQUIRE(res);
+        CHECK_FALSE(contains(res->body, "TOKEN-HW-FORENSICS"));
+        CHECK(forensics_audit_rows(h).count == 0);
+        // Control: the ordinary reply is served to the same caller and also leaves none.
+        auto ord = h.sink.Get(poll_url("agent-1", "hardware-bbbb2222", "hardware"));
+        REQUIRE(ord);
+        CHECK(contains(ord->body, "TOKEN-HW-ORDINARY"));
+        CHECK(forensics_audit_rows(h).count == 0);
+        CHECK(h.audit_full.back() == "hardware.action.result|success|Agent|agent-1");
+    }
+    SECTION("a global Forensics:Read serving a Forensics reply leaves exactly one row") {
+        h.forensics.admin();
+        auto res = h.sink.Get(forensics_url);
+        REQUIRE(res);
+        CHECK(contains(res->body, "TOKEN-HW-FORENSICS"));
+        CHECK(res->get_header_value("Sec-Audit-Failed").empty());
+        const auto rows = forensics_audit_rows(h);
+        CHECK(rows.count == 1);
+        CHECK(rows.full == "response.forensics.read|success|Execution|browser_inventory-aaaa1111");
+        CHECK(rows.detail == "forensics_rows=1 plugins=browser_inventory");
+        // The page's own row is still written.
+        CHECK(std::ranges::count(h.audits, "hardware.action.result|success") == 1);
+    }
+    SECTION("a scoped Forensics:Read leaves a row only for the device it is scoped to") {
+        h.forensics.scoped({"agent-other"});
+        auto denied = h.sink.Get(forensics_url);
+        REQUIRE(denied);
+        CHECK_FALSE(contains(denied->body, "TOKEN-HW-FORENSICS"));
+        CHECK(forensics_audit_rows(h).count == 0);
+        h.forensics.scoped({"agent-1"});
+        auto ok = h.sink.Get(forensics_url);
+        REQUIRE(ok);
+        CHECK(contains(ok->body, "TOKEN-HW-FORENSICS"));
+        CHECK(forensics_audit_rows(h).count == 1);
+    }
+    SECTION("a rendered Forensics failure text is also a served row") {
+        h.forensics.admin();
+        auto res = h.sink.Get(poll_url("agent-1", "browser_inventory-ffff6666", "browser_inventory"));
+        REQUIRE(res);
+        CHECK(contains(res->body, "TOKEN-HW-FORENSICS-ERR"));
+        const auto rows = forensics_audit_rows(h);
+        CHECK(rows.count == 1);
+        CHECK(rows.detail == "forensics_rows=1 plugins=browser_inventory");
+    }
+    SECTION("an ordinary plugin's reply leaves no verb row, even for a Forensics:Read caller") {
+        h.forensics.admin();
+        auto res = h.sink.Get(poll_url("agent-1", "hardware-bbbb2222", "hardware"));
+        REQUIRE(res);
+        CHECK(contains(res->body, "TOKEN-HW-ORDINARY"));
+        CHECK(forensics_audit_rows(h).count == 0);
+        CHECK(h.audit_full.back() == "hardware.action.result|success|Agent|agent-1");
+    }
+    SECTION("a pending poll renders no reply and leaves no verb row") {
+        h.forensics.admin();
+        auto res = h.sink.Get(poll_url("agent-1", "browser_inventory-9999aaaa", "browser_inventory"));
+        REQUIRE(res);
+        CHECK(contains(res->body, "Waiting for the device to respond"));
+        CHECK(forensics_audit_rows(h).count == 0);
+    }
+    SECTION("a failed persist of the verb row still renders the page and sets Sec-Audit-Failed") {
+        h.forensics.admin();
+        h.audit_should_fail = true;
+        h.audit_fail_only = "response.forensics.read"; // the page's own row persists normally
+        auto res = h.sink.Get(forensics_url);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "TOKEN-HW-FORENSICS"));
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(forensics_audit_rows(h).count == 1); // attempted once, not retried
+        // Control: an ordinary reply under the same failing sink sets no header.
+        auto ord = h.sink.Get(poll_url("agent-1", "hardware-bbbb2222", "hardware"));
+        REQUIRE(ord);
+        CHECK(contains(ord->body, "TOKEN-HW-ORDINARY"));
+        CHECK(ord->get_header_value("Sec-Audit-Failed").empty());
     }
 }
 

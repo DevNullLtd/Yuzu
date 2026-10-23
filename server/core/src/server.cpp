@@ -19344,7 +19344,8 @@ private:
                                      for (const auto& r :
                                           response_store_->query(command_id, tier, q)
                                               .value_or(std::vector<StoredResponse>{}))
-                                         out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                                         out.push_back({r.agent_id, r.status, r.output,
+                                                        r.error_detail, r.plugin});
                                      return out;
                                  },
                              // #4990: the poll validates the plugin prefix of its command id

@@ -10,6 +10,7 @@
 #include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "app_shell.hpp"
+#include "forensics_read_audit.hpp" // #4990: response.forensics.read
 #include "authz_model.hpp"          // authz::in_scope
 #include "http_route_sink.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, ensure_correlation_id
@@ -940,6 +941,21 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             deps_.audit_fn, req, res, "hardware.action.result", "success", "Agent", id,
             plugin + " command_id=" + command_id + " phase=" +
                 std::to_string(static_cast<int>(view.phase)));
+        // #4990: the row this render serves, if any, is the one whose text reached `view`
+        // (Rendered -> the output row, Failed -> the terminal row; the other phases print none).
+        // A `response.forensics.read` row is written only when that row is a Forensics-tier
+        // plugin's. Set-and-proceed, like the hardware.action.result row above: a failed persist
+        // sets `Sec-Audit-Failed` and the page still renders.
+        {
+            const DexAgentResponse* served_row =
+                view.phase == HwActionResultView::Phase::Rendered ? with_output
+                : view.phase == HwActionResultView::Phase::Failed ? terminal
+                                                                   : nullptr;
+            ForensicsServed served;
+            if (served_row)
+                served.note(served_row->plugin, deps_.forensics_plugins);
+            (void)emit_forensics_read_audit(deps_.audit_fn, req, res, served, command_id);
+        }
         // action name isn't carried on the wire (only plugin + command_id are, to
         // keep the poll URL short) — the panel only needs it for the RenderedEmpty
         // caption, so an empty string there is a cosmetic-only gap.

@@ -225,8 +225,8 @@ not output, and are unchanged.
 
 **Audit.** A read that serves at least one Forensics-tier row writes one `response.forensics.read`
 row (`forensics_rows=<n> plugins=<names>`), on the row-returning surfaces only; see
-`docs/user-manual/audit-log.md`. The drawer's row is set-and-proceed (`Sec-Audit-Failed` on a failed
-persist).
+`docs/user-manual/audit-log.md`. The drawer's row, and the row written by the Hardware Actions-lens result poll, are
+set-and-proceed (`Sec-Audit-Failed` on a failed persist).
 
 **#3789 (closed):** the legacy pre-v1 `/api/executions*` route family (`execution_routes.cpp` as
 of #2542 PR-7, extracted from `server.cpp` onto the `HttpRouteSink` seam) — the one
