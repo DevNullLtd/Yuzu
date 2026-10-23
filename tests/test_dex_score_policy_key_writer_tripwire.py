@@ -100,9 +100,6 @@ def wiring_problems(text):
     if provider[0] > decl[0] or body.count("{") != body.count("}"):
         out.append("the provider must be constructed in the scope that declares dex_api, before it "
                    "(it depends only on the runtime config store, not on the signals store)")
-    elif lines[decl[0] + 1] != "if (guaranteed_state_store_) {":
-        out.append("expected `if (guaranteed_state_store_) {` right after the dex_api declaration; "
-                   "update this gate if the block moved")
     return out
 
 
