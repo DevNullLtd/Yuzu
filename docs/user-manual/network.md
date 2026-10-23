@@ -109,20 +109,20 @@ Permission required: **`Infrastructure:Read`**. Each read is audited as
 ## Platform coverage (v1)
 
 This table is the **device-level heartbeat** sampler (the fleet gauges). The
-separate opt-in **per-connection `netqual` tier** below now has Windows RTT via
+separate **per-connection `netqual` tier** below now has Windows RTT via
 ESTATS — see its row.
 
 | Platform | RTT (heartbeat) | Retransmit | Throughput |
 |---|---|---|---|
 | Linux | Full — netlink `INET_DIAG` per-connection `TCP_INFO` | Yes — per-connection sum | Yes (`/proc/net/dev`) |
-| Windows | Heartbeat: not yet · **per-connection: yes via the opt-in `netqual` tier (ESTATS, elevated — ADR-0020)** | Yes — `GetTcpStatisticsEx` (system-wide; see caveat) | Yes (`GetIfTable2`) |
+| Windows | Heartbeat: not yet · **per-connection: yes via the `netqual` tier (ESTATS, elevated — ADR-0020)** | Yes — `GetTcpStatisticsEx` (system-wide; see caveat) | Yes (`GetIfTable2`) |
 | macOS | Not yet (deferred) | Not yet (deferred) | Yes (`NET_RT_IFLIST2`) |
 
 **Linux, Windows, and macOS agents all emit heartbeat network facts.** At the
 **heartbeat** layer Windows reports device throughput (`GetIfTable2`) and an
 interval retransmit rate (`GetTcpStatisticsEx`) but **not RTT** — the fleet
 gauge has no per-connection ESTATS sweep. **Per-connection smoothed RTT IS
-available on Windows** in the opt-in `netqual` TAR tier (below) via ESTATS
+available on Windows** in the `netqual` TAR tier (below) via ESTATS
 (`GetPerTcpConnectionEStats`: per-connection enable, **admin/elevated only**,
 ms-resolution — ADR-0020); it is a distinct, on-device warehouse tier, not a
 heartbeat gauge. **Two caveats on the Windows heartbeat retransmit rate:**
@@ -151,17 +151,15 @@ per-destination data leaves the device on the heartbeat.** Network sampling
 shares the agent's `--dex-disable` flag — disabling DEX disables the network
 heartbeat facts.
 
-### Per-connection tier (opt-in, off by default)
+### Per-connection tier (`netqual`)
 
 A separate **`netqual`** TAR capture source can record per-connection TCP
 quality — smoothed RTT, jitter, and current-loss counters per ESTABLISHED
 connection, joined to the owning process — into the agent's **local edge
 warehouse** as `$NetQual_Live`. It is governed independently of the heartbeat:
 
-- **Off by default.** Set the agent TAR config key **`netqual_enabled = true`**
-  to enable it (mirrors `procperf_enabled`; per-connection telemetry is
-  usage-class data under the works-council posture, so it is never on by
-  default).
+- **On by default.** Set the agent TAR config key **`netqual_enabled = false`**
+  to disable it on a host (mirrors `procperf_enabled`).
 - **Bucket-only.** Only a coarse destination *class* — `loopback` / `private` /
   `public` — is stored. The raw remote address, port, and hostname are dropped
   at the collector edge and **never persisted**. The owning process is recorded
@@ -191,7 +189,7 @@ warehouse** as `$NetQual_Live`. It is governed independently of the heartbeat:
   [the TAR dashboard doc](tar.md)).
 - **Retrospective companions (ADR-0020).** `$NetQual_Boot` records one row per
   boot from since-boot OS counters — a coarse "network quality before TAR was
-  running this boot" baseline — and the separate opt-in **`netconn`** source
+  running this boot" baseline — and the separate **`netconn`** source
   (`$NetConn_Live`, `netconn_enabled`) backfills OS-retained connectivity
   transitions (connect/disconnect, internet-capability changes, Wi-Fi drops with
   reason codes) reaching days-to-weeks before TAR existed on the box, storing
