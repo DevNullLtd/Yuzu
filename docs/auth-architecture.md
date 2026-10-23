@@ -938,12 +938,14 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   by `AuthManager::reap_expired_elevation` at the `AuthRoutes::resolve_session`
   cookie chokepoint, on the FIRST authenticated request the operator makes
   *after* the window has lapsed. `elevated_until` is cleared to the sentinel on
-  that first observing call, so emission is exactly-once — a request that finds
+  that first observing call, so on a single server replica emission is exact (the
+  clear is rechecked under the exclusive session lock); with several replicas a rare
+  duplicate is possible (effectively-once, ADR-2002) — a request that finds
   the sentinel already cleared (a prior reap, or a manual
   `revoke_elevation`/`revoke_user_elevations`, which clear to the same
   sentinel) emits nothing, so a manual step-down never ALSO produces a spurious
   `expired` row. **The `role.elevation.expired` emission is itself best-effort
-  / at-most-once** (governance hardening round, UP-3): `elevated_until` is
+  (never retried, so it can be lost)** (governance hardening round, UP-3): `elevated_until` is
   cleared to the sentinel BEFORE the audit call, so a store failure loses only
   the confirmatory `expired` row, never the reap itself (the session still
   correctly reverts to base role) — and the window's end remains
@@ -3361,7 +3363,7 @@ header, so these names stay rejected on client ingress permanently.
 ## API tokens and automation
 
 - **API tokens** — Bearer token and `X-Yuzu-Token` header auth for automation. MCP tokens (see `docs/mcp-server.md`) use the same table with mandatory expiration (max 90 days).
-- **Ownership-scoped revocation** — `DELETE /api/v1/tokens/{id}` and `DELETE /api/settings/api-tokens/{id}` both require the caller to own the token; the global `admin` role is the sole bypass. Cross-user revoke returns `404 token not found` (identical to unknown-id, to prevent enumeration). Denied attempts are recorded with `result=denied`, `detail=owner=<principal>`. See #222 and `docs/user-manual/server-admin.md` "Upgrade Notes".
+- **Ownership-scoped revocation** — `DELETE /api/v1/tokens/{id}` and `DELETE /api/settings/api-tokens/{id}` both require the caller to own the token; an effective `admin` role (the global `admin` role, or a session holding a JIT admin elevation) is the sole bypass. Cross-user revoke returns `404 token not found` (identical to unknown-id, to prevent enumeration). Denied attempts are recorded with `result=denied`, `detail=owner=<principal>`. See #222 and `docs/user-manual/server-admin.md` "Upgrade Notes".
 
 ### Device tokens (`DeviceTokenStore`, ADR-0052, capability 18.8) — currently dormant, docs/user-manual/rest-api.md "Device Tokens"
 
