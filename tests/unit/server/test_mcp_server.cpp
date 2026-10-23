@@ -23180,6 +23180,131 @@ TEST_CASE("MCP get_bundle_result: an Unknown Forensics decision is a retryable e
     CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
 }
 
+TEST_CASE("MCP get_bundle_result: serving a Forensics step writes exactly one "
+          "response.forensics.read row with surface=bundle, and a persist failure shows as "
+          "audit_persisted:false (#4990)",
+          "[pg][mcp][bundle][forensics_tier][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start_with_dispatch(fake_bundle_dispatch());
+
+    auto disp = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":87,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-1","steps":[{"plugin":"browser_inventory","action":"profiles"},{"plugin":"os_info","action":"uptime"}]}}})");
+    auto exec_id = bundle_payload(disp)["bundle_id"].get<std::string>();
+    auto inject = [&](const std::string& cmd, const std::string& out, const std::string& plugin) {
+        yuzu::server::StoredResponse r;
+        r.execution_id = exec_id;
+        r.instruction_id = cmd;
+        r.agent_id = "agent-1";
+        r.plugin = plugin;
+        r.status = 1;
+        r.output = out;
+        r.timestamp = 100;
+        store.store(r);
+    };
+    inject("cmd-browser_inventory-profiles", "marker-4990-mcp-audit",
+           yuzu::server::test::kForensicsPlugin);
+    inject("cmd-os_info-uptime", "up 3d", "os_info");
+    const std::string get_call =
+        std::string(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":88,"params":{"name":"get_bundle_result","arguments":{"bundle_id":")") +
+        exec_id + R"("}}})";
+
+    using Row = std::array<std::string, 4>;
+    auto verb_rows = [&] {
+        std::vector<Row> out;
+        for (std::size_t i = 0; i < ts.audit_log.size(); ++i)
+            if (ts.audit_log[i].rfind("response.forensics.read|", 0) == 0)
+                out.push_back({ts.audit_log[i].substr(std::string("response.forensics.read|").size()),
+                               ts.audit_target_types[i], ts.audit_target_ids[i],
+                               ts.audit_details[i]});
+        return out;
+    };
+    auto reset_log = [&] {
+        ts.audit_log.clear();
+        ts.audit_details.clear();
+        ts.audit_target_ids.clear();
+        ts.audit_target_types.clear();
+    };
+
+    SECTION("a non-holder gets no Forensics output and no audit row") {
+        ts.forensics_for_test.viewer();
+        reset_log();
+        auto p = bundle_payload(ts.call(get_call));
+        CHECK(p["steps"][0]["output"] == "");
+        CHECK(p["steps"][1]["output"] == "up 3d");
+        CHECK_FALSE(p.contains("audit_persisted"));
+        CHECK(verb_rows().empty());
+    }
+    SECTION("a holder gets the output and exactly one audit row") {
+        ts.forensics_for_test.admin();
+        reset_log();
+        auto p = bundle_payload(ts.call(get_call));
+        CHECK(p["steps"][0]["output"] == "marker-4990-mcp-audit");
+        CHECK_FALSE(p.contains("audit_persisted"));
+        const auto rows = verb_rows();
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == Row{"success", "Execution", exec_id,
+                             "forensics_rows=1 plugins=browser_inventory surface=bundle"});
+    }
+    SECTION("a failed verb row still serves the output and reports audit_persisted:false") {
+        ts.forensics_for_test.admin();
+        reset_log();
+        ts.audit_succeeds_for_action_ = [](const std::string& action) {
+            return action != "response.forensics.read";
+        };
+        auto res = ts.call(get_call);
+        auto p = bundle_payload(res);
+        CHECK(p["steps"][0]["output"] == "marker-4990-mcp-audit");
+        REQUIRE(p.contains("audit_persisted"));
+        CHECK(p["audit_persisted"] == false);
+        CHECK(bundle_structured(res)["audit_persisted"] == false);
+        CHECK(verb_rows().size() == 1);
+        ts.audit_succeeds_for_action_ = nullptr;
+    }
+}
+
+TEST_CASE("MCP get_bundle_result: a bundle with no Forensics step writes no response.forensics.read "
+          "row (#4990)",
+          "[pg][mcp][bundle][forensics_tier][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start_with_dispatch(fake_bundle_dispatch());
+    auto disp = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":89,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime"}]}}})");
+    auto exec_id = bundle_payload(disp)["bundle_id"].get<std::string>();
+    yuzu::server::StoredResponse r;
+    r.execution_id = exec_id;
+    r.instruction_id = "cmd-os_info-uptime";
+    r.agent_id = "agent-1";
+    r.plugin = "os_info";
+    r.status = 1;
+    r.output = "up 3d";
+    r.timestamp = 100;
+    store.store(r);
+
+    ts.forensics_for_test.admin();
+    ts.audit_log.clear();
+    auto p = bundle_payload(ts.call(
+        std::string(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":90,"params":{"name":"get_bundle_result","arguments":{"bundle_id":")") +
+        exec_id + R"("}}})"));
+    CHECK(p["steps"][0]["output"] == "up 3d");
+    CHECK_FALSE(p.contains("audit_persisted"));
+    for (const auto& a : ts.audit_log)
+        CHECK(a.rfind("response.forensics.read|", 0) != 0);
+}
+
 TEST_CASE("MCP get_bundle_result: #3344 retry_after_ms present only while complete=false",
           "[pg][mcp][bundle]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

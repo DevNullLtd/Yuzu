@@ -453,6 +453,7 @@ TEST_CASE("response.forensics.read detail: rows, plugins and a closed surface to
         {ForensicsSurface::kDrawer, "drawer"},
         {ForensicsSurface::kExecutionsPage, "executions_page"},
         {ForensicsSurface::kHardware, "hardware"},
+        {ForensicsSurface::kBundle, "bundle"},
     };
     for (const auto& [surface, spelling] : all) {
         INFO(spelling);
@@ -463,6 +464,33 @@ TEST_CASE("response.forensics.read detail: rows, plugins and a closed surface to
     // An out-of-range value is a fixed token, never an unbounded or empty one.
     CHECK(served.detail(static_cast<ForensicsSurface>(250)) ==
           "forensics_rows=2 plugins=app_usage,execution_artifacts surface=unknown");
+}
+
+TEST_CASE("response.forensics.read bundle summary counts only responded Forensics steps",
+          "[server][responses][security][forensics][audit][bundle]") {
+    const auto set = make_set({"app_usage", "execution_artifacts"});
+    BundleAggregate agg;
+    auto step = [&](const char* plugin, BundleStepState st) {
+        BundleStepResult r;
+        r.plugin = plugin;
+        r.action = "x";
+        r.state = st;
+        agg.steps.push_back(r);
+    };
+    step("execution_artifacts", BundleStepState::Responded);
+    step("APP_USAGE", BundleStepState::Responded);          // ASCII case folded
+    step("app_usage", BundleStepState::Pending);            // filtered out or not yet answered
+    step("execution_artifacts", BundleStepState::DispatchFailed);
+    step("shellexec", BundleStepState::Responded);          // ordinary plugin: not counted
+
+    const auto served = summarize_forensics_served(agg, &set);
+    CHECK(served.rows == 2);
+    CHECK(served.detail(ForensicsSurface::kBundle) ==
+          "forensics_rows=2 plugins=app_usage,execution_artifacts surface=bundle");
+
+    BundleAggregate none;
+    CHECK_FALSE(summarize_forensics_served(none, &set).any());
+    CHECK_FALSE(summarize_forensics_served(agg, nullptr).any()); // unwired set serves nothing
 }
 
 TEST_CASE("ResponseTierFilter::refuse_unwired and for_fixed_plugin_poll",

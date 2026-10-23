@@ -13,6 +13,8 @@
 ///                         answers 503 + `Sec-Audit-Failed` before building any body.
 ///   * MCP                 set-and-proceed, the failure surfaces as `audit_persisted:false`.
 ///   * dashboard HTML      set-and-proceed, the failure surfaces as `Sec-Audit-Failed`.
+/// Bundle collation (`surface=bundle`) follows the same split: REST fail closed (the collate poll
+/// re-audits on every poll, accepted as on the other polls), MCP `audit_persisted:false`.
 /// Row-returning surfaces only: aggregate, facet and count reads emit nothing.
 ///
 /// Detail is `forensics_rows=<n> plugins=<a,b> surface=<s>`. Every token goes through `audit_token`
@@ -28,6 +30,7 @@
 #include <string>
 #include <string_view>
 
+#include "bundle_service.hpp" // BundleAggregate: the bundle collation's served steps
 #include "response_tier_filter.hpp"
 #include "rest_audit.hpp"
 #include "web_utils.hpp" // audit_token
@@ -47,6 +50,7 @@ enum class ForensicsSurface : std::uint8_t {
     kDrawer,         ///< the executions drawer
     kExecutionsPage, ///< the Operate Executions page detail (`view=page`)
     kHardware,       ///< the hardware result poll
+    kBundle,         ///< bundle collation (REST GET /bundles/{id}, MCP get_bundle_result)
 };
 
 [[nodiscard]] constexpr std::string_view to_string(ForensicsSurface s) noexcept {
@@ -65,6 +69,8 @@ enum class ForensicsSurface : std::uint8_t {
         return "executions_page";
     case ForensicsSurface::kHardware:
         return "hardware";
+    case ForensicsSurface::kBundle:
+        return "bundle";
     }
     return "unknown"; // out-of-range value: a fixed token, never an unbounded one
 }
@@ -112,6 +118,18 @@ template <class Rows>
     ForensicsServed served;
     for (const auto& r : rows)
         served.note(r.plugin, set);
+    return served;
+}
+
+/// Summarise a collated bundle: one served row per step that RESPONDED (a pending or
+/// dispatch-failed step carries no output, and a step the caller's tier filter excluded collates
+/// as pending, so it is never counted). Counts only what the aggregate actually hands the caller.
+[[nodiscard]] inline ForensicsServed summarize_forensics_served(const BundleAggregate& agg,
+                                                                const ForensicsPluginSet* set) {
+    ForensicsServed served;
+    for (const auto& step : agg.steps)
+        if (step.state == BundleStepState::Responded)
+            served.note(step.plugin, set);
     return served;
 }
 

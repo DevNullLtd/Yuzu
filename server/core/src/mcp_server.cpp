@@ -2459,7 +2459,10 @@ static const ToolDef kTools[] = {
      "without a GLOBAL Forensics:Read (an MCP-tier token needs the global grant) that step "
      "stays state=pending with an empty output, so such a bundle never reports complete=true "
      "to that caller and polling it will not end. An authorization read that cannot be "
-     "completed returns a retryable error (retry_after_ms) instead of a partial result.",
+     "completed returns a retryable error (retry_after_ms) instead of a partial result. "
+     "A collation that serves a Forensics-tier step's output writes a response.forensics.read "
+     "access-audit row (surface=bundle); if that row fails to persist the output is still "
+     "returned and the result carries audit_persisted:false.",
      R"j({"type":"object","properties":{)j"
      R"j("bundle_id":{"type":"string","minLength":1,"description":"The bundle id (bundle-…) returned by execute_bundle"})j"
      R"j(},"required":["bundle_id"]})j",
@@ -2470,7 +2473,8 @@ static const ToolDef kTools[] = {
      R"j("plugin":{"type":"string"},"action":{"type":"string"},"state":{"type":"string","enum":["pending","responded","dispatch_failed"]},)j"
      R"j("status":{"type":"integer","description":"CommandResponse::Status enum value, meaningful when state is responded"},"output":{"type":"string"})j"
      R"j(},"required":["plugin","action","state","status","output"]}},)j"
-     R"j("retry_after_ms":{"type":"integer","description":"Present only while complete=false — minimum ms before polling again"})j"
+     R"j("retry_after_ms":{"type":"integer","description":"Present only while complete=false — minimum ms before polling again"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the access-audit row for serving a Forensics-tier step's output failed to persist"})j"
      R"j(},"required":["complete","received","succeeded","expected","steps"]})j"},
 
     // ── Internal-CA tools (MCP/REST parity for /api/v1/ca/*, PR4 B-2) ──────────
@@ -21752,6 +21756,18 @@ McpServer::HandlerFn McpServer::build_handler(
                 count_poll("get_bundle_result", !agg->complete);
                 mcp_audit("success", std::string("bundle_id=") + bundle_id +
                                          " complete=" + (agg->complete ? "1" : "0"));
+                // #4990: a collation that serves a Forensics-tier step's output leaves its own
+                // separately countable row (set-and-proceed: a drop shows as audit_persisted:false).
+                // Only this row is surfaced: the ordinary collate row keeps its existing behaviour.
+                if (const auto served = summarize_forensics_served(*agg, forensics_plugins_);
+                    served.any() &&
+                    !yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, kForensicsReadVerb, "success", "Execution", bundle_id,
+                        served.detail(ForensicsSurface::kBundle))) {
+                    // Same string-splice as retry_after_ms above: never reserialize the payload.
+                    if (const auto pos = payload.rfind('}'); pos != std::string::npos)
+                        payload.insert(pos, ",\"audit_persisted\":false");
+                }
                 res.set_content(success_response(id, tool_result(payload, kObjectOutputSchema)),
                                 "application/json");
                 return;

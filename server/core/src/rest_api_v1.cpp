@@ -368,9 +368,10 @@ static bool deny_mcp_token_session(
                                                     const httplib::Request& req,
                                                     httplib::Response& res,
                                                     const ForensicsServed& served,
-                                                    const std::string& target_id) {
-    if (emit_forensics_read_audit(audit_fn, req, res, served, target_id,
-                                  ForensicsSurface::kRest))
+                                                    const std::string& target_id,
+                                                    ForensicsSurface surface =
+                                                        ForensicsSurface::kRest) {
+    if (emit_forensics_read_audit(audit_fn, req, res, served, target_id, surface))
         return true;
     res.status = 503;
     res.set_content(detail::a4_error(res,
@@ -3578,6 +3579,12 @@ void RestApiV1::register_routes(
                  }
                  audit_fn(req, "bundle.collate", "success", "Execution", id,
                           std::string("complete=") + (agg->complete ? "1" : "0"));
+                 // #4990: a collation that serves a Forensics-tier step's output leaves its own
+                 // separately countable row (fail closed, like the neighbouring REST reads).
+                 if (!audit_forensics_or_refuse(audit_fn, req, res,
+                                                summarize_forensics_served(*agg, forensics_plugins),
+                                                id, ForensicsSurface::kBundle))
+                     return;
                  res.set_content(ok_json(aggregate_to_json(*agg)), "application/json");
              });
 
