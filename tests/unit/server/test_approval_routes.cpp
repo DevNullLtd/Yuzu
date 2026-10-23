@@ -954,9 +954,9 @@ TEST_CASE("approval_routes: GET /api/approvals shows a bound ticket's frozen req
     auto unbound = mgr->submit("def-plain", "submitter1", "scope", "", ApprovalOrigin::kInstruction);
     REQUIRE(unbound.has_value());
     const std::string request = R"({"definition":{"name":"Block RDP","hash":"abc"},"targets":["host-1"]})";
-    auto bound = mgr->submit_bound("guardian.deploy.r1", "submitter1", "", "",
-                                   ApprovalOrigin::kGuardianDeploy,
-                                   BoundRequest{request, {"designer1"}});
+    auto bound =
+        mgr->submit_bound("guardian.deploy.r1", "submitter1", "", ApprovalOrigin::kGuardianDeploy,
+                          BoundRequest{request, {"designer1"}});
     REQUIRE(bound.has_value());
 
     Harness h;

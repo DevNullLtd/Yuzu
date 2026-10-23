@@ -84,8 +84,8 @@ a caller-held transaction connection so consumption commits or rolls back with t
 effect (PR3 is intended to use it for the deploy write). A precondition denial gets its own audit
 row and counter, written by the store for any redeemer that supplies a precondition.
 
-A bound ticket is never a scheduled one: `submit_bound` refuses a non-empty `schedule_id` with the
-ordinary validation failure and writes nothing. `ScheduleRunner` matches approved tickets on
+A bound ticket is never a scheduled one: `submit_bound` has no `schedule_id` parameter, so the
+combination cannot be written. `ScheduleRunner` matches approved tickets on
 (schedule id, definition, scope) with no origin check and fires the schedule's own definition, so
 a bound ticket that carried a schedule id could be fired without its frozen request, digest or
 excluded roots ever being compared. The unbound scheduled path (#6096) is unchanged.
@@ -456,12 +456,14 @@ keep them green and extend them to the new surface. Test names are the case titl
   `upgrading.md` finds a seeded pending and a seeded approved-and-unconsumed bound ticket, in
   `test_approval_manager_bound.cpp`. The pinned consuming statement backstops redemption only
   after the upgrade, not on the older build.
-- **Never schedule-fired** (`schedule_id` refusal): a bound ticket MUST NOT be fired by
-  `ScheduleRunner`. `submit_bound` refuses a non-empty `schedule_id` today, which is the only
-  barrier, because the runner has no origin check of its own. PR3 MUST keep that refusal (or add
-  an origin check to the runner in the same change that removes it), and any later producer of
-  bound tickets inherits the same rule. Proof: `submit_bound: a bound mint with a schedule id is
-  refused and writes nothing`, in `test_approval_manager_bound.cpp`.
+- **Never schedule-fired** (no `schedule_id` parameter): a bound ticket MUST NOT be fired by
+  `ScheduleRunner`. `submit_bound` takes no `schedule_id` and writes the row with an empty one,
+  which is the only barrier, because the runner has no origin check of its own. PR3 MUST keep
+  that signature (or add an origin check to the runner in the same change that adds a schedule id
+  to the bound mint), and any later producer of bound tickets inherits the same rule. Proof:
+  `submit_bound: a bound mint cannot name a schedule`, in `test_approval_manager_bound.cpp`
+  (a `static_assert` that the schedule-id call shape does not compile, plus a mint that stores an
+  empty schedule id).
 
 ## Honest residuals and not in the MVP
 

@@ -194,8 +194,7 @@ TEST_CASE("ApprovalManager bound: a database at v2 that already has the bound co
     auto& pool = bundle.pool();
     ApprovalManager& first = *bundle;
 
-    auto bound = first.submit_bound("guardian.d", "alice", "scope", "",
-                                    ApprovalOrigin::kGuardianDeploy,
+    auto bound = first.submit_bound("guardian.d", "alice", "scope", ApprovalOrigin::kGuardianDeploy,
                                     BoundRequest{R"({"k":"v","n":[1,2]})", {"carol"}});
     REQUIRE(bound.has_value());
     REQUIRE(first.approve(*bound, "bob", "").has_value());
@@ -641,9 +640,8 @@ TEST_CASE("submit_bound: freezes request_json, its digest and the excluded roots
     yuzu::test::ApprovalManagerPg bundle;
     ApprovalManager& mgr = *bundle;
 
-    auto id = mgr.submit_bound("guardian.deploy.r1", "alice", "scope", "",
-                               ApprovalOrigin::kGuardianDeploy,
-                               bound_request({"carol", "dave"}));
+    auto id = mgr.submit_bound("guardian.deploy.r1", "alice", "scope",
+                               ApprovalOrigin::kGuardianDeploy, bound_request({"carol", "dave"}));
     REQUIRE(id.has_value());
 
     auto row = mgr.get(*id);
@@ -669,11 +667,11 @@ TEST_CASE("submit_bound: the same bytes always digest the same; different bytes 
           "[pg][approval_manager][bound]") {
     yuzu::test::ApprovalManagerPg bundle;
     ApprovalManager& mgr = *bundle;
-    auto a = mgr.submit_bound("guardian.a", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+    auto a = mgr.submit_bound("guardian.a", "alice", "", ApprovalOrigin::kGuardianDeploy,
                               BoundRequest{R"({"k":1})", {}});
-    auto b = mgr.submit_bound("guardian.b", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+    auto b = mgr.submit_bound("guardian.b", "alice", "", ApprovalOrigin::kGuardianDeploy,
                               BoundRequest{R"({"k":1})", {}});
-    auto c = mgr.submit_bound("guardian.c", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+    auto c = mgr.submit_bound("guardian.c", "alice", "", ApprovalOrigin::kGuardianDeploy,
                               BoundRequest{R"({"k":2})", {}});
     REQUIRE((a && b && c));
     CHECK(mgr.get(*a)->request_digest == mgr.get(*b)->request_digest);
@@ -684,8 +682,8 @@ TEST_CASE("submit_bound: a bound ticket redeems only on its declared surface",
           "[pg][approval_manager][bound]") {
     yuzu::test::ApprovalManagerPg bundle;
     ApprovalManager& mgr = *bundle;
-    auto id = mgr.submit_bound("guardian.deploy.r1", "alice", "", "",
-                               ApprovalOrigin::kGuardianDeploy, bound_request());
+    auto id = mgr.submit_bound("guardian.deploy.r1", "alice", "", ApprovalOrigin::kGuardianDeploy,
+                               bound_request());
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "bob", "").has_value());
 
@@ -714,8 +712,8 @@ TEST_CASE("submit_bound: an engine principal cannot submit a gated effect (typed
     ApprovalManager& mgr = *bundle;
 
     for (const char* engine : {"engine:vuln", "engine:x"}) {
-        auto r = mgr.submit_bound("guardian.deploy.r1", engine, "", "",
-                                  ApprovalOrigin::kGuardianDeploy, bound_request());
+        auto r = mgr.submit_bound("guardian.deploy.r1", engine, "", ApprovalOrigin::kGuardianDeploy,
+                                  bound_request());
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error().kind == SubmitFailure::kEnginePrincipal);
         CHECK(r.error().message == kEnginePrincipalSubmitMessage);
@@ -723,7 +721,7 @@ TEST_CASE("submit_bound: an engine principal cannot submit a gated effect (typed
     CHECK(mgr.pending_count() == 0); // nothing written
 
     // A human whose name merely CONTAINS the word is not an engine principal.
-    auto human = mgr.submit_bound("guardian.deploy.r1", "engineer:ann", "", "",
+    auto human = mgr.submit_bound("guardian.deploy.r1", "engineer:ann", "",
                                   ApprovalOrigin::kGuardianDeploy, bound_request());
     CHECK(human.has_value());
 }
@@ -745,29 +743,38 @@ std::string request_of_size(std::size_t total) {
     return std::string(R"({"k":")") + std::string(total - 8, 'a') + "\"}";
 }
 
+// Dependent on M so an ill-formed call makes the concept false instead of the program ill-formed.
+template <class M>
+concept CallableWithScheduleId =
+    requires(M& m, const std::string& s, ApprovalOrigin o, const BoundRequest& b) {
+        m.submit_bound(s, s, s, s, o, b);
+    };
+template <class M>
+concept CallableWithoutScheduleId =
+    requires(M& m, const std::string& s, ApprovalOrigin o, const BoundRequest& b) {
+        m.submit_bound(s, s, s, o, b);
+    };
+
 } // namespace
 
 // A bound ticket is never a scheduled ticket. ScheduleRunner matches approved tickets on
 // (schedule_id, definition, scope) with no origin check and fires the schedule's OWN
 // definition, so a bound ticket carrying a schedule id could be fired without the frozen
-// request, digest or excluded roots ever being compared. The mint refuses the combination.
-TEST_CASE("submit_bound: a bound mint with a schedule id is refused and writes nothing",
+// request, digest or excluded roots ever being compared. `submit_bound` therefore has no
+// schedule-id parameter at all: the combination cannot be written, so there is nothing to
+// refuse at runtime.
+TEST_CASE("submit_bound: a bound mint cannot name a schedule",
           "[pg][approval_manager][bound][6096]") {
+    // The old call shape (a schedule id between the scope and the origin) must not compile.
+    static_assert(!CallableWithScheduleId<ApprovalManager>,
+                  "submit_bound must not accept a schedule id");
+    static_assert(CallableWithoutScheduleId<ApprovalManager>,
+                  "control: the schedule-less shape is callable");
+
     yuzu::test::ApprovalManagerPg bundle;
     ApprovalManager& mgr = *bundle;
     REQUIRE(mgr.pending_count() == 0);
 
-    SECTION("refused with the validation kind, no row, no pending-count change") {
-        for (const auto origin : {ApprovalOrigin::kGuardianDeploy, ApprovalOrigin::kSchedule}) {
-            auto r = mgr.submit_bound("guardian.d", "alice", "scope", "sched-a", origin,
-                                      bound_request({"carol"}));
-            REQUIRE_FALSE(r.has_value());
-            CHECK(r.error().kind == SubmitFailure::kInvalidRequest);
-            CHECK(r.error().message.find("schedule") != std::string::npos);
-            CHECK(mgr.pending_count() == 0);
-            CHECK(mgr.query({}).empty()); // no row of any status
-        }
-    }
     SECTION("an unbound mint with a schedule id (the #6096 path) is unchanged") {
         auto id = mgr.submit("d", "alice", "scope", "sched-a", ApprovalOrigin::kSchedule, "p", "a");
         REQUIRE(id.has_value());
@@ -778,8 +785,8 @@ TEST_CASE("submit_bound: a bound mint with a schedule id is refused and writes n
         CHECK(row->request_json.empty());
     }
     SECTION("a bound mint with an empty schedule id still works") {
-        auto id = mgr.submit_bound("guardian.d", "alice", "scope", "",
-                                   ApprovalOrigin::kGuardianDeploy, bound_request({"carol"}));
+        auto id = mgr.submit_bound("guardian.d", "alice", "scope", ApprovalOrigin::kGuardianDeploy,
+                                   bound_request({"carol"}));
         REQUIRE(id.has_value());
         CHECK(mgr.pending_count() == 1);
         const auto row = mgr.get(*id);
@@ -797,7 +804,7 @@ TEST_CASE("submit_bound: every validation bound, at the edge and one past it",
     yuzu::test::ApprovalManagerPg bundle;
     ApprovalManager& mgr = *bundle;
     const auto submit = [&](BoundRequest b, ApprovalOrigin o = ApprovalOrigin::kGuardianDeploy) {
-        return mgr.submit_bound("guardian.d", "alice", "", "", o, b);
+        return mgr.submit_bound("guardian.d", "alice", "", o, b);
     };
     const auto refused_for = [&](BoundRequest b, const std::string& reason,
                                  ApprovalOrigin o = ApprovalOrigin::kGuardianDeploy) {
@@ -873,7 +880,7 @@ TEST_CASE("submit_bound: a NUL byte in request_json or a control character in a 
     yuzu::test::ApprovalManagerPg bundle;
     ApprovalManager& mgr = *bundle;
     const auto refused = [&](BoundRequest b) {
-        auto r = mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy, b);
+        auto r = mgr.submit_bound("guardian.d", "alice", "", ApprovalOrigin::kGuardianDeploy, b);
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error().kind == SubmitFailure::kInvalidRequest);
     };
@@ -894,9 +901,9 @@ TEST_CASE("submit_bound: a NUL byte in request_json or a control character in a 
 
     // Still-valid inputs are unchanged: an ESCAPED NUL (the six characters \u0000) is
     // ordinary text, and a root with punctuation or non-ASCII UTF-8 is fine.
-    auto escaped = mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
-                                    BoundRequest{R"({"k":"a\u0000b"})", {"oidc:carol@example.org",
-                                                                          "d\xC3\xA9j\xC3\xA0"}});
+    auto escaped = mgr.submit_bound(
+        "guardian.d", "alice", "", ApprovalOrigin::kGuardianDeploy,
+        BoundRequest{R"({"k":"a\u0000b"})", {"oidc:carol@example.org", "d\xC3\xA9j\xC3\xA0"}});
     REQUIRE(escaped.has_value());
     auto row = mgr.get(*escaped);
     REQUIRE(row.has_value());
@@ -911,7 +918,7 @@ TEST_CASE("submit_bound: the pending cap refuses with the typed queue-full kind"
     ApprovalManager& mgr = *bundle;
     yuzu::test::seed_pending(bundle.pool(), "cap-", ApprovalManager::kMaxPendingApprovals,
                              /*age_seconds=*/60);
-    auto r = mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+    auto r = mgr.submit_bound("guardian.d", "alice", "", ApprovalOrigin::kGuardianDeploy,
                               bound_request());
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().kind == SubmitFailure::kQueueFull);
@@ -923,7 +930,7 @@ TEST_CASE("approve: a reviewer in excluded_roots is refused; others are not",
           "[pg][approval_manager][bound]") {
     yuzu::test::ApprovalManagerPg bundle;
     ApprovalManager& mgr = *bundle;
-    auto id = mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+    auto id = mgr.submit_bound("guardian.d", "alice", "", ApprovalOrigin::kGuardianDeploy,
                                bound_request({"carol", "dave"}));
     REQUIRE(id.has_value());
 
@@ -959,7 +966,7 @@ TEST_CASE("reviewer_is_excluded: byte-for-byte membership, the one predicate app
 TEST_CASE("reject: an excluded root may still reject", "[pg][approval_manager][bound]") {
     yuzu::test::ApprovalManagerPg bundle;
     ApprovalManager& mgr = *bundle;
-    auto id = mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+    auto id = mgr.submit_bound("guardian.d", "alice", "", ApprovalOrigin::kGuardianDeploy,
                                bound_request({"carol"}));
     REQUIRE(id.has_value());
     CHECK(mgr.reject(*id, "carol", "withdrawn").has_value());
@@ -970,7 +977,7 @@ TEST_CASE("approve: an unreadable excluded_roots column fails CLOSED", "[pg][app
     yuzu::test::ApprovalManagerPg bundle;
     ApprovalManager& mgr = *bundle;
     for (const char* garbage : {"not json", R"({"a":1})", R"(["ok", 3])"}) {
-        auto id = mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+        auto id = mgr.submit_bound("guardian.d", "alice", "", ApprovalOrigin::kGuardianDeploy,
                                    bound_request({"carol"}));
         REQUIRE(id.has_value());
         REQUIRE(run_sql(bundle.pool(),
@@ -1004,7 +1011,7 @@ TEST_CASE("approve: a bound request that cannot be read or verified is refused; 
         {"request_digest", ""},
     };
     for (const auto& [column, value] : edits) {
-        auto id = mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+        auto id = mgr.submit_bound("guardian.d", "alice", "", ApprovalOrigin::kGuardianDeploy,
                                    bound_request());
         REQUIRE(id.has_value());
         REQUIRE(run_sql(bundle.pool(),
@@ -1019,7 +1026,7 @@ TEST_CASE("approve: a bound request that cannot be read or verified is refused; 
         CHECK(mgr.reject(*id, "bob", "").has_value()); // the way to clear it from the queue
     }
     // And an untouched bound ticket still approves.
-    auto ok = mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+    auto ok = mgr.submit_bound("guardian.d", "alice", "", ApprovalOrigin::kGuardianDeploy,
                                bound_request());
     REQUIRE(ok.has_value());
     CHECK(mgr.approve(*ok, "bob", "").has_value());
@@ -1042,7 +1049,7 @@ TEST_CASE("approve: an unreadable request whose digest still MATCHES it is refus
         std::string(R"({"k":")") + std::string(kMaxRequestJsonBytes, 'a') + "\"}", // too big
     };
     for (const auto& bad : unreadable) {
-        auto id = mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+        auto id = mgr.submit_bound("guardian.d", "alice", "", ApprovalOrigin::kGuardianDeploy,
                                    bound_request());
         REQUIRE(id.has_value());
         const auto digest = sha256_hex(bad);
@@ -1077,7 +1084,7 @@ namespace {
 
 // An approved, unconsumed bound ticket (alice -> bob) excluding carol.
 std::string approved_bound(ApprovalManager& mgr, const std::string& def = "guardian.d") {
-    auto id = mgr.submit_bound(def, "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+    auto id = mgr.submit_bound(def, "alice", "", ApprovalOrigin::kGuardianDeploy,
                                bound_request({"carol"}));
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "bob", "").has_value());
@@ -1387,7 +1394,7 @@ constexpr const char* kFlipToApproved =
 // A pending bound ticket (alice, excluding carol) after `setup` SQL.
 std::string pending_bound(ApprovalManager& mgr, yuzu::test::ApprovalManagerPg& bundle,
                           const std::string& setup_sql = {}) {
-    auto id = mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+    auto id = mgr.submit_bound("guardian.d", "alice", "", ApprovalOrigin::kGuardianDeploy,
                                bound_request({"carol"}));
     REQUIRE(id.has_value());
     if (!setup_sql.empty())
@@ -2079,7 +2086,7 @@ TEST_CASE("a precondition denial is counted per origin and reported to the obser
     CHECK(seen[0].consumed_by == "alice");
     CHECK(seen[0].reason == "state moved");
 
-    auto g = mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+    auto g = mgr.submit_bound("guardian.d", "alice", "", ApprovalOrigin::kGuardianDeploy,
                               bound_request());
     REQUIRE(g.has_value());
     REQUIRE(mgr.approve(*g, "bob", "").has_value());
@@ -2155,7 +2162,7 @@ TEST_CASE("a precondition denial writes an approval.precondition_denied audit ro
     mgr.set_precondition_denial_observer(
         make_precondition_denial_audit_observer([&audit]() -> AuditStore* { return &audit; }));
 
-    auto g = mgr.submit_bound("guardian.secret-def", "alice", "secret-scope", "",
+    auto g = mgr.submit_bound("guardian.secret-def", "alice", "secret-scope",
                               ApprovalOrigin::kGuardianDeploy, bound_request());
     REQUIRE(g.has_value());
     REQUIRE(mgr.approve(*g, "bob", "").has_value());

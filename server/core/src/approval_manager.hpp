@@ -681,6 +681,13 @@ public:
     /// the id, `origin` having no default) is exactly `submit()`'s, in the same
     /// transaction - there is one mint body, not two.
     ///
+    /// There is deliberately no `schedule_id` parameter: a bound ticket is never a
+    /// scheduled one. `ScheduleRunner` matches approved tickets on (schedule id,
+    /// definition, scope) with no origin check and fires the schedule's own definition,
+    /// so a bound ticket carrying a schedule id could be fired without its frozen
+    /// request, digest or excluded roots ever being compared. The row is written with
+    /// an empty `schedule_id`, and no signature of this function can say otherwise.
+    ///
     /// Refused with a TYPED error (`SubmitFailure`), nothing written, when:
     ///   - the submitter is an engine principal (`engine:` is a reserved namespace
     ///     no human account can hold - the boot-time collision scan fails closed on
@@ -698,8 +705,8 @@ public:
     ///     over `kMaxExcludedRoots`.
     [[nodiscard]] std::expected<std::string, SubmitError>
     submit_bound(const std::string& definition_id, const std::string& submitted_by,
-                 const std::string& scope_expression, const std::string& schedule_id,
-                 ApprovalOrigin origin, const BoundRequest& bound, std::string target_plugin = {},
+                 const std::string& scope_expression, ApprovalOrigin origin,
+                 const BoundRequest& bound, std::string target_plugin = {},
                  std::string target_action = {});
 
     std::vector<Approval> query(const ApprovalQuery& q = {}) const;

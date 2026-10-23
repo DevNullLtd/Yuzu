@@ -824,7 +824,7 @@ TEST_CASE("approvals_fragment_routes: a bound ticket renders its frozen request,
     BoundRequest br{R"({"definition":{"name":"Block <b>RDP</b>","hash":"abc123"},)"
                     R"("params":{"port":3389},"targets":["host-1"]})",
                     {}};
-    auto id = mgr->submit_bound("guardian.deploy.r1", "submitter1", "", "",
+    auto id = mgr->submit_bound("guardian.deploy.r1", "submitter1", "",
                                 ApprovalOrigin::kGuardianDeploy, br);
     REQUIRE(id.has_value());
 
@@ -851,7 +851,7 @@ TEST_CASE("approvals_fragment_routes: a viewer in excluded_roots is not offered 
     yuzu::test::ApprovalManagerPg mgr;
     BoundRequest br{R"({"definition":{"name":"n","hash":"h"},"targets":["t"],"params":{}})",
                     {"designer1"}};
-    REQUIRE(mgr->submit_bound("guardian.deploy.r1", "submitter1", "", "",
+    REQUIRE(mgr->submit_bound("guardian.deploy.r1", "submitter1", "",
                               ApprovalOrigin::kGuardianDeploy, br)
                 .has_value());
 
@@ -925,7 +925,7 @@ TEST_CASE("approvals_fragment_routes: an unreadable stored request never crashes
           "[pg][server][routes][approvals_fragment_routes][bound]") {
     yuzu::test::ApprovalManagerPg mgr;
     BoundRequest br{R"({"definition":{"name":"n","hash":"h"},"targets":["t"],"params":{}})", {}};
-    auto id = mgr->submit_bound("guardian.deploy.r1", "submitter1", "", "",
+    auto id = mgr->submit_bound("guardian.deploy.r1", "submitter1", "",
                                 ApprovalOrigin::kGuardianDeploy, br);
     REQUIRE(id.has_value());
 
@@ -972,7 +972,7 @@ TEST_CASE("approvals_fragment_routes: a readable bound request carries no unread
           "[pg][server][routes][approvals_fragment_routes][bound]") {
     yuzu::test::ApprovalManagerPg mgr;
     BoundRequest br{R"({"definition":{"name":"n","hash":"h"},"targets":["t"],"params":{}})", {}};
-    REQUIRE(mgr->submit_bound("guardian.deploy.r1", "submitter1", "", "",
+    REQUIRE(mgr->submit_bound("guardian.deploy.r1", "submitter1", "",
                               ApprovalOrigin::kGuardianDeploy, br)
                 .has_value());
     Harness h;
@@ -992,9 +992,9 @@ TEST_CASE("approvals_fragment_routes: the unreadable-request warning is throttle
           "never repeated per render, and carries only the 8-char id prefix",
           "[pg][server][routes][approvals_fragment_routes][bound]") {
     yuzu::test::ApprovalManagerPg mgr;
-    auto id = mgr->submit_bound("guardian.deploy.r1", "submitter1", "", "",
-                                ApprovalOrigin::kGuardianDeploy,
-                                BoundRequest{R"({"definition":{"name":"n","hash":"h"}})", {}});
+    auto id =
+        mgr->submit_bound("guardian.deploy.r1", "submitter1", "", ApprovalOrigin::kGuardianDeploy,
+                          BoundRequest{R"({"definition":{"name":"n","hash":"h"}})", {}});
     REQUIRE(id.has_value());
     poison_request(mgr, *id, "not json");
 
@@ -1024,9 +1024,9 @@ TEST_CASE("approvals_fragment_routes: Approve is withheld exactly when the store
           "state: unreadable roots (no 'excluded' hint) and a digest that no longer matches",
           "[pg][server][routes][approvals_fragment_routes][bound]") {
     yuzu::test::ApprovalManagerPg mgr;
-    auto id = mgr->submit_bound("guardian.deploy.r1", "submitter1", "", "",
-                                ApprovalOrigin::kGuardianDeploy,
-                                BoundRequest{R"({"definition":{"name":"n","hash":"h"}})", {"designer1"}});
+    auto id =
+        mgr->submit_bound("guardian.deploy.r1", "submitter1", "", ApprovalOrigin::kGuardianDeploy,
+                          BoundRequest{R"({"definition":{"name":"n","hash":"h"}})", {"designer1"}});
     REQUIRE(id.has_value());
 
     const auto set_column = [&](const char* column, const std::string& value) {

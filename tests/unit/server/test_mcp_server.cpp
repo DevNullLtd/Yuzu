@@ -9970,7 +9970,7 @@ TEST_CASE("MCP list_pending_approvals: a bound ticket carries request/digest/roo
     auto plain = appr.submit("def-plain", "operator1", "scope-1", "", ApprovalOrigin::kInstruction);
     REQUIRE(plain.has_value());
     auto bound = appr.submit_bound(
-        "guardian.deploy.r1", "operator1", "", "", ApprovalOrigin::kGuardianDeploy,
+        "guardian.deploy.r1", "operator1", "", ApprovalOrigin::kGuardianDeploy,
         yuzu::server::BoundRequest{R"({"definition":{"name":"Block RDP","hash":"abc"}})",
                                    {"designer1"}});
     REQUIRE(bound.has_value());

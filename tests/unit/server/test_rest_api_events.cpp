@@ -1891,8 +1891,7 @@ TEST_CASE("GET /api/v1/approvals/{id} and the list: a bound ticket carries reque
     auto plain = h->submit("def-plain", "alice", "tag:prod", "", ApprovalOrigin::kInstruction);
     REQUIRE(plain.has_value());
     const std::string request = R"({"definition":{"name":"Block RDP","hash":"abc"},"targets":["host-1"]})";
-    auto bound = h->submit_bound("guardian.deploy.r1", "alice", "", "",
-                                 ApprovalOrigin::kGuardianDeploy,
+    auto bound = h->submit_bound("guardian.deploy.r1", "alice", "", ApprovalOrigin::kGuardianDeploy,
                                  BoundRequest{request, {"designer1"}});
     REQUIRE(bound.has_value());
 
