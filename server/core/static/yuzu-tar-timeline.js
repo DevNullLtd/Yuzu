@@ -21,7 +21,7 @@
  * Request rate: only a held key (and playback) is throttled. A key moves the line at once, but
  * commits straight away only when the last commit is a second old; inside that second it marks a
  * commit owed and the ONE interval (shared with playback) makes it, with the newest time, once
- * the second is up. A block click, Previous / Next, a linked item, a scrub release and Play
+ * the second is up. A block click, Previous / Next, a scrub release and Play
  * restart commit at once, so the line, the highlight and the panels agree (the newest request
  * wins and aborts the older). A click that changes nothing (the time and item already shown)
  * requests nothing, so a held Enter on a focused button cannot repeat a request; a panel that

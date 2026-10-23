@@ -386,12 +386,12 @@ operator-visible. A signed-out request is redirected to sign in; a missing `id` 
   Repeated time changes (playback and a held key) are limited to one panel refresh a
   second, the newest time wins, and the timer waits for the previous answer; an answer
   still missing after ten seconds is abandoned and a fresh request made. A click on a
-  block, on Previous / Next or on a linked item, a scrub release, Play restart and the
+  block or on Previous / Next, a scrub release, Play restart and the
   first move after a quiet second refresh the panels at once. A click on what is already
   shown (the same time and item) asks for nothing, unless its panel failed, in which case
   it asks again. Stopping on Pause, the window end or a hidden tab commits the exact stop
   time once so the panels agree with the line. A click on a linked item in the Selected
-  panel stops playback; Play at the window end restarts from the window start. Play is
+  panel refreshes that panel and stops playback; Play at the window end restarts from the window start. Play is
   disabled with a note when the window is a day or longer or not valid.
 
 The fragments themselves, their permissions and audit are separate work. What the page
