@@ -140,7 +140,13 @@ untwinned baseline shrinks as F2+ wires real twins, and rises only when a
 change raises it with a stated reviewed reason - a newly-discovered fragment
 route, or extraction-completeness catching up to a route that already
 existed); this document's generated block going stale relative to a
-fresh render; a dated exception row that is not pinned, or is pinned to a
+fresh render; a twinned row whose REST route and MCP tool disagree on securable,
+operation or confinement kind (check 6, gate parity, a label-and-call-site tripwire
+with a size-pinned, shrink-only allowlist, `GATE_PARITY_KNOWN_MISMATCHES`, plus
+`GATE_PARITY_NO_GATE_ALLOWED` for routes whose gate it cannot read); a registry
+tool whose test file does not name it, assert a schema refusal and an audit row, or
+appear in `tests/meson.build` (check 7); a registry file count that is not
+`MIN_REGISTRY_FILES`; a dated exception row that is not pinned, or is pinned to a
 different issue or revisit date (`STRICT_EXCEPTION_PINS` in the script keys
 every dated exception row by `capability_id` to its issue and date, and a pin
 whose row was twinned or retired is stale); and, as a warning only, a revisit

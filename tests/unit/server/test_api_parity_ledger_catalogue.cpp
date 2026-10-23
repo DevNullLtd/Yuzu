@@ -20,7 +20,7 @@
 //     preflight treats it as no twin: it skips it on a non-twinned row, errors
 //     on twinned and twinned-mcp-only, and accepts it on twinned-rest-only).
 // It does not check row shape, the status and twin requirements, the baselines,
-// or which domain files exist beyond a minimum count. A ledger file that is an
+// or which domain files exist beyond their exact count (kLedgerFiles). A ledger file that is an
 // empty array is accepted, because the preflight's procedure for a new domain
 // starts its file as [].
 //
@@ -32,8 +32,8 @@
 // the same authorization, or that a dispatch branch exists.
 //
 // The ledger directory arrives as YUZU_API_PARITY_LEDGER_DIR (tests/meson.build).
-// A missing, unreadable or malformed ledger, or one that yields too few files or
-// no rows or claims, FAILS the test: it must never pass vacuously.
+// A missing, unreadable or malformed ledger, or one whose file count is not exactly
+// kLedgerFiles, or that yields no rows or claims, FAILS the test: it must never pass vacuously.
 
 #include "mcp_server_testonly.hpp"
 
@@ -64,11 +64,12 @@ namespace {
 // (RESOURCE_TWIN_PREFIX in scripts/ci/check-api-parity.py).
 constexpr std::string_view kResourcePrefix = "resource:";
 
-// Exact number of domain files the preflight declares (DOMAINS in check-api-parity.py).
+// Exact number of domain files the preflight declares (DOMAINS in scripts/ci/check-api-parity.py).
 // Equality, not a floor: a deleted or renamed ledger file silently drops its claims, and a
-// stray extra file silently adds unreviewed ones. Move it together with DOMAINS (and the same
-// constant in test_twin_completeness.cpp): raise it when a domain file is added, and lower it
-// only when a domain is deliberately removed from DOMAINS.
+// stray extra file silently adds unreviewed ones. The count is pinned in three places that move
+// together: DOMAINS in scripts/ci/check-api-parity.py, this constant, and kLedgerFiles in
+// tests/unit/server/test_twin_completeness.cpp. Raise it when a domain file is added, and lower
+// it only when a domain is deliberately removed from DOMAINS.
 constexpr std::size_t kLedgerFiles = 24;
 
 struct LedgerScan {
@@ -204,9 +205,9 @@ TEST_CASE("API parity ledger: every mcp_twin claim is in the compiled MCP catalo
          "resource in the tool catalogue (kTools[] or a registry file) / kResources[]. If "
          "the files count tripped, a ledger file is missing, an extra one was added, or a "
          "domain was added or removed: move kLedgerFiles together with DOMAINS in "
-         "check-api-parity.py. This test is stricter than the preflight: it also checks "
+         "scripts/ci/check-api-parity.py and kLedgerFiles in test_twin_completeness.cpp. This test is stricter than the preflight: it also checks "
          "non-twinned rows and empty claims.");
-    // The failure lines are asserted first so a floor trip (for example a renamed
+    // The failure lines are asserted first so a count or floor trip (for example a renamed
     // mcp_twin key) is reported with its cause rather than hiding it.
     CHECK(scan.failures.empty());
     // Exact file count (see kLedgerFiles); rows and claims stay sanity floors.

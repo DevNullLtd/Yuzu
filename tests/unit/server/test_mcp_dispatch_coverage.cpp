@@ -424,7 +424,8 @@ TEST_CASE("MCP dispatch coverage: every mcp_tools_*.cpp record is registered and
         }
     }
     INFO("mcp_tools_*.cpp files scanned: " << files << " (expected " << kRegistryDomainFiles
-                                           << "); bump kRegistryDomainFiles with the new file");
+                                           << "); bump kRegistryDomainFiles with the new file, together with "
+                                              "MIN_REGISTRY_FILES in scripts/ci/check-api-parity.py");
     CHECK(files == kRegistryDomainFiles);
 
     // Set equality in both directions, and no name declared twice across files.
@@ -540,8 +541,9 @@ TEST_CASE("MCP dispatch coverage: mcp_tools_*.cpp and mcp_tool*.hpp include no s
     INFO("mcp_tools_*.cpp files: " << files.cpp.size() << " (expected " << kRegistryDomainFiles
                                    << "), mcp_tool*.hpp files: " << files.hpp.size()
                                    << " (expected " << kToolHeaderFiles
-                                   << "); bump kRegistryDomainFiles / kToolHeaderFiles with the "
-                                      "new file");
+                                   << "); bump kRegistryDomainFiles (together with MIN_REGISTRY_FILES in "
+                                      "scripts/ci/check-api-parity.py) for a new mcp_tools_<domain>.cpp, "
+                                      "or kToolHeaderFiles for a new mcp_tool*.hpp");
     CHECK(files.cpp.size() == kRegistryDomainFiles);
     CHECK(files.hpp.size() == kToolHeaderFiles);
     INFO(join(offences));

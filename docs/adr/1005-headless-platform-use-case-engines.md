@@ -861,9 +861,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      registry tool is both a ledger `mcp_twin` and a `kExpectedTwins` row. Each
      check carries a size-pinned, shrink-only allowlist seeded from the tree as
      it stood. The gate-parity table (`GATE_PARITY_KNOWN_MISMATCHES`) holds
-     the four rows whose REST and MCP gates still differ after the check
-     learned two shapes (a REST handler that refuses a service-scoped token
-     before its gate, and an MCP handler whose own fleet read confines), with a
+     the six rows whose REST and MCP gates still differ, or whose agreement
+     the check cannot prove, after it learned two shapes (a REST handler that
+     refuses a service-scoped token before its gate, and an MCP handler whose
+     own fleet read confines), with a
      one-line reason each in the script; a second table
      (`GATE_PARITY_NO_GATE_ALLOWED`) holds routes whose gate the script cannot
      read. Both shrink only: a fix removes its entry and lowers the pin, and
