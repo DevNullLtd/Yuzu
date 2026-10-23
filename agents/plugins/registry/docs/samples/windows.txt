@@ -5,17 +5,17 @@ type|REG_SZ
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=set_value hive=HKCU key=Software\YuzuCaptureTmp name=probe value=1
-audit|op=set_value|hive=HKCU|result=ok|reason=-|verify=ok|key=Software\YuzuCaptureTmp|name=probe|type=REG_SZ|len=4|dry_run=-|counted_keys=-|counted_values=-|capped=-|sid=-|old_state=absent|old_type=-|old=-|new=31000000
+audit|op=set_value|hive=HKCU|result=ok|reason=-|verify=ok|key=Software\YuzuCaptureTmp|name=probe|type=REG_SZ|len=4|dry_run=-|counted_keys=-|counted_values=-|capped=-|created=1|sid=-|old_state=absent|old_type=-|old=-|new=31000000
 status|ok
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=delete_value hive=HKCU key=Software\YuzuCaptureTmp name=probe
-audit|op=delete_value|hive=HKCU|result=ok|reason=-|verify=ok|key=Software\YuzuCaptureTmp|name=probe|type=-|len=-|dry_run=-|counted_keys=-|counted_values=-|capped=-|sid=-|old_state=present|old_type=REG_SZ|old=31000000|new=-
+audit|op=delete_value|hive=HKCU|result=ok|reason=-|verify=ok|key=Software\YuzuCaptureTmp|name=probe|type=-|len=-|dry_run=-|counted_keys=-|counted_values=-|capped=-|created=0|sid=-|old_state=present|old_type=REG_SZ|old=31000000|new=-
 status|ok
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=delete_key hive=HKCU key=Software\YuzuCaptureTmp
-audit|op=delete_key|hive=HKCU|result=ok|reason=-|verify=ok|key=Software\YuzuCaptureTmp|name=-|type=-|len=-|dry_run=0|counted_keys=1|counted_values=0|capped=0|sid=-|old_state=-|old_type=-|old=-|new=-
+audit|op=delete_key|hive=HKCU|result=ok|reason=-|verify=ok|key=Software\YuzuCaptureTmp|name=-|type=-|len=-|dry_run=0|counted_keys=1|counted_values=0|capped=0|created=0|sid=-|old_state=-|old_type=-|old=-|new=-
 status|ok
 counted_keys|1
 counted_values|0

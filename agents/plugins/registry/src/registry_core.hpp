@@ -16,9 +16,12 @@
  *    steps (the key, then its `SymbolicLinkValue`), so one completed after its probe is followed by the next
  *    relative open, and a component renamed away leaves the handle bound to the object at its new name. The
  *    walk therefore ends on the fast open's own test: the canonical name of the leaf handle has to equal the
- *    canonical name of the FIRST component's handle (read right after that open, before its probe) plus the
- *    remaining requested components, ASCII case-insensitively, else `key_is_link`; a name that cannot be read
- *    refuses with its win32 token. One derivation serves every hive, HKCU and HKCR included.
+ *    canonical name of the FIRST component's handle (read right after that open, before its probe, and itself
+ *    required to end in the requested first component) plus the remaining requested components, ASCII
+ *    case-insensitively, else `key_is_link`; a name that cannot be read refuses with its win32 token. One
+ *    derivation serves every hive, HKCU and HKCR included. A create is relative to a handle the kernel parses
+ *    again, so it can land beneath a link completed meanwhile; when the name test refuses a walk that created
+ *    keys, they are deleted by their own handles, leaf first, and `created` reports any that could not be.
  *  - the FAST open (open_fast; HKLM and HKU only): ONE open_path of the whole path with REG_OPTION_OPEN_LINK,
  *    then final_name -- the kernel's canonical name of the object the handle is bound to -- is compared
  *    with `<root kernel name>\<requested path>` (ASCII case-insensitively, every other byte exactly) and the
@@ -38,8 +41,8 @@
  *       key_is_link on any successful query whatever the value's type, so the walk refuses, the fast open
  *       accepts.
  * A decoy on the LEAF is refused on both paths (the same probe). A non-ASCII case variant, a failed or
- * overflowing final_name and a failed root_name all fall back to the walk (which refuses the non-ASCII variant
- * after the first component, its own name test using the same ASCII-only fold). No handle outlives one command.
+ * overflowing final_name and a failed root_name all fall back to the walk (which refuses the non-ASCII variant,
+ * its own name tests using the same ASCII-only fold). No handle outlives one command.
  *
  * The walk's ACCEPT carries the same kind of guarantee (see its bullet): the leaf handle's kernel name is the
  * first component's name plus the remaining requested components, so a link completed after its probe, or a
@@ -121,17 +124,15 @@ template <class Raw>
     for (int attempt = 0; attempt < 3; ++attempt) {
         std::uint32_t got = static_cast<std::uint32_t>(buf.size());
         const long rc = raw(&type, buf.data(), &got);
-        if (rc == kErrorMoreData) { // the value grew between the two reads
+        if (rc != kErrorSuccess && rc != kErrorMoreData) return rc;
+        // The value grew between the two reads, or SUCCESS reported a count the buffer cannot hold (never form the
+        // copy range from it): one arm, so both honour the ceiling.
+        if (rc == kErrorMoreData || got > buf.size()) {
             if (got > max_read) {
                 out.type = type;
                 out.size = got;
                 return kErrorSuccess;
             }
-            buf.resize(got);
-            continue;
-        }
-        if (rc != kErrorSuccess) return rc;
-        if (got > buf.size()) { // never form the copy range from a count the buffer cannot hold
             buf.resize(got);
             continue;
         }
@@ -228,7 +229,7 @@ private:
 struct Opened {
     explicit Opened(RegistryWriter& r) : leaf(r) {}
     Owned leaf;
-    unsigned created = 0;  ///< components THIS call created (also set when it failed part-way)
+    unsigned created = 0;  ///< keys THIS call created and left behind (a refused walk deletes them: the residual)
     unsigned missing = 0;  ///< components that did not exist when the walk reached them
     std::string error;     ///< "" or a token
     bool fast = false;     ///< the handle came from open_fast
@@ -305,14 +306,25 @@ struct Opened {
     leaf_access |= kKeyQueryValue;
     const std::uint32_t inter_access = kKeyQueryValue | (create ? kKeyCreateSubKey : 0);
     Owned cur{reg};
+    std::vector<Owned> made_keys; // the keys this call creates, leaf last; held open so a refused walk can delete them
     Handle parent = root;
     std::string first_name; // the canonical name of the first component's handle, read right after its open
-    // Hands the leaf over only when its kernel name is the requested path (leaf_name_check); `cur` closes it otherwise.
+    // Hands the leaf over only when its kernel name is the requested path (leaf_name_check). Otherwise the leaf is
+    // closed and every key this call created is deleted by its own handle, leaf first (a create made through a
+    // parent that had become a link lands beneath the link's target before any name can be read); `created` is
+    // then what could not be deleted.
     const auto hand_over = [&]() -> Opened {
-        if (auto why = leaf_name_check(reg, cur.get(), first_name, parts); !why.empty())
+        Owned& leaf = made_keys.empty() ? cur : made_keys.back();
+        if (auto why = leaf_name_check(reg, leaf.get(), first_name, parts); !why.empty()) {
             out.error = std::move(why);
-        else
-            out.leaf = std::move(cur);
+            for (auto it = made_keys.rbegin(); it != made_keys.rend(); ++it)
+                if (reg.delete_key_by_handle(it->get()) == kErrorSuccess) {
+                    it->reset(); // a deleted key's handle is closed before its parent is deleted in turn
+                    --out.created;
+                }
+        } else {
+            out.leaf = std::move(leaf);
+        }
         return std::move(out);
     };
     for (std::size_t i = 0; i < parts.size(); ++i) {
@@ -335,20 +347,21 @@ struct Opened {
                 const bool last_j = j + 1 == parts.size();
                 Handle made = 0;
                 bool created_new = false;
-                const long crc = reg.create_sub(parent, parts[j], last_j ? leaf_access : (kKeyQueryValue | kKeyCreateSubKey),
-                                                made, created_new);
+                // kAccessDelete: a refused walk deletes what it made through this very handle.
+                const std::uint32_t create_access =
+                    (last_j ? leaf_access : (kKeyQueryValue | kKeyCreateSubKey)) | kAccessDelete;
+                const long crc = reg.create_sub(parent, parts[j], create_access, made, created_new);
                 if (crc != kErrorSuccess) {
                     out.error = rc_token(crc, Missing::key);
                     return out;
                 }
-                Owned made_h{reg, made}; // closes on the early return below
+                made_keys.emplace_back(reg, made); // closes on the early return below
                 if (!created_new) { // the walk saw it absent a moment ago
                     out.error = std::string{kTokConcurrentChange};
                     return out;
                 }
                 ++out.created;
-                cur = std::move(made_h); // closes the previous (checked) parent after the child exists
-                parent = cur.get();
+                parent = made_keys.back().get(); // the checked parent in `cur` stays open until the walk ends
             }
             return hand_over();
         }
@@ -357,11 +370,20 @@ struct Opened {
             return out;
         }
         Owned opened{reg, next};
-        if (i == 0) // before the probe: no later swap can move what this names
+        if (i == 0) { // before the probe: no later swap can move what this names
             if (const long nrc = reg.final_name(next, first_name); nrc != kErrorSuccess) {
                 out.error = rc_token(nrc, Missing::key);
                 return out;
             }
+            // The component the handle is bound to must still be named as requested: a rename between the open
+            // and this read would otherwise anchor the whole walk at the renamed object.
+            const auto sep = first_name.rfind('\\');
+            if (sep == std::string::npos ||
+                !names_equal_ascii_ci(std::string_view{first_name}.substr(sep + 1), parts[0])) {
+                out.error = std::string{kTokKeyIsLink};
+                return out;
+            }
+        }
         if (!(last && leaf_may_be_link)) {
             if (auto link = probe_link(reg, next); !link.empty()) {
                 out.error = std::move(link);
@@ -398,7 +420,7 @@ struct WriteOutcome {
     std::string result = "refused"; ///< ok | refused (nothing mutated) | failed (a mutation was attempted)
     std::string reason;             ///< "" or a token
     std::string verify;             ///< ok | mismatch | ""
-    unsigned created = 0;
+    unsigned created = 0;           ///< keys this operation created and left behind (0 = nothing stranded)
     OldValue old;
     bool has_old = false;
     bool mutated = false;
@@ -601,6 +623,7 @@ inline void fill_old(AuditRecord& au, const OldValue& old) {
     base.result = o.result;
     base.reason = o.reason;
     base.verify = o.verify;
+    base.created = static_cast<long long>(o.created);
     if (o.has_old) fill_old(base, o.old);
     if (is_delete_key) {
         base.dry_run = 0;

@@ -962,9 +962,9 @@ means roughly 219M rows. At an assumed ~200 bytes/row that is on the order
 of 44 GB plus a comparable index footprint in the `audit_store.audit_events`
 table -- but row size varies with `principal`, `action`, `detail`, `target`
 and `user_agent`, so treat the byte figure as an order of magnitude, not a
-threshold. Audit rows are emitted per REQUEST rather than per device (agent-reported
-rows such as `registry.write` are one per device per command), but
-not only for operator requests: agent enrolment, fleet-topology pushes and
+threshold. Dispatch rows are per request; agent-reported rows such as `registry.write`
+are per device per command. Rows are written for more than operator
+requests: agent enrolment, fleet-topology pushes and
 rejections, and background schedule execution all write rows too, so fleet
 size does influence the rate. Measure your own
 `yuzu_server_audit_events_total` rate rather than assuming an operator-only

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <iterator>
 #include <map>
@@ -82,13 +83,17 @@ public:
     std::map<Handle, NodeP> open;
     Handle next = 0x100;
     std::vector<std::string> log;
+    /// "<call>:<name>:<access mask in hex>" of every open_sub / open_path / create_sub, in call order.
+    std::vector<std::string> masks;
     /// Every call across the seam, and per method: the deterministic stand-in for latency.
     std::size_t seam_calls = 0;
     std::map<std::string, std::size_t> by_method;
-    /// Fired BEFORE create_sub and AFTER query_value / delete_value, named "<op>:<name>" (e.g.
-    /// "create_sub:B"), so a test can change the tree at a call boundary.
+    /// Fired BEFORE create_sub and final_name ("final_name") and AFTER query_value / delete_value, named
+    /// "<op>:<name>" (e.g. "create_sub:B"), so a test can change the tree at a call boundary.
     std::function<void(const std::string&)> before, after;
     std::function<void(Node&, const std::string&)> tamper_after_set;
+    /// Lets a test rewrite the name final_name is about to answer (a name the kernel would never give).
+    std::function<void(std::string&)> name_hook;
     /// Fired at the start of every enum_value call: a value set that grows while it is being enumerated.
     std::function<void(Node&)> grow_on_enum;
     /// "<op>:<name>" -> rc, consumed on use. open_path/final_name/root_name also take the bare method name.
@@ -150,10 +155,11 @@ public:
     }
 
     // RegistryWriter
-    long open_sub(Handle parent, std::string_view name, std::uint32_t, Handle& out) override {
+    long open_sub(Handle parent, std::string_view name, std::uint32_t access, Handle& out) override {
         tally("open_sub");
         const std::string ev = "open_sub:" + std::string{name};
         log.push_back(ev);
+        masks.push_back(ev + ":" + hex(access));
         long rc = 0;
         if (const auto inj = take(ev)) rc = *inj;
         NodeP child;
@@ -170,10 +176,11 @@ public:
         }
         return rc;
     }
-    long open_path(Handle root_h, std::string_view key_path, std::uint32_t, Handle& out) override {
+    long open_path(Handle root_h, std::string_view key_path, std::uint32_t access, Handle& out) override {
         tally("open_path");
         const std::string ev = "open_path:" + std::string{key_path};
         log.push_back(ev);
+        masks.push_back(ev + ":" + hex(access));
         if (const auto inj = take(ev, "open_path")) return *inj;
         const auto start = node(root_h);
         if (!start) return 1018;
@@ -187,11 +194,13 @@ public:
     long final_name(Handle key_h, std::string& out) override {
         tally("final_name");
         log.push_back("final_name");
+        if (before) before("final_name");
         if (const auto inj = take("final_name", "final_name")) return *inj;
         const auto n = node(key_h);
         std::string path;
         if (!n || n->deleted || !canonical_path(n.get(), path)) return 1018;
         out = std::string{kRootName} + (path.empty() ? "" : "\\" + path);
+        if (name_hook) name_hook(out);
         return 0;
     }
     long root_name(Handle root_h, std::string& out) override {
@@ -202,10 +211,12 @@ public:
         out = kRootName;
         return 0;
     }
-    long create_sub(Handle parent, std::string_view name, std::uint32_t, Handle& out, bool& created_new) override {
+    long create_sub(Handle parent, std::string_view name, std::uint32_t access, Handle& out,
+                    bool& created_new) override {
         tally("create_sub");
         const std::string ev = "create_sub:" + std::string{name};
         log.push_back(ev);
+        masks.push_back(ev + ":" + hex(access));
         if (before) before(ev);
         long rc = 0;
         if (const auto inj = take(ev)) rc = *inj;
@@ -234,6 +245,7 @@ public:
     }
     void close(Handle key_h) override {
         tally("close");
+        log.push_back("close");
         open.erase(key_h);
     }
     long query_value(Handle key_h, std::string_view name, std::size_t cap, QueryResult& out) override {
@@ -291,6 +303,7 @@ public:
     long delete_key_by_handle(Handle key_h) override {
         tally("delete_key_by_handle");
         log.push_back("delete_key_by_handle");
+        if (const auto inj = take("delete_key_by_handle")) return *inj;
         const auto n = node(key_h);
         if (!n || n->deleted) return 1018;
         if (n->deny_delete_key || !n->subkeys.empty()) return 5; // STATUS_CANNOT_DELETE maps to access denied
@@ -300,6 +313,11 @@ public:
     }
 
 private:
+    static std::string hex(std::uint32_t mask) {
+        char buf[16];
+        std::snprintf(buf, sizeof buf, "0x%x", static_cast<unsigned>(mask));
+        return buf;
+    }
     void tally(const char* method) {
         ++seam_calls;
         ++by_method[method];
@@ -676,7 +694,7 @@ TEST_CASE("registry core: the walk refuses a leaf whose kernel name is not the r
         CHECK(reg.get("A\\Parked\\C", "Marker")->data == dword(0xD0));
         CHECK(reg.get("Decoy", "V") == nullptr);
     }
-    SECTION("the create path: the parent completed into a link just before create_sub") {
+    SECTION("the create path: the parent completed into a link just before create_sub; what was made is deleted") {
         FakeRegistry reg;
         const NodeP top = reg.key("Top");
         reg.put("Decoy", "Marker", kRegDword, dword(0xDEC0));
@@ -688,11 +706,41 @@ TEST_CASE("registry core: the walk refuses a leaf whose kernel name is not the r
         };
         const auto o = set_value_verified(reg, FakeRegistry::kRoot, "Top\\A\\B", "V", kRegDword, dword(7), false);
         CHECK(o.reason == "key_is_link");
-        CHECK(o.result == "failed"); // A and B were created beneath the decoy before the name could be read
-        CHECK(o.created == 2);
-        CHECK(reg.calls("set_value") == 0); // but the value is not written
-        CHECK(reg.get("Decoy\\A\\B", "V") == nullptr);
+        // A and B were created beneath the decoy before the name could be read, then deleted by their own
+        // handles, leaf first (the fake refuses to delete a key that still has a subkey): nothing is left.
+        CHECK(o.result == "refused");
+        CHECK(o.created == 0);
+        CHECK_FALSE(o.mutated);
+        REQUIRE(reg.method_calls("delete_key_by_handle") == 2);
+        const auto first_delete = std::find(reg.log.begin(), reg.log.end(), "delete_key_by_handle");
+        const auto second_delete = std::find(std::next(first_delete), reg.log.end(), "delete_key_by_handle");
+        CHECK(std::find(first_delete, second_delete, "close") != second_delete); // the leaf's handle is closed first
+        CHECK_FALSE(reg.exists("Decoy\\A"));
+        CHECK(reg.calls("set_value") == 0);
         CHECK(reg.get("Decoy", "Marker")->data == dword(0xDEC0));
+        CHECK(render_single_action(AuditRecord{}, o, false).lines[0].find("|created=0|") != std::string::npos);
+    }
+    SECTION("a created key the cleanup cannot delete stays reported: failed, with the residual count") {
+        FakeRegistry reg;
+        const NodeP top = reg.key("Top");
+        reg.put("Decoy", "Marker", kRegDword, dword(0xDEC0));
+        reg.before = [&](const std::string& ev) {
+            if (ev == "create_sub:A") {
+                top->is_link = true;
+                top->link_target = "Decoy";
+            }
+        };
+        reg.inject["delete_key_by_handle"] = 5;
+        const auto o = set_value_verified(reg, FakeRegistry::kRoot, "Top\\A", "V", kRegDword, dword(7), false);
+        CHECK(o.reason == "key_is_link");
+        CHECK(o.result == "failed");
+        CHECK(o.created == 1);
+        CHECK(reg.exists("Decoy\\A"));
+        CHECK(reg.calls("set_value") == 0);
+        // The residual is on the wire, where the server's audit row carries it.
+        CHECK(render_single_action(AuditRecord{}, o, false).lines[0].find("|result=failed|reason=key_is_link|") !=
+              std::string::npos);
+        CHECK(render_single_action(AuditRecord{}, o, false).lines[0].find("|created=1|") != std::string::npos);
     }
     SECTION("a legitimate walk is accepted, case variants and a leaf link for delete_key included") {
         FakeRegistry reg;
@@ -751,6 +799,72 @@ TEST_CASE("registry core: a walk whose handle cannot be named refuses and holds 
         CHECK(reg.calls("set_value") == 0);
         CHECK(reg.get("A\\B", "V") == nullptr);
     }
+}
+
+TEST_CASE("registry core: a first component renamed between its open and its name read is refused",
+          "[registry][core][walk_identity]") {
+    struct Case {
+        const char* request;
+        const char* parked_leaf; ///< where the requested leaf sits once A has been renamed to Parked
+    };
+    for (const Case c : {Case{"A", "Parked"}, Case{"A\\B", "Parked\\B"}}) {
+        INFO(c.request);
+        FakeRegistry reg;
+        reg.put("A\\B", "Marker", kRegDword, dword(0xD0));
+        int names = 0;
+        // The first name read follows the open of A immediately: the rename lands between the two, so the handle is
+        // bound to an object that is no longer called A and the leaf's name (Parked\B) would match a walk anchored
+        // at the renamed object.
+        reg.before = [&](const std::string& ev) {
+            if (ev == "final_name" && ++names == 1) {
+                reg.root->subkeys["Parked"] = reg.root->subkeys["A"];
+                reg.root->subkeys.erase("A");
+            }
+        };
+        const auto o = set_value_verified(reg, FakeRegistry::kRoot, c.request, "V", kRegDword, dword(7), false);
+        CHECK(o.result == "refused");
+        CHECK(o.reason == "key_is_link");
+        CHECK(reg.calls("set_value") == 0);
+        CHECK(reg.get(c.parked_leaf, "V") == nullptr);
+    }
+}
+
+TEST_CASE("registry core: a first-component name with no separator is refused", "[registry][core][walk_identity]") {
+    FakeRegistry reg;
+    reg.key("A");
+    // Every name read answers "A": equal to the requested component and to the leaf test's expectation, but not a
+    // path the kernel could name, so only the separator check stands between it and an accepted walk.
+    reg.name_hook = [](std::string& n) { n = "A"; };
+    const auto o = set_value_verified(reg, FakeRegistry::kRoot, "A", "V", kRegDword, dword(7), false);
+    CHECK(o.result == "refused");
+    CHECK(o.reason == "key_is_link");
+    CHECK(reg.calls("set_value") == 0);
+}
+
+TEST_CASE("registry core: every open and create asks for the access it needs", "[registry][core]") {
+    FakeRegistry reg;
+    reg.key("Software");
+    // One denied open of the intermediate component: the walk retries it with the read access alone.
+    reg.inject["open_sub:Software"] = 5;
+    const auto o = set_value_verified(reg, FakeRegistry::kRoot, "Software\\New\\Deeper", "V", kRegDword, dword(3),
+                                      false);
+    REQUIRE(o.result == "ok");
+    // KEY_QUERY_VALUE 0x1, KEY_SET_VALUE 0x2, KEY_CREATE_SUB_KEY 0x4, DELETE 0x10000. A created key carries DELETE
+    // so a refused walk can remove it by handle; the leaf also carries what the write and the probe need.
+    const std::vector<std::string> expected{
+        "open_sub:Software:0x5",         // denied
+        "open_sub:Software:0x1",         // the retry
+        "open_sub:New:0x5",              // not there
+        "create_sub:New:0x10005",
+        "create_sub:Deeper:0x10003",
+    };
+    CHECK(reg.masks == expected);
+
+    FakeRegistry fast;
+    fast.key("Software\\Acme");
+    REQUIRE(set_value_verified(fast, FakeRegistry::kRoot, "Software\\Acme", "V", kRegDword, dword(3), true).ok());
+    const std::vector<std::string> expected_fast{"open_path:Software\\Acme:0x3"};
+    CHECK(fast.masks == expected_fast);
 }
 
 TEST_CASE("registry core: a missing suffix is created component-wise from the checked handle",
@@ -1183,6 +1297,22 @@ TEST_CASE("registry core: query_value_bounded never forms a copy range from a co
         CHECK(q.bytes == ramp(300)); // none of it is the 0xEE the lying call left behind
         CHECK(m.calls.size() == 2);
         CHECK(m.calls[1].second == 300);
+    }
+    SECTION("a SUCCESS count past max_read is answered size-only, as MORE_DATA is: the ceiling holds on both arms") {
+        QueryModel m;
+        m.value = ramp(300);
+        m.script = [&](std::size_t n, std::uint32_t* t, std::uint8_t* data, std::uint32_t* size) -> std::optional<long> {
+            if (n != 1) return std::nullopt;
+            *t = kRegBinary;
+            *size = 500; // the sized read was given room for 300; the ceiling is 350
+            data[0] = 0xEE;
+            return 0;
+        };
+        QueryResult q;
+        CHECK(query_value_bounded(4096, std::ref(m), q, /*max_read=*/350) == 0);
+        CHECK(q.size == 500);
+        CHECK(q.bytes.empty());
+        CHECK(m.calls.size() == 2); // no retry with a buffer sized by the lie
     }
     SECTION("a SUCCESS on a sized read that reports more bytes than it was given room for is retried with room") {
         QueryModel m;

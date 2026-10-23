@@ -262,6 +262,7 @@ TEST_CASE("registry render_audit_line: byte-exact grammar", "[registry][parsers]
     r.len = 4;
     r.result = "ok";
     r.verify = "ok";
+    r.created = 2;
     r.old_state = "present";
     r.old_type = "REG_DWORD";
     r.old_bytes = B({1, 0, 0, 0});
@@ -272,7 +273,7 @@ TEST_CASE("registry render_audit_line: byte-exact grammar", "[registry][parsers]
     r.has_new = true;
     CHECK(render_audit_line(r) ==
           "audit|op=set_value|hive=HKLM|result=ok|reason=-|verify=ok|key=SOFTWARE\\Acme|name=Ver|"
-          "type=REG_DWORD|len=4|dry_run=-|counted_keys=-|counted_values=-|capped=-|sid=-|"
+          "type=REG_DWORD|len=4|dry_run=-|counted_keys=-|counted_values=-|capped=-|created=2|sid=-|"
           "old_state=present|old_type=REG_DWORD|old=01000000|new=02000000");
 
     SECTION("a refusal carries its reason and nothing it did not do") {
@@ -285,7 +286,7 @@ TEST_CASE("registry render_audit_line: byte-exact grammar", "[registry][parsers]
         x.old_state = "absent";
         CHECK(render_audit_line(x) ==
               "audit|op=delete_value|hive=HKCU|result=refused|reason=value_not_found|verify=-|"
-              "key=Software\\X|name=-|type=-|len=-|dry_run=-|counted_keys=-|counted_values=-|capped=-|sid=-|"
+              "key=Software\\X|name=-|type=-|len=-|dry_run=-|counted_keys=-|counted_values=-|capped=-|created=-|sid=-|"
               "old_state=absent|old_type=-|old=-|new=-");
     }
     SECTION("delete_key counts, dry_run and the sid column") {
@@ -299,10 +300,11 @@ TEST_CASE("registry render_audit_line: byte-exact grammar", "[registry][parsers]
         x.counted_keys = 3;
         x.counted_values = 7;
         x.capped = 0;
+        x.created = 0;
         x.sid = "S-1-5-21-1-2-3-1001";
         CHECK(render_audit_line(x) ==
               "audit|op=delete_key|hive=HKU|result=ok|reason=-|verify=ok|key=k|name=-|type=-|len=-|"
-              "dry_run=1|counted_keys=3|counted_values=7|capped=0|sid=S-1-5-21-1-2-3-1001|"
+              "dry_run=1|counted_keys=3|counted_values=7|capped=0|created=0|sid=S-1-5-21-1-2-3-1001|"
               "old_state=-|old_type=-|old=-|new=-");
     }
     SECTION("old and new are capped at 256 raw bytes with ~<total>") {
@@ -336,7 +338,7 @@ TEST_CASE("registry render_audit_line: byte-exact grammar", "[registry][parsers]
         const auto line = render_audit_line(x);
         CHECK(line.find('\n') == std::string::npos);
         CHECK(line.find("|key=a_result_ok_audit_op_x|name=n_verify_ok|") != std::string::npos);
-        CHECK(std::count(line.begin(), line.end(), '|') == 18); // the grammar's 19 fields, nothing extra
+        CHECK(std::count(line.begin(), line.end(), '|') == 19); // the grammar's 20 parts, nothing extra
     }
 }
 
@@ -358,6 +360,7 @@ TEST_CASE("registry audit producer contract: no pipe LF or CR survives and the f
     r.counted_keys = 1;
     r.counted_values = 2;
     r.capped = 0;
+    r.created = 0;
     r.old_state = "present";
     r.old_type = "REG_SZ";
     r.old_bytes = B({0x7c, 0x0a, 0x0d});
@@ -371,7 +374,7 @@ TEST_CASE("registry audit producer contract: no pipe LF or CR survives and the f
     CHECK(line.find('\n') == std::string::npos);
     CHECK(line.find('\r') == std::string::npos);
     for (const char c : line) CHECK(static_cast<unsigned char>(c) >= 0x20); // no control byte at all
-    // 19 pipe-separated parts: the tag, then the 18 fields in the published order, each `name=value`.
+    // 20 pipe-separated parts: the tag, then the 19 fields in the published order, each `name=value`.
     std::vector<std::string> parts;
     for (std::size_t pos = 0; pos <= line.size();) {
         const std::size_t bar = std::min(line.find('|', pos), line.size());
@@ -380,7 +383,7 @@ TEST_CASE("registry audit producer contract: no pipe LF or CR survives and the f
     }
     constexpr std::string_view kOrder[] = {"op",   "hive",     "result",         "reason",         "verify",
                                            "key",  "name",     "type",           "len",            "dry_run",
-                                           "counted_keys", "counted_values", "capped", "sid",
+                                           "counted_keys", "counted_values", "capped", "created", "sid",
                                            "old_state", "old_type", "old",       "new"};
     REQUIRE(parts.size() == 1 + std::size(kOrder));
     CHECK(parts[0] == "audit");

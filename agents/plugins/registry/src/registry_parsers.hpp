@@ -454,6 +454,7 @@ struct AuditRecord {
     int dry_run = -1;                   ///< 0 / 1; -1 = "-"
     long long counted_keys = -1, counted_values = -1;
     int capped = -1;
+    long long created = -1;             ///< keys the operation created and left behind; -1 = "-"
     std::string sid;
     std::string old_state;              ///< absent | present | unreadable; "" = "-"
     std::string old_type;
@@ -501,6 +502,7 @@ namespace detail {
     o += "|counted_keys=" + num(r.counted_keys);
     o += "|counted_values=" + num(r.counted_values);
     o += "|capped=" + num(r.capped);
+    o += "|created=" + num(r.created);
     o += "|sid=" + audit_token(r.sid, 64);
     o += "|old_state=" + dash(r.old_state);
     o += "|old_type=" + dash(r.old_type);

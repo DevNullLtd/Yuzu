@@ -297,7 +297,8 @@ int emit(yuzu::CommandContext& ctx, const ActionOutput& out) {
     return out.rc;
 }
 
-// L7: log access to sensitive registry paths for the agent log (unchanged behaviour).
+// L7: log access to sensitive registry paths for the agent log. The key is request-supplied and not yet validated,
+// so it is logged through sanitize_field (a CR or LF in it must not forge an agent-log line).
 void audit_sensitive_path(std::string_view hive, std::string_view key_path) {
     if (hive != "HKLM") return;
     const auto starts_ci = [&](std::string_view upper_prefix) { // ASCII upper-cased prefix match, no copy of the key
@@ -307,7 +308,7 @@ void audit_sensitive_path(std::string_view hive, std::string_view key_path) {
                });
     };
     if (starts_ci("SOFTWARE\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\RUN") || starts_ci("SYSTEM\\CURRENTCONTROLSET\\SERVICES"))
-        spdlog::info("Registry: accessing sensitive path HKLM\\{}", key_path);
+        spdlog::info("Registry: accessing sensitive path HKLM\\{}", sanitize_field(key_path));
 }
 
 struct Target {

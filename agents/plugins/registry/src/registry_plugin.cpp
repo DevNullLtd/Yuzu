@@ -73,28 +73,38 @@ public:
     int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
 #ifndef _WIN32
         (void)params;
-        // Unknown actions are refused BEFORE the platform answer, so a misspelled one is never terminal SUCCESS.
-        bool known = false;
-        for (const char* const* a = actions(); *a != nullptr; ++a) {
-            if (action == *a) { known = true; break; }
-        }
-        if (!known) {
-            ctx.write_output("error|unknown action: " + yuzu::profiles::sanitize_field(action));
-            return 1;
-        }
-        static constexpr std::string_view kMutatingActions[] = {"set_value", "delete_value", "delete_key"};
-        const bool is_mutator = std::ranges::find(kMutatingActions, action) != std::end(kMutatingActions);
+        // ONE try/catch(...) at the ABI seam, as execute_guarded is on the Windows leg: nothing thrown here (the
+        // only throw sites are string allocations) crosses the plugin boundary.
+        try {
+            // Unknown actions are refused BEFORE the platform answer, so a misspelled one is never terminal SUCCESS.
+            bool known = false;
+            for (const char* const* a = actions(); *a != nullptr; ++a) {
+                if (action == *a) { known = true; break; }
+            }
+            if (!known) {
+                ctx.write_output("error|unknown action: " + yuzu::profiles::sanitize_field(action));
+                return 1;
+            }
+            static constexpr std::string_view kMutatingActions[] = {"set_value", "delete_value", "delete_key"};
+            const bool is_mutator = std::ranges::find(kMutatingActions, action) != std::end(kMutatingActions);
 
 #if defined(__APPLE__)
-        // macOS-specific honest sentinel (points at the real macOS alternative).
-        ctx.write_output("registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists");
+            // macOS-specific honest sentinel (points at the real macOS alternative).
+            ctx.write_output("registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists");
 #else
-        // Linux/other: platform-neutral honest sentinel -- do NOT name macOS tools on a Linux agent.
-        ctx.write_output("registry|unsupported|Windows registry is not available on this platform");
+            // Linux/other: platform-neutral honest sentinel -- do NOT name macOS tools on a Linux agent.
+            ctx.write_output("registry|unsupported|Windows registry is not available on this platform");
 #endif
-        // BR-03: a mutator that touched nothing must never report SUCCESS (rc 1); a read honestly
-        // reporting "unsupported" is itself a successful read (rc 0).
-        return is_mutator ? 1 : 0;
+            // BR-03: a mutator that touched nothing must never report SUCCESS (rc 1); a read honestly
+            // reporting "unsupported" is itself a successful read (rc 0).
+            return is_mutator ? 1 : 0;
+        } catch (...) {
+            try {
+                ctx.write_output("error|exception");
+            } catch (...) {
+            }
+            return 1;
+        }
 #else
         return yuzu::registry::execute_windows(ctx, action, params);
 #endif
