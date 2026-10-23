@@ -1245,7 +1245,12 @@ The response's top-level keys are `weak_key_rules`, `active`, `expiring_within_d
 `expiring_within_days` and `expired_within_days` are verdict-shaped names under the D10 lint, and
 they are exactly D13's closed allow-list (`0070:1332-1338`). 2a-3 adds three allow-list entries
 keyed by (`/api/v1/crypto/certificates/counts`, field), the same three for
-`get_crypto_certificate_counts`, and the same for the counts fragment, each citing D13.
+`get_crypto_certificate_counts`, the counts fragment, the snapshot route and
+`export_crypto_certificate_snapshot` (the snapshot embeds the same counts object), each citing D13:
+15 entries, test-pinned. The response also carries a `total` count (`rule_id` `all_certificates`)
+and an `any_rule` entry under `weak_key_rules`, which counts a certificate matching several rules
+once, as D13 requires of the total; both are count objects with their own criterion, not new
+rules.
 
 **One SQL statement per count read.** The counts are computed in one statement that selects
 `date_trunc('second', now()) AS as_of` and uses that value in every comparison. Nothing is stored
