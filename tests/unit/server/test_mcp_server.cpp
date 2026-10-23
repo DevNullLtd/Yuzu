@@ -19901,16 +19901,26 @@ TEST_CASE("MCP CA: an unfiltered list_issued_certs store read failure is a retry
     ts.crypto_access_fn_for_test = mcp_ca_available;
     ts.start("operator");
 
-    auto rename_issued = [&](const char* sql) {
+    // Returns false instead of throwing so the restore guard below is safe in a destructor.
+    auto rename_issued = [&](const char* sql) -> bool {
         yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
-        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        if (PQstatus(conn.get()) != CONNECTION_OK)
+            return false;
         yuzu::server::pg::PgResult r{PQexec(conn.get(), sql)};
-        REQUIRE(r.ok());
+        return r.ok();
     };
-    rename_issued("ALTER TABLE ca_store.ca_issued RENAME TO ca_issued_r2_gone");
+    // Restores the table on every exit from this test (a failed REQUIRE below included), so a
+    // failure here cannot leave the cloned database without ca_issued. CHECK never throws.
+    struct RestoreIssued {
+        decltype(rename_issued)& fn;
+        ~RestoreIssued() {
+            CHECK(fn("ALTER TABLE ca_store.ca_issued_r2_gone RENAME TO ca_issued"));
+        }
+    };
+    REQUIRE(rename_issued("ALTER TABLE ca_store.ca_issued RENAME TO ca_issued_r2_gone"));
+    const RestoreIssued restore{rename_issued};
     const auto res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"list_issued_certs"}})");
-    rename_issued("ALTER TABLE ca_store.ca_issued_r2_gone RENAME TO ca_issued");
     REQUIRE(res);
     CHECK(res->body.find("agent-store-down-secret") == std::string::npos);
     const auto body = nlohmann::json::parse(res->body);

@@ -1535,18 +1535,23 @@ namespace {
 class IssuedTableGone {
 public:
     explicit IssuedTableGone(const std::string& dsn) : dsn_(dsn) {
-        run("ALTER TABLE ca_store.ca_issued RENAME TO ca_issued_r2_gone");
+        REQUIRE(run("ALTER TABLE ca_store.ca_issued RENAME TO ca_issued_r2_gone"));
     }
-    ~IssuedTableGone() { run("ALTER TABLE ca_store.ca_issued_r2_gone RENAME TO ca_issued"); }
+    // Destructors are noexcept: REQUIRE throws on failure and would call std::terminate, so the
+    // restore reports through CHECK (records the failure, never throws).
+    ~IssuedTableGone() {
+        CHECK(run("ALTER TABLE ca_store.ca_issued_r2_gone RENAME TO ca_issued"));
+    }
     IssuedTableGone(const IssuedTableGone&) = delete;
     IssuedTableGone& operator=(const IssuedTableGone&) = delete;
 
 private:
-    void run(const char* sql) {
+    [[nodiscard]] bool run(const char* sql) {
         pg::PgConn conn{PQconnectdb(dsn_.c_str())};
-        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        if (PQstatus(conn.get()) != CONNECTION_OK)
+            return false;
         pg::PgResult r{PQexec(conn.get(), sql)};
-        REQUIRE(r.ok());
+        return r.ok();
     }
     std::string dsn_;
 };
