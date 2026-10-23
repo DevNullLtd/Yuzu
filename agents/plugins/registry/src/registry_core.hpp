@@ -20,8 +20,10 @@
  *    required to end in the requested first component) plus the remaining requested components, ASCII
  *    case-insensitively, else `key_is_link`; a name that cannot be read refuses with its win32 token. One
  *    derivation serves every hive, HKCU and HKCR included. A create is relative to a handle the kernel parses
- *    again, so it can land beneath a link completed meanwhile; when the name test refuses a walk that created
- *    keys, they are deleted by their own handles, leaf first, and `created` reports any that could not be.
+ *    again, so it can land beneath a link completed meanwhile; a walk that does not hand its leaf over (the name
+ *    test refuses, or a later create fails or finds its key already there) deletes every key it created, by its
+ *    own handle, leaf first, and `created` reports any that could not be. A key a create merely opened is
+ *    closed, never deleted.
  *  - the FAST open (open_fast; HKLM and HKU only): ONE open_path of the whole path with REG_OPTION_OPEN_LINK,
  *    then final_name -- the kernel's canonical name of the object the handle is bound to -- is compared
  *    with `<root kernel name>\<requested path>` (ASCII case-insensitively, every other byte exactly) and the
@@ -229,7 +231,7 @@ private:
 struct Opened {
     explicit Opened(RegistryWriter& r) : leaf(r) {}
     Owned leaf;
-    unsigned created = 0;  ///< keys THIS call created and left behind (a refused walk deletes them: the residual)
+    unsigned created = 0;  ///< keys THIS call created and left behind (a walk that stops deletes them: the residual)
     unsigned missing = 0;  ///< components that did not exist when the walk reached them
     std::string error;     ///< "" or a token
     bool fast = false;     ///< the handle came from open_fast
@@ -306,22 +308,26 @@ struct Opened {
     leaf_access |= kKeyQueryValue;
     const std::uint32_t inter_access = kKeyQueryValue | (create ? kKeyCreateSubKey : 0);
     Owned cur{reg};
-    std::vector<Owned> made_keys; // the keys this call creates, leaf last; held open so a refused walk can delete them
+    std::vector<Owned> made_keys; // keys create_sub reported new, leaf last; held open so a walk that stops can delete them
     Handle parent = root;
     std::string first_name; // the canonical name of the first component's handle, read right after its open
-    // Hands the leaf over only when its kernel name is the requested path (leaf_name_check). Otherwise the leaf is
-    // closed and every key this call created is deleted by its own handle, leaf first (a create made through a
-    // parent that had become a link lands beneath the link's target before any name can be read); `created` is
-    // then what could not be deleted.
+    // Every exit that follows a create but does not hand the leaf over deletes what this call created, by its own
+    // handles, leaf first (a create made through a parent that had become a link lands beneath the link's target
+    // before any name can be read); `created` is then what could not be deleted. Only a key create_sub reported
+    // as new is in made_keys: one it merely opened is somebody else's and is closed, never deleted.
+    const auto roll_back = [&] {
+        for (auto it = made_keys.rbegin(); it != made_keys.rend(); ++it)
+            if (reg.delete_key_by_handle(it->get()) == kErrorSuccess) {
+                it->reset(); // a deleted key's handle is closed before its parent is deleted in turn
+                --out.created;
+            }
+    };
+    // Hands the leaf over only when its kernel name is the requested path (leaf_name_check); otherwise it rolls back.
     const auto hand_over = [&]() -> Opened {
         Owned& leaf = made_keys.empty() ? cur : made_keys.back();
         if (auto why = leaf_name_check(reg, leaf.get(), first_name, parts); !why.empty()) {
             out.error = std::move(why);
-            for (auto it = made_keys.rbegin(); it != made_keys.rend(); ++it)
-                if (reg.delete_key_by_handle(it->get()) == kErrorSuccess) {
-                    it->reset(); // a deleted key's handle is closed before its parent is deleted in turn
-                    --out.created;
-                }
+            roll_back();
         } else {
             out.leaf = std::move(leaf);
         }
@@ -347,19 +353,22 @@ struct Opened {
                 const bool last_j = j + 1 == parts.size();
                 Handle made = 0;
                 bool created_new = false;
-                // kAccessDelete: a refused walk deletes what it made through this very handle.
+                // kAccessDelete: a walk that stops deletes what it made through this very handle.
                 const std::uint32_t create_access =
                     (last_j ? leaf_access : (kKeyQueryValue | kKeyCreateSubKey)) | kAccessDelete;
                 const long crc = reg.create_sub(parent, parts[j], create_access, made, created_new);
                 if (crc != kErrorSuccess) {
                     out.error = rc_token(crc, Missing::key);
+                    roll_back();
                     return out;
                 }
-                made_keys.emplace_back(reg, made); // closes on the early return below
+                Owned made_owner{reg, made}; // closes on the early return below: opened-existing is never deleted
                 if (!created_new) { // the walk saw it absent a moment ago
                     out.error = std::string{kTokConcurrentChange};
+                    roll_back();
                     return out;
                 }
+                made_keys.push_back(std::move(made_owner));
                 ++out.created;
                 parent = made_keys.back().get(); // the checked parent in `cur` stays open until the walk ends
             }

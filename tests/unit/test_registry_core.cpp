@@ -850,7 +850,7 @@ TEST_CASE("registry core: every open and create asks for the access it needs", "
                                       false);
     REQUIRE(o.result == "ok");
     // KEY_QUERY_VALUE 0x1, KEY_SET_VALUE 0x2, KEY_CREATE_SUB_KEY 0x4, DELETE 0x10000. A created key carries DELETE
-    // so a refused walk can remove it by handle; the leaf also carries what the write and the probe need.
+    // so a walk that stops can remove it by handle; the leaf also carries what the write and the probe need.
     const std::vector<std::string> expected{
         "open_sub:Software:0x5",         // denied
         "open_sub:Software:0x1",         // the retry
@@ -917,10 +917,115 @@ TEST_CASE("registry core: a create that finds the key already there refuses conc
             if (ev == "create_sub:B") reg.key("Top\\A\\B");
         };
         const auto o = set_value_verified(reg, FakeRegistry::kRoot, "Top\\A\\B", "V", kRegDword, dword(3), fast);
-        CHECK(o.result == "failed"); // A was created before the conflict: a mutation happened
+        // A was created before the conflict and cannot be removed (the other party's B is inside it): reported.
+        CHECK(o.result == "failed");
         CHECK(o.reason == "concurrent_change");
         CHECK(o.created == 1);
         CHECK(reg.calls("set_value") == 0);
+    }
+}
+
+// A walk that creates keys and then does not hand its leaf over deletes every key it created, on EVERY such exit
+// (a later create fails, a later create finds its key already there, the name test refuses -- that last one is
+// covered above), and only keys create_sub reported as new. Where a section says so, Top is completed into a link
+// to Decoy just before the first create, which lands that create beneath Decoy: the stranded key the rollback
+// exists for. The mutant each section turns red is named on its first line.
+TEST_CASE("registry core: a walk that does not hand its leaf over deletes the keys it created",
+          "[registry][core][walk_identity]") {
+    FakeRegistry reg;
+    const NodeP top = reg.key("Top");
+    reg.put("Decoy", "Marker", kRegDword, dword(0xDEC0));
+    const auto complete_link = [&](const std::string& ev) {
+        if (ev == "create_sub:A") {
+            top->is_link = true;
+            top->link_target = "Decoy";
+        }
+    };
+    const auto write = [&](const char* key) {
+        return set_value_verified(reg, FakeRegistry::kRoot, key, "V", kRegDword, dword(7), false);
+    };
+
+    SECTION("a later create fails: the key beneath the link target is removed, the failure keeps its token") {
+        // mutant: no roll_back() after the failed create_sub
+        reg.before = complete_link;
+        reg.inject["create_sub:B"] = 1450;
+        const auto o = write("Top\\A\\B");
+        CHECK(o.result == "refused");
+        CHECK(o.reason == "win32:1450");
+        CHECK(o.created == 0);
+        CHECK_FALSE(reg.exists("Decoy\\A"));
+        CHECK(reg.get("Decoy", "Marker")->data == dword(0xDEC0));
+        CHECK(reg.calls("set_value") == 0);
+    }
+    SECTION("a later create finds its key elsewhere: ours is removed, the one it found is closed and untouched") {
+        // mutants: no roll_back() on the !created_new exit; the opened-existing key pushed into made_keys
+        reg.put("Other\\B", "Marker", kRegDword, dword(0xB0));
+        reg.before = [&](const std::string& ev) {
+            complete_link(ev);
+            if (ev == "create_sub:B") { // the fake follows a create below a key that became a link: B is found in Other
+                const NodeP a = reg.key("Decoy\\A", false);
+                a->is_link = true;
+                a->link_target = "Other";
+            }
+        };
+        const auto o = write("Top\\A\\B");
+        CHECK(o.result == "refused");
+        CHECK(o.reason == "concurrent_change");
+        CHECK(o.created == 0);
+        CHECK_FALSE(reg.exists("Decoy\\A"));
+        REQUIRE(reg.get("Other\\B", "Marker") != nullptr);
+        CHECK(reg.get("Other\\B", "Marker")->data == dword(0xB0));
+        CHECK(reg.method_calls("delete_key_by_handle") == 1); // only the key this call created was ever deleted
+    }
+    SECTION("a later create finds its key inside ours: that key survives, ours is the reported residual") {
+        // mutants: no roll_back() on the !created_new exit (no delete is tried); the opened-existing key pushed
+        // into made_keys (its delete is tried first and succeeds)
+        reg.before = [&](const std::string& ev) {
+            complete_link(ev);
+            if (ev == "create_sub:B") reg.put("Decoy\\A\\B", "Marker", kRegDword, dword(0xB0));
+        };
+        const auto o = write("Top\\A\\B");
+        CHECK(o.result == "failed");
+        CHECK(o.reason == "concurrent_change");
+        CHECK(o.created == 1);
+        CHECK(reg.exists("Decoy\\A"));
+        REQUIRE(reg.get("Decoy\\A\\B", "Marker") != nullptr);
+        CHECK(reg.get("Decoy\\A\\B", "Marker")->data == dword(0xB0));
+        CHECK(reg.method_calls("delete_key_by_handle") == 1); // A was tried; B never was
+    }
+    SECTION("a legitimate partial failure under a plain parent is all-or-nothing too") {
+        // mutant: no roll_back() after the failed create_sub
+        reg.inject["create_sub:B"] = 5;
+        const auto o = write("Top\\A\\B");
+        CHECK(o.result == "refused");
+        CHECK(o.reason == "access_denied");
+        CHECK(o.created == 0);
+        CHECK_FALSE(reg.exists("Top\\A"));
+        CHECK(reg.exists("Top")); // the parent the walk found is not ours to delete
+    }
+    SECTION("a rollback delete that fails is reported: failed, with the residual count") {
+        // mutant: --created taken whether or not the delete succeeded
+        reg.before = complete_link;
+        reg.inject["create_sub:B"] = 1450;
+        reg.inject["delete_key_by_handle"] = 5;
+        const auto o = write("Top\\A\\B");
+        CHECK(o.result == "failed");
+        CHECK(o.reason == "win32:1450");
+        CHECK(o.created == 1);
+        CHECK(reg.exists("Decoy\\A"));
+        CHECK(reg.calls("set_value") == 0);
+    }
+    SECTION("the first create finds its key already there: nothing was created, nothing is deleted") {
+        // mutant: the opened-existing key pushed into made_keys before the !created_new test
+        reg.before = [&](const std::string& ev) {
+            if (ev == "create_sub:A") reg.put("Top\\A", "Marker", kRegDword, dword(0xB0));
+        };
+        const auto o = write("Top\\A\\B");
+        CHECK(o.result == "refused");
+        CHECK(o.reason == "concurrent_change");
+        CHECK(o.created == 0);
+        REQUIRE(reg.get("Top\\A", "Marker") != nullptr);
+        CHECK(reg.method_calls("delete_key_by_handle") == 0);
     }
 }
 
