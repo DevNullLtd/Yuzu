@@ -1172,6 +1172,49 @@ TEST_CASE("/fragments/results/filter-bar: facet options never offer a Forensics 
     CHECK(contains(admin->body, "TOKEN-FORENSICS-A"));
 }
 
+TEST_CASE("/fragments/results and filter-bar: an Unknown Forensics decision shows a visible notice, "
+          "never the empty or no-results state",
+          "[pg][server][dashboard][fragment][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-tier-unk";
+    put_tier_row(rs, command_id, "agent-a", yuzu::server::test::kForensicsPlugin, "TOKEN-FORENSICS-A");
+    put_tier_row(rs, command_id, "agent-c", yuzu::server::test::kOrdinaryPlugin, "TOKEN-ORDINARY-C");
+
+    FragmentResultsHarness h(&rs);
+    h.routes.set_fleet_read_fn(admit_all);
+    h.forensics.unknown();
+
+    auto results = h.get("/fragments/results?command_id=" + command_id + "&plugin=vuln_scan");
+    REQUIRE(results);
+    CHECK(results->status == 200); // 200 so htmx swaps the notice in
+    CHECK(contains(results->body, "data-forensics-tier-unknown=\"true\""));
+    CHECK(contains(results->body, "Results unavailable."));
+    CHECK(contains(results->body, "permission check"));
+    CHECK(contains(results->body, "retry"));
+    // Not the genuine zero-match state, and not a single row of either kind.
+    CHECK_FALSE(contains(results->body, "No results match your filters"));
+    CHECK_FALSE(contains(results->body, "TOKEN-ORDINARY-C"));
+    CHECK_FALSE(contains(results->body, "TOKEN-FORENSICS-A"));
+    // A Forensics-read row is for rows actually shown; none were.
+    CHECK(h.persisted_audits.empty());
+
+    auto bar = h.get("/fragments/results/filter-bar?command_id=" + command_id + "&plugin=vuln_scan");
+    REQUIRE(bar);
+    CHECK(contains(bar->body, "Filters unavailable."));
+    CHECK_FALSE(contains(bar->body, "TOKEN-ORDINARY-C"));
+    CHECK_FALSE(contains(bar->body, "TOKEN-FORENSICS-A"));
+
+    // Control: Denied renders the ordinary rows through the same route.
+    h.forensics.viewer();
+    auto ok = h.get("/fragments/results?command_id=" + command_id + "&plugin=vuln_scan");
+    REQUIRE(ok);
+    CHECK(contains(ok->body, "TOKEN-ORDINARY-C"));
+    CHECK_FALSE(contains(ok->body, "Results unavailable."));
+}
+
 TEST_CASE("/fragments/results: an unwired Forensics resolver or plugin set fails closed",
           "[pg][server][dashboard][fragment][security][forensics]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

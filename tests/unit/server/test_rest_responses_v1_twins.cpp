@@ -585,6 +585,36 @@ TEST_CASE("GET /api/v1/responses/:id: Forensics rows follow the caller's Forensi
     CHECK(data_outputs(h.sink.Get("/api/v1/responses/instr-tier-get")) == kScopedA);
 }
 
+TEST_CASE("v1 response reads: an Unknown Forensics decision is a retryable 503, never a partial 200",
+          "[pg][rest][responses][v1][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+    seed_tier(h, "instr-tier-unk");
+    h.forensics.unknown();
+
+    for (const std::string path : {"/api/v1/responses/instr-tier-unk",
+                                   "/api/v1/responses/instr-tier-unk/aggregate?group_by=agent_id",
+                                   "/api/v1/responses/instr-tier-unk/export",
+                                   "/api/v1/responses/instr-tier-unk/export?format=csv"}) {
+        INFO(path);
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        REQUIRE(res->status == 503);
+        const auto body = nlohmann::json::parse(res->body);
+        CHECK(body["error"]["code"] == 503);
+        CHECK(body["error"]["retry_after_ms"] == 5000);
+        CHECK_FALSE(body["error"].contains("permission"));
+        CHECK(res->body.find("ordinary-") == std::string::npos);
+        CHECK(res->body.find("forensics-") == std::string::npos);
+    }
+    // A refusal serves nothing, so it writes no read row.
+    CHECK(h.audit_log.empty());
+
+    h.forensics.viewer();
+    CHECK(data_outputs(h.sink.Get("/api/v1/responses/instr-tier-unk")) == kOrdinaryOnly);
+}
+
 TEST_CASE("GET /api/v1/responses/:id: a filtered row looks absent, not marked",
           "[pg][rest][responses][v1][security][forensics]") {
     YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);

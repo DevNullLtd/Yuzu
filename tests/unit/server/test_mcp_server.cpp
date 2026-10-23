@@ -23152,6 +23152,34 @@ TEST_CASE("MCP get_bundle_result: a Forensics step's output follows the caller's
     CHECK(shown["steps"][1]["output"] == "up 3d");
 }
 
+TEST_CASE("MCP get_bundle_result: an Unknown Forensics decision is a retryable error, not a hidden step "
+          "(#4990)",
+          "[pg][mcp][bundle][forensics_tier]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start_with_dispatch(fake_bundle_dispatch());
+    auto disp = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":84,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime"}]}}})");
+    auto exec_id = bundle_payload(disp)["bundle_id"].get<std::string>();
+
+    ts.forensics_for_test.unknown();
+    const std::string get_call =
+        std::string(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":86,"params":{"name":"get_bundle_result","arguments":{"bundle_id":")") +
+        exec_id + R"("}}})";
+    auto res = ts.call(get_call);
+    REQUIRE(res->status == 200);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK_FALSE(body.contains("result"));
+    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+}
+
 TEST_CASE("MCP get_bundle_result: #3344 retry_after_ms present only while complete=false",
           "[pg][mcp][bundle]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
@@ -27510,6 +27538,77 @@ TEST_CASE("MCP query_responses: a filtered row looks absent and the cap flag fol
         CHECK(response_outputs(result).size() == 2);
         CHECK(result.contains("result_truncated_by_cap"));
     }
+}
+
+TEST_CASE("MCP response tools: an Unknown Forensics decision is a retryable error, never a partial result",
+          "[pg][mcp][integration][response][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    seed_mcp_tier(store, "exec-unk", "instr-unk");
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+    ts.forensics_for_test.unknown();
+
+    const auto expect_retryable_refusal = [&](const nlohmann::json& body) {
+        REQUIRE(body.contains("error"));
+        CHECK_FALSE(body.contains("result"));
+        CHECK(body["error"]["code"] == -32603);
+        // A5: the hint is honest and bounded; a retry is the remedy, not a permission grant.
+        CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+        CHECK(body["error"]["message"].get<std::string>().find("could not be resolved") !=
+              std::string::npos);
+        const auto text = body.dump();
+        CHECK(text.find("ordinary-") == std::string::npos);
+        CHECK(text.find("forensics-") == std::string::npos);
+    };
+
+    SECTION("query_responses on both id paths") {
+        expect_retryable_refusal(mcp_tool_call(ts, "query_responses", R"({"execution_id":"exec-unk"})"));
+        expect_retryable_refusal(
+            mcp_tool_call(ts, "query_responses", R"({"instruction_id":"instr-unk"})"));
+    }
+    SECTION("aggregate_responses") {
+        expect_retryable_refusal(mcp_tool_call(
+            ts, "aggregate_responses",
+            R"({"instruction_id":"instr-unk","group_by":"status","aggregate":"count"})"));
+    }
+    // A refusal is a failure row, never a success read row: nothing was served.
+    for (const auto& a : ts.audit_log)
+        CHECK(a.find("|success") == std::string::npos);
+
+    // Control: once the decision is Denied the same call serves the ordinary rows.
+    ts.forensics_for_test.viewer();
+    CHECK(response_outputs(query_responses_result(ts, R"({"execution_id":"exec-unk"})")) ==
+          TierOutputs{"ordinary-A", "ordinary-C"});
+}
+
+TEST_CASE("MCP preview_management_group_agent_count: an Unknown Forensics decision is a retryable "
+          "error, not a count over a partial row set",
+          "[pg][mcp][integration][response][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    seed_mcp_tier(store, "exec-unk-prev", "instr-unk-prev");
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start();
+    ts.forensics_for_test.unknown();
+    const auto body = mcp_tool_call(
+        ts, "preview_management_group_agent_count",
+        R"({"command_id":"instr-unk-prev","plugin":"procfetch","filters":{"pid":"1234"}})");
+    REQUIRE(body.contains("error"));
+    CHECK_FALSE(body.contains("result"));
+    CHECK(body["error"]["code"] == -32603);
+    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+    // The Unknown refusal, not the store-degrade branch that follows it.
+    CHECK(body["error"]["message"].get<std::string>().find("could not be resolved") !=
+          std::string::npos);
 }
 
 TEST_CASE("MCP query_responses: an unwired Forensics resolver or plugin set fails closed",

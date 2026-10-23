@@ -404,6 +404,31 @@ TEST_CASE("REST visualization: Forensics rows are charted only for a caller with
     }
 }
 
+TEST_CASE("REST visualization: an Unknown Forensics decision is a retryable 503, not a partial chart",
+          "[pg][rest][visualization][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    VizHarness h(pool);
+    auto spec = R"({"type":"pie","processor":"single_series","labelField":1,
+                    "title":"Top procs"})";
+    auto def_id = h.make_def(spec, "procfetch");
+    h.push_response("cmd-unk", "agent-1", "1|ordinary-one|/x|d", "procfetch");
+
+    h.forensics.unknown();
+    auto res = h.sink.Get("/api/v1/executions/cmd-unk/visualization?definition_id=" + def_id);
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["retry_after_ms"] == 5000);
+    CHECK(res->body.find("ordinary-one") == std::string::npos);
+    CHECK(h.audit_log.empty());
+
+    h.forensics.viewer();
+    auto ok = h.sink.Get("/api/v1/executions/cmd-unk/visualization?definition_id=" + def_id);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
 TEST_CASE("REST visualization: response.forensics.read is written only when Forensics rows feed "
           "the chart",
           "[pg][rest][visualization][audit][security][forensics]") {

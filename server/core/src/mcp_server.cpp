@@ -9897,7 +9897,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 // the twin matching whichever id this call used.
                 // #4990: derived after the ManagementGroup:Write gate and the scope derivation above, before
                 // the store read (the resolver never writes a response).
-                const auto tier = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                const auto tier_resolved = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                if (!tier_resolved) { // Unknown: a retryable error, never a partial result (#4990)
+                    mcp_audit("failure", "forensics tier unresolved");
+                    res.set_content(a4_error(kInternalError,
+                                             "Authorization for this read could not be resolved; "
+                                             "no partial result is returned",
+                                             {}, /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const ResponseTierFilter& tier = *tier_resolved;
                 AggregateScope scope_arg; // nullopt = unrestricted
                 bool scope_filtered = false;
                 std::size_t dropped_agents = 0;
@@ -10864,7 +10874,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 // #1634: resolve the gate's VisibleSet before aggregation. An engaged,
                 // empty AggregateScope is deliberate and produces zero rows.
                 // #4990: derived after the Response:Read gate (never writes a response), before the store read.
-                const auto tier = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                const auto tier_resolved = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                if (!tier_resolved) { // Unknown: a retryable error, never a partial result (#4990)
+                    mcp_audit("failure", "forensics tier unresolved");
+                    res.set_content(a4_error(kInternalError,
+                                             "Authorization for this read could not be resolved; "
+                                             "no partial result is returned",
+                                             {}, /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const ResponseTierFilter& tier = *tier_resolved;
                 AggregateScope agg_scope; // nullopt = unrestricted
                 std::size_t dropped_agents = 0;
                 if (gate.scope) {
@@ -11784,7 +11804,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
 
                 // #4990: derived after the Response:Read gate (never writes a response), before the store read.
-                const auto tier = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                const auto tier_resolved = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                if (!tier_resolved) { // Unknown: a retryable error, never a partial result (#4990)
+                    mcp_audit("failure", "forensics tier unresolved");
+                    res.set_content(a4_error(kInternalError,
+                                             "Authorization for this read could not be resolved; "
+                                             "no partial result is returned",
+                                             {}, /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const ResponseTierFilter& tier = *tier_resolved;
                 auto count = group_agent_count_preview(response_store, tier, command_id, filters,
                                                        agent_scope);
                 if (!count) {
@@ -21643,7 +21673,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 const bool is_admin = session->role == auth::Role::admin;
                 // #4990: the caller's own Forensics visibility, resolved on this request.
-                const auto tier = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                const auto tier_resolved = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                if (!tier_resolved) { // Unknown: a retryable error, never a partial result (#4990)
+                    mcp_audit("failure", "forensics tier unresolved");
+                    res.set_content(a4_error(kInternalError,
+                                             "Authorization for this read could not be resolved; "
+                                             "no partial result is returned",
+                                             {}, /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const ResponseTierFilter& tier = *tier_resolved;
                 auto agg = bundle_orch->collate(bundle_id, session->username, is_admin, tier);
                 if (!agg) {
                     // #2691 (Doomgoose finding #3): kDegraded is a real store

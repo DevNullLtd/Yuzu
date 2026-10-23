@@ -8,13 +8,16 @@
 //   * admin()   = a global Forensics:Read          (VisibleSet nullopt)
 //   * viewer()  = no Forensics:Read at all         (present-empty, also the unwired answer)
 //   * scoped(a) = Forensics:Read on those agents   (present subset)
+//   * unknown() = the resolver could not answer    (the tri-state's Unknown, `ForensicsUnknown`)
 // The resolver itself is exercised against the real RbacStore in test_authz_topology_floor.cpp;
 // these tests pin what each SURFACE renders for each answer, against a real store.
 
+#include <expected>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <httplib.h>
@@ -43,15 +46,30 @@ inline constexpr const char* kOrdinaryPlugin = "shellexec";
 /// The caller's Forensics visibility, mutable between requests. `fn()` borrows `*this`.
 struct ForensicsCaller {
     authz::VisibleSet visible{std::nullopt};
+    std::optional<ForensicsUnknown> unknown_why; ///< engaged = the resolver answers Unknown
 
-    void admin() { visible = std::nullopt; }
-    void viewer() { visible = authz::deny_all(); }
+    void admin() { set(std::nullopt); }
+    void viewer() { set(authz::deny_all()); }
     void scoped(const std::vector<std::string>& agents) {
-        visible = authz::VisibleSet{std::unordered_set<std::string>(agents.begin(), agents.end())};
+        set(authz::VisibleSet{std::unordered_set<std::string>(agents.begin(), agents.end())});
+    }
+    void unknown(ForensicsUnknown why = ForensicsUnknown::RbacUnavailable) {
+        visible = authz::deny_all(); // what an ignorant consumer would see: still nothing
+        unknown_why = why;
     }
 
     [[nodiscard]] ForensicsVisibilityFn fn() {
-        return [this](const httplib::Request&) { return visible; };
+        return [this](const httplib::Request&) -> ForensicsVisibility {
+            if (unknown_why)
+                return std::unexpected(*unknown_why);
+            return visible;
+        };
+    }
+
+private:
+    void set(authz::VisibleSet v) {
+        visible = std::move(v);
+        unknown_why.reset();
     }
 };
 

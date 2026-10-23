@@ -585,6 +585,42 @@ TEST_CASE("GET /api/v1/management-groups/agent-count-preview — a real filter a
 // #4990: the preview count is a membership oracle over response output (how many agents returned
 // this value), so it must be computed over the rows the caller may read. Real PG-backed store,
 // exact counts, and an ordinary-plugin control row.
+TEST_CASE("agent-count-preview: an Unknown Forensics decision is a retryable 503, not a count",
+          "[pg][rest][devices][facets][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-rest-preview-unknown";
+    StoredResponse r;
+    r.instruction_id = command_id;
+    r.agent_id = "agent-c";
+    r.received_at_ms = 1000;
+    r.status = 0;
+    r.output = "same-value";
+    r.plugin = yuzu::server::test::kOrdinaryPlugin;
+    rs.store(r);
+
+    DeviceRestHarness h(/*wire_fleet_read_fn=*/true, &rs);
+    const std::string url = std::string(kPreviewPath) + "?command_id=" + command_id +
+                            "&plugin=registry&output=same-value";
+    h.forensics.unknown();
+    auto res = h.sink.Get(url);
+    REQUIRE(res != nullptr);
+    REQUIRE(res->status == 503);
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["retry_after_ms"] == 5000);
+    CHECK(body["error"]["message"].get<std::string>().find("could not be resolved") !=
+          std::string::npos);
+    CHECK(res->body.find("agent_count") == std::string::npos);
+
+    h.forensics.viewer(); // control
+    auto ok = h.sink.Get(url);
+    REQUIRE(ok != nullptr);
+    CHECK(ok->status == 200);
+    CHECK(nlohmann::json::parse(ok->body)["data"]["agent_count"].get<int64_t>() == 1);
+}
+
 TEST_CASE("agent-count-preview: Forensics rows are not counted for a caller without Forensics:Read",
           "[pg][rest][devices][facets][security][forensics]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

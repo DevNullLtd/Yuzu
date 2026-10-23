@@ -3,12 +3,19 @@
 /// #4990: who may read Forensics-plugin rows out of the response store.
 ///
 /// `resolve_forensics_visible` is the ONE production resolver behind every operator surface's
-/// `ForensicsVisibilityFn`. Its answer is an ADR-0033 `authz::VisibleSet`:
-///   * `nullopt`      = the caller holds a global `Forensics:Read` (may read every Forensics row)
-///   * present subset = RBAC enforcement is on and the caller holds a management-group-scoped
-///                      `Forensics:Read`: only those agents' Forensics rows
-///   * present EMPTY  = no Forensics row (no grant, unwired, degraded, or a caller class that never
-///                      carries per-agent authority here). Also the answer for every error.
+/// `ForensicsVisibilityFn`. Its answer is TRI-STATE: a `std::expected<authz::VisibleSet,
+/// ForensicsUnknown>`.
+///   * Granted  (value, an ADR-0033 `authz::VisibleSet`):
+///       `nullopt`      = the caller holds a global `Forensics:Read` (may read every Forensics row)
+///       present subset = RBAC enforcement is on and the caller holds a management-group-scoped
+///                        `Forensics:Read`: only those agents' Forensics rows
+///   * Denied   (value, present EMPTY): a DEFINITIVE answer, there is no grant (also a caller class
+///                        that never carries per-agent authority here). Correct behaviour, silent.
+///   * Unknown  (error, `ForensicsUnknown`): the question could not be answered (a store degrade or
+///                        an unwired dependency). Never admits a Forensics row. A surface that
+///                        hands a machine caller rows must answer a retryable 503 rather than a 200
+///                        with the Forensics rows silently missing; an HTML surface shows a visible
+///                        notice, never an empty or "no results" state.
 ///
 /// Deliberately NOT modelled on `response_visible_set_fn`, which returns `nullopt` whenever RBAC is
 /// off: right for `Response:Read` (an unconfined read), wrong here, where a global grant is the only
@@ -21,12 +28,16 @@
 /// Unwired means present-empty: `tier_filter_for` turns a missing resolver into `deny_all()`, and a
 /// missing plugin set into a filter that refuses every row.
 
+#include <cstdint>
+#include <expected>
 #include <functional>
+#include <string_view>
 
 #include <httplib.h>
 
 #include "authz_model.hpp"
 #include "response_tier_filter.hpp"
+#include "rest_a4_envelope_http.hpp"
 
 namespace yuzu::server {
 
@@ -34,8 +45,35 @@ class AuthRoutes;
 class ManagementGroupStore;
 class RbacStore;
 
+/// Why the resolver could not answer. A CLOSED set: the names below are the `reason` label of
+/// `yuzu_server_forensics_tier_withheld_total` (seeded from `kForensicsUnknownReasons`).
+enum class ForensicsUnknown : std::uint8_t {
+    RbacUnavailable, ///< the authorization read answered 503 (an unavailable authorization store)
+    ScopeReadFailed, ///< the management-group scoped-visibility lookup failed
+    Unwired,         ///< a dependency the resolver needs was never wired (impossible in production)
+};
+
+/// The `reason` label spelling of `u`.
+[[nodiscard]] constexpr std::string_view to_string(ForensicsUnknown u) noexcept {
+    switch (u) {
+    case ForensicsUnknown::RbacUnavailable:
+        return "rbac_unavailable";
+    case ForensicsUnknown::ScopeReadFailed:
+        return "scope_read_failed";
+    case ForensicsUnknown::Unwired:
+        return "unwired";
+    }
+    return "unwired"; // out-of-range value: the closed set's catch-all, never an unbounded label
+}
+
+inline constexpr ForensicsUnknown kForensicsUnknownReasons[] = {
+    ForensicsUnknown::RbacUnavailable, ForensicsUnknown::ScopeReadFailed, ForensicsUnknown::Unwired};
+
+/// The resolver's tri-state answer (see the header comment).
+using ForensicsVisibility = std::expected<authz::VisibleSet, ForensicsUnknown>;
+
 /// Per-request resolver wired once in `server.cpp` and passed to each surface.
-using ForensicsVisibilityFn = std::function<authz::VisibleSet(const httplib::Request&)>;
+using ForensicsVisibilityFn = std::function<ForensicsVisibility(const httplib::Request&)>;
 
 /// The stores the production resolver reads. Borrowed; any null member makes the answer
 /// present-empty (never "unrestricted").
@@ -46,27 +84,59 @@ struct ForensicsVisibilityDeps {
 };
 
 /// The production resolver. Order is load-bearing:
-///   1. `AuthRoutes::has_permission(req, "Forensics", "Read")` true => `nullopt` (global). This
-///      already decides JIT elevation, engine principals (RBAC-only), MCP tier, service scope
-///      (a service-scoped token never proves Forensics) and the RBAC-off legacy floor.
+///   1. `AuthRoutes::probe_permission(req, scratch, "Forensics", "Read")` true => `nullopt`
+///      (global). It is `has_permission` with the gate's own response kept in a scratch object, so
+///      it decides the same things (JIT elevation, engine principals (RBAC-only), MCP tier, service
+///      scope (a service-scoped token never proves Forensics), the RBAC-off legacy floor), writes no
+///      denial row for a cookie session, and lets a 503 (an unavailable authorization store) be told
+///      apart from a 403. A 503 => Unknown(RbacUnavailable).
 ///   2. else, only when RBAC enforcement is in effect and the caller is an ordinary session (not a
 ///      service-scoped token, not an engine principal, not an MCP-tier token):
-///      `RbacStore::visible_agents_for_permission` => that subset. A store failure => present-empty.
-///   3. else present-empty.
+///      `RbacStore::visible_agents_for_permission` => that subset. A lookup failure =>
+///      Unknown(ScopeReadFailed).
+///   3. else Denied (present-empty).
 /// Step 2 skips caller classes the global probe treats specially because their authority is not
 /// "the minting user's grants": using the owner's scoped grants for them would widen them.
-[[nodiscard]] authz::VisibleSet resolve_forensics_visible(const ForensicsVisibilityDeps& deps,
-                                                          const httplib::Request& req);
+/// Known limit: `require_permission`'s RBAC branch answers a degraded `check_permission` with a 403,
+/// not a 503, so a degrade that hits only step 1 and not step 2 classifies as Denied; the
+/// `yuzu_server_rbac_read_degrade_total` series is the signal for that case.
+[[nodiscard]] ForensicsVisibility resolve_forensics_visible(const ForensicsVisibilityDeps& deps,
+                                                            const httplib::Request& req);
 
 /// The filter a surface passes to every `ResponseStore` read: the resolver's answer applied to the
-/// Forensics plugin set. An unwired resolver (empty `fn`) is `deny_all()`; an unwired plugin set
-/// (`nullptr`, impossible in production because boot refuses without one) refuses every row.
-[[nodiscard]] inline ResponseTierFilter tier_filter_for(const httplib::Request& req,
-                                                        const ForensicsVisibilityFn& fn,
-                                                        const ForensicsPluginSet* plugins) {
+/// Forensics plugin set. An unwired resolver (empty `fn`) is Denied (`deny_all()`); an unwired
+/// plugin set (`nullptr`, impossible in production because boot refuses without one) refuses every
+/// row. An Unknown answer is returned as the error so a surface cannot read the store without
+/// deciding what to tell the caller: it must not hand a machine caller a partial 200.
+[[nodiscard]] inline std::expected<ResponseTierFilter, ForensicsUnknown>
+tier_filter_for(const httplib::Request& req, const ForensicsVisibilityFn& fn,
+                const ForensicsPluginSet* plugins) {
     if (!plugins)
         return ResponseTierFilter::refuse_unwired();
-    return ResponseTierFilter::exclude(*plugins, fn ? fn(req) : authz::deny_all());
+    if (!fn)
+        return ResponseTierFilter::exclude(*plugins, authz::deny_all());
+    auto visible = fn(req);
+    if (!visible)
+        return std::unexpected(visible.error());
+    return ResponseTierFilter::exclude(*plugins, std::move(*visible));
+}
+
+/// `retry_after_ms` a REST/MCP refusal advertises: the generic transient-fault floor
+/// (`mcp::kMcpStoreFaultRetryMs`, also what the sibling store-degrade 503s answer).
+inline constexpr std::int64_t kForensicsUnknownRetryMs = 5000;
+
+/// The machine-surface refusal for an Unknown answer: a retryable A4 503. No `.permission` field
+/// (a grant would not fix an outage) and no content of the read. The route must return afterwards.
+inline void respond_forensics_tier_unknown(httplib::Response& res) {
+    detail::A4ErrorOpts opts; // not a designated initializer: this header is in many TUs
+    opts.retry_after_ms = kForensicsUnknownRetryMs;
+    opts.remediation = "retry the request";
+    res.status = 503;
+    res.set_content(detail::a4_error(res,
+                                     "authorization for this read could not be resolved; "
+                                     "refusing to serve a partial result",
+                                     opts),
+                    "application/json");
 }
 
 } // namespace yuzu::server

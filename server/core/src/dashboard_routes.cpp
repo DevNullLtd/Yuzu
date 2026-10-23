@@ -111,6 +111,20 @@ static int col_index_for_name(const std::vector<std::string>& cols, const std::s
 // A facet value over kMaxFacetValueBytes is not indexed in newly stored responses (rows an older
 // server stored may still match), so such a filter may match nothing; the results page says so
 // rather than let an empty table read as "no agent has this value".
+/// #4990: the results fragment when the caller's Forensics-tier decision could not be made (an
+/// unavailable authorization read). A visible banner in the table body and the summary slot, the
+/// same treatment as a store degrade: never the empty or "no results match your filters" state,
+/// which would read as a genuine zero-match answer.
+static std::string render_forensics_unknown_results() {
+    return "<tbody id=\"results-tbody\"><tr><td colspan=\"99\" "
+           "class=\"empty-state result-degrade-banner\" data-forensics-tier-unknown=\"true\">"
+           "<b>Results unavailable.</b> The permission check for this view could not be "
+           "completed. This is <b>not</b> \"no results\" &mdash; retry shortly.</td></tr></tbody>"
+           "<div id=\"result-summary\" hx-swap-oob=\"true\">"
+           "<span class=\"result-degrade-banner\">permission check incomplete &mdash; count "
+           "unavailable</span></div>";
+}
+
 static bool any_filter_value_too_long(const std::vector<FacetFilter>& filters) {
     return std::any_of(filters.begin(), filters.end(),
                        [](const FacetFilter& f) { return facet_filter_value_over_bound(f.value); });
@@ -415,7 +429,14 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                 // #4990: derived after the Response:Read gate (never writes a response); the
                 // filter narrows the rows, facets and counts below to what the caller may read.
-                const auto tier = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                const auto tier_resolved =
+                    tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                if (!tier_resolved) {
+                    // Unknown: a visible notice, never the empty or "no results" state (#4990).
+                    res.set_content(render_forensics_unknown_results(), "text/html; charset=utf-8");
+                    return;
+                }
+                const ResponseTierFilter& tier = *tier_resolved;
                 ForensicsServed served;
                 auto html = render_results(command_id, tier, plugin, sort_col, sort_dir,
                                            page, per_page, filters, text_query,
@@ -466,7 +487,20 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                 // #4990: derived after the Response:Read gate; facet options come from the
                 // rows the caller may read, so a filtered value is not offered.
-                const auto tier = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                const auto tier_resolved =
+                    tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                if (!tier_resolved) {
+                    res.set_header("Cache-Control", "no-store, private");
+                    res.set_header("Vary", "Cookie");
+                    res.set_content(
+                        "<div id=\"filter-bar\" class=\"filter-bar result-degrade-banner\">"
+                        "<b>Filters unavailable.</b> The permission check for this view could "
+                        "not be completed. This is <b>not</b> \"no filters\" &mdash; retry "
+                        "shortly.</div>",
+                        "text/html; charset=utf-8");
+                    return;
+                }
+                const ResponseTierFilter& tier = *tier_resolved;
                 auto html = render_filter_bar(command_id, tier, plugin, definition_id, template_id,
                                               session->username, auth::is_elevated(*session));
                 // The body is now principal-specific (confined per caller's
@@ -579,9 +613,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 if (response_store_ && !filters.empty()) {
                     // #4990: after the ManagementGroup:Write gate; the tier filter alone closes
                     // the Forensics half (no Response:Read gate is added to this route).
-                    const auto tier = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
-                    agent_count = response_store_->facet_agent_count(command_id, tier, filters,
-                                                                      agent_scope);
+                    // Unknown leaves `agent_count` empty: the form then says the count is
+                    // unavailable, never a number computed over a partial row set.
+                    if (const auto tier =
+                            tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_))
+                        agent_count = response_store_->facet_agent_count(command_id, *tier, filters,
+                                                                          agent_scope);
                 }
                 else if (filters.empty())
                     agent_count = 0; // genuine: no filter → no scoped count
@@ -662,7 +699,19 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // filter alone closes the Forensics half, so the membership this materialises
                  // never reflects rows the caller may not read.
                  const auto tier = tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
-                 auto agent_ids_opt = response_store_->facet_agent_ids(command_id, tier, filters);
+                 if (!tier) {
+                     // Unknown: this action materialises membership, so it refuses outright rather
+                     // than proceeding on a filter computed from a partial answer (#4990).
+                     res.status = 503;
+                     res.set_header("HX-Retarget", "#group-form-slot");
+                     res.set_content(
+                         "<span class=\"feedback-error\">"
+                         "The permission check for this action could not be completed. "
+                         "Nothing was created. Retry shortly.</span>",
+                         "text/html; charset=utf-8");
+                     return;
+                 }
+                 auto agent_ids_opt = response_store_->facet_agent_ids(command_id, *tier, filters);
                  if (!agent_ids_opt.has_value()) {
                      res.status = 503;
                      res.set_header("HX-Retarget", "#group-form-slot");

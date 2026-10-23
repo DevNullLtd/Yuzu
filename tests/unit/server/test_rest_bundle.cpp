@@ -607,3 +607,29 @@ TEST_CASE("GET /api/v1/bundles/{id}: a Forensics step's output follows the calle
         CHECK(a["data"]["steps"][1]["output"] == "up 3d");
     }
 }
+
+TEST_CASE("GET /api/v1/bundles/{id}: an Unknown Forensics decision is a retryable 503, not a hidden step "
+          "(#4990)",
+          "[pg][bundle][rest][forensics_tier]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
+    int status = 0;
+    auto disp = h.post("/api/v1/bundles",
+                       R"({"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime"}]})",
+                       status);
+    REQUIRE(status == 202);
+    auto exec_id = disp["data"]["bundle_id"].get<std::string>();
+    h.put_response(exec_id, "cmd-os_info-uptime", 1, "up 3d", "os_info");
+
+    h.forensics.unknown();
+    auto refused = h.get("/api/v1/bundles/" + exec_id, status);
+    REQUIRE(status == 503);
+    CHECK(refused["error"]["retry_after_ms"] == 5000);
+    CHECK(refused.dump().find("up 3d") == std::string::npos);
+
+    h.forensics.viewer(); // control: a Denied decision collates the ordinary step
+    auto ok = h.get("/api/v1/bundles/" + exec_id, status);
+    CHECK(status == 200);
+    CHECK(ok["data"]["steps"][0]["output"] == "up 3d");
+}

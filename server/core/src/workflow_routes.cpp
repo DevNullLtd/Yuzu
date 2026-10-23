@@ -76,7 +76,7 @@ struct PageResponses {
 };
 
 PageResponses collect_page_responses(ResponseStore* store, bool may_read_responses,
-                                     const ResponseTierFilter& tier,
+                                     bool tier_unknown, const ResponseTierFilter& tier,
                                      const ForensicsPluginSet* forensics_plugins,
                                      const Execution& exec,
                                      const std::vector<AgentExecStatus>& visible_agents,
@@ -89,6 +89,12 @@ PageResponses collect_page_responses(ResponseStore* store, bool may_read_respons
     }
     if (!store || !store->is_open()) {
         out.state = operate_pages::ResponsesState::kUnavailable;
+        return out;
+    }
+    // #4990: the Forensics-tier decision could not be made: no store read, and the section says
+    // so (the degraded notice), never "no responses".
+    if (tier_unknown) {
+        out.state = operate_pages::ResponsesState::kDegraded;
         return out;
     }
     ResponseQuery rq;
@@ -692,10 +698,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // filter permits. The Execution:Read gate.scope keeps driving the confined-projection
             // redaction and the row scope filter below, so the effective row scope is the meet.
             const bool may_read_responses = probe_perm_fn && probe_perm_fn(req, "Response", "Read");
-            // Not derived when the section is withheld: nothing below reads the store then.
-            const auto tier = may_read_responses
-                                  ? tier_filter_for(req, forensics_visibility_fn, forensics_plugins)
-                                  : ResponseTierFilter::refuse_unwired();
+            // Not derived when the section is withheld: nothing below reads the store then. An
+            // Unknown answer reads nothing either and renders the degraded notice (not "no
+            // responses"), so the filter below is only ever used for a resolved answer.
+            const auto tier_resolved =
+                may_read_responses
+                    ? tier_filter_for(req, forensics_visibility_fn, forensics_plugins)
+                    : std::expected<ResponseTierFilter, ForensicsUnknown>{
+                          ResponseTierFilter::refuse_unwired()};
+            const bool tier_unknown = !tier_resolved;
+            const ResponseTierFilter tier =
+                tier_resolved ? *tier_resolved : ResponseTierFilter::refuse_unwired();
             // #4990: the drawer's `response.forensics.read` row, written only when the rendered
             // responses include a Forensics-tier plugin's. Set-and-proceed: a failed persist sets
             // `Sec-Audit-Failed` and the drawer still renders. Both render branches call it.
@@ -861,8 +874,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 for (const auto& a : agents)
                     devs.rows.push_back({a.agent_id, a.status, a.error_detail, a.exit_code,
                                          a.dispatched_at, a.completed_at});
-                auto pr = collect_page_responses(response_store, may_read_responses, tier,
-                                                 forensics_plugins, exec, agents, gate.scope);
+                auto pr = collect_page_responses(response_store, may_read_responses, tier_unknown,
+                                                 tier, forensics_plugins, exec, agents, gate.scope);
                 devs.responses = std::move(pr.rows);
                 devs.responses_total = pr.total;
                 devs.responses_state = pr.state;
@@ -1143,6 +1156,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 html += "<details class=\"per-agent-responses\"><summary>Responses</summary>"
                         "<div class=\"empty-state\">Viewing responses requires the "
                         "<b>Response:Read</b> permission.</div></details>";
+            } else if (response_store && response_store->is_open() && tier_unknown) {
+                // #4990: Unknown tier decision: no store read, a degraded notice (not "no responses").
+                html += "<details class=\"per-agent-responses\"><summary>Responses</summary>"
+                        "<div class=\"empty-state result-degrade-banner\">"
+                        "<b>Responses unavailable.</b> The permission check for this view could "
+                        "not be completed. This is <b>not</b> \"no responses\" &mdash; retry "
+                        "shortly.</div></details>";
             } else if (response_store && response_store->is_open()) {
                 ResponseQuery rq;
                 rq.since = exec.dispatched_at;

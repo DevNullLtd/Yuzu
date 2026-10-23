@@ -111,6 +111,20 @@ public:
         return f;
     }
 
+    /// Whether this filter lets a stored row of `plugin` from `agent_id` through: the same decision
+    /// the SQL predicate makes, for a surface that must know BEFORE it reads (a result poll that
+    /// would otherwise wait on a row it can never be shown). A plugin outside the Forensics set is
+    /// admitted by every filter except `refuse_unwired()`.
+    [[nodiscard]] bool admits(std::string_view plugin, std::string_view agent_id) const {
+        if (refuse_all_)
+            return false;
+        if (excluded_.empty())
+            return true; // unrestricted: a global Forensics:Read, or an internal consumer
+        if (!std::ranges::binary_search(excluded_, ascii_lower(plugin)))
+            return true; // not a Forensics-tier plugin
+        return std::ranges::binary_search(exempt_agents_, std::string(agent_id));
+    }
+
     // -- Accessors for response_store.cpp (the SQL builder); not a policy surface. -----------------
 
     /// True when a SQL clause is needed: the filter excludes plugins for at least some agents.

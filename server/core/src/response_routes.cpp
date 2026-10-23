@@ -83,7 +83,12 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         // #4990: the existing gate ran first; this derives the tier filter (writes no response).
-        const auto tier = tier_filter_for(req, deps.forensics_visibility_fn, deps.forensics_plugins);
+        const auto tier_resolved = tier_filter_for(req, deps.forensics_visibility_fn, deps.forensics_plugins);
+        if (!tier_resolved) { // Unknown: never a partial 200 (#4990)
+            respond_forensics_tier_unknown(res);
+            return;
+        }
+        const ResponseTierFilter& tier = *tier_resolved;
 
         auto group_by = req.get_param_value("group_by");
         if (group_by.empty())
@@ -236,7 +241,12 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         // #4990: the existing gate ran first; this derives the tier filter (writes no response).
-        const auto tier = tier_filter_for(req, deps.forensics_visibility_fn, deps.forensics_plugins);
+        const auto tier_resolved = tier_filter_for(req, deps.forensics_visibility_fn, deps.forensics_plugins);
+        if (!tier_resolved) { // Unknown: never a partial 200 (#4990)
+            respond_forensics_tier_unknown(res);
+            return;
+        }
+        const ResponseTierFilter& tier = *tier_resolved;
 
         ResponseQuery q;
         if (req.has_param("agent_id"))
@@ -404,7 +414,12 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         // #4990: the existing gate ran first; this derives the tier filter (writes no response).
-        const auto tier = tier_filter_for(req, deps.forensics_visibility_fn, deps.forensics_plugins);
+        const auto tier_resolved = tier_filter_for(req, deps.forensics_visibility_fn, deps.forensics_plugins);
+        if (!tier_resolved) { // Unknown: never a partial 200 (#4990)
+            respond_forensics_tier_unknown(res);
+            return;
+        }
+        const ResponseTierFilter& tier = *tier_resolved;
 
         ResponseQuery q;
         if (req.has_param("agent_id"))

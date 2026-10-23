@@ -16011,7 +16011,7 @@ private:
         // wrong here (a global Forensics:Read is the only thing that admits; with RBAC off it is
         // floored to administrators). See forensics_visibility.hpp.
         yuzu::server::ForensicsVisibilityFn forensics_visibility_fn =
-            [this](const httplib::Request& req) -> yuzu::server::authz::VisibleSet {
+            [this](const httplib::Request& req) -> yuzu::server::ForensicsVisibility {
             return yuzu::server::resolve_forensics_visible(
                 {.auth_routes = auth_routes_.get(),
                  .rbac_store = rbac_store_.get(),

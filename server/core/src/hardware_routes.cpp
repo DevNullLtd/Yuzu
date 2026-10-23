@@ -908,7 +908,16 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         // Derived after the gates above (it never writes a response): the replies are read only
         // as far as the caller may read the plugin's tier.
-        const auto tier = tier_filter_for(req, deps_.forensics_visibility_fn, deps_.forensics_plugins);
+        const auto tier_resolved =
+            tier_filter_for(req, deps_.forensics_visibility_fn, deps_.forensics_plugins);
+        if (!tier_resolved) {
+            // Unknown: stop polling with a retry notice. Polling on would end in a false "timed
+            // out" for a device that did answer, and the rows can never be shown from here.
+            send_html(res, "<div class=\"gp-placeholder\">The permission check for this result "
+                           "could not be completed. Retry shortly.</div>");
+            return;
+        }
+        const ResponseTierFilter& tier = *tier_resolved;
         const auto rows = deps_.responses_fn(command_id, tier, id);
         const DexAgentResponse* with_output = nullptr;
         const DexAgentResponse* terminal = nullptr;

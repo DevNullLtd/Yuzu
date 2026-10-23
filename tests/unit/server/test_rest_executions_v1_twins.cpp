@@ -553,6 +553,41 @@ TEST_CASE("GET /api/v1/executions/:id/responses: Forensics rows follow the calle
     CHECK(outputs() == Outputs{"ordinary-A"});
 }
 
+// #4990: an Unknown Forensics decision is a retryable 503 on the machine surface, never a partial 200.
+TEST_CASE("GET /api/v1/executions/:id/responses: an Unknown Forensics decision is a retryable 503",
+          "[pg][rest][executions][v1][responses][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    auto exec_id = h.make_exec_with_agents("def-resp-unk");
+    StoredResponse r;
+    r.instruction_id = "def-resp-unk";
+    r.agent_id = "agent-A";
+    r.timestamp = 1735689610;
+    r.status = 0;
+    r.output = "ordinary-A";
+    r.plugin = yuzu::server::test::kOrdinaryPlugin;
+    r.execution_id = exec_id;
+    h.response_store->store(r);
+
+    h.forensics.unknown();
+    auto res = h.sink.Get("/api/v1/executions/" + exec_id + "/responses");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == 503);
+    CHECK(body["error"]["retry_after_ms"] == 5000);
+    CHECK_FALSE(body["error"].contains("permission"));
+    CHECK(res->body.find("ordinary-A") == std::string::npos);
+
+    // Control: a Denied decision serves the ordinary row.
+    h.forensics.viewer();
+    auto ok = h.sink.Get("/api/v1/executions/" + exec_id + "/responses");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(ok->body.find("ordinary-A") != std::string::npos);
+}
+
 // #4990: the `response.forensics.read` audit row on the execution-scoped read.
 TEST_CASE("GET /api/v1/executions/:id/responses: response.forensics.read is written only when "
           "Forensics rows are served",

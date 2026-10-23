@@ -1673,6 +1673,38 @@ TEST_CASE("GET /api/responses/:id/export: rows and the truncation flag come from
     }
 }
 
+TEST_CASE("legacy response reads: an Unknown Forensics decision is a retryable 503, never a partial 200",
+          "[server][routes][response_routes][rest][pg][security][forensics]") {
+    PgHarness h;
+    seed_tier_rows(h, "instr-tier-unk");
+    h.forensics.unknown();
+
+    for (const std::string path : {"/api/responses/instr-tier-unk",
+                                   "/api/responses/instr-tier-unk/aggregate?group_by=agent_id",
+                                   "/api/responses/instr-tier-unk/export",
+                                   "/api/responses/instr-tier-unk/export?format=csv"}) {
+        INFO(path);
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        REQUIRE(res->status == 503);
+        const auto body = json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK(body["error"]["code"] == 503);
+        CHECK(body["error"]["retry_after_ms"] == 5000);
+        // A grant would not fix an outage: the refusal never names a permission to acquire.
+        CHECK_FALSE(body["error"].contains("permission"));
+        // Not one row, ordinary or Forensics, is served on a refusal.
+        CHECK(res->body.find("ordinary-") == std::string::npos);
+        CHECK(res->body.find("forensics-") == std::string::npos);
+    }
+    // A refusal serves nothing, so it leaves no read row of any kind.
+    CHECK(h.audits.empty());
+
+    // Control: the same harness answers 200 with the ordinary rows once the decision is Denied.
+    h.forensics.viewer();
+    CHECK(served_outputs(h.sink.Get("/api/responses/instr-tier-unk")) == kOrdinaryOnly);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // #4990: the `response.forensics.read` audit row on the legacy row-returning reads. Asserted on the
 // RECORDED audit rows (never on a mock having been called), over a real store, with an ordinary

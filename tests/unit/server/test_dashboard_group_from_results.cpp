@@ -444,6 +444,34 @@ TEST_CASE("group-from-results: when every match is a Forensics row the caller ma
     CHECK(h.audits_for("response.read", "denied") == 0);
 }
 
+TEST_CASE("group-from-results: an Unknown Forensics decision refuses and creates no group",
+          "[pg][server][dashboard][group_from_results][security][forensics]") {
+    GroupFromResultsHarness h;
+    StoredResponse r;
+    r.instruction_id = kCommandId;
+    r.agent_id = "agent-A";
+    r.status = 1;
+    r.plugin = yuzu::server::test::kOrdinaryPlugin;
+    r.output = "high|cat-a|title|detail\n";
+    h.rs().store(r);
+
+    h.forensics.unknown();
+    auto res = h.post(GroupFromResultsHarness::form_body("tier-unknown-group"));
+    CHECK(res->status == 503);
+    CHECK(res->body.find("could not be completed") != std::string::npos);
+    CHECK(res->body.find("Nothing was created") != std::string::npos);
+    CHECK(res->get_header_value("HX-Retarget") == "#group-form-slot");
+    // This action materialises membership: an Unknown answer must create nothing, not a group from
+    // the ordinary rows alone.
+    CHECK_FALSE(h.mg.find_group_by_name("tier-unknown-group").has_value());
+
+    // Control: a Denied decision still creates the group from the ordinary row.
+    h.forensics.viewer();
+    auto ok = h.post(GroupFromResultsHarness::form_body("tier-denied-group"));
+    CHECK(ok->status != 503);
+    CHECK(h.mg.find_group_by_name("tier-denied-group").has_value());
+}
+
 // -- (2b) #5623: an empty match with a filter over the ingest bound says so --
 
 TEST_CASE("group-from-results: a 422 for an over-bound filter value explains the undercount, "

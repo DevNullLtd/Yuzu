@@ -14,11 +14,14 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <initializer_list>
 #include <optional>
+#include <set>
 #include <span>
 #include <unordered_set>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -353,20 +356,24 @@ TEST_CASE("tier_filter_for fails closed on unwired inputs",
     const auto set = make_set({"app_usage", "execution_artifacts"});
 
     SECTION("no resolver wired: present-empty (every Forensics plugin excluded for every agent)") {
-        const auto f = tier_filter_for(req, ForensicsVisibilityFn{}, &set);
+        const auto r = tier_filter_for(req, ForensicsVisibilityFn{}, &set);
+        REQUIRE(r.has_value()); // Denied, not Unknown: an unwired derivation behind a primary gate
+        const auto& f = *r;
         CHECK(f.restricts());
         CHECK_FALSE(f.refuses_every_row());
         CHECK(f.excluded_plugins() == set.names());
         CHECK(f.exempt_agents().empty());
     }
     SECTION("no plugin set wired: every row is refused, never admitted") {
-        const auto f = tier_filter_for(
+        const auto r = tier_filter_for(
             req, [](const httplib::Request&) { return authz::VisibleSet{}; }, nullptr);
-        CHECK(f.restricts());
-        CHECK(f.refuses_every_row());
+        REQUIRE(r.has_value());
+        CHECK(r->restricts());
+        CHECK(r->refuses_every_row());
         // Even a resolver that would admit everything cannot make an unwired set permissive.
         const auto g = tier_filter_for(req, ForensicsVisibilityFn{}, nullptr);
-        CHECK(g.refuses_every_row());
+        REQUIRE(g.has_value());
+        CHECK(g->refuses_every_row());
     }
     SECTION("the resolver's answer is applied, and consulted once per request") {
         int calls = 0;
@@ -374,16 +381,56 @@ TEST_CASE("tier_filter_for fails closed on unwired inputs",
             ++calls;
             return authz::VisibleSet{};
         };
-        CHECK_FALSE(tier_filter_for(req, global, &set).restricts());
+        const auto gr = tier_filter_for(req, global, &set);
+        REQUIRE(gr.has_value());
+        CHECK_FALSE(gr->restricts());
         const ForensicsVisibilityFn subset = [&](const httplib::Request&) {
             ++calls;
             return authz::VisibleSet{std::unordered_set<std::string>{"agent-a"}};
         };
-        const auto f = tier_filter_for(req, subset, &set);
-        CHECK(f.restricts());
-        CHECK(f.exempt_agents() == std::vector<std::string>{"agent-a"});
+        const auto fr = tier_filter_for(req, subset, &set);
+        REQUIRE(fr.has_value());
+        CHECK(fr->restricts());
+        CHECK(fr->exempt_agents() == std::vector<std::string>{"agent-a"});
         CHECK(calls == 2);
     }
+    SECTION("an Unknown resolver answer is returned as the error, never as a filter") {
+        for (const auto why : {ForensicsUnknown::RbacUnavailable, ForensicsUnknown::ScopeReadFailed,
+                               ForensicsUnknown::Unwired}) {
+            const ForensicsVisibilityFn unknown = [why](const httplib::Request&) {
+                return ForensicsVisibility{std::unexpected(why)};
+            };
+            const auto r = tier_filter_for(req, unknown, &set);
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error() == why);
+        }
+        // The closed reason set: three spellings, all distinct, none empty.
+        std::set<std::string_view> names;
+        for (const auto u : kForensicsUnknownReasons)
+            names.insert(to_string(u));
+        CHECK(names == std::set<std::string_view>{"rbac_unavailable", "scope_read_failed", "unwired"});
+    }
+}
+
+TEST_CASE("ResponseTierFilter::admits answers as the SQL predicate does",
+          "[server][responses][security][forensics]") {
+    const auto set = make_set({"app_usage"});
+    const auto deny = ResponseTierFilter::exclude(set, authz::deny_all());
+    const auto scoped = ResponseTierFilter::exclude(
+        set, authz::VisibleSet{std::unordered_set<std::string>{"agent-a"}});
+    const auto global = ResponseTierFilter::exclude(set, std::nullopt);
+
+    // A Forensics plugin: refused for Denied, admitted only for a scoped agent, admitted for global.
+    CHECK_FALSE(deny.admits("app_usage", "agent-a"));
+    CHECK(scoped.admits("app_usage", "agent-a"));
+    CHECK_FALSE(scoped.admits("app_usage", "agent-b"));
+    CHECK(scoped.admits("APP_USAGE", "agent-a")); // ASCII case folded, like the SQL predicate
+    CHECK(global.admits("app_usage", "agent-b"));
+    // An ordinary plugin is admitted by every filter that is not refuse_unwired.
+    CHECK(deny.admits("shellexec", "agent-a"));
+    CHECK(scoped.admits("shellexec", "agent-b"));
+    CHECK(ResponseTierFilter::unrestricted_internal_consumer().admits("app_usage", "agent-a"));
+    CHECK_FALSE(ResponseTierFilter::refuse_unwired().admits("shellexec", "agent-a"));
 }
 
 TEST_CASE("ResponseTierFilter::refuse_unwired and for_fixed_plugin_poll",

@@ -674,6 +674,66 @@ TEST_CASE("create-group-form route: dispatched through TestRouteSink, the "
     CHECK(res->get_header_value("Vary") == "Cookie");
 }
 
+// #4990: an Unknown Forensics decision must not show a number computed over a partial row set.
+TEST_CASE("create-group-form route: an Unknown Forensics decision shows the count as unavailable, "
+          "not a number",
+          "[pg][server][dashboard][create_group_form][security][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    const std::string command_id = "cmd-create-group-unknown";
+    for (const char* agent : {"agent-1", "agent-2"}) {
+        StoredResponse r;
+        r.instruction_id = command_id;
+        r.agent_id = agent;
+        r.received_at_ms = 1000;
+        r.status = 0;
+        r.plugin = "registry";
+        r.output = "match";
+        rs.store(r);
+    }
+    yuzu::MetricsRegistry metrics;
+    DashboardRoutes::AuthFn auth_fn =
+        [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "testuser";
+        s.role = auth::Role::admin;
+        return s;
+    };
+    DashboardRoutes::PermFn perm_fn = [](const httplib::Request&, httplib::Response&,
+                                         const std::string&, const std::string&) { return true; };
+    DashboardRoutes::AuditFn audit_fn = [](const httplib::Request&, const std::string&,
+                                           const std::string&, const std::string&,
+                                           const std::string&, const std::string&) {};
+    struct SinkHarness {
+        yuzu::server::test::ForensicsCaller forensics;
+        DashboardRoutes routes;
+        yuzu::server::test::TestRouteSink sink;
+    } h;
+    yuzu::server::test::wire_forensics(h.routes, h.forensics);
+    h.routes.register_routes(h.sink, auth_fn, perm_fn, audit_fn, &rs, /*mgmt_group_store=*/nullptr,
+                             /*registry=*/nullptr, /*tag_store=*/nullptr, /*event_bus=*/nullptr,
+                             /*agents_json_fn=*/[] { return std::string{"[]"}; },
+                             /*dispatch_fn=*/DashboardRoutes::DispatchFn{},
+                             /*caller_fn=*/DashboardRoutes::CallerFn{},
+                             /*resolve_fn=*/DashboardRoutes::ResolveFn{}, &metrics,
+                             /*instruction_store=*/nullptr);
+    const std::string url =
+        "/fragments/create-group-form?command_id=" + command_id + "&plugin=registry&f_output=match";
+
+    h.forensics.unknown();
+    auto unk = h.sink.Get(url);
+    REQUIRE(unk != nullptr);
+    CHECK(unk->status == 200);
+    CHECK(contains(unk->body, "agent count unavailable"));
+    CHECK_FALSE(contains(unk->body, "agents will be added"));
+
+    h.forensics.admin(); // control: a resolved decision shows the real count
+    auto ok = h.sink.Get(url);
+    REQUIRE(ok != nullptr);
+    CHECK(contains(ok->body, "2 agents will be added"));
+}
+
 // #5623: a filter value over the ingest bound is not indexed in newly stored responses, so the
 // form must not present its count as the answer. Static sentence, never the value.
 TEST_CASE("create-group-form route: a filter value over kMaxFacetValueBytes replaces the "

@@ -3544,7 +3544,12 @@ void RestApiV1::register_routes(
                      session && auth::effective_role(*session) == auth::Role::admin; // JIT elevation
                  const auto id = req.matches[1].str();
                  // #4990: the caller's own Forensics visibility, resolved on this request.
-                 const auto tier = tier_filter_for(req, forensics_visibility_fn, forensics_plugins);
+                 const auto tier_resolved = tier_filter_for(req, forensics_visibility_fn, forensics_plugins);
+                 if (!tier_resolved) { // Unknown: never a partial 200 (#4990)
+                     respond_forensics_tier_unknown(res);
+                     return;
+                 }
+                 const ResponseTierFilter& tier = *tier_resolved;
                  auto agg = bundle_orch->collate(id, principal, is_admin, tier);
                  if (!agg) {
                      // #2691 (Doomgoose finding #3): kDegraded is a real store
@@ -4135,7 +4140,12 @@ void RestApiV1::register_routes(
 
                  // #4990: after the ManagementGroup:Write gate and the session resolve; the filter
                  // alone closes the Forensics half (no Response:Read gate is added here).
-                 const auto tier = tier_filter_for(req, forensics_visibility_fn, forensics_plugins);
+                 const auto tier_resolved = tier_filter_for(req, forensics_visibility_fn, forensics_plugins);
+                 if (!tier_resolved) { // Unknown: never a partial 200 (#4990)
+                     respond_forensics_tier_unknown(res);
+                     return;
+                 }
+                 const ResponseTierFilter& tier = *tier_resolved;
                  auto count = group_agent_count_preview(response_store, tier, command_id, filters,
                                                         agent_scope);
                  if (!count) {
@@ -10668,7 +10678,12 @@ void RestApiV1::register_routes(
             if (!gate.admitted)
                 return; // gate already wrote the response.
             // #4990: derived after the gate (never writes a response), before scope resolution.
-            const auto tier = tier_filter_for(req, forensics_visibility_fn, forensics_plugins);
+            const auto tier_resolved = tier_filter_for(req, forensics_visibility_fn, forensics_plugins);
+            if (!tier_resolved) { // Unknown: never a partial 200 (#4990)
+                respond_forensics_tier_unknown(res);
+                return;
+            }
+            const ResponseTierFilter& tier = *tier_resolved;
             if (!response_store || !response_store->is_open()) {
                 res.status = 503;
                 res.set_content(
@@ -10861,7 +10876,12 @@ void RestApiV1::register_routes(
             if (!gate.admitted)
                 return; // gate already wrote the response.
             // #4990: derived after the gate (never writes a response), before scope resolution.
-            const auto tier = tier_filter_for(req, forensics_visibility_fn, forensics_plugins);
+            const auto tier_resolved = tier_filter_for(req, forensics_visibility_fn, forensics_plugins);
+            if (!tier_resolved) { // Unknown: never a partial 200 (#4990)
+                respond_forensics_tier_unknown(res);
+                return;
+            }
+            const ResponseTierFilter& tier = *tier_resolved;
             if (!response_store || !response_store->is_open()) {
                 res.status = 503;
                 res.set_content(
@@ -11018,7 +11038,12 @@ void RestApiV1::register_routes(
             if (!gate.admitted)
                 return; // gate already wrote the response.
             // #4990: derived after the gate (never writes a response), before scope resolution.
-            const auto tier = tier_filter_for(req, forensics_visibility_fn, forensics_plugins);
+            const auto tier_resolved = tier_filter_for(req, forensics_visibility_fn, forensics_plugins);
+            if (!tier_resolved) { // Unknown: never a partial 200 (#4990)
+                respond_forensics_tier_unknown(res);
+                return;
+            }
+            const ResponseTierFilter& tier = *tier_resolved;
             if (!response_store || !response_store->is_open()) {
                 res.status = 503;
                 res.set_content(
@@ -11193,7 +11218,12 @@ void RestApiV1::register_routes(
             if (!gate.admitted)
                 return; // gate already wrote the response.
             // #4990: derived after the gate (never writes a response), before scope resolution.
-            const auto tier = tier_filter_for(req, forensics_visibility_fn, forensics_plugins);
+            const auto tier_resolved = tier_filter_for(req, forensics_visibility_fn, forensics_plugins);
+            if (!tier_resolved) { // Unknown: never a partial 200 (#4990)
+                respond_forensics_tier_unknown(res);
+                return;
+            }
+            const ResponseTierFilter& tier = *tier_resolved;
             if (!response_store || !response_store->is_open()) {
                 res.status = 503;
                 res.set_content(
@@ -11961,7 +11991,12 @@ void RestApiV1::register_routes(
             if (!gate.admitted)
                 return; // gate already wrote the response.
             // #4990: derived after the gate (never writes a response), before scope resolution.
-            const auto tier = tier_filter_for(req, forensics_visibility_fn, forensics_plugins);
+            const auto tier_resolved = tier_filter_for(req, forensics_visibility_fn, forensics_plugins);
+            if (!tier_resolved) { // Unknown: never a partial 200 (#4990)
+                respond_forensics_tier_unknown(res);
+                return;
+            }
+            const ResponseTierFilter& tier = *tier_resolved;
             if (!response_store || !instruction_store || !response_store->is_open() ||
                 !instruction_store->is_open()) {
                 res.status = 503;
