@@ -89,6 +89,17 @@ jobs:
       - name: Response store read tripwire self-test (#4990)
         run: python3 -I tests/test_response_store_read_tripwire_selftest.py
 
+      # #4990: server.cpp keeps wiring the Forensics plugin set and the visibility resolver into
+      # every surface that reads stored responses. A route class built without them fails closed
+      # and would silently lose Forensics rows for every caller, so no unit test notices a
+      # dropped line; this lexical gate does. The self-test deletes each required statement in
+      # memory and proves the gate names it.
+      - name: Forensics tier wiring gate (#4990)
+        run: python3 -I tests/test_forensics_tier_wiring_lexical.py
+
+      - name: Forensics tier wiring gate self-test (#4990)
+        run: python3 -I tests/test_forensics_tier_wiring_lexical_selftest.py
+
       # Personal-data guard: no real home paths, SIDs, tailnet IPs, MACs, private
       # keys, consumer e-mail or tracked session artifacts in this PUBLIC repo.
       # Pre-existing hits live in scripts/ci/personal-data-baseline.json (counts

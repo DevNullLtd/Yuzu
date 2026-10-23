@@ -4059,6 +4059,23 @@ test('response store read tripwire selftest',
   timeout: 30,
 )
 
+# #4990: server.cpp must keep wiring the Forensics plugin set and the visibility resolver into every
+# surface that reads stored responses (a route class built without them fails CLOSED and would
+# silently lose Forensics rows for every caller). Lexical gate + a selftest that deletes each
+# required statement in memory; both also run in .github/workflows/docs-lint.yml.
+test('forensics tier wiring lexical',
+  _python3_test,
+  args: [files('test_forensics_tier_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('forensics tier wiring lexical selftest',
+  _python3_test,
+  args: [files('test_forensics_tier_wiring_lexical_selftest.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Personal-data commit guard (scripts/ci/check-personal-data.py) and its
 # self-test. Both also run in .github/workflows/docs-lint.yml on every PR.
 test('personal data guard',
