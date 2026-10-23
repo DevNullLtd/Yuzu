@@ -260,9 +260,22 @@ check output are shown to readers who do not hold `Forensics:Read`. Such a
 policy therefore shows `unknown` for every agent with an empty `check_result`,
 and never a verdict from, or a stored copy of, Forensics output. `unknown`
 there says nothing about the device. A Forensics-tier plugin is not a suitable
-policy check. A separate follow-up tracks the dispatch-side authorisation of
-policy checks. A `check_result` stored by an evaluation before the upgrade
-stays until the policy is next evaluated.
+policy check. The check instruction is still dispatched to the endpoints and the
+plugin's response row is still stored (it is readable only through the
+`Forensics:Read` tier and kept for the response retention window, 90 days by
+default); only the verdict and `check_result` are withheld. A separate
+follow-up (#6065) tracks the dispatch-side authorization of policy checks.
+
+A `check_result` that an evaluation stored before the upgrade stays until that
+(policy, agent) pair is next written by an evaluation. It is not removed by the
+upgrade and has no age limit. For a disabled policy, a decommissioned agent
+(the decommission cascade does not include the policy store) or an agent that
+is no longer in the policy's scope, the pair is never written again, so the old
+text stays. To remove it, delete the policy (`DELETE /api/policies/{id}`,
+`Policy:Delete`; its status rows go with it), or enable the policy and
+evaluate it again (`POST /api/policies/{id}/evaluate`), which overwrites the
+rows of the agents it still covers. This is a residual the owner has accepted
+for #4990.
 
 Implementation/lifecycle: the thread is `PolicyEvaluator`
 (`policy_evaluator.{hpp,cpp}`), wired in `server.cpp` against a hoisted shared
