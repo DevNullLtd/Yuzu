@@ -861,8 +861,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      registry tool is both a ledger `mcp_twin` and a `kExpectedTwins` row. Each
      check carries a size-pinned, shrink-only allowlist seeded from the tree as
      it stood. The gate-parity table (`GATE_PARITY_KNOWN_MISMATCHES`) holds
-     rows whose REST and MCP gates differ, several of them unadjudicated at
-     seed, with a one-line reason each in the script; a second table
+     the four rows whose REST and MCP gates still differ after the check
+     learned two shapes (a REST handler that refuses a service-scoped token
+     before its gate, and an MCP handler whose own fleet read confines), with a
+     one-line reason each in the script; a second table
      (`GATE_PARITY_NO_GATE_ALLOWED`) holds routes whose gate the script cannot
      read. Both shrink only: a fix removes its entry and lowers the pin, and
      adding an entry or raising a pin is a reviewed deferral that needs a
@@ -870,9 +872,12 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      tripwires, not proofs: the check compares gate labels, not effect (REST
      reads the management-group axis, MCP the service-scope axis), a row whose
      `rest_v1_twin` or `mcp_twin` is null compares nothing, and the checks read
-     source text, so the first gate call in a handler is taken as its gate.
-     `MIN_REGISTRY_FILES` rises from 1 to 3, the number of `mcp_tools_*.cpp`
-     registry files. Second, `get.api-agents` becomes
+     source text, so the first gate call in a handler is taken as its gate and
+     each further distinct gate must agree or be matched by a gate call the MCP
+     handler makes. `MIN_REGISTRY_FILES` rises from 1 to 3, the number of
+     `mcp_tools_*.cpp` registry files, and must equal that count; the
+     test-existence tripwire also requires the test file to be registered in
+     `tests/meson.build`. Second, `get.api-agents` becomes
      `exception:#4041 revisit:2027-01-31`: MCP `list_agents` is unconfined (a
      known gap, the World A gap tracked by #4041, not a design choice) while
      `GET /api/v1/devices` is confined through `require_fleet_read`, so it is

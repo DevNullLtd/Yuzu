@@ -108,32 +108,47 @@ WHAT IT CHECKS
      `rest_v1_twin` is a {method, path} object (any status), the REST route's gate
      and the MCP tool's gate must agree on (confinement, securable, operation).
      REST side: the registration call's whole argument list is brace-bounded and
-     comment-stripped, and the FIRST gate call in it is read (`perm_fn(`,
+     comment-stripped, and every gate call in it is read (`perm_fn(`,
      `scoped_perm_fn(`, `fleet_read_fn(`, `list_read_fn(`, `require_permission(`,
      `require_scoped_permission(`, with any `deps.`/`deps_.` receiver and an optional
      trailing `_`), taking its `"Securable", "Operation"` literals; plain perm vs
-     scoped vs fleet-read is the gate kind. MCP side: the tool's pair in
-     mcp_server.cpp's kToolSecurityRows[], or for a registry tool the positional
-     `"Securable", "Operation", ServiceScopeClass::x` triple of its ToolRecord.
-     The confinement comparison is REST scoped/fleet == MCP `confined`. A route
-     with no recognisable gate (auth_fn only, a helper closure, a member-function
-     gate) fails CLOSED unless named in the size-pinned, shrink-only
-     GATE_PARITY_NO_GATE_ALLOWED; a mismatch is an error unless named, with its
-     exact two gates and a reason, in GATE_PARITY_KNOWN_MISMATCHES (same pin and
-     shrink-only rules; a stale or reshaped entry fails). LIMITS: it compares LABELS,
-     not effect (the REST kind is the management-group axis, the MCP kind the
-     service-scope axis, so a matching or mismatching label proves neither); first
-     gate call in the text, not the strictest on any path, and a conditional or
-     helper-lambda call that comes first is read as the route's gate; an inline
-     refusal before the gate (deny_fleet_wide_service_scoped) and an in-handler
-     second gate are not read; a row with a null twin on either side compares
-     nothing. A row whose route or tool cannot be found is an error, never a skip.
+     scoped vs fleet-read is the gate kind. The FIRST call is the route's gate; a plain
+     gate that comes after an unconditional service-scope refusal (`if (deny_fleet_wide_
+     service_scoped(...)) return;` or `deny_service_scoped_schedule_list`, directly in the
+     handler body, the call being the whole condition and the branch returning) has kind
+     `refused`. Any further DISTINCT gate triple must also agree with the MCP side or the
+     row is a finding, and a further gate whose arguments cannot be read fails closed.
+     MCP side: the tool's pair in mcp_server.cpp's kToolSecurityRows[], or for a registry
+     tool the positional `"Securable", "Operation", ServiceScopeClass::x` triple of its
+     ToolRecord. The confinement comparison: REST scoped/fleet == MCP `confined`; REST
+     plain == MCP `denied` or `global_safe`; REST refused == MCP `denied` or `confined`.
+     Two things are read from the MCP handler body (the single `if (tool_name == "<tool>")`
+     branch, or the function a registry record points at): a tool whose label is not
+     `confined` but whose handler calls the fleet / list read mechanism, every call asking
+     for the tool's own pair, compares as confined; and the gate calls the handler makes
+     are the gates a further REST gate may match. A route with no recognisable gate (auth_fn
+     only, a helper closure, a member-function gate) fails CLOSED unless named in the
+     size-pinned, shrink-only GATE_PARITY_NO_GATE_ALLOWED; a mismatch is an error unless
+     named, with its exact gates and a reason, in GATE_PARITY_KNOWN_MISMATCHES (same pin and
+     shrink-only rules; a stale or reshaped entry fails). A lexical gate drops an entry only
+     when the handler text proves the two sides agree; what it cannot prove stays listed.
+     LIMITS: it compares LABELS and call sites, not effect (the REST kind is the
+     management-group axis, the MCP label the service-scope axis, so a matching or mismatching
+     label proves neither); a conditional or helper-lambda call that comes first is read as
+     the route's gate; a refusal inside a condition with other terms, behind a branch or in
+     another function, and an MCP handler's own refusal call, are not read; a gate reached
+     through a call this script does not list (a tier check, a helper closure) is invisible; a
+     row with a null twin on either side compares nothing. A row whose route or tool cannot be
+     found is an error, never a skip. The count of mcp_tools_*.cpp registry files must equal
+     MIN_REGISTRY_FILES.
   7. REGISTRY TEST EXISTENCE. Every registry tool's domain test file
-     tests/unit/server/test_mcp_tools_<domain>.cpp must exist, name the tool in a
-     string literal, call `schema_violation(` and hold a CHECK/REQUIRE that mentions
-     an audit row; a tool that cannot yet is named in the size-pinned, shrink-only
-     TEST_EXISTENCE_ALLOWED. A TRIPWIRE, not a proof: it shows the file was written,
-     not that it exercises this tool's audit contract.
+     tests/unit/server/test_mcp_tools_<domain>.cpp must exist, be registered in
+     tests/meson.build (outside a `#` comment), hold a TEST_CASE that both names the tool
+     in a string literal and calls `schema_violation(`, and a TEST_CASE that both names it
+     and has a CHECK/REQUIRE that mentions an audit row (the two may be different cases:
+     schema conformance and audit are normally separate tests); a tool that cannot yet is
+     named in the size-pinned, shrink-only TEST_EXISTENCE_ALLOWED. A TRIPWIRE, not a proof:
+     it shows the test was written, not that it exercises this tool's audit contract.
 
 USAGE
   check-api-parity.py                    # run the full gate (CI mode)
@@ -154,6 +169,7 @@ USAGE
 """
 import argparse
 import datetime
+import inspect
 import json
 import os
 import re
@@ -1767,6 +1783,8 @@ def ratchet_errors(untwinned, generic_planned):
 
 # Where the per-domain MCP twin tests live (check 7).
 MCP_TOOL_TESTS_DIR = ROOT / "tests" / "unit" / "server"
+# The meson file that must register each per-domain test (check 7).
+TESTS_MESON = ROOT / "tests" / "meson.build"
 
 _CPP_SCAN = re.compile(r"""[/"'R]""")
 
@@ -1892,9 +1910,145 @@ def first_gate(span_text):
     return _GATE_KIND[m.group(1).rstrip("_")], a.group(1), a.group(2)
 
 
+# The fleet-wide service-scoped REFUSAL helpers check 6 recognises: a closed list, because a
+# helper that refuses something else (a tag mutation, a session) says nothing about the read
+# gate that follows it. Each is called as `if (helper(req, res, ...)) return;` and answers 403 to
+# a service-scoped token (deny_fleet_wide_service_scoped in rest_api_v1.cpp,
+# deny_service_scoped_schedule_list in workflow_routes.cpp), so a plain perm_fn gate AFTER one is
+# reached by non-service-scoped callers only: the route's kind is `refused`, not `plain`.
+_REFUSAL_CALL = re.compile(r"(?<![\w.>])(?:deny_fleet_wide_service_scoped|deny_service_scoped_schedule_list)\s*\(")
+_IF_OPENER = re.compile(r"\bif\s*\(\s*$")
+_STATEMENT_RETURN = re.compile(r"(?:^|[;{}])\s*return\b")
+# REST gate kinds that confine (or refuse) a service-scoped or management-group caller; `plain`
+# is the only kind that does not.
+_REST_CONFINING_KINDS = frozenset({"scoped", "fleet", "refused"})
+
+
+def _brace_depth_before(text, off):
+    """Net `{` depth of text[:off], literals skipped (`text` comment-blanked)."""
+    depth = 0
+    i = 0
+    while True:
+        m = _BRACKET_SCAN.search(text, i, off)
+        if not m:
+            return depth
+        i = m.start()
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+        elif c in "\"'R":
+            lit = _cpp_literal_end(text, i)
+            if lit is not None:
+                i = lit
+                continue
+        i += 1
+
+
+def _depth0_text(block):
+    """`block` (the text between a block's braces) with every nested `{...}` group and every
+    literal removed, so a statement scan sees only the block's own top-level statements."""
+    out, last, i = [], 0, 0
+    while True:
+        m = _BRACKET_SCAN.search(block, i)
+        if not m:
+            out.append(block[last:])
+            return "".join(out)
+        i = m.start()
+        c = block[i]
+        if c == "{":
+            out.append(block[last:i] + " ")
+            last = i = _balanced_end(block, i)
+            continue
+        if c in "\"'R":
+            lit = _cpp_literal_end(block, i)
+            if lit is not None:
+                out.append(block[last:i] + " ")
+                last = i = lit
+                continue
+        i += 1
+
+
+def unconditional_refusals(span_text):
+    """Offsets of the refusal-helper calls in a handler span that PROVABLY end the request for
+    a service-scoped caller before anything after them runs: the call is the whole condition of
+    an `if` that sits directly in the handler body (brace depth 1, not inside a branch or a
+    nested lambda), and the `if` returns (`return;` itself, or a braced block with a
+    top-level `return` statement). `if (!helper(...))`, `a && helper(...)`, a call that is not
+    in an `if`, one behind another branch, or one whose branch does not return, are NOT
+    recognised, so the route keeps its `plain` kind (fail closed). `span_text` is comment-blanked."""
+    found = []
+    for m in _REFUSAL_CALL.finditer(span_text):
+        if not _IF_OPENER.search(span_text[:m.start()]):
+            continue
+        if _brace_depth_before(span_text, m.start()) != 1:
+            continue
+        close = _balanced_end(span_text, m.end() - 1)
+        rest = span_text[close:]
+        cond_end = re.match(r"\s*\)\s*", rest)
+        if not cond_end:
+            continue
+        body = rest[cond_end.end():]
+        if re.match(r"return\b", body):
+            found.append(m.start())
+        elif body.startswith("{"):
+            block = body[:_balanced_end(body, 0)]
+            if _STATEMENT_RETURN.search(_depth0_text(block[1:-1])):
+                found.append(m.start())
+    return found
+
+
+def all_gate_calls(span_text):
+    """Every gate call in a handler span, in text order: (offset, kind, securable, operation) or,
+    when the arguments are not `req, res, "Securable", "Operation"` literals, (offset, None,
+    function_name, why). `span_text` is comment-blanked."""
+    calls = []
+    for m in _GATE_CALL.finditer(span_text):
+        open_i = m.end() - 1
+        args = span_text[open_i + 1:_balanced_end(span_text, open_i) - 1]
+        a = _GATE_ARGS.match(args)
+        if not a:
+            calls.append((m.start(), None, m.group(1), f"{m.group(1)}( arguments are not `req, res, "
+                                                          f"\"Securable\", \"Operation\"` literals"))
+        else:
+            calls.append((m.start(), _GATE_KIND[m.group(1).rstrip("_")], a.group(1), a.group(2)))
+    return calls
+
+
+def handler_gate(span_text):
+    """The gate of one REST handler span: (kind, securable, operation) for the FIRST gate call
+    (as first_gate reads it), or (None, why) when there is none or it cannot be read. A plain gate
+    that comes after an unconditional service-scope refusal (see unconditional_refusals) has kind
+    `refused`. When the handler holds further DISTINCT gates, the result is the 4-tuple (kind,
+    securable, operation, extras), extras being the other (kind, securable, operation) triples in
+    text order; a further gate whose arguments cannot be read is the triple ("unparsed",
+    function_name, "?"), so a second gate is never silently dropped. `span_text` is
+    comment-blanked."""
+    calls = all_gate_calls(span_text)
+    if not calls:
+        return None, "no recognised gate call in the handler"
+    if calls[0][1] is None:
+        return None, calls[0][3]
+    refusals = unconditional_refusals(span_text)
+
+    def triple(c):
+        if c[1] is None:
+            return ("unparsed", c[2], "?")
+        kind = "refused" if c[1] == "plain" and any(r < c[0] for r in refusals) else c[1]
+        return (kind, c[2], c[3])
+    first = triple(calls[0])
+    extras = []
+    for c in calls[1:]:
+        t = triple(c)
+        if t != first and t not in extras:
+            extras.append(t)
+    return first + (tuple(extras),) if extras else first
+
+
 def extract_rest_gates(owners):
     """{(METHOD, canonical_path): [(owner_file, gate)]} for every /api/vN/ registration in the
-    named server/core/src files; `gate` is first_gate()'s result over the registration call's
+    named server/core/src files; `gate` is handler_gate()'s result over the registration call's
     whole argument list (path literal, then the handler lambda)."""
     gates = {}
     versioned = re.compile(r"^/api/v\d+/")
@@ -1903,7 +2057,7 @@ def extract_rest_gates(owners):
         for method, raw, open_i in iter_verb_calls(text, fname, warn=False):
             if versioned.match(raw):
                 span = text[open_i:_balanced_end(text, open_i)]
-                gates.setdefault((method, canonicalize(raw)), []).append((fname, first_gate(span)))
+                gates.setdefault((method, canonicalize(raw)), []).append((fname, handler_gate(span)))
     return gates
 
 
@@ -1969,6 +2123,84 @@ def extract_mcp_security():
     return by_tool, registry
 
 
+# The confinement mechanisms an MCP handler can call. A `denied` ServiceScopeClass label says the
+# C8 chokepoint refuses a service-scoped caller before the handler runs; it does not say the
+# handler fails to confine a management-group caller, which the fleet / list read calls below do.
+_MCP_CONFINE_CALL = re.compile(r"(?<![\w])(?:\w+(?:\.|->))*(fleet_read_fn_?|list_read_fn_?"
+                               r"|authorize_list_read|require_fleet_read|require_list_read)\s*\(")
+
+
+def _function_body(text, name):
+    """The body (braces included) of the single function definition `name(...) ... {` in
+    comment-blanked `text`, or None when there is not exactly one definition. A call or a
+    declaration ends in `;` or `,` after its parentheses and is not a definition."""
+    bodies = []
+    for m in re.finditer(r"(?<![\w.>])" + re.escape(name) + r"\s*\(", text):
+        close = _balanced_end(text, m.end() - 1)
+        tail = re.match(r"\s*(?:const\s*|noexcept\s*|override\s*)*\{", text[close:])
+        if tail:
+            open_i = close + tail.end() - 1
+            bodies.append(text[open_i:_balanced_end(text, open_i)])
+    return bodies[0] if len(bodies) == 1 else None
+
+
+def mcp_handler_effect(body, pair):
+    """"confined" when an MCP handler body (comment-blanked) calls the fleet / list read
+    confinement mechanism and EVERY such call asks for exactly `pair` (the tool's own securable and
+    operation) with literal arguments; None otherwise (no call, a call that asks for a different
+    pair, or one whose arguments cannot be read). Lexical: it shows the call is written, not that
+    every path reaches it or that it narrows the data."""
+    seen = 0
+    for m in _MCP_CONFINE_CALL.finditer(body):
+        open_i = m.end() - 1
+        a = _GATE_ARGS.match(body[open_i + 1:_balanced_end(body, open_i) - 1])
+        if not a or (a.group(1), a.group(2)) != pair:
+            return None
+        seen += 1
+    return "confined" if seen else None
+
+
+def mcp_handler_gates(body):
+    """The set of (kind, securable, operation) gate calls an MCP handler body (comment-blanked)
+    makes with literal arguments; a call whose arguments cannot be read is left out (it can only
+    fail to match, never excuse a REST gate)."""
+    return {(c[1], c[2], c[3]) for c in all_gate_calls(body) if c[1] is not None}
+
+
+def extract_mcp_handlers(by_tool, registry, tools):
+    """(effects, gates) for the named `tools`. The handler is the single
+    `if (tool_name == "<tool>") {` dispatch branch in mcp_server.cpp for a legacy tool, or the
+    function a registry record points at (`&handler`) for a registry tool; a tool with no single
+    such body is simply not derived (it keeps its label), never an error. effects is
+    {tool: "confined"} for a tool whose ServiceScopeClass label is not `confined` but whose
+    handler proves the confinement mechanism (mcp_handler_effect); gates is
+    {tool: mcp_handler_gates(body)}."""
+    text = blank_cpp_comments(_read_mcp_server_cpp())
+    effects, gates, reg_text = {}, {}, {}
+    for tool in sorted(tools):
+        if tool not in by_tool:
+            continue
+        securable, operation, label = by_tool[tool]
+        if tool in registry:
+            fname = registry[tool]
+            if fname not in reg_text:
+                reg_text[fname] = blank_cpp_comments((_registry_dir() / fname).read_text(encoding="utf-8"))
+            rtext = reg_text[fname]
+            start = rtext.find(f'{{"{tool}",')
+            end = rtext.find("\n    {", start + 1) if start >= 0 else -1
+            h = re.search(r"&(\w+)\s*\}", rtext[start:end if end >= 0 else len(rtext)]) if start >= 0 else None
+            body = _function_body(rtext, h.group(1)) if h else None
+        else:
+            hits = list(re.finditer(r'\bif\s*\(\s*tool_name\s*==\s*"' + re.escape(tool) + r'"\s*\)\s*\{', text))
+            body = text[hits[0].end() - 1:_balanced_end(text, hits[0].end() - 1)] if len(hits) == 1 else None
+        if not body:
+            continue
+        gates[tool] = mcp_handler_gates(body)
+        if label != "confined" and mcp_handler_effect(body, (securable, operation)):
+            effects[tool] = "confined"
+    return effects, gates
+
+
 # Check 6 allowlists. Both are SHRINK-ONLY and SIZE-PINNED (pattern: GRANDFATHERED_MAX): each entry
 # must still be a live finding, the table's size must equal its MAX, and an entry whose finding
 # changes shape (a different gate on either side) is stale. A fix removes its entry AND lowers the
@@ -1977,59 +2209,19 @@ def extract_mcp_security():
 #
 # KNOWN_MISMATCHES: (METHOD, canonical REST path, tool) -> (REST gate, MCP gate, reason), where a
 # gate reads `<kind>:<Securable>:<Operation>`. REST kind is plain (perm_fn / require_permission),
-# scoped (scoped_perm_fn) or fleet (fleet_read_fn / list_read_fn, the admit-then-filter reads); MCP
-# kind is the tool's ServiceScopeClass (denied / confined / global_safe). The comparison is the
-# securable, the operation, and whether the surface is confined (REST scoped or fleet == MCP
-# confined); denied and global_safe both count as unconfined.
-GATE_PARITY_KNOWN_MISMATCHES_MAX = 18
+# refused (plain behind an unconditional service-scope refusal), scoped (scoped_perm_fn) or fleet
+# (fleet_read_fn / list_read_fn, the admit-then-filter reads); a REST gate with further distinct
+# gates reads `<gate>; also <gate>, ...`. MCP kind is the tool's ServiceScopeClass (denied /
+# confined / global_safe), written `<label>+confined-by-handler` when the handler's own fleet
+# read proves it confines. The comparison is the securable, the operation, and the confinement
+# side (see _gate_agrees); every further REST gate must agree too or be matched by a gate call the
+# MCP handler makes.
+GATE_PARITY_KNOWN_MISMATCHES_MAX = 4
 GATE_PARITY_KNOWN_MISMATCHES = {
-    ("GET", "/api/v1/dex/app", "get_dex_app"): (
-        "plain:GuaranteedState:Read", "confined:GuaranteedState:Read",
-        "REST gates on plain perm_fn behind an inline deny_fleet_wide_service_scoped refusal (a "
-        "service-scoped token is refused outright); the MCP row is `confined`, so the two differ "
-        "in confinement kind"),
-    ("GET", "/api/v1/dex/overview", "get_dex_overview"): (
-        "plain:GuaranteedState:Read", "confined:GuaranteedState:Read",
-        "REST gates on plain perm_fn behind an inline deny_fleet_wide_service_scoped refusal (a "
-        "service-scoped token is refused outright); the MCP row is `confined`, so the two differ "
-        "in confinement kind"),
-    ("GET", "/api/v1/dex/perf/compare", "compare_app_perf_versions"): (
-        "plain:GuaranteedState:Read", "confined:GuaranteedState:Read",
-        "REST gates on plain perm_fn behind an inline deny_fleet_wide_service_scoped refusal (a "
-        "service-scoped token is refused outright); the MCP row is `confined`, so the two differ "
-        "in confinement kind"),
-    ("GET", "/api/v1/dex/perf/devices", "list_dex_perf_devices"): (
-        "plain:GuaranteedState:Read", "confined:GuaranteedState:Read",
-        "REST gates on plain perm_fn behind an inline deny_fleet_wide_service_scoped refusal (a "
-        "service-scoped token is refused outright); the MCP row is `confined`, so the two differ "
-        "in confinement kind"),
-    ("GET", "/api/v1/dex/signals/{param}", "get_dex_signal_detail"): (
-        "plain:GuaranteedState:Read", "confined:GuaranteedState:Read",
-        "REST gates on plain perm_fn behind an inline deny_fleet_wide_service_scoped refusal (a "
-        "service-scoped token is refused outright); the MCP row is `confined`, so the two differ "
-        "in confinement kind"),
-    ("GET", "/api/v1/guaranteed-state/rules/{param}/status", "get_guardian_rule_status"): (
-        "fleet:GuaranteedState:Read", "denied:GuaranteedState:Read",
-        "REST serves through the admit-then-filter list read and handles gate.scope itself; the "
-        "MCP row is the default `denied`. Unadjudicated at seed"),
-    ("GET", "/api/v1/guaranteed-state/status", "get_guardian_status"): (
-        "fleet:GuaranteedState:Read", "denied:GuaranteedState:Read",
-        "REST serves through the admit-then-filter list read and handles gate.scope itself; the "
-        "MCP row is the default `denied`. Unadjudicated at seed"),
     ("GET", "/api/v1/inventory/tables", "list_inventory_tables"): (
         "plain:Inventory:Read", "denied:Infrastructure:Read",
-        "REST requires Inventory:Read, the MCP tool Infrastructure:Read. Unadjudicated at seed; "
-        "tracked by #6329"),
-    ("GET", "/api/v1/network/devices", "list_network_devices"): (
-        "plain:GuaranteedState:Read", "confined:GuaranteedState:Read",
-        "REST gates on plain perm_fn behind an inline deny_fleet_wide_service_scoped refusal (a "
-        "service-scoped token is refused outright); the MCP row is `confined`, so the two differ "
-        "in confinement kind"),
-    ("GET", "/api/v1/plugin-config", "list_plugin_config"): (
-        "fleet:PluginConfig:Read", "denied:PluginConfig:Read",
-        "REST admits through the list read, then answers 403 to any confined caller (gate.scope), "
-        "so it is global-only in effect; the MCP row is `denied`, which agrees in effect but not "
-        "in label"),
+        "REST requires Inventory:Read, the MCP tool Infrastructure:Read; the MCP gate "
+        "alignment is tracked by #6329"),
     ("GET", "/api/v1/rbac/roles", "discover_permissions"): (
         "plain:UserManagement:Read", "denied:Infrastructure:Read",
         "the tool serves the taxonomy at Infrastructure:Read and gates the role-to-permission "
@@ -2040,32 +2232,12 @@ GATE_PARITY_KNOWN_MISMATCHES = {
         "the tool serves the taxonomy at Infrastructure:Read and gates the role-to-permission "
         "grid in-handler on UserManagement:Read (declared via roles_omitted); this route is the "
         "grid half, so the tier row and the REST gate name different securables by design"),
-    ("GET", "/api/v1/result-sets/{param}/members", "get_result_set_members"): (
-        "fleet:Infrastructure:Read", "denied:Infrastructure:Read",
-        "REST runs the fleet read after a deny_fleet_wide_service_scoped refusal; the MCP row is "
-        "the default `denied`. Unadjudicated at seed"),
-    ("GET", "/api/v1/schedules", "list_schedules"): (
-        "plain:Schedule:Read", "confined:Schedule:Read",
-        "REST gates on plain perm_fn behind an inline deny_service_scoped_schedule_list refusal (a "
-        "service-scoped token is refused outright); the MCP row is `confined`, so the two differ "
-        "in confinement kind"),
-    ("GET", "/api/v1/tar/capture-sources", "list_tar_capture_sources_devices"): (
-        "fleet:Infrastructure:Read", "denied:Infrastructure:Read",
-        "REST is the confined fleet read for management-group callers; the MCP row stays `denied` "
-        "on purpose (kToolSecurityRows #4027 comment, parity with the REST service-scope 403)"),
-    ("GET", "/api/v1/tar/process-tree", "list_tar_process_tree_devices"): (
-        "fleet:Infrastructure:Read", "denied:Infrastructure:Read",
-        "REST is the confined fleet read for management-group callers; the MCP row stays `denied` "
-        "on purpose (kToolSecurityRows #4027 comment, parity with the REST service-scope 403)"),
-    ("GET", "/api/v1/tar/retention-paused", "list_tar_retention_paused"): (
-        "fleet:Infrastructure:Read", "denied:Infrastructure:Read",
-        "REST is the confined fleet read for management-group callers; the MCP row stays `denied` "
-        "on purpose (kToolSecurityRows #4027 comment, parity with the REST service-scope 403)"),
     ("POST", "/api/v1/result-sets", "create_result_set"): (
         "fleet:Infrastructure:Read", "denied:Infrastructure:Write",
-        "The first gate call this script reads in the REST handler is a conditional one (a "
-        "device-existence read), not necessarily the route's gate, so the operation difference "
-        "may be a limit of the lexical read. Unadjudicated at seed"),
+        "The REST handler's Infrastructure:Write check is a tier_ok() call this script does "
+        "not read; the one gate call it does read is a later conditional fleet read (a "
+        "device-existence read), so the operation difference is a limit of the lexical read. "
+        "Read in review: the tool's Infrastructure:Write row matches the REST tier check"),
 }
 # NO_GATE_ALLOWED: (METHOD, canonical REST path, tool) -> reason. A twinned route whose handler
 # holds no gate call this script recognises (owner-only reads that call auth_fn alone, helper
@@ -2121,14 +2293,46 @@ def _gate_desc(kind, securable, operation):
     return f"{kind}:{securable}:{operation}"
 
 
-def gate_parity_findings(ledger_rows, mcp_tools, rest_gates, mcp_security):
+def _gate_agrees(gate, mcp_class, mcp_pair, mcp_gates=frozenset()):
+    """One REST gate triple against the MCP tool: same securable and operation, and the same
+    side of the confinement line. `scoped` and `fleet` confine, so they need an MCP `confined`;
+    `plain` confines nothing, so it needs `denied` or `global_safe`; `refused` (a plain gate behind
+    an unconditional service-scope refusal) turns a service-scoped caller away exactly as a
+    `denied` tool does and is the REST shape of a `confined` tool that refuses it, so it agrees
+    with either and not with `global_safe`. A triple the MCP handler itself gates on (`mcp_gates`,
+    the exact (kind, securable, operation) triples its body calls) also agrees: that is how a
+    second gate is matched. An unreadable triple never agrees."""
+    kind, securable, operation = gate
+    if kind == "unparsed":
+        return False
+    if gate in mcp_gates:
+        return True
+    if (securable, operation) != mcp_pair:
+        return False
+    if kind == "refused":
+        return mcp_class in ("denied", "confined")
+    return (kind in _REST_CONFINING_KINDS) == (mcp_class == "confined")
+
+
+def gate_parity_findings(ledger_rows, mcp_tools, rest_gates, mcp_security, mcp_effects=None, mcp_gates=None):
     """Check 6 core (pure, selftested): (mismatches, no_gates, errors). Every ledger row whose
     mcp_twin is a tool name (not `resource:`) AND whose rest_v1_twin is an object is compared;
     a row with a null twin on either side compares nothing (a REST-only or MCP-only capability
     has no pair to hold against its other half), and a tool check 2 already reports as missing
-    is skipped here; a REST route this script cannot locate is an error, never a skip. mismatches is {key: (rest_gate, mcp_gate)}, no_gates {key: why}, where key
-    is (METHOD, canonical REST path, tool)."""
+    is skipped here; a REST route this script cannot locate is an error, never a skip. mismatches
+    is {key: (rest_gate, mcp_gate)}, no_gates {key: why}, where key is (METHOD, canonical REST
+    path, tool).
+
+    A REST gate is (kind, securable, operation), optionally with a fourth item: the other
+    DISTINCT gate triples the handler holds. The first is compared; every other one must also
+    agree with the MCP side or the row is a finding, and its description names them all, so an
+    allowlist entry pins the whole set. `mcp_effects` is {tool: "confined"} for a tool whose
+    ServiceScopeClass label is not `confined` but whose handler PROVABLY calls the confinement
+    mechanism (extract_mcp_handlers): that tool compares as confined and its description says so.
+    `mcp_gates` is {tool: set of (kind, securable, operation)} for the gate calls in that handler."""
     mismatches, no_gates, errors = {}, {}, []
+    mcp_effects = mcp_effects or {}
+    mcp_gates = mcp_gates or {}
     for row in ledger_rows.values():
         tool, rest = row["mcp_twin"], row["rest_v1_twin"]
         if not tool or tool.startswith(RESOURCE_TWIN_PREFIX) or not isinstance(rest, dict):
@@ -2147,15 +2351,24 @@ def gate_parity_findings(ledger_rows, mcp_tools, rest_gates, mcp_security):
             errors.append(f"{row['_file']}: MCP tool {tool!r} (twin of {route[0]} {route[1]}) has no "
                           f"securable/operation pair this script can read")
             continue
-        mcp_desc = _gate_desc(mcp[2], mcp[0], mcp[1])
+        mcp_class = mcp_effects.get(tool, mcp[2])
+        mcp_desc = _gate_desc(mcp[2] if mcp_class == mcp[2] else f"{mcp[2]}+{mcp_class}-by-handler",
+                              mcp[0], mcp[1])
         for owner, gate in rest_gates[route]:
             if gate[0] is None:
                 no_gates[key] = f"{owner}: {gate[1]}"
                 continue
-            kind, securable, operation = gate
-            rest_desc = _gate_desc(kind, securable, operation)
-            if (securable, operation) != (mcp[0], mcp[1]) or (kind != "plain") != (mcp[2] == "confined"):
-                mismatches[key] = (rest_desc, mcp_desc)
+            primary, extras = tuple(gate[:3]), (gate[3] if len(gate) > 3 else ())
+            tool_gates = mcp_gates.get(tool, frozenset())
+            # The first gate is held to the label (or the proven effect); a handler's own gate
+            # calls match only the further gates, never the first.
+            if (_gate_agrees(primary, mcp_class, (mcp[0], mcp[1]))
+                    and all(_gate_agrees(g, mcp_class, (mcp[0], mcp[1]), tool_gates) for g in extras)):
+                continue
+            rest_desc = _gate_desc(*primary)
+            if extras:
+                rest_desc += "; also " + ", ".join(_gate_desc(*e) for e in extras)
+            mismatches[key] = (rest_desc, mcp_desc)
     return mismatches, no_gates, errors
 
 
@@ -2207,14 +2420,52 @@ def gate_parity_errors(mismatches, no_gates, errors=()):
     return out
 
 
-def registry_tests_findings(registry, tests_dir):
+_TEST_BLOCK_OPENER = re.compile(r"\b(?:TEST_CASE|TEST_CASE_METHOD|TEMPLATE_TEST_CASE|SCENARIO)\s*\(")
+
+
+def test_case_blocks(text):
+    """The text of every Catch2 test-case block (macro, arguments and braced body) in
+    comment-blanked `text`. A macro whose arguments are not followed by a braced body is skipped."""
+    blocks = []
+    for m in _TEST_BLOCK_OPENER.finditer(text):
+        close = _balanced_end(text, m.end() - 1)
+        body = re.compile(r"\s*\{").match(text, close)
+        if body:
+            blocks.append(text[m.start():_balanced_end(text, body.end() - 1)])
+    return blocks
+
+
+def meson_registered_files(meson_text):
+    """The single-quoted strings of tests/meson.build outside `#` comments (a commented-out
+    entry is not a registration), as one set."""
+    names = set()
+    for line in meson_text.split("\n"):
+        kept, quote = [], False
+        for ch in line:
+            if ch == "'":
+                quote = not quote
+            elif ch == "#" and not quote:
+                break
+            kept.append(ch)
+        names.update(re.findall(r"'([^']*)'", "".join(kept)))
+    return names
+
+
+def registry_tests_findings(registry, tests_dir, meson_text):
     """Check 7 core (selftested): {tool: [defect, ...]} for every registry tool whose domain test
     file (`tests/unit/server/test_mcp_tools_<domain>.cpp`, the domain being the `mcp_tools_<domain>.cpp`
-    record file's) is missing, does not name the tool in a string literal, has no `schema_violation(`
-    call (the served output schema is checked against a real body) or has no CHECK/REQUIRE that
-    mentions an audit row. A TRIPWIRE: a name, a call and an assertion that mentions audit
-    prove the file was written, not that it tests this tool's audit contract."""
+    record file's) is missing or unreadable, is not registered in tests/meson.build (`meson_text`;
+    an unregistered file never runs), or has no single TEST_CASE block that both names the tool
+    in a string literal and calls `schema_violation(` (the served output schema is checked
+    against a real body), or no single TEST_CASE block that both names it and holds a
+    CHECK/REQUIRE that mentions an audit row. Blocks, not files: a file that names the tool in
+    one test and asserts audit in an unrelated one proves nothing about this tool. The two
+    pairs are separate on purpose: a domain's schema-conformance test and its audit tests are
+    normally different test cases (the real hardware tests are), so one block holding all three
+    would fail honest tests. A TRIPWIRE: a name, a call and an assertion that mentions audit
+    prove the test was written, not that it tests this tool's audit contract."""
     found = {}
+    registered = meson_registered_files(meson_text)
     for tool, fname in sorted(registry.items()):
         domain = fname[len("mcp_tools_"):-len(".cpp")]
         path = Path(tests_dir) / f"test_mcp_tools_{domain}.cpp"
@@ -2224,12 +2475,17 @@ def registry_tests_findings(registry, tests_dir):
             found[tool] = [f"{path.name} is missing or unreadable"]
             continue
         defects = []
-        if f'"{tool}"' not in text:
-            defects.append(f"{path.name} never names \"{tool}\"")
-        if "schema_violation(" not in text:
-            defects.append(f"{path.name} never calls schema_violation(")
-        if not _AUDIT_ASSERT.search(text):
-            defects.append(f"{path.name} has no CHECK/REQUIRE that mentions an audit row")
+        if f"unit/server/{path.name}" not in registered:
+            defects.append(f"{path.name} is not registered in tests/meson.build")
+        named = [b for b in test_case_blocks(text) if f'"{tool}"' in b]
+        if not named:
+            defects.append(f"no TEST_CASE in {path.name} names \"{tool}\"")
+        else:
+            if not any("schema_violation(" in b for b in named):
+                defects.append(f"no TEST_CASE in {path.name} both names \"{tool}\" and calls schema_violation(")
+            if not any(_AUDIT_ASSERT.search(b) for b in named):
+                defects.append(f"no TEST_CASE in {path.name} both names \"{tool}\" and has a CHECK/REQUIRE "
+                               f"that mentions an audit row")
         if defects:
             found[tool] = defects
     return found
@@ -2242,12 +2498,25 @@ def registry_tests_errors(findings):
         if tool in TEST_EXISTENCE_ALLOWED:
             continue
         out.append(f"test existence: registry tool {tool!r}: {'; '.join(defects)} - a registry tool ships "
-                   f"with a tests/unit/server/test_mcp_tools_<domain>.cpp that names it, validates its "
-                   f"output with schema_violation( and asserts its audit row (docs/api-twin-recipe.md); "
+                   f"with a registered tests/unit/server/test_mcp_tools_<domain>.cpp whose test cases name it, "
+                   f"validate its output with schema_violation( and assert its audit row (docs/api-twin-recipe.md); "
                    f"or name it in TEST_EXISTENCE_ALLOWED with a reason")
     out += _pinned_table_errors("TEST_EXISTENCE_ALLOWED", "TEST_EXISTENCE_ALLOWED_MAX",
                                 TEST_EXISTENCE_ALLOWED, TEST_EXISTENCE_ALLOWED_MAX, set(findings))
     return out
+
+
+def registry_floor_errors(count):
+    """The registry-file floor as an EQUALITY (pure, selftested). extract_mcp_tools() already
+    refuses fewer than MIN_REGISTRY_FILES files, so a deleted file cannot silently drop its tools;
+    this refuses MORE, so the floor cannot sit below the real count and let a later deletion pass
+    unseen. A new `mcp_tools_<domain>.cpp` therefore edits the constant in the same change."""
+    if count == MIN_REGISTRY_FILES:
+        return []
+    return [f"registry files: found {count} mcp_tools_*.cpp file(s) under server/core/src but "
+            f"MIN_REGISTRY_FILES is {MIN_REGISTRY_FILES} - set MIN_REGISTRY_FILES to {count} in THIS "
+            f"change (a new registry file bumps it, a removed one lowers it), so the floor always "
+            f"equals the real count"]
 
 
 def gate_checks(ledger_rows, mcp_tools, bucket_b):
@@ -2255,9 +2524,19 @@ def gate_checks(ledger_rows, mcp_tools, bucket_b):
     by_tool, registry = extract_mcp_security()
     owners = {fname for key, regs in bucket_b.items() for fname, _raw in regs}
     rest_gates = extract_rest_gates(owners)
-    mismatches, no_gates, errors = gate_parity_findings(ledger_rows, mcp_tools, rest_gates, by_tool)
+    twinned = {row["mcp_twin"] for row in ledger_rows.values()
+               if row["mcp_twin"] and isinstance(row["rest_v1_twin"], dict)}
+    effects, mcp_gates = extract_mcp_handlers(by_tool, registry, twinned)
+    mismatches, no_gates, errors = gate_parity_findings(ledger_rows, mcp_tools, rest_gates, by_tool,
+                                                        effects, mcp_gates)
+    try:
+        meson_text = TESTS_MESON.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as e:
+        raise AnchorError(f"cannot read {TESTS_MESON} ({_why(e)}) - check 7 reads it to confirm each "
+                          f"registry domain's test file is registered")
     return (gate_parity_errors(mismatches, no_gates, errors)
-            + registry_tests_errors(registry_tests_findings(registry, MCP_TOOL_TESTS_DIR)))
+            + registry_floor_errors(len(list(_registry_dir().glob("mcp_tools_*.cpp"))))
+            + registry_tests_errors(registry_tests_findings(registry, MCP_TOOL_TESTS_DIR, meson_text)))
 
 
 def run_check(ledger_dir=None, doc_path=None, extracted=None, today=None, gate_fn=None):
@@ -3280,6 +3559,47 @@ def _selftest_body():
         got = first_gate(code)
         check(got[0] is None and isinstance(got[1], str), f"first_gate({label}): must report no gate, got {got}")
 
+    # -- handler_gate: every gate call, and the refusal-then-gate shape --------------------------
+    def _span(body):
+        return f'("/api/v1/x", [&](const R& q, P& p) {{\n{body}\n}})'
+    deny = 'deny_fleet_wide_service_scoped(q, p, "act", "T", "detail", "msg")'
+    gate = 'if (!perm_fn(q, p, "Sec", "Read")) return;'
+    for label, body, want in (
+            ("refusal-then-gate", f"if ({deny}) return;\n{gate}", ("refused", "Sec", "Read")),
+            ("refusal-braced-return", f'if (deny_service_scoped_schedule_list(q, p)) {{ note(p); return; }}\n{gate}',
+             ("refused", "Sec", "Read")),
+            ("refusal-multi-line-args", f'if (deny_fleet_wide_service_scoped(\n q, p, "a)", "T",\n "d", "m"))\n  return;\n{gate}',
+             ("refused", "Sec", "Read")),
+            ("refusal-after-gate", f"{gate}\nif ({deny}) return;", ("plain", "Sec", "Read")),
+            ("refusal-no-return", f"if ({deny}) {{ log(); }}\n{gate}", ("plain", "Sec", "Read")),
+            ("refusal-statement-not-return", f"if ({deny}) log();\n{gate}", ("plain", "Sec", "Read")),
+            ("refusal-return-in-nested-branch", f"if ({deny}) {{ if (y) return; }}\n{gate}", ("plain", "Sec", "Read")),
+            ("refusal-return-in-string", f'if ({deny}) {{ log("return;"); }}\n{gate}', ("plain", "Sec", "Read")),
+            ("refusal-negated", f"if (!{deny}) return;\n{gate}", ("plain", "Sec", "Read")),
+            ("refusal-compound-condition", f"if (x && {deny}) return;\n{gate}", ("plain", "Sec", "Read")),
+            ("refusal-not-an-if", f"auto r = {deny};\n{gate}", ("plain", "Sec", "Read")),
+            ("refusal-behind-branch", f"if (x) {{ if ({deny}) return; }}\n{gate}", ("plain", "Sec", "Read")),
+            ("refusal-in-nested-lambda", f"auto f = [&] {{ if ({deny}) return; }};\n{gate}", ("plain", "Sec", "Read")),
+            ("other-deny-helper", f'if (deny_service_scoped_tag_mutation_fn(q, p)) return;\n{gate}', ("plain", "Sec", "Read")),
+            ("refusal-then-fleet", f'if ({deny}) return;\nauto g = fleet_read_fn(q, p, "Sec", "Read");', ("fleet", "Sec", "Read")),
+            ("refusal-then-scoped", f'if ({deny}) return;\nscoped_perm_fn(q, p, "Sec", "Read", id);', ("scoped", "Sec", "Read")),
+            ("same-gate-twice", f"{gate}\n{gate}", ("plain", "Sec", "Read")),
+            ("second-gate", f'{gate}\nauto g = fleet_read_fn(q, p, "Other", "Write");',
+             ("plain", "Sec", "Read", (("fleet", "Other", "Write"),))),
+            ("second-gate-kind-only", f'{gate}\nscoped_perm_fn(q, p, "Sec", "Read", id);',
+             ("plain", "Sec", "Read", (("scoped", "Sec", "Read"),))),
+            ("two-extras-deduped", f'{gate}\nperm_fn(q, p, "A", "Read");\nperm_fn(q, p, "A", "Read");\nperm_fn(q, p, "B", "Read");',
+             ("plain", "Sec", "Read", (("plain", "A", "Read"), ("plain", "B", "Read")))),
+            ("second-gate-unreadable", f"{gate}\nperm_fn(q, p, securable, op);",
+             ("plain", "Sec", "Read", (("unparsed", "perm_fn", "?"),))),
+            ("refused-first-then-plain-extra", f'if ({deny}) return;\n{gate}\nperm_fn(q, p, "A", "Read");',
+             ("refused", "Sec", "Read", (("refused", "A", "Read"),)))):
+        got = handler_gate(_span(body))
+        check(got == want, f"handler_gate({label}): want {want}, got {got}")
+    for label, body in (("none", "auth_fn(q, p);"), ("first-unreadable", "perm_fn(q, p, securable, op);\n" + gate)):
+        got = handler_gate(_span(body))
+        check(got[0] is None and isinstance(got[1], str), f"handler_gate({label}): must report no gate, got {got}")
+
     with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as td:
         tsrc = Path(td) / "src"
         tsrc.mkdir()
@@ -3293,7 +3613,11 @@ def _selftest_body():
             '    sink.Post("/api/v1" "/b", [&](const R& q, P& p) { auth_fn(q, p); });\n'
             '    sink.Get("/fragments/f", [&](const R& q, P& p) { perm_fn(q, p, "Frag", "Read"); });\n'
             '    sink.Put(R"(/api/v1/c/(\\d+))", [&](const R& q, P& p) {\n'
-            '        auto g = fleet_read_fn(q, p, "Fleet", "Read"); }); }\n', encoding="utf-8")
+            '        auto g = fleet_read_fn(q, p, "Fleet", "Read"); });\n'
+            '    sink.Get("/api/v1/d", [&](const R& q, P& p) {\n'
+            '        if (deny_fleet_wide_service_scoped(q, p, "a", "T", "d", "m")) return;\n'
+            '        if (!perm_fn(q, p, "Ref", "Read")) return;\n'
+            '        auto g = fleet_read_fn(q, p, "Ref", "Read"); }); }\n', encoding="utf-8")
         with _patched(SERVER_SRC=tsrc):
             gates = extract_rest_gates({"routes.cpp"})
         check(gates.get(("GET", "/api/v1/a")) == [("routes.cpp", ("plain", "Real", "Read"))],
@@ -3302,6 +3626,8 @@ def _selftest_body():
               "extract_rest_gates: an adjacent-literal route with no gate call reports no gate")
         check(gates.get(("PUT", "/api/v1/c/{param}")) == [("routes.cpp", ("fleet", "Fleet", "Read"))],
               f"extract_rest_gates: raw-string route path, got {gates.get(('PUT', '/api/v1/c/{param}'))}")
+        check(gates.get(("GET", "/api/v1/d")) == [("routes.cpp", ("refused", "Ref", "Read", (("fleet", "Ref", "Read"),)))],
+              f"extract_rest_gates: a refusal-then-gate handler with a second gate, got {gates.get(('GET', '/api/v1/d'))}")
         check(all(not k[1].startswith("/fragments") for k in gates), "extract_rest_gates: only /api/vN/ routes")
 
         sec_cpp = Path(td) / "mcp_server.cpp"
@@ -3403,31 +3729,189 @@ def _selftest_body():
         e = gate_parity_errors(mism, nog)
         check(any("grew" in x for x in e), f"gate parity: an allowlist larger than its MAX is reported, got {e}")
 
+    # -- check 6: further gates, the refused kind and handler-proven confinement ------------------
+    def _fp(tools):
+        """gate_parity_findings over {tool: (rest_gate, mcp_triple)} with one route per tool."""
+        rows = {("GET", f"/fragments/{t}"): _gp_row(t, path=f"/api/v1/{t}") for t in tools}
+        rest = {("GET", f"/api/v1/{t}"): [("a.cpp", v[0])] for t, v in tools.items()}
+        return rows, set(tools), rest, {t: v[1] for t, v in tools.items()}
+    S = ("Sec", "Read")
+    fp_cases = {
+        "extra_ok": (("plain", *S, (("plain", "Tee", "Read"),)), (*S, "denied")),
+        "extra_kind": (("plain", *S, (("fleet", "Tee", "Read"),)), (*S, "denied")),
+        "extra_bad": (("plain", *S, (("plain", "Zed", "Read"),)), (*S, "denied")),
+        "extra_unread": (("plain", *S, (("unparsed", "perm_fn", "?"),)), (*S, "denied")),
+        "extra_only_first_gate": (("plain", "Tee", "Read"), (*S, "denied")),
+        "plain_denied": (("plain", *S), (*S, "denied")),
+        "plain_global": (("plain", *S), (*S, "global_safe")),
+        "fleet_denied": (("fleet", *S), (*S, "denied")),
+        "fleet_effect": (("fleet", *S), (*S, "denied")),
+        "plain_effect": (("plain", *S), (*S, "denied")),
+        "fleet_confined": (("fleet", *S), (*S, "confined")),
+        "refused_denied": (("refused", *S), (*S, "denied")),
+        "refused_confined": (("refused", *S), (*S, "confined")),
+        "refused_global": (("refused", *S), (*S, "global_safe")),
+        "refused_wrong_op": (("refused", "Sec", "Write"), (*S, "confined")),
+    }
+    rows_, tools_, rest_, sec_ = _fp(fp_cases)
+    handler_gates = {"extra_ok": {("plain", "Tee", "Read")}, "extra_kind": {("plain", "Tee", "Read")},
+                     "extra_bad": {("plain", "Tee", "Read")}, "extra_unread": {("unparsed", "perm_fn", "?")},
+                     "extra_only_first_gate": {("plain", "Tee", "Read")}}
+    handler_effects = {"fleet_effect": "confined", "plain_effect": "confined"}
+    m1, n1, e1 = gate_parity_findings(rows_, tools_, rest_, sec_, handler_effects, handler_gates)
+    check(not n1 and not e1, f"gate parity (further gates): no gap or error expected, got {n1} {e1}")
+    check(set(t for _m, _p, t in m1) == {"extra_kind", "extra_bad", "extra_unread", "extra_only_first_gate",
+                                         "fleet_denied", "plain_effect", "refused_global",
+                                         "refused_wrong_op"},
+          f"gate parity (further gates): the mismatching rows are exactly the unmatched ones, got {sorted(t for _m, _p, t in m1)}")
+    check(m1[("GET", "/api/v1/extra_bad", "extra_bad")] == ("plain:Sec:Read; also plain:Zed:Read", "denied:Sec:Read"),
+          f"gate parity (further gates): the description names every further gate, got {m1[('GET', '/api/v1/extra_bad', 'extra_bad')]}")
+    check(m1[("GET", "/api/v1/extra_unread", "extra_unread")][0] == "plain:Sec:Read; also unparsed:perm_fn:?",
+          "gate parity (further gates): an unreadable further gate is a finding even when the handler lists the same unreadable triple")
+    check(m1[("GET", "/api/v1/plain_effect", "plain_effect")][1] == "denied+confined-by-handler:Sec:Read",
+          f"gate parity (handler effect): a proven effect is named in the description, got {m1[('GET', '/api/v1/plain_effect', 'plain_effect')]}")
+    check(("GET", "/api/v1/fleet_effect", "fleet_effect") not in m1 and ("GET", "/api/v1/fleet_denied", "fleet_denied") in m1,
+          "gate parity (handler effect): the same REST gate agrees with a proven effect and not with the bare label")
+    check(("GET", "/api/v1/extra_only_first_gate", "extra_only_first_gate") in m1,
+          "gate parity (further gates): the handler's own gates never excuse a mismatch on the first gate")
+    m2, _n, _e = gate_parity_findings(rows_, tools_, rest_, sec_)
+    check(("GET", "/api/v1/extra_ok", "extra_ok") in m2 and ("GET", "/api/v1/fleet_effect", "fleet_effect") in m2,
+          "gate parity: without the handler facts a further gate and a confined effect are unmatched")
+
+    # -- extract_mcp_handlers: the handler body is found, read and proven, or left alone -------------
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as td:
+        hcpp = Path(td) / "mcp_server.cpp"
+        hreg = Path(td) / "reg"
+        hreg.mkdir()
+        hcpp.write_text(
+            'void d() {\n'
+            'if (tool_name == "t_fleet") {\n  auto gate = fleet_read_fn_(req, res, "Sec", "Read");\n}\n'
+            'if (tool_name == "t_list") { auto g = list_read_fn_(req, res, "Sec", "Read"); }\n'
+            'if (tool_name == "t_wrong") { auto g = fleet_read_fn_(req, res, "Other", "Read"); }\n'
+            'if (tool_name == "t_mixed") { fleet_read_fn_(req, res, "Sec", "Read"); fleet_read_fn_(req, res, "Other", "Read"); }\n'
+            'if (tool_name == "t_twice") { fleet_read_fn_(req, res, "Sec", "Read"); }\n'
+            'if (tool_name == "t_twice") { }\n'
+            'if (tool_name == "t_comment") {\n  // fleet_read_fn_(req, res, "Sec", "Read");\n}\n'
+            'if (tool_name == "t_plain") { if (!perm_fn(req, res, "Sec", "Read")) return; }\n'
+            'if (tool_name == "t_unread") { fleet_read_fn_(req, res, sec, "Read"); }\n'
+            'if (tool_name == "t_conf") { fleet_read_fn_(req, res, "Sec", "Read"); }\n'
+            'if (tool_name == "t_or" || tool_name == "t_or2") { fleet_read_fn_(req, res, "Sec", "Read"); }\n'
+            '}\n', encoding="utf-8")
+        (hreg / "mcp_tools_one.cpp").write_text(
+            'namespace {\nvoid handle_reg_t(const ToolCallContext& ctx) {\n'
+            '    const auto gate = deps->fleet_read_fn(ctx.req, ctx.res, "Sec", "Read");\n}\n'
+            'void handle_reg_n(const ToolCallContext& ctx) { deps->fleet_read_fn(ctx.req, ctx.res, "Other", "Read"); }\n'
+            'constexpr ToolRecord kToolRecords[] = {\n'
+            '    {"reg_t", "d", kIn, kOut, "Sec", "Read", ServiceScopeClass::denied, ToolEffect::ReadOnly, true, "T",\n'
+            '     &handle_reg_t},\n'
+            '    {"reg_n", "d", kIn, kOut, "Sec", "Read", ServiceScopeClass::denied, ToolEffect::ReadOnly, true, "T",\n'
+            '     &handle_reg_n},\n'
+            '};\n}\n', encoding="utf-8")
+        h_by_tool = {t: ("Sec", "Read", "denied") for t in (
+            "t_fleet", "t_list", "t_wrong", "t_mixed", "t_twice", "t_comment", "t_plain", "t_unread", "t_or",
+            "reg_t", "reg_n", "t_missing")}
+        h_by_tool["t_conf"] = ("Sec", "Read", "confined")
+        h_registry = {"reg_t": "mcp_tools_one.cpp", "reg_n": "mcp_tools_one.cpp"}
+        with _patched(MCP_SERVER_CPP=hcpp, MCP_REGISTRY_DIR=hreg):
+            effs, gts = extract_mcp_handlers(h_by_tool, h_registry, set(h_by_tool) | {"not_a_tool"})
+        check(effs == {"t_fleet": "confined", "t_list": "confined", "reg_t": "confined"},
+              f"extract_mcp_handlers: only a proven fleet/list read of the tool's own pair gives the effect "
+              f"(wrong pair, mixed pairs, a duplicated branch, a comment, a plain gate, unreadable arguments, a "
+              f"label that is already confined and a disjunction branch do not), got {effs}")
+        check(gts.get("t_fleet") == {("fleet", "Sec", "Read")} and gts.get("t_plain") == {("plain", "Sec", "Read")}
+              and gts.get("t_mixed") == {("fleet", "Sec", "Read"), ("fleet", "Other", "Read")}
+              and gts.get("t_comment") == set() and gts.get("reg_n") == {("fleet", "Other", "Read")}
+              and "t_twice" not in gts and "t_or" not in gts and "t_missing" not in gts,
+              f"extract_mcp_handlers: the handler's gate calls are collected for a single body only, got {gts}")
+    check(mcp_handler_effect('fleet_read_fn_(req, res, "Sec", "Read");', ("Sec", "Read")) == "confined"
+          and mcp_handler_effect('authorize_list_read(req, res, "Sec", "Read");', ("Sec", "Read")) == "confined"
+          and mcp_handler_effect("noop();", ("Sec", "Read")) is None
+          and mcp_handler_effect('fleet_read_fn_(req, res, "Sec", "Write");', ("Sec", "Read")) is None
+          and mcp_handler_effect('fleet_read_fn_(req, res);', ("Sec", "Read")) is None,
+          "mcp_handler_effect: the call must exist, be readable and ask for the tool's own pair")
+
     # -- check 7 core: the registry tool's domain test file ----------------------------------------
     good_test = ('#include "x"\nTEST_CASE("t") {\n  CHECK(schema_violation(s, v) == "");\n'
                  '  call("tool_x");\n  CHECK(audit_log.size() == 1);\n}\n')
+    meson_text = ("tests = [\n"
+                  "  'unit/server/test_mcp_tools_alpha.cpp',  # a registered file\n"
+                  "  'unit/server/test_mcp_tools_beta.cpp',\n"
+                  "  'unit/server/test_mcp_tools_gamma.cpp',\n"
+                  "  'unit/server/test_mcp_tools_split.cpp',\n"
+                  "  'unit/server/test_mcp_tools_other.cpp',\n"
+                  "  # 'unit/server/test_mcp_tools_commented.cpp',\n"
+                  "  'unit/server/test_mcp_tools_tail.cpp' # trailing comment 'unit/server/test_mcp_tools_unreg.cpp'\n"
+                  "]\n")
+    check(meson_registered_files(meson_text) == {
+        "unit/server/test_mcp_tools_alpha.cpp", "unit/server/test_mcp_tools_beta.cpp",
+        "unit/server/test_mcp_tools_gamma.cpp", "unit/server/test_mcp_tools_split.cpp",
+        "unit/server/test_mcp_tools_other.cpp", "unit/server/test_mcp_tools_tail.cpp"},
+          f"meson_registered_files: comments (full-line and trailing) do not register, got {meson_registered_files(meson_text)}")
+    blocks = test_case_blocks(blank_cpp_comments(
+        'TEST_CASE("a", "[x]") { f("n}"); { g(); } }\n// TEST_CASE("c") { h(); }\n'
+        'SCENARIO("s") { k(); }\nTEST_CASE("decl-only");\nTEMPLATE_TEST_CASE("t", "[x]", int) { m(); }\n'))
+    check(len(blocks) == 3 and 'f("n}")' in blocks[0] and "g()" in blocks[0] and "k()" in blocks[1]
+          and "m()" in blocks[2] and not any("h()" in b for b in blocks),
+          f"test_case_blocks: braced bodies only, nested braces and string braces survive, comments are blanked, got {blocks}")
     with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as td:
         tdir = Path(td)
-        (tdir / "test_mcp_tools_alpha.cpp").write_text(good_test, encoding="utf-8")
-        (tdir / "test_mcp_tools_beta.cpp").write_text(
-            '// "tool_y" schema_violation( CHECK(audit)\nTEST_CASE("t") { CHECK(1 == 1); }\n', encoding="utf-8")
-        (tdir / "test_mcp_tools_gamma.cpp").write_text(good_test.replace("schema_violation(", "other("), encoding="utf-8")
+        for fname, body in (
+                ("alpha", good_test),
+                ("beta", '// "tool_y" schema_violation( CHECK(audit)\nTEST_CASE("t") { CHECK(1 == 1); }\n'),
+                ("gamma", good_test.replace("schema_violation(", "other(").replace("tool_x", "tool_g")),
+                # the name and schema_violation( share a case; the audit assertion is in an unrelated one
+                ("split", 'TEST_CASE("a") { call("tool_s"); CHECK(schema_violation(s, v) == ""); }\n'
+                          'TEST_CASE("b") { CHECK(audit_log.size() == 1); }\n'),
+                # the tool is named in one case; schema_violation( and the audit assertion are in another
+                ("other", 'TEST_CASE("a") { call("tool_o"); }\n'
+                          'TEST_CASE("b") { CHECK(schema_violation(s, v) == ""); CHECK(audit_log.size() == 1); }\n'),
+                ("unreg", good_test.replace("tool_x", "tool_u")),
+                ("commented", good_test.replace("tool_x", "tool_c")),
+                ("tail", good_test.replace("tool_x", "tool_t"))):
+            (tdir / f"test_mcp_tools_{fname}.cpp").write_text(body, encoding="utf-8")
         reg = {"tool_x": "mcp_tools_alpha.cpp", "tool_y": "mcp_tools_beta.cpp", "tool_z": "mcp_tools_delta.cpp",
-               "tool_g": "mcp_tools_gamma.cpp"}
-        found = registry_tests_findings(reg, tdir)
-        check(set(found) == {"tool_y", "tool_z", "tool_g"} and len(found["tool_y"]) == 3
-              and "missing" in found["tool_z"][0] and len(found["tool_g"]) == 2,
-              f"registry tests: comments do not count, a missing file and a missing call are found, got {found}")
+               "tool_g": "mcp_tools_gamma.cpp", "tool_s": "mcp_tools_split.cpp", "tool_o": "mcp_tools_other.cpp",
+               "tool_u": "mcp_tools_unreg.cpp", "tool_c": "mcp_tools_commented.cpp", "tool_t": "mcp_tools_tail.cpp"}
+        found = registry_tests_findings(reg, tdir, meson_text)
+        check(set(found) == {"tool_y", "tool_z", "tool_g", "tool_s", "tool_o", "tool_u", "tool_c"},
+              f"registry tests: only the defective tools are found (tool_x and tool_t are clean), got {sorted(found)}")
+        check("names" in found["tool_y"][0] and len(found["tool_y"]) == 1,
+              f"registry tests: a name that appears only in a comment is not named, got {found['tool_y']}")
+        check("missing" in found["tool_z"][0], f"registry tests: a missing file is found, got {found['tool_z']}")
+        check(len(found["tool_g"]) == 1 and "schema_violation(" in found["tool_g"][0],
+              f"registry tests: a missing schema_violation( call is found, got {found['tool_g']}")
+        check(len(found["tool_s"]) == 1 and "audit" in found["tool_s"][0],
+              f"registry tests: an audit assertion in an unrelated test case does not count, got {found['tool_s']}")
+        check(len(found["tool_o"]) == 2 and any("schema_violation(" in d for d in found["tool_o"])
+              and any("audit" in d for d in found["tool_o"]),
+              f"registry tests: a name in another test case than the call and the assertion fails both, got {found['tool_o']}")
+        check(found["tool_u"] == ["test_mcp_tools_unreg.cpp is not registered in tests/meson.build"],
+              f"registry tests: a test file absent from tests/meson.build is found, got {found['tool_u']}")
+        check(len(found["tool_c"]) == 1 and "not registered" in found["tool_c"][0],
+              f"registry tests: a commented-out meson entry does not register the file, got {found['tool_c']}")
         with _patched(TEST_EXISTENCE_ALLOWED={}, TEST_EXISTENCE_ALLOWED_MAX=0):
-            check(len(registry_tests_errors(found)) == 3 and registry_tests_errors({}) == [],
+            check(len(registry_tests_errors(found)) == 7 and registry_tests_errors({}) == [],
                   "registry tests: unexcused findings are errors, a clean tree passes")
-        with _patched(TEST_EXISTENCE_ALLOWED={k: "r" for k in found}, TEST_EXISTENCE_ALLOWED_MAX=3):
+        with _patched(TEST_EXISTENCE_ALLOWED={k: "r" for k in found}, TEST_EXISTENCE_ALLOWED_MAX=7):
             check(registry_tests_errors(found) == [], "registry tests: pinned findings are excused")
             e = registry_tests_errors({k: v for k, v in found.items() if k != "tool_g"})
             check(any("stale" in x and "tool_g" in x for x in e),
                   f"registry tests: an entry whose finding is gone is stale, got {e}")
         with _patched(TEST_EXISTENCE_ALLOWED={"tool_y": "r"}, TEST_EXISTENCE_ALLOWED_MAX=0):
             check(any("grew" in x for x in registry_tests_errors(found)), "registry tests: an oversized allowlist is reported")
+
+    # -- registry-file floor equality, and the wiring of the new checks into the real run -------------
+    with _patched(MIN_REGISTRY_FILES=3):
+        check(registry_floor_errors(3) == [], "registry floor: the real count equal to the floor passes")
+        more, fewer = registry_floor_errors(4), registry_floor_errors(2)
+        check(len(more) == 1 and "found 4" in more[0] and "set MIN_REGISTRY_FILES to 4" in more[0],
+              f"registry floor: an extra registry file fails and says to bump the floor, got {more}")
+        check(len(fewer) == 1 and "found 2" in fewer[0] and "set MIN_REGISTRY_FILES to 2" in fewer[0],
+              f"registry floor: a missing registry file fails and says to lower the floor, got {fewer}")
+    gate_src = inspect.getsource(gate_checks)
+    check("registry_floor_errors(" in gate_src and "registry_tests_findings(registry, MCP_TOOL_TESTS_DIR, meson_text)" in gate_src
+          and "extract_mcp_handlers(" in gate_src and "effects, mcp_gates" in gate_src,
+          "gate_checks must run the floor equality, check 7 with the meson text, and hand the MCP handler facts to check 6")
 
     if failures:
         print("SELFTEST FAILURES:", *failures, sep="\n  ")
