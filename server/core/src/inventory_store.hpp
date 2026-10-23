@@ -189,9 +189,9 @@ public:
     /// `delete_agent`'s lease/txn idiom exactly, keyed on `plugin` instead of
     /// `agent_id`. Defence-in-depth (ADR-0016 §5) for the boot-time typed-
     /// source purge (server.cpp): a typed source's rows never belong in this
-    /// generic store — `is_typed_inventory_source` is the primary control,
-    /// this is hygiene for a newer-agent/older-server window where a typed
-    /// blob landed here before the exclusion took effect. Returns false on a
+    /// generic store — the gateway skip (`is_typed_inventory_source`) and the
+    /// read filter on every read are the controls; this is hygiene that
+    /// reclaims rows a newer-agent/older-server window left here. Returns false on a
     /// closed store, a lease/lock timeout, or a SQL failure (never throws) —
     /// callers must not treat a false return as fatal (never set
     /// `startup_failed_` on it).

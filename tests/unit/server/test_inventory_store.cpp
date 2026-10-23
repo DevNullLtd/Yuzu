@@ -347,6 +347,33 @@ TEST_CASE("InventoryStore reads never return a typed source's stray row (ADR-007
         REQUIRE(named.has_value());
         CHECK(named->empty());
     }
+    SECTION("stray typed rows never consume the query limit or flag truncation") {
+        InventoryQuery q;
+        q.agent_id = "agent-1";
+        // One above the generic row count: with the filter, one candidate (not at the
+        // limit, so not truncated); without it, the six stray rows would fill the
+        // limit and flag truncation (#2633's exact-at-cap rule).
+        q.limit = 2;
+        bool truncated = true;
+        auto rows = store.query(q, &truncated);
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        CHECK(rows->front().plugin == "hardware_info");
+        CHECK_FALSE(truncated);
+    }
+    SECTION("delete_source removes every typed source's rows and leaves the generic row") {
+        for (const auto typed : yuzu::server::kTypedInventorySources) {
+            CHECK(store.delete_source(typed));
+            CHECK(raw_row_count(pool, std::string(typed)) == 0);
+        }
+        CHECK(raw_row_count(pool, "hardware_info") == 1);
+    }
+    SECTION("delete_agent erases typed stray rows too, not just the visible ones") {
+        CHECK(store.delete_agent("agent-1"));
+        for (const auto typed : yuzu::server::kTypedInventorySources)
+            CHECK(raw_row_count(pool, std::string(typed)) == 0);
+        CHECK(raw_row_count(pool, "hardware_info") == 0);
+    }
     SECTION("list_tables and count leave typed sources out") {
         auto tables = store.list_tables();
         REQUIRE(tables.has_value());

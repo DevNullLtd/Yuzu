@@ -4058,8 +4058,11 @@ TEST_CASE("typed_inventory_sources: one list drives the predicate, and certifica
     using yuzu::server::is_typed_inventory_source;
     using yuzu::server::kTypedInventorySources;
     // The predicate (gateway skip), the boot purge and the read filter all iterate
-    // kTypedInventorySources, so every member must satisfy the predicate.
-    for (const auto name : kTypedInventorySources)
+    // kTypedInventorySources. Pin the exact set, so removing or renaming a source
+    // fails here rather than silently reopening that source's generic read.
+    static_assert(kTypedInventorySources.size() == 6);
+    for (const auto name : {"installed_software", "app_perf", "device_ci", "software_licensing",
+                            "app_usage", "certificate_inventory"})
         CHECK(is_typed_inventory_source(name));
     CHECK(is_typed_inventory_source("certificate_inventory"));
     static_assert(is_typed_inventory_source("certificate_inventory"));
