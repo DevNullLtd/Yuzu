@@ -3138,14 +3138,25 @@ TEST_CASE("MCP audit_engine_no_admin: fails CLOSED (error + retry hint, no ok:tr
         REQUIRE_FALSE(j.contains("result"));
         CHECK(j["error"]["message"].get<std::string>() ==
               "rbac resolution unavailable - cannot verify");
-        CHECK(j["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultRetryMs);
+        // Same 2000 ms hint as the REST twin and the mint/rotate arms (REST Retry-After: 2).
+        CHECK(j["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultShortRetryMs);
         CHECK(r->body.find("violations") == std::string::npos); // no partial list
         CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
                          "engine_principal.audit.no_admin|failure") == 1);
         CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                         "mcp.audit_engine_no_admin|failure") == 1);
+        CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
                          "engine_principal.audit.no_admin|success") == 0);
 
         fault.repair();
+        // Healed: the same call answers again, and the violation is reported.
+        auto healed = ts.call(call);
+        REQUIRE(healed);
+        auto jh = nlohmann::json::parse(healed->body);
+        REQUIRE(jh.contains("result"));
+        CHECK(nlohmann::json::parse(jh["result"]["content"][0]["text"].get<std::string>())
+                  ["violations"]
+                  .size() == 1);
     }
 }
 
@@ -3179,6 +3190,18 @@ TEST_CASE("MCP audit_engine_no_admin: include_revoked=false fails closed when th
             std::vector<std::string>{id});
         REQUIRE(ins.status() == PGRES_COMMAND_OK);
     }
+    // A shadow grant: an engine: id with NO roster row at all (no engine_principals row), as a
+    // direct DB write or a stale grant would leave. A roster walk would never see it.
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto ins = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO rbac_store.principal_roles (principal_type, principal_id, role_name) "
+            "VALUES ('user', 'engine:mcp-shadow', 'Administrator')",
+            std::vector<std::string>{});
+        REQUIRE(ins.status() == PGRES_COMMAND_OK);
+    }
 
     McpTestServer ts;
     ts.rbac_store_for_test = &rbac;
@@ -3188,10 +3211,18 @@ TEST_CASE("MCP audit_engine_no_admin: include_revoked=false fails closed when th
     auto all = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":72,)"
                        R"("params":{"name":"audit_engine_no_admin","arguments":{}}})");
     REQUIRE(all);
+    // The detail of the most recent domain success row (the mcp.* row after it carries none).
+    const auto last_success_detail = [&ts]() -> std::string {
+        for (std::size_t i = ts.audit_log.size(); i-- > 0;)
+            if (ts.audit_log[i] == "engine_principal.audit.no_admin|success")
+                return ts.audit_details[i];
+        return "<none>";
+    };
     auto ja = nlohmann::json::parse(all->body);
     REQUIRE(ja.contains("result"));
     CHECK(nlohmann::json::parse(ja["result"]["content"][0]["text"].get<std::string>())["violations"]
-              .size() == 2);
+              .size() == 3); // live, gone and the shadow grant
+    CHECK(last_success_detail().starts_with("violations=3 scope=all"));
 
     const std::string active_only =
         R"({"jsonrpc":"2.0","method":"tools/call","id":73,)"
@@ -3200,8 +3231,18 @@ TEST_CASE("MCP audit_engine_no_admin: include_revoked=false fails closed when th
     REQUIRE(narrowed);
     auto jn = nlohmann::json::parse(narrowed->body);
     REQUIRE(jn.contains("result"));
-    CHECK(nlohmann::json::parse(jn["result"]["content"][0]["text"].get<std::string>())["violations"]
-              .size() == 1); // engine:mcp-live only
+    // The revoked principal is narrowed out, as asked; the shadow grant is NOT dropped: it is
+    // reported as orphan_grant (alongside its admin_role), not hidden by the roster filter.
+    const auto narrowed_v =
+        nlohmann::json::parse(jn["result"]["content"][0]["text"].get<std::string>())["violations"];
+    std::vector<std::string> seen;
+    for (const auto& v : narrowed_v)
+        seen.push_back(v["principal_id"].get<std::string>() + ":" + v["reason"].get<std::string>());
+    CHECK(seen == std::vector<std::string>{"engine:mcp-live:admin_role",
+                                           "engine:mcp-shadow:admin_role",
+                                           "engine:mcp-shadow:orphan_grant"});
+    // The success row records that this run was narrowed, so its count is not a fleet count.
+    CHECK(last_success_detail().starts_with("violations=3 scope=active"));
 
     yuzu::test::SqlFault fault(
         pool, "ALTER TABLE engine_principal_store.engine_principals RENAME TO engine_principals_gone",
@@ -3408,12 +3449,17 @@ TEST_CASE("MCP mint_engine_credential: fails CLOSED with a retry hint and mints 
         auto body = nlohmann::json::parse(r->body);
         REQUIRE(body.contains("error"));
         REQUIRE_FALSE(body.contains("result"));
+        // The guard's own message (create_token's fallback would read differently, and carries
+        // kMcpStoreFaultRetryMs): this is the 503 of the checked pre-mint read.
+        CHECK(body["error"]["message"].get<std::string>() ==
+              "could not confirm the principal has no active credential; retry");
         CHECK(body["error"]["data"]["retry_after_ms"].get<int>() ==
               mcp::kMcpStoreFaultShortRetryMs);
         CHECK(r->body.find("raw_token") == std::string::npos);
     }
-    // The checked read's own string reached the audit row, so this 503 is the guard's.
     REQUIRE(!ts.audit_log.empty());
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "mcp.mint_engine_credential|failure") == 1);
     CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
                      "engine_principal.credential.mint|failure") == 1);
     CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
@@ -3468,7 +3514,60 @@ TEST_CASE("MCP mint_engine_credential: withholds the secret with a partial audit
     CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
                      "engine_principal.credential.mint|partial") == 1);
     CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "mcp.mint_engine_credential|partial") == 1);
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
                      "engine_principal.credential.mint|success") == 0);
+}
+
+TEST_CASE("MCP mint_engine_credential: withholds the secret with a partial audit when the "
+          "read-back ANSWERS but the new credential is no longer active",
+          "[mcp][pg][engine_principal][mint][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+
+    // A DEFERRED constraint trigger revokes the new row at COMMIT of the mint's own INSERT, as
+    // if it were revoked out of band after create_token. The read answers with no active row: it
+    // used to deliver the secret with token_id "" under a success row for a dead credential.
+    for (const char* sql :
+         {"CREATE FUNCTION api_token_store.mcp_mint_revoke() RETURNS trigger LANGUAGE plpgsql AS "
+          "$$ BEGIN UPDATE api_token_store.api_tokens SET revoked = TRUE WHERE token_id = "
+          "NEW.token_id; RETURN NULL; END $$",
+          "CREATE CONSTRAINT TRIGGER mcp_mint_revoke AFTER INSERT ON api_token_store.api_tokens "
+          "DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION "
+          "api_token_store.mcp_mint_revoke()"}) {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(lease.get(), sql, std::vector<std::string>{});
+        INFO(PQresultErrorMessage(r.get()));
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start();
+    auto r = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"mint_engine_credential","arguments":{"principal_id":"engine:mcp-mint-gone","ttl_days":90}}})");
+
+    REQUIRE(r);
+    auto body = nlohmann::json::parse(r->body);
+    REQUIRE(body.contains("error"));
+    REQUIRE_FALSE(body.contains("result"));
+    CHECK(r->body.find("raw_token") == std::string::npos);
+    CHECK(body["error"]["message"].get<std::string>().find(
+              "no active credential was found on read-back") != std::string::npos);
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null()); // retrying the mint cannot help
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "engine_principal.credential.mint|partial") == 1);
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "mcp.mint_engine_credential|partial") == 1);
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "engine_principal.credential.mint|success") == 0);
+    CHECK(store.list_active_for_principal("engine:mcp-mint-gone").empty());
 }
 
 TEST_CASE("MCP rotate_engine_credential: withholds the secret with a retry hint and a partial "
@@ -3509,6 +3608,10 @@ TEST_CASE("MCP rotate_engine_credential: withholds the secret with a retry hint 
     CHECK(r->body.find("raw_token") == std::string::npos);
     CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
                      "engine_principal.credential.rotate|partial") == 1);
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "mcp.rotate_engine_credential|partial") == 1);
+    // The read-failure arm keeps its re-serve wording: the pair does exist.
+    CHECK(body["error"]["message"].get<std::string>().find("re-serve it") != std::string::npos);
     for (const auto& a : ts.audit_log)
         CHECK(a != "engine_principal.credential.reveal|success");
     CHECK(store.list_active_for_principal(principal).size() == 2);
@@ -3562,8 +3665,17 @@ TEST_CASE("MCP rotate_engine_credential: withholds the secret when the successor
     REQUIRE(body.contains("error"));
     REQUIRE_FALSE(body.contains("result"));
     CHECK(r->body.find("raw_token") == std::string::npos);
+    // No retry hint and no "re-serve": the pair is gone, so a retry would perform a NEW rotation.
+    // The message says to look first.
+    const auto msg = body["error"]["message"].get<std::string>();
+    CHECK(msg.find("A successor may exist; inspect the principal's credentials") !=
+          std::string::npos);
+    CHECK(msg.find("re-serve") == std::string::npos);
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
     CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
                      "engine_principal.credential.rotate|partial") == 1);
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     "mcp.rotate_engine_credential|partial") == 1);
     for (const auto& a : ts.audit_log)
         CHECK(a != "engine_principal.credential.reveal|success");
 }

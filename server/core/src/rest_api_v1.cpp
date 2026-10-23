@@ -5537,26 +5537,40 @@ void RestApiV1::register_routes(
             std::string minted_token_id;
             int64_t minted_created_at = -1;
             auto active_after = token_store->list_active_for_principal_checked(principal_id);
-            if (!active_after) {
+            if (active_after) {
+                for (const auto& t : *active_after) {
+                    if (t.created_at > minted_created_at) {
+                        minted_created_at = t.created_at;
+                        minted_token_id = t.token_id;
+                    }
+                }
+            }
+            // The read-back must both ANSWER and find the new row. An answered read with
+            // no active row (the credential, or the principal, revoked out of band between
+            // create_token and here) is the same class as a failed read: the secret would
+            // otherwise be delivered with token_id '' under a `success` row for a
+            // credential that is already dead. Same arm: 503, secret withheld, `partial`.
+            if (!active_after || minted_token_id.empty()) {
                 res.status = 503;
                 res.set_content(
-                    detail::a4_error(res, "the credential was minted but could not be read back; "
-                                          "the secret was withheld. The credential exists but is "
-                                          "unusable: rotate it to obtain a secret, do not retry "
-                                          "the mint"),
+                    detail::a4_error(
+                        res, active_after
+                                 ? "the credential was minted but no active credential was found on "
+                                   "read-back; the secret was withheld. List the principal's "
+                                   "credentials; rotate if one is listed, do not retry the mint"
+                                 : "the credential was minted but could not be read back; the secret "
+                                   "was withheld. The credential exists but is unusable: rotate it "
+                                   "to obtain a secret, do not retry the mint"),
                     "application/json");
                 (void)detail::emit_behavioral_audit(
                     audit_fn, req, res, "engine_principal.credential.mint", "partial",
                     "EnginePrincipal", principal_id,
-                    "credential minted but its secret could not be read back for delivery: " +
-                        active_after.error());
+                    active_after
+                        ? std::string("credential minted but no active credential row was found on "
+                                      "read-back, secret withheld")
+                        : "credential minted but its secret could not be read back for delivery: " +
+                              active_after.error());
                 return;
-            }
-            for (const auto& t : *active_after) {
-                if (t.created_at > minted_created_at) {
-                    minted_created_at = t.created_at;
-                    minted_token_id = t.token_id;
-                }
             }
             // #2466/#2406: fail closed — the credential was minted, but an
             // unrecorded mint must not return the one-time secret. On a dropped
@@ -5708,17 +5722,17 @@ void RestApiV1::register_routes(
             // belongs to a credential that is no longer a pending successor, and
             // handing it out with token_id '' gives confirm nothing to pin. Same
             // posture as a failed read: 503, secret withheld, 'partial', no
-            // reveal row. A retry is safe: it re-serves inside the grace window
-            // or rotates from whatever credential remains.
+            // reveal row. NO retry hint: the pair is gone, so a retry would not
+            // re-serve anything, it would perform a NEW rotation the caller did
+            // not ask for. The remedy is to look first, then rotate if needed.
             if (successor_token_id.empty()) {
                 res.status = 503;
-                res.set_header("Retry-After", "2");
                 res.set_content(
                     detail::a4_error(res,
                                      "rotation succeeded but no pending successor credential was "
-                                     "found; the secret was withheld. Check the principal's "
-                                     "credentials and rotate again",
-                                     detail::A4ErrorOpts{.retry_after_ms = 2000}),
+                                     "found; the secret was withheld. A successor may exist; "
+                                     "inspect the principal's credentials (GET "
+                                     "/api/v1/engine-principals/{id}), then rotate again if needed"),
                     "application/json");
                 (void)detail::emit_behavioral_audit(
                     audit_fn, req, res, "engine_principal.credential.rotate", "partial",
@@ -6034,8 +6048,10 @@ void RestApiV1::register_routes(
             // we could not actually read.
             if (all_securables.empty() || all_operations.empty()) {
                 res.status = 503;
+                res.set_header("Retry-After", "2");
                 res.set_content(
-                    detail::a4_error(res, "rbac reference data unavailable — cannot verify"),
+                    detail::a4_error(res, "rbac reference data unavailable — cannot verify",
+                                     detail::A4ErrorOpts{.retry_after_ms = 2000}),
                     "application/json");
                 (void)detail::emit_behavioral_audit(
                     audit_fn, req, res, "engine_principal.audit.no_admin", "failure", "AuditLog",

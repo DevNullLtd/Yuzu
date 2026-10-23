@@ -34,7 +34,10 @@
 ///     each run's `engine_principal.audit.no_admin` audit row is the evidence
 ///     the control operated.
 ///   - roles a principal inherits through group membership are not followed
-///     (an `engine:` id cannot be a managed group member today).
+///     (an `engine:` id cannot be a managed group member today);
+///   - the grants, the roles and the role permissions are three separate reads,
+///     not one snapshot: a role granted or edited between them is picked up by
+///     the next run (a candidate follow-up is a single REPEATABLE READ pass).
 ///
 /// Principal selection is grant-table-driven (access-review clause 3, never a
 /// roster walk): every grant whose principal_id starts with `engine:` counts,
@@ -55,6 +58,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server::engine_no_admin_audit {
@@ -74,7 +78,18 @@ inline constexpr std::size_t kAuditIdMax = 100;
 struct Violation {
     std::string principal_id;
     std::string role; ///< role name; empty for a union-only wildcard_grant
-    std::string reason; ///< admin_role | system_role | wildcard_grant
+    std::string reason; ///< admin_role | system_role | wildcard_grant | orphan_grant
+};
+
+/// MCP `include_revoked=false`: the roster read that scopes the report. A
+/// principal in `revoked` is narrowed out (that is what the flag asks for). A
+/// principal in NEITHER set holds a grant with no roster row at all (a shadow
+/// or orphan row, or one created after the grants were read): it is never
+/// dropped, it is evaluated normally AND reported as `orphan_grant`, because a
+/// roster-walk that silently omits it is the clause-3 regression.
+struct ActiveScope {
+    std::unordered_set<std::string> active;
+    std::unordered_set<std::string> revoked;
 };
 
 /// The checked reads, taken as vectors so `evaluate` stays pure.
@@ -110,13 +125,15 @@ namespace detail {
 } // namespace detail
 
 /// Pure evaluation. `securables`/`operations` define the current grid.
-/// `only_principals`, when non-null, restricts the report to those ids
-/// (MCP `include_revoked=false`). Output is ordered by principal id, then
-/// role name, so two runs over the same state are byte-identical.
+/// `scope`, when non-null, narrows the report to ACTIVE principals (MCP
+/// `include_revoked=false`); see ActiveScope for how a grant with no roster row
+/// is handled. Output is ordered by principal id, then role name (a principal's
+/// union-only and `orphan_grant` rows, which carry no role, follow its
+/// per-role rows), so two runs over the same state are byte-identical.
 [[nodiscard]] inline std::vector<Violation>
 evaluate(const Inputs& in, const std::vector<std::string>& securables,
          const std::vector<std::string>& operations,
-         const std::unordered_set<std::string>* only_principals = nullptr) {
+         const ActiveScope* scope = nullptr) {
     std::vector<Violation> out;
 
     std::unordered_set<std::string> grid;
@@ -143,12 +160,16 @@ evaluate(const Inputs& in, const std::vector<std::string>& securables,
             system_roles.insert(r.name);
 
     // principal id -> distinct role names, whatever the grant's principal_type.
+    std::set<std::string> orphans; // only populated when `scope` is given
     std::map<std::string, std::set<std::string>> roles_by_principal;
     for (const auto& g : in.grants) {
         if (!std::string_view(g.principal_id).starts_with(kEnginePrincipalPrefix))
             continue;
-        if (only_principals && !only_principals->contains(g.principal_id))
-            continue;
+        if (scope && !scope->active.contains(g.principal_id)) {
+            if (scope->revoked.contains(g.principal_id))
+                continue; // narrowed out on request: a revoked principal
+            orphans.insert(g.principal_id);
+        }
         roles_by_principal[g.principal_id].insert(g.role_name);
     }
 
@@ -177,15 +198,34 @@ evaluate(const Inputs& in, const std::vector<std::string>& securables,
         // No single role covers the grid but together they do.
         if (!any_role_covers && covers_grid(union_allowed))
             out.push_back({principal_id, "", "wildcard_grant"});
+        if (orphans.contains(principal_id))
+            out.push_back({principal_id, "", "orphan_grant"});
     }
     return out;
 }
 
-/// Success-row audit detail: `violations=N`, plus up to kAuditSampleMax
-/// `principal_id:reason` tokens when N > 0. Every principal id is neutralised
-/// with audit_token (CWE-117); reasons are fixed strings.
-[[nodiscard]] inline std::string audit_detail(const std::vector<Violation>& violations) {
+/// The longest prefix of `s` that is at most `max_bytes` long and does not end
+/// inside a UTF-8 multibyte sequence (a continuation byte is 10xxxxxx).
+[[nodiscard]] inline std::string_view utf8_prefix(std::string_view s, std::size_t max_bytes) {
+    if (s.size() <= max_bytes)
+        return s;
+    std::size_t n = max_bytes;
+    while (n > 0 && (static_cast<unsigned char>(s[n]) & 0xC0U) == 0x80U)
+        --n;
+    return s.substr(0, n);
+}
+
+/// Success-row audit detail: `violations=N scope=active|all`, plus up to
+/// kAuditSampleMax `principal_id:reason` tokens when N > 0. Every principal id is neutralised
+/// with audit_token (CWE-117) after being cut to kAuditIdMax bytes at a UTF-8
+/// character boundary (never inside a multibyte sequence); reasons are fixed
+/// strings. `scope=active` marks a run narrowed to active principals (MCP
+/// include_revoked=false), so a narrowed `violations=0` is distinguishable from
+/// a full-population one.
+[[nodiscard]] inline std::string audit_detail(const std::vector<Violation>& violations,
+                                              bool narrowed_to_active = false) {
     std::string d = "violations=" + std::to_string(violations.size());
+    d += narrowed_to_active ? " scope=active" : " scope=all";
     if (violations.empty())
         return d;
     d += " sample=";
@@ -193,8 +233,7 @@ evaluate(const Inputs& in, const std::vector<std::string>& securables,
     for (std::size_t i = 0; i < n; ++i) {
         if (i != 0)
             d += ',';
-        d += audit_token(std::string_view(violations[i].principal_id).substr(0, kAuditIdMax)) + ":" +
-             violations[i].reason;
+        d += audit_token(utf8_prefix(violations[i].principal_id, kAuditIdMax)) + ":" + violations[i].reason;
     }
     return d;
 }

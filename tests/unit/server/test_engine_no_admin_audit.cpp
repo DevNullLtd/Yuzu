@@ -155,25 +155,64 @@ TEST_CASE("no-admin audit: an empty grid is never a wildcard", "[engine_principa
     CHECK(audit::evaluate(in, {}, {}).empty());
 }
 
-TEST_CASE("no-admin audit: only_principals narrows the report to the named ids",
+TEST_CASE("no-admin audit: the active scope skips a REVOKED principal but never drops a grant "
+          "with no roster row (orphan_grant)",
           "[engine_principal][no_admin][pure]") {
-    auto in = inputs_with({{"engine", "engine:live", "admin"}, {"engine", "engine:gone", "admin"}},
-                          {}, {});
-    const std::unordered_set<std::string> active{"engine:live"};
-    const auto v = audit::evaluate(in, kSecurables, kOperations, &active);
-    REQUIRE(v.size() == 1);
-    CHECK(v[0].principal_id == "engine:live");
+    auto in = inputs_with({{"engine", "engine:live", "admin"},
+                           {"engine", "engine:revoked", "admin"},
+                           {"user", "engine:shadow", "Administrator"},
+                           {"engine", "engine:orphan", "Reader"}},
+                          {{.name = "Reader"}}, {{"Reader", "Inventory", "Read", "allow"}});
+    audit::ActiveScope scope;
+    scope.active = {"engine:live"};
+    scope.revoked = {"engine:revoked"};
+    const auto v = audit::evaluate(in, kSecurables, kOperations, &scope);
+
+    auto reasons_for = [&](const std::string& id) {
+        std::vector<std::string> out;
+        for (const auto& x : v)
+            if (x.principal_id == id)
+                out.push_back(x.reason);
+        return out;
+    };
+    CHECK(reasons_for("engine:live") == std::vector<std::string>{"admin_role"});
+    CHECK(reasons_for("engine:revoked").empty()); // narrowed out on request
+    // No roster row at all: evaluated normally AND flagged, so a roster walk cannot hide it.
+    CHECK(reasons_for("engine:shadow") == std::vector<std::string>{"admin_role", "orphan_grant"});
+    // A harmless role on an orphan is still reported: the missing principal is the finding.
+    CHECK(reasons_for("engine:orphan") == std::vector<std::string>{"orphan_grant"});
+    // Without a scope, nothing is an orphan and the revoked principal is audited.
+    const auto full = audit::evaluate(in, kSecurables, kOperations);
+    for (const auto& x : full)
+        CHECK(x.reason != "orphan_grant");
+    CHECK(full.size() == 3); // live, revoked, shadow (admin roles); engine:orphan is clean
+}
+
+TEST_CASE("no-admin audit: a principal listed as neither active nor revoked is an orphan, not "
+          "silently narrowed away",
+          "[engine_principal][no_admin][pure]") {
+    // The race the narrowing must survive: the roster was read AFTER the grants, so a principal
+    // created in between has a grant and no roster row.
+    auto in = inputs_with({{"engine", "engine:newborn", "admin"}}, {}, {});
+    audit::ActiveScope scope; // empty roster
+    const auto v = audit::evaluate(in, kSecurables, kOperations, &scope);
+    REQUIRE(v.size() == 2);
+    CHECK(v[0].reason == "admin_role");
+    CHECK(v[1].reason == "orphan_grant");
+    CHECK(v[1].role.empty());
 }
 
 TEST_CASE("no-admin audit: the success detail carries a bounded, neutralised sample",
           "[engine_principal][no_admin][pure]") {
-    CHECK(audit::audit_detail({}) == "violations=0");
+    CHECK(audit::audit_detail({}) == "violations=0 scope=all");
+    // A run narrowed to active principals says so, so its zero is not read as a full-fleet zero.
+    CHECK(audit::audit_detail({}, /*narrowed_to_active=*/true) == "violations=0 scope=active");
 
     std::vector<audit::Violation> many;
     for (int i = 0; i < 12; ++i)
         many.push_back({"engine:p" + std::to_string(i), "admin", "admin_role"});
     const auto d = audit::audit_detail(many);
-    CHECK(d.starts_with("violations=12 sample=engine:p0:admin_role,"));
+    CHECK(d.starts_with("violations=12 scope=all sample=engine:p0:admin_role,"));
     CHECK(d.find("engine:p9:admin_role") != std::string::npos);
     CHECK(d.find("engine:p10") == std::string::npos); // capped at ten
 
@@ -183,4 +222,22 @@ TEST_CASE("no-admin audit: the success detail carries a bounded, neutralised sam
     CHECK(hostile.find('\r') == std::string::npos);
     CHECK(hostile.find('\n') == std::string::npos);
     CHECK(hostile.find("result=success") == std::string::npos);
+}
+
+TEST_CASE("no-admin audit: the audited principal id is cut at a UTF-8 character boundary",
+          "[engine_principal][no_admin][pure]") {
+    // 98 ASCII bytes then a 3-byte character straddling the 100-byte cap: the cut must back up to
+    // 98, never leave a lone lead byte in the audit detail.
+    const std::string id = "engine:" + std::string(91, 'a') + "\xE2\x82\xAC" + "tail";
+    REQUIRE(id.size() > audit::kAuditIdMax);
+    const auto cut = audit::utf8_prefix(id, audit::kAuditIdMax);
+    CHECK(cut.size() == 98);
+    CHECK(cut.find('\xE2') == std::string_view::npos);
+    // At a boundary the full budget is used; a short id is untouched.
+    const std::string ascii(150, 'b');
+    CHECK(audit::utf8_prefix(ascii, audit::kAuditIdMax).size() == audit::kAuditIdMax);
+    CHECK(audit::utf8_prefix("short", audit::kAuditIdMax) == "short");
+    // End to end through the audit detail.
+    const auto d = audit::audit_detail({{id, "r", "admin_role"}});
+    CHECK(d.find('\xE2') == std::string::npos);
 }

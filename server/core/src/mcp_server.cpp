@@ -2802,13 +2802,15 @@ static const ToolDef kTools[] = {
      "reported), it is point-in-time, and nothing schedules it. Reason admin_role or system_role "
      "means the assignment check was bypassed (data corruption, direct DB write, or a code "
      "regression) and is a security incident; wildcard_grant means review whether the grant is "
-     "intended. FAILS CLOSED: if any read cannot be answered it returns a retryable internal "
+     "intended (permitted by design). With include_revoked=false only principals the roster "
+     "lists as revoked are skipped; a grant whose principal has no roster row is reported as "
+     "orphan_grant, never dropped. FAILS CLOSED: if any read cannot be answered it returns a retryable internal "
      "error (retry_after_ms) with no partial violations[], never ok:true - treat that as "
      "'unable to verify', not 'clean'. Same checks and {ok, violations} shape as GET "
      "/api/v1/engine-principals/audit/no-admin; include_revoked is MCP-only. Requires "
      "AuditLog:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("include_revoked":{"type":"boolean","default":true,"description":"false restricts the audit to lifecycle_state=active principals only"})j"
+     R"j("include_revoked":{"type":"boolean","default":true,"description":"false skips principals the roster lists as revoked (a grant with no roster row is still reported as orphan_grant)"})j"
      R"j(}})j",
      R"j({"type":"object","properties":{"ok":{"type":"boolean"},"violations":{"type":"array","items":{"type":"object","properties":{"principal_id":{"type":"string"},"role":{"type":"string"},"reason":{"type":"string"}},"required":["principal_id","reason"]}}},"required":["ok","violations"]})j"},
 
@@ -8943,19 +8945,28 @@ McpServer::HandlerFn McpServer::build_handler(
                         // different diagnostic tool needs its own arm here rather
                         // than inheriting this string unmodified.
                         if (kind == ConsumeFailure::kPrecondition) {
+                            // Wording only (no new retry hint): the denial may be a
+                            // transient store read failure, where the right move is to
+                            // recall the SAME approval_id, and the client cannot be told
+                            // which (anti-oracle, above). A new request here would burn
+                            // a human-approved ticket on a store blip; a retry_after_ms
+                            // would be dishonest for the terminal states. So lead with
+                            // the same-approval_id retry, and only then the state check.
                             const std::string remediation =
                                 tool_name == "confirm_engine_rotation"
-                                    ? "the approval_id is still valid and was NOT consumed; call "
-                                      "get_engine_principal (mirrors GET "
+                                    ? "the approval_id is still valid and was NOT consumed; do "
+                                      "not submit a new request because of this denial. Recall "
+                                      "this tool with the SAME approval_id. If the denial "
+                                      "persists, call get_engine_principal (mirrors GET "
                                       "/api/v1/engine-principals/{id}) to check the rotation's "
-                                      "current state before deciding whether to recall it again "
-                                      "with the same approval_id, or submit a new request if a "
-                                      "fresh approval is needed"
-                                    : "the approval_id is still valid and was NOT consumed; "
-                                      "check the current state of the operation this approval "
-                                      "authorizes before deciding whether to recall it again "
-                                      "with the same approval_id, or submit a new request if a "
-                                      "fresh approval is needed";
+                                      "current state before deciding whether a fresh approval "
+                                      "is needed"
+                                    : "the approval_id is still valid and was NOT consumed; do "
+                                      "not submit a new request because of this denial. Recall "
+                                      "this tool with the SAME approval_id. If the denial "
+                                      "persists, check the current state of the operation this "
+                                      "approval authorizes before deciding whether a fresh "
+                                      "approval is needed";
                             res.set_content(
                                 a4_error(kPermissionDenied,
                                          "approval cannot be redeemed right now: a precondition "
@@ -26716,6 +26727,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     const bool check_audit_ok =
                         audit_fn(req, "engine_principal.credential.mint", "failure",
                                  "EnginePrincipal", principal_id, active_before.error());
+                    mcp_audit("failure", active_before.error());
                     res.set_content(
                         a4_error(kInternalError,
                                  "could not confirm the principal has no active credential; retry",
@@ -26764,31 +26776,47 @@ McpServer::HandlerFn McpServer::build_handler(
                 bool found_newest = false;
                 auto active_after =
                     engine_credential_store_->list_active_for_principal_checked(principal_id);
-                if (!active_after) {
-                    const bool partial_audit_ok = audit_fn(
-                        req, "engine_principal.credential.mint", "partial", "EnginePrincipal",
-                        principal_id,
-                        "credential minted but its secret could not be read back for delivery: " +
-                            active_after.error());
+                if (active_after) {
+                    for (const auto& t : *active_after) {
+                        if (!found_newest || t.created_at > newest.created_at) {
+                            newest = t;
+                            found_newest = true;
+                        }
+                    }
+                }
+                // The read-back must both ANSWER and find the new row. An answered read with
+                // no active row (the credential, or the principal, revoked out of band after
+                // create_token) takes the same arm as a failed read: otherwise the secret is
+                // delivered with token_id '' under a `success` row for a dead credential.
+                if (!active_after || !found_newest) {
+                    const std::string partial_detail =
+                        active_after
+                            ? std::string("credential minted but no active credential row was "
+                                          "found on read-back, secret withheld")
+                            : "credential minted but its secret could not be read back for "
+                              "delivery: " +
+                                  active_after.error();
+                    const bool partial_audit_ok =
+                        audit_fn(req, "engine_principal.credential.mint", "partial",
+                                 "EnginePrincipal", principal_id, partial_detail);
+                    mcp_audit("partial", partial_detail);
                     res.set_content(
                         a4_error(503,
-                                 "the credential was minted but could not be read back; the "
-                                 "one-time secret was withheld. The credential exists but is "
-                                 "unusable: rotate it to obtain a secret",
+                                 active_after
+                                     ? "the credential was minted but no active credential was "
+                                       "found on read-back; the one-time secret was withheld. List "
+                                       "the principal's credentials; rotate if one is listed"
+                                     : "the credential was minted but could not be read back; the "
+                                       "one-time secret was withheld. The credential exists but is "
+                                       "unusable: rotate it to obtain a secret",
                                  "rotate the credential; do not retry the mint",
                                  /*retry_after_ms=*/-1, /*cid_override=*/{}, partial_audit_ok),
                         "application/json");
                     return;
                 }
-                for (const auto& t : *active_after) {
-                    if (!found_newest || t.created_at > newest.created_at) {
-                        newest = t;
-                        found_newest = true;
-                    }
-                }
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "engine_principal.credential.mint", "success", "EnginePrincipal",
-                    found_newest ? newest.token_id : principal_id, "principal=" + principal_id);
+                    newest.token_id, "principal=" + principal_id);
                 if (!audit_ok) {
                     // #3937: fail closed — the credential was minted but its audit row
                     // did not persist, so the one-time secret is WITHHELD (never built
@@ -26808,7 +26836,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 JObj payload;
-                payload.add("token_id", found_newest ? newest.token_id : "")
+                payload.add("token_id", newest.token_id)
                     .add("raw_token", *minted)
                     .add("principal_id", principal_id)
                     .add("expires_at", expires_at);
@@ -26928,18 +26956,39 @@ McpServer::HandlerFn McpServer::build_handler(
                         }
                     }
                 }
-                if (!found_successor) {
-                    const std::string why =
-                        active_after
-                            ? "rotation committed but no active credential links to a "
-                              "predecessor on read-back (revoked or confirmed out of band); "
-                              "secret withheld"
-                            : "a successor exists (newly minted or re-served) but its secret "
-                              "could not be read back for delivery: " +
-                                  active_after.error();
+                if (!found_successor && active_after) {
+                    // The read ANSWERED and no active credential links to a predecessor
+                    // (revoked or confirmed out of band): there is no pending pair to
+                    // re-serve, so a retry hint would only drive an unrequested NEW
+                    // rotation. No retry hint; the remedy is to look, then rotate if needed.
+                    const std::string no_link_detail =
+                        "rotation committed but no active credential links to a predecessor on "
+                        "read-back (revoked or confirmed out of band); secret withheld";
                     const bool partial_audit_ok =
                         audit_fn(req, "engine_principal.credential.rotate", "partial",
-                                 "EnginePrincipal", principal_id, why);
+                                 "EnginePrincipal", principal_id, no_link_detail);
+                    mcp_audit("partial", no_link_detail);
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "rotation succeeded but no pending successor credential was "
+                                 "found; the one-time secret was withheld. A successor may exist; "
+                                 "inspect the principal's credentials (GET "
+                                 "/api/v1/engine-principals/{id}), then rotate again if needed",
+                                 "inspect the principal's credentials, then rotate again if needed; "
+                                 "do not retry automatically",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, partial_audit_ok),
+                        "application/json");
+                    return;
+                }
+                if (!found_successor) {
+                    const std::string read_failed_detail =
+                        "a successor exists (newly minted or re-served) but its secret could not "
+                        "be read back for delivery: " +
+                        active_after.error();
+                    const bool partial_audit_ok =
+                        audit_fn(req, "engine_principal.credential.rotate", "partial",
+                                 "EnginePrincipal", principal_id, read_failed_detail);
+                    mcp_audit("partial", read_failed_detail);
                     res.set_content(
                         a4_error(kInternalError,
                                  "rotation succeeded but the successor could not be read back; "
@@ -26959,7 +27008,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // every JSON-RPC call, so a replay naturally produces its own row.
                 const bool reveal_audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "engine_principal.credential.reveal", "success",
-                    "EnginePrincipal", found_successor ? successor.token_id : principal_id,
+                    "EnginePrincipal", successor.token_id,
                     "principal=" + principal_id + " action=rotate");
                 if (!reveal_audit_ok) {
                     // #3937: fail closed — the reveal IS this route's success audit, so
@@ -26983,10 +27032,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 JObj payload;
-                payload.add("token_id", found_successor ? successor.token_id : "")
+                payload.add("token_id", successor.token_id)
                     .add("raw_token", *rotated)
                     .add("principal_id", principal_id)
-                    .add("overlap_expires_at", found_successor ? successor.overlap_expires_at : 0);
+                    .add("overlap_expires_at", successor.overlap_expires_at);
                 mcp_audit("success", principal_id);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -28036,7 +28085,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     mcp_audit("failure", "engine principal or rbac store unavailable");
                     res.set_content(a4_error(kInternalError,
                                              "engine principal or rbac store unavailable",
-                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                                     "application/json");
                     return;
                 }
@@ -28072,7 +28121,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                    "no-admin", "rbac_resolution_failed");
                     res.set_content(a4_error(kInternalError,
                                              "rbac reference data unavailable — cannot verify",
-                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                                     "application/json");
                     return;
                 }
@@ -28085,7 +28134,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         a4_error(kInternalError,
                                  std::string(engine_no_admin_audit::kUnavailableMessage),
                                  "retry the request",
-                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                         "application/json");
                 };
                 auto inputs = engine_no_admin_audit::read_inputs(*rbac_store);
@@ -28096,20 +28145,24 @@ McpServer::HandlerFn McpServer::build_handler(
                 // include_revoked=false narrows the report to ACTIVE principals; that
                 // roster read is a checked read too. The default (true) audits every
                 // grant on record, so a revoked principal that still holds an admin
-                // grant is still flagged (parity with the REST twin).
-                std::optional<std::unordered_set<std::string>> active_only;
+                // grant is still flagged (parity with the REST twin). The narrowing
+                // drops ONLY principals the roster says are revoked: an engine: grant
+                // whose principal has no roster row at all is never dropped, it is
+                // reported as orphan_grant (a roster walk would hide it).
+                std::optional<engine_no_admin_audit::ActiveScope> scope;
                 if (!include_revoked) {
-                    auto active = engine_principal_store_->list_all_checked(false);
-                    if (!active) {
+                    auto roster = engine_principal_store_->list_all_checked(true);
+                    if (!roster) {
                         fail_closed();
                         return;
                     }
-                    active_only.emplace();
-                    for (const auto& p : *active)
-                        active_only->insert(p.principal_id);
+                    scope.emplace();
+                    for (const auto& p : *roster)
+                        (p.lifecycle_state == "active" ? scope->active : scope->revoked)
+                            .insert(p.principal_id);
                 }
                 const auto found = engine_no_admin_audit::evaluate(
-                    *inputs, all_securables, all_operations, active_only ? &*active_only : nullptr);
+                    *inputs, all_securables, all_operations, scope ? &*scope : nullptr);
                 JArr violations;
                 for (const auto& v : found) {
                     violations.add(JObj()
@@ -28122,7 +28175,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 JObj payload;
                 payload.add("ok", found.empty()).raw("violations", violations.str());
                 (void)audit_fn(req, "engine_principal.audit.no_admin", "success", "AuditLog",
-                               "no-admin", engine_no_admin_audit::audit_detail(found));
+                               "no-admin",
+                               engine_no_admin_audit::audit_detail(found, scope.has_value()));
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
