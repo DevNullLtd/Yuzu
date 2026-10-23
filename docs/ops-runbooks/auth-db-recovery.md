@@ -684,23 +684,81 @@ recorded as `sessions_ended=<n>` at the end of the audit row's `detail`
 (`... (os_identity=<account>, sessions_ended=<n>)`); the command's stdout line is
 unchanged. If ending the sessions fails, the factor is already cleared: the
 command exits non-zero with `error: MFA cleared but the account's sessions were
-not ended`. The audit row is still written, with `sessions_ended=failed`. Treat
-that as an incomplete reset. Run `DELETE /api/v1/sessions?username=<name>`
-yourself and record the manual session deletion in your change-management
-system. Disabling MFA from Settings ends **every** session of the account, the
-caller's included, and sends the browser to the landing page; if the durable
-delete fails there, the audit row is `mfa.disabled` with `result=partial` and
-`sessions_ended=failed`, and the user presses Disable again to retry. Neither
-path ends API tokens; revoke those through the token endpoints.
+not ended`; the server log carries `--mfa-reset: MFA cleared for '<name>' but ending its
+sessions failed (<cause>). End them now with DELETE /api/v1/sessions?username=<name> and
+record the reset.` The audit row is still written, with `sessions_ended=failed`. Treat
+that as an incomplete reset and end the sessions as described under "Ending the
+sessions by hand" below. Disabling MFA from Settings ends **every** session of the
+account, the caller's included, and sends the browser to the landing page. If the
+durable delete fails there, the audit row is `mfa.disabled` with `result=partial` and
+`sessions_ended=failed`, the page says "MFA was disabled, but the account's sessions
+could not be ended. Ask an administrator to end them.", and there is **no retry
+control**: after the clear the page shows the not-enrolled view, and the Disable form
+exists only in the enrolled view. If the clear itself fails on an account that had a
+verified factor, the sessions are still ended (the clear may have committed with its
+acknowledgement lost) and the audit row is `mfa.disabled` with `result=error` and
+`disable failed (sessions_ended=<n>|failed)`. Cancelling an enrolment that was never
+verified ends no session (`result=ok`, `no verified factor to clear`). Neither path
+ends API tokens: an administrator revokes a token with
+`DELETE /api/v1/tokens/{token_id}` (the global administrator role may revoke any
+token; the owner lists token ids with `GET /api/v1/tokens`).
 
 **Re-running `--mfa-reset`.** Running it again after a `sessions_ended=failed`
 is safe for sessions (the delete is idempotent), but it also clears any factor
 the user has enrolled in the meantime. Re-run it only before the user enrols
 again; once they have, end the sessions with
-`DELETE /api/v1/sessions?username=<name>` instead. That route needs
-`UserManagement:Write` and an MFA step-up when the caller is enrolled, so use a
-different administrator; in a sole-administrator lockout there is no other
-caller, so re-run `--mfa-reset` before they enrol again.
+`DELETE /api/v1/sessions?username=<name>` instead.
+
+**Ending the sessions by hand.** `DELETE /api/v1/sessions?username=<name>` needs
+`UserManagement:Write`. Calling it on your own username is permitted (the audit row
+is `session.revoke_all.self`). It asks for an MFA step-up only when the caller is a
+session whose account has an enrolled factor; an API-token caller and a session whose
+account has no enrolled factor skip the step-up. So a sole administrator who has just
+cleared their own factor can run it with their own session or an API token, and a
+sole-administrator lockout where no administrator session or token is left is covered
+by re-running `--mfa-reset` (before the user enrols again) or, if no `yuzu-server`
+binary is available, by the two statements under
+[Fallback: direct SQL](#fallback-direct-sql). Treat `db_persisted: false` in the
+response as a failed delete and call it again.
+
+**Check that no session remains.** After ending the sessions, confirm that no live
+row is left for the account:
+
+```bash
+psql -q "$YUZU_POSTGRES_DSN" -c \
+  "SELECT count(*) FROM session_store.sessions WHERE username = 'alice';"
+```
+
+The count must be 0. A session the user opens after the reset (a fresh sign-in) shows
+as a new row, so run the check straight after the delete. The delete bumps the session
+write-generation, and each replica polls that counter about once a second
+(`kSessionGenRefreshMs`, 1000 ms) and drops its cached sessions when it advances, so
+the account is signed out on every replica within about a second. If a replica's poll
+is failing, it trusts its cache for at most 30 seconds from its last successful poll
+(`kSessionGenStaleServeBoundMs`) and then falls back to the store, which no longer
+holds the row. After a restore or a failover to a lagging standby this bound does not
+hold; see [Sessions are durable](#sessions-are-durable).
+
+**Finding a partial result.** A failed session delete from Settings increments
+`yuzu_auth_session_store_degrade_total{op="invalidate_user"}`, but a single event
+does not reliably page: `YuzuSessionStoreDegraded` fires on
+`increase(yuzu_auth_session_store_degrade_total[10m]) > 0` held for 10 minutes, so it
+needs the database to keep failing. The `--mfa-reset` command emits no metric at all.
+Look for the audit rows instead. This query lists the last seven days of rows whose
+sessions were not ended:
+
+```bash
+psql -q "$YUZU_POSTGRES_DSN" -c \
+  "SELECT to_timestamp(timestamp) AT TIME ZONE 'UTC' AS at_utc, principal, action, result, target_id, detail
+     FROM audit_store.audit_events
+    WHERE action IN ('mfa.disabled', 'mfa.reset.breakglass')
+      AND (result = 'partial' OR detail LIKE '%sessions_ended=failed%')
+      AND timestamp >= extract(epoch FROM now() - interval '7 days')
+    ORDER BY timestamp DESC;"
+```
+
+Each row names the account in `target_id`. End its sessions, run the check above, and
+record the manual deletion in your change-management system. The query is read-only.
 
 **Detective control.** Because the CLI exits without serving, it emits no
 Prometheus metric — the audit row is the only signal. Alert on
@@ -729,9 +787,10 @@ SQL
 
 This clears the factor only. It ends **no session**, and a session made under the
 old factor may hold an MFA proof from it. End the account's sessions in the same
-sitting, either with `DELETE /api/v1/sessions?username=alice` (needs a different
-administrator holding `UserManagement:Write`; not possible in a sole-administrator
-lockout) or with the same statements the server runs:
+sitting, either with `DELETE /api/v1/sessions?username=alice` (needs
+`UserManagement:Write`; see "Ending the sessions by hand" above for who can call it
+and when it asks for a step-up) or, in a lockout where no administrator session or
+token is left, with the same statements the server runs:
 
 ```bash
 psql -v ON_ERROR_STOP=1 "$YUZU_POSTGRES_DSN" <<'SQL'
@@ -744,7 +803,8 @@ SQL
 ```
 
 The generation bump is required for the same reason as in
-[Sessions are durable](#sessions-are-durable). API tokens are not touched.
+[Sessions are durable](#sessions-are-durable). API tokens are not touched. Run the
+"Check that no session remains" query above afterwards.
 
 Clearing the secret needs no KEK (you are writing NULL, not reading
 ciphertext), so this works even when the KEK is unavailable.

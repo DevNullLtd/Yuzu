@@ -210,10 +210,6 @@ principal and not an engine principal. The existing rule that the reviewer canno
     are using included (neither ends API tokens). **With RBAC enforcement off (the shipped default),** the legacy gate requires the `admin` role for
     approving, so a non-admin is refused `403` "admin role required" before the MFA check and enrolling a non-admin
     approver achieves nothing until RBAC enforcement is turned on.
-  - **Mixed versions and clearing a factor.** Until every replica and the CLI image run this build, an old binary's
-    `--mfa-reset` or Settings disable clears the factor without ending the account's sessions. Afterwards run the new
-    binary's `--mfa-reset` (before the user enrols again, because it clears the factor) or
-    `DELETE /api/v1/sessions?username=<name>`.
   - **An unreadable MFA store, or an unreadable stored session proof,** answers `503` with `retry_after_ms` and increments
     `yuzu_auth_secret_unavailable_total{route="approval"}`; nothing is decided.
 - **A same-site `Origin` (or `Referer`) is now required.** A browser or script `POST` to
@@ -416,6 +412,33 @@ older binary ignores, so a rollback starts cleanly. What changes is which checks
   the control, or by a replica that does not have it. Use that token as the cutover marker when sampling
   decisions, and to spot an old replica still serving approvals during a roll. The audit row does not name the
   replica; your load balancer's access log is the place to find which one answered.
+- **Mixed versions and clearing a factor.** Until every replica and the CLI image run this build, an old binary's
+  `--mfa-reset` or Settings disable clears the factor without ending the account's sessions, so its existing
+  sessions stay live. Afterwards run the new
+  binary's `--mfa-reset` (before the user enrols again, because it clears the factor) or
+  `DELETE /api/v1/sessions?username=<name>`. To find the accounts cleared during the mixed window, list the
+  `mfa.disabled` and `mfa.reset.breakglass` rows in it. The bounds follow the same rules as the approval query below
+  (UTC, an explicit `+00` on each, widened by a margin for clock skew). A row written by an old binary has no
+  `sessions_ended=` in its `detail`; a row from this build always has one, except `no verified factor to clear`
+  (a cancelled, unfinished enrolment, which cleared nothing).
+
+  ```bash
+  psql -q "$YUZU_POSTGRES_DSN" -c \
+    "SET TIME ZONE 'UTC';
+     SELECT to_timestamp(timestamp) AS at, principal, action, result, target_id, detail
+       FROM audit_store.audit_events
+      WHERE action IN ('mfa.disabled', 'mfa.reset.breakglass')
+        AND result IN ('ok', 'success')
+        AND COALESCE(detail, '') NOT LIKE '%sessions_ended=%'
+        AND COALESCE(detail, '') <> 'no verified factor to clear'
+        AND timestamp >= extract(epoch FROM timestamptz '<first replica upgraded, minus margin, UTC with +00>')
+        AND timestamp <  extract(epoch FROM timestamptz '<last replica upgraded, plus margin, UTC with +00>')
+      ORDER BY timestamp;"
+  ```
+
+  Each row's `target_id` is an account whose sessions were left live. End them as above. An empty list is not
+  evidence that none were cleared: it has the same blind spots as the approval query below (bounds that miss the
+  window, an audit store restored or purged, a lost audit write), so run the same count control over the same bounds.
 - **Mixed-version admission is an accepted limit of a rolling upgrade.** The approver
   gate is stateless and no minimum-version check exists, so while a rolling upgrade is in progress an old replica
   can admit a decision the new gate would refuse. Accepted by the Yuzu project maintainer on 2026-10-19 in the #6079

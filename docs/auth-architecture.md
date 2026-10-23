@@ -763,8 +763,14 @@ Consequences, each deliberate:
   `sessions_ended` either way. Disabling MFA from Settings (`mfa_disable`) deletes EVERY session of the account, the caller's
   included (`AuthManager::invalidate_user_sessions`, same generation bump), clears the cookie and sends the
   browser to `/home`; the audit row records `sessions_ended=<n>`, or result `partial` with
-  `sessions_ended=failed` when the durable delete failed (the factor stays cleared, and pressing Disable
-  again retries the delete). Neither path ends API tokens. These are the only two production callers of
+  `sessions_ended=failed` when the durable delete failed (the factor stays cleared and the page has no retry
+  control: the Disable form exists only in the enrolled view, so an administrator ends the sessions with
+  `DELETE /api/v1/sessions?username=<name>` or `--mfa-reset`). When the clear itself fails on an account that had a
+  verified factor (a failed status read counts as had one) the sessions are still ended, because the clear may
+  have committed with its acknowledgement lost (audit `error`, `disable failed (sessions_ended=<n>|failed)`);
+  cancelling an enrolment that was never verified ends none (audit `ok`, `no verified factor to clear`). The row is
+  written through the session-bound audit writer, so the actor's principal, role and session are recorded even
+  though that session was just deleted. Neither path ends API tokens. These are the only two production callers of
   `mfa_disable`. The proof-versus-enrolment comparison above remains the second line: it assumes the
   database primary clock does not step backward (ADR-2002 section 4 treats database clock integrity as
   a security dependency; the shipped control is the `YuzuSessionReapClockAnomaly` alert, which fires only when a

@@ -117,7 +117,7 @@ Settings → Security and sign-in → Two-factor sign-in → **Regenerate recove
 
 #### Disabling MFA
 
-Settings → Security and sign-in → Two-factor sign-in → **Disable two-factor**. Clears the secret + all recovery codes. After disable, the user falls back to password-only login. Disabling also ends every session of the account, the one you are using included, so the browser is sent to the landing page and you sign in again; API tokens are not ended.
+Settings → Security and sign-in → Two-factor sign-in → **Disable two-factor**. Clears the secret + all recovery codes. After disable, the user falls back to password-only login. Disabling also ends every session of the account, the one you are using included, so the browser is sent to the landing page and you sign in again; API tokens are not ended. If the sessions cannot be ended after the factor was cleared, the page says so and asks you to have an administrator end them; there is no retry control, because the Disable form is only shown while a factor is enrolled. **Cancel setup** on an enrolment you never finished clears no usable factor, so it ends no session and does not sign you out.
 
 #### Recovery when locked out
 
@@ -142,7 +142,7 @@ Every MFA state transition emits an audit row (`docs/user-manual/audit-log.md` l
 - `mfa.enroll.verified` — first code accepted; enrollment is live (Settings or the `POST /login/mfa/enroll` bootstrap)
 - `mfa.enroll.failed` — first code rejected (Settings or login bootstrap)
 - `mfa.enroll.race` — an already-enrolled account (a concurrent verify won the race); audited distinctly from a rejected code, kept out of the bad-code population (#3777, CC7.2)
-- `mfa.disabled` - an administrator cleared their own factor from Settings; detail `sessions_ended=<n>` counts the account's sessions ended by it, the caller's included (`partial` + `sessions_ended=failed` when the factor was cleared but the durable delete did not persist; `error` + detail `blocked: mfa_enforcement=<mode>` when the self-target guard refuses a disable under enforcement)
+- `mfa.disabled` - an administrator cleared their own factor from Settings; `principal` and `target_id` are the account, and the row is attributed to the acting session even though that session was just deleted. Detail `sessions_ended=<n>` counts the account's sessions ended by it, the caller's included (`ok`); `no verified factor to clear` (`ok`) when an unfinished enrolment was cancelled, which ends no session; `partial` + `sessions_ended=failed` when the factor was cleared but the durable delete did not persist; `error` + `disable failed (sessions_ended=<n>|failed)` when the clear failed on an account that had a verified factor (its sessions are still ended); `error` + `disable failed` when it failed on an account with none; `error` + `blocked: mfa_enforcement=<mode>` when the self-target guard refuses a disable under enforcement
 - `mfa.login.required` — `POST /login` returned a 202 pending challenge
 - `mfa.login.verified` — `POST /login/mfa` TOTP accepted, session minted
 - `mfa.login.failed` — `POST /login/mfa` rejected the code or the pending token
