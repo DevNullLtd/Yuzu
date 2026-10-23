@@ -646,7 +646,7 @@ What exists today:
   have no typed-source filter. The routed concern for the app-usage read surface records that as an
   accepted gap.
 
-**Proposed (PR 2a-1):**
+**Proposed (PR 2a-1, and 2a-1b for the background purge):**
 - `typed_inventory_sources.hpp` exports `inline constexpr std::array kTypedInventorySources`. The
   predicate (and so the gateway skip), the purge and the read filter all iterate it, so there is
   one list.
@@ -655,7 +655,8 @@ What exists today:
   servers at 2a-1 or later (see [Phasing](#phasing-and-pr-order)). 2a-2 adds the seam behind it.
 - `InventoryStore::get`, `query` and `list_tables` exclude every typed source in SQL
   (`plugin <> ALL($1)`).
-- **The purge starts at boot but no longer blocks it.** The batched background pass (bounded rows
+- **The purge starts at boot but no longer blocks it (PR 2a-1b).** 2a-1 keeps the existing
+  synchronous boot purge, iterating the one array; 2a-1b replaces it. The batched background pass (bounded rows
   per batch, classified in `background_jobs.hpp`) is started at every boot, so typed sources stay
   members of the boot-time purge ADR-0070 D12 requires (`0070:1049`). What changes is that the
   server does not wait for it to finish before serving, instead of one unbounded `delete_source`
@@ -736,7 +737,7 @@ concern. The design states how a pruned store's rows are re-sent despite hash-sk
 | `cert_inventory_store.run_retention_prune` | `ReplicaSafe` | Advisory-lock single-writer retention, the `execution_tracker.reap_command_execution_mappings` precedent (`background_jobs.hpp:118-119`). |
 | `revocation_source.refresh` (2b-1) | `FencedLeaderOnly` | Network egress that would otherwise run once per replica. The dispatch site is wrapped in `leader_gate_permits` (`leader_gate.hpp`) and carries `YUZU_ASSERT_BACKGROUND_JOB`, as the header requires (`background_jobs.hpp:27-32`). `ca.publish_crl` is the nearest precedent (`:212`). |
 | `revocation_source.verify_certificate_signatures` (2b-2) | `ReplicaSafe` | An idempotent upsert of a pure function of (certificate DER, registered key). It reads both schemas, so it runs through the named cross-schema query owner (see [The store](#the-store)). |
-| `typed_inventory_purge` (2a-1) | `ReplicaSafe` | The batched purge of typed-source rows from the generic store: an idempotent bounded delete. |
+| `inventory_store.purge_typed_sources` (2a-1b) | `ReplicaSafe` | The batched purge of typed-source rows from the generic store: an idempotent bounded delete. |
 | `cert_inventory.fleet_store_status` (2a-2) | `ReplicaSafe` | A read-only fleet gauge sweep, like the existing inventory-freshness gauge (`background_jobs.hpp:209`). |
 
 A replica that loses leadership clears the gauges only the refresh job sets
