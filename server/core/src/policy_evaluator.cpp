@@ -8,6 +8,7 @@
 #include "mcp_jsonrpc.hpp" // json_exceeds_depth / kMcpMaxJsonDepth (#2437-class depth guard)
 #include "policy_store.hpp"
 #include "response_store.hpp"
+#include "response_tier_filter.hpp" // #4990
 #include "result_envelope.hpp"
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
@@ -899,12 +900,17 @@ void PolicyEvaluator::collect_ready() {
         // reads as "no terminal response yet", the same as a genuinely slow
         // agent — verdict_for() below already treats an unmatched target as
         // "unknown", never a fabricated compliant/drifted verdict.
-        // #4990: internal consumer. Compliance verdicts read status and output of the policy's own
-        // check dispatch (a non-Forensics plugin), never an operator-facing read surface.
+        // #4990: the check instruction's plugin is chosen by whoever authored the instruction
+        // definition and is dispatched as a system caller, and the verdict and the first bytes of
+        // its output (`make_check_result`) are served by the compliance routes and MCP to readers
+        // below the Forensics tier. So this read EXCLUDES the Forensics plugins outright
+        // (`deny_all()`): a Forensics check yields no row and scores `unknown`, never a verdict
+        // from, or a stored copy of, Forensics output.
+        const auto tier = d_.forensics_plugins
+                              ? ResponseTierFilter::exclude(*d_.forensics_plugins, authz::deny_all())
+                              : ResponseTierFilter::refuse_unwired();
         auto rows = d_.response_store
-                        ? d_.response_store
-                              ->query_by_execution(f.execution_id,
-                                                   ResponseTierFilter::unrestricted_internal_consumer())
+                        ? d_.response_store->query_by_execution(f.execution_id, tier)
                               .value_or(std::vector<StoredResponse>{})
                         : std::vector<StoredResponse>{};
         auto best = latest_per_agent(rows);

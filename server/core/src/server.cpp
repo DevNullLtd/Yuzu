@@ -17188,6 +17188,7 @@ private:
             .custom_properties_store = custom_properties_store_.get(),
             .mgmt_group_store = mgmt_group_store_.get(),
             .metrics = &metrics_,
+            .forensics_plugins = forensics_plugins(), // #4990
             .dispatch_fn = command_dispatch_fn,
             // #3495: lets a shutdown request stop tick() from starting
             // further dispatch_instruction() calls once stop_requested_
