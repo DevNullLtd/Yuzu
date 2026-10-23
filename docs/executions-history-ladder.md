@@ -224,13 +224,14 @@ through a real filter: the policy evaluator excludes the Forensics plugins outri
 scores `unknown`), the result-set materialiser does the same (a set sourced from such a command
 materialises empty for every creator), and bundle collation applies the caller's own decision
 (approval to dispatch a step does not imply reading its output; a step the caller may not read stays
-`pending` with an empty output). `tests/test_forensics_tier_wiring_lexical.py` pins that `server.cpp`
+`pending` with an empty output; a collation that serves a Forensics-tier step's output writes the
+`response.forensics.read` row with `surface=bundle`, REST fail-closed and MCP `audit_persisted:false`).
+`tests/test_forensics_tier_wiring_lexical.py` pins that `server.cpp`
 wires the plugin set and the resolver into each of these.
 
 **Not covered by this tier.** The policy evaluator still dispatches a Forensics-tier plugin as a
 system caller if a policy check instruction names one (only its output is withheld); tightening who
-may cause that dispatch is separate follow-up work. Bundle collation does not write a
-`response.forensics.read` row. Failure text stored before the sanitiser is reduced on read only
+may cause that dispatch is separate follow-up work. Failure text stored before the sanitiser is reduced on read only
 while the execution's command correlation (24 hours) is still held.
 
 **The executions drawer.** `GET /fragments/executions/{id}/detail` (both render branches: the
