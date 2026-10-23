@@ -721,7 +721,9 @@ see §5 for which chokepoints apply.
    listed with a reason in `GATE_PARITY_KNOWN_MISMATCHES`; a REST handler that refuses a service-scoped
    token before its gate reads as `refused`, an MCP handler whose own fleet read confines is read as
    confining, and every further REST gate call must agree or be matched, one to one, by a gate call the MCP
-   handler makes; a route whose gate the script cannot read
+   handler makes, and in the other direction a gate call in a derived MCP handler for a pair other than
+   the tool's declared one is a finding too (for rows with a REST object twin; an MCP-only tool or a
+   handler that shares a dispatch branch is not held to it); a route whose gate the script cannot read
    fails closed unless it is in `GATE_PARITY_NO_GATE_ALLOWED`; both tables are shrink-only) and `scripts/ci/check-mcp-retry-hints.py` (a new tool's handler
    block, and a new or changed `mcp_tool*.hpp`: a store/query-fault branch needs a retry hint or a
    `// retry-hint-exempt:` comment).

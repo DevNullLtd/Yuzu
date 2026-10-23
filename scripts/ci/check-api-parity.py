@@ -142,9 +142,15 @@ WHAT IT CHECKS
      when the handler text proves the two sides agree; what it cannot prove stays listed.
      PRIMARY HANDLER PAIR RULE (HANDLER_PAIR_RULE, on): a derived MCP handler's gate call for a
      (securable, operation) other than the tool's declared pair, not spent matching a further REST
-     gate, is a finding of its own, so the declared kToolSecurityRows pair cannot drift from what
-     the handler asks. It compares literal arguments of gate calls in the whole handler body (the
-     lexical limit below applies) and a handler whose body cannot be derived is not held to it.
+     gate, is a finding of its own (the MCP description of the row gains a `; handler also gates
+     on <gate>` suffix per such call, repeated calls named once each), so for the COMPARED rows
+     the declared kToolSecurityRows pair is held to what the handler asks. Compared rows are the
+     tools with a REST object twin whose handler body can be derived; an MCP-only tool, a tool
+     sharing a dispatch branch with other tools, and a row with a null twin on either side are
+     not held to it. It compares literal arguments of gate calls in the whole handler body (the
+     lexical limit below applies). The further REST gates are matched against the handler's
+     calls even when the primary gate disagrees, so a call a further gate consumes is never
+     reported as foreign.
      LIMITS: it compares LABELS and call sites, not effect (the REST kind is the
      management-group axis, the MCP label the service-scope axis, so a matching or mismatching
      label proves neither); a conditional or helper-lambda call that comes first is read as
@@ -1976,9 +1982,10 @@ def first_gate(span_text):
 # reached by non-service-scoped callers only: the route's kind is `refused`, not `plain`.
 _REFUSAL_CALL = re.compile(r"(?<![\w.>])(?:deny_fleet_wide_service_scoped|deny_service_scoped_schedule_list)\s*\(")
 _IF_OPENER = re.compile(r"\bif\s*\(\s*$")
-# An `if` whose text just before it ends in `else` is an `else if`: its refusal runs only when the
-# earlier branch was not taken, so it is not unconditional.
-_ELSE_BEFORE = re.compile(r"\belse\s*$")
+# The characters that may end the text just before an `if` that is a statement of its own: `;`, `{`
+# or `}`. Anything else (`else`, `)` of an `if`/`while`/`for` head, a label or `case ...:`) makes the
+# `if` the body of another construct, so its refusal runs only when that construct lets it.
+_STATEMENT_BOUNDARY = ";{}"
 _STATEMENT_RETURN = re.compile(r"(?:^|[;{}])\s*return\b")
 # REST gate kinds that confine (or refuse) a service-scoped or management-group caller; `plain`
 # is the only kind that does not.
@@ -2036,7 +2043,9 @@ def unconditional_refusals(span_text):
     a service-scoped caller before anything after them runs: the call is the whole condition of
     an `if` that sits directly in the handler body (brace depth 1, not inside a branch or a
     nested lambda), and the `if` returns (`return;` itself, or a braced block with a
-    top-level `return` statement). `if (!helper(...))`, `a && helper(...)`, an `else if`, a call that is not
+    top-level `return` statement). The `if` must also begin a statement: the text before it is empty
+    or ends in `;`, `{` or `}`, so an `else if` and the unbraced body of another `if`, `while`,
+    `for` or a label are not recognised. `if (!helper(...))`, `a && helper(...)`, a call that is not
     in an `if`, one behind another branch, or one whose branch does not return, are NOT
     recognised, so the route keeps its `plain` kind (fail closed). `span_text` is comment-blanked."""
     found = []
@@ -2044,7 +2053,8 @@ def unconditional_refusals(span_text):
         opener = _IF_OPENER.search(span_text[:m.start()])
         if not opener:
             continue
-        if _ELSE_BEFORE.search(span_text[:opener.start()]):
+        before = span_text[:opener.start()].rstrip()
+        if before and before[-1] not in _STATEMENT_BOUNDARY:
             continue
         if _brace_depth_before(span_text, m.start()) != 1:
             continue
@@ -2291,10 +2301,14 @@ def extract_mcp_handlers(by_tool, registry, tools):
 # confined / global_safe), written `<label>+confined-by-handler` when the handler's own fleet
 # read proves it confines. The comparison is the securable, the operation, and the confinement
 # side (see _gate_agrees); every further REST gate call must agree too or be matched, one-to-one, by a
-# gate call the MCP handler makes.
+# gate call the MCP handler makes. A pinned MCP gate may end in `; handler also gates on <gate>`, one
+# suffix per handler gate call for another (securable, operation) pair that no further REST gate
+# consumed (the handler pair rule below); the rule holds compared rows only, not MCP-only or
+# shared-branch tools.
 # HANDLER_PAIR_RULE: when True (the shipped setting), check 6 also holds a derived MCP handler's own
 # gate calls to the tool's declared pair (see gate_parity_findings): a gate call for another pair
-# that no further REST gate consumed is a finding. Measured when it was added: it flips no row that
+# that no further REST gate consumed is a finding, for compared rows only (a tool with a REST object
+# twin whose handler body can be derived). Measured when it was added: it flips no row that
 # agreed, and it re-describes three pinned GATE_PARITY_KNOWN_MISMATCHES entries (discover_permissions
 # x2, create_result_set), whose extra handler gate their reasons already explain. The switch exists so
 # the selftest can exercise both settings; do not turn it off to unblock a twin.
@@ -2331,7 +2345,9 @@ GATE_PARITY_KNOWN_MISMATCHES = {
         "The REST handler's Infrastructure:Write check is a tier_ok() call this script does "
         "not read; the one gate call it does read is a later conditional fleet read (a "
         "device-existence read), so the operation difference is a limit of the lexical read. "
-        "Read in review: the tool's Infrastructure:Write row matches the REST tier check"),
+        "Read in review: the tool's Infrastructure:Write row matches the REST tier check. The "
+        "MCP handler's own fleet:Infrastructure:Read gate is the one now shown after "
+        "'handler also gates on'"),
 }
 # NO_GATE_ALLOWED: (METHOD, canonical REST path, tool) -> reason. A twinned route whose handler
 # holds no gate call this script recognises (owner-only reads that call auth_fn alone, helper
@@ -2380,29 +2396,38 @@ TEST_EXISTENCE_ALLOWED = {
         "test_mcp_tools_hardware.cpp)"),
 }
 
-_ASSERT_MACRO = re.compile(r"\b(CHECK|REQUIRE)\w*\s*\(")
+# The Catch2 assertion macros that evaluate an expression: CHECK, REQUIRE, their _FALSE forms, the
+# matcher forms and CHECK_NOFAIL. Not CHECKSUM(, CHECK_NOTHROW( / CHECK_THROWS*( or their REQUIRE twins,
+# which assert no expression about the audit row.
+_ASSERT_MACRO = re.compile(r"\b(?:CHECK|REQUIRE)(?:_FALSE|_THAT|_NOFAIL)?\s*\(")
 _SCHEMA_CALL = re.compile(r"(?<![\w])schema_violation\s*\(")
-# An assertion that something is ABSENT: no audit row, an empty audit log, a zero count.
-_NEGATIVE_ASSERT = re.compile(r"\.empty\s*\(\s*\)|(?:==\s*0u?|<\s*1|<=\s*0)\b|\b0u?\s*==")
+# An assertion that something is ABSENT: no audit row, an empty audit log, a zero count (any
+# unsigned/long suffix, optionally parenthesised), `IsEmpty()`, `begin() == end()`.
+_NEGATIVE_ASSERT = re.compile(
+    r"\.empty\s*\(\s*\)|\bIsEmpty\s*\(\s*\)|\bbegin\s*\([^()]*\)\s*==\s*[\w.:>\-]*\bend\s*\("
+    r"|==\s*(?:\(\s*)?0[uUlL]*(?![\w.])|<\s*1[uUlL]*(?![\w.])|<=\s*0[uUlL]*(?![\w.])"
+    r"|(?<![\w.])0[uUlL]*\s*\)?\s*==")
 
 
 def has_audit_assertion(block):
     """True when a test-case block (comment-blanked, literals intact) holds a CHECK/REQUIRE whose
-    arguments mention `audit` (an identifier, or a key such as "audit_persisted") and do not
-    assert an absence: not a `*_FALSE` macro, not a leading `!`, no `.empty()` and no comparison
-    with zero, read with literals blanked so a quoted `"== 0"` is not one. A test that only shows
-    no audit row was written (a refused call, an unwired sink) does not assert the row the tool
-    writes. A literal that merely contains the word still counts: the real tests assert the
-    persisted-flag key by name, so this is a tripwire on shape, not a proof."""
+    arguments mention `audit` (an identifier, or a key such as "audit_persisted") and that asserts
+    the row is PRESENT. Negation is parity: the assertion is flipped when the macro is a `*_FALSE`
+    form or the arguments (literals blanked, so a quoted `"== 0"` is not a comparison) start with
+    `!`, and it has an absence shape when _NEGATIVE_ASSERT matches (`.empty()`, `IsEmpty()`, a
+    comparison with zero, `begin() == end()`); it counts only when the two agree, so
+    `CHECK(audit.size() == 1)`, `REQUIRE(!audit.empty())` and `CHECK_FALSE(audit.empty())` count and
+    `CHECK(audit.empty())`, `CHECK(!audit_written)` and `CHECK_FALSE(audit_written)` do not. A test
+    that only shows no audit row was written (a refused call, an unwired sink) does not assert the
+    row the tool writes. A literal that merely contains the word still counts: the real tests assert
+    the persisted-flag key by name, so this is a tripwire on shape, not a proof."""
     for m in _ASSERT_MACRO.finditer(block):
         open_i = m.end() - 1
         args = block[open_i + 1:_balanced_end(block, open_i) - 1]
         code = blank_cpp_literals(args)
-        if m.group(0).split("(")[0].rstrip().endswith("_FALSE"):
-            continue
-        if "audit" not in args.lower() or code.lstrip().startswith("!") or _NEGATIVE_ASSERT.search(code):
-            continue
-        return True
+        flipped = m.group(0).split("(")[0].rstrip().endswith("_FALSE") or code.lstrip().startswith("!")
+        if "audit" in args.lower() and bool(_NEGATIVE_ASSERT.search(code)) == flipped:
+            return True
     return False
 
 
@@ -2449,6 +2474,13 @@ def gate_parity_findings(ledger_rows, mcp_tools, rest_gates, mcp_security, mcp_e
     is {key: (rest_gate, mcp_gate)}, no_gates {key: why}, where key is (METHOD, canonical REST
     path, tool).
 
+    The handler pair rule (HANDLER_PAIR_RULE) holds a derived handler to its declared pair, for
+    the compared rows only (a tool with a REST object twin whose handler body can be derived; an
+    MCP-only tool or a shared-branch tool is not held to it): each handler gate call for a
+    (securable, operation) other than the declared pair, that no further REST gate consumed, is a
+    finding, and the MCP description names it after `; handler also gates on <gate>` once per call.
+    Further REST gates consume handler calls whether or not the primary gate agrees.
+
     A REST gate is (kind, securable, operation), optionally with a fourth item: the other
     gate triples the handler holds, one per call. The first is compared; every other one must also
     agree with the MCP side or the row is a finding, and its description names them all, so an
@@ -2494,9 +2526,12 @@ def gate_parity_findings(ledger_rows, mcp_tools, rest_gates, mcp_security, mcp_e
             # The first gate is held to the label (or the proven effect); a handler's own gate
             # calls match only the further gates, never the first.
             tool_gates = collections.Counter(mcp_gates.get(tool, ()))
-            agrees = (_gate_agrees(primary, mcp_class, (mcp[0], mcp[1]), mcp_proof=tool_proof)
-                      and all(_gate_agrees(g, mcp_class, (mcp[0], mcp[1]), tool_gates, tool_proof)
-                              for g in extras))
+            # Every further gate is matched even when the primary already disagrees (a computed list,
+            # not a short-circuiting `and all(...)`), so the handler gates they consume are not then
+            # reported as foreign.
+            primary_agrees = _gate_agrees(primary, mcp_class, (mcp[0], mcp[1]), mcp_proof=tool_proof)
+            extras_agree = [_gate_agrees(g, mcp_class, (mcp[0], mcp[1]), tool_gates, tool_proof) for g in extras]
+            agrees = primary_agrees and all(extras_agree)
             # Independent of the REST comparison: a derived handler's gate call for a pair other than
             # the tool's declared one, not spent matching a further REST gate above, is a finding.
             foreign = ([t for t in sorted(tool_gates.elements()) if t[1:] != (mcp[0], mcp[1])]
@@ -3728,6 +3763,12 @@ def _selftest_body():
             ("refusal-else-if", f"if (x) {{ touch(); }} else if ({deny}) return;\n{gate}", ("plain", "Sec", "Read")),
             ("refusal-else-if-line-break", f"if (x) touch();\nelse\n  if ({deny}) {{ return; }}\n{gate}",
              ("plain", "Sec", "Read")),
+            ("refusal-unbraced-under-if", f"if (a) if ({deny}) return;\n{gate}", ("plain", "Sec", "Read")),
+            ("refusal-unbraced-under-while", f"while (a) if ({deny}) return;\n{gate}", ("plain", "Sec", "Read")),
+            ("refusal-unbraced-under-for", f"for (;;) if ({deny}) return;\n{gate}", ("plain", "Sec", "Read")),
+            ("refusal-under-case-label", f"switch (k) {{ case 1: if ({deny}) return; }}\n{gate}", ("plain", "Sec", "Read")),
+            ("refusal-after-braced-block", f"{{ touch(); }}\nif ({deny}) return;\n{gate}", ("refused", "Sec", "Read")),
+            ("refusal-after-statement", f"touch();\nif ({deny}) return;\n{gate}", ("refused", "Sec", "Read")),
             ("refusal-after-else-block", f"if (x) {{ touch(); }} else {{ touch(); }}\nif ({deny}) return;\n{gate}",
              ("refused", "Sec", "Read")),
             ("refusal-behind-branch", f"if (x) {{ if ({deny}) return; }}\n{gate}", ("plain", "Sec", "Read")),
@@ -4010,6 +4051,26 @@ def _selftest_body():
           "gate parity (handler pair): a foreign handler gate consumed by a further REST gate agrees")
     check(_hp(("plain", *S, (foreign,)), {foreign: 2})[0] != {},
           "gate parity (handler pair): a second foreign handler call beyond the REST further gates is left over")
+    same_sec = ("plain", S[0], "Write")
+    mh, _nh, _eh = _hp(("plain", *S), {same_sec: 1})
+    check(mh == {("GET", "/api/v1/hp", "t_hp"): ("plain:Sec:Read", "denied:Sec:Read; handler also gates on plain:Sec:Write")},
+          f"gate parity (handler pair): the same securable with a different operation is foreign, got {mh}")
+    other = ("plain", "Bar", "Read")
+    mh, _nh, _eh = _hp(("plain", *S), {foreign: 1, other: 1})
+    check(mh == {("GET", "/api/v1/hp", "t_hp"): ("plain:Sec:Read", "denied:Sec:Read; handler also gates on plain:Bar:Read"
+                                                                  "; handler also gates on plain:Foo:Write")},
+          f"gate parity (handler pair): two distinct foreign gates are both named, got {mh}")
+    mh, _nh, _eh = _hp(("plain", *S), {foreign: 2})
+    check(mh == {("GET", "/api/v1/hp", "t_hp"): ("plain:Sec:Read", "denied:Sec:Read; handler also gates on plain:Foo:Write"
+                                                                  "; handler also gates on plain:Foo:Write")},
+          f"gate parity (handler pair): a repeated foreign call is named once per call, got {mh}")
+    mh, _nh, _eh = _hp(("plain", "Other", "Read", (foreign,)), {foreign: 1})
+    check(len(mh) == 1 and "handler also gates on" not in next(iter(mh.values()))[1],
+          f"gate parity (handler pair): when the primary disagrees, a handler gate that a further REST gate "
+          f"matches is not reported as foreign, got {mh}")
+    mh, _nh, _eh = _hp(("plain", "Other", "Read", (foreign,)), {foreign: 2})
+    check(len(mh) == 1 and next(iter(mh.values()))[1].count("handler also gates on plain:Foo:Write") == 1,
+          f"gate parity (handler pair): with the primary disagreeing, only the unconsumed handler call is foreign, got {mh}")
     check(_hp(("plain", *S), {("plain", *S): 1, ("scoped", *S): 1})[0] == {},
           "gate parity (handler pair): handler gates on the tool's own pair (any kind) agree")
     check(_hp(("plain", *S), {foreign: 1}, derived=False)[0] == {},
@@ -4061,6 +4122,7 @@ def _selftest_body():
             'if (tool_name == "t_ref_nested") {\n  if (flag) {\n    if (deny_fleet_wide_service_scoped(req, res)) return;\n  }\n}\n'
             'if (tool_name == "t_ref_noreturn") {\n  if (deny_fleet_wide_service_scoped(req, res)) { log(); }\n}\n'
             'if (tool_name == "t_ref_elseif") {\n  if (x) { touch(); } else if (deny_fleet_wide_service_scoped(req, res)) return;\n  noop();\n}\n'
+            'if (tool_name == "t_ref_unbraced") {\n  if (x) if (deny_fleet_wide_service_scoped(req, res)) return;\n  noop();\n}\n'
             'if (tool_name == "t_bare") { noop(); }\n'
             'if (tool_name == "t_dup") { perm_fn(req, res, "Tee", "Read"); if (x) perm_fn(req, res, "Tee", "Read"); }\n'
             '}\n', encoding="utf-8")
@@ -4076,7 +4138,7 @@ def _selftest_body():
             '};\n}\n', encoding="utf-8")
         h_by_tool = {t: ("Sec", "Read", "denied") for t in (
             "t_fleet", "t_list", "t_wrong", "t_mixed", "t_twice", "t_comment", "t_plain", "t_unread", "t_or",
-            "reg_t", "reg_n", "t_missing", "t_ref", "t_ref_elseif", "t_ref_nested", "t_ref_noreturn", "t_bare", "t_dup")}
+            "reg_t", "reg_n", "t_missing", "t_ref", "t_ref_elseif", "t_ref_nested", "t_ref_noreturn", "t_ref_unbraced", "t_bare", "t_dup")}
         h_by_tool["t_conf"] = ("Sec", "Read", "confined")
         h_registry = {"reg_t": "mcp_tools_one.cpp", "reg_n": "mcp_tools_one.cpp"}
         with _patched(MCP_SERVER_CPP=hcpp, MCP_REGISTRY_DIR=hreg):
@@ -4096,6 +4158,7 @@ def _selftest_body():
         check(prfs.get("t_ref") == frozenset({"refusal"}) and prfs.get("t_fleet") == frozenset({"confine"})
               and prfs.get("t_conf") == frozenset({"confine"}) and prfs.get("reg_t") == frozenset({"confine"})
               and prfs.get("t_ref_elseif") == frozenset() and prfs.get("t_ref_nested") == frozenset() and prfs.get("t_ref_noreturn") == frozenset()
+              and prfs.get("t_ref_unbraced") == frozenset()
               and prfs.get("t_bare") == frozenset() and prfs.get("t_wrong") == frozenset()
               and "t_twice" not in prfs and "t_or" not in prfs and "t_missing" not in prfs,
               f"extract_mcp_handlers: evidence is a top-level returning refusal call or a confinement call "
@@ -4193,7 +4256,31 @@ def _selftest_body():
             ("negated", 'TEST_CASE("t") { CHECK(!audit_written); }', False),
             ("no-audit-word", 'TEST_CASE("t") { CHECK(rows.size() == 1); }', False),
             ("only-in-a-bare-statement", 'TEST_CASE("t") { audit_log.push_back("x"); }', False),
-            ("negative-then-positive", 'TEST_CASE("t") { CHECK(audit.empty()); CHECK(audit_log.size() == 1); }', True)):
+            ("negative-then-positive", 'TEST_CASE("t") { CHECK(audit.empty()); CHECK(audit_log.size() == 1); }', True),
+            ("require-negated-empty", 'TEST_CASE("t") { REQUIRE(!audit.empty()); }', True),
+            ("check-false-empty", 'TEST_CASE("t") { CHECK_FALSE(audit.empty()); }', True),
+            ("require-false-empty", 'TEST_CASE("t") { REQUIRE_FALSE(audit_log.empty()); }', True),
+            ("negated-flag", 'TEST_CASE("t") { CHECK(!audit_written); }', False),
+            ("check-false-flag", 'TEST_CASE("t") { CHECK_FALSE(audit_written); }', False),
+            ("size-zero-u", 'TEST_CASE("t") { CHECK(audit.size() == 0U); }', False),
+            ("size-zero-ul", 'TEST_CASE("t") { CHECK(audit.size() == 0ul); }', False),
+            ("size-lt-one-u", 'TEST_CASE("t") { CHECK(audit.size() < 1u); }', False),
+            ("size-le-zero-u", 'TEST_CASE("t") { CHECK(audit.size() <= 0u); }', False),
+            ("zero-u-first", 'TEST_CASE("t") { CHECK(0U == audit.size()); }', False),
+            ("size-zero-parenthesised", 'TEST_CASE("t") { CHECK(audit.size() == (0)); }', False),
+            ("zero-parenthesised-first", 'TEST_CASE("t") { CHECK((0) == audit.size()); }', False),
+            ("is-empty-matcher", 'TEST_CASE("t") { CHECK_THAT(audit, Catch::Matchers::IsEmpty()); }', False),
+            ("begin-equals-end", 'TEST_CASE("t") { CHECK(audit.begin() == audit.end()); }', False),
+            ("negated-begin-equals-end", 'TEST_CASE("t") { CHECK(!(audit.begin() == audit.end())); }', True),
+            ("size-not-zero", 'TEST_CASE("t") { CHECK(audit.size() != 0); }', True),
+            ("quoted-zero-literal", 'TEST_CASE("t") { CHECK(row["audit"] == "== 0"); }', True),
+            ("checksum-is-not-an-assert", 'TEST_CASE("t") { CHECKSUM(audit_log.size() == 1); }', False),
+            ("check-nothrow", 'TEST_CASE("t") { CHECK_NOTHROW(audit_log.push_back("x")); }', False),
+            ("check-throws-as", 'TEST_CASE("t") { CHECK_THROWS_AS(audit_log.at(9), std::out_of_range); }', False),
+            ("require-nothrow", 'TEST_CASE("t") { REQUIRE_NOTHROW(audit_log.size()); }', False),
+            ("require-throws", 'TEST_CASE("t") { REQUIRE_THROWS(audit_log.at(9)); }', False),
+            ("check-that-positive", 'TEST_CASE("t") { CHECK_THAT(audit_log, Catch::Matchers::SizeIs(1)); }', True),
+            ("check-nofail", 'TEST_CASE("t") { CHECK_NOFAIL(audit_log.size() == 1); }', True)):
         check(has_audit_assertion(block) is want, f"has_audit_assertion({label}): want {want}")
     lit_src = 'f("a(", \'b\', R"x(c)x", g(1))'
     lit_out = blank_cpp_literals(lit_src)

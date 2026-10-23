@@ -875,9 +875,11 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `rest_v1_twin` or `mcp_twin` is null compares nothing, and the checks read
      source text, so the first gate call in a handler is taken as its gate and
      each further gate call must agree or be matched, one to one, by a gate call the MCP
-     handler makes, and a derived MCP handler's gate call for a pair other than the
-     tool's declared pair is a finding of its own (three pinned entries carry that
-     extra handler gate in their description). `MIN_REGISTRY_FILES` rises from 1 to 3, the number of
+     handler makes, and, for a row with a REST object twin whose MCP handler body can be
+     derived, that handler's gate call for a pair other than the tool's declared
+     pair is a finding of its own (three pinned entries carry that extra handler
+     gate in their description; MCP-only tools and shared-branch handlers are not
+     held to it). `MIN_REGISTRY_FILES` rises from 1 to 3, the number of
      `mcp_tools_*.cpp` registry files, and must equal that count; the
      test-existence tripwire also requires the test file to be registered in
      `tests/meson.build`, reads the `schema_violation(` call with string literals
