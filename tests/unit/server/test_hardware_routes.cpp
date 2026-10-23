@@ -1456,6 +1456,32 @@ TEST_CASE("result poll: a caller who lacks the Forensics read proof gets a permi
     CHECK(contains(own_device->body, "Waiting"));
 }
 
+TEST_CASE("result poll: a grant withdrawn between two polls of the same command ends the poll with the "
+          "permission notice, never a timeout",
+          "[hardware][route][security][forensics]") {
+    // The route re-resolves the caller's Forensics visibility on EVERY poll, so a holder who is
+    // still waiting (pending, polling on) and then loses the grant gets the notice on the very next
+    // poll, including at the attempt count where an ordinary poll would turn into "Timed out".
+    HwHarness h;
+    const auto url = poll_url("agent-1", "browser_inventory-aaaa1111", "browser_inventory");
+
+    h.forensics.admin();
+    auto before = h.sink.Get(url + "&n=1");
+    REQUIRE(before);
+    CHECK(contains(before->body, "Waiting"));
+    CHECK(contains(before->body, "hx-get")); // still polling
+
+    h.forensics.viewer(); // the grant is withdrawn mid-poll
+    for (const char* attempt : {"&n=2", "&n=39", "&n=40"}) {
+        INFO(attempt);
+        auto after = h.sink.Get(url + attempt);
+        REQUIRE(after);
+        CHECK(contains(after->body, "data-forensics-read-required"));
+        CHECK_FALSE(contains(after->body, "Timed out"));
+        CHECK_FALSE(contains(after->body, "hx-get")); // the poll ends: nothing re-arms it
+    }
+}
+
 TEST_CASE("result poll: an Unknown Forensics decision ends a Forensics poll with a retry notice, never a "
           "timeout or rows; an ordinary plugin's poll does not depend on it",
           "[pg][hardware][route][security][forensics]") {
