@@ -3510,8 +3510,10 @@ resulting latency bounds.
   authoring surface that makes `RbacStore::assign_role(principal_type="engine")`
   reachable in production — see `docs/user-manual/rest-api.md` "Engine
   Principals" for the full contract. Mutations require admin + MFA step-up;
-  admin/built-in/wildcard role targets are rejected as `4xx`, never silently
-  narrowed or a `500` (design §4.2 "no admin, ever").
+  the `admin`/`Administrator` roles and every built-in role are rejected as `4xx`,
+  never silently narrowed or a `500` (design §4.2 "no admin, ever"). A custom role
+  whose grants cover everything is not rejected at assignment; the no-admin audit
+  route reports it afterwards.
 - Authorization model: scoped role assignments `(principal, role, scope)`
   for **all** principal classes, evaluated permissions ∩ scope through
   ADR-0017's `authorize_list_read` chokepoint for list/fan-out reads and

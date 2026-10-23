@@ -250,8 +250,9 @@ unchanged. Evidence for this entry is the governance ledger for #3526.
 
 **Addendum — machine-identity resource-bounding (CC6.6, PR 4.4).** Engine
 principals (ADR-1005 class) are already least-privilege by construction —
-default-deny RBAC resolution, structurally barred from admin/built-in/
-wildcard roles (see the `engine_principal_store.*` row in `CLAUDE.md`) — and
+default-deny RBAC resolution, barred from the admin and built-in roles at assignment, with a
+no-admin audit route that reports any wildcard grant afterwards (see the
+`engine_principal_store.*` row in `CLAUDE.md`) — and
 PR 4.4 adds the complementary resource-bounding control: a per-principal
 in-flight concurrency cap and request-rate cap enforced at the server's
 single pre-routing chokepoint, so a compromised or malfunctioning engine
