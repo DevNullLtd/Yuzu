@@ -256,12 +256,17 @@ permission (maintainer ruling 2026-10-23, #2485): that case is detected
 afterwards by the no-admin audit route, which is a pull-only, point-in-time
 check. `ok:true` means no role held by an engine principal covers the whole
 permission grid at the time of the run; a role granting all but one pair is not
-reported, and nothing schedules or alerts on the check. The cadence is the
-operator's, and the `engine_principal.audit.no_admin` run rows (which name up to
-ten detected principals) are the evidence the control operated. A machine-identity
+reported, and nothing schedules or alerts on the check. It evaluates three
+separate reads (grants, roles, role permissions), not one snapshot. The cadence is
+the operator's, and the `engine_principal.audit.no_admin` run rows (`violations=N
+scope=all|active`, then up to ten detected principals) are the evidence the
+control operated. A dropped success-row write is signalled only by
+`Sec-Audit-Failed` on REST (the MCP tool gives no signal), and the Tokens page
+runs the check on every load, so a period with no rows is evidence the check did
+not run only where those writes are monitored. A machine-identity
 access review must therefore include the engine grants and a no-admin run. The
 route and its MCP twin fail closed when a read cannot be answered, so a degraded
-store is never reported as clean. Risk register: a custom wildcard role on a
+store is never reported as clean. Risk to be recorded in the risk register: a custom wildcard role on a
 machine identity is detected, not prevented, with pull-only detection. See the
 engine-principal routed-concern row in `.claude/routed-concerns-access-control.md`.
 PR 4.4 adds the complementary resource-bounding control: a per-principal

@@ -294,7 +294,7 @@ until real data says otherwise.)
   (not merely omit in UI) granting an engine principal the `admin` /
   `Administrator` role names, any built-in (`is_system`) role, or elevation
   eligibility. The ServiceNow-integration admin-token pattern must be
-  unconstructable through any surface. **Amended by Decision 15:** a custom
+  unconstructable through any surface. **Amended by design doc decision log #15:** a custom
   role whose permissions cover the whole grid is NOT rejected at assignment; it
   is detected afterwards by the fail-closed no-admin auditor.
 - **No "all permissions" toggle** exists for engine principals on any
@@ -312,7 +312,7 @@ until real data says otherwise.)
   against resolved role permissions and listing admin/system/wildcard grants —
   must exist as an independent check, the same way the sampled-auth-log
   export independently evidences auth-surface behavior rather than asking
-  an auditor to trust the login code. Since Decision 15 it is also the ONLY
+  an auditor to trust the login code. Since design doc decision log #15 it is also the ONLY
   control over a wildcard custom role, so it fails closed: a read it cannot
   answer is a `503`, never `ok:true`. `ok:true` means no role (and no
   principal's union of roles) covers the whole grid at run time; it is
@@ -880,7 +880,7 @@ ladder sequencing + #1715 deny-precedence decision (maintainer).
     itself audited and metered when exercised.
 13. "No admin, ever" and "no all-permissions toggle" get a named
     auditor-runnable verification query (PR 4.3/4.4), not just trust in
-    the write path. Scoped by Decision 15: the query is auditor-runnable
+    the write path. Scoped by design doc decision log #15: the query is auditor-runnable
     and detective for a custom wildcard role; assignment itself only bars
     the admin names and built-in roles.
 14. Compliance/enterprise hand-offs named explicitly rather than left

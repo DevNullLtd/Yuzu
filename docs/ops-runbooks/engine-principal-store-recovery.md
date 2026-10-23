@@ -285,13 +285,30 @@ the same server replica) to receive the same secret. After a restart, on a
 different replica, or once the window ends, the retry is `409` and the pair is
 stuck with a successor whose secret nobody has.
 
-Recover by revoking the **successor** (`GET /api/v1/tokens` lists the principal's
-credentials; the successor is the active one whose `supersedes_token_id` is set
-and whose `overlap_expires_at` is `0`), then rotate again. Alternatively rotate
-from the sole remaining credential. Do **not** revoke only the predecessor: that
-leaves the principal holding one credential whose secret no one has. A `partial`
-row on `engine_principal.credential.mint` means the credential exists but its
-secret was never shown; rotate it (a second mint is `409`).
+Recover in three steps:
+
+1. Find the successor with `GET /api/v1/engine-principals/{id}`. In its
+   `active_credentials` list a stuck pair is two credentials sharing a
+   `rotation_group`; the successor is the one whose `overlap_expires_at` is `0`
+   while the predecessor's is non-zero. That read is fail-soft, so an empty list
+   during an incident is not authoritative: repeat it once the store is healthy.
+   (`GET /api/v1/tokens` is scoped to the caller's own tokens and does not list
+   an engine credential.)
+2. Revoke the successor with `DELETE /api/v1/tokens/{token_id}`. REST only: the
+   MCP tools have no per-credential revoke. It needs `ApiToken:Delete`, a fresh
+   MFA step-up and an effective administrator (the token's owner is the engine
+   principal, so anyone else gets `404 token not found`).
+3. Rotate again. With the successor gone the predecessor is the sole credential.
+
+Do **not** revoke only the predecessor: that leaves the principal holding one
+credential whose secret no one has. Do **not** revoke the principal itself as a
+recovery step; that is terminal. A `partial` row on
+`engine_principal.credential.mint` means the credential exists but its secret
+was never shown (or, when the read-back found no active row, that it may already
+be gone); list the principal's credentials and rotate if one is listed (a second
+mint is `409`). A `partial` row on `engine_principal.credential.rotate` whose
+detail says no active credential links to a predecessor carries no retry hint:
+inspect first, then rotate again if needed.
 
 ## Cross-references
 

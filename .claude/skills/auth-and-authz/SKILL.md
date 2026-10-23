@@ -741,7 +741,7 @@ duplicate `10`; the one live cross-reference to the old numbering
       advertisement. (The overstated `dangerous`-class-gate wording lives in
       `.claude/routed-concerns-access-control.md` — the engine-principal row,
       not `routed-concerns.md`. Resolved 2026-10-23 (#2485): the row, the user
-      manual, the SOC 2 addendum and the design doc (Decision 15) now state
+      manual, the SOC 2 addendum and the design doc (decision log #15) now state
       "permitted, detected afterwards by the fail-closed no-admin auditor".)
 
     **Remaining: Phase 5 (delegation).** RFC 8693 token exchange and

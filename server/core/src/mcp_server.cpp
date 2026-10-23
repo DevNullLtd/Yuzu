@@ -2502,7 +2502,7 @@ static const ToolDef kTools[] = {
     // durable identity behind an autonomous use-case-engine module —
     // hard-locked to MCP tier readonly (§8), never grantable the admin/
     // Administrator role names or a built-in role (§4.2; a custom full-grid
-    // role is permitted and detected afterwards, design Decision 15), and
+    // role is permitted and detected afterwards, design doc decision log #15), and
     // structurally barred from
     // acting as caller of its OWN lifecycle surface (§9). Mutating tools
     // require Security:Write — supervised MCP tier, approval-gated,
@@ -2575,7 +2575,11 @@ static const ToolDef kTools[] = {
      "this response; it cannot be retrieved again, only rotated or revoked. Use "
      "rotate_engine_credential once a credential already exists — this tool is for the initial "
      "mint only (a second call errors: at most two active credentials, and only "
-     "rotate_engine_credential drives that state machine). Mirrors POST "
+     "rotate_engine_credential drives that state machine). If the pre-mint check cannot read the "
+     "store it returns a retryable error (retry_after_ms) and mints nothing; if the credential "
+     "was minted but cannot be read back, or the read-back finds none, the secret is withheld "
+     "(no retry hint): do not retry the mint, list the principal's credentials and rotate if one "
+     "is listed. Mirrors POST "
      "/api/v1/engine-principals/{id}/credentials. Approval-gated — requires Security:Write (live "
      "credential issuance; supervised MCP tier; maker-checker approval). Additive: issues the "
      "first credential, overwrites nothing.",
@@ -2593,8 +2597,11 @@ static const ToolDef kTools[] = {
      "generally idempotent: a re-call within a short grace window after the original mint "
      "re-serves the SAME successor secret (each reveal — original or replay — is independently "
      "audited as engine_principal.credential.reveal); once the grace window lapses, a re-call "
-     "errors and the caller must fall back to an explicit re-mint or the principal-level revoke "
-     "compromise runbook — never an indefinite retry. Mirrors POST "
+     "errors and the caller must recover over REST (find the stuck successor with GET "
+     "/api/v1/engine-principals/{id}, revoke it with DELETE /api/v1/tokens/{token_id} as an "
+     "administrator, then rotate again), never an indefinite retry, and never revoke the "
+     "principal, which is terminal. If the read-back answers but finds no linked successor, the "
+     "secret is withheld with NO retry hint: inspect the principal's credentials first. Mirrors POST "
      "/api/v1/engine-principals/{id}/credentials/rotate. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
