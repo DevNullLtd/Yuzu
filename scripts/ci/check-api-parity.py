@@ -140,6 +140,11 @@ WHAT IT CHECKS
      named, with its exact gates and a reason, in GATE_PARITY_KNOWN_MISMATCHES (same pin and
      shrink-only rules; a stale or reshaped entry fails). A lexical gate drops an entry only
      when the handler text proves the two sides agree; what it cannot prove stays listed.
+     PRIMARY HANDLER PAIR RULE (HANDLER_PAIR_RULE, on): a derived MCP handler's gate call for a
+     (securable, operation) other than the tool's declared pair, not spent matching a further REST
+     gate, is a finding of its own, so the declared kToolSecurityRows pair cannot drift from what
+     the handler asks. It compares literal arguments of gate calls in the whole handler body (the
+     lexical limit below applies) and a handler whose body cannot be derived is not held to it.
      LIMITS: it compares LABELS and call sites, not effect (the REST kind is the
      management-group axis, the MCP label the service-scope axis, so a matching or mismatching
      label proves neither); a conditional or helper-lambda call that comes first is read as
@@ -162,8 +167,10 @@ WHAT IT CHECKS
   7. REGISTRY TEST EXISTENCE. Every registry tool's domain test file
      tests/unit/server/test_mcp_tools_<domain>.cpp must exist, be registered in
      tests/meson.build (outside a `#` comment), hold a TEST_CASE that both names the tool
-     in a string literal and calls `schema_violation(`, and a TEST_CASE that both names it
-     and has a CHECK/REQUIRE that mentions an audit row. Two shapes are accepted: the schema
+     in a string literal and calls `schema_violation(` (a call-shaped token outside any string or
+     character literal), and a TEST_CASE that both names it and has a CHECK/REQUIRE that mentions an
+     audit row and does not assert an absence (not CHECK_FALSE / a leading `!`, no `.empty()`, no
+     comparison with zero). Two shapes are accepted: the schema
      pair and the audit pair may sit in different TEST_CASEs (schema conformance and audit are
      normally separate tests), and one TEST_CASE may satisfy several tools. A table-driven test
      whose tool names sit outside any TEST_CASE body (a file-scope list the cases loop over) is
@@ -1882,6 +1889,29 @@ def blank_cpp_comments(text):
     return "".join(parts)
 
 
+def blank_cpp_literals(text):
+    """`text` (comment-blanked) with the whole of every string, raw-string and character literal,
+    quotes included, replaced by spaces (newlines kept, so offsets survive). What is left is the
+    code outside literals: a token that must be a CALL is looked for here, so a name written
+    inside a string (`"schema_violation("`) is not one."""
+    parts = []
+    last = i = 0
+    while True:
+        m = _CPP_SCAN.search(text, i)
+        if not m:
+            break
+        i = m.start()
+        lit = _cpp_literal_end(text, i)
+        if lit is None:
+            i += 1
+            continue
+        parts.append(text[last:i])
+        parts.append(re.sub(r"[^\n]", " ", text[i:lit]))
+        last = i = lit
+    parts.append(text[last:])
+    return "".join(parts)
+
+
 _BRACKET_SCAN = re.compile(r"""[()\[\]{}"'R]""")
 
 
@@ -1946,6 +1976,9 @@ def first_gate(span_text):
 # reached by non-service-scoped callers only: the route's kind is `refused`, not `plain`.
 _REFUSAL_CALL = re.compile(r"(?<![\w.>])(?:deny_fleet_wide_service_scoped|deny_service_scoped_schedule_list)\s*\(")
 _IF_OPENER = re.compile(r"\bif\s*\(\s*$")
+# An `if` whose text just before it ends in `else` is an `else if`: its refusal runs only when the
+# earlier branch was not taken, so it is not unconditional.
+_ELSE_BEFORE = re.compile(r"\belse\s*$")
 _STATEMENT_RETURN = re.compile(r"(?:^|[;{}])\s*return\b")
 # REST gate kinds that confine (or refuse) a service-scoped or management-group caller; `plain`
 # is the only kind that does not.
@@ -2003,12 +2036,15 @@ def unconditional_refusals(span_text):
     a service-scoped caller before anything after them runs: the call is the whole condition of
     an `if` that sits directly in the handler body (brace depth 1, not inside a branch or a
     nested lambda), and the `if` returns (`return;` itself, or a braced block with a
-    top-level `return` statement). `if (!helper(...))`, `a && helper(...)`, a call that is not
+    top-level `return` statement). `if (!helper(...))`, `a && helper(...)`, an `else if`, a call that is not
     in an `if`, one behind another branch, or one whose branch does not return, are NOT
     recognised, so the route keeps its `plain` kind (fail closed). `span_text` is comment-blanked."""
     found = []
     for m in _REFUSAL_CALL.finditer(span_text):
-        if not _IF_OPENER.search(span_text[:m.start()]):
+        opener = _IF_OPENER.search(span_text[:m.start()])
+        if not opener:
+            continue
+        if _ELSE_BEFORE.search(span_text[:opener.start()]):
             continue
         if _brace_depth_before(span_text, m.start()) != 1:
             continue
@@ -2256,6 +2292,13 @@ def extract_mcp_handlers(by_tool, registry, tools):
 # read proves it confines. The comparison is the securable, the operation, and the confinement
 # side (see _gate_agrees); every further REST gate call must agree too or be matched, one-to-one, by a
 # gate call the MCP handler makes.
+# HANDLER_PAIR_RULE: when True (the shipped setting), check 6 also holds a derived MCP handler's own
+# gate calls to the tool's declared pair (see gate_parity_findings): a gate call for another pair
+# that no further REST gate consumed is a finding. Measured when it was added: it flips no row that
+# agreed, and it re-describes three pinned GATE_PARITY_KNOWN_MISMATCHES entries (discover_permissions
+# x2, create_result_set), whose extra handler gate their reasons already explain. The switch exists so
+# the selftest can exercise both settings; do not turn it off to unblock a twin.
+HANDLER_PAIR_RULE = True
 GATE_PARITY_KNOWN_MISMATCHES_MAX = 6
 GATE_PARITY_KNOWN_MISMATCHES = {
     ("GET", "/api/v1/dex/perf/devices", "list_dex_perf_devices"): (
@@ -2271,17 +2314,20 @@ GATE_PARITY_KNOWN_MISMATCHES = {
         "REST requires Inventory:Read, the MCP tool Infrastructure:Read; the MCP gate "
         "alignment is tracked by #6329"),
     ("GET", "/api/v1/rbac/roles", "discover_permissions"): (
-        "plain:UserManagement:Read", "denied:Infrastructure:Read",
+        "plain:UserManagement:Read",
+        "denied:Infrastructure:Read; handler also gates on plain:UserManagement:Read",
         "the tool serves the taxonomy at Infrastructure:Read and gates the role-to-permission "
         "grid in-handler on UserManagement:Read (declared via roles_omitted); this route is the "
         "grid half, so the tier row and the REST gate name different securables by design"),
     ("GET", "/api/v1/rbac/roles/{param}/permissions", "discover_permissions"): (
-        "plain:UserManagement:Read", "denied:Infrastructure:Read",
+        "plain:UserManagement:Read",
+        "denied:Infrastructure:Read; handler also gates on plain:UserManagement:Read",
         "the tool serves the taxonomy at Infrastructure:Read and gates the role-to-permission "
         "grid in-handler on UserManagement:Read (declared via roles_omitted); this route is the "
         "grid half, so the tier row and the REST gate name different securables by design"),
     ("POST", "/api/v1/result-sets", "create_result_set"): (
-        "fleet:Infrastructure:Read", "denied:Infrastructure:Write",
+        "fleet:Infrastructure:Read",
+        "denied:Infrastructure:Write; handler also gates on fleet:Infrastructure:Read",
         "The REST handler's Infrastructure:Write check is a tier_ok() call this script does "
         "not read; the one gate call it does read is a later conditional fleet read (a "
         "device-existence read), so the operation difference is a limit of the lexical read. "
@@ -2334,7 +2380,30 @@ TEST_EXISTENCE_ALLOWED = {
         "test_mcp_tools_hardware.cpp)"),
 }
 
-_AUDIT_ASSERT = re.compile(r"\b(?:CHECK|REQUIRE)\w*\s*\([^;]*audit", re.IGNORECASE)
+_ASSERT_MACRO = re.compile(r"\b(CHECK|REQUIRE)\w*\s*\(")
+_SCHEMA_CALL = re.compile(r"(?<![\w])schema_violation\s*\(")
+# An assertion that something is ABSENT: no audit row, an empty audit log, a zero count.
+_NEGATIVE_ASSERT = re.compile(r"\.empty\s*\(\s*\)|(?:==\s*0u?|<\s*1|<=\s*0)\b|\b0u?\s*==")
+
+
+def has_audit_assertion(block):
+    """True when a test-case block (comment-blanked, literals intact) holds a CHECK/REQUIRE whose
+    arguments mention `audit` (an identifier, or a key such as "audit_persisted") and do not
+    assert an absence: not a `*_FALSE` macro, not a leading `!`, no `.empty()` and no comparison
+    with zero, read with literals blanked so a quoted `"== 0"` is not one. A test that only shows
+    no audit row was written (a refused call, an unwired sink) does not assert the row the tool
+    writes. A literal that merely contains the word still counts: the real tests assert the
+    persisted-flag key by name, so this is a tripwire on shape, not a proof."""
+    for m in _ASSERT_MACRO.finditer(block):
+        open_i = m.end() - 1
+        args = block[open_i + 1:_balanced_end(block, open_i) - 1]
+        code = blank_cpp_literals(args)
+        if m.group(0).split("(")[0].rstrip().endswith("_FALSE"):
+            continue
+        if "audit" not in args.lower() or code.lstrip().startswith("!") or _NEGATIVE_ASSERT.search(code):
+            continue
+        return True
+    return False
 
 
 def _gate_desc(kind, securable, operation):
@@ -2425,14 +2494,20 @@ def gate_parity_findings(ledger_rows, mcp_tools, rest_gates, mcp_security, mcp_e
             # The first gate is held to the label (or the proven effect); a handler's own gate
             # calls match only the further gates, never the first.
             tool_gates = collections.Counter(mcp_gates.get(tool, ()))
-            if (_gate_agrees(primary, mcp_class, (mcp[0], mcp[1]), mcp_proof=tool_proof)
-                    and all(_gate_agrees(g, mcp_class, (mcp[0], mcp[1]), tool_gates, tool_proof)
-                            for g in extras)):
+            agrees = (_gate_agrees(primary, mcp_class, (mcp[0], mcp[1]), mcp_proof=tool_proof)
+                      and all(_gate_agrees(g, mcp_class, (mcp[0], mcp[1]), tool_gates, tool_proof)
+                              for g in extras))
+            # Independent of the REST comparison: a derived handler's gate call for a pair other than
+            # the tool's declared one, not spent matching a further REST gate above, is a finding.
+            foreign = ([t for t in sorted(tool_gates.elements()) if t[1:] != (mcp[0], mcp[1])]
+                       if HANDLER_PAIR_RULE and tool in mcp_gates else [])
+            if agrees and not foreign:
                 continue
             rest_desc = _gate_desc(*primary)
             if extras:
                 rest_desc += "; also " + ", ".join(_gate_desc(*e) for e in extras)
-            mismatches[key] = (rest_desc, mcp_desc)
+            mismatches[key] = (rest_desc, mcp_desc + "".join(f"; handler also gates on {_gate_desc(*t)}"
+                                                             for t in foreign))
     return mismatches, no_gates, errors
 
 
@@ -2545,11 +2620,11 @@ def registry_tests_findings(registry, tests_dir, meson_text):
         if not named:
             defects.append(f"no TEST_CASE in {path.name} names \"{tool}\"")
         else:
-            if not any("schema_violation(" in b for b in named):
+            if not any(_SCHEMA_CALL.search(blank_cpp_literals(b)) for b in named):
                 defects.append(f"no TEST_CASE in {path.name} both names \"{tool}\" and calls schema_violation(")
-            if not any(_AUDIT_ASSERT.search(b) for b in named):
+            if not any(has_audit_assertion(b) for b in named):
                 defects.append(f"no TEST_CASE in {path.name} both names \"{tool}\" and has a CHECK/REQUIRE "
-                               f"that mentions an audit row")
+                               f"that asserts an audit row (not an absence of one)")
         if defects:
             found[tool] = defects
     return found
@@ -2845,6 +2920,12 @@ def _selftest_body():
             yield
         finally:
             g.update(saved)
+
+    def _gpf_norule(*args, **kw):
+        """gate_parity_findings with the handler pair rule off: the fixtures that test the REST-side
+        matching give the MCP handler gate calls for pairs other than the declared one on purpose."""
+        with _patched(HANDLER_PAIR_RULE=False):
+            return gate_parity_findings(*args, **kw)
 
     # -- parse_literal_at: the two literal forms it must recognise --------
     lit, end = parse_literal_at('"/api/v1/foo"', 0)
@@ -3644,6 +3725,11 @@ def _selftest_body():
             ("refusal-negated", f"if (!{deny}) return;\n{gate}", ("plain", "Sec", "Read")),
             ("refusal-compound-condition", f"if (x && {deny}) return;\n{gate}", ("plain", "Sec", "Read")),
             ("refusal-not-an-if", f"auto r = {deny};\n{gate}", ("plain", "Sec", "Read")),
+            ("refusal-else-if", f"if (x) {{ touch(); }} else if ({deny}) return;\n{gate}", ("plain", "Sec", "Read")),
+            ("refusal-else-if-line-break", f"if (x) touch();\nelse\n  if ({deny}) {{ return; }}\n{gate}",
+             ("plain", "Sec", "Read")),
+            ("refusal-after-else-block", f"if (x) {{ touch(); }} else {{ touch(); }}\nif ({deny}) return;\n{gate}",
+             ("refused", "Sec", "Read")),
             ("refusal-behind-branch", f"if (x) {{ if ({deny}) return; }}\n{gate}", ("plain", "Sec", "Read")),
             ("refusal-in-nested-lambda", f"auto f = [&] {{ if ({deny}) return; }};\n{gate}", ("plain", "Sec", "Read")),
             ("other-deny-helper", f'if (deny_service_scoped_tag_mutation_fn(q, p)) return;\n{gate}', ("plain", "Sec", "Read")),
@@ -3853,7 +3939,7 @@ def _selftest_body():
                       "refused_confine_proof": frozenset({"confine"}),
                       "refused_denied_noproof": frozenset(), "refused_confined_noproof": frozenset(),
                       "refused_effect": frozenset({"confine"})}
-    m1, n1, e1 = gate_parity_findings(rows_, tools_, rest_, sec_, handler_effects, handler_gates, handler_proofs)
+    m1, n1, e1 = _gpf_norule(rows_, tools_, rest_, sec_, handler_effects, handler_gates, handler_proofs)
     check(not n1 and not e1, f"gate parity (further gates): no gap or error expected, got {n1} {e1}")
     check(set(t for _m, _p, t in m1) == {"extra_kind", "extra_bad", "extra_unread", "extra_only_first_gate",
                                          "extra_dup_one_call", "extra_dup_set",
@@ -3891,7 +3977,7 @@ def _selftest_body():
                 ("GET", "/fragments/r2"): _gp_row("t_two", path="/api/v1/r2")}
     two_rest = {("GET", "/api/v1/r1"): [("a.cpp", ("plain", *S, (("plain", "Tee", "Read"),)))],
                 ("GET", "/api/v1/r2"): [("a.cpp", ("plain", *S, (("plain", "Tee", "Read"),)))]}
-    mt, nt, et = gate_parity_findings(two_rows, {"t_two"}, two_rest, {"t_two": (*S, "denied")}, {},
+    mt, nt, et = _gpf_norule(two_rows, {"t_two"}, two_rest, {"t_two": (*S, "denied")}, {},
                                       {"t_two": collections.Counter({("plain", "Tee", "Read"): 1})}, {})
     check(not mt and not nt and not et,
           f"gate parity (one-to-one): the MCP call counts are copied per row, not shared across rows, got {mt} {nt} {et}")
@@ -3900,10 +3986,43 @@ def _selftest_body():
     own_rows = {("GET", "/fragments/o"): _gp_row("t_own", path="/api/v1/o")}
     own_gate = ("plain", *S, (("plain", "Tee", "Read"),))
     own_rest = {("GET", "/api/v1/o"): [("a.cpp", own_gate), ("b.cpp", own_gate)]}
-    mo, no_, eo = gate_parity_findings(own_rows, {"t_own"}, own_rest, {"t_own": (*S, "denied")}, {},
+    mo, no_, eo = _gpf_norule(own_rows, {"t_own"}, own_rest, {"t_own": (*S, "denied")}, {},
                                        {"t_own": collections.Counter({("plain", "Tee", "Read"): 1})}, {})
     check(not mo and not no_ and not eo,
           f"gate parity (one-to-one): the MCP call counts are copied per owner entry of one route, got {mo} {no_} {eo}")
+    # ... and the handler primary pair rule (HANDLER_PAIR_RULE): a derived handler's gate call for a pair other
+    # than the tool's declared one, not spent matching a further REST gate, is a mismatch.
+    hp_rows = {("GET", "/fragments/hp"): _gp_row("t_hp", path="/api/v1/hp")}
+    hp_tools, hp_sec = {"t_hp"}, {"t_hp": (*S, "denied")}
+    foreign = ("plain", "Foo", "Write")
+
+    def _hp(rest_gate, handler_gates, label="denied", derived=True, on=True):
+        sec = {"t_hp": (*S, label)}
+        gates = {"t_hp": collections.Counter(handler_gates)} if derived else {}
+        with _patched(HANDLER_PAIR_RULE=on):
+            return gate_parity_findings(hp_rows, hp_tools, {("GET", "/api/v1/hp"): [("a.cpp", rest_gate)]}, sec,
+                                        {}, gates, {})
+    mh, nh, eh = _hp(("plain", *S), {foreign: 1})
+    check(mh == {("GET", "/api/v1/hp", "t_hp"): ("plain:Sec:Read", "denied:Sec:Read; handler also gates on plain:Foo:Write")}
+          and not nh and not eh,
+          f"gate parity (handler pair): a leftover foreign-pair handler gate is a mismatch that names it, got {mh}")
+    check(_hp(("plain", *S, (foreign,)), {foreign: 1})[0] == {},
+          "gate parity (handler pair): a foreign handler gate consumed by a further REST gate agrees")
+    check(_hp(("plain", *S, (foreign,)), {foreign: 2})[0] != {},
+          "gate parity (handler pair): a second foreign handler call beyond the REST further gates is left over")
+    check(_hp(("plain", *S), {("plain", *S): 1, ("scoped", *S): 1})[0] == {},
+          "gate parity (handler pair): handler gates on the tool's own pair (any kind) agree")
+    check(_hp(("plain", *S), {foreign: 1}, derived=False)[0] == {},
+          "gate parity (handler pair): a body that was not derived has no effect")
+    check(_hp(("plain", *S), {foreign: 1}, on=False)[0] == {},
+          "gate parity (handler pair): the rule does nothing while HANDLER_PAIR_RULE is False")
+    hp_gs = {"t_hp": ("GuaranteedState", "Read", "confined")}
+    with _patched(HANDLER_PAIR_RULE=True):
+        mg, _ng, _eg = gate_parity_findings(hp_rows, hp_tools, {("GET", "/api/v1/hp"): [("a.cpp", ("scoped", "GuaranteedState", "Read"))]},
+                                            hp_gs, {}, {"t_hp": collections.Counter({("scoped", "Infrastructure", "Read"): 1})}, {})
+    check(mg == {("GET", "/api/v1/hp", "t_hp"): ("scoped:GuaranteedState:Read",
+                                                 "confined:GuaranteedState:Read; handler also gates on scoped:Infrastructure:Read")},
+          f"gate parity (handler pair): REST and declared pairs equal but the handler gates elsewhere is a mismatch, got {mg}")
     check(m1[("GET", "/api/v1/extra_bad", "extra_bad")] == ("plain:Sec:Read; also plain:Zed:Read", "denied:Sec:Read"),
           f"gate parity (further gates): the description names every further gate, got {m1[('GET', '/api/v1/extra_bad', 'extra_bad')]}")
     check(m1[("GET", "/api/v1/extra_unread", "extra_unread")][0] == "plain:Sec:Read; also unparsed:perm_fn:?",
@@ -3941,6 +4060,7 @@ def _selftest_body():
             'if (tool_name == "t_ref") {\n  if (deny_fleet_wide_service_scoped(req, res)) return;\n  noop();\n}\n'
             'if (tool_name == "t_ref_nested") {\n  if (flag) {\n    if (deny_fleet_wide_service_scoped(req, res)) return;\n  }\n}\n'
             'if (tool_name == "t_ref_noreturn") {\n  if (deny_fleet_wide_service_scoped(req, res)) { log(); }\n}\n'
+            'if (tool_name == "t_ref_elseif") {\n  if (x) { touch(); } else if (deny_fleet_wide_service_scoped(req, res)) return;\n  noop();\n}\n'
             'if (tool_name == "t_bare") { noop(); }\n'
             'if (tool_name == "t_dup") { perm_fn(req, res, "Tee", "Read"); if (x) perm_fn(req, res, "Tee", "Read"); }\n'
             '}\n', encoding="utf-8")
@@ -3956,7 +4076,7 @@ def _selftest_body():
             '};\n}\n', encoding="utf-8")
         h_by_tool = {t: ("Sec", "Read", "denied") for t in (
             "t_fleet", "t_list", "t_wrong", "t_mixed", "t_twice", "t_comment", "t_plain", "t_unread", "t_or",
-            "reg_t", "reg_n", "t_missing", "t_ref", "t_ref_nested", "t_ref_noreturn", "t_bare", "t_dup")}
+            "reg_t", "reg_n", "t_missing", "t_ref", "t_ref_elseif", "t_ref_nested", "t_ref_noreturn", "t_bare", "t_dup")}
         h_by_tool["t_conf"] = ("Sec", "Read", "confined")
         h_registry = {"reg_t": "mcp_tools_one.cpp", "reg_n": "mcp_tools_one.cpp"}
         with _patched(MCP_SERVER_CPP=hcpp, MCP_REGISTRY_DIR=hreg):
@@ -3975,7 +4095,7 @@ def _selftest_body():
               f"extract_mcp_handlers: the handler's gate calls are collected for a single body only, got {gts}")
         check(prfs.get("t_ref") == frozenset({"refusal"}) and prfs.get("t_fleet") == frozenset({"confine"})
               and prfs.get("t_conf") == frozenset({"confine"}) and prfs.get("reg_t") == frozenset({"confine"})
-              and prfs.get("t_ref_nested") == frozenset() and prfs.get("t_ref_noreturn") == frozenset()
+              and prfs.get("t_ref_elseif") == frozenset() and prfs.get("t_ref_nested") == frozenset() and prfs.get("t_ref_noreturn") == frozenset()
               and prfs.get("t_bare") == frozenset() and prfs.get("t_wrong") == frozenset()
               and "t_twice" not in prfs and "t_or" not in prfs and "t_missing" not in prfs,
               f"extract_mcp_handlers: evidence is a top-level returning refusal call or a confinement call "
@@ -4057,6 +4177,67 @@ def _selftest_body():
                   f"registry tests: an entry whose finding is gone is stale, got {e}")
         with _patched(TEST_EXISTENCE_ALLOWED={"tool_y": "r"}, TEST_EXISTENCE_ALLOWED_MAX=0):
             check(any("grew" in x for x in registry_tests_errors(found)), "registry tests: an oversized allowlist is reported")
+
+    # -- check 7 bait: a name inside a literal is not a call, a negative assertion is not an audit row ----
+    for label, block, want in (
+            ("identifier-compare", 'TEST_CASE("t") { CHECK(h.audit_log.size() == 1); }', True),
+            ("row-equality", 'TEST_CASE("t") { CHECK(h.audit_log == std::vector<std::string>{"mcp.t|failure"}); }', True),
+            ("flag-key-true-arm", 'TEST_CASE("t") { CHECK(sc["audit_persisted"] == false); }', True),
+            ("require-form", 'TEST_CASE("t") { REQUIRE(audit_rows(h) == 2u); }', True),
+            ("check-false", 'TEST_CASE("t") { CHECK_FALSE(r.contains("audit_persisted")); }', False),
+            ("require-false", 'TEST_CASE("t") { REQUIRE_FALSE(audit_ok); }', False),
+            ("empty", 'TEST_CASE("t") { std::vector<int> audit; CHECK(audit.empty()); }', False),
+            ("size-zero", 'TEST_CASE("t") { CHECK(audit.size() == 0); }', False),
+            ("zero-first", 'TEST_CASE("t") { CHECK(0u == audit.size()); }', False),
+            ("count-zero-helper", 'TEST_CASE("t") { CHECK(h.tool_audit_rows() == 0); }', False),
+            ("negated", 'TEST_CASE("t") { CHECK(!audit_written); }', False),
+            ("no-audit-word", 'TEST_CASE("t") { CHECK(rows.size() == 1); }', False),
+            ("only-in-a-bare-statement", 'TEST_CASE("t") { audit_log.push_back("x"); }', False),
+            ("negative-then-positive", 'TEST_CASE("t") { CHECK(audit.empty()); CHECK(audit_log.size() == 1); }', True)):
+        check(has_audit_assertion(block) is want, f"has_audit_assertion({label}): want {want}")
+    lit_src = 'f("a(", \'b\', R"x(c)x", g(1))'
+    lit_out = blank_cpp_literals(lit_src)
+    check(len(lit_out) == len(lit_src) and lit_out.replace(" ", "") == "f(,,,g(1))" and "a(" not in lit_out,
+          f"blank_cpp_literals: strings, chars and raw strings are blanked in place, got {lit_out!r}")
+    bait_meson = "tests = [\n" + "".join(f"  'unit/server/test_mcp_tools_{n}.cpp',\n" for n in (
+        "bs", "ba", "ne", "nz", "nc", "mid", "okk")) + "]\n"
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as td:
+        tdir = Path(td)
+        for fname, body in (
+                # the call is only a string literal
+                ("bs", 'TEST_CASE("t") { call("tool_bs"); CHECK("schema_violation(" != nullptr); CHECK(audit_log.size() == 1); }\n'),
+                # the call is a longer name, and a bare mention without a call
+                ("ba", 'TEST_CASE("t") { call("tool_ba"); CHECK(my_schema_violation(s, v) == ""); CHECK(audit_log.size() == 1); }\n'
+                       'TEST_CASE("u") { call("tool_ba2"); auto f = schema_violation; CHECK(audit_log.size() == 1); }\n'),
+                # the only audit mention is an empty-ness assertion
+                ("ne", 'TEST_CASE("t") { call("tool_ne"); CHECK(schema_violation(s, v) == "");\n'
+                       '  std::vector<int> audit; CHECK(audit.empty()); }\n'),
+                ("nz", 'TEST_CASE("t") { call("tool_nz"); CHECK(schema_violation(s, v) == "");\n'
+                       '  CHECK(audit.size() == 0); CHECK_FALSE(r.contains("audit_persisted")); CHECK(!audit_ok); }\n'),
+                # a negative AND a positive assertion: the positive one counts
+                ("mid", 'TEST_CASE("t") { call("tool_mid"); CHECK(schema_violation(s, v) == "");\n'
+                        '  CHECK(audit.empty()); CHECK(audit_log.size() == 1); }\n'),
+                ("okk", good_test.replace("tool_x", "tool_ok"))):
+            (tdir / f"test_mcp_tools_{fname}.cpp").write_text(body, encoding="utf-8")
+        (tdir / "test_mcp_tools_nc.cpp").write_text(
+            'TEST_CASE("t") { call("tool_nc"); CHECK(schema_violation(s, v) == ""); CHECK(audit_log.size() == 1); }\n',
+            encoding="utf-8")
+        bait_reg = {"tool_bs": "mcp_tools_bs.cpp", "tool_ba": "mcp_tools_ba.cpp", "tool_ba2": "mcp_tools_ba.cpp",
+                    "tool_ne": "mcp_tools_ne.cpp", "tool_nz": "mcp_tools_nz.cpp", "tool_mid": "mcp_tools_mid.cpp",
+                    "tool_ok": "mcp_tools_okk.cpp", "tool_nc": "mcp_tools_nc.cpp"}
+        bait = registry_tests_findings(bait_reg, tdir, bait_meson)
+        check(set(bait) == {"tool_bs", "tool_ba", "tool_ba2", "tool_ne", "tool_nz"},
+              f"registry tests (bait): only the bait shapes are found, got {sorted(bait)}")
+        def bg(tool):
+            return bait.get(tool) or [""]
+        check(len(bg("tool_bs")) == 1 and "schema_violation(" in bg("tool_bs")[0],
+              f"registry tests (bait): schema_violation( inside a string literal is not a call, got {bg('tool_bs')}")
+        check(len(bg("tool_ba")) == 1 and "schema_violation(" in bg("tool_ba")[0]
+              and len(bg("tool_ba2")) == 1 and "schema_violation(" in bg("tool_ba2")[0],
+              f"registry tests (bait): a longer name or a bare mention is not a call, got {bg('tool_ba')} {bg('tool_ba2')}")
+        check(len(bg("tool_ne")) == 1 and "audit" in bg("tool_ne")[0]
+              and len(bg("tool_nz")) == 1 and "audit" in bg("tool_nz")[0],
+              f"registry tests (bait): a negative assertion is not an audit-row assertion, got {bg('tool_ne')} {bg('tool_nz')}")
 
     # -- registry-file floor equality, and the wiring of the new checks into the real run -------------
     with _patched(MIN_REGISTRY_FILES=3):

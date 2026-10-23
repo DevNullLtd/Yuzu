@@ -875,10 +875,13 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `rest_v1_twin` or `mcp_twin` is null compares nothing, and the checks read
      source text, so the first gate call in a handler is taken as its gate and
      each further gate call must agree or be matched, one to one, by a gate call the MCP
-     handler makes. `MIN_REGISTRY_FILES` rises from 1 to 3, the number of
+     handler makes, and a derived MCP handler's gate call for a pair other than the
+     tool's declared pair is a finding of its own (three pinned entries carry that
+     extra handler gate in their description). `MIN_REGISTRY_FILES` rises from 1 to 3, the number of
      `mcp_tools_*.cpp` registry files, and must equal that count; the
      test-existence tripwire also requires the test file to be registered in
-     `tests/meson.build`. Second, `get.api-agents` becomes
+     `tests/meson.build`, reads the `schema_violation(` call with string literals
+     blanked, and does not count a negative audit assertion. Second, `get.api-agents` becomes
      `exception:#4041 revisit:2027-01-31`: MCP `list_agents` is unconfined (a
      known gap, the World A gap tracked by #4041, not a design choice) while
      `GET /api/v1/devices` is confined through `require_fleet_read`, so it is

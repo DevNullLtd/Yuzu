@@ -330,7 +330,8 @@ so the record is not a single point of truth: keep the two in step. (A confined 
    twin-completeness test, `tests/unit/server/test_twin_completeness.cpp`, fails a registry record with
    no row or no ledger `mcp_twin`), and a domain test file `tests/unit/server/test_mcp_tools_<domain>.cpp`
    that names the tool, calls `schema_violation(` on a served body and asserts the audit row
-   (`check-api-parity.py` check 7 reads it and requires the file to be listed in `tests/meson.build`; the
+   (string literals do not count as the call and a negative audit assertion such as
+   `audit.empty()` does not count as the row; `check-api-parity.py` check 7 reads it and requires the file to be listed in `tests/meson.build`; the
    schema pair and the audit pair are each checked inside one `TEST_CASE`, and the two may sit in
    different cases; a tripwire, not a proof). A brand-new `mcp_tools_<domain>.cpp` also sets
    `MIN_REGISTRY_FILES` (an exact count) in `scripts/ci/check-api-parity.py` and `kRegistryDomainFiles`
