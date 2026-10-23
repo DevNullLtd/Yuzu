@@ -208,8 +208,9 @@ SQL beside the agent scope, before `ORDER BY`/`LIMIT`/`GROUP BY`, so the cap fla
 options and aggregates are computed over the rows the caller may read. A filtered row is simply
 absent: there is no marker or field, so an empty result no longer implies that no data exists. The
 one error is an unresolved decision: when the caller's authority cannot be determined (one disclosed exception: a degrade of
-only the global permission read for an ordinary session is answered `403` and classifies as Denied, a `200` with the
-Forensics rows absent; `yuzu_server_rbac_read_degrade_total` and the `YuzuRbacReadDegraded` alert are the signal, see
+only the global permission read for a caller other than an engine principal is answered `403` and classifies as Denied, a `200` with the
+Forensics rows absent; an engine principal is answered `503` when the RBAC store is not open, while a failed permission query is a `403` (Denied) for every caller class;
+`yuzu_server_rbac_read_degrade_total` and the `YuzuRbacReadDegraded` alert are the signal, see
 `docs/authz-model.md`) the REST routes
 answer a retryable `503` (`retry_after_ms`), MCP a retryable `kInternalError`, and an HTML surface a
 notice, and

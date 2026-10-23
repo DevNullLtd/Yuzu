@@ -6739,8 +6739,9 @@ short result does not imply that no data exists**. The one error is the unresolv
 server cannot determine whether the caller may read Forensics rows (an authorization or
 management-group store fault), the route answers a retryable A4 `503` (`retry_after_ms`, no
 `permission` field) instead of a result with those rows silently missing. One case is not covered by that
-rule: if only the global permission read degrades for an ordinary session, the session is answered as not holding
-the global grant, so the result is a `200` with the Forensics rows absent and no `503`;
+rule: if only the global permission read degrades for a caller other than an engine principal, the caller is answered as not holding
+the global grant, so the result is a `200` with the Forensics rows absent and no `503`
+(an engine principal is answered `503` when the RBAC store is not open, while a failed permission query is a `403` for every caller class);
 `yuzu_server_rbac_read_degrade_total` (alert `YuzuRbacReadDegraded`) is the signal for that case. `Forensics:Read` is a global grant, or, for an ordinary session or plain API token while RBAC
 enforcement is on, a grant scoped to management groups (only the Forensics rows of the agents in
 that scope are served). Service-scoped tokens, MCP-tier tokens and engine principals need a global
