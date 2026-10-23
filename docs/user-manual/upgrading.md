@@ -514,7 +514,16 @@ unlimited/no-expiry behaviour, or size them to the rollout window and the number
 
 **What changed.** The generic inventory store's reads (`query_inventory`, `get_agent_inventory`, `list_inventory_tables` and their REST twins, `POST /api/v1/inventory/evaluate`, and the inventory-query result-set source) no longer return rows for the typed daily-sync sources: `installed_software`, `app_perf`, `device_ci`, `software_licensing`, `app_usage`, and the reserved `certificate_inventory`. Those sources have their own stores and gates. Before this change, a typed source's blob that reached the generic store through an older server's gateway path could be read there under `Infrastructure:Read` or `Inventory:Read` until the next boot purge removed it. That window is now closed on every server at this release or later (see the per-server note below). The gateway also drops a `certificate_inventory` blob, a source no agent sends yet, instead of storing it generically.
 
-**Who notices.** Only a caller that read one of those six source names from the generic store. Their data was never meant to be there, and the typed routes (for example, the software inventory and app-usage reads) are unchanged.
+**Who notices.** Only a caller that read one of those six source names from the generic store. Their data was never meant to be there. Use the typed surface instead, which is unchanged:
+
+| Source | REST | MCP |
+|---|---|---|
+| `installed_software` | `GET /api/v1/inventory/software` | `query_installed_software` |
+| `device_ci` | `GET /api/v1/hardware/{id}` | `get_hardware_ci`, `list_hardware_ci` |
+| `app_perf` | the `/api/v1/dex/perf/*` routes | `list_dex_perf_apps`, `list_dex_perf_devices` |
+| `software_licensing` | `GET /api/v1/sle/agents/{agent_id}` | `query_software_licenses` |
+| `app_usage` | `GET /api/v1/forensics/agents/{agent_id}/app-usage` | `get_agent_app_usage` |
+| `certificate_inventory` | reserved; its routes arrive with its store | — |
 
 **Deploy order, and what is per server.** The filter protects reads served by a server at this release or later, and nothing else. Every server older than this release, or rolled back below it, keeps storing typed-source blobs that arrive through a gateway attached to it, and keeps serving them under `Infrastructure:Read` or `Inventory:Read`. In a multi-replica deployment that means the exposure is not closed until every replica runs this release: during a rolling upgrade, reads routed to an older replica still return those rows, and rows an older replica writes after an upgraded replica's boot purge stay in the table (unreadable through upgraded replicas) until a purge runs again. Upgrade servers before agents, finish the rolling upgrade promptly, and never roll a server back below this release once agents send `certificate_inventory` (none does yet).
 
