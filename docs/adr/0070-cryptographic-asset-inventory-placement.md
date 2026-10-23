@@ -1013,6 +1013,18 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
     never pruned, and a location seen within the bound never is. Accepted residual: a forward step
     of the database clock in force when the device next reports shortens the bound by that step.
     The prune PR does not merge until the owner rules on this.
+  - **R17 — the agents-before-servers window for `certificate_inventory` (PROPOSED, awaiting the
+    owner's ruling; not in force).** D12 says stray certificate rows must never be readable and the
+    mixed-version window is not acceptable for this source. A server older than the typed-source
+    read filter (or rolled back below it) that receives the agent's blob through a gateway stores
+    it in the generic store, readable under `Infrastructure:Read`. The agent receives no persistent
+    configuration from the server today, so it cannot tell such a server apart. The owner chooses:
+    (a) accept the window, closed by deploy order (servers first, never roll a server back below
+    the read filter while certificate-collecting agents run), the agent PR's merge-order test and
+    an `upgrading.md` note, and amend D12's "not acceptable" for this case; or (b) close it in
+    code: a new reserved `__sync__` enable action, persisted on the agent with the source off by
+    default and sent by the server on every connect from a stored setting, so an older server
+    never enables it. The agent collector PR does not merge until the owner rules on this.
 - A capped or timed-out capture is reported `constrained`, and the report is never an
   empty success.
 - An empty blob is never sent for a failed or constrained capture (the ADR-0016

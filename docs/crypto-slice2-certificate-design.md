@@ -1880,6 +1880,10 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
 
 7. **R16, one location-grain prune rule** (ADR-0070 D12, proposed). See
    [Retention and the prune](#retention-and-the-prune). 2a-2d does not merge before this ruling.
+8. **R17, the agents-before-servers window** (ADR-0070 D12, proposed): accept it by deploy order
+   and amend D12, or close it with a server-sent `__sync__` enable action. 2a-2e does not merge
+   before this ruling; option (b) adds a server half to 2a-2a's successor and an agent half to
+   2a-2e.
 
 ## How this could ship wrong
 
