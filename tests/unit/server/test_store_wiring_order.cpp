@@ -132,6 +132,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <iterator>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -745,7 +746,7 @@ TEST_CASE("find_confined_dispatch_sink_sites recognises the documented construct
 // delegation with its store arguments in order (rbac, then management groups, then the username).
 // That catches a seam rebound to inline logic, a dropped call, a swapped or wrong store, and a
 // delegation moved into dead code. It does not prove the seam is the one the routes receive; the
-// [1712] case below covers that for the response-visible-set seam.
+// [1712] case above covers the response-visible-set seam; the use-site counts below cover the rest.
 TEST_CASE("server.cpp: every username-keyed resolver seam delegates to the engine-aware "
           "resolver (#6204)",
           "[wiring_order][6204]") {
@@ -757,12 +758,18 @@ TEST_CASE("server.cpp: every username-keyed resolver seam delegates to the engin
             ++n;
         return n;
     };
-    const auto matches = [&text](const char* pattern) {
-        std::size_t n = 0;
+    // A seam matches when its anchor literal is followed, at that exact position, by the pattern.
+    // Anchoring first keeps the regex off the whole ~1.5 MB file (the banner above records what a
+    // whole-file std::regex costs on MSVC debug).
+    const auto seam = [&text](std::string_view anchor, const char* pattern) {
         const std::regex re(pattern);
-        for (auto it = std::sregex_iterator(text.begin(), text.end(), re);
-             it != std::sregex_iterator(); ++it)
-            ++n;
+        std::size_t n = 0;
+        for (auto pos = text.find(anchor); pos != std::string::npos;
+             pos = text.find(anchor, pos + anchor.size())) {
+            const std::string window = text.substr(pos, 800);
+            if (std::regex_search(window, re, std::regex_constants::match_continuous))
+                ++n;
+        }
         return n;
     };
     CHECK(count("yuzu::server::visibility::dispatch_permission(") == 1);
@@ -771,25 +778,61 @@ TEST_CASE("server.cpp: every username-keyed resolver seam delegates to the engin
     CHECK(count("yuzu::server::visibility::infrastructure_visible_set(") == 1);
     CHECK(count("yuzu::server::visibility::response_visible_set(") == 1);
     // Each delegation sits directly inside its seam, with the right stores in the right order.
-    CHECK(matches(R"(bool\s+dispatch_has_permission\s*\(\s*std::string_view principal,)"
-                  R"(\s*std::string_view securable,\s*yuzu::server::authz::Operation op\s*\)\s*const\s*\{)"
-                  R"(\s*return yuzu::server::visibility::dispatch_permission\(\s*rbac_store_\.get\(\),)"
-                  R"(\s*principal,\s*securable,\s*op\s*\);)") == 1);
-    CHECK(matches(R"(bool\s+response_agent_in_scope\s*\(\s*const std::string& username,)"
-                  R"(\s*const std::string& agent_id\s*\)\s*const\s*\{)"
-                  R"(\s*return yuzu::server::visibility::response_agent_in_scope\(\s*rbac_store_\.get\(\),)"
-                  R"(\s*mgmt_group_store_\.get\(\),\s*username,\s*agent_id\s*\);)") == 1);
-    CHECK(matches(R"(nlohmann::json\s+get_visible_agents_json\s*\(\s*const std::string& username\s*\)\s*\{)"
-                  R"(\s*return yuzu::server::visibility::visible_agents_json\(\s*registry_\.to_json_obj\(\),)"
-                  R"(\s*rbac_store_\.get\(\),\s*mgmt_group_store_\.get\(\),\s*username\s*\);)") == 1);
-    CHECK(matches(R"(auto\s+visible_set_fn\s*=\s*\[this\]\(const std::string& username\))"
-                  R"(\s*->\s*std::optional<std::set<std::string>>\s*\{)"
-                  R"(\s*return yuzu::server::visibility::infrastructure_visible_set\(\s*rbac_store_\.get\(\),)"
-                  R"(\s*mgmt_group_store_\.get\(\),\s*username\s*\);)") == 1);
-    CHECK(matches(R"(auto\s+response_visible_set_fn\s*=\s*\[this\]\(const std::string& username\))"
-                  R"(\s*->\s*std::optional<std::set<std::string>>\s*\{)"
-                  R"(\s*return yuzu::server::visibility::response_visible_set\(\s*rbac_store_\.get\(\),)"
-                  R"(\s*mgmt_group_store_\.get\(\),\s*username\s*\);)") == 1);
+    {
+        INFO("seam: dispatch_has_permission");
+        CHECK(seam("dispatch_has_permission(",
+                   R"(dispatch_has_permission\(\s*std::string_view principal,)"
+                   R"(\s*std::string_view securable,\s*yuzu::server::authz::Operation op\s*\)\s*const\s*\{)"
+                   R"(\s*return yuzu::server::visibility::dispatch_permission\(\s*rbac_store_\.get\(\),)"
+                   R"(\s*principal,\s*securable,\s*op\s*\);)") == 1);
+    }
+    {
+        INFO("seam: response_agent_in_scope");
+        CHECK(seam("response_agent_in_scope(const",
+                   R"(response_agent_in_scope\(\s*const std::string& username,)"
+                   R"(\s*const std::string& agent_id\s*\)\s*const\s*\{)"
+                   R"(\s*return yuzu::server::visibility::response_agent_in_scope\(\s*rbac_store_\.get\(\),)"
+                   R"(\s*mgmt_group_store_\.get\(\),\s*username,\s*agent_id\s*\);)") == 1);
+    }
+    {
+        INFO("seam: get_visible_agents_json");
+        CHECK(seam("get_visible_agents_json(const",
+                   R"(get_visible_agents_json\(\s*const std::string& username\s*\)\s*\{)"
+                   R"(\s*return yuzu::server::visibility::visible_agents_json\(\s*registry_\.to_json_obj\(\),)"
+                   R"(\s*rbac_store_\.get\(\),\s*mgmt_group_store_\.get\(\),\s*username\s*\);)") == 1);
+    }
+    {
+        INFO("seam: visible_set_fn");
+        CHECK(seam("auto visible_set_fn",
+                   R"(auto\s+visible_set_fn\s*=\s*\[this\]\(const std::string& username\))"
+                   R"(\s*->\s*std::optional<std::set<std::string>>\s*\{)"
+                   R"(\s*return yuzu::server::visibility::infrastructure_visible_set\(\s*rbac_store_\.get\(\),)"
+                   R"(\s*mgmt_group_store_\.get\(\),\s*username\s*\);)") == 1);
+    }
+    {
+        INFO("seam: response_visible_set_fn");
+        CHECK(seam("auto response_visible_set_fn",
+                   R"(auto\s+response_visible_set_fn\s*=\s*\[this\]\(const std::string& username\))"
+                   R"(\s*->\s*std::optional<std::set<std::string>>\s*\{)"
+                   R"(\s*return yuzu::server::visibility::response_visible_set\(\s*rbac_store_\.get\(\),)"
+                   R"(\s*mgmt_group_store_\.get\(\),\s*username\s*\);)") == 1);
+    }
+    // The seams are handed on: visible_set_fn to the two route registrations that take it, and the
+    // dispatch binder to both classify_and_authorize_dispatch lambdas. (The response-visible-set seam
+    // is covered by the [1712] case above.)
+    {
+        INFO("use sites of visible_set_fn");
+        std::size_t uses = 0;
+        const std::regex use_re(R"([^_A-Za-z0-9]visible_set_fn\s*,)");
+        for (auto it = std::sregex_iterator(text.begin(), text.end(), use_re);
+             it != std::sregex_iterator(); ++it)
+            ++uses;
+        CHECK(uses == 2);
+    }
+    {
+        INFO("use sites of dispatch_has_permission");
+        CHECK(count("return dispatch_has_permission(principal, securable, op);") == 2);
+    }
     // The exec-visible derivations (session-keyed and headless username-keyed) feed the composer.
     CHECK(count("facts.principal_is_engine = sess.is_engine();") == 1);
     CHECK(count("facts.principal_is_engine = yuzu::server::authz::is_engine_principal_name(username);") == 1);
@@ -797,13 +840,39 @@ TEST_CASE("server.cpp: every username-keyed resolver seam delegates to the engin
     CHECK(count("authz::is_engine_principal_name(") == 1);
 }
 
-// #6204: ONE enforcement snapshot per decision. Two `rbac_enforcement_in_effect` reads in one
-// resolver can disagree across a concurrent toggle and let an engine fall through both branches. The
-// header holds only these five resolvers, so the read count is pinned per function: a second read
-// added to any of them fails here, with no store or thread timing involved. A concurrent-toggle
-// stress test was tried and dropped: with the second read reintroduced it still passed 3 of 3 runs,
-// because the window between two reads (nanoseconds) is far narrower than a toggle (a Postgres
-// write), so it could not fail on the defect it named.
+// #6204: ONE enforcement snapshot per decision. Two enforcement reads in one resolver can disagree
+// across a concurrent toggle and let an engine fall through both branches. The header holds only
+// these five resolvers, so the read count is pinned per function: a second read added to any of
+// them fails here, with no store or thread timing involved. The scan counts the three ways to read
+// the flag (`rbac_enforcement_in_effect`, `rbac_enforcement_label`, `is_rbac_enabled`); a read
+// through some other helper is not seen, so this is a tripwire for the obvious regression, not a
+// proof of one snapshot. A concurrent-toggle stress test was tried and dropped: with the second
+// read reintroduced it still passed 3 of 3 runs, because the window between two reads
+// (nanoseconds) is far narrower than a toggle (a Postgres write), so it could not fail on the
+// defect it named.
+namespace {
+std::size_t count_enforcement_reads(const std::string& body) {
+    static const std::regex re(R"(\b(?:rbac_enforcement_in_effect|rbac_enforcement_label|is_rbac_enabled)\s*\()");
+    std::size_t n = 0;
+    for (auto it = std::sregex_iterator(body.begin(), body.end(), re); it != std::sregex_iterator();
+         ++it)
+        ++n;
+    return n;
+}
+} // namespace
+
+TEST_CASE("the enforcement-read counter sees each spelling and ignores look-alikes (#6204)",
+          "[wiring_order][6204][snapshot]") {
+    CHECK(count_enforcement_reads("a = rbac_enforcement_in_effect(rbac);") == 1);
+    CHECK(count_enforcement_reads("a = rbac_enforcement_in_effect (rbac);") == 1);
+    CHECK(count_enforcement_reads("a = rbac_enforcement_in_effect\n    (rbac);") == 1);
+    CHECK(count_enforcement_reads("a = rbac->is_rbac_enabled();") == 1);
+    CHECK(count_enforcement_reads("a = rbac_enforcement_label(rbac);") == 1);
+    CHECK(count_enforcement_reads("x = rbac_enforcement_in_effect(r); y = rbac->is_rbac_enabled();") == 2);
+    CHECK(count_enforcement_reads("a = my_rbac_enforcement_in_effect_cached(rbac);") == 0);
+    CHECK(count_enforcement_reads("a = rbac->check_permission(u, s, o);") == 0);
+}
+
 TEST_CASE("engine_aware_visibility.hpp: each resolver reads enforcement exactly once (#6204)",
           "[wiring_order][6204][snapshot]") {
     const std::string text =
@@ -817,15 +886,10 @@ TEST_CASE("engine_aware_visibility.hpp: each resolver reads enforcement exactly 
     starts.push_back(text.size());
     const char* names[] = {"dispatch_permission", "response_agent_in_scope", "visible_agents_json",
                            "infrastructure_visible_set", "response_visible_set"};
-    for (std::size_t i = 0; i < 5; ++i) {
+    for (std::size_t i = 0; i < std::size(names); ++i) {
         const std::string body = text.substr(starts[i], starts[i + 1] - starts[i]);
         INFO("resolver: " << names[i]);
         CHECK(body.find(names[i]) != std::string::npos);
-        std::size_t reads = 0;
-        const std::string call = "rbac_enforcement_in_effect(";
-        for (auto pos = body.find(call); pos != std::string::npos;
-             pos = body.find(call, pos + call.size()))
-            ++reads;
-        CHECK(reads == 1);
+        CHECK(count_enforcement_reads(body) == 1);
     }
 }

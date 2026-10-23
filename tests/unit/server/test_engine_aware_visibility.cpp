@@ -224,6 +224,11 @@ TEST_CASE("every resolver narrows to deny or empty on an absent RBAC store (#620
         REQUIRE(resp.has_value());
         CHECK(resp->empty());
     }
+    // A human who is a member of a management group is confined to that group, never the fleet,
+    // even with no RBAC store to consult.
+    REQUIRE(r.mgmt.assign_role({r.group, "user", "carol", "ExecRunner6204"}).has_value());
+    CHECK(ids(vis::visible_agents_json(fleet(), nullptr, &r.mgmt, "carol")) ==
+          std::set<std::string>{"agent-1", "agent-2"});
 }
 
 // The engine rule leans on the stores refusing what would give an engine a confined view: scoped
@@ -235,12 +240,13 @@ TEST_CASE("an engine cannot be given a confined view: scoped assignment and grou
     VisRig r;
     auto scoped = r.mgmt.assign_role({r.group, "engine", kEngine, "ExecRunner6204"});
     REQUIRE_FALSE(scoped.has_value());
-    CHECK(scoped.error().find("engine") != std::string::npos);
+    CHECK(scoped.error().find("engine principals cannot hold scoped role assignments") !=
+          std::string::npos);
 
     REQUIRE(r.rbac.create_group({"G6204rbac", "", "local", "", 0}).has_value());
     auto member = r.rbac.add_group_member("G6204rbac", kEngine);
     REQUIRE_FALSE(member.has_value());
-    CHECK(member.error().find("engine:") != std::string::npos);
+    CHECK(member.error().find("cannot be added as a group member") != std::string::npos);
 }
 
 // An absent management-group store with enforcement on: nothing to resolve a confined view against,
@@ -264,5 +270,13 @@ TEST_CASE("an absent management-group store narrows to empty unless the caller h
         r.grant_engine("InfraReader6204");
         CHECK(ids(vis::visible_agents_json(fleet(), &r.rbac, nullptr, kEngine)).size() == 3);
         CHECK_FALSE(vis::infrastructure_visible_set(&r.rbac, nullptr, kEngine).has_value());
+        r.grant_user("alice", "InfraReader6204");
+        CHECK(ids(vis::visible_agents_json(fleet(), &r.rbac, nullptr, "alice")).size() == 3);
+        CHECK_FALSE(vis::infrastructure_visible_set(&r.rbac, nullptr, "alice").has_value());
+    }
+    SECTION("a global Response:Read grant still resolves without the store") {
+        r.grant_engine("RespReader6204");
+        CHECK_FALSE(vis::response_visible_set(&r.rbac, nullptr, kEngine).has_value());
+        CHECK(vis::response_agent_in_scope(&r.rbac, nullptr, kEngine, "agent-1"));
     }
 }
