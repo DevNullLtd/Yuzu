@@ -1523,7 +1523,10 @@ TEST_CASE("Engine-principal REST: a stuck rotation pair is recovered by revoking
     }
 
     // The maintenance sweep must not touch the survivor either: it is a standalone credential
-    // with no rotation stamp, so a sweep run well past any overlap window leaves it active.
+    // with no rotation stamp, so a sweep leaves it active. The sweep decides eligibility from
+    // PostgreSQL's own now(); the `now` passed here is only a plausibility check, so it does NOT
+    // advance the sweep clock. This guards the predicate (a stamped survivor would be a
+    // candidate), not the timing.
     {
         const auto swept = h.token_store->sweep_expired_rotations(now_epoch() + 3 * 86400);
         CHECK(swept.outcome == ApiTokenStore::SweepOutcome::Ok);
