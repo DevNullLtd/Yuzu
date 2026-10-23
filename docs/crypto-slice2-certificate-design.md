@@ -653,7 +653,7 @@ What exists today:
 - The array includes `certificate_inventory` from 2a-1, before the source or its store exists. Its
   only effects then are the gateway skip and the read filter, which is what closes the window for
   servers at 2a-1 or later (see [Phasing](#phasing-and-pr-order)). 2a-2 adds the seam behind it.
-- `InventoryStore::get`, `query` and `list_tables` exclude every typed source in SQL
+- `InventoryStore::get`, `query`, `list_tables` and `count` exclude every typed source in SQL
   (`plugin <> ALL($1)`).
 - **The purge starts at boot but no longer blocks it (PR 2a-1b).** 2a-1 keeps the existing
   synchronous boot purge, iterating the one array; 2a-1b replaces it. The batched background pass (bounded rows
@@ -662,8 +662,7 @@ What exists today:
   server does not wait for it to finish before serving, instead of one unbounded `delete_source`
   per name during boot (`server.cpp:7612-7621`). The read filter makes that deferral safe: a row
   the pass has not reached yet is already unreadable.
-- Tests: the purge's list is the typed set; an inserted typed-source row is invisible to all three
-  reads; the gateway skip drops a `certificate_inventory` blob on a 2a-1 server.
+- Tests: the purge's list is the typed set; an inserted typed-source row is invisible to every generic read; the gateway skip drops a `certificate_inventory` blob on a 2a-1 server.
 
 This also closes the window `app_usage` and `device_ci` accept today. That is a behaviour change for
 those two sources (stray rows stop being readable under `Infrastructure:Read` / `Inventory:Read`).
