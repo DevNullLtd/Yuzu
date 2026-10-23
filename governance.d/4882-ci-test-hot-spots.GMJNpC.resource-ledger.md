@@ -1,7 +1,7 @@
 # Resource Ledger - CI PR2 test hot spots (#4882, #2600)
 
 Run: `governance.d/4882-ci-test-hot-spots.GMJNpC.jsonl`
-Range: `5f4064fb4..4c821ff21` (the branch's own commits 614d837b2..a477db1cc plus the gate-fix commits and the origin/dev merge 8d1caf981).
+Range: `5f4064fb4..4c821ff21` (the branch's own commits 614d837b2..a477db1cc plus the gate-fix commits and the origin/dev merge 8d1caf981), then pass 2 `10fe4a988..19bbabeb9` (after the second origin/dev merge 10fe4a988: the scanner port and the last pattern-pass case, below).
 
 ## Summary
 
@@ -25,3 +25,22 @@ changes are eight test-only `*_for_test` seams plus one ownership move; the rest
 No thread, callback context or raw resource API was added. Every seam has zero callers outside tests.
 Confirmed independently by cpp-safety (Gate 3, no findings), security-guardian and authdb. Sanitizer coverage:
 TSan, already in the Linux sanitizer legs; ASan/UBSan add nothing new.
+
+## Pass 2 (`10fe4a988..19bbabeb9`, test-only plus one comment-only production header)
+
+No new or modified fd / HANDLE / SOCKET / `FILE*` / `sqlite3_stmt*` / `sqlite3*` / OpenSSL object / BCrypt handle /
+allocated C string / mapped library / temp path / subprocess / thread / callback context. `server/core/src/mcp_server.hpp`
+is a comment-only edit (the registration call was quoted in a comment that the header scan reads as code).
+
+| Item | Owner | Acquired | Released | Failure cleanup |
+|---|---|---|---|---|
+| Memoised corpora behind `read_all_cpp_files`, `read_all_header_files`, `discover_mutating_routes` (`route_inventory_scan.hpp`) | one function-local `static const` vector each, inline function, one instance per test binary | first call (magic static) | process exit | a `REQUIRE` throwing in the initialiser leaves the static uninitialised and the next call retries (checked with Catch2 by unhappy-path); callers hold `const&` and never store it past a test case |
+| `std::ifstream` in the readers | the reader loop body (RAII) | per file | scope exit | `INFO(dir)` / `INFO(entry.path())` now name the failing path |
+| initialiser lambda `[&dir]` | the static's initialising statement | with it | end of that statement | consumed synchronously, never stored; a temporary `fs::path` argument outlives it |
+| `find_step_up_calls`, `plain_literal` (`route_registration_scan.hpp`) | pure; results own their `std::string` labels, offsets are `size_t` | n/a | n/a | the `[&]` lambdas `skip`/`eat`/`tok` are consumed inside the loop iteration; `string_view::compare(pos, n, tok)` is never reached with `pos > size()` (cpp-safety, cpp-expert) |
+
+Independently confirmed by cpp-safety (Gate 3, no findings; ASan+UBSan, libc++ debug hardening, exact-size heap buffers, 122,861
+prefix/suffix windows around real call sites, 100,000 random token strings, 359 `.cpp` and 556 header files: zero reports, plus a
+positive control that aborts on a deliberate over-read), cpp-expert (ODR across translation units: one instance after link),
+security-guardian and unhappy-path (1.2M and 400k differential inputs against the old patterns: 0 differences). Sanitizer
+coverage: ASan/UBSan run locally on macOS; TSan adds nothing (no threads).
