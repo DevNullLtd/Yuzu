@@ -92,7 +92,7 @@ counter or a store rather than a read, the PR says so, and the next PR in the ch
 | 2a-2f | Agent collector: Windows | The Windows machine-store reads and the private-key metadata. | A Windows agent reports its certificates. | 2a-2e |
 | 2a-2g | Agent collector: macOS | The System keychain and SystemRoots reads. | A macOS agent reports its certificates. | 2a-2e |
 | 2a-3 | D13 certificate counts | The counts read (REST + MCP), the snapshot export, the D13 condition-1 lint entries and the recompute test; the data the certificate widgets read. | Operators see the counts on `/crypto` and through MCP. | 2a-2b |
-| 2a-4 | CBOM certificate half | Certificate, algorithm and public-key components in `GET /api/v1/crypto/cbom` and `export_crypto_cbom`, gated by the certificate securable. | The CBOM gains its certificate half. | 2a-2b |
+| 2a-4 | CBOM certificate half | Certificate, algorithm and public-key components in `GET /api/v1/crypto/cbom` and `export_crypto_cbom`, gated by the certificate securable. | The CBOM gains its certificate half. | 2a-2b, and the DPIA screening |
 | 2b-1a | Revocation sources | `RevocationSourceStore`; registration REST + MCP, with the registration-time address checks and the resolved address-class display; the admin-only predicate and the floor-header amendment; `/readyz` membership. | An administrator registers, lists and removes a CA and its CRL URLs. | — |
 | 2b-1b | CRL fetcher | The fetcher and its egress checks; CRL verification and acceptance; the leader-gated refresh job; `crl_past_next_update` on the source read; metrics and alerts. | A registered source shows its fetch status, held CRL, `thisUpdate`, `nextUpdate` and entry count; the alerts fire. | 2b-1a |
 | 2b-2 | Revocation statements | Read-time matching on the per-certificate read (`CertificateRevocationReader`); the revoked windows in the counts read; the signature-verification job; the server re-parse of stored DER and `claim_mismatch`; the widgets' revoked data. | Certificates read "revoked on …", "on hold", "not listed on …" or "revocation not checked", with the cause. | 2a-3, 2b-1b |
@@ -1917,6 +1917,12 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
    amendment to D13 condition 3, "never stored"), a longer bound with its own read slot, or an
    asynchronous count job. 2a-3 ships the read-time counts with the limit stated; the chosen fix is
    its own PR.
+
+10. **CBOM audit posture** (raised by 2a-4's governance, owner acknowledgement pending). The CBOM
+    certificate half writes its own `crypto.certificates.view` row (`via=cbom`) and is omitted,
+    named in `halves_omitted`, when that row cannot be stored, on REST and on MCP alike (stricter
+    than OD-2's MCP set-and-proceed); the export's own row stays set-and-proceed for the library
+    half. The code is kept and this design follows it.
 
 ## How this could ship wrong
 
